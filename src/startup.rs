@@ -1201,7 +1201,17 @@ impl Startup {
         cfg.max_budget_usd = max_budget_usd;
         validate_startup_permission_policy(&cli, &cfg)?;
 
-        // Load context first so prompts/themes are available early.
+        // Load context first so prompts/themes are available early. Root
+        // context files share a budget relative to the startup model's window
+        // (mini-agent-59sgr).
+        context::set_context_file_budget(context::context_file_budget_for(
+            cfg.resolve_context_window(
+                &cli.resolve_provider(&cfg),
+                &cli.resolve_model(&cfg),
+                config::quick_models_map(&cfg),
+            ),
+            cfg.context_files_max_bytes,
+        ));
         let no_context_files = cli.resolve_no_context_files(&cfg);
         // Persistent memory is read once below, after the session is known,
         // so a resumed session's compaction exclusion is applied in one pass.

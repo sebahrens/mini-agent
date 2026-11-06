@@ -748,13 +748,52 @@ const MAX_ANCESTOR_CONTEXT_BYTES: usize = 524_288;
 
 /// Appended where a context file was cut to fit the budget.
 const CONTEXT_TRUNCATION_NOTICE: &str =
-    "\n\n[context file truncated: the combined context-file limit was reached]";
+    "\n\n[context file truncated: combined limit reached; see context_files_max_bytes]";
+
+/// Smallest accepted combined context-file budget.
+const MIN_CONTEXT_FILE_BUDGET: usize = 16 * 1024;
+
+/// Combined context-file budget for this process, set at startup from the
+/// model's window (mini-agent-59sgr). Defaults to the absolute cap.
+static CONTEXT_FILE_BUDGET: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(MAX_ANCESTOR_CONTEXT_BYTES);
+
+/// The combined budget for a context window: explicit
+/// `context_files_max_bytes`, else as many bytes as the window has tokens
+/// (about a quarter of the window at four bytes per token). Always within
+/// 16 KiB..512 KiB.
+pub(crate) fn context_file_budget_for(context_window: u64, explicit: Option<u64>) -> usize {
+    let bytes = explicit.unwrap_or(context_window);
+    usize::try_from(bytes)
+        .unwrap_or(usize::MAX)
+        .clamp(MIN_CONTEXT_FILE_BUDGET, MAX_ANCESTOR_CONTEXT_BYTES)
+}
+
+/// Install the combined context-file budget used by later loads.
+pub(crate) fn set_context_file_budget(bytes: usize) {
+    CONTEXT_FILE_BUDGET.store(
+        bytes.clamp(MIN_CONTEXT_FILE_BUDGET, MAX_ANCESTOR_CONTEXT_BYTES),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
 
 /// The running total of context-file bytes admitted into the prompt
 /// (mini-agent-ag4ze).
-#[derive(Default)]
 struct ContextBudget {
     used: usize,
+    limit: usize,
+}
+
+impl Default for ContextBudget {
+    fn default() -> Self {
+        // Unit tests run concurrently with startup tests that install a
+        // process budget; they construct explicit budgets instead.
+        #[cfg(not(test))]
+        let limit = CONTEXT_FILE_BUDGET.load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        let limit = MAX_ANCESTOR_CONTEXT_BYTES;
+        Self { used: 0, limit }
+    }
 }
 
 impl ContextBudget {
@@ -764,11 +803,10 @@ impl ContextBudget {
         if content.trim().is_empty() {
             return None;
         }
-        let remaining = MAX_ANCESTOR_CONTEXT_BYTES.saturating_sub(self.used);
+        let limit = self.limit;
+        let remaining = limit.saturating_sub(self.used);
         if remaining == 0 {
-            tracing::warn!(
-                "context file {label} skipped: context files exceed {MAX_ANCESTOR_CONTEXT_BYTES} bytes"
-            );
+            tracing::warn!("context file {label} skipped: context files exceed {limit} bytes");
             return None;
         }
         if content.len() <= remaining && !truncated {
@@ -780,9 +818,9 @@ impl ContextBudget {
             end -= 1;
         }
         tracing::warn!(
-            "context file {label} truncated to {end} bytes: context files exceed {MAX_ANCESTOR_CONTEXT_BYTES} bytes"
+            "context file {label} truncated to {end} bytes: context files exceed {limit} bytes"
         );
-        self.used = MAX_ANCESTOR_CONTEXT_BYTES;
+        self.used = limit;
         let mut kept = content;
         kept.truncate(end);
         kept.push_str(CONTEXT_TRUNCATION_NOTICE);
@@ -859,9 +897,40 @@ mod repository_context_tests {
 
     // mini-agent-ag4ze: one oversized file is cut to the byte cap, and nothing
     // after the cap is admitted.
+    // mini-agent-59sgr: a 400 KiB AGENTS.md under a 128k window is cut to a
+    // window-relative budget with a visible notice.
+    #[test]
+    fn a_large_context_file_is_truncated_to_a_window_relative_budget() {
+        let limit = context_file_budget_for(128_000, None);
+        assert_eq!(limit, 128_000);
+        assert_eq!(
+            context_file_budget_for(1_000_000, None),
+            MAX_ANCESTOR_CONTEXT_BYTES
+        );
+        assert_eq!(
+            context_file_budget_for(8_000, None),
+            MIN_CONTEXT_FILE_BUDGET
+        );
+        assert_eq!(context_file_budget_for(128_000, Some(64 * 1024)), 64 * 1024);
+        assert_eq!(
+            context_file_budget_for(128_000, Some(u64::MAX)),
+            MAX_ANCESTOR_CONTEXT_BYTES
+        );
+        let mut budget = ContextBudget { used: 0, limit };
+        let admitted = budget
+            .admit("AGENTS.md", "a".repeat(400 * 1024), false)
+            .unwrap();
+        assert_eq!(admitted.len(), limit + CONTEXT_TRUNCATION_NOTICE.len());
+        assert!(admitted.ends_with(CONTEXT_TRUNCATION_NOTICE));
+        assert!(CONTEXT_TRUNCATION_NOTICE.contains("context_files_max_bytes"));
+    }
+
     #[test]
     fn a_single_oversized_context_file_is_truncated_to_the_cap() {
-        let mut budget = ContextBudget::default();
+        let mut budget = ContextBudget {
+            used: 0,
+            limit: MAX_ANCESTOR_CONTEXT_BYTES,
+        };
         let huge = "x".repeat(MAX_ANCESTOR_CONTEXT_BYTES + 10);
         let admitted = budget.admit("AGENTS.md", huge, false).unwrap();
         assert!(admitted.ends_with(CONTEXT_TRUNCATION_NOTICE));
@@ -872,13 +941,17 @@ mod repository_context_tests {
         assert!(budget.admit("CLAUDE.md", "more".into(), false).is_none());
 
         // A read that was already cut is marked even when it fits exactly.
-        let mut budget = ContextBudget::default();
+        let mut budget = ContextBudget {
+            used: 0,
+            limit: MAX_ANCESTOR_CONTEXT_BYTES,
+        };
         let admitted = budget.admit("AGENTS.md", "short".into(), true).unwrap();
         assert_eq!(admitted, format!("short{CONTEXT_TRUNCATION_NOTICE}"));
 
         // Multi-byte text is cut on a character boundary.
         let mut budget = ContextBudget {
             used: MAX_ANCESTOR_CONTEXT_BYTES - 3,
+            limit: MAX_ANCESTOR_CONTEXT_BYTES,
         };
         let admitted = budget.admit("CLAUDE.md", "éé".into(), false).unwrap();
         assert_eq!(admitted, format!("é{CONTEXT_TRUNCATION_NOTICE}"));

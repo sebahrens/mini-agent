@@ -765,6 +765,12 @@ pub struct Config {
     /// context window.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compact_restore_read_tokens: Option<u64>,
+    /// Combined byte budget for root context files (AGENTS.md, CLAUDE.md,
+    /// ARCHITECTURE.md, global AGENTS.md). Unset: as many bytes as the
+    /// model's context window has tokens, within 16 KiB..512 KiB
+    /// (mini-agent-59sgr).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_files_max_bytes: Option<u64>,
     /// Values not owned by this build, including fields behind disabled Cargo
     /// features and fields introduced by newer mini-agent versions.
     ///

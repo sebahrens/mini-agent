@@ -746,6 +746,7 @@ Accepted top-level keys:
 | `tool_result_spill_head_chars` | integer | Characters of a spilled result kept from its start. Default: a sixth of the threshold. If head + tail would not stay below the threshold, both fall back to the default split. |
 | `tool_result_spill_tail_chars` | integer | Characters of a spilled result kept from its end. Default: two thirds of the threshold. |
 | `compact_restore_read_tokens` | integer | Token budget for re-attaching the newest file windows read in the compacted history (at most 5, one per path) to the compaction summary. Default: `context_window / 20`, at most `25000`. `0` disables. |
+| `context_files_max_bytes` | integer | Combined byte budget for root context files (global and workspace `AGENTS.md`, `CLAUDE.md`, `ARCHITECTURE.md`). Default: the startup model's context window in tokens, clamped to `16384`–`524288`. |
 | `compact_enabled`         | boolean | Master switch for all automatic conversation compaction (between ordinary TUI turns, between `/loop` iterations, before an over-budget resumed headless `-p` request, headless context relief, and mid-turn compaction). Default: `true`. An explicit `false` is honored: nothing is ever compacted automatically.            |
 | `claude_project_agents`   | boolean | Read project `.claude/agents/*.md` as specialist definitions (Claude Code compatibility). `false` makes mini-agent ignore that layer entirely (no loading, no validation warnings), leaving `.mini-agent/agents`, the user-global and the built-in definitions. Default: `true`. Restart required. |
 | `mid_turn_compact_threshold` | number | Mid-turn compaction. Fraction of the context window (`0.0`–`1.0`) of real provider prompt pressure at which to compact *during* a turn, not just between turns. Default when unset: `0.9`; `0` disables mid-turn compaction. Honored only when `compact_enabled` is `true`. See Mid-turn compaction below.            |
@@ -3017,8 +3018,12 @@ untagged duplicate cancellation cannot be redirected to queued work. Other
 sessions remain independent and continue normally.
 
 Context files (global and workspace `AGENTS.md`, `CLAUDE.md`, and `ARCHITECTURE.md`)
-share a 512 KiB budget. A file that does not fit in what remains is truncated with a
-visible notice rather than loaded whole, and files after the budget is spent are skipped.
+share a budget relative to the startup model's context window: as many bytes as the
+window has tokens (about a quarter of the window at four bytes per token), within
+16 KiB–512 KiB, so a 128k window admits 128,000 bytes. `context_files_max_bytes`
+sets it explicitly (same bounds). A file that does not fit in what remains is
+truncated with a visible notice (`[context file truncated: ...]`) rather than loaded
+whole, and files after the budget is spent are skipped.
 
 Root `CLAUDE.local.md` and authored `@path` or `@{path with spaces}` includes are
 captured at agent construction. Native `read`, `edit`, `write` and `notebook_edit`
@@ -3034,7 +3039,10 @@ path/content fingerprint and covers subsequently captured instruction bytes;
 unchecked Ask/Deny fails with a bounded error instead of requesting an implicit
 grant. Author includes remain inside their original global or workspace root,
 reject symlinks and multiple hard links, and use at most four include levels,
-32 files per traversal and 16 KiB per UTF-8 source. New sources share at most
+32 files per traversal and 16 KiB per UTF-8 source. A source over its per-source
+or remaining bound is loaded truncated with an `[instruction source truncated: ...]`
+notice (sized so its JSON-escaped receipt still fits the delivery cap) instead of
+being rejected; invalid UTF-8 is still rejected. New sources share at most
 128 KiB and the remainder of the old 512 KiB context budget after JSON escaping;
 earlier root content retains priority. Physical file aliases and include cycles
 are deduplicated while preserving the first authored scope/order.

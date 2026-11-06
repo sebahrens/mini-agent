@@ -192,6 +192,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     key("compact_enabled").shaped(ConfigShape::Bool),
     key("tool_result_spill_chars").described("Generic spill threshold (characters) for tool results without their own bound, e.g. MCP. Default: context window/10, clamped to 12000..50000.").shaped(ConfigShape::Integer),
     key("tool_result_spill_head_chars").described("Characters kept from the start of a spilled tool result. Default: threshold/6.").shaped(ConfigShape::Integer),
+    key("context_files_max_bytes").described("Combined byte budget for root context files (AGENTS.md, CLAUDE.md, ARCHITECTURE.md). Default: the model's context window in tokens, clamped to 16384..524288.").shaped(ConfigShape::Integer),
     key("compact_restore_read_tokens").described("Token budget for re-attaching the newest file windows (up to 5) read before a compaction. Default: window/20 capped at 25000; 0 disables.").shaped(ConfigShape::Integer),
     key("tool_result_spill_tail_chars").described("Characters kept from the end of a spilled tool result. Default: threshold*2/3.").shaped(ConfigShape::Integer),
     key("claude_project_agents").shaped(ConfigShape::Bool),

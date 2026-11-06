@@ -37,6 +37,9 @@ Notable changes to mini-agent are documented in this file. The format follows
   (up to 5, quoted as untrusted, possibly stale content) within `compact_restore_read_tokens`
   (default `window / 20`, at most 25,000; `0` disables), so the model need not re-read them
   (mini-agent-xzt6g).
+- Root context files now share a window-relative budget (window tokens as bytes, 16 KiB–512 KiB,
+  `context_files_max_bytes` overrides) instead of a fixed 512 KiB, and an oversized nested or
+  included instruction source loads truncated with a notice instead of failing (mini-agent-59sgr).
 
 ### Security
 
