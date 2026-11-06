@@ -364,8 +364,8 @@ else
     FAIL=$((FAIL + 1))
 fi
 _assert_file_absent "no binary installed after failed attestation" "${ATTEST_FAIL_DIR}/${BINARY_NAME}"
-if grep -Eq "^attestation verify /.*/${ARCHIVE} --repo sebahrens/mini-agent\$" "$GH_LOG"; then
-    echo "  PASS: installer verifies the downloaded archive against sebahrens/mini-agent"
+if grep -Eq "^attestation verify /.*/${ARCHIVE} --repo sebahrens/mini-agent --signer-workflow sebahrens/mini-agent/.github/workflows/release\\.yml --source-ref refs/tags/v${CARGO_VERSION//./\\.}\$" "$GH_LOG"; then
+    echo "  PASS: installer pins the attestation to the release workflow and the requested tag"
     PASS=$((PASS + 1))
 else
     echo "  FAIL: installer did not run gh attestation verify on the archive"

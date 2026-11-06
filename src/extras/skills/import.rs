@@ -9,7 +9,9 @@ use crate::paths::AppPaths;
 use crate::{fs as secure_fs, paths::portable};
 
 use super::catalog::{AgentSkillCatalog, CatalogError};
-use super::manifest::{AgentSkillManifest, ManifestError, parse_skill_markdown};
+use super::manifest::{
+    AgentSkillManifest, ManifestError, parse_skill_markdown, parse_skill_markdown_lenient,
+};
 
 #[cfg(feature = "skills")]
 use crate::extras::js::skills::store::SkillStore;
@@ -240,7 +242,7 @@ pub fn import_agent_skill(
         return Err(ImportError::InvalidSource);
     };
 
-    publish_tree(tree, expected_directory.as_deref(), app_paths)
+    publish_tree(tree, expected_directory.as_deref(), app_paths, false)
 }
 
 /// Shared validated publication. Discovery supplies bytes read through retained
@@ -250,8 +252,9 @@ pub(super) fn publish_tree(
     tree: SourceTree,
     expected_directory: Option<&str>,
     app_paths: &AppPaths,
+    lenient: bool,
 ) -> Result<ImportedSkill, ImportError> {
-    let (tree, manifest) = normalize_skill_tree(tree, expected_directory)?;
+    let (tree, manifest) = normalize_skill_tree(tree, expected_directory, lenient)?;
     validate_instruction_budget(&tree)?;
     validate_learned_js_references(&manifest, app_paths)?;
     let identity = identity(&tree);
@@ -667,6 +670,7 @@ fn validate_ratio(expanded: u64, compressed: u64) -> Result<(), ImportError> {
 fn normalize_skill_tree(
     tree: SourceTree,
     expected_directory: Option<&str>,
+    lenient: bool,
 ) -> Result<(SourceTree, AgentSkillManifest), ImportError> {
     let skill_paths: Vec<&str> = tree
         .entries
@@ -705,11 +709,16 @@ fn normalize_skill_tree(
         }
     };
 
-    let manifest = parse_skill_markdown(
-        normalized
-            .file("SKILL.md")
-            .ok_or(ImportError::InvalidSkillRoot)?,
-    )?;
+    let skill_md = normalized
+        .file("SKILL.md")
+        .ok_or(ImportError::InvalidSkillRoot)?;
+    // Only Claude Code compatibility roots get Claude Code's defaults; explicit
+    // imports stay on the strict Agent Skills rules.
+    let manifest = if lenient {
+        parse_skill_markdown_lenient(skill_md, &directory_name)?
+    } else {
+        parse_skill_markdown(skill_md)?
+    };
     Ok((
         normalized,
         manifest_for_directory(manifest, &directory_name)?,
@@ -805,8 +814,11 @@ fn validate_existing(root: &Path, name: &str, digest: &str) -> Result<(), Import
         return Err(ImportError::DigestConflict);
     }
     let tree = collect_directory(root)?;
-    let manifest = parse_skill_markdown(tree.file("SKILL.md").ok_or(ImportError::DigestConflict)?)
-        .map_err(|_| ImportError::DigestConflict)?;
+    let manifest = parse_skill_markdown_lenient(
+        tree.file("SKILL.md").ok_or(ImportError::DigestConflict)?,
+        name,
+    )
+    .map_err(|_| ImportError::DigestConflict)?;
     if manifest.name != name || identity(&tree).digest != digest {
         return Err(ImportError::DigestConflict);
     }

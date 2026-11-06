@@ -8,6 +8,18 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Added
 
+- Agent hook file reads (`hooks_agent_read_files`) now obey `read` permission rules (deny and ask
+  both refuse), `.gitignore`/`.ignore` and a wider credential list (mini-agent-m9txi). `update`
+  and `install.sh` pin build-provenance verification to the release workflow and tag
+  (mini-agent-tn2d8). `skills_extra_dirs`/`--add-dir` expand `~`, resolve relative entries against
+  their config file and report every dropped entry (mini-agent-yxhsr); `add_dir_tool_access` (off by
+  default) lets the file tools reach `--add-dir` directories under the normal permission rules
+  (mini-agent-5y1p9). MEMORY.md keeps half the injection budget against long daily logs, with a
+  startup notice when a section is cut (mini-agent-fl1s9); invalid UTF-8 in memory files is
+  decoded lossily with a warning instead of hiding the file (mini-agent-y05zj). `.claude/skills`
+  packages load without full frontmatter (mini-agent-7wwkr). `project_root_discovery` (off by
+  default) starts at the nearest `.git` ancestor; otherwise a notice names the skipped root assets
+  (mini-agent-ucpw0).
 - `read` hands scanned and figure-only PDF pages to Anthropic, OpenAI Responses and Gemini models as
   one provider-native PDF document block holding only those pages (catalogued vision models only;
   encrypted, oversized or unextractable files fall back to page images). rig's `ToolResultContent`

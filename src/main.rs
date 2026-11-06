@@ -24,6 +24,7 @@ mod pricing;
 mod print;
 mod process_creation;
 mod product;
+mod project_root;
 mod provider;
 mod provider_http;
 mod provider_listing;
@@ -233,8 +234,38 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let workspace_root =
+    let launch_dir =
         std::env::current_dir().context("failed to resolve the startup workspace root")?;
+    // Project-root discovery: opt-in (user config or --config) move to the
+    // nearest .git ancestor; otherwise say which root assets were not loaded.
+    let user_config = paths::AppPaths::from_process(Some(launch_dir.clone()))
+        .ok()
+        .map(|early| config::pick_existing(&early.config_dir));
+    let workspace_root = match project_root::apply(
+        &launch_dir,
+        user_config.as_deref(),
+        &config_overrides,
+    )
+    .context("failed to move to the project root")?
+    {
+        Some(root) => {
+            eprintln!(
+                "notice: project root {} (started in {}): project config, MCP servers, agents, skills, instructions and memory come from the root",
+                root.display(),
+                launch_dir.display()
+            );
+            root
+        }
+        None => {
+            if let Some(notice) = project_root::skipped_assets_notice(
+                &launch_dir,
+                paths::process_home_dir().as_deref(),
+            ) {
+                eprintln!("notice: {notice}");
+            }
+            launch_dir
+        }
+    };
     let workspace = std::sync::Arc::new(
         paths::WorkspaceBinding::capture(&workspace_root)
             .context("failed to bind the startup workspace root")?,
@@ -644,18 +675,33 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
     #[cfg(feature = "agent-skills")]
     {
         extras::skills::index::AgentSkillSearchPolicy::configure(&cfg);
-        let path_list = |list: &Option<Vec<String>>| -> Vec<std::path::PathBuf> {
+        // Config entries resolve against the directory of the config file that
+        // set them, command-line entries against the launch directory.
+        let launch = std::env::current_dir().unwrap_or_default();
+        let entries = |key: &str,
+                       list: &Option<Vec<String>>|
+         -> Vec<extras::skills::session::ExtraDirEntry> {
+            let base = cfg
+                .provenance
+                .base_dir_for(key)
+                .unwrap_or_else(|| launch.clone());
             list.iter()
                 .flatten()
-                .map(std::path::PathBuf::from)
+                .map(|entry| (entry.clone(), base.clone()))
                 .collect()
         };
-        let mut add_dirs = path_list(&cfg.skills_extra_dirs);
-        add_dirs.extend(cli.add_dir.iter().cloned());
-        extras::skills::session::configure_extra_roots(
-            add_dirs,
-            path_list(&cfg.skills_plugin_dirs),
+        let mut add_dirs = entries("skills_extra_dirs", &cfg.skills_extra_dirs);
+        add_dirs.extend(
+            cli.add_dir
+                .iter()
+                .map(|dir| (dir.to_string_lossy().into_owned(), launch.clone())),
         );
+        for note in extras::skills::session::configure_extra_roots(
+            add_dirs,
+            entries("skills_plugin_dirs", &cfg.skills_plugin_dirs),
+        ) {
+            eprintln!("warning: {note}");
+        }
     }
     // ── Hooks: load settings.json config, apply trust, install dispatcher ──
     // Done this early (before provider/API-key resolution) so `--hooks-test`

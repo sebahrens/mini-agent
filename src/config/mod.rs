@@ -90,6 +90,20 @@ impl ConfigLayer {
 }
 
 impl ConfigProvenance {
+    /// The directory a relative path value of `key` should resolve against:
+    /// the directory of the config file of the layer that set it last. `None`
+    /// for the command line, an unset key, or an unknown file location.
+    #[cfg(feature = "agent-skills")]
+    pub(crate) fn base_dir_for(&self, key: &str) -> Option<std::path::PathBuf> {
+        let file = match self.sources.get(key)?.iter().max()? {
+            ConfigLayer::Global => self.global_file.as_ref(),
+            ConfigLayer::Project => self.project_file.as_ref(),
+            ConfigLayer::Local => self.local_file.as_ref(),
+            ConfigLayer::Cli => None,
+        }?;
+        file.parent().map(std::path::Path::to_path_buf)
+    }
+
     pub(crate) fn record(&mut self, value: &toml::Value, layer: ConfigLayer) {
         let Some(table) = value.as_table() else {
             return;
@@ -1007,6 +1021,17 @@ pub struct Config {
     /// Plugin directories: each is searched for `skills/`. Default none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skills_plugin_dirs: Option<Vec<String>>,
+    /// Start sessions at the nearest `.git` ancestor when launched below it, so
+    /// project config, MCP servers, agents, skills, instructions and memory
+    /// come from the repository root. Read only from the user config file or
+    /// `--config` before any project file is seen; default false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_root_discovery: Option<bool>,
+    /// `--add-dir` directories also become directories the file tools may
+    /// reach under the normal permission rules (an external-directory allow;
+    /// deny rules still win). Default false: `--add-dir` only adds skill roots.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub add_dir_tool_access: Option<bool>,
     /// Let PermissionRequest hooks answer approvals (allow once / deny).
     /// Default false: they only observe.
     #[serde(skip_serializing_if = "Option::is_none")]

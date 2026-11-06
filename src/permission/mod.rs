@@ -483,12 +483,36 @@ pub(crate) fn build_interactive_permission_with_cli_at(
     let seeds = cli_rules::config(cli)?;
     let result = build_interactive_permission_at(cfg, authority, working_dir)?;
     if let Some(permission) = &result.0 {
-        permission
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .apply_ephemeral_cli_rules(&seeds)?;
+        let mut checker = permission.lock().unwrap_or_else(|error| error.into_inner());
+        checker.apply_ephemeral_cli_rules(&seeds)?;
+        grant_add_dir_access(&mut checker, cli, cfg);
     }
     Ok(result)
+}
+
+/// `add_dir_tool_access = true`: every existing `--add-dir` directory becomes an
+/// allowed external directory for the file tools. Off by default; the per-tool
+/// permission rules and explicit denies still decide each access.
+pub(crate) fn grant_add_dir_access(
+    checker: &mut checker::PermissionChecker,
+    cli: &crate::cli::Cli,
+    cfg: &crate::config::Config,
+) {
+    if !cfg.add_dir_tool_access.unwrap_or(false) {
+        return;
+    }
+    for dir in &cli.add_dir {
+        let absolute = if dir.is_absolute() {
+            dir.clone()
+        } else if let Ok(cwd) = std::env::current_dir() {
+            cwd.join(dir)
+        } else {
+            continue;
+        };
+        if absolute.is_dir() {
+            checker.allow_external_directory(&absolute);
+        }
+    }
 }
 
 pub(crate) fn build_noninteractive_permission_with_cli(
@@ -499,10 +523,9 @@ pub(crate) fn build_noninteractive_permission_with_cli(
     let seeds = cli_rules::config(cli)?;
     let result = build_noninteractive_permission(cfg, authority)?;
     if let Some(permission) = &result.0 {
-        permission
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .apply_ephemeral_cli_rules(&seeds)?;
+        let mut checker = permission.lock().unwrap_or_else(|error| error.into_inner());
+        checker.apply_ephemeral_cli_rules(&seeds)?;
+        grant_add_dir_access(&mut checker, cli, cfg);
     }
     Ok(result)
 }

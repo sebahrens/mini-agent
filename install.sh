@@ -408,8 +408,20 @@ fi
 #   MINI_AGENT_INSTALL_NO_GH=1     never invoke gh (also skips verification)
 attestation_manual_hint() {
     echo "  Verify it yourself with the GitHub CLI (https://cli.github.com):" >&2
-    echo "    gh attestation verify ${ARCHIVE_FILE} --repo ${REPO}" >&2
+    echo "    gh attestation verify ${ARCHIVE_FILE} --repo ${REPO} ${ATTESTATION_PIN[*]}" >&2
 }
+
+# Pin the attestation to the release workflow (not any workflow in the repo)
+# and, when a version was requested, to its tag. For "latest" the tag is not
+# known before the archive is opened, so the signing identity is matched to the
+# release workflow at any v* tag instead.
+if [[ -n "$RELEASE_VERSION" ]]; then
+    ATTESTATION_PIN=(--signer-workflow "${REPO}/.github/workflows/release.yml" \
+        --source-ref "refs/tags/v${RELEASE_VERSION}")
+else
+    ATTESTATION_PIN=(--cert-identity-regex \
+        "^https://github\\.com/${REPO//./\\.}/\\.github/workflows/release\\.yml@refs/tags/v[0-9]")
+fi
 
 verify_attestation() {
     if [[ "${MINI_AGENT_SKIP_ATTESTATION:-}" == "1" ]]; then
@@ -435,12 +447,12 @@ verify_attestation() {
         return 0
     fi
     local log="${TMPDIR}/.attestation.log"
-    if gh attestation verify "$ARCHIVE_PATH" --repo "$REPO" >"$log" 2>&1; then
-        echo "Verified build provenance for ${ARCHIVE_FILE} (gh attestation verify --repo ${REPO})."
+    if gh attestation verify "$ARCHIVE_PATH" --repo "$REPO" "${ATTESTATION_PIN[@]}" >"$log" 2>&1; then
+        echo "Verified build provenance for ${ARCHIVE_FILE} (gh attestation verify --repo ${REPO}, pinned to the release workflow)."
         return 0
     fi
     echo "Error: build provenance verification failed for ${ARCHIVE_FILE}." >&2
-    echo "  'gh attestation verify --repo ${REPO}' did not accept the archive:" >&2
+    echo "  'gh attestation verify --repo ${REPO} ${ATTESTATION_PIN[*]}' did not accept the archive:" >&2
     sed 's/^/    /' "$log" >&2
     echo "  Nothing was installed. To install without provenance verification anyway," >&2
     echo "  rerun with MINI_AGENT_SKIP_ATTESTATION=1." >&2

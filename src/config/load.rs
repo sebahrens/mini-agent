@@ -4387,6 +4387,42 @@ mod project_config_trust_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(feature = "agent-skills")]
+    #[test]
+    fn relative_skill_dirs_resolve_against_the_file_of_the_layer_that_set_them() {
+        let mut provenance = crate::config::ConfigProvenance {
+            global_file: Some("/home/u/.config/mini-agent/config.toml".into()),
+            project_file: Some("/repo/.mini-agent/config.toml".into()),
+            ..Default::default()
+        };
+        provenance.sources.insert(
+            "skills_extra_dirs",
+            [crate::config::ConfigLayer::Global].into(),
+        );
+        assert_eq!(
+            provenance.base_dir_for("skills_extra_dirs").unwrap(),
+            std::path::Path::new("/home/u/.config/mini-agent")
+        );
+        provenance.sources.insert(
+            "skills_extra_dirs",
+            [
+                crate::config::ConfigLayer::Global,
+                crate::config::ConfigLayer::Project,
+            ]
+            .into(),
+        );
+        assert_eq!(
+            provenance.base_dir_for("skills_extra_dirs").unwrap(),
+            std::path::Path::new("/repo/.mini-agent")
+        );
+        provenance.sources.insert(
+            "skills_extra_dirs",
+            [crate::config::ConfigLayer::Cli].into(),
+        );
+        assert!(provenance.base_dir_for("skills_extra_dirs").is_none());
+        assert!(provenance.base_dir_for("skills_plugin_dirs").is_none());
+    }
+
     #[test]
     fn hook_and_skill_root_opt_ins_are_never_benign_project_keys() {
         for key in [
@@ -4396,6 +4432,8 @@ mod project_config_trust_tests {
             "hooks_agent_read_files",
             "skills_extra_dirs",
             "skills_plugin_dirs",
+            "add_dir_tool_access",
+            "project_root_discovery",
             "claude_user_agents",
         ] {
             assert!(
@@ -4407,6 +4445,7 @@ mod project_config_trust_tests {
         assert!(config.hooks_mcp_tool_unprompted.is_none());
         assert!(config.hooks_agent_read_files.is_none());
         assert!(config.skills_extra_dirs.is_none());
+        assert!(config.add_dir_tool_access.is_none());
     }
 
     #[test]

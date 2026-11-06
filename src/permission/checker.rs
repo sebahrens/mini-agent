@@ -2569,6 +2569,26 @@ impl PermissionChecker {
         self.allow_all_mcp_calls = allow;
     }
 
+    /// Treats `dir` (resolved through symlinks) and everything under it as an
+    /// allowed external directory, like Claude Code's added working directories.
+    /// Only the external-directory prompt is lifted: the per-tool rules,
+    /// protected paths and every explicit deny, including an `external_directory`
+    /// deny, still apply (a deny wins over this allow).
+    pub(crate) fn allow_external_directory(&mut self, dir: &Path) {
+        let Some(resolved) = resolve_path_allow_missing(dir) else {
+            return;
+        };
+        for encoded in [
+            crate::permission::pattern::descendant_path_pattern(&resolved),
+            crate::permission::pattern::exact_path_pattern(&resolved),
+        ] {
+            if let Some(pattern) = Pattern::new_generated_path_scope(&encoded) {
+                self.ext_dir_rules.push((pattern, Action::Allow));
+            }
+        }
+        self.policy_changed();
+    }
+
     fn policy_changed(&mut self) {
         self.compatibility_revision = self
             .compatibility_revision

@@ -564,8 +564,13 @@ pub(crate) fn discover(
                     .join(namespace);
                 destination.data_dir = cache.join("data");
                 destination.cache_dir = cache.join("cache");
-                let installed = publish_tree(tree, Some(&name), &destination)
-                    .map_err(|error| error.to_string())?;
+                let installed = publish_tree(
+                    tree,
+                    Some(&name),
+                    &destination,
+                    source.origin.contains(".claude"),
+                )
+                .map_err(|error| error.to_string())?;
                 let mut catalogue = AgentSkillCatalog::new(&destination);
                 let index = catalogue
                     .refresh_lexical()

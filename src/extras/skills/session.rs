@@ -127,38 +127,156 @@ impl InstructionOwner {
 pub(crate) struct ExtraSkillRoots {
     pub(crate) add_dirs: Vec<PathBuf>,
     pub(crate) plugin_dirs: Vec<PathBuf>,
+    /// Startup notes about dropped or suspect entries (not part of identity).
+    pub(crate) notes: Vec<String>,
 }
 
-const MAX_EXTRA_DIRS: usize = 16;
+pub(crate) const MAX_EXTRA_DIRS: usize = 16;
 
 static EXTRA_ROOTS: OnceLock<ExtraSkillRoots> = OnceLock::new();
 
-/// Installs the process-wide extra roots once at startup. Relative entries
-/// resolve against the launch directory; empty entries are dropped.
-pub(crate) fn configure_extra_roots(add_dirs: Vec<PathBuf>, plugin_dirs: Vec<PathBuf>) {
-    let normalize = |dirs: Vec<PathBuf>| -> Vec<PathBuf> {
-        let mut out: Vec<PathBuf> = Vec::new();
-        for dir in dirs {
-            if dir.as_os_str().is_empty() {
-                continue;
-            }
-            let dir = if dir.is_absolute() {
-                dir
-            } else if let Ok(cwd) = std::env::current_dir() {
-                cwd.join(dir)
-            } else {
-                continue;
-            };
-            if !out.contains(&dir) && out.len() < MAX_EXTRA_DIRS {
-                out.push(dir);
+/// One authored `--add-dir` / `skills_extra_dirs` / `skills_plugin_dirs`
+/// entry: the text as written and the directory a relative entry resolves
+/// against (the config file's directory, or the launch directory for the
+/// command line).
+pub(crate) type ExtraDirEntry = (String, PathBuf);
+
+/// Expands `~` and `~user` at the start of `raw`. `Err` names why an entry
+/// that starts with `~` cannot be used (it is never silently kept literal).
+pub(crate) fn expand_user_tilde(raw: &str) -> Result<PathBuf, String> {
+    let Some(rest) = raw.strip_prefix('~') else {
+        return Ok(PathBuf::from(raw));
+    };
+    let (user, tail) = match rest.split_once(['/', '\\']) {
+        Some((user, tail)) => (user, tail),
+        None => (rest, ""),
+    };
+    let home = if user.is_empty() {
+        crate::paths::process_home_dir().ok_or("the home directory is unknown")?
+    } else {
+        user_home_dir(user).ok_or_else(|| format!("no home directory for user '{user}'"))?
+    };
+    Ok(if tail.is_empty() {
+        home
+    } else {
+        home.join(tail)
+    })
+}
+
+/// Home directory of another user: the `/etc/passwd` entry, else a sibling of
+/// the current home directory (`/Users/<name>`, `/home/<name>`) that exists.
+/// No directory-service lookup is made; an unknown name is an error upstream.
+#[cfg(unix)]
+fn user_home_dir(user: &str) -> Option<PathBuf> {
+    if user.contains(['/', '\\', '\0']) || user == "." || user == ".." {
+        return None;
+    }
+    if let Ok(passwd) = std::fs::read_to_string("/etc/passwd") {
+        for line in passwd.lines() {
+            let mut fields = line.split(':');
+            if fields.next() == Some(user)
+                && let Some(home) = fields.nth(4).filter(|home| home.starts_with('/'))
+            {
+                return Some(PathBuf::from(home));
             }
         }
-        out
-    };
+    }
+    let sibling = crate::paths::process_home_dir()?.parent()?.join(user);
+    sibling.is_dir().then_some(sibling)
+}
+
+#[cfg(not(unix))]
+fn user_home_dir(_user: &str) -> Option<PathBuf> {
+    None
+}
+
+/// Resolves the authored entries of one setting: `~`/`~user` expanded,
+/// relative entries anchored at their base directory, duplicates dropped. An
+/// entry that is over the cap, cannot be expanded, or is not a directory is
+/// dropped; a directory that does not exist yet is kept (it may appear later)
+/// but reported. Every dropped or suspect entry yields one note naming it.
+pub(crate) fn resolve_extra_dirs(
+    setting: &str,
+    entries: Vec<ExtraDirEntry>,
+) -> (Vec<PathBuf>, Vec<String>) {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut notes = Vec::new();
+    for (raw, base) in entries {
+        if raw.trim().is_empty() {
+            continue;
+        }
+        let expanded = match expand_user_tilde(raw.trim()) {
+            Ok(path) => path,
+            Err(reason) => {
+                notes.push(format!("{setting} entry '{raw}' skipped: {reason}"));
+                continue;
+            }
+        };
+        let dir = if expanded.is_absolute() {
+            expanded
+        } else {
+            base.join(expanded)
+        };
+        if out.contains(&dir) {
+            continue;
+        }
+        if out.len() >= MAX_EXTRA_DIRS {
+            notes.push(format!(
+                "{setting} entry '{raw}' ignored: at most {MAX_EXTRA_DIRS} directories are used"
+            ));
+            continue;
+        }
+        match std::fs::metadata(&dir) {
+            Ok(metadata) if !metadata.is_dir() => {
+                notes.push(format!(
+                    "{setting} entry '{raw}' skipped: {} is not a directory",
+                    dir.display()
+                ));
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => notes.push(format!(
+                "{setting} entry '{raw}' does not exist yet ({}); no skills are loaded from it",
+                dir.display()
+            )),
+            Err(error) => {
+                notes.push(format!(
+                    "{setting} entry '{raw}' skipped: {} is unreadable ({})",
+                    dir.display(),
+                    error.kind()
+                ));
+                continue;
+            }
+            Ok(_) => {}
+        }
+        out.push(dir);
+    }
+    (out, notes)
+}
+
+/// Installs the process-wide extra roots once at startup and returns the notes
+/// for entries that were dropped or suspect, so the caller can print them; the
+/// same notes are listed by `/skills`.
+pub(crate) fn configure_extra_roots(
+    add_dirs: Vec<ExtraDirEntry>,
+    plugin_dirs: Vec<ExtraDirEntry>,
+) -> Vec<String> {
+    let (add_dirs, mut notes) = resolve_extra_dirs("skills_extra_dirs/--add-dir", add_dirs);
+    let (plugin_dirs, plugin_notes) = resolve_extra_dirs("skills_plugin_dirs", plugin_dirs);
+    notes.extend(plugin_notes);
     let _ = EXTRA_ROOTS.set(ExtraSkillRoots {
-        add_dirs: normalize(add_dirs),
-        plugin_dirs: normalize(plugin_dirs),
+        add_dirs,
+        plugin_dirs,
+        notes: notes.clone(),
     });
+    notes
+}
+
+/// Notes about extra-directory entries that were dropped or suspect at startup.
+pub(crate) fn extra_root_notes() -> Vec<String> {
+    EXTRA_ROOTS
+        .get()
+        .map(|roots| roots.notes.clone())
+        .unwrap_or_default()
 }
 
 fn configured_extra_roots() -> ExtraSkillRoots {
@@ -1631,6 +1749,7 @@ mod discovery_tests {
         Arc::get_mut(&mut fixture.services).unwrap().extra = ExtraSkillRoots {
             add_dirs: vec![outside.join("added"), outside.join("missing")],
             plugin_dirs: vec![outside.join("plug")],
+            ..Default::default()
         };
         let open = fixture.services.refresh(false).await.unwrap();
         assert_eq!(open.packages["from-added"].origin, "added dir .claude");
@@ -1640,12 +1759,56 @@ mod discovery_tests {
     }
 
     #[test]
+    fn extra_dir_entries_expand_tilde_anchor_at_their_base_and_report_every_drop() {
+        let dir = crate::tests::OwnedTestDirectory::new("extradirs");
+        let base = dir.path().join("cfg");
+        std::fs::create_dir_all(base.join("rel")).unwrap();
+        std::fs::write(base.join("file.txt"), "x").unwrap();
+        let entries = |list: &[&str]| -> Vec<ExtraDirEntry> {
+            list.iter()
+                .map(|e| ((*e).to_owned(), base.clone()))
+                .collect()
+        };
+        let (dirs, notes) = resolve_extra_dirs(
+            "skills_extra_dirs",
+            entries(&["rel", "rel", "file.txt", "gone", "~nosuchuser_zz9/x", ""]),
+        );
+        assert_eq!(dirs, vec![base.join("rel"), base.join("gone")]);
+        let text = notes.join("\n");
+        assert!(
+            text.contains("'file.txt'") && text.contains("not a directory"),
+            "{text}"
+        );
+        assert!(
+            text.contains("'gone'") && text.contains("does not exist"),
+            "{text}"
+        );
+        assert!(
+            text.contains("'~nosuchuser_zz9/x'") && text.contains("skipped"),
+            "{text}"
+        );
+        // `~` resolves to the home directory instead of becoming `<base>/~/..`.
+        if let Some(home) = crate::paths::process_home_dir() {
+            let (dirs, _) = resolve_extra_dirs("s", entries(&["~/team-skills"]));
+            assert_eq!(dirs, vec![home.join("team-skills")]);
+        }
+        // The cap is reported rather than silent.
+        let many: Vec<ExtraDirEntry> = (0..MAX_EXTRA_DIRS + 2)
+            .map(|index| (format!("d{index}"), base.clone()))
+            .collect();
+        let (dirs, notes) = resolve_extra_dirs("s", many);
+        assert_eq!(dirs.len(), MAX_EXTRA_DIRS);
+        assert_eq!(notes.iter().filter(|n| n.contains("at most 16")).count(), 2);
+    }
+
+    #[test]
     fn extra_roots_never_expand_outside_the_named_directories() {
         // Adversarial: `..` and the filesystem root add nothing beyond what the
         // named directory (canonicalized) really contains; "/" is refused.
         let roots = ExtraSkillRoots {
             add_dirs: vec![PathBuf::from("/")],
             plugin_dirs: vec![PathBuf::from("/nonexistent-dir-for-test/../x")],
+            ..Default::default()
         };
         assert!(roots.source_roots().is_empty());
     }
@@ -1725,6 +1888,67 @@ mod discovery_tests {
             "{:?}",
             snapshot.diagnostics
         );
+    }
+
+    #[tokio::test]
+    async fn bare_and_partial_claude_skills_load_with_directory_and_body_defaults() {
+        let fixture = Fixture::new(false);
+        let write = |source: &str, dir: &str, text: &str| {
+            let package = fixture.root.path().join(source).join(dir);
+            std::fs::create_dir_all(&package).unwrap();
+            std::fs::write(package.join("SKILL.md"), text).unwrap();
+        };
+        write(
+            ".claude/skills",
+            "bare-skill",
+            "\n# Bare heading\nBody text\n",
+        );
+        write(
+            ".claude/skills",
+            "no-description",
+            "---\nuser-invocable: yes\n---\nDoes the thing.\n",
+        );
+        write(
+            ".claude/skills",
+            "broken-yaml",
+            "---\nname: broken-yaml\ndescription: use it: now [oops\n  bad: : :\n---\nBody\n",
+        );
+        let long = "x".repeat(2000);
+        write(
+            ".claude/skills",
+            "long-desc",
+            &format!("---\ndescription: {long}\n---\nBody\n"),
+        );
+        // Strict roots keep the Agent Skills requirements.
+        write(".agents/skills", "strict-bare", "no frontmatter\n");
+        let snapshot = fixture.services.refresh(false).await.unwrap();
+        let text = snapshot.diagnostics.join("\n");
+        for name in ["bare-skill", "no-description", "broken-yaml", "long-desc"] {
+            assert!(snapshot.packages.contains_key(name), "{name}: {text}");
+        }
+        assert_eq!(
+            snapshot.packages["bare-skill"].record.description,
+            "Bare heading"
+        );
+        assert_eq!(
+            snapshot.packages["no-description"].record.description,
+            "Does the thing."
+        );
+        assert!(
+            snapshot.packages["broken-yaml"]
+                .record
+                .description
+                .starts_with("use it")
+        );
+        assert_eq!(
+            snapshot.packages["long-desc"]
+                .record
+                .description
+                .chars()
+                .count(),
+            1024
+        );
+        assert!(!snapshot.packages.contains_key("strict-bare"), "{text}");
     }
 
     #[tokio::test]

@@ -48,8 +48,8 @@ pub enum ManifestError {
 /// keys below are interpreted, and none of them grants a capability.
 #[derive(Debug, Deserialize)]
 struct RawManifest {
-    name: String,
-    description: String,
+    name: Option<String>,
+    description: Option<String>,
     license: Option<String>,
     compatibility: Option<String>,
     #[serde(default, deserialize_with = "lenient_metadata")]
@@ -79,8 +79,13 @@ where
     Ok(match raw {
         Some(Value::Bool(flag)) => Some(flag),
         Some(Value::String(text)) => match text.trim().to_ascii_lowercase().as_str() {
-            "true" => Some(true),
-            "false" => Some(false),
+            "true" | "yes" | "on" | "1" => Some(true),
+            "false" | "no" | "off" | "0" => Some(false),
+            _ => None,
+        },
+        Some(Value::Number(number)) => match number.as_i64() {
+            Some(1) => Some(true),
+            Some(0) => Some(false),
             _ => None,
         },
         _ => None,
@@ -133,10 +138,134 @@ pub(super) fn parse_skill_markdown(bytes: &[u8]) -> Result<AgentSkillManifest, M
     let text = std::str::from_utf8(bytes).map_err(|_| ManifestError::NonUtf8)?;
     let yaml = frontmatter(text)?;
     let raw: RawManifest = serde_yaml_ng::from_str(yaml)?;
-    validate_name(&raw.name)?;
-    if !(1..=1024).contains(&raw.description.chars().count()) {
+    let name = raw.name.clone().ok_or(ManifestError::InvalidName)?;
+    let description = raw
+        .description
+        .clone()
+        .ok_or(ManifestError::InvalidDescription)?;
+    validate_name(&name)?;
+    if !(1..=1024).contains(&description.chars().count()) {
         return Err(ManifestError::InvalidDescription);
     }
+    finish_manifest(raw, name, description)
+}
+
+/// Longest description kept by the lenient parser; longer text is truncated.
+const LENIENT_DESCRIPTION_CHARS: usize = 1024;
+
+/// Claude Code compatible parse for a package whose directory name is known:
+/// no frontmatter field is required. `name` defaults to the directory name,
+/// `description` to the first non-empty body line (cut at 1024 characters), a
+/// `SKILL.md` without frontmatter is plain instruction content, malformed YAML
+/// falls back to the simple `key: value` lines, and an over-long description or
+/// compatibility note is truncated or dropped instead of rejecting the package.
+/// A name that is present must still be a valid Agent Skills name. Every
+/// manifest the strict parser accepts parses identically here.
+pub(super) fn parse_skill_markdown_lenient(
+    bytes: &[u8],
+    directory: &str,
+) -> Result<AgentSkillManifest, ManifestError> {
+    let text = String::from_utf8_lossy(bytes);
+    let (yaml, body) = match split_frontmatter(&text) {
+        Some((yaml, body)) => (yaml, body),
+        None => ("", &*text),
+    };
+    let mut raw: RawManifest = if yaml.trim().is_empty() {
+        empty_raw()
+    } else {
+        serde_yaml_ng::from_str(yaml).unwrap_or_else(|_| scan_simple_keys(yaml))
+    };
+    if raw
+        .compatibility
+        .as_ref()
+        .is_some_and(|value| !(1..=500).contains(&value.chars().count()))
+    {
+        raw.compatibility = None;
+    }
+    let name = raw
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(directory)
+        .to_owned();
+    validate_name(&name)?;
+    let description = raw
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+        .or_else(|| first_body_line(body))
+        .unwrap_or_else(|| name.clone());
+    let description: String = description
+        .chars()
+        .take(LENIENT_DESCRIPTION_CHARS)
+        .collect();
+    finish_manifest(raw, name, description)
+}
+
+fn empty_raw() -> RawManifest {
+    RawManifest {
+        name: None,
+        description: None,
+        license: None,
+        compatibility: None,
+        metadata: BTreeMap::new(),
+        allowed_tools: None,
+        learned_js: Vec::new(),
+        disable_model_invocation: None,
+        user_invocable: None,
+    }
+}
+
+/// Recovers the scalar keys the loader uses from frontmatter that is not valid
+/// YAML (an unquoted colon, a stray tab): top-level `key: value` lines only.
+fn scan_simple_keys(yaml: &str) -> RawManifest {
+    let mut raw = empty_raw();
+    for line in yaml.lines() {
+        if line.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+            .unwrap_or(value);
+        let flag = || {
+            lenient_bool(serde_yaml_ng::Value::String(value.to_owned()))
+                .ok()
+                .flatten()
+        };
+        match key.trim() {
+            "name" => raw.name = Some(value.to_owned()),
+            "description" => raw.description = Some(value.to_owned()),
+            "license" => raw.license = Some(value.to_owned()),
+            "allowed-tools" if !value.is_empty() => raw.allowed_tools = Some(value.to_owned()),
+            "disable-model-invocation" => raw.disable_model_invocation = flag(),
+            "user-invocable" => raw.user_invocable = flag(),
+            _ => {}
+        }
+    }
+    raw
+}
+
+fn first_body_line(body: &str) -> Option<String> {
+    body.lines()
+        .map(|line| line.trim().trim_start_matches('#').trim())
+        .find(|line| !line.is_empty())
+        .map(str::to_owned)
+}
+
+fn finish_manifest(
+    raw: RawManifest,
+    name: String,
+    description: String,
+) -> Result<AgentSkillManifest, ManifestError> {
     if raw
         .compatibility
         .as_ref()
@@ -157,8 +286,8 @@ pub(super) fn parse_skill_markdown(bytes: &[u8]) -> Result<AgentSkillManifest, M
         return Err(ManifestError::InvalidLearnedJs);
     }
     Ok(AgentSkillManifest {
-        name: raw.name,
-        description: raw.description,
+        name,
+        description,
         license: raw.license,
         compatibility: raw.compatibility,
         metadata: raw.metadata,
@@ -174,6 +303,24 @@ fn is_full_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// The YAML between the leading `---` lines and the text after the closing one.
+fn split_frontmatter(text: &str) -> Option<(&str, &str)> {
+    let mut lines = text.split_inclusive('\n');
+    let first = lines.next()?;
+    if trim_line_ending(first) != "---" {
+        return None;
+    }
+    let yaml_start = first.len();
+    let mut offset = yaml_start;
+    for line in lines {
+        if trim_line_ending(line) == "---" {
+            return Some((&text[yaml_start..offset], &text[offset + line.len()..]));
+        }
+        offset += line.len();
+    }
+    None
 }
 
 fn frontmatter(text: &str) -> Result<&str, ManifestError> {
@@ -216,6 +363,34 @@ fn validate_name(name: &str) -> Result<(), ManifestError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lenient_manifest_defaults_name_and_description_and_accepts_yes_no_flags() {
+        let bare = parse_skill_markdown_lenient(b"\n## Title line\nmore\n", "my-skill").unwrap();
+        assert_eq!(
+            (bare.name.as_str(), bare.description.as_str()),
+            ("my-skill", "Title line")
+        );
+        let flags = parse_skill_markdown_lenient(
+            b"---\ndisable-model-invocation: on\nuser-invocable: 0\n---\nbody\n",
+            "flags",
+        )
+        .unwrap();
+        assert!(flags.disable_model_invocation && !flags.user_invocable);
+        // Malformed YAML falls back to the simple key lines.
+        let broken = parse_skill_markdown_lenient(
+            b"---\nname: other\ndescription: a: b: [\n\t- x\n---\nbody\n",
+            "other",
+        )
+        .unwrap();
+        assert_eq!(broken.description, "a: b: [");
+        // A present name must still be valid; strict parsing still rejects a bare file.
+        assert!(parse_skill_markdown_lenient(b"---\nname: Bad Name\n---\n", "x").is_err());
+        assert!(parse_skill_markdown(b"just text\n").is_err());
+        assert!(parse_skill_markdown(b"---\nname: only-name\n---\n").is_err());
+        let empty = parse_skill_markdown_lenient(b"", "empty-one").unwrap();
+        assert_eq!(empty.description, "empty-one");
+    }
 
     #[test]
     fn agent_skill_manifest_preserves_allowed_tools_without_interpreting_them() {

@@ -2282,3 +2282,117 @@ fn memory_read_windows_respect_character_boundaries() {
     assert!(limited.contains("continue with offset=18"), "{limited}");
     cleanup(&m);
 }
+
+// ---- injection budget: MEMORY.md is never crowded out by daily logs ----------
+
+#[test]
+fn a_huge_daily_log_cannot_crowd_out_long_term_memory() {
+    let m = fresh("budget-priority");
+    fs::write(memory_md(&m), "- DURABLE-FACT-ALPHA\n- DURABLE-FACT-OMEGA").unwrap();
+    // Two logs that each exceed the whole budget.
+    fs::write(daily(&m, "2026-05-25"), "today line\n".repeat(4000)).unwrap();
+    fs::write(daily(&m, "2026-05-24"), "yesterday line\n".repeat(4000)).unwrap();
+    let (block, notices) = m.context_block_and_notices_excluding(None);
+    let block = block.unwrap();
+    assert!(block.contains("DURABLE-FACT-ALPHA") && block.contains("DURABLE-FACT-OMEGA"));
+    assert!(block.contains("Long-term memory (MEMORY.md)"));
+    // The log is the part that gives way, visibly: a marker in the block and a
+    // user-facing notice that says how to read the rest.
+    assert!(block.contains("section truncated"), "{block:.200}");
+    assert!(block.contains("section omitted"));
+    let text = notices.join("\n");
+    assert!(
+        text.contains("budget") && text.contains("memory_read") && text.contains("omitted"),
+        "{text}"
+    );
+    assert!(block.len() <= MAX_INJECT_BYTES + 512);
+    cleanup(&m);
+}
+
+#[test]
+fn a_large_scratchpad_and_a_40_kib_daily_log_still_leave_a_large_memory_md_whole_up_to_half() {
+    let m = fresh("budget-half");
+    let memory: String = (0..400)
+        .map(|index| format!("- durable fact number {index:04}\n"))
+        .collect();
+    assert!(memory.len() > 10_000 && memory.len() < MAX_INJECT_BYTES / 2);
+    fs::write(memory_md(&m), &memory).unwrap();
+    fs::write(scratchpad(&m), "- [ ] open item\n".repeat(2500)).unwrap();
+    fs::write(daily(&m, "2026-05-25"), "x".repeat(40 * 1024)).unwrap();
+    let block = m.context_block().unwrap();
+    assert!(block.contains("durable fact number 0000"));
+    assert!(
+        block.contains("durable fact number 0399"),
+        "last fact survives"
+    );
+    assert!(!block.contains("MEMORY.md]\n…[section truncated"));
+    cleanup(&m);
+}
+
+#[test]
+fn small_stores_produce_no_budget_notice() {
+    let m = fresh("budget-quiet");
+    fs::write(memory_md(&m), "- fact").unwrap();
+    fs::write(daily(&m, "2026-05-25"), "a line").unwrap();
+    let (block, notices) = m.context_block_and_notices_excluding(None);
+    assert!(block.unwrap().contains("a line"));
+    assert!(notices.is_empty(), "{notices:?}");
+    cleanup(&m);
+}
+
+// ---- invalid UTF-8 is tolerated, never silently dropped ----------------------
+
+#[test]
+fn invalid_utf8_in_memory_files_is_decoded_lossily_with_a_warning() {
+    let m = fresh("lossy");
+    let mut memory = b"- caf\xe9 is the project cafe\n".to_vec();
+    memory.extend_from_slice(b"- LATIN1-MEMORY-MARK\n");
+    fs::write(memory_md(&m), &memory).unwrap();
+    fs::write(
+        daily(&m, "2026-05-25"),
+        b"daily \xff\xfe note LATIN1-DAILY-MARK\n",
+    )
+    .unwrap();
+    let (block, notices) = m.context_block_and_notices_excluding(None);
+    let block = block.unwrap();
+    assert!(block.contains("LATIN1-MEMORY-MARK") && block.contains("LATIN1-DAILY-MARK"));
+    assert!(block.contains("not valid UTF-8") && block.contains('\u{fffd}'));
+    let text = notices.join("\n");
+    assert!(text.contains("MEMORY.md is not valid UTF-8"), "{text}");
+    assert!(text.contains("daily log 2026-05-25"), "{text}");
+
+    // memory_search finds the text and says that the file was decoded lossily.
+    let rendered = m.search("LATIN1-MEMORY-MARK").render(8192);
+    assert!(rendered.contains("LATIN1-MEMORY-MARK"), "{rendered}");
+    assert!(
+        rendered.contains("Warning: MEMORY.md is not valid UTF-8"),
+        "{rendered}"
+    );
+    assert!(hit_path_contains(&m, "LATIN1-DAILY-MARK", "2026-05-25"));
+
+    // memory_read shows the text with the same note, and the files stay byte-identical.
+    let page = m
+        .read_for_args(&read_args("long_term", None, None))
+        .unwrap();
+    assert!(
+        page.contains("LATIN1-MEMORY-MARK") && page.contains("not valid UTF-8"),
+        "{page}"
+    );
+    assert_eq!(fs::read(memory_md(&m)).unwrap(), memory);
+    cleanup(&m);
+}
+
+#[test]
+fn a_write_to_a_file_with_invalid_utf8_does_not_rewrite_it_lossily() {
+    let m = fresh("lossy-write");
+    let original = b"- caf\xe9\n".to_vec();
+    fs::write(memory_md(&m), &original).unwrap();
+    // Strict read-modify-write refuses rather than replacing the stray byte.
+    let result = m.write(WriteTarget::LongTerm, "- new fact", WriteMode::Append, None);
+    let error = result
+        .expect_err("a write over invalid UTF-8 must be refused")
+        .to_string();
+    assert!(error.contains("not valid UTF-8"), "{error}");
+    assert_eq!(fs::read(memory_md(&m)).unwrap(), original);
+    cleanup(&m);
+}

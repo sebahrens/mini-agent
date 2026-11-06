@@ -6974,6 +6974,10 @@ impl<'a> App<'a> {
                 if entries.is_empty() {
                     renderer.write_line("  no currently authorized skills", C_TOOL)?;
                 }
+                #[cfg(feature = "agent-skills")]
+                for note in crate::extras::skills::session::extra_root_notes() {
+                    renderer.write_line(&sanitize_output(&note), C_ERROR)?;
+                }
                 for diagnostic in snapshot.diagnostics.iter().take(16) {
                     renderer.write_line(&sanitize_output(diagnostic), C_ERROR)?;
                 }
