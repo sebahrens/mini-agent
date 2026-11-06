@@ -209,8 +209,10 @@ new child id. Exactly one prompt is accepted.
 The conversations are bounded and in memory only: the session keeps the 16
 most recent (8 MiB of serialized conversation each; larger ones get no id),
 owned by the session's task pool (or the task tool without one). They do not
-survive a restart. An unknown or expired id is rejected with an explicit
-error. Worktree-isolated children are not resumable (their worktree ends with
+survive a restart: when a saved session is resumed (`--continue`, `--resume`), one system
+notice names the `[child id: ...]` ids stored in it as no longer resumable (ids from before the
+last such notice are not repeated), so the model starts a new task instead of using a dead id. An
+unknown or expired id is rejected with an explicit error. Worktree-isolated children are not resumable (their worktree ends with
 them); failed children get no id.
 
 ## Specialist Agent Types

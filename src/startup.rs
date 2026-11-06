@@ -2273,6 +2273,8 @@ impl Startup {
             tools,
         };
         self.session.sync_environment(now, self.session_resumed);
+        // Resumable child conversations do not survive a restart.
+        self.session.note_stale_child_ids(self.session_resumed);
     }
 
     async fn dispatch_inner(mut self: Box<Self>) -> anyhow::Result<()> {

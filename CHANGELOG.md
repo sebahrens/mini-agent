@@ -101,6 +101,10 @@ Notable changes to mini-agent are documented in this file. The format follows
   are honoured; `skills`, `permissionMode`, `background`, `memory` and `hooks` now produce a notice
   naming the behaviour that is not applied (mini-agent-syofy).
 
+- Resuming a saved session now tells the model once that the `[child id: ...]` subagent ids in its
+  history are no longer resumable (child conversations are memory-only), instead of leaving dead
+  resume ids on offer (mini-agent-csk01).
+
 ### Shell and pty jobs (round 7, group P)
 
 - `job_status` input no longer accepts TAB or shell history expansion (`!` followed by text, a
