@@ -8,6 +8,7 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- Headless `-p` that abandons a silent piped stdin now says so on machine output even under `--quiet`: the stream-json `system` init record and the `json`/`stream-json` result carry `stdin_abandoned` and `stdin_idle_secs`, and the stderr warning is no longer suppressed by `--quiet` for `--output json`/`stream-json` (mini-agent-54j41).
 - ACP prompts on a provider-native Anthropic session now relieve context mid-turn: at a tool-batch boundary under pressure the native epoch is closed, the saved transcript is compacted, the thinking chain restarts as a new epoch and the same prompt continues, instead of ending in a provider context error; relief stops with a named reason when a segment ran no tools or nothing could be compacted (mini-agent-wkzav).
 - Headless context relief carries the turns and `turn_token_budget` tokens spent by earlier segments into later ones, so `max_agent_turns` / `--max-agent-turns` bounds the whole prompt instead of resetting per relief segment (mini-agent-djjua).
 - The sandbox HTTP proxy replaces the client's `Host` header with the allowlisted request-URI authority before

@@ -1297,8 +1297,11 @@ impl Startup {
         #[cfg(feature = "acp")]
         let read_stdin = read_stdin && !cli.acp_enabled;
         if read_stdin {
+            // `--quiet` silences the warning for text output only: machine
+            // output must not hide that the piped input was dropped
+            // (mini-agent-54j41).
             let stdin = match crate::print::read_headless_stdin(
-                cli.quiet,
+                cli.quiet && cli.output_format() == crate::cli::OutputFormat::Text,
                 !cli.message.join(" ").trim().is_empty(),
             )
             .await
@@ -2561,7 +2564,9 @@ impl Startup {
         let output = crate::print::HeadlessOutputPolicy::from_cli(&self.cli);
         let json_output = output.format != OutputFormat::Text;
         let identity = (self.session.id.to_string(), self.session.name.to_string());
-        output.emit_event(serde_json::json!({"type":"system", "session_id":identity.0, "session_name":identity.1, "ephemeral":self.cli.no_session, "provider":self.session.provider, "model":self.session.model})).await?;
+        let mut system = serde_json::json!({"type":"system", "session_id":identity.0, "session_name":identity.1, "ephemeral":self.cli.no_session, "provider":self.session.provider, "model":self.session.model});
+        crate::print::annotate_stdin_abandoned(&mut system);
+        output.emit_event(system).await?;
         // The `git status` baseline runs concurrently with the work that
         // cannot change the workspace (compaction, MCP connect, agent build)
         // and is joined before anything that can: the `!` command below, or
