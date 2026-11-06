@@ -249,6 +249,9 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
     .context("failed to move to the project root")?
     {
         Some(root) => {
+            // The process directory is now the root: pin the launch-relative
+            // file arguments to where the command was typed.
+            cli.absolutize_launch_paths(&launch_dir);
             eprintln!(
                 "notice: project root {} (started in {}): project config, MCP servers, agents, skills, instructions and memory come from the root",
                 root.display(),

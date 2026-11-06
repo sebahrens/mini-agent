@@ -1578,6 +1578,26 @@ impl Cli {
             .unwrap_or_else(default_sandbox_backend)
     }
 
+    /// Makes the relative file arguments absolute against `base` (the
+    /// directory the command was launched from). Called before
+    /// `project_root_discovery` changes the process directory, so `--add-dir
+    /// ./x`, `--image a.png`, `--output-schema`, `--loop-plan` and `--log-file`
+    /// keep meaning "relative to where I typed the command". `~`-prefixed
+    /// entries are left for their own home expansion.
+    pub fn absolutize_launch_paths(&mut self, base: &std::path::Path) {
+        fn fix(path: &mut std::path::PathBuf, base: &std::path::Path) {
+            if path.is_relative() && !path.starts_with("~") {
+                *path = base.join(&*path);
+            }
+        }
+        self.add_dir.iter_mut().for_each(|p| fix(p, base));
+        self.image.iter_mut().for_each(|p| fix(p, base));
+        self.output_schema.iter_mut().for_each(|p| fix(p, base));
+        self.log_file.iter_mut().for_each(|p| fix(p, base));
+        #[cfg(feature = "loop")]
+        self.loop_plan.iter_mut().for_each(|p| fix(p, base));
+    }
+
     /// Effective `sandbox-toolchain-roots`: CLI entries replace the
     /// configured list, which replaces the built-in default.
     pub fn resolve_sandbox_toolchain_roots(&self, cfg: &config::Config) -> Vec<std::path::PathBuf> {
@@ -1715,6 +1735,38 @@ pub fn write_completions(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn launch_paths_become_absolute_against_the_launch_dir() {
+        let mut cli = Cli::try_parse_from([
+            "mini-agent",
+            "-p",
+            "--add-dir",
+            "./x",
+            "--add-dir",
+            "~/h",
+            "--add-dir",
+            "/abs",
+            "-i",
+            "a.png",
+            "--output-schema",
+            "s.json",
+            "q",
+        ])
+        .unwrap();
+        let base = std::path::Path::new("/launch/sub");
+        cli.absolutize_launch_paths(base);
+        assert_eq!(
+            cli.add_dir,
+            vec![
+                base.join("./x"),
+                std::path::PathBuf::from("~/h"),
+                std::path::PathBuf::from("/abs")
+            ]
+        );
+        assert_eq!(cli.image, vec![base.join("a.png")]);
+        assert_eq!(cli.output_schema, Some(base.join("s.json")));
+    }
+
     #[test]
     fn image_flag_is_repeatable_and_needs_print() {
         let cli = Cli::try_parse_from(["mini-agent", "-p", "-i", "a.png", "--image", "b.png", "q"])
