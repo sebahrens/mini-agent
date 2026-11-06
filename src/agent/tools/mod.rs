@@ -804,6 +804,44 @@ pub struct JobStatusArgs {
     /// Text typed into a `pty = true` job with `action = "input"`.
     #[serde(default)]
     pub input: Option<String>,
+    /// Named keys pressed in a `pty = true` job with `action = "input"`, in
+    /// order. Mutually exclusive with `input`.
+    #[serde(default)]
+    pub keys: Option<Vec<JobKey>>,
+}
+
+/// A named terminal key `job_status` can press. The tool renders the bytes,
+/// so model text never carries raw control characters.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum JobKey {
+    CtrlC,
+    CtrlD,
+    Esc,
+    Up,
+    Down,
+    Left,
+    Right,
+    Tab,
+    Enter,
+    Backspace,
+}
+
+impl JobKey {
+    pub(crate) fn bytes(self) -> &'static [u8] {
+        match self {
+            Self::CtrlC => b"\x03",
+            Self::CtrlD => b"\x04",
+            Self::Esc => b"\x1b",
+            Self::Up => b"\x1b[A",
+            Self::Down => b"\x1b[B",
+            Self::Right => b"\x1b[C",
+            Self::Left => b"\x1b[D",
+            Self::Tab => b"\t",
+            Self::Enter => b"\r",
+            Self::Backspace => b"\x7f",
+        }
+    }
 }
 
 #[derive(Deserialize)]

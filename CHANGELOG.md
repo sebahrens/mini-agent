@@ -70,6 +70,15 @@ Notable changes to mini-agent are documented in this file. The format follows
   `gh attestation verify`, honours `HTTPS_PROXY`, needs `--allow-downgrade` for older releases, and
   the update notice follows the install channel (mini-agent-skgg9, -zml6o, -x6nc9, -w7046, -17mth,
   -nfj5h, -t5ybs, -gwx1b, -e3bor).
+### Shell and pty jobs (round 7, group P)
+
+- `job_status` input no longer accepts TAB or shell history expansion (`!` followed by text, a
+  leading `^`), which an interactive bash rewrote after the permission check (mini-agent-jmtww).
+- `job_status action=input` takes a structured `keys` list (`ctrl_c`, `ctrl_d`, `esc`, `up`, `down`,
+  `left`, `right`, `tab`, `enter`, `backspace`) rendered by the tool. Ctrl-C/Ctrl-D need no
+  permission; Enter judges the typed line; cursor/history keys make the next Enter an opaque edited
+  line for policy; Tab on a partly typed line is refused (mini-agent-0i1wh).
+
 ### Security
 
 - `--mcp-server`: a `run` prompt starting with `!` is refused (it ran a raw shell command in the
