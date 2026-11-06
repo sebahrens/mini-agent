@@ -4,6 +4,7 @@ mod commands;
 pub mod config;
 mod cron;
 mod idle;
+mod model_options;
 mod persona;
 mod policy;
 mod sessions;
@@ -587,6 +588,9 @@ struct SessionState {
     /// snapshots it, so a switch takes effect from the next prompt.
     context: Arc<ContextFiles>,
     turns: Arc<StdMutex<SessionTurns>>,
+    /// The `model` and `effort` selections (`session/set_config_option`,
+    /// `/model`, `/effort`); read at the start of each prompt.
+    model_overrides: model_options::Overrides,
     read_tracker: crate::agent::tools::ReadTracker,
     todo_store: crate::agent::tools::TodoStore,
     #[cfg(feature = "goal")]
@@ -1817,12 +1821,17 @@ async fn persona_config_options(
         .await
         .get(session_id)
         .map(|session| {
-            persona::session_config_options(
+            let mut options = persona::session_config_options(
                 &state.cli,
                 &state.cfg,
                 &session.base_context,
                 &session.context,
-            )
+            );
+            options.extend(model_options::config_options(
+                &state.cfg,
+                &session.model_overrides,
+            ));
+            options
         })
         .unwrap_or_default()
 }
@@ -2022,6 +2031,7 @@ async fn install_session(
             base_context: Arc::new(base_context),
             context: Arc::new(context),
             turns: turns.clone(),
+            model_overrides: Default::default(),
             read_tracker,
             todo_store,
             #[cfg(feature = "goal")]
@@ -2105,7 +2115,7 @@ async fn switch_session_persona(
         .map_err(|error| agent_client_protocol::Error::new(-32000, error))?;
     persona::check_route(&state.cli, &state.cfg, &route)
         .map_err(|error| agent_client_protocol::Error::new(-32000, error))?;
-    let options = persona::session_config_options(&state.cli, &state.cfg, &base, &context);
+    let mut options = persona::session_config_options(&state.cli, &state.cfg, &base, &context);
     tracing::info!(
         "ACP session {} persona: {} ({}/{})",
         session_id,
@@ -2116,7 +2126,100 @@ async fn switch_session_persona(
     let mut sessions = state.sessions.lock().await;
     let session = sessions.get_mut(session_id).ok_or_else(unknown_session)?;
     session.context = Arc::new(context);
+    options.extend(model_options::config_options(
+        &state.cfg,
+        &session.model_overrides,
+    ));
     Ok(options)
+}
+
+/// Apply a `model` or `effort` selection to a session that is not running a
+/// prompt, validating it before anything is stored. `native` is whether the
+/// session's history is provider-native, which a model switch cannot follow.
+/// Returns the one-line confirmation `/model` and `/effort` show.
+async fn set_model_override(
+    state: &AcpState,
+    session_id: &SessionId,
+    config_id: &str,
+    value: &str,
+    native: bool,
+) -> Result<String, agent_client_protocol::Error> {
+    let invalid = |message: String| agent_client_protocol::Error::new(-32602, message);
+    let mut next = state
+        .sessions
+        .lock()
+        .await
+        .get(session_id)
+        .map(|session| session.model_overrides.clone())
+        .ok_or_else(|| invalid("unknown ACP session".into()))?;
+    let context = state
+        .sessions
+        .lock()
+        .await
+        .get(session_id)
+        .map(|session| session.context.clone())
+        .ok_or_else(|| invalid("unknown ACP session".into()))?;
+    if config_id == model_options::MODEL_CONFIG_ID {
+        next.model = model_options::parse_model(&state.cfg, value).map_err(invalid)?;
+        if next.model.is_some() && native {
+            return Err(agent_client_protocol::Error::new(
+                -32000,
+                "native session changes require a new ACP session",
+            ));
+        }
+    } else {
+        next.effort = model_options::parse_effort(value).map_err(invalid)?;
+    }
+    // The selection must work for the route the next prompt will take: its
+    // credential resolves and its model accepts the effort. Nothing is
+    // substituted, so an unusable choice is refused now rather than failing
+    // the next prompt.
+    let route = match next.model.as_deref() {
+        Some(alias) => model_options::route_for(&state.cfg, alias),
+        None => persona::resolve_route(&state.cli, &state.cfg, &context),
+    }
+    .map_err(|error| agent_client_protocol::Error::new(-32000, error))?;
+    persona::check_route(&state.cli, &state.cfg, &route)
+        .map_err(|error| agent_client_protocol::Error::new(-32000, error))?;
+    if let Some(effort) = next.effort {
+        let client = persona::route_client(&state.cli, &state.cfg, &route, &state.provider_clients)
+            .map_err(|error| agent_client_protocol::Error::new(-32000, error))?;
+        let probe = crate::session::Session::new(&route.provider, &route.model, 0, "");
+        let controls = crate::provider::effort::SessionReasoning {
+            effort: Some(effort),
+            thinking: None,
+        };
+        client
+            .resolve_session_reasoning(&state.cfg, &probe, controls)
+            .map_err(|error| {
+                invalid(persona::bounded_message(&format!(
+                    "{}/{} cannot use effort '{}': {error}",
+                    route.provider,
+                    route.model,
+                    effort.as_wire_str()
+                )))
+            })?;
+    }
+    let mut sessions = state.sessions.lock().await;
+    let session = sessions
+        .get_mut(session_id)
+        .ok_or_else(|| invalid("unknown ACP session".into()))?;
+    session.model_overrides = next.clone();
+    Ok(if config_id == model_options::MODEL_CONFIG_ID {
+        format!(
+            "Model: {} ({}/{}); applies from the next prompt.",
+            next.model
+                .as_deref()
+                .unwrap_or(model_options::DEFAULT_VALUE),
+            route.provider,
+            route.model
+        )
+    } else {
+        format!(
+            "Reasoning effort: {}; applies from the next prompt.",
+            model_options::effort_label(next.effort)
+        )
+    })
 }
 
 async fn handle_set_session_config_option(
@@ -2126,7 +2229,55 @@ async fn handle_set_session_config_option(
     state: &AcpState,
 ) -> Result<(), agent_client_protocol::Error> {
     let _activity = state.idle.admit()?;
-    if req.config_id.0.as_ref() != persona::PERSONA_CONFIG_ID {
+    let config_id = req.config_id.0.to_string();
+    if config_id == model_options::MODEL_CONFIG_ID || config_id == model_options::EFFORT_CONFIG_ID {
+        let Some(value) = req.value.as_value_id() else {
+            return responder.respond_with_error(agent_client_protocol::Error::new(
+                -32602,
+                persona::bounded_message(&format!(
+                    "ACP session config option '{config_id}' takes a value id"
+                )),
+            ));
+        };
+        let value = value.0.to_string();
+        // Like a permission-mode change, a selection waits for an idle session
+        // so it cannot alter a prompt that already started.
+        let native = {
+            let sessions = state.sessions.lock().await;
+            let Some(session) = sessions.get(&req.session_id) else {
+                return responder.respond_with_error(agent_client_protocol::Error::new(
+                    -32602,
+                    "unknown ACP session",
+                ));
+            };
+            if !lock_unpoisoned(&session.turns).queue.is_empty() {
+                return responder.respond_with_error(agent_client_protocol::Error::new(
+                    -32000,
+                    "ACP session already has an active prompt",
+                ));
+            }
+            match session.history.try_lock() {
+                Ok(history) => {
+                    crate::session::native_publication::is_native_bearing(&history.session)
+                }
+                Err(_) => {
+                    return responder.respond_with_error(agent_client_protocol::Error::new(
+                        -32000,
+                        "ACP session history is busy",
+                    ));
+                }
+            }
+        };
+        if let Err(error) =
+            set_model_override(state, &req.session_id, &config_id, &value, native).await
+        {
+            return responder.respond_with_error(error);
+        }
+        return responder.respond(SetSessionConfigOptionResponse::new(
+            persona_config_options(state, &req.session_id).await,
+        ));
+    }
+    if config_id != persona::PERSONA_CONFIG_ID {
         return responder.respond_with_error(agent_client_protocol::Error::new(
             -32602,
             persona::bounded_message(&format!(
@@ -3784,6 +3935,9 @@ async fn run_prompt(
             commands::Command::Undo | commands::Command::Compact | commands::Command::Rename(_) => {
                 true
             }
+            commands::Command::Model(_)
+            | commands::Command::Effort(_)
+            | commands::Command::Cost => false,
             #[cfg(feature = "goal")]
             commands::Command::Goal(arguments) => !arguments.is_empty() && arguments != "status",
         };
@@ -3806,6 +3960,37 @@ async fn run_prompt(
             commands::Command::Rename(name) => {
                 history.session.name = name.as_str().into();
                 Some(format!("Session renamed to {name}."))
+            }
+            commands::Command::Cost => Some(cost_summary(state, &history)),
+            commands::Command::Model(_) | commands::Command::Effort(_) => {
+                let (config_id, argument) = match command {
+                    commands::Command::Model(argument) => {
+                        (model_options::MODEL_CONFIG_ID, argument)
+                    }
+                    commands::Command::Effort(argument) => {
+                        (model_options::EFFORT_CONFIG_ID, argument)
+                    }
+                    _ => unreachable!("matched above"),
+                };
+                let native =
+                    crate::session::native_publication::is_native_bearing(&history.session);
+                let line = if argument.is_empty() {
+                    selection_summary(state, &session_id, config_id).await
+                } else {
+                    match set_model_override(state, &session_id, config_id, argument, native).await
+                    {
+                        Ok(line) => {
+                            let options = persona_config_options(state, &session_id).await;
+                            let _ = cx.send_notification(SessionNotification::new(
+                                session_id.clone(),
+                                SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options)),
+                            ));
+                            line
+                        }
+                        Err(error) => format!("{}: {}", config_id, error.message),
+                    }
+                };
+                Some(line)
             }
             #[cfg(feature = "goal")]
             commands::Command::Goal(arguments) => {
@@ -4283,6 +4468,57 @@ async fn run_prompt(
     Ok(())
 }
 
+/// `/cost`: spend and context use for the session so far.
+fn cost_summary(state: &AcpState, history: &SessionHistory) -> String {
+    let used = history
+        .session
+        .effective_context_tokens_after_tool_result_pruning(
+            state.cfg.resolve_keep_recent_tool_results(),
+        );
+    let window = if history.context_window > 0 {
+        format!("{used} of {} tokens in context", history.context_window)
+    } else {
+        format!("{used} tokens in context")
+    };
+    format!(
+        "Session cost: ${:.4}; {window}.",
+        history.session.total_cost.max(0.0)
+    )
+}
+
+/// `/model` and `/effort` without an argument: the current selection and the
+/// choices, from the same options the config selectors show.
+async fn selection_summary(state: &AcpState, session_id: &SessionId, config_id: &str) -> String {
+    let overrides = state
+        .sessions
+        .lock()
+        .await
+        .get(session_id)
+        .map(|session| session.model_overrides.clone())
+        .unwrap_or_default();
+    if config_id == model_options::MODEL_CONFIG_ID {
+        let mut aliases: Vec<_> = crate::config::quick_models_map(&state.cfg)
+            .keys()
+            .cloned()
+            .collect();
+        aliases.sort();
+        format!(
+            "Model: {}. Choose default{}{}.",
+            overrides
+                .model
+                .as_deref()
+                .unwrap_or(model_options::DEFAULT_VALUE),
+            if aliases.is_empty() { "" } else { " or " },
+            persona::bounded_message(&aliases.join(", "))
+        )
+    } else {
+        format!(
+            "Reasoning effort: {}. Choose default, low, medium, high, xhigh or max.",
+            model_options::effort_label(overrides.effort)
+        )
+    }
+}
+
 /// Push the context meter: tokens in context, the routed model's window and
 /// the session's cumulative cost. Skipped until a window is known.
 fn send_usage_update(
@@ -4618,7 +4854,28 @@ async fn execute_prompt(
     // The session prompt's `[prompt_to_model]` route, or the startup
     // selection when it is unmapped. A route that cannot be initialized
     // refuses the turn: no other provider is substituted for it.
-    let route = match persona::resolve_route(&state.cli, &state.cfg, &context) {
+    // The session's `model` selection (config option, `/model`) replaces the
+    // prompt's route; `effort` is applied to the agent below.
+    let overrides = state
+        .sessions
+        .lock()
+        .await
+        .get(&session_id)
+        .map(|session| session.model_overrides.clone())
+        .unwrap_or_default();
+    let route = match overrides.model.as_deref() {
+        Some(alias) => {
+            if crate::session::native_publication::is_native_bearing(&history.session) {
+                return Ok(PromptOutcome::failed(
+                    "native session changes require a new ACP session; reset the model to default"
+                        .into(),
+                ));
+            }
+            model_options::route_for(&state.cfg, alias)
+        }
+        None => persona::resolve_route(&state.cli, &state.cfg, &context),
+    };
+    let route = match route {
         Ok(route) => route,
         Err(error) => return Ok(PromptOutcome::failed(error)),
     };
@@ -4763,6 +5020,7 @@ async fn execute_prompt(
         ..
     } = route;
     let provider_is_anthropic_native = state.cfg.is_anthropic_native(&provider_str);
+    let route_description = format!("{provider_str}/{model_str}");
 
     tracing::debug!(
         "ACP run_prompt: provider={}, model={}, prompt={:?}, prompt_len={}",
@@ -5079,8 +5337,27 @@ async fn execute_prompt(
         history.session.messages.len(),
         state.cli.no_session,
     );
+    let agent = agent.with_main_session(&state.cfg, &history.session);
+    // The session's effort selection overrides the saved controls in memory
+    // only; an effort this route's model cannot honour fails the prompt
+    // rather than being silently dropped.
+    let agent = match overrides.effort {
+        Some(effort) => {
+            let mut controls = history.session.reasoning_controls;
+            controls.effort = Some(effort);
+            let agent = agent.with_reasoning_controls(&state.cfg, controls);
+            if let Err(error) = agent.effective_reasoning() {
+                return Ok(PromptOutcome::failed(persona::bounded_message(&format!(
+                    "reasoning effort '{}' is not usable on {route_description}: {error}; \
+                     choose another effort or reset it to default",
+                    effort.as_wire_str()
+                ))));
+            }
+            agent
+        }
+        None => agent,
+    };
     let agent = agent
-        .with_main_session(&state.cfg, &history.session)
         .with_file_checkpoints(file_checkpoints.clone())
         .with_spend(crate::spend::run::Run::current())
         .with_question_turn(cron::question_origin().capture(None));
@@ -7019,23 +7296,59 @@ mod protocol_tests {
         let sink = updates.clone();
         let workspace = ProtocolTempDir::new();
         let cwd = workspace.path().to_path_buf();
-        Client.builder().on_receive_notification(async move |notification: SessionNotification, _cx| {
-            sink.lock().unwrap().push(notification); Ok(())
-        }, agent_client_protocol::on_receive_notification!()).connect_with(InMemoryAgent(state), async move |cx| {
-            let id = cx.send_request(NewSessionRequest::new(cwd)).block_task().await?.session_id;
-            cx.send_request(prompt(id.clone(), "name this session please")).block_task().await?;
-            cx.send_request(prompt(id.clone(), "second prompt keeps the title")).block_task().await?;
-            cx.send_request(InitializeRequest::new(ProtocolVersion::V1)).block_task().await?;
-            Ok(())
-        }).await.unwrap();
+        Client
+            .builder()
+            .on_receive_notification(
+                async move |notification: SessionNotification, _cx| {
+                    sink.lock().unwrap().push(notification);
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                let id = cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?
+                    .session_id;
+                cx.send_request(prompt(id.clone(), "name this session please"))
+                    .block_task()
+                    .await?;
+                cx.send_request(prompt(id.clone(), "second prompt keeps the title"))
+                    .block_task()
+                    .await?;
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
         let updates = updates.lock().unwrap();
-        let usage: Vec<_> = updates.iter().filter_map(|n| match &n.update {
-            SessionUpdate::UsageUpdate(u) => Some(u.clone()), _ => None }).collect();
+        let usage: Vec<_> = updates
+            .iter()
+            .filter_map(|n| match &n.update {
+                SessionUpdate::UsageUpdate(u) => Some(u.clone()),
+                _ => None,
+            })
+            .collect();
         assert_eq!(usage.len(), 2, "one usage_update after each prompt");
-        assert!(usage[0].size > 0, "the routed model's context window is reported");
-        let titles: Vec<_> = updates.iter().filter_map(|n| match &n.update {
-            SessionUpdate::SessionInfoUpdate(u) => Some(format!("{:?}", u.title)), _ => None }).collect();
-        assert_eq!(titles.len(), 1, "the title is pushed once, when it first exists: {titles:?}");
+        assert!(
+            usage[0].size > 0,
+            "the routed model's context window is reported"
+        );
+        let titles: Vec<_> = updates
+            .iter()
+            .filter_map(|n| match &n.update {
+                SessionUpdate::SessionInfoUpdate(u) => Some(format!("{:?}", u.title)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            titles.len(),
+            1,
+            "the title is pushed once, when it first exists: {titles:?}"
+        );
         assert!(titles[0].contains("name this session please"));
     }
 
@@ -12090,14 +12403,247 @@ brainstorm = "no-such-quick-model"
     }
 
     fn persona_config_value(options: &[SessionConfigOption]) -> String {
-        let [option] = options else {
-            panic!("exactly one persona option expected: {options:?}");
-        };
-        assert_eq!(option.id.0.as_ref(), persona::PERSONA_CONFIG_ID);
+        let option = options
+            .iter()
+            .find(|option| option.id.0.as_ref() == persona::PERSONA_CONFIG_ID)
+            .unwrap_or_else(|| panic!("persona option expected: {options:?}"));
         match &option.kind {
             SessionConfigKind::Select(select) => select.current_value.0.to_string(),
             other => panic!("the persona option must be a select: {other:?}"),
         }
+    }
+
+    fn option_json(options: &[SessionConfigOption], id: &str) -> serde_json::Value {
+        let option = options
+            .iter()
+            .find(|option| option.id.0.as_ref() == id)
+            .unwrap_or_else(|| panic!("option {id} expected: {options:?}"));
+        serde_json::to_value(option).unwrap()
+    }
+
+    #[tokio::test]
+    async fn i7zf8_model_and_effort_options_select_the_next_prompts_route() {
+        let turns = Arc::new(AtomicUsize::new(0));
+        let state = persona_state(PERSONA_CONFIG, counting_fixture(turns.clone()));
+        let probe = state.clone();
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+        let updates = Arc::new(StdMutex::new(Vec::<SessionNotification>::new()));
+        let sink = updates.clone();
+
+        Client
+            .builder()
+            .on_receive_notification(
+                async move |notification: SessionNotification, _cx| {
+                    sink.lock().unwrap().push(notification);
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(InMemoryAgent(state.clone()), async move |cx| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let created = cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?;
+                let session = created.session_id.clone();
+                let options = created.config_options.unwrap_or_default();
+                let model = option_json(&options, "model");
+                assert_eq!(model["category"], "model");
+                assert_eq!(model["currentValue"], "default");
+                let values: Vec<_> = model["options"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|o| o["value"].as_str().unwrap().to_owned())
+                    .collect();
+                assert!(values.contains(&"review-fast".to_owned()) && values[0] == "default");
+                let effort = option_json(&options, "effort");
+                assert_eq!(effort["category"], "thought_level");
+                assert_eq!(effort["currentValue"], "default");
+
+                // A model selection routes the next prompt, over the persona's route.
+                let options = cx
+                    .send_request(SetSessionConfigOptionRequest::new(
+                        session.clone(),
+                        "model",
+                        "review-fast",
+                    ))
+                    .block_task()
+                    .await?
+                    .config_options;
+                assert_eq!(
+                    option_json(&options, "model")["currentValue"],
+                    "review-fast"
+                );
+                cx.send_request(prompt(session.clone(), "with model"))
+                    .block_task()
+                    .await?;
+                // Effort is validated and persists in the session's options.
+                let options = cx
+                    .send_request(SetSessionConfigOptionRequest::new(
+                        session.clone(),
+                        "effort",
+                        "high",
+                    ))
+                    .block_task()
+                    .await?
+                    .config_options;
+                assert_eq!(option_json(&options, "effort")["currentValue"], "high");
+                assert_eq!(
+                    option_json(&options, "model")["currentValue"],
+                    "review-fast"
+                );
+                // Unknown values and unusable routes are refused and change nothing.
+                for (id, value) in [
+                    ("model", "not-a-quick-model"),
+                    ("model", "ask-unsigned"),
+                    ("model", "acme-review"),
+                    ("effort", "turbo"),
+                    ("effort", "none"),
+                ] {
+                    assert!(
+                        cx.send_request(SetSessionConfigOptionRequest::new(
+                            session.clone(),
+                            id,
+                            value
+                        ))
+                        .block_task()
+                        .await
+                        .is_err(),
+                        "{id}={value} is refused"
+                    );
+                }
+                // `default` clears the override and the persona route returns.
+                cx.send_request(SetSessionConfigOptionRequest::new(
+                    session.clone(),
+                    "model",
+                    "default",
+                ))
+                .block_task()
+                .await?;
+                cx.send_request(prompt(session.clone(), "default again"))
+                    .block_task()
+                    .await?;
+                let overrides = state.sessions.lock().await[&session]
+                    .model_overrides
+                    .clone();
+                assert_eq!(overrides.model, None);
+                assert_eq!(
+                    overrides.effort,
+                    Some(crate::config::types::ReasoningEffort::High)
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let routes = lock_unpoisoned(&probe.turn_routes).clone();
+        assert_eq!(routes.len(), 2);
+        assert_eq!(
+            routes[0],
+            route("acme", "acme-review", None),
+            "the model selection replaces the persona route"
+        );
+        assert_eq!(
+            routes[1],
+            route("acme", "acme-review", Some(("review", "review-fast")))
+        );
+    }
+
+    #[tokio::test]
+    async fn i7zf8_model_effort_and_cost_slash_commands() {
+        let turns = Arc::new(AtomicUsize::new(0));
+        let state = persona_state(PERSONA_CONFIG, counting_fixture(turns.clone()));
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+        let updates = Arc::new(StdMutex::new(Vec::<SessionNotification>::new()));
+        let sink = updates.clone();
+        let inspect = state.clone();
+
+        Client
+            .builder()
+            .on_receive_notification(
+                async move |notification: SessionNotification, _cx| {
+                    sink.lock().unwrap().push(notification);
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session = cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?
+                    .session_id;
+                for text in [
+                    "/model review-fast",
+                    "/effort low",
+                    "/model nope",
+                    "/model",
+                    "/cost",
+                ] {
+                    cx.send_request(prompt(session.clone(), text))
+                        .block_task()
+                        .await?;
+                }
+                let overrides = inspect.sessions.lock().await[&session]
+                    .model_overrides
+                    .clone();
+                assert_eq!(overrides.model.as_deref(), Some("review-fast"));
+                assert_eq!(
+                    overrides.effort,
+                    Some(crate::config::types::ReasoningEffort::Low)
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            turns.load(Ordering::Acquire),
+            0,
+            "local commands never run a model"
+        );
+        let updates = updates.lock().unwrap();
+        let text: Vec<String> = updates
+            .iter()
+            .filter_map(|n| match &n.update {
+                SessionUpdate::AgentMessageChunk(chunk) => match &chunk.content {
+                    ContentBlock::Text(t) => Some(t.text.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert!(
+            text[0].starts_with("Model: review-fast (acme/acme-review)"),
+            "{text:?}"
+        );
+        assert!(text[1].starts_with("Reasoning effort: low"), "{text:?}");
+        assert!(
+            text[2].starts_with("model: "),
+            "unknown model is explained: {text:?}"
+        );
+        assert!(
+            text[3].starts_with("Model: review-fast. Choose"),
+            "{text:?}"
+        );
+        assert!(text[4].starts_with("Session cost: $"), "{text:?}");
+        assert!(
+            updates
+                .iter()
+                .any(|n| matches!(&n.update, SessionUpdate::ConfigOptionUpdate(_))),
+            "a command selection refreshes the client's selectors"
+        );
+        assert!(updates.iter().any(|n| matches!(&n.update,
+            SessionUpdate::AvailableCommandsUpdate(c) if ["model", "effort", "cost"]
+                .iter().all(|name| c.available_commands.iter().any(|a| a.name == *name)))));
     }
 
     #[tokio::test]
@@ -12288,7 +12834,9 @@ brainstorm = "no-such-quick-model"
                 );
                 assert!(
                     cx.send_request(SetSessionConfigOptionRequest::new(
-                        session, "model", "review"
+                        session,
+                        "no-such-option",
+                        "review"
                     ))
                     .block_task()
                     .await

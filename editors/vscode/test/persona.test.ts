@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type * as acp from '@agentclientprotocol/sdk';
-import { PERSONA_CONFIG_ID, personaSelector } from '../src/persona';
+import { EFFORT_CONFIG_ID, MODEL_CONFIG_ID, PERSONA_CONFIG_ID, personaSelector } from '../src/persona';
 import { SessionUpdateRouter } from '../src/protocolSession';
 
 function personaOption(current: string, values: string[]): acp.SessionConfigOption {
@@ -69,5 +69,19 @@ describe('persona selector', () => {
     release({ stopReason: 'end_turn' });
     await turn;
     expect(request.mock.calls.some(call => call[0] === 'session/set_config_option')).toBe(false);
+  });
+
+  it('reads the model and effort selectors independently of the persona', () => {
+    const options: acp.SessionConfigOption[] = [
+      personaOption('general', ['general']),
+      { id: MODEL_CONFIG_ID, name: 'Model', type: 'select', currentValue: 'default',
+        options: [{ value: 'default', name: 'Default' }, { value: 'fast', name: 'fast', description: 'openai/gpt-f' }] },
+      { id: EFFORT_CONFIG_ID, name: 'Reasoning effort', type: 'select', currentValue: 'high',
+        options: [{ value: 'default', name: 'Default' }, { value: 'high', name: 'high' }] },
+    ];
+    expect(personaSelector(options, MODEL_CONFIG_ID)?.choices.map(choice => choice.value)).toEqual(['default', 'fast']);
+    expect(personaSelector(options, EFFORT_CONFIG_ID)?.current).toBe('high');
+    expect(personaSelector(options)?.current).toBe('general');
+    expect(personaSelector([personaOption('general', ['general'])], MODEL_CONFIG_ID)).toBeUndefined();
   });
 });

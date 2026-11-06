@@ -75,6 +75,14 @@
         "title": "Mini Agent: Select Persona"
       },
       {
+        "command": "mini-agent.selectModel",
+        "title": "Mini Agent: Select Model"
+      },
+      {
+        "command": "mini-agent.selectEffort",
+        "title": "Mini Agent: Select Reasoning Effort"
+      },
+      {
         "command": "mini-agent.selectMode",
         "title": "Mini Agent: Select Permission Mode"
       }

@@ -15,7 +15,7 @@ import {
   withRecentStderr,
 } from './diagnostics';
 import { log } from './log';
-import { PERSONA_CONFIG_ID, personaSelector } from './persona';
+import { EFFORT_CONFIG_ID, MODEL_CONFIG_ID, PERSONA_CONFIG_ID, personaSelector } from './persona';
 import { clientCapabilities, readTextFile, writeTextFile } from './clientFs';
 import { clientFileAccessEnabled, vscodeClientFsHost } from './vscodeClientFs';
 import { SessionUpdateRouter, type PublicProtocolSession } from './protocolSession';
@@ -329,15 +329,29 @@ export class AgentSession {
 
   /** Pick the persona (prompt and routed model) for the workspace conversation. */
   async selectPersona(): Promise<void> {
+    return this.selectOption(PERSONA_CONFIG_ID, 'persona', 'Select the Mini Agent persona for this conversation');
+  }
+
+  /** Pick the model (a configured quick model) for the workspace conversation. */
+  async selectModel(): Promise<void> {
+    return this.selectOption(MODEL_CONFIG_ID, 'model', 'Select the Mini Agent model for this conversation');
+  }
+
+  /** Pick the reasoning effort for the workspace conversation. */
+  async selectEffort(): Promise<void> {
+    return this.selectOption(EFFORT_CONFIG_ID, 'reasoning effort', 'Select the Mini Agent reasoning effort for this conversation');
+  }
+
+  private async selectOption(configId: string, noun: string, placeHolder: string): Promise<void> {
     await this.start();
     return this.transitions.run(async () => {
       requireTrustedWorkspace();
       if (this.state !== 'running') { throw new Error('Mini Agent failed to start.'); }
-      if (this.conversation.isPrompting) { throw new Error('Wait for the current prompt to settle before switching persona.'); }
+      if (this.conversation.isPrompting) { throw new Error(`Wait for the current prompt to settle before switching ${noun}.`); }
       const active = await this.conversation.current();
-      const selector = personaSelector(active.configOptions?.());
+      const selector = personaSelector(active.configOptions?.(), configId);
       if (!selector || !active.setConfigOption) {
-        void vscode.window.showInformationMessage('This Mini Agent session offers no persona selection.');
+        void vscode.window.showInformationMessage(`This Mini Agent session offers no ${noun} selection.`);
         return;
       }
       const items = selector.choices.map(choice => ({
@@ -346,13 +360,13 @@ export class AgentSession {
         ...(choice.description ? { detail: safeSessionLabel(choice.description) } : {}),
         value: choice.value,
       }));
-      const picked = await vscode.window.showQuickPick(items, { placeHolder: 'Select the Mini Agent persona for this conversation' });
+      const picked = await vscode.window.showQuickPick(items, { placeHolder });
       if (!picked || picked.value === selector.current) { return; }
       requireTrustedWorkspace();
-      if (this.conversation.isPrompting) { throw new Error('A prompt started meanwhile; the persona was not changed.'); }
-      await active.setConfigOption(PERSONA_CONFIG_ID, picked.value);
-      log.info(`ACP persona selected: ${picked.value}`);
-      void vscode.window.showInformationMessage(`Mini Agent persona: ${picked.label}. It applies from the next prompt.`);
+      if (this.conversation.isPrompting) { throw new Error(`A prompt started meanwhile; the ${noun} was not changed.`); }
+      await active.setConfigOption(configId, picked.value);
+      log.info(`ACP ${noun} selected: ${picked.value}`);
+      void vscode.window.showInformationMessage(`Mini Agent ${noun}: ${picked.label}. It applies from the next prompt.`);
     });
   }
 

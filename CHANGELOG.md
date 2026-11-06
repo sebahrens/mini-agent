@@ -8,6 +8,11 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Added
 
+- ACP: sessions advertise `model` (quick models) and `effort` selectors and `/model`, `/effort`,
+  `/cost` commands, and send `usage_update`/`session_info_update`; VS Code adds Select Model and
+  Select Reasoning Effort, pages through every saved session when resuming, shows permission
+  details in a wrapping modal, and reports or forwards skipped chat references
+  (mini-agent-i7zf8, mini-agent-kqsvd, mini-agent-wzr6v, mini-agent-y5cbc, mini-agent-qs0x6).
 - ACP: with the new default-off `acp_client_file_access` (project-trust gated) and a client that
   advertises `fs.readTextFile`/`fs.writeTextFile`, `read`, `edit` and overwrite `write` use the
   editor's live text and publish through it, still behind the workspace and permission checks

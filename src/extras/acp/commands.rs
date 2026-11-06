@@ -7,6 +7,12 @@ pub(super) enum Command {
     Compact,
     Undo,
     Rename(String),
+    /// `/model [alias|default]`: show or select the session's model.
+    Model(String),
+    /// `/effort [level|default]`: show or select the reasoning effort.
+    Effort(String),
+    /// `/cost`: the session's spend and context use.
+    Cost,
     #[cfg(feature = "goal")]
     Goal(String),
 }
@@ -24,17 +30,30 @@ pub(super) fn classify(
         .unwrap_or((text.text.trim(), ""));
     let arguments = arguments.trim();
     Ok(match name {
-        "/compact" | "/undo" => {
+        "/model" | "/effort" => {
+            if arguments.chars().count() > 100 || arguments.chars().any(char::is_control) {
+                return Err(agent_client_protocol::Error::new(
+                    -32602,
+                    "ACP selection must be at most 100 non-control characters",
+                ));
+            }
+            Some(if name == "/model" {
+                Command::Model(arguments.to_owned())
+            } else {
+                Command::Effort(arguments.to_owned())
+            })
+        }
+        "/compact" | "/undo" | "/cost" => {
             if !arguments.is_empty() {
                 return Err(agent_client_protocol::Error::new(
                     -32602,
                     "this ACP command takes no arguments",
                 ));
             }
-            Some(if name == "/compact" {
-                Command::Compact
-            } else {
-                Command::Undo
+            Some(match name {
+                "/compact" => Command::Compact,
+                "/cost" => Command::Cost,
+                _ => Command::Undo,
             })
         }
         "/rename" => {
@@ -153,6 +172,15 @@ pub(super) async fn announce(
             "Remove the last conversation turn; files and billed usage remain",
         ),
         AvailableCommand::new("rename", "Rename this saved session"),
+        AvailableCommand::new("cost", "Show this session's cost and context use"),
+        AvailableCommand::new(
+            "model",
+            "Show or select the model from [quick_models]: /model [alias|default]",
+        ),
+        AvailableCommand::new(
+            "effort",
+            "Show or select the reasoning effort: /effort [low|medium|high|xhigh|max|default]",
+        ),
         AvailableCommand::new(
             "cron",
             "Repeat a prompt on an interval while this session is idle: /cron <interval> <prompt>, /cron list, /cron stop <id>|all",
