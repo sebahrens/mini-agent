@@ -134,7 +134,7 @@ pub enum McpServerConfig {
         network: McpStdioNetwork,
         /// Per-server timeouts and tool selection.
         #[serde(flatten, default)]
-        options: McpServerOptions,
+        options: Box<McpServerOptions>,
     },
     Url {
         url: String,
@@ -149,7 +149,7 @@ pub enum McpServerConfig {
         oauth: Option<OAuthConfig>,
         /// Per-server timeouts and tool selection.
         #[serde(flatten, default)]
-        options: McpServerOptions,
+        options: Box<McpServerOptions>,
     },
     /// A built-in registration whose endpoint and trust identity cannot be
     /// supplied or changed through deserialized user configuration.
@@ -264,7 +264,7 @@ impl McpServerConfig {
     /// Per-server options; built-in registrations use the defaults.
     pub(crate) fn options(&self) -> McpServerOptions {
         match self {
-            Self::Command { options, .. } | Self::Url { options, .. } => options.clone(),
+            Self::Command { options, .. } | Self::Url { options, .. } => (**options).clone(),
             Self::BuiltIn { .. } => McpServerOptions::default(),
         }
     }
