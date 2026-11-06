@@ -77,15 +77,42 @@ pub(crate) fn github_latest_url(repository: &str) -> Option<String> {
 }
 
 fn notice(version: Option<&str>, current: &str) -> Option<String> {
+    let exe = std::env::current_exe()
+        .and_then(|path| path.canonicalize())
+        .ok();
+    let home = std::env::var("HOME").ok();
+    let channel = match &exe {
+        Some(exe) => crate::self_update::classify_install(
+            &exe.to_string_lossy(),
+            home.as_deref(),
+            version.unwrap_or(current),
+        ),
+        None => crate::self_update::InstallChannel::SelfManaged,
+    };
+    notice_for(version, current, &channel)
+}
+
+/// The notice text for an install channel: self-managed installs are told to
+/// run `mini-agent update`; a managed one gets its own upgrade instruction
+/// (never the `install.sh` pipeline, which would create a second binary).
+fn notice_for(
+    version: Option<&str>,
+    current: &str,
+    channel: &crate::self_update::InstallChannel,
+) -> Option<String> {
     let version = version?;
     if stable_version(version)? <= stable_version(current)? {
         return None;
     }
     let version = normalized_version(version)?;
-    Some(format!(
-        "[update] v{version} available. Install with:\n  curl -fsSL https://raw.githubusercontent.com/{}/main/install.sh | bash -s -- --release {version}",
-        crate::product::REPOSITORY_SLUG
-    ))
+    Some(match channel {
+        crate::self_update::InstallChannel::SelfManaged => {
+            format!("[update] v{version} available; run `mini-agent update`.")
+        }
+        crate::self_update::InstallChannel::Managed(instruction) => {
+            format!("[update] v{version} available. {instruction}")
+        }
+    })
 }
 
 pub(crate) fn should_check(
@@ -304,36 +331,78 @@ async fn fetch_latest(endpoint: &str) -> Option<String> {
     fetch_latest_within(endpoint, REQUEST_TIMEOUT).await
 }
 
+/// How the release lookup reaches GitHub. The passive startup/headless check
+/// stays direct (documented); an explicit `mini-agent update` honours the
+/// environment proxies and `https` redirects like its archive download does.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum LookupPolicy {
+    Passive,
+    Explicit,
+}
+
 /// [`fetch_latest`] with a caller-chosen deadline (an explicit `update` can wait longer
-/// than the startup notice).
+/// than the startup notice). Passive policy: direct, no redirects.
 pub(crate) async fn fetch_latest_within(endpoint: &str, timeout: Duration) -> Option<String> {
-    let client = reqwest::Client::builder()
-        .no_proxy()
+    request_latest(endpoint, timeout, LookupPolicy::Passive)
+        .await
+        .ok()
+}
+
+/// The explicit-command lookup: environment proxies, up to five `https`
+/// redirects, and an error that names the HTTP status or transport failure.
+pub(crate) async fn fetch_latest_explicit(
+    endpoint: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    request_latest(endpoint, timeout, LookupPolicy::Explicit).await
+}
+
+pub(crate) fn build_lookup_client(
+    timeout: Duration,
+    policy: LookupPolicy,
+) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
         .timeout(timeout)
         .connect_timeout(timeout)
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(concat!("mini-agent/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .ok()?;
+        .user_agent(concat!("mini-agent/", env!("CARGO_PKG_VERSION")));
+    builder = match policy {
+        LookupPolicy::Passive => builder
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none()),
+        LookupPolicy::Explicit => builder.redirect(crate::self_update::https_only_redirects()),
+    };
+    builder.build().map_err(|error| error.to_string())
+}
+
+async fn request_latest(
+    endpoint: &str,
+    timeout: Duration,
+    policy: LookupPolicy,
+) -> Result<String, String> {
+    let client = build_lookup_client(timeout, policy)?;
     let mut response = client
         .get(endpoint)
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
         .send()
         .await
-        .ok()?;
+        .map_err(|error| format!("request to {endpoint} failed: {error}"))?;
     if response.status() != reqwest::StatusCode::OK {
-        return None;
+        return Err(format!("{endpoint} answered HTTP {}", response.status()));
     }
     if response
         .content_length()
         .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
     {
-        return None;
+        return Err("the release response is too large".into());
     }
     let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.ok()? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("reading the release response failed: {error}"))?
+    {
         if chunk.len() > MAX_RESPONSE_BYTES.saturating_sub(bytes.len()) {
-            return None;
+            return Err("the release response is too large".into());
         }
         bytes.extend_from_slice(&chunk);
     }
@@ -343,11 +412,13 @@ pub(crate) async fn fetch_latest_within(endpoint: &str, timeout: Duration) -> Op
         draft: bool,
         prerelease: bool,
     }
-    let release: Release = serde_json::from_slice(&bytes).ok()?;
+    let release: Release = serde_json::from_slice(&bytes)
+        .map_err(|_| "the release response is not valid release JSON".to_string())?;
     if release.draft || release.prerelease {
-        return None;
+        return Err("the latest release is a draft or prerelease".into());
     }
     normalized_version(&release.tag_name)
+        .ok_or_else(|| format!("the release tag {:?} is not a version", release.tag_name))
 }
 
 #[cfg(test)]
@@ -392,9 +463,13 @@ mod tests {
     #[test]
     fn update_versions_compare_numerically_and_reject_command_text() {
         assert!(
-            notice(Some("v1.10.0"), "1.9.4")
-                .unwrap()
-                .contains("--release 1.10.0")
+            notice_for(
+                Some("v1.10.0"),
+                "1.9.4",
+                &crate::self_update::InstallChannel::SelfManaged
+            )
+            .unwrap()
+            .contains("v1.10.0 available; run `mini-agent update`")
         );
         assert!(notice(Some("1.9.4"), "1.9.4").is_none());
         assert!(notice(Some("1.9.3"), "1.9.4").is_none());
@@ -412,6 +487,96 @@ mod tests {
             assert!(stable_version(invalid).is_none(), "{invalid:?}");
             assert!(notice(Some(invalid), "1.0.0").is_none());
         }
+    }
+
+    #[test]
+    fn update_notice_matches_the_install_channel() {
+        use crate::self_update::{InstallChannel, classify_install};
+        let text = |channel: &InstallChannel| notice_for(Some("1.10.0"), "1.9.0", channel).unwrap();
+        let own = text(&InstallChannel::SelfManaged);
+        assert_eq!(own, "[update] v1.10.0 available; run `mini-agent update`.");
+        assert!(!own.contains("curl"));
+        let home = Some("/home/u");
+        for (path, needle) in [
+            (
+                "/opt/homebrew/Cellar/mini-agent/1/bin/mini-agent",
+                "Homebrew",
+            ),
+            ("/home/u/.cargo/bin/mini-agent", "cargo install --locked"),
+            ("/nix/store/x-mini-agent/bin/mini-agent", "Nix"),
+            ("/usr/bin/mini-agent", "package manager"),
+            ("/home/u/.vscode/extensions/m/bin/mini-agent", "extension"),
+        ] {
+            let channel = classify_install(path, home, "1.10.0");
+            let notice = text(&channel);
+            assert!(
+                notice.starts_with("[update] v1.10.0 available. "),
+                "{notice}"
+            );
+            assert!(notice.contains(needle), "{path}: {notice}");
+            assert!(!notice.contains("install.sh"), "{notice}");
+        }
+        // Windows installs point at the MSI document, never the bash pipeline.
+        let windows = InstallChannel::Managed(
+            "Windows installs are updated with the MSI (see docs/agent/WINDOWS_INSTALL.md)".into(),
+        );
+        assert!(text(&windows).contains("WINDOWS_INSTALL.md"));
+        assert!(notice_for(Some("1.9.0"), "1.9.0", &InstallChannel::SelfManaged).is_none());
+    }
+
+    async fn serve_once(response: &str) -> String {
+        let response = response.to_owned();
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buffer = [0u8; 2048];
+                let _ = socket.read(&mut buffer).await;
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        format!("http://{address}/latest")
+    }
+
+    #[tokio::test]
+    async fn explicit_lookup_reports_status_and_blocks_non_https_redirects() {
+        let timeout = Duration::from_secs(2);
+        let moved = serve_once(
+            "HTTP/1.1 301 Moved\r\nLocation: http://127.0.0.1:1/x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let error = fetch_latest_explicit(&moved, timeout).await.unwrap_err();
+        assert!(error.contains("redirect"), "{error}");
+        let missing =
+            serve_once("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await;
+        let error = fetch_latest_explicit(&missing, timeout).await.unwrap_err();
+        assert!(error.contains("HTTP 404"), "{error}");
+        let body = r#"{"tag_name":"v9.9.9","draft":false,"prerelease":false}"#;
+        let ok = serve_once(&format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ))
+        .await;
+        assert_eq!(fetch_latest_explicit(&ok, timeout).await.unwrap(), "9.9.9");
+        let unreachable = fetch_latest_explicit("http://127.0.0.1:1/latest", timeout)
+            .await
+            .unwrap_err();
+        assert!(unreachable.contains("failed"), "{unreachable}");
+        // The passive check keeps its quiet Option contract.
+        assert_eq!(
+            fetch_latest_within("http://127.0.0.1:1/latest", timeout).await,
+            None
+        );
+    }
+
+    #[test]
+    fn passive_lookup_is_direct_and_explicit_lookup_follows_the_environment() {
+        let timeout = Duration::from_secs(1);
+        assert!(build_lookup_client(timeout, LookupPolicy::Passive).is_ok());
+        assert!(build_lookup_client(timeout, LookupPolicy::Explicit).is_ok());
+        assert_ne!(LookupPolicy::Passive, LookupPolicy::Explicit);
     }
 
     #[test]
@@ -504,7 +669,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(first.unwrap().contains("--release 1.10.0"));
+        assert!(first.unwrap().contains("v1.10.0 available"));
         let cached = check_cached(root.path(), 101, "1.9.4", || async {
             panic!("cache hit must not request a release")
         })

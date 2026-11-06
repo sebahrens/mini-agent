@@ -909,6 +909,23 @@ fn is_tool_output_key(key: KeyEvent) -> bool {
         && !key.modifiers.contains(KeyModifiers::ALT)
 }
 
+/// Ctrl+Z (no other modifier): the terminal is in raw mode, where ISIG is off,
+/// so the shell's job-control key arrives as an ordinary key event.
+#[cfg(unix)]
+fn is_suspend_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('z' | 'Z'))
+        && key.modifiers == KeyModifiers::CONTROL
+        && key.kind == crossterm::event::KeyEventKind::Press
+}
+
+/// Ctrl+Z suspends only when the user has not bound it (an `undo = ["ctrl+z"]`
+/// binding wins) and no modal owns the keyboard: a permission or question
+/// prompt, a chain prompt or an open picker never hands the terminal back.
+#[cfg(unix)]
+fn suspend_applies(key: KeyEvent, bound: bool, modal: bool) -> bool {
+    is_suspend_key(key) && !bound && !modal
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TranscriptScroll {
     Top,
@@ -974,6 +991,51 @@ mod home_end_tests {
         // Other keys are never transcript scrolls here.
         let page_up = KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE);
         assert_eq!(transcript_scroll_key(page_up, true, false), None);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod suspend_key_tests {
+    use super::*;
+
+    #[test]
+    fn ctrl_z_suspends_only_when_unbound_and_no_modal_owns_the_keyboard() {
+        let ctrl_z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL);
+        assert!(suspend_applies(ctrl_z, false, false));
+        // An undo = ["ctrl+z"] binding wins; a permission prompt or picker is inert.
+        assert!(!suspend_applies(ctrl_z, true, false));
+        assert!(!suspend_applies(ctrl_z, false, true));
+        for other in [
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+            KeyEvent::new(
+                KeyCode::Char('z'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            KeyEvent::new(
+                KeyCode::Char('z'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            KeyEvent::new_with_kind(
+                KeyCode::Char('z'),
+                KeyModifiers::CONTROL,
+                crossterm::event::KeyEventKind::Release,
+            ),
+        ] {
+            assert!(!suspend_applies(other, false, false), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn a_user_undo_binding_on_ctrl_z_is_reconfigured_and_keeps_the_key() {
+        let ctrl_z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL);
+        let default = KeyBindings::default();
+        assert!(default.action(ctrl_z, false).is_none());
+        assert!(!default.is_reconfigured(ctrl_z));
+        let mut keys = std::collections::BTreeMap::new();
+        keys.insert("undo".to_string(), vec!["ctrl+z".to_string()]);
+        let bound = KeyBindings::from_overrides(Some(&keys)).unwrap();
+        assert!(bound.is_reconfigured(ctrl_z));
     }
 }
 
@@ -4176,6 +4238,19 @@ impl<'a> App<'a> {
                 )?,
             }
             return Ok(());
+        }
+
+        #[cfg(unix)]
+        {
+            let modal = self.permission_prompt.is_some()
+                || self.question_prompt.is_some()
+                || self.renderer.chain_prompt.is_some()
+                || self.renderer.chain_but_mode
+                || self.input.picker.as_ref().is_some_and(Picker::active);
+            let bound = action.is_some() || self.input.keybindings.is_reconfigured(key);
+            if suspend_applies(key, bound, modal) {
+                return self.suspend_to_shell();
+            }
         }
 
         // Ctrl+T is unbound by default; a user binding for it wins.
@@ -7930,6 +8005,25 @@ impl<'a> App<'a> {
             &mut self.user_rx,
             &mut self.deferred_user_events,
         );
+    }
+
+    /// Ctrl+Z: give the terminal back, stop the whole process with SIGTSTP (the
+    /// shell's `fg` continues it), then re-enter raw mode and the alternate
+    /// screen and repaint. Same hand-off as an external editor or lazygit.
+    #[cfg(unix)]
+    fn suspend_to_shell(&mut self) -> anyhow::Result<()> {
+        self.pause_event_thread();
+        self.terminal_guard.suspend()?;
+        let stopped = nix::sys::signal::raise(nix::sys::signal::Signal::SIGTSTP);
+        // Execution continues here only after SIGCONT.
+        let resume_result = self.terminal_guard.resume();
+        self.rebind_event_thread();
+        resume_result?;
+        if let Err(error) = stopped {
+            self.renderer
+                .write_line(&format!("cannot suspend: {error}"), C_ERROR)?;
+        }
+        Ok(())
     }
 
     fn rebind_event_thread(&mut self) {

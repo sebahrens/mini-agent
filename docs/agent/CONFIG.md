@@ -353,6 +353,7 @@ configured provider endpoints win endpoint environment fallbacks.
 | `MINI_AGENT_PROVIDER`, `MINI_AGENT_MODEL` | Environment-backed `--provider` and `--model`: explicit CLI wins, then these values, then config/default provider and model selection. |
 | `OPENROUTER_MODEL` | Legacy model fallback after `--model`/`MINI_AGENT_MODEL`, before config; only applies when OpenRouter is the provider in effect. |
 | `MINI_AGENT_HOME` | Application home for roots without a more specific `MINI_AGENT_*_DIR` override; precedes default home/platform layout discovery. |
+| `MINI_AGENT_SKIP_ATTESTATION`, `MINI_AGENT_INSTALL_NO_GH` | `mini-agent update` (as in `install.sh`): `MINI_AGENT_SKIP_ATTESTATION=1` skips the `gh attestation verify` provenance check (with a warning and the manual command); `MINI_AGENT_INSTALL_NO_GH=1` never invokes `gh`, so the install counts as unattested and needs `--allow-unattested`. |
 | `MINI_AGENT_CONFIG_DIR`, `MINI_AGENT_DATA_DIR`, `MINI_AGENT_LOCAL_DATA_DIR`, `MINI_AGENT_STATE_DIR`, `MINI_AGENT_CACHE_DIR`, `MINI_AGENT_CREDENTIALS_DIR` | Override the corresponding persistence root before `MINI_AGENT_HOME` and platform defaults. Legacy `ZEROSTACK_*_DIR` spellings are read only when the canonical name is unset. `--config` selects an explicit config file; these variables still control other roots. See application paths above for artifact and no-persist policy. |
 | `EXA_API_KEY`, `CONTEXT7_API_KEY`, `GREP_APP_API_KEY` | Credentials for the corresponding built-in MCP registrations when enabled; `EXA_API_KEY` also supplies native `web_search`. User-configured registrations retain their own configured headers. |
 | `GITHUB_COPILOT_API_TOKEN`, `COPILOT_GITHUB_TOKEN` | Copilot model API token or explicitly supplied GitHub bootstrap token, respectively. CLI API key wins, then these designated sources, then `api_keys.copilot`, then a saved Copilot login. No ambient GitHub CLI/Actions tokens or editor caches are read. Isolated custom providers need their own token or explicit inheritance. |
@@ -971,10 +972,10 @@ startup notice for a newer stable release. [`src/update.rs`](../../src/update.rs
 owns the check. It uses the package repository's GitHub latest-release endpoint
 without credentials, provider settings, redirects, or ambient proxies. Drafts,
 prereleases, malformed tags, oversized bodies, and network failures produce no
-new notice. The check never downloads or runs an installer. A notice prints
-the explicit-release command for the existing installer, which checks release
-`SHA256SUMS` and also requires build attestation when authenticated `gh` is
-available. The release metadata itself is not an attestation.
+new notice. The check never downloads or runs an installer. A notice follows the install channel: a self-managed
+install is told to run `mini-agent update`; Homebrew, cargo, Nix, system
+package, VS Code extension and Windows installs get their own instruction (never
+the `install.sh` pipeline, which would create a second binary). The release metadata itself is not an attestation.
 
 The private `<state>/update/latest.json` cache retains the last valid version
 and attempt timestamp. A nonblocking cross-process lock admits one check at a
@@ -1001,9 +1002,17 @@ beside the installed binary and renames it into place atomically (a running
 session keeps the old inode). It refuses, printing the right command, when the
 binary was installed by Homebrew, npm, cargo, Nix or a system package, by the VS Code
 extension, or is a local build; on Windows it points to the MSI, because a running
-`.exe` cannot be replaced in place. Build provenance is not checked by this command
-(use `gh attestation verify` or rerun `install.sh`, which also refreshes the bundled
-notice documents). The bare word `update` followed by anything else stays an ordinary prompt.
+`.exe` cannot be replaced in place. Before the rename it runs
+`gh attestation verify <archive> --repo <slug>` when `gh` is installed and signed
+in, and a rejection aborts with nothing installed. Without a usable `gh` it prints
+the manual command first and requires `--allow-unattested` or an interactive "yes"
+for a checksum-only install; `MINI_AGENT_SKIP_ATTESTATION=1` skips verification as
+in `install.sh` and `MINI_AGENT_INSTALL_NO_GH=1` never calls `gh`. A `--release`
+older than the running version needs `--allow-downgrade` or an interactive "yes".
+The explicit command (version lookup and download alike) honours `HTTPS_PROXY` and
+reports the HTTP status or transport error on failure; the passive startup check
+stays direct (no proxy, no redirects). `install.sh` also refreshes the bundled
+notice documents. The bare word `update` followed by anything else stays an ordinary prompt.
 
 ## Prompt-cache prefix and memory snapshots
 
@@ -4361,6 +4370,9 @@ line_start = ["f2"]
 open_editor = ["ctrl+x"]
 undo = ["ctrl+z"]
 ```
+
+`Ctrl+Z` suspends the TUI to the shell on Unix unless you bind it (as `undo` above does);
+see COMMANDS.md.
 
 `/keys` lists the effective action/chord map. Empty arrays disable an action;
 explicit chords must be unique. At most eight chords per action are accepted,

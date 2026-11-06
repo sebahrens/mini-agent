@@ -2372,17 +2372,27 @@ impl Startup {
     async fn dispatch_print_stream_input(&mut self) -> anyhow::Result<()> {
         if self.native_ticket.is_some() || self.native_headless.is_some() {
             anyhow::bail!(
-                "--input-format stream-json does not support provider-native session history yet; use --acp for multi-turn native sessions"
+                "{} Or use --acp for multi-turn native sessions.",
+                crate::headless_media::native_history_refusal("--input-format stream-json turns")
             );
         }
         let output = crate::print::HeadlessOutputPolicy::from_cli(&self.cli);
         let mut pending =
             Some(self.cli.message.join(" ").trim().to_string()).filter(|prompt| !prompt.is_empty());
         let mut last_failure = None;
+        // Opt-in control channel: stdin is read by a task that answers
+        // control lines at once (even mid-turn) and queues the rest.
+        let mut queued = self
+            .cli
+            .stream_json_control
+            .then(|| crate::print::spawn_control_reader(output, self.permission.clone()));
         loop {
             let prompt = match pending.take() {
                 Some(prompt) => prompt,
-                None => match crate::print::read_stream_input_line().await? {
+                None => match match &mut queued {
+                    Some(queue) => Ok(queue.recv().await),
+                    None => crate::print::read_stream_input_line().await,
+                }? {
                     None => break,
                     Some(Ok(line)) if line.trim().is_empty() => continue,
                     Some(Ok(line)) => match crate::headless_media::parse_stream_user_input(
@@ -2479,7 +2489,8 @@ impl Startup {
         anyhow::ensure!(!is_bang, "images cannot be attached to a `!` shell command");
         anyhow::ensure!(
             self.native_ticket.is_none() && self.native_headless.is_none(),
-            "image attachments do not support provider-native session history yet"
+            "{}",
+            crate::headless_media::native_history_refusal("image attachments")
         );
         #[cfg(feature = "multimodal")]
         crate::headless_media::ensure_vision(&self.session.provider, &self.session.model)

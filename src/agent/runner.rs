@@ -5364,7 +5364,7 @@ where
                         StreamedAssistantContent::ReasoningDelta { reasoning, .. },
                     )) => {
                         // Display only: the complete item above is what gets replayed.
-                        if let Err(error) = output_policy.reasoning(&reasoning).await {
+                        if let Err(error) = output_policy.reasoning_delta(&reasoning).await {
                             fail_turn!(error);
                         }
                     }

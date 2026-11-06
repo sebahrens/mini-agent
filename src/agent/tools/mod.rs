@@ -908,6 +908,17 @@ async fn settle_check(
         }
         CheckResult::Ask => {
             let Some(tx) = ask_tx else {
+                // Headless with `--stream-json-control`: the driver answers.
+                if let Some(control) = crate::headless_control::state() {
+                    return match control.ask(tool, input).await {
+                        crate::headless_control::Reply::Allow => Ok(None),
+                        crate::headless_control::Reply::Deny(reason) => {
+                            Err(ToolError::Msg(format!(
+                                "Permission denied by the stream-json control channel: {reason}"
+                            )))
+                        }
+                    };
+                }
                 // Headless: an opted-in PermissionRequest hook may still
                 // answer; otherwise the non-interactive denial stands.
                 #[cfg(feature = "hooks")]

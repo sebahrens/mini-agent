@@ -2677,6 +2677,297 @@ fn stream_json_reports_real_tool_order_usage_identity_and_terminal_failures() {
 }
 
 #[test]
+fn include_partial_messages_adds_deltas_and_leaves_default_output_unchanged() {
+    let run = |partial: bool| -> Vec<serde_json::Value> {
+        let root = TempRoot::new();
+        let server = root.local_provider("tool_completed");
+        let mut command = root.provider_command("write");
+        command.args(["-p", "--output", "stream-json", "--no-session"]);
+        if partial {
+            command.arg("--include-partial-messages");
+        }
+        command.arg("write the file");
+        let output = bounded_output(command);
+        server.join().unwrap().unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    };
+    let plain = run(false);
+    let partial = run(true);
+    let is_delta = |row: &serde_json::Value| {
+        matches!(row["type"].as_str(), Some("text_delta" | "reasoning_delta"))
+    };
+    // Default output has no delta records.
+    assert!(!plain.iter().any(is_delta));
+    let delta = partial
+        .iter()
+        .find(|row| row["type"] == "text_delta")
+        .expect("a text_delta under --include-partial-messages");
+    assert_eq!(delta["text"], "partial reply");
+    assert_eq!(delta["message_id"], "msg_1");
+    assert_eq!(delta["truncated"], false);
+    // Everything else keeps its type order: final assistant_text and result unchanged.
+    let kinds = |rows: &[serde_json::Value]| -> Vec<String> {
+        rows.iter()
+            .filter(|row| !is_delta(row))
+            .map(|row| row["type"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(kinds(&plain), kinds(&partial));
+    assert!(
+        partial
+            .iter()
+            .any(|row| row["type"] == "assistant_text" && row["text"] == "partial reply")
+    );
+}
+
+/// A child whose stdin the test writes to while it reads stdout line by line.
+struct ControlDriver {
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    lines: std::sync::mpsc::Receiver<serde_json::Value>,
+}
+
+impl ControlDriver {
+    fn start(mut command: Command) -> Self {
+        use std::io::BufRead as _;
+        use std::process::Stdio;
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start the driven headless run");
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take().unwrap();
+        let (tx, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+            {
+                if let Ok(value) = serde_json::from_str(&line) {
+                    let _ = tx.send(value);
+                }
+            }
+        });
+        Self {
+            child,
+            stdin,
+            lines,
+        }
+    }
+
+    fn send(&mut self, line: &str) {
+        use std::io::Write as _;
+        let stdin = self.stdin.as_mut().unwrap();
+        writeln!(stdin, "{line}").unwrap();
+        stdin.flush().unwrap();
+    }
+
+    /// Reads rows until one matches, failing after 20 seconds.
+    fn until(&self, what: &str, matches: impl Fn(&serde_json::Value) -> bool) -> serde_json::Value {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match self.lines.recv_timeout(left) {
+                Ok(row) if matches(&row) => return row,
+                Ok(_) => {}
+                Err(_) => panic!("timed out waiting for {what}"),
+            }
+        }
+    }
+
+    /// Closes stdin and waits for the run to end.
+    fn finish(mut self) -> std::process::ExitStatus {
+        drop(self.stdin.take());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return status;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = self.child.kill();
+                panic!("driven run did not exit");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for ControlDriver {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+#[test]
+fn stream_json_control_approves_and_denies_asks_and_stays_closed_by_default() {
+    for decision in ["allow", "deny"] {
+        let root = TempRoot::new();
+        std::fs::create_dir(root.0.join("tmp")).unwrap();
+        let server = root.local_provider("permission_ask");
+        let mut command = root.command();
+        command
+            .env("HEADLESS_LOCAL_TEST_KEY", "local-test-key")
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost")
+            .args([
+                "--no-sandbox",
+                "--no-context-files",
+                "--guarded",
+                "--tools",
+                "write",
+                "--provider",
+                "local-test",
+                "--model",
+                "test",
+                "-p",
+                "--input-format",
+                "stream-json",
+                "--output",
+                "stream-json",
+                "--stream-json-control",
+                "write the file",
+            ]);
+        let mut driver = ControlDriver::start(command);
+        let request = driver.until("a can_use_tool request", |row| {
+            row["type"] == "control_request"
+        });
+        assert_eq!(request["request"]["subtype"], "can_use_tool");
+        assert_eq!(request["request"]["tool_name"], "write");
+        let id = request["request_id"].as_str().unwrap().to_owned();
+        // A reply for an unknown request does not settle the ask.
+        driver.send(r#"{"type":"control_response","response":{"subtype":"success","request_id":"perm_999","response":{"behavior":"allow"}}}"#);
+        driver.until("an input_error for the unknown id", |row| {
+            row["type"] == "input_error"
+        });
+        driver.send(&format!(
+            r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{id}","response":{{"behavior":"{decision}","message":"not today"}}}}}}"#
+        ));
+        driver.until("the turn result", |row| row["type"] == "result");
+        let denied_row = decision == "deny";
+        let status = driver.finish();
+        server.join().unwrap().unwrap();
+        assert!(status.success(), "{decision}");
+        assert_eq!(
+            root.0.join("tmp/effect.txt").exists(),
+            !denied_row,
+            "{decision}"
+        );
+    }
+    // Default closed: without the flag a control line is an input_error and the
+    // ask is denied without ever emitting a control_request.
+    let root = TempRoot::new();
+    let server = root.local_provider("permission_ask");
+    let mut command = root.command();
+    command
+        .env("HEADLESS_LOCAL_TEST_KEY", "local-test-key")
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .args([
+            "--no-sandbox",
+            "--no-context-files",
+            "--guarded",
+            "--tools",
+            "write",
+            "--provider",
+            "local-test",
+            "--model",
+            "test",
+            "-p",
+            "--input-format",
+            "stream-json",
+            "--output",
+            "stream-json",
+            "write the file",
+        ]);
+    let mut driver = ControlDriver::start(command);
+    let result = driver.until("the turn result", |row| row["type"] == "result");
+    assert_eq!(result["result"], "finished");
+    driver.send(r#"{"type":"control_request","request_id":"r","request":{"subtype":"interrupt"}}"#);
+    let error = driver.until("an input_error for the control line", |row| {
+        row["type"] == "input_error"
+    });
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("control_request")
+    );
+    assert!(driver.finish().success());
+    server.join().unwrap().unwrap();
+    assert!(!root.0.join("tmp/effect.txt").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn stream_json_control_interrupts_a_running_tool() {
+    let root = TempRoot::new();
+    let server = root.local_provider("active_command");
+    let mut command = root.provider_command("write,shell");
+    command.args([
+        "--shell",
+        "/bin/sh",
+        "-p",
+        "--input-format",
+        "stream-json",
+        "--output",
+        "stream-json",
+        "--stream-json-control",
+        "write the file",
+    ]);
+    let mut driver = ControlDriver::start(command);
+    driver.until("the shell tool to start", |row| {
+        row["type"] == "tool_call" && row["name"] == "shell"
+    });
+    let marker = root.0.join("command.pid");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !marker.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "command never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    driver.send(
+        r#"{"type":"control_request","request_id":"stop-1","request":{"subtype":"interrupt"}}"#,
+    );
+    let ack = driver.until("the interrupt acknowledgement", |row| {
+        row["type"] == "control_response"
+    });
+    assert_eq!(ack["response"]["request_id"], "stop-1");
+    assert_eq!(ack["response"]["subtype"], "success");
+    let result = driver.until("the interrupted turn's result", |row| {
+        row["type"] == "result"
+    });
+    assert_eq!(result["stop_reason"], "failed");
+    let pid: i32 = std::fs::read_to_string(&marker)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // The interrupted command is reaped, not left running.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "command survived the interrupt"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let _ = driver.finish();
+    let _ = server.join();
+}
+
+#[test]
 fn piped_stdin_is_bounded_untrusted_model_context_and_invalid_input_is_local() {
     use std::process::Stdio;
     let root = TempRoot::new();

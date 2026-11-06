@@ -60,6 +60,12 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Hosted web search: new `hosted-web-search-allowed-domains`, `-blocked-domains` and `-max-uses`
   (mini-agent-8fcmp); granular, regex and mode-level `web_search` denies now withhold the hosted
   tool (mini-agent-5zh97).
+- Headless/CLI: opt-in `--include-partial-messages` (`text_delta`/`reasoning_delta` stream-json
+  events) and `--stream-json-control` (interrupt, tool permission answers and mode narrowing over
+  stdin); Ctrl+Z suspends the TUI on Unix; `mini-agent update` verifies build provenance with
+  `gh attestation verify`, honours `HTTPS_PROXY`, needs `--allow-downgrade` for older releases, and
+  the update notice follows the install channel (mini-agent-skgg9, -zml6o, -x6nc9, -w7046, -17mth,
+  -nfj5h, -t5ybs, -gwx1b, -e3bor).
 ### Security
 
 - `--mcp-server`: a `run` prompt starting with `!` is refused (it ran a raw shell command in the
