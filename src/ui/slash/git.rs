@@ -549,6 +549,7 @@ async fn execute_native(
                     revision: None,
                     message: None,
                     max_count: None,
+                    ..Default::default()
                 },
                 events,
             )
@@ -563,6 +564,7 @@ async fn execute_native(
                             revision: None,
                             message: None,
                             max_count: Some(8),
+                            ..Default::default()
                         },
                         events,
                     )
@@ -613,6 +615,7 @@ async fn execute_native(
                     revision: None,
                     message: None,
                     max_count: None,
+                    ..Default::default()
                 },
                 events,
             )
@@ -628,6 +631,7 @@ async fn execute_native(
                     revision: None,
                     message: None,
                     max_count: None,
+                    ..Default::default()
                 },
                 events,
             )
@@ -641,6 +645,7 @@ async fn execute_native(
                     revision: None,
                     message: None,
                     max_count: None,
+                    ..Default::default()
                 },
                 events,
             )
@@ -654,6 +659,7 @@ async fn execute_native(
                     revision: None,
                     message: None,
                     max_count: None,
+                    ..Default::default()
                 },
                 events,
             )
@@ -667,6 +673,7 @@ async fn execute_native(
                     revision: None,
                     message: Some(message),
                     max_count: None,
+                    ..Default::default()
                 },
                 events,
             )
@@ -796,16 +803,7 @@ async fn call_git(
     args: crate::git::tool::GitArgs,
     events: &tokio::sync::mpsc::Sender<crate::event::AgentEvent>,
 ) -> Result<serde_json::Value, String> {
-    use crate::git::tool::GitOperation;
-    let operation = match &args.operation {
-        GitOperation::Status => "status",
-        GitOperation::Diff => "diff",
-        GitOperation::Log => "log",
-        GitOperation::Show => "show",
-        GitOperation::Stage => "stage",
-        GitOperation::Unstage => "unstage",
-        GitOperation::Commit => "commit",
-    };
+    let operation = args.operation.name();
     let payload = serde_json::json!({"operation":operation,"paths":args.paths,"revision":args.revision,"message":args.message,"max_count":args.max_count});
     let value = emit_call(
         "git",

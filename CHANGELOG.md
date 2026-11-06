@@ -19,6 +19,12 @@ Notable changes to mini-agent are documented in this file. The format follows
   background job, so REPLs and prompting tools can be driven inside the sandbox
   (mini-agent-gklvo).
 
+- The structured `git` tool adds `branches`, `branch_create`, `switch`, `stash_push`,
+  `stash_pop`, `stash_list`, `tag` and `restore`, each behind its own `git/<operation>` permission
+  key and inside the existing `.git` protection model; `diff`/`show` gain `format`
+  (`stat`, `name_status`) and `offset` paging so changes larger than 192 KiB can be read in full
+  (mini-agent-k4fem).
+
 ### Changed
 
 - Foreground `shell` commands that print more than 1 MiB are no longer killed: the capture keeps

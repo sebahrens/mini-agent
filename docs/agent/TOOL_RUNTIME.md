@@ -592,6 +592,26 @@ See [CONFIG.md](CONFIG.md) for the default model and opt-out.
 
 ## Native Git command proposals
 
+The model-facing `git` tool (`src/git/tool.rs`) runs fixed, hardened Git argv
+inside the workspace-service sandbox, where refs, `HEAD`, objects and the index
+are writable but `.git` config, hooks, info and modules stay protected. Besides
+`status`, `diff`, `log`, `show`, `stage`, `unstage` and `commit` it offers
+`branches` (list), `branch_create` (`name`, optional start `revision`), `switch`
+(existing local branch `name`), `stash_push` (optional `message` and `paths`),
+`stash_pop`, `stash_list`, `tag` (`name`, optional `revision`; `message` makes it
+annotated) and `restore` (discard working-tree changes of `paths`, from the
+index or a `revision`). Each mutation has its own permission key
+(`git/branch`, `git/switch`, `git/stash`, `git/tag`, `git/restore`; restore and
+stash paths additionally need `write`); listing reuses `git/status`. Names are
+validated with `git check-ref-format`; stashes and annotated tags receive the
+host-resolved commit identity. Operations that touch the working tree use the
+filter guard, which now also empties `filter.<driver>.smudge`. `diff` and `show`
+accept `format` (`patch`, `stat` with `--summary`, or `name_status`) and page
+their output: one run captures up to 16 MiB (30 s), each call returns at most
+192 KiB ending on a line boundary with `offset`, `next_offset` and
+`total_bytes`, and `truncated` reports output beyond the run ceiling. There are
+still no remotes, fetch/pull/push or network operations.
+
 `src/ui/slash/git.rs` owns parsing, bounded request-path selection, proposal
 validation and SDK-free native actors for `/diff`, `/commit` and `/pr`. The App
 owns the preview, async event receiver and captured session/workspace identity.
