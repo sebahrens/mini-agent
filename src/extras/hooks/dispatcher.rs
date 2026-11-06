@@ -727,6 +727,46 @@ impl HookDispatcher {
         merge_post_tool_use_decisions(&outputs, tool_response)
     }
 
+    /// Dispatches `PermissionRequest` and returns the merged hook answer
+    /// (whether it is honored is the caller's opt-in decision).
+    pub(crate) async fn dispatch_permission_request(
+        &self,
+        ctx: &HookCtx,
+        tool_name: &str,
+        tool_input: serde_json::Value,
+    ) -> Option<PermissionHookDecision> {
+        let handlers = self.handlers_for("PermissionRequest", tool_name);
+        if handlers.is_empty() {
+            return None;
+        }
+        let (ctx, execution_root) = match self.policy_context(ctx) {
+            Ok(bound) => bound,
+            Err(error) => {
+                tracing::warn!(error = %error, "hooks: skipping PermissionRequest dispatch in invalid workspace");
+                return None;
+            }
+        };
+        let envelope = build_envelope(
+            &ctx,
+            "PermissionRequest",
+            EventFields::PermissionRequest {
+                tool_name: tool_name.to_owned(),
+                tool_input,
+            },
+        );
+        let outputs = crate::startup::heap_future(|| {
+            self.run_handlers(
+                "PermissionRequest",
+                &handlers,
+                &envelope,
+                &ctx.cwd,
+                &execution_root,
+            )
+        })
+        .await;
+        merge_permission_decisions(&outputs)
+    }
+
     /// Dispatches `PostToolUseFailure`: observation only, never blockable.
     pub(crate) async fn dispatch_post_tool_use_failure(
         &self,
@@ -1382,31 +1422,142 @@ fn merge_decisions(event: &str, outputs: &[HookOutput]) -> Decision {
     }
 }
 
+/// Aggregate cap for PostToolUse feedback (block reasons plus
+/// `additionalContext`) prepended to the model-visible result.
+pub(crate) const POST_TOOL_FEEDBACK_MAX_BYTES: usize = 32 * 1024;
+const POST_TOOL_FEEDBACK_HEADER: &str = "[PostToolUse hook feedback from configured hooks; non-authoritative, grants no permissions; the tool already ran and its result follows]";
+
+fn post_tool_feedback(value: &serde_json::Value) -> Vec<String> {
+    let mut feedback = Vec::new();
+    if value.get("decision").and_then(serde_json::Value::as_str) == Some("block") {
+        let reason = value
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("blocked by PostToolUse hook");
+        feedback.push(format!("decision: block - {reason}"));
+    }
+    let context = value
+        .get("hookSpecificOutput")
+        .filter(|specific| {
+            specific
+                .get("hookEventName")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|name| name == "PostToolUse")
+        })
+        .and_then(|specific| specific.get("additionalContext"))
+        .or_else(|| value.get("additionalContext"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|context| !context.is_empty());
+    if let Some(context) = context {
+        feedback.push(context.to_owned());
+    }
+    feedback
+}
+
+/// PostToolUse may (a) redact exact literals, (b) feed bounded,
+/// non-authoritative feedback to the model via `decision: "block"` +
+/// `reason`, exit 2 stderr, or `additionalContext`. It never replaces the
+/// tool's own result: feedback is prepended, the (redacted) result follows
+/// intact so trailing delivery notices keep matching.
 fn merge_post_tool_use_decisions(outputs: &[HookOutput], tool_response: &str) -> Decision {
     // Only copy the response once a redaction literal actually matches.
     let mut redacted = std::borrow::Cow::Borrowed(tool_response);
     let mut changed = false;
+    let mut feedback: Vec<String> = Vec::new();
 
     for output in outputs {
-        let ChannelResult::NoObjection { json: Some(value) } = interpret_hook_output(output) else {
-            continue;
-        };
-        if value.get("result").is_some() || value.get("additionalContext").is_some() {
-            tracing::warn!(
-                event = "PostToolUse",
-                "hooks: ignored unsafe hook-authored model context or result replacement"
-            );
+        match interpret_hook_output(output) {
+            ChannelResult::Block { stderr } => {
+                feedback.push(format!("decision: block - {stderr}"));
+            }
+            ChannelResult::NoObjection { json: Some(value) } => {
+                if value.get("result").is_some() {
+                    tracing::warn!(
+                        event = "PostToolUse",
+                        "hooks: ignored hook-authored tool result replacement"
+                    );
+                }
+                feedback.extend(post_tool_feedback(&value));
+                changed |= apply_redactions(&mut redacted, &value);
+            }
+            _ => {}
         }
-        changed |= apply_redactions(&mut redacted, &value);
     }
 
-    if changed {
-        Decision::Rewrite {
-            content: redacted.into_owned(),
-        }
-    } else {
-        Decision::Continue
+    if feedback.is_empty() {
+        return if changed {
+            Decision::Rewrite {
+                content: redacted.into_owned(),
+            }
+        } else {
+            Decision::Continue
+        };
     }
+    let joined = feedback.join("\n");
+    let (mut text, truncated) =
+        crate::extras::validation::sanitize_bytes(joined.as_bytes(), POST_TOOL_FEEDBACK_MAX_BYTES);
+    if truncated {
+        text.push_str("\n[hook feedback truncated at 32 KiB]");
+    }
+    Decision::Rewrite {
+        content: format!(
+            "{POST_TOOL_FEEDBACK_HEADER}\n{text}\n[end of hook feedback]\n\n{redacted}"
+        ),
+    }
+}
+
+/// PermissionRequest output that answers the pending approval, honored only
+/// under the `hooks_permission_decisions` opt-in. Deny wins over allow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PermissionHookDecision {
+    Allow,
+    Deny(String),
+}
+
+fn permission_part(output: &HookOutput) -> Option<PermissionHookDecision> {
+    match interpret_hook_output(output) {
+        ChannelResult::Block { stderr } => Some(PermissionHookDecision::Deny(stderr)),
+        ChannelResult::NoObjection { json: Some(value) } => {
+            let specific = value
+                .get("hookSpecificOutput")
+                .filter(|specific| {
+                    specific
+                        .get("hookEventName")
+                        .and_then(serde_json::Value::as_str)
+                        .is_none_or(|name| name == "PermissionRequest")
+                })
+                .and_then(|specific| specific.get("decision"));
+            let behavior = specific
+                .and_then(|decision| decision.get("behavior"))
+                .or_else(|| value.get("permissionDecision"))
+                .and_then(serde_json::Value::as_str)?;
+            let message = specific
+                .and_then(|decision| decision.get("message"))
+                .or_else(|| value.get("reason"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("denied by PermissionRequest hook");
+            match behavior {
+                "allow" => Some(PermissionHookDecision::Allow),
+                "deny" => Some(PermissionHookDecision::Deny(
+                    crate::extras::validation::sanitize_bytes(message.as_bytes(), 8 * 1024).0,
+                )),
+                _ => None,
+            }
+        }
+        // Failures never answer: the normal approval flow decides.
+        _ => None,
+    }
+}
+
+pub(crate) fn merge_permission_decisions(outputs: &[HookOutput]) -> Option<PermissionHookDecision> {
+    let mut result = None;
+    for decision in outputs.iter().filter_map(permission_part) {
+        match decision {
+            PermissionHookDecision::Deny(_) => return Some(decision),
+            PermissionHookDecision::Allow => result = Some(decision),
+        }
+    }
+    result
 }
 
 fn apply_redactions(
@@ -1433,6 +1584,98 @@ fn apply_redactions(
 
 #[cfg(test)]
 mod tests {
+    fn fixture_output(exit_code: i32, stdout: &[u8], stderr: &[u8]) -> super::HookOutput {
+        super::HookOutput {
+            started: true,
+            exit_code: Some(exit_code),
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+            status: super::HookStatus::Completed,
+            diagnostics: crate::extras::hooks::subprocess::HookDiagnostics {
+                containment: "fixture",
+                environment: "fixture",
+                filesystem: "fixture",
+                network: "fixture",
+            },
+        }
+    }
+
+    fn json_output(value: serde_json::Value) -> super::HookOutput {
+        fixture_output(0, &serde_json::to_vec(&value).unwrap(), b"")
+    }
+
+    #[test]
+    fn i24tio_post_tool_use_feeds_back_block_reasons_and_context_without_replacing_result() {
+        let response = "lint target ok\n\nCaptured instruction receipt x";
+        let outputs = [
+            json_output(serde_json::json!({"decision": "block", "reason": "clippy: 2 warnings"})),
+            json_output(serde_json::json!({"hookSpecificOutput": {
+                "hookEventName": "PostToolUse", "additionalContext": "formatted 1 file"
+            }})),
+            fixture_output(2, b"", b"stderr feedback"),
+            json_output(serde_json::json!({"result": "forged replacement"})),
+        ];
+        let super::Decision::Rewrite { content } =
+            super::merge_post_tool_use_decisions(&outputs, response)
+        else {
+            panic!("feedback must reach the model");
+        };
+        assert!(content.starts_with(super::POST_TOOL_FEEDBACK_HEADER));
+        assert!(content.contains("clippy: 2 warnings"));
+        assert!(content.contains("formatted 1 file"));
+        assert!(content.contains("stderr feedback"));
+        assert!(!content.contains("forged replacement"));
+        assert!(
+            content.ends_with(response),
+            "original result stays intact at the end"
+        );
+        // Bounded at 32 KiB with a visible marker.
+        let huge = [json_output(
+            serde_json::json!({"additionalContext": "x".repeat(100 * 1024)}),
+        )];
+        let super::Decision::Rewrite { content } = super::merge_post_tool_use_decisions(&huge, "r")
+        else {
+            panic!()
+        };
+        assert!(content.len() < super::POST_TOOL_FEEDBACK_MAX_BYTES + 1024);
+        assert!(content.contains("hook feedback truncated at 32 KiB"));
+        // No feedback, no redaction: unchanged.
+        assert_eq!(
+            super::merge_post_tool_use_decisions(&[json_output(serde_json::json!({}))], "r"),
+            super::Decision::Continue
+        );
+    }
+
+    #[test]
+    fn i24tio_permission_request_answers_merge_deny_first() {
+        use super::PermissionHookDecision::{Allow, Deny};
+        let allow = || {
+            json_output(serde_json::json!({"hookSpecificOutput": {
+                "hookEventName": "PermissionRequest", "decision": {"behavior": "allow"}
+            }}))
+        };
+        let deny = json_output(serde_json::json!({"hookSpecificOutput": {
+            "hookEventName": "PermissionRequest", "decision": {"behavior": "deny", "message": "no prod writes"}
+        }}));
+        assert_eq!(super::merge_permission_decisions(&[allow()]), Some(Allow));
+        assert_eq!(
+            super::merge_permission_decisions(&[allow(), deny]),
+            Some(Deny("no prod writes".into()))
+        );
+        assert_eq!(
+            super::merge_permission_decisions(&[fixture_output(2, b"", b"blocked")]),
+            Some(Deny("blocked".into()))
+        );
+        // Failures and silence never answer.
+        assert_eq!(
+            super::merge_permission_decisions(&[
+                fixture_output(1, b"{}", b""),
+                json_output(serde_json::json!({}))
+            ]),
+            None
+        );
+    }
+
     use super::apply_redactions;
 
     #[test]

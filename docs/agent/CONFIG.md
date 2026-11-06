@@ -735,6 +735,7 @@ Accepted top-level keys:
 | `update_check`            | boolean | Opt-in release notice at interactive startup. Default: `false`. Checks the package's GitHub repository anonymously, directly over HTTPS, at most once every 24 hours, with a two-second request bound and a 128 KiB response cap. Headless, loop, and ACP modes skip it. Requires project trust when set locally. No automatic download or installation. |
 | `session_retention_days` | integer | Delete saved session snapshots (`<uuid>.json` in the sessions directory) whose modification time is older than this many days, once per interactive startup in a background thread. Default: unset/`0` (keep forever). A session open in this or another live process (its lock is held) is never removed; tool-output spill directories are left in place. Requires project trust when set locally. |
 | `hooks_http_enabled` | boolean | Allow `type: "http"` hook handlers to POST event JSON to their configured URL. Default: `false` (http hooks load but are never contacted). Requires `hooks`. See [HTTP handlers](#http-handlers). |
+| `hooks_permission_decisions` | boolean | Let `PermissionRequest` hooks answer a pending approval with allow (once) or deny, including in headless runs. Default: `false` (observe only). Requires `hooks`. See [Hook event parity](#hook-event-parity). |
 | `acp_history_max_turns` | integer | ACP only: summarize live history after this many user turns. Default: unset/`0` (no turn cap; compaction follows token pressure under `compact_enabled` and the byte guard). |
 | `acp_history_max_bytes` | integer | ACP only: serialized live-history memory guard. Default: max(2 MiB, 4 bytes per context-window token); minimum 64 KiB. |
 | `acp_max_sessions` | integer | ACP only: concurrently loaded sessions per process. Default: `64`. |
@@ -1230,7 +1231,15 @@ a concurrent MCP invocation cannot borrow the approval token.
 `PostToolUse` may set `"redactions"` to an array of exact, non-empty strings.
 Every occurrence is replaced with the fixed marker `[REDACTED]`. Hook-authored
 `"result"` replacements are ignored so a hook cannot substitute arbitrary
-model-visible output.
+model-visible output. A `PostToolUse` hook can feed back to the model (the
+"run the linter after an edit and tell the model" pattern): `"decision":
+"block"` with a `"reason"`, exit code 2 with stderr, and
+`"additionalContext"` (flat or under `hookSpecificOutput` with
+`hookEventName: "PostToolUse"`) are collected, sanitized, capped at 32 KiB in
+total (with a visible truncation marker), framed as a non-authoritative notice
+that grants no permissions, and prepended to the tool result. The tool has
+already run, so `block` cannot undo it; the original (redacted) result
+follows intact. This applies in TUI, headless and ACP runs alike.
 
 `SubagentStart` can set `"additionalContext"` to prepend text to the child
 prompt. Both subagent lifecycle envelopes include the resolved `agent_type`
@@ -4082,8 +4091,21 @@ compaction emits `SessionStart` with `source: "compact"`; a budget no-op does no
 `PermissionRequest` observes the exact tool name and input before its approval is
 sent to the frontend, followed by a `Notification` with
 `notification_type: "permission_prompt"`. These events run in the caller's
-existing cancellable work scope. Their output cannot approve a request, change
-permission policy, or replace a tool result; the frontend still owns the reply.
+existing cancellable work scope. By default their output cannot approve a
+request, change permission policy, or replace a tool result; the frontend
+still owns the reply.
+
+With `hooks_permission_decisions = true` (default `false`; a sensitive key that
+needs trust when set locally) a `PermissionRequest` hook may answer the pending
+approval: `{"hookSpecificOutput": {"hookEventName": "PermissionRequest",
+"decision": {"behavior": "allow" | "deny", "message": "..."}}}` (or flat
+`permissionDecision`), or exit 2 to deny. Deny wins over allow; `allow` answers
+*once* and never records an allow-always grant; hook failures, timeouts and
+silence fall through to the normal prompt. Deny rules are applied before an
+approval is ever requested, so a hook cannot override them. Headless runs
+(`-p`, `--loop`), which otherwise deny every approval request, also consult the
+hook when this is enabled. A hook answer skips the `permission_prompt`
+notification.
 
 Project `.claude/settings.json` hook groups load alongside native project hook
 settings. Each project binding still requires the existing exact trust approval;

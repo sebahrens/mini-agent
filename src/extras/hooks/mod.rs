@@ -714,28 +714,49 @@ pub(crate) async fn dispatch_cwd_changed(old_cwd: &str, new_cwd: &str) {
     .await;
 }
 
-pub(crate) async fn dispatch_permission_request(tool: &str, input: &str) {
-    let Some(dispatcher) = get_dispatcher() else {
-        return;
-    };
+static PERMISSION_DECISIONS_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `hooks_permission_decisions`: let PermissionRequest hooks answer an
+/// approval (allow once / deny). Default off: they only observe.
+pub(crate) fn set_permission_decisions_enabled(enabled: bool) {
+    PERMISSION_DECISIONS_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn permission_decisions_enabled() -> bool {
+    PERMISSION_DECISIONS_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Dispatches `PermissionRequest` (and, unless a hook answered, the
+/// `permission_prompt` Notification). Returns a hook answer only when
+/// `hooks_permission_decisions` is enabled; never an allow-always grant.
+pub(crate) async fn dispatch_permission_request(
+    tool: &str,
+    input: &str,
+) -> Option<dispatcher::PermissionHookDecision> {
+    let dispatcher = get_dispatcher()?;
     if FORMAT_REPAIR.try_with(|_| ()).is_ok() {
-        return;
+        return None;
     }
     let ctx = best_effort_ctx();
     let canonical = normalize::canonical_tool_name(tool);
-    let _ = crate::startup::heap_future(|| {
-        dispatcher.dispatch(
-            "PermissionRequest",
-            Some(&canonical),
+    let decision = crate::startup::heap_future(|| {
+        dispatcher.dispatch_permission_request(
             &ctx,
-            envelope::EventFields::PermissionRequest {
-                tool_name: canonical.clone(),
-                tool_input: serde_json::from_str(input)
-                    .unwrap_or_else(|_| serde_json::Value::String(input.into())),
-            },
+            &canonical,
+            serde_json::from_str(input).unwrap_or_else(|_| serde_json::Value::String(input.into())),
         )
     })
-    .await;
+    .await
+    .filter(|_| permission_decisions_enabled());
+    if let Some(decision) = &decision {
+        tracing::info!(
+            tool = canonical.as_str(),
+            ?decision,
+            "hooks: PermissionRequest hook answered the approval"
+        );
+        return Some(decision.clone());
+    }
     let _ = crate::startup::heap_future(|| {
         dispatcher.dispatch(
             "Notification",
@@ -748,6 +769,7 @@ pub(crate) async fn dispatch_permission_request(tool: &str, input: &str) {
         )
     })
     .await;
+    None
 }
 
 /// Testable core: dispatches `SessionEnd`. Informational only (not

@@ -19,6 +19,10 @@ Notable changes to mini-agent are documented in this file. The format follows
   `FileChanged` and `CwdChanged`; an opt-in `type: "http"` handler (`hooks_http_enabled`, default
   off); unsupported handler types are skipped per hook with a warning instead of rejecting the
   whole settings file; `/hooks` lists supported and undispatched events and handler types.
+- `PostToolUse` hooks can feed back to the model (`decision: "block"` + `reason`, exit 2 stderr,
+  `additionalContext`; 32 KiB, framed as a non-authoritative notice prepended to the result), and
+  with the new opt-in `hooks_permission_decisions` a `PermissionRequest` hook can answer an
+  approval with allow-once or deny, including in headless runs.
 
 ### Fixed
 

@@ -816,6 +816,28 @@ async fn settle_check(
         }
         CheckResult::Ask => {
             let Some(tx) = ask_tx else {
+                // Headless: an opted-in PermissionRequest hook may still
+                // answer; otherwise the non-interactive denial stands.
+                #[cfg(feature = "hooks")]
+                if crate::extras::hooks::permission_decisions_enabled() {
+                    match crate::startup::heap_future(|| {
+                        crate::extras::hooks::dispatch_permission_request(tool, input)
+                    })
+                    .await
+                    {
+                        Some(crate::extras::hooks::dispatcher::PermissionHookDecision::Allow) => {
+                            return Ok(None);
+                        }
+                        Some(crate::extras::hooks::dispatcher::PermissionHookDecision::Deny(
+                            reason,
+                        )) => {
+                            return Err(ToolError::Msg(format!(
+                                "Permission denied by PermissionRequest hook: {reason}"
+                            )));
+                        }
+                        None => {}
+                    }
+                }
                 return Err(ToolError::Msg(diagnostic.noninteractive_error()));
             };
             handle_ask_inner(

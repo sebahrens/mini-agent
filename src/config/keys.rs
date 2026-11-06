@@ -320,6 +320,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     key("acp_max_sessions").described("ACP: concurrently loaded sessions (default 64)").shaped(ConfigShape::Integer),
     key("acp_max_client_mcp_servers").described("ACP: client-supplied MCP servers per session (default 8)").shaped(ConfigShape::Integer),
     gated("hooks", "hooks_http_enabled").described("Allow type \"http\" hook handlers to POST event JSON to their configured URL (default false: http hooks stay inert)").shaped(ConfigShape::Bool),
+    gated("hooks", "hooks_permission_decisions").described("Let PermissionRequest hooks answer a pending approval with allow (once) or deny, also in headless runs (default false: observe only)").shaped(ConfigShape::Bool),
     key("session_retention_days").described("Delete saved sessions not modified for this many days at interactive startup (default 0: keep forever). Sessions open in a live process are never removed.").shaped(ConfigShape::Integer),
     gated("lsp", "lsp").shaped(ConfigShape::Object),
     gated("advisor", "advisor").shaped(ConfigShape::Object),

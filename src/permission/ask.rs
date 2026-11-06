@@ -296,11 +296,21 @@ pub(crate) async fn send_permission_request(
             crate::spend::run::Run::current().and_then(|run| run.background_ask_origin());
     }
     #[cfg(feature = "hooks")]
-    if !request.reply.is_closed() {
-        crate::startup::heap_future(|| {
+    if !request.reply.is_closed()
+        && let Some(decision) = crate::startup::heap_future(|| {
             crate::extras::hooks::dispatch_permission_request(&request.tool, &request.input)
         })
-        .await;
+        .await
+    {
+        // Opt-in (`hooks_permission_decisions`) hook answer: allow once or
+        // deny; it never records an allow-always grant.
+        let _ = request.reply.send(match decision {
+            crate::extras::hooks::dispatcher::PermissionHookDecision::Allow => {
+                UserDecision::AllowOnce
+            }
+            crate::extras::hooks::dispatcher::PermissionHookDecision::Deny(_) => UserDecision::Deny,
+        });
+        return Ok(());
     }
     sender.send(request.into()).await
 }

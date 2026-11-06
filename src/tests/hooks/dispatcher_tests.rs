@@ -1392,3 +1392,33 @@ async fn ytyt3_new_lifecycle_events_dispatch_with_their_envelopes() {
     assert_eq!(lines[3]["file_path"], "src/lib.rs");
     assert_eq!(lines[4]["new_cwd"], "/b");
 }
+
+// mini-agent-24tio: the shared PermissionRequest entry point (used by the
+// interactive ask path and by headless settle_check) answers only under the
+// hooks_permission_decisions opt-in.
+#[tokio::test]
+async fn i24tio_permission_request_hook_answers_only_when_opted_in() {
+    let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+    let config = config_with(
+        "PermissionRequest",
+        None,
+        vec![handler(
+            r#"echo '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}'"#,
+        )],
+    );
+    crate::extras::hooks::init_dispatcher(HookDispatcher::from_config(&config).unwrap());
+    assert!(!crate::extras::hooks::permission_decisions_enabled());
+    assert_eq!(
+        crate::extras::hooks::dispatch_permission_request("bash", r#"{"command":"ls"}"#).await,
+        None,
+        "default stays observe-only"
+    );
+    crate::extras::hooks::set_permission_decisions_enabled(true);
+    let answer =
+        crate::extras::hooks::dispatch_permission_request("bash", r#"{"command":"ls"}"#).await;
+    crate::extras::hooks::set_permission_decisions_enabled(false);
+    assert_eq!(
+        answer,
+        Some(crate::extras::hooks::dispatcher::PermissionHookDecision::Allow)
+    );
+}

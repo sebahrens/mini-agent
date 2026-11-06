@@ -768,6 +768,10 @@ pub struct Config {
     /// http handlers load but are never contacted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hooks_http_enabled: Option<bool>,
+    /// Let PermissionRequest hooks answer approvals (allow once / deny).
+    /// Default false: they only observe.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hooks_permission_decisions: Option<bool>,
     /// Values not owned by this build, including fields behind disabled Cargo
     /// features and fields introduced by newer mini-agent versions.
     ///
