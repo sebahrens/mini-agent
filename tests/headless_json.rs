@@ -5338,6 +5338,7 @@ fn headless_agent_mentions_on_refuses_an_unknown_agent_before_any_request() {
 
 // mini-agent-cr55c: `--input-format stream-json` runs one turn per JSON user
 // line in one session; malformed lines are reported and skipped.
+#[cfg(all(unix, any(feature = "goal", feature = "subagents")))]
 #[test]
 fn stream_json_input_runs_each_user_line_as_a_turn_in_one_session() {
     use std::process::Stdio;
