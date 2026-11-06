@@ -5131,10 +5131,58 @@ impl Sandbox {
             .await
     }
 
+    /// Offset where the next un-offset read of `id` would start.
+    pub(crate) fn background_job_cursor(&self, id: &str) -> Result<u64, String> {
+        validate_background_job_id(id)?;
+        let jobs = self
+            .background_jobs
+            .jobs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        Ok(jobs
+            .get(id)
+            .ok_or_else(|| self.missing_background_job(id))?
+            .delivered)
+    }
+
+    /// Read output of `id` from `from` without moving the delivery cursor.
+    pub(crate) fn peek_background_job_window(
+        &self,
+        id: &str,
+        from: u64,
+        max: usize,
+    ) -> Result<OutputWindow, String> {
+        validate_background_job_id(id)?;
+        let jobs = self
+            .background_jobs
+            .jobs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        Ok(jobs
+            .get(id)
+            .ok_or_else(|| self.missing_background_job(id))?
+            .capture
+            .read_window(from, max))
+    }
+
     pub(crate) async fn wait_background_job(
         &self,
         id: &str,
         wait: std::time::Duration,
+    ) -> Result<BackgroundJobSnapshot, String> {
+        self.wait_background_job_until(id, wait, None, || false)
+            .await
+    }
+
+    /// [`Self::wait_background_job`] that also returns as soon as `done()` is
+    /// true. Output does not notify waiters (only job end does), so `done` is
+    /// re-run every `poll` (when given) as well as on each notification.
+    pub(crate) async fn wait_background_job_until(
+        &self,
+        id: &str,
+        wait: std::time::Duration,
+        poll: Option<std::time::Duration>,
+        mut done: impl FnMut() -> bool,
     ) -> Result<BackgroundJobSnapshot, String> {
         validate_background_job_id(id)?;
         let changed = {
@@ -5158,11 +5206,15 @@ impl Sandbox {
             tokio::pin!(notified);
             notified.as_mut().enable();
             let snapshot = self.background_job_snapshot(id)?;
-            if snapshot.status.is_terminal() {
+            if snapshot.status.is_terminal() || done() {
                 return Ok(snapshot);
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() || tokio::time::timeout(remaining, notified).await.is_err() {
+            if remaining.is_zero() {
+                return self.background_job_snapshot(id);
+            }
+            let slice = poll.map_or(remaining, |poll| remaining.min(poll));
+            if tokio::time::timeout(slice, notified).await.is_err() && poll.is_none() {
                 return self.background_job_snapshot(id);
             }
         }

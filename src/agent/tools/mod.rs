@@ -812,6 +812,10 @@ pub struct JobStatusArgs {
     /// order. Mutually exclusive with `input`.
     #[serde(default)]
     pub keys: Option<Vec<JobKey>>,
+    /// Regex for `action = "wait"`: return as soon as new output matches it
+    /// (or the job ends, or `timeout_ms` expires).
+    #[serde(default)]
+    pub until: Option<String>,
 }
 
 /// A named terminal key `job_status` can press. The tool renders the bytes,

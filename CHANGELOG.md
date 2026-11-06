@@ -8,6 +8,8 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Added
 
+- `job_status action=wait` takes `until=<regex>` and returns as soon as new output matches, reporting the
+  matched line (mini-agent-8o0kx).
 - Model-authored shell commands start with `PAGER`/`GIT_PAGER`/`GH_PAGER=cat`, `GIT_TERMINAL_PROMPT=0` and a
   no-op `GIT_EDITOR`/`GIT_SEQUENCE_EDITOR` so pty and editor-launching commands fail fast instead of hanging;
   `shell-env` overrides them (mini-agent-aseut).
