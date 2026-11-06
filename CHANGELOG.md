@@ -8,6 +8,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### ACP, IDE and headless
 
+- `!` shell commands now time out after 120 s by default (was 30 s) and accept a per-command
+  deadline, `!timeout=300 cargo test` (clamped to 1-600 s). A timed-out command reports
+  `timed out after N s` with how to raise it. The 1 MiB output cap is unchanged and is still
+  reported as an output-limit stop.
 - ACP tool calls now carry a descriptive title (tool plus path, command or pattern), a tool kind,
   file locations for path tools, an `in_progress` update when the tool starts, and diff content:
   edit/write approval dialogs show the proposed change, and results carry the recorded mutation
