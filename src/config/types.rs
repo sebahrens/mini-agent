@@ -39,6 +39,10 @@ pub struct SubagentPolicy {
     /// parent's eligible web tools under its permissions. Default false.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub allow_web: bool,
+    /// Bytes of a replaced report's raw text kept for `/tasks result`
+    /// (default 6144, at most 16384).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_unverified_bytes: Option<usize>,
 }
 
 #[cfg(feature = "subagents")]

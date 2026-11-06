@@ -23,6 +23,8 @@ const MAX_LOG_ARGS_BYTES: usize = 100;
 const MAX_LOG_ERROR_BYTES: usize = 80;
 /// Raw child text kept for the user after a host repair.
 pub(crate) const MAX_UNVERIFIED_BYTES: usize = 6 * 1024;
+/// Largest configurable `[subagents] task_unverified_bytes`.
+pub(crate) const MAX_UNVERIFIED_BYTES_CEILING: usize = 16 * 1024;
 /// Foreground task records kept in memory for `/tasks`.
 const MAX_RECENT_FOREGROUND: usize = 8;
 
@@ -120,7 +122,7 @@ impl TaskDetails {
                     && child
                         .unverified
                         .as_ref()
-                        .is_none_or(|text| text.len() <= MAX_UNVERIFIED_BYTES)
+                        .is_none_or(|text| text.len() <= MAX_UNVERIFIED_BYTES_CEILING)
                     && child.evidence.as_ref().is_none_or(|evidence| {
                         evidence.task_id.len() <= 64
                             && evidence.records

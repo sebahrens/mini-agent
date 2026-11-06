@@ -4026,6 +4026,11 @@ location is a private scratch directory; the workspace stays read-only.
 `web_fetch`/`web_search` the parent's eligible web tools. See
 [Opt-in read-only shell and web tools](SUBAGENTS.md#opt-in-read-only-shell-and-web-tools).
 
+`[subagents] task_unverified_bytes` (default 6144, at most 16384) bounds the
+raw text of a host-replaced child report that `/tasks result <id>` shows the
+user (never the model). Persona frontmatter `contract: none` skips the report
+contract entirely and returns the child's text verbatim.
+
 ### Hook event parity
 
 `PreCompact` observes an actual compaction before summarization. Its envelope has

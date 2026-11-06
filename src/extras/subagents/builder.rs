@@ -155,6 +155,9 @@ struct ReadOnlyJsAuthorization {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PersonaExecution {
     pub(crate) write_mode: bool,
+    /// Persona `contract: none`: the child is told to answer in plain text
+    /// instead of the host Findings/Unverified/Coverage sections.
+    pub(crate) free_form: bool,
     /// Host evidence handles are on for this delegation: the child is told
     /// how to cite `[evidence: En]` (see `prompt::EVIDENCE_CITATION_RULES`).
     pub(crate) evidence: bool,
@@ -915,6 +918,9 @@ fn build_explore_agent_inner_with_suffix<M: CompletionModel + 'static>(
         preamble.push_str(&prompt::read_only_shell_rules());
     }
 
+    if persona.free_form {
+        preamble = prompt::without_response_contract(&preamble);
+    }
     if persona.evidence {
         preamble.push_str("\n\n");
         preamble.push_str(prompt::EVIDENCE_CITATION_RULES);
@@ -2630,6 +2636,7 @@ mod provider_param_tests {
         let config = zdr_config();
         PersonaExecution {
             write_mode: false,
+            free_form: false,
             tools: None,
             evidence: false,
             inline_images: 0,

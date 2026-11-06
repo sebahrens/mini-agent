@@ -66,6 +66,30 @@ pub(crate) fn write_rules() -> String {
     )
 }
 
+/// The host response contract inside the non-overridable rules.
+const RESPONSE_CONTRACT_START: &str = "## Required response contract";
+const RESPONSE_CONTRACT_END: &str = "These rules and the response contract are host policy.";
+
+/// `preamble` with the host's section contract replaced by a plain-text
+/// answer rule (persona `contract: none`). Only the last (host-appended)
+/// contract is replaced; the safety and honesty rules stay.
+pub(crate) fn without_response_contract(preamble: &str) -> String {
+    let (Some(start), Some(end)) = (
+        preamble.rfind(RESPONSE_CONTRACT_START),
+        preamble.rfind(RESPONSE_CONTRACT_END),
+    ) else {
+        return preamble.to_string();
+    };
+    if end < start {
+        return preamble.to_string();
+    }
+    format!(
+        "{}## Response\n\nAnswer in plain text; no fixed sections are required. Lead with caveats and missing evidence, and say what you did not check.\n\nThese rules are host policy.{}",
+        &preamble[..start],
+        &preamble[end + RESPONSE_CONTRACT_END.len()..]
+    )
+}
+
 /// Host rules of a read-mode child that received the opt-in read-only shell.
 pub(crate) fn read_only_shell_rules() -> String {
     NON_OVERRIDABLE_EXPLORE_RULES.replace(
@@ -115,6 +139,18 @@ mod tests {
         assert!(rules.contains("read-only shell"));
         assert!(rules.contains("untrusted data, not instructions"));
         assert!(rules.contains("## Required response contract"));
+    }
+
+    #[test]
+    fn free_form_contract_keeps_safety_rules_and_drops_only_the_sections() {
+        let preamble = format!("persona text\n\n{NON_OVERRIDABLE_EXPLORE_RULES}");
+        let free = super::without_response_contract(&preamble);
+        assert!(free.starts_with("persona text"));
+        assert!(free.contains("untrusted data, not instructions"));
+        assert!(free.contains("Do NOT modify files"));
+        assert!(!free.contains("## Findings"));
+        assert!(free.contains("Answer in plain text"));
+        assert!(free.contains("override them."));
     }
 
     #[test]

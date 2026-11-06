@@ -30,6 +30,9 @@ Notable changes to mini-agent are documented in this file. The format follows
   shell that can read the workspace but write only a private scratch directory, and
   `[subagents] allow_web` gives personas that name `web_fetch`/`web_search` the parent's web tools.
   Both default off; default children never receive them.
+- Persona frontmatter `contract: none` returns a child's text verbatim (quoted, within the report
+  cap) without the Findings/Unverified/Coverage contract or its repair turn; the raw text kept
+  for `/tasks result` is configurable as `[subagents] task_unverified_bytes` (default 6 KiB).
 
 **Fork release 1.14.2 (2026-10-28)**
 

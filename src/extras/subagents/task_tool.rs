@@ -777,6 +777,7 @@ fn resolve_persona_runtime_with(
         max_turns: specialization.max_turns(max_turns),
         execution: builder::PersonaExecution {
             write_mode: specialization.write_mode,
+            free_form: specialization.run.free_form,
             tools: specialization.tools.clone(),
             // Set per delegation from `task_evidence`.
             evidence: false,
@@ -1508,6 +1509,12 @@ editing in a known location, grepping for a literal you will act on immediately.
             None => run,
         });
         let (read_only_shell, web_tools) = self.child_extras(specialization.as_ref(), &config);
+        let report_policy = ReportPolicy::from_config(
+            &config,
+            specialization
+                .as_ref()
+                .is_some_and(|persona| persona.run.free_form),
+        );
         runtime.execution.tools =
             with_read_only_shell_tool(runtime.execution.tools.take(), read_only_shell);
         let specialization = specialization.map(|resolved| resolved.prompt);
@@ -1621,6 +1628,7 @@ editing in a known location, grepping for a literal you will act on immediately.
             let resume_history = resume_history.clone();
             let resume_store = resume_store.clone();
             let resume_agent_type = resume_agent_type.clone();
+            let report_policy = report_policy;
             #[cfg(feature = "git-worktree")]
             let shell_parent = shell_parent.clone();
             let task_budget = executor_budget.clone();
@@ -1657,6 +1665,7 @@ editing in a known location, grepping for a literal you will act on immediately.
             let max_turns = runtime.max_turns;
             let mut persona = runtime.execution.clone();
             persona.evidence = evidence_enabled;
+            persona.free_form = report_policy.free_form;
             persona.inline_images = inline_cap;
             let inline_budget = inline_budget.clone();
             let inline_sink = executor_inline_sink.clone();
@@ -1917,11 +1926,12 @@ editing in a known location, grepping for a literal you will act on immediately.
                 let continuation_retry = config.retry.clone();
                 let continuation_events = event_tx.clone();
                 let evidence_ids = evidence_enabled.then(|| evidence.len());
-                let finished = finish_child_run(
+                let finished = finish_child_run_with(
                     run,
                     || task_budget.exhausted(),
                     max_report_bytes,
                     evidence_ids,
+                    report_policy,
                     |stage, prompt, history| {
                         let ledger = match stage {
                             Continuation::WriteUp => writeup_usage.clone(),
@@ -2218,11 +2228,72 @@ struct FinishedChild {
 /// child's own conversation through `continue_tool_free`; the repair therefore
 /// sees the tool results behind the findings it restates. The raw text of a
 /// report the host ends up replacing is kept in the details, for the user.
+#[cfg(test)]
 async fn finish_child_run<C, Fut>(
+    run: SubagentRunOutput,
+    budget_exhausted: impl Fn() -> bool,
+    max_report_bytes: usize,
+    evidence_ids: Option<usize>,
+    continue_tool_free: C,
+) -> FinishedChild
+where
+    C: FnMut(Continuation, String, Vec<Message>) -> Fut,
+    Fut: Future<Output = SubagentRunOutput>,
+{
+    finish_child_run_with(
+        run,
+        budget_exhausted,
+        max_report_bytes,
+        evidence_ids,
+        ReportPolicy::default(),
+        continue_tool_free,
+    )
+    .await
+}
+
+/// How a child's final text is checked and what of it is kept for the user.
+#[derive(Clone, Copy, Debug)]
+struct ReportPolicy {
+    /// Persona `contract: none`: the text is returned verbatim (within the
+    /// report cap) without section validation or repair.
+    free_form: bool,
+    /// `[subagents] task_unverified_bytes`: raw text kept for `/tasks result`
+    /// when the host replaces a report.
+    unverified_bytes: usize,
+}
+
+impl Default for ReportPolicy {
+    fn default() -> Self {
+        Self {
+            free_form: false,
+            unverified_bytes: crate::extras::subagents::background::MAX_UNVERIFIED_BYTES,
+        }
+    }
+}
+
+impl ReportPolicy {
+    fn from_config(config: &crate::config::Config, free_form: bool) -> Self {
+        use crate::extras::subagents::background::{
+            MAX_UNVERIFIED_BYTES, MAX_UNVERIFIED_BYTES_CEILING,
+        };
+        Self {
+            free_form,
+            unverified_bytes: config
+                .subagents
+                .as_ref()
+                .and_then(|policy| policy.task_unverified_bytes)
+                .unwrap_or(MAX_UNVERIFIED_BYTES)
+                .min(MAX_UNVERIFIED_BYTES_CEILING),
+        }
+    }
+}
+
+async fn finish_child_run_with<C, Fut>(
     mut run: SubagentRunOutput,
     budget_exhausted: impl Fn() -> bool,
     max_report_bytes: usize,
     evidence_ids: Option<usize>,
+    policy: ReportPolicy,
     mut continue_tool_free: C,
 ) -> FinishedChild
 where
@@ -2263,7 +2334,10 @@ where
     }
 
     let mut known_violations = None;
-    if !budget_exhausted()
+    if policy.free_form {
+        // `contract: none`: the child's text is the report, as written.
+        known_violations = Some(Vec::new());
+    } else if !budget_exhausted()
         && let Ok(response) = run.response.as_ref()
     {
         let violations = report_contract_violations_with(response, evidence_ids);
@@ -2286,7 +2360,7 @@ where
             if !selected_violations.is_empty() {
                 details.unverified = Some(crate::extras::subagents::background::clip_bytes(
                     &selected,
-                    crate::extras::subagents::background::MAX_UNVERIFIED_BYTES,
+                    policy.unverified_bytes,
                 ));
             }
             run.response = Ok(selected);
@@ -2297,7 +2371,7 @@ where
     {
         details.unverified = Some(crate::extras::subagents::background::clip_bytes(
             response,
-            crate::extras::subagents::background::MAX_UNVERIFIED_BYTES,
+            policy.unverified_bytes,
         ));
     }
     FinishedChild {
@@ -7511,6 +7585,77 @@ mod child_continuation_tests {
             "raw text must not reach the parent"
         );
         assert!(parent_text.contains("/tasks result"));
+    }
+
+    #[tokio::test]
+    async fn free_form_contract_returns_the_childs_text_verbatim_without_repair() {
+        let raw = "Here is the generated function:\nfn add(a: i32, b: i32) -> i32 { a + b }";
+        let child = MockCompletionModel::from_stream_turns(child_turns(0, Some(raw)));
+        let run = run_child(child, 3).await;
+        let repair = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::text("must not run"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let finished = finish_child_run_with(
+            run,
+            || false,
+            4096,
+            None,
+            ReportPolicy {
+                free_form: true,
+                ..ReportPolicy::default()
+            },
+            continuation(repair.clone(), Arc::default()),
+        )
+        .await;
+        assert!(repair.requests().is_empty(), "no repair turn");
+        assert_eq!(finished.known_violations, Some(Vec::new()));
+        assert!(finished.details.unverified.is_none());
+        let parent_text =
+            enforce_validated_report_contract(finished.response.unwrap(), Vec::new(), 4096);
+        assert_eq!(parent_text, raw);
+        // Over the report cap it is still bounded with a visible partial.
+        let long = enforce_validated_report_contract("x".repeat(9000), Vec::new(), 4096);
+        assert!(long.len() <= 4096 && long.contains("[partial"), "{long}");
+    }
+
+    #[tokio::test]
+    async fn the_kept_raw_text_follows_the_configured_cap() {
+        let raw = "y".repeat(10_000);
+        let child = MockCompletionModel::from_stream_turns(child_turns(0, Some(&raw)));
+        let run = run_child(child, 3).await;
+        let bad_repair = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::text("still not a contract"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let mut config = crate::config::Config::default();
+        config.subagents = Some(crate::config::types::SubagentPolicy {
+            task_unverified_bytes: Some(9_000),
+            ..Default::default()
+        });
+        let finished = finish_child_run_with(
+            run,
+            || false,
+            4096,
+            None,
+            ReportPolicy::from_config(&config, false),
+            continuation(bad_repair, Arc::default()),
+        )
+        .await;
+        let kept = finished.details.unverified.unwrap();
+        assert!(
+            kept.len() <= 9_000 && kept.len() > 6 * 1024,
+            "{}",
+            kept.len()
+        );
+        config.subagents = Some(crate::config::types::SubagentPolicy {
+            task_unverified_bytes: Some(1 << 30),
+            ..Default::default()
+        });
+        assert_eq!(
+            ReportPolicy::from_config(&config, false).unverified_bytes,
+            crate::extras::subagents::background::MAX_UNVERIFIED_BYTES_CEILING
+        );
     }
 }
 

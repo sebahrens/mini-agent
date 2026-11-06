@@ -546,6 +546,13 @@ mode: review
   its ceiling rejects the `task` call with an error naming the key, never a
   silent clamp. A per-call `max_turns`/`timeout_secs` argument takes
   precedence over the persona.
+- `contract: none` (default `sections`) returns the child's final text
+  verbatim instead of requiring the Findings/Unverified/Coverage sections: the
+  child is told to answer in plain text, the host skips section validation and
+  the repair turn, and the text reaches the parent quoted inside the usual
+  `[subagent output ...]` fence and cut (with a visible partial marker) at
+  `task_max_report_bytes`. Use it for free-form delegation such as code
+  generation or summaries. The safety and honesty rules still apply.
 - `inline_images` is an integer from 0 to 3 that narrows
   `[subagents] task_inline_images` for this persona (it can never widen it);
   see [Inline image lane](#inline-image-lane).
@@ -641,7 +648,8 @@ extra calls only counted).
 `/tasks <id>` shows it for background tasks (stored with the task result and
 persisted with the session) and for the eight most recent foreground calls
 (in memory, listed by `/tasks`). When the host replaces a child's text with a
-repaired report, the child's raw text (capped at 6 KiB) is kept for the user:
+repaired report, the child's raw text (capped at `[subagents]
+task_unverified_bytes`, default 6 KiB, at most 16 KiB) is kept for the user:
 `/tasks result <id>` prints it marked unverified. Neither the log nor the raw
 text is part of `task_result` output or any other model-visible text.
 
@@ -1086,6 +1094,7 @@ normal TOML/YAML/JSON mini-agent configuration described in
 | `task_timeout_secs`         | `u64`    | `300`                    | Whole-call wall-clock deadline of foreground calls; completed sibling results and in-flight narration are retained when it expires |
 | `[subagents] task_background_timeout_secs` | `u64` | `3600` | Whole-call deadline of `run_in_background` calls (at most 86400) |
 | `[subagents] task_max_turns_ceiling` | `usize` | `100` | Highest per-call or persona `max_turns`; larger values are rejected |
+| `[subagents] task_unverified_bytes` | `usize` | `6144` | Raw text of a host-replaced report kept for `/tasks result` (at most 16384) |
 | `[subagents] task_timeout_ceiling_secs` | `u64` | `3600` | Highest per-call or persona `timeout_secs` (at most 86400); larger values are rejected |
 | `task_enabled`              | `bool`   | `true`                   | Whether the `task` tool is registered |
 | `task_evidence`             | `bool`   | `true`                   | Host-minted evidence handles, citations, the Evidence section and `task_evidence` ([details](#evidence-handles)); tool registration follows a restart |

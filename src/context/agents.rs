@@ -143,6 +143,10 @@ pub(crate) struct AgentRunSettings {
     /// A read-mode persona named `shell`/`Bash` in `tools`: it receives the
     /// sandboxed read-only shell when `[subagents] allow_read_only_shell`.
     pub(crate) read_only_shell: bool,
+    /// `contract: none`: the child's final text is returned verbatim
+    /// (quoted, within the report cap) without the Findings/Unverified/
+    /// Coverage contract, its validation or its repair turn.
+    pub(crate) free_form: bool,
 }
 
 /// Largest `max_turns` frontmatter value accepted while parsing.
@@ -358,6 +362,14 @@ fn normalize_agent_definition(
             "frontmatter timeout_secs must be an integer from 1 to 86400",
         )?,
         read_only_shell,
+        free_form: match mapping.get(serde_yaml_ng::Value::String("contract".into())) {
+            None => false,
+            Some(value) => match value.as_str() {
+                Some("none") => true,
+                Some("sections") => false,
+                _ => return Err("frontmatter contract must be none or sections"),
+            },
+        },
     };
     #[cfg(feature = "mcp")]
     let mcp_servers = mapping
@@ -378,6 +390,7 @@ fn normalize_agent_definition(
         "inline_images",
         "max_turns",
         "timeout_secs",
+        "contract",
         "mcp_servers",
     ];
     #[cfg(not(feature = "mcp"))]
@@ -394,6 +407,7 @@ fn normalize_agent_definition(
         "inline_images",
         "max_turns",
         "timeout_secs",
+        "contract",
     ];
     let mut unknown_keys = mapping
         .keys()
@@ -2479,6 +2493,10 @@ pub(crate) mod tests {
                 .read_only_shell
         );
         assert!(!parse("tools: Read").unwrap().2.run.read_only_shell);
+        assert!(parse("contract: none").unwrap().2.run.free_form);
+        assert!(!parse("contract: sections").unwrap().2.run.free_form);
+        assert!(!parse("tools: Read").unwrap().2.run.free_form);
+        assert!(parse("contract: loose").unwrap_err().contains("contract"));
     }
 
     #[test]
