@@ -5617,6 +5617,9 @@ pub(crate) struct SubagentRunOutput {
     pub tool_log: Vec<crate::extras::subagents::background::ToolLogEntry>,
     /// The run ended because its model-turn budget was exhausted.
     pub turn_budget_exhausted: bool,
+    /// The child's next request would exceed its context window
+    /// ([`CHILD_CONTEXT_REFUSAL`]); `history` is the conversation so far.
+    pub context_exhausted: bool,
 }
 
 #[cfg(feature = "subagents")]
@@ -5631,9 +5634,15 @@ impl SubagentRunOutput {
             tool_calls: 0,
             tool_log: Vec::new(),
             turn_budget_exhausted: false,
+            context_exhausted: false,
         }
     }
 }
+
+/// Why a child request was refused locally: its estimate exceeds the child
+/// window. Names the key that raises it.
+#[cfg(feature = "subagents")]
+pub(crate) const CHILD_CONTEXT_REFUSAL: &str = "task: child context estimate exceeds its configured/model window; use a narrower brief or raise subagent_context_window for a supported model";
 
 #[cfg(feature = "subagents")]
 const SUBAGENT_TURN_BUDGET_PARTIAL: &str = "[partial: turn budget exhausted]";
@@ -5781,6 +5790,7 @@ where
                 tool_calls,
                 tool_log,
                 turn_budget_exhausted,
+                context_exhausted: false,
             }
         };
     }
@@ -5874,6 +5884,20 @@ where
                     child_history = chat_history.as_ref().clone();
                 }
                 break;
+            }
+            Err(rig::agent::StreamingError::Prompt(prompt))
+                if matches!(prompt.as_ref(), rig::completion::PromptError::PromptCancelled { reason, .. }
+                    if reason == CHILD_CONTEXT_REFUSAL) =>
+            {
+                // Keep the conversation so the task can compact it and
+                // continue (mini-agent-d0rfu).
+                if let rig::completion::PromptError::PromptCancelled { chat_history, .. } = *prompt
+                {
+                    child_history = chat_history;
+                }
+                let mut out = finish!(Err(format!("subagent error: {CHILD_CONTEXT_REFUSAL}")));
+                out.context_exhausted = true;
+                return out;
             }
             Err(e) => {
                 return SubagentRunOutput::bare(

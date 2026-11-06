@@ -38,8 +38,15 @@ impl<M: CompletionModel> rig::agent::AgentHook<M> for ReportRepairGuard {
 /// of model capacity. Observe the complete normalized request after patches;
 /// never trim signed history or rewrite the request to make it fit.
 #[derive(Clone, Copy)]
-struct ChildContextGuard {
+pub(crate) struct ChildContextGuard {
     window: u64,
+}
+
+impl ChildContextGuard {
+    #[cfg(test)]
+    pub(crate) fn new(window: u64) -> Self {
+        Self { window }
+    }
 }
 impl<M: CompletionModel> rig::agent::AgentHook<M> for ChildContextGuard {
     async fn on_event(
@@ -53,9 +60,7 @@ impl<M: CompletionModel> rig::agent::AgentHook<M> for ChildContextGuard {
             if estimated.is_none_or(|input| {
                 input.saturating_add(request.max_tokens.unwrap_or(0)) > self.window
             }) {
-                return rig::agent::Flow::terminate(
-                    "task: child context estimate exceeds its configured/model window; use a narrower brief or raise subagent_context_window for a supported model",
-                );
+                return rig::agent::Flow::terminate(crate::agent::runner::CHILD_CONTEXT_REFUSAL);
             }
         }
         rig::agent::Flow::cont()

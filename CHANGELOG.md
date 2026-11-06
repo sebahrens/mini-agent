@@ -19,6 +19,10 @@ Notable changes to mini-agent are documented in this file. The format follows
   prompt pressure crosses `mid_turn_compact_threshold`, the runner stops after the complete tool
   batch, the session (in memory for `--no-session`) is compacted and the task continues
   (mini-agent-sgzh0). ACP turns are not covered yet.
+- A `task` child whose next request would exceed `subagent_context_window` now compacts its own
+  conversation (oldest tool results trimmed, tool-free summary, continue) instead of failing, at
+  most twice per child and charged to the task's weighted units; with `compact_enabled = false`
+  the refusal, which names `subagent_context_window`, is unchanged (mini-agent-d0rfu).
 
 ### Security
 
