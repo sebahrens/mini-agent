@@ -97,6 +97,7 @@ pub(crate) struct SubagentAuthorization {
     /// Opt-in parent web tools of a persona (`[subagents] allow_web`).
     web: Option<ParentWebTools>,
     /// Parent Git / LSP capabilities a persona may name in `tools`.
+    #[cfg_attr(not(any(feature = "git-worktree", feature = "lsp")), allow(dead_code))]
     code: Option<ParentCodeTools>,
 }
 
@@ -791,6 +792,7 @@ pub(crate) fn persona_tool_kinds(
     }
     // Code-intelligence tools need an explicit persona entry and a parent
     // that has them.
+    #[cfg(any(feature = "git-worktree", feature = "lsp"))]
     if let (Some(code), Some(selected)) = (&authorization.code, selected) {
         #[cfg(feature = "git-worktree")]
         if code.git_sandbox.is_some() && selected.contains(&AgentTool::Git) {
@@ -805,8 +807,6 @@ pub(crate) fn persona_tool_kinds(
                 kinds.push(AgentTool::LspNavigate);
             }
         }
-        #[cfg(not(any(feature = "git-worktree", feature = "lsp")))]
-        let _ = code;
     }
     // Web tools need the opt-in and an explicit persona entry.
     if let (Some(web), Some(selected)) = (&authorization.web, selected) {
@@ -2436,6 +2436,7 @@ mod tests {
     }
 
     #[cfg(feature = "git-worktree")]
+    #[allow(clippy::needless_update)]
     #[test]
     fn git_and_lsp_tools_are_granted_only_to_personas_that_name_them() {
         use crate::context::agents::AgentTool;

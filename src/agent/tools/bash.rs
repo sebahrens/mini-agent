@@ -246,6 +246,7 @@ struct JobScopeInner {
     ids: std::sync::Mutex<std::collections::BTreeSet<String>>,
 }
 
+#[cfg_attr(not(feature = "subagents"), allow(dead_code))]
 impl JobScope {
     pub fn new(sandbox: Sandbox) -> Self {
         Self(std::sync::Arc::new(JobScopeInner {
@@ -334,6 +335,7 @@ impl ShellTool {
     }
 
     /// Record every background job this tool starts in `scope` (subagents).
+    #[cfg_attr(not(feature = "subagents"), allow(dead_code))]
     pub fn with_job_scope(mut self, scope: JobScope) -> Self {
         self.job_scope = Some(scope);
         self
@@ -1085,6 +1087,7 @@ impl JobStatusTool {
     }
 
     /// Restrict the tool to the jobs started under `scope` (subagents).
+    #[cfg_attr(not(feature = "subagents"), allow(dead_code))]
     pub fn with_job_scope(mut self, scope: JobScope) -> Self {
         self.job_scope = Some(scope);
         self

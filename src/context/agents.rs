@@ -9,12 +9,16 @@ const MAX_AGENT_PROMPT_BYTES: usize = 256 * 1024;
 /// when-to-use text and examples, so this is far above a display length).
 const MAX_AGENT_DESCRIPTION_CHARS: usize = 4096;
 /// Longest description derived from the prompt when there is no frontmatter one.
+#[cfg_attr(not(feature = "subagents"), allow(dead_code))]
 const MAX_DERIVED_DESCRIPTION_CHARS: usize = 160;
 /// Per-agent share of the model-facing `agent_type` listing.
+#[cfg_attr(not(feature = "subagents"), allow(dead_code))]
 const MAX_LISTED_DESCRIPTION_CHARS: usize = 1000;
 /// Combined size of all listed descriptions before they are shortened.
+#[cfg_attr(not(feature = "subagents"), allow(dead_code))]
 const MAX_LISTED_DESCRIPTIONS_TOTAL_CHARS: usize = 12_000;
 /// Shortest per-agent share the combined budget may squeeze a description to.
+#[cfg_attr(not(feature = "subagents"), allow(dead_code))]
 const MIN_LISTED_DESCRIPTION_CHARS: usize = 160;
 const MAX_AGENT_MODEL_CHARS: usize = 256;
 const MAX_PROJECT_NOTES_BYTES: usize = 64 * 1024;
@@ -2103,6 +2107,7 @@ pub(crate) fn available_schema_entries_for_workspace(
 /// [`MAX_LISTED_DESCRIPTIONS_TOTAL_CHARS`] the shared limit shrinks (never
 /// below [`MIN_LISTED_DESCRIPTION_CHARS`]) and, as a last resort, the tail of
 /// the alphabetical list is omitted.
+#[cfg_attr(not(feature = "subagents"), allow(dead_code))]
 fn fit_listing_descriptions(lengths: &[usize]) -> (Vec<Option<usize>>, Option<String>) {
     let total_at =
         |limit: usize| -> usize { lengths.iter().map(|length| (*length).min(limit)).sum() };
