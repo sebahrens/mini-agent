@@ -437,7 +437,10 @@ mod tests {
             .await
             .unwrap();
         assert!(listing.contains("f10049"), "{listing}");
-        assert!(listing.contains("entries 10041-10050 of 10050"), "{listing}");
+        assert!(
+            listing.contains("entries 10041-10050 of 10050"),
+            "{listing}"
+        );
         assert!(!listing.contains("listing stopped"), "{listing}");
         std::fs::remove_dir_all(temp).unwrap();
     }

@@ -86,6 +86,8 @@ async fn workspace_tools_skip_vcs_metadata_unless_it_is_the_explicit_root() {
         let found = FindFilesTool::new(None, None, 100)
             .with_workspace(&root)
             .call(FindFilesArgs {
+                offset: None,
+                limit: None,
                 sort: crate::agent::tools::FindFilesSort::Name,
                 mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: r".*\.txt".into(),

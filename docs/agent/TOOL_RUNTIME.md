@@ -353,7 +353,7 @@ only if the glob is invalid. `src/*.rs` matches files directly in `src`, while
 basename globs such as `*.rs` and `test_*.rs` match at any depth. Other patterns
 retain filename-regex matching. Set `mode: "regex"` explicitly for patterns such
 as `^test_.*\.rs$`, or `mode: "glob"` for literal glob semantics. An empty result
-names the interpretation and suggests an alternative. Capped output is selected
+names the interpretation and suggests an alternative. `offset` (matches to skip) and `limit` (lowers the cap) page a capped result in the same stable order; the truncation notice names `continue with offset=N`. Capped output is selected
 with a bounded top-N heap: omitted `sort` or `sort: "name"` selects paths in
 lexicographic order; `sort: "mtime"` selects the most recently modified files first.
 Equal timestamps use ascending path order, and unavailable timestamps sort last.

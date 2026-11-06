@@ -814,9 +814,15 @@ pub enum FindFilesSort {
     Mtime,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 pub struct FindFilesArgs {
     pub pattern: String,
+    /// Matches to skip (0-based) for paging past the result cap.
+    #[serde(default)]
+    pub offset: Option<usize>,
+    /// Lower the configured result cap for this call.
+    #[serde(default)]
+    pub limit: Option<usize>,
     pub path: Option<String>,
     /// Auto treats glob metacharacters and path separators as a path glob.
     #[serde(default)]

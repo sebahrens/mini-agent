@@ -12400,6 +12400,8 @@ mod workspace_tests {
         let first_find = FindFilesTool::new(None, None, 100)
             .with_workspace_binding(first_workspace.clone())
             .call(FindFilesArgs {
+                offset: None,
+                limit: None,
                 sort: crate::agent::tools::FindFilesSort::Name,
                 mode: crate::agent::tools::FindFilesMode::Regex,
                 pattern: "sentinel".into(),
