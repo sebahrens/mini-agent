@@ -448,6 +448,15 @@ pub async fn handle_agent_event(
             run.response_start_block = None;
             renderer.write_line(&crate::event::retry_notice_text(attempt, max, delay_ms), Color::Yellow)?;
         }
+        AgentEvent::OutputTruncated { message } => {
+            finalize_response_segment(renderer, run)?;
+            if run.agent_line_started {
+                renderer.write_line("", Color::White)?;
+                run.agent_line_started = false;
+            }
+            run.response_start_block = None;
+            renderer.write_line(&message, Color::Yellow)?;
+        }
         AgentEvent::CompactionBoundary { .. } => {}
         AgentEvent::AwaitingUser { question, interactions } => {
             ui.session.adopt_provider_tool_identity(&interactions);

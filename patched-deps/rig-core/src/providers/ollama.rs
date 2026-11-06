@@ -579,6 +579,10 @@ impl GetTokenUsage for StreamingCompletionResponse {
 
         usage
     }
+
+    fn output_truncated(&self) -> bool {
+        self.done_reason.as_deref() == Some("length")
+    }
 }
 
 /// Reassembles newline-delimited JSON lines from a chunked HTTP byte stream.

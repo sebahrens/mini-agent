@@ -5090,6 +5090,17 @@ async fn relay_prompt_events(
                     tracing::warn!("ACP failed to send tool-loop notification: {}", e);
                 }
             }
+            AgentEvent::OutputTruncated { message } => {
+                let chunk =
+                    ContentChunk::new(ContentBlock::Text(TextContent::new(message.to_string())));
+                let notif = SessionNotification::new(
+                    session_id.clone(),
+                    SessionUpdate::AgentThoughtChunk(chunk),
+                );
+                if let Err(e) = cx.send_notification(notif) {
+                    tracing::warn!("ACP failed to send truncation notification: {}", e);
+                }
+            }
             AgentEvent::Retrying {
                 attempt,
                 max,

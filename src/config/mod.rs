@@ -2226,7 +2226,9 @@ mod subagent_settings127_tests {
     fn subagent130_only_explicit_parent_response_limits_constrain_children() {
         let mut cfg = load::rich_default_config();
         assert_eq!(cfg.max_tokens, None);
-        assert_eq!(crate::cli::Cli::default().resolve_max_tokens(&cfg), 16_384);
+        // The implicit main default follows the model's catalog ceiling.
+        let implicit = crate::cli::Cli::default().resolve_max_tokens(&cfg);
+        assert!(implicit <= crate::cli::DEFAULT_MAX_TOKENS_CEILING);
         assert_eq!(cfg.resolve_subagent_max_tokens(), 32_000);
         // First startup persists these defaults. Loading them again must not
         // convert the implicit main response fallback into a child ceiling.
@@ -2234,7 +2236,10 @@ mod subagent_settings127_tests {
             load::serialize_config_content(std::path::Path::new("config.toml"), &cfg).unwrap();
         cfg = load::parse_config_content(std::path::Path::new("config.toml"), &serialized).unwrap();
         assert_eq!(cfg.max_tokens, None);
-        assert_eq!(crate::cli::Cli::default().resolve_max_tokens(&cfg), 16_384);
+        assert_eq!(
+            crate::cli::Cli::default().resolve_max_tokens(&cfg),
+            implicit
+        );
         assert_eq!(cfg.resolve_subagent_max_tokens(), 32_000);
         cfg = load::merge_config_value_layer(
             &cfg,

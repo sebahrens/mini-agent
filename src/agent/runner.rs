@@ -1548,6 +1548,8 @@ fn warn_unknown_stream_item<R: serde::Serialize>(item: &MultiTurnStreamItem<R>) 
     tracing::warn!("unknown stream item variant: {detail}");
 }
 
+use crate::agent::output_truncation::{OutputTruncation, TruncationDecision};
+
 fn duration_millis(delay: std::time::Duration) -> u64 {
     u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)
 }
@@ -3942,6 +3944,7 @@ where
         // `loop`); set when a `Stop` hook forces continuation instead of the
         // default re-injected `retry_prompt`.
         let mut next_instruction: Option<String> = None;
+        let mut output_truncation = OutputTruncation::default();
         #[cfg(feature = "hooks")]
         let mut stop_hook_active = false;
         #[cfg(feature = "hooks")]
@@ -4337,6 +4340,19 @@ where
                             return;
                         }
 
+                        if let Some(decision) = output_truncation.final_response() {
+                            tracing::warn!("{}", decision.notice());
+                            let _ = event_tx
+                                .send(AgentEvent::OutputTruncated {
+                                    message: CompactString::from(decision.notice()),
+                                })
+                                .await;
+                            if let TruncationDecision::Continue { instruction, .. } = decision {
+                                next_instruction = Some(instruction);
+                                break;
+                            }
+                        }
+
                         // An accepted `goal_report` completes a round even when
                         // no closing text follows it (mini-agent-64qyf).
                         if terminal_was_streamed
@@ -4453,6 +4469,7 @@ where
                         break;
                     }
                     Ok(MultiTurnStreamItem::CompletionCall(call)) => {
+                        output_truncation.observe_call(&call);
                         let usage = call.usage;
                         let delta = record_completion_call(
                             &mut completion_retry,
@@ -4568,6 +4585,26 @@ where
                         )
                         .await;
                         park_question!();
+                        if let Some(decision) = output_truncation.stream_error(&e.to_string()) {
+                            tracing::warn!("{}: {e}", decision.notice());
+                            let _ = event_tx
+                                .send(AgentEvent::OutputTruncated {
+                                    message: CompactString::from(decision.notice()),
+                                })
+                                .await;
+                            if let TruncationDecision::Continue { instruction, .. } = decision {
+                                next_instruction = Some(instruction);
+                                retrying_interrupted_completion = true;
+                                break;
+                            }
+                            let _ = event_tx
+                                .send(AgentEvent::error_with(
+                                    CompactString::from(decision.notice()),
+                                    completed_so_far!(),
+                                ))
+                                .await;
+                            return;
+                        }
                         if let Some((attempt, delay)) =
                             midstream_retry(&mut completion_retry, &retry_config, &e)
                         {
@@ -5067,6 +5104,7 @@ where
     let mut workspace_may_have_changed = false;
     let mut verification_attempt = 0u32;
     let mut next_instruction: Option<String> = None;
+    let mut output_truncation = OutputTruncation::default();
     // Every terminal failure below returns through this, so the completed tool
     // records and observed usage of the failed turn survive for persistence.
     macro_rules! turn_failure {
@@ -5245,6 +5283,7 @@ where
                         }
                     }
                     Ok(MultiTurnStreamItem::CompletionCall(call)) => {
+                        output_truncation.observe_call(&call);
                         let delta = record_completion_call(
                             &mut completion_retry,
                             retry_config,
@@ -5297,6 +5336,22 @@ where
                         park_question!();
                         if !tool_calls.finalize_unresolved(&mut interactions).is_empty() {
                             fail_turn!(UNRESOLVED_TOOL_CALLS_ERROR);
+                        }
+                        if let Some(decision) = output_truncation.final_response() {
+                            tracing::warn!("{}", decision.notice());
+                            if let Err(error) = crate::print::headless_stderr_async(format!(
+                                "{}\n",
+                                decision.notice()
+                            ))
+                            .await
+                            {
+                                fail_turn!(error);
+                            }
+                            if let TruncationDecision::Continue { instruction, .. } = decision {
+                                next_instruction = Some(instruction);
+                                continue_turn = true;
+                                return Ok(false);
+                            }
                         }
                         // A round whose work ended in an accepted `goal_report` has
                         // said what it had to say; it is complete, not empty
@@ -5389,6 +5444,23 @@ where
                     Err(e) => {
                         tool_calls.finalize_unresolved(&mut interactions);
                         park_question!();
+                        if let Some(decision) = output_truncation.stream_error(&e.to_string()) {
+                            tracing::warn!("{}: {e}", decision.notice());
+                            let notice = decision.notice().to_string();
+                            if let TruncationDecision::Continue { instruction, .. } = decision {
+                                if let Err(error) =
+                                    crate::print::headless_stderr_async(format!("{notice}\n"))
+                                        .await
+                                {
+                                    fail_turn!(error);
+                                }
+                                next_instruction = Some(instruction);
+                                retrying_interrupted_completion = true;
+                                continue_turn = true;
+                                return Ok(false);
+                            }
+                            fail_turn!(notice);
+                        }
                         if let Some((_, delay)) =
                             midstream_retry(&mut completion_retry, retry_config, &e)
                         {

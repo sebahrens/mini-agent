@@ -173,6 +173,11 @@ pub enum AgentEvent {
         /// The sleep before this retry, including any provider wait hint.
         delay_ms: u64,
     },
+    /// The provider stopped a response at its output-token limit. Display-only
+    /// notice; the runner continues the turn or ends it as the message says.
+    OutputTruncated {
+        message: CompactString,
+    },
     Verification {
         attempt: u32,
         max: u32,

@@ -26,6 +26,10 @@ struct RawModel {
     id: String,
     name: String,
     context: Option<u32>,
+    /// Provider's maximum output tokens per response (models.dev
+    /// `limit.output`).
+    #[serde(default)]
+    max_output: Option<u32>,
     #[serde(default)]
     input_price: Option<f64>,
     #[serde(default)]
@@ -40,14 +44,26 @@ struct Catalog {
     entries: HashMap<String, Vec<ModelEntry>>,
     #[cfg_attr(not(feature = "multimodal"), allow(dead_code))]
     image_input: HashMap<String, HashMap<String, bool>>,
+    max_output: HashMap<String, HashMap<String, u32>>,
 }
 static CATALOG: LazyLock<Catalog> = LazyLock::new(|| {
-    let (entries, image_input) = parse_catalog_parts(CATALOG_JSON);
+    let (entries, image_input, max_output) = parse_catalog_parts(CATALOG_JSON);
     Catalog {
         entries,
         image_input,
+        max_output,
     }
 });
+
+/// The provider's maximum output tokens per response for an exact embedded
+/// provider/model id, or `None` when the catalog does not list it.
+pub(crate) fn model_max_output(provider: &str, model: &str) -> Option<u64> {
+    CATALOG
+        .max_output
+        .get(provider)?
+        .get(model)
+        .map(|&tokens| u64::from(tokens))
+}
 
 /// Explicit immutable input modality for an exact embedded provider/model ID.
 /// Unknown gateways remain unknown; this lookup does not guess from model names.
@@ -64,6 +80,7 @@ fn parse_catalog(json: &str) -> HashMap<String, Vec<ModelEntry>> {
 type CatalogParts = (
     HashMap<String, Vec<ModelEntry>>,
     HashMap<String, HashMap<String, bool>>,
+    HashMap<String, HashMap<String, u32>>,
 );
 
 /// One deserialisation yields both the entry lists and the explicit image flags.
@@ -74,19 +91,24 @@ fn parse_catalog_parts(json: &str) -> CatalogParts {
             tracing::warn!(
                 "embedded data/models.json is malformed; using an empty model catalog: {error}"
             );
-            return (HashMap::new(), HashMap::new());
+            return (HashMap::new(), HashMap::new(), HashMap::new());
         }
     };
 
     let mut entries = HashMap::with_capacity(raw.len());
     let mut image_input = HashMap::with_capacity(raw.len());
+    let mut max_output = HashMap::with_capacity(raw.len());
     for (provider, models) in raw {
         let mut flags = HashMap::new();
+        let mut outputs = HashMap::new();
         let list = models
             .into_iter()
             .map(|m| {
                 if let Some(image) = m.image_input {
                     flags.insert(m.id.clone(), image);
+                }
+                if let Some(tokens) = m.max_output.filter(|&tokens| tokens > 0) {
+                    outputs.insert(m.id.clone(), tokens);
                 }
                 ModelEntry {
                     id: m.id,
@@ -101,9 +123,10 @@ fn parse_catalog_parts(json: &str) -> CatalogParts {
             })
             .collect();
         entries.insert(provider.clone(), list);
-        image_input.insert(provider, flags);
+        image_input.insert(provider.clone(), flags);
+        max_output.insert(provider, outputs);
     }
-    (entries, image_input)
+    (entries, image_input, max_output)
 }
 
 /// Baked model entries for a provider, or `None` when the provider is not in the
@@ -115,6 +138,26 @@ pub fn catalog_entries(provider: &str) -> Option<&'static [ModelEntry]> {
 #[cfg(test)]
 mod tests {
     use super::parse_catalog;
+
+    #[test]
+    fn catalog_max_output_is_parsed_and_embedded() {
+        let (_, _, outputs) = super::parse_catalog_parts(
+            r#"{"anthropic":[{"id":"a","name":"a","context":1000,"max_output":64000},{"id":"b","name":"b","context":1000},{"id":"c","name":"c","max_output":0}]}"#,
+        );
+        assert_eq!(outputs["anthropic"].get("a"), Some(&64_000));
+        assert_eq!(outputs["anthropic"].get("b"), None);
+        assert_eq!(outputs["anthropic"].get("c"), None);
+        // Every embedded direct-API entry carries its output ceiling.
+        for provider in ["anthropic", "openai"] {
+            for entry in super::catalog_entries(provider).unwrap() {
+                assert!(
+                    super::model_max_output(provider, &entry.id).is_some(),
+                    "{provider}/{} lacks max_output",
+                    entry.id
+                );
+            }
+        }
+    }
 
     #[test]
     fn malformed_catalog_falls_back_to_empty() {

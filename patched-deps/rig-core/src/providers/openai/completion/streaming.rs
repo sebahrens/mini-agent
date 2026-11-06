@@ -117,6 +117,9 @@ struct StreamingCompletionChunk<U = Usage> {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct StreamingCompletionResponse<U = Usage> {
     pub usage: U,
+    /// A choice finished with `finish_reason: length` (mini-agent patch).
+    #[serde(skip)]
+    pub output_truncated: bool,
 }
 
 impl<U> GetTokenUsage for StreamingCompletionResponse<U>
@@ -125,6 +128,10 @@ where
 {
     fn token_usage(&self) -> crate::completion::Usage {
         self.usage.token_usage()
+    }
+
+    fn output_truncated(&self) -> bool {
+        self.output_truncated
     }
 }
 
@@ -288,6 +295,7 @@ where
                     // some compatible providers still emit for tool calls.
                     finish_reason: match &choice.finish_reason {
                         Some(FinishReason::ToolCalls) => CompatibleFinishReason::ToolCalls,
+                        Some(FinishReason::Length) => CompatibleFinishReason::Length,
                         Some(FinishReason::Other(other)) if other == "function_call" => {
                             CompatibleFinishReason::ToolCalls
                         }
@@ -309,7 +317,15 @@ where
     }
 
     fn build_final_response(&self, usage: Self::Usage) -> Self::FinalResponse {
-        StreamingCompletionResponse { usage }
+        StreamingCompletionResponse {
+            usage,
+            output_truncated: false,
+        }
+    }
+
+    fn mark_output_truncated(&self, mut response: Self::FinalResponse) -> Self::FinalResponse {
+        response.output_truncated = true;
+        response
     }
 
     fn decorate_tool_call(

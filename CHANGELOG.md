@@ -12,6 +12,11 @@ Notable changes to mini-agent are documented in this file. The format follows
   `Retry-After` may extend a retry up to the new `retry.max_retry_after_ms` ceiling (default
   5 minutes, at most 10), `x-should-retry` overrides the status classification, and the retry
   notice shows the actual wait.
+- The default `max_tokens` now follows each model's catalog output ceiling (capped at 32000;
+  16384 for unlisted models), and explicit values are clamped to it. The catalog records
+  `max_output` per model. Output-limit stops (`max_tokens`, `length`, `max_output_tokens`,
+  `MAX_TOKENS`) are no longer silent: a notice is shown, the turn continues with a resume
+  instruction (up to 3 times), and a cut-off tool call is reported instead of executed.
 
 **Fork release 1.14.2 (2026-10-28)**
 

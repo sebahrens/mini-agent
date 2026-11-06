@@ -601,6 +601,13 @@ impl GetTokenUsage for CopilotStreamingResponse {
             Self::Responses(response) => response.token_usage(),
         }
     }
+
+    fn output_truncated(&self) -> bool {
+        match self {
+            Self::Chat(response) => response.output_truncated(),
+            Self::Responses(response) => response.output_truncated(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1675,6 +1682,8 @@ impl CompatibleStreamProfile for CopilotChatCompatibleProfile {
                 |choice| CompatibleChoiceData {
                     finish_reason: if choice.finish_reason == Some(ChatFinishReason::ToolCalls) {
                         CompatibleFinishReason::ToolCalls
+                    } else if choice.finish_reason == Some(ChatFinishReason::Length) {
+                        CompatibleFinishReason::Length
                     } else {
                         CompatibleFinishReason::Other
                     },
@@ -1692,7 +1701,18 @@ impl CompatibleStreamProfile for CopilotChatCompatibleProfile {
     fn build_final_response(&self, usage: Self::Usage) -> Self::FinalResponse {
         CopilotStreamingResponse::Chat(openai::completion::streaming::StreamingCompletionResponse {
             usage,
+            output_truncated: false,
         })
+    }
+
+    fn mark_output_truncated(&self, response: Self::FinalResponse) -> Self::FinalResponse {
+        match response {
+            CopilotStreamingResponse::Chat(mut chat) => {
+                chat.output_truncated = true;
+                CopilotStreamingResponse::Chat(chat)
+            }
+            other => other,
+        }
     }
 
     fn uses_distinct_tool_call_eviction(&self) -> bool {
