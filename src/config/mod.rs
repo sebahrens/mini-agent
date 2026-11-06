@@ -93,6 +93,7 @@ impl ConfigProvenance {
     /// The directory a relative path value of `key` should resolve against:
     /// the directory of the config file of the layer that set it last. `None`
     /// for the command line, an unset key, or an unknown file location.
+    #[cfg(feature = "agent-skills")]
     pub(crate) fn base_dir_for(&self, key: &str) -> Option<std::path::PathBuf> {
         let file = match self.sources.get(key)?.iter().max()? {
             ConfigLayer::Global => self.global_file.as_ref(),

@@ -4387,6 +4387,7 @@ mod project_config_trust_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(feature = "agent-skills")]
     #[test]
     fn relative_skill_dirs_resolve_against_the_file_of_the_layer_that_set_them() {
         let mut provenance = crate::config::ConfigProvenance {
