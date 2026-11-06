@@ -544,18 +544,9 @@ impl Mem {
         }
     }
 
-    /// Read a memory file for the model, capping the output so a long file can't
-    /// flood the conversation context. Missing/empty reads as "(empty)".
-    fn read_capped(p: &Path) -> String {
-        match read_text(p) {
-            Ok(s) if s.is_empty() => "(empty)".to_string(),
-            Ok(s) => truncate_cjk(&s, MAX_INJECT_BYTES, "\n…[memory truncated]"),
-            Err(_) => "(empty)".to_string(),
-        }
-    }
-
-    /// Like `read_capped`, but an oversized append-only daily log keeps its
+    /// Read a memory file, capping the output; an oversized append-only daily log keeps its
     /// newest entries (the tail) instead of its oldest.
+    #[cfg(test)]
     pub(crate) fn read_capped_tail(p: &Path) -> String {
         match read_text(p) {
             Ok(s) if s.is_empty() => "(empty)".to_string(),
@@ -566,6 +557,70 @@ impl Mem {
             ),
             Err(_) => "(empty)".to_string(),
         }
+    }
+
+    /// Read a byte window of a memory file for `memory_read`. The window is at
+    /// most `MAX_INJECT_BYTES`; `tail` returns the newest bytes, otherwise the
+    /// window starts at `offset` (default 0). Any truncation says which bytes
+    /// are shown, the file's total size, and how to continue.
+    pub(crate) fn read_window(p: &Path, offset: Option<usize>, limit: usize, tail: bool) -> String {
+        let text = match read_text(p) {
+            Ok(text) if !text.is_empty() => text,
+            _ => return "(empty)".to_string(),
+        };
+        let total = text.len();
+        let limit = limit.clamp(16, MAX_INJECT_BYTES);
+        if let Some(offset) = offset
+            && offset > total
+        {
+            return format!("(offset {offset} is past the end of the file: {total} bytes total)");
+        }
+        let (mut start, mut end) = match (offset, tail) {
+            (None, true) => (total.saturating_sub(limit), total),
+            (offset, _) => {
+                let start = offset.unwrap_or(0);
+                (start, (start + limit).min(total))
+            }
+        };
+        while start < total && !text.is_char_boundary(start) {
+            start += 1;
+        }
+        while end > start && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == start && start < total {
+            // A single character wider than the window: return it whole.
+            end = start + 1;
+            while end < total && !text.is_char_boundary(end) {
+                end += 1;
+            }
+        }
+        if start == 0 && end == total {
+            return text;
+        }
+        let mut out = String::with_capacity(end - start + 256);
+        if start > 0 {
+            if tail && offset.is_none() {
+                out.push_str(&format!(
+                    "…[memory truncated: older entries omitted; showing bytes {start}-{end} of \
+{total}; use offset=0 to page from the start]\n"
+                ));
+            } else {
+                out.push_str(&format!(
+                    "…[memory: showing bytes {start}-{end} of {total}; {start} earlier bytes \
+omitted; offset=0 reads from the start]\n"
+                ));
+            }
+        }
+        out.push_str(&text[start..end]);
+        if end < total {
+            out.push_str(&format!(
+                "\n…[memory truncated: showing bytes {start}-{end} of {total}; {} bytes remain; \
+continue with offset={end}, or tail=true for the newest entries]",
+                total - end
+            ));
+        }
+        out
     }
 
     fn truncate_to_bytes(s: &str, max: usize) -> &str {
@@ -1782,6 +1837,17 @@ pub struct MemoryReadArgs {
     pub source: String,
     /// note name (for source=note) or YYYY-MM-DD (for source=daily)
     pub name: Option<String>,
+    /// Byte offset to start reading at (default 0; daily logs default to their
+    /// newest bytes). Use the `offset=N` named in a truncation marker to page.
+    #[serde(default)]
+    pub offset: Option<usize>,
+    /// Maximum bytes to return (default and maximum 32768).
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Return the last `limit` bytes (newest appended entries) instead of the
+    /// head. Default: true for daily logs, false otherwise.
+    #[serde(default)]
+    pub tail: Option<bool>,
 }
 
 pub struct MemoryRead {
@@ -1801,7 +1867,9 @@ impl Tool for MemoryRead {
 
     fn description(&self) -> String {
         "Read a memory file: source=long_term (MEMORY.md), scratchpad, \
-daily (name=YYYY-MM-DD, omit for today), note (name=<stem>), or list (enumerate everything)."
+daily (name=YYYY-MM-DD, omit for today), note (name=<stem>), or list (enumerate everything). \
+Output is capped at 32 KiB: a truncation marker gives the total size and the offset to continue \
+from; pass offset/limit to page through a large file, or tail=true to read its newest entries."
             .to_string()
     }
 
@@ -1810,7 +1878,10 @@ daily (name=YYYY-MM-DD, omit for today), note (name=<stem>), or list (enumerate 
             "type": "object",
             "properties": {
                 "source": { "type": "string", "description": "long_term, scratchpad, daily, note, or list" },
-                "name":   { "type": "string", "description": "note stem or YYYY-MM-DD" }
+                "name":   { "type": "string", "description": "note stem or YYYY-MM-DD" },
+                "offset": { "type": "integer", "minimum": 0, "description": "byte offset to start at (use the offset named in a truncation marker)" },
+                "limit":  { "type": "integer", "minimum": 16, "maximum": 32768, "description": "maximum bytes to return (default 32768)" },
+                "tail":   { "type": "boolean", "description": "return the newest bytes instead of the head (default true only for daily)" }
             },
             "required": ["source"]
         })
@@ -1824,9 +1895,21 @@ daily (name=YYYY-MM-DD, omit for today), note (name=<stem>), or list (enumerate 
         );
         check_perm(&self.permission, &self.ask_tx, Self::NAME, &args.source).await?;
         let m = Mem::open();
+        m.read_for_args(&args)
+    }
+}
+
+impl Mem {
+    /// The `memory_read` body for `args` (permission already checked).
+    pub(crate) fn read_for_args(&self, args: &MemoryReadArgs) -> Result<String, ToolError> {
+        let m = self;
+        let limit = args.limit.unwrap_or(MAX_INJECT_BYTES);
+        let window = |p: &Path, default_tail: bool| {
+            Mem::read_window(p, args.offset, limit, args.tail.unwrap_or(default_tail))
+        };
         let body = match args.source.as_str() {
-            "long_term" => Mem::read_capped(&m.memory_md()),
-            "scratchpad" => Mem::read_capped(&m.scratchpad()),
+            "long_term" => window(&m.memory_md(), false),
+            "scratchpad" => window(&m.scratchpad(), false),
             "daily" => {
                 // `name` is caller-supplied; validate before splicing it into a
                 // path, since `daily_file` does no sanitization (an unchecked
@@ -1837,7 +1920,7 @@ daily (name=YYYY-MM-DD, omit for today), note (name=<stem>), or list (enumerate 
                         "invalid daily date name (expected YYYY-MM-DD)".into(),
                     ));
                 }
-                Mem::read_capped_tail(&m.daily_file(date))
+                window(&m.daily_file(date), true)
             }
             "note" => {
                 let name = args
@@ -1847,7 +1930,7 @@ daily (name=YYYY-MM-DD, omit for today), note (name=<stem>), or list (enumerate 
                 let p = m
                     .note_path(name)
                     .ok_or_else(|| ToolError::Msg("invalid note name".into()))?;
-                Mem::read_capped(&p)
+                window(&p, false)
             }
             // Global root yields MEMORY.md only (projects/ is a dir, skipped);
             // notes/daily are the current project's, so listing is automatically

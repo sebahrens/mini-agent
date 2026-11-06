@@ -236,7 +236,11 @@ fn catalog_entries(
     index: &super::index::AgentSkillIndex,
     budget: usize,
 ) -> (Vec<(String, String)>, usize) {
-    let mut records: Vec<_> = index.records().iter().collect();
+    let mut records: Vec<_> = index
+        .records()
+        .iter()
+        .filter(|record| !record.disable_model_invocation)
+        .collect();
     records.sort_by(|left, right| left.name.cmp(&right.name));
     let mut used = 0usize;
     let mut entries = Vec::new();

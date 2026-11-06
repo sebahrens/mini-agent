@@ -6832,7 +6832,10 @@ impl<'a> App<'a> {
             let entries = snapshot
                 .packages
                 .iter()
-                .filter(|(name, _)| !crate::ui::pickers::list::reserved_command(name))
+                .filter(|(name, package)| {
+                    package.record.user_invocable
+                        && !crate::ui::pickers::list::reserved_command(name)
+                })
                 .map(|(name, package)| {
                     (
                         format!("/{name}"),
@@ -14605,7 +14608,9 @@ fn skill_command_entries(
     snapshot
         .packages
         .iter()
-        .filter(|(name, _)| !crate::ui::pickers::list::reserved_command(name))
+        .filter(|(name, package)| {
+            package.record.user_invocable && !crate::ui::pickers::list::reserved_command(name)
+        })
         .map(|(name, package)| {
             (
                 format!("/{name}"),

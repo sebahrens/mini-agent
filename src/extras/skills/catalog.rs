@@ -390,6 +390,8 @@ fn scan_record(
         resources,
         allowed_tools: manifest.allowed_tools,
         learned_js: manifest.learned_js,
+        disable_model_invocation: manifest.disable_model_invocation,
+        user_invocable: manifest.user_invocable,
         embedding: Vec::new(),
     }))
 }

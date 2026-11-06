@@ -21,6 +21,36 @@ const CLAUDE_PROJECT_AGENT_LAYER: &str = ".claude/agents";
 static CLAUDE_PROJECT_AGENTS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
+/// Whether the user's `~/.claude/agents` definitions are read
+/// (`claude_user_agents`). Opt-in: default closed.
+static CLAUDE_USER_AGENTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_claude_user_agents(enabled: bool) {
+    CLAUDE_USER_AGENTS.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn claude_user_agents_dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(enabled) = CLAUDE_USER_AGENTS_OVERRIDE.with(std::cell::Cell::get) {
+        return enabled
+            .then(crate::paths::process_home_dir)
+            .flatten()
+            .map(|home| home.join(".claude/agents"));
+    }
+    CLAUDE_USER_AGENTS
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .then(crate::paths::process_home_dir)
+        .flatten()
+        .map(|home| home.join(".claude/agents"))
+}
+
+#[cfg(test)]
+thread_local! {
+    static CLAUDE_USER_AGENTS_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
 #[cfg(test)]
 thread_local! {
     static CLAUDE_PROJECT_AGENTS_OVERRIDE: std::cell::Cell<Option<bool>> =
@@ -173,6 +203,9 @@ struct AgentMetadata {
     #[cfg(feature = "mcp")]
     mcp_servers: Option<std::collections::BTreeMap<String, Vec<String>>>,
     unknown_keys: Vec<String>,
+    /// Claude Code compatibility adjustments (name mismatch, shortened
+    /// description) surfaced as `[specialist metadata: ...]` notices.
+    compat_notices: Vec<String>,
 }
 
 type NormalizedAgentDefinition = (String, String, AgentMetadata);
@@ -235,10 +268,15 @@ fn normalize_agent_definition(
     let mapping = metadata
         .as_mapping()
         .ok_or("frontmatter must be a YAML mapping")?;
+    let mut compat_notices = Vec::new();
+    // Claude Code files carry an arbitrary file name; the filename stem stays
+    // the agent type here, so a differing frontmatter name is reported, not fatal.
     if let Some(declared_name) = mapping.get(serde_yaml_ng::Value::String("name".into()))
         && declared_name.as_str() != Some(&name)
     {
-        return Err("frontmatter name does not match the filename stem");
+        compat_notices.push(format!(
+            "[specialist metadata: frontmatter name differs from the file name; using \"{name}\"]"
+        ));
     }
     let mode = mapping
         .get(serde_yaml_ng::Value::String("mode".into()))
@@ -262,7 +300,14 @@ fn normalize_agent_definition(
                 return Err("frontmatter description must not be empty");
             }
             if description.chars().count() > MAX_AGENT_DESCRIPTION_CHARS {
-                return Err("frontmatter description exceeds the 160 character limit");
+                let shortened = description
+                    .chars()
+                    .take(MAX_AGENT_DESCRIPTION_CHARS)
+                    .collect::<String>();
+                compat_notices.push(format!(
+                    "[specialist metadata: description shortened to {MAX_AGENT_DESCRIPTION_CHARS} characters for display]"
+                ));
+                return Ok(format!("{}…", shortened.trim_end()));
             }
             Ok(description)
         })
@@ -440,6 +485,7 @@ fn normalize_agent_definition(
                     #[cfg(feature = "mcp")]
                     mcp_servers,
                     unknown_keys,
+                    compat_notices,
                 },
             )
         })
@@ -880,6 +926,7 @@ impl AgentDefinition {
 
 fn metadata_notices(metadata: &AgentMetadata) -> Vec<String> {
     let mut notices = unknown_key_notices(&metadata.unknown_keys);
+    notices.extend(metadata.compat_notices.iter().cloned());
     if let Some(notice) = &metadata.tool_narrowing_notice {
         notices.push(format!("[specialist metadata: {notice}]"));
     }
@@ -955,14 +1002,16 @@ pub(crate) fn project_persona_set(
     use sha2::{Digest, Sha256};
     let mut entries = Vec::new();
     for layer in project_agent_layers() {
-        match workspace.read_relative_definition_layer(
+        match workspace.read_relative_definition_layer_degrading(
             Path::new(layer),
             "md",
             MAX_AGENT_PROMPT_BYTES,
             MAX_PROJECT_AGENT_ENTRIES,
             MAX_PROJECT_AGENT_FILES,
         ) {
-            Ok(definitions) => {
+            // Files past the limit are never loaded, so they are not trusted
+            // either; the digest covers exactly the loaded set.
+            Ok((definitions, _skipped)) => {
                 for (name, content) in definitions {
                     let content = content.ok()?;
                     entries.push((
@@ -1180,6 +1229,16 @@ fn load_base(paths: &crate::paths::AppPaths) -> HashMap<String, AgentDefinition>
         normalize_agent_definitions(crate::context::load_embedded_files(&EMBEDDED, "md")),
         AgentDefinitionSource::Embedded,
     );
+    // Lower priority than mini-agent's own user directory, which follows.
+    if let Some(directory) = claude_user_agents_dir() {
+        merge_external_definitions(
+            &mut agents,
+            crate::context::load_dir_files_bounded_status(&directory, "md", MAX_AGENT_PROMPT_BYTES),
+            &directory,
+            AgentDefinitionSource::UserGlobal,
+            "claude-user",
+        );
+    }
     merge_external_definitions(
         &mut agents,
         crate::context::load_dir_files_bounded_status(
@@ -1346,6 +1405,7 @@ enum LayerStamp {
 struct PersonaFingerprint {
     trusted: bool,
     user: LayerStamp,
+    claude_user: Option<LayerStamp>,
     project: Vec<LayerStamp>,
 }
 
@@ -1408,6 +1468,10 @@ fn persona_fingerprint(
     trusted: bool,
 ) -> Option<PersonaFingerprint> {
     let user = user_layer_stamp(&paths.agents_dir())?;
+    let claude_user = match claude_user_agents_dir() {
+        Some(directory) => Some(user_layer_stamp(&directory)?),
+        None => None,
+    };
     let project = if trusted {
         project_agent_layers()
             .map(|layer| project_layer_stamp(workspace, layer))
@@ -1418,6 +1482,7 @@ fn persona_fingerprint(
     Some(PersonaFingerprint {
         trusted,
         user,
+        claude_user,
         project,
     })
 }
@@ -1481,7 +1546,7 @@ fn load_uncached(
     let mut agents = load_base(paths);
     if trusted {
         for layer in project_agent_layers() {
-            let definitions = workspace.read_relative_definition_layer(
+            let definitions = workspace.read_relative_definition_layer_degrading(
                 Path::new(layer),
                 "md",
                 MAX_AGENT_PROMPT_BYTES,
@@ -1489,23 +1554,27 @@ fn load_uncached(
                 MAX_PROJECT_AGENT_FILES,
             );
             match definitions {
-                Ok(definitions) if layer == ".mini-agent/agents" => {
-                    merge_project_definitions(
-                        &mut agents,
-                        definitions,
-                        workspace.root().join(layer),
-                        true,
-                    );
+                Ok((definitions, skipped)) => {
+                    record_skipped_layer_files(&mut agents, layer, &skipped);
+                    if layer == ".mini-agent/agents" {
+                        merge_project_definitions(
+                            &mut agents,
+                            definitions,
+                            workspace.root().join(layer),
+                            true,
+                        );
+                    } else {
+                        merge_external_definitions(
+                            &mut agents,
+                            definitions.into_iter().filter(|(name, _)| name != ".notes"),
+                            &workspace.root().join(layer),
+                            AgentDefinitionSource::ProjectOverride {
+                                directory: workspace.root().join(layer),
+                            },
+                            "project",
+                        );
+                    }
                 }
-                Ok(definitions) => merge_external_definitions(
-                    &mut agents,
-                    definitions.into_iter().filter(|(name, _)| name != ".notes"),
-                    &workspace.root().join(layer),
-                    AgentDefinitionSource::ProjectOverride {
-                        directory: workspace.root().join(layer),
-                    },
-                    "project",
-                ),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
                     tracing::warn!(layer, %error, "ignoring unavailable project specialist layer")
@@ -1514,6 +1583,42 @@ fn load_uncached(
         }
     }
     agents
+}
+
+const MAX_SKIPPED_NOTICE_NAMES: usize = 8;
+
+/// A layer over the file limit loads its first files and names the rest.
+fn record_skipped_layer_files(
+    agents: &mut HashMap<String, AgentDefinition>,
+    layer: &str,
+    skipped: &[String],
+) {
+    if skipped.is_empty() {
+        return;
+    }
+    let shown = skipped
+        .iter()
+        .take(MAX_SKIPPED_NOTICE_NAMES)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = skipped.len().saturating_sub(MAX_SKIPPED_NOTICE_NAMES);
+    let more = if more > 0 {
+        format!(" and {more} more")
+    } else {
+        String::new()
+    };
+    tracing::warn!(
+        layer,
+        skipped = skipped.len(),
+        "project specialist layer exceeds the {MAX_PROJECT_AGENT_FILES}-file limit"
+    );
+    let notice = format!(
+        "[specialist source: {layer} has more than {MAX_PROJECT_AGENT_FILES} files; skipped {shown}{more}]"
+    );
+    for definition in agents.values_mut() {
+        definition.ignored_definition_notices.push(notice.clone());
+    }
 }
 
 /// One-line notice naming project persona files ignored because the project is
@@ -1940,6 +2045,66 @@ pub(crate) mod tests {
         assert!(!load_for_paths_and_workspace(&paths, &workspace).contains_key("linked"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn claude_user_agents_layer_is_opt_in_and_below_the_mini_agent_user_dir() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                CLAUDE_USER_AGENTS_OVERRIDE.with(|cell| cell.set(None));
+            }
+        }
+        let _reset = Reset;
+        let fixture = crate::tests::OwnedTestDirectory::new("claude-user-agents");
+        let root = fixture.path();
+        let paths = isolated_paths(root);
+        crate::paths::prepare_storage_roots(&paths).unwrap();
+        let home = root.join("home");
+        let _home = crate::paths::ScopedTestHome::set(&home);
+        std::fs::create_dir_all(home.join(".claude/agents")).unwrap();
+        std::fs::create_dir_all(paths.agents_dir()).unwrap();
+        std::fs::write(home.join(".claude/agents/personal.md"), "personal persona").unwrap();
+        std::fs::write(home.join(".claude/agents/shared.md"), "claude home shared").unwrap();
+        std::fs::write(paths.agents_dir().join("shared.md"), "mini-agent shared").unwrap();
+        // Invalid file: reported, never loaded.
+        std::fs::write(
+            home.join(".claude/agents/broken.md"),
+            "---\nmode: BAD\n---\nbody",
+        )
+        .unwrap();
+        // Over-long description and a different name still load.
+        std::fs::write(
+            home.join(".claude/agents/verbose.md"),
+            format!(
+                "---\nname: Verbose\ndescription: {}\n---\nbody",
+                "y".repeat(500)
+            ),
+        )
+        .unwrap();
+
+        // Default closed.
+        let closed = load_base(&paths);
+        assert!(!closed.contains_key("personal"));
+
+        CLAUDE_USER_AGENTS_OVERRIDE.with(|cell| cell.set(Some(true)));
+        let open = load_base(&paths);
+        assert_eq!(open["personal"].prompt, "personal persona");
+        assert_eq!(open["personal"].source, AgentDefinitionSource::UserGlobal);
+        assert_eq!(open["shared"].prompt, "mini-agent shared");
+        assert!(!open.contains_key("broken"));
+        assert!(open.contains_key("verbose"));
+
+        // Edits are seen through the cached loader (the stamp covers the layer).
+        let workspace = crate::paths::WorkspaceBinding::capture(root).unwrap();
+        let first = load_for_paths_and_workspace(&paths, &workspace);
+        assert!(first.contains_key("personal"));
+        std::fs::remove_file(home.join(".claude/agents/personal.md")).unwrap();
+        let second = load_for_paths_and_workspace(&paths, &workspace);
+        assert!(!second.contains_key("personal"));
+        CLAUDE_USER_AGENTS_OVERRIDE.with(|cell| cell.set(Some(false)));
+        assert!(!load_for_paths_and_workspace(&paths, &workspace).contains_key("verbose"));
+    }
+
     #[test]
     fn claude_project_agents_false_skips_only_the_claude_layer() {
         struct Reset;
@@ -1965,11 +2130,11 @@ pub(crate) mod tests {
         }
         std::fs::write(root.join(".claude/agents/claude-only.md"), "Claude persona").unwrap();
         std::fs::write(root.join(".mini-agent/agents/mini-only.md"), "mini persona").unwrap();
-        // A Claude Code definition mini-agent would reject (description > 160).
+        // A Claude Code definition with a long description and a different name.
         std::fs::write(
             root.join(".claude/agents/long.md"),
             format!(
-                "---\nname: long\ndescription: {}\n---\nbody",
+                "---\nname: Long Reviewer\ndescription: {}\n---\nbody",
                 "x".repeat(400)
             ),
         )
@@ -1983,10 +2148,11 @@ pub(crate) mod tests {
         CLAUDE_PROJECT_AGENTS_OVERRIDE.with(|cell| cell.set(Some(true)));
         let with_claude = load_for_paths_and_workspace(&paths, &workspace);
         assert!(with_claude.contains_key("claude-only"));
-        assert!(
-            !with_claude.contains_key("long"),
-            "over-long description is rejected"
-        );
+        let long = &with_claude["long"];
+        assert!(long.one_line_description().chars().count() <= MAX_AGENT_DESCRIPTION_CHARS + 1);
+        let notice = long.result_notice("long").unwrap();
+        assert!(notice.contains("description shortened"), "{notice}");
+        assert!(notice.contains("differs from the file name"), "{notice}");
 
         CLAUDE_PROJECT_AGENTS_OVERRIDE.with(|cell| cell.set(Some(false)));
         let without = load_for_paths_and_workspace(&paths, &workspace);
@@ -2060,7 +2226,7 @@ pub(crate) mod tests {
         assert!(next["review"].prompt.starts_with("persona .claude/agents"));
         std::fs::write(
             root.join(".mini-agent/agents/review.md"),
-            "---\nname: wrong\n---\ninvalid",
+            "---\nmode: BAD\n---\ninvalid",
         )
         .unwrap();
         let fallback = load_for_paths_and_workspace(&paths, &workspace);
@@ -2142,7 +2308,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn project_agent_layer_limits_fail_closed_before_any_partial_merge() {
+    fn project_agent_layer_over_file_limit_degrades_with_notice() {
         let fixture = crate::tests::OwnedTestDirectory::new("project-agent-layer-limits");
         let root = fixture.path();
         let paths = isolated_paths(root);
@@ -2166,7 +2332,15 @@ pub(crate) mod tests {
         let workspace = crate::paths::WorkspaceBinding::capture(root).unwrap();
         let resolved = load_for_paths_and_workspace(&paths, &workspace);
         assert_eq!(resolved["review"].prompt, "valid lower layer");
-        assert!(!resolved.keys().any(|name| name.starts_with("agent-")));
+        // The first 128 files (sorted) load; the rest are named in a notice.
+        let loaded = resolved
+            .keys()
+            .filter(|name| name.starts_with("agent-"))
+            .count();
+        assert_eq!(loaded, MAX_PROJECT_AGENT_FILES);
+        let notice = resolved["review"].result_notice("review").unwrap();
+        assert!(notice.contains("has more than 128 files"), "{notice}");
+        assert!(notice.contains("skipped agent-"), "{notice}");
         assert!(
             workspace
                 .read_relative_definition_layer(Path::new(".claude/agents"), "md", 8, 0, 1)
@@ -2310,8 +2484,14 @@ pub(crate) mod tests {
         assert_eq!(normalized.1, "Trusted body\n");
         assert_eq!(normalized.2.description.as_deref(), Some("metadata only"));
         assert!(normalize_agent_definition("README".into(), "body".into()).is_err());
-        assert!(
+        // A differing frontmatter name no longer drops the persona.
+        let mismatched =
             normalize_agent_definition("review".into(), "---\nname: different\n---\nbody".into())
+                .unwrap();
+        assert_eq!(mismatched.0, "review");
+        assert_eq!(mismatched.2.compat_notices.len(), 1);
+        assert!(
+            normalize_agent_definition("review".into(), "---\nmode: BAD\n---\nbody".into())
                 .is_err()
         );
         assert!(
@@ -2776,10 +2956,7 @@ pub(crate) mod tests {
 
         merge_external_definitions(
             &mut agents,
-            [(
-                "review".to_string(),
-                Ok("---\nname: wrong\n---\nbody".into()),
-            )],
+            [("review".to_string(), Ok("---\nmode: BAD\n---\nbody".into()))],
             Path::new("/config/agents"),
             AgentDefinitionSource::UserGlobal,
             "user",
@@ -2791,7 +2968,7 @@ pub(crate) mod tests {
         let notice = resolved.result_notice("review").unwrap();
         assert!(notice.starts_with("[specialist source: user definition ignored:"));
         assert!(notice.contains("/config/agents/review.md"));
-        assert!(notice.contains("frontmatter name does not match"));
+        assert!(notice.contains("not a valid prompt name"));
         assert!(notice.contains("using compiled-in default"));
 
         merge_project_definitions(

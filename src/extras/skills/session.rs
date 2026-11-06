@@ -485,6 +485,9 @@ impl InstructionServices {
             .packages
             .get(name)
             .ok_or("skill is unavailable or requires source approval/read permission")?;
+        if !package.record.user_invocable {
+            return Err("skill is not user-invocable (user-invocable: false)".into());
+        }
         if crate::ui::pickers::list::reserved_command(name) {
             return Err("skill name collides with a built-in command".into());
         }
@@ -1722,6 +1725,84 @@ mod discovery_tests {
             "{:?}",
             snapshot.diagnostics
         );
+    }
+
+    #[tokio::test]
+    async fn disable_model_invocation_skill_is_not_selected_or_listed_but_stays_pinnable() {
+        let fixture = Fixture::new(false);
+        let deploy = fixture.skill(
+            ".claude/skills",
+            "deploy-prod",
+            "deploy the production release",
+            "DEPLOY_BODY",
+        );
+        std::fs::write(
+            &deploy,
+            "---\nname: deploy-prod\ndescription: deploy the production release\ndisable-model-invocation: true\n---\nDEPLOY_BODY\n",
+        )
+        .unwrap();
+        fixture.skill(
+            ".claude/skills",
+            "deploy-notes",
+            "deploy the production release notes",
+            "NOTES_BODY",
+        );
+        let hidden = fixture.skill(
+            ".claude/skills",
+            "internal-only",
+            "internal helper skill",
+            "INTERNAL_BODY",
+        );
+        std::fs::write(
+            &hidden,
+            "---\nname: internal-only\ndescription: internal helper skill\nuser-invocable: false\n---\nINTERNAL_BODY\n",
+        )
+        .unwrap();
+
+        // Automatic/search selection never returns the model-disabled skill.
+        let selection = fixture
+            .services
+            .select("deploy the production release", None)
+            .await
+            .unwrap();
+        let names: Vec<_> = selection.selected.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"deploy-notes"), "{names:?}");
+        assert!(!names.contains(&"deploy-prod"), "{names:?}");
+        assert!(
+            selection
+                .sections
+                .iter()
+                .all(|section| !section.markdown.contains("DEPLOY_BODY"))
+        );
+        assert!(
+            selection
+                .catalog
+                .iter()
+                .all(|(name, _)| name != "deploy-prod")
+        );
+
+        // Explicit pinning still loads it.
+        let pin = fixture.services.pin("deploy-prod").await.unwrap();
+        let pinned = fixture
+            .services
+            .select("unrelated words", Some(&pin))
+            .await
+            .unwrap();
+        assert_eq!(pinned.selected[0].name, "deploy-prod");
+        assert!(pinned.sections[0].markdown.contains("DEPLOY_BODY"));
+
+        // user-invocable: false is hidden from the picker source and unpinnable,
+        // but remains model-selectable.
+        assert!(fixture.services.pin("internal-only").await.is_err());
+        let snapshot = fixture.services.refresh(false).await.unwrap();
+        assert!(!snapshot.packages["internal-only"].record.user_invocable);
+        assert!(snapshot.packages["deploy-prod"].record.user_invocable);
+        let auto = fixture
+            .services
+            .select("internal helper skill", None)
+            .await
+            .unwrap();
+        assert!(auto.selected.iter().any(|s| s.name == "internal-only"));
     }
 
     #[tokio::test]

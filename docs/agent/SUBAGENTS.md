@@ -264,13 +264,17 @@ first among eligible layers:
 .mini-agent/agents/<name>.md     # trusted mini-agent project override (highest)
 .claude/agents/<name>.md         # trusted Claude-style project definition
 data_dir/agents/<name>.md        # user global
+~/.claude/agents/<name>.md       # optional Claude Code user layer (claude_user_agents = true)
 data/agents/<name>.md            # compiled-in default
 ```
 
+Set `claude_user_agents = true` to also read your personal Claude Code agents from
+`~/.claude/agents`. It is off by default (a personal agent can run in write mode), project config
+needs trust to enable it, and the layer is treated like the user-global one: same validation,
+no project trust involved, and mini-agent's own `data_dir/agents` wins on a name clash.
+
 Set `claude_project_agents = false` to skip the `.claude/agents` layer when a
-repository's Claude Code agents are not meant for mini-agent (for example
-descriptions longer than the 160-character limit, which are otherwise reported
-as invalid on every start).
+repository's Claude Code agents are not meant for mini-agent.
 
 `src/context/mentions.rs` parses agent mentions in submitted text against the
 same trust-gated resolution. The canonical token is `@agent:<name>`; Claude
@@ -481,8 +485,10 @@ loader, so an edited persona applies on the next `task` call.
 Project reads use the session's captured workspace capability and refuse
 symlinks (including linked directory components), reparse points, and nonregular
 files. Each layer is enumerated before reading, with at most 1,024 directory
-entries and 128 Markdown files; an over-limit layer is ignored in full rather
-than selecting files in filesystem order. Each file remains capped at 256 KiB,
+entries and 128 Markdown files; a layer with more than 128 Markdown files
+loads the first 128 in sorted file-name order (never filesystem order) and the
+task result carries a `[specialist source: ... skipped ...]` notice naming the
+skipped files, while more than 1,024 directory entries still ignores the layer. Each file remains capped at 256 KiB,
 so all three project layers read at most 96 MiB plus one sentinel byte per file
 per resolution. An untrusted checkout cannot add, replace, or
 extend agent types; resolution falls back to user-global or compiled-in
@@ -611,8 +617,8 @@ services/process tree. MCP output still passes through the existing bounded
 tool-result and `[subagent output ...]` report boundaries.
 
 The block is validated and removed before the prompt is installed. Malformed
-metadata, mismatched names, empty prompt bodies, invalid UTF-8, and oversized
-files are rejected. The loader emits a warning naming the file and reason. If the
+metadata, empty prompt bodies, invalid UTF-8, and oversized
+files are rejected. Claude Code compatibility: a frontmatter `name` that differs from the file name is not fatal (the file name stays the agent type and a `[specialist metadata: ...]` notice is recorded), and a `description` over 160 characters is shortened with an ellipsis and a notice. The loader emits a warning naming the file and reason. If the
 rejected user or trusted-project file has the same valid stem as an available
 lower-priority persona, the task result is prefixed with a
 `[specialist source: ... definition ignored: ...]` notice and identifies the

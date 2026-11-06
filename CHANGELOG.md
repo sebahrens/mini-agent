@@ -22,6 +22,18 @@ Notable changes to mini-agent are documented in this file. The format follows
 - `--mcp-server-timeout <secs>` and `--mcp-server-max-runs <n>` (defaults 1800 and 4, shown in the
   `run` tool description); a timed-out `run` is stopped with SIGTERM first and reports the child's
   stderr tail and its saved session id (mini-agent-tu8q0).
+- `memory_read` accepts `offset`, `limit` and `tail`, and its truncation marker states the total
+  size, remaining bytes and the offset to continue from, so entries appended past 32 KiB stay
+  readable (mini-agent-zcipw).
+- `claude_user_agents = true` (default off, project-trust gated) also reads `~/.claude/agents`
+  below mini-agent's own user agents (mini-agent-xt7qy).
+- Claude Code subagent files load when the description is over 160 characters (shortened with a
+  notice) or the frontmatter name differs from the file name, and a layer with more than 128
+  files loads the first 128 and names the skipped ones (mini-agent-bw4qi).
+- Skills with `disable-model-invocation: true` are no longer auto-selected, catalogued or returned
+  by `skills_search` (still pinnable with `/name`); `user-invocable: false` hides a skill from
+  the `/` picker (mini-agent-glikt).
+
 - ACP: with the new default-off `acp_client_file_access` (project-trust gated) and a client that
   advertises `fs.readTextFile`/`fs.writeTextFile`, `read`, `edit` and overwrite `write` use the
   editor's live text and publish through it, still behind the workspace and permission checks

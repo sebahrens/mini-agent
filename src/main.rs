@@ -274,6 +274,7 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
         let mut cfg = config::load_for_diagnostics_in_workspace(&app_paths, &workspace);
         config::layers::apply_overrides(&mut cfg, &config_overrides).map_err(anyhow::Error::msg)?;
         context::agents::set_claude_project_agents(cfg.resolve_claude_project_agents());
+        context::agents::set_claude_user_agents(cfg.resolve_claude_user_agents());
         let mut report =
             diagnostics::DoctorReport::capture(&cli, &cfg, &app_paths, None, None, true);
         report.section("Terminal");
@@ -392,6 +393,7 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
     let (mut cfg, is_first_startup) =
         config::load_in_workspace(&app_paths, &workspace, is_interactive);
     context::agents::set_claude_project_agents(cfg.resolve_claude_project_agents());
+    context::agents::set_claude_user_agents(cfg.resolve_claude_user_agents());
 
     // Headless and ACP runs never prompt: personas stay inert, so say so once.
     if !is_interactive && let Some(notice) = context::agents::untrusted_personas_notice(&workspace)
@@ -406,6 +408,7 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
             .unwrap_or(sandbox::DEFAULT_COMMAND_TIMEOUT_SECS),
     );
     context::agents::set_claude_project_agents(cfg.resolve_claude_project_agents());
+    context::agents::set_claude_user_agents(cfg.resolve_claude_user_agents());
     provider::set_provider_timeouts(cfg.provider_timeouts);
     provider::set_cli_fallback_model(cli.fallback_model.clone());
     models_catalog::spawn_refresh_if_stale(cfg.models_catalog_refresh_days);
