@@ -312,7 +312,8 @@ impl ToolDyn for McpTool {
                         ServiceError::Timeout { .. } => format!(
                             "MCP tool '{tool_name}' on server '{server_name}' timed out after {} ms; \
                              the server may be hung or the request too large. Retry with a \
-                             narrower request, or raise `mcp_tool_timeout_secs` in the config.",
+                             narrower request, or raise `mcp_tool_timeout_secs` (or this server's \
+                             `tool_timeout_sec`) in the config.",
                             call_timeout.as_millis()
                         ),
                         other => format!("MCP tool error: {other}"),

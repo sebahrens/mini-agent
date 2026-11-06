@@ -151,6 +151,12 @@ fn main() {
         return;
     }
 
+    if let Some(delay) = env::var("MCP_FIXTURE_STARTUP_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        thread::sleep(Duration::from_millis(delay));
+    }
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
     let mut pending_aux: Option<String> = None;
@@ -423,6 +429,7 @@ impl FixtureBuild {
             env.insert("MCP_FIXTURE_TOOL_NAME".to_string(), tool_name.to_string());
         }
         McpServerConfig::Command {
+            options: Default::default(),
             defer: Default::default(),
             command,
             args,
@@ -799,6 +806,7 @@ async fn mcp_command_transport_uses_the_explicit_workspace() {
     let workspace = fixture.root.join("selected workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     let config = McpServerConfig::Command {
+        options: Default::default(),
         command: fixture.executable.display().to_string(),
         defer: Default::default(),
         args: Vec::new(),
@@ -829,6 +837,7 @@ async fn mcp_stdio_failure_cleanup_is_bounded_and_leaves_no_child() {
     let fixture = FixtureBuild::compile();
 
     let missing = McpServerConfig::Command {
+        options: Default::default(),
         command: "mini-agent-mcp-fixture-that-does-not-exist".to_string(),
         defer: Default::default(),
         args: Vec::new(),
@@ -1607,6 +1616,55 @@ async fn mcp_tool_call_hang_times_out_with_tool_error() {
     assert!(message.contains("probe"), "{message}");
     assert!(message.contains("mcp_tool_timeout_secs"), "{message}");
 
+    let pid = wait_for_pid(&lease).await;
+    shutdown(manager).await;
+    assert_process_reaped(pid).await;
+    fixture.cleanup();
+}
+
+#[tokio::test]
+async fn mcp_per_server_startup_and_tool_timeouts_override_the_defaults() {
+    let fixture = FixtureBuild::compile();
+    let lease = fixture.lease("slow-start");
+    let mut config = fixture.config(
+        fixture.executable.display().to_string(),
+        Vec::new(),
+        "hang-tools-call",
+        &lease,
+    );
+    let McpServerConfig::Command { env, options, .. } = &mut config else {
+        unreachable!()
+    };
+    // Slower than the 10 s default initialize bound.
+    env.insert("MCP_FIXTURE_STARTUP_DELAY_MS".into(), "12000".into());
+    options.startup_timeout_sec = Some(30);
+    options.tool_timeout_sec = Some(1);
+    let started = std::time::Instant::now();
+    let handle = McpClientHandle::connect(CompactString::new("fixture"), &config)
+        .await
+        .expect("startup_timeout_sec = 30 admits a 12 s startup");
+    assert!(started.elapsed() >= Duration::from_secs(12));
+    let manager = McpClientManager::from_handles(vec![handle]);
+    let mut tools = manager
+        .collect_tools_with_timeouts(
+            Some(permission_for(Action::Allow)),
+            None,
+            McpToolTimeouts::default(),
+        )
+        .await;
+    let tool = tools
+        .iter_mut()
+        .find(|tool| tool.name() == "probe")
+        .expect("fixture tool must be listed");
+    let started = std::time::Instant::now();
+    let error = tokio::time::timeout(Duration::from_secs(10), tool.call("{}".to_string()))
+        .await
+        .expect("the per-server tool timeout bounds the call")
+        .expect_err("a hung tools/call must fail");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let message = error.to_string();
+    assert!(message.contains("timed out after 1000 ms"), "{message}");
+    assert!(message.contains("tool_timeout_sec"), "{message}");
     let pid = wait_for_pid(&lease).await;
     shutdown(manager).await;
     assert_process_reaped(pid).await;

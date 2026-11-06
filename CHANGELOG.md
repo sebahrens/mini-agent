@@ -70,6 +70,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Added
 
+- MCP server entries accept `startup_timeout_sec` (initialize, default 10 s; also raises the
+  30 s `tools/list` budget) and `tool_timeout_sec` (per-server `tools/call`, default
+  `mcp_tool_timeout_secs` = 120 s), clamped to 1..=3600 (mini-agent-02r1x).
 - `web_search` accepts optional `num_results` (<= 10), `allowed_domains` / `blocked_domains`
   (enforced locally as well) and `recency`; snippets grow to 3,000 characters. Without
   `EXA_API_KEY` the native tool is no longer registered, leaving the keyless Exa MCP server

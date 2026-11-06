@@ -488,6 +488,8 @@ impl McpClientManager {
                 let source_proof = handle.source_proof.clone();
                 let elicitation = handle.elicitation.clone();
                 let liveness = Arc::downgrade(&handle.liveness);
+                let list_timeout = handle.options.list_timeout(timeouts.list);
+                let call_timeout = handle.options.tool_timeout(timeouts.call);
                 let live_peer = peer.clone();
                 let client_is_live: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
                     liveness.upgrade().is_some() && !live_peer.is_transport_closed()
@@ -498,7 +500,7 @@ impl McpClientManager {
                 async move {
                     let _permit = sem.acquire_owned().await;
                     let result = listed
-                        .get_or_try_init(|| client::list_bounded_tools(&peer, timeouts.list))
+                        .get_or_try_init(|| client::list_bounded_tools(&peer, list_timeout))
                         .await
                         .cloned();
                     let outcome = match &result {
@@ -515,6 +517,7 @@ impl McpClientManager {
                         client_is_live,
                         peer,
                         result,
+                        (list_timeout, call_timeout),
                     )
                 }
             })
@@ -531,6 +534,7 @@ impl McpClientManager {
             client_is_live,
             peer,
             result,
+            (list_timeout, call_timeout),
         ) in results
         {
             match result {
@@ -563,7 +567,7 @@ impl McpClientManager {
                             peer: peer.clone(),
                             permission: permission.clone(),
                             ask_tx: ask_tx.clone(),
-                            call_timeout: timeouts.call,
+                            call_timeout,
                             spill_scope: self.spill_scope.clone(),
                         });
                     }
@@ -590,11 +594,11 @@ impl McpClientManager {
                     tracing::debug!(
                         "MCP server '{}': tools/list timed out after {} ms",
                         server_name,
-                        timeouts.list.as_millis()
+                        list_timeout.as_millis()
                     );
                     self.push_tool_notice(format!(
                         "MCP server '{server_name}' tools unavailable: tools/list timed out after {} ms",
-                        timeouts.list.as_millis()
+                        list_timeout.as_millis()
                     ));
                 }
                 Err(e) => {
@@ -901,6 +905,7 @@ mod tests {
     /// with a non-zero code (simulates a server that refuses to connect).
     fn failing_config() -> McpServerConfig {
         McpServerConfig::Command {
+            options: Default::default(),
             defer: Default::default(),
             command: if cfg!(windows) {
                 "cmd".to_string()

@@ -5525,6 +5525,7 @@ mod mcp_delta_tests {
             let path = state.join(file);
             crate::fs::private_atomic_create_sync(&path, original.as_bytes()).unwrap();
             let server = crate::extras::mcp::config::McpServerConfig::Url {
+                options: Default::default(),
                 url: "http://127.0.0.1:3000/mcp".into(),
                 defer: Default::default(),
                 allow_local: true,

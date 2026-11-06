@@ -137,6 +137,7 @@ pub(super) fn parse(text: &str) -> Result<Action, &'static str> {
             return Err("URL MCP servers do not take command arguments");
         }
         McpServerConfig::Url {
+            options: Default::default(),
             url: target,
             defer: Default::default(),
             allow_local: local,
@@ -148,6 +149,7 @@ pub(super) fn parse(text: &str) -> Result<Action, &'static str> {
             return Err("--allow-local applies only to URL MCP servers");
         }
         McpServerConfig::Command {
+            options: Default::default(),
             command: target,
             defer: Default::default(),
             args: positional[2..].to_vec(),

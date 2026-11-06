@@ -144,6 +144,21 @@ no product configuration, marker, journal, permission or fallback is changed.
 The four prior native experiments remain unchanged. The added control requires
 its own exact native Windows discovery/execution before any new kernel claim.
 
+## Per-server timeouts
+
+Command and URL server entries accept two optional timeout fields (seconds,
+clamped to 1..=3600). Built-in registrations use the defaults.
+
+| Field | Default | Bounds |
+| --- | --- | --- |
+| `startup_timeout_sec` | 10 s | Connect, OAuth restore/refresh and the `initialize` handshake. It also raises (never lowers) the server's `tools/list` budget, default 30 s. |
+| `tool_timeout_sec` | `mcp_tool_timeout_secs` (120 s) | One `tools/call` on this server. |
+
+```json
+{"mcp_servers": {"slow": {"command": "npx", "args": ["-y", "some-mcp"],
+  "startup_timeout_sec": 60, "tool_timeout_sec": 300}}}
+```
+
 ## Captured source checks at tool dispatch
 
 Each configured connection retains its captured workspace, selected server and

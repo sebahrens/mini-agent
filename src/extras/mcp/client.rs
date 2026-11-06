@@ -114,6 +114,8 @@ pub struct McpClientHandle {
     /// `notifications/tools/list_changed` subscription, re-listing on every
     /// agent rebuild could not observe anything this cache hides.
     pub(crate) tools: Arc<tokio::sync::OnceCell<Arc<ListedTools>>>,
+    /// Per-server options captured from the configuration that connected.
+    pub(crate) options: super::config::McpServerOptions,
 }
 
 /// Longest stdout line (one JSON-RPC message) accepted from a stdio MCP
@@ -374,7 +376,8 @@ impl McpClientHandle {
         config: &McpServerConfig,
         workspace: &std::path::Path,
     ) -> anyhow::Result<Self> {
-        Self::connect_with_timeout_in(server_name, config, MCP_INITIALIZE_TIMEOUT, workspace).await
+        let timeout = config.options().startup_timeout(MCP_INITIALIZE_TIMEOUT);
+        Self::connect_with_timeout_in(server_name, config, timeout, workspace).await
     }
 
     #[cfg(test)]
@@ -427,10 +430,11 @@ impl McpClientHandle {
         workspace: &Arc<crate::paths::WorkspaceBinding>,
         admission: &(dyn Fn() -> bool + Send + Sync),
     ) -> anyhow::Result<Self> {
+        let timeout = config.options().startup_timeout(MCP_INITIALIZE_TIMEOUT);
         Self::connect_bound_with_timeout_in(
             server_name,
             config,
-            MCP_INITIALIZE_TIMEOUT,
+            timeout,
             workspace.root(),
             Some(workspace),
             Some(admission),
@@ -562,6 +566,7 @@ impl McpClientHandle {
                     liveness: std::sync::Arc::new(()),
                     auxiliary: Arc::new(tokio::sync::OnceCell::new()),
                     tools: Arc::new(tokio::sync::OnceCell::new()),
+                    options: Default::default(),
                 })
             }
             McpServerConfig::Url {
@@ -605,6 +610,7 @@ impl McpClientHandle {
             }
         };
         let mut handle = result?;
+        handle.options = config.options();
         if validate().is_err() || crate::agent::runner::current_work_scope_is_cancelled() {
             // A completed handshake cannot confer authority after its retained
             // workspace changed. Join this exact candidate before rejecting it.
@@ -703,6 +709,7 @@ impl McpClientHandle {
             liveness: std::sync::Arc::new(()),
             auxiliary: Arc::new(tokio::sync::OnceCell::new()),
             tools: Arc::new(tokio::sync::OnceCell::new()),
+            options: Default::default(),
         })
     }
 
@@ -752,7 +759,9 @@ impl McpClientHandle {
     pub async fn cached_tools(&self) -> Result<Arc<ListedTools>, ServiceError> {
         let peer = self.running_service.peer();
         self.tools
-            .get_or_try_init(|| list_bounded_tools(peer, MCP_LIST_TOOLS_TIMEOUT))
+            .get_or_try_init(|| {
+                list_bounded_tools(peer, self.options.list_timeout(MCP_LIST_TOOLS_TIMEOUT))
+            })
             .await
             .cloned()
     }
