@@ -70,7 +70,6 @@ use crate::ui::event_handler::ensure_agent;
 use crate::ui::events::sanitize_output;
 use crate::ui::input::InputEditor;
 use crate::ui::renderer::Renderer;
-use crate::ui::slash::handle_compress;
 use crate::ui::state::{
     AgentRunState, BtwStats, ChainState, PendingMainTurn, SlashState, UiContext,
 };
@@ -1659,6 +1658,7 @@ pub(crate) fn mark_main_turn_started(
         session.add_message(MessageRole::User, pending_turn.prompt());
     }
     run.pending_turn = Some(pending_turn);
+    run.reactive_relief_used = false;
 }
 
 /// Records the common bookkeeping for a main turn only after its runner has
@@ -1777,6 +1777,31 @@ pub(crate) async fn mid_turn_compact_and_respawn(
     ui: &mut UiContext<'_>,
     slash: &SlashState,
 ) -> anyhow::Result<()> {
+    compact_and_respawn(Some(pressure), interactions, renderer, run, ui, slash).await
+}
+
+/// Reactive context relief (mini-agent-cj9oh): the provider rejected a request
+/// for exceeding its context window, so compact regardless of the local
+/// estimate (which may be wrong for an unknown window or a tokenizer mismatch)
+/// and resume the turn once. The caller bounds this to once per turn.
+pub(crate) async fn reactive_compact_and_respawn(
+    interactions: &[rig::message::Message],
+    renderer: &mut Renderer,
+    run: &mut AgentRunState,
+    ui: &mut UiContext<'_>,
+    slash: &SlashState,
+) -> anyhow::Result<()> {
+    compact_and_respawn(None, interactions, renderer, run, ui, slash).await
+}
+
+async fn compact_and_respawn(
+    pressure: Option<f64>,
+    interactions: &[rig::message::Message],
+    renderer: &mut Renderer,
+    run: &mut AgentRunState,
+    ui: &mut UiContext<'_>,
+    slash: &SlashState,
+) -> anyhow::Result<()> {
     // The runner sent the boundary event and returned voluntarily. Dropping
     // its handle is bookkeeping, not cancellation of a tool or provider call.
     // Retain the old slot through every fallible preparation step. The App
@@ -1817,17 +1842,32 @@ pub(crate) async fn mid_turn_compact_and_respawn(
     run.response_start_block = None;
     run.agent_line_started = false;
 
-    renderer.write_line(
-        &format!(
-            "mid-turn context relief, restarting (at {}%)...",
-            (pressure * 100.0).round() as u64
-        ),
-        Color::DarkGrey,
-    )?;
+    match pressure {
+        Some(pressure) => renderer.write_line(
+            &format!(
+                "mid-turn context relief, restarting (at {}%)...",
+                (pressure * 100.0).round() as u64
+            ),
+            Color::DarkGrey,
+        )?,
+        None => renderer.write_line(
+            "the provider rejected the prompt as too long; compacting and retrying once...",
+            Color::DarkGrey,
+        )?,
+    }
 
-    // 3. Compact the session (no-op if its text history is under the limit).
-    let compress_result =
-        handle_compress(None, true, run, renderer, ui, slash.reasoning_enabled).await;
+    // 3. Compact the session (no-op if its text history is under the limit;
+    // a provider rejection forces it past the local budget estimate).
+    let compress_result = crate::ui::slash::handle_compress_with_force(
+        None,
+        true,
+        pressure.is_none(),
+        run,
+        renderer,
+        ui,
+        slash.reasoning_enabled,
+    )
+    .await;
     if let Err(e) = compress_result {
         renderer.write_line(&format!("mid-turn compact error: {}", e), C_ERROR)?;
     }

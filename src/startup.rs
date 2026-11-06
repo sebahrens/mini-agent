@@ -833,6 +833,60 @@ async fn compact_headless_session_if_needed(
     .map(|(usage, _)| usage)
 }
 
+/// Background, once-per-process housekeeping for persisted sessions: retention
+/// pruning (`session_retention_days`) and, when `sweep_orphans` is set, the
+/// idle orphan tool-output sweep. Interactive startup always sweeps; headless
+/// (`-p`, `--loop`) and ACP runs call it only when retention is configured, so
+/// an unconfigured run never deletes anything (mini-agent-5gfko).
+pub(crate) fn spawn_session_housekeeping(
+    retention_days: Option<u32>,
+    sweep_orphans: bool,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        if let Some(days) = retention_days
+            && let Err(error) = crate::session::storage::prune_sessions_older_than(
+                days,
+                std::time::SystemTime::now(),
+            )
+        {
+            tracing::warn!("session retention skipped: {error:#}");
+        }
+        // Directories of deleted/never-saved sessions are not covered by
+        // retention; sweep those that have been idle for a long time.
+        if sweep_orphans
+            && let Err(error) = crate::session::storage::sweep_orphan_tool_outputs(
+                std::time::SystemTime::now(),
+                crate::session::storage::ORPHAN_TOOL_OUTPUT_GRACE,
+            )
+        {
+            tracing::warn!("orphan tool-output sweep skipped: {error:#}");
+        }
+    })
+}
+
+/// Housekeeping for non-interactive runs: only when `session_retention_days`
+/// is set and the run persists sessions.
+pub(crate) fn spawn_noninteractive_housekeeping(
+    cfg: &Config,
+    no_session: bool,
+) -> Option<std::thread::JoinHandle<()>> {
+    let days = cfg.session_retention_days.filter(|days| *days > 0)?;
+    (!no_session).then(|| spawn_session_housekeeping(Some(days), true))
+}
+
+/// Give a short-lived headless process a moment to finish housekeeping before
+/// it exits; never blocks longer than two seconds.
+async fn settle_housekeeping(handle: Option<std::thread::JoinHandle<()>>) {
+    let Some(handle) = handle else { return };
+    for _ in 0..100 {
+        if handle.is_finished() {
+            let _ = handle.join();
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 /// Compact the headless session; `force` is context relief (see
 /// [`headless_compaction_plan_with`]). Returns the summarizer usage (already
 /// charged to the session) and whether any history was compacted.
@@ -861,6 +915,11 @@ async fn compact_headless_session(
         None => spend,
     };
     let compaction_model = compaction_model.map(|(_, model)| model);
+    let budget_cap = cfg.compaction_budget_cap(
+        &session.provider,
+        compaction_model.as_deref(),
+        session.context_window,
+    );
     let observed = crate::spend::run::UsageObserver::with_run(spend.clone());
     let request_observer = observed.clone();
     let compacted = compact_headless_session_with_force(
@@ -877,6 +936,12 @@ async fn compact_headless_session(
             })
             .await;
             let model = compaction_model.unwrap_or(model);
+            let (input_token_budget, response_token_budget) =
+                crate::config::CompactionBudgetCap::apply(
+                    budget_cap,
+                    input_token_budget,
+                    response_token_budget,
+                );
             client
                 .compress_messages_observed_with_timeout(
                     &model,
@@ -1230,6 +1295,11 @@ impl Startup {
 
         let max_budget_usd = cli.resolve_max_budget_usd(&cfg)?;
         cfg.max_budget_usd = max_budget_usd;
+        if let Some(warning) =
+            crate::spend::service_tier_ceiling_warning(&cfg, &cli.resolve_model(&cfg))
+        {
+            eprintln!("warning: {warning}");
+        }
         validate_startup_permission_policy(&cli, &cfg)?;
 
         // Load context first so prompts/themes are available early. Root
@@ -2216,6 +2286,15 @@ impl Startup {
             }
             self.resume_override_pending = false;
         }
+        #[cfg(feature = "loop")]
+        let headless_run = self.cli.print || self.cli.loop_mode;
+        #[cfg(not(feature = "loop"))]
+        let headless_run = self.cli.print;
+        let housekeeping = if headless_run {
+            spawn_noninteractive_housekeeping(&self.cfg, self.cli.no_session)
+        } else {
+            None
+        };
         if self.cli.print {
             #[cfg(feature = "hooks")]
             if let Some(task) = self.session_start_task.take() {
@@ -2243,6 +2322,7 @@ impl Startup {
             } else {
                 heap_future(|| self.dispatch_print()).await
             };
+            settle_housekeeping(housekeeping).await;
             #[cfg(feature = "subagents")]
             self.session.close_background_tasks().await;
             // Every headless exit ends the session: a failed turn, a
@@ -3150,26 +3230,11 @@ impl Startup {
         if let Some(notice) = crate::update::headless_notice(&cli, &cfg, &paths.state_dir) {
             eprintln!("{notice}");
         }
-        let retention_days = cfg.session_retention_days.filter(|days| *days > 0);
         // The current session is already claimed, so it is never pruned.
-        std::thread::spawn(move || {
-            if let Some(days) = retention_days
-                && let Err(error) = crate::session::storage::prune_sessions_older_than(
-                    days,
-                    std::time::SystemTime::now(),
-                )
-            {
-                tracing::warn!("session retention skipped: {error:#}");
-            }
-            // Directories of deleted/never-saved sessions are not covered by
-            // retention; sweep those that have been idle for a long time.
-            if let Err(error) = crate::session::storage::sweep_orphan_tool_outputs(
-                std::time::SystemTime::now(),
-                crate::session::storage::ORPHAN_TOOL_OUTPUT_GRACE,
-            ) {
-                tracing::warn!("orphan tool-output sweep skipped: {error:#}");
-            }
-        });
+        drop(spawn_session_housekeeping(
+            cfg.session_retention_days.filter(|days| *days > 0),
+            true,
+        ));
         // Creating a context-file template is a filesystem setup action, not
         // permission to start an agent turn. Only an explicit CLI message may
         // auto-trigger interactive execution.

@@ -467,6 +467,30 @@ pub async fn handle_compress(
     ui: &mut UiContext<'_>,
     reasoning_enabled: bool,
 ) -> anyhow::Result<()> {
+    handle_compress_with_force(
+        instructions,
+        auto,
+        false,
+        run,
+        renderer,
+        ui,
+        reasoning_enabled,
+    )
+    .await
+}
+
+/// [`handle_compress`] with an optional `force` that skips the local budget
+/// estimate while keeping the automatic announcement and hook semantics. Used
+/// when the provider itself rejected the prompt as too long.
+pub async fn handle_compress_with_force(
+    instructions: Option<&str>,
+    auto: bool,
+    force: bool,
+    run: &mut AgentRunState,
+    renderer: &mut Renderer,
+    ui: &mut UiContext<'_>,
+    reasoning_enabled: bool,
+) -> anyhow::Result<()> {
     // Mirror the auto-compaction trigger's reserve exactly (including memory's
     // effective_reserve) so the budget gate here can never disagree with the
     // gate that decided to call us.
@@ -489,7 +513,7 @@ pub async fn handle_compress(
 
     let cut_idx = match plan_tui_compaction(
         ui.session,
-        auto,
+        auto && !force,
         max_tokens,
         keep_recent,
         keep_recent_tool_results,
@@ -539,6 +563,11 @@ pub async fn handle_compress(
         None => compaction_run,
     };
     let compaction_model = compaction_model.map(|(_, model)| model);
+    let budget_cap = ui.cfg.compaction_budget_cap(
+        &ui.session.provider,
+        compaction_model.as_deref(),
+        ui.session.context_window,
+    );
     let compaction_timeout = ui.cfg.resolve_compaction_timeout();
     let observed = crate::spend::run::UsageObserver::with_run(compaction_run);
     let request_observer = observed.clone();
@@ -556,6 +585,11 @@ pub async fn handle_compress(
         restore_read_tokens,
         |model, messages, previous_summary, input_budget, response_budget| async move {
             let model = compaction_model.unwrap_or(model);
+            let (input_budget, response_budget) = crate::config::CompactionBudgetCap::apply(
+                budget_cap,
+                input_budget,
+                response_budget,
+            );
             client
                 .compress_messages_observed_with_timeout(
                     &model,

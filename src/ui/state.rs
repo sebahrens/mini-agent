@@ -557,6 +557,10 @@ pub(crate) struct AgentRunState {
     pub was_reasoning: bool,
     pub turn_trace: Vec<compact_str::CompactString>,
     pub awaiting_compaction_relief: bool,
+    /// The one provider-rejection (context-length) compact-and-retry of the
+    /// current logical main turn has been spent (mini-agent-cj9oh). Reset when
+    /// a new main turn starts; a second rejection surfaces unchanged.
+    pub reactive_relief_used: bool,
     pub pending_compaction_pressure: Option<f64>,
     /// Facts accumulated for the goal round currently in flight. Present only
     /// while a goal is running; the gate consumes and clears it when the round

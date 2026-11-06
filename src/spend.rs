@@ -15,9 +15,11 @@ mod ledger;
 mod report;
 #[cfg(test)]
 mod request_tests;
-pub(crate) use report::cost_lines;
 #[cfg(test)]
 pub(crate) use report::long_context_label;
+pub(crate) use report::{
+    configured_service_tier, cost_lines, service_tier_ceiling_warning, service_tier_note,
+};
 pub(crate) mod run;
 pub(crate) use ledger::{Ledger, LedgerSummary};
 const MAX_PENDING_RECEIPTS: usize = 1024;

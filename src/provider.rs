@@ -467,32 +467,175 @@ pub(crate) fn merge_extra_body(
     }
 }
 
+/// Default Anthropic hosted-search `max_uses`.
+const DEFAULT_HOSTED_SEARCH_MAX_USES: u32 = 5;
+/// Upper bound accepted for `hosted-web-search-max-uses`.
+const MAX_HOSTED_SEARCH_MAX_USES: u32 = 50;
+
+/// Validated hosted-search domain filters and use cap.
+struct HostedSearchOptions {
+    allowed: Vec<String>,
+    blocked: Vec<String>,
+    max_uses: u32,
+}
+
+fn hosted_search_options(cfg: &Config) -> Result<HostedSearchOptions, String> {
+    use crate::agent::tools::web_search::normalized_domains;
+    let allowed = normalized_domains(
+        "hosted-web-search-allowed-domains",
+        cfg.hosted_web_search_allowed_domains.clone(),
+    )
+    .map_err(|e| e.to_string())?;
+    let blocked = normalized_domains(
+        "hosted-web-search-blocked-domains",
+        cfg.hosted_web_search_blocked_domains.clone(),
+    )
+    .map_err(|e| e.to_string())?;
+    if !allowed.is_empty() && !blocked.is_empty() {
+        return Err("hosted web search accepts allowed or blocked domains, not both".into());
+    }
+    let max_uses = cfg
+        .hosted_web_search_max_uses
+        .unwrap_or(DEFAULT_HOSTED_SEARCH_MAX_USES);
+    if !(1..=MAX_HOSTED_SEARCH_MAX_USES).contains(&max_uses) {
+        return Err(format!(
+            "hosted-web-search-max-uses must be between 1 and {MAX_HOSTED_SEARCH_MAX_USES}"
+        ));
+    }
+    Ok(HostedSearchOptions {
+        allowed,
+        blocked,
+        max_uses,
+    })
+}
+
 /// Hosted web-search tool definition for providers that run search
-/// server-side, or `None` where the provider has no supported bridge.
-fn hosted_web_search_tool(model: &AnyModel) -> Option<serde_json::Value> {
+/// server-side, or `None` where the provider has no supported bridge. Invalid
+/// filter configuration, or a block-list on a provider that cannot express one,
+/// withholds the tool (fail closed) with a warning rather than searching
+/// unfiltered.
+fn hosted_web_search_tool(model: &AnyModel, cfg: &Config) -> Option<serde_json::Value> {
+    if !matches!(
+        model,
+        AnyModel::Anthropic(_) | AnyModel::OpenAI(OpenAiModel::Responses(_))
+    ) {
+        return None;
+    }
+    let options = match hosted_search_options(cfg) {
+        Ok(options) => options,
+        Err(error) => {
+            tracing::warn!("hosted web search withheld: {error}");
+            return None;
+        }
+    };
     match model {
-        AnyModel::Anthropic(_) => Some(serde_json::json!({
-            "type": "web_search_20250305",
-            "name": "web_search",
-            "max_uses": 5
-        })),
+        AnyModel::Anthropic(_) => {
+            let mut tool = serde_json::json!({
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": options.max_uses
+            });
+            if !options.allowed.is_empty() {
+                tool["allowed_domains"] = options.allowed.into();
+            } else if !options.blocked.is_empty() {
+                tool["blocked_domains"] = options.blocked.into();
+            }
+            Some(tool)
+        }
         AnyModel::OpenAI(OpenAiModel::Responses(_)) => {
-            Some(serde_json::json!({"type": "web_search"}))
+            if !options.blocked.is_empty() {
+                tracing::warn!(
+                    "hosted web search withheld: OpenAI Responses web_search has no blocked-domain filter"
+                );
+                return None;
+            }
+            let mut tool = serde_json::json!({"type": "web_search"});
+            if !options.allowed.is_empty() {
+                tool["filters"] = serde_json::json!({"allowed_domains": options.allowed});
+            }
+            Some(tool)
         }
         _ => None,
     }
 }
 
-fn web_search_denied(cfg: &Config) -> bool {
-    cfg.permission_deny
+/// True when a `permission`/`permission-regex` value carries a `deny` for
+/// `web_search`: the plain string form (`web_search = "deny"`) or any granular
+/// map entry (`web_search = { "*" = "deny" }`). Provider-hosted search cannot
+/// evaluate per-URL patterns, so a partial deny is treated as a total one.
+fn permission_value_denies_web_search(value: &serde_json::Value) -> bool {
+    let Some(rule) = value.get("web_search") else {
+        return false;
+    };
+    let is_deny = |v: &serde_json::Value| {
+        v.as_str()
+            .is_some_and(|mode| mode.eq_ignore_ascii_case("deny"))
+    };
+    match rule {
+        serde_json::Value::Object(map) => map.values().any(is_deny),
+        other => is_deny(other),
+    }
+}
+
+/// True when the startup permission mode denies `web_search` by default
+/// (`readonly` and `planwrite` deny every non-read tool). Mirrors the mode
+/// precedence of `resolve_execution_authority`; runtime Shift+Tab switches are
+/// not re-evaluated because the hosted tool is attached when the agent is built.
+fn startup_mode_denies_web_search(cli: &Cli, cfg: &Config) -> bool {
+    if cli.yolo || cli.accept_all {
+        return false;
+    }
+    if cli.read_only {
+        return true;
+    }
+    if cli.guarded || cli.restrictive {
+        return false;
+    }
+    if cfg.yolo.unwrap_or(false)
+        || cfg.accept_all.unwrap_or(false)
+        || cfg.restrictive.unwrap_or(false)
+    {
+        return false;
+    }
+    cfg.default_permission_mode
+        .as_deref()
+        .is_some_and(|mode| matches!(mode, "readonly" | "planwrite"))
+}
+
+/// Whether any configured rule or startup mode denies `web_search`. Hosted
+/// search runs provider-side, so any deny shape (`permission-deny` key with or
+/// without patterns, string or granular `permission`/`permission-regex`, or a
+/// read-only/plan-write startup mode without an explicit web_search rule)
+/// withholds the hosted tool. An explicit `ask` does not: it matches the
+/// standard-mode default under which hosted search is already opt-in.
+fn web_search_denied(cli: &Cli, cfg: &Config) -> bool {
+    if cfg
+        .permission_deny
         .as_ref()
         .is_some_and(|rules| rules.contains_key("web_search"))
-        || cfg
-            .permission
-            .as_ref()
-            .and_then(|value| value.get("web_search"))
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|mode| mode.eq_ignore_ascii_case("deny"))
+    {
+        return true;
+    }
+    let sources = [cfg.permission.as_ref(), cfg.permission_regex.as_ref()];
+    if sources
+        .iter()
+        .flatten()
+        .any(|v| permission_value_denies_web_search(v))
+    {
+        return true;
+    }
+    let explicit_rule = sources
+        .iter()
+        .flatten()
+        .any(|v| v.get("web_search").is_some())
+        || [
+            &cfg.permission_allow,
+            &cfg.permission_allow_prefix,
+            &cfg.permission_ask,
+        ]
+        .iter()
+        .any(|m| m.as_ref().is_some_and(|m| m.contains_key("web_search")));
+    !explicit_rule && startup_mode_denies_web_search(cli, cfg)
 }
 
 /// Adds the provider-hosted web-search tool to the main agent's request
@@ -509,12 +652,12 @@ pub(crate) fn with_hosted_web_search(
 ) -> Option<serde_json::Value> {
     if !cfg.hosted_web_search.unwrap_or(false)
         || cfg.web_search_provider.as_deref() == Some("off")
-        || web_search_denied(cfg)
+        || web_search_denied(cli, cfg)
         || !cli.tool_is_eligible(cfg, "web_search")
     {
         return extra_body;
     }
-    let Some(tool) = hosted_web_search_tool(model) else {
+    let Some(tool) = hosted_web_search_tool(model, cfg) else {
         return extra_body;
     };
     let mut body = match extra_body {
@@ -1441,9 +1584,9 @@ fn default_compaction_request_timeout(input_token_budget: u64) -> Duration {
 ///
 /// `usage` is the raw sum of the provider reports, one per request. Callers
 /// normalize it once for the session's provider (`Config::normalize_usage`)
-/// and charge it at the session model's prices: compaction always runs on the
-/// session model, and up to `MAX_COMPACTION_REQUESTS` full-context requests
-/// are real spend.
+/// and charge it at the price profile of the model that ran them: the session
+/// model, or the configured `compaction_model`. Up to `MAX_COMPACTION_REQUESTS`
+/// full-context requests are real spend.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompactionOutput {
     pub summary: String,

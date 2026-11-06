@@ -73,6 +73,11 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
                     for line in lines {
                         write_result(ctx.renderer, line);
                     }
+                    if let Some(tier) =
+                        crate::spend::configured_service_tier(ctx.cfg, &ctx.session.model)
+                    {
+                        write_result(ctx.renderer, crate::spend::service_tier_note(&tier));
+                    }
                 }
                 Err(_) => write_error(
                     ctx.renderer,

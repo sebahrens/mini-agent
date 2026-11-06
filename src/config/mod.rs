@@ -609,6 +609,31 @@ pub struct Config {
         alias = "hosted_web_search"
     )]
     pub hosted_web_search: Option<bool>,
+    /// Domain allow-list for provider-hosted web search (Anthropic
+    /// `allowed_domains`, OpenAI Responses `filters.allowed_domains`). At most
+    /// 20 bare domains; not combinable with the block-list.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "hosted-web-search-allowed-domains",
+        alias = "hosted_web_search_allowed_domains"
+    )]
+    pub hosted_web_search_allowed_domains: Option<Vec<String>>,
+    /// Domain block-list for provider-hosted web search (Anthropic only; the
+    /// OpenAI Responses tool has no block filter, so hosted search is withheld
+    /// there rather than run unfiltered).
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "hosted-web-search-blocked-domains",
+        alias = "hosted_web_search_blocked_domains"
+    )]
+    pub hosted_web_search_blocked_domains: Option<Vec<String>>,
+    /// Anthropic hosted-search `max_uses` per request (1..=50, default 5).
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "hosted-web-search-max-uses",
+        alias = "hosted_web_search_max_uses"
+    )]
+    pub hosted_web_search_max_uses: Option<u32>,
     /// Total `web_fetch` deadline in seconds (DNS, approval, redirects and
     /// body). Default 30; clamped to 1..=300.
     #[serde(
@@ -1371,6 +1396,30 @@ impl Config {
         Some((alias.to_owned(), entry.model.to_string()))
     }
 
+    /// Budget cap for summarizer requests run on `compaction_model`. The
+    /// session-derived budgets assume the session model's window; a
+    /// cheaper/faster compaction model with a smaller window would receive
+    /// requests it cannot hold. Returns `None` when no cap applies (no
+    /// compaction model, or its window is not smaller than the session's).
+    pub fn compaction_budget_cap(
+        &self,
+        provider: &str,
+        compaction_model: Option<&str>,
+        session_window: u64,
+    ) -> Option<CompactionBudgetCap> {
+        let model = compaction_model?;
+        let qm = load::quick_models_map(self);
+        let window = self.resolve_context_window(provider, model, qm);
+        if window >= session_window {
+            return None;
+        }
+        let reserve = self.resolve_reserve_tokens(model, qm, window);
+        Some(CompactionBudgetCap {
+            max_input: window.saturating_sub(reserve),
+            max_response: reserve,
+        })
+    }
+
     /// Post-edit formatter timeout, clamped to 1-600 seconds.
     pub fn resolve_format_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.format_timeout_secs.unwrap_or(10).clamp(1, 600))
@@ -1900,6 +1949,24 @@ where
     crate::permission::permission_mode_cycle(configured.as_deref())
         .map_err(serde::de::Error::custom)?;
     Ok(configured)
+}
+
+/// Upper bounds on a summarizer request's input and response token budgets,
+/// derived from the compaction model's own context window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionBudgetCap {
+    pub max_input: u64,
+    pub max_response: u64,
+}
+
+impl CompactionBudgetCap {
+    /// Clamps `(input_budget, response_budget)` to this cap.
+    pub fn apply(cap: Option<Self>, input: u64, response: u64) -> (u64, u64) {
+        match cap {
+            Some(cap) => (input.min(cap.max_input), response.min(cap.max_response)),
+            None => (input, response),
+        }
+    }
 }
 
 /// `js-fetch-origins`: the string `"all"` (no origin narrowing), the string
@@ -2848,5 +2915,35 @@ mod agent_mention_tool_choice_tests {
         assert_eq!(cfg.resolve_compaction_model("anthropic"), None);
         let cfg: Config = toml::from_str("compaction_model = 'missing'").unwrap();
         assert_eq!(cfg.resolve_compaction_model("openai"), None);
+    }
+
+    #[test]
+    fn compaction_budget_cap_follows_the_compaction_models_own_window() {
+        let cfg: Config = toml::from_str(
+            "compaction_model = 'fast'
+             [quick_models.fast]
+provider = 'openai'
+model = 'small'
+context_window = 128000
+",
+        )
+        .unwrap();
+        let cap = cfg
+            .compaction_budget_cap("openai", Some("small"), 1_000_000)
+            .expect("smaller window caps the budgets");
+        assert_eq!(cap.max_input + cap.max_response, 128_000);
+        // Session budgets sized for 1M are cut to the 128k-token equivalent.
+        let (input, response) = super::CompactionBudgetCap::apply(Some(cap), 900_000, 100_000);
+        assert!(input + response <= 128_000);
+        assert!(
+            crate::provider::compaction_request_limits(input, response, 0).0 <= 128_000 * 13 / 4
+        );
+        // A window at least as large as the session's, or no model: untouched.
+        assert_eq!(
+            cfg.compaction_budget_cap("openai", Some("small"), 100_000),
+            None
+        );
+        assert_eq!(cfg.compaction_budget_cap("openai", None, 1_000_000), None);
+        assert_eq!(super::CompactionBudgetCap::apply(None, 7, 3), (7, 3));
     }
 }
