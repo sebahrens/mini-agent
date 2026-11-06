@@ -342,6 +342,9 @@ impl ControlState {
                 crate::permission::SecurityMode::NAMES.join(", ")
             )
         })?;
+        if let Some(refusal) = crate::config::managed::mode_violation(mode) {
+            return Err(refusal);
+        }
         let permission = self.permission.lock().unwrap_or_else(|e| e.into_inner());
         let Some(permission) = permission.as_ref() else {
             return Err("this run has no permission checker".into());

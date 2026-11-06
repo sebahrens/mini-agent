@@ -32,8 +32,8 @@ mod output_capture;
 #[cfg(unix)]
 pub(crate) mod pty;
 pub(crate) use output_capture::{
-    OutputChannel, OutputTranscript, OutputWindow, SHELL_HARD_OUTPUT_BYTES, SpoolPolicy,
-    TranscriptPart,
+    OutputChannel, OutputLog, OutputTranscript, OutputWindow, SHELL_HARD_OUTPUT_BYTES, SpoolPolicy,
+    TranscriptPart, write_private_log,
 };
 mod git_metadata;
 mod read_roots;
@@ -5131,10 +5131,58 @@ impl Sandbox {
             .await
     }
 
+    /// Offset where the next un-offset read of `id` would start.
+    pub(crate) fn background_job_cursor(&self, id: &str) -> Result<u64, String> {
+        validate_background_job_id(id)?;
+        let jobs = self
+            .background_jobs
+            .jobs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        Ok(jobs
+            .get(id)
+            .ok_or_else(|| self.missing_background_job(id))?
+            .delivered)
+    }
+
+    /// Read output of `id` from `from` without moving the delivery cursor.
+    pub(crate) fn peek_background_job_window(
+        &self,
+        id: &str,
+        from: u64,
+        max: usize,
+    ) -> Result<OutputWindow, String> {
+        validate_background_job_id(id)?;
+        let jobs = self
+            .background_jobs
+            .jobs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        Ok(jobs
+            .get(id)
+            .ok_or_else(|| self.missing_background_job(id))?
+            .capture
+            .read_window(from, max))
+    }
+
     pub(crate) async fn wait_background_job(
         &self,
         id: &str,
         wait: std::time::Duration,
+    ) -> Result<BackgroundJobSnapshot, String> {
+        self.wait_background_job_until(id, wait, None, || false)
+            .await
+    }
+
+    /// [`Self::wait_background_job`] that also returns as soon as `done()` is
+    /// true. Output does not notify waiters (only job end does), so `done` is
+    /// re-run every `poll` (when given) as well as on each notification.
+    pub(crate) async fn wait_background_job_until(
+        &self,
+        id: &str,
+        wait: std::time::Duration,
+        poll: Option<std::time::Duration>,
+        mut done: impl FnMut() -> bool,
     ) -> Result<BackgroundJobSnapshot, String> {
         validate_background_job_id(id)?;
         let changed = {
@@ -5158,11 +5206,15 @@ impl Sandbox {
             tokio::pin!(notified);
             notified.as_mut().enable();
             let snapshot = self.background_job_snapshot(id)?;
-            if snapshot.status.is_terminal() {
+            if snapshot.status.is_terminal() || done() {
                 return Ok(snapshot);
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() || tokio::time::timeout(remaining, notified).await.is_err() {
+            if remaining.is_zero() {
+                return self.background_job_snapshot(id);
+            }
+            let slice = poll.map_or(remaining, |poll| remaining.min(poll));
+            if tokio::time::timeout(slice, notified).await.is_err() && poll.is_none() {
                 return self.background_job_snapshot(id);
             }
         }
@@ -7201,8 +7253,29 @@ fn essential_env() -> Vec<(&'static str, String)> {
             vars.push((*name, val));
         }
     }
+    vars.extend(
+        NONINTERACTIVE_ENV
+            .iter()
+            .map(|(name, value)| (*name, (*value).to_string())),
+    );
+    if !vars.iter().any(|(name, _)| *name == "TERM") {
+        vars.push(("TERM", "dumb".to_string()));
+    }
     vars
 }
+
+/// Fixed defaults so a model-authored command never waits for a human: no
+/// pager, no credential prompt, and a no-op commit/rebase editor. An operator
+/// overrides any of them with `shell-env`/`shell-inherit-env`, which layer
+/// after this allowlist. A user-set `TERM` is kept; `dumb` only fills a gap.
+const NONINTERACTIVE_ENV: &[(&str, &str)] = &[
+    ("PAGER", "cat"),
+    ("GIT_PAGER", "cat"),
+    ("GH_PAGER", "cat"),
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("GIT_EDITOR", ":"),
+    ("GIT_SEQUENCE_EDITOR", ":"),
+];
 
 /// Resolver, host and CA files bound read-only into the workspace profile
 /// when `sandbox-network = "allow"`.
@@ -12445,6 +12518,41 @@ echo PRIVATE_TEMP_PASS"#,
                 "zerobox command restored non-allow-listed variable {key:?}"
             );
         }
+    }
+
+    #[test]
+    fn model_shell_environment_is_non_interactive_unless_the_operator_overrides_it() {
+        let sandbox = Sandbox::new(false, "none");
+        let base: std::collections::BTreeMap<_, _> = sandbox
+            .get_essential_env()
+            .iter()
+            .map(|(key, value)| (*key, value.as_str()))
+            .collect();
+        for (key, value) in [
+            ("PAGER", "cat"),
+            ("GIT_PAGER", "cat"),
+            ("GH_PAGER", "cat"),
+            ("GIT_TERMINAL_PROMPT", "0"),
+            ("GIT_EDITOR", ":"),
+        ] {
+            assert_eq!(base.get(key), Some(&value), "{key}");
+        }
+        assert!(base.contains_key("TERM"));
+        let overridden = Sandbox::new(false, "none").with_shell_env(ShellEnvPolicy {
+            set: [("GIT_PAGER".to_string(), "less".to_string())].into(),
+            ..ShellEnvPolicy::default()
+        });
+        let command = overridden.wrap_command("true").unwrap();
+        let value = |name: &str| {
+            command
+                .as_std()
+                .get_envs()
+                .filter(|(key, _)| *key == std::ffi::OsStr::new(name))
+                .last()
+                .and_then(|(_, value)| value.map(|value| value.to_string_lossy().into_owned()))
+        };
+        assert_eq!(value("GIT_PAGER").as_deref(), Some("less"));
+        assert_eq!(value("PAGER").as_deref(), Some("cat"));
     }
 
     /// `shell-inherit-env` / `shell-env` reach shell commands on every spawn

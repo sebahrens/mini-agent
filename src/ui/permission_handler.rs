@@ -26,6 +26,8 @@ enum PromptInput {
     /// Only native write/edit under the captured workspace, for this session.
     AllowWorkspaceEdits,
     Deny,
+    /// `t`: deny once and tell the model what to do differently (one line).
+    DenyWithNote,
     /// Esc / Ctrl+C / Ctrl+D: deny and stop the current run.
     Abort,
     StopWithInstruction,
@@ -40,10 +42,10 @@ enum PromptInput {
 fn permission_options(folder: Option<&std::path::Path>) -> String {
     match folder {
         Some(folder) => format!(
-            "  (y) allow once  (a) allow for this session  (f) allow read+edit+list in {} for this session  (n) deny once  (s) deny and stop with instruction  (ESC) deny and stop",
+            "  (y) allow once  (a) allow for this session  (f) allow read+edit+list in {} for this session  (n) deny once  (t) deny and tell the model why  (s) deny and stop with instruction  (ESC) deny and stop",
             folder.display()
         ),
-        None => "  (y) allow once  (a) allow for this session  (n) deny once  (s) deny and stop with instruction  (ESC) deny and stop".to_string(),
+        None => "  (y) allow once  (a) allow for this session  (n) deny once  (t) deny and tell the model why  (s) deny and stop with instruction  (ESC) deny and stop".to_string(),
     }
 }
 
@@ -75,6 +77,7 @@ fn classify_prompt_key(key: KeyEvent) -> PromptInput {
         KeyCode::Char('f' | 'F') if plain => PromptInput::AllowFolder,
         KeyCode::Char('w' | 'W') if plain => PromptInput::AllowWorkspaceEdits,
         KeyCode::Char('n' | 'N') if plain => PromptInput::Deny,
+        KeyCode::Char('t' | 'T') if plain => PromptInput::DenyWithNote,
         KeyCode::Char('s' | 'S') if plain => PromptInput::StopWithInstruction,
         KeyCode::Char('e' | 'E') if plain => PromptInput::ToggleFull,
         KeyCode::Esc => PromptInput::Abort,
@@ -163,6 +166,8 @@ pub(crate) struct PermissionState {
     project: Option<std::path::PathBuf>,
     was_at_bottom: bool,
     instruction: Option<String>,
+    /// Draft of a deny note while the user is typing one for this request.
+    note: Option<String>,
 }
 
 pub(crate) enum PermissionEvent {
@@ -224,6 +229,7 @@ impl PermissionState {
                 .then(|| ui.workspace.root().to_path_buf()),
             was_at_bottom: !renderer.is_scrolling(),
             instruction: None,
+            note: None,
         };
         state.show(renderer)?;
         renderer.set_activity(crate::ui::terminal::AgentActivity::WaitingForApproval)?;
@@ -243,6 +249,7 @@ impl PermissionState {
             project: None,
             was_at_bottom: !renderer.is_scrolling(),
             instruction: Some(String::new()),
+            note: None,
         };
         state.show_instruction(renderer)?;
         Ok(state)
@@ -345,6 +352,23 @@ impl PermissionState {
         Ok(())
     }
 
+    fn show_note(&self, renderer: &mut Renderer) -> anyhow::Result<()> {
+        let request = self.request.as_ref().expect("approval owns its request");
+        renderer.permission_prompt = Some(super::renderer::PermissionPrompt {
+            tool: format!(
+                "[permission] {}: {} - note for the model: {}",
+                request.tool,
+                sanitize_for_review(&request.input),
+                sanitize_for_review(self.note.as_deref().unwrap_or_default())
+            )
+            .into(),
+            options: "[Enter] deny and send the note to the model  [Esc] back to the prompt".into(),
+            expanded: false,
+        });
+        draw_prompt(renderer)?;
+        Ok(())
+    }
+
     fn show_instruction(&self, renderer: &mut Renderer) -> anyhow::Result<()> {
         renderer.permission_prompt = Some(super::renderer::PermissionPrompt {
             tool: format!(
@@ -377,6 +401,62 @@ impl PermissionState {
             renderer.resize();
             renderer.invalidate();
             draw_prompt(renderer)?;
+            return Ok(PermissionEvent::Waiting);
+        }
+        if let Some(note) = self.note.as_mut() {
+            match event {
+                UserEvent::Key(key) => match key.code {
+                    KeyCode::Enter => {
+                        let decision = UserDecision::deny_with_reason(note);
+                        let mut shown = None;
+                        if let Some(request) = self.request.take() {
+                            let line = (request.tool.to_string(), request.input.clone());
+                            if request.reply.send(decision).is_ok() {
+                                shown = Some(line);
+                            }
+                        }
+                        self.note = None;
+                        self.finish(renderer)?;
+                        if let Some((tool, input)) = shown {
+                            note_decision(renderer, &tool, &input, "denied")?;
+                        }
+                        return Ok(PermissionEvent::Finished);
+                    }
+                    KeyCode::Esc => {
+                        self.note = None;
+                        self.show(renderer)?;
+                        return Ok(PermissionEvent::Waiting);
+                    }
+                    _ if classify_prompt_key(*key) == PromptInput::Abort
+                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        // Ctrl+C / Ctrl+D still abort the run.
+                        self.note = None;
+                        if let Some(request) = self.request.take() {
+                            let _ = request.reply.send(UserDecision::Deny);
+                        }
+                        self.finish(renderer)?;
+                        return Ok(PermissionEvent::Stop { instruction: false });
+                    }
+                    KeyCode::Backspace => {
+                        note.pop();
+                    }
+                    KeyCode::Char(character)
+                        if !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                            && !character.is_control() =>
+                    {
+                        note.push(character)
+                    }
+                    _ => {}
+                },
+                UserEvent::Paste(text) => {
+                    note.extend(text.chars().filter(|character| !character.is_control()));
+                }
+                _ => return Ok(PermissionEvent::Unhandled),
+            }
+            self.show_note(renderer)?;
             return Ok(PermissionEvent::Waiting);
         }
         if let Some(instruction) = self.instruction.as_mut() {
@@ -444,6 +524,13 @@ impl PermissionState {
                         | PromptInput::AllowProject
                 ))
         {
+            return Ok(PermissionEvent::Waiting);
+        }
+        if input == PromptInput::DenyWithNote {
+            if self.offer.is_none() && self.request.is_some() {
+                self.note = Some(String::new());
+                self.show_note(renderer)?;
+            }
             return Ok(PermissionEvent::Waiting);
         }
         if input == PromptInput::AllowWorkspaceEdits {
@@ -800,6 +887,19 @@ mod tests {
             decision_line("edit", "f.rs", "denied"),
             "✗ denied edit: f.rs"
         );
+    }
+
+    #[test]
+    fn deny_with_note_has_an_explicit_key_and_is_advertised() {
+        assert_eq!(
+            classify_prompt_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE)),
+            PromptInput::DenyWithNote
+        );
+        assert_eq!(
+            classify_prompt_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)),
+            PromptInput::Ignore
+        );
+        assert!(permission_options(None).contains("(t) deny and tell the model why"));
     }
 
     #[test]

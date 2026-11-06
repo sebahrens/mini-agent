@@ -92,6 +92,19 @@ pub fn builtin_servers() -> Vec<(&'static str, LspServerConfig)> {
             ),
         ),
         ("lua", server("lua-language-server", &[], &[".lua"])),
+        ("java", server("jdtls", &[], &[".java"])),
+        ("csharp", server("csharp-ls", &[], &[".cs"])),
+        (
+            "ruby",
+            server("ruby-lsp", &[], &[".rb", ".rake", ".gemspec"]),
+        ),
+        ("php", server("intelephense", &["--stdio"], &[".php"])),
+        (
+            "kotlin",
+            server("kotlin-language-server", &[], &[".kt", ".kts"]),
+        ),
+        ("swift", server("sourcekit-lsp", &[], &[".swift"])),
+        ("zig", server("zls", &[], &[".zig"])),
     ]
 }
 
@@ -157,6 +170,51 @@ pub fn server_for_path<'a>(
     servers
         .iter()
         .find(|(_, cfg)| cfg.extensions.iter().any(|e| e.as_str() == dot_ext))
+}
+
+#[cfg(test)]
+mod language_coverage_tests {
+    use super::*;
+
+    #[test]
+    fn builtins_cover_jvm_dotnet_ruby_php_kotlin_swift_and_zig() {
+        let servers = resolve_servers(&HashMap::new());
+        for (file, expected) in [
+            ("A.java", "jdtls"),
+            ("a.cs", "csharp-ls"),
+            ("a.rb", "ruby-lsp"),
+            ("Rakefile.rake", "ruby-lsp"),
+            ("x.gemspec", "ruby-lsp"),
+            ("a.php", "intelephense"),
+            ("a.kt", "kotlin-language-server"),
+            ("build.gradle.kts", "kotlin-language-server"),
+            ("a.swift", "sourcekit-lsp"),
+            ("a.zig", "zls"),
+            ("a.rs", "rust-analyzer"),
+        ] {
+            let (_, server) = server_for_path(&servers, std::path::Path::new(file))
+                .unwrap_or_else(|| panic!("no server for {file}"));
+            assert_eq!(server.command, expected, "{file}");
+        }
+    }
+
+    #[test]
+    fn new_builtins_are_inactive_without_their_binary_and_can_be_disabled() {
+        let empty = std::ffi::OsString::new();
+        let none = available_servers(&HashMap::new(), Some(empty.as_os_str()));
+        for name in ["java", "csharp", "ruby", "php", "kotlin", "swift", "zig"] {
+            assert!(none.iter().all(|(n, _)| n != name), "{name} needs PATH");
+        }
+        let mut user = HashMap::new();
+        user.insert(
+            "zig".to_string(),
+            LspServerConfig {
+                disabled: true,
+                ..Default::default()
+            },
+        );
+        assert!(server_for_path(&resolve_servers(&user), std::path::Path::new("a.zig")).is_none());
+    }
 }
 
 #[cfg(test)]

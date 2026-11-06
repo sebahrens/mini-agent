@@ -532,6 +532,10 @@ fn parse_permission_mode(value: &str) -> Option<(SecurityMode, &'static str)> {
 }
 
 fn set_permission_mode(ctx: &mut SlashCtx<'_>, mode: SecurityMode, label: &str) {
+    if let Some(refusal) = crate::config::managed::mode_violation(mode) {
+        write_error(ctx.renderer, refusal);
+        return;
+    }
     if let Some(permission) = ctx.permission {
         permission
             .lock()
@@ -572,6 +576,10 @@ pub(crate) fn parse_mode_arg(arg: &str) -> Option<SecurityMode> {
 }
 
 async fn set_mode(ctx: &mut SlashCtx<'_>, mode: SecurityMode) {
+    if let Some(refusal) = crate::config::managed::mode_violation(mode) {
+        write_error(ctx.renderer, refusal);
+        return;
+    }
     if let Some(p) = ctx.permission {
         p.lock().unwrap_or_else(|e| e.into_inner()).set_mode(mode);
         write_ok(ctx.renderer, format!("security mode: {mode}"));

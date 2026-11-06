@@ -464,6 +464,12 @@ fn create_private_log(path: &Path) -> std::io::Result<std::fs::File> {
     crate::fs::open_private_file_checked(path, crate::fs::PrivateFileAccess::Append)
 }
 
+/// Write `bytes` as a new private log file at `path`.
+pub(crate) fn write_private_log(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = create_private_log(path)?;
+    file.write_all(bytes)
+}
+
 /// Read up to `max` bytes of a private log starting at `offset`.
 pub(crate) fn read_log_range(path: &Path, offset: u64, max: usize) -> std::io::Result<Vec<u8>> {
     let mut file = crate::fs::open_private_file_checked(path, crate::fs::PrivateFileAccess::Read)?;

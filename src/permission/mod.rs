@@ -171,6 +171,8 @@ pub(crate) enum ExecutionAuthorityError {
         "`sandbox-required = true` is set in the user configuration, so {conflict} is refused (remove the setting from the global config to run unsandboxed)"
     )]
     SandboxRequired { conflict: &'static str },
+    #[error("{0}")]
+    ManagedPolicy(String),
     #[error(
         "`permission-checks-required = true` is set in the user configuration, so --dangerously-skip-permissions is refused (remove the setting from the global config to bypass permission checks)"
     )]
@@ -183,6 +185,25 @@ pub(crate) enum ExecutionAuthorityError {
 /// and both startup and ACP consume the same value. Approval-channel wiring
 /// intentionally remains frontend-specific.
 pub(crate) fn resolve_execution_authority(
+    cli: &crate::cli::Cli,
+    cfg: &crate::config::Config,
+    sandbox_policy: crate::sandbox::SandboxPolicy,
+    sandbox_backend: &str,
+) -> Result<ResolvedExecutionAuthority, ExecutionAuthorityError> {
+    resolve_execution_authority_under(
+        crate::config::managed::active(),
+        cli,
+        cfg,
+        sandbox_policy,
+        sandbox_backend,
+    )
+}
+
+/// [`resolve_execution_authority`] under an explicit administrator policy.
+/// The managed layer is checked first so its refusals name the managed file
+/// instead of a user-configuration setting.
+pub(crate) fn resolve_execution_authority_under(
+    managed: Option<&crate::config::managed::ManagedPolicy>,
     cli: &crate::cli::Cli,
     cfg: &crate::config::Config,
     sandbox_policy: crate::sandbox::SandboxPolicy,
@@ -206,25 +227,59 @@ pub(crate) fn resolve_execution_authority(
         })?,
     };
 
-    let mode = if cli.yolo {
-        SecurityMode::Yolo
+    let (mode, mode_source) = if cli.yolo {
+        (SecurityMode::Yolo, "--yolo")
     } else if cli.accept_all {
-        SecurityMode::Standard
+        (SecurityMode::Standard, "--accept-all")
     } else if cli.read_only {
-        SecurityMode::ReadOnly
+        (SecurityMode::ReadOnly, "--read-only")
     } else if cli.guarded {
-        SecurityMode::Guarded
+        (SecurityMode::Guarded, "--guarded")
     } else if cli.restrictive {
-        SecurityMode::Restrictive
+        (SecurityMode::Restrictive, "--restrictive")
     } else if cfg.yolo.unwrap_or(false) {
-        SecurityMode::Yolo
+        (SecurityMode::Yolo, "`yolo = true`")
     } else if cfg.accept_all.unwrap_or(false) {
-        SecurityMode::Standard
+        (SecurityMode::Standard, "`accept_all = true`")
     } else if cfg.restrictive.unwrap_or(false) {
-        SecurityMode::Restrictive
+        (SecurityMode::Restrictive, "`restrictive = true`")
     } else {
-        configured_default
+        (configured_default, "`default_permission_mode`")
     };
+
+    if let Some(policy) = managed {
+        if policy.mode_violation(mode).is_some() {
+            return Err(ExecutionAuthorityError::ManagedPolicy(policy.refusal(
+                &format!(
+                    "{mode_source} (security mode `{mode}`; permitted: {})",
+                    policy
+                        .permitted_modes()
+                        .iter()
+                        .map(|mode| mode.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            )));
+        }
+        if policy.permission_checks_required() && cli.dangerously_skip_permissions {
+            return Err(ExecutionAuthorityError::ManagedPolicy(
+                policy.refusal("--dangerously-skip-permissions"),
+            ));
+        }
+        if policy.sandbox_required() && !cli.resolve_sandbox(cfg) {
+            return Err(ExecutionAuthorityError::ManagedPolicy(policy.refusal(
+                if cli.no_sandbox {
+                    "--no-sandbox"
+                } else {
+                    "`sandbox = false`"
+                },
+            )));
+        }
+        let (provider, _) = cli.resolve_provider_and_model(cfg);
+        policy
+            .check_provider(&provider)
+            .map_err(ExecutionAuthorityError::ManagedPolicy)?;
+    }
 
     // User-global opt-in guards: a flag may tighten a session but never
     // remove a protection the user made mandatory.
@@ -601,11 +656,11 @@ pub(crate) fn permission_mode_cycle(
     configured: Option<&[String]>,
 ) -> Result<Vec<SecurityMode>, String> {
     let Some(names) = configured else {
-        return Ok(vec![
+        return Ok(managed_cycle(vec![
             SecurityMode::Standard,
             SecurityMode::Guarded,
             SecurityMode::Yolo,
-        ]);
+        ]));
     };
     if names.is_empty() || names.len() > SecurityMode::NAMES.len() {
         return Err(
@@ -627,7 +682,25 @@ pub(crate) fn permission_mode_cycle(
         }
         modes.push(mode);
     }
-    Ok(modes)
+    Ok(managed_cycle(modes))
+}
+
+/// Drop modes the administrator's managed policy forbids from the shortcut
+/// ring. A ring emptied by the policy falls back to the least privileged
+/// permitted mode.
+fn managed_cycle(modes: Vec<SecurityMode>) -> Vec<SecurityMode> {
+    let Some(policy) = crate::config::managed::active() else {
+        return modes;
+    };
+    let kept: Vec<SecurityMode> = modes
+        .into_iter()
+        .filter(|mode| policy.mode_allowed(*mode))
+        .collect();
+    if kept.is_empty() {
+        vec![policy.clamp_mode(SecurityMode::ReadOnly)]
+    } else {
+        kept
+    }
 }
 
 impl SecurityMode {

@@ -836,7 +836,7 @@ Accepted top-level keys:
 | `shell-job-notifications` | boolean | Notify the model when a background shell job ends on its own: a bounded notice (job id, command, status, exit code, output tail as fenced untrusted text, log path) is appended once to the next `shell`/`job_status` result and injected into the next model request, and an idle TUI session is woken with a short prompt (at most 8 wakes in a row without a user turn). Jobs the model or user stopped, or already read to their end with `job_status`, send nothing. Default: `true`; `false` disables notices and wakes. |
 | `shell-allow-escalation` | boolean | Offer the `shell` parameters `escalate` and `justification`, so a command the sandbox blocks (network, a write outside the roots, docker) can be retried **once, without the sandbox**, after the user approves it. Default: `false`: the parameters are not in the tool schema and a call that sends them is refused. When on, every escalation shows a dedicated prompt (reason and command) in every permission mode, including `yolo` and under allow-all rules; configured `deny` rules still win and no prompt is shown for them; an always-allow answer is treated as allow-once and is never stored; a non-interactive run (no one to ask) refuses, unless `-p --input-format stream-json --output stream-json --stream-json-control` is on, where the driver is asked (`sandbox_escalation`, once-only); the approved use is written to the `mini_agent::audit::sandbox_escalation` log target. The command runs with the same cleared environment (`shell-inherit-env` applies) in the workspace, and only that command is uncontained; later commands stay sandboxed. Ignored when `sandbox-required = true` or the sandbox is already off. Security-sensitive: a project-local value needs project-config trust. |
 | `shell-inherit-env` | array | Names (or `*` globs such as `NVM_*`) of variables copied from the parent process into contained shell commands (`shell`, background jobs, pty, `!`, validation commands and post-edit formatters), layered after the fixed allowlist (`PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `LANG`, `LC_ALL`, `COLORTERM`, `NO_COLOR`, `TMPDIR` and Windows basics). Default: empty, so the shell sees only the allowlist. Example: `["HTTPS_PROXY", "SSL_CERT_FILE", "JAVA_HOME", "NVM_DIR", "VIRTUAL_ENV"]`. Credential-looking names (`*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*PASSWORD*`, `*_KEY`, `*_PAT`, ...) are a config error as exact names and are silently skipped when matched by a glob, unless the global-only `shell-env-allow-secrets` is `true`. Loader and shell-startup variables (`LD_*`, `DYLD_*`, `BASH_ENV`, `ENV`, `PROMPT_COMMAND`, `SHELLOPTS`, `BASHOPTS`, `PS4`, `IFS`, `BASH_FUNC_*`) are always refused. At most 64 entries. Hooks, workspace services and MCP/LSP launch (which have their own `inherit_env`) are unaffected; the Windows AppContainer helper does not honour it. Security-sensitive: a project-local value applies only after content-bound project-config trust. `/sandbox` and `--print-config` show the names (never values). |
-| `shell-env` | object | Literal `NAME = "value"` variables set for contained shell commands after `shell-inherit-env` (a literal wins). Same name rules and limits as `shell-inherit-env` (values at most 8 KiB, no NUL). Default: empty. Security-sensitive: a project-local value needs project-config trust. |
+| `shell-env` | object | Literal `NAME = "value"` variables set for contained shell commands after `shell-inherit-env` (a literal wins). Same name rules and limits as `shell-inherit-env` (values at most 8 KiB, no NUL). Default: empty. Model-authored commands always start with non-interactive defaults so they never wait on a pager or editor: `PAGER=cat`, `GIT_PAGER=cat`, `GH_PAGER=cat`, `GIT_TERMINAL_PROMPT=0`, `GIT_EDITOR=:`, `GIT_SEQUENCE_EDITOR=:`, and `TERM=dumb` only when the parent has no `TERM`; set the same name here (or inherit it) to override one. Security-sensitive: a project-local value needs project-config trust. |
 | `shell-env-allow-secrets` | boolean | Global-only (ignored in project config). Permit credential-looking names such as `GH_TOKEN` or `OPENAI_API_KEY` in `shell-inherit-env` and `shell-env`, and let globs match them. Loader-injection names stay refused. Default: `false`. |
 | `sandbox-network-hosts` | array | Hosts contained shell commands may reach when `sandbox-network = "allowlist"`: `registry.npmjs.org` (exact), `*.github.com` (subdomains only, not `github.com` itself), each optionally with `:port` (default ports are 80 and 443). At most 128 entries; schemes, paths, IPv6 and other wildcards are config errors. Default: empty. In `allowlist` mode the Seatbelt profile denies all network except outbound connections to a per-process loopback proxy, and the command environment sets `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` (and lowercase forms) to it with a random per-process credential. The proxy forwards HTTPS `CONNECT` tunnels and plain `http://` requests only to listed hosts, hosts approved earlier in the session, or hosts you approve at a prompt (`sandbox_network`, `host:port`; an always-allow answer lasts for the session only and is not written to config; headless runs and the absence of a prompt channel refuse, except under `--stream-json-control`, where the driver answers the `sandbox_network` ask: one ask per `host:port` at a time, shared by the connections waiting on it; a plain allow covers only those, a reply with `"scope":"run"` is remembered for the rest of the run, and a deny is remembered for 30 seconds). It resolves names itself and never connects to loopback, private, link-local, carrier-grade NAT, benchmarking (`198.18.0.0/15`), multicast or reserved addresses, nor to IPv6 NAT64 (`64:ff9b::/96`, `64:ff9b:1::/48`), 6to4, Teredo or IPv4-compatible addresses that embed one, so a listed name cannot reach the machine, the LAN or a metadata service. Traffic is not inspected: a tool that ignores the proxy variables or uses raw sockets, SSH or UDP simply fails, because the sandbox denies it. Enforced on macOS (Seatbelt) and Linux (`bwrap`). On Linux the command keeps its empty network namespace (`--unshare-net`); the proxy also listens on a private 0700 Unix socket that is bind-mounted into the namespace, and mini-agent re-runs itself inside the namespace as a small forwarder (`mini-agent __mini-agent-net-forwarder SOCKET PORT -- COMMAND`) that relays `127.0.0.1:3128` to that socket and then `exec`s the command, so the proxy variables point at `127.0.0.1:3128`. The forwarder only moves bytes; host filtering, prompting and the credential check stay in the host proxy, and the namespace has no other route out. zerobox and Windows AppContainer keep the network denied, and `/sandbox` says so. Windows blocker: the AppContainer has zero capabilities, so Winsock denies every `connect`/`bind`/`listen` on AF_INET/AF_INET6, including loopback to its own process; an inherited pipe or brokered named pipe could carry bytes to the host proxy, but ordinary tools (npm, pip, git, cargo) only speak TCP to `HTTP_PROXY`, so a relay they can reach needs a TCP socket inside the container, i.e. an `internetClient`/`privateNetworkClientServer` capability or a loopback exemption, which are exactly what the zero-capability and no-loopback-exemption attestations (`current_token_has_zero_capabilities`, `appcontainer_has_no_loopback_exemption`) forbid. AF_UNIX relays work without a capability but are only usable by tools with unix-socket proxy support (essentially curl), so they are not offered as a partial feature. Hooks, workspace services and JS `spawn` are unaffected. Security-sensitive: a project-local value (and `sandbox-network = "allowlist"`) needs project-config trust. |
 | `sandbox-home-masks` | array | Extra HOME-relative dot paths hidden in every profile, added to the built-in masks (which cannot be removed). Same syntax rules as `sandbox-home-mounts`, without `:rw`. Project layers may set this without approval because they can only add masks: a project list is merged with, never replaces, inherited masks. On Windows AppContainer, which exposes nothing from HOME except explicit roots, a mask is honoured when no AppContainer root equals, contains or lies inside it; otherwise the sandbox is unavailable rather than silently wider. Restart required. |
@@ -1110,6 +1110,54 @@ If the file is missing, empty, or whitespace-only, nothing is appended.
 Use cases: inject persistent rules, style preferences, team-wide policies,
 or provider-specific output formatting that should always be present
 regardless of which prompt or mode is active.
+
+## Managed policy (administrator-enforced settings)
+
+An administrator can pin permissions, sandbox, MCP and providers with a root-owned
+`managed-config.toml`, read once at startup and applied **after** user config, project config,
+`--config` overrides, CLI flags and prompt directives. Nothing those sources set can widen it.
+
+| OS | Path |
+| -- | ---- |
+| Linux | `/etc/mini-agent/managed-config.toml` |
+| macOS | `/Library/Application Support/mini-agent/managed-config.toml` |
+| Windows (experimental) | `C:\ProgramData\mini-agent\managed-config.toml` (no ownership check) |
+
+On Unix the file and its directory must be owned by root and not group- or world-writable, and the
+file must be a regular file (not a symlink) of at most 256 KiB. A present file that is unreadable,
+invalid, has an unknown key, or fails these checks is a **startup error** (fail closed), not a skipped
+layer. A missing file means no managed policy.
+
+```toml
+[permissions]
+deny = { shell = ["rm -rf *"], write = ["/etc/**"] }  # appended to permission-deny; wins over allow rules
+allowed_modes = ["standard", "guarded", "readonly"]   # security modes users may select (default: all)
+disable_yolo = true                                   # shorthand: remove `yolo` from the modes
+require_permission_checks = true                      # refuse --dangerously-skip-permissions
+
+[sandbox]
+required = true                                       # force sandbox on; refuses --no-sandbox, sandbox = false
+
+[mcp]
+disabled = false                                      # true refuses every MCP server
+allowed_servers = ["github"]                          # absent = no allowlist
+denied_servers = ["scratch"]
+
+[providers]
+allowed = ["anthropic", "openai"]                     # absent = no allowlist
+denied = ["openrouter"]
+```
+
+Enforcement: a disallowed mode from `--yolo`, `yolo = true`, `default_permission_mode`, a project
+layer or startup flags, `--dangerously-skip-permissions`, `--no-sandbox` and a disallowed provider
+are refused at startup with a message naming the managed file. `/mode`, `/permissions` and the
+stream-json control channel refuse a disallowed mode with the same message; a `%%mode=` prompt
+directive is ignored; Shift+Tab skips disallowed modes; the permission checker also lowers any mode
+change to the nearest permitted one. MCP servers outside the policy are dropped from the merged
+configuration (with a warning) and refused at connect time, including servers from `.mcp.json`. A
+provider outside the policy is refused wherever it is resolved. `/doctor` (`--doctor`) shows the
+`managed policy` path and a values-free summary of what it enforces. Managed hooks keep their own
+`managed-settings.json` (see Hooks).
 
 ## Hooks
 
@@ -2603,7 +2651,9 @@ When a rule resolves to `ask`, the TUI shows the request and these keys:
   for this session in one approval: the directory itself for `list_dir`,
   otherwise the file's parent. It does not cover `write`, so creating files
   still asks.
-- `n` denies this call; `Esc`, `Ctrl+C`, or `Ctrl+D` deny and stop the run.
+- `n` denies this call; `t` denies it and opens a one-line note (at most 500 characters, control characters
+  stripped) that is returned to the model as the denial text (`Permission denied by user: <note>`);
+  an opted-in `PermissionRequest` hook's deny reason is passed through the same way; `Esc`, `Ctrl+C`, or `Ctrl+D` deny and stop the run.
   `s` stops the run and offers an optional instruction as the next editable
   user draft; it is sent only after a separate Enter.
 
@@ -4139,7 +4189,12 @@ lsp:
 
 Built-in server defaults (used only when the binary is on PATH):
 rust-analyzer, gopls, typescript-language-server, pyright-langserver,
-clangd, bash-language-server, lua-language-server.
+clangd, bash-language-server, lua-language-server, jdtls (`.java`),
+csharp-ls (`.cs`), ruby-lsp (`.rb`, `.rake`, `.gemspec`), intelephense
+(`.php`), kotlin-language-server (`.kt`, `.kts`), sourcekit-lsp (`.swift`) and
+zls (`.zig`). Each is skipped silently when its binary is not on PATH; the
+built-in names `java`, `csharp`, `ruby`, `php`, `kotlin`, `swift` and `zig` can
+be overridden or set `disabled = true` like the others.
 
 Behavior notes:
 

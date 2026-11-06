@@ -4,6 +4,7 @@ pub(crate) mod keybindings;
 pub(crate) mod keys;
 pub(crate) mod layers;
 pub mod load;
+pub(crate) mod managed;
 pub(crate) mod schema;
 pub mod types;
 

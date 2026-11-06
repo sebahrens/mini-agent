@@ -792,6 +792,7 @@ impl PermissionChecker {
         permission_modes: Option<Vec<String>>,
         sandbox: crate::permission::SandboxResolution,
     ) -> anyhow::Result<Self> {
+        let mode = crate::config::managed::clamp_mode(mode);
         let default_action = configs
             .glob
             .default
@@ -2311,6 +2312,8 @@ impl PermissionChecker {
     }
 
     pub fn set_mode(&mut self, mode: SecurityMode) {
+        // An administrator's managed policy bounds every mode change.
+        let mode = crate::config::managed::clamp_mode(mode);
         tracing::debug!("perm mode changed: {:?} -> {:?}", self.mode, mode);
         if self.mode != mode || self.user_mode != mode {
             self.policy_changed();
@@ -2326,6 +2329,10 @@ impl PermissionChecker {
     /// raise it above the mode the user selected (CLI flag, config, or
     /// `/mode`). Returns whether the mode was applied.
     pub fn set_prompt_mode(&mut self, mode: SecurityMode) -> bool {
+        if let Some(refusal) = crate::config::managed::mode_violation(mode) {
+            tracing::warn!("{refusal}; ignoring the prompt directive");
+            return false;
+        }
         if mode.privilege_rank() > self.user_mode.privilege_rank() {
             tracing::warn!(
                 "prompt directive requested mode {mode} above the user-selected {}; ignoring",

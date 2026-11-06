@@ -812,6 +812,10 @@ pub struct JobStatusArgs {
     /// order. Mutually exclusive with `input`.
     #[serde(default)]
     pub keys: Option<Vec<JobKey>>,
+    /// Regex for `action = "wait"`: return as soon as new output matches it
+    /// (or the job ends, or `timeout_ms` expires).
+    #[serde(default)]
+    pub until: Option<String>,
 }
 
 /// A named terminal key `job_status` can press. The tool renders the bytes,
@@ -1083,7 +1087,10 @@ async fn handle_ask_inner(
             }
             Ok(())
         }
-        _ => Err(ToolError::Msg("Permission denied by user".to_string())),
+        Ok(denied) => Err(ToolError::Msg(crate::permission::ask::denial_message(
+            &denied,
+        ))),
+        Err(_) => Err(ToolError::Msg("Permission denied by user".to_string())),
     }
 }
 
@@ -1152,7 +1159,13 @@ pub(crate) async fn request_sandbox_escalation_approval(
     match decision {
         // An always-grant is deliberately not recorded: every escalation asks.
         Ok(UserDecision::AllowOnce | UserDecision::AllowAlways(_)) => Ok(()),
-        _ => Err(ToolError::Msg(
+        Ok(denied) => Err(ToolError::Msg(match denied.deny_reason() {
+            Some(reason) => {
+                format!("Sandbox escalation denied by user: {reason}; the command was not run")
+            }
+            None => "Sandbox escalation denied by user; the command was not run".to_string(),
+        })),
+        Err(_) => Err(ToolError::Msg(
             "Sandbox escalation denied by user; the command was not run".to_string(),
         )),
     }

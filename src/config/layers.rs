@@ -553,6 +553,18 @@ pub(crate) fn apply_overrides(
     cfg: &mut super::Config,
     overrides: &[toml::Value],
 ) -> Result<(), &'static str> {
+    apply_overrides_unmanaged(cfg, overrides)?;
+    // The administrator's managed policy is read last and wins.
+    if let Some(policy) = super::managed::active() {
+        policy.apply(cfg);
+    }
+    Ok(())
+}
+
+fn apply_overrides_unmanaged(
+    cfg: &mut super::Config,
+    overrides: &[toml::Value],
+) -> Result<(), &'static str> {
     if overrides.is_empty() {
         return Ok(());
     }

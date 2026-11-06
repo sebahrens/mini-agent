@@ -66,6 +66,20 @@ call is interrupted before either happens, the job is stopped. At most
 table is full an explicit `background = true` call fails naming the key, while
 an `auto_background` call simply runs as an ordinary foreground command.
 
+`job_status action=wait` returns when the job ends or `timeout_ms` expires. Pass
+`until=<regex>` (Rust regex syntax, at most 512 bytes, linear-time engine) to also
+return as soon as output not yet read (or after `since`) matches, for a server
+or watcher that never exits; the result begins with `Wait: output matched /re/
+(in bytes A..B): <matched line>` and the job keeps running. Terminal escape
+sequences are stripped before matching. If nothing matches before the deadline
+or the job's exit, the result says so and the unread output follows. `until` is
+refused with any action other than `wait`.
+
+When the shell line cap (`max_output_lines`, default 2000) omits lines but the
+byte cap did not, the complete output is saved to a private log in the session
+output-log directory and the result footer names it, so `read`/`grep` can
+recover the omitted middle without re-running the command.
+
 `shell` takes an optional `workdir` (workspace-relative, or absolute inside the
 workspace). It is resolved with symlinks and `..` followed and must be an
 existing directory inside the canonical workspace root; anything else is

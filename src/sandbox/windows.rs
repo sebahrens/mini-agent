@@ -5620,6 +5620,17 @@ fn essential_windows_environment() -> Vec<(String, String)> {
             .ok()
             .map(|value| ((*name).to_string(), value))
     })
+    .chain(
+        [
+            ("PAGER", "cat"),
+            ("GIT_PAGER", "cat"),
+            ("GH_PAGER", "cat"),
+            ("GIT_TERMINAL_PROMPT", "0"),
+            ("GIT_EDITOR", ":"),
+            ("GIT_SEQUENCE_EDITOR", ":"),
+        ]
+        .map(|(name, value)| (name.to_string(), value.to_string())),
+    )
     .collect()
 }
 

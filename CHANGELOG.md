@@ -21,6 +21,22 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Added
 
+- Built-in language servers for Java (`jdtls`), C# (`csharp-ls`), Ruby (`ruby-lsp`), PHP (`intelephense`), Kotlin
+  (`kotlin-language-server`), Swift (`sourcekit-lsp`) and Zig (`zls`), used only when on PATH (mini-agent-f8tdh).
+- `job_status action=wait` takes `until=<regex>` and returns as soon as new output matches, reporting the
+  matched line (mini-agent-8o0kx).
+- Model-authored shell commands start with `PAGER`/`GIT_PAGER`/`GH_PAGER=cat`, `GIT_TERMINAL_PROMPT=0` and a
+  no-op `GIT_EDITOR`/`GIT_SEQUENCE_EDITOR` so pty and editor-launching commands fail fast instead of hanging;
+  `shell-env` overrides them (mini-agent-aseut).
+- Administrator-managed policy layer: a root-owned `managed-config.toml` (permission deny rules, selectable
+  security modes / yolo ban, forced sandbox, MCP and provider allow/deny lists) is applied after every other
+  source; flags, project config and prompt directives that widen it are refused naming the file, and
+  `/doctor` shows the managed source (mini-agent-33500).
+- The permission prompt has a `t` (deny and tell the model why) path; the note, or an opted-in
+  `PermissionRequest` hook's deny reason, reaches the model as the tool-denial text via the new
+  `UserDecision::DenyWithReason` (mini-agent-rirdm).
+- When the shell line cap omits lines and the byte cap did not, the full output is saved to a private
+  log named in the footer (mini-agent-iypjy).
 - Agent hook file reads (`hooks_agent_read_files`) now obey `read` permission rules (deny and ask
   both refuse), `.gitignore`/`.ignore` and a wider credential list (mini-agent-m9txi). `update`
   and `install.sh` pin build-provenance verification to the release workflow and tag

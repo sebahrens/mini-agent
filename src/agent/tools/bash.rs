@@ -7,8 +7,9 @@ use crate::extras::truncate::head_tail_lines;
 use crate::sandbox::{
     BackgroundJobOutput, CommandLimits, CommandOutput, CommandOutputLimit, CommandProgress,
     CommandStatus, DEFAULT_BACKGROUND_COMMAND_TIMEOUT, DEFAULT_COMMAND_LIMITS,
-    MAX_BACKGROUND_JOB_WAIT_MILLIS, OutputChannel, OutputTranscript, SHELL_HARD_OUTPUT_BYTES,
-    Sandbox, ShellOutputCapture, SpoolPolicy, TranscriptPart,
+    MAX_BACKGROUND_JOB_WAIT_MILLIS, OutputChannel, OutputLog, OutputTranscript, OutputWindow,
+    SHELL_HARD_OUTPUT_BYTES, Sandbox, ShellOutputCapture, SpoolPolicy, TranscriptPart,
+    write_private_log,
 };
 use compact_str::CompactString;
 
@@ -713,6 +714,7 @@ impl ShellTool {
             result.push_str(&termination);
         }
 
+        let transcript = self.spill_line_capped_output(transcript, &result);
         let mut result = bound_output_lines(result, self.max_output_lines);
         push_log_footer(&mut result, &transcript);
 
@@ -851,9 +853,60 @@ impl ShellTool {
             }
             result.push_str(&format!("Exit code: {code}"));
         }
+        let transcript = self.spill_line_capped_output(transcript, &result);
         let mut result = bound_output_lines(result, self.max_output_lines);
         push_log_footer(&mut result, &transcript);
         Ok(Some(result))
+    }
+}
+
+impl ShellTool {
+    /// When the line cap will drop lines but the byte-retention log was never
+    /// opened (everything still fit in memory), save the complete retained
+    /// output to a private log so the omitted lines stay recoverable.
+    fn spill_line_capped_output(
+        &self,
+        mut transcript: OutputTranscript,
+        rendered: &str,
+    ) -> OutputTranscript {
+        let Some(cap) = self.max_output_lines else {
+            return transcript;
+        };
+        let cap = usize::try_from(cap).unwrap_or(usize::MAX).max(1);
+        if transcript.log.is_some()
+            || transcript.omitted_bytes > 0
+            || crate::extras::truncate::line_count(rendered) <= cap
+        {
+            return transcript;
+        }
+        let Some(dir) = self.output_log_dir.as_deref() else {
+            return transcript;
+        };
+        let bytes: Vec<u8> = transcript
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                TranscriptPart::Output(_, bytes) => Some(bytes.as_slice()),
+                TranscriptPart::Omitted(_) => None,
+            })
+            .flatten()
+            .copied()
+            .collect();
+        let path = ShellOutputCapture::log_path_in(dir, "shell-output");
+        match write_private_log(&path, &bytes) {
+            Ok(()) => {
+                transcript.log = Some(OutputLog {
+                    path,
+                    bytes: bytes.len() as u64,
+                    complete: true,
+                });
+            }
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "failed to save line-capped command output");
+                transcript.log_error = Some(error.to_string());
+            }
+        }
+        transcript
     }
 }
 
@@ -1168,7 +1221,7 @@ impl Tool for JobStatusTool {
     type Output = String;
 
     fn description(&self) -> String {
-        "Poll, wait for, stop, or list session-scoped background shell jobs. Poll, wait and stop return only output produced since the previous poll/wait/stop of that job (at most 64 KiB per call; a larger range shows its start and end around a byte gap), with the byte offset to continue from. Pass since=<offset> to re-read the complete stream from any offset (for example since=0). The complete output is also logged to the file named in the result, readable with read/grep, and the log outlives the job record. Wait returns when the job ends or timeout_ms expires (default 10000, maximum 60000 milliseconds); expiration leaves the job running. List returns ids, commands, statuses and log paths without an id. Stop waits up to 5 seconds for process-tree cleanup."
+        "Poll, wait for, stop, or list session-scoped background shell jobs. Poll, wait and stop return only output produced since the previous poll/wait/stop of that job (at most 64 KiB per call; a larger range shows its start and end around a byte gap), with the byte offset to continue from. Pass since=<offset> to re-read the complete stream from any offset (for example since=0). The complete output is also logged to the file named in the result, readable with read/grep, and the log outlives the job record. Wait returns when the job ends or timeout_ms expires (default 10000, maximum 60000 milliseconds); expiration leaves the job running. Wait with until=<regex> also returns as soon as output not yet read (or after since) matches the regex, and reports the matched line, so a server that never exits can be waited on for its ready message. List returns ids, commands, statuses and log paths without an id. Stop waits up to 5 seconds for process-tree cleanup."
             .to_string()
     }
 
@@ -1207,6 +1260,12 @@ impl Tool for JobStatusTool {
                     "type": "integer",
                     "minimum": 0,
                     "description": "Byte offset in the job's complete output to read from instead of the end of the previous read (poll, wait or stop)"
+                },
+                "until": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_UNTIL_PATTERN_BYTES,
+                    "description": "Only with action=wait: a Rust-syntax regex (linear-time engine). The wait returns early, with the matched line reported, once unread output (or output after since) matches; terminal escape sequences are stripped before matching. If it never matches, the wait ends at the job's exit or timeout_ms and says so; the job keeps running."
                 }
             },
             "required": []
@@ -1230,6 +1289,15 @@ impl JobStatusTool {
                 "job_status timeout_ms is only valid with action=wait and must be between 1 and 60000 milliseconds. Example: {\"id\":\"job-...\",\"action\":\"wait\",\"timeout_ms\":10000}".into(),
             ));
         }
+        let until = match args.until.as_deref() {
+            None => None,
+            Some(_) if args.action != JobAction::Wait => {
+                return Err(ToolError::Msg(
+                    "job_status until is only valid with action=wait. Example: {\"id\":\"job-...\",\"action\":\"wait\",\"until\":\"listening on\"}".into(),
+                ));
+            }
+            Some(pattern) => Some(compile_until_pattern(pattern)?),
+        };
         if args.input.is_some() && args.keys.is_some() {
             return Err(ToolError::Msg(
                 "job_status takes either input (text) or keys (named keys), not both.".into(),
@@ -1276,6 +1344,7 @@ impl JobStatusTool {
                 .collect::<Vec<_>>()
                 .join("\n"));
         }
+        let mut wait_note: Option<String> = None;
         let id = args.id.as_deref().ok_or_else(|| ToolError::Msg(
             "job_status requires an id for poll, wait or stop. Example: {\"id\":\"job-...\",\"action\":\"wait\"}".into(),
         ))?;
@@ -1292,14 +1361,66 @@ impl JobStatusTool {
                     .remove(id);
                 self.sandbox.stop_background_job(id).await.map(drop)
             }
-            JobAction::Wait => self
-                .sandbox
-                .wait_background_job(
-                    id,
-                    std::time::Duration::from_millis(args.timeout_ms.unwrap_or(10_000)),
-                )
-                .await
-                .map(drop),
+            JobAction::Wait => {
+                let wait = std::time::Duration::from_millis(args.timeout_ms.unwrap_or(10_000));
+                match &until {
+                    None => self.sandbox.wait_background_job(id, wait).await.map(drop),
+                    Some(regex) => {
+                        let mut scan_from = match args.since {
+                            Some(since) => since,
+                            None => self
+                                .sandbox
+                                .background_job_cursor(id)
+                                .map_err(ToolError::Msg)?,
+                        };
+                        let mut found: Option<UntilMatch> = None;
+                        let snapshot = self
+                            .sandbox
+                            .wait_background_job_until(id, wait, Some(UNTIL_POLL_INTERVAL), || {
+                                while found.is_none() {
+                                    let Ok(window) = self.sandbox.peek_background_job_window(
+                                        id,
+                                        scan_from,
+                                        UNTIL_SCAN_BYTES,
+                                    ) else {
+                                        break;
+                                    };
+                                    let (hit, next) = scan_for_pattern(regex, &window);
+                                    found = hit;
+                                    if next <= scan_from && found.is_none() {
+                                        break;
+                                    }
+                                    scan_from = next;
+                                    if window.next <= scan_from && found.is_none() {
+                                        break;
+                                    }
+                                }
+                                found.is_some()
+                            })
+                            .await
+                            .map_err(ToolError::Msg)?;
+                        wait_note = Some(match &found {
+                            Some(hit) => format!(
+                                "Wait: output matched /{}/ (in bytes {}..{}): {}",
+                                regex.as_str(),
+                                hit.from,
+                                hit.to,
+                                hit.line
+                            ),
+                            None if snapshot.status.is_terminal() => format!(
+                                "Wait: the job ended without output matching /{}/; any unread output follows.",
+                                regex.as_str()
+                            ),
+                            None => format!(
+                                "Wait: output did not match /{}/ within {} ms; the job is still running.",
+                                regex.as_str(),
+                                wait.as_millis()
+                            ),
+                        });
+                        Ok(())
+                    }
+                }
+            }
             JobAction::Input if args.keys.is_some() => {
                 self.press_keys(id, args.keys.as_deref().unwrap_or_default())
                     .await
@@ -1395,8 +1516,83 @@ impl JobStatusTool {
             .sandbox
             .read_background_job_output(id, args.since, JOB_OUTPUT_READ_BYTES)
             .map_err(ToolError::Msg)?;
-        Ok(render_background_job(output, self.max_output_lines))
+        let rendered = render_background_job(output, self.max_output_lines);
+        Ok(match wait_note {
+            Some(note) => format!("{note}\n{rendered}"),
+            None => rendered,
+        })
     }
+}
+
+/// Longest `until` regex source accepted.
+const MAX_UNTIL_PATTERN_BYTES: usize = 512;
+/// How often an `until` wait re-checks output (job output does not notify).
+const UNTIL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+/// Bytes of new output examined per `until` scan step.
+const UNTIL_SCAN_BYTES: usize = 256 * 1024;
+
+fn compile_until_pattern(pattern: &str) -> Result<regex::Regex, ToolError> {
+    if pattern.is_empty() || pattern.len() > MAX_UNTIL_PATTERN_BYTES {
+        return Err(ToolError::Msg(format!(
+            "job_status until must be 1..={MAX_UNTIL_PATTERN_BYTES} bytes"
+        )));
+    }
+    regex::RegexBuilder::new(pattern)
+        .size_limit(1 << 20)
+        .dfa_size_limit(1 << 20)
+        .build()
+        .map_err(|error| {
+            ToolError::Msg(format!(
+                "job_status until is not a valid regex (Rust syntax): {error}"
+            ))
+        })
+}
+
+struct UntilMatch {
+    from: u64,
+    to: u64,
+    line: String,
+}
+
+/// Look for `regex` in one non-advancing output window. Returns the hit (with
+/// the matched line, bounded) and the offset the next scan should start from:
+/// the start of the last, possibly unfinished, line so a ready message split
+/// across reads is still found.
+fn scan_for_pattern(regex: &regex::Regex, window: &OutputWindow) -> (Option<UntilMatch>, u64) {
+    let tail_start = window.next - window.tail.len() as u64;
+    let pieces = [(window.start, &window.head), (tail_start, &window.tail)];
+    for (offset, bytes) in pieces {
+        if bytes.is_empty() {
+            continue;
+        }
+        let text = normalize_terminal_output(&String::from_utf8_lossy(bytes));
+        if let Some(found) = regex.find(&text) {
+            let line_start = text[..found.start()].rfind('\n').map_or(0, |at| at + 1);
+            let line_end = text[found.start()..]
+                .find('\n')
+                .map_or(text.len(), |at| found.start() + at);
+            let line: String = text[line_start..line_end].chars().take(300).collect();
+            return (
+                Some(UntilMatch {
+                    from: offset,
+                    to: window.next,
+                    line,
+                }),
+                window.next,
+            );
+        }
+    }
+    let (offset, last) = if window.tail.is_empty() {
+        (window.start, &window.head)
+    } else {
+        (tail_start, &window.tail)
+    };
+    let next = match last.iter().rposition(|byte| *byte == b'\n') {
+        Some(at) => offset + at as u64 + 1,
+        None if last.len() > 8192 => window.next - 8192,
+        None => offset,
+    };
+    (None, next.max(window.start))
 }
 
 /// Source-compatibility alias for integrations that still construct the old
@@ -1701,7 +1897,7 @@ fn push_log_footer(result: &mut String, transcript: &OutputTranscript) {
             log.bytes,
             log.path.display()
         )
-    } else if transcript.omitted_bytes > 0 {
+    } else if transcript.omitted_bytes > 0 || transcript.log_error.is_some() {
         let reason = transcript.log_error.as_deref().map_or_else(
             || "no output log is configured".to_string(),
             |error| format!("the output log could not be written: {error}"),
@@ -1737,6 +1933,60 @@ mod tests {
 
     fn test_tool() -> BashTool {
         BashTool::new(None, None, Sandbox::new(false, "bwrap"), None)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_commands_start_with_a_non_interactive_environment() {
+        let output = test_tool()
+            .call(BashArgs {
+                command: "echo \"$PAGER $GIT_PAGER $GH_PAGER $GIT_TERMINAL_PROMPT $GIT_EDITOR\""
+                    .to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.trim(), "cat cat cat 0 :");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn line_cap_saves_the_full_output_to_a_log_even_under_the_byte_cap() {
+        let dir = crate::tests::support::temp::TempDir::new("line-cap-log");
+        let logs = dir.path().join("logs");
+        let mut shell = test_tool().with_output_log_dir(Some(logs.clone()));
+        shell.max_output_lines = Some(50);
+        let result = shell
+            .call(BashArgs {
+                command: "seq 1 5000".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(result.contains("lines omitted"), "{result}");
+        let footer = result
+            .lines()
+            .find(|line| line.contains("saved to"))
+            .unwrap_or_else(|| panic!("no log footer: {result}"));
+        let logged = std::fs::read_dir(&logs)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .next()
+            .unwrap();
+        assert!(footer.contains(&logged.display().to_string()), "{footer}");
+        let body = std::fs::read_to_string(&logged).unwrap();
+        assert_eq!(body.lines().count(), 5000);
+        assert!(body.contains("\n2500\n"));
+        // Output under the cap creates no log.
+        let small = shell
+            .call(BashArgs {
+                command: "seq 1 10".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!small.contains("saved to"), "{small}");
+        assert_eq!(std::fs::read_dir(&logs).unwrap().count(), 1);
     }
 
     #[cfg(unix)]
@@ -2833,6 +3083,111 @@ mod tests {
             })
             .await
             .unwrap()
+    }
+
+    #[test]
+    fn until_scan_finds_a_match_in_either_part_and_resumes_at_the_last_line() {
+        let regex = compile_until_pattern("listening on \\d+").unwrap();
+        let window = OutputWindow {
+            start: 100,
+            head: b"booting\n\x1b[32mlistening on 8080\x1b[0m\n".to_vec(),
+            skipped: 0,
+            tail: Vec::new(),
+            next: 100 + 33,
+        };
+        let (hit, _) = scan_for_pattern(&regex, &window);
+        let hit = hit.expect("match through terminal escapes");
+        assert_eq!(hit.line, "listening on 8080");
+        let in_tail = OutputWindow {
+            start: 0,
+            head: b"nothing here\n".to_vec(),
+            skipped: 5,
+            tail: b"x\nlistening on 9\n".to_vec(),
+            next: 40,
+        };
+        assert!(scan_for_pattern(&regex, &in_tail).0.is_some());
+        // A partial last line is re-scanned from its start next time.
+        let partial = OutputWindow {
+            start: 0,
+            head: b"done\nlistening o".to_vec(),
+            skipped: 0,
+            tail: Vec::new(),
+            next: 16,
+        };
+        let (none, next) = scan_for_pattern(&regex, &partial);
+        assert!(none.is_none());
+        assert_eq!(next, 5);
+        assert!(compile_until_pattern("(").is_err());
+        assert!(compile_until_pattern(&"a".repeat(MAX_UNTIL_PATTERN_BYTES + 1)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wait_until_returns_when_output_matches_and_leaves_the_job_running() {
+        let shell = test_tool();
+        let status = JobStatusTool::new(shell.sandbox.clone(), None);
+        let started = shell
+            .call(BashArgs {
+                command: "echo booting; sleep 0.5; echo listening on 8080; sleep 30".to_string(),
+                background: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let id = background_id(&started);
+        let began = Instant::now();
+        let waited = status
+            .call(JobStatusArgs {
+                id: Some(id.clone()),
+                action: JobAction::Wait,
+                timeout_ms: Some(20_000),
+                until: Some("listening on \\d+".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(began.elapsed() < Duration::from_secs(10), "{waited}");
+        assert!(
+            waited.contains("Wait: output matched /listening on \\d+/"),
+            "{waited}"
+        );
+        assert!(waited.contains("listening on 8080"), "{waited}");
+        assert!(waited.contains("Status: running"), "{waited}");
+
+        // Nothing new matches: the wait ends at its deadline and says so.
+        let missed = status
+            .call(JobStatusArgs {
+                id: Some(id.clone()),
+                action: JobAction::Wait,
+                timeout_ms: Some(300),
+                until: Some("never-printed".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            missed.contains("did not match /never-printed/ within 300 ms"),
+            "{missed}"
+        );
+        assert!(missed.contains("the job is still running"), "{missed}");
+
+        for bad in [
+            JobStatusArgs {
+                id: Some(id.clone()),
+                action: JobAction::Poll,
+                until: Some("x".into()),
+                ..Default::default()
+            },
+            JobStatusArgs {
+                id: Some(id.clone()),
+                action: JobAction::Wait,
+                until: Some("(".into()),
+                ..Default::default()
+            },
+        ] {
+            assert!(status.call(bad).await.is_err());
+        }
+        shell.sandbox.stop_background_job(&id).await.unwrap();
     }
 
     #[cfg(unix)]
