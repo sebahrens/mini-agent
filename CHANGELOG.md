@@ -12,6 +12,10 @@ Notable changes to mini-agent are documented in this file. The format follows
   `Retry-After` may extend a retry up to the new `retry.max_retry_after_ms` ceiling (default
   5 minutes, at most 10), `x-should-retry` overrides the status classification, and the retry
   notice shows the actual wait.
+- Quota and billing errors (`insufficient_quota`, exhausted credit balance, hard billing limits)
+  are no longer retried as transient 429s and now tell the user to check billing; rate-limit
+  reset headers (`anthropic-ratelimit-*-reset`, `x-ratelimit-reset-*`) set the wait when
+  `Retry-After` is missing.
 - The default `max_tokens` now follows each model's catalog output ceiling (capped at 32000;
   16384 for unlisted models), and explicit values are clamped to it. The catalog records
   `max_output` per model. Output-limit stops (`max_tokens`, `length`, `max_output_tokens`,

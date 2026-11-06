@@ -255,7 +255,8 @@ impl ProviderHttpClient {
 }
 
 /// A failed provider response together with the retry-relevant response
-/// headers (`Retry-After`, `retry-after-ms`, `x-should-retry`). Only those
+/// headers (`Retry-After`, `retry-after-ms`, `x-should-retry`, rate-limit
+/// reset headers). Only those
 /// headers are kept, so credentials or cookies never ride the error chain.
 #[derive(Debug, thiserror::Error)]
 #[error("{source}")]
@@ -289,10 +290,10 @@ impl ProviderRetryAfterError {
 
 /// Whether a response header carries retry guidance worth preserving.
 pub(crate) fn is_retry_hint_header(name: &http::HeaderName) -> bool {
-    matches!(
-        name.as_str(),
-        "retry-after" | "retry-after-ms" | "x-should-retry"
-    )
+    let name = name.as_str();
+    matches!(name, "retry-after" | "retry-after-ms" | "x-should-retry")
+        || (name.starts_with("anthropic-ratelimit-") && name.ends_with("-reset"))
+        || name.starts_with("x-ratelimit-reset")
 }
 
 fn retry_hint_headers(headers: &http::HeaderMap) -> http::HeaderMap {

@@ -169,7 +169,92 @@ pub(crate) fn provider_retry_hint(
     header("retry-after-ms")
         .and_then(parse_retry_after_ms)
         .or_else(|| header("retry-after").and_then(|value| parse_retry_after(value, now)))
+        .or_else(|| {
+            // Without an explicit hint, a rate-limited response's reset
+            // headers say when capacity returns. Which limit was hit is not
+            // reported, so wait for the latest reset.
+            (response.status == http::StatusCode::TOO_MANY_REQUESTS)
+                .then(|| rate_limit_reset(&response.headers, now))
+                .flatten()
+        })
 }
+
+/// The latest reset among `anthropic-ratelimit-*-reset` (RFC 3339 instants)
+/// and OpenAI `x-ratelimit-reset-*` (durations such as `1s`, `6m0s`,
+/// `20ms`).
+fn rate_limit_reset(headers: &http::HeaderMap, now: SystemTime) -> Option<Duration> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            let name = name.as_str();
+            let value = value.to_str().ok()?.trim();
+            if name.starts_with("anthropic-ratelimit-") && name.ends_with("-reset") {
+                let instant = chrono::DateTime::parse_from_rfc3339(value).ok()?;
+                let instant = SystemTime::UNIX_EPOCH
+                    + Duration::from_millis(u64::try_from(instant.timestamp_millis()).ok()?);
+                Some(instant.duration_since(now).unwrap_or_default())
+            } else if name.starts_with("x-ratelimit-reset") {
+                parse_go_duration(value)
+            } else {
+                None
+            }
+        })
+        .max()
+}
+
+/// A Go-style duration (`1h2m3.5s`, `250ms`, `6m0s`) or plain seconds.
+fn parse_go_duration(value: &str) -> Option<Duration> {
+    if let Ok(seconds) = value.parse::<f64>() {
+        return (seconds.is_finite() && seconds >= 0.0)
+            .then(|| Duration::from_secs_f64(seconds.min(1e9)));
+    }
+    let mut total = 0.0_f64;
+    let mut rest = value;
+    if rest.is_empty() {
+        return None;
+    }
+    while !rest.is_empty() {
+        let digits = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .filter(|&end| end > 0)?;
+        let number: f64 = rest[..digits].parse().ok()?;
+        rest = &rest[digits..];
+        let (scale, unit_len) = if rest.starts_with("ms") {
+            (0.001, 2)
+        } else if rest.starts_with('h') {
+            (3600.0, 1)
+        } else if rest.starts_with('m') {
+            (60.0, 1)
+        } else if rest.starts_with('s') {
+            (1.0, 1)
+        } else {
+            return None;
+        };
+        total += number * scale;
+        rest = &rest[unit_len..];
+    }
+    (total.is_finite() && total >= 0.0).then(|| Duration::from_secs_f64(total.min(1e9)))
+}
+
+/// Provider errors that no retry can fix: an exhausted quota, an unpaid
+/// balance or a hard billing limit. They often arrive as HTTP 429, which
+/// would otherwise be retried until the budget is spent.
+pub fn is_quota_exhausted_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    error_sources(error).any(|candidate| is_quota_exhausted_message(&candidate.to_string()))
+}
+
+fn is_quota_exhausted_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("insufficient_quota")
+        || lower.contains("billing_hard_limit")
+        || lower.contains("exceeded your current quota")
+        || lower.contains("credit balance is too low")
+        || lower.contains("usage_limit_reached")
+        || lower.contains("billing_not_active")
+}
+
+/// Guidance appended to a quota or billing failure.
+pub const QUOTA_EXHAUSTED_HINT: &str = "The provider reports an exhausted quota, credit balance or billing limit; retrying will not help. Check the account's plan, credits and billing settings, or switch provider/model.";
 
 /// `retry-after-ms`: a non-negative decimal number of milliseconds.
 fn parse_retry_after_ms(value: &str) -> Option<Duration> {
@@ -214,6 +299,12 @@ pub fn is_retryable(error: &(dyn std::error::Error + 'static)) -> bool {
         if is_context_length_error_message(&candidate.to_string()) {
             return false;
         }
+    }
+
+    // Exhausted quota / billing errors never recover by waiting, even when
+    // the provider labels them 429.
+    if is_quota_exhausted_error(error) {
+        return false;
     }
 
     // An explicit provider verdict (`x-should-retry`, sent by Anthropic) wins
@@ -354,10 +445,18 @@ pub fn is_context_length_error_message(message: &str) -> bool {
 /// recovery guidance for context overflow or a provider deadline.
 pub fn with_provider_error_hint(error: &(dyn std::error::Error + 'static)) -> String {
     let message = with_context_length_hint(&error.to_string());
+    if is_quota_exhausted_error(error) {
+        return format!("{message}\n{QUOTA_EXHAUSTED_HINT}");
+    }
     if is_provider_timeout(error) {
-        format!("{message}\n{PROVIDER_TIMEOUT_HINT}")
-    } else {
-        message
+        return format!("{message}\n{PROVIDER_TIMEOUT_HINT}");
+    }
+    match provider_retry_hint(error, SystemTime::now()) {
+        Some(wait) if !wait.is_zero() => format!(
+            "{message}\nThe provider's rate limit resets in about {}s.",
+            wait.as_secs().max(1)
+        ),
+        _ => message,
     }
 }
 
@@ -624,6 +723,77 @@ mod tests {
             crate::event::retry_notice_text(2, 3, 1_250),
             "retrying in 1.2s... (2/3)"
         );
+    }
+
+    #[test]
+    fn quota_exhausted_429_is_not_retried_and_says_to_check_billing() {
+        let quota = crate::provider_http::ProviderRetryAfterError::for_test(
+            429,
+            &[("retry-after", "20")],
+            r#"{"error":{"message":"You exceeded your current quota","type":"insufficient_quota","code":"insufficient_quota"}}"#,
+        );
+        assert!(!is_retryable(&quota));
+        let message = with_provider_error_hint(&quota);
+        assert!(message.contains("billing"), "{message}");
+        let anthropic = io::Error::other(
+            "HTTP status 400: Your credit balance is too low to access the Anthropic API",
+        );
+        assert!(!is_retryable(&anthropic));
+        // An ordinary rate limit is still retried.
+        assert!(is_retryable(&hinted(429, &[])));
+    }
+
+    #[test]
+    fn rate_limit_reset_headers_are_used_when_retry_after_is_missing() {
+        let now = SystemTime::now();
+        let reset = chrono::DateTime::<chrono::Utc>::from(now + Duration::from_secs(30))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let anthropic = hinted(
+            429,
+            &[
+                ("anthropic-ratelimit-requests-reset", reset.as_str()),
+                ("anthropic-ratelimit-tokens-reset", "not-a-date"),
+            ],
+        );
+        let wait = provider_retry_hint(&anthropic, now).unwrap();
+        assert!(
+            wait > Duration::from_secs(28) && wait <= Duration::from_secs(30),
+            "{wait:?}"
+        );
+        let openai = hinted(
+            429,
+            &[
+                ("x-ratelimit-reset-requests", "1s"),
+                ("x-ratelimit-reset-tokens", "6m0s"),
+            ],
+        );
+        assert_eq!(
+            provider_retry_hint(&openai, now),
+            Some(Duration::from_secs(360))
+        );
+        // Retry-After still wins, and non-429 responses ignore reset headers.
+        let explicit = hinted(
+            429,
+            &[("retry-after", "2"), ("x-ratelimit-reset-tokens", "6m0s")],
+        );
+        assert_eq!(
+            provider_retry_hint(&explicit, now),
+            Some(Duration::from_secs(2))
+        );
+        let overloaded = hinted(529, &[("x-ratelimit-reset-tokens", "6m0s")]);
+        assert_eq!(provider_retry_hint(&overloaded, now), None);
+        assert!(with_provider_error_hint(&openai).contains("resets in about 360s"));
+        for (value, expected) in [
+            ("20ms", Some(Duration::from_millis(20))),
+            ("1h2m3s", Some(Duration::from_secs(3723))),
+            ("1.5s", Some(Duration::from_millis(1500))),
+            ("7", Some(Duration::from_secs(7))),
+            ("", None),
+            ("5x", None),
+            ("m", None),
+        ] {
+            assert_eq!(parse_go_duration(value), expected, "{value}");
+        }
     }
 
     #[test]
