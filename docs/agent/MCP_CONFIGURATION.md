@@ -56,10 +56,25 @@ Project URL servers may use `"type": "http"` or `"streamable-http"`; the legacy
 alternative. For auth headers sourced from the environment, `bearerTokenEnvVar`
 (`Authorization: Bearer ${VAR}`) and `envHttpHeaders` (`{"Header": "VAR"}`) are
 folded into `headers` as ordinary `${VAR}` references, with the same
-substitution, bounds and missing-variable behavior. `headersHelper` (a command
-run to mint headers) is deliberately not supported: a project file must not
-name a command that runs outside the server sandbox. Use an environment
-variable that your own tooling refreshes.
+substitution, bounds and missing-variable behavior. `headersHelper` (also `headers_helper`; a command that mints headers) is
+**closed by default**: it runs a command named by configuration, so nothing runs
+unless the top-level `mcp_headers_helper = true` is set. Without it the server
+does not connect and the notice names the key; the command is never started.
+Project config reaches that key only through content-bound project trust, and a
+project `.mcp.json` entry additionally needs its own file trust, so an untrusted
+clone cannot cause a command to run. Forms: `"headersHelper": "./get-token.sh"`
+(one program), an argument array `["./tok", "--audience", "x"]`, or a table
+`{"command": [...], "inherit_env": ["TOKEN_SRC"], "sandbox": "<backend>"}`.
+There is no shell and no `${VAR}` expansion: the first element is the program (a
+path with a directory is taken relative to the workspace; a bare name searches
+only absolute `PATH` entries). The helper starts with a cleared environment
+(only `inherit_env` names are passed), may use the same workspace-service
+`sandbox` backend as stdio servers, is stopped after 10 s, and must print a JSON
+object of header names to string values (at most 64 KiB and 32 headers; framing
+and hop-by-hop headers such as `Host` and `Content-Length` are refused). Its
+headers override static `headers` of the same name. Failure notices carry the
+exit status only, never its output. It runs on every (re)connect, not on each
+request; command servers cannot use it.
 
 URL servers require public addresses by default. Explicit `allow_local=true`
 also permits loopback-only endpoints: IPv4 `127/8`, IPv6 `::1`, normalized mapped

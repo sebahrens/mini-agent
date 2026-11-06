@@ -606,8 +606,13 @@ impl McpClientHandle {
                 inherit_env,
                 sandbox,
                 network,
+                options,
                 ..
             } => {
+                anyhow::ensure!(
+                    options.headers_helper.is_none(),
+                    "headersHelper applies only to URL servers"
+                );
                 tracing::debug!(
                     "MCP command transport configured ({} args, {} env vars, {} inherited env vars)",
                     args.len(),
@@ -711,6 +716,7 @@ impl McpClientHandle {
                 allow_local,
                 headers,
                 oauth,
+                options,
                 ..
             } => {
                 let endpoint = tokio::select! {
@@ -719,6 +725,27 @@ impl McpClientHandle {
                     result = validate_mcp_server_url_policy(url, *allow_local) => result?,
                 };
                 validate()?;
+                // A configured headers helper runs after URL policy passes and
+                // only under the explicit `mcp_headers_helper` opt-in.
+                let merged;
+                let headers = if let Some(helper) = &options.headers_helper {
+                    merged = tokio::select! {
+                        biased;
+                        _ = crate::agent::runner::current_work_scope_cancelled() => anyhow::bail!("MCP connection cancelled"),
+                        result = super::headers_helper::merged_headers(
+                            &server_name,
+                            helper,
+                            headers,
+                            workspace,
+                            super::headers_helper::is_enabled(),
+                            super::headers_helper::HELPER_TIMEOUT,
+                        ) => result?,
+                    };
+                    validate()?;
+                    &merged
+                } else {
+                    headers
+                };
                 let mut handle = Self::connect_http_with_timeout(
                     server_name,
                     url,
@@ -1088,6 +1115,7 @@ pub(crate) async fn call_tool_observed(
     .await
 }
 
+#[cfg(test)]
 pub(crate) async fn call_tool_with_ceiling(
     peer: &Peer<RoleClient>,
     params: CallToolRequestParams,
@@ -1194,7 +1222,7 @@ fn append_bounded(rendered: &mut String, value: &str, limit: usize) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn stdio_command(
+pub(super) fn stdio_command(
     command: &str,
     args: &[String],
     workspace: &Path,

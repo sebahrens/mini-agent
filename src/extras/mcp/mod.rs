@@ -6,6 +6,7 @@ pub(crate) mod deferred;
 mod egress;
 pub(crate) mod elicitation;
 pub(crate) mod forms;
+pub(crate) mod headers_helper;
 pub(crate) mod health;
 pub mod oauth;
 pub(crate) mod progress;
@@ -257,6 +258,7 @@ impl McpClientManager {
         cfg: &crate::config::Config,
         workspace: &Arc<crate::paths::WorkspaceBinding>,
     ) -> Self {
+        headers_helper::set_enabled(cfg.mcp_headers_helper == Some(true));
         let mut manager = if let Some(servers) = &cfg.mcp_servers {
             Self::connect_all_with_binding(
                 servers,

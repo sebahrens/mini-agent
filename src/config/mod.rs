@@ -618,6 +618,12 @@ pub struct Config {
     #[cfg(feature = "mcp")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp_tool_timeout_secs: Option<u64>,
+    /// Opt in to MCP `headers_helper` commands (default off). A server entry
+    /// may name a command whose JSON output supplies request headers; it runs
+    /// only when this is `true`.
+    #[cfg(feature = "mcp")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_headers_helper: Option<bool>,
     #[cfg(feature = "mcp")]
     #[serde(
         skip_serializing_if = "Option::is_none",

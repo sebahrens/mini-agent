@@ -192,6 +192,83 @@ pub struct McpServerOptions {
     /// takes the exclusive lane.
     #[serde(default, skip_serializing_if = "is_false")]
     pub parallel_read_only: bool,
+    /// URL servers only: a command run at connect time whose JSON output
+    /// supplies extra request headers (for example a short-lived token).
+    /// It never runs unless the top-level `mcp_headers_helper = true` opt-in
+    /// is set; see `headers_helper.rs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers_helper: Option<McpHeadersHelper>,
+}
+
+/// The command behind `headers_helper`. Never run through a shell: `command`
+/// is an argument vector whose first element is the program.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "McpHeadersHelperWire")]
+pub struct McpHeadersHelper {
+    pub command: Vec<String>,
+    /// Parent environment names delegated to the helper; everything else is
+    /// cleared. Empty by default.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inherit_env: Vec<String>,
+    /// Optional workspace-service sandbox backend, as for stdio servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum McpHeadersHelperWire {
+    Program(String),
+    Argv(Vec<String>),
+    Full {
+        command: Vec<String>,
+        #[serde(default)]
+        inherit_env: Vec<String>,
+        #[serde(default)]
+        sandbox: Option<String>,
+    },
+}
+
+impl From<McpHeadersHelperWire> for McpHeadersHelper {
+    fn from(wire: McpHeadersHelperWire) -> Self {
+        match wire {
+            McpHeadersHelperWire::Program(program) => Self {
+                command: vec![program],
+                inherit_env: Vec::new(),
+                sandbox: None,
+            },
+            McpHeadersHelperWire::Argv(command) => Self {
+                command,
+                inherit_env: Vec::new(),
+                sandbox: None,
+            },
+            McpHeadersHelperWire::Full {
+                command,
+                inherit_env,
+                sandbox,
+            } => Self {
+                command,
+                inherit_env,
+                sandbox,
+            },
+        }
+    }
+}
+
+impl McpHeadersHelper {
+    /// Structural bounds, checked when a definition is parsed.
+    pub(crate) fn validate(&self) -> Result<(), &'static str> {
+        if self.command.is_empty() || self.command[0].trim().is_empty() {
+            return Err("headersHelper needs a program");
+        }
+        if self.command.len() > 16 || self.command.iter().any(|arg| arg.len() > 4096) {
+            return Err("headersHelper command exceeds bounds");
+        }
+        if self.inherit_env.len() > 32 {
+            return Err("headersHelper inherit_env exceeds bounds");
+        }
+        Ok(())
+    }
 }
 
 fn clamp_timeout(secs: u64) -> std::time::Duration {

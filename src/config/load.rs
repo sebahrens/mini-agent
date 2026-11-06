@@ -3695,6 +3695,15 @@ mod project_config_trust_tests {
     }
 
     #[test]
+    #[cfg(feature = "mcp")]
+    fn project_config_cannot_enable_the_mcp_headers_helper_without_trust() {
+        let (benign, _, sensitive) =
+            split_project_override("mcp_headers_helper = true\nmax_tokens = 1\n").unwrap();
+        assert!(sensitive.contains("mcp_headers_helper"), "{sensitive:?}");
+        assert!(benign.get("mcp_headers_helper").is_none());
+    }
+
+    #[test]
     fn permission_mode_cycle_is_global_only_even_for_approved_project_config() {
         let root = crate::tests::OwnedTestDirectory::new("project-mode-cycle-global-only");
         let path = root.path().join("project/.mini-agent/config.toml");

@@ -685,10 +685,15 @@ pub(crate) fn parse_definition(mut value: Value) -> Result<McpServerConfig, &'st
             });
         }
     }
-    if object.contains_key("headersHelper") || object.contains_key("headers_helper") {
-        return Err(
-            "headersHelper is not supported because it would run a command named by a project file; use `headers` with ${VAR}, `bearerTokenEnvVar`, or `envHttpHeaders`",
-        );
+    for key in ["headersHelper", "headers_helper"] {
+        if let Some(helper) = object.remove(key) {
+            if !url {
+                return Err("headersHelper applies only to URL servers");
+            }
+            if object.insert("headers_helper".into(), helper).is_some() {
+                return Err("duplicate MCP headersHelper");
+            }
+        }
     }
     header_env_fields(object, url)?;
     if let Some(allow) = object.remove("allowLocal")
@@ -698,6 +703,9 @@ pub(crate) fn parse_definition(mut value: Value) -> Result<McpServerConfig, &'st
     }
     let server: McpServerConfig =
         serde_json::from_value(value).map_err(|_| "MCP server fields have invalid types")?;
+    if let Some(helper) = &server.options().headers_helper {
+        helper.validate()?;
+    }
     if let McpServerConfig::Command { command, args, .. } = &server
         && (command.is_empty() || command.len() > MAX_VALUE_BYTES || args.len() > MAX_ARGV)
     {
@@ -1181,7 +1189,8 @@ mod tests {
             serde_json::json!({"command":"c","bearerTokenEnvVar":"X"}),
             serde_json::json!({"url":"https://e.com","envHttpHeaders":{"H":"1BAD"}}),
             serde_json::json!({"url":"https://e.com","envHttpHeaders":"x"}),
-            serde_json::json!({"url":"https://e.com","headersHelper":"./get-token.sh"}),
+            serde_json::json!({"url":"https://e.com","headersHelper":"./get-token.sh","headers_helper":"x"}),
+            serde_json::json!({"url":"https://e.com","headersHelper":7}),
         ] {
             assert!(parse_definition(bad).is_err());
         }

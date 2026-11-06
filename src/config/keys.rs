@@ -277,6 +277,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
         .shaped(ConfigShape::Integer),
     aliased("allow_all_mcp_calls", &["allow-all-mcp-calls"]).shaped(ConfigShape::Bool),
     gated("mcp", "mcp_tool_timeout_secs").described("Bound on one MCP `tools/call` round trip, in seconds. Default: 120.").shaped(ConfigShape::Integer),
+    gated("mcp", "mcp_headers_helper").described("Allow MCP URL servers to run a `headers_helper` command (JSON header output, 10 s, no shell, cleared environment) to supply request headers. Default: false; a project config can only set it after project trust.").shaped(ConfigShape::Bool),
     gated_aliased("mcp", "enable-exa-mcp", &["enable_exa_mcp"]).shaped(ConfigShape::Bool),
     gated_aliased("mcp", "enable-context7-mcp", &["enable_context7_mcp"]).shaped(ConfigShape::Bool),
     gated_aliased("mcp", "enable-grepapp-mcp", &["enable_grepapp_mcp"]).shaped(ConfigShape::Bool),
