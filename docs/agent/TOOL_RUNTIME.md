@@ -107,8 +107,13 @@ to the session's sandbox, so list can recover ids after transcript compaction
 and agent rebuilds. A session permits at most eight concurrent jobs and retains the newest
 32 job records; `list` also shows each job's log path. Background
 commands use the same shell, workspace, sandbox, and permission decision as
-foreground commands, and all are cancelled on turn cancellation or session
-shutdown.
+foreground commands. Jobs are session-scoped: interrupting a turn (Esc, Ctrl+C,
+ACP `session/cancel`) kills only foreground process groups, and the TUI then
+reports how many jobs are still running. Job process groups register in the
+job registry's own set, so `kill_active` never signals them. A job ends when it
+exits, reaches its deadline, is stopped through `job_status`/`/jobs stop`, or
+when the session ends: `/quit` cancels every job and dropping the session's
+sandbox cancels and reaps the rest.
 
 While a foreground shell call runs in an interactive turn, the tool forwards a
 throttled (at most every 100 ms) display-only `AgentEvent::ToolProgress` with

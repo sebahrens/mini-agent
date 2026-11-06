@@ -1107,6 +1107,7 @@ mod tests {
         fn drop(&mut self) {
             let _ = self.gate.release();
             self.shell.sandbox.kill_active();
+            self.shell.sandbox.cancel_background_jobs();
         }
     }
 
@@ -1789,6 +1790,54 @@ mod tests {
         assert!(terminal.len() < 70 * 1024, "rolling output was not bounded");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interrupted_turn_keeps_jobs_and_dropping_the_session_sandbox_reaps_them() {
+        let pid_file =
+            std::env::temp_dir().join(format!("mini-agent-session-job-{}", uuid::Uuid::new_v4()));
+        let shell = test_tool();
+        let status = JobStatusTool::new(shell.sandbox.clone(), None);
+        let started = shell
+            .call(BashArgs {
+                command: format!(
+                    "echo $$ > {}; while :; do sleep 1; done",
+                    shell_quote(&pid_file)
+                ),
+                timeout: Some(60_000),
+                background: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let id = background_id(&started);
+        wait_for_nonempty_file(&pid_file).await;
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // Esc / ACP cancel: foreground groups die, the job does not.
+        shell.sandbox.kill_active();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            process_exists(pid),
+            "turn interruption killed a background job"
+        );
+        let listed = status
+            .call(JobStatusArgs {
+                action: JobAction::List,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(listed.contains(&format!("{id}: running")), "{listed}");
+        // Session end: the last sandbox clone cancels and reaps the job tree.
+        drop(status);
+        drop(shell);
+        wait_for_process_exit(pid).await;
+        let _ = std::fs::remove_file(pid_file);
+    }
+
     async fn poll_job(status: &JobStatusTool, id: &str, since: Option<u64>) -> String {
         status
             .call(JobStatusArgs {
@@ -2194,7 +2243,14 @@ mod tests {
             "background job capacity is full (maximum 8 running jobs)"
         );
 
+        // Interrupting a turn kills foreground groups only; jobs survive.
         shell.sandbox.kill_active();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(shell.sandbox.running_background_job_count(), 8);
+        for summary in shell.sandbox.background_job_summaries() {
+            assert_eq!(summary.status.as_str(), "running");
+        }
+        shell.sandbox.cancel_background_jobs();
         for id in ids {
             let terminal = wait_for_terminal_job(&status, &id).await;
             assert!(terminal.contains("Status: cancelled"), "{terminal}");

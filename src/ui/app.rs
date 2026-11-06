@@ -3772,6 +3772,8 @@ impl<'a> App<'a> {
             UserEvent::Quit => {
                 self.cancel_all_permissions();
                 self.cron.stop_all();
+                // Background jobs outlive interrupted turns but not the session.
+                self.ui.sandbox.cancel_background_jobs();
                 // The terminal may already be gone (SIGHUP): drawing can fail,
                 // but stopping the run and saving must still happen.
                 if self.run.is_running
@@ -5176,6 +5178,16 @@ impl<'a> App<'a> {
             "interrupted (changes may be partial; review with git diff)",
             C_ERROR,
         )?;
+        let jobs = self.ui.sandbox.running_background_job_count();
+        if jobs > 0 {
+            self.renderer.write_line(
+                &format!(
+                    "{jobs} background job{} still running; /jobs lists them and /jobs stop <id> ends one",
+                    if jobs == 1 { "" } else { "s" }
+                ),
+                C_AGENT,
+            )?;
+        }
         Ok(())
     }
 

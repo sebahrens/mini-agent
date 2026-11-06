@@ -10160,7 +10160,7 @@ mod protocol_tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn turn_cancellation_stops_session_background_jobs() {
+    async fn turn_cancellation_keeps_session_background_jobs_running() {
         let sandbox = Sandbox::new(false, "bwrap");
         let id = sandbox
             .start_background_command(
@@ -10172,7 +10172,17 @@ mod protocol_tests {
         let control = TurnControl::new();
         assert!(control.attach_sandbox(sandbox.clone()));
         assert!(control.cancel());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let snapshot = sandbox.background_job_snapshot(&id).unwrap();
+        assert_eq!(
+            snapshot.status.as_str(),
+            "running",
+            "jobs are session-scoped"
+        );
+        assert_eq!(sandbox.running_background_job_count(), 1);
 
+        // Session end still settles every job.
+        sandbox.cancel_background_jobs();
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let snapshot = sandbox.background_job_snapshot(&id).unwrap();
@@ -10183,7 +10193,7 @@ mod protocol_tests {
             }
         })
         .await
-        .expect("ACP cancellation must settle every session background job");
+        .expect("session shutdown must settle every background job");
         assert_eq!(sandbox.running_background_job_count(), 0);
         assert_eq!(sandbox.active_group_count(), 0);
     }

@@ -798,6 +798,7 @@ mod tests {
             .catch_unwind()
             .await;
             sandbox.kill_active();
+            sandbox.cancel_background_jobs();
             let background_settled = if let Some(job) = &job {
                 sandbox
                     .wait_background_job(job, Duration::from_secs(5))
@@ -1076,6 +1077,7 @@ mod tests {
             .catch_unwind()
             .await;
             sandbox.kill_active();
+            sandbox.cancel_background_jobs();
             if let Some(job) = &job {
                 let final_state = sandbox
                     .wait_background_job(job, Duration::from_secs(5))

@@ -923,6 +923,9 @@ struct BackgroundJobsInner {
     jobs: Mutex<HashMap<String, BackgroundJobRecord>>,
     /// Log paths of pruned records, newest last.
     pruned_logs: Mutex<VecDeque<(String, PathBuf)>>,
+    /// Process groups of running jobs. Kept apart from the owning sandbox's
+    /// active groups so interrupting a turn (`kill_active`) leaves jobs alive.
+    process_groups: Arc<Mutex<HashSet<u32>>>,
     /// Records in `jobs` without a terminal state. Updated only while `jobs`
     /// is locked, so the redraw path can read it without the lock.
     running: AtomicUsize,
@@ -4912,7 +4915,26 @@ impl Sandbox {
     fn detached_background_sandbox(&self) -> Self {
         let mut sandbox = self.clone();
         sandbox.background_jobs = Arc::new(BackgroundJobsInner::default());
+        // Job trees register in the registry's own set, so `kill_active`
+        // (turn interruption) does not signal them; their per-job
+        // cancellation token and `cancel_background_jobs` still do.
+        sandbox.active_groups = self.background_jobs.process_groups.clone();
+        sandbox.cancelled_groups = Arc::new(Mutex::new(HashSet::new()));
         sandbox
+    }
+
+    /// Stop every running background job: session shutdown and `/quit`.
+    /// Turn interruption deliberately does not call this.
+    pub(crate) fn cancel_background_jobs(&self) {
+        let mut jobs = self
+            .background_jobs
+            .jobs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for job in jobs.values_mut().filter(|job| job.terminal.is_none()) {
+            job.stop_requested = true;
+            job.cancellation.cancel();
+        }
     }
 
     async fn run_background_command(
@@ -5698,27 +5720,25 @@ impl Sandbox {
         let _ = response_tx.send(output);
     }
 
+    /// Kill this sandbox's foreground process groups (turn interruption).
+    /// Background jobs are session-scoped and survive; they stop through
+    /// `job_status`/`/jobs stop`, their deadline, [`Self::cancel_background_jobs`]
+    /// or the registry being dropped with the session.
     pub fn kill_active(&self) {
-        // Cancel registered jobs before examining process groups. A job may
-        // have been inserted but not spawned yet; its command worker observes
-        // this token both before wrapping and immediately before spawning.
-        {
-            let mut jobs = self
-                .background_jobs
-                .jobs
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            for job in jobs.values_mut().filter(|job| job.terminal.is_none()) {
-                job.stop_requested = true;
-                job.cancellation.cancel();
-            }
-        }
+        #[cfg(windows)]
+        let background_groups = self
+            .background_jobs
+            .process_groups
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         #[cfg(windows)]
         let general: Vec<_> = self
             .general_owners
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
+            .filter(|owner| !background_groups.contains(&owner.pid()))
             .cloned()
             .collect();
         #[cfg(windows)]
