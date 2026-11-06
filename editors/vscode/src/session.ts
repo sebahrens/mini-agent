@@ -16,6 +16,8 @@ import {
 } from './diagnostics';
 import { log } from './log';
 import { PERSONA_CONFIG_ID, personaSelector } from './persona';
+import { clientCapabilities, readTextFile, writeTextFile } from './clientFs';
+import { clientFileAccessEnabled, vscodeClientFsHost } from './vscodeClientFs';
 import { SessionUpdateRouter, type PublicProtocolSession } from './protocolSession';
 
 type SessionState = 'stopped' | 'starting' | 'running' | 'stopping';
@@ -208,11 +210,21 @@ export class AgentSession {
 
     const output = Writable.toWeb(proc.stdin) as WritableStream<Uint8Array>;
     const input = Readable.toWeb(proc.stdout) as ReadableStream<Uint8Array>;
-    const app = acp.client({ name: 'mini-agent-vscode' })
+    // Editor-backed file access is opt-in (machine scope) and closed by default.
+    const clientFiles = clientFileAccessEnabled();
+    const fsContext = () => ({
+      workspaceRoot: cwd, trusted: vscode.workspace.isTrusted, host: vscodeClientFsHost,
+    });
+    let app = acp.client({ name: 'mini-agent-vscode' })
       .onNotification(acp.methods.client.session.update, notification => this.updates.receive(notification.params))
       .onRequest(acp.methods.client.session.requestPermission, request => (
         this.requestPermission(request.params, request.signal)
       ));
+    if (clientFiles) {
+      app = app
+        .onRequest(acp.methods.client.fs.readTextFile, request => readTextFile(fsContext(), request.params))
+        .onRequest(acp.methods.client.fs.writeTextFile, request => writeTextFile(fsContext(), request.params));
+    }
     const connection = app.connect(acp.ndJsonStream(output, input));
     this.connection = connection;
     this.client = connection.agent;
@@ -220,7 +232,7 @@ export class AgentSession {
     try {
       const initialized = await connection.agent.request(acp.methods.agent.initialize, {
         protocolVersion: acp.PROTOCOL_VERSION,
-        clientCapabilities: {},
+        clientCapabilities: clientCapabilities(clientFiles),
         clientInfo: { name: 'mini-agent-vscode', version: extensionVersion(this.context) },
       }, { cancellationSignal: AbortSignal.timeout(10_000) });
       this.supportsLoad = initialized.agentCapabilities?.loadSession === true;

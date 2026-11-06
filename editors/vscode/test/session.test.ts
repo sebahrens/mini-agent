@@ -21,11 +21,15 @@ const logMock = vi.hoisted(() => ({
 }));
 const spawnMock = vi.hoisted(() => vi.fn());
 const trust = vi.hoisted(() => ({ isTrusted: true }));
+const clientFiles = vi.hoisted(() => ({ enabled: undefined as boolean | undefined, registered: [] as string[] }));
 const protocol = vi.hoisted(() => ({ connect: vi.fn() }));
 
 vi.mock('vscode', () => ({
   StatusBarAlignment: { Right: 2 },
-  workspace: { get isTrusted() { return trust.isTrusted; } },
+  workspace: {
+    get isTrusted() { return trust.isTrusted; },
+    getConfiguration: () => ({ inspect: () => ({ globalValue: clientFiles.enabled }) }),
+  },
   window: {
     createStatusBarItem: vi.fn(() => statusBar),
     showErrorMessage: ui.showErrorMessage,
@@ -110,7 +114,7 @@ vi.mock('@agentclientprotocol/sdk', async () => {
   const actual = await vi.importActual<typeof import('@agentclientprotocol/sdk')>('@agentclientprotocol/sdk');
   return {
     ...actual,
-    client: vi.fn(() => { const builder = { onNotification: () => builder, onRequest: () => builder, connect: protocol.connect }; return builder; }),
+    client: vi.fn(() => { const builder = { onNotification: () => builder, onRequest: (method: string) => { clientFiles.registered.push(method); return builder; }, connect: protocol.connect }; return builder; }),
     ndJsonStream: vi.fn(() => ({})),
   };
 });
@@ -173,6 +177,8 @@ function makeSession(executable = '/usr/bin/mini-agent'): AgentSession {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  clientFiles.enabled = undefined;
+  clientFiles.registered = [];
   trust.isTrusted = true;
 });
 
@@ -428,5 +434,38 @@ describe('AgentSession ACP trust transitions', () => {
     expect(child.exitCode).toBe(0);
     expect(statusBar.hide).toHaveBeenCalled();
     session.dispose();
+  });
+});
+
+describe('editor-backed client file access', () => {
+  async function initializeCapabilities(): Promise<unknown> {
+    successfulProbe();
+    spawnMock.mockReturnValueOnce(new FakeProtocolProcess());
+    const agent = {
+      request: vi.fn(async (method: string, _params?: unknown) => method === 'initialize'
+        ? { protocolVersion: 1, agentCapabilities: {} } : { sessionId: 's', stopReason: 'end_turn' }),
+      notify: vi.fn(async () => undefined),
+    };
+    protocol.connect.mockReturnValue({ agent, close: vi.fn() });
+    const session = makeSession();
+    try {
+      await session.start();
+      const call = agent.request.mock.calls.find(entry => entry[0] === 'initialize');
+      return (call?.[1] as { clientCapabilities: unknown }).clientCapabilities;
+    } finally { await session.stop(); session.dispose(); }
+  }
+
+  it('advertises nothing and registers no fs handlers by default', async () => {
+    expect(await initializeCapabilities()).toEqual({});
+    expect(clientFiles.registered).not.toContain('fs/read_text_file');
+    expect(clientFiles.registered).not.toContain('fs/write_text_file');
+  });
+
+  it('a workspace-level or false value stays closed; the user setting opens it', async () => {
+    clientFiles.enabled = false;
+    expect(await initializeCapabilities()).toEqual({});
+    clientFiles.enabled = true;
+    expect(await initializeCapabilities()).toEqual({ fs: { readTextFile: true, writeTextFile: true } });
+    expect(clientFiles.registered).toEqual(expect.arrayContaining(['fs/read_text_file', 'fs/write_text_file']));
   });
 });

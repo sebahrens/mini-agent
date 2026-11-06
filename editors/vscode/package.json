@@ -88,6 +88,12 @@
           "description": "Path to the mini-agent executable. Leave empty to use the bundled artifact.",
           "scope": "machine"
         },
+        "mini-agent.clientFileAccess": {
+          "type": "boolean",
+          "default": false,
+          "description": "Let the Mini Agent server read and write workspace files through the editor (unsaved buffers, undo stack) using ACP fs/read_text_file and fs/write_text_file. Paths are confined to the trusted workspace folder.",
+          "scope": "machine"
+        },
         "mini-agent.showThoughts": {
           "type": "boolean",
           "default": false,

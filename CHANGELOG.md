@@ -8,6 +8,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### ACP, IDE and headless
 
+- VS Code: opt-in `mini-agent.clientFileAccess` (machine scope, default off) advertises ACP
+  `fs/read_text_file` and `fs/write_text_file` and serves them from the live editor buffers,
+  confined to the trusted workspace. The Mini Agent server does not yet route its own read, edit
+  and write tools through them.
 - `mini-agent update [--check] [--release X.Y.Z]` downloads the matching release archive, checks it
   against `SHA256SUMS` with `install.sh`'s fail-closed rules, runs the new binary's `--version`,
   and replaces the installed executable atomically (Unix). It refuses Homebrew, npm, cargo, Nix,
