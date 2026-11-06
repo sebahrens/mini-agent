@@ -293,26 +293,83 @@ fn exit_reason(status: std::process::ExitStatus) -> String {
     }
 }
 
+/// Kills the credential command's whole process group when dropped (or on
+/// demand), so `sh -c` wrappers cannot leave a grandchild running or holding
+/// the stdout pipe open past the deadline. The command is spawned as the
+/// leader of its own group; on non-Unix targets only the direct child is
+/// killed by the callers.
+struct GroupKill {
+    #[cfg(unix)]
+    pgid: Option<i32>,
+}
+
+impl GroupKill {
+    fn new(pid: Option<u32>) -> Self {
+        #[cfg(unix)]
+        {
+            Self {
+                pgid: pid
+                    .and_then(|pid| i32::try_from(pid).ok())
+                    .filter(|pid| *pid > 1),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+            Self {}
+        }
+    }
+
+    fn kill(&self) {
+        #[cfg(unix)]
+        if let Some(pgid) = self.pgid {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pgid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    }
+}
+
+impl Drop for GroupKill {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
 fn run_blocking(credential: &CommandCredential) -> Result<String, String> {
     use std::io::Read as _;
     use std::process::{Command, Stdio};
     let spec = &credential.spec;
-    let mut child = Command::new(&spec.command[0])
+    let mut command = Command::new(&spec.command[0]);
+    command
         .args(&spec.command[1..])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let mut child = command
         .spawn()
         .map_err(|error| credential.failure(&format!("could not start ({:?})", error.kind())))?;
+    let group = GroupKill::new(Some(child.id()));
     let mut stdout = child.stdout.take().expect("piped stdout");
-    let reader = std::thread::spawn(move || {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    // Never joined: a descendant that escaped the group and still holds the
+    // pipe only keeps this detached thread alive, not the caller.
+    std::thread::spawn(move || {
         let mut output = Vec::new();
         let _ = (&mut stdout)
             .take(MAX_OUTPUT_BYTES as u64 + 1)
             .read_to_end(&mut output);
-        output
+        let _ = sender.send(output);
     });
     let deadline = Instant::now() + spec.timeout();
+    let timed_out =
+        || credential.failure(&format!("timed out after {} s", spec.timeout().as_secs()));
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -320,17 +377,23 @@ fn run_blocking(credential: &CommandCredential) -> Result<String, String> {
                 std::thread::sleep(Duration::from_millis(10));
             }
             Ok(None) => {
+                group.kill();
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = reader.join();
-                return Err(
-                    credential.failure(&format!("timed out after {} s", spec.timeout().as_secs()))
-                );
+                return Err(timed_out());
             }
-            Err(_) => return Err(credential.failure("could not be waited on")),
+            Err(_) => {
+                group.kill();
+                return Err(credential.failure("could not be waited on"));
+            }
         }
     };
-    let output = reader.join().unwrap_or_default();
+    // The helper exited: end anything it left behind so the pipe closes.
+    group.kill();
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let Ok(output) = receiver.recv_timeout(remaining.max(Duration::from_millis(200))) else {
+        return Err(timed_out());
+    };
     if !status.success() {
         return Err(credential.failure(&exit_reason(status)));
     }
@@ -340,33 +403,49 @@ fn run_blocking(credential: &CommandCredential) -> Result<String, String> {
 async fn run_async(credential: &CommandCredential) -> Result<String, String> {
     use tokio::io::AsyncReadExt as _;
     let spec = &credential.spec;
-    let mut child = tokio::process::Command::new(&spec.command[0])
+    let mut command = tokio::process::Command::new(&spec.command[0]);
+    command
         .args(&spec.command[1..])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
         .spawn()
         .map_err(|error| credential.failure(&format!("could not start ({:?})", error.kind())))?;
+    // Dropping this (timeout, cancellation, or normal return) kills the group.
+    let group = GroupKill::new(child.id());
     let mut stdout = child.stdout.take().expect("piped stdout");
     let run = async {
         let mut output = Vec::new();
-        (&mut stdout)
-            .take(MAX_OUTPUT_BYTES as u64 + 1)
-            .read_to_end(&mut output)
-            .await
-            .map_err(|_| credential.failure("output could not be read"))?;
-        let status = child
-            .wait()
-            .await
-            .map_err(|_| credential.failure("could not be waited on"))?;
+        let status = {
+            let mut limited = (&mut stdout).take(MAX_OUTPUT_BYTES as u64 + 1);
+            let mut read = Box::pin(limited.read_to_end(&mut output));
+            let status = tokio::select! {
+                read_result = &mut read => {
+                    read_result.map_err(|_| credential.failure("output could not be read"))?;
+                    child.wait().await
+                }
+                status = child.wait() => {
+                    // The helper exited: end what it left behind so the pipe
+                    // closes instead of stalling on a backgrounded daemon.
+                    group.kill();
+                    read.await
+                        .map_err(|_| credential.failure("output could not be read"))?;
+                    status
+                }
+            };
+            status.map_err(|_| credential.failure("could not be waited on"))?
+        };
         Ok::<_, String>((output, status))
     };
-    let (output, status) = tokio::time::timeout(spec.timeout(), run)
-        .await
-        .map_err(|_| {
-            credential.failure(&format!("timed out after {} s", spec.timeout().as_secs()))
-        })??;
+    let result = tokio::time::timeout(spec.timeout(), run).await;
+    group.kill();
+    let (output, status) = result.map_err(|_| {
+        credential.failure(&format!("timed out after {} s", spec.timeout().as_secs()))
+    })??;
     if !status.success() {
         return Err(credential.failure(&exit_reason(status)));
     }
@@ -868,5 +947,88 @@ mod tests {
             .expect("expired token renewed before sending");
         assert_eq!(*seen.lock().unwrap(), ["ttl-2"]);
         configure(None).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn process_alive(marker: &str) -> bool {
+        std::process::Command::new("pgrep")
+            .args(["-f", marker])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blocking_timeout_returns_promptly_and_kills_grandchildren() {
+        let marker = "sleep 30.4817";
+        let credential = CommandCredential::new(
+            "gw",
+            ApiKeyCommandSpec {
+                command: vec!["sh".into(), "-c".into(), format!("{marker}; echo tok")],
+                ttl_secs: Some(0),
+                timeout_secs: Some(1),
+            },
+        );
+        let started = Instant::now();
+        let error = run_blocking(&credential).unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "{:?}",
+            started.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!process_alive(marker), "grandchild survived the timeout");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blocking_success_does_not_wait_for_a_backgrounded_daemon() {
+        let marker = "sleep 31.5291";
+        let credential = CommandCredential::new(
+            "gw",
+            ApiKeyCommandSpec {
+                command: vec!["sh".into(), "-c".into(), format!("{marker} & echo tok")],
+                ttl_secs: Some(0),
+                timeout_secs: Some(5),
+            },
+        );
+        let started = Instant::now();
+        assert_eq!(run_blocking(&credential).unwrap(), "tok");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!process_alive(marker), "daemon survived the helper");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn async_timeout_kills_grandchildren_and_success_ignores_daemons() {
+        let marker = "sleep 32.6113";
+        let hung = CommandCredential::new(
+            "gw",
+            ApiKeyCommandSpec {
+                command: vec!["sh".into(), "-c".into(), format!("{marker}; echo tok")],
+                ttl_secs: Some(0),
+                timeout_secs: Some(1),
+            },
+        );
+        let started = Instant::now();
+        assert!(run_async(&hung).await.unwrap_err().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(4));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!process_alive(marker));
+        let marker = "sleep 33.7127";
+        let daemon = CommandCredential::new(
+            "gw",
+            ApiKeyCommandSpec {
+                command: vec!["sh".into(), "-c".into(), format!("{marker} & echo tok")],
+                ttl_secs: Some(0),
+                timeout_secs: Some(5),
+            },
+        );
+        assert_eq!(run_async(&daemon).await.unwrap(), "tok");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!process_alive(marker));
     }
 }
