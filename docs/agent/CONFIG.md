@@ -1710,8 +1710,23 @@ format and effort share the same native `output_config`.
 `/effort` reports the effective level/source. `/effort low|medium|high|xhigh|max`
 persists the main-session override, and `/effort default` clears it. Supported
 levels depend on the actual adapter and model: Opus/Sonnet4.6 omit `xhigh`, and
-Opus4.5 supports only low/medium/high. Unknown model capabilities and unsupported
-levels are refused. Native OpenAI does not accept the new `max` value here.
+Opus4.5 supports only low/medium/high. Unsupported levels are refused. Native
+OpenAI does not accept the new `max` value here.
+
+Model ids outside the exact table are handled conservatively:
+
+| Model id | Configured `[reasoning] effort` | Session `/effort` |
+| --- | --- | --- |
+| Official-looking newer Claude id (`claude-<opus\|sonnet\|haiku\|fable\|mythos>-<major>[-<minor>][-YYYYMMDD]`, 5.x or 4.6+), e.g. `claude-opus-5-9` | Sent as `output_config.effort` with adaptive thinking, like current models | Same |
+| Bedrock/Vertex spellings (`us.anthropic.claude-sonnet-5`, `anthropic.claude-opus-4-8-v1:0`, `claude-sonnet-4-5@20250929`) | Normalized to the native id, then as direct Anthropic | Same |
+| Other unknown Claude/gateway aliases | Dropped with a warning (the turn still runs) | Refused |
+| Gemini 3 (`gemini-3*`) | `generationConfig.thinkingConfig.thinkingLevel` (`minimal`/`low`/`medium`/`high`; `xhigh`/`max` map to `high`) | Same |
+| Gemini 2.5 (`gemini-2.5*`) | `generationConfig.thinkingConfig.thinkingBudget` (none 0 (128 on Pro), minimal 512, low 2048, medium 8192, high 16384, xhigh/max the model ceiling) | Same |
+| Other Gemini models | Dropped with a warning | Refused |
+| Ollama | Not mapped; configured effort is ignored | Refused |
+
+An explicit `thinkingConfig` in `extra_body.generationConfig` always wins over the mapped
+value, and Gemini thinking is set with `/effort`, not `/reasoning on|off`.
 
 Native `/reasoning on|off|default` controls request thinking without changing the
 signed system prefix or the feed's display preference. Models such as Opus5.5

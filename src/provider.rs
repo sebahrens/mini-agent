@@ -862,6 +862,7 @@ impl AnyClient {
             AnyModel::Copilot(model) => copilot::reasoning_protocol(model),
             AnyModel::OpenAI(OpenAiModel::Responses(_)) => effort::Protocol::OpenAiResponses,
             AnyModel::OpenAI(OpenAiModel::Completions(_)) => effort::Protocol::OpenAiCompletions,
+            AnyModel::Gemini(_) => effort::Protocol::Gemini,
             _ => effort::Protocol::Other,
         };
         let raw = crate::config::resolve_extra_body(cfg, &session.model);
@@ -3395,7 +3396,7 @@ impl AnyAgent {
             AnyAgentInner::OpenAI(OpenAiAgent::Completions(a)) => {
                 (P::OpenAiCompletions, &a.model.model)
             }
-            AnyAgentInner::Gemini(a) => (P::Other, &a.model.model),
+            AnyAgentInner::Gemini(a) => (P::Gemini, &a.model.model),
             AnyAgentInner::Ollama(a) => (P::Other, &a.model.model),
             AnyAgentInner::Copilot(a) => (copilot::reasoning_protocol(&a.model), &a.model.model),
         }
