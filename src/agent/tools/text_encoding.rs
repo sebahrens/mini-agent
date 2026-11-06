@@ -30,7 +30,7 @@ pub(crate) fn decode_utf16_bom(bytes: &[u8]) -> Option<Result<(String, TextEncod
         _ => return None,
     };
     let payload = &bytes[2..];
-    if payload.len() % 2 != 0 {
+    if !payload.len().is_multiple_of(2) {
         return Some(Err(
             "the UTF-16 payload has an odd number of bytes".to_string()
         ));
