@@ -53,12 +53,22 @@ pub(crate) fn support_lines() -> Vec<String> {
             KNOWN_UNDISPATCHED_HOOK_EVENTS.join(", ")
         ),
         format!(
-            "  handler types: {} (http {}); prompt, agent and mcp_tool handlers are skipped with a warning",
+            "  handler types: {} (http {}; mcp_tool {}; prompt/agent {})",
             SUPPORTED_HOOK_TYPES.join(", "),
             if crate::extras::hooks::http_hooks_enabled() {
                 "enabled"
             } else {
                 "disabled: set hooks_http_enabled = true"
+            },
+            if crate::extras::hooks::backend::mcp_tool_hooks_enabled() {
+                "enabled"
+            } else {
+                "disabled: set hooks_mcp_tool_enabled = true"
+            },
+            if crate::extras::hooks::backend::model_hooks_enabled() {
+                "enabled"
+            } else {
+                "disabled: set hooks_model_enabled = true"
             }
         ),
     ]

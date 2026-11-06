@@ -871,6 +871,14 @@ pub struct Config {
     /// http handlers load but are never contacted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hooks_http_enabled: Option<bool>,
+    /// Allow `type: "mcp_tool"` hook handlers to call a connected MCP server
+    /// tool. Default false: they load but never run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hooks_mcp_tool_enabled: Option<bool>,
+    /// Allow `type: "prompt"` and `"agent"` hook handlers to send the hook
+    /// event to a model. Default false: they load but never run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hooks_model_enabled: Option<bool>,
     /// Let PermissionRequest hooks answer approvals (allow once / deny).
     /// Default false: they only observe.
     #[serde(skip_serializing_if = "Option::is_none")]

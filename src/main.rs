@@ -627,6 +627,12 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
     #[cfg(feature = "hooks")]
     {
         crate::extras::hooks::set_http_hooks_enabled(cfg.hooks_http_enabled.unwrap_or(false));
+        crate::extras::hooks::backend::set_mcp_tool_hooks_enabled(
+            cfg.hooks_mcp_tool_enabled.unwrap_or(false),
+        );
+        crate::extras::hooks::backend::set_model_hooks_enabled(
+            cfg.hooks_model_enabled.unwrap_or(false),
+        );
         crate::extras::hooks::set_permission_decisions_enabled(
             cfg.hooks_permission_decisions.unwrap_or(false),
         );

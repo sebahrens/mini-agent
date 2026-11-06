@@ -220,6 +220,20 @@ fn hook_confirmation_description(
         "event={event}; matcher={matcher}; subprocess trust={trust:?}; explicit env keys={env_keys}; env binding sha256={env_binding_sha256:?}{content}"
     );
 
+    match handler.kind.as_str() {
+        "mcp_tool" => {
+            return format!(
+                "mcp_tool call server+tool+input={argv} (runs without a per-call prompt when hooks_mcp_tool_enabled is set); {policy}"
+            );
+        }
+        "prompt" | "agent" => {
+            return format!(
+                "{} hook prompt+model={argv} (sends the hook event to the model when hooks_model_enabled is set); {policy}",
+                handler.kind
+            );
+        }
+        _ => {}
+    }
     if handler.kind == "http" {
         // The URL lives in `command`, literal request headers in `env`.
         return format!("http POST url={argv} (headers are the env binding); {policy}");

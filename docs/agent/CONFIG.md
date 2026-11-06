@@ -755,6 +755,8 @@ Accepted top-level keys:
 | `session_retention_days` | integer | Delete saved session snapshots (`<uuid>.json` in the sessions directory) whose modification time is older than this many days, once per interactive startup in a background thread. Default: unset/`0` (keep forever). A session open in this or another live process (its lock is held) is never removed; tool-output spill directories are left in place. Requires project trust when set locally. |
 | `persist_project_approvals` | boolean | Offer `(p) always allow in this project` on TUI approval prompts and load those rules at interactive startup. Default: `false`. Rules are stored privately per workspace in the state directory, never in the repository; headless runs ignore them. See [Interactive approvals](#interactive-approvals). |
 | `hooks_http_enabled` | boolean | Allow `type: "http"` hook handlers to POST event JSON to their configured URL. Default: `false` (http hooks load but are never contacted). Requires `hooks`. See [HTTP handlers](#http-handlers). |
+| `hooks_mcp_tool_enabled` | boolean | Allow `type: "mcp_tool"` hook handlers to call a tool on a connected MCP server. Default: `false` (they load but never run). Requires `hooks` and `mcp`. See [Prompt, agent and MCP tool handlers](#prompt-agent-and-mcp-tool-handlers). |
+| `hooks_model_enabled` | boolean | Allow `type: "prompt"` and `"agent"` hook handlers to send the hook event to a model. Default: `false` (they load but never run). Requires `hooks`. See [Prompt, agent and MCP tool handlers](#prompt-agent-and-mcp-tool-handlers). |
 | `hooks_permission_decisions` | boolean | Let `PermissionRequest` hooks answer a pending approval with allow (once) or deny, including in headless runs. Default: `false` (observe only). Requires `hooks`. See [Hook event parity](#hook-event-parity). |
 | `skills_max_selected` | integer | Agent Skills injected per turn by prompt relevance. Default: `3` (at most 16). Requires `agent-skills`. See [SKILLS.md](SKILLS.md#selection-limits-and-the-always-visible-catalog). |
 | `skills_score_floor` | number | Minimum relevance score for automatic Agent Skill selection, 0.0–1.0. Default: `0.20`. |
@@ -1211,6 +1213,35 @@ identity and are shown in the project-hook approval prompt.
 `config.toml` (a sensitive key; project-local values need trust) to let them
 send requests; otherwise they load but are never contacted, and `/hooks`
 reports them as disabled.
+
+### Prompt, agent and MCP tool handlers
+
+```json
+{ "type": "mcp_tool", "server": "memory", "tool": "save_observation", "input": { "file": "${tool_input.file_path}" } }
+{ "type": "prompt", "prompt": "Does this command delete data? $ARGUMENTS", "model": "cheap", "timeout": 30 }
+{ "type": "agent", "prompt": "Verify the change is safe: $ARGUMENTS" }
+```
+
+All three are **off by default** and are part of the hook's trust identity (server, tool, input,
+prompt and model are shown in the project-hook approval prompt; `command`, `args`, `env`, `if`,
+`url` and `headers` are rejected). `async` and `once` work as for commands.
+
+- `mcp_tool` needs `hooks_mcp_tool_enabled = true`. It calls `tool` on the already connected MCP
+  server named `server` (default timeout 600 s, at most 600 s); the text content of the result is
+  read like a command hook's stdout after exit 0, an error result like a non-zero exit, a missing or
+  closed server as a failure. `${a.b.c}` inside `input` string values is replaced by that path of the
+  event JSON (nothing else is evaluated). The call is made by operator-authored, trust-approved
+  configuration and does not prompt per call. The server is resolved by name among the servers
+  connected in this process, so give servers distinct names when several ACP sessions run.
+- `prompt` and `agent` need `hooks_model_enabled = true`, which sends the event JSON to a model
+  provider. The handler's text is the instruction; `$ARGUMENTS` is replaced by the event (bounded
+  to 64 KiB, fenced as untrusted data), otherwise the event is appended. The model must answer
+  `{"ok": true|false, "reason": "..."}`: `false` blocks through the event's normal block path, an
+  unparseable reply is a failure. The model is the startup model (or `model`, a quick-model name or a
+  model of that provider); usage is attributed to the current run. Default timeouts: 30 s (`prompt`),
+  60 s (`agent`). The `agent` type is currently a tool-free, single-turn verdict: it cannot read files
+  or run tools, so it can never change anything, but it also cannot investigate like Claude Code's
+  agent hook.
 
 ### Events
 

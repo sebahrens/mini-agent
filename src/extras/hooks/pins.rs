@@ -201,6 +201,10 @@ impl HookContentPins {
             return Self::default();
         };
         let mut pins = Self::default();
+        // `mcp_tool`, `prompt` and `agent` handlers launch no workspace file.
+        if matches!(handler.kind.as_str(), "mcp_tool" | "prompt" | "agent") {
+            return pins;
+        }
         let search_path = handler_search_path(handler);
         if let Some(command) = handler.command.as_deref()
             && let Ok(program) = resolve_hook_program(command, search_path.as_deref(), &root)

@@ -142,6 +142,8 @@ impl McpClientManager {
     /// Wrap already-connected handles. Handles should be sorted by server name
     /// so tool ordering and collision handling stay deterministic.
     pub fn from_handles(handles: Vec<client::McpClientHandle>) -> Self {
+        #[cfg(feature = "hooks")]
+        crate::extras::hooks::backend::register_mcp_peers(&handles);
         let health = health::Health::default();
         for handle in &handles {
             health

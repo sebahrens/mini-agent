@@ -1318,6 +1318,56 @@ async fn ytyt3_http_hook_is_closed_by_default_and_decides_when_enabled() {
     assert_eq!(envelope["hook_event_name"], "Stop");
 }
 
+// mini-agent-s3uqw: mcp_tool, prompt and agent handlers are default closed;
+// opting in runs them, and a failing one fails closed on a gating event.
+#[tokio::test]
+async fn s3uqw_backend_handlers_are_closed_by_default_and_run_after_opt_in() {
+    use crate::extras::hooks::backend::{set_mcp_tool_hooks_enabled, set_model_hooks_enabled};
+    assert!(!crate::extras::hooks::backend::mcp_tool_hooks_enabled());
+    assert!(!crate::extras::hooks::backend::model_hooks_enabled());
+    let mcp = HookHandler {
+        kind: "mcp_tool".into(),
+        command: Some("not-connected".into()),
+        args: Some(vec!["tool".into(), "{}".into()]),
+        ..handler("unused")
+    };
+    let model = |kind: &str| HookHandler {
+        kind: kind.into(),
+        command: Some("Is it safe?".into()),
+        args: None,
+        ..handler("unused")
+    };
+    for (handlers, enable, disable) in [
+        (
+            vec![mcp],
+            set_mcp_tool_hooks_enabled as fn(bool),
+            set_mcp_tool_hooks_enabled as fn(bool),
+        ),
+        (
+            vec![model("prompt"), model("agent")],
+            set_model_hooks_enabled as fn(bool),
+            set_model_hooks_enabled as fn(bool),
+        ),
+    ] {
+        let dispatcher =
+            HookDispatcher::from_config(&config_with("PreToolUse", None, handlers)).unwrap();
+        let closed = dispatcher
+            .dispatch_pre_tool_use(&ctx(), "bash", serde_json::json!({}))
+            .await;
+        assert_eq!(closed.verdict, Verdict::Defer, "default stays closed");
+        enable(true);
+        let open = dispatcher
+            .dispatch_pre_tool_use(&ctx(), "bash", serde_json::json!({}))
+            .await;
+        disable(false);
+        assert_eq!(
+            open.verdict,
+            Verdict::Deny,
+            "an unavailable backend fails closed"
+        );
+    }
+}
+
 #[tokio::test]
 async fn ytyt3_new_lifecycle_events_dispatch_with_their_envelopes() {
     let root = crate::tests::OwnedTestDirectory::new("hooks-new-events");

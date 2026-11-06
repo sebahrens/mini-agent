@@ -187,6 +187,7 @@ impl CommandTemplate {
     }
 
     /// Whether expansion reads workspace files (and so needs a read policy).
+    #[cfg(any(feature = "acp", test))]
     pub(crate) fn has_includes(&self) -> bool {
         self.segments
             .iter()

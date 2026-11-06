@@ -341,6 +341,8 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     key("acp_max_sessions").described("ACP: concurrently loaded sessions (default 64)").shaped(ConfigShape::Integer),
     key("acp_max_client_mcp_servers").described("ACP: client-supplied MCP servers per session (default 8)").shaped(ConfigShape::Integer),
     key("hooks_http_enabled").described("Allow type \"http\" hook handlers to POST event JSON to their configured URL (default false: http hooks stay inert)").shaped(ConfigShape::Bool),
+    key("hooks_mcp_tool_enabled").described("Allow type \"mcp_tool\" hook handlers to call a tool on a connected MCP server (default false: they stay inert)").shaped(ConfigShape::Bool),
+    key("hooks_model_enabled").described("Allow type \"prompt\" and \"agent\" hook handlers to send the hook event to a model (default false: they stay inert)").shaped(ConfigShape::Bool),
     key("hooks_permission_decisions").described("Let PermissionRequest hooks answer a pending approval with allow (once) or deny, also in headless runs (default false: observe only)").shaped(ConfigShape::Bool),
     key("skills_max_selected").described("Agent Skills injected per turn by relevance (default 3, at most 16)").shaped(ConfigShape::Integer),
     key("skills_score_floor").described("Minimum relevance score for automatic Agent Skill selection (default 0.20)").shaped(ConfigShape::Number),

@@ -1198,7 +1198,7 @@ impl AnyClient {
         .await
     }
 
-    #[cfg(feature = "goal")]
+    #[cfg(any(feature = "goal", feature = "hooks"))]
     pub(crate) async fn plain_completion_observed(
         &self,
         model_name: &str,

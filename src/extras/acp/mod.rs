@@ -2586,6 +2586,10 @@ async fn handle_prompt(
     // A user-defined prompt command expands to one ordinary user text block;
     // everything downstream (and agent-mention routing) sees that block.
     let mut prompt_blocks = req.prompt.clone();
+    #[cfg_attr(
+        not(feature = "subagents"),
+        allow(unused_variables, unused_assignments)
+    )]
     let mut expanded_custom = false;
     if command.is_none() && commands::invocation(&req.prompt).is_some() {
         let workspace = state
@@ -2603,6 +2607,7 @@ async fn handle_prompt(
         }
     }
     let prompt_input = parse_prompt_blocks(&prompt_blocks)?;
+    let _ = expanded_custom; // read only by agent-mention routing (`subagents`)
 
     let snapshot = {
         let sessions = state.sessions.lock().await;

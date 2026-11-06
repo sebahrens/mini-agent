@@ -60,7 +60,7 @@ fn unsupported_handler_types_are_skipped_per_hook_without_dropping_the_file() {
             {
                 "hooks": [
                     {"type": "http", "command": "irrelevant"},
-                    {"type": "prompt", "prompt": "judge"},
+                    {"type": "teleport", "prompt": "judge"},
                     {"type": "command", "command": "guard"},
                     {"type": "http", "url": "https://hooks.example.invalid/pre", "headers": {"X-Token": "literal"}},
                     {"type": "http", "url": "file:///etc/passwd"}
@@ -134,4 +134,42 @@ fn repo_settings_shape_and_unknown_events_keep_known_hooks() {
     ] {
         assert_eq!(config.get(event).map(Vec::len), Some(1), "{event}");
     }
+}
+
+#[test]
+fn s3uqw_prompt_agent_and_mcp_tool_handlers_parse_and_reject_hostile_shapes() {
+    let value = json!({"PreToolUse": [{"hooks": [
+        {"type": "prompt", "prompt": "Is this safe? $ARGUMENTS", "model": "cheap", "timeout": 5},
+        {"type": "agent", "prompt": "Check the diff"},
+        {"type": "mcp_tool", "server": "memory", "tool": "save", "input": {"p": "${tool_input.file_path}"}},
+        // Rejected: missing/empty/oversized fields and subprocess/URL fields.
+        {"type": "prompt"},
+        {"type": "prompt", "prompt": "   "},
+        {"type": "prompt", "prompt": "x", "command": "sh"},
+        {"type": "prompt", "prompt": "x", "model": 7},
+        {"type": "agent", "prompt": "x".repeat(33 * 1024)},
+        {"type": "agent", "prompt": "x", "url": "https://example.invalid"},
+        {"type": "mcp_tool", "tool": "save"},
+        {"type": "mcp_tool", "server": "a\nb", "tool": "t"},
+        {"type": "mcp_tool", "server": "s", "tool": "t", "input": [1]},
+        {"type": "mcp_tool", "server": "s", "tool": "t", "args": ["--evil"]},
+        {"type": "mcp_tool", "server": "s", "tool": "t", "if": "true"},
+        {"type": "mcp_tool", "server": "s", "tool": "t", "input": {"big": "y".repeat(70 * 1024)}}
+    ]}]});
+    let config = parse_hooks_config(&value).unwrap();
+    let hooks = &config["PreToolUse"][0].hooks;
+    assert_eq!(hooks.len(), 3, "{hooks:?}");
+    assert_eq!(
+        hooks[0].command.as_deref(),
+        Some("Is this safe? $ARGUMENTS")
+    );
+    assert_eq!(hooks[0].args.as_deref(), Some(&["cheap".to_string()][..]));
+    assert_eq!(hooks[1].args, None);
+    assert_eq!(hooks[2].command.as_deref(), Some("memory"));
+    let args = hooks[2].args.as_deref().unwrap();
+    assert_eq!(args[0], "save");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&args[1]).unwrap(),
+        json!({"p": "${tool_input.file_path}"})
+    );
 }
