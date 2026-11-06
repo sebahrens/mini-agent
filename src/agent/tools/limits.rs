@@ -19,6 +19,9 @@ pub const MIN_MAX_RESULT_CHARS: usize = 4_000;
 pub const DEFAULT_MAX_READ_LINE_CHARS: usize = 2_000;
 /// Smallest accepted read line width.
 pub const MIN_MAX_READ_LINE_CHARS: usize = 80;
+/// Default raw-size limit for notebook views and edits, independent of
+/// `max_text_file_size` (image outputs make executed notebooks large).
+pub const DEFAULT_NOTEBOOK_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ToolLimits {
@@ -26,6 +29,9 @@ pub struct ToolLimits {
     pub max_result_chars: usize,
     /// Characters of one `read` line shown before a clip marker.
     pub max_read_line_chars: usize,
+    /// Raw notebook size accepted by the cell view and `notebook_edit`
+    /// (never above the 64 MiB hard ceiling).
+    pub notebook_max_bytes: u64,
 }
 
 impl Default for ToolLimits {
@@ -33,6 +39,7 @@ impl Default for ToolLimits {
         Self {
             max_result_chars: DEFAULT_MAX_RESULT_CHARS,
             max_read_line_chars: DEFAULT_MAX_READ_LINE_CHARS,
+            notebook_max_bytes: DEFAULT_NOTEBOOK_MAX_BYTES,
         }
     }
 }
@@ -56,6 +63,10 @@ impl ToolLimits {
                 .max_read_line_chars
                 .map_or(defaults.max_read_line_chars, to_usize)
                 .max(MIN_MAX_READ_LINE_CHARS),
+            notebook_max_bytes: table
+                .notebook_max_bytes
+                .unwrap_or(defaults.notebook_max_bytes)
+                .min(super::notebook::MAX_NOTEBOOK_BYTES),
         }
     }
 
@@ -74,6 +85,7 @@ impl ToolLimits {
 static CURRENT: RwLock<ToolLimits> = RwLock::new(ToolLimits {
     max_result_chars: DEFAULT_MAX_RESULT_CHARS,
     max_read_line_chars: DEFAULT_MAX_READ_LINE_CHARS,
+    notebook_max_bytes: DEFAULT_NOTEBOOK_MAX_BYTES,
 });
 
 /// Install the limits resolved from the active configuration.
@@ -106,6 +118,12 @@ mod tests {
         assert!(toml::from_str::<Config>("[tool_limits]\nunknown = 1\n").is_err());
         let width: Config = toml::from_str("[tool_limits]\nmax_read_line_chars = 500\n").unwrap();
         assert_eq!(ToolLimits::from_config(&width).max_read_line_chars, 500);
+        let notebook: Config =
+            toml::from_str("[tool_limits]\nnotebook_max_bytes = 999999999999\n").unwrap();
+        assert_eq!(
+            ToolLimits::from_config(&notebook).notebook_max_bytes,
+            super::super::notebook::MAX_NOTEBOOK_BYTES
+        );
         let limits = ToolLimits::default();
         assert!(
             limits.backstop_head_chars() + limits.backstop_tail_chars() + 1_000

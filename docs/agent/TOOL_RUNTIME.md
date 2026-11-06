@@ -759,8 +759,12 @@ unique IDs and receives a new ID on insertion.
 Untouched JSON field payloads remain validated raw JSON, preserving large
 integers and opaque metadata. Opaque nesting is not recursively traversed;
 byte caps, rather than an assumed semantic nesting limit, bound its handling.
-Notebook input and resulting serialization must fit `max_text_file_size`
-(default 1 MiB), with an absolute 8 MiB ceiling. There are at most 4,096 cells,
+Notebook input and resulting serialization must fit the notebook limit,
+`[tool_limits] notebook_max_bytes` (default 32 MiB), or `max_text_file_size` when
+that is larger, with an absolute 64 MiB ceiling. Notebooks have their own limit
+because embedded image outputs routinely make executed notebooks larger than the
+1 MiB text cap even though the cell view never renders those payloads. A notebook
+above the limit is refused with a message naming it. There are at most 4,096 cells,
 256 interpreted fields per notebook/cell/output object, 1,024 bytes per field
 name and 1 MiB of decoded source per cell. Duplicate interpreted object fields,
 invalid UTF-8 and ambiguous cell IDs are rejected. Unselected unknown cell
@@ -768,8 +772,10 @@ types are preserved; mutation of an unknown type is refused.
 
 The default `read` view shows virtual cell/source/output lines. Its existing
 `offset`/`limit` arguments address those virtual lines, and the limit is capped
-by `max_read_lines`. Returned text is capped at 64 KiB (or the configured text
-cap, if smaller); text outputs have separate 4 KiB per-cell and 16 KiB overall
+by `max_read_lines`. Returned text is capped at 64 KiB: a window that would exceed
+it stops early and ends with `[view truncated after N line(s) at the 64 KiB notebook
+view cap; continue with offset=M]`, and a single virtual line longer than the cap is
+clipped with a pointer to `raw_notebook:true` character windows. Text outputs have separate 4 KiB per-cell and 16 KiB overall
 limits with explicit omissions, and at most 4,096 output objects per cell.
 Stream outputs show their text; `execute_result` and `display_data` outputs show
 their `text/plain` data; `error` outputs show `ename: evalue` and the traceback with

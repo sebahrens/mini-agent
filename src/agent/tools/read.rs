@@ -400,9 +400,15 @@ impl ReadTool {
 
         if notebook_view {
             use tokio::io::AsyncReadExt;
-            let cap = super::notebook::byte_limit(self.max_text_file_size);
-            if !metadata.is_file() || metadata.len() > cap {
-                return Err(ToolError::Msg("Notebook view requires a regular bounded notebook; use raw_notebook:true for raw line windows".into()));
+            let cap = super::notebook::notebook_byte_limit(self.max_text_file_size);
+            if !metadata.is_file() {
+                return Err(ToolError::Msg("Notebook view requires a regular notebook file; use raw_notebook:true for raw line windows".into()));
+            }
+            if metadata.len() > cap {
+                return Err(ToolError::Msg(format!(
+                    "Notebook is {} bytes, larger than the {cap} byte notebook view limit ([tool_limits] notebook_max_bytes); use raw_notebook:true with offset/limit or character_offset/character_limit for raw windows",
+                    metadata.len()
+                )));
             }
             let mut bytes = Vec::with_capacity(metadata.len() as usize);
             file.take(cap.saturating_add(1))
@@ -1614,6 +1620,32 @@ mod tests {
         let tag = crate::agent::tools::crc::crc32_hex(line.as_bytes());
         assert!(tagged.contains(&format!("  1|{tag} ")), "{tagged:.300}");
         assert!(tagged.contains(&marker), "{tagged:.300}");
+    }
+
+    /// mini-agent-qsttm: notebooks have their own size limit, so a 3 MiB
+    /// notebook dominated by an image output reads in the virtual view under
+    /// the default 1 MiB text cap.
+    #[tokio::test]
+    async fn three_mib_notebook_with_image_output_reads_in_virtual_view() {
+        let dir = crate::tests::support::temp::TempDir::new("read-big-notebook");
+        let path = dir.path().join("plots.ipynb");
+        let notebook = serde_json::json!({
+            "nbformat":4,"nbformat_minor":5,"metadata":{},
+            "cells":[{"cell_type":"code","id":"plot","source":"plt.plot(x)","metadata":{},
+                      "execution_count":1,"outputs":[{"output_type":"display_data","metadata":{},
+                      "data":{"image/png":"A".repeat(3 * 1024 * 1024),"text/plain":"<Figure>"}}]}]
+        })
+        .to_string();
+        assert!(notebook.len() > 3 * 1024 * 1024);
+        std::fs::write(&path, notebook).unwrap();
+        let output = ReadTool::new(None, None, None, 2000)
+            .call(read_args(&path))
+            .await
+            .unwrap();
+        assert!(output.contains("Notebook cell view:"), "{output}");
+        assert!(output.contains("plt.plot(x)"), "{output}");
+        assert!(output.contains("[image/png output omitted]"), "{output}");
+        assert!(output.len() < 4096, "{}", output.len());
     }
 
     #[tokio::test]

@@ -30,6 +30,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 - The notebook `read` view now shows `execute_result`/`display_data` `text/plain` data and
   `error` outputs (`ename: evalue` plus the ANSI-stripped traceback) and labels image and other
   rich outputs by mime type instead of `[opaque output payload omitted]`.
+- Notebooks have their own size limit, `[tool_limits] notebook_max_bytes` (default 32 MiB, hard
+  ceiling 64 MiB), so executed notebooks with image outputs read and edit under the 1 MiB text
+  cap; a view window over the 64 KiB cap is truncated with the next `offset` instead of failing.
 - The macOS production-binary containment matrix now reports a fixed, source-free phase label,
   I/O class and worker-exit class (`MACOS_CONTAINMENT_MATRIX_FAILED=<phase>`,
   `MACOS_CONTAINMENT_MATRIX_IO_CLASS=<class>`, `MACOS_CONTAINMENT_MATRIX_WORKER_EXIT=<class>`) for

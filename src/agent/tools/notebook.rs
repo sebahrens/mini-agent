@@ -8,7 +8,9 @@ use serde_json::value::RawValue;
 
 use super::ToolError;
 
-pub(crate) const MAX_NOTEBOOK_BYTES: u64 = 8 * 1024 * 1024;
+/// Hard ceiling for any notebook parse; `[tool_limits] notebook_max_bytes`
+/// (default 32 MiB) selects the effective limit below it.
+pub(crate) const MAX_NOTEBOOK_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CELLS: usize = 4096;
 const MAX_SOURCE_BYTES: usize = 1024 * 1024;
 const MAX_VIEW_BYTES: usize = 64 * 1024;
@@ -20,6 +22,12 @@ fn error(message: &'static str) -> ToolError {
 }
 pub(crate) fn byte_limit(configured: u64) -> u64 {
     configured.min(MAX_NOTEBOOK_BYTES)
+}
+/// Effective notebook raw-size limit: notebooks get their own limit
+/// (`[tool_limits] notebook_max_bytes`) because image outputs routinely make
+/// them larger than `max_text_file_size`; a larger text cap still applies.
+pub(crate) fn notebook_byte_limit(configured_text_cap: u64) -> u64 {
+    byte_limit(configured_text_cap.max(super::limits::current().notebook_max_bytes))
 }
 
 // A map visitor rejects duplicate interpreted fields. Opaque nested values are
@@ -424,14 +432,40 @@ pub(crate) fn view(
     let mut selected = String::new();
     let mut total = 0usize;
     let mut selected_lines = 0usize;
-    let end = offset.saturating_add(limit);
+    let mut end = offset.saturating_add(limit);
     let mut output_budget = MAX_OUTPUT_TOTAL;
+    // Room for the header and continuation notice inside the view cap.
+    let selected_cap = cap.saturating_sub(1024);
+    let mut truncated_at: Option<usize> = None;
     let mut push = |line: &str| -> Result<(), ToolError> {
         if total >= offset && total < end {
-            if selected.len().saturating_add(line.len()).saturating_add(32) > cap {
-                return Err(error(
-                    "Notebook view exceeds its output cap; use a narrower virtual line window",
-                ));
+            if selected.len().saturating_add(line.len()).saturating_add(32) > selected_cap {
+                use std::fmt::Write;
+                if selected_lines == 0 {
+                    // A single over-cap virtual line is clipped, not refused.
+                    let mut cut = selected_cap.saturating_sub(256).min(line.len());
+                    while !line.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    writeln!(
+                        &mut selected,
+                        "{}| {} … [virtual line truncated: {} bytes; use raw_notebook:true with character_offset/character_limit for the rest]",
+                        total + 1,
+                        &line[..cut],
+                        line.len()
+                    )
+                    .expect("string writing");
+                    selected_lines += 1;
+                    total += 1;
+                    truncated_at = Some(total);
+                    end = total;
+                    return Ok(());
+                }
+                // Stop the window before this line and say where to resume.
+                truncated_at = Some(total);
+                end = total;
+                total += 1;
+                return Ok(());
             }
             use std::fmt::Write;
             writeln!(&mut selected, "{}| {}", total + 1, line).expect("string writing");
@@ -517,7 +551,17 @@ pub(crate) fn view(
             "Notebook view exceeds its output cap; use a narrower virtual line window",
         ));
     }
-    let text = header + &selected;
+    let mut text = header + &selected;
+    if let Some(next) = truncated_at {
+        use std::fmt::Write;
+        write!(
+            &mut text,
+            "\n[view truncated after {selected_lines} line(s) at the {} KiB notebook view cap; continue with offset={}]",
+            cap / 1024,
+            next + 1
+        )
+        .expect("string writing");
+    }
     let mut crc = super::crc::Crc32::new();
     crc.update(text.as_bytes());
     Ok(NotebookView {
@@ -562,7 +606,7 @@ impl NotebookTool {
             ask_tx,
             workspace,
             tracker,
-            limit: byte_limit(limit.unwrap_or(1024 * 1024)),
+            limit: notebook_byte_limit(limit.unwrap_or(1024 * 1024)),
             diff_options,
             #[cfg(test)]
             publication_cancellation: None,
@@ -1012,6 +1056,62 @@ mod tests {
         assert!(text.contains("traceback bytes omitted]"), "{text}");
         assert!(text.contains("| frame 1999"), "{text}");
         assert!(!text.contains("| frame 5\n"), "{text}");
+    }
+    /// mini-agent-qsttm: a window over the 64 KiB view cap is truncated with
+    /// the exact next offset instead of failing; a lone huge line is clipped.
+    #[test]
+    fn notebook_view_truncates_oversized_windows_with_a_next_offset() {
+        let source: Vec<String> = (0..2_000)
+            .map(|n| format!("{n:04} {}\n", "s".repeat(95)))
+            .collect();
+        let notebook = serde_json::json!({
+            "nbformat":4,"nbformat_minor":5,"metadata":{},
+            "cells":[{"cell_type":"code","id":"c","source":source,"metadata":{},
+                      "execution_count":null,"outputs":[]}]
+        })
+        .to_string();
+        let first = view(
+            notebook.as_bytes(),
+            "book.ipynb",
+            0,
+            5_000,
+            MAX_NOTEBOOK_BYTES,
+        )
+        .unwrap()
+        .text;
+        assert!(first.len() <= MAX_VIEW_BYTES, "{}", first.len());
+        let next: usize = first
+            .split("continue with offset=")
+            .nth(1)
+            .and_then(|rest| rest.trim_end_matches(']').parse().ok())
+            .expect("next offset");
+        assert!(first.contains(&format!("{}| ", next - 1)), "{first:.200}");
+        assert!(!first.contains(&format!("\n{next}| ")), "{first:.200}");
+        let second = view(
+            notebook.as_bytes(),
+            "book.ipynb",
+            next - 1,
+            5,
+            MAX_NOTEBOOK_BYTES,
+        )
+        .unwrap()
+        .text;
+        assert!(second.contains(&format!("\n{next}| ")), "{second}");
+
+        let wide = serde_json::json!({
+            "nbformat":4,"nbformat_minor":5,"metadata":{},
+            "cells":[{"cell_type":"markdown","id":"m","source":"w".repeat(200_000),"metadata":{}}]
+        })
+        .to_string();
+        let clipped = view(wide.as_bytes(), "book.ipynb", 1, 1, MAX_NOTEBOOK_BYTES)
+            .unwrap()
+            .text;
+        assert!(
+            clipped.contains("[virtual line truncated: 200000 bytes"),
+            "{:.200}",
+            &clipped[clipped.len() - 300..]
+        );
+        assert!(clipped.len() <= MAX_VIEW_BYTES);
     }
     fn policy(root: &Path, mode: SecurityMode, config: PermissionConfig) -> PermCheck {
         Arc::new(std::sync::Mutex::new(

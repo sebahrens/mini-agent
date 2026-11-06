@@ -1057,4 +1057,7 @@ pub struct ToolLimitsConfig {
     /// Characters of one `read` line shown before it is clipped.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_read_line_chars: Option<u64>,
+    /// Raw notebook size accepted by the cell view and `notebook_edit`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notebook_max_bytes: Option<u64>,
 }
