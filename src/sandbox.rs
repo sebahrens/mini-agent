@@ -800,9 +800,35 @@ pub(crate) const DEFAULT_COMMAND_LIMITS: CommandLimits = CommandLimits {
 };
 
 /// Bounds of `command_timeout_secs`, the deadline of `!` commands and loop
-/// validation commands (default 30 s).
+/// validation commands (default 120 s).
 pub(crate) const MAX_COMMAND_TIMEOUT_SECS: u64 = 600;
-static COMMAND_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(30);
+/// Default `command_timeout_secs`: builds and test suites routinely run past
+/// 30 s, so a user-typed `!cargo test` gets two minutes before it is stopped.
+pub(crate) const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 120;
+static COMMAND_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(DEFAULT_COMMAND_TIMEOUT_SECS);
+
+/// Split a leading `timeout=<seconds> ` per-command override off the text
+/// after `!` (`!timeout=300 cargo test`). The value is clamped to
+/// 1..=[`MAX_COMMAND_TIMEOUT_SECS`]. Anything that is not exactly digits
+/// followed by whitespace and a command is left untouched for the shell.
+pub(crate) fn split_timeout_override(command: &str) -> (Option<u64>, &str) {
+    let Some(rest) = command.trim_start().strip_prefix("timeout=") else {
+        return (None, command);
+    };
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let (value, tail) = rest.split_at(digits);
+    if digits == 0 || digits > 6 || !tail.starts_with(char::is_whitespace) || tail.trim().is_empty()
+    {
+        return (None, command);
+    }
+    match value.parse::<u64>() {
+        Ok(seconds) => (
+            Some(seconds.clamp(1, MAX_COMMAND_TIMEOUT_SECS)),
+            tail.trim_start(),
+        ),
+        Err(_) => (None, command),
+    }
+}
 
 /// Set the process-wide `command_timeout_secs` (clamped to 1..=600).
 pub(crate) fn set_command_timeout_secs(seconds: u64) {
@@ -1211,6 +1237,8 @@ impl OwnedExplicitShellAudit {
 pub(crate) struct ExplicitShellRun {
     pub audit: ExplicitShellAudit,
     pub output: CommandOutput,
+    /// Deadline this run was given, for the timeout message.
+    pub timeout: std::time::Duration,
 }
 
 impl ExplicitShellRun {
@@ -1248,9 +1276,10 @@ impl ExplicitShellRun {
                 },
                 None => format!("explicit shell failed; boundary={boundary}"),
             }),
-            CommandStatus::TimedOut => {
-                Some(format!("explicit shell timed out; boundary={boundary}"))
-            }
+            CommandStatus::TimedOut => Some(format!(
+                "explicit shell timed out after {} s; raise `command_timeout_secs` (max {MAX_COMMAND_TIMEOUT_SECS}) or run `!timeout=<seconds> <command>`; boundary={boundary}",
+                self.timeout.as_secs()
+            )),
             CommandStatus::Cancelled => {
                 Some(format!("explicit shell cancelled; boundary={boundary}"))
             }
@@ -4535,6 +4564,14 @@ impl Sandbox {
                 "empty command after '!'",
             ));
         }
+        let (timeout_override, command) = split_timeout_override(command);
+        let limits = match timeout_override {
+            Some(seconds) => CommandLimits {
+                timeout: std::time::Duration::from_secs(seconds),
+                ..limits
+            },
+            None => limits,
+        };
 
         let cwd = self.working_dir()?;
         let boundary = self.explicit_shell_boundary();
@@ -4565,7 +4602,11 @@ impl Sandbox {
                 progress,
             )
             .await?;
-        Ok(ExplicitShellRun { audit, output })
+        Ok(ExplicitShellRun {
+            audit,
+            output,
+            timeout: limits.timeout,
+        })
     }
 
     /// Run an interactive support utility with inherited stdio but the same

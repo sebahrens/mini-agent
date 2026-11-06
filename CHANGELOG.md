@@ -113,6 +113,40 @@ Notable changes to mini-agent are documented in this file. The format follows
   not queued). `run` now returns the child's session id (also as `structuredContent.session_id`) and
   accepts `session_id` to continue that conversation; `--mcp-server-allow-model-override` (default
   off) lets a call pick `model`.
+### ACP, IDE and headless
+
+- VS Code: opt-in `mini-agent.clientFileAccess` (machine scope, default off) advertises ACP
+  `fs/read_text_file` and `fs/write_text_file` and serves them from the live editor buffers,
+  confined to the trusted workspace. The Mini Agent server does not yet route its own read, edit
+  and write tools through them.
+- `mini-agent update [--check] [--release X.Y.Z]` downloads the matching release archive, checks it
+  against `SHA256SUMS` with `install.sh`'s fail-closed rules, runs the new binary's `--version`,
+  and replaces the installed executable atomically (Unix). It refuses Homebrew, npm, cargo, Nix,
+  system-package, VS Code extension, local-build and Windows installs and prints the right command.
+  With `update_check = true`, `-p` now prints a one-line stderr update notice from the cached check.
+- Headless `-p` accepts images: `-i/--image FILE` (repeatable) and `image` content blocks
+  (base64 or path source) on `--input-format stream-json`. They use `/add`'s size limits and
+  downscaling, persist as a typed user message, and are refused with a clear error for a model the
+  catalog lists as text-only, with a `!` command, or with provider-native session history.
+- `--output-format` is accepted as a hidden alias of `--output` (scripts written for Claude Code's
+  `claude -p --output-format stream-json`); the docs now use `--output` throughout.
+- `!` shell commands now time out after 120 s by default (was 30 s) and accept a per-command
+  deadline, `!timeout=300 cargo test` (clamped to 1-600 s). A timed-out command reports
+  `timed out after N s` with how to raise it. The 1 MiB output cap is unchanged and is still
+  reported as an output-limit stop.
+- ACP tool calls now carry a descriptive title (tool plus path, command or pattern), a tool kind,
+  file locations for path tools, an `in_progress` update when the tool starts, and diff content:
+  edit/write approval dialogs show the proposed change, and results carry the recorded mutation
+  as an ACP diff (bounded hunks, marked `_meta."mini-agent-partial"`/`"mini-agent-truncated"`)
+  instead of an `agent_thought_chunk`.
+- VS Code: chat prompts now carry the references the user attached (files, ranges, #-variables)
+  and, with `/selection`, the active selection, as ACP `resource_link`/`resource` blocks. At most
+  20 references and 256 KiB are sent, only existing files inside the trusted workspace (symlinks
+  resolved), and every dropped or clipped reference is reported in the chat. The ACP server now
+  advertises `promptCapabilities.embeddedContext` (text resources only).
+- VS Code: tool calls show their title (not the call id) and a fenced result or diff; `Mini Agent:
+  Select Permission Mode` calls `session/set_mode`; `/commands` lists and `/run <name>` runs the
+  server slash commands; `mini-agent.showThoughts` keeps reasoning text in the transcript.
 
 ### Subagents
 

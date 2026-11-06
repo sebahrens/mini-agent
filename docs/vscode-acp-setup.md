@@ -69,6 +69,8 @@ The extension contributes exactly two settings, both machine-scoped:
 | Setting | Default | Meaning |
 |---|---|---|
 | `mini-agent.executablePath` | `""` | Path to the `mini-agent` executable. Leave empty to use the binary bundled in the VSIX. A custom path is accepted only from User/Remote machine settings; workspace settings cannot replace the executable. An absolute path (or `~/...`) is used as given; a bare command name such as `mini-agent` is resolved once, when the session starts, to an absolute path by searching the absolute directories on the extension host's `PATH` (on Windows with the `.exe`/`.com` extensions from `PATHEXT`). The current directory and the workspace are never searched, and the version probe and the agent launch use that same resolved path. |
+| `mini-agent.clientFileAccess` | `false` | Opt in (User/Remote machine settings only) to advertise ACP `fs.readTextFile`/`fs.writeTextFile`: a server that calls them reads the live editor text, unsaved changes included, and writes through the editor so changes land in the undo stack. Paths must be absolute and resolve (symlinks followed) inside the trusted workspace folder; each transfer is capped at 2 MiB. Closed by default: nothing is advertised and no handler is registered. The Mini Agent server does not call these methods yet, so enabling it changes nothing for it today. |
+| `mini-agent.showThoughts` | `false` | Keep the agent's reasoning text in the chat transcript as a quote instead of a transient progress line. |
 | `mini-agent.logLevel` | `info` | Verbosity of the Mini Agent output channel (`error`, `warn`, `info`, `debug`, `trace`). |
 
 No API key is required: the bundled binary is started over stdio, and the model

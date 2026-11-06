@@ -9,11 +9,16 @@ export class SessionUnavailableError extends Error {
 
 export interface ConversationSession {
   prompt(
-    text: string,
+    content: string | readonly acp.ContentBlock[],
     onUpdate: (update: acp.SessionUpdate) => void,
     signal: AbortSignal,
   ): Promise<acp.StopReason>;
   close(): Promise<void>;
+  /** Permission modes the agent advertised, with the current one. */
+  modes?(): acp.SessionModeState | undefined;
+  setMode?(modeId: string): Promise<void>;
+  /** Slash commands the agent advertised for this session. */
+  commands?(): readonly acp.AvailableCommand[];
   configOptions?(): readonly acp.SessionConfigOption[];
   setConfigOption?(configId: string, value: string): Promise<void>;
 }
@@ -39,7 +44,7 @@ export class Conversation {
   constructor(private readonly createSession: ConversationSessionFactory) {}
 
   async prompt(
-    text: string,
+    text: string | readonly acp.ContentBlock[],
     onUpdate: (update: acp.SessionUpdate) => void,
     signal: AbortSignal,
   ): Promise<acp.StopReason> {

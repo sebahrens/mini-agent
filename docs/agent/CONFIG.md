@@ -750,8 +750,8 @@ Accepted top-level keys:
 | `max_bash_output_lines`   | integer | Line cap for shell tool output returned to the model, applied to successful output and to the partial output embedded in timeout/output-limit errors. Longer output keeps its head and tail around an `[... N lines omitted ...]` marker. Default: `2000`. Set `0` to disable line truncation (the 1 MiB per-stream / 1.5 MiB combined byte limits still apply). |
 | `shell_timeout_secs`      | integer | Foreground shell tool deadline in seconds. Default: `120`; clamped to 1–600. The tool definition publishes this effective cap; a call's millisecond `timeout` can only lower it. Background shell jobs retain their 24-hour cap, other command classes retain their existing limits, and brokered JS `spawn` is bounded by `js-step-timeout-secs`. Sensitive in project-local configuration: changing it requires project trust. |
 | `shell_auto_background` | boolean | Default for the shell call flag `auto_background`: a foreground command that reaches its deadline keeps running as a background job (its id and output so far are returned) instead of being killed. Default: `false`. Same sandbox, permission decision and job limits as `background = true`. Sensitive in project-local configuration. |
-| `command_timeout_secs` | integer | Deadline of `!` commands (TUI and headless) in seconds. Default: `30`; clamped to 1–600. Loop/goal validators, hooks and brokered JS `spawn` keep their own deadlines. Sensitive in project-local configuration. |
-| `update_check`            | boolean | Opt-in release notice at interactive startup. Default: `false`. Checks the package's GitHub repository anonymously, directly over HTTPS, at most once every 24 hours, with a two-second request bound and a 128 KiB response cap. Headless, loop, and ACP modes skip it. Requires project trust when set locally. No automatic download or installation. |
+| `command_timeout_secs` | integer | Deadline of `!` commands (TUI and headless) in seconds. Default: `120`; clamped to 1–600. A single command can set its own deadline with `!timeout=300 cargo test` (same clamp). A timed-out run reports `timed out after N s` and how to raise it. Loop/goal validators, hooks and brokered JS `spawn` keep their own deadlines. Sensitive in project-local configuration. |
+| `update_check`            | boolean | Opt-in release notice at interactive startup. Default: `false`. Checks the package's GitHub repository anonymously, directly over HTTPS, at most once every 24 hours, with a two-second request bound and a 128 KiB response cap. Loop and ACP modes skip it; `-p` prints a one-line stderr notice from the cached result only (no network; `--quiet` silences it). Requires project trust when set locally. Nothing is downloaded unless you run `mini-agent update`. |
 | `session_retention_days` | integer | Delete saved session snapshots (`<uuid>.json` in the sessions directory) whose modification time is older than this many days, once per interactive startup in a background thread. Default: unset/`0` (keep forever). A session open in this or another live process (its lock is held) is never removed. Deleting a session (retention or `/sessions delete`) also removes its private tool-output directory (spills, full command logs, `/rewind` file-checkpoint preimages); independently of this key, startup removes tool-output directories that match no saved session and have been idle for 14 days. Requires project trust when set locally. |
 | `persist_project_approvals` | boolean | Offer `(p) always allow in this project` on TUI approval prompts and load those rules at interactive startup. Default: `false`. Rules are stored privately per workspace in the state directory, never in the repository; headless runs ignore them. See [Interactive approvals](#interactive-approvals). |
 | `hooks_http_enabled` | boolean | Allow `type: "http"` hook handlers to POST event JSON to their configured URL. Default: `false` (http hooks load but are never contacted). Requires `hooks`. See [HTTP handlers](#http-handlers). |
@@ -970,8 +970,26 @@ can be shown on later startups. The check runs in the background and never
 delays the first frame; its notice is printed when it arrives. Invalid or linked cache state disables the
 optional check for that startup. HTTP headers and body share a two-second
 deadline and a 128 KiB body cap. Headless, loop, and ACP modes neither check nor
-create update-cache state. Unset or `update_check = false` disables the feature;
-project-local opt-in requires the ordinary content-bound project trust approval.
+create update-cache state; a `-p` run only reads the cache, never the network.
+Unset or `update_check = false` disables the feature; project-local opt-in
+requires the ordinary content-bound project trust approval.
+
+### `mini-agent update`
+
+`mini-agent update --check` reports whether a newer stable release exists, and
+`mini-agent update [--release X.Y.Z]` installs it. It downloads the release's
+`SHA256SUMS` and the host's `mini-agent-<arch>-<os>.tar.gz` over HTTPS (at most
+five redirects, https only), accepts the archive only when `SHA256SUMS` has exactly
+one canonical `<64 lowercase hex>  <file>` line for it that matches the downloaded
+bytes (the rules of `install.sh`), takes only the `mini-agent` executable out of
+the archive by exact name, runs its `--version` to confirm the release, stages it
+beside the installed binary and renames it into place atomically (a running
+session keeps the old inode). It refuses, printing the right command, when the
+binary was installed by Homebrew, npm, cargo, Nix or a system package, by the VS Code
+extension, or is a local build; on Windows it points to the MSI, because a running
+`.exe` cannot be replaced in place. Build provenance is not checked by this command
+(use `gh attestation verify` or rerun `install.sh`, which also refreshes the bundled
+notice documents). The bare word `update` followed by anything else stays an ordinary prompt.
 
 ## Prompt-cache prefix and memory snapshots
 
@@ -1781,7 +1799,7 @@ table. This feeds the status line, the spend account, and `max_budget_usd`
 for both the main session and subagent/advisor/judge calls.
 
 A custom provider with no `model_prices` entry (and no catalog or listing
-price) is unpriced: headless `--output-format json` reports `"cost": 0` and
+price) is unpriced: headless `--output json` reports `"cost": 0` and
 adds `"cost_unpriced": true`, so 0 means "not priced", not "free". Cached
 tokens are read from the response's `prompt_tokens_details.cached_tokens`
 (Chat Completions) and stay 0 when the gateway omits that field.

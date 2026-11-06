@@ -108,3 +108,36 @@ describe('public ACP conversation adapter', () => {
     }
   });
 });
+
+describe('permission modes, commands and content-block prompts', () => {
+  const modes: acp.SessionModeState = {
+    currentModeId: 'default',
+    availableModes: [{ id: 'default', name: 'default' }, { id: 'plan', name: 'plan' }],
+  };
+
+  it('sends content blocks verbatim and tracks mode and command updates', async () => {
+    const router = new SessionUpdateRouter();
+    router.begin();
+    const request = vi.fn(async () => ({ stopReason: 'end_turn' }));
+    const session = router.finish({ request, notify: vi.fn() } as unknown as acp.ClientContext, 's1', [], modes);
+    router.receive({ sessionId: 's1', update: { sessionUpdate: 'current_mode_update', currentModeId: 'plan' } });
+    router.receive({ sessionId: 's1', update: { sessionUpdate: 'available_commands_update', availableCommands: [{ name: 'compact', description: 'Compact' }] } });
+    expect(session.modes()?.currentModeId).toBe('plan');
+    expect(session.commands().map(command => command.name)).toEqual(['compact']);
+    const blocks: acp.ContentBlock[] = [{ type: 'text', text: 'hi' }, { type: 'resource_link', name: 'a', uri: 'file:///w/a' }];
+    await session.prompt(blocks, vi.fn(), new AbortController().signal);
+    expect(request).toHaveBeenCalledWith('session/prompt', { sessionId: 's1', prompt: blocks });
+  });
+
+  it('switches mode only to an advertised id', async () => {
+    const router = new SessionUpdateRouter();
+    router.begin();
+    const request = vi.fn(async () => ({}));
+    const session = router.finish({ request, notify: vi.fn() } as unknown as acp.ClientContext, 's1', [], modes);
+    await expect(session.setMode('bypass')).rejects.toThrow(/does not offer/);
+    expect(request).not.toHaveBeenCalled();
+    await session.setMode('plan');
+    expect(request).toHaveBeenCalledWith('session/set_mode', { sessionId: 's1', modeId: 'plan' }, expect.anything());
+    expect(session.modes()?.currentModeId).toBe('plan');
+  });
+});

@@ -12,6 +12,7 @@ mod event;
 mod extras;
 mod fs;
 mod git;
+mod headless_media;
 mod hex;
 mod logging;
 mod models_catalog;
@@ -28,6 +29,7 @@ mod provider_listing;
 mod question;
 mod retry;
 mod sandbox;
+mod self_update;
 mod session;
 mod setup;
 mod spend;
@@ -75,6 +77,14 @@ fn main() -> anyhow::Result<ExitCode> {
     // largest single stack frame at startup (hundreds of KiB in an unoptimized
     // build); here it sits directly on `main` rather than on top of the
     // runtime and startup frames, all under the 1 MiB Windows default stack.
+    // `mini-agent update` is handled before clap so that only its exact forms
+    // are a subcommand; `mini-agent update the docs` stays an ordinary prompt.
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if let Some(update) = self_update::parse_update_args(&argv) {
+        let runtime = normal_runtime().context("failed to initialize the async runtime")?;
+        let code = runtime.block_on(self_update::run(update));
+        return Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)));
+    }
     let cli = cli::Cli::parse_command_line();
     if let Some(shell) = cli.completions {
         match cli::write_completions(shell, &mut std::io::stdout().lock()) {
@@ -391,7 +401,10 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
 
     let loaded_warning_count = cfg.load_warnings.len();
     config::layers::apply_overrides(&mut cfg, &config_overrides).map_err(anyhow::Error::msg)?;
-    sandbox::set_command_timeout_secs(cfg.command_timeout_secs.unwrap_or(30));
+    sandbox::set_command_timeout_secs(
+        cfg.command_timeout_secs
+            .unwrap_or(sandbox::DEFAULT_COMMAND_TIMEOUT_SECS),
+    );
     context::agents::set_claude_project_agents(cfg.resolve_claude_project_agents());
     provider::set_provider_timeouts(cfg.provider_timeouts);
     provider::set_cli_fallback_model(cli.fallback_model.clone());

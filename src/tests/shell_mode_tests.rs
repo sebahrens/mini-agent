@@ -945,3 +945,78 @@ impl Write for AuditCapture {
         Ok(())
     }
 }
+
+#[test]
+fn timeout_override_prefix_is_strict_and_clamped() {
+    use crate::sandbox::{MAX_COMMAND_TIMEOUT_SECS, split_timeout_override};
+    assert_eq!(
+        split_timeout_override("timeout=300 cargo test"),
+        (Some(300), "cargo test")
+    );
+    assert_eq!(
+        split_timeout_override(" timeout=5\tmake"),
+        (Some(5), "make")
+    );
+    assert_eq!(
+        split_timeout_override("timeout=0 true"),
+        (Some(1), "true"),
+        "zero is raised to the 1 s floor"
+    );
+    assert_eq!(
+        split_timeout_override("timeout=99999 true"),
+        (Some(MAX_COMMAND_TIMEOUT_SECS), "true"),
+        "above the ceiling is clamped, not honoured"
+    );
+    // Everything else belongs to the shell untouched.
+    for raw in [
+        "timeout=",
+        "timeout=5",
+        "timeout=5   ",
+        "timeout=5x make",
+        "timeout=-5 make",
+        "timeout=1234567 make",
+        "timeout=99999999999999999999999 make",
+        "timeout =5 make",
+        "TIMEOUT=5 make",
+        "echo timeout=5 make",
+        "timeout 5 make",
+    ] {
+        assert_eq!(split_timeout_override(raw), (None, raw), "{raw:?}");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn explicit_shell_timeout_override_kills_and_says_how_to_raise_it() {
+    let sandbox = Sandbox::new(false, "bwrap");
+    let started = std::time::Instant::now();
+    let run = sandbox
+        .run_explicit_shell("!timeout=1 sleep 30", COMPLETION_LIMITS, None)
+        .await
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "the per-command deadline, not the 60 s default, applied"
+    );
+    assert_eq!(run.output.status, CommandStatus::TimedOut);
+    assert_eq!(
+        run.audit.command, "sleep 30",
+        "the prefix is not shell text"
+    );
+    let rendered = run.rendered_output();
+    assert!(rendered.contains("timed out after 1 s"), "{rendered}");
+    assert!(rendered.contains("command_timeout_secs"), "{rendered}");
+    assert!(rendered.contains("!timeout=<seconds>"), "{rendered}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn explicit_shell_override_does_not_change_a_completing_command() {
+    let sandbox = Sandbox::new(false, "bwrap");
+    let run = sandbox
+        .run_explicit_shell("!timeout=5 printf ok", SUCCESS_LIMITS, None)
+        .await
+        .unwrap();
+    assert!(run.succeeded(), "{}", run.rendered_output());
+    assert_eq!(run.rendered_output(), "ok");
+}

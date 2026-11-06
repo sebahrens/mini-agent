@@ -291,6 +291,38 @@ pub fn load_attachment(path: &Path) -> std::io::Result<MediaAttachment> {
     })
 }
 
+/// An in-memory image (for example a base64 block from headless stdin) as an
+/// attachment. The signature must be a supported image type and, when the
+/// producer claimed a type, must agree with it; oversized images are the
+/// caller's to downscale with [`fit_image_attachment`].
+pub fn image_from_bytes(
+    label: &Path,
+    data: Vec<u8>,
+    claimed_mime: Option<&str>,
+) -> Result<MediaAttachment, String> {
+    if data.is_empty() || data.len() as u64 > MAX_MEDIA_BYTES {
+        return Err(format!(
+            "image is empty or larger than {MAX_MEDIA_BYTES} bytes"
+        ));
+    }
+    let sniffed = sniff_media(&data)
+        .filter(|mime| mime.starts_with("image/"))
+        .ok_or("image signature is not a supported type (png, jpeg, gif, webp)")?;
+    if let Some(claimed) = claimed_mime
+        && claimed != sniffed
+    {
+        return Err(format!(
+            "image signature {sniffed} does not match the declared type {claimed}"
+        ));
+    }
+    Ok(MediaAttachment::Image {
+        path: label.to_path_buf(),
+        data,
+        mime: sniffed.to_owned(),
+        clipboard: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

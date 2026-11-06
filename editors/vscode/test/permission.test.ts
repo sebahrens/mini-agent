@@ -55,6 +55,8 @@ describe('toolCallInputLines', () => {
     expect(lines).toEqual([
       'rm -rf build',
       'edit /repo/src/main.rs',
+      '-a',
+      '+b',
       'terminal term-7',
       'resource: file:///repo/x',
       'path: /repo/src/lib.rs',

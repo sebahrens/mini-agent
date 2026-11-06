@@ -691,7 +691,7 @@ continue unsandboxed after warning, but audit and failures label that condition
 `unsandboxed-unavailable-default-fallback:<backend>` rather than claiming the
 operator chose the bypass. An explicitly requested unavailable sandbox still
 fails closed. Output is capped (1 MiB per stream, 1.5 MiB combined), commands
-time out after 30 seconds, and TUI `Ctrl+C`/`Ctrl+D` cancels the whole process
+time out after `command_timeout_secs` (default 120 seconds; `!timeout=<seconds> <command>` sets it per command, up to 600; a timed-out run reports the deadline and how to raise it), and TUI `Ctrl+C`/`Ctrl+D` cancels the whole process
 tree before accepting the next command.
 In `--print` mode, `Ctrl+C` or Unix `SIGTERM` cancels the explicit shell command
 and waits for its owned process group to terminate, the direct child to be reaped,
@@ -704,6 +704,7 @@ finishing, stops waiting and exits with status 130.
 | `!ls -la` | List files in the current directory. |
 | `!git status` | Check git status without involving the agent. |
 | `!cargo test` | Run tests and capture the output. |
+| `!timeout=300 cargo test` | Same, with a 300 s deadline for this command only (1–600 s; the default is `command_timeout_secs`, 120 s). |
 | `!` | Empty command shows an error. |
 
 If you want to run a command and then discuss the output with the agent, just

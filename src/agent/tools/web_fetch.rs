@@ -295,7 +295,9 @@ async fn extract_pdf_text(bytes: Vec<u8>) -> Result<String, ToolError> {
         let mut without_text = 0usize;
         let mut shown = 0usize;
         for page in 1..=count.min(PDF_MAX_PAGES) {
-            let text = document.page_text(page - 1);
+            let text = document.page_text(page - 1).map_err(|error| {
+                ToolError::Msg(format!("web_fetch could not read the PDF text: {error}."))
+            })?;
             if text.is_empty() {
                 without_text += 1;
             }
