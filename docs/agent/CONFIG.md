@@ -4228,18 +4228,22 @@ be overridden or set `disabled = true` like the others.
 
 **Trade-off for the build-evaluating built-ins.** `jdtls`, `csharp-ls`, `ruby-lsp`,
 `kotlin-language-server`, `sourcekit-lsp` and `zls` load the repository's build definitions
-(Gradle scripts, MSBuild projects and analyzers, the Gemfile, `Package.swift`, `build.zig`) to
-resolve a project, which runs repository code in the server process outside the shell sandbox. The
-built-in entries for these six (the names `java`, `csharp`, `ruby`, `kotlin`, `swift`, `zig`)
-therefore start **only when the workspace's `.mini-agent/config.toml` is trusted** (the same
-content-bound project-config trust as other project settings, read without prompting). In an
-untrusted workspace, one without a project config, or when the trust store is unavailable they are
-not registered and a warning is logged naming the server. This default is closed: a repository
-cannot make them run just by being opened and edited. To use one anyway without trusting the
-project, define it yourself in your user config (for example `[lsp.servers.kotlin]` with an absolute
-`command` and `extensions`): a same-named user entry is your explicit choice and is never withheld.
-`rust-analyzer` (`build.rs` and proc macros run when it loads a crate) and the other built-ins keep
-their existing behaviour. `/doctor` lists configured servers without applying this gate.
+(Gradle scripts, MSBuild projects and analyzers, the Gemfile, `Package.swift`, `build.zig`);
+`rust-analyzer` runs `build.rs` and proc macros when it loads a crate; `pyright-langserver`
+executes the interpreter a repository's `pyrightconfig.json`/virtualenv selects;
+`typescript-language-server` loads `tsconfig.json` plugins and a workspace TypeScript; `gopls`
+runs the Go toolchain a repository's `go.mod` selects. All of this is repository code running in
+the server process outside the shell sandbox. The built-in entries for these ten (the names `java`,
+`csharp`, `ruby`, `kotlin`, `swift`, `zig`, `rust`, `python`, `typescript`, `go`) therefore start
+**only when the workspace's `.mini-agent/config.toml` is trusted** (the same content-bound
+project-config trust as other project settings, read without prompting). In an untrusted
+workspace, one without a project config, or when the trust store is unavailable they are not
+registered. The withheld state is visible: `/doctor` lists each as `withheld server`, and the `lsp`
+tool's no-server message names the withheld built-in and how to enable it. This default is closed:
+a repository cannot make them run just by being opened and edited. To use one anyway without
+trusting the project, define it yourself in your user config (for example `[lsp.servers.rust]` with
+`command = "rust-analyzer"` and `extensions = [".rs"]`): a same-named user entry is your explicit
+choice and is never withheld. `clangd`, `bash`, `lua` and `php` keep their existing behaviour.
 
 Behavior notes:
 

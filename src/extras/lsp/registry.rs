@@ -108,38 +108,82 @@ pub fn builtin_servers() -> Vec<(&'static str, LspServerConfig)> {
     ]
 }
 
-/// Built-ins whose servers evaluate repository build definitions (Gradle,
-/// MSBuild, Bundler, SwiftPM, `build.zig`) to resolve a project, so opening an
-/// untrusted repository and editing one file would run repository code outside
-/// the shell sandbox. They start only in a project whose config is trusted; a
+/// Built-ins whose servers evaluate repository build definitions or run
+/// repository-selected code to resolve a project, so opening an untrusted
+/// repository and editing one file would run repository code outside the shell
+/// sandbox: Gradle, MSBuild, Bundler, SwiftPM and `build.zig` (java, csharp,
+/// ruby, kotlin, swift, zig); `build.rs` and proc macros (rust); the
+/// interpreter and plugins a repository's `pyrightconfig.json`/`tsconfig.json`
+/// select (python, typescript); and the toolchain a repository's `go.mod`
+/// selects (go). They start only in a project whose config is trusted; a
 /// same-named `[lsp.servers.<name>]` entry is the user's explicit choice and
 /// is never withheld.
-pub const BUILD_EVALUATING_BUILTINS: &[&str] =
-    &["java", "csharp", "ruby", "kotlin", "swift", "zig"];
+pub const BUILD_EVALUATING_BUILTINS: &[&str] = &[
+    "java",
+    "csharp",
+    "ruby",
+    "kotlin",
+    "swift",
+    "zig",
+    "rust",
+    "python",
+    "typescript",
+    "go",
+];
 
-/// Drops the build-evaluating built-ins of `servers` unless `trusted()` says
-/// the project is trusted. `trusted` runs only when one of them is present.
+/// A built-in left out of the registered set because the project is untrusted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WithheldBuiltin {
+    pub name: String,
+    pub extensions: Vec<String>,
+}
+
+impl WithheldBuiltin {
+    /// One-line reason and remedy, shown by `/doctor` and the `lsp` tool.
+    pub(crate) fn explanation(&self) -> String {
+        format!(
+            "built-in '{0}' language server is withheld: it runs repository build/config code and this project's .mini-agent/config.toml is missing or not trusted. Trust the project config, or define [lsp.servers.{0}] in your own config to enable it",
+            self.name
+        )
+    }
+}
+
+/// Splits the build-evaluating built-ins of `servers` off unless `trusted()`
+/// says the project is trusted. `trusted` runs only when one of them is
+/// present.
+pub(crate) fn split_untrusted_builtins(
+    servers: Vec<(String, LspServerConfig)>,
+    user: &HashMap<String, LspServerConfig>,
+    trusted: impl FnOnce() -> bool,
+) -> (Vec<(String, LspServerConfig)>, Vec<WithheldBuiltin>) {
+    let gated = |name: &str| BUILD_EVALUATING_BUILTINS.contains(&name) && !user.contains_key(name);
+    if !servers.iter().any(|(name, _)| gated(name)) || trusted() {
+        return (servers, Vec::new());
+    }
+    let (withheld, kept): (Vec<_>, Vec<_>) = servers.into_iter().partition(|(name, _)| gated(name));
+    let withheld = withheld
+        .into_iter()
+        .map(|(name, cfg)| {
+            tracing::warn!(
+                "lsp[{name}]: built-in server not started because it evaluates project build files and this project's config is not trusted; trust the project config or define [lsp.servers.{name}] yourself"
+            );
+            WithheldBuiltin {
+                name,
+                extensions: cfg.extensions.iter().map(|e| e.to_string()).collect(),
+            }
+        })
+        .collect();
+    (kept, withheld)
+}
+
+/// Drops the build-evaluating built-ins of `servers` unless trusted.
+#[cfg(test)]
 pub(crate) fn withhold_untrusted_builtins(
     servers: Vec<(String, LspServerConfig)>,
     user: &HashMap<String, LspServerConfig>,
     trusted: impl FnOnce() -> bool,
 ) -> Vec<(String, LspServerConfig)> {
-    let gated = |name: &str| BUILD_EVALUATING_BUILTINS.contains(&name) && !user.contains_key(name);
-    if !servers.iter().any(|(name, _)| gated(name)) || trusted() {
-        return servers;
-    }
-    servers
-        .into_iter()
-        .filter(|(name, _)| {
-            let keep = !gated(name);
-            if !keep {
-                tracing::warn!(
-                    "lsp[{name}]: built-in server not started because it evaluates project build files and this project's config is not trusted; trust the project config or define [lsp.servers.{name}] yourself"
-                );
-            }
-            keep
-        })
-        .collect()
+    split_untrusted_builtins(servers, user, trusted).0
 }
 
 /// Merges user config over the built-ins: a same-named entry replaces the
@@ -256,16 +300,7 @@ mod language_coverage_tests {
                 "{gated} must be withheld"
             );
         }
-        for plain in [
-            "rust",
-            "go",
-            "typescript",
-            "python",
-            "clangd",
-            "bash",
-            "lua",
-            "php",
-        ] {
+        for plain in ["clangd", "bash", "lua", "php"] {
             assert!(untrusted.iter().any(|n| n == plain), "{plain} stays");
         }
         let trusted = kept(withhold_untrusted_builtins(
@@ -285,7 +320,7 @@ mod language_coverage_tests {
         assert!(with_override.iter().any(|n| n == "kotlin"));
         assert!(!with_override.iter().any(|n| n == "java"));
         // Trust is not even evaluated when no gated server is present.
-        let only_plain = vec![fixture("rust", ".rs")];
+        let only_plain = vec![fixture("clangd", ".c")];
         let out = withhold_untrusted_builtins(only_plain, &HashMap::new(), || {
             panic!("trust must not be consulted")
         });

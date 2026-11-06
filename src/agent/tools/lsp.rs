@@ -470,8 +470,12 @@ impl Tool for LspNavigateTool {
             )));
         }
         if !self.manager.handles(&path) {
+            let reason = self
+                .manager
+                .withheld_explanation(&path)
+                .map_or_else(String::new, |why| format!(" ({why})"));
             return Err(ToolError::Msg(format!(
-                "No language server is configured for '{expanded}'."
+                "No language server is configured for '{expanded}'{reason}."
             )));
         }
         let permission_path = canonical_permission_path(&path)?;
