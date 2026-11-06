@@ -2464,7 +2464,11 @@ mod tests {
         // Budget fits page 1 only: the scan page is cut, named for
         // continuation, and must not also be attached.
         let cut = render_with_images(&pdf, "doc.pdf", None, 60, 4, false).unwrap();
-        assert!(cut.text.contains("[truncated before page 2"), "{}", cut.text);
+        assert!(
+            cut.text.contains("[truncated before page 2"),
+            "{}",
+            cut.text
+        );
         assert!(cut.text.contains("Hello filters"), "{}", cut.text);
         assert!(cut.images.is_empty(), "{}", cut.text);
         assert!(!cut.text.contains("image"), "{}", cut.text);

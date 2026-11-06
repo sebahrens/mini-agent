@@ -567,7 +567,10 @@ async fn versionless_initial_publish_and_clear_are_accepted_within_unchanged_epo
     let query = LspTool::new(manager.clone(), None, None);
     assert!(
         query
-            .call(LspArgs { path: None })
+            .call(LspArgs {
+                path: None,
+                ..Default::default()
+            })
             .await
             .unwrap()
             .contains("initial versionless diagnostic")
@@ -575,7 +578,10 @@ async fn versionless_initial_publish_and_clear_are_accepted_within_unchanged_epo
     assert!(manager.publish_synced_diagnostics_for_test(&uri, "rust", None, Vec::new()));
     assert_eq!(
         LspTool::new(manager.clone(), None, None)
-            .call(LspArgs { path: None })
+            .call(LspArgs {
+                path: None,
+                ..Default::default()
+            })
             .await
             .unwrap(),
         "No diagnostics."
@@ -754,7 +760,10 @@ async fn atomic_edit_waits_for_publish_bound_to_replacement_identity() {
     );
     assert_eq!(
         LspTool::new(manager.clone(), None, None)
-            .call(LspArgs { path: None })
+            .call(LspArgs {
+                path: None,
+                ..Default::default()
+            })
             .await
             .unwrap(),
         "No diagnostics."
@@ -767,7 +776,13 @@ async fn clean_project_reports_nothing() {
     let manager = LspManager::new(&LspConfig::default(), root.path().to_path_buf());
     let query = LspTool::new(manager.clone(), None, None);
     assert_eq!(
-        query.call(LspArgs { path: None }).await.unwrap(),
+        query
+            .call(LspArgs {
+                path: None,
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
         "No diagnostics."
     );
     let source = root.path().join("x.rs");
@@ -778,7 +793,13 @@ async fn clean_project_reports_nothing() {
         "rust",
         vec![diag(lsp_types::DiagnosticSeverity::ERROR, 0, 0, "boom")],
     );
-    let block = query.call(LspArgs { path: None }).await.unwrap();
+    let block = query
+        .call(LspArgs {
+            path: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
     assert!(block.contains("x.rs:1:1 error: boom"), "{block}");
 }
 
@@ -936,6 +957,7 @@ async fn explicit_in_root_path_obeys_read_allow_deny_and_ask() {
     let output = allow
         .call(LspArgs {
             path: Some(file.display().to_string()),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -945,6 +967,7 @@ async fn explicit_in_root_path_obeys_read_allow_deny_and_ask() {
     let error = deny
         .call(LspArgs {
             path: Some(file.display().to_string()),
+            ..Default::default()
         })
         .await
         .unwrap_err()
@@ -955,6 +978,7 @@ async fn explicit_in_root_path_obeys_read_allow_deny_and_ask() {
     let (result, ()) = tokio::join!(
         ask.call(LspArgs {
             path: Some(file.display().to_string()),
+            ..Default::default()
         }),
         answer_once(ask_rx.unwrap(), &canonical),
     );
@@ -983,6 +1007,7 @@ async fn explicit_external_path_obeys_external_directory_allow_deny_and_ask() {
         let result = tool
             .call(LspArgs {
                 path: Some(file.display().to_string()),
+                ..Default::default()
             })
             .await;
         match action {
@@ -1010,6 +1035,7 @@ async fn explicit_external_path_obeys_external_directory_allow_deny_and_ask() {
     let (result, ()) = tokio::join!(
         ask.call(LspArgs {
             path: Some(file.display().to_string()),
+            ..Default::default()
         }),
         answer_once(ask_rx.unwrap(), &canonical),
     );
@@ -1023,7 +1049,13 @@ async fn project_query_obeys_read_allow_deny_and_ask_before_cache_disclosure() {
 
     let (allow, _, _) = lsp_tool(root.path(), read_permission(Action::Allow));
     assert_eq!(
-        allow.call(LspArgs { path: None }).await.unwrap(),
+        allow
+            .call(LspArgs {
+                path: None,
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
         "No diagnostics."
     );
 
@@ -1039,7 +1071,10 @@ async fn project_query_obeys_read_allow_deny_and_ask_before_cache_disclosure() {
         )],
     );
     let error = deny
-        .call(LspArgs { path: None })
+        .call(LspArgs {
+            path: None,
+            ..Default::default()
+        })
         .await
         .unwrap_err()
         .to_string();
@@ -1048,7 +1083,10 @@ async fn project_query_obeys_read_allow_deny_and_ask_before_cache_disclosure() {
 
     let (ask, ask_rx, _) = lsp_tool(root.path(), read_permission(Action::Ask));
     let (result, ()) = tokio::join!(
-        ask.call(LspArgs { path: None }),
+        ask.call(LspArgs {
+            path: None,
+            ..Default::default()
+        }),
         answer_once(ask_rx.unwrap(), &canonical_root),
     );
     assert_eq!(result.unwrap(), "No diagnostics.");
@@ -1094,7 +1132,13 @@ async fn project_query_filters_diagnostics_for_denied_files() {
         )],
     );
 
-    let output = tool.call(LspArgs { path: None }).await.unwrap();
+    let output = tool
+        .call(LspArgs {
+            path: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
     assert!(
         output.contains("public.rs:2:3 warning: public warning"),
         "{output}"
@@ -1134,6 +1178,7 @@ async fn explicit_denial_prevents_sync_or_server_launch_and_cached_disclosure() 
     let error = tool
         .call(LspArgs {
             path: Some(file.display().to_string()),
+            ..Default::default()
         })
         .await
         .unwrap_err()
@@ -1202,7 +1247,14 @@ async fn lsp_allow_always_uses_canonical_path_pattern_and_deny_still_wins() {
     );
 
     let first_tool = tool.clone();
-    let task = tokio::spawn(async move { first_tool.call(LspArgs { path: None }).await });
+    let task = tokio::spawn(async move {
+        first_tool
+            .call(LspArgs {
+                path: None,
+                ..Default::default()
+            })
+            .await
+    });
     let request = ask_rx
         .as_mut()
         .unwrap()
@@ -1250,7 +1302,14 @@ async fn lsp_allow_always_uses_canonical_path_pattern_and_deny_still_wins() {
     assert!(ask_rx.as_mut().unwrap().try_recv().is_err());
 
     let second_tool = tool.clone();
-    let second = tokio::spawn(async move { second_tool.call(LspArgs { path: None }).await });
+    let second = tokio::spawn(async move {
+        second_tool
+            .call(LspArgs {
+                path: None,
+                ..Default::default()
+            })
+            .await
+    });
     let repeated_request =
         tokio::time::timeout(Duration::from_secs(1), ask_rx.as_mut().unwrap().recv())
             .await
@@ -1304,7 +1363,14 @@ async fn assert_aggregate_literal_metachar_scope(project_name: &str, sibling_nam
     );
 
     let first_tool = tool.clone();
-    let first = tokio::spawn(async move { first_tool.call(LspArgs { path: None }).await });
+    let first = tokio::spawn(async move {
+        first_tool
+            .call(LspArgs {
+                path: None,
+                ..Default::default()
+            })
+            .await
+    });
     let root_request = ask_rx
         .as_mut()
         .unwrap()
@@ -1342,7 +1408,14 @@ async fn assert_aggregate_literal_metachar_scope(project_name: &str, sibling_nam
     assert!(!output.contains("sibling diagnostic"), "{output}");
 
     let second_tool = tool.clone();
-    let second = tokio::spawn(async move { second_tool.call(LspArgs { path: None }).await });
+    let second = tokio::spawn(async move {
+        second_tool
+            .call(LspArgs {
+                path: None,
+                ..Default::default()
+            })
+            .await
+    });
     let repeated_request =
         tokio::time::timeout(Duration::from_secs(1), ask_rx.as_mut().unwrap().recv())
             .await
@@ -1473,7 +1546,13 @@ async fn aggregate_authorization_bounds_open_handles_and_preserves_sorted_result
         Some(permission(root.path(), PermissionConfig::default())),
         None,
     );
-    let output = tool.call(LspArgs { path: None }).await.unwrap();
+    let output = tool
+        .call(LspArgs {
+            path: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
     let mut last = 0;
     for index in 0..12 {
         let needle = format!("file-{index:02}.rs:1:1 error: diagnostic-{index:02}");
@@ -1555,8 +1634,17 @@ async fn aggregate_snapshot_caps_high_cardinality_high_volume_diagnostics_before
         Some(permission(root.path(), PermissionConfig::default())),
         None,
     );
-    let output = tool.call(LspArgs { path: None }).await.unwrap();
-    assert!(output.contains("… (truncated)"), "{output}");
+    let output = tool
+        .call(LspArgs {
+            path: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        output.contains("more diagnostics in") && output.contains("pass offset=200"),
+        "{output}"
+    );
     assert_eq!(manager.peak_bound_diagnostic_count(), 1);
 }
 
@@ -1774,7 +1862,13 @@ async fn project_wide_listing_discloses_files_dropped_from_a_full_cache() {
         permission: None,
         ask_tx: None,
     };
-    let output = tool.call(LspArgs { path: None }).await.unwrap();
+    let output = tool
+        .call(LspArgs {
+            path: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
     assert!(
         output.contains("[3 files' diagnostics dropped: cache full]"),
         "{output}"
@@ -1882,7 +1976,13 @@ async fn windows_aggregate_binding_uses_manager_root_canonical_representation() 
         Some(permission(root.path(), PermissionConfig::default())),
         None,
     );
-    let output = tool.call(LspArgs { path: None }).await.unwrap();
+    let output = tool
+        .call(LspArgs {
+            path: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
     assert!(output.contains("main.rs:1:1 error: windows canonical diagnostic"));
 }
 
@@ -1904,6 +2004,7 @@ async fn windows_lsp_tool_verbatim_canonical_path_matches_ordinary_configured_de
     let error = tool
         .call(LspArgs {
             path: Some(ordinary_policy_path),
+            ..Default::default()
         })
         .await
         .unwrap_err()
@@ -1930,6 +2031,7 @@ async fn windows_lsp_tool_verbatim_external_path_matches_ordinary_external_rule(
     let error = tool
         .call(LspArgs {
             path: Some(ordinary_policy_path),
+            ..Default::default()
         })
         .await
         .unwrap_err()
@@ -1984,6 +2086,7 @@ async fn windows_lsp_tool_matches_ordinary_and_verbatim_raw_external_regex_denie
         let error = tool
             .call(LspArgs {
                 path: Some(ordinary_policy_path.clone()),
+                ..Default::default()
             })
             .await
             .unwrap_err()
@@ -2008,6 +2111,7 @@ async fn explicit_lsp_allow_always_suppresses_later_asks() {
         first_tool
             .call(LspArgs {
                 path: Some(first_path.display().to_string()),
+                ..Default::default()
             })
             .await
     });
@@ -2031,6 +2135,7 @@ async fn explicit_lsp_allow_always_suppresses_later_asks() {
         Duration::from_secs(1),
         tool.call(LspArgs {
             path: Some(file.display().to_string()),
+            ..Default::default()
         }),
     )
     .await
@@ -2049,6 +2154,7 @@ async fn dropped_lsp_ask_reply_fails_closed_before_manager_access() {
     let task = tokio::spawn(async move {
         tool.call(LspArgs {
             path: Some(file.display().to_string()),
+            ..Default::default()
         })
         .await
     });
@@ -2093,6 +2199,7 @@ async fn explicit_fifo_is_rejected_promptly_before_lsp_client_access() {
         Duration::from_secs(1),
         tool.call(LspArgs {
             path: Some(fifo.display().to_string()),
+            ..Default::default()
         }),
     )
     .await
@@ -2150,6 +2257,7 @@ async fn explicit_non_utf8_canonical_path_cannot_reuse_lossy_permission_key() {
         Duration::from_secs(1),
         tool.call(LspArgs {
             path: Some(requested.display().to_string()),
+            ..Default::default()
         }),
     )
     .await
@@ -2216,7 +2324,13 @@ async fn aggregate_rejects_symlink_alias_uri_variants_and_stale_retargets() {
         None,
     );
     assert_eq!(
-        replacement_tool.call(LspArgs { path: None }).await.unwrap(),
+        replacement_tool
+            .call(LspArgs {
+                path: None,
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
         "No diagnostics.",
         "a same-path inode replacement must invalidate cached diagnostics"
     );
@@ -2232,7 +2346,13 @@ async fn aggregate_rejects_symlink_alias_uri_variants_and_stale_retargets() {
         ..PermissionConfig::default()
     };
     let tool = LspTool::new(manager, Some(permission(root.path(), config)), None);
-    let output = tool.call(LspArgs { path: None }).await.unwrap();
+    let output = tool
+        .call(LspArgs {
+            path: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
     assert_eq!(output, "No diagnostics.");
 }
 
@@ -2440,4 +2560,183 @@ fn rename_preview_is_bounded_and_never_names_outside_files() {
     );
     assert_eq!(ops.outside, 2);
     assert_eq!(ops.file_ops, vec!["create /ws/new.rs".to_string()]);
+}
+
+async fn inject_error_files(root: &TempDir, manager: &LspManager, files: usize, per_file: u32) {
+    for file_index in 0..files {
+        let dir = root
+            .path()
+            .join(if file_index % 2 == 0 { "src" } else { "lib" });
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("page-{file_index:02}.rs"));
+        std::fs::write(&path, "contents").unwrap();
+        let path = path.canonicalize().unwrap();
+        let diagnostics = (0..per_file)
+            .map(|n| {
+                let severity = if n % 5 == 0 {
+                    lsp_types::DiagnosticSeverity::WARNING
+                } else {
+                    lsp_types::DiagnosticSeverity::ERROR
+                };
+                diag(severity, n, 0, &format!("f{file_index:02}-d{n:03}"))
+            })
+            .collect();
+        assert!(manager.try_inject_diagnostics(
+            &crate::extras::lsp::client::file_uri(&path).unwrap(),
+            "rust",
+            diagnostics,
+        ));
+    }
+}
+
+#[tokio::test]
+async fn explicit_project_diagnostics_page_with_exact_hidden_counts() {
+    let root = TempDir::new("diagnostics-paging");
+    let manager = LspManager::new(&LspConfig::default(), root.path().to_path_buf());
+    // 6 files x 45 diagnostics = 270, above the 200 default page.
+    inject_error_files(&root, &manager, 6, 45).await;
+    let tool = LspTool::new(
+        manager.clone(),
+        Some(permission(root.path(), PermissionConfig::default())),
+        None,
+    );
+    let first = tool.call(LspArgs::default()).await.unwrap();
+    assert_eq!(first.matches(": f").count() >= 200, true, "{first}");
+    assert_eq!(
+        first
+            .lines()
+            .filter(|l| l.contains(" error: f") || l.contains(" warning: f"))
+            .count(),
+        200
+    );
+    assert!(
+        first.contains("70 more diagnostics in 2 file(s) not shown (showing 1-200 of 270 in 6 files); pass offset=200"),
+        "{first}"
+    );
+    let second = tool
+        .call(LspArgs {
+            offset: Some(200),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        second
+            .lines()
+            .filter(|l| l.contains(" error: f") || l.contains(" warning: f"))
+            .count(),
+        70
+    );
+    assert!(!second.contains("not shown"), "{second}");
+    // Pages do not overlap and cover everything exactly once.
+    let key = |text: &str| -> std::collections::BTreeSet<String> {
+        text.lines()
+            .filter(|l| l.contains(": f"))
+            .map(str::to_string)
+            .collect()
+    };
+    assert!(key(&first).is_disjoint(&key(&second)));
+    assert_eq!(key(&first).len() + key(&second).len(), 270);
+
+    // Severity and directory filters narrow the listing; errors only.
+    let errors = tool
+        .call(LspArgs {
+            severity: Some(crate::agent::tools::lsp::DiagSeverity::Error),
+            limit: Some(1000),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(!errors.contains("warning:"), "{errors}");
+    assert_eq!(errors.matches(" error: f").count(), 6 * 36);
+    let lib_only = tool
+        .call(LspArgs {
+            directory: Some("lib".into()),
+            limit: Some(1000),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        lib_only.contains("lib/page-01.rs") && !lib_only.contains("src/page-00.rs"),
+        "{lib_only}"
+    );
+    // Past the end is stated, not silent.
+    let past = tool
+        .call(LspArgs {
+            offset: Some(5000),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        past.contains("no diagnostics at offset 5000 (270"),
+        "{past}"
+    );
+    // Bad arguments are rejected.
+    for bad in [
+        LspArgs {
+            limit: Some(0),
+            ..Default::default()
+        },
+        LspArgs {
+            limit: Some(5000),
+            ..Default::default()
+        },
+        LspArgs {
+            directory: Some("../x".into()),
+            ..Default::default()
+        },
+        LspArgs {
+            directory: Some("/abs".into()),
+            ..Default::default()
+        },
+        LspArgs {
+            path: Some("a.rs".into()),
+            directory: Some("lib".into()),
+            ..Default::default()
+        },
+    ] {
+        assert!(tool.call(bad).await.is_err());
+    }
+}
+
+#[test]
+fn single_file_diagnostics_page_states_hidden_count_and_post_edit_cap_stays_20() {
+    use crate::extras::lsp::DiagPage;
+    let diags: Vec<_> = (0..250)
+        .map(|n| {
+            diag(
+                lsp_types::DiagnosticSeverity::ERROR,
+                n,
+                0,
+                &format!("m{n:03}"),
+            )
+        })
+        .collect();
+    let edit =
+        crate::extras::lsp::format_file_diags_for_test("rust", &diags, 0, DiagPage::EDIT).unwrap();
+    assert_eq!(edit.matches(" error: m").count(), 20, "{edit}");
+    assert!(
+        edit.contains("230 more diagnostics not shown (showing 1-20 of 250)"),
+        "{edit}"
+    );
+    let query = DiagPage {
+        offset: 0,
+        limit: 200,
+        severity: None,
+    };
+    let page = crate::extras::lsp::format_file_diags_for_test("rust", &diags, 0, query).unwrap();
+    assert_eq!(page.matches(" error: m").count(), 200);
+    assert!(
+        page.contains("50 more diagnostics not shown (showing 1-200 of 250); pass offset=200"),
+        "{page}"
+    );
+    let rest = DiagPage {
+        offset: 200,
+        ..query
+    };
+    let rest = crate::extras::lsp::format_file_diags_for_test("rust", &diags, 0, rest).unwrap();
+    assert_eq!(rest.matches(" error: m").count(), 50);
+    assert!(!rest.contains("not shown"), "{rest}");
 }

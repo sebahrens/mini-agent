@@ -24,11 +24,32 @@ pub struct LspTool {
     pub ask_tx: Option<AskSender>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct LspArgs {
     /// File to inspect. Omit to list diagnostics for every file.
     pub path: Option<String>,
+    /// Diagnostics to skip (page with the offset the previous truncation
+    /// footer names).
+    #[serde(default)]
+    pub offset: Option<usize>,
+    /// Most diagnostics to return (default 200, at most 1000).
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Only `error` or only `warning` diagnostics.
+    #[serde(default)]
+    pub severity: Option<DiagSeverity>,
+    /// Project-wide listing only: restrict to files under this
+    /// workspace-relative directory.
+    #[serde(default)]
+    pub directory: Option<String>,
+}
+
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagSeverity {
+    Error,
+    Warning,
 }
 
 impl LspTool {
@@ -53,19 +74,66 @@ impl Tool for LspTool {
     type Output = String;
 
     fn description(&self) -> String {
-        "Get language-server diagnostics (errors/warnings). With `path`: diagnostics for that file, synced from disk first. Without: every file that currently has diagnostics.".to_string()
+        "Get language-server diagnostics (errors/warnings). With `path`: diagnostics for that file, synced from disk first. Without: every file that currently has diagnostics (optionally under `directory`). Up to 200 diagnostics are returned per call (`limit`, at most 1000), errors first; a truncation line states how many diagnostics and files are hidden and the `offset` to continue with. `severity` narrows to errors or warnings.".to_string()
     }
 
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "File to inspect (optional; omit for all files)" }
+                "path": { "type": "string", "description": "File to inspect (optional; omit for all files)" },
+                "offset": { "type": "integer", "minimum": 0, "description": "Diagnostics to skip; pass the offset named by the previous truncation line" },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Most diagnostics to return (default 200)" },
+                "severity": { "type": "string", "enum": ["error", "warning"], "description": "Only diagnostics of this severity" },
+                "directory": { "type": "string", "description": "Project-wide listing only: workspace-relative directory to restrict to" }
             }
         })
     }
 
     async fn call(&self, args: LspArgs) -> Result<String, ToolError> {
+        let limit = args
+            .limit
+            .unwrap_or(crate::extras::lsp::QUERY_DIAG_LIMIT_DEFAULT);
+        if limit == 0 || limit > crate::extras::lsp::QUERY_DIAG_LIMIT_MAX {
+            return Err(ToolError::Msg(format!(
+                "limit must be between 1 and {}",
+                crate::extras::lsp::QUERY_DIAG_LIMIT_MAX
+            )));
+        }
+        let severity = args.severity.map(|severity| match severity {
+            DiagSeverity::Error => lsp_types::DiagnosticSeverity::ERROR,
+            DiagSeverity::Warning => lsp_types::DiagnosticSeverity::WARNING,
+        });
+        let offset = args.offset.unwrap_or(0);
+        let page = crate::extras::lsp::DiagPage {
+            offset,
+            limit,
+            severity,
+        };
+        if args.path.is_some() && args.directory.is_some() {
+            return Err(ToolError::Msg(
+                "directory applies only to the project-wide listing; omit path".to_string(),
+            ));
+        }
+        let directory = match args.directory.as_deref() {
+            None => None,
+            Some(dir) => {
+                let dir = Path::new(dir);
+                if dir.is_absolute()
+                    || dir.components().any(|c| {
+                        !matches!(
+                            c,
+                            std::path::Component::Normal(_) | std::path::Component::CurDir
+                        )
+                    })
+                {
+                    return Err(ToolError::Msg(
+                        "directory must be a workspace-relative path without `..`".to_string(),
+                    ));
+                }
+                Some(dir.to_path_buf())
+            }
+        };
         match args.path {
             Some(path) => {
                 let expanded = crate::fs::expand_tilde(&path);
@@ -103,11 +171,11 @@ impl Tool for LspTool {
                 };
                 let diagnostics = if bound_relative {
                     self.manager
-                        .diagnostics_block_relative(relative, QUERY_WAIT, baseline)
+                        .diagnostics_query_relative(relative, QUERY_WAIT, baseline, page)
                         .await
                 } else {
                     self.manager
-                        .diagnostics_block_since(&path, QUERY_WAIT, baseline)
+                        .diagnostics_query_since(&path, QUERY_WAIT, baseline, page)
                         .await
                 };
                 let output = diagnostics
@@ -134,7 +202,6 @@ impl Tool for LspTool {
                 // Each file then receives its own path check so an explicit
                 // deny rule cannot leak through the project-wide aggregate.
                 let mut snapshots = Vec::new();
-                let mut remaining_lines = crate::extras::lsp::MAX_DIAG_LINES;
                 for uri in self.manager.diagnostic_candidate_uris() {
                     let Some(binding) = self.manager.bind_diagnostic_uri(&uri).await else {
                         continue;
@@ -142,6 +209,14 @@ impl Tool for LspTool {
                     let Ok(permission_path) = canonical_permission_path(binding.path()) else {
                         continue;
                     };
+                    if let Some(dir) = &directory
+                        && !binding
+                            .path()
+                            .strip_prefix(&root)
+                            .is_ok_and(|relative| relative.starts_with(dir))
+                    {
+                        continue;
+                    }
                     let external = !binding.path().starts_with(&root);
                     if check_perm_canonical_path(
                         &self.permission,
@@ -154,23 +229,17 @@ impl Tool for LspTool {
                     .is_ok()
                         && let Some(snapshot) = self
                             .manager
-                            .snapshot_bound_diagnostics(&binding, remaining_lines)
+                            .snapshot_bound_diagnostics_with(&binding, usize::MAX, severity)
                             .await
                     {
-                        remaining_lines =
-                            remaining_lines.saturating_sub(snapshot.retained_line_count());
-                        let truncated = snapshot.is_truncated();
                         snapshots.push(snapshot);
-                        if truncated {
-                            break;
-                        }
                     }
                     // `binding` and its descriptor are released here before
                     // the next cache candidate is opened.
                 }
                 let mut output = self
                     .manager
-                    .all_diagnostics_block_for_snapshots(&snapshots)
+                    .diagnostics_page_for_snapshots(&snapshots, offset, limit)
                     .map(|block| format!("Files with diagnostics:\n{block}"))
                     .unwrap_or_else(|| "No diagnostics.".to_string());
                 let dropped = self.manager.dropped_diagnostic_files();

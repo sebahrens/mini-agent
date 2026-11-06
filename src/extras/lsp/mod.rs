@@ -44,6 +44,28 @@ const SERVER_FAILURE_COUNT_MAX: u32 = 7;
 
 /// Max diagnostics lines appended to a tool result.
 pub(crate) const MAX_DIAG_LINES: usize = 20;
+/// Default and largest page of an explicit `lsp_diagnostics` query (the
+/// post-edit appendix keeps [`MAX_DIAG_LINES`]).
+pub(crate) const QUERY_DIAG_LIMIT_DEFAULT: usize = 200;
+pub(crate) const QUERY_DIAG_LIMIT_MAX: usize = 1000;
+
+/// Which diagnostics of a file to render: a window over the severity-ordered
+/// list, optionally narrowed to one severity.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DiagPage {
+    pub(crate) offset: usize,
+    pub(crate) limit: usize,
+    pub(crate) severity: Option<DiagnosticSeverity>,
+}
+
+impl DiagPage {
+    /// The post-edit appendix: first [`MAX_DIAG_LINES`], errors and warnings.
+    pub(crate) const EDIT: Self = Self {
+        offset: 0,
+        limit: MAX_DIAG_LINES,
+        severity: None,
+    };
+}
 
 #[derive(Clone)]
 pub struct LspManager {
@@ -301,10 +323,12 @@ pub(crate) struct DiagnosticSnapshot {
 }
 
 impl DiagnosticSnapshot {
+    #[cfg(test)]
     pub(crate) fn retained_line_count(&self) -> usize {
         self.lines.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn is_truncated(&self) -> bool {
         self.truncated
     }
@@ -708,7 +732,20 @@ impl LspManager {
         wait: Duration,
         baseline: Option<u64>,
     ) -> Option<String> {
-        self.diagnostics_block_observed(path, wait, baseline)
+        self.diagnostics_query_since(path, wait, baseline, DiagPage::EDIT)
+            .await
+    }
+
+    /// [`Self::diagnostics_block_since`] for an explicit query: `page` selects
+    /// the window and the truncation footer states what is hidden.
+    pub(crate) async fn diagnostics_query_since(
+        &self,
+        path: &Path,
+        wait: Duration,
+        baseline: Option<u64>,
+        page: DiagPage,
+    ) -> Option<String> {
+        self.diagnostics_block_observed(path, wait, baseline, page)
             .await
             .0
     }
@@ -720,6 +757,7 @@ impl LspManager {
         path: &Path,
         wait: Duration,
         baseline: Option<u64>,
+        page: DiagPage,
     ) -> (Option<String>, Option<bool>) {
         if !self.handles(path) {
             return (None, None);
@@ -727,7 +765,7 @@ impl LspManager {
         let Some(uri) = client::file_uri(path) else {
             return (None, None);
         };
-        let (output, published) = self.diagnostics_block_wait(uri, wait, baseline).await;
+        let (output, published) = self.diagnostics_block_wait(uri, wait, baseline, page).await;
         (output, Some(published))
     }
 
@@ -736,6 +774,7 @@ impl LspManager {
         uri: String,
         wait: Duration,
         baseline: Option<u64>,
+        page: DiagPage,
     ) -> (Option<String>, bool) {
         let mut published = false;
         // A production edit atomically replaces the file, so the previous
@@ -775,17 +814,17 @@ impl LspManager {
                 break; // timeout: use whatever is stored
             }
         }
-        (self.format_stored_diagnostics(uri).await, published)
+        (self.format_stored_diagnostics(uri, page).await, published)
     }
 
-    async fn format_stored_diagnostics(&self, uri: String) -> Option<String> {
+    async fn format_stored_diagnostics(&self, uri: String, page: DiagPage) -> Option<String> {
         self.inner.workspace.validate().ok()?;
         let file = self.inner.diags.lock().unwrap().get(&uri)?.clone();
         let output = crate::agent::runner::spawn_blocking_scoped(move || {
             if !diagnostic_identity_is_current(&uri, &file) {
                 return None;
             }
-            format_file_diags(&file.server, &file.diagnostics, file.omitted)
+            format_file_diags(&file.server, &file.diagnostics, file.omitted, page)
         })
         .await
         .ok()
@@ -843,7 +882,7 @@ impl LspManager {
             full_wait
         };
         let (output, published) = self
-            .diagnostics_block_wait(uri.clone(), wait, baseline)
+            .diagnostics_block_wait(uri.clone(), wait, baseline, DiagPage::EDIT)
             .await;
         let mut waits = self
             .inner
@@ -881,14 +920,16 @@ impl LspManager {
         output
     }
 
-    pub async fn diagnostics_block_relative(
+    pub(crate) async fn diagnostics_query_relative(
         &self,
         relative: &Path,
         wait: Duration,
         baseline: Option<u64>,
+        page: DiagPage,
     ) -> Option<String> {
         let parent = self.resolve_relative(relative)?;
-        self.diagnostics_block_since(&parent, wait, baseline).await
+        self.diagnostics_query_since(&parent, wait, baseline, page)
+            .await
     }
 
     fn resolve_relative(&self, relative: &Path) -> Option<PathBuf> {
@@ -980,6 +1021,18 @@ impl LspManager {
         binding: &BoundDiagnosticPath,
         remaining_lines: usize,
     ) -> Option<DiagnosticSnapshot> {
+        self.snapshot_bound_diagnostics_with(binding, remaining_lines, None)
+            .await
+    }
+
+    /// [`Self::snapshot_bound_diagnostics`] limited to one severity and with
+    /// the lines in a stable severity, line, column order.
+    pub(crate) async fn snapshot_bound_diagnostics_with(
+        &self,
+        binding: &BoundDiagnosticPath,
+        remaining_lines: usize,
+        severity: Option<DiagnosticSeverity>,
+    ) -> Option<DiagnosticSnapshot> {
         let (version, content) = {
             let store = self.inner.diags.lock().unwrap();
             let cached = store.get(&binding.uri)?;
@@ -1011,16 +1064,19 @@ impl LspManager {
             .strip_prefix(self.inner.workspace.root())
             .map(|relative| relative.display().to_string())
             .unwrap_or_else(|_| binding.path.display().to_string());
-        let mut interesting = cached
+        let mut interesting: Vec<_> = cached
             .diagnostics
             .iter()
-            .filter(|diag| diag.severity <= Some(DiagnosticSeverity::WARNING));
+            .filter(|diag| diag.severity <= Some(DiagnosticSeverity::WARNING))
+            .filter(|diag| severity.is_none_or(|wanted| diag.severity == Some(wanted)))
+            .collect();
+        interesting.sort_by_key(|d| (d.severity, d.range.start.line, d.range.start.character));
+        let truncated = interesting.len() > remaining_lines;
         let lines: Vec<String> = interesting
-            .by_ref()
+            .into_iter()
             .take(remaining_lines)
             .map(|diagnostic| format_diag_line(&display, diagnostic))
             .collect();
-        let truncated = interesting.next().is_some();
         Some(DiagnosticSnapshot {
             uri: binding.uri.clone(),
             lines,
@@ -1035,6 +1091,7 @@ impl LspManager {
         self.inner.diags.dropped_files()
     }
 
+    #[cfg(test)]
     pub fn all_diagnostics_block_for_snapshots(
         &self,
         snapshots: &[DiagnosticSnapshot],
@@ -1055,6 +1112,57 @@ impl LspManager {
             }
         }
         if out.is_empty() { None } else { Some(out) }
+    }
+
+    /// Window `[offset, offset + limit)` over the diagnostics of `snapshots`
+    /// (files in URI order, diagnostics in severity/line order within a file).
+    /// The footer states how many diagnostics and files are hidden and the
+    /// `offset` that continues the listing.
+    pub(crate) fn diagnostics_page_for_snapshots(
+        &self,
+        snapshots: &[DiagnosticSnapshot],
+        offset: usize,
+        limit: usize,
+    ) -> Option<String> {
+        let mut entries: Vec<_> = snapshots.iter().filter(|s| !s.lines.is_empty()).collect();
+        entries.sort_by(|a, b| a.uri.cmp(&b.uri));
+        let total: usize = entries.iter().map(|s| s.lines.len()).sum();
+        if total == 0 {
+            return None;
+        }
+        let end = offset.saturating_add(limit).min(total);
+        let mut out = String::new();
+        let mut position = 0;
+        let mut files_hidden = 0;
+        for snapshot in &entries {
+            let first = position;
+            position += snapshot.lines.len();
+            for (index, line) in snapshot.lines.iter().enumerate() {
+                if (offset..end).contains(&(first + index)) {
+                    out.push_str(line);
+                }
+            }
+            if snapshot.omitted > 0 && (offset..end).contains(&(position - 1)) {
+                out.push_str(&omitted_notice(&snapshot.uri, snapshot.omitted));
+            }
+            if position > end {
+                files_hidden += 1;
+            }
+        }
+        if offset >= total {
+            out.push_str(&format!(
+                "\n  … no diagnostics at offset {offset} ({total} in {} files in total)",
+                entries.len()
+            ));
+        } else if end < total {
+            out.push_str(&format!(
+                "\n  … {} more diagnostics in {files_hidden} file(s) not shown (showing {}-{end} of {total} in {} files); pass offset={end} to continue, or narrow with severity/directory",
+                total - end,
+                offset + 1,
+                entries.len()
+            ));
+        }
+        Some(out)
     }
 
     #[cfg(test)]
@@ -1377,22 +1485,37 @@ fn format_file_diags(
     server: &str,
     diags: &[lsp_types::Diagnostic],
     omitted: usize,
+    page: DiagPage,
 ) -> Option<String> {
     let mut sorted: Vec<_> = diags
         .iter()
         .filter(|d| d.severity <= Some(DiagnosticSeverity::WARNING))
+        .filter(|d| {
+            page.severity
+                .is_none_or(|wanted| d.severity == Some(wanted))
+        })
         .collect();
     if sorted.is_empty() {
         return None;
     }
-    sorted.sort_by_key(|d| d.severity);
+    sorted.sort_by_key(|d| (d.severity, d.range.start.line, d.range.start.character));
+    let total = sorted.len();
     let mut out = format!("\n\nLSP diagnostics ({server}):");
-    for (i, d) in sorted.iter().enumerate() {
-        if i >= MAX_DIAG_LINES {
-            out.push_str("\n  … (truncated)");
-            break;
-        }
+    for d in sorted.iter().skip(page.offset).take(page.limit) {
         out.push_str(&format_diag_line("", d));
+    }
+    let end = page.offset.saturating_add(page.limit).min(total);
+    if page.offset >= total {
+        out.push_str(&format!(
+            "\n  … no diagnostics at offset {} ({total} in total)",
+            page.offset
+        ));
+    } else if end < total {
+        out.push_str(&format!(
+            "\n  … {} more diagnostics not shown (showing {}-{end} of {total}); pass offset={end} to continue",
+            total - end,
+            page.offset + 1,
+        ));
     }
     if omitted > 0 {
         out.push_str(&format!(
@@ -1401,6 +1524,16 @@ fn format_file_diags(
         ));
     }
     Some(out)
+}
+
+#[cfg(test)]
+pub(crate) fn format_file_diags_for_test(
+    server: &str,
+    diags: &[lsp_types::Diagnostic],
+    omitted: usize,
+    page: DiagPage,
+) -> Option<String> {
+    format_file_diags(server, diags, omitted, page)
 }
 
 fn omitted_notice(uri: &str, omitted: usize) -> String {

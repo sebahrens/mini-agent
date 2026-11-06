@@ -1220,6 +1220,7 @@ async fn lsp_process_diagnostics_reach_real_write_edit_and_query_tools() {
             query
                 .call(LspArgs {
                     path: Some(path.clone()),
+                    ..Default::default()
                 })
                 .await,
         ));
@@ -1230,7 +1231,12 @@ async fn lsp_process_diagnostics_reach_real_write_edit_and_query_tools() {
                 .diagnostics_block_since(&source, Duration::ZERO, None)
                 .await,
             manager.snapshot_bound_diagnostics(&binding, 20).await,
-            query.call(LspArgs { path: None }).await,
+            query
+                .call(LspArgs {
+                    path: None,
+                    ..Default::default()
+                })
+                .await,
         ));
     }
     manager.shutdown().await;
@@ -1711,6 +1717,7 @@ async fn lsp_process_permission_wait_rejects_leaf_and_parent_symlink_retargets()
                 let query = tokio::spawn(async move {
                     tool.call(LspArgs {
                         path: Some(requested),
+                        ..Default::default()
                     })
                     .await
                 });
