@@ -211,6 +211,13 @@ pub struct Cli {
     pub include_partial_messages: bool,
 
     #[arg(
+        long = "stream-json-control",
+        requires_all = ["print", "input_format"],
+        help = "With -p --input-format stream-json --output stream-json: let stdin control_request/control_response lines interrupt the running turn, answer tool permission asks (denied after 60 s) and narrow the permission mode (default off)"
+    )]
+    pub stream_json_control: bool,
+
+    #[arg(
         long = "max-stdin-bytes",
         value_name = "BYTES",
         requires = "print",

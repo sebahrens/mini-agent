@@ -2300,10 +2300,19 @@ impl Startup {
         let mut pending =
             Some(self.cli.message.join(" ").trim().to_string()).filter(|prompt| !prompt.is_empty());
         let mut last_failure = None;
+        // Opt-in control channel: stdin is read by a task that answers
+        // control lines at once (even mid-turn) and queues the rest.
+        let mut queued = self
+            .cli
+            .stream_json_control
+            .then(|| crate::print::spawn_control_reader(output, self.permission.clone()));
         loop {
             let prompt = match pending.take() {
                 Some(prompt) => prompt,
-                None => match crate::print::read_stream_input_line().await? {
+                None => match match &mut queued {
+                    Some(queue) => Ok(queue.recv().await),
+                    None => crate::print::read_stream_input_line().await,
+                }? {
                     None => break,
                     Some(Ok(line)) if line.trim().is_empty() => continue,
                     Some(Ok(line)) => match crate::headless_media::parse_stream_user_input(

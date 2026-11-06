@@ -109,6 +109,46 @@ pub(crate) async fn read_stream_input_line() -> anyhow::Result<Option<Result<Str
     .await?
 }
 
+/// Queue depth of non-control stdin lines read ahead of the running turn. A
+/// driver that queues more than this stalls its own control lines, so keep
+/// follow-ups to a few messages.
+const CONTROL_QUEUE_LINES: usize = 64;
+
+/// `--stream-json-control`: enables the control channel and reads stdin in a
+/// task so `control_request` / `control_response` lines act while a turn runs.
+/// Other lines (user messages, malformed input) are queued in order, in the
+/// shape [`read_stream_input_line`] returns; the queue closes at EOF.
+pub(crate) fn spawn_control_reader(
+    output: HeadlessOutputPolicy,
+    permission: Option<crate::permission::checker::PermCheck>,
+) -> tokio::sync::mpsc::Receiver<Result<String, String>> {
+    crate::headless_control::enable(output, permission);
+    let (tx, rx) = tokio::sync::mpsc::channel(CONTROL_QUEUE_LINES);
+    tokio::spawn(async move {
+        loop {
+            let line = match read_stream_input_line().await {
+                Ok(Some(line)) => line,
+                Ok(None) | Err(_) => break,
+            };
+            if let Ok(text) = &line
+                && let Some(control) = crate::headless_control::classify_line(text.trim())
+            {
+                let ack = crate::headless_control::state().and_then(|s| s.handle(control));
+                if let Some(event) = ack
+                    && output.emit_event(event).await.is_err()
+                {
+                    break;
+                }
+                continue;
+            }
+            if tx.send(line).await.is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
 pub(crate) fn headless_result_emitted() -> bool {
     HEADLESS_RESULT_EMITTED.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -993,7 +1033,16 @@ impl HeadlessInterrupts {
         Self::Os
     }
 
+    /// Next interruption: an OS signal, or a driver `interrupt` control request
+    /// when `--stream-json-control` is on.
     pub(crate) async fn recv(&mut self) -> io::Result<()> {
+        tokio::select! {
+            result = self.recv_signal() => result,
+            () = crate::headless_control::interrupted() => Ok(()),
+        }
+    }
+
+    async fn recv_signal(&mut self) -> io::Result<()> {
         match self {
             #[cfg(unix)]
             Self::Os {
@@ -1022,7 +1071,7 @@ impl HeadlessInterrupts {
     /// Resolve on the next signal or at `deadline`, whichever comes first.
     async fn second_signal_or(&mut self, deadline: tokio::time::Instant) -> ForcedStop {
         tokio::select! {
-            _ = self.recv() => ForcedStop::SecondSignal,
+            _ = self.recv_signal() => ForcedStop::SecondSignal,
             () = tokio::time::sleep_until(deadline) => ForcedStop::Deadline,
         }
     }

@@ -341,6 +341,7 @@ If you want to use mini-agent from scripts or other programs, these CLI flags ar
 | `-i`, `--image FILE` | With `-p`, attach an image (png, jpeg, gif, webp); repeatable (at most 8, 2 MiB each and 4 MiB in total after the same downscaling `/add` applies). Sent with the first turn and saved in the session like a pasted image. A model the catalog lists as text-only refuses the run before any request; images cannot be combined with a `!` command. With the Anthropic provider, images (and `--input-format stream-json`) need `--no-session` or a non-Anthropic provider, because a persisted Anthropic session keeps provider-native history that cannot hold image turns yet; the refusal names these options. |
 | `--stream-json-preview-bytes N` | With `-p`, cap stream-json text, tool-argument, tool-result and diff previews at `N` bytes (256–1,048,576; default 8,192). |
 | `--include-partial-messages` | With `-p --output stream-json`, also emit `{"type":"text_delta"\|"reasoning_delta","message_id":"msg_<n>","text":...,"truncated":bool}` records as the model streams (coalesced per ready burst, each bounded by `--stream-json-preview-bytes`). `message_id` names the completion in progress. `assistant_text`, `usage` and `result` are unchanged, so each fragment also appears as `assistant_text`; without the flag the output is byte-identical to before. |
+| `--stream-json-control` | With `-p --input-format stream-json --output stream-json`, opt in to the stdin control channel (see below). Default off: control lines are ordinary `input_error`s and headless asks stay denied. |
 | `--max-stdin-bytes N` | With `-p`, piped-stdin limit (per input line with `--input-format stream-json`; 1,024–67,108,864; default 1,048,576). |
 | `--quiet` | With `-p`, silence reasoning, stdin notices, and tool progress on stderr. Errors and operational warnings remain visible. Conflicts with `--pure-stdout`. |
 | `-c`, `--continue` | Continue the most recent session saved for the current workspace. Use `--session` to select one from another workspace. If another running mini-agent process owns that session, continue in a forked copy under a new ID (with a notice) instead of overwriting its turns. |
@@ -424,6 +425,22 @@ nonzero if any turn failed. Approvals behave as in any headless run (no prompts;
 unless an opted-in `PermissionRequest` hook answers). Provider-native (Anthropic) session history
 is not supported in this mode yet: add `--no-session` (nothing is saved), use a non-Anthropic provider, or use `--acp` for multi-turn native sessions. Token-level `text_delta` /
 `reasoning_delta` events are emitted only with `--include-partial-messages`.
+
+With `--stream-json-control`, stdin is read while a turn runs and these lines act at once
+(every one is acknowledged with `{"type":"control_response","response":{"subtype":"success"|"error","request_id":...}}`):
+
+- `{"type":"control_request","request_id":"x","request":{"subtype":"interrupt"}}` cancels the running
+  turn like the first SIGINT (the turn still emits its failed `result`; nothing is remembered when no
+  turn is running).
+- `{"type":"control_request","request_id":"x","request":{"subtype":"set_permission_mode","mode":"readonly"}}`
+  switches the mode but can only narrow it, like a prompt `%%mode=` directive; raising privilege is refused.
+- A tool `Ask` emits `{"type":"control_request","request_id":"perm_N","request":{"subtype":"can_use_tool","tool_name":...,"input":...,"truncated":bool}}`
+  and waits up to 60 s for `{"type":"control_response","response":{"subtype":"success","request_id":"perm_N","response":{"behavior":"allow"|"deny","message":"..."}}}`.
+  Only an explicit `allow` approves (once; never an allow-always grant). A `deny`, an `error` reply, the
+  timeout, a closed stdin or an interrupted turn all deny, and a reply with an unknown id is an `input_error`.
+
+User messages that arrive during a turn are queued in order (up to 64) and run after its `result`.
+The channel is a CLI flag only; no project configuration can enable it.
 
 Runtime stdout and stderr writes preserve backpressure and event order. Consumers should drain
 both pipes. If a consumer holds either sink open but stops reading, the pending write remains
