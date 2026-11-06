@@ -53,6 +53,7 @@ export class AgentSession {
   private readonly updates = new SessionUpdateRouter();
   private supportsLoad = false;
   private embeddedContext = false;
+  private imageContent = false;
   private state: SessionState = 'stopped';
   private readonly transitions = new SerialTransitionQueue();
   private readonly statusBar: vscode.StatusBarItem;
@@ -75,6 +76,7 @@ export class AgentSession {
 
   /** Whether the running agent accepts embedded resource blocks in prompts. */
   get acceptsEmbeddedContext(): boolean { return this.embeddedContext; }
+  get acceptsImages(): boolean { return this.imageContent; }
 
   /** Slash commands the agent advertised (empty until it has sent them). */
   async availableCommands(): Promise<readonly acp.AvailableCommand[]> {
@@ -240,6 +242,7 @@ export class AgentSession {
       }, { cancellationSignal: AbortSignal.timeout(10_000) });
       this.supportsLoad = initialized.agentCapabilities?.loadSession === true;
       this.embeddedContext = initialized.agentCapabilities?.promptCapabilities?.embeddedContext === true;
+      this.imageContent = initialized.agentCapabilities?.promptCapabilities?.image === true;
       log.info(`ACP initialized at protocol ${initialized.protocolVersion}`);
       requireTrustedWorkspace();
       this.setState('running');

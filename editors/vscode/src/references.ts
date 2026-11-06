@@ -3,6 +3,9 @@ import { pathToFileURL } from 'node:url';
 import type * as acp from '@agentclientprotocol/sdk';
 
 export const MAX_REFERENCES = 20;
+/** Same cap as the CLI `-i` flag and the agent's MAX_USER_IMAGE_BYTES. */
+export const MAX_IMAGE_BYTES = 2 * 1024 * 1024;
+const IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
 export const MAX_SNIPPET_BYTES = 64 * 1024;
 export const MAX_TOTAL_REFERENCE_BYTES = 256 * 1024;
 const MIN_SNIPPET_BUDGET_BYTES = 256;
@@ -14,7 +17,10 @@ export type ReferenceInput =
     readonly kind: 'snippet'; readonly fsPath: string; readonly text: string;
     readonly startLine?: number; readonly endLine?: number; readonly name?: string;
   }
-  | { readonly kind: 'text'; readonly text: string; readonly name?: string };
+  | { readonly kind: 'text'; readonly text: string; readonly name?: string }
+  | { readonly kind: 'image'; readonly mimeType: string; readonly bytes: Uint8Array; readonly name?: string }
+  /** A reference the host handed over that cannot be sent (untitled:, git:, remote, unknown kind). */
+  | { readonly kind: 'unsupported'; readonly name: string; readonly reason: string };
 
 export interface PromptBuildOptions {
   readonly text: string;
@@ -24,6 +30,8 @@ export interface PromptBuildOptions {
   readonly trusted: boolean;
   /** Agent advertised promptCapabilities.embeddedContext. */
   readonly embeddedContext: boolean;
+  /** Agent advertised promptCapabilities.image. */
+  readonly image?: boolean;
   /** Resolves symlinks; injected so the containment check is testable. */
   readonly realpath: (target: string) => Promise<string>;
 }
@@ -65,7 +73,8 @@ function clipBytes(text: string, limit: number): { text: string; omitted: number
 function label(reference: ReferenceInput): string {
   const name = reference.name?.trim();
   if (name) { return name.slice(0, 200); }
-  return reference.kind === 'text' ? 'reference' : path.basename(reference.fsPath);
+  if (reference.kind === 'unsupported') { return reference.name.slice(0, 200) || 'reference'; }
+  return reference.kind === 'text' || reference.kind === 'image' ? 'reference' : path.basename(reference.fsPath);
 }
 
 /**
@@ -88,6 +97,21 @@ export async function buildPromptBlocks(options: PromptBuildOptions): Promise<Pr
       break;
     }
     const name = label(reference);
+    if (reference.kind === 'unsupported') {
+      notes.push(`Skipped "${name}": ${reference.reason}.`);
+      continue;
+    }
+    if (reference.kind === 'image') {
+      if (!options.image) { notes.push(`Skipped image "${name}": the Mini Agent server does not accept images (needs the multimodal feature).`); continue; }
+      if (!IMAGE_MIME_TYPES.has(reference.mimeType)) { notes.push(`Skipped image "${name}": ${reference.mimeType} is not supported (png, jpeg, gif, webp).`); continue; }
+      if (reference.bytes.length === 0 || reference.bytes.length > MAX_IMAGE_BYTES) {
+        notes.push(`Skipped image "${name}": ${reference.bytes.length} bytes is outside the 1 byte to ${MAX_IMAGE_BYTES / 1024 / 1024} MiB limit.`);
+        continue;
+      }
+      blocks.push({ type: 'image', mimeType: reference.mimeType, data: Buffer.from(reference.bytes).toString('base64') });
+      accepted += 1;
+      continue;
+    }
     if (reference.kind === 'file') {
       const resolved = await containedRealPath(options, reference.fsPath);
       if (!resolved) { notes.push(`Skipped "${name}": not an existing file inside the workspace.`); continue; }

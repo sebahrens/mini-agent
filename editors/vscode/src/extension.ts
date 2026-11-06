@@ -185,6 +185,7 @@ function registerChatParticipant(context: vscode.ExtensionContext): vscode.ChatP
           workspaceRoot: active.workspaceFolder.uri.fsPath,
           trusted: vscode.workspace.isTrusted,
           embeddedContext: active.acceptsEmbeddedContext,
+          image: active.acceptsImages,
           realpath,
         });
         for (const note of built.notes) { response.markdown(`_${note}_\n\n`); }
