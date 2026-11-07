@@ -807,6 +807,13 @@ async fn verify_provenance(
     }
 }
 
+/// Whether `--version` output names exactly `version` as its version token:
+/// `mini-agent 1.1.10` must not satisfy a request for `1.1.1`.
+fn version_probe_matches(stdout: &str, version: &str) -> bool {
+    let mut tokens = stdout.trim_start().split_whitespace();
+    tokens.next() == Some(BINARY_NAME) && tokens.next() == Some(version)
+}
+
 /// Runs the staged binary's `--version` before replacing anything, so a wrong
 /// or broken executable never takes the installed one's place.
 async fn install_verified(exe: &Path, binary: &[u8], version: &str) -> Result<(), String> {
@@ -818,6 +825,7 @@ async fn install_verified(exe: &Path, binary: &[u8], version: &str) -> Result<()
     let binary = binary.to_vec();
     let probe_clone = probe.clone();
     let expected = format!("{BINARY_NAME} {version}");
+    let requested_version = version.to_owned();
     let outcome = tokio::task::spawn_blocking(move || -> Result<(), String> {
         install_atomically(&probe_clone, &binary).map_err(|error| {
             format!(
@@ -831,7 +839,7 @@ async fn install_verified(exe: &Path, binary: &[u8], version: &str) -> Result<()
             .output_guarded()
             .map_err(|error| format!("the downloaded executable does not run: {error}"))?;
         let stdout = String::from_utf8_lossy(&output.stdout);
-        if !output.status.success() || !stdout.trim_start().starts_with(&expected) {
+        if !output.status.success() || !version_probe_matches(&stdout, &requested_version) {
             return Err(format!(
                 "the downloaded executable reports {:?}, expected {expected:?}",
                 stdout.trim()
@@ -853,6 +861,19 @@ async fn install_verified(exe: &Path, binary: &[u8], version: &str) -> Result<()
 
 #[cfg(test)]
 mod tests {
+    // mini-agent-et59d
+    #[test]
+    fn version_probe_requires_a_whole_version_token() {
+        use super::version_probe_matches as m;
+        assert!(m("mini-agent 1.1.1 (build abc)\n", "1.1.1"));
+        assert!(m("  mini-agent 1.1.1\n", "1.1.1"));
+        assert!(!m("mini-agent 1.1.10 (build abc)\n", "1.1.1"));
+        assert!(!m("mini-agent 1.2.30\n", "1.2.3"));
+        assert!(!m("other 1.1.1\n", "1.1.1"));
+        assert!(!m("mini-agent-evil 1.1.1\n", "1.1.1"));
+        assert!(!m("", "1.1.1"));
+    }
+
     use super::*;
     use std::io::Write as _;
 
