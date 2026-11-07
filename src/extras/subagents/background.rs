@@ -2686,7 +2686,7 @@ impl rig::tool::Tool for EvidenceTool {
         }
         // Images belong to the record, not to a text page: only the first
         // page carries them.
-        if content.images.is_empty() || offset > 1 {
+        if content.images.is_empty() || offset > 1 || column > 0 {
             if total == 0 && content.images.is_empty() {
                 response.push_str("\n[empty tool result]");
             }
@@ -2943,6 +2943,59 @@ mod evidence_tool_tests {
             EvidenceTool::NAME
         ));
         drop(fixture.pool.clone());
+    }
+
+    #[cfg(feature = "multimodal")]
+    #[tokio::test]
+    async fn task_evidence_attaches_images_only_to_the_first_page_of_a_split_line() {
+        let fixture = fixture("task-evidence-split-image").await;
+        let long = "x".repeat(EVIDENCE_PAGE_BYTES * 2);
+        let history = exchange(
+            "c",
+            "read",
+            serde_json::json!({"path": "big.png"}),
+            vec![ToolResultContent::Text(Text::from(long)), png()],
+        );
+        let mut evidence = ChildEvidence::default();
+        evidence.record_history(&history);
+        let task_id = uuid::Uuid::new_v4().to_string();
+        fixture
+            .pool
+            .evidence()
+            .store(fixture.pool.session_id(), task_id.clone(), evidence)
+            .await;
+        let vision = tool(&fixture, None, true);
+        let first = call(
+            &fixture,
+            &vision,
+            serde_json::json!({"task_id": task_id, "id": "E1"}),
+        )
+        .await
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(value["parts"][0]["type"], "image");
+        let hint = value["response"].as_str().unwrap();
+        let column: usize = hint
+            .split("column=")
+            .nth(1)
+            .unwrap()
+            .trim_end_matches(|c: char| !c.is_ascii_digit())
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let next = call(
+            &fixture,
+            &vision,
+            serde_json::json!({"task_id": task_id, "id": "E1", "offset": 1, "column": column}),
+        )
+        .await
+        .unwrap();
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&next).is_err(),
+            "continuation page must not carry images"
+        );
     }
 
     #[cfg(feature = "multimodal")]
