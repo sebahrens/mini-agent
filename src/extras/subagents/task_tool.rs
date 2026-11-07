@@ -2209,6 +2209,15 @@ editing in a known location, grepping for a literal you will act on immediately.
                     .with_child_context(evidence_base_dir, evidence_mcp);
                 #[cfg_attr(not(feature = "hooks"), allow(unused_mut))]
                 let mut omitted_images = super::image_cost::omitted_images(&run.history);
+                // Conversations replaced by context compaction come first, so
+                // numbering continues across the compaction.
+                let compacted = std::mem::take(&mut run.compacted_histories);
+                for earlier in &compacted {
+                    omitted_images += super::image_cost::omitted_images(earlier);
+                    if evidence_enabled {
+                        evidence.record_history(earlier);
+                    }
+                }
                 if evidence_enabled {
                     evidence.record_history(&run.history);
                 }
@@ -4266,7 +4275,12 @@ where
         tool_log.truncate(crate::extras::subagents::background::MAX_TOOL_LOG_ENTRIES);
         let turns = run.turns.saturating_add(next.turns);
         let tool_calls = run.tool_calls.saturating_add(next.tool_calls);
+        // The replaced conversation still holds tool results (and omitted
+        // images) the child gathered; keep it for evidence recording.
+        let mut compacted = std::mem::take(&mut run.compacted_histories);
+        compacted.push(std::mem::take(&mut run.history));
         run = next;
+        run.compacted_histories = compacted;
         run.tool_log = tool_log;
         run.turns = turns;
         run.tool_calls = tool_calls;
@@ -8129,6 +8143,15 @@ mod child_continuation_tests {
         assert!(!run.context_exhausted);
         assert_eq!(run.usage.input_tokens, 10 + 20 + 30);
         assert_eq!(run.tool_calls, 1);
+        // The pre-compaction tool result is kept for evidence, numbered first.
+        assert_eq!(run.compacted_histories.len(), 1);
+        let mut evidence = super::super::evidence::ChildEvidence::default();
+        for earlier in &run.compacted_histories {
+            evidence.record_history(earlier);
+        }
+        evidence.record_history(&run.history);
+        assert_eq!(evidence.len(), 1, "the bulky call is evidence E1");
+        assert_eq!(evidence.metas().next().unwrap().tool, BulkyTool::NAME);
         // The refused over-window request never reached the provider.
         assert_eq!(model.requests().len(), 3);
         let summary_history = &model.requests()[1].chat_history;
