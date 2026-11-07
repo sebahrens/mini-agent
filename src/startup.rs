@@ -725,7 +725,10 @@ fn headless_compaction_plan_with(
     Some(HeadlessCompactionPlan {
         cut_idx,
         tokens_before,
-        input_token_budget: session.context_window.saturating_sub(reserve),
+        input_token_budget: crate::ui::slash::summarizer_input_budget(
+            session.context_window,
+            reserve,
+        ),
         response_token_budget: reserve,
     })
 }
@@ -6300,6 +6303,28 @@ mod tests {
             ..crate::config::Config::default()
         };
         (session, cfg)
+    }
+
+    // mini-agent-agmr4: a zero context window (auto-compaction off) still
+    // lets forced relief compact, with the same 128k input fallback as the TUI.
+    #[test]
+    fn forced_headless_relief_plan_uses_the_128k_fallback_for_a_zero_window() {
+        let (mut session, cfg) = fork_test_session();
+        session.context_window = 0;
+        let plan = super::headless_compaction_plan_with(
+            &session,
+            &cfg,
+            0,
+            #[cfg(feature = "memory")]
+            None,
+            true,
+        )
+        .expect("forced relief compacts older history");
+        assert!(
+            plan.input_token_budget >= 100_000,
+            "{}",
+            plan.input_token_budget
+        );
     }
 
     // mini-agent-o2nut: headless compaction forks the conversation's own

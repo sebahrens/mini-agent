@@ -451,7 +451,7 @@ pub(super) fn show_compaction_summary(renderer: &mut Renderer, session: &Session
     }
 }
 
-fn summarizer_input_budget(context_window: u64, reserve: u64) -> u64 {
+pub(crate) fn summarizer_input_budget(context_window: u64, reserve: u64) -> u64 {
     if context_window == 0 {
         128_000
     } else {
