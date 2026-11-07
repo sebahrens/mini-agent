@@ -108,9 +108,12 @@ text, a line starting with `^`), because an interactive bash or zsh rewrites
 the line (completion, history) before running it. It judges each chunk together
 with the unterminated line typed so far, so permission rules see the command
 the terminal will run. Named keys go through the separate `keys` list
-(`ctrl_c`, `ctrl_d`, `esc`, `up`, `down`, `left`, `right`, `tab`, `enter`,
-`backspace`), whose bytes the tool renders: `ctrl_c`/`ctrl_d` carry no text and
-need no permission; `enter` judges the line typed so far; cursor, history and
+(`ctrl_c`, `ctrl_d`, `ctrl_l`, `ctrl_z`, `esc`, `up`, `down`, `left`, `right`,
+`tab`, `shift_tab`, `enter`, `backspace`, `page_up`, `page_down`, `home`, `end`,
+`delete`, `f1`..`f12`; at most 64 per call), whose bytes the tool renders:
+`ctrl_c`/`ctrl_d` carry no text and need no permission (`ctrl_l` only redraws and
+`ctrl_z` suspends the foreground program); `enter` judges the line typed so far;
+cursor, history, paging, Home/End/Delete, Shift-Tab, function and
 `esc` keys make the next Enter judged as an opaque "edited line" command (so an
 ask or deny rule can stop it; `ctrl_c` clears the line); `tab` on a partly typed
 line is refused.

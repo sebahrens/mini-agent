@@ -1243,12 +1243,13 @@ impl JobStatusTool {
                         text.pop();
                     }
                 }
-                JobKey::Left | JobKey::Right => {
+                JobKey::Left | JobKey::Right | JobKey::CtrlZ => {
                     if !text.is_empty() || edited {
                         edited = true;
                     }
                 }
-                JobKey::Up | JobKey::Down | JobKey::Esc => edited = true,
+                // Redraw only: the line editor's buffer is unchanged.
+                JobKey::CtrlL => {}
                 JobKey::Tab => {
                     if !text.is_empty() || edited {
                         return Err("job_status keys: tab on a partly typed line lets the shell complete it into a different command than was permission-checked. Send the full text instead, or press ctrl_c first.".into());
@@ -1262,6 +1263,12 @@ impl JobStatusTool {
                     });
                     text.clear();
                     edited = false;
+                }
+                // Arrows, history, paging, Home/End/Delete, Shift-Tab, F-keys, Esc.
+                other => {
+                    if other.edits_line() {
+                        edited = true;
+                    }
                 }
             }
         }
@@ -1364,8 +1371,8 @@ impl Tool for JobStatusTool {
                     "type": "array",
                     "minItems": 1,
                     "maxItems": MAX_JOB_KEYS,
-                    "items": {"type": "string", "enum": ["ctrl_c", "ctrl_d", "esc", "up", "down", "left", "right", "tab", "enter", "backspace"]},
-                    "description": "Only with action=input, instead of input: named keys pressed in order (ctrl_c interrupts the foreground program, ctrl_d sends EOF, plus esc, arrows, tab, enter, backspace for pagers, TUIs and REPLs). The tool renders the bytes. ctrl_c and ctrl_d are always allowed; enter judges the typed line like input; cursor, history and esc keys make the line unknowable so the next enter is judged as an opaque edited line (use ctrl_c to clear it); tab on a partly typed line is refused."
+                    "items": {"type": "string", "enum": JobKey::NAMES},
+                    "description": "Only with action=input, instead of input: named keys pressed in order (ctrl_c interrupts the foreground program, ctrl_d sends EOF, ctrl_z suspends it, ctrl_l redraws the screen, plus esc, arrows, page_up, page_down, home, end, delete, shift_tab, f1..f12, tab, enter, backspace for pagers, TUIs and REPLs). The tool renders the bytes. ctrl_c and ctrl_d are always allowed; enter judges the typed line like input; cursor, history, function and esc keys make the line unknowable so the next enter is judged as an opaque edited line (use ctrl_c to clear it); tab on a partly typed line is refused."
                 },
                 "timeout_ms": {
                     "type": "integer",
@@ -4097,6 +4104,75 @@ mod tests {
             "{actions:?}"
         );
         assert!(status["properties"].get("timeout_ms").is_some());
+    }
+
+    #[test]
+    fn extended_job_keys_have_fixed_bytes_and_a_matching_schema_enum() {
+        for (name, bytes) in [
+            ("page_up", &b"\x1b[5~"[..]),
+            ("page_down", b"\x1b[6~"),
+            ("home", b"\x1b[H"),
+            ("end", b"\x1b[F"),
+            ("delete", b"\x1b[3~"),
+            ("shift_tab", b"\x1b[Z"),
+            ("ctrl_l", b"\x0c"),
+            ("ctrl_z", b"\x1a"),
+            ("f1", b"\x1bOP"),
+            ("f4", b"\x1bOS"),
+            ("f5", b"\x1b[15~"),
+            ("f10", b"\x1b[21~"),
+            ("f12", b"\x1b[24~"),
+        ] {
+            let key: JobKey = serde_json::from_value(serde_json::json!(name)).unwrap();
+            assert_eq!(key.bytes(), bytes, "{name}");
+        }
+        // Every advertised name parses, renders printable-free bytes, and none repeats.
+        let mut seen = std::collections::HashSet::new();
+        for name in JobKey::NAMES {
+            let key: JobKey = serde_json::from_value(serde_json::json!(name)).unwrap();
+            assert!(
+                !key.bytes().is_empty() && seen.insert(key.bytes()),
+                "{name}"
+            );
+        }
+        assert_eq!(JobKey::NAMES.len(), 30);
+        assert!(
+            JobKey::Home.edits_line() && JobKey::F5.edits_line() && JobKey::ShiftTab.edits_line()
+        );
+        assert!(!JobKey::CtrlL.edits_line() && !JobKey::Enter.edits_line());
+        assert!(serde_json::from_value::<JobKey>(serde_json::json!("f13")).is_err());
+    }
+
+    /// The new keys reach a real pty as the exact escape sequences, and keys
+    /// that rewrite the line make the next Enter an opaque, judged line.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn extended_job_keys_reach_a_pty_and_mark_the_line_edited() {
+        let shell = test_tool();
+        let status = JobStatusTool::new(shell.sandbox.clone(), None);
+        let id = start_pty_job(&shell, "cat -v").await;
+        let mut seen = String::new();
+        for key in [
+            JobKey::PageUp,
+            JobKey::PageDown,
+            JobKey::Home,
+            JobKey::End,
+            JobKey::Delete,
+            JobKey::ShiftTab,
+            JobKey::F1,
+            JobKey::F12,
+            JobKey::CtrlL,
+        ] {
+            seen.push_str(&job_keys(&status, &id, &[key]).await.unwrap());
+        }
+        seen.push_str(&job_keys(&status, &id, &[JobKey::Enter]).await.unwrap());
+        for echoed in [
+            "^[[5~", "^[[6~", "^[[H", "^[[F", "^[[3~", "^[[Z", "^[OP", "^[[24~", "^L",
+        ] {
+            assert!(seen.contains(echoed), "{echoed} missing from {seen:?}");
+        }
+        job_keys(&status, &id, &[JobKey::CtrlC]).await.unwrap();
+        shell.sandbox.stop_background_job(&id).await.unwrap();
     }
 
     #[test]

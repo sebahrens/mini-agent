@@ -840,9 +840,93 @@ pub enum JobKey {
     Tab,
     Enter,
     Backspace,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+    Delete,
+    ShiftTab,
+    CtrlL,
+    CtrlZ,
+    F1,
+    F2,
+    F3,
+    F4,
+    F5,
+    F6,
+    F7,
+    F8,
+    F9,
+    F10,
+    F11,
+    F12,
 }
 
 impl JobKey {
+    /// Every accepted key name, in schema order.
+    pub(crate) const NAMES: [&'static str; 30] = [
+        "ctrl_c",
+        "ctrl_d",
+        "esc",
+        "up",
+        "down",
+        "left",
+        "right",
+        "tab",
+        "enter",
+        "backspace",
+        "page_up",
+        "page_down",
+        "home",
+        "end",
+        "delete",
+        "shift_tab",
+        "ctrl_l",
+        "ctrl_z",
+        "f1",
+        "f2",
+        "f3",
+        "f4",
+        "f5",
+        "f6",
+        "f7",
+        "f8",
+        "f9",
+        "f10",
+        "f11",
+        "f12",
+    ];
+
+    /// Keys that move or rewrite the shell's line editor (cursor, history,
+    /// completion, function-key bindings): after one, the typed line is no
+    /// longer knowable from the text sent so far.
+    pub(crate) fn edits_line(self) -> bool {
+        matches!(
+            self,
+            Self::Up
+                | Self::Down
+                | Self::Esc
+                | Self::PageUp
+                | Self::PageDown
+                | Self::Home
+                | Self::End
+                | Self::Delete
+                | Self::ShiftTab
+                | Self::F1
+                | Self::F2
+                | Self::F3
+                | Self::F4
+                | Self::F5
+                | Self::F6
+                | Self::F7
+                | Self::F8
+                | Self::F9
+                | Self::F10
+                | Self::F11
+                | Self::F12
+        )
+    }
+
     pub(crate) fn bytes(self) -> &'static [u8] {
         match self {
             Self::CtrlC => b"\x03",
@@ -855,6 +939,26 @@ impl JobKey {
             Self::Tab => b"\t",
             Self::Enter => b"\r",
             Self::Backspace => b"\x7f",
+            Self::PageUp => b"\x1b[5~",
+            Self::PageDown => b"\x1b[6~",
+            Self::Home => b"\x1b[H",
+            Self::End => b"\x1b[F",
+            Self::Delete => b"\x1b[3~",
+            Self::ShiftTab => b"\x1b[Z",
+            Self::CtrlL => b"\x0c",
+            Self::CtrlZ => b"\x1a",
+            Self::F1 => b"\x1bOP",
+            Self::F2 => b"\x1bOQ",
+            Self::F3 => b"\x1bOR",
+            Self::F4 => b"\x1bOS",
+            Self::F5 => b"\x1b[15~",
+            Self::F6 => b"\x1b[17~",
+            Self::F7 => b"\x1b[18~",
+            Self::F8 => b"\x1b[19~",
+            Self::F9 => b"\x1b[20~",
+            Self::F10 => b"\x1b[21~",
+            Self::F11 => b"\x1b[23~",
+            Self::F12 => b"\x1b[24~",
         }
     }
 }
