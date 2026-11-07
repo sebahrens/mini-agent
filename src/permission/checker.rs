@@ -745,7 +745,7 @@ impl PermissionChecker {
                                     "invalid `{config_field}` rule for tool `{tool_name}` pattern `{pat}`: {error}"
                                 )
                             })?
-                        } else if tool_name == "js/fetch" && *action == Action::Deny {
+                        } else if is_url_identity_tool(tool_name) && *action == Action::Deny {
                             Pattern::new(&fetch_deny_glob(pat))
                         } else {
                             Pattern::new(pat)
@@ -997,7 +997,7 @@ impl PermissionChecker {
                                 entry.push((Pattern::new_path(&canonical), action));
                             }
                             Pattern::new_path(pat)
-                        } else if alias == "js/fetch" && action == Action::Deny {
+                        } else if is_url_identity_tool(alias) && action == Action::Deny {
                             Pattern::new(&fetch_deny_glob(pat))
                         } else {
                             Pattern::new(pat)
@@ -2977,7 +2977,13 @@ pub(crate) fn exact_allow_scope_for_input(tool: &str, input: &str) -> Option<Str
     ))
 }
 
-/// A `js/fetch` deny glob with every `*` run widened to `**`. Fetch identities
+/// Tools whose permission identity is a URL (or URL-shaped destination list),
+/// so their deny globs use [`fetch_deny_glob`] widening.
+fn is_url_identity_tool(tool: &str) -> bool {
+    matches!(tool, "js/fetch" | "web_fetch" | "web_search")
+}
+
+/// A URL-identity (`js/fetch`, `web_fetch`, `web_search`) deny glob with every `*` run widened to `**`. Fetch identities
 /// are URLs, so a deny of `https://example.com/*` or `*` must not stop matching
 /// at the first `/` (mini-agent-ewqgo); a narrower deny would let a path through.
 fn fetch_deny_glob(pattern: &str) -> String {
@@ -3699,6 +3705,39 @@ mod tests {
             );
         }
         assert_eq!(fetch_deny_glob("a*b***c?"), "a**b**c?");
+    }
+
+    // mini-agent-y45pa: web_fetch identities are URL-shaped too.
+    #[test]
+    fn single_star_web_fetch_deny_matches_deeper_urls() {
+        let identity = "https://evil.example/a/b destinations=[93.184.216.34:443]";
+        for pattern in ["https://evil.example/*", "*evil.example*", "*"] {
+            for tool in ["web_fetch", "web_search"] {
+                let deny_entries = Some([(tool.to_owned(), vec![pattern.to_owned()])].into());
+                let configs = PermissionConfigs::from(PermissionConfig {
+                    deny_entries,
+                    ..PermissionConfig::default()
+                });
+                let mut checker =
+                    PermissionChecker::new(&configs, SecurityMode::Yolo, None, None).unwrap();
+                assert!(
+                    matches!(checker.check(tool, identity), CheckResult::Denied(_)),
+                    "deny `{tool}:{pattern}` must deny {identity}"
+                );
+            }
+        }
+        // Granular config form (compile_config) widens identically.
+        let configs = PermissionConfigs::from(PermissionConfig {
+            web_fetch: Some(ToolPerm::Granular(
+                [("https://evil.example/*".to_owned(), Action::Deny)].into(),
+            )),
+            ..PermissionConfig::default()
+        });
+        let mut checker = PermissionChecker::new(&configs, SecurityMode::Yolo, None, None).unwrap();
+        assert!(matches!(
+            checker.check("web_fetch", identity),
+            CheckResult::Denied(_)
+        ));
     }
 
     #[test]
