@@ -1455,10 +1455,10 @@ impl Drop for CancelOnDrop {
         let Some((peer, id)) = self.armed.take() else {
             return;
         };
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        if tokio::runtime::Handle::try_current().is_err() {
             return;
-        };
-        runtime.spawn(async move {
+        }
+        tokio::spawn(async move {
             let notification = rmcp::model::CancelledNotification::new(
                 rmcp::model::CancelledNotificationParam::new(
                     Some(id),
