@@ -787,7 +787,12 @@ impl WorkspaceInstructions {
         if depth > MAX_INCLUDE_DEPTH {
             return Err("Workspace instruction include depth limit reached".into());
         }
-        let path = normal_relative(path)?;
+        let path = match normal_relative(path) {
+            Ok(path) => path,
+            // An unusable optional/authored include is literal text.
+            Err(_) if optional => return Ok(()),
+            Err(error) => return Err(error),
+        };
         let key = (binding.root().to_owned(), path.clone());
         if seen.contains(&key) {
             return Ok(());
@@ -909,7 +914,7 @@ impl WorkspaceInstructions {
                 &parent.join(include),
                 scope,
                 depth + 1,
-                false,
+                true,
                 seen,
                 nodes,
                 loaded,
@@ -1057,7 +1062,7 @@ impl WorkspaceInstructions {
                     &root.path.parent().unwrap_or(Path::new("")).join(include),
                     self.workspace.root(),
                     1,
-                    false,
+                    true,
                     &mut seen,
                     &mut nodes,
                     &mut loaded,
@@ -1631,46 +1636,118 @@ fn normal_relative(path: &Path) -> Result<PathBuf, String> {
     }
     Ok(result)
 }
+/// `text` with fenced and inline code bytes replaced by `x` (same length), so
+/// example `@word` tokens inside code are never read as includes.
+fn mask_code(text: &str) -> String {
+    let mut masked = text.as_bytes().to_vec();
+    let mut fence: Option<(u8, usize)> = None;
+    let mut start = 0;
+    for line in text.split_inclusive('\n') {
+        let end = start + line.len();
+        let trimmed = line.trim_start_matches(' ');
+        let indent = line.len() - trimmed.len();
+        let marker = trimmed.bytes().next().filter(|b| matches!(b, b'`' | b'~'));
+        let run = marker.map_or(0, |m| trimmed.bytes().take_while(|b| *b == m).count());
+        let fence_line = indent <= 3 && run >= 3;
+        match fence {
+            Some((m, len)) => {
+                masked[start..end].fill(b'x');
+                if fence_line && marker == Some(m) && run >= len && trimmed[run..].trim().is_empty()
+                {
+                    fence = None;
+                }
+            }
+            None if fence_line && !(marker == Some(b'`') && trimmed[run..].contains('`')) => {
+                masked[start..end].fill(b'x');
+                fence = marker.map(|m| (m, run));
+            }
+            None => mask_inline_code(line, &mut masked[start..end]),
+        }
+        start = end;
+    }
+    String::from_utf8(masked).unwrap_or_default()
+}
+fn mask_inline_code(line: &str, masked: &mut [u8]) {
+    let bytes = line.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] != b'`' {
+            at += 1;
+            continue;
+        }
+        let run = bytes[at..].iter().take_while(|b| **b == b'`').count();
+        let mut scan = at + run;
+        let mut close = None;
+        while scan < bytes.len() {
+            if bytes[scan] == b'`' {
+                let len = bytes[scan..].iter().take_while(|b| **b == b'`').count();
+                if len == run {
+                    close = Some(scan + len);
+                    break;
+                }
+                scan += len;
+            } else {
+                scan += 1;
+            }
+        }
+        match close {
+            Some(end) => {
+                masked[at..end].fill(b'x');
+                at = end;
+            }
+            None => at += run,
+        }
+    }
+}
+/// Authored `@path` includes outside code. Malformed or unusable tokens are
+/// literal text, never an error; a missing target is skipped at load time.
 fn include_paths(text: &str) -> Result<Vec<PathBuf>, String> {
+    let masked = mask_code(text);
     let mut result = Vec::new();
     let mut at = 0;
-    while at < text.len() {
-        let rest = &text[at..];
+    while at < masked.len() {
+        let rest = &masked[at..];
         if rest.starts_with("@@") {
             at += 2;
             continue;
         }
         if rest.starts_with('@')
             && (at == 0
-                || text[..at]
+                || masked[..at]
                     .chars()
                     .next_back()
                     .is_some_and(char::is_whitespace))
         {
             let (used, path) = if let Some(braced) = rest.strip_prefix("@{") {
-                let end = braced
+                match braced
                     .find('}')
-                    .ok_or("Unterminated authored instruction include")?;
-                (end + 3, &braced[..end])
+                    .filter(|end| !braced[..*end].contains('\n'))
+                {
+                    Some(end) => (end + 3, &text[at + 2..at + 2 + end]),
+                    None => {
+                        at += 2;
+                        continue;
+                    }
+                }
             } else {
                 let end = rest[1..]
                     .find(char::is_whitespace)
                     .unwrap_or(rest.len() - 1);
-                (end + 1, &rest[1..end + 1])
+                (end + 1, &text[at + 1..at + 1 + end])
             };
+            at += used;
             if path.is_empty()
                 || path.len() > MAX_PATH_BYTES
                 || path.contains('\\')
                 || path.chars().any(char::is_control)
                 || Path::new(path).is_absolute()
             {
-                return Err("Instruction include must be a bounded relative path".into());
+                continue;
             }
             result.push(PathBuf::from(path));
             if result.len() > MAX_INCLUDE_NODES {
                 return Err("Workspace instruction include node limit reached".into());
             }
-            at += used;
         } else {
             at += rest.chars().next().unwrap().len_utf8();
         }
@@ -2122,6 +2199,13 @@ mod tests {
         assert!(Arc::ptr_eq(&sources[0].text, &reused[0].text));
     }
     #[test]
+    fn include_paths_ignore_code_and_malformed_tokens() {
+        let text = "ask @alice\n```py\n @pytest.fixture\n```\n~~~\n @x\n~~~\n`@a` ``b @c`` @ \n@{unclosed @/abs\n @real.md @{b c.md}";
+        let found = include_paths(text).unwrap();
+        let found: Vec<_> = found.iter().map(|p| p.to_str().unwrap()).collect();
+        assert_eq!(found, ["alice", "real.md", "b c.md"]);
+    }
+    #[test]
     fn context63_include_cycles_depth_missing_escape_and_postescape_budget_are_bounded() {
         let (_root, service) = fixture();
         let root = service.workspace.root();
@@ -2146,6 +2230,7 @@ mod tests {
             "@/absolute.md",
             "@missing.md",
             "@{unclosed",
+            "ask @alice and @ here\n```\n@pytest.fixture\n```\nuse `@Override` now",
         ] {
             let (_other, service) = fixture();
             let result = service.capture_initial(
@@ -2159,8 +2244,9 @@ mod tests {
                 ],
                 0,
             );
-            assert!(result.is_err(), "{malformed}");
-            assert!(service.initial_overlay().is_empty());
+            assert!(result.is_ok(), "{malformed}");
+            assert_eq!(service.state.lock().unwrap().initial.sources.len(), 0);
+            assert!(service.state.lock().unwrap().initial.error.is_none());
         }
         let (_other, service) = fixture();
         for index in 0..=MAX_INCLUDE_DEPTH + 1 {
