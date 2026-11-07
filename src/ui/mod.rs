@@ -1293,6 +1293,18 @@ fn directed_input(
     input
 }
 
+/// The budget scope for a main run started here. Every start through this
+/// path is a new runner after the previous one ended (including a chain
+/// phase continuing the user turn), so it gets a fresh `max_agent_turns` /
+/// `turn_token_budget` scope. Only context-relief respawns share the carry,
+/// and they do not come through here.
+fn main_start_budget_carry(
+    run: &mut AgentRunState,
+    _origin: crate::question::QuestionOrigin,
+) -> std::sync::Arc<crate::agent::runner::HeadlessBudgetCarry> {
+    run.fresh_budget_carry()
+}
+
 /// [`start_main_run`] with an optional non-persisted host directive for this
 /// request only. `first_request_tool` is the typed marker of an `@agent`
 /// mention turn under `agent_mention_tool_choice = "force"`. `text` alone is captured by `PendingMainTurn`, saved as the
@@ -1425,6 +1437,7 @@ pub(crate) async fn start_main_run_with_directive(
     }
     run.question_turn = question_origin.capture(run.question_turn.take());
     let question_turn = run.question_turn.clone();
+    let budget_carry = main_start_budget_carry(run, question_origin);
     #[cfg(feature = "agent-skills")]
     {
         if run.instruction_turn.is_none() || question_origin.starts_new_turn() {
@@ -1454,7 +1467,9 @@ pub(crate) async fn start_main_run_with_directive(
         pending_turn.message_index(),
         ui.cli.no_session,
     );
-    let agent = agent.with_file_checkpoints(file_checkpoints.clone());
+    let agent = agent
+        .with_file_checkpoints(file_checkpoints.clone())
+        .with_budget_carry(budget_carry);
     let mut pending_turn = Some(pending_turn);
     run.native_checkpointed = false;
     let runner = if let Some(mut owner) = native_owner.take() {
@@ -1947,6 +1962,7 @@ async fn compact_and_respawn(
             ui.cli.no_session,
         ))
         .with_question_turn(run.question_turn.clone())
+        .with_budget_carry(std::sync::Arc::clone(&run.budget_carry))
         .spawn_runner_paused(
             MID_TURN_CONTINUE_PROMPT.to_string(),
             history,
@@ -2601,5 +2617,29 @@ mod goal_plan_workspace_tests {
         move_goal_plan_to_workspace(&store, &original, &linked);
         assert_eq!(std::fs::read_to_string(&plan).unwrap(), "- [x] step two\n");
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod main_start_budget_carry_tests {
+    use super::*;
+
+    /// A chain phase (plan -> build) continues the user turn but is a brand-new
+    /// runner after the previous phase ended, so it must not inherit the
+    /// previous phase's spent turns and tokens (mini-agent-xorxl.5).
+    #[test]
+    fn chain_continuation_starts_with_a_fresh_budget_scope() {
+        let mut run = AgentRunState::default();
+        let previous = std::sync::Arc::clone(&run.budget_carry);
+        for origin in [
+            crate::question::QuestionOrigin::ContinueUserTurn,
+            crate::question::QuestionOrigin::NewUserTurn,
+            crate::question::QuestionOrigin::Scheduled,
+        ] {
+            let carry = main_start_budget_carry(&mut run, origin);
+            assert!(!std::sync::Arc::ptr_eq(&carry, &previous));
+            assert!(std::sync::Arc::ptr_eq(&carry, &run.budget_carry));
+            run.budget_carry = std::sync::Arc::clone(&previous);
+        }
     }
 }

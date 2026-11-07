@@ -561,6 +561,11 @@ pub(crate) struct AgentRunState {
     /// current logical main turn has been spent (mini-agent-cj9oh). Reset when
     /// a new main turn starts; a second rejection surfaces unchanged.
     pub reactive_relief_used: bool,
+    /// Turns and tokens already spent by earlier runner segments of the
+    /// current logical main turn, so context relief continues the per-prompt
+    /// `max_agent_turns` / `turn_token_budget` instead of restarting them
+    /// (mini-agent-xorxl.5).
+    pub budget_carry: std::sync::Arc<crate::agent::runner::HeadlessBudgetCarry>,
     pub pending_compaction_pressure: Option<f64>,
     /// Facts accumulated for the goal round currently in flight. Present only
     /// while a goal is running; the gate consumes and clears it when the round
@@ -597,6 +602,15 @@ pub(crate) struct PendingGoalGate {
 }
 
 impl AgentRunState {
+    /// Starts a new budget scope (a fresh logical turn or goal round) and
+    /// returns the carry its runner segments charge.
+    pub(crate) fn fresh_budget_carry(
+        &mut self,
+    ) -> std::sync::Arc<crate::agent::runner::HeadlessBudgetCarry> {
+        self.budget_carry = Default::default();
+        std::sync::Arc::clone(&self.budget_carry)
+    }
+
     pub(crate) async fn retire(&mut self, timeout: std::time::Duration) -> anyhow::Result<()> {
         self.agent = None;
         if let Some(abort) = self.main_abort.take() {

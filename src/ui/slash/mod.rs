@@ -491,6 +491,38 @@ pub async fn handle_compress_with_force(
     ui: &mut UiContext<'_>,
     reasoning_enabled: bool,
 ) -> anyhow::Result<()> {
+    let byte_pressure = auto
+        && ui
+            .session
+            .actionable_size_pressure(ui.cfg.resolve_compact_size_fraction());
+    let result = handle_compress_unfloored(
+        instructions,
+        auto,
+        force,
+        run,
+        renderer,
+        ui,
+        reasoning_enabled,
+    )
+    .await;
+    if result.is_err() && byte_pressure {
+        // A failed byte-pressure compaction must not re-arm at the next tool
+        // batch and pay for another summarizer request on unchanged history
+        // (mini-agent-xorxl.6); material growth re-arms it.
+        ui.session.bytes_after_last_compaction = Some(ui.session.approx_persisted_bytes());
+    }
+    result
+}
+
+async fn handle_compress_unfloored(
+    instructions: Option<&str>,
+    auto: bool,
+    force: bool,
+    run: &mut AgentRunState,
+    renderer: &mut Renderer,
+    ui: &mut UiContext<'_>,
+    reasoning_enabled: bool,
+) -> anyhow::Result<()> {
     // Mirror the auto-compaction trigger's reserve exactly (including memory's
     // effective_reserve) so the budget gate here can never disagree with the
     // gate that decided to call us.
@@ -511,9 +543,17 @@ pub async fn handle_compress_with_force(
     let max_tokens = ui.session.context_window.saturating_sub(reserve);
     let summarizer_input_budget = summarizer_input_budget(ui.session.context_window, reserve);
 
+    // Byte pressure that a compaction can still relieve is as good a reason to
+    // compact as token pressure (mini-agent-xorxl.6); without it the advertised
+    // image-heavy relief never passed this gate.
+    let byte_pressure = auto
+        && ui
+            .session
+            .actionable_size_pressure(ui.cfg.resolve_compact_size_fraction());
     let cut_idx = match plan_tui_compaction(
         ui.session,
         auto && !force,
+        byte_pressure,
         max_tokens,
         keep_recent,
         keep_recent_tool_results,
@@ -526,6 +566,11 @@ pub async fn handle_compress_with_force(
         TuiCompactionGate::NothingToSummarize => {
             if !auto {
                 renderer.write_line("not enough conversation history to compact yet", C_AGENT)?;
+            } else if byte_pressure {
+                // Nothing can be summarized, so the bytes are pinned. Record
+                // that, or every tool batch would retire and respawn the
+                // runner on unchanged history; material growth re-arms relief.
+                ui.session.bytes_after_last_compaction = Some(ui.session.approx_persisted_bytes());
             }
             return Ok(());
         }
@@ -743,17 +788,20 @@ pub(crate) enum TuiCompactionGate {
     Cut(usize),
 }
 
-/// Auto-compaction only makes sense when actually over budget; manual
+/// Auto-compaction only makes sense when actually over the token budget or
+/// under actionable byte pressure (`byte_pressure`); manual
 /// /compress is the user's explicit intent, so it skips the budget gate and
 /// proceeds regardless of how full the context is.
 pub(crate) fn plan_tui_compaction(
     session: &Session,
     auto: bool,
+    byte_pressure: bool,
     max_tokens: u64,
     keep_recent: u64,
     keep_recent_tool_results: usize,
 ) -> TuiCompactionGate {
     if auto
+        && !byte_pressure
         && session.effective_context_tokens_after_tool_result_pruning(keep_recent_tool_results)
             <= max_tokens
     {
@@ -1330,6 +1378,7 @@ mod compaction_budget_tests {
             plan_tui_compaction(
                 &session,
                 true,
+                false,
                 MAX_TOKENS,
                 KEEP_RECENT,
                 KEEP_RECENT_TOOL_RESULTS,
@@ -1383,6 +1432,7 @@ mod compaction_budget_tests {
             plan_tui_compaction(
                 &session,
                 true,
+                false,
                 MAX_TOKENS,
                 KEEP_RECENT,
                 KEEP_RECENT_TOOL_RESULTS,
@@ -1484,16 +1534,42 @@ mod compaction_budget_tests {
         session.add_message(MessageRole::User, "old");
         session.add_message(MessageRole::Assistant, "recent");
         assert_eq!(
-            plan_tui_compaction(&session, true, 99_000, 1, KEEP_RECENT_TOOL_RESULTS),
+            plan_tui_compaction(&session, true, false, 99_000, 1, KEEP_RECENT_TOOL_RESULTS),
             TuiCompactionGate::WithinBudget
         );
         assert_eq!(
-            plan_tui_compaction(&session, false, 99_000, 1, KEEP_RECENT_TOOL_RESULTS),
+            plan_tui_compaction(&session, false, false, 99_000, 1, KEEP_RECENT_TOOL_RESULTS),
             TuiCompactionGate::Cut(1)
         );
         assert_eq!(
-            plan_tui_compaction(&session, false, 99_000, 1_000, KEEP_RECENT_TOOL_RESULTS,),
+            plan_tui_compaction(
+                &session,
+                false,
+                false,
+                99_000,
+                1_000,
+                KEEP_RECENT_TOOL_RESULTS,
+            ),
             TuiCompactionGate::NothingToSummarize
         );
+    }
+
+    /// mini-agent-xorxl.6: actionable byte pressure at low token pressure must
+    /// pass the automatic gate, which used to answer `WithinBudget`.
+    #[test]
+    fn auto_gate_honours_byte_pressure_below_the_token_budget() {
+        let mut session = Session::new("openai", "model", 100_000, "");
+        session.add_message(MessageRole::User, "old");
+        session.add_message(MessageRole::Assistant, "older reply");
+        session.add_message(MessageRole::User, "recent");
+        assert_eq!(
+            plan_tui_compaction(&session, true, false, 99_000, 1, KEEP_RECENT_TOOL_RESULTS),
+            TuiCompactionGate::WithinBudget,
+            "no pressure of either kind stays a no-op"
+        );
+        assert!(matches!(
+            plan_tui_compaction(&session, true, true, 99_000, 1, KEEP_RECENT_TOOL_RESULTS),
+            TuiCompactionGate::Cut(_)
+        ));
     }
 }

@@ -1034,12 +1034,35 @@ pub(crate) async fn with_headless_mid_turn<F: std::future::Future>(
 pub(crate) struct HeadlessBudgetCarry {
     turns: std::sync::atomic::AtomicUsize,
     tokens: std::sync::atomic::AtomicU64,
+    // Interactive runners are spawned tasks that can end in many ways, so they
+    // publish their running totals here after every completion instead of
+    // reporting once at exit (mini-agent-xorxl.5). `begin_segment` folds them
+    // into the settled totals when the next segment of the prompt starts.
+    segment_turns: std::sync::atomic::AtomicUsize,
+    segment_tokens: std::sync::atomic::AtomicU64,
 }
 
 impl HeadlessBudgetCarry {
     fn spent(&self) -> (usize, u64) {
         use std::sync::atomic::Ordering::SeqCst;
         (self.turns.load(SeqCst), self.tokens.load(SeqCst))
+    }
+
+    /// Starts a new segment: whatever the previous segment published becomes
+    /// settled spend, and the returned totals are what that segment left.
+    fn begin_segment(&self) -> (usize, u64) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let turns = self.segment_turns.swap(0, SeqCst);
+        let tokens = self.segment_tokens.swap(0, SeqCst);
+        self.add(turns, tokens);
+        self.spent()
+    }
+
+    /// Publishes the running totals of the segment currently executing.
+    fn note_segment(&self, turns: usize, tokens: u64) {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.segment_turns.store(turns, SeqCst);
+        self.segment_tokens.store(tokens, SeqCst);
     }
 
     fn add(&self, turns: usize, tokens: u64) {
@@ -1056,6 +1079,22 @@ impl HeadlessBudgetCarry {
 
 tokio::task_local! {
     static HEADLESS_BUDGET_CARRY: std::sync::Arc<HeadlessBudgetCarry>;
+}
+
+tokio::task_local! {
+    static INTERACTIVE_BUDGET_CARRY: std::sync::Arc<HeadlessBudgetCarry>;
+}
+
+/// Run `work` (spawning an interactive runner segment) so the runner charges
+/// its turns and tokens to `carry` and starts with only the remainder.
+pub(crate) async fn with_interactive_budget_carry<F: std::future::Future>(
+    carry: Option<std::sync::Arc<HeadlessBudgetCarry>>,
+    work: F,
+) -> F::Output {
+    match carry {
+        Some(carry) => INTERACTIVE_BUDGET_CARRY.scope(carry, work).await,
+        None => work.await,
+    }
 }
 
 /// Run `work` (one headless segment) charging its turns and tokens to `carry`.
@@ -4107,6 +4146,7 @@ where
     // this frame and every wrapper below (cancellation select, subagent and
     // tool-call scopes, `tokio::spawn`) would each reserve a full copy, which
     // overflowed a 2 MiB test thread with `acp,hooks` (mini-agent-ood0d).
+    let interactive_carry = INTERACTIVE_BUDGET_CARRY.try_with(Arc::clone).ok();
     let agent_future = crate::startup::heap_future(|| async move {
         if let Some(start_rx) = start_rx
             && start_rx.await.is_err()
@@ -4177,7 +4217,30 @@ where
         let mut goal_report_accepted = false;
         let mut workspace_may_have_changed = false;
         let mut verification_attempt = 0u32;
-        let max_turns = agent.default_max_turns.unwrap_or(1);
+        let max_turns_total = agent.default_max_turns.unwrap_or(1);
+        // A context-relief segment continues the same prompt: only the
+        // remainder of the per-prompt turn and token budgets is available
+        // (mini-agent-xorxl.5, the interactive twin of mini-agent-djjua).
+        let (prior_turns, prior_tokens) = interactive_carry
+            .as_ref()
+            .map_or((0, 0), |carry| carry.begin_segment());
+        let max_turns = max_turns_total.saturating_sub(prior_turns);
+        if let Some(budget) = turn_token_budget
+            && prior_tokens >= budget
+        {
+            let _ = event_tx
+                .send(AgentEvent::error_with(
+                    CompactString::from(format!(
+                        "Agent exhausted its cumulative token budget ({prior_tokens}/{budget}) \
+                         before completing. Compact the session or raise turn_token_budget \
+                         before retrying."
+                    )),
+                    Vec::new(),
+                ))
+                .await;
+            return;
+        }
+        let turn_token_budget = turn_token_budget.map(|budget| budget.saturating_sub(prior_tokens));
         let mut turns_used = 0usize;
         let mut turns_at_stream_start = turns_used;
         let mut response = String::new();
@@ -4216,11 +4279,18 @@ where
         let mut consecutive_stop_blocks: u32 = 0;
 
         if max_turns == 0 {
+            let message = if prior_turns > 0 {
+                format!(
+                    "Agent exhausted its maximum turn budget ({max_turns_total}) before \
+                     completing.{}",
+                    crate::cli::MAX_AGENT_TURNS_HINT
+                )
+            } else {
+                "Agent exhausted its maximum turn budget (0) before starting.".to_string()
+            };
             let _ = event_tx
                 .send(AgentEvent::error_with(
-                    CompactString::from(
-                        "Agent exhausted its maximum turn budget (0) before starting.",
-                    ),
+                    CompactString::from(message),
                     Vec::new(),
                 ))
                 .await;
@@ -4569,6 +4639,9 @@ where
                         let usage = res.usage();
                         let context_complete = !usage_ledger.stream_has_observed_usage();
                         let terminal_delta = reconcile_terminal_usage(&mut usage_ledger, usage);
+                        if let Some(carry) = &interactive_carry {
+                            carry.note_segment(turns_used, observed_tokens(usage_ledger.total));
+                        }
                         if terminal_delta.has_values() {
                             let _ = event_tx
                                 .send(AgentEvent::UsageDelta {
@@ -4750,6 +4823,9 @@ where
                             &mut usage_ledger,
                             usage,
                         );
+                        if let Some(carry) = &interactive_carry {
+                            carry.note_segment(turns_used, observed_tokens(usage_ledger.total));
+                        }
                         tracing::debug!(
                             "agent completion: input_tokens={}, output_tokens={}, cached_input_tokens={}, cache_creation_input_tokens={}, cumulative_tokens={}",
                             usage.input_tokens,
@@ -6680,6 +6756,149 @@ mod tests {
         assert_eq!(
             tool_result_ids_of(&interactions),
             ["compact-first", "compact-second"]
+        );
+    }
+
+    /// mini-agent-xorxl.5: a context-relief respawn continues the same prompt,
+    /// so the interactive runner must start with only the turns the earlier
+    /// segment left, not the full configured `max_agent_turns`.
+    #[tokio::test]
+    async fn interactive_relief_segment_gets_only_the_remaining_turn_budget() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let carry = Arc::new(super::HeadlessBudgetCarry::default());
+        let spawn = |model: MockCompletionModel| {
+            let calls = calls.clone();
+            super::with_interactive_budget_carry(Some(carry.clone()), async move {
+                super::spawn_agent_paused(
+                    AgentBuilder::new(model)
+                        .tool(CountingTool(calls))
+                        .default_max_turns(2)
+                        .build(),
+                    "work".to_owned(),
+                    Vec::new(),
+                    crate::retry::RetryConfig::default(),
+                    None,
+                    #[cfg(feature = "skills")]
+                    None,
+                    #[cfg(feature = "hooks")]
+                    None,
+                )
+            })
+        };
+        // Segment one: one completion with a tool call, then the boundary.
+        let first_model = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::tool_call("relief-1", CountingTool::NAME, serde_json::json!({})),
+            MockStreamEvent::final_response(usage(120, 8, 0, 0)),
+        ]]);
+        let mut first = spawn(first_model).await.start_interactive();
+        let decision_tx = first
+            .compaction_decision_tx
+            .take()
+            .expect("decision channel");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match first.event_rx.recv().await.expect("boundary") {
+                    crate::event::AgentEvent::UsageDelta {
+                        context_complete: true,
+                        ..
+                    } => decision_tx
+                        .send(super::CompactionBoundaryDecision::Compact)
+                        .await
+                        .expect("runner waits at the boundary"),
+                    crate::event::AgentEvent::CompactionBoundary { .. } => break,
+                    crate::event::AgentEvent::Error { message, .. } => panic!("{message}"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("first segment reaches the compaction boundary");
+        // Segment two needs two completions (tool call, then answer) but only
+        // one turn of the two-turn prompt budget is left.
+        let second_model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call("relief-2", CountingTool::NAME, serde_json::json!({})),
+                MockStreamEvent::final_response(usage(40, 4, 0, 0)),
+            ],
+            vec![
+                MockStreamEvent::text("must not be reached"),
+                MockStreamEvent::final_response(usage(50, 4, 0, 0)),
+            ],
+        ]);
+        let mut second = spawn(second_model.clone()).await.start_interactive();
+        let second_decisions = second
+            .compaction_decision_tx
+            .take()
+            .expect("decision channel");
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match second.event_rx.recv().await.expect("terminal event") {
+                    crate::event::AgentEvent::UsageDelta {
+                        context_complete: true,
+                        ..
+                    } => {
+                        let _ = second_decisions
+                            .send(super::CompactionBoundaryDecision::Continue)
+                            .await;
+                    }
+                    event @ (crate::event::AgentEvent::Done { .. }
+                    | crate::event::AgentEvent::Error { .. }) => break event,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("second segment terminates");
+        assert!(
+            matches!(terminal, crate::event::AgentEvent::Error { .. }),
+            "the relief segment must not get a fresh two-turn budget: {terminal:?}"
+        );
+        assert_eq!(second_model.requests().len(), 1);
+    }
+
+    /// The cumulative token budget also spans the relief: tokens spent before
+    /// the boundary count against the respawned segment.
+    #[tokio::test]
+    async fn interactive_relief_segment_charges_prior_tokens_to_the_budget() {
+        let carry = Arc::new(super::HeadlessBudgetCarry::default());
+        carry.note_segment(1, 500);
+        let model = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::text("late"),
+            MockStreamEvent::final_response(usage(10, 1, 0, 0)),
+        ]]);
+        let mut runner = super::with_interactive_budget_carry(Some(carry), async {
+            super::spawn_agent_paused(
+                AgentBuilder::new(model.clone())
+                    .default_max_turns(4)
+                    .build(),
+                "work".to_owned(),
+                Vec::new(),
+                crate::retry::RetryConfig::default(),
+                Some(500),
+                #[cfg(feature = "skills")]
+                None,
+                #[cfg(feature = "hooks")]
+                None,
+            )
+        })
+        .await
+        .start_interactive();
+        let terminal = loop {
+            let event = runner.event_rx.recv().await.expect("terminal event");
+            if matches!(
+                event,
+                crate::event::AgentEvent::Done { .. } | crate::event::AgentEvent::Error { .. }
+            ) {
+                break event;
+            }
+        };
+        assert!(
+            matches!(terminal, crate::event::AgentEvent::Error { .. }),
+            "{terminal:?}"
+        );
+        assert!(
+            model.requests().is_empty(),
+            "no request once the budget is spent"
         );
     }
 

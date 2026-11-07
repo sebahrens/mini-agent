@@ -3431,6 +3431,9 @@ pub struct AnyAgent {
     turn_token_budget: Option<u64>,
     spend: Option<crate::spend::run::Run>,
     file_checkpoints: Option<crate::session::file_checkpoints::Recorder>,
+    /// Per-prompt budget spent by earlier context-relief segments of an
+    /// interactive turn (mini-agent-xorxl.5).
+    budget_carry: Option<std::sync::Arc<runner::HeadlessBudgetCarry>>,
     native_capture: Option<crate::agent::native_capture::NativeCapture>,
     #[cfg(feature = "js")]
     js_probe_pending: bool,
@@ -4255,6 +4258,7 @@ impl AnyAgent {
             turn_token_budget: None,
             spend: None,
             file_checkpoints: None,
+            budget_carry: None,
             native_capture: None,
             #[cfg(feature = "js")]
             js_probe_pending: false,
@@ -4502,6 +4506,16 @@ impl AnyAgent {
         kind: crate::spend::RequestKind,
     ) -> Self {
         self.spend = Some(crate::spend::run::Run::for_session(session, cfg, kind));
+        self
+    }
+
+    /// Charges the turn and token spend of the runner this agent spawns to
+    /// `carry` and starts it with only the remainder of the per-prompt budgets.
+    pub(crate) fn with_budget_carry(
+        mut self,
+        carry: std::sync::Arc<runner::HeadlessBudgetCarry>,
+    ) -> Self {
+        self.budget_carry = Some(carry);
         self
     }
 
@@ -4932,6 +4946,7 @@ impl AnyAgent {
             turn_token_budget: None,
             spend: None,
             file_checkpoints: None,
+            budget_carry: None,
             native_capture: None,
             #[cfg(feature = "js")]
             js_probe_pending: false,
@@ -5661,6 +5676,7 @@ impl AnyAgent {
         // the short factory frame while the spend scope still owns every poll.
         let question_turn = self.question_turn.clone();
         let file_checkpoints = self.file_checkpoints.clone();
+        let budget_carry = self.budget_carry.clone();
         let future = crate::spend::run::scope(
             self.spend.clone(),
             crate::startup::heap_future(|| async move {
@@ -5905,7 +5921,10 @@ impl AnyAgent {
         );
         crate::question::scope(
             question_turn,
-            crate::session::file_checkpoints::scope(file_checkpoints, future),
+            crate::session::file_checkpoints::scope(
+                file_checkpoints,
+                runner::with_interactive_budget_carry(budget_carry, future),
+            ),
         )
         .await
     }

@@ -2172,17 +2172,14 @@ editing in a known location, grepping for a literal you will act on immediately.
                     config.resolve_compact_enabled(),
                     config.subagent_context_window.unwrap_or(u64::MAX),
                     &execution_prompt,
+                    max_turns,
                     || task_budget.exhausted(),
-                    |stage, prompt, history| {
+                    |stage, prompt, history, turns| {
                         let agent = match stage {
                             ChildRelief::Summarize => relief_agent
                                 .clone()
                                 .for_subagent_report_repair(repair_max_tokens),
                             ChildRelief::Continue => relief_agent.clone(),
-                        };
-                        let turns = match stage {
-                            ChildRelief::Summarize => REPORT_REPAIR_MAX_TURNS,
-                            ChildRelief::Continue => max_turns,
                         };
                         let retry = relief_retry.clone();
                         let events = relief_events.clone();
@@ -4232,11 +4229,12 @@ async fn relieve_child_context<C, Fut>(
     enabled: bool,
     window: u64,
     brief: &str,
+    max_turns: usize,
     budget_exhausted: impl Fn() -> bool,
     mut continue_child: C,
 ) -> SubagentRunOutput
 where
-    C: FnMut(ChildRelief, String, Vec<Message>) -> Fut,
+    C: FnMut(ChildRelief, String, Vec<Message>, usize) -> Fut,
     Fut: Future<Output = SubagentRunOutput>,
 {
     let initial_usage = run.usage;
@@ -4246,6 +4244,10 @@ where
         && compactions < MAX_CHILD_COMPACTIONS
         && !run.history.is_empty()
         && !budget_exhausted()
+        // The child's `max_turns` bounds the whole task: a continuation gets
+        // only what the earlier segments left (mini-agent-xorxl.5). Nothing
+        // left keeps the visible context refusal instead of a fresh budget.
+        && (run.turns as usize) < max_turns
     {
         compactions += 1;
         let trimmed = trim_child_history(&run.history, window / 2);
@@ -4253,6 +4255,8 @@ where
             ChildRelief::Summarize,
             CHILD_SUMMARY_PROMPT.to_string(),
             trimmed,
+            // The tool-free summary is separately bounded.
+            REPORT_REPAIR_MAX_TURNS,
         )
         .await;
         run.usage = usage_saturating_add(initial_usage, summary.usage);
@@ -4267,6 +4271,7 @@ where
             ChildRelief::Continue,
             CHILD_CONTINUE_PROMPT.to_string(),
             history,
+            max_turns.saturating_sub(run.turns as usize),
         )
         .await;
         let relief_usage = next.usage;
@@ -8117,8 +8122,9 @@ mod child_continuation_tests {
             true,
             window,
             "inspect the bulky thing",
+            5,
             || false,
-            |stage, prompt, history| {
+            |stage, prompt, history, turns| {
                 stages.push(stage);
                 let agent = small_window_child(&model, window);
                 let ledger = relief_ledger.clone();
@@ -8127,7 +8133,7 @@ mod child_continuation_tests {
                         &agent,
                         &prompt,
                         history,
-                        3,
+                        turns,
                         None,
                         &crate::retry::RetryConfig::default(),
                         ledger,
@@ -8190,8 +8196,9 @@ mod child_continuation_tests {
             false,
             4_000,
             "brief",
+            5,
             || false,
-            |_, _, _| {
+            |_, _, _, _| {
                 called = true;
                 async { SubagentRunOutput::bare(Ok(String::new()), Usage::new()) }
             },
@@ -8202,6 +8209,97 @@ mod child_continuation_tests {
             .response
             .expect_err("disabled compaction keeps the refusal");
         assert!(error.contains("subagent_context_window"), "{error}");
+    }
+
+    /// mini-agent-xorxl.5: the child's `max_turns` bounds the whole task, so a
+    /// context-relief continuation receives only the turns the earlier
+    /// segments left, across every relief; the tool-free summary stays
+    /// separately bounded by `REPORT_REPAIR_MAX_TURNS`.
+    #[tokio::test]
+    async fn child_context_relief_continues_with_only_the_remaining_turns() {
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call("bulky-1", BulkyTool::NAME, serde_json::json!({})),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            text_usage("SUMMARY", 20),
+            text_usage("final report", 30),
+        ]);
+        let window = 4_000;
+        let agent = small_window_child(&model, window);
+        let first = run_subagent_with_history(
+            &agent,
+            "inspect the bulky thing",
+            Vec::new(),
+            2,
+            None,
+            &crate::retry::RetryConfig::default(),
+            SharedUsageLedger::default(),
+            None,
+        )
+        .await;
+        assert!(first.context_exhausted, "{:?}", first.response);
+        assert!(first.turns >= 1, "the first segment spent a turn");
+        let spent = first.turns as usize;
+        let mut grants = Vec::new();
+        let _ = relieve_child_context(
+            first,
+            true,
+            window,
+            "inspect the bulky thing",
+            2,
+            || false,
+            |stage, prompt, history, turns| {
+                grants.push((stage, turns));
+                let agent = small_window_child(&model, window);
+                async move {
+                    run_subagent_with_history(
+                        &agent,
+                        &prompt,
+                        history,
+                        turns,
+                        None,
+                        &crate::retry::RetryConfig::default(),
+                        SharedUsageLedger::default(),
+                        None,
+                    )
+                    .await
+                }
+            },
+        )
+        .await;
+        assert_eq!(
+            grants,
+            [
+                (ChildRelief::Summarize, REPORT_REPAIR_MAX_TURNS),
+                (ChildRelief::Continue, 2 - spent)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn child_context_relief_stops_when_no_turns_remain() {
+        let mut exhausted =
+            SubagentRunOutput::bare(Err("context window".to_string()), Usage::new());
+        exhausted.context_exhausted = true;
+        exhausted.history = vec![Message::user("brief")];
+        exhausted.turns = 2;
+        let mut called = false;
+        let run = relieve_child_context(
+            exhausted,
+            true,
+            4_000,
+            "brief",
+            2,
+            || false,
+            |_, _, _, _| {
+                called = true;
+                async { SubagentRunOutput::bare(Ok(String::new()), Usage::new()) }
+            },
+        )
+        .await;
+        assert!(!called, "no summary or continuation past the turn cap");
+        assert!(run.response.is_err());
     }
 
     #[test]
