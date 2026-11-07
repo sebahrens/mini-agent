@@ -1561,7 +1561,9 @@ fn is_metadata_ip(address: IpAddr) -> bool {
         IpAddr::V6(ip) => {
             ip.to_ipv4_mapped()
                 .is_some_and(|v4| is_metadata_ip(IpAddr::V4(v4)))
-                || ip == "fd00:ec2::254".parse::<std::net::Ipv6Addr>().unwrap()
+                || ["fd00:ec2::254", "fd20:ce::254"]
+                    .iter()
+                    .any(|metadata| ip == metadata.parse::<std::net::Ipv6Addr>().unwrap())
         }
     }
 }
@@ -2004,6 +2006,8 @@ mod local_policy_tests {
             "169.254.170.2",
             "100.100.100.200",
             "fd00:ec2::254",
+            "fd20:ce::254",
+            "FD20:00CE:0:0:0:0:0:254",
             "::ffff:169.254.169.254",
             "127.0.0.1",
             "0.0.0.0",

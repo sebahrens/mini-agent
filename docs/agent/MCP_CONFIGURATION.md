@@ -105,7 +105,7 @@ It is closed by default (empty). Every address a name resolves to must then be
 public or inside a listed range, so a name that also resolves to an unlisted
 private address is still refused; DNS answers stay pinned exactly as for public
 servers; and cloud metadata addresses (`169.254.169.254`, `169.254.170.2`,
-`169.254.169.253`, `100.100.100.200`, `192.0.0.192`, `fd00:ec2::254`), loopback
+`169.254.169.253`, `100.100.100.200`, `192.0.0.192`, `fd00:ec2::254`, `fd20:ce::254`), loopback
 (use `allow_local`), unspecified, multicast and reserved space are never unlocked,
 whatever is listed. Redirects stay same-origin only, and OAuth authorization
 servers on other hosts stay public-only. The option belongs in user-global
