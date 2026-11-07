@@ -2701,9 +2701,10 @@ impl Session {
     }
 
     /// Cheap estimate of the encoded session size, dominated by base64 images
-    /// (user prompts and tool results) and message text. Never serializes.
+    /// (user prompts and tool results), message text, retained compaction
+    /// pixels and the native replay payload (counted, never copied).
     pub(crate) fn approx_persisted_bytes(&self) -> usize {
-        self.messages.iter().fold(0usize, |total, message| {
+        let messages = self.messages.iter().fold(0usize, |total, message| {
             let user = message.user.as_ref().map_or(0, |user| {
                 user.blocks().iter().fold(0usize, |sum, block| {
                     sum.saturating_add(match block {
@@ -2724,7 +2725,24 @@ impl Session {
                 .saturating_add(message.content.len())
                 .saturating_add(user)
                 .saturating_add(tool)
-        })
+        });
+        // The persisted JSON also carries the active compaction's retained
+        // pixels and the native replay payload; leaving them out hid up to
+        // ~11 MiB of the real file from the trigger (mini-agent-g4bww).
+        let images = self.compactions.iter().fold(0usize, |sum, record| {
+            sum.saturating_add(record.images.approx_encoded_bytes())
+        });
+        let native = self
+            .native_history
+            .iter()
+            .chain(self.retired_native_history.iter())
+            .fold(0usize, |sum, history| {
+                sum.saturating_add(
+                    native_replay::bounded_serialized(history, native_replay::MAX_NATIVE_PAYLOAD)
+                        .unwrap_or(native_replay::MAX_NATIVE_PAYLOAD),
+                )
+            });
+        messages.saturating_add(images).saturating_add(native)
     }
 
     /// Whether the encoded session passed `fraction` of the persisted-session
