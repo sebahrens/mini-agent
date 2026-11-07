@@ -240,6 +240,20 @@ pub(crate) fn parse_body_retry_hint(message: &str) -> Option<Duration> {
                 && let Ok(number) = rest[..number_end].parse::<f64>()
             {
                 let unit = &rest[number_end..];
+                // Compound Go-style waits ("1m30s", "1h12m5.4s.") go through
+                // parse_go_duration so every component and hours count.
+                let compact_end = rest
+                    .find(|c: char| !(c.is_ascii_digit() || matches!(c, '.' | 'h' | 'm' | 's')))
+                    .unwrap_or(rest.len());
+                let compact = rest[..compact_end].trim_end_matches('.');
+                if !unit.starts_with("millisecond")
+                    && compact.len() > number_end
+                    && let Some(wait) = parse_go_duration(compact)
+                {
+                    keep(Some(wait));
+                    from += found + needle.len();
+                    continue;
+                }
                 let scale = if unit.starts_with("ms") || unit.starts_with("millisecond") {
                     Some(0.001)
                 } else if unit.starts_with("min")
@@ -1024,6 +1038,20 @@ mod tests {
             "You exceeded your current quota, please check your plan and billing details.",
         );
         assert!(!is_retryable(&bare));
+    }
+
+    #[test]
+    fn body_retry_hints_honour_compound_and_hour_waits() {
+        for (text, secs) in [
+            ("Please try again in 1m30s", 90.0),
+            ("Rate limit reached. Please try again in 1h12m5.4s.", 4325.4),
+            ("retry in 2h", 7200.0),
+            ("Please try again in 10milliseconds", 0.01),
+            ("try again in 5minutes", 300.0),
+        ] {
+            let got = parse_body_retry_hint(text).expect(text).as_secs_f64();
+            assert!((got - secs).abs() < 1e-6, "{text}: {got}");
+        }
     }
 
     #[test]
