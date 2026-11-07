@@ -542,6 +542,21 @@ async fn kill_tree(child: &mut tokio::process::Child, pid: Option<u32>) {
     let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
 }
 
+/// Kills the run's process group when the run future is dropped (the
+/// server aborts its tasks on client loss, before `run_prompt` can reach its
+/// own cancel branch). `kill_on_drop` alone SIGKILLs only the direct child,
+/// leaving sandboxed grandchildren and shell jobs behind.
+struct GroupKillOnDrop(#[cfg_attr(not(unix), allow(dead_code))] Option<u32>);
+
+impl Drop for GroupKillOnDrop {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.0 {
+            crate::sandbox::kill_process_group_if_live(pid);
+        }
+    }
+}
+
 fn truncate_utf8(text: &mut String, cap: usize) -> bool {
     if text.len() <= cap {
         return false;
@@ -814,6 +829,7 @@ async fn run_prompt(
         }
     };
     let pid = child.id();
+    let _group_guard = GroupKillOnDrop(pid);
     let control_stdin = if elicit.is_some() {
         child.stdin.take()
     } else {
@@ -1385,6 +1401,56 @@ mod tests {
         drop(client_in);
         server.await.unwrap().unwrap();
         let _ = std::fs::remove_file(&marker);
+    }
+
+    #[tokio::test]
+    async fn client_loss_kills_the_whole_process_group_of_a_running_call() {
+        let marker = std::env::temp_dir().join(format!(
+            "mini-agent-mcp-lost-{}-{}.pid",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let script = format!("sleep 300 & echo $! > '{}'; wait", marker.display());
+        let (mut client_in, server_in) = tokio::io::duplex(1 << 16);
+        let (server_out, _client_out) = tokio::io::duplex(1 << 16);
+        let server = tokio::spawn(serve(shell(&script), server_in, server_out));
+        let mut bytes = serde_json::to_vec(&call(7, json!({"prompt":"x"}))).unwrap();
+        bytes.push(b'\n');
+        client_in.write_all(&bytes).await.unwrap();
+        for _ in 0..200 {
+            if marker.exists() && !std::fs::read_to_string(&marker).unwrap().trim().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let grandchild: i32 = std::fs::read_to_string(&marker)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // A protocol failure (an oversize request line) ends serve() with the
+        // run still going.
+        let oversize = vec![b'x'; MAX_REQUEST_LINE_BYTES + 1];
+        let _ = client_in.write_all(&oversize).await;
+        assert!(server.await.unwrap().is_err());
+        for _ in 0..200 {
+            if nix::sys::signal::kill(nix::unistd::Pid::from_raw(grandchild), None).is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let survived = nix::sys::signal::kill(nix::unistd::Pid::from_raw(grandchild), None).is_ok();
+        if survived {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(grandchild),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        let _ = std::fs::remove_file(&marker);
+        assert!(!survived, "grandchild {grandchild} survived client loss");
     }
 
     #[tokio::test]
