@@ -1813,7 +1813,10 @@ fn compile_until_pattern(pattern: &str) -> Result<regex::Regex, ToolError> {
             "job_status until must be 1..={MAX_UNTIL_PATTERN_BYTES} bytes"
         )));
     }
+    // Multi-line so `^` and `$` anchor at each line of the scanned output, as
+    // they do for the per-line `monitor` of the same syntax.
     regex::RegexBuilder::new(pattern)
+        .multi_line(true)
         .size_limit(1 << 20)
         .dfa_size_limit(1 << 20)
         .build()
@@ -3521,6 +3524,26 @@ mod tests {
             })
             .await
             .unwrap()
+    }
+
+    #[test]
+    fn until_anchors_match_each_line_of_a_chunk() {
+        let regex = compile_until_pattern("^Listening|ready$").unwrap();
+        let window = OutputWindow {
+            start: 0,
+            head: b"building\nListening on 8080\n".to_vec(),
+            skipped: 0,
+            tail: Vec::new(),
+            next: 26,
+        };
+        let (hit, _) = scan_for_pattern(&regex, &window);
+        assert_eq!(hit.expect("mid-chunk line matches").line, "Listening on 8080");
+        let end = OutputWindow {
+            head: b"x\nserver ready\nmore\n".to_vec(),
+            next: 21,
+            ..window
+        };
+        assert_eq!(scan_for_pattern(&regex, &end).0.unwrap().line, "server ready");
     }
 
     #[test]
