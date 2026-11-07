@@ -17,7 +17,6 @@
 use rig::agent::{AgentHook, Flow, HookContext, RequestPatch, StepEvent, StepEventKind};
 use rig::completion::{CompletionModel, Message};
 use rig::message::{AssistantContent, Image, ToolResultContent, UserContent};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Most images one request may carry (the provider threshold for the stricter
 /// many-image dimension rule).
@@ -30,30 +29,142 @@ pub(crate) const MAX_REQUEST_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 const ELISION_BLOCK: usize = 5;
 const EVIDENCE_PREFIX: &str = "[Historical image evidence from the summarized transcript";
 
-/// Effective cap; lowered once when a provider still rejects the request.
-static IMAGE_CAP: AtomicUsize = AtomicUsize::new(MAX_REQUEST_IMAGES);
+/// Images per request for providers that accept far more than Anthropic's
+/// stricter-dimension threshold (OpenAI, Gemini and their gateways).
+const WIDE_REQUEST_IMAGES: usize = 100;
+/// Most images one prompt may carry before the request is refused up front.
+const STRICT_HARD_LIMIT: usize = 100;
+const WIDE_HARD_LIMIT: usize = 500;
 
+/// Image limits of one provider/model scope.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ImageProfile {
+    scope: String,
+    default_cap: usize,
+    hard_limit: usize,
+}
+
+impl ImageProfile {
+    /// The profile for `provider`/`model`. Anthropic models (direct, Bedrock,
+    /// Vertex, gateways) and unknown providers keep the strict 20-image cap;
+    /// OpenAI- and Gemini-style APIs get a wider one.
+    pub(crate) fn for_provider(provider: &str, model: &str) -> Self {
+        let provider_lower = provider.to_ascii_lowercase();
+        let model_lower = model.to_ascii_lowercase();
+        let anthropic = model_lower.contains("claude")
+            || provider_lower.contains("anthropic")
+            || provider_lower.contains("bedrock");
+        let wide = !anthropic
+            && [
+                "openai", "gemini", "google", "azure", "copilot", "xai", "grok",
+            ]
+            .iter()
+            .any(|name| provider_lower.contains(name));
+        Self {
+            scope: format!("{provider_lower}/{model_lower}"),
+            default_cap: if wide {
+                WIDE_REQUEST_IMAGES
+            } else {
+                MAX_REQUEST_IMAGES
+            },
+            hard_limit: if wide {
+                WIDE_HARD_LIMIT
+            } else {
+                STRICT_HARD_LIMIT
+            },
+        }
+    }
+}
+
+impl Default for ImageProfile {
+    fn default() -> Self {
+        Self {
+            scope: String::new(),
+            default_cap: MAX_REQUEST_IMAGES,
+            hard_limit: STRICT_HARD_LIMIT,
+        }
+    }
+}
+
+/// Caps lowered after a provider rejection, per provider/model scope, so one
+/// Anthropic rejection never degrades an OpenAI or Gemini session.
+static TIGHTENED: std::sync::Mutex<Vec<(String, usize)>> = std::sync::Mutex::new(Vec::new());
+/// `(scope, default cap)` of the request being built most recently.
+static ACTIVE: std::sync::Mutex<Option<(String, usize)>> = std::sync::Mutex::new(None);
+/// User-visible elision notices not yet shown.
+static NOTICES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+static LAST_NOTICE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn scope_cap(scope: &str, default_cap: usize) -> usize {
+    lock(&TIGHTENED)
+        .iter()
+        .find(|(name, _)| name == scope)
+        .map_or(default_cap, |(_, cap)| (*cap).min(default_cap))
+}
+
+/// Effective cap of the active provider/model scope.
+#[cfg(test)]
 pub(crate) fn image_cap() -> usize {
-    IMAGE_CAP.load(Ordering::Relaxed)
+    let (scope, default_cap) = lock(&ACTIVE)
+        .clone()
+        .unwrap_or_else(|| (String::new(), MAX_REQUEST_IMAGES));
+    scope_cap(&scope, default_cap)
 }
 
 /// A provider rejected the request for its image count or dimensions: keep
-/// fewer images from now on. Returns whether the cap actually shrank.
+/// fewer images from now on for the active scope only. Returns whether the
+/// cap actually shrank.
 pub(crate) fn tighten_after_provider_rejection() -> bool {
-    IMAGE_CAP
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cap| {
-            (cap > 1).then_some((cap / 2).max(1))
-        })
-        .is_ok()
+    let (scope, default_cap) = lock(&ACTIVE)
+        .clone()
+        .unwrap_or_else(|| (String::new(), MAX_REQUEST_IMAGES));
+    let current = scope_cap(&scope, default_cap);
+    if current <= 1 {
+        return false;
+    }
+    let next = (current / 2).max(1);
+    let mut tightened = lock(&TIGHTENED);
+    match tightened.iter_mut().find(|(name, _)| *name == scope) {
+        Some(entry) => entry.1 = next,
+        None => tightened.push((scope, next)),
+    }
+    true
 }
 
-/// Serializes tests that read or move the process-wide cap.
+/// Elision notices queued since the last call; the runner shows them to the
+/// user (TUI, headless stderr, ACP) once per request round.
+pub(crate) fn take_notices() -> Vec<String> {
+    std::mem::take(&mut *lock(&NOTICES))
+}
+
+fn queue_notice(text: String) {
+    let mut last = lock(&LAST_NOTICE);
+    if *last == text {
+        return;
+    }
+    last.clone_from(&text);
+    let mut notices = lock(&NOTICES);
+    if notices.len() < 8 {
+        notices.push(text);
+    }
+}
+
+/// Serializes tests that read or move the process-wide state.
 #[cfg(test)]
 pub(crate) static CAP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
 pub(crate) fn reset_cap_for_tests() {
-    IMAGE_CAP.store(MAX_REQUEST_IMAGES, Ordering::Relaxed);
+    lock(&TIGHTENED).clear();
+    *lock(&ACTIVE) = None;
+    lock(&NOTICES).clear();
+    lock(&LAST_NOTICE).clear();
 }
 
 /// Provider message for an over-limit image request ("many-image requests",
@@ -217,8 +328,38 @@ pub(crate) fn enforce(
 }
 
 /// Applies the per-request image budget to every completion call.
-#[derive(Clone, Copy, Default)]
-pub(crate) struct ImageBudgetHook;
+#[derive(Clone, Default)]
+pub(crate) struct ImageBudgetHook {
+    profile: ImageProfile,
+}
+
+impl ImageBudgetHook {
+    pub(crate) fn for_provider(provider: &str, model: &str) -> Self {
+        Self {
+            profile: ImageProfile::for_provider(provider, model),
+        }
+    }
+}
+
+/// Whether the newest message alone cannot be sent: it exceeds the provider's
+/// hard image limit, the byte budget, or a cap a provider rejection lowered.
+fn prompt_refusal(prompt: &Message, cap: usize, profile: &ImageProfile) -> Option<String> {
+    let images = scan(std::slice::from_ref(prompt));
+    let bytes = images.iter().map(|image| image.0).sum::<usize>();
+    let tightened = cap < profile.default_cap;
+    let over_count = images.len() > profile.hard_limit || (tightened && images.len() > cap);
+    let over_bytes = bytes > MAX_REQUEST_IMAGE_BYTES;
+    if !over_count && !over_bytes {
+        return None;
+    }
+    Some(format!(
+        "This message carries {} images ({} MiB encoded), more than the provider accepts in one request (limit {} images, {} MiB). Send fewer or smaller images and try again; older images in the saved session are unaffected.",
+        images.len(),
+        bytes / (1024 * 1024),
+        cap.min(profile.hard_limit),
+        MAX_REQUEST_IMAGE_BYTES / (1024 * 1024)
+    ))
+}
 
 impl<M: CompletionModel> AgentHook<M> for ImageBudgetHook {
     async fn on_event(&self, _ctx: &HookContext, event: StepEvent<'_, M>) -> Flow {
@@ -228,7 +369,11 @@ impl<M: CompletionModel> AgentHook<M> for ImageBudgetHook {
         else {
             return Flow::Continue;
         };
-        let cap = image_cap();
+        *lock(&ACTIVE) = Some((self.profile.scope.clone(), self.profile.default_cap));
+        let cap = scope_cap(&self.profile.scope, self.profile.default_cap);
+        if let Some(reason) = prompt_refusal(prompt, cap, &self.profile) {
+            return Flow::terminate(reason);
+        }
         match enforce(history, prompt, cap, MAX_REQUEST_IMAGE_BYTES) {
             Some((patched, dropped)) => {
                 tracing::warn!(
@@ -236,6 +381,10 @@ impl<M: CompletionModel> AgentHook<M> for ImageBudgetHook {
                     cap,
                     "older images replaced by a placeholder to stay within the per-request image budget"
                 );
+                queue_notice(format!(
+                    "{dropped} older image(s) were left out of this request to stay within the provider's image budget (at most {cap} images, {} MiB). They remain in the saved session; re-read the file or re-capture the screen if needed.",
+                    MAX_REQUEST_IMAGE_BYTES / (1024 * 1024)
+                ));
                 Flow::patch_request(RequestPatch::new().history(patched))
             }
             None => Flow::Continue,
@@ -402,7 +551,7 @@ mod tests {
         let history: Vec<Message> = (0..24).map(|id| tool_image_message(id, 64)).collect();
         let mut stream = agent
             .stream_chat(tool_image_message(24, 64), history.clone())
-            .add_hook(ImageBudgetHook)
+            .add_hook(ImageBudgetHook::default())
             .await;
         while let Some(item) = stream.next().await {
             item.expect("request must be sent");
@@ -467,7 +616,7 @@ mod tests {
         let history: Vec<Message> = (0..25).map(|id| tool_image_message(id, 64)).collect();
         let mut stream = agent
             .stream_chat(Message::user("go"), history)
-            .add_hook(ImageBudgetHook)
+            .add_hook(ImageBudgetHook::default())
             .add_hook(InjectOnTurnTwo)
             .await;
         while let Some(item) = stream.next().await {
@@ -493,6 +642,104 @@ mod tests {
         assert!(!is_image_limit_error_message("prompt is too long"));
         assert!(tighten_after_provider_rejection());
         assert_eq!(image_cap(), MAX_REQUEST_IMAGES / 2);
+        reset_cap_for_tests();
+    }
+
+    fn activate(profile: &ImageProfile) {
+        *lock(&ACTIVE) = Some((profile.scope.clone(), profile.default_cap));
+    }
+
+    #[test]
+    fn a_rejection_on_one_provider_does_not_lower_another_providers_cap() {
+        let _guard = CAP_TEST_LOCK.blocking_lock();
+        reset_cap_for_tests();
+        let anthropic = ImageProfile::for_provider("anthropic", "claude-sonnet-4");
+        let openai = ImageProfile::for_provider("openai", "gpt-5");
+        assert_eq!(anthropic.default_cap, MAX_REQUEST_IMAGES);
+        assert_eq!(openai.default_cap, WIDE_REQUEST_IMAGES);
+        // A Claude model behind a gateway stays strict.
+        assert_eq!(
+            ImageProfile::for_provider("openai", "anthropic/claude-x").default_cap,
+            MAX_REQUEST_IMAGES
+        );
+        activate(&anthropic);
+        assert!(tighten_after_provider_rejection());
+        assert_eq!(image_cap(), MAX_REQUEST_IMAGES / 2);
+        activate(&openai);
+        assert_eq!(image_cap(), WIDE_REQUEST_IMAGES);
+        activate(&anthropic);
+        assert_eq!(image_cap(), MAX_REQUEST_IMAGES / 2);
+        reset_cap_for_tests();
+    }
+
+    #[tokio::test]
+    async fn elision_queues_one_user_visible_notice_and_dedupes() {
+        use crate::tests::fake_model::text_turns;
+        use futures::StreamExt;
+        let _guard = CAP_TEST_LOCK.lock().await;
+        reset_cap_for_tests();
+        let model = text_turns([["ok"]]);
+        let agent = rig::agent::AgentBuilder::new(model.clone()).build();
+        let history: Vec<Message> = (0..24).map(|id| tool_image_message(id, 64)).collect();
+        let mut stream = agent
+            .stream_chat(tool_image_message(24, 64), history)
+            .add_hook(ImageBudgetHook::for_provider("anthropic", "claude-x"))
+            .await;
+        while let Some(item) = stream.next().await {
+            item.expect("request must be sent");
+        }
+        let notices = take_notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("older image(s) were left out"));
+        assert!(take_notices().is_empty());
+        queue_notice("same".into());
+        queue_notice("same".into());
+        assert_eq!(take_notices().len(), 1);
+        reset_cap_for_tests();
+    }
+
+    #[tokio::test]
+    async fn a_prompt_over_the_hard_limit_or_a_tightened_cap_is_refused_clearly() {
+        use crate::tests::fake_model::text_turns;
+        use futures::StreamExt;
+        let _guard = CAP_TEST_LOCK.lock().await;
+        reset_cap_for_tests();
+        let profile = ImageProfile::for_provider("anthropic", "claude-x");
+        // Just above the soft cap: still sent (history elision only).
+        assert!(prompt_refusal(&tool_image_message(0, 8), 20, &profile).is_none());
+        let many = Message::User {
+            content: OneOrMany::many(
+                (0..STRICT_HARD_LIMIT + 1).map(|_| UserContent::Image(image(8))),
+            )
+            .unwrap(),
+        };
+        assert!(
+            prompt_refusal(&many, 20, &profile)
+                .unwrap()
+                .contains("101 images")
+        );
+        let few = Message::User {
+            content: OneOrMany::many((0..6).map(|_| UserContent::Image(image(8)))).unwrap(),
+        };
+        assert!(prompt_refusal(&few, 20, &profile).is_none());
+        assert!(prompt_refusal(&few, 5, &profile).is_some(), "tightened cap");
+        let huge = Message::User {
+            content: OneOrMany::one(UserContent::Image(image(MAX_REQUEST_IMAGE_BYTES + 1))),
+        };
+        assert!(prompt_refusal(&huge, 20, &profile).is_some());
+        // End to end: the run is refused before any provider request.
+        let model = text_turns([["ok"]]);
+        let agent = rig::agent::AgentBuilder::new(model.clone()).build();
+        let mut stream = agent
+            .stream_chat(many, Vec::<Message>::new())
+            .add_hook(ImageBudgetHook::for_provider("anthropic", "claude-x"))
+            .await;
+        let mut failed = false;
+        while let Some(item) = stream.next().await {
+            failed |= item.is_err();
+        }
+        assert!(failed);
+        assert!(model.requests().is_empty());
         reset_cap_for_tests();
     }
 }

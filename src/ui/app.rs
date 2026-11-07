@@ -4776,6 +4776,17 @@ impl<'a> App<'a> {
             && self.ui.session.context_window > 0
             && let Some(threshold) = self.ui.cfg.resolve_mid_turn_compact_threshold()
         {
+            // Image-heavy sessions hit the byte ceiling long before the token
+            // threshold: byte pressure makes any boundary a compaction point.
+            let threshold = if self
+                .ui
+                .session
+                .size_pressure(self.ui.cfg.resolve_compact_size_fraction())
+            {
+                f64::MIN_POSITIVE
+            } else {
+                threshold
+            };
             let real_input_tokens = crate::session::Session::real_input_tokens(
                 self.ui.cfg.is_anthropic_native(&self.ui.session.provider),
                 usage.input_tokens,
@@ -4799,11 +4810,18 @@ impl<'a> App<'a> {
             decision_tx.publish_gate(if mid_turn_observation.is_some() {
                 crate::agent::runner::CompactionPressureGate::Limit {
                     window: self.ui.session.context_window,
-                    threshold: self
+                    threshold: if self
                         .ui
-                        .cfg
-                        .resolve_mid_turn_compact_threshold()
-                        .unwrap_or(0.0),
+                        .session
+                        .size_pressure(self.ui.cfg.resolve_compact_size_fraction())
+                    {
+                        f64::MIN_POSITIVE
+                    } else {
+                        self.ui
+                            .cfg
+                            .resolve_mid_turn_compact_threshold()
+                            .unwrap_or(0.0)
+                    },
                     anthropic_native: self.ui.cfg.is_anthropic_native(&self.ui.session.provider),
                 }
             } else {

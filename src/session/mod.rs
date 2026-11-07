@@ -2684,6 +2684,50 @@ impl Session {
         effective
     }
 
+    /// Whether any of the first `end` messages carries an image (user prompt
+    /// or tool result).
+    pub(crate) fn prefix_has_images(&self, end: usize) -> bool {
+        self.messages.iter().take(end).any(|message| {
+            message.user.as_ref().is_some_and(user::PersistedUserMessage::has_images)
+                || matches!(&message.tool, Some(PersistedToolMessage::Result { images, .. }) if !images.is_empty())
+        })
+    }
+
+    /// Cheap estimate of the encoded session size, dominated by base64 images
+    /// (user prompts and tool results) and message text. Never serializes.
+    pub(crate) fn approx_persisted_bytes(&self) -> usize {
+        self.messages.iter().fold(0usize, |total, message| {
+            let user = message.user.as_ref().map_or(0, |user| {
+                user.blocks().iter().fold(0usize, |sum, block| {
+                    sum.saturating_add(match block {
+                        user::UserBlock::Text { text } => text.len(),
+                        user::UserBlock::Image { data, .. } => data.len(),
+                    })
+                })
+            });
+            let tool = match &message.tool {
+                Some(PersistedToolMessage::Result { output, images, .. }) => {
+                    images.iter().fold(output.len(), |sum, image| {
+                        sum.saturating_add(image.encoded_len())
+                    })
+                }
+                _ => 0,
+            };
+            total
+                .saturating_add(message.content.len())
+                .saturating_add(user)
+                .saturating_add(tool)
+        })
+    }
+
+    /// Whether the encoded session passed `fraction` of the persisted-session
+    /// byte ceiling, the point where compaction must run before saves stop.
+    pub(crate) fn size_pressure(&self, fraction: Option<f64>) -> bool {
+        fraction.is_some_and(|fraction| {
+            self.approx_persisted_bytes() as f64 > storage::MAX_SESSION_BYTES as f64 * fraction
+        })
+    }
+
     pub fn needs_compaction_after_tool_result_pruning(
         &self,
         reserve_tokens: u64,

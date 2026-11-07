@@ -109,7 +109,7 @@ configuration. Before trust, startup may merge only this exhaustive benign top-l
 `always_show_welcome`, `chain`, `chat_left_margin`, `colors`, `compact_enabled`,
 `context_window`, `default_prompt`, `edit_system`, `keep_recent_tokens`, `max_agent_turns`,
 `max_bash_output_lines`, `max_find_results`, `max_grep_results`, `max_list_dir_entries`,
-`max_read_lines`, `max_text_file_size`, `max_tokens`, `mid_turn_compact_threshold`, `model`,
+`max_read_lines`, `max_text_file_size`, `max_tokens`, `mid_turn_compact_threshold`, `compact_size_fraction`, `model`,
 `reserve_tokens`, `retry`, `show_cost_always`, `show_reasoning`, `reasoning_display`, `show_tool_details`, `statusline`,
 the four `subagent_max_*` result/read limits, `temperature`, and `tool_output`.
 

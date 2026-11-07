@@ -218,6 +218,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     key("claude_project_agents").shaped(ConfigShape::Bool),
     key("claude_user_agents").shaped(ConfigShape::Bool),
     key("mid_turn_compact_threshold").described("Mid-turn compaction threshold, as a fraction of the context window (0.0–1.0) of real provider prompt pressure. Default 0.9; 0 disables.").shaped(ConfigShape::Number),
+    key("compact_size_fraction").described("Fraction (0.0–1.0) of the 32 MiB persisted-session ceiling at which automatic compaction starts, so image-heavy sessions compact before saving stops. Default 0.75; 0 disables.").shaped(ConfigShape::Number),
     key("always_show_welcome").shaped(ConfigShape::Bool),
     aliased("auto-update-prompts", &["auto_update_prompts"]).shaped(ConfigShape::Bool),
     aliased("auto-update-themes", &["auto_update_themes"]).shaped(ConfigShape::Bool),

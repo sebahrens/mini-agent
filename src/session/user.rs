@@ -236,6 +236,57 @@ mod tests {
         }
     }
     #[test]
+    fn image_heavy_session_with_few_tokens_reports_size_pressure() {
+        let mut session = crate::session::Session::new("logical", "model", 1_000_000, "");
+        // 5 prompts of two ~2.4 MiB base64 images: far under any token threshold,
+        // past 75% of the 32 MiB persisted-session ceiling.
+        let raw = vec![7u8; 1_900_000];
+        for _ in 0..5 {
+            session.add_user_message(
+                PersistedUserMessage::new(vec![image(&raw), image(&raw)]).unwrap(),
+            );
+        }
+        assert!(session.approx_persisted_bytes() > 24 * 1024 * 1024);
+        assert!(session.effective_context_tokens() < 100_000);
+        assert!(!session.needs_compaction_after_tool_result_pruning(0, 0));
+        assert!(session.size_pressure(Some(0.75)));
+        assert!(!session.size_pressure(Some(1.0)));
+        assert!(!session.size_pressure(None), "0 disables the byte trigger");
+        let small = crate::session::Session::new("logical", "model", 1_000_000, "");
+        assert!(!small.size_pressure(Some(0.75)));
+    }
+    #[test]
+    fn history_prefix_conversion_leaves_the_session_cache_and_messages_alone() {
+        let mut session = crate::session::Session::new("logical", "model", 32_000, "");
+        session.add_user_message(
+            PersistedUserMessage::new(vec![UserBlock::Text { text: "one".into() }]).unwrap(),
+        );
+        session.add_message(crate::session::MessageRole::Assistant, "two");
+        session.add_user_message(
+            PersistedUserMessage::new(vec![UserBlock::Text {
+                text: "three".into(),
+            }])
+            .unwrap(),
+        );
+        assert!(!session.prefix_has_images(3));
+        let full = crate::agent::runner::convert_history_shared_with_tool_result_retention(
+            &session,
+            usize::MAX,
+        );
+        let prefix = crate::agent::runner::convert_history_prefix(&session, 2, usize::MAX);
+        assert_eq!(prefix.len(), 2);
+        assert_eq!(session.messages.len(), 3);
+        let again = crate::agent::runner::convert_history_shared_with_tool_result_retention(
+            &session,
+            usize::MAX,
+        );
+        assert_eq!(again.len(), full.len(), "the full history is still served");
+        assert_eq!(full.len(), 3);
+        session.add_user_message(PersistedUserMessage::new(vec![image(b"px")]).unwrap());
+        assert!(session.prefix_has_images(4));
+        assert!(!session.prefix_has_images(3));
+    }
+    #[test]
     fn canonical_user53_order_survives_storage_and_converter() {
         let user = PersistedUserMessage::new(vec![
             UserBlock::Text {

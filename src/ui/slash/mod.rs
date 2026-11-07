@@ -569,6 +569,20 @@ pub async fn handle_compress_with_force(
         ui.session.context_window,
     );
     let compaction_timeout = ui.cfg.resolve_compaction_timeout();
+    // Same model on a native prompt-cache route: fork the conversation's own
+    // request instead of re-serializing it, so the summary reads the cache.
+    let cache_fork = if compaction_model.is_none() {
+        cache_fork_input(
+            ui,
+            cut_idx,
+            keep_recent_tool_results,
+            summarizer_input_budget,
+            reasoning_enabled,
+        )
+        .await
+    } else {
+        None
+    };
     let observed = crate::spend::run::UsageObserver::with_run(compaction_run);
     let request_observer = observed.clone();
     let client = &ui.client;
@@ -590,6 +604,26 @@ pub async fn handle_compress_with_force(
                 input_budget,
                 response_budget,
             );
+            if let Some((agent, history)) = cache_fork {
+                match agent
+                    .compress_forked(
+                        history,
+                        messages.len(),
+                        instructions,
+                        input_budget,
+                        response_budget,
+                        retry_config,
+                        request_observer.clone(),
+                        compaction_timeout,
+                    )
+                    .await
+                {
+                    Ok(output) => return Ok(output),
+                    Err(error) => tracing::warn!(
+                        "cache-reusing compaction failed, using the text summarizer: {error}"
+                    ),
+                }
+            }
             client
                 .compress_messages_observed_with_timeout(
                     &model,
@@ -765,6 +799,45 @@ where
         stage_summary,
     )
     .await
+}
+
+/// The agent and conversation prefix for a cache-reusing compaction fork, when
+/// the fork is safe: a native prompt-cache route, no provider-native replay
+/// history, no images (the request-time image budget would diverge from the
+/// prefix), and a prefix that fits the summarizer budget in one request.
+async fn cache_fork_input(
+    ui: &mut UiContext<'_>,
+    cut_idx: usize,
+    keep_recent_tool_results: usize,
+    input_token_budget: u64,
+    reasoning_enabled: bool,
+) -> Option<(crate::provider::AnyAgent, Vec<rig::completion::Message>)> {
+    if ui.session.native_history_snapshot().is_some() || ui.session.prefix_has_images(cut_idx) {
+        return None;
+    }
+    let first_live = ui.session.compacted_context().1;
+    let tokens: u64 = ui.session.messages[first_live.min(cut_idx)..cut_idx]
+        .iter()
+        .map(|message| message.estimated_tokens)
+        .sum();
+    // Leave room for the instruction and the estimator's error.
+    if tokens.saturating_add(2_000) > input_token_budget / 10 * 9 {
+        return None;
+    }
+    let agent = ui
+        .agent_build_ctx()
+        .rebuild_agent(&ui.session.model, reasoning_enabled)
+        .await;
+    agent.supports_cache_fork().then(|| {
+        (
+            agent,
+            crate::agent::runner::convert_history_prefix(
+                ui.session,
+                cut_idx,
+                keep_recent_tool_results,
+            ),
+        )
+    })
 }
 
 /// As [`compact_session_with`], re-attaching the newest file windows read in

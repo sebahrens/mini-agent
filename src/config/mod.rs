@@ -48,6 +48,9 @@ pub const DEFAULT_MAX_BASH_OUTPUT_LINES: u64 = 2000;
 /// Mid-turn compaction threshold used when `mid_turn_compact_threshold` is
 /// unset (fraction of the context window of real provider prompt pressure).
 pub const DEFAULT_MID_TURN_COMPACT_THRESHOLD: f64 = 0.9;
+/// Fraction of the persisted-session byte ceiling at which automatic
+/// compaction starts when `compact_size_fraction` is unset.
+pub const DEFAULT_COMPACT_SIZE_FRACTION: f64 = 0.75;
 pub const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 120;
 /// Room kept above the response cap in the default `reserve_tokens`, so the
 /// summarizer request itself still fits when compaction fires.
@@ -380,6 +383,12 @@ pub struct Config {
     /// mid-turn compaction. Honored only when `compact_enabled` is also true.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mid_turn_compact_threshold: Option<f64>,
+    /// Fraction (0.0–1.0) of the 32 MiB persisted-session ceiling at which
+    /// automatic compaction starts, so image-heavy sessions compact before
+    /// saving stops. `None` resolves to [`DEFAULT_COMPACT_SIZE_FRACTION`]; `0`
+    /// disables the byte trigger. Honored only when `compact_enabled` is true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compact_size_fraction: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub always_show_welcome: Option<bool>,
     #[serde(
@@ -1536,6 +1545,16 @@ impl Config {
         }
     }
 
+    /// Byte-pressure compaction trigger as a fraction of the persisted-session
+    /// ceiling; `None` when disabled (`0` or out of range).
+    pub fn resolve_compact_size_fraction(&self) -> Option<f64> {
+        match self.compact_size_fraction {
+            None => Some(DEFAULT_COMPACT_SIZE_FRACTION),
+            Some(f) if f > 0.0 && f <= 1.0 => Some(f),
+            _ => None,
+        }
+    }
+
     /// Size limit for files changed by edit/write/notebook_edit (see
     /// [`Config::max_edit_file_size`]).
     pub fn resolve_max_edit_file_size(&self) -> u64 {
@@ -2454,6 +2473,18 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(explicit.resolve_keep_recent_tokens(1_000_000), 1_234);
+    }
+
+    #[test]
+    fn compact_size_fraction_defaults_and_disables() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.resolve_compact_size_fraction(), Some(0.75));
+        cfg.compact_size_fraction = Some(0.5);
+        assert_eq!(cfg.resolve_compact_size_fraction(), Some(0.5));
+        for off in [0.0, -1.0, 1.5] {
+            cfg.compact_size_fraction = Some(off);
+            assert_eq!(cfg.resolve_compact_size_fraction(), None);
+        }
     }
 
     #[test]
