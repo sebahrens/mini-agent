@@ -1140,6 +1140,7 @@ layer. A missing file means no managed policy.
 ```toml
 [permissions]
 deny = { shell = ["rm -rf *"], write = ["/etc/**"] }  # appended to permission-deny; wins over allow rules
+# a deny on write, edit or notebook_edit applies to all three (and js/write_file)
 allowed_modes = ["standard", "guarded", "readonly"]   # security modes users may select (default: all)
 disable_yolo = true                                   # shorthand: remove `yolo` from the modes
 require_permission_checks = true                      # refuse --dangerously-skip-permissions (implied by deny, allowed_modes, disable_yolo)

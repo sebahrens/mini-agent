@@ -113,6 +113,10 @@ struct McpEntrySpec {
     headers: Option<BTreeMap<String, String>>,
 }
 
+/// Permission rule keys for tools that modify file contents. A managed deny on
+/// any of them applies to all of them (`js/write_file` follows `write`).
+const WRITE_FAMILY: [&str; 3] = ["write", "edit", "notebook_edit"];
+
 impl McpEntry {
     fn texts(&self) -> Vec<&str> {
         match self {
@@ -899,10 +903,19 @@ impl ManagedPolicy {
     pub(crate) fn apply(&self, cfg: &mut super::Config) {
         let deny = cfg.permission_deny.get_or_insert_with(Default::default);
         for (tool, patterns) in &self.file.permissions.deny {
-            let entry = deny.entry(tool.clone()).or_default();
-            for pattern in patterns {
-                if !entry.contains(pattern) {
-                    entry.push(pattern.clone());
+            // The file-modifying tools are separate rule keys; a managed deny
+            // for one must not be bypassable through a sibling.
+            let keys: &[&str] = if WRITE_FAMILY.contains(&tool.as_str()) {
+                &WRITE_FAMILY
+            } else {
+                &[]
+            };
+            for key in std::iter::once(tool.as_str()).chain(keys.iter().copied()) {
+                let entry = deny.entry(key.to_string()).or_default();
+                for pattern in patterns {
+                    if !entry.contains(pattern) {
+                        entry.push(pattern.clone());
+                    }
                 }
             }
         }
@@ -1381,6 +1394,35 @@ mod tests {
             checker.check("shell", "npm test"),
             crate::permission::checker::CheckResult::Allowed
         ));
+    }
+
+    #[test]
+    fn managed_write_deny_covers_every_file_modifying_tool() {
+        for key in ["write", "edit", "notebook_edit"] {
+            let policy = policy(&format!(
+                "[permissions]\ndeny = {{ {key} = [\"/etc/**\"] }}\n"
+            ));
+            let mut cfg: super::super::Config = toml::from_str(
+                "permission_allow = { edit = [\"/etc/**\"], write = [\"/etc/**\"] }\n",
+            )
+            .unwrap();
+            policy.apply(&mut cfg);
+            let configs = cfg.build_permission_config().unwrap();
+            let checker = crate::permission::checker::PermissionChecker::new(
+                &configs,
+                SecurityMode::Yolo,
+                std::env::current_dir().ok(),
+                None,
+            )
+            .unwrap();
+            for tool in ["write", "edit", "notebook_edit", "js/write_file"] {
+                assert!(
+                    checker.path_is_denied_lexically(tool, "/etc/hosts"),
+                    "{key} deny must cover {tool}"
+                );
+            }
+            assert!(!checker.path_is_denied_lexically("read", "/etc/hosts"));
+        }
     }
 
     #[test]
