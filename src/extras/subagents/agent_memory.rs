@@ -239,18 +239,29 @@ impl AgentMemory {
                     .read_to_end(&mut bytes)
                     .map_err(io_error)?;
                 if bytes.len() > MAX_FILE_BYTES {
-                    return Err(ToolError::Msg(format!(
-                        "agent_memory: {} is over {MAX_FILE_BYTES} bytes; write a shorter consolidated version",
-                        file.display()
-                    )));
+                    // An oversized file cannot be appended to, but a full
+                    // rewrite replaces it: pin the replacement to the exact
+                    // bytes via a streamed digest instead of refusing.
+                    if append {
+                        return Err(ToolError::Msg(format!(
+                            "agent_memory: {} is over {MAX_FILE_BYTES} bytes and cannot be appended to; use action=write with a shorter consolidated version",
+                            file.display()
+                        )));
+                    }
+                    let mut full = self.binding.open_regular_relative(file).map_err(io_error)?;
+                    let digest =
+                        crate::fs::ContentDigest::of_reader(&mut full).map_err(io_error)?;
+                    Some((identity, Vec::new(), digest))
+                } else {
+                    let digest = crate::fs::ContentDigest::of(&bytes);
+                    Some((identity, bytes, digest))
                 }
-                Some((identity, bytes))
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(io_error(error)),
         };
         let mut next = Vec::new();
-        if append && let Some((_, bytes)) = &existing {
+        if append && let Some((_, bytes, _)) = &existing {
             next.extend_from_slice(bytes);
             if !next.is_empty() && !next.ends_with(b"\n") {
                 next.push(b'\n');
@@ -263,8 +274,7 @@ impl AgentMemory {
             )));
         }
         match existing {
-            Some((identity, bytes)) => {
-                let digest = crate::fs::ContentDigest::of(&bytes);
+            Some((identity, _, digest)) => {
                 self.binding
                     .replace_relative_private_atomic_expecting(file, &next, &identity, &digest)
                     .map_err(io_error)?;
@@ -534,6 +544,32 @@ mod tests {
         };
         let error = tool.call(one_more).await.unwrap_err().to_string();
         assert!(error.contains("already holds"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn write_replaces_an_oversized_existing_file_but_append_is_refused() {
+        let root = crate::tests::OwnedTestDirectory::new("agent-memory-oversized");
+        let (memory, _workspace) = memory(&root, AgentMemoryScope::User);
+        let dir = memory.directory().to_path_buf();
+        let tool = AgentMemoryTool::new(Arc::new(memory));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("MEMORY.md"), vec![b'x'; MAX_FILE_BYTES * 2]).unwrap();
+        let append = AgentMemoryArgs {
+            action: Action::Append,
+            file: Some("MEMORY.md".into()),
+            content: Some("more".into()),
+        };
+        assert!(tool.call(append).await.is_err());
+        let write = AgentMemoryArgs {
+            action: Action::Write,
+            file: Some("MEMORY.md".into()),
+            content: Some("short index".into()),
+        };
+        tool.call(write).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("MEMORY.md")).unwrap(),
+            "short index"
+        );
     }
 
     #[cfg(unix)]
