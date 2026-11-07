@@ -577,17 +577,15 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("promote-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("job.log");
-        let mut capture = SpooledCapture::new(policy(
-            4,
-            4,
-            Some(10),
-            LogPolicy::OnOverflow(path.clone()),
-        ));
+        let mut capture =
+            SpooledCapture::new(policy(4, 4, Some(10), LogPolicy::OnOverflow(path.clone())));
         capture.push(OutputChannel::Stdout, b"abc").unwrap();
         assert!(!path.exists(), "no log while everything is retained");
         capture.promote_to_background();
         assert_eq!(std::fs::read(&path).unwrap(), b"abc");
-        capture.push(OutputChannel::Stdout, b"0123456789abcdef").unwrap();
+        capture
+            .push(OutputChannel::Stdout, b"0123456789abcdef")
+            .unwrap();
         assert_eq!(capture.total_bytes(), 19);
         assert_eq!(std::fs::read(&path).unwrap().len(), 19);
         let _ = std::fs::remove_dir_all(&dir);
