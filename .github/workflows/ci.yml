@@ -26,7 +26,8 @@ on:
   # aggregate) run only for tag pushes, the weekly schedule and manual
   # dispatch; they are skipped on branch pushes and pull requests. The native
   # Linux gate (linux-sandbox-policy) is the only per-push coverage of
-  # Linux-only code and runs on every event. A tag run still requires every
+  # Linux-only code and runs when code or tests change, plus drift/tag events.
+  # Non-build records-only pushes skip it. A tag run still requires every
   # gate: scripts/ci_success.py accepts their `skipped` result only for
   # branch-push and pull-request events, and release.yml requires the tag
   # run's ci-success.
@@ -107,7 +108,10 @@ jobs:
         run: |
           # One classifier owns the filter and pass-cache exclusions. Missing
           # Python, script errors and unresolved history all run the matrix.
-          python3 scripts/ci_scope.py --filter || echo "code=true" >> "$GITHUB_OUTPUT"
+          python3 scripts/ci_scope.py --filter || {
+            echo "::warning::CI impact classifier unavailable; running the full matrix"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          }
 
       # Refines code=true: a push or pull request whose every non-docs path is
       # test-only by path gets scope=tests (fmt/policy, Linux clippy and the
@@ -223,9 +227,9 @@ jobs:
   # assembled archive re-checked against the lockfile (mini-agent-yiodv).
   #
   # Two measures keep this off the fast path. It is code-gated (`needs:
-  # changes`), so a documentation-only push skips it like the build matrix
-  # (Markdown cannot break assembly; LICENSE, NOTICE and SOURCE.md, which the
-  # packager checks, count as code in the filter), while every code change,
+  # changes`), so non-build records/docs and test-only pushes skip assembly.
+  # Consumed Markdown, LICENSE, NOTICE and SOURCE.md remain build inputs.
+  # Every production/build-input change,
   # tag push and full dispatch still assembles the archive. It used to sit in
   # the unconditional `fmt` job and cost several minutes on every docs push.
   # And the ~500 npm tarballs (~195 MB) are cached across runs under the
@@ -280,8 +284,8 @@ jobs:
 
   # Runs on pushes as well as pull requests: work lands directly on main, so a
   # pull-request-only gate left the eval and the Gym smoke unexercised for
-  # weeks (mini-agent-5casv). Only a documentation-only change or the Windows
-  # sandbox dispatch scope skips it; neither step reads pull-request context.
+  # weeks (mini-agent-5casv). Non-build records, test-only changes and targeted
+  # Windows dispatches skip it; neither step reads pull-request context.
   harness-regression:
     if: needs.changes.outputs.code == 'true' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox') && needs.changes.outputs.full == 'true'
     needs: changes
@@ -298,7 +302,7 @@ jobs:
 
       # The deterministic five-task suite uses scripted providers and bounded
       # per-fixture turn/tool/token budgets, so it is cheap enough to gate
-      # every push and pull request. The `harness_regression_eval` filter also
+      # production-input pushes and pull requests. The `harness_regression_eval` filter also
       # selects harness_regression_eval_evidence_axis, which drives the real
       # task executor against a scripted loopback child with task_evidence on
       # and off and asserts that evidence handles never lower parent accuracy.

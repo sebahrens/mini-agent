@@ -16,11 +16,16 @@ These paths also leave production and test pass fingerprints unchanged, so
 including a review report in a later source change does not invalidate extra
 cached results. The exemption is based on the owning directory or exact metadata
 path, not on a blanket JSON or log extension rule.
+File modes are included in pass fingerprints: changing an executable bit on a
+build/test input invalidates its pass, while modes on excluded evidence do not.
 
 Embedded agent documentation, normative specs, benchmark baselines, the ACP
 registry, release source/license documents, unknown data files, build settings,
 workflow actions, and production source remain inputs. Test-only changes retain
-their existing test scope and platform rules. A mixed change retains the checks
+native coverage selected by paths and Rust `cfg`/`cfg_attr` attributes, including
+multiline and per-item attributes anywhere in either diff revision. Removed
+tests and removed gates retain their previous platform coverage. Negated
+platform conditions conservatively retain both native platforms. A mixed change retains the checks
 required by its code or tests.
 
 Agent configuration such as `.claude/settings.json` remains an input because
@@ -32,6 +37,8 @@ Tags, scheduled drift checks, full manual runs, and unresolved history retain
 their existing full/fail-open policy. The explicit Windows manual proof scopes
 are unchanged. The formatting job executes the scope, fingerprint, and workflow
 filter regression tests on every normal push, including records-only changes.
+The classifier logs its decision, fallback reason, and at most 20 changed paths.
+Paths are JSON-escaped so embedded newlines cannot create misleading log entries.
 
 When adding a consumer of a previously exempt path, update the classifier and
 its negative-control tests in the same change. Unknown non-Markdown documentation

@@ -1,0 +1,126 @@
+FFFFFFFF
+======================================================================
+FAIL: test_multiline_item_and_late_platform_attributes_keep_native_rows (scripts.tests.test_ci_scope.ClassifyTests.test_multiline_item_and_late_platform_attributes_keep_native_rows) (source='#![cfg(\n all(feature = "mcp", target_os = "windows")\n)]')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/seb/projects/mini-agent/scripts/tests/test_ci_scope.py", line 95, in test_multiline_item_and_late_platform_attributes_keep_native_rows
+    self.assertEqual(expected, self.scope("tests/native_contract.rs", sources={"tests/native_contract.rs": source})[1:])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Tuples differ: (False, True) != (False, False)
+
+First differing element 1:
+True
+False
+
+- (False, True)
++ (False, False)
+
+======================================================================
+FAIL: test_multiline_item_and_late_platform_attributes_keep_native_rows (scripts.tests.test_ci_scope.ClassifyTests.test_multiline_item_and_late_platform_attributes_keep_native_rows) (source='#[cfg(\n target_os = "macos"\n)]\nfn native_test() {}')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/seb/projects/mini-agent/scripts/tests/test_ci_scope.py", line 95, in test_multiline_item_and_late_platform_attributes_keep_native_rows
+    self.assertEqual(expected, self.scope("tests/native_contract.rs", sources={"tests/native_contract.rs": source})[1:])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Tuples differ: (True, False) != (False, False)
+
+First differing element 0:
+True
+False
+
+- (True, False)
++ (False, False)
+
+======================================================================
+FAIL: test_multiline_item_and_late_platform_attributes_keep_native_rows (scripts.tests.test_ci_scope.ClassifyTests.test_multiline_item_and_late_platform_attributes_keep_native_rows) (source='#![cfg_attr(feature = "native", cfg(unix))]')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/seb/projects/mini-agent/scripts/tests/test_ci_scope.py", line 95, in test_multiline_item_and_late_platform_attributes_keep_native_rows
+    self.assertEqual(expected, self.scope("tests/native_contract.rs", sources={"tests/native_contract.rs": source})[1:])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Tuples differ: (True, False) != (False, False)
+
+First differing element 0:
+True
+False
+
+- (True, False)
++ (False, False)
+
+======================================================================
+FAIL: test_multiline_item_and_late_platform_attributes_keep_native_rows (scripts.tests.test_ci_scope.ClassifyTests.test_multiline_item_and_late_platform_attributes_keep_native_rows) (source='/ license\n// license\n// license\n// license\n// license\n// license\n#[cfg(windows)]\nfn native_test() {}')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/seb/projects/mini-agent/scripts/tests/test_ci_scope.py", line 95, in test_multiline_item_and_late_platform_attributes_keep_native_rows
+    self.assertEqual(expected, self.scope("tests/native_contract.rs", sources={"tests/native_contract.rs": source})[1:])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Tuples differ: (False, True) != (False, False)
+
+First differing element 1:
+True
+False
+
+- (False, True)
++ (False, False)
+
+======================================================================
+FAIL: test_multiline_item_and_late_platform_attributes_keep_native_rows (scripts.tests.test_ci_scope.ClassifyTests.test_multiline_item_and_late_platform_attributes_keep_native_rows) (source='#[cfg(any(windows, target_os = "macos"))]')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/seb/projects/mini-agent/scripts/tests/test_ci_scope.py", line 95, in test_multiline_item_and_late_platform_attributes_keep_native_rows
+    self.assertEqual(expected, self.scope("tests/native_contract.rs", sources={"tests/native_contract.rs": source})[1:])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Tuples differ: (True, True) != (False, False)
+
+First differing element 0:
+True
+False
+
+- (True, True)
++ (False, False)
+
+======================================================================
+FAIL: test_multiline_item_and_late_platform_attributes_keep_native_rows (scripts.tests.test_ci_scope.ClassifyTests.test_multiline_item_and_late_platform_attributes_keep_native_rows) (source='#[cfg(not(unix))]')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/seb/projects/mini-agent/scripts/tests/test_ci_scope.py", line 95, in test_multiline_item_and_late_platform_attributes_keep_native_rows
+    self.assertEqual(expected, self.scope("tests/native_contract.rs", sources={"tests/native_contract.rs": source})[1:])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Tuples differ: (True, True) != (False, False)
+
+First differing element 0:
+True
+False
+
+- (True, True)
++ (False, False)
+
+======================================================================
+FAIL: test_multiline_item_and_late_platform_attributes_keep_native_rows (scripts.tests.test_ci_scope.ClassifyTests.test_multiline_item_and_late_platform_attributes_keep_native_rows) (source='#[cfg(not(target_os = "linux"))]')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/seb/projects/mini-agent/scripts/tests/test_ci_scope.py", line 95, in test_multiline_item_and_late_platform_attributes_keep_native_rows
+    self.assertEqual(expected, self.scope("tests/native_contract.rs", sources={"tests/native_contract.rs": source})[1:])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Tuples differ: (True, True) != (False, False)
+
+First differing element 0:
+True
+False
+
+- (True, True)
++ (False, False)
+
+======================================================================
+FAIL: test_real_index_mode_changes_invalidate_only_relevant_input_classes (scripts.tests.test_ci_fingerprint.FingerprintInputSetTests.test_real_index_mode_changes_invalidate_only_relevant_input_classes)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/seb/projects/mini-agent/scripts/tests/test_ci_fingerprint.py", line 77, in test_real_index_mode_changes_invalidate_only_relevant_input_classes
+    self.assertNotEqual(compute(baseline, input_class), compute(executable, input_class))
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'f3baea56658ee46e3f0c5f6620bc716c10288e6abf52cf17b8cf10dde6d277f7' == 'f3baea56658ee46e3f0c5f6620bc716c10288e6abf52cf17b8cf10dde6d277f7'
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.064s
+
+FAILED (failures=8)

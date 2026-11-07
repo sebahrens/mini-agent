@@ -22,9 +22,9 @@ dispatch and the weekly schedule, so on pull requests and branch pushes their
 `skipped` result is accepted by design; on a tag push or dispatch they must
 succeed like every other job, which keeps the release's CI evidence complete.
 
-Whenever `changes` reported `code=true` every other gating job must succeed on
-every event, including `harness-regression` on a push (it used to run on pull
-requests only, which left it unexercised because work lands directly on main).
+For a full code scope, every applicable gating job must succeed, including
+`harness-regression` on branch pushes. The explicit test-scope and heavy-gate
+exceptions above are the only additional accepted skips for code=true runs.
 `failure` and `cancelled` are never accepted.
 """
 

@@ -1,0 +1,77 @@
+{
+  "baseline": "f167a2e137377e32aeaefb08caa90ff17d1c8fa9",
+  "parent": "mini-agent-fb6g7",
+  "scope": [
+    "CI input classification, pass fingerprints and aggregate acceptance",
+    "Release/operator CI guidance and changed regression tests",
+    "Spot-check of previously repaired directory-listing completeness and credential-command documentation"
+  ],
+  "findings": [
+    {
+      "bead": "mini-agent-fb6g7.1",
+      "priority": 4,
+      "title": "Restore CI impact diagnostics",
+      "correction": "The workflow reports the selected route, conservative fallback reason, and at most20 JSON-escaped changed paths; missing Python emits an explicit warning.",
+      "status": "implemented; local acceptance passed; hosted owning checks pending"
+    },
+    {
+      "bead": "mini-agent-fb6g7.2",
+      "priority": 4,
+      "title": "Correct release and CI scope guidance",
+      "correction": "Reconciled records-only, test-only, packaging, harness and Linux-gate behavior in the release guide, workflow comments and aggregate documentation.",
+      "status": "implemented; local acceptance passed; hosted owning checks pending"
+    },
+    {
+      "bead": "mini-agent-fb6g7.3",
+      "priority": 3,
+      "title": "Invalidate CI pass caches for file-mode changes",
+      "correction": "Tracked identities now include mode plus object ID. Real Git index tests distinguish production/test helper modes while preserving evidence exclusions.",
+      "status": "implemented; local acceptance passed; hosted owning checks pending"
+    },
+    {
+      "bead": "mini-agent-fb6g7.4",
+      "priority": 3,
+      "title": "Retain platform proofs from before/after Rust test attributes",
+      "correction": "Scans complete multiline, item-level and cfg_attr markers from both Git revisions, including deleted tests and removed gates. Literal path lookup handles bracketed names; unreadable or nonregular test inputs fail open. Negated platform conditions retain both native OS rows conservatively.",
+      "status": "implemented; local acceptance passed; hosted owning checks pending"
+    }
+  ],
+  "validation": {
+    "focused_python": {
+      "tests": 62,
+      "result": "passed"
+    },
+    "broader_python": {
+      "ci_policy_tests": 194,
+      "package_policy_tests": 117,
+      "feature_graph_tests": 28,
+      "result": "passed; feature graph result reused after documentation-only edits"
+    },
+    "rust": {
+      "command": "cargo test --locked --bin mini-agent -- docs:: test_workflow_only_headless_relevance_check_executes_embedded_policy --test-threads=1",
+      "tests": 4,
+      "result": "passed"
+    },
+    "negative_control": {
+      "baseline": "f167a2e1",
+      "tests": 2,
+      "expected_assertion_failures": 8,
+      "errors": 0,
+      "evidence": "2026-11-07-additional-p4-evidence/negative-controls.log"
+    },
+    "native_smoke": "Final installed debug artifact: JS runtime check PASS (2).",
+    "scope_rationale": "Production Rust logic, dependency graph and containment code are unchanged. Reuse the full green source matrix42408094543; verify the changed CI policy jobs, embedded documentation, debug installation and a final records-only green CI run.",
+    "install": {
+      "command": "cargo install --path . --debug --locked",
+      "result": "passed; final build completed in12.19s",
+      "version": "mini-agent 1.12.0\nbuild: 0a0185f42defdd3a466a4f4731e61e16a92a93476e005abb50999d6a1dad4ab5\ntarget: aarch64-apple-darwin"
+    }
+  },
+  "root_final_review": {
+    "findings": [],
+    "assessment": "No further confirmed issue in the reviewed paths after the four corrections. Platform attribute collection is conservative rather than a full Rust cfg evaluator."
+  },
+  "hosted_validation": {
+    "status": "pending"
+  }
+}

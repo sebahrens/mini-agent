@@ -78,6 +78,22 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual((True, False), self.scope("src/tests/c_tests.rs", sources=gated)[1:])
         self.assertEqual((False, False), self.scope("src/tests/d_tests.rs", sources=gated)[1:])
 
+    def test_multiline_item_and_late_platform_attributes_keep_native_rows(self) -> None:
+        cases = (
+            ('#![cfg(\n all(feature = "mcp", target_os = "windows")\n)]', (False, True)),
+            ('#[cfg(\n target_os = "macos"\n)]\nfn native_test() {}', (True, False)),
+            ('#![cfg_attr(feature = "native", cfg(unix))]', (True, False)),
+            ('// license\n' * 600 + '#[cfg(windows)]\nfn native_test() {}', (False, True)),
+            ('#[cfg(any(windows, target_os = "macos"))]', (True, True)),
+            ('#[cfg(target_os = "linux")]', (False, False)),
+            ('#[cfg(not(unix))]', (True, True)),
+            ('#[cfg(not(target_os = "linux"))]', (True, True)),
+            ('#[cfg(not(feature = "sandbox"))]', (False, False)),
+        )
+        for source, expected in cases:
+            with self.subTest(source=source[-100:]):
+                self.assertEqual(expected, self.scope("tests/native_contract.rs", sources={"tests/native_contract.rs": source})[1:])
+
     def test_outputs(self) -> None:
         tests = ci_scope.Scope("tests", False, False)
         self.assertIn("full=false\nmacos=false\nwindows=false\n", ci_scope.render(tests))
@@ -90,16 +106,21 @@ class ClassifyTests(unittest.TestCase):
 
 
 class ResolveTests(unittest.TestCase):
-    def resolve(self, paths, **env):
+    def resolve(self, paths, report=None, **env):
         def run(cmd, **kwargs):
             if isinstance(paths, Exception):
                 raise paths
-            output = "" if cmd[1] == "cat-file" else "".join(f"{p}\0" for p in paths)
+            if cmd[1] == "diff":
+                output = "".join(f"{p}\0" for p in paths)
+            elif cmd[1] == "--literal-pathspecs":
+                output = f"100644 blob {'0' * 40}\t{cmd[-1]}\0"
+            else:
+                output = ""
             return subprocess.CompletedProcess(cmd, 0, stdout=output)
 
         base = {"EVENT": "pull_request", "GITHUB_REF": "refs/pull/1/merge", "BASE_SHA": BASE, "HEAD_SHA": HEAD}
         base.update(env)
-        return ci_scope.resolve(base, run=run)
+        return ci_scope.resolve(base, run=run, report=report)
 
     def test_test_only_pull_request_and_push(self) -> None:
         self.assertEqual("tests", self.resolve(["src/tests/a_tests.rs"]).scope)
@@ -119,10 +140,43 @@ class ResolveTests(unittest.TestCase):
     def test_docs_verdict_is_shared_with_the_workflow_filter(self) -> None:
         self.assertEqual("docs", self.resolve(["README.md", "docs/reviews/final.json"]).scope)
 
+    def test_diagnostics_explain_scope_fallback_and_bound_escaped_paths(self) -> None:
+        messages = []
+        paths = ['docs/reviews/a\n::error::.json'] + [f"docs/reviews/{n}.json" for n in range(24)]
+        self.assertEqual("docs", self.resolve(paths, report=messages.append).scope)
+        self.assertIn("Changed paths (25):", messages[0])
+        self.assertIn("5 more omitted", messages[0])
+        self.assertNotIn("\n", messages[0])
+        self.assertIn("skipping the expensive matrix", messages[-1])
+        messages.clear()
+        self.assertEqual(ci_scope.FULL, self.resolve([], BASE_SHA="", report=messages.append))
+        self.assertIn("missing base/head revision", messages[-1])
+        messages.clear()
+        self.assertEqual(ci_scope.FULL, self.resolve(["src/main.rs"], report=messages.append))
+        self.assertIn("build or unknown inputs", messages[-1])
+
+    def test_unreadable_or_nonregular_revision_test_fails_open(self) -> None:
+        for mode in ("100644", "120000"):
+            def run(cmd, **kwargs):
+                if cmd[1] == "diff":
+                    output = "tests/native_contract.rs\0"
+                elif cmd[1] == "--literal-pathspecs":
+                    output = f"{mode} blob {'0' * 40}\ttests/native_contract.rs\0"
+                elif cmd[1] == "show":
+                    raise subprocess.CalledProcessError(128, cmd)
+                else:
+                    output = ""
+                return subprocess.CompletedProcess(cmd, 0, stdout=output)
+            with self.subTest(mode=mode):
+                self.assertEqual(ci_scope.FULL, ci_scope.resolve(
+                    {"EVENT": "push", "BASE_SHA": BASE, "HEAD_SHA": HEAD}, run=run,
+                ))
+
 
 class DocsFilterEquivalenceTests(unittest.TestCase):
     def test_workflow_uses_the_shared_classifier(self) -> None:
-        self.assertIn('python3 scripts/ci_scope.py --filter || echo "code=true"', WORKFLOW)
+        self.assertIn('python3 scripts/ci_scope.py --filter || {', WORKFLOW)
+        self.assertIn('CI impact classifier unavailable; running the full matrix', WORKFLOW)
         self.assertNotIn("docs_only=", WORKFLOW)
         self.assertNotIn("consumed_docs=", WORKFLOW)
 
@@ -169,6 +223,22 @@ class GitDiffTests(unittest.TestCase):
             review.rename(source)
             moved_in = commit()
             self.assertEqual("code", scope(moved_out, moved_in).scope)
+
+            native = root / "tests/[native]_contract.rs"
+            native.parent.mkdir()
+            native.write_text('// license\n' * 600 + '#[cfg(\n target_os = "windows"\n)]\nfn native_test() {}\n')
+            native_added = commit()
+            expected = ci_scope.Scope("tests", False, True)
+            self.assertEqual(expected, scope(moved_in, native_added))
+            # Checkout state is not either diff revision and must not control
+            # coverage; removing the gate must retain its former native proof.
+            native.write_text("fn native_test() {}\n")
+            self.assertEqual(expected, scope(moved_in, native_added))
+            gate_removed = commit()
+            self.assertEqual(expected, scope(native_added, gate_removed))
+            native.unlink()
+            native_deleted = commit()
+            self.assertEqual(expected, scope(native_added, native_deleted))
 
 
 class WorkflowWiringTests(unittest.TestCase):

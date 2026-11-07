@@ -59,6 +59,33 @@ def compute(items, input_class, **kw) -> str:
 
 
 class FingerprintInputSetTests(unittest.TestCase):
+    def test_real_index_mode_changes_invalidate_only_relevant_input_classes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            def git(*args):
+                return subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
+            git("init", "-q")
+            for name in ("run.sh", "tests/helper.sh", "docs/reviews/evidence.sh"):
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("#!/bin/sh\nexit 0\n")
+            git("add", ".")
+            baseline = fp.tracked_files(directory)
+            git("update-index", "--chmod=+x", "run.sh")
+            executable = fp.tracked_files(directory)
+            for input_class in fp.CLASSES:
+                self.assertNotEqual(compute(baseline, input_class), compute(executable, input_class))
+            git("update-index", "--chmod=-x", "run.sh")
+            git("update-index", "--chmod=+x", "tests/helper.sh")
+            helper = fp.tracked_files(directory)
+            self.assertEqual(compute(baseline, "production"), compute(helper, "production"))
+            self.assertNotEqual(compute(baseline, "production+tests"), compute(helper, "production+tests"))
+            git("update-index", "--chmod=-x", "tests/helper.sh")
+            git("update-index", "--chmod=+x", "docs/reviews/evidence.sh")
+            evidence = fp.tracked_files(directory)
+            for input_class in fp.CLASSES:
+                self.assertEqual(compute(baseline, input_class), compute(evidence, input_class))
+
     def test_docs_only_change_changes_neither_class(self) -> None:
         for input_class in fp.CLASSES:
             with self.subTest(input_class=input_class):

@@ -37,7 +37,7 @@ PINNED_FILES = ("Cargo.lock", "rust-toolchain.toml", ".github/workflows/ci.yml")
 
 
 def tracked_files(root: str = ".") -> list[tuple[str, str]]:
-    """(path, git object id) of every tracked file."""
+    """(path, mode:object-id) of every tracked file, including executable bits."""
 
     out = subprocess.run(
         ["git", "ls-files", "-s", "-z"],
@@ -48,7 +48,8 @@ def tracked_files(root: str = ".") -> list[tuple[str, str]]:
     entries = []
     for record in filter(None, out.split("\0")):
         meta, _, path = record.partition("\t")
-        entries.append((path, meta.split()[1]))
+        mode, oid, _stage = meta.split()
+        entries.append((path, f"{mode}:{oid}"))
     return sorted(entries)
 
 

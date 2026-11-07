@@ -88,6 +88,8 @@ class CiDocsFilterTests(unittest.TestCase):
                 text=True,
             )
             self.assertEqual(0, result.returncode, result.stderr)
+            if broken_python:
+                self.assertIn("CI impact classifier unavailable", result.stdout)
             values = re.findall(r"^code=(true|false)$", output.read_text(), re.MULTILINE)
             self.assertEqual(1, len(values), output.read_text())
             return values[0]
