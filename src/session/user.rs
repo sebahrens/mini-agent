@@ -308,8 +308,14 @@ mod tests {
                 .is_some_and(|f| f > 24 << 20)
         );
         session.truncate_to(0);
-        let floor = session.bytes_after_last_compaction.unwrap();
-        assert!(floor <= session.approx_persisted_bytes());
+        // A rewind drops (or lowers) the floor; it may never stay above the
+        // remaining history.
+        let remaining = session.approx_persisted_bytes();
+        assert!(
+            session
+                .bytes_after_last_compaction
+                .is_none_or(|floor| floor <= remaining)
+        );
         // Regrow past the threshold: relief must arm again.
         let raw = vec![7u8; 1_900_000];
         for _ in 0..6 {
@@ -341,8 +347,12 @@ mod tests {
         assert!(before > 1_000_000);
         session.truncate_to(0);
         assert!(session.compactions.is_empty());
-        let floor = session.bytes_after_last_compaction.unwrap();
-        assert!(floor <= session.approx_persisted_bytes(), "floor={floor}");
+        let remaining = session.approx_persisted_bytes();
+        let floor = session.bytes_after_last_compaction;
+        assert!(
+            floor.is_none_or(|floor| floor <= remaining),
+            "floor={floor:?}"
+        );
     }
     #[test]
     fn redo_discards_a_floor_measured_before_the_restore() {
