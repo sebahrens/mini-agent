@@ -66,6 +66,30 @@ pub(crate) type SandboxCommand = Command;
 #[cfg(unix)]
 const WORKSPACE_AUTHORITY_FD: i32 = 197;
 
+/// Lowest descriptor number a pre_exec dup2 source may hold. The fixed
+/// child-side targets (bwrap `--args` 196, workspace authority 197) must never
+/// be reachable by the allocator, or one closure's dup2 could clobber another
+/// closure's source descriptor.
+#[cfg(unix)]
+const FIRST_UNRESERVED_FD: i32 = 198;
+
+/// Move `file` to a descriptor number above every fixed pre_exec target.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn move_fd_above_reserved(file: std::fs::File) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    if file.as_raw_fd() >= FIRST_UNRESERVED_FD {
+        return Ok(file);
+    }
+    // SAFETY: duplicating a descriptor we own; the result is wrapped at once.
+    let raw = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, FIRST_UNRESERVED_FD) };
+    if raw == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `raw` is a fresh descriptor owned by nobody else.
+    Ok(unsafe { std::fs::File::from_raw_fd(raw) })
+}
+
 type EssentialEnvironment = Arc<[(&'static str, String)]>;
 type NetworkProxyCell = Arc<OnceLock<Result<Arc<net_proxy::NetworkProxy>, String>>>;
 type EssentialEnvironmentCache = Arc<OnceLock<EssentialEnvironment>>;
@@ -2331,6 +2355,7 @@ impl Sandbox {
         };
         let directory = workspace
             .try_clone_directory_file()
+            .and_then(move_fd_above_reserved)
             .map_err(|error| format!("sandbox: failed to clone workspace handle: {error}"))?;
         let fd = directory.as_raw_fd();
         unsafe {
@@ -7765,6 +7790,8 @@ fn bwrap_set_env(cmd: &mut Command, env: &[(OsString, OsString)]) -> Result<(), 
     let mut file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(raw) });
     file.write_all(&bytes)
         .and_then(|()| file.seek(SeekFrom::Start(0)).map(drop))
+        .map_err(|error| format!("sandbox: failed to stage the bwrap environment: {error}"))?;
+    let file = move_fd_above_reserved(file)
         .map_err(|error| format!("sandbox: failed to stage the bwrap environment: {error}"))?;
     let fd = file.as_raw_fd();
     // SAFETY: only async-signal-safe libc calls run between fork and exec.
@@ -13217,5 +13244,28 @@ echo PRIVATE_TEMP_PASS"#,
             .await;
             assert!(ok && text.contains("forked"), "{text}");
         }
+    }
+
+    /// A source descriptor sitting on a fixed pre_exec target (196/197) would be
+    /// clobbered by another closure's dup2; sources must land above both.
+    #[cfg(unix)]
+    #[test]
+    fn pre_exec_sources_never_sit_on_reserved_descriptors() {
+        use std::os::fd::AsRawFd;
+        let mut held = Vec::new();
+        let victim = loop {
+            let file = std::fs::File::open("/dev/null").unwrap();
+            if file.as_raw_fd() >= 196 {
+                break file;
+            }
+            held.push(file);
+        };
+        let moved = move_fd_above_reserved(victim).unwrap();
+        assert!(
+            moved.as_raw_fd() > WORKSPACE_AUTHORITY_FD,
+            "{}",
+            moved.as_raw_fd()
+        );
+        drop(held);
     }
 }
