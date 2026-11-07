@@ -242,6 +242,7 @@ fn forbidden_v4(ip: Ipv4Addr) -> bool {
         || (a == 100 && (64..=127).contains(&b)) // carrier-grade NAT
         || (a == 198 && (b == 18 || b == 19)) // benchmarking 198.18.0.0/15
         || ip.octets()[..3] == [192, 0, 0] // IETF protocol assignments 192.0.0.0/24
+        || ip.octets() == [168, 63, 129, 16] // Azure WireServer
         || a >= 240
 }
 

@@ -1727,6 +1727,7 @@ fn is_metadata_ip(address: IpAddr) -> bool {
                     | [169, 254, 169, 253]
                     | [100, 100, 100, 200]
                     | [192, 0, 0, 192]
+                    | [168, 63, 129, 16]
             )
         }
         IpAddr::V6(ip) => {
@@ -1832,7 +1833,9 @@ fn is_restricted_ip(address: IpAddr) -> bool {
 
 fn is_restricted_ipv4(address: Ipv4Addr) -> bool {
     let [first, second, third, _] = address.octets();
-    first == 0
+    // Azure WireServer: a public-range virtual IP only reachable from an Azure VM.
+    address.octets() == [168, 63, 129, 16]
+        || first == 0
         || first == 10
         || (first == 100 && (64..=127).contains(&second))
         || first == 127
@@ -2175,6 +2178,8 @@ mod local_policy_tests {
         for ip in [
             "169.254.169.254",
             "169.254.170.2",
+            "168.63.129.16",
+            "::ffff:168.63.129.16",
             "100.100.100.200",
             "fd00:ec2::254",
             "fd20:ce::254",
@@ -2236,6 +2241,7 @@ mod local_policy_tests {
             "10.0.0.1",
             "192.168.1.2",
             "169.254.169.254",
+            "168.63.129.16",
             "0.0.0.0",
             "::",
             "fc00::1",

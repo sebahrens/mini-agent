@@ -189,6 +189,7 @@ pub(crate) fn is_public_ipv4(address: Ipv4Addr) -> bool {
         (0x6440_0000, 10), // shared address space
         (0x7f00_0000, 8),  // loopback
         (0xa9fe_0000, 16), // link-local and metadata
+        (0xa83f_8110, 32), // Azure WireServer 168.63.129.16 (public-range platform VIP)
         (0xac10_0000, 12), // RFC1918
         (0xc000_0000, 24), // IETF protocol assignments
         (0xc000_0200, 24), // TEST-NET-1
@@ -2118,6 +2119,8 @@ pub(crate) mod web_http_tests {
         for ip in [
             "127.0.0.1",
             "169.254.169.254",
+            "168.63.129.16",
+            "::ffff:168.63.129.16",
             "10.0.0.1",
             "::1",
             "::ffff:127.0.0.1",
