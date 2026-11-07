@@ -125,29 +125,51 @@ pub(crate) fn spawn_control_reader(
 ) -> tokio::sync::mpsc::Receiver<Result<String, String>> {
     crate::headless_control::enable(output, permission, ask_timeout);
     let (tx, rx) = tokio::sync::mpsc::channel(CONTROL_QUEUE_LINES);
-    tokio::spawn(async move {
-        loop {
-            let line = match read_stream_input_line().await {
-                Ok(Some(line)) => line,
-                Ok(None) | Err(_) => break,
-            };
-            if let Ok(text) = &line
-                && let Some(control) = crate::headless_control::classify_line(text.trim())
+    tokio::spawn(control_reader_loop(
+        crate::headless_control::state(),
+        output,
+        tx,
+        read_stream_input_line,
+    ));
+    rx
+}
+
+/// The reader task body: routes control lines to `state`, queues the rest,
+/// and on EOF, a read error or a dead output closes the control channel so
+/// pending and future asks deny instead of waiting for a driver that is gone.
+async fn control_reader_loop<F, Fut>(
+    state: Option<&crate::headless_control::ControlState>,
+    output: HeadlessOutputPolicy,
+    tx: tokio::sync::mpsc::Sender<Result<String, String>>,
+    mut next_line: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Option<Result<String, String>>>>,
+{
+    loop {
+        let line = match next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) | Err(_) => break,
+        };
+        if let Ok(text) = &line
+            && let Some(control) = crate::headless_control::classify_line(text.trim())
+        {
+            let ack = state.and_then(|s| s.handle(control));
+            if let Some(event) = ack
+                && output.emit_event(event).await.is_err()
             {
-                let ack = crate::headless_control::state().and_then(|s| s.handle(control));
-                if let Some(event) = ack
-                    && output.emit_event(event).await.is_err()
-                {
-                    break;
-                }
-                continue;
-            }
-            if tx.send(line).await.is_err() {
                 break;
             }
+            continue;
         }
-    });
-    rx
+        if tx.send(line).await.is_err() {
+            break;
+        }
+    }
+    // No driver can answer from here on: deny pending and future asks.
+    if let Some(state) = state {
+        state.close();
+    }
 }
 
 pub(crate) fn headless_result_emitted() -> bool {
@@ -1992,6 +2014,24 @@ fn parse_git_status(output: &[u8]) -> BTreeMap<String, [u8; 2]> {
         .collect()
 }
 
+/// Converts repository-root-relative status paths to workspace-relative ones;
+/// anything outside the workspace prefix is dropped.
+fn strip_workspace_prefix(
+    statuses: BTreeMap<String, [u8; 2]>,
+    prefix: &str,
+) -> BTreeMap<String, [u8; 2]> {
+    if prefix.is_empty() {
+        return statuses;
+    }
+    statuses
+        .into_iter()
+        .filter_map(|(path, status)| {
+            let relative = path.strip_prefix(prefix)?;
+            (!relative.is_empty()).then(|| (relative.to_owned(), status))
+        })
+        .collect()
+}
+
 fn workspace_path_state(root: &Path, path: &str, status: [u8; 2]) -> WorkspacePathState {
     let metadata = std::fs::symlink_metadata(root.join(path)).ok();
     let kind = metadata.as_ref().map(|metadata| {
@@ -2024,6 +2064,22 @@ pub(crate) async fn capture_workspace_change_baseline(
     root: &Path,
 ) -> Option<WorkspaceChangeBaseline> {
     let runner = crate::git::runner::GitRunner::discover().ok()?;
+    // `status --porcelain` prints repository-root-relative paths and covers the
+    // whole repository. The workspace may be a subdirectory, so learn its
+    // prefix, limit status to it (pathspec `.`) and strip the prefix so every
+    // path is workspace-relative like the tool-derived ones.
+    let prefix = runner
+        .run(
+            root,
+            "headless-output-prefix",
+            ["rev-parse", "--show-prefix"],
+            crate::git::runner::QUERY_LIMITS,
+        )
+        .await
+        .ok()?;
+    let prefix = String::from_utf8_lossy(&prefix.stdout)
+        .trim_end_matches(['\n', '\r'])
+        .to_owned();
     let output = runner
         .run(
             root,
@@ -2036,13 +2092,15 @@ pub(crate) async fn capture_workspace_change_baseline(
                 "--no-renames",
                 // Never spawn Git inside a (model-writable) nested repository.
                 "--ignore-submodules=dirty",
+                "--",
+                ".",
             ],
             crate::git::runner::QUERY_LIMITS,
         )
         .await
         .ok()?;
     let root = root.to_path_buf();
-    let statuses = parse_git_status(&output.stdout);
+    let statuses = strip_workspace_prefix(parse_git_status(&output.stdout), &prefix);
     let paths = tokio::task::spawn_blocking(move || {
         statuses
             .into_iter()
@@ -2738,43 +2796,70 @@ pub(crate) fn print_sessions(
     all: bool,
 ) -> anyhow::Result<()> {
     let catalogue = session::catalogue::list(workspace, all)?;
-    if catalogue.rows.is_empty() {
-        println!(
-            "no saved sessions in {}",
-            if all {
-                "any workspace"
-            } else {
-                "the current workspace"
-            }
-        );
-    } else {
-        println!(
-            "recent sessions ({}; {}):",
-            catalogue.rows.len(),
-            if all {
-                "all workspaces"
-            } else {
-                "current workspace"
-            }
-        );
-        for row in &catalogue.rows {
-            println!(
-                "  {}  {}  {}msgs  {}/{}  workspace:{}  {}",
-                short_session_id(&row.id),
-                crate::ui::pickers::sessions::relative_time(&row.updated_at),
-                row.message_count,
-                crate::ui::events::sanitize_output(&row.provider),
-                crate::ui::events::sanitize_output(&row.model),
-                crate::ui::events::sanitize_output(&row.working_dir),
-                row.title
-            );
-        }
-        println!(
-            "Use --session <id-or-name> to load a session; --resume-all includes other workspaces."
-        );
+    let stdout = io::stdout();
+    let stderr = io::stderr();
+    write_sessions(&mut stdout.lock(), &mut stderr.lock(), &catalogue, all)
+}
+
+/// A reader that exits early (`| head -1`) is success, not a panic.
+fn tolerate_closed_pipe(result: io::Result<()>) -> anyhow::Result<()> {
+    match result {
+        Err(error) if error.kind() != io::ErrorKind::BrokenPipe => Err(error.into()),
+        _ => Ok(()),
     }
+}
+
+fn write_sessions(
+    out: &mut impl io::Write,
+    err: &mut impl io::Write,
+    catalogue: &session::catalogue::Catalogue,
+    all: bool,
+) -> anyhow::Result<()> {
+    let listing = (|| -> io::Result<()> {
+        if catalogue.rows.is_empty() {
+            writeln!(
+                out,
+                "no saved sessions in {}",
+                if all {
+                    "any workspace"
+                } else {
+                    "the current workspace"
+                }
+            )?;
+        } else {
+            writeln!(
+                out,
+                "recent sessions ({}; {}):",
+                catalogue.rows.len(),
+                if all {
+                    "all workspaces"
+                } else {
+                    "current workspace"
+                }
+            )?;
+            for row in &catalogue.rows {
+                writeln!(
+                    out,
+                    "  {}  {}  {}msgs  {}/{}  workspace:{}  {}",
+                    short_session_id(&row.id),
+                    crate::ui::pickers::sessions::relative_time(&row.updated_at),
+                    row.message_count,
+                    crate::ui::events::sanitize_output(&row.provider),
+                    crate::ui::events::sanitize_output(&row.model),
+                    crate::ui::events::sanitize_output(&row.working_dir),
+                    row.title
+                )?;
+            }
+            writeln!(
+                out,
+                "Use --session <id-or-name> to load a session; --resume-all includes other workspaces."
+            )?;
+        }
+        out.flush()
+    })();
+    tolerate_closed_pipe(listing)?;
     if let Some(notice) = catalogue.notice() {
-        eprintln!("session catalogue limited: {notice}");
+        tolerate_closed_pipe(writeln!(err, "session catalogue limited: {notice}"))?;
     }
     Ok(())
 }
@@ -3330,6 +3415,82 @@ fn system_instruction_entries(cli: &cli::Cli) -> Vec<(&'static str, String)> {
 
 #[cfg(test)]
 mod tests {
+
+    use crate::print::{HeadlessOutputPolicy, control_reader_loop};
+
+    fn control_state() -> std::sync::Arc<crate::headless_control::ControlState> {
+        std::sync::Arc::new(crate::headless_control::ControlState::new(
+            HeadlessOutputPolicy::legacy(false, false),
+            None,
+            std::time::Duration::ZERO,
+        ))
+    }
+
+    async fn run_reader_over(
+        state: &crate::headless_control::ControlState,
+        script: Vec<anyhow::Result<Option<Result<String, String>>>>,
+    ) -> Vec<Result<String, String>> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut script = script.into_iter();
+        control_reader_loop(
+            Some(state),
+            HeadlessOutputPolicy::legacy(false, false),
+            tx,
+            move || {
+                let next = script.next().unwrap_or(Ok(None));
+                async move { next }
+            },
+        )
+        .await;
+        let mut queued = Vec::new();
+        while let Some(line) = rx.recv().await {
+            queued.push(line);
+        }
+        queued
+    }
+
+    #[tokio::test]
+    async fn stdin_eof_mid_ask_denies_the_pending_and_later_asks() {
+        let state = control_state();
+        let waiting = std::sync::Arc::clone(&state);
+        let ask = tokio::spawn(async move { waiting.ask("write", "x").await });
+        while state.pending_ids().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        let queued = run_reader_over(&state, vec![Ok(None)]).await;
+        assert!(queued.is_empty());
+        assert!(matches!(
+            ask.await.unwrap(),
+            crate::headless_control::Reply::Deny(_)
+        ));
+        assert!(matches!(
+            state.ask("bash", "touch x").await,
+            crate::headless_control::Reply::Deny(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn stdin_read_error_mid_ask_denies_and_keeps_queued_lines() {
+        let state = control_state();
+        let waiting = std::sync::Arc::clone(&state);
+        let ask = tokio::spawn(async move { waiting.ask("write", "x").await });
+        while state.pending_ids().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        let queued = run_reader_over(
+            &state,
+            vec![
+                Ok(Some(Ok(r#"{"type":"user","content":"hi"}"#.into()))),
+                Err(anyhow::anyhow!("broken pipe")),
+            ],
+        )
+        .await;
+        assert_eq!(queued.len(), 1);
+        assert!(matches!(
+            ask.await.unwrap(),
+            crate::headless_control::Reply::Deny(_)
+        ));
+    }
     #[cfg(unix)]
     #[test]
     #[allow(unsafe_code)]
@@ -3831,6 +3992,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn listing_sessions_into_a_closed_pipe_is_success() {
+        let row = crate::session::catalogue::SessionRow {
+            id: "abcdef123456".into(),
+            title: "t".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            working_dir: "/w".into(),
+            message_count: 1,
+            provider: "p".into(),
+            model: "m".into(),
+            current_workspace: true,
+        };
+        let catalogue = crate::session::catalogue::Catalogue {
+            rows: vec![row],
+            truncated: true,
+            skipped: 0,
+        };
+        let empty = crate::session::catalogue::Catalogue::default();
+        for catalogue in [&catalogue, &empty] {
+            assert!(
+                super::write_sessions(
+                    &mut BrokenPipeWriter,
+                    &mut BrokenPipeWriter,
+                    catalogue,
+                    false
+                )
+                .is_ok()
+            );
+            assert!(
+                super::write_sessions(
+                    &mut FlushBrokenPipeWriter,
+                    &mut BrokenPipeWriter,
+                    catalogue,
+                    true
+                )
+                .is_ok()
+            );
+        }
+        // Other write errors still surface.
+        struct Full;
+        impl io::Write for Full {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("disk full"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        assert!(super::write_sessions(&mut Full, &mut io::sink(), &empty, false).is_err());
+    }
+
     struct FlushBrokenPipeWriter;
 
     impl io::Write for FlushBrokenPipeWriter {
@@ -4286,6 +4498,49 @@ mod tests {
         );
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn workspace_change_snapshot_in_a_repo_subdirectory_is_workspace_relative() {
+        let repo = std::env::temp_dir().join(format!(
+            "mini-agent-headless-change-subdir-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let workspace = repo.join("packages").join("app");
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::create_dir_all(repo.join("other")).unwrap();
+        let runner = crate::git::runner::GitRunner::discover().expect("Git should be available");
+        runner
+            .run(
+                &repo,
+                "headless-output-test-init",
+                ["init", "--quiet"],
+                crate::git::runner::LOCAL_MUTATION_LIMITS,
+            )
+            .await
+            .expect("temporary repository should initialize");
+        std::fs::write(workspace.join("src/z.rs"), "a").unwrap();
+
+        let before = super::capture_workspace_change_baseline(&workspace).await;
+        // A sibling package changes concurrently, and a pre-dirty file is
+        // edited again; neither must leak a repo-root-relative path.
+        std::fs::write(repo.join("other/y.rs"), "x").unwrap();
+        std::fs::write(workspace.join("src/z.rs"), "longer content").unwrap();
+        std::fs::write(workspace.join("src/x.rs"), "new").unwrap();
+        let tool_call = Message::Assistant {
+            id: None,
+            content: OneOrMany::one(AssistantContent::tool_call(
+                "c1",
+                "edit",
+                serde_json::json!({"path": "src/x.rs"}),
+            )),
+        };
+        assert_eq!(
+            super::files_changed_since(&workspace, before.as_ref(), &[tool_call]).await,
+            ["src/x.rs", "src/z.rs"]
+        );
+
+        std::fs::remove_dir_all(repo).unwrap();
     }
 
     #[cfg(feature = "advisor")]
