@@ -49,7 +49,7 @@ pub(crate) fn tighten_after_provider_rejection() -> bool {
 
 /// Serializes tests that read or move the process-wide cap.
 #[cfg(test)]
-pub(crate) static CAP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static CAP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
 pub(crate) fn reset_cap_for_tests() {
@@ -135,10 +135,8 @@ fn replace(messages: &mut [Message], elide: &[bool], note: &str) {
             Message::User { content } => {
                 for item in content.iter_mut() {
                     match item {
-                        UserContent::Image(_) => {
-                            if take(&mut ordinal) {
-                                *item = UserContent::text(note);
-                            }
+                        UserContent::Image(_) if take(&mut ordinal) => {
+                            *item = UserContent::text(note);
                         }
                         UserContent::ToolResult(result) => {
                             for inner in result.content.iter_mut() {
@@ -397,7 +395,7 @@ mod tests {
     async fn twenty_five_read_images_still_send_and_the_transcript_keeps_them() {
         use crate::tests::fake_model::{MockStreamEvent, text_turns};
         use futures::StreamExt;
-        let _guard = CAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = CAP_TEST_LOCK.lock().await;
         reset_cap_for_tests();
         let model = text_turns([["ok"]]);
         let agent = rig::agent::AgentBuilder::new(model.clone()).build();
@@ -434,7 +432,7 @@ mod tests {
         use crate::tests::fake_model::MockStreamEvent;
         use futures::StreamExt;
         use rig::test_utils::MockCompletionModel;
-        let _guard = CAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = CAP_TEST_LOCK.lock().await;
         reset_cap_for_tests();
         struct Probe;
         impl rig::tool::Tool for Probe {
@@ -486,7 +484,7 @@ mod tests {
 
     #[test]
     fn provider_rejection_halves_the_cap_and_is_recognised() {
-        let _guard = CAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = CAP_TEST_LOCK.blocking_lock();
         reset_cap_for_tests();
         assert!(is_image_limit_error_message(
             "image dimensions exceed max allowed size for many-image requests: 2000 pixels"

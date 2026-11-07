@@ -610,9 +610,7 @@ mod tests {
 
     #[tokio::test]
     async fn many_image_rejection_tightens_the_budget_and_retries_once_without_a_delay() {
-        let _guard = crate::agent::image_budget::CAP_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::agent::image_budget::CAP_TEST_LOCK.lock().await;
         crate::agent::image_budget::reset_cap_for_tests();
         let calls = Arc::new(Mutex::new(0usize));
         let observed = Arc::clone(&calls);
