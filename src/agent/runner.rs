@@ -3171,6 +3171,36 @@ pub(crate) fn convert_history_prefix(
     convert_history_uncached(&prefix, keep_recent_tool_results, false)
 }
 
+/// The cache-fork prefix for compacting `session` up to `cut_idx`, or `None`
+/// when the fork is ineligible: a native thinking chain is in play, images sit
+/// in the prefix, or the prefix would not fit the summarizer's input budget.
+/// The caller still has to check the agent route (`supports_cache_fork`) and
+/// that no separate `compaction_model` is configured (mini-agent-o2nut).
+pub(crate) fn cache_fork_history(
+    session: &Session,
+    cut_idx: usize,
+    keep_recent_tool_results: usize,
+    input_token_budget: u64,
+) -> Option<Vec<Message>> {
+    if session.native_history_snapshot().is_some() || session.prefix_has_images(cut_idx) {
+        return None;
+    }
+    let first_live = session.compacted_context().1;
+    let tokens: u64 = session.messages[first_live.min(cut_idx)..cut_idx]
+        .iter()
+        .map(|message| message.estimated_tokens)
+        .sum();
+    // Leave room for the instruction and the estimator's error.
+    if tokens.saturating_add(2_000) > input_token_budget / 10 * 9 {
+        return None;
+    }
+    Some(convert_history_prefix(
+        session,
+        cut_idx,
+        keep_recent_tool_results,
+    ))
+}
+
 /// Rewrites a persisted tool identity into one that is safe to replay on its
 /// own.
 ///

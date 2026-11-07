@@ -2422,7 +2422,7 @@ where
 /// instruction appended as the final user turn and tool calls disabled. The
 /// prefix matches the conversation's earlier requests, so a native
 /// prompt-cache route bills it at the cache-read rate (mini-agent-o2nut).
-async fn run_forked_summarizer<M>(
+pub(crate) async fn run_forked_summarizer<M>(
     agent: &rig::agent::Agent<M>,
     history: Vec<Message>,
     instruction: String,
@@ -2760,7 +2760,7 @@ where
 /// The final user turn of a forked (cache-reusing) summarization request: the
 /// summarizer contract plus the user's compression preference, applied to the
 /// conversation that precedes it.
-fn fork_instruction(instructions: Option<&str>) -> String {
+pub(crate) fn fork_instruction(instructions: Option<&str>) -> String {
     let mut text = summarizer_preamble();
     text.push_str(
         "\n\n---\n\nThis message is a summarization request, not a continuation of the work. \
