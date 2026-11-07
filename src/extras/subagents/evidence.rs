@@ -417,13 +417,25 @@ fn path_checks(
         "grep" => ("grep", true),
         "find_files" => ("find_files", true),
         "list_dir" => ("list_dir", true),
-        "lsp_diagnostics" | "lsp_navigate" | "notebook_edit" | "notebook_read" => ("read", false),
+        // Without a path, diagnostics are project-wide (optionally restricted
+        // by `directory`), so the root or that directory is the subject.
+        "lsp_diagnostics" => ("read", true),
+        "lsp_navigate" | "notebook_edit" | "notebook_read" => ("read", false),
         _ => return Vec::new(),
     };
-    let raw = arguments
-        .get("path")
-        .and_then(serde_json::Value::as_str)
-        .filter(|path| !path.is_empty());
+    let string_arg = |name: &str| {
+        arguments
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+    };
+    let raw = string_arg("path").or_else(|| {
+        if tool == "lsp_diagnostics" {
+            string_arg("directory")
+        } else {
+            None
+        }
+    });
     let raw = match raw {
         Some(raw) => raw,
         None if default_to_root => ".",
@@ -829,6 +841,31 @@ mod tests {
                 ("E1".to_owned(), "first".to_owned()),
                 ("E2".to_owned(), "second".to_owned())
             ]
+        );
+    }
+
+    #[test]
+    fn workspace_wide_lsp_diagnostics_are_rejudged_at_the_root() {
+        let root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let mut evidence = ChildEvidence::default().with_child_context(Some(root.clone()), vec![]);
+        evidence.record_history(&[
+            call("a", "lsp_diagnostics", serde_json::json!({})),
+            result("a", vec![text("diag")]),
+            call(
+                "b",
+                "lsp_diagnostics",
+                serde_json::json!({"directory": "src"}),
+            ),
+            result("b", vec![text("diag")]),
+        ]);
+        let metas: Vec<_> = evidence.metas().cloned().collect();
+        assert_eq!(
+            metas[0].path_checks,
+            vec![("read", root.to_str().unwrap().to_owned())]
+        );
+        assert_eq!(
+            metas[1].path_checks,
+            vec![("read", root.join("src").to_str().unwrap().to_owned())]
         );
     }
 
