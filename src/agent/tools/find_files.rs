@@ -1958,7 +1958,8 @@ impl FindFilesTool {
         FindFilesTool {
             permission,
             ask_tx,
-            max_results,
+            // A zero cap would panic `clamp(1, cap)` and page forever.
+            max_results: max_results.max(1),
             workspace: None,
         }
     }
@@ -3097,6 +3098,32 @@ mod tests {
         assert!(!output.contains("m.txt"), "{output}");
         assert!(!output.contains("z.txt"), "{output}");
         assert!(output.starts_with("4 files found (showing first 2):"));
+    }
+
+    /// mini-agent-sx8pj: a zero cap used to panic `limit.clamp(1, cap)` and,
+    /// without a limit, page forever with `offset=0`.
+    #[tokio::test]
+    async fn zero_result_cap_does_not_panic_or_return_an_empty_page() {
+        let dir = TempDir::new("zero_cap");
+        for name in ["a.txt", "b.txt"] {
+            std::fs::write(dir.path().join(name), "").unwrap();
+        }
+        for limit in [Some(1), None] {
+            let output = FindFilesTool::new(None, None, 0)
+                .call(FindFilesArgs {
+                    no_ignore: false,
+                    offset: None,
+                    limit,
+                    sort: crate::agent::tools::FindFilesSort::Name,
+                    mode: crate::agent::tools::FindFilesMode::Regex,
+                    pattern: r"\.txt$".to_string(),
+                    path: Some(dir.path().to_string_lossy().into_owned()),
+                })
+                .await
+                .unwrap();
+            assert!(output.contains("a.txt"), "{output}");
+            assert!(!output.contains("offset=0"), "{output}");
+        }
     }
 
     #[tokio::test]

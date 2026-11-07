@@ -228,6 +228,7 @@ pub(crate) fn validate_extra_body(cfg: &mut Config) -> Result<Vec<String>, Strin
             crate::sandbox::MAX_BACKGROUND_JOBS_LIMIT
         ));
     }
+    cfg.validate_tool_limits()?;
     #[cfg(feature = "subagents")]
     cfg.validate_subagent_settings()?;
     let global_is_responses = cfg
@@ -417,6 +418,7 @@ pub(crate) fn parse_config_content(path: &Path, content: &str) -> io::Result<Con
 }
 
 pub(crate) fn serialize_config_content(path: &Path, cfg: &Config) -> io::Result<String> {
+    cfg.validate_tool_limits().map_err(io::Error::other)?;
     #[cfg(feature = "subagents")]
     cfg.validate_subagent_settings().map_err(io::Error::other)?;
     match path.extension().and_then(|extension| extension.to_str()) {

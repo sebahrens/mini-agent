@@ -1653,7 +1653,7 @@ impl Config {
     }
 
     pub fn resolve_max_read_lines(&self) -> u64 {
-        self.max_read_lines.unwrap_or(2000)
+        self.max_read_lines.unwrap_or(2000).max(1)
     }
 
     /// Line cap applied to shell tool output returned to the model.
@@ -1696,36 +1696,68 @@ impl Config {
             .unwrap_or_default()
     }
 
+    /// Rejects result caps of zero: a zero cap makes `find_files` panic on
+    /// `clamp(1, cap)`, `grep` report no matches, `read` refuse every default
+    /// read and `list_dir` return empty pages. The resolve_* getters also
+    /// clamp to 1 for configs built in code.
+    pub(crate) fn validate_tool_limits(&self) -> Result<(), String> {
+        let limits: &[(&str, Option<u64>)] = &[
+            ("max_read_lines", self.max_read_lines),
+            ("max_grep_results", self.max_grep_results),
+            ("max_find_results", self.max_find_results),
+            ("max_list_dir_entries", self.max_list_dir_entries),
+            #[cfg(feature = "subagents")]
+            ("subagent_max_read_lines", self.subagent_max_read_lines),
+            #[cfg(feature = "subagents")]
+            ("subagent_max_grep_results", self.subagent_max_grep_results),
+            #[cfg(feature = "subagents")]
+            ("subagent_max_find_results", self.subagent_max_find_results),
+            #[cfg(feature = "subagents")]
+            (
+                "subagent_max_list_dir_entries",
+                self.subagent_max_list_dir_entries,
+            ),
+        ];
+        for (name, value) in limits {
+            if *value == Some(0) {
+                return Err(format!("{name} must be at least 1"));
+            }
+        }
+        Ok(())
+    }
+
     pub fn resolve_max_grep_results(&self) -> u64 {
-        self.max_grep_results.unwrap_or(150)
+        self.max_grep_results.unwrap_or(150).max(1)
     }
 
     pub fn resolve_max_find_results(&self) -> u64 {
-        self.max_find_results.unwrap_or(150)
+        self.max_find_results.unwrap_or(150).max(1)
     }
 
     pub fn resolve_max_list_dir_entries(&self) -> Option<u64> {
-        self.max_list_dir_entries.or(Some(150))
+        self.max_list_dir_entries
+            .or(Some(150))
+            .map(|cap| cap.max(1))
     }
 
     #[cfg(feature = "subagents")]
     pub fn resolve_subagent_max_read_lines(&self) -> u64 {
-        self.subagent_max_read_lines.unwrap_or(2000)
+        self.subagent_max_read_lines.unwrap_or(2000).max(1)
     }
 
     #[cfg(feature = "subagents")]
     pub fn resolve_subagent_max_grep_results(&self) -> u64 {
-        self.subagent_max_grep_results.unwrap_or(200)
+        self.subagent_max_grep_results.unwrap_or(200).max(1)
     }
 
     #[cfg(feature = "subagents")]
     pub fn resolve_subagent_max_find_results(&self) -> u64 {
-        self.subagent_max_find_results.unwrap_or(200)
+        self.subagent_max_find_results.unwrap_or(200).max(1)
     }
 
     #[cfg(feature = "subagents")]
     pub fn resolve_subagent_max_list_dir_entries(&self) -> Option<u64> {
-        self.subagent_max_list_dir_entries
+        self.subagent_max_list_dir_entries.map(|cap| cap.max(1))
     }
 
     /// Independent child input capacity; the main session's context pin is not
@@ -3062,6 +3094,29 @@ mod task_cost_config_tests {
         let staged: Config =
             toml::from_str("[task_cost_overrides.future]\nweighting='fixed'").unwrap();
         staged.validate_subagent_settings().unwrap();
+    }
+
+    #[test]
+    fn zero_tool_result_caps_are_rejected_and_clamped() {
+        for key in [
+            "max_read_lines",
+            "max_grep_results",
+            "max_find_results",
+            "max_list_dir_entries",
+        ] {
+            let cfg: Config = toml::from_str(&format!("{key} = 0")).unwrap();
+            let error = cfg.validate_tool_limits().unwrap_err();
+            assert!(error.contains(key), "{error}");
+        }
+        let zero: Config = toml::from_str(
+            "max_read_lines = 0\nmax_grep_results = 0\nmax_find_results = 0\nmax_list_dir_entries = 0",
+        )
+        .unwrap();
+        assert_eq!(zero.resolve_max_read_lines(), 1);
+        assert_eq!(zero.resolve_max_grep_results(), 1);
+        assert_eq!(zero.resolve_max_find_results(), 1);
+        assert_eq!(zero.resolve_max_list_dir_entries(), Some(1));
+        Config::default().validate_tool_limits().unwrap();
     }
 
     #[test]

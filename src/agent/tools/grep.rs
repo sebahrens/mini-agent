@@ -171,7 +171,8 @@ impl GrepTool {
         GrepTool {
             permission,
             ask_tx,
-            max_results,
+            // A zero cap would report "No matches found." for a matching tree.
+            max_results: max_results.max(1),
             workspace: None,
         }
     }
