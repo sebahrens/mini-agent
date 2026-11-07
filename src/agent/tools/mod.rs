@@ -373,6 +373,9 @@ struct TrackedRead {
     offset: usize,
     limit: usize,
     version: ReadVersion,
+    /// A displayed line was clipped, so the model never saw the full content.
+    /// Such a window still dedupes repeats but never authorizes an overwrite.
+    clipped: bool,
 }
 
 impl Default for ReadTracker {
@@ -499,6 +502,28 @@ impl ReadTracker {
             limit,
             metadata,
             served_content_crc32,
+            false,
+        )
+    }
+
+    /// As [`Self::record_read`] for a window in which at least one line was
+    /// clipped on display: repeats are still denied, overwrite is not authorized.
+    pub(crate) fn record_clipped_read(
+        &self,
+        path: &str,
+        offset: usize,
+        limit: usize,
+        metadata: &std::fs::Metadata,
+        served_content_crc32: u32,
+    ) {
+        self.record_read_kind(
+            ReadKind::Raw,
+            path,
+            offset,
+            limit,
+            metadata,
+            served_content_crc32,
+            true,
         )
     }
 
@@ -517,6 +542,7 @@ impl ReadTracker {
             limit,
             metadata,
             crc,
+            false,
         )
     }
 
@@ -528,7 +554,15 @@ impl ReadTracker {
         metadata: &std::fs::Metadata,
         crc: u32,
     ) {
-        self.record_read_kind(ReadKind::NotebookView, path, offset, limit, metadata, crc)
+        self.record_read_kind(
+            ReadKind::NotebookView,
+            path,
+            offset,
+            limit,
+            metadata,
+            crc,
+            false,
+        )
     }
 
     fn record_read_kind(
@@ -539,6 +573,7 @@ impl ReadTracker {
         limit: usize,
         metadata: &std::fs::Metadata,
         served_content_crc32: u32,
+        clipped: bool,
     ) {
         let mut tracked = self.tracked.lock().unwrap_or_else(|e| e.into_inner());
         let entries = tracked.windows_mut(path);
@@ -549,6 +584,7 @@ impl ReadTracker {
             offset,
             limit,
             version: ReadVersion::new(metadata, served_content_crc32),
+            clipped,
         });
         if entries.len() > MAX_WINDOWS_PER_PATH {
             // Drop the oldest window, sparing whole-file raw reads that
@@ -578,6 +614,7 @@ impl ReadTracker {
                     entry.kind == ReadKind::Raw
                         && entry.offset == 0
                         && entry.limit >= total_lines
+                        && !entry.clipped
                         && entry.version == version
                 })
             })
