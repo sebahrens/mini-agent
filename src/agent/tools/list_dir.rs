@@ -322,20 +322,17 @@ impl Tool for ListDirTool {
         } else {
             total_entries.to_string()
         };
-        let mut result = match (depth, start) {
-            (1, 0) => format!("Listing {}:\n", path),
-            (1, _) => format!(
-                "Listing {} (entries {}-{} of {total_label}):\n",
-                path,
-                start + 1,
-                end
-            ),
-            (_, _) => format!(
-                "Listing {} (depth {depth}; entries {}-{} of {total_label}):\n",
-                path,
-                start + 1,
-                end
-            ),
+        let range = if page.is_empty() {
+            String::new()
+        } else {
+            format!("entries {}-{end} of {total_label}", start + 1)
+        };
+        let mut result = match (depth, start, page.is_empty()) {
+            (1, 0, false) => format!("Listing {}:\n", path),
+            (1, _, true) => format!("Listing {}:\n", path),
+            (1, _, false) => format!("Listing {} ({range}):\n", path),
+            (_, _, true) => format!("Listing {} (depth {depth}):\n", path),
+            (_, _, false) => format!("Listing {} (depth {depth}; {range}):\n", path),
         };
         if page.is_empty() {
             result.push_str(&format!(
@@ -458,6 +455,33 @@ mod tests {
             .unwrap();
         assert!(listing.contains("secret.txt"), "{listing}");
         assert!(!listing.contains("gitignored"), "{listing}");
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    /// mini-agent-o93uc: a past-the-end offset must not print an inverted range.
+    #[tokio::test]
+    async fn past_end_offset_header_has_no_inverted_range() {
+        let temp = std::env::temp_dir().join(format!(
+            "mini-agent-list-dir-pastend-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        for i in 0..10 {
+            std::fs::write(temp.join(format!("f{i}")), "").unwrap();
+        }
+        let listing = ListDirTool::new(None, None, None)
+            .with_workspace(&temp)
+            .call(ListDirArgs {
+                path: None,
+                offset: Some(50),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!listing.contains("entries 11-10"), "{listing}");
+        assert!(!listing.contains("entries 11-"), "{listing}");
+        assert!(listing.contains("no entries at offset 50"), "{listing}");
         std::fs::remove_dir_all(temp).unwrap();
     }
 
