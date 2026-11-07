@@ -1425,6 +1425,11 @@ pub(crate) async fn start_main_run_with_directive(
     }
     run.question_turn = question_origin.capture(run.question_turn.take());
     let question_turn = run.question_turn.clone();
+    let budget_carry = if question_origin.starts_new_turn() {
+        run.fresh_budget_carry()
+    } else {
+        std::sync::Arc::clone(&run.budget_carry)
+    };
     #[cfg(feature = "agent-skills")]
     {
         if run.instruction_turn.is_none() || question_origin.starts_new_turn() {
@@ -1454,7 +1459,9 @@ pub(crate) async fn start_main_run_with_directive(
         pending_turn.message_index(),
         ui.cli.no_session,
     );
-    let agent = agent.with_file_checkpoints(file_checkpoints.clone());
+    let agent = agent
+        .with_file_checkpoints(file_checkpoints.clone())
+        .with_budget_carry(budget_carry);
     let mut pending_turn = Some(pending_turn);
     run.native_checkpointed = false;
     let runner = if let Some(mut owner) = native_owner.take() {
@@ -1947,6 +1954,7 @@ async fn compact_and_respawn(
             ui.cli.no_session,
         ))
         .with_question_turn(run.question_turn.clone())
+        .with_budget_carry(std::sync::Arc::clone(&run.budget_carry))
         .spawn_runner_paused(
             MID_TURN_CONTINUE_PROMPT.to_string(),
             history,

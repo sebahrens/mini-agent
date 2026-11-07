@@ -2293,6 +2293,7 @@ impl<'a> App<'a> {
                 let agent = run.agent.as_ref().unwrap().clone();
                 #[cfg(feature = "agent-skills")]
                 let agent = agent.with_instruction_turn(run.instruction_turn.clone());
+                let budget_carry = run.fresh_budget_carry();
                 let paused = agent
                     .with_main_session(ui.cfg, ui.session)
                     .with_spend_for_session(ui.session, ui.cfg, crate::spend::RequestKind::Turn)
@@ -2302,6 +2303,7 @@ impl<'a> App<'a> {
                         ui.cli.no_session,
                     ))
                     .with_question_turn(run.question_turn.clone())
+                    .with_budget_carry(budget_carry)
                     .spawn_runner_paused(
                         prompt,
                         history,
@@ -7471,6 +7473,7 @@ impl<'a> App<'a> {
                                 None,
                             ));
                     }
+                    let budget_carry = self.run.fresh_budget_carry();
                     let paused = crate::startup::heap_future(|| {
                         let agent = self.run.agent.as_ref().unwrap().clone();
                         #[cfg(feature = "agent-skills")]
@@ -7488,6 +7491,7 @@ impl<'a> App<'a> {
                                 self.ui.cli.no_session,
                             ))
                             .with_question_turn(self.run.question_turn.clone())
+                            .with_budget_carry(budget_carry)
                             .spawn_runner_paused(
                                 prompt,
                                 history,
@@ -7610,6 +7614,7 @@ impl<'a> App<'a> {
                                 None,
                             ));
                     }
+                    let budget_carry = self.run.fresh_budget_carry();
                     let paused = crate::startup::heap_future(|| {
                         let agent = self.run.agent.as_ref().unwrap().clone();
                         #[cfg(feature = "agent-skills")]
@@ -7627,6 +7632,7 @@ impl<'a> App<'a> {
                                 self.ui.cli.no_session,
                             ))
                             .with_question_turn(self.run.question_turn.clone())
+                            .with_budget_carry(budget_carry)
                             .spawn_runner_paused(
                                 prompt,
                                 Vec::new(),

@@ -1190,6 +1190,7 @@ async fn finish_goal_round(
             };
             #[cfg(feature = "agent-skills")]
             let round_agent = round_agent.with_instruction_turn(run.instruction_turn.clone());
+            let budget_carry = run.fresh_budget_carry();
             let paused = round_agent
                 .with_main_session(ui.cfg, ui.session)
                 .with_spend_for_session(ui.session, ui.cfg, crate::spend::RequestKind::Turn)
@@ -1199,6 +1200,7 @@ async fn finish_goal_round(
                     ui.cli.no_session,
                 ))
                 .with_question_turn(run.question_turn.clone())
+                .with_budget_carry(budget_carry)
                 .spawn_runner_paused(
                     relaunch.prompt,
                     history,
