@@ -1,0 +1,58 @@
+{
+  "review": "Windows linked-worktree ignore portability",
+  "findings": [
+    {
+      "priority": "P1",
+      "status": "implemented; native CI pending",
+      "location": "src/agent/tools/find_files.rs:bound_platform::nt_error",
+      "problem": "NtCreateFile errors were all io::ErrorKind::Other, so newly fallible ignore resolution rejected missing optional .git/commondir/info/exclude on Windows.",
+      "fix": "RtlNtStatusToDosError from existing windows-sys Foundation feature, then io::Error::from_raw_os_error. No new FFI or dependency feature.",
+      "tests": [
+        "windows_native_errors_preserve_missing_and_access_denied_classes",
+        "windows_optional_git_metadata_accepts_missing_paths_and_rejects_corruption"
+      ]
+    },
+    {
+      "priority": "P4",
+      "bead": "gkqd4.23",
+      "status": "implemented; native CI pending",
+      "problem": "Git-created .git gitfiles are hidden on Windows; std::fs::write creates/truncates via CREATE_ALWAYS, which rejects existing hidden files. Two corruption fixtures therefore could fail before testing malformed metadata.",
+      "fix": "Open existing gitfile with write+truncate and no create, then write_all, preserving hidden attributes.",
+      "tests": [
+        "linked_worktree_common_exclude_applies_to_native_discovery",
+        "linked_worktree_hook_reads_honor_common_exclude_and_root_negation"
+      ],
+      "sources": [
+        "https://github.com/git/git/blob/master/compat/mingw.c",
+        "https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew"
+      ]
+    },
+    {
+      "priority": "P4",
+      "bead": "gkqd4.25",
+      "status": "implemented; local and native rerun owned by root",
+      "evidence": "Native Windows job128469176018 failed both linked fixture tests during Git config loading; /private/tmp/mini-agent-review-ci-windows-platform-failure.log",
+      "problem": "Fixture forwarded canonical verbatim Windows paths to C Git, including GIT_CONFIG_GLOBAL.",
+      "fix": "Every fixture Git path operand/environment value uses existing child_process_path spelling on Windows: repo -C, template, hooksPath, worktree destination, global config. Filesystem ownership/assertions retain canonical paths. OsString argv and exact failure diagnostics added.",
+      "scope": "Test-only linked_ignore_fixture module; no production edits."
+    }
+  ],
+  "post_fix_static_checks": [
+    "Windows DirectoryReader initializes restart=1 for every new read_directory; first NtQueryDirectoryFile restarts sequential walk enumeration.",
+    "root_exclude_matcher opens and validates commondir before consulting ROOT_EXCLUDE_CACHE, so NUL corruption cannot be hidden by earlier cached excludes.",
+    "Error conversion preserves PermissionDenied rather than treating denial as optional absence; control asserts both NT mapping and propagation.",
+    "PathBuf::join supports absolute drive/UNC paths and normalizes dot/dotdot joins on verbatim Windows prefixes; no confirmed production path defect beyond native error classification.",
+    "Unix-only FIFO/symlink/DAC compatibility fixtures are cfg(unix); portable linked-worktree and corruption cases remain enabled on Windows.",
+    "New native error controls use owned directory fixtures and actual relative NT opens without invoking Git."
+  ],
+  "additional_confirmed_p0_p3": [],
+  "validation": [
+    "Selected rustfmt and git diff --check clean.",
+    "No Cargo, commits, Git mutations or bead writes.",
+    "Parent includes new controls in native Windows platform CI; no local Windows runtime available."
+  ],
+  "residuals": [
+    "Native Windows rerun remains required for NTSTATUS conversion, hidden-attribute corruption controls and corrected C Git fixture path spelling."
+  ],
+  "coordinator_status": "See ../2026-11-07-continuation-review.json for final validation and hosted CI."
+}

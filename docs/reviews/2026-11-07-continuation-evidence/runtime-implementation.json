@@ -91,6 +91,23 @@
       ],
       "evidence": "New actual binary regression runs ordinary and two-turn stream input against a repository-owned stdio MCP fixture, checks a single connection and exact logical SessionEnd envelope. Standalone fixture compiled successfully with rustc; Cargo/binary regression awaits next batch. Actual TaskTool fixture now additionally sets up same-name independent parent/child MCP managers: parent positive control, child real Read tool hook, and capped Stop lifecycle; parent must stay at one call and child get exactly two. Catches missing actual child AnyAgent routing setter and missing Stop overlay; awaiting coordinated run.",
       "limit": "Integration agent owns broader HookBindings/provider/ACP policy tests. New plain+stream MCP EOF fixture uses custom OpenAI, not native Anthropic HTTP. Child policy consumer regression is provided separately by integration; this shard composes actual production TaskTool peer routing."
+    },
+    {
+      "id": "mini-agent-gkqd4.21",
+      "change": "Stalled headless output distinguishes live interrupt-driver ownership from generic hook/IO scope ownership. Weak active token and weak actual driver scope are inherited without extending listener lifetime. Inherited child emissions register/join IO in the actual driver scope and also observe their own child cancellation; generic-scope emissions receive a bounded nested driver forwarding cancellation and retaining exact parent registration. Forced process exit skips only root-hook joins after the recorded deadline, preserving retained physical cleanup owners. Native startup probe physical retirement is unchanged.",
+      "tests": [
+        "print::tests::generic_scopes_and_reused_native_scopes_do_not_claim_an_expired_interrupt_driver",
+        "print::tests::generic_parent_cancellation_reaches_output_driver_and_keeps_its_exact_child_join",
+        "stalled_open_stdout_has_bounded_signal_cleanup_and_preserves_accounting_without_changing_inherited_flags",
+        "stalled_stderr_progress_and_runtime_reports_and_both_sinks_settle_owned_work_before_exit"
+      ],
+      "evidence": "Both new ownership units passed. Root minimal print+lifetime row passed39 (/private/tmp/mini-agent-ci-minimal-output.log), stack/lifecycle14 and final inventory28 passed. Actual repaired stdout five-case fixture passed12.17s (/private/tmp/mini-agent-ci-stalled-stdout-final.log); actual stderr seven-case fixture passed in /private/tmp/mini-agent-ci-stalled-portable.log. Installed pre-repair binary with corrected portable fixtures failed both original contracts: final-text first-signal acknowledgement and goal stderr forced-exit bound (/private/tmp/mini-agent-ci-stalled-negative-control.log). No timeout/assertion relaxation or inherited OFD flag mutation.",
+      "files": [
+        "src/agent/runner.rs",
+        "src/print.rs",
+        "src/startup.rs"
+      ],
+      "risks": "Root owns final Clippy/CI/commit/push. Startup native probe physical retirement remains unchanged; no speculative drop-before-retirement branch. Portable fixture control proves .21 sensitivity locally; cross-platform CI rerun remains root-owned."
     }
   ],
   "validation": {
@@ -105,7 +122,7 @@
       "failures": "two TUI pressure scripts omitted now-required paid summary; corrected with explicit billed rows and production graceful failure path hardening"
     },
     "local": "git diff --check passed; extracted standalone MCP and portable TaskTool marker fixtures compiled via rustc; no Cargo run by subagent.",
-    "pending": "Root focused rerun of three fixed runtime failures and affected compaction controls, then any remaining gates root chooses; no shard Cargo.",
+    "pending": "Root final Clippy and CI rows, commit/push; runtime output positive and baseline negative controls complete locally.",
     "full_suite_attempt": {
       "result": "6244 passed, 10 failed, 16 ignored",
       "log": "/private/tmp/mini-agent-review-fixes-full.log",
@@ -140,5 +157,14 @@
       "Final source includes peer edits; root independently audits combined HookBindings and SessionEnd behavior."
     ]
   },
-  "coordinator_status": "Local validation complete. Later coordinator corrections and test results are authoritative in ../2026-11-07-continuation-review.json; hosted CI pending."
+  "portable_stalled_fixture": {
+    "mechanism": "Fresh owned host pipes admitted only512 bytes then EAGAIN while POLLOUT/kqueue advertised nominal space. Earlier local readiness failures reproduced identically against installed pre-repair binary.",
+    "fix": "Provider gates bracket intended tool/final payload. Startup and bounded intermediate output is drained/retained before stopping reads. Stderr and both-sink cases prove saturation via actual EAGAIN and FIONREAD on read ends, restoring inherited writer flags before provider release. Final JSON waits for durable snapshot and exact result-field+128x payload, with prefix limited below64KiB versus unchanged2MiB result. Startup notices cannot establish final admission.",
+    "validation": "Five stdout cases and seven stderr cases pass repaired binary; baseline negative controls retain original failures.",
+    "files": [
+      "tests/headless_json.rs"
+    ],
+    "priority": "P4 test portability; root owns bead filing"
+  },
+  "coordinator_status": "See ../2026-11-07-continuation-review.json for final validation and hosted CI."
 }

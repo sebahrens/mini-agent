@@ -2303,19 +2303,23 @@ pub(crate) mod windows_tree_tests {
         }
     }
     impl Descendant {
-        pub(crate) async fn assert_retired(&self) {
+        pub(crate) async fn assert_retired(&self, action: &str) {
             tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
                     // SAFETY: this exact live process handle stays owned here.
                     match unsafe { WaitForSingleObject(self.0.as_raw_handle(), 0) } {
                         WAIT_OBJECT_0 => break,
                         WAIT_TIMEOUT => tokio::time::sleep(Duration::from_millis(10)).await,
-                        other => panic!("descendant observation failed: {other}"),
+                        other => {
+                            panic!("MCP descendant observation failed after {action}: {other}")
+                        }
                     }
                 }
             })
             .await
-            .expect("MCP descendant survived retirement");
+            .unwrap_or_else(|error| {
+                panic!("MCP descendant survived retirement after {action}: {error}")
+            });
         }
     }
     impl Fixture {
@@ -2329,7 +2333,12 @@ pub(crate) mod windows_tree_tests {
             let dir = crate::tests::OwnedTestDirectory::new("mcp-windows-tree");
             let program = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"))
                 .join("System32/WindowsPowerShell/v1.0/powershell.exe");
-            let quote = |path: &std::path::Path| path.display().to_string().replace('\'', "''");
+            let quote = |path: &std::path::Path| {
+                crate::sandbox::windows::child_process_path(path)
+                    .display()
+                    .to_string()
+                    .replace('\'', "''")
+            };
             let child = dir.path().join("child.ps1");
             std::fs::write(
                 &child,
@@ -2353,7 +2362,9 @@ $p=[System.Diagnostics.Process]::new(); $p.StartInfo=$i;
 if(-not $p.Start()) {{ exit 9 }}
 while(-not [IO.File]::Exists('{}')) {{ Start-Sleep -Milliseconds 10 }}
 while(-not [IO.File]::Exists('{}')) {{ Start-Sleep -Milliseconds 10 }}
-[Console]::WriteLine('{{}}');
+$bytes=[System.Text.Encoding]::UTF8.GetBytes('{{}}');
+$stdout=[Console]::OpenStandardOutput();
+$stdout.Write($bytes,0,$bytes.Length); $stdout.Flush();
 "#,
                 quote(&program),
                 quote(&child),
@@ -2383,7 +2394,9 @@ while(-not [IO.File]::Exists('{}')) {{ Start-Sleep -Milliseconds 10 }}
                 "-ExecutionPolicy".into(),
                 "Bypass".into(),
                 "-File".into(),
-                self.parent.display().to_string(),
+                crate::sandbox::windows::child_process_path(&self.parent)
+                    .display()
+                    .to_string(),
             ]
         }
         pub(crate) fn root(&self) -> &std::path::Path {
@@ -2392,7 +2405,7 @@ while(-not [IO.File]::Exists('{}')) {{ Start-Sleep -Milliseconds 10 }}
         pub(crate) fn release(&self) {
             std::fs::write(self.dir.path().join("release"), "go").unwrap();
         }
-        pub(crate) async fn ready(&self) -> Descendant {
+        pub(crate) async fn ready(&self, action: &str) -> Descendant {
             let marker = self.dir.path().join("child.pid");
             let pid = tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
@@ -2405,7 +2418,7 @@ while(-not [IO.File]::Exists('{}')) {{ Start-Sleep -Milliseconds 10 }}
                 }
             })
             .await
-            .expect("MCP descendant startup");
+            .unwrap_or_else(|error| panic!("MCP descendant startup failed in {action}: {error}"));
             // SAFETY: marker belongs to this held fixture and its child is
             // blocked until release. Retain the handle before any retirement.
             let handle = unsafe {
@@ -2417,11 +2430,16 @@ while(-not [IO.File]::Exists('{}')) {{ Start-Sleep -Milliseconds 10 }}
                     pid,
                 )
             };
-            assert!(!handle.is_null(), "retain live fixture descendant");
+            assert!(
+                !handle.is_null(),
+                "retain live fixture descendant in {action}: {}",
+                std::io::Error::last_os_error()
+            );
             let child = Descendant(unsafe { OwnedHandle::from_raw_handle(handle) });
             assert_eq!(
                 unsafe { WaitForSingleObject(child.0.as_raw_handle(), 0) },
-                WAIT_TIMEOUT
+                WAIT_TIMEOUT,
+                "fixture descendant must be live before {action}"
             );
             child
         }
@@ -2464,34 +2482,51 @@ while(-not [IO.File]::Exists('{}')) {{ Start-Sleep -Milliseconds 10 }}
                     async move { run_prompt(&command, &request, cancelled, None, None).await },
                 );
             let _task_owner = AbortTaskOnDrop(task.abort_handle());
-            let descendant = fixture.ready().await;
+            let descendant = fixture.ready(action).await;
             match action {
                 "success" | "success-inherited" => fixture.release(),
                 "cancel" => {
-                    cancel.send(()).unwrap();
+                    cancel
+                        .send(())
+                        .unwrap_or_else(|_| panic!("MCP run completed before {action}"));
                 }
                 "drop" => task.abort(),
                 _ => {}
             }
             let result = tokio::time::timeout(Duration::from_secs(20), task)
                 .await
-                .expect("MCP run retirement");
+                .unwrap_or_else(|error| panic!("MCP run failed to retire in {action}: {error}"));
             match action {
-                "drop" => assert!(matches!(result, Err(error) if error.is_cancelled())),
-                "cancel" => assert!(matches!(result.unwrap(), RunOutcome::Cancelled)),
-                "timeout" => assert!(matches!(
-                    result.unwrap(),
-                    RunOutcome::Finished { is_error: true, .. }
-                )),
-                _ => assert!(matches!(
-                    result.unwrap(),
+                "drop" => assert!(
+                    matches!(result, Err(error) if error.is_cancelled()),
+                    "MCP run drop must cancel its task"
+                ),
+                "cancel" => assert!(
+                    matches!(
+                        result.unwrap_or_else(|error| panic!(
+                            "MCP run task failed in {action}: {error}"
+                        )),
+                        RunOutcome::Cancelled
+                    ),
+                    "MCP run cancel must return cancellation"
+                ),
+                "timeout" => match result
+                    .unwrap_or_else(|error| panic!("MCP run task failed in {action}: {error}"))
+                {
+                    RunOutcome::Finished { is_error: true, .. } => {}
+                    _ => panic!("MCP run timeout did not return a tool error"),
+                },
+                _ => match result
+                    .unwrap_or_else(|error| panic!("MCP run task failed in {action}: {error}"))
+                {
                     RunOutcome::Finished {
-                        is_error: false,
-                        ..
-                    }
-                )),
+                        is_error: false, ..
+                    } => {}
+                    RunOutcome::Finished { text, .. } => panic!("MCP run {action} failed: {text}"),
+                    RunOutcome::Cancelled => panic!("MCP run {action} was unexpectedly cancelled"),
+                },
             }
-            descendant.assert_retired().await;
+            descendant.assert_retired(action).await;
         }
     }
 }

@@ -1,0 +1,35 @@
+    Checking tokio v1.53.3
+   Compiling mini-agent v1.12.0 (/Users/seb/projects/mini-agent)
+    Checking aws-smithy-async v1.3.0
+    Checking tokio-util v0.7.19
+    Checking tokio-native-tls v0.3.1
+    Checking tower v0.5.3
+    Checking process-wrap v9.1.0
+    Checking aws-smithy-runtime-api v1.19.0
+    Checking tower-http v0.6.11
+    Checking h2 v0.4.19
+    Checking tokio-stream v0.1.19
+    Checking google-cloud-gax v1.15.0
+    Checking aws-smithy-schema v0.2.1
+    Checking aws-smithy-http v0.64.1
+    Checking aws-credential-types v1.3.0
+    Checking aws-smithy-observability v0.3.0
+    Checking aws-sigv4 v1.6.0
+    Checking aws-smithy-runtime v1.16.0
+    Checking aws-types v1.6.0
+    Checking aws-smithy-json v0.63.1
+    Checking aws-smithy-xml v0.62.1
+    Checking aws-smithy-query v0.62.1
+    Checking hyper v1.11.1
+    Checking aws-runtime v1.10.0
+    Checking hyper-util v0.1.20
+    Checking aws-sdk-ssooidc v1.116.0
+    Checking aws-sdk-sso v1.114.0
+    Checking aws-sdk-sts v1.119.0
+    Checking hyper-tls v0.6.0
+    Checking reqwest v0.13.4
+    Checking aws-config v1.12.0
+    Checking rmcp v2.2.0
+    Checking google-cloud-auth v1.17.0 (/Users/seb/projects/mini-agent/patched-deps/google-cloud-auth)
+    Checking rig-core v0.40.0 (/Users/seb/projects/mini-agent/patched-deps/rig-core)
+    Finished `dev` profile [unoptimized] target(s) in 41.30s

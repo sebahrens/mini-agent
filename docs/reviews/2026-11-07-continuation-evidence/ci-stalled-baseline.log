@@ -1,0 +1,29 @@
+   Compiling mini-agent v1.12.0 (/Users/seb/projects/mini-agent)
+    Finished `test` profile [unoptimized] target(s) in 8.48s
+     Running tests/headless_json.rs (target/debug/deps/headless_json-f62e74dcf7072634)
+
+running 2 tests
+test stalled_open_stdout_has_bounded_signal_cleanup_and_preserves_accounting_without_changing_inherited_flags ... FAILED
+test stalled_stderr_progress_and_runtime_reports_and_both_sinks_settle_owned_work_before_exit ... FAILED
+
+failures:
+
+---- stalled_open_stdout_has_bounded_signal_cleanup_and_preserves_accounting_without_changing_inherited_flags stdout ----
+
+thread 'stalled_open_stdout_has_bounded_signal_cleanup_and_preserves_accounting_without_changing_inherited_flags' (67129906) panicked at tests/headless_json.rs:3931:68:
+called `Result::unwrap()` on an `Err` value: Os { code: 2, kind: NotFound, message: "No such file or directory" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- stalled_stderr_progress_and_runtime_reports_and_both_sinks_settle_owned_work_before_exit stdout ----
+
+thread 'stalled_stderr_progress_and_runtime_reports_and_both_sinks_settle_owned_work_before_exit' (67130611) panicked at tests/headless_json.rs:4116:13:
+fixture readiness deadline
+
+
+failures:
+    stalled_open_stdout_has_bounded_signal_cleanup_and_preserves_accounting_without_changing_inherited_flags
+    stalled_stderr_progress_and_runtime_reports_and_both_sinks_settle_owned_work_before_exit
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 62 filtered out; finished in 25.05s
+
+error: test failed, to rerun pass `--test headless_json`

@@ -1254,11 +1254,20 @@ async fn headless_output_async(sink: HeadlessSink, text: String) -> anyhow::Resu
     if headless_force_stopped() {
         return emit_after_forced_stop(sink, text).await;
     }
-    if crate::agent::runner::current_work_cancellation().is_some() {
-        write_owned_output(sink, text).await
+    if crate::agent::runner::current_work_scope_is_cancelled() {
+        write_owned_output(sink, text, None).await
+    } else if let Some(driver) = crate::agent::runner::current_headless_interrupt_scope() {
+        // An independently owned child may inherit the driver's lease. Its
+        // transport belongs to that actual driver's cancellation and join,
+        // while the child's own cancellation can still stop its await.
+        let parent = crate::agent::runner::current_work_cancellation();
+        let work = write_owned_output(sink, text, parent);
+        #[cfg(feature = "hooks")]
+        let work = crate::agent::runner::HookBindings::capture().run(work);
+        driver.run(work).await
     } else {
-        let turn = run_headless_turn(async move {
-            match write_owned_output(sink, text).await {
+        let turn = run_headless_output_turn(async move {
+            match write_owned_output(sink, text, None).await {
                 Ok(()) => crate::agent::runner::HeadlessTurn {
                     response: String::new(),
                     usage: Usage::default(),
@@ -1276,6 +1285,51 @@ async fn headless_output_async(sink: HeadlessSink, text: String) -> anyhow::Resu
     }
 }
 
+/// Hook and publication scopes own work without necessarily owning signals.
+/// Give their output a bounded driver while retaining its exact parent owner.
+async fn run_headless_output_turn<F>(turn: F) -> crate::agent::runner::HeadlessTurn
+where
+    F: std::future::Future<Output = crate::agent::runner::HeadlessTurn>,
+{
+    let parent = crate::agent::runner::current_work_cancellation();
+    let scope = crate::agent::runner::AgentWorkScope::new();
+    let cleanup = if parent.is_some() {
+        match crate::agent::runner::AgentRunCleanupGuard::auxiliary_child(scope.clone(), ()) {
+            Ok(cleanup) => cleanup,
+            Err(error) => {
+                return crate::agent::runner::HeadlessTurn::failed_before_start(anyhow::anyhow!(
+                    error
+                ));
+            }
+        }
+    } else {
+        crate::agent::runner::AgentRunCleanupGuard::auxiliary(scope.clone())
+    };
+    let (result, forced) = crate::startup::heap_future(|| {
+        run_headless_turn_with_scope(
+            turn,
+            HeadlessInterrupts::os(),
+            HEADLESS_FORCED_STOP_GRACE,
+            scope,
+            parent,
+        )
+    })
+    .await;
+    if forced.is_some() {
+        record_forced_stop();
+        drop(cleanup);
+    } else {
+        cleanup.settle().await;
+        #[cfg(feature = "hooks")]
+        if let Some(failure) = &result.failure {
+            let error = format!("{failure:#}");
+            crate::startup::heap_future(|| crate::extras::hooks::dispatch_stop_failure(&error))
+                .await;
+        }
+    }
+    result
+}
+
 // A forced stdin/tool stop still needs its final error when stdout is usable.
 // This transport-only scope cannot restart provider work and adds at most
 // 200 ms; a previously canceled output transport admits no new jobs at all.
@@ -1284,7 +1338,7 @@ async fn emit_after_forced_stop(sink: HeadlessSink, text: String) -> anyhow::Res
     let limit = std::time::Duration::from_millis(100);
     let result = scope
         .run(async {
-            let emission = write_owned_output(sink, text);
+            let emission = write_owned_output(sink, text, None);
             tokio::pin!(emission);
             tokio::select! {
                 biased;
@@ -1308,7 +1362,11 @@ async fn emit_after_forced_stop(sink: HeadlessSink, text: String) -> anyhow::Res
     result
 }
 
-async fn write_owned_output(sink: HeadlessSink, text: String) -> anyhow::Result<()> {
+async fn write_owned_output(
+    sink: HeadlessSink,
+    text: String,
+    parent: Option<crate::agent::runner::AgentWorkCancellation>,
+) -> anyhow::Result<()> {
     use std::sync::atomic::Ordering;
     if sink.closed().load(Ordering::Relaxed) {
         return Ok(());
@@ -1317,6 +1375,7 @@ async fn write_owned_output(sink: HeadlessSink, text: String) -> anyhow::Result<
     if cancellation
         .as_ref()
         .is_some_and(|cancel| cancel.is_cancelled())
+        || parent.as_ref().is_some_and(|cancel| cancel.is_cancelled())
     {
         sink.closed().store(true, Ordering::Relaxed);
         anyhow::bail!(crate::agent::runner::HEADLESS_INTERRUPTED);
@@ -1337,15 +1396,27 @@ async fn write_owned_output(sink: HeadlessSink, text: String) -> anyhow::Result<
         sink,
     };
     let mut job = crate::agent::runner::spawn_blocking_scoped(move || sink.write(&text));
-    let completed = crate::agent::runner::await_headless_work(async {
+    let work = crate::agent::runner::await_headless_work(async {
         match tokio::time::timeout(std::time::Duration::from_millis(250), &mut job).await {
             Ok(result) => result,
             Err(_) => {
-                if matches!(sink, HeadlessSink::Stdout) { stdout_notice("Headless stdout is still writing; interrupt to stop (10-second cleanup grace).\n"); }
+                if matches!(sink, HeadlessSink::Stdout) {
+                    stdout_notice(
+                        "Headless stdout is still writing; interrupt to stop (10-second cleanup grace).\n",
+                    );
+                }
                 (&mut job).await
             }
         }
-    }).await;
+    });
+    let completed = match parent.as_ref() {
+        Some(parent) => tokio::select! {
+            biased;
+            () = parent.cancelled() => Err(anyhow::anyhow!(crate::agent::runner::HEADLESS_INTERRUPTED)),
+            completed = work => completed,
+        },
+        None => work.await,
+    };
     let result = match completed {
         Ok(result) => {
             admission.joined = true;
@@ -1406,7 +1477,7 @@ fn emit_headless(
 }
 
 /// Wait for a headless interruption without affecting the interactive UI.
-#[cfg(feature = "goal")]
+#[cfg(any(feature = "goal", feature = "subagents"))]
 pub(crate) async fn headless_interrupt() -> io::Result<()> {
     HeadlessInterrupts::os().recv().await
 }
@@ -1512,6 +1583,19 @@ impl HeadlessInterrupts {
         }
     }
 
+    async fn recv_with_parent(
+        &mut self,
+        parent: Option<&crate::agent::runner::AgentWorkCancellation>,
+    ) -> io::Result<()> {
+        match parent {
+            Some(parent) => tokio::select! {
+                result = self.recv() => result,
+                () = parent.cancelled() => Ok(()),
+            },
+            None => self.recv().await,
+        }
+    }
+
     async fn recv_signal(&mut self) -> io::Result<()> {
         match self {
             #[cfg(unix)]
@@ -1555,13 +1639,14 @@ async fn settle_headless_scope(
     interrupts: &mut HeadlessInterrupts,
     grace: std::time::Duration,
     deadline: Option<tokio::time::Instant>,
+    parent: Option<&crate::agent::runner::AgentWorkCancellation>,
 ) -> Option<ForcedStop> {
     let deadline = match deadline {
         Some(deadline) => deadline,
         None => tokio::select! {
             biased;
             () = scope.wait_idle() => return None,
-            _ = interrupts.recv() => tokio::time::Instant::now() + grace,
+            _ = interrupts.recv_with_parent(parent) => tokio::time::Instant::now() + grace,
         },
     };
     tokio::select! {
@@ -1609,6 +1694,7 @@ where
     F: std::future::Future<Output = io::Result<T>>,
 {
     let scope = crate::agent::runner::AgentWorkScope::new();
+    let _interrupt_owner = scope.own_headless_interrupts();
     let (result, deadline) = scope
         .run(async {
             // Keep the response receiver alive until this scope is cancelled.
@@ -1632,7 +1718,7 @@ where
             outcome
         })
         .await;
-    match settle_headless_scope(&scope, &mut interrupts, grace, deadline).await {
+    match settle_headless_scope(&scope, &mut interrupts, grace, deadline, None).await {
         Some(forced) => (Err(forced_stop_io_error(forced, grace)), Some(forced)),
         None => (result, None),
     }
@@ -1692,6 +1778,7 @@ where
             HeadlessInterrupts::os(),
             HEADLESS_FORCED_STOP_GRACE,
             scope,
+            None,
         )
     });
     let mut owner =
@@ -1722,7 +1809,7 @@ where
     F: std::future::Future<Output = crate::agent::runner::HeadlessTurn>,
 {
     let scope = crate::agent::runner::AgentWorkScope::new();
-    run_headless_turn_with_scope(turn, interrupts, grace, scope).await
+    run_headless_turn_with_scope(turn, interrupts, grace, scope, None).await
 }
 
 async fn run_headless_turn_with_scope<F>(
@@ -1730,16 +1817,18 @@ async fn run_headless_turn_with_scope<F>(
     mut interrupts: HeadlessInterrupts,
     grace: std::time::Duration,
     scope: Arc<crate::agent::runner::AgentWorkScope>,
+    parent: Option<crate::agent::runner::AgentWorkCancellation>,
 ) -> (crate::agent::runner::HeadlessTurn, Option<ForcedStop>)
 where
     F: std::future::Future<Output = crate::agent::runner::HeadlessTurn>,
 {
+    let _interrupt_owner = scope.own_headless_interrupts();
     let (mut result, deadline, forced) = scope
         .run(async {
             tokio::pin!(turn);
             tokio::select! {
                 biased;
-                signal = interrupts.recv() => {
+                signal = interrupts.recv_with_parent(parent.as_ref()) => {
                     scope.cancellation_handle().cancel();
                     let deadline = tokio::time::Instant::now() + grace;
                     let mut result = tokio::select! {
@@ -1769,7 +1858,9 @@ where
     scope.cancellation_handle().cancel();
     let forced = match forced {
         Some(forced) => Some(forced),
-        None => settle_headless_scope(&scope, &mut interrupts, grace, deadline).await,
+        None => {
+            settle_headless_scope(&scope, &mut interrupts, grace, deadline, parent.as_ref()).await
+        }
     };
     if let Some(forced) = forced {
         let error = forced.error(grace);
@@ -3808,6 +3899,99 @@ mod tests {
     ) {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         (sender, super::HeadlessInterrupts::Channel(receiver))
+    }
+
+    #[tokio::test]
+    async fn generic_scopes_and_reused_native_scopes_do_not_claim_an_expired_interrupt_driver() {
+        use crate::agent::runner::{AgentWorkScope, current_work_has_headless_interrupt_owner};
+        let parent = AgentWorkScope::new();
+        parent.run(async {
+            assert!(!current_work_has_headless_interrupt_owner());
+            let scope = AgentWorkScope::new();
+            let mut inherited = None;
+            let (_signals, interrupts) = injected_interrupts();
+            let (turn, forced) = super::run_headless_turn_with_scope(async {
+                assert!(current_work_has_headless_interrupt_owner());
+                let child = AgentWorkScope::new();
+                child.run(async {
+                    assert!(current_work_has_headless_interrupt_owner());
+                    let driver = crate::agent::runner::current_headless_interrupt_scope().unwrap();
+                    assert!(std::sync::Arc::ptr_eq(&driver, &scope), "an independent child must route IO back to the actual signal and join owner");
+                }).await;
+                inherited = Some(child);
+                crate::agent::runner::HeadlessTurn::failed_before_start(anyhow::anyhow!("controlled failure"))
+            }, interrupts, std::time::Duration::from_secs(1), scope.clone(), None).await;
+            assert!(turn.failure.is_some());
+            assert_eq!(forced, None);
+            assert!(!current_work_has_headless_interrupt_owner());
+            scope.run(async { assert!(!current_work_has_headless_interrupt_owner()); }).await;
+            inherited.unwrap().run(async { assert!(!current_work_has_headless_interrupt_owner()); }).await;
+        }).await;
+    }
+
+    #[tokio::test]
+    async fn generic_parent_cancellation_reaches_output_driver_and_keeps_its_exact_child_join() {
+        use crate::agent::runner::{AgentRunCleanupGuard, AgentWorkScope};
+        use std::time::Duration;
+        let parent = AgentWorkScope::new();
+        let cancellation = parent.cancellation_handle();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (_signals, interrupts) = injected_interrupts();
+        let owner = parent.clone();
+        let run = tokio::spawn(async move {
+            owner
+                .run(async {
+                    let scope = AgentWorkScope::new();
+                    let cleanup = AgentRunCleanupGuard::auxiliary_child(scope.clone(), ()).unwrap();
+                    let result = super::run_headless_turn_with_scope(
+                        async {
+                            stalled_work(started_tx, release_rx);
+                            let error = crate::agent::runner::await_headless_work(
+                                std::future::pending::<()>(),
+                            )
+                            .await
+                            .unwrap_err();
+                            crate::agent::runner::HeadlessTurn {
+                                response: "owned partial output".into(),
+                                usage: Usage::default(),
+                                interactions: Vec::new(),
+                                failure: Some(error),
+                            }
+                        },
+                        interrupts,
+                        Duration::from_millis(100),
+                        scope,
+                        crate::agent::runner::current_work_cancellation(),
+                    )
+                    .await;
+                    drop(cleanup);
+                    result
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        cancellation.cancel();
+        let (turn, forced) = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(forced, Some(super::ForcedStop::Deadline));
+        assert_eq!(turn.response, "owned partial output");
+        assert!(format!("{:#}", turn.failure.unwrap()).contains("did not settle"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), parent.wait_idle())
+                .await
+                .is_err(),
+            "a forced nested driver retains its parent registration until the actual write joins"
+        );
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), parent.wait_idle())
+            .await
+            .unwrap();
     }
 
     // mini-agent-p73n1: a second interrupt ends the wait for a turn that never

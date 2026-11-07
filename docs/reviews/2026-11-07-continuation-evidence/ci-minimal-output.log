@@ -1,0 +1,47 @@
+   Compiling mini-agent v1.12.0 (/Users/seb/projects/mini-agent)
+    Finished `test` profile [unoptimized] target(s) in 40.90s
+     Running unittests src/main.rs (target/debug/deps/mini_agent-e2ef44a6c435f7ab)
+
+running 39 tests
+test print::tests::a_second_interrupt_force_stops_a_stalled_headless_command ... ok
+test print::tests::a_second_interrupt_force_stops_a_turn_that_never_returns ... ok
+test print::tests::claude_result_record_adds_subtype_and_cache_read_tokens ... ok
+test print::tests::claude_schema_maps_events_to_sdk_messages ... ok
+test print::tests::cli_seed_rule_inventory_reports_effective_maps_without_plaintext ... ok
+test print::tests::config_reports_complete_not_compiled_javascript_worker_section ... ok
+test print::tests::config_reports_the_installed_package_version_and_build_target ... ok
+test print::tests::config_reports_the_production_chat_history_entry_limit ... ok
+test print::tests::config_reports_the_production_chat_history_path_policy ... ok
+test print::tests::config_reports_whether_javascript_was_compiled ... ok
+test print::tests::config_system_prompt_entries_escape_terminal_controls_and_show_defaults ... ok
+test print::tests::flushing_config_output_treats_a_closed_pipe_as_success ... ok
+test print::tests::generic_parent_cancellation_reaches_output_driver_and_keeps_its_exact_child_join ... ok
+test print::tests::generic_scopes_and_reused_native_scopes_do_not_claim_an_expired_interrupt_driver ... ok
+test print::tests::git_status_parser_preserves_nul_delimited_paths ... ok
+test print::tests::headless_json_flags_unpriced_models_and_reports_cached_tokens ... ok
+test print::tests::headless_json_marks_every_non_completed_stop_as_error ... ok
+test print::tests::headless_json_reports_tool_stats_files_usage_and_invocation_cost ... ok
+test print::tests::headless_output_stops_quietly_after_a_closed_pipe ... ok
+test print::tests::headless_turn_settles_registered_blocking_work_before_returning ... ok
+test print::tests::interrupted_command_cancels_before_drop_triggered_diagnostic_admission ... ok
+test print::tests::late_stdin_producer_is_abandoned_and_marked ... ok
+test print::tests::listing_sessions_into_a_closed_pipe_is_success ... ok
+test print::tests::print_config_repeats_load_warnings_and_omits_an_empty_section ... ok
+test print::tests::profile100_print_config_entry_reports_the_effective_profile ... ok
+test print::tests::run_duration_is_wall_clock_since_the_previous_result ... ok
+test print::tests::session_list_line_shows_a_title_before_the_preview ... ok
+test print::tests::slow_stdin_producer_is_waited_for_only_with_longer_or_zero_idle ... ok
+test print::tests::stalled_cleanup_after_an_interrupt_is_bounded_and_keeps_the_partial_turn ... ok
+test print::tests::stdin_eof_mid_ask_denies_the_pending_and_later_asks ... ok
+test print::tests::stdin_probe_distinguishes_silent_open_pipe_from_data_and_eof ... ok
+test print::tests::stdin_read_error_mid_ask_denies_and_keeps_queued_lines ... ok
+test print::tests::tool_paths_use_forward_slashes ... ok
+test print::tests::uninterrupted_turns_still_wait_for_their_cleanup ... ok
+test print::tests::workspace_change_snapshot_in_a_repo_subdirectory_is_workspace_relative ... ok
+test print::tests::workspace_change_snapshot_reports_only_invocation_changes ... ok
+test print::tests::writing_config_output_treats_a_closed_pipe_as_success ... ok
+test print::tests::zero_base_headless_json_cache_charge_preserves_request_snapshot ... ok
+test startup::headless_session_lifetime_tests::ephemeral_finalizer_keeps_in_memory_history ... {"cost":0.0,"cost_unpriced":true,"duration_ms":1827,"files_changed":[],"is_error":false,"num_turns":0,"result":"FIRST_REPLY_AUDIT_MARKER","session_id":"b8b85e3c-e883-4ad7-8214-2520e69341b5","session_name":"","session_persisted":false,"stop_reason":"completed","tool_calls":{"by_name":{},"total":0},"total_cost_usd":0.0,"type":"result","usage":{"cache_creation_input_tokens":0,"cached_input_tokens":0,"hosted_search_requests":0,"input_tokens":3,"output_tokens":2,"reasoning_tokens":0,"tool_use_prompt_tokens":0,"total_tokens":5}}
+ok
+
+test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 3711 filtered out; finished in 3.71s

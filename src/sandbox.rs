@@ -823,8 +823,8 @@ fn shell_candidates(
 }
 
 /// Transfers a direct-exec workspace service and every descendant into one
-/// owned lifecycle boundary. Wrapper order is significant on Windows because
-/// `JobObject` observes the inner `KillOnDrop` marker.
+/// owned lifecycle boundary. On Windows the explicit drop owner wraps the
+/// assigned Job, preserving assignment-before-resume and tree termination.
 ///
 /// On Unix every workspace service, sandboxed or trusted, starts in a fresh
 /// session with no controlling terminal (see
@@ -837,8 +837,186 @@ pub(crate) fn owned_workspace_service_tree(command: Command) -> CommandWrap {
     #[cfg(unix)]
     command.wrap(NewSessionGroupLeader(ProcessGroup::leader()));
     #[cfg(windows)]
-    command.wrap(JobObject);
+    {
+        command.wrap(JobObject);
+        command.wrap(WorkspaceServiceJobDrop);
+    }
     command
+}
+
+/// The locked process-wrap 9.1.0 temporarily removes its wrapper registry
+/// during spawn, so JobObject cannot discover KillOnDrop and omits its native
+/// kill-on-close flag. Preserve assignment-before-resume, then explicitly
+/// terminate the still-owned Job on every Rust drop/unwrap path.
+#[cfg(all(windows, any(feature = "mcp", feature = "lsp")))]
+#[derive(Debug)]
+struct WorkspaceServiceJobDrop;
+
+#[cfg(all(windows, any(feature = "mcp", feature = "lsp")))]
+impl process_wrap::tokio::CommandWrapper for WorkspaceServiceJobDrop {
+    fn wrap_child(
+        &mut self,
+        child: Box<dyn process_wrap::tokio::ChildWrapper>,
+        _core: &CommandWrap,
+    ) -> std::io::Result<Box<dyn process_wrap::tokio::ChildWrapper>> {
+        Ok(Box::new(WorkspaceServiceJobChild { owned: Some(child) }))
+    }
+}
+
+#[cfg(all(windows, any(feature = "mcp", feature = "lsp")))]
+#[derive(Debug)]
+struct WorkspaceServiceJobChild {
+    owned: Option<Box<dyn process_wrap::tokio::ChildWrapper>>,
+}
+
+#[cfg(all(windows, any(feature = "mcp", feature = "lsp")))]
+impl WorkspaceServiceJobChild {
+    fn owned(&self) -> &dyn process_wrap::tokio::ChildWrapper {
+        self.owned.as_deref().expect("owned service Job")
+    }
+    fn owned_mut(&mut self) -> &mut (dyn process_wrap::tokio::ChildWrapper + 'static) {
+        self.owned.as_deref_mut().expect("owned service Job")
+    }
+}
+
+#[cfg(all(windows, any(feature = "mcp", feature = "lsp")))]
+impl Drop for WorkspaceServiceJobChild {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.owned {
+            let _ = child.start_kill();
+        }
+    }
+}
+
+#[cfg(all(windows, any(feature = "mcp", feature = "lsp")))]
+impl process_wrap::tokio::ChildWrapper for WorkspaceServiceJobChild {
+    // Match JobObjectChild's flattening for direct-leader/pipe access, but
+    // never let default lifecycle methods skip the retained Job object.
+    fn inner(&self) -> &dyn process_wrap::tokio::ChildWrapper {
+        self.owned().inner()
+    }
+    fn inner_mut(&mut self) -> &mut dyn process_wrap::tokio::ChildWrapper {
+        self.owned_mut().inner_mut()
+    }
+    fn into_inner(mut self: Box<Self>) -> Box<dyn process_wrap::tokio::ChildWrapper> {
+        let _ = self.owned_mut().start_kill();
+        self.owned.take().expect("owned service Job")
+    }
+    fn start_kill(&mut self) -> std::io::Result<()> {
+        self.owned_mut().start_kill()
+    }
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        self.owned_mut().try_wait()
+    }
+    fn wait(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<ExitStatus>> + Send + '_>>
+    {
+        self.owned_mut().wait()
+    }
+}
+
+#[cfg(all(test, windows, any(feature = "mcp", feature = "lsp")))]
+mod workspace_job_drop_tests {
+    use super::*;
+    use process_wrap::tokio::ChildWrapper;
+    use std::os::windows::process::ExitStatusExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug, Default)]
+    struct Counts {
+        job_kills: AtomicUsize,
+        raw_kills: AtomicUsize,
+        job_waits: AtomicUsize,
+        job_polls: AtomicUsize,
+    }
+    #[derive(Debug)]
+    struct Raw(Arc<Counts>);
+    impl ChildWrapper for Raw {
+        fn inner(&self) -> &dyn ChildWrapper {
+            self
+        }
+        fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+            self
+        }
+        fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
+            self
+        }
+        fn id(&self) -> Option<u32> {
+            None
+        }
+        fn start_kill(&mut self) -> std::io::Result<()> {
+            self.0.raw_kills.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    #[derive(Debug)]
+    struct Job {
+        raw: Raw,
+        counts: Arc<Counts>,
+    }
+    impl ChildWrapper for Job {
+        fn inner(&self) -> &dyn ChildWrapper {
+            &self.raw
+        }
+        fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+            &mut self.raw
+        }
+        fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
+            Box::new(self.raw)
+        }
+        fn start_kill(&mut self) -> std::io::Result<()> {
+            self.counts.job_kills.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+            self.counts.job_polls.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(ExitStatus::from_raw(0)))
+        }
+        fn wait(
+            &mut self,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = std::io::Result<ExitStatus>> + Send + '_>,
+        > {
+            self.counts.job_waits.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(ExitStatus::from_raw(0)) })
+        }
+    }
+    fn owned(counts: Arc<Counts>) -> Box<dyn ChildWrapper> {
+        Box::new(WorkspaceServiceJobChild {
+            owned: Some(Box::new(Job {
+                raw: Raw(counts.clone()),
+                counts,
+            })),
+        })
+    }
+
+    #[tokio::test]
+    async fn mcp_stdio_workspace_job_drop_and_unwrap_keep_job_lifecycle_dispatch() {
+        let counts = Arc::new(Counts::default());
+        let mut child = owned(counts.clone());
+        child.start_kill().unwrap();
+        Box::into_pin(child.kill()).await.unwrap();
+        child.try_wait().unwrap();
+        assert_eq!(counts.job_kills.load(Ordering::SeqCst), 2);
+        assert_eq!(counts.job_waits.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.job_polls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            counts.raw_kills.load(Ordering::SeqCst),
+            0,
+            "flattened access must never redirect Job termination to raw child"
+        );
+        drop(child);
+        assert_eq!(counts.job_kills.load(Ordering::SeqCst), 3);
+        let unwrapped = owned(counts.clone()).into_inner();
+        assert_eq!(
+            counts.job_kills.load(Ordering::SeqCst),
+            4,
+            "unwrap must initiate retirement before transferring the Job"
+        );
+        drop(unwrapped);
+        assert_eq!(counts.raw_kills.load(Ordering::SeqCst), 0);
+    }
 }
 
 /// `process-wrap` process-group ownership for a child that makes itself a

@@ -524,7 +524,7 @@ mod windows_tree_tests {
                 run("tree-test", &helper, &root, Duration::from_secs(15)).await
             });
             let _task_owner = AbortOnDrop(task.abort_handle());
-            let descendant = fixture.ready().await;
+            let descendant = fixture.ready(action).await;
             match action {
                 "success" | "success-inherited" => fixture.release(),
                 "drop" => task.abort(),
@@ -532,13 +532,23 @@ mod windows_tree_tests {
             }
             let result = tokio::time::timeout(Duration::from_secs(20), task)
                 .await
-                .expect("MCP helper retirement");
+                .unwrap_or_else(|error| panic!("MCP helper failed to retire in {action}: {error}"));
             match action {
-                "success" | "success-inherited" => assert!(result.unwrap().is_ok()),
-                "timeout" => assert!(result.unwrap().is_err()),
-                _ => assert!(result.unwrap_err().is_cancelled()),
+                "success" | "success-inherited" => {
+                    result
+                        .unwrap()
+                        .unwrap_or_else(|error| panic!("MCP helper {action} failed: {error:#}"));
+                }
+                "timeout" => assert!(
+                    result.unwrap().is_err(),
+                    "MCP helper timeout unexpectedly succeeded"
+                ),
+                _ => assert!(
+                    result.unwrap_err().is_cancelled(),
+                    "MCP helper drop did not cancel task"
+                ),
             }
-            descendant.assert_retired().await;
+            descendant.assert_retired(action).await;
         }
     }
 }

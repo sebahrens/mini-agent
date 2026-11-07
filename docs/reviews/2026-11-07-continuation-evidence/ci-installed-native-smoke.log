@@ -1,0 +1,4 @@
+mini-agent 1.12.0
+build: 7654f930ad3d8ee95e9ba12fed571a590fb8ec54dc78aa8c7bdd84ca116f139b
+target: aarch64-apple-darwin
+JS runtime check: PASS (2)

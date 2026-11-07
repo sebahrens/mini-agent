@@ -391,7 +391,31 @@ mod bound_platform {
     }
 
     fn nt_error(status: NtStatus) -> std::io::Error {
-        std::io::Error::other(format!("Windows native filesystem error: {status:#x}"))
+        // Keep native missing/access-denied classes: optional Git metadata
+        // must distinguish absence from a failed authorization or bad path.
+        // SAFETY: RtlNtStatusToDosError accepts any NTSTATUS value and does
+        // not borrow memory or transfer ownership.
+        let code = unsafe { windows_sys::Win32::Foundation::RtlNtStatusToDosError(status) };
+        std::io::Error::from_raw_os_error(code as i32)
+    }
+
+    #[cfg(test)]
+    mod native_error_tests {
+        use super::*;
+
+        #[test]
+        fn windows_native_errors_preserve_missing_and_access_denied_classes() {
+            use windows_sys::Win32::Foundation::{
+                STATUS_ACCESS_DENIED, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
+            };
+            for status in [STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND] {
+                assert_eq!(nt_error(status).kind(), std::io::ErrorKind::NotFound);
+            }
+            assert_eq!(
+                nt_error(STATUS_ACCESS_DENIED).kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+        }
     }
 
     pub(super) fn open_root(path: &Path) -> std::io::Result<File> {
@@ -2614,48 +2638,73 @@ mod linked_ignore_fixture {
         std::fs::create_dir(&empty).unwrap();
         let global = base.join("empty-gitconfig");
         std::fs::write(&global, "").unwrap();
-        let git = |args: &[&str]| {
+        let child_path = |path: &Path| {
+            #[cfg(windows)]
+            {
+                crate::sandbox::windows::child_process_path(path)
+            }
+            #[cfg(not(windows))]
+            {
+                path.to_path_buf()
+            }
+        };
+        // Rust keeps the canonical owned paths. Every path given to C Git
+        // uses its supported child-process spelling on Windows.
+        let child_repo = child_path(&repo);
+        let child_workspace = child_path(&workspace);
+        let child_empty = child_path(&empty);
+        let child_global = child_path(&global);
+        let git = |args: &[std::ffi::OsString]| {
+            let mut argv: Vec<std::ffi::OsString> = vec![
+                "-C".into(),
+                child_repo.as_os_str().to_owned(),
+                "-c".into(),
+                "user.name=fixture".into(),
+                "-c".into(),
+                "user.email=fixture@example.invalid".into(),
+                "-c".into(),
+                "commit.gpgSign=false".into(),
+                "-c".into(),
+                format!("core.hooksPath={}", child_empty.display()).into(),
+            ];
+            argv.extend_from_slice(args);
             let output = std::process::Command::new("git")
-                .arg("-C")
-                .arg(&repo)
-                .args([
-                    "-c",
-                    "user.name=fixture",
-                    "-c",
-                    "user.email=fixture@example.invalid",
-                    "-c",
-                    "commit.gpgSign=false",
-                    "-c",
-                ])
-                .arg(format!("core.hooksPath={}", empty.display()))
-                .args(args)
+                .args(&argv)
                 .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_CONFIG_GLOBAL", &global)
+                .env("GIT_CONFIG_GLOBAL", &child_global)
                 .env_remove("GIT_DIR")
                 .env_remove("GIT_WORK_TREE")
                 .env_remove("GIT_COMMON_DIR")
                 .env_remove("GIT_CONFIG_COUNT")
                 .env_remove("GIT_CONFIG_PARAMETERS")
                 .output()
-                .expect("fixture Git");
+                .unwrap_or_else(|error| panic!("fixture Git failed to start: {error}; argv={argv:?}; GIT_CONFIG_GLOBAL={child_global:?}"));
             assert!(
                 output.status.success(),
-                "fixture Git failed: {}",
+                "fixture Git failed: argv={argv:?}; GIT_CONFIG_GLOBAL={child_global:?}; status={}; stdout={:?}; stderr={:?}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
         };
         git(&[
-            "init",
-            "--quiet",
-            &format!("--template={}", empty.display()),
+            "init".into(),
+            "--quiet".into(),
+            format!("--template={}", child_empty.display()).into(),
         ]);
-        git(&["commit", "--allow-empty", "--quiet", "-m", "fixture"]);
         git(&[
-            "worktree",
-            "add",
-            "--detach",
-            "--quiet",
-            workspace.to_str().unwrap(),
+            "commit".into(),
+            "--allow-empty".into(),
+            "--quiet".into(),
+            "-m".into(),
+            "fixture".into(),
+        ]);
+        git(&[
+            "worktree".into(),
+            "add".into(),
+            "--detach".into(),
+            "--quiet".into(),
+            child_workspace.as_os_str().to_owned(),
         ]);
         std::fs::create_dir_all(repo.join(".git/info")).unwrap();
         std::fs::write(repo.join(".git/info/exclude"), "notes.txt\nkept.txt\n").unwrap();
@@ -3675,7 +3724,17 @@ mod tests {
             found.contains("kept.txt:") && found.contains("plain.txt:"),
             "{found}"
         );
-        std::fs::write(workspace.join(".git"), "invalid gitfile\n").unwrap();
+        // Git marks this existing gitfile hidden on Windows. Truncate
+        // without create so the fixture preserves that attribute.
+        std::io::Write::write_all(
+            &mut std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(workspace.join(".git"))
+                .unwrap(),
+            b"invalid gitfile\n",
+        )
+        .unwrap();
         assert!(
             find.call(
                 serde_json::from_value(serde_json::json!({"pattern":"*.txt", "path":"nested"}))
@@ -3707,6 +3766,56 @@ mod tests {
                 .any(|line| Path::new(line).file_name() == Some(std::ffi::OsStr::new("notes.txt"))),
             "explicit no_ignore failed: {found}"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_optional_git_metadata_accepts_missing_paths_and_rejects_corruption() {
+        let owner = crate::tests::OwnedTestDirectory::new("windows-optional-git-ignore");
+        let workspace = owner.path().canonicalize().unwrap();
+        std::fs::write(workspace.join("plain.txt"), "fixture").unwrap();
+        let metadata = crate::fs::checked_path_metadata(&workspace).unwrap();
+        let bound = BoundDirectory::open(&workspace, &metadata).unwrap();
+        // No repository, ordinary repository without commondir/info, then
+        // missing optional exclude: each uses the actual relative NT opener.
+        assert!(
+            root_exclude_matcher(&bound.root, &workspace)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            bound
+                .walker()
+                .unwrap()
+                .any(|entry| entry.file_name == "plain.txt")
+        );
+        std::fs::create_dir(workspace.join(".git")).unwrap();
+        assert!(
+            root_exclude_matcher(&bound.root, &workspace)
+                .unwrap()
+                .is_none()
+        );
+        std::fs::create_dir(workspace.join(".git/info")).unwrap();
+        assert!(
+            root_exclude_matcher(&bound.root, &workspace)
+                .unwrap()
+                .is_none()
+        );
+        std::fs::write(workspace.join(".git/info/exclude"), "plain.txt\n").unwrap();
+        assert!(
+            !bound
+                .walker()
+                .unwrap()
+                .any(|entry| entry.file_name == "plain.txt")
+        );
+        std::fs::write(workspace.join(".git/commondir"), "\0").unwrap();
+        assert!(root_exclude_matcher(&bound.root, &workspace).is_err());
+        let denied = common_git_directory(
+            &workspace.join(".git"),
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        )
+        .unwrap_err();
+        assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
     #[test]

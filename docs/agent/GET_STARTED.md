@@ -394,6 +394,9 @@ mini-agent -p --output stream-json "Update the README example"
 Invalid UTF-8 and oversized input fail locally. Empty prompts fail before reading stdin;
 `--loop`, ACP, interactive mode, and explicit `-p '!command'` do not consume it. A stalled stdin
 reader uses the same interrupt and 10-second forced-stop grace as an active headless turn.
+The same bound applies when an open stdout or stderr pipe stops draining, including final
+answers and goal status reports after the model turn ends. A second interrupt ends the cleanup
+wait immediately; completed work and accounting are retained before final output.
 
 `--output stream-json` writes one JSON object per line: `system` (logical session ID/name,
 provider/model, and `ephemeral`), `assistant_text`, `tool_call`, `tool_result`, `usage`, optional

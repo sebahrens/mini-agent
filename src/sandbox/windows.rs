@@ -5710,7 +5710,7 @@ fn windows_command_line(program: &Path, arguments: &[String]) -> String {
         .join(" ")
 }
 
-fn child_process_path(path: &Path) -> PathBuf {
+pub(crate) fn child_process_path(path: &Path) -> PathBuf {
     let units: Vec<u16> = path.as_os_str().encode_wide().collect();
     const VERBATIM: &[u16] = &[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
     const VERBATIM_UNC: &[u16] = &[

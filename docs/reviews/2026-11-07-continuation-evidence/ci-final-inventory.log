@@ -1,0 +1,35 @@
+   Compiling mini-agent v1.12.0 (/Users/seb/projects/mini-agent)
+    Finished `test` profile [unoptimized] target(s) in 25.20s
+     Running unittests src/main.rs (target/debug/deps/mini_agent-eb54318180c9c0b0)
+
+running 28 tests
+test tests::subprocess_inventory_tests::boundary_validation_fails_closed_for_unclassified_multiline_and_ufcs_terminals ... ok
+test tests::subprocess_inventory_tests::current_subprocess_inventory_accepts_exact_broker_and_rejects_cross_family_classes ... ok
+test tests::subprocess_inventory_tests::macro_non_process_identity_binds_full_nesting_chain ... ok
+test tests::subprocess_inventory_tests::macro_non_process_identity_binds_name_receiver_and_shape ... ok
+test tests::subprocess_inventory_tests::macro_non_process_identity_structurally_binds_exact_tokens ... ok
+test tests::subprocess_inventory_tests::path_provenance_fails_closed_for_self_prefix_namespace_collisions ... ok
+test tests::subprocess_inventory_tests::process_creation_raw_inventory_rejects_a_guard_dropped_before_spawn ... ok
+test tests::subprocess_inventory_tests::process_creation_raw_inventory_rejects_guards_across_suspension_and_deferral ... ok
+test tests::subprocess_inventory_tests::process_creation_raw_inventory_rejects_locally_defined_deferred_macros ... ok
+test tests::subprocess_inventory_tests::process_creation_raw_inventory_rejects_macro_deferred_terminals ... ok
+test tests::subprocess_inventory_tests::process_creation_raw_inventory_rejects_new_unguarded_helpers ... ok
+test tests::subprocess_inventory_tests::process_creation_raw_terminals_are_exact_and_guard_dominated ... ok
+test tests::subprocess_inventory_tests::production_source_excludes_test_only_modules ... ok
+test tests::subprocess_inventory_tests::production_subprocess_sites_have_a_trust_classification ... ok
+test tests::subprocess_inventory_tests::subprocess_inventory_rejects_site_specific_relabels_in_mixed_files ... ok
+test tests::subprocess_inventory_tests::token_terminal_discovery_distinguishes_guarded_calls_and_ignores_text ... ok
+test tests::subprocess_inventory_tests::token_terminal_discovery_does_not_trust_process_alias_spelling ... ok
+test tests::subprocess_inventory_tests::token_terminal_discovery_fails_closed_after_opaque_module_imports ... ok
+test tests::subprocess_inventory_tests::token_terminal_discovery_normalizes_raw_terminal_identifiers ... ok
+test tests::subprocess_inventory_tests::token_terminal_discovery_rejects_aliased_macro_method_ident_indirection ... ok
+test tests::subprocess_inventory_tests::token_terminal_discovery_rejects_inferred_macro_method_ident_indirection ... ok
+test tests::subprocess_inventory_tests::token_terminal_discovery_rejects_macro_method_ident_indirection ... ok
+test tests::subprocess_inventory_tests::token_terminal_discovery_rejects_multiline_creation_lock_bypasses ... ok
+test tests::subprocess_inventory_tests::token_terminal_discovery_rejects_nested_macro_method_ident_indirection ... ok
+test tests::subprocess_inventory_tests::token_terminal_discovery_rejects_process_function_item_indirection ... ok
+test tests::subprocess_inventory_tests::token_terminal_discovery_rejects_std_and_tokio_ufcs_bypasses ... ok
+test tests::subprocess_inventory_tests::token_terminal_discovery_resolves_process_type_aliases_and_module_reexports ... ok
+test tests::subprocess_inventory_tests::windows_capable_production_process_terminals_use_creation_boundary ... ok
+
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 6250 filtered out; finished in 50.88s

@@ -1338,14 +1338,14 @@ fn needs_openrouter_context_refresh(cfg: &Config, model: &str) -> bool {
 
 /// Headless detached work belongs to the session, including the final loop
 /// iteration. A forced stop skips grace but still joins cancellation below.
-#[cfg(all(test, feature = "subagents"))]
+#[cfg(all(test, unix, feature = "loop", feature = "subagents"))]
 pub(crate) struct HeadlessExitWaitTestGate {
     pub entered: std::sync::atomic::AtomicBool,
     pub release: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
-#[cfg(all(test, feature = "subagents"))]
+#[cfg(all(test, unix, feature = "loop", feature = "subagents"))]
 tokio::task_local! { static HEADLESS_EXIT_WAIT_TEST_GATE: std::sync::Arc<HeadlessExitWaitTestGate>; }
-#[cfg(all(test, feature = "subagents"))]
+#[cfg(all(test, unix, feature = "loop", feature = "subagents"))]
 pub(crate) async fn with_headless_exit_wait_gate<F: std::future::Future>(
     gate: std::sync::Arc<HeadlessExitWaitTestGate>,
     future: F,
@@ -1355,7 +1355,7 @@ pub(crate) async fn with_headless_exit_wait_gate<F: std::future::Future>(
 
 #[cfg(feature = "subagents")]
 pub(crate) async fn wait_headless_background_tasks(session: &Session, cfg: &Config) {
-    #[cfg(test)]
+    #[cfg(all(test, unix, feature = "loop"))]
     let _ = HEADLESS_EXIT_WAIT_TEST_GATE.try_with(|gate| {
         gate.entered
             .store(true, std::sync::atomic::Ordering::SeqCst)
@@ -1370,7 +1370,7 @@ pub(crate) async fn wait_headless_background_tasks(session: &Session, cfg: &Conf
     if active == 0 || secs == 0 || crate::print::headless_force_stopped() {
         return;
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix, feature = "loop"))]
     let _ = HEADLESS_EXIT_WAIT_TEST_GATE.try_with(|gate| {
         if let Some(release) = gate.release.lock().unwrap().take() {
             let _ = release.send(());
@@ -2502,7 +2502,14 @@ impl Startup {
         #[cfg(not(feature = "hooks"))]
         let result = work.await;
         #[cfg(feature = "hooks")]
-        hook_cleanup.settle().await;
+        if crate::print::headless_force_stopped() {
+            // A nested output driver already exhausted its interrupt grace.
+            // Its retained join must not turn the root hook cleanup into an
+            // unbounded wait before main performs the recorded forced exit.
+            drop(hook_cleanup);
+        } else {
+            hook_cleanup.settle().await;
+        }
         #[cfg(feature = "js")]
         if let Some(probe) = probe {
             probe.retire_after_owner_exit().await?;
@@ -8555,7 +8562,7 @@ mod native_publication_startup_tests {
     }
 }
 
-#[cfg(all(test, feature = "goal"))]
+#[cfg(test)]
 mod headless_session_lifetime_tests {
     use super::*;
 
@@ -8659,6 +8666,7 @@ mod headless_session_lifetime_tests {
         assert_eq!(startup.session.total_input_tokens, 3);
     }
 
+    #[cfg(feature = "goal")]
     #[test]
     fn ephemeral_goal_round_keeps_retained_history() {
         let mut session = Session::new("openrouter", "test", 128_000, "");
@@ -8677,6 +8685,7 @@ mod headless_session_lifetime_tests {
         );
         assert_eq!(session.total_input_tokens, 3);
     }
+    #[cfg(feature = "goal")]
     #[tokio::test]
     async fn failed_goal_save_does_not_duplicate_final_round() {
         #[cfg(feature = "hooks")]

@@ -382,10 +382,18 @@ impl TempRoot {
         use std::time::{Duration, Instant};
 
         let budget_fixture = outcome.starts_with("budget_") || outcome.starts_with("question_");
+        let gate_progress = matches!(
+            outcome,
+            "gated_flood_after_tool" | "gated_flood_reasoning_after_tool"
+        );
+        let gate_final = outcome == "gated_large_completed";
         let outcome = match outcome {
             "budget_effect" => "permission_allow",
             "budget_schema" => "schema_effect_repair",
             "budget_completed" => "completed",
+            "gated_flood_after_tool" => "flood_after_tool",
+            "gated_flood_reasoning_after_tool" => "flood_reasoning_after_tool",
+            "gated_large_completed" => "large_completed",
             _ => outcome,
         };
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -601,6 +609,8 @@ impl TempRoot {
                 if (matches!(outcome, "gated_partial_failure" | "gated_transient_failure")
                     && index == 1)
                     || outcome == "gated_goal_round"
+                    || (gate_progress && index == 1)
+                    || gate_final
                 {
                     std::fs::write(&waiting, "ready")?;
                     let release = waiting.with_extension("release");
@@ -3787,6 +3797,91 @@ fn headless_session_identity_follows_the_actual_resumed_and_renamed_session() {
 }
 
 #[cfg(unix)]
+fn stalled_fixture_pipe_snapshot(fd: Option<&std::os::fd::OwnedFd>) -> String {
+    use std::os::fd::AsRawFd;
+    let Some(fd) = fd else {
+        return "drained by fixture".into();
+    };
+    let mut available = 0_i32;
+    if unsafe { libc::ioctl(fd.as_raw_fd(), libc::FIONREAD, &mut available) } == -1 {
+        return format!(
+            "queued-byte query failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let mut bytes = vec![0; (available.max(0) as usize).min(16 * 1024)];
+    if !bytes.is_empty() {
+        let count = unsafe { libc::read(fd.as_raw_fd(), bytes.as_mut_ptr().cast(), bytes.len()) };
+        if count < 0 {
+            return format!("queued read failed: {}", std::io::Error::last_os_error());
+        }
+        bytes.truncate(count as usize);
+    }
+    format!(
+        "{available} queued bytes: {:?}",
+        String::from_utf8_lossy(&bytes)
+    )
+}
+
+#[cfg(unix)]
+fn stalled_fixture_files(root: &TempRoot) -> String {
+    let mut names: Vec<_> = std::fs::read_dir(&root.0)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .collect();
+    names.sort();
+    format!("{names:?}")
+}
+
+#[cfg(unix)]
+fn drain_stalled_startup(
+    root: &TempRoot,
+    readers: &mut [(&std::os::fd::OwnedFd, &mut Vec<u8>)],
+    deadline: std::time::Instant,
+    require_tool_result: bool,
+) {
+    use std::os::fd::AsRawFd;
+    loop {
+        let tool_result = !require_tool_result
+            || readers[0].1.split(|byte| *byte == b'\n').any(|line| {
+                serde_json::from_slice::<serde_json::Value>(line)
+                    .is_ok_and(|row| row["type"] == "tool_result")
+            });
+        if root.0.join("provider.waiting").exists() && tool_result {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "gated startup drain: {}",
+            stalled_fixture_files(root)
+        );
+        let mut polls: Vec<_> = readers
+            .iter()
+            .map(|(fd, _)| libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        assert!(unsafe { libc::poll(polls.as_mut_ptr(), polls.len() as libc::nfds_t, 10) } >= 0);
+        for ((fd, bytes), poll) in readers.iter_mut().zip(polls) {
+            if poll.revents & libc::POLLIN != 0 {
+                let mut chunk = [0_u8; 4096];
+                let count =
+                    unsafe { libc::read(fd.as_raw_fd(), chunk.as_mut_ptr().cast(), chunk.len()) };
+                assert!(count > 0, "startup output closed before provider gate");
+                bytes.extend_from_slice(&chunk[..count as usize]);
+                assert!(
+                    bytes.len() <= 1024 * 1024,
+                    "provider must remain gated while startup output drains"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
 #[test]
 fn stalled_open_stdout_has_bounded_signal_cleanup_and_preserves_accounting_without_changing_inherited_flags()
  {
@@ -3836,9 +3931,9 @@ fn stalled_open_stdout_has_bounded_signal_cleanup_and_preserves_accounting_witho
         };
         let server = (mode != "system").then(|| {
             root.local_provider(if matches!(mode, "active-stream" | "resume-active") {
-                "flood_after_tool"
+                "gated_flood_after_tool"
             } else {
-                "large_completed"
+                "gated_large_completed"
             })
         });
         let mut command = root.provider_command("write");
@@ -3874,6 +3969,8 @@ fn stalled_open_stdout_has_bounded_signal_cleanup_and_preserves_accounting_witho
         drop(command);
         let stderr_pipe = child.stderr.take().unwrap();
         let (gate_tx, gate_rx) = mpsc::channel();
+        let live_stderr = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let capture = live_stderr.clone();
         let stderr = std::thread::spawn(move || {
             let mut captured = String::new();
             for line in BufReader::new(stderr_pipe).lines() {
@@ -3887,6 +3984,7 @@ fn stalled_open_stdout_has_bounded_signal_cleanup_and_preserves_accounting_witho
                 if captured.len() < 64 * 1024 {
                     captured.push_str(&line);
                     captured.push('\n');
+                    *capture.lock().unwrap() = captured.clone();
                 }
             }
             captured
@@ -3899,12 +3997,108 @@ fn stalled_open_stdout_has_bounded_signal_cleanup_and_preserves_accounting_witho
             parent_writer: Some(parent_writer),
         };
         let mut reader = Some(reader);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut prefix = Vec::new();
+        if mode != "system" {
+            // Even a tiny pipe can block startup records. Reach the intended
+            // tool/final-output boundary before deliberately stopping reads.
+            drain_stalled_startup(
+                &root,
+                &mut [(reader.as_ref().unwrap(), &mut prefix)],
+                deadline,
+                matches!(mode, "active-stream" | "resume-active"),
+            );
+            // Startup may already have emitted a transient write notice on
+            // a very small pipe. It cannot establish final-payload admission.
+            while gate_rx.try_recv().is_ok() {}
+            std::fs::write(root.0.join("provider.release"), "release").unwrap();
+            let payload_start = prefix.len();
+            if !matches!(mode, "active-stream" | "resume-active") {
+                while !std::fs::read_dir(root.0.join("sessions")).is_ok_and(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .any(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+                }) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "{mode}: final snapshot before output admission; stderr={:?}; files={}",
+                        live_stderr.lock().unwrap(),
+                        stalled_fixture_files(&root)
+                    );
+                    if mode == "final-json" {
+                        // Bounded assistant/usage rows precede persistence;
+                        // tiny pipes need them drained to reach final output.
+                        let fd = reader.as_ref().unwrap().as_raw_fd();
+                        let mut ready = libc::pollfd {
+                            fd,
+                            events: libc::POLLIN,
+                            revents: 0,
+                        };
+                        assert!(unsafe { libc::poll(&mut ready, 1, 10) } >= 0);
+                        if ready.revents & libc::POLLIN != 0 {
+                            let mut bytes = [0; 4096];
+                            let count =
+                                unsafe { libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len()) };
+                            assert!(count > 0, "{mode}: output closed before final snapshot");
+                            prefix.extend_from_slice(&bytes[..count as usize]);
+                            assert!(
+                                prefix.len() - payload_start < 64 * 1024,
+                                "only bounded intermediate rows may drain before final snapshot"
+                            );
+                        }
+                    } else {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            }
+            let final_marker = [b"\"result\":\"".as_slice(), &[b'x'; 128]].concat();
+            while !(if mode == "final-json" {
+                prefix[payload_start..]
+                    .windows(final_marker.len())
+                    .any(|bytes| bytes == final_marker.as_slice())
+            } else {
+                prefix[payload_start..]
+                    .windows(128)
+                    .any(|bytes| bytes.iter().all(|byte| *byte == b'x'))
+            }) {
+                assert!(
+                    Instant::now() < deadline,
+                    "{mode}: intended large output never reached its pipe; stderr={:?}",
+                    live_stderr.lock().unwrap()
+                );
+                let fd = reader.as_ref().unwrap().as_raw_fd();
+                let mut ready = libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                assert!(unsafe { libc::poll(&mut ready, 1, 10) } >= 0);
+                if ready.revents & libc::POLLIN != 0 {
+                    let mut bytes = [0; 4096];
+                    let count = unsafe { libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len()) };
+                    assert!(
+                        count > 0,
+                        "{mode}: output closed before intended large payload"
+                    );
+                    prefix.extend_from_slice(&bytes[..count as usize]);
+                    assert!(
+                        prefix.len() - payload_start < 64 * 1024,
+                        "the fixture must stop draining at the start of the large payload"
+                    );
+                }
+            }
+        }
         // Reader remains open and deliberately undrained. The production
         // pending-write notice gates the signal on an admitted output job.
         assert_eq!(
             gate_rx
-                .recv_timeout(Duration::from_secs(10))
-                .expect("full stdout pipe readiness"),
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|error| panic!(
+                    "{mode}: full stdout pipe readiness: {error}; stderr={:?}; files={}; stdout={}",
+                    live_stderr.lock().unwrap(),
+                    stalled_fixture_files(&root),
+                    stalled_fixture_pipe_snapshot(reader.as_ref())
+                )),
             "blocked"
         );
         assert!(fixture.child.try_wait().unwrap().is_none());
@@ -3928,10 +4122,22 @@ fn stalled_open_stdout_has_bounded_signal_cleanup_and_preserves_accounting_witho
 
         if matches!(mode, "active-stream" | "resume-active") {
             assert_eq!(
-                std::fs::read_to_string(root.0.join("effect.txt")).unwrap(),
+                std::fs::read_to_string(root.0.join("effect.txt")).unwrap_or_else(|error| panic!(
+                    "{mode}: effect before signal: {error}; stderr={:?}; files={}; stdout={}",
+                    live_stderr.lock().unwrap(),
+                    stalled_fixture_files(&root),
+                    stalled_fixture_pipe_snapshot(reader.as_ref())
+                )),
                 "written\n"
             );
         } else if mode != "system" {
+            assert!(
+                root.0.join("sessions").is_dir(),
+                "{mode}: missing saved session before signal; stderr={:?}; files={}; stdout={}",
+                live_stderr.lock().unwrap(),
+                stalled_fixture_files(&root),
+                stalled_fixture_pipe_snapshot(reader.as_ref())
+            );
             let saved = root.saved_session();
             assert_eq!(saved["total_input_tokens"], 100);
             assert_eq!(saved["total_output_tokens"], 20);
@@ -3949,7 +4155,7 @@ fn stalled_open_stdout_has_bounded_signal_cleanup_and_preserves_accounting_witho
         assert_eq!(
             gate_rx
                 .recv_timeout(Duration::from_secs(5))
-                .expect("first signal cancellation acknowledged"),
+                .unwrap_or_else(|error| panic!("{mode}: first signal cancellation acknowledged: {error}; stderr={:?}; files={}; stdout={}", live_stderr.lock().unwrap(), stalled_fixture_files(&root), stalled_fixture_pipe_snapshot(reader.as_ref()))),
             "cancelled"
         );
         if matches!(mode, "active-stream" | "resume-active") {
@@ -3967,8 +4173,9 @@ fn stalled_open_stdout_has_bounded_signal_cleanup_and_preserves_accounting_witho
         }
         if mode == "resume-active" {
             let pipe = reader.take().unwrap();
+            let retained = std::mem::take(&mut prefix);
             fixture.stdout = Some(std::thread::spawn(move || {
-                let mut emitted = Vec::new();
+                let mut emitted = retained;
                 std::fs::File::from(pipe).read_to_end(&mut emitted).unwrap();
                 emitted
             }));
@@ -4003,7 +4210,7 @@ fn stalled_open_stdout_has_bounded_signal_cleanup_and_preserves_accounting_witho
         let emitted = if let Some(reader) = fixture.stdout.take() {
             reader.join().unwrap()
         } else {
-            let mut emitted = Vec::new();
+            let mut emitted = prefix;
             std::fs::File::from(reader.take().unwrap())
                 .read_to_end(&mut emitted)
                 .unwrap();
@@ -4033,6 +4240,12 @@ fn stalled_open_stdout_has_bounded_signal_cleanup_and_preserves_accounting_witho
                 "blocked system output must not start provider work"
             );
         } else {
+            assert!(
+                root.0.join("sessions").is_dir(),
+                "{mode}: missing saved session after exit {status:?}; stderr={stderr}; files={}; stdout_prefix={:?}",
+                stalled_fixture_files(&root),
+                String::from_utf8_lossy(&emitted[..emitted.len().min(4096)])
+            );
             let saved = root.saved_session();
             assert_eq!(
                 saved["total_input_tokens"], 100,
@@ -4096,28 +4309,29 @@ fn stalled_stderr_progress_and_runtime_reports_and_both_sinks_settle_owned_work_
         let control = writer.try_clone().unwrap();
         (reader, writer, control)
     }
-    fn full(fd: &OwnedFd) -> bool {
-        let mut poll = libc::pollfd {
-            fd: fd.as_raw_fd(),
-            events: libc::POLLOUT,
-            revents: 0,
-        };
-        let result = unsafe { libc::poll(&mut poll, 1, 0) };
-        assert!(result >= 0);
-        assert_eq!(
-            poll.revents & (libc::POLLERR | libc::POLLHUP),
-            0,
-            "reader must remain open"
+    fn queued(fd: &OwnedFd) -> usize {
+        let mut bytes = 0_i32;
+        assert_ne!(
+            unsafe { libc::ioctl(fd.as_raw_fd(), libc::FIONREAD, &mut bytes) },
+            -1
         );
-        poll.revents & libc::POLLOUT == 0
+        bytes as usize
     }
-    fn wait(deadline: Instant, mut condition: impl FnMut() -> bool) {
+    fn wait(
+        deadline: Instant,
+        mut condition: impl FnMut() -> bool,
+        diagnostics: impl Fn() -> String,
+    ) {
         while !condition() {
-            assert!(Instant::now() < deadline, "fixture readiness deadline");
+            assert!(
+                Instant::now() < deadline,
+                "fixture readiness deadline: {}",
+                diagnostics()
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
     }
-    fn fill_while_provider_is_gated(fd: &OwnedFd) {
+    fn fill_while_provider_is_gated(fd: &OwnedFd, reader: &OwnedFd) -> usize {
         // Only fixture preparation changes this controlled OFD temporarily.
         // No child stderr emission is active at either gated preparation point.
         let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
@@ -4154,7 +4368,11 @@ fn stalled_stderr_progress_and_runtime_reports_and_both_sinks_settle_owned_work_
             unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags) },
             -1
         );
-        assert!(full(fd));
+        // Some hosts advertise POLLOUT despite a physical EAGAIN boundary.
+        // The actual failed writes above prove saturation without trusting it.
+        let witness = queued(reader);
+        assert!(witness > 0);
+        witness
     }
     struct Fixture {
         child: Child,
@@ -4204,9 +4422,9 @@ fn stalled_stderr_progress_and_runtime_reports_and_both_sinks_settle_owned_work_
         } else if mode == "ordinary-report" {
             "gated_partial_failure"
         } else if mode == "both" {
-            "flood_after_tool"
+            "gated_flood_after_tool"
         } else {
-            "flood_reasoning_after_tool"
+            "gated_flood_reasoning_after_tool"
         };
         let server = root.local_provider(outcome);
         let mut command = root.provider_command("write");
@@ -4269,63 +4487,73 @@ fn stalled_stderr_progress_and_runtime_reports_and_both_sinks_settle_owned_work_
             server: Some(server),
         };
         let deadline = Instant::now() + Duration::from_secs(10);
+        let mut stdout_prefix = Vec::new();
+        let mut stderr_prefix = Vec::new();
         if mode == "both" {
-            // Consume only the small operational notice while stderr is usable,
-            // then hold both read ends open but stop consuming either pipe.
-            let mut line = Vec::new();
-            loop {
-                let fd = fixture.err_reader.as_ref().unwrap().as_raw_fd();
-                let mut ready = libc::pollfd {
-                    fd,
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                if unsafe { libc::poll(&mut ready, 1, 100) } == 0 {
-                    assert!(Instant::now() < deadline);
-                    continue;
-                }
-                let mut byte = [0];
-                assert_eq!(unsafe { libc::read(fd, byte.as_mut_ptr().cast(), 1) }, 1);
-                line.push(byte[0]);
-                if byte[0] == b'\n' {
-                    if line.starts_with(b"Headless stdout is still writing") {
-                        break;
-                    }
-                    line.clear();
-                }
-            }
-            assert!(full(fixture.out_control.as_ref().unwrap()));
-            fill_while_provider_is_gated(fixture.err_control.as_ref().unwrap());
-        } else if matches!(
+            drain_stalled_startup(
+                &root,
+                &mut [
+                    (fixture.out_reader.as_ref().unwrap(), &mut stdout_prefix),
+                    (fixture.err_reader.as_ref().unwrap(), &mut stderr_prefix),
+                ],
+                deadline,
+                true,
+            );
+        } else {
+            drain_stalled_startup(
+                &root,
+                &mut [(fixture.err_reader.as_ref().unwrap(), &mut stderr_prefix)],
+                deadline,
+                false,
+            );
+        }
+        let diagnostics = || {
+            format!(
+                "mode={mode}; files={}; stdout={}; stderr={}",
+                stalled_fixture_files(&root),
+                stalled_fixture_pipe_snapshot(fixture.out_reader.as_ref()),
+                stalled_fixture_pipe_snapshot(fixture.err_reader.as_ref())
+            )
+        };
+        if mode != "goal" {
+            assert_eq!(
+                std::fs::read_to_string(root.0.join("effect.txt")).unwrap(),
+                "written\n"
+            );
+        }
+        // The provider is physically parked. Prepare real EAGAIN boundaries,
+        // then restore every inherited writer flag before letting it answer.
+        let stderr_saturation = fill_while_provider_is_gated(
+            fixture.err_control.as_ref().unwrap(),
+            fixture.err_reader.as_ref().unwrap(),
+        );
+        let stdout_saturation = (mode == "both").then(|| {
+            fill_while_provider_is_gated(
+                fixture.out_control.as_ref().unwrap(),
+                fixture.out_reader.as_ref().unwrap(),
+            )
+        });
+        std::fs::write(root.0.join("provider.release"), "release").unwrap();
+        if matches!(
             mode,
             "ordinary-report" | "goal" | "retry-log" | "retry-log-resumed"
         ) {
-            wait(deadline, || root.0.join("provider.waiting").exists());
-            if mode != "goal" {
-                assert_eq!(
-                    std::fs::read_to_string(root.0.join("effect.txt")).unwrap(),
-                    "written\n"
-                );
-            }
-            fill_while_provider_is_gated(fixture.err_control.as_ref().unwrap());
-            std::fs::write(root.0.join("provider.release"), "release").unwrap();
             // The actual ordinary-error reporter runs after durable turn
             // settlement, so its stalled sink must not lose history or cost.
             if !mode.starts_with("retry-log") {
-                wait(deadline, || {
-                    std::fs::read_dir(root.0.join("sessions")).is_ok_and(|entries| {
-                        entries
-                            .filter_map(Result::ok)
-                            .any(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
-                    })
-                });
+                wait(
+                    deadline,
+                    || {
+                        std::fs::read_dir(root.0.join("sessions")).is_ok_and(|entries| {
+                            entries.filter_map(Result::ok).any(|entry| {
+                                entry.path().extension().is_some_and(|ext| ext == "json")
+                            })
+                        })
+                    },
+                    diagnostics,
+                );
                 assert_eq!(root.saved_session()["total_input_tokens"], 100);
             }
-        } else {
-            wait(deadline, || {
-                root.0.join("request-1.json").exists()
-                    && full(fixture.err_control.as_ref().unwrap())
-            });
         }
         // The queues themselves prove backpressure. Let the admitted write
         // reach its kernel wait while all model/provider readiness is explicit.
@@ -4334,7 +4562,16 @@ fn stalled_stderr_progress_and_runtime_reports_and_both_sinks_settle_owned_work_
             fixture.child.try_wait().unwrap().is_none(),
             "{mode}: expected an admitted blocked write"
         );
-        assert!(full(fixture.err_control.as_ref().unwrap()));
+        assert!(
+            queued(fixture.err_reader.as_ref().unwrap()) >= stderr_saturation,
+            "no stderr reader drains the proven EAGAIN boundary before signalling"
+        );
+        if let Some(saturation) = stdout_saturation {
+            assert!(
+                queued(fixture.out_reader.as_ref().unwrap()) >= saturation,
+                "both physical sink boundaries remain held"
+            );
+        }
         let flags = unsafe {
             libc::fcntl(
                 fixture.err_control.as_ref().unwrap().as_raw_fd(),
@@ -4391,7 +4628,7 @@ fn stalled_stderr_progress_and_runtime_reports_and_both_sinks_settle_owned_work_
         );
         drop(fixture.err_control.take());
         drop(fixture.out_control.take());
-        let stdout = if let Some(reader) = fixture.stdout.take() {
+        let stdout_tail = if let Some(reader) = fixture.stdout.take() {
             reader.join().unwrap()
         } else {
             let mut bytes = Vec::new();
@@ -4400,7 +4637,7 @@ fn stalled_stderr_progress_and_runtime_reports_and_both_sinks_settle_owned_work_
                 .unwrap();
             bytes
         };
-        let stderr = if let Some(reader) = fixture.stderr.take() {
+        let stderr_tail = if let Some(reader) = fixture.stderr.take() {
             reader.join().unwrap()
         } else {
             let mut bytes = Vec::new();
@@ -4409,6 +4646,10 @@ fn stalled_stderr_progress_and_runtime_reports_and_both_sinks_settle_owned_work_
                 .unwrap();
             bytes
         };
+        let mut stdout = stdout_prefix;
+        stdout.extend(stdout_tail);
+        let mut stderr = stderr_prefix;
+        stderr.extend(stderr_tail);
         assert!(
             !String::from_utf8_lossy(&stderr).contains("panicked"),
             "{mode}"

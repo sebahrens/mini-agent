@@ -194,5 +194,34 @@
     "Backend regression replies now match production streaming SSE contract; ACP fixture tests its actual canonical/protocol identity equivalence plus empty path.",
     "Subprocess inventory requires both exact source-line/occurrence and full-token macro digest; added11 data-only line identities after second-layer failure, without changing parser or exemption rules."
   ],
-  "coordinator_status": "Local validation complete. Later coordinator corrections and test results are authoritative in ../2026-11-07-continuation-review.json; hosted CI pending."
+  "windows_fixture_review": {
+    "status": "one confirmed fixture operand issue corrected; remaining reviewed seams scoped clear statically",
+    "evidence": [
+      "OwnedTestDirectory::new canonicalizes temp paths; Windows native child operands must project verbatim paths to ordinary drive/UNC spellings using existing child_process_path.",
+      "MCP Fixture now projects parent.ps1 argv and every embedded PS path through crate::sandbox::windows::child_process_path while preserving canonical filesystem owner/cleanup paths.",
+      "Existing child_process_path made pub(crate), visibility only; guarded JobObject/KillOnDrop process ownership unchanged."
+    ],
+    "files": [
+      "src/extras/mcp/server.rs",
+      "src/sandbox/windows.rs"
+    ],
+    "native_execution": "Pending root Windows CI; no Cargo/native probe run by subagent."
+  },
+  "windows_native_followup": {
+    "evidence_log": "/private/tmp/mini-agent-review-ci-windows-mcp-failure.log",
+    "root_cause": "Locked process-wrap9.1.0 generic_wrap.rs spawn_with removes wrapper registry before JobObject.wrap_child checks has_wrap<KillOnDrop>, so native kill-on-close flag is false. Cached9.1.1 has same bug.",
+    "change": "Windows-only WorkspaceServiceJobChild owns actual JobObjectChild; Drop/into_inner synchronously initiate its Job termination, explicit lifecycle methods preserve Job dispatch while raw leader/pipe access remains flattened. No dependency update, native Job FFI, or fabricated context. Fixture writes raw UTF8 bytes through OpenStandardOutput; each lifecycle arm reports readiness, join, backend-result, and descendant failure context.",
+    "files": [
+      "src/sandbox.rs",
+      "src/extras/mcp/server.rs",
+      "src/extras/mcp/headers_helper.rs",
+      "docs/specs/subprocess-trust.md"
+    ],
+    "tests": [
+      "mcp_stdio_workspace_job_drop_and_unwrap_keep_job_lifecycle_dispatch",
+      "existing real Windows server/helper descendant lifetime cases now name arm and error/result; explicit UTF8 fixture output"
+    ],
+    "validation": "Source frozen after root fmt; Windows native CI pending. Root controls Cargo/native probes; subagent ran none."
+  },
+  "coordinator_status": "See ../2026-11-07-continuation-review.json for final validation and hosted CI."
 }

@@ -1218,6 +1218,10 @@ pub(crate) struct AgentWorkScope {
     /// `ToolLoopGuard` and consumed when the matching `ToolResult` is emitted.
     failed_tool_calls: std::sync::Mutex<std::collections::HashSet<String>>,
     headless_diagnostics: std::sync::OnceLock<Arc<crate::logging::HeadlessDiagnostics>>,
+    // Children may reuse a live interrupt driver, but must not extend its
+    // lifetime or confuse a generic ownership scope with a signal listener.
+    headless_interrupt_owner:
+        std::sync::Mutex<Option<(std::sync::Weak<()>, std::sync::Weak<AgentWorkScope>)>>,
     cancellation: Notify,
     idle: Notify,
     /// Workspace root that hook dispatch inside this turn uses instead of
@@ -1247,6 +1251,7 @@ impl AgentWorkScope {
             advisor_messages: std::sync::Mutex::new(Vec::new()),
             failed_tool_calls: std::sync::Mutex::new(std::collections::HashSet::new()),
             headless_diagnostics: std::sync::OnceLock::new(),
+            headless_interrupt_owner: std::sync::Mutex::new(inherited_headless_interrupt_owner()),
             cancellation: Notify::new(),
             idle: Notify::new(),
             #[cfg(feature = "hooks")]
@@ -1321,6 +1326,9 @@ impl AgentWorkScope {
                 advisor_messages: std::sync::Mutex::new(Vec::new()),
                 failed_tool_calls: std::sync::Mutex::new(std::collections::HashSet::new()),
                 headless_diagnostics: std::sync::OnceLock::new(),
+                headless_interrupt_owner: std::sync::Mutex::new(
+                    inherited_headless_interrupt_owner(),
+                ),
                 cancellation: Notify::new(),
                 idle: Notify::new(),
                 #[cfg(feature = "hooks")]
@@ -1340,6 +1348,18 @@ impl AgentWorkScope {
 
     pub(crate) async fn run<F: std::future::Future>(self: &Arc<Self>, future: F) -> F::Output {
         AGENT_WORK_SCOPE.scope(Arc::clone(self), future).await
+    }
+
+    /// Retain this lease through signal handling and exact child settlement.
+    /// Reusing a scope after the driver returns never reuses its old listener.
+    pub(crate) fn own_headless_interrupts(self: &Arc<Self>) -> Arc<()> {
+        let owner = Arc::new(());
+        *self
+            .headless_interrupt_owner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) =
+            Some((Arc::downgrade(&owner), Arc::downgrade(self)));
+        owner
     }
 
     /// Synchronous registration under an existing owner. Background admission
@@ -1408,7 +1428,6 @@ pub(crate) struct AgentWorkCancellation {
 }
 
 impl AgentWorkCancellation {
-    #[cfg(feature = "mcp")]
     pub(crate) async fn cancelled(&self) {
         self.scope.cancelled().await;
     }
@@ -1479,14 +1498,13 @@ impl AgentRunCleanupGuard {
     /// registration through settlement, including cancellation/unwinding.
     /// The existing cleanup waiter owns this tuple; no new detached owner is
     /// introduced and the parent cannot report idle before the child retires.
-    #[cfg(feature = "subagents")]
     pub(crate) fn auxiliary_child<T: Send + 'static>(
         scope: Arc<AgentWorkScope>,
         retained: T,
     ) -> Result<Self, &'static str> {
         let parent = AGENT_WORK_SCOPE
             .try_with(|parent| parent.register())
-            .map_err(|_| "subagent child has no parent work owner")?;
+            .map_err(|_| "child has no parent work owner")?;
         let mut cleanup = Self::auxiliary(scope);
         // Release the permits before the final parent-idle notification.
         cleanup.retain_until_settled((retained, parent));
@@ -1781,6 +1799,30 @@ pub(crate) fn current_work_cancellation() -> Option<AgentWorkCancellation> {
     AGENT_WORK_SCOPE
         .try_with(|scope| scope.cancellation_handle())
         .ok()
+}
+
+fn inherited_headless_interrupt_owner()
+-> Option<(std::sync::Weak<()>, std::sync::Weak<AgentWorkScope>)> {
+    AGENT_WORK_SCOPE
+        .try_with(|scope| {
+            scope
+                .headless_interrupt_owner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+pub(crate) fn current_work_has_headless_interrupt_owner() -> bool {
+    current_headless_interrupt_scope().is_some()
+}
+
+pub(crate) fn current_headless_interrupt_scope() -> Option<Arc<AgentWorkScope>> {
+    let (lease, scope) = inherited_headless_interrupt_owner()?;
+    let _lease = lease.upgrade()?;
+    scope.upgrade()
 }
 
 pub(crate) fn has_current_work_scope() -> bool {

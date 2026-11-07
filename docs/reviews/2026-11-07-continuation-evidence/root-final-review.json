@@ -1,7 +1,13 @@
 {
   "reviewer": "root-final",
   "baseline": "eef3001c6d0bba40fad24ecd595fa60fd5db0289",
-  "findings": [],
+  "findings": [
+    {
+      "bead": "mini-agent-p0h9g.7",
+      "priority": 2,
+      "status": "Native Windows failure corrected in source; fresh native acceptance pending"
+    }
+  ],
   "scope": [
     "ledger retry/rotation/session rollup exactness and OAuth lock wait/cancellation",
     "invocation-local hook manager/read policy/logical session identity across ACP, main agents, child agents, and JS permission callbacks",
@@ -20,9 +26,16 @@
     "TUI failures distinguish recoverable compaction/admission from renderer errors",
     "linked worktree common excludes now cover root and nested searches; ordinary ancestor aliases and execute-only parents preserved",
     "ancestor optional ignore files open nonblocking and reject special nodes",
-    "worker exit-before-read fixture reduced to one diagnostic, preserving protocol and closed-diagnostic assertions"
+    "worker exit-before-read fixture reduced to one diagnostic, preserving protocol and closed-diagnostic assertions",
+    "CI feature-boundary helper and lifetime test gates corrected",
+    "Generic hook ownership separated from active headless interrupt ownership; child output retains the actual driver and parent cancellation",
+    "Root review retained physical native-probe retirement and rejected a speculative forced-exit skip",
+    "Windows native error kinds preserved for optional Git metadata",
+    "Git-created hidden metadata fixtures truncate existing files without recreation",
+    "Stalled-output fixtures handle512-byte pipes and stale startup notices while preserving original negative-control failures",
+    "Windows workspace-service drop explicitly terminates the exact retained Job despite process-wrap registry behavior"
   ],
-  "assessment": "No additional confirmed P0-P3 finding remains in the reviewed source paths after the final corrections. Local affected regressions, strict lint rows, locked debug install, production native JS preflight and connectivity smoke passed. Hosted CI remains pending; this is a scoped assessment, not proof of absence of all defects.",
+  "assessment": "Final source follow-up found and corrected the feature-boundary, native error-kind, output ownership and fixture issues. All actual stdout/stderr positive cases passed; the pre-repair binary still fails both original cancellation contracts. No further confirmed source finding in the reviewed paths, but final clearance is withheld pending fresh hosted CI, especially the previously failing Windows helper/descendant acceptance.",
   "residual_risks": [
     "Native Windows process lifecycle requires the new CI tests; local execution is macOS.",
     "A speculative model-hook workspace identity replacement race lacked a reproduced contract violation and was retained as unverified in the follow-on report.",

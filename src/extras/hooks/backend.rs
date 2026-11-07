@@ -1073,7 +1073,17 @@ mod tests {
             read_hook_file(&binding, "plain.txt", None).unwrap(),
             "fixture-needle\n"
         );
-        std::fs::write(workspace.join(".git"), "gitdir: malformed-missing-target\n").unwrap();
+        // Git marks this existing gitfile hidden on Windows. Truncate
+        // without create so the fixture preserves that attribute.
+        std::io::Write::write_all(
+            &mut std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(workspace.join(".git"))
+                .unwrap(),
+            b"gitdir: malformed-missing-target\n",
+        )
+        .unwrap();
         // A .gitignore whitelist cannot override an unavailable Git layout.
         assert!(read_hook_file(&binding, "kept.txt", None).is_err());
     }

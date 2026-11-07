@@ -1,0 +1,26 @@
+   Compiling mini-agent v1.12.0 (/Users/seb/projects/mini-agent)
+    Finished `test` profile [unoptimized] target(s) in 29.86s
+     Running unittests src/main.rs (target/debug/deps/mini_agent-eb54318180c9c0b0)
+
+running 14 tests
+test agent::runner::tests::spawning_a_turn_keeps_the_turn_state_machine_off_the_caller_stack ... ok
+test provider::effort_tests::replay_probe::effort46_actual_headless_frontend_on_one_mib ... first completed answer
+second completed answer
+ok
+test provider::effort_tests::replay_probe::effort46_actual_headless_frontend_reaps_held_async_session_end_before_publication ... first completed answer
+ok
+test provider::effort_tests::replay_probe::effort46_actual_tui_changed_policy_refuses_retired_session_end_before_effects ... ok
+test provider::effort_tests::replay_probe::effort46_actual_tui_session_end_retires_held_hook_before_healthy_reload ... ok
+test sandbox::worker::startup_probe::tests::startup_worker_probe_cancel_before_start_does_not_poison_retry ... ok
+test sandbox::worker::startup_probe::tests::startup_worker_probe_dropped_retirement_keeps_physical_work_owned ... ok
+test sandbox::worker::startup_probe::tests::startup_worker_probe_dropped_retirement_waiter_keeps_native_proof_owned ... ok
+test sandbox::worker::startup_probe::tests::startup_worker_probe_keeps_real_input_polling_and_both_race_orders ... ok
+test sandbox::worker::startup_probe::tests::startup_worker_probe_owner_exit_skips_a_queued_probe_and_joins_a_running_one ... ok
+test session::native_publication::tests::native_session_end_permit_is_bound_to_its_acknowledged_retired_value ... ok
+test startup::native_publication_startup_tests::native_publication_actual_startup_idle_zero_cap_preserves_denial_on_one_mib ... Reading piped stdin (limit 1048576 bytes)
+Reading piped stdin (limit 1048576 bytes)
+ok
+test tests::hooks::session_lifecycle_tests::session_end_runs_the_matching_hook_with_reason ... ok
+test tests::subprocess_inventory_tests::windows_capable_production_process_terminals_use_creation_boundary ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 6264 filtered out; finished in 21.44s

@@ -1,0 +1,18 @@
+CI 42394587015: clippy
+2026-11-07T17:07:31.3631555Z error[E0425]: cannot find function `headless_interrupt` in module `crate::print`
+2026-11-07T17:07:31.3664786Z ##[error]    --> src/startup.rs:1384:27
+2026-11-07T17:07:57.6481047Z error: could not compile `mini-agent` (bin "mini-agent") due to 1 previous error
+2026-11-07T17:08:37.4354032Z error: could not compile `mini-agent` (bin "mini-agent" test) due to 1 previous error
+CI 42394587015: fmt
+2026-11-07T17:07:41.5821096Z FAIL: test_environment_table_covers_explicit_source_reads_and_indirect_public_controls (scripts.tests.test_check_package_metadata.EnvironmentReferenceTests.test_environment_table_covers_explicit_source_reads_and_indirect_public_controls)
+2026-11-07T17:07:41.5824872Z AssertionError: Lists differ: [] != ['HOOK_MARKER']
+2026-11-07T17:07:41.5825587Z 'HOOK_MARKER'
+2026-11-07T17:07:41.5826010Z + ['HOOK_MARKER'] : Document new env reads in the canonical environment table
+2026-11-07T17:07:41.5826848Z FAILED (failures=1)
+CI 42394587015: parallel
+2026-11-07T17:15:49.3735684Z test result: ok. 6170 passed; 0 failed; 37 ignored; 0 measured; 0 filtered out; finished in 190.21s
+2026-11-07T17:16:58.2735486Z thread 'stalled_open_stdout_has_bounded_signal_cleanup_and_preserves_accounting_without_changing_inherited_flags' (42155) panicked at tests/headless_json.rs:3952:18:
+2026-11-07T17:16:58.2736118Z first signal cancellation acknowledged: Timeout
+2026-11-07T17:16:58.2739980Z thread 'stalled_stderr_progress_and_runtime_reports_and_both_sinks_settle_owned_work_before_exit' (42180) panicked at tests/headless_json.rs:4362:13:
+2026-11-07T17:16:58.2740320Z goal: stderr/both sinks defeated forced-exit bound
+2026-11-07T17:16:58.2743005Z test result: FAILED. 63 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; finished in 64.35s

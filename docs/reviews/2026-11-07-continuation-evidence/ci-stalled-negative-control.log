@@ -1,0 +1,23 @@
+    Finished `test` profile [unoptimized] target(s) in 0.26s
+     Running tests/headless_json.rs (target/debug/deps/headless_json-f62e74dcf7072634)
+
+running 2 tests
+test stalled_open_stdout_has_bounded_signal_cleanup_and_preserves_accounting_without_changing_inherited_flags ...
+thread 'stalled_open_stdout_has_bounded_signal_cleanup_and_preserves_accounting_without_changing_inherited_flags' (67182793) panicked at tests/headless_json.rs:4129:41:
+final-text: first signal cancellation acknowledged: timed out waiting on channel; stderr="Reading piped stdin (limit 1048576 bytes)\nHeadless stdout is still writing; interrupt to stop (10-second cleanup grace).\n"; files=["chat_history.json", "config.toml", "docs", "prompts", "provider.release", "provider.waiting", "request-0.json", "sessions", "themes", "tool-outputs", "usage.jsonl", "usage.lock"]; stdout=512 queued bytes: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test stalled_stderr_progress_and_runtime_reports_and_both_sinks_settle_owned_work_before_exit ...
+thread 'stalled_stderr_progress_and_runtime_reports_and_both_sinks_settle_owned_work_before_exit' (67183439) panicked at tests/headless_json.rs:4570:13:
+goal: stderr/both sinks defeated forced-exit bound
+FAILED
+
+failures:
+
+failures:
+    stalled_open_stdout_has_bounded_signal_cleanup_and_preserves_accounting_without_changing_inherited_flags
+    stalled_stderr_progress_and_runtime_reports_and_both_sinks_settle_owned_work_before_exit
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 62 filtered out; finished in 74.67s
+
+error: test failed, to rerun pass `--test headless_json`

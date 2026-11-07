@@ -1,0 +1,23 @@
+   Compiling mini-agent v1.12.0 (/Users/seb/projects/mini-agent)
+    Finished `test` profile [unoptimized] target(s) in 1.11s
+     Running tests/headless_json.rs (target/debug/deps/headless_json-f62e74dcf7072634)
+
+running 2 tests
+test stalled_open_stdout_has_bounded_signal_cleanup_and_preserves_accounting_without_changing_inherited_flags ... FAILED
+test stalled_stderr_progress_and_runtime_reports_and_both_sinks_settle_owned_work_before_exit ... ok
+
+failures:
+
+---- stalled_open_stdout_has_bounded_signal_cleanup_and_preserves_accounting_without_changing_inherited_flags stdout ----
+
+thread 'stalled_open_stdout_has_bounded_signal_cleanup_and_preserves_accounting_without_changing_inherited_flags' (67177257) panicked at tests/headless_json.rs:4021:21:
+final-json: final snapshot before output admission; stderr="Reading piped stdin (limit 1048576 bytes)\nHeadless stdout is still writing; interrupt to stop (10-second cleanup grace).\n"; files=["config.toml", "docs", "prompts", "provider.release", "provider.waiting", "request-0.json", "themes", "tool-outputs"]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    stalled_open_stdout_has_bounded_signal_cleanup_and_preserves_accounting_without_changing_inherited_flags
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 62 filtered out; finished in 74.87s
+
+error: test failed, to rerun pass `--test headless_json`

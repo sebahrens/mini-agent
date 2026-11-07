@@ -5197,7 +5197,7 @@ mod tests {
                 &source,
                 r##"
 fn main() {
-    std::fs::write(std::env::var_os("HOOK_MARKER").unwrap(), "seen").unwrap();
+    std::fs::write(std::env::args_os().nth(1).unwrap(), "seen").unwrap();
     println!("{}", r#"{"decision":"block","reason":"keep digging"}"#);
 }
 "##,
@@ -5260,8 +5260,7 @@ fn main() {
             if _stop_hook {
                 #[allow(unused_mut)]
                 let mut hooks = serde_json::json!({
-                    "SubagentStop": [{"hooks": [{"type": "command", "command": stop_hook_executable.to_string_lossy(), "args": [],
-                        "env": {"HOOK_MARKER": fixture.path().join("stop-hook-ran").to_string_lossy()},
+                    "SubagentStop": [{"hooks": [{"type": "command", "command": stop_hook_executable.to_string_lossy(), "args": [fixture.path().join("stop-hook-ran").to_string_lossy()],
                         "trust": "trusted", "timeout": 5}]}]
                 });
                 #[cfg(feature = "mcp")]

@@ -1,0 +1,18 @@
+   Compiling mini-agent v1.12.0 (/Users/seb/projects/mini-agent)
+    Finished `test` profile [unoptimized] target(s) in 46.61s
+     Running unittests src/main.rs (target/debug/deps/mini_agent-eb54318180c9c0b0)
+
+running 11 tests
+test agent::tools::find_files::tests::invalid_linked_git_metadata_refuses_discovery_before_exposing_entries ... ok
+test agent::tools::find_files::tests::linked_worktree_common_exclude_applies_to_native_discovery ... ok
+test extras::hooks::backend::tests::linked_worktree_hook_reads_honor_common_exclude_and_root_negation ... ok
+test sandbox::git_metadata::tests::bwrap_binds_of_a_linked_worktree_cover_only_its_gitfile ... ok
+test sandbox::git_metadata::tests::discovery_of_a_linked_worktree_follows_the_gitfile_and_commondir ... ok
+test sandbox::git_metadata::tests::linked_worktree_relative_external_metadata_is_checked_for_aliases ... ok
+test sandbox::sandbox_tests::bwrap_linked_worktree_binds_its_gitfile_read_only ... ok
+test sandbox::sandbox_tests::seatbelt_linked_worktree_profile_denies_gitfile_and_common_dir_writes ... ok
+test tests::worktree_tests::tests::detect_reports_linked_worktree_branch_and_refuses_main_and_detached ... ok
+test tests::worktree_tests::tests::linked_worktree_status_matches_native_git_for_clean_and_all_dirty_states ... ok
+test tests::worktree_tests::tests::linked_worktree_symbolic_source_ref_is_rejected_without_dereference ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 6267 filtered out; finished in 3.53s

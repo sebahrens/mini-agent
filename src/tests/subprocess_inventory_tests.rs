@@ -2099,6 +2099,14 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
 /// a process method. Any unlisted `spawn`, `output`, or `status` identifier in
 /// macro-controlled tokens remains process authority and fails closed.
 const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
+    // Native NTSTATUS conversion assertion: `status` is input data, never
+    // a process method. The complete reviewed macro digest is pinned below.
+    (
+        "src/agent/tools/find_files.rs",
+        "assert_eq!(nt_error(status).kind(), std::io::ErrorKind::NotFound);",
+        1,
+        "NON-PROCESS",
+    ),
     // Exact capture/JSON data tokens within the reviewed full macro digests.
     (
         "src/extras/mcp/headers_helper.rs",
@@ -4678,6 +4686,11 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     (
         "src/agent/tools/find_files.rs",
         &[
+            // Exact NTSTATUS-to-io::ErrorKind assertion above; no launch.
+            (
+                "655047f670f8e91bbcbec3df81a00e1406129981a29ecc548d059ddd0f0e2253",
+                1,
+            ),
             (
                 "36a39cd2cd56c5eee3bdefba64b4371c8d56e3c0eb582c77bbd8f47f6b51e22e",
                 1,

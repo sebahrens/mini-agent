@@ -1,6 +1,6 @@
 {
   "baseline": "eef3001c",
-  "scope": "Implemented 19 continuation findings plus eight prior post-fix findings (27 total). Final root source review and local validation complete; pushed-SHA hosted CI pending.",
+  "scope": "25 continuation findings plus eight prior post-fix findings (33 total). All follow-up source corrections and affected local validation complete; fresh hosted feature/platform acceptance pending.",
   "findings": [
     {
       "id": "BOUNDARIES-A-1",
@@ -701,6 +701,60 @@
       "review_report": "root-final-validation",
       "bead": "mini-agent-gkqd4.19",
       "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+    },
+    {
+      "priority": 4,
+      "title": "Exercise headless lifetime tests without the goal feature",
+      "file": "src/startup.rs",
+      "scenario": "A module-level goal gate silently excluded the stream pool lifetime regression from reduced subagents configurations. Restrict the goal gate to the two goal-specific tests.",
+      "bead": "mini-agent-gkqd4.20",
+      "review_report": "CI follow-up review",
+      "implementation_status": "local regression passed; hosted CI pending"
+    },
+    {
+      "priority": 2,
+      "title": "Distinguish generic hook ownership from headless interrupt-driver ownership",
+      "file": "src/print.rs",
+      "scenario": "Linux CI reproduced stalled final stdout and goal stderr that never acknowledged SIGINT or completed forced exit. A new generic startup AgentWorkScope caused output to bypass the actual headless interrupt driver.",
+      "bead": "mini-agent-gkqd4.21",
+      "review_report": "CI follow-up review",
+      "implementation_status": "implemented; actual binary positive and negative-control validation passed; hosted CI pending"
+    },
+    {
+      "priority": 1,
+      "title": "Preserve Windows missing-file error kinds for optional Git metadata",
+      "file": "src/agent/tools/find_files.rs",
+      "scenario": "NtCreateFile errors were wrapped as ErrorKind::Other. Optional .git, commondir and info/exclude readers use NotFound to distinguish absence from invalid metadata, so ordinary Windows discovery could fail closed unnecessarily.",
+      "bead": "mini-agent-gkqd4.22",
+      "review_report": "Final Windows portability review",
+      "implementation_status": "implemented; static/local affected validation passed; native Windows acceptance pending"
+    },
+    {
+      "priority": 4,
+      "title": "Truncate existing hidden Git metadata in Windows corruption fixtures",
+      "file": "src/agent/tools/find_files.rs; src/extras/hooks/backend.rs",
+      "scenario": "Git-created .git files are hidden on Windows, so std::fs::write uses a creation mode that can fail before corrupting fixture metadata. Open existing gitfiles with write+truncate and no create, preserving attributes and the original refusal assertions.",
+      "bead": "mini-agent-gkqd4.23",
+      "review_report": "Final Windows portability review",
+      "implementation_status": "implemented; static/local affected validation passed; native Windows acceptance pending"
+    },
+    {
+      "priority": 4,
+      "title": "Make stalled-output readiness independent of small-pipe capacity and poll behavior",
+      "file": "tests/headless_json.rs",
+      "scenario": "Both baseline and repaired binaries fail local readiness before interruption. Native pipe probes accept512 bytes then return EAGAIN while POLLOUT still reports writable. Gate post-tool provider output and establish physical backpressure without relying on minimum capacity or poll-only readiness.",
+      "bead": "mini-agent-gkqd4.24",
+      "review_report": "Root native fixture diagnosis",
+      "implementation_status": "implemented; actual binary positive and negative-control validation passed; hosted CI pending"
+    },
+    {
+      "priority": 4,
+      "title": "Normalize Git fixture child paths on Windows",
+      "file": "src/agent/tools/find_files.rs",
+      "scenario": "Native Windows CI reached linked-worktree tests but fixture Git failed reading configuration because canonical verbatim paths crossed C Git argv/environment boundaries. Normalize -C, hooks/template paths, global config and worktree destination while preserving canonical filesystem ownership.",
+      "bead": "mini-agent-gkqd4.25",
+      "review_report": "Native Windows platform CI",
+      "implementation_status": "implemented;11 local linked-worktree regressions passed; native Windows acceptance pending"
     }
   ],
   "validation": {
@@ -740,8 +794,40 @@
     },
     "format": "cargo fmt and cargo fmt --check passed; git diff --check passed.",
     "reused_results_rationale": "Final changes after the full run affected hook/MCP/discovery/JS caller paths; these received the 360-test affected batch and passing four-test correction gate. Runtime/ACP/TUI/TaskTool/loop fixes passed the 43-test correction batch, except its unrelated worker fixture and inventory failures, which subsequently passed. Root ledger/OAuth/checkpoint/trust passing results and original-size stack passes remain valid. Default+skills compilation and reduced hooks/minimal rows cover conditional boundaries; CI supplies remaining supported feature/platform rows.",
-    "evidence_format": "Stored logs normalize trailing whitespace and terminal empty lines; original command logs remain under /private/tmp during the session."
+    "evidence_format": "Stored logs normalize trailing whitespace and terminal empty lines; original command logs remain under /private/tmp during the session.",
+    "ci_followup": {
+      "run": "https://github.com/sebahrens/mini-agent/actions/runs/42394587015",
+      "status": "not green; corrections in progress",
+      "feature_gate": "Shared interrupt helper now compiled with goal OR subagents. Unix loop-only test gate matches actual caller. Reduced hooks,js,subagents,skills,sandbox regression: 3 passed; strict all-targets Clippy passed.",
+      "test_environment": "TaskTool fixture marker now passed explicitly as argv; package metadata policy 117 passed.",
+      "new_findings": [
+        "mini-agent-gkqd4.20",
+        "mini-agent-gkqd4.21",
+        "mini-agent-gkqd4.22",
+        "mini-agent-gkqd4.23",
+        "mini-agent-gkqd4.24",
+        "mini-agent-gkqd4.25"
+      ],
+      "linux_parallel": "6170 unit tests passed, 37 ignored; headless integration 63 passed and two confirmed output-cancellation failures under gkqd4.21.",
+      "windows_native": "MCP descendant regressions failed natively in job128469175866; diagnosing actual retirement separately from PowerShell fixture path spelling. Five explicit Windows discovery/hook/error-kind tests required in next run.",
+      "local_followup": "85 affected unit tests passed; exact inventory classification corrected, then14 stack/SessionEnd/startup-probe/inventory tests and28 full inventory tests passed.39 minimal print/lifetime tests passed. Strict production Clippy and final reduced all-targets Clippy passed;250 Python workflow/metadata tests passed after final changes.",
+      "output_acceptance": {
+        "stdout": "All five actual binary cases passed (12.17s), including forced active output, resumed output, final text, final JSON and blocked startup.",
+        "stderr": "All seven actual binary cases passed, including both sinks, reasoning, resumed output, ordinary errors, retry logs and goal reporting.",
+        "negative_control": "Same portable fixtures run against installed pre-repair binary: expected failures at final-text first-signal acknowledgement and goal forced-exit bound;0passed2failed74.67s.",
+        "fixture_portability": "Provider gates separate startup and intended large writes; real EAGAIN establishes saturation; read-end FIONREAD observes it. Exact prefixes,2MiB payloads, original readiness/interrupt/exit bounds, saved usage and inherited flags remain asserted."
+      },
+      "install": {
+        "command": "cargo install --path . --debug --locked",
+        "result": "passed",
+        "build_id": "7654f930ad3d8ee95e9ba12fed571a590fb8ec54dc78aa8c7bdd84ca116f139b",
+        "native_js": "PASS (2)",
+        "note": "Production repair installed; subsequent Windows Git fixture correction is test-only.",
+        "connectivity": "Installed binary exited0 with final hello from the live provider; no session/tools/context-file mode."
+      },
+      "final_git_fixture": "11 linked-worktree/discovery/hook/containment-profile regressions passed after normalizing Windows Git child path spellings."
+    }
   },
-  "status": "local_validation_complete_ci_pending",
+  "status": "local_ci_corrections_validated_native_ci_pending",
   "final_root_review": "2026-11-07-continuation-evidence/root-final-review.json"
 }

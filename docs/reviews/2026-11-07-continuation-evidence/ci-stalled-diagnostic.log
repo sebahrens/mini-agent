@@ -1,0 +1,29 @@
+   Compiling mini-agent v1.12.0 (/Users/seb/projects/mini-agent)
+    Finished `test` profile [unoptimized] target(s) in 15.27s
+     Running tests/headless_json.rs (target/debug/deps/headless_json-f62e74dcf7072634)
+
+running 2 tests
+test stalled_open_stdout_has_bounded_signal_cleanup_and_preserves_accounting_without_changing_inherited_flags ... FAILED
+test stalled_stderr_progress_and_runtime_reports_and_both_sinks_settle_owned_work_before_exit ... FAILED
+
+failures:
+
+---- stalled_open_stdout_has_bounded_signal_cleanup_and_preserves_accounting_without_changing_inherited_flags stdout ----
+
+thread 'stalled_open_stdout_has_bounded_signal_cleanup_and_preserves_accounting_without_changing_inherited_flags' (67141171) panicked at tests/headless_json.rs:3977:91:
+active-stream: effect before signal: No such file or directory (os error 2); stderr="Reading piped stdin (limit 1048576 bytes)\nHeadless stdout is still writing; interrupt to stop (10-second cleanup grace).\n"; files=["config.toml", "docs", "prompts", "themes", "tool-outputs"]; stdout=381 queued bytes: "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"c85ec67f-e7f2-48fe-8b88-54d9c70af37e\",\"session_name\":\"\",\"ephemeral\":false,\"provider\":\"local-test\",\"model\":\"test\",\"cwd\":\"/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-headless-json-process-34751-0\",\"permission_mode\":\"yolo\",\"sandbox\":{\"enabled\":false,\"backend\":\"seatbelt\",\"profile\":\"workspace\",\"network\":\"deny\"}}\n"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- stalled_stderr_progress_and_runtime_reports_and_both_sinks_settle_owned_work_before_exit stdout ----
+
+thread 'stalled_stderr_progress_and_runtime_reports_and_both_sinks_settle_owned_work_before_exit' (67141893) panicked at tests/headless_json.rs:4171:13:
+fixture readiness deadline: mode=reasoning; files=["config.toml", "docs", "effect.txt", "prompts", "request-0.json", "request-1.json", "themes", "tool-outputs", "usage.jsonl", "usage.lock"]; stdout=drained by fixture; stderr=512 queued bytes: "Reading piped stdin (limit 1048576 bytes)\nreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonreasonre"
+
+
+failures:
+    stalled_open_stdout_has_bounded_signal_cleanup_and_preserves_accounting_without_changing_inherited_flags
+    stalled_stderr_progress_and_runtime_reports_and_both_sinks_settle_owned_work_before_exit
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 62 filtered out; finished in 25.03s
+
+error: test failed, to rerun pass `--test headless_json`

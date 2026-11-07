@@ -2862,6 +2862,8 @@ jobs:
           $tests = @(
             'agent::tools::find_files::tests::linked_worktree_common_exclude_applies_to_native_discovery',
             'agent::tools::find_files::tests::invalid_linked_git_metadata_refuses_discovery_before_exposing_entries',
+            'agent::tools::find_files::bound_platform::native_error_tests::windows_native_errors_preserve_missing_and_access_denied_classes',
+            'agent::tools::find_files::tests::windows_optional_git_metadata_accepts_missing_paths_and_rejects_corruption',
             'extras::hooks::backend::tests::linked_worktree_hook_reads_honor_common_exclude_and_root_negation'
           )
           $discovered = @(cargo test --locked --bin mini-agent -- --list 2>&1)
