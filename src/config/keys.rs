@@ -554,8 +554,9 @@ pub(super) fn line_column(content: &str, offset: usize) -> (usize, usize) {
     (line, column)
 }
 
-/// Replace the contents of every `"..."` and `'...'` run in a parser message,
-/// which is where serde and toml echo the offending value.
+/// Replace the contents of every `"..."`, `'...'` and backtick run in a parser
+/// message, which is where serde and toml echo the offending value (serde
+/// quotes unknown enum variants and fields in backticks).
 fn redact_quoted(message: &str) -> String {
     let mut out = String::with_capacity(message.len());
     let mut open: Option<char> = None;
@@ -567,7 +568,7 @@ fn redact_quoted(message: &str) -> String {
                 open = None;
             }
             Some(_) => {}
-            None if ch == '"' || ch == '\'' => {
+            None if ch == '"' || ch == '\'' || ch == '`' => {
                 out.push(ch);
                 open = Some(ch);
             }
@@ -623,6 +624,20 @@ mod tests {
             "invalid type: string \"…\", expected u64"
         );
         assert_eq!(redact_quoted("unterminated 'abc"), "unterminated '…");
+    }
+
+    // mini-agent-khsly: serde quotes unknown enum variants in backticks.
+    #[test]
+    fn backtick_quoted_values_are_redacted() {
+        assert_eq!(
+            redact_quoted("unknown variant `sk-secret`, expected one of `a`, `b`"),
+            "unknown variant `…`, expected one of `…`, `…`"
+        );
+        assert_eq!(redact_quoted("bad `abc"), "bad `…");
+        let content = "sandbox_profile = \"sk-secret-value\"\n";
+        let error = toml::from_str::<super::super::Config>(content).unwrap_err();
+        let text = describe_toml_error(content, &error);
+        assert!(!text.contains("sk-secret-value"), "{text}");
     }
 
     #[test]
