@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 //! Parent side of the Windows ConPTY path for shell commands that need a TTY
 //! (`pty = true`).
 //!

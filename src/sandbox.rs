@@ -35,7 +35,7 @@ mod output_capture;
 pub(crate) mod pty;
 mod pty_common;
 #[cfg(windows)]
-mod pty_windows;
+pub(crate) mod pty_windows;
 pub(crate) use output_capture::{
     OutputChannel, OutputLog, OutputTranscript, OutputWindow, SHELL_HARD_OUTPUT_BYTES, SpoolPolicy,
     TranscriptPart, write_private_log,

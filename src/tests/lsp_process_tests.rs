@@ -1751,6 +1751,7 @@ async fn lsp_process_navigate_names_outside_workspace_locations_subject_to_read_
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn lsp_process_permission_wait_rejects_leaf_and_parent_symlink_retargets() {
     use crate::agent::tools::lsp::{LspArgs, LspTool};

@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 //! Windows ConPTY hosting for the AppContainer helper (`pty = true`).
 //!
 //! The helper creates the pseudoconsole, hands it to the target through
