@@ -16422,6 +16422,27 @@ mod plan_approval_tests {
         #[tokio::test]
         async fn mention_tool_choice55_force_reaches_only_mention_turns() {
             use crate::config::AgentMentionToolChoice::{Force, Hint};
+            // The `task` tool registers only once the process-wide subagent
+            // runtime is installed. Other tests do that as a side effect, so
+            // this test passed only by suite order; install it explicitly
+            // (idempotent) so it also passes when run alone.
+            if !crate::extras::subagents::is_initialized() {
+                let cfg = crate::config::Config::default();
+                let client = crate::provider::create_client(
+                    "openrouter",
+                    Some("unused-test-key"),
+                    cfg.custom_providers_map(),
+                    cfg.api_keys.as_ref(),
+                )
+                .unwrap();
+                crate::extras::subagents::install(crate::extras::subagents::resolve_config(
+                    &cfg,
+                    Some("unused-test-key"),
+                    "openrouter",
+                    "owned-model",
+                    &client,
+                ));
+            }
             let typed = "@agent:rust-maintainer audit src/auth.rs";
             let (calls, ..) = submit_with(typed, vec!["FORCED55"], |_| {}, Some(Force)).await;
             assert_eq!(calls.len(), 1);
