@@ -706,6 +706,7 @@ fn headless_compaction_plan_with(
             pending_tokens,
             cfg.resolve_keep_recent_tool_results(),
         )
+        && !session.size_pressure(cfg.resolve_compact_size_fraction())
     {
         return None;
     }
@@ -3881,7 +3882,12 @@ async fn run_bound_headless_segment(
         .flatten()
         .map(|threshold| crate::agent::runner::HeadlessMidTurnPolicy {
             window: session.context_window,
-            threshold,
+            // Byte pressure (images) ends the segment at the next boundary.
+            threshold: if session.size_pressure(cfg.resolve_compact_size_fraction()) {
+                f64::MIN_POSITIVE
+            } else {
+                threshold
+            },
             anthropic_native: cfg.is_anthropic_native(&session.provider),
         });
     let mut turn = heap_future(|| {
@@ -5005,7 +5011,11 @@ async fn relieve_headless_turn(
                 .flatten()
                 .map(|threshold| crate::agent::runner::HeadlessMidTurnPolicy {
                     window: session.context_window,
-                    threshold,
+                    threshold: if session.size_pressure(cfg.resolve_compact_size_fraction()) {
+                        f64::MIN_POSITIVE
+                    } else {
+                        threshold
+                    },
                     anthropic_native: cfg.is_anthropic_native(&session.provider),
                 });
         let turn = crate::agent::runner::with_headless_budget_carry(

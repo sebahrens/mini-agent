@@ -37,6 +37,7 @@ pub(super) const BENIGN_PROJECT_CONFIG_KEYS: &[&str] = &[
     "chat_left_margin",
     "colors",
     "compact_enabled",
+    "compact_size_fraction",
     "context_window",
     "default_prompt",
     "edit_system",

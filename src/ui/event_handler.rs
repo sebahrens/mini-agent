@@ -682,7 +682,9 @@ async fn handle_agent_done(
         ui.session.needs_compaction_after_tool_result_pruning(
             reserve,
             ui.cfg.resolve_keep_recent_tool_results(),
-        ),
+        ) || ui
+            .session
+            .size_pressure(ui.cfg.resolve_compact_size_fraction()),
         loop_running,
     ) {
         let compress_result = handle_compress(None, true, run, renderer, ui, true).await;

@@ -236,6 +236,26 @@ mod tests {
         }
     }
     #[test]
+    fn image_heavy_session_with_few_tokens_reports_size_pressure() {
+        let mut session = crate::session::Session::new("logical", "model", 1_000_000, "");
+        // 5 prompts of two ~2.4 MiB base64 images: far under any token threshold,
+        // past 75% of the 32 MiB persisted-session ceiling.
+        let raw = vec![7u8; 1_900_000];
+        for _ in 0..5 {
+            session.add_user_message(
+                PersistedUserMessage::new(vec![image(&raw), image(&raw)]).unwrap(),
+            );
+        }
+        assert!(session.approx_persisted_bytes() > 24 * 1024 * 1024);
+        assert!(session.effective_context_tokens() < 100_000);
+        assert!(!session.needs_compaction_after_tool_result_pruning(0, 0));
+        assert!(session.size_pressure(Some(0.75)));
+        assert!(!session.size_pressure(Some(1.0)));
+        assert!(!session.size_pressure(None), "0 disables the byte trigger");
+        let small = crate::session::Session::new("logical", "model", 1_000_000, "");
+        assert!(!small.size_pressure(Some(0.75)));
+    }
+    #[test]
     fn canonical_user53_order_survives_storage_and_converter() {
         let user = PersistedUserMessage::new(vec![
             UserBlock::Text {
