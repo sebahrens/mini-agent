@@ -250,6 +250,14 @@ offset 0 also reports a change since the previous one). Bytes beyond the 4 MiB
 fetch bound stay unreachable and the header says so. Unscoped
 `list_mcp_resources` paging is per server, so its `more matches` hint names
 `server=<name>` (and the query/limit in use).
+Resource templates (`resources/templates/list`, RFC 6570 URI patterns such as
+`repo://{owner}/{repo}/blob/{path}`) are discovered with the same paging, 128 /
+256 KiB bounds and skipped/over-bound counts, and listed under each server as
+`uri_template:` lines (the `query` filter applies; `offset`/`limit` page
+resources only). A template catalogue that could not be enumerated completely is
+marked `template catalogue incomplete`. A server that does not implement the
+method simply has no templates. The model fills in the variables and passes the
+resulting URI to `read_mcp_resource`, which accepts any URI.
 Binary parts and non-text MIME types are omitted with a note stating the part
 size and MIME type, and a resource with nothing readable is refused with that
 reason. Operator `@mcp:` attachments stay strict: text over 256 KiB is refused

@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use rmcp::model::{
     ClientRequest, ContentBlock, GetPromptRequest, GetPromptRequestParams, GetPromptResult,
-    ListPromptsRequest, ListResourcesRequest, PaginatedRequestParams, Prompt, ReadResourceRequest,
-    ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents, ServerResult,
+    ListPromptsRequest, ListResourceTemplatesRequest, ListResourcesRequest, PaginatedRequestParams,
+    Prompt, ReadResourceRequest, ReadResourceRequestParams, ReadResourceResult, Resource,
+    ResourceContents, ResourceTemplate, ServerResult,
 };
 use rmcp::service::{PeerRequestOptions, ServiceError};
 
@@ -127,6 +128,10 @@ pub(crate) struct Catalogue {
     pub resources_incomplete: bool,
     pub prompts_omitted: Omitted,
     pub resources_omitted: Omitted,
+    /// `resources/templates/list`: parameterised (RFC 6570) resource URIs.
+    pub templates: Vec<ResourceTemplate>,
+    pub templates_incomplete: bool,
+    pub templates_omitted: Omitted,
 }
 
 /// The connection's prompt/resource catalogue. Filled once after connect and
@@ -192,6 +197,9 @@ impl AuxiliaryCache {
             }
             if fresh.resources_incomplete && fresh.resources.is_empty() {
                 fresh.resources = previous.resources.clone();
+            }
+            if fresh.templates_incomplete && fresh.templates.is_empty() {
+                fresh.templates = previous.templates.clone();
             }
         }
         *self.current.write().unwrap_or_else(|e| e.into_inner()) = Some(std::sync::Arc::new(fresh));
@@ -405,10 +413,106 @@ pub(crate) async fn discover_captured(
             }
             Err(_) => catalogue.resources_incomplete = true,
         }
+        match list_templates(client, timeout).await {
+            Ok(listed) => {
+                catalogue.templates_incomplete = listed.truncated || listed.omitted.total() > 0;
+                catalogue.templates_omitted = listed.omitted;
+                catalogue.templates = listed.templates;
+            }
+            // Resource templates are optional: a server that does not
+            // implement the method answers with a JSON-RPC error, which is an
+            // empty list, not a degraded catalogue.
+            Err(ServiceError::McpError(_)) => {}
+            Err(_) => catalogue.templates_incomplete = true,
+        }
     }
     catalogue.prompts.sort_by(|a, b| a.name.cmp(&b.name));
     catalogue.resources.sort_by(|a, b| a.uri.cmp(&b.uri));
     catalogue
+}
+
+struct ListedTemplates {
+    templates: Vec<ResourceTemplate>,
+    omitted: Omitted,
+    truncated: bool,
+}
+
+/// Enumerate `resources/templates/list` under the same bounds as the other
+/// catalogues: malformed or duplicate entries are counted, entries beyond the
+/// item or metadata bound are counted, and an early stop is flagged.
+async fn list_templates(
+    client: &RpcClient,
+    timeout: Duration,
+) -> Result<ListedTemplates, ServiceError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut cursor = None;
+    let mut seen_cursors = BTreeSet::new();
+    let mut seen = BTreeSet::new();
+    let mut listed = ListedTemplates {
+        templates: Vec::new(),
+        omitted: Omitted::default(),
+        truncated: false,
+    };
+    let mut bytes = 0_usize;
+    let mut full = false;
+    for _ in 0..MAX_PAGES {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(ServiceError::Timeout { timeout });
+        }
+        let page = PaginatedRequestParams::default().with_cursor(cursor.take());
+        let response = request(
+            client,
+            ClientRequest::ListResourceTemplatesRequest(ListResourceTemplatesRequest::with_param(
+                page,
+            )),
+            remaining,
+        )
+        .await?;
+        let ServerResult::ListResourceTemplatesResult(page) = response else {
+            return Err(ServiceError::UnexpectedResponse);
+        };
+        for entry in page.resource_templates {
+            if !identifier(&entry.uri_template, 2048)
+                || !identifier(&entry.name, 256)
+                || !seen.insert(entry.uri_template.clone())
+            {
+                listed.omitted.invalid += 1;
+                continue;
+            }
+            let size = serde_json::to_vec(&entry).map_or(usize::MAX, |v| v.len());
+            if full
+                || listed.templates.len() >= MAX_ITEMS
+                || bytes.saturating_add(size) > MAX_METADATA_BYTES
+            {
+                full = true;
+                listed.omitted.over_bound += 1;
+                continue;
+            }
+            bytes += size;
+            listed.templates.push(entry);
+        }
+        match page.next_cursor {
+            None => {
+                listed
+                    .templates
+                    .sort_by(|a, b| a.uri_template.cmp(&b.uri_template));
+                return Ok(listed);
+            }
+            Some(next) if identifier(&next, 2048) && seen_cursors.insert(next.clone()) => {
+                cursor = Some(next)
+            }
+            Some(_) => {
+                listed.truncated = true;
+                break;
+            }
+        }
+    }
+    listed.truncated = true;
+    listed
+        .templates
+        .sort_by(|a, b| a.uri_template.cmp(&b.uri_template));
+    Ok(listed)
 }
 
 /// One server listing: the kept entries plus what was left out and why.

@@ -252,6 +252,13 @@ fn main() {
                 continue;
             }
             write_response(&mut stdout,&format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"resources\":[{{\"uri\":\"urn:owned:notes\",\"name\":\"notes\",\"mimeType\":\"text/plain\"}}]}}}}"));
+        } else if compact.contains("\"method\":\"resources/templates/list\"") {
+            let id=request_id(&compact);
+            if mode == "aux-templates" {
+                write_response(&mut stdout,&format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"resourceTemplates\":[{{\"uriTemplate\":\"repo://{{owner}}/{{repo}}/blob/{{path}}\",\"name\":\"file\"}},{{\"uriTemplate\":\"\",\"name\":\"bad\"}}]}}}}"));
+            } else {
+                write_response(&mut stdout,&format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"error\":{{\"code\":-32601,\"message\":\"Method not found\"}}}}"));
+            }
         } else if compact.contains("\"method\":\"prompts/get\"") {
             let id=request_id(&compact);
             write_response(&mut stdout,&format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"messages\":[{{\"role\":\"user\",\"content\":{{\"type\":\"text\",\"text\":\"Prompt BODY 雪\"}}}},{{\"role\":\"assistant\",\"content\":{{\"type\":\"text\",\"text\":\"/commit %%next code\"}}}}]}}}}"));
@@ -2840,6 +2847,58 @@ async fn mcp_auxiliary_stdio_catalogue_and_selected_literal_reads_are_bounded_an
     let (prompt, resource) = result.unwrap();
     assert!(prompt.contains("Prompt BODY 雪") && prompt.contains("/commit %%next code"));
     assert_eq!(resource, "Resource BODY 雪");
+}
+
+#[tokio::test]
+async fn mcp_resource_templates_are_discovered_and_listed_and_unsupported_servers_stay_complete() {
+    use crate::extras::mcp::resource_tools::ListMcpResourcesTool;
+    let fixture = FixtureBuild::compile();
+    let cfg = fixture.config(
+        fixture.executable.to_string_lossy().into_owned(),
+        Vec::new(),
+        "aux-templates",
+        &fixture.lease("aux-templates"),
+    );
+    let handle = McpClientHandle::connect_in("owned".into(), &cfg, &fixture.root)
+        .await
+        .unwrap();
+    handle.discover_auxiliary().await;
+    let captured = handle.auxiliary.get().unwrap().clone();
+    assert_eq!(captured.templates.len(), 1);
+    assert_eq!(captured.templates_omitted.invalid, 1);
+    assert!(captured.templates_incomplete);
+    let manager = McpClientManager::from_handles(vec![handle]);
+    let allowed = Some(permission_for_named_tools(&[("owned", "resources/list")]));
+    let list = ListMcpResourcesTool::new(manager.resource_servers(), allowed, None);
+    let listing = ToolDyn::call(&list, serde_json::json!({}).to_string())
+        .await
+        .unwrap();
+    assert!(
+        listing.contains("- uri_template: repo://{owner}/{repo}/blob/{path} | name: file"),
+        "{listing}"
+    );
+    assert!(
+        listing.contains("template catalogue incomplete"),
+        "{listing}"
+    );
+    manager.shutdown().await;
+    // A server answering method-not-found has no templates and stays complete.
+    let cfg = fixture.config(
+        fixture.executable.to_string_lossy().into_owned(),
+        Vec::new(),
+        "aux",
+        &fixture.lease("aux-no-templates"),
+    );
+    let handle = McpClientHandle::connect_in("owned".into(), &cfg, &fixture.root)
+        .await
+        .unwrap();
+    handle.discover_auxiliary().await;
+    let captured = handle.auxiliary.get().unwrap().clone();
+    assert!(captured.templates.is_empty() && !captured.templates_incomplete);
+    McpClientManager::from_handles(vec![handle])
+        .shutdown()
+        .await;
+    fixture.cleanup();
 }
 
 #[tokio::test]
