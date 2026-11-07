@@ -200,6 +200,9 @@ pub(crate) struct OverCap {
     pub(crate) names: Vec<String>,
     /// Pagination finished, so `count` is the whole overflow.
     pub(crate) exact: bool,
+    /// Pagination stopped at `MCP_LIST_TOOLS_MAX_PAGES` while the server still
+    /// offered another page, so more tools than were counted may exist.
+    pub(crate) page_limited: bool,
 }
 const MCP_STDERR_LIMIT: usize = 8 * 1024;
 const MCP_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -248,8 +251,9 @@ pub(crate) async fn list_bounded_tools(
     // A catalogue of exactly the cap that was listed to the end lost nothing;
     // report a cut only when tools were counted past the cap or the listing
     // stopped before the server's last page.
-    listed.reached_tool_cap =
-        listed.over_cap.count > 0 || (listed.entries.len() >= cap && !listed.over_cap.exact);
+    listed.reached_tool_cap = listed.over_cap.count > 0
+        || listed.over_cap.page_limited
+        || (listed.entries.len() >= cap && !listed.over_cap.exact);
     Ok(Arc::new(listed))
 }
 
@@ -1331,6 +1335,7 @@ pub(crate) async fn list_all_tools_selected(
                 tracing::debug!(
                     "MCP tools/list stopped after {pages} pages; ignoring further cursors"
                 );
+                over_cap.page_limited = true;
                 break;
             }
             next => cursor = next,
@@ -1415,9 +1420,63 @@ async fn call_tool_with_display(
     let _display = display.and_then(|(registry, id, events)| {
         registry.register(handle.progress_token.clone(), id, events)
     });
-    match handle.await_response().await? {
+    // rmcp only notifies the server on its own timeouts; dropping this future
+    // (a user interrupt or a cancelled turn) would leave a side-effecting tool
+    // running. The guard sends `notifications/cancelled` unless the call ended.
+    let mut guard = CancelOnDrop::new(peer, handle.id.clone());
+    // `await_response` is the only code that removes the progress-reset watcher
+    // from the peer (its map is private), and it cannot be resumed once its
+    // future is dropped. So the wait runs in its own task: abandoning this call
+    // sends the cancel notification, while the task still ends the request on
+    // its own (the server's reply to the cancel, or the idle/ceiling timeout)
+    // and removes the watcher, instead of leaking one entry per abandoned call.
+    let (done, outcome) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let _ = done.send(handle.await_response().await);
+    });
+    let outcome = outcome.await.unwrap_or(Err(ServiceError::TransportClosed));
+    guard.disarm();
+    match outcome? {
         ServerResult::CallToolResult(result) => Ok(result),
         _ => Err(ServiceError::UnexpectedResponse),
+    }
+}
+
+/// Sends `notifications/cancelled` for an in-flight request when dropped
+/// before [`CancelOnDrop::disarm`].
+struct CancelOnDrop {
+    armed: Option<(Peer<RoleClient>, rmcp::model::RequestId)>,
+}
+
+impl CancelOnDrop {
+    fn new(peer: &Peer<RoleClient>, id: rmcp::model::RequestId) -> Self {
+        Self {
+            armed: Some((peer.clone(), id)),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = None;
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        let Some((peer, id)) = self.armed.take() else {
+            return;
+        };
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        tokio::spawn(async move {
+            let notification = rmcp::model::CancelledNotification::new(
+                rmcp::model::CancelledNotificationParam::new(
+                    Some(id),
+                    Some("the client abandoned the call".to_owned()),
+                ),
+            );
+            let _ = peer.send_notification(notification.into()).await;
+        });
     }
 }
 

@@ -23,7 +23,9 @@ export type ReferenceInput =
   | { readonly kind: 'text'; readonly text: string; readonly name?: string }
   | { readonly kind: 'image'; readonly mimeType: string; readonly bytes: Uint8Array; readonly name?: string }
   /** A reference the host handed over that cannot be sent (untitled:, git:, remote, unknown kind). */
-  | { readonly kind: 'unsupported'; readonly name: string; readonly reason: string };
+  | { readonly kind: 'unsupported'; readonly name: string; readonly reason: string }
+  /** A reference past the collector's read budget: counted and reported, never opened or read. */
+  | { readonly kind: 'deferred' };
 
 export interface PromptBuildOptions {
   readonly text: string;
@@ -74,6 +76,7 @@ function clipBytes(text: string, limit: number): { text: string; omitted: number
 }
 
 function label(reference: ReferenceInput): string {
+  if (reference.kind === 'deferred') { return 'reference'; }
   const name = reference.name?.trim();
   if (name) { return name.slice(0, 200); }
   if (reference.kind === 'unsupported') { return reference.name.slice(0, 200) || 'reference'; }
@@ -96,12 +99,16 @@ export async function buildPromptBlocks(options: PromptBuildOptions): Promise<Pr
   let accepted = 0;
   let imageCount = 0;
   let imageBytes = 0;
+  let deferred = 0;
+  let capped = false;
   for (const [index, reference] of options.references.entries()) {
     if (accepted >= MAX_REFERENCES) {
       // Count only references the cap actually cut off; earlier skips were reported individually.
       notes.push(`Only the first ${MAX_REFERENCES} references were sent; ${options.references.length - index} more were dropped.`);
+      capped = true;
       break;
     }
+    if (reference.kind === 'deferred') { deferred += 1; continue; }
     const name = label(reference);
     if (reference.kind === 'unsupported') {
       notes.push(`Skipped "${name}": ${reference.reason}.`);
@@ -158,6 +165,9 @@ export async function buildPromptBlocks(options: PromptBuildOptions): Promise<Pr
       blocks.push({ type: 'text', text: `Reference ${range}:\n${body}` });
     }
     accepted += 1;
+  }
+  if (deferred > 0 && !capped) {
+    notes.push(`${deferred} more references were not read: more than ${MAX_REFERENCES} were attached.`);
   }
   return { blocks, notes };
 }

@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { realpath } from 'node:fs/promises';
+import { lstat, realpath } from 'node:fs/promises';
 import type { ClientFsHost } from './clientFs';
 
 /** Whether the user opted in. Machine scope: workspace settings cannot turn it on. */
@@ -26,7 +26,12 @@ export const vscodeClientFsHost: ClientFsHost = {
     const edit = new vscode.WorkspaceEdit();
     edit.replace(uri, new vscode.Range(0, 0, document.lineCount, 0), text);
     if (!(await vscode.workspace.applyEdit(edit))) { throw new Error('the editor rejected the edit'); }
-    if (!(await document.save())) { throw new Error('the editor could not save the file'); }
+    // save() resolves false for a document that is not dirty: an identical write,
+    // or auto-save winning the race. That is success; only a still-dirty document failed.
+    if (!(await document.save()) && document.isDirty) { throw new Error('the editor could not save the file'); }
   },
   realpath: path => realpath(path),
+  isSymlink: async path => {
+    try { return (await lstat(path)).isSymbolicLink(); } catch { return false; }
+  },
 };

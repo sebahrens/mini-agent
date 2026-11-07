@@ -168,7 +168,7 @@ fn main() {
     for line in stdin.lock().lines() {
         let line = line.unwrap();
         let compact = line.replace(' ', "").replace('\t', "");
-        if mode.starts_with("aux") {
+        if mode.starts_with("aux") || mode == "hang-tools-call" {
             let lease=std::path::PathBuf::from(env::var_os("MCP_FIXTURE_LEASE_FILE").unwrap());
             let mut trace=OpenOptions::new().create(true).append(true).open(lease.with_extension("rpc")).unwrap();
             writeln!(trace,"{line}").unwrap();
@@ -295,6 +295,20 @@ fn main() {
                     write_response(&mut stdout, &response);
                     continue;
                 }
+            }
+            if mode == "endless-pages" {
+                // One tool per page and a cursor on every page, forever.
+                let page: usize = compact
+                    .split("\"cursor\":\"")
+                    .nth(1)
+                    .and_then(|rest| rest.split('"').next())
+                    .and_then(|cursor| cursor.parse().ok())
+                    .unwrap_or(0);
+                write_response(
+                    &mut stdout,
+                    &format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"tools\":[{{\"name\":\"p{page}\",\"inputSchema\":{{\"type\":\"object\"}}}}],\"nextCursor\":\"{}\"}}}}", page + 1),
+                );
+                continue;
             }
             if mode == "many-tools" {
                 let tools = (0..200)
@@ -1720,6 +1734,60 @@ async fn mcp_tool_call_with_progress_outlives_the_idle_timeout_but_not_the_ceili
     fixture.cleanup();
 }
 
+// mini-agent-ys16l: an abandoned call must still finish its request inside rmcp,
+// which is what removes the progress-reset watcher from the peer.
+#[tokio::test]
+async fn mcp_abandoned_call_still_completes_its_request_so_the_watcher_is_released() {
+    let fixture = FixtureBuild::compile();
+    let lease = fixture.lease("hang-tools-call");
+    let handle = McpClientHandle::connect(
+        CompactString::new("fixture"),
+        &fixture.config(
+            fixture.executable.display().to_string(),
+            Vec::new(),
+            "hang-tools-call",
+            &lease,
+        ),
+    )
+    .await
+    .unwrap();
+    let params =
+        || rmcp::model::CallToolRequestParams::new("probe").with_arguments(serde_json::Map::new());
+    let metrics = tokio::runtime::Handle::current().metrics();
+    let baseline = metrics.num_alive_tasks();
+    let peer = handle.peer();
+    let _ = tokio::time::timeout(
+        Duration::from_millis(100),
+        crate::extras::mcp::client::call_tool_with_ceiling(
+            &peer,
+            params(),
+            Duration::from_millis(600),
+            Duration::from_secs(30),
+        ),
+    )
+    .await;
+    // Right after the drop the request is still owned by a task that will run
+    // rmcp's own cleanup...
+    assert!(
+        metrics.num_alive_tasks() > baseline,
+        "the abandoned request must stay owned until rmcp releases its watcher"
+    );
+    // ...and it ends once the idle timeout fires.
+    let mut ended = false;
+    for _ in 0..40 {
+        if metrics.num_alive_tasks() <= baseline + 1 {
+            ended = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(ended, "the abandoned request must end at the idle timeout");
+    McpClientManager::from_handles(vec![handle])
+        .shutdown()
+        .await;
+    fixture.cleanup();
+}
+
 #[tokio::test]
 async fn mcp_progress_notifications_become_live_previews_for_the_call() {
     let fixture = FixtureBuild::compile();
@@ -1811,6 +1879,58 @@ async fn mcp_tool_call_hang_times_out_with_tool_error() {
 }
 
 #[tokio::test]
+async fn mcp_tool_call_dropped_mid_flight_sends_notifications_cancelled() {
+    let fixture = FixtureBuild::compile();
+    let lease = fixture.lease("hang-tools-call");
+    let handle = McpClientHandle::connect(
+        CompactString::new("fixture"),
+        &fixture.config(
+            fixture.executable.display().to_string(),
+            Vec::new(),
+            "hang-tools-call",
+            &lease,
+        ),
+    )
+    .await
+    .unwrap();
+    let manager = McpClientManager::from_handles(vec![handle]);
+    let mut tools = manager
+        .collect_tools_with_timeouts(
+            Some(permission_for(Action::Allow)),
+            None,
+            McpToolTimeouts {
+                list: Duration::from_secs(5),
+                call: Duration::from_secs(60),
+            },
+        )
+        .await;
+    let tool = tools
+        .iter_mut()
+        .find(|tool| tool.name() == "probe")
+        .expect("fixture tool must be listed");
+    // The turn is cancelled: the call future is dropped well inside the bound.
+    let _ = tokio::time::timeout(Duration::from_millis(500), tool.call("{}".to_string())).await;
+    let trace = lease.with_extension("rpc");
+    let mut seen = false;
+    for _ in 0..50 {
+        let text = std::fs::read_to_string(&trace).unwrap_or_default();
+        if text.contains("notifications/cancelled") {
+            seen = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        seen,
+        "dropping an in-flight call must cancel it on the server"
+    );
+    let pid = wait_for_pid(&lease).await;
+    shutdown(manager).await;
+    assert_process_reaped(pid).await;
+    fixture.cleanup();
+}
+
+#[tokio::test]
 async fn mcp_per_server_startup_and_tool_timeouts_override_the_defaults() {
     let fixture = FixtureBuild::compile();
     let lease = fixture.lease("slow-start");
@@ -1857,6 +1977,31 @@ async fn mcp_per_server_startup_and_tool_timeouts_override_the_defaults() {
     shutdown(manager).await;
     assert_process_reaped(pid).await;
     fixture.cleanup();
+}
+
+#[tokio::test]
+async fn mcp_tool_listing_cut_by_the_page_limit_is_reported_below_the_tool_cap() {
+    let fixture = FixtureBuild::compile();
+    let lease = fixture.lease("endless-pages");
+    let config = fixture.config(
+        fixture.executable.display().to_string(),
+        Vec::new(),
+        "endless-pages",
+        &lease,
+    );
+    let handle = McpClientHandle::connect(CompactString::new("fixture"), &config)
+        .await
+        .unwrap();
+    let listed = handle.cached_tools().await.unwrap();
+    assert_eq!(
+        listed.entries.len(),
+        crate::extras::mcp::client::MCP_LIST_TOOLS_MAX_PAGES
+    );
+    assert!(listed.over_cap.page_limited && !listed.over_cap.exact);
+    assert!(listed.reached_tool_cap, "a page-limit cut must be reported");
+    let pid = wait_for_pid(&lease).await;
+    shutdown(McpClientManager::from_handles(vec![handle])).await;
+    assert_process_reaped(pid).await;
 }
 
 #[tokio::test]

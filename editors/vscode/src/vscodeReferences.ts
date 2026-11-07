@@ -38,11 +38,20 @@ export async function collectReferences(
   includeSelection: boolean,
 ): Promise<ReferenceInput[]> {
   const out: ReferenceInput[] = [];
-  for (const reference of request.references.slice(0, MAX_REFERENCES + 1)) {
+  // Every attached reference is kept so the builder can report the real number
+  // it dropped, but only the first MAX_REFERENCES get an expensive read (document
+  // open, image buffer); later ones become cheap `deferred` placeholders.
+  let reads = 0;
+  for (const reference of request.references) {
     const value: unknown = reference.value;
     const name: unknown = (reference as { name?: unknown }).name;
     const named = typeof name === 'string' && name ? { name } : {};
     const display = typeof name === 'string' && name ? name : 'reference';
+    const expensive = isLocation(value) || (isBinary(value) && value.mimeType.startsWith('image/'));
+    if (expensive) {
+      if (reads >= MAX_REFERENCES) { out.push({ kind: 'deferred' }); continue; }
+      reads += 1;
+    }
     if (isLocation(value)) {
       if (value.uri.scheme !== 'file') { out.push(unsupported(display, `only local files can be sent, not ${value.uri.scheme}: references`)); continue; }
       try {
