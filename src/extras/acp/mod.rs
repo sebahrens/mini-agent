@@ -3088,6 +3088,10 @@ fn parse_prompt_blocks(
                         mime_type,
                     });
                 }
+                // A blank text block (the VS Code client always sends the typed
+                // text first, empty for /selection or image-only prompts)
+                // carries nothing; the image is the prompt's content.
+                ContentBlock::Text(text) if text.text.trim().is_empty() => {}
                 _ => content.push(UserBlock::Text {
                     text: render_prompt_blocks(std::slice::from_ref(block))?,
                 }),
@@ -3285,6 +3289,27 @@ mod typed_prompt_tests {
             assert_eq!(prompt.to_message(), expected.to_message());
         }
     }
+    #[cfg(feature = "multimodal")]
+    #[test]
+    fn acp_image_prompt_with_blank_text_blocks_is_accepted() {
+        let image = || ContentBlock::Image(ImageContent::new("aW5lcnQ=", "image/png"));
+        // Image-only after an empty typed-text block.
+        let prompt = parse_prompt_blocks(&[
+            ContentBlock::Text(TextContent::new("")),
+            image(),
+        ])
+        .unwrap();
+        assert_eq!(prompt.literal_text(), "");
+        // /selection: blank text, a snippet, then the image.
+        let prompt = parse_prompt_blocks(&[
+            ContentBlock::Text(TextContent::new("  ")),
+            ContentBlock::Text(TextContent::new("snippet")),
+            image(),
+        ])
+        .unwrap();
+        assert_eq!(prompt.literal_text(), "snippet");
+    }
+
     #[test]
     fn acp53_prompt_text_and_block_limits_precede_runner_admission() {
         assert!(
