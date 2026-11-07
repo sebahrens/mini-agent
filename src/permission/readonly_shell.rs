@@ -233,19 +233,19 @@ fn grep_directories_action_may_recurse(args: &[String]) -> bool {
                     return true;
                 }
             }
-        } else if let Some(cluster) = a.strip_prefix('-') {
-            if let Some(pos) = cluster.find('d') {
-                let rest = &cluster[pos + 1..];
-                let v = if rest.is_empty() {
-                    let v = args.get(i).map(String::as_str).unwrap_or("");
-                    i += 1;
-                    v
-                } else {
-                    rest
-                };
-                if !non_traversing(v) {
-                    return true;
-                }
+        } else if let Some(cluster) = a.strip_prefix('-')
+            && let Some(pos) = cluster.find('d')
+        {
+            let rest = &cluster[pos + 1..];
+            let v = if rest.is_empty() {
+                let v = args.get(i).map(String::as_str).unwrap_or("");
+                i += 1;
+                v
+            } else {
+                rest
+            };
+            if !non_traversing(v) {
+                return true;
             }
         }
     }
