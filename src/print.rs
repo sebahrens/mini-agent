@@ -1996,6 +1996,24 @@ fn parse_git_status(output: &[u8]) -> BTreeMap<String, [u8; 2]> {
         .collect()
 }
 
+/// Converts repository-root-relative status paths to workspace-relative ones;
+/// anything outside the workspace prefix is dropped.
+fn strip_workspace_prefix(
+    statuses: BTreeMap<String, [u8; 2]>,
+    prefix: &str,
+) -> BTreeMap<String, [u8; 2]> {
+    if prefix.is_empty() {
+        return statuses;
+    }
+    statuses
+        .into_iter()
+        .filter_map(|(path, status)| {
+            let relative = path.strip_prefix(prefix)?;
+            (!relative.is_empty()).then(|| (relative.to_owned(), status))
+        })
+        .collect()
+}
+
 fn workspace_path_state(root: &Path, path: &str, status: [u8; 2]) -> WorkspacePathState {
     let metadata = std::fs::symlink_metadata(root.join(path)).ok();
     let kind = metadata.as_ref().map(|metadata| {
@@ -3880,6 +3898,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn listing_sessions_into_a_closed_pipe_is_success() {
+        let row = crate::session::catalogue::SessionRow {
+            id: "abcdef123456".into(),
+            title: "t".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            working_dir: "/w".into(),
+            message_count: 1,
+            provider: "p".into(),
+            model: "m".into(),
+            current_workspace: true,
+        };
+        let catalogue = crate::session::catalogue::Catalogue {
+            rows: vec![row],
+            truncated: true,
+            skipped: 0,
+        };
+        let empty = crate::session::catalogue::Catalogue::default();
+        for catalogue in [&catalogue, &empty] {
+            assert!(
+                super::write_sessions(
+                    &mut BrokenPipeWriter,
+                    &mut BrokenPipeWriter,
+                    catalogue,
+                    false
+                )
+                .is_ok()
+            );
+            assert!(
+                super::write_sessions(
+                    &mut FlushBrokenPipeWriter,
+                    &mut BrokenPipeWriter,
+                    catalogue,
+                    true
+                )
+                .is_ok()
+            );
+        }
+        // Other write errors still surface.
+        struct Full;
+        impl io::Write for Full {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("disk full"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        assert!(super::write_sessions(&mut Full, &mut io::sink(), &empty, false).is_err());
+    }
+
     struct FlushBrokenPipeWriter;
 
     impl io::Write for FlushBrokenPipeWriter {
@@ -4335,6 +4404,49 @@ mod tests {
         );
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn workspace_change_snapshot_in_a_repo_subdirectory_is_workspace_relative() {
+        let repo = std::env::temp_dir().join(format!(
+            "mini-agent-headless-change-subdir-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let workspace = repo.join("packages").join("app");
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::create_dir_all(repo.join("other")).unwrap();
+        let runner = crate::git::runner::GitRunner::discover().expect("Git should be available");
+        runner
+            .run(
+                &repo,
+                "headless-output-test-init",
+                ["init", "--quiet"],
+                crate::git::runner::LOCAL_MUTATION_LIMITS,
+            )
+            .await
+            .expect("temporary repository should initialize");
+        std::fs::write(workspace.join("src/z.rs"), "a").unwrap();
+
+        let before = super::capture_workspace_change_baseline(&workspace).await;
+        // A sibling package changes concurrently, and a pre-dirty file is
+        // edited again; neither must leak a repo-root-relative path.
+        std::fs::write(repo.join("other/y.rs"), "x").unwrap();
+        std::fs::write(workspace.join("src/z.rs"), "longer content").unwrap();
+        std::fs::write(workspace.join("src/x.rs"), "new").unwrap();
+        let tool_call = Message::Assistant {
+            id: None,
+            content: OneOrMany::one(AssistantContent::tool_call(
+                "c1",
+                "edit",
+                serde_json::json!({"path": "src/x.rs"}),
+            )),
+        };
+        assert_eq!(
+            super::files_changed_since(&workspace, before.as_ref(), &[tool_call]).await,
+            ["src/x.rs", "src/z.rs"]
+        );
+
+        std::fs::remove_dir_all(repo).unwrap();
     }
 
     #[cfg(feature = "advisor")]
