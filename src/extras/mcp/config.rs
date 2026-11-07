@@ -202,6 +202,16 @@ pub struct McpServerOptions {
     /// is set; see `headers_helper.rs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub headers_helper: Option<McpHeadersHelper>,
+    /// URL servers only: CIDR ranges (`10.0.0.0/8`, `100.64.0.0/10`,
+    /// `fd00::/8`, or a single address) of private, LAN, VPN, CGNAT, ULA and
+    /// link-local addresses this server may resolve to. Empty by default, so
+    /// private addresses stay refused. DNS answers are still pinned, every
+    /// resolved address must be public or inside a listed range, and cloud
+    /// metadata addresses stay blocked whatever is listed. Loopback needs
+    /// `allow_local`. User-global config only: a project `.mcp.json` entry
+    /// that sets it is refused, and project config needs project trust.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_cidrs: Vec<String>,
 }
 
 /// The command behind `headers_helper`. Never run through a shell: `command`

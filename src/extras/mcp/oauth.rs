@@ -1515,12 +1515,15 @@ pub(crate) async fn begin_login_bound(
     url: &str,
     settings: &OAuthSettings,
     allow_local: bool,
+    allowed_cidrs: &[String],
     source: super::egress::SourceValidator,
 ) -> anyhow::Result<LoginSession> {
     anyhow::ensure!(source(), "MCP OAuth source changed");
     // The login talks to the same server (and its authorization server) as
     // the transport, so it is held to the same public-address policy.
-    let endpoint = super::client::validate_mcp_server_url_policy(url, allow_local).await?;
+    let endpoint =
+        super::client::validate_mcp_server_url_policy_cidrs(url, allow_local, allowed_cidrs)
+            .await?;
     anyhow::ensure!(source(), "MCP OAuth source changed");
     let mut manager =
         authorization_manager_bound(url, Some(&endpoint), Some(source.clone())).await?;

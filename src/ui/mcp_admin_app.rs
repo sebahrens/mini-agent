@@ -425,6 +425,7 @@ impl App<'_> {
             .settings()
             .ok_or_else(|| anyhow::anyhow!("MCP OAuth settings are unavailable"))?;
         let allow_local = *allow_local;
+        let allowed_cidrs = server.options().allowed_cidrs;
         let origin = self
             .mcp_current_config()
             .mcp_origins
@@ -455,7 +456,7 @@ impl App<'_> {
             tokio::select! {
                 biased;
                 _ = crate::agent::runner::current_work_scope_cancelled() => Err("MCP login cancelled".into()),
-                result = tokio::time::timeout(crate::extras::mcp::client::MCP_INITIALIZE_TIMEOUT, crate::extras::mcp::oauth::begin_login_bound(&task_name, &url, &settings, allow_local, Arc::new(move || proof.valid(&proof.session_id, &proof.workspace)))) => {
+                result = tokio::time::timeout(crate::extras::mcp::client::MCP_INITIALIZE_TIMEOUT, crate::extras::mcp::oauth::begin_login_bound(&task_name, &url, &settings, allow_local, &allowed_cidrs, Arc::new(move || proof.valid(&proof.session_id, &proof.workspace)))) => {
                     let login = result.map_err(|_| "MCP OAuth setup timed out")?.map_err(|_| "MCP OAuth setup failed (credential values omitted)")?;
                     Ok(Completion::LoginReady(Box::new(login)))
                 }

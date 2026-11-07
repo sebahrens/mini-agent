@@ -695,6 +695,12 @@ pub(crate) fn parse_definition(mut value: Value) -> Result<McpServerConfig, &'st
             }
         }
     }
+    // Private-network reach is a user-global decision, never a repository's.
+    if object.contains_key("allowed_cidrs") || object.contains_key("allowedCidrs") {
+        return Err(
+            "allowed_cidrs (private-network access) can only be set in user-global config, not in a project .mcp.json",
+        );
+    }
     header_env_fields(object, url)?;
     if let Some(allow) = object.remove("allowLocal")
         && object.insert("allow_local".into(), allow).is_some()
@@ -1191,6 +1197,9 @@ mod tests {
             serde_json::json!({"url":"https://e.com","envHttpHeaders":"x"}),
             serde_json::json!({"url":"https://e.com","headersHelper":"./get-token.sh","headers_helper":"x"}),
             serde_json::json!({"url":"https://e.com","headersHelper":7}),
+            // mini-agent-ygcvf: private-network reach is user-global only.
+            serde_json::json!({"url":"https://e.com","allowed_cidrs":["10.0.0.0/8"]}),
+            serde_json::json!({"url":"https://e.com","allowedCidrs":["10.0.0.0/8"]}),
         ] {
             assert!(parse_definition(bad).is_err());
         }

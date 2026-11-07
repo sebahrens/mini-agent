@@ -727,7 +727,7 @@ impl McpClientHandle {
                 let endpoint = tokio::select! {
                     biased;
                     _ = crate::agent::runner::current_work_scope_cancelled() => anyhow::bail!("MCP connection cancelled"),
-                    result = validate_mcp_server_url_policy(url, *allow_local) => result?,
+                    result = validate_mcp_server_url_policy_cidrs(url, *allow_local, &options.allowed_cidrs) => result?,
                 };
                 validate()?;
                 // A configured headers helper runs after URL policy passes and
@@ -1374,7 +1374,23 @@ pub(crate) async fn validate_mcp_server_url_policy(
     value: &str,
     allow_local: bool,
 ) -> anyhow::Result<ValidatedEndpoint> {
-    validate_mcp_server_url_policy_with(value, allow_local, &super::egress::system_lookup()).await
+    validate_mcp_server_url_policy_cidrs(value, allow_local, &[]).await
+}
+
+/// As [`validate_mcp_server_url_policy`], additionally permitting the private
+/// ranges listed in `allowed_cidrs` (the server's `allowed_cidrs` option).
+pub(crate) async fn validate_mcp_server_url_policy_cidrs(
+    value: &str,
+    allow_local: bool,
+    allowed_cidrs: &[String],
+) -> anyhow::Result<ValidatedEndpoint> {
+    validate_mcp_server_url_policy_with_cidrs(
+        value,
+        allow_local,
+        allowed_cidrs,
+        &super::egress::system_lookup(),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1390,6 +1406,16 @@ pub(super) async fn validate_mcp_server_url_policy_with(
     allow_local: bool,
     lookup: &super::egress::Lookup,
 ) -> anyhow::Result<ValidatedEndpoint> {
+    validate_mcp_server_url_policy_with_cidrs(value, allow_local, &[], lookup).await
+}
+
+pub(super) async fn validate_mcp_server_url_policy_with_cidrs(
+    value: &str,
+    allow_local: bool,
+    allowed_cidrs: &[String],
+    lookup: &super::egress::Lookup,
+) -> anyhow::Result<ValidatedEndpoint> {
+    let cidrs = parse_allowed_cidrs(allowed_cidrs)?;
     let (host, _port, literal_ip) = parse_mcp_server_url_policy(value, allow_local)?;
     let addresses = if let Some(address) = literal_ip {
         vec![address]
@@ -1402,7 +1428,7 @@ pub(super) async fn validate_mcp_server_url_policy_with(
     let local =
         allow_local && !addresses.is_empty() && addresses.iter().all(|ip| is_loopback_ip(*ip));
     if !local {
-        validate_resolved_addresses(&addresses)?;
+        validate_resolved_addresses_in(&addresses, &cidrs)?;
     }
     let mut endpoint = ValidatedEndpoint::new(host, &addresses, literal_ip.is_some());
     if local {
@@ -1454,14 +1480,131 @@ fn parse_mcp_server_url_policy(
 }
 
 pub(super) fn validate_resolved_addresses(addresses: &[IpAddr]) -> anyhow::Result<()> {
+    validate_resolved_addresses_in(addresses, &[])
+}
+
+/// A parsed `allowed_cidrs` entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct AllowedCidr {
+    network: IpAddr,
+    bits: u8,
+}
+
+impl AllowedCidr {
+    fn contains(&self, address: IpAddr) -> bool {
+        match (self.network, address) {
+            (IpAddr::V4(network), IpAddr::V4(address)) => prefix_matches(
+                u128::from(u32::from(network)),
+                u128::from(u32::from(address)),
+                32,
+                self.bits,
+            ),
+            (IpAddr::V6(network), IpAddr::V6(address)) => {
+                prefix_matches(u128::from(network), u128::from(address), 128, self.bits)
+            }
+            _ => false,
+        }
+    }
+}
+
+fn prefix_matches(network: u128, address: u128, width: u32, bits: u8) -> bool {
+    let shift = width - u32::from(bits);
+    shift >= 128 || network >> shift == address >> shift
+}
+
+/// Parses `allowed_cidrs`: `addr/bits` or a bare address (a single host).
+pub(super) fn parse_allowed_cidrs(entries: &[String]) -> anyhow::Result<Vec<AllowedCidr>> {
+    anyhow::ensure!(
+        entries.len() <= 64,
+        "MCP allowed_cidrs lists more than 64 ranges"
+    );
+    entries
+        .iter()
+        .map(|entry| {
+            let (address, bits) = match entry.trim().split_once('/') {
+                Some((address, bits)) => (address, Some(bits)),
+                None => (entry.trim(), None),
+            };
+            let network: IpAddr = address.parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "MCP allowed_cidrs entry '{entry}' is not an IP range such as 10.0.0.0/8"
+                )
+            })?;
+            let max = if network.is_ipv4() { 32 } else { 128 };
+            let bits = match bits {
+                Some(bits) => bits.parse::<u8>().ok().filter(|bits| *bits <= max),
+                None => Some(max),
+            }
+            .ok_or_else(|| {
+                anyhow::anyhow!("MCP allowed_cidrs entry '{entry}' has an invalid prefix length")
+            })?;
+            Ok(AllowedCidr { network, bits })
+        })
+        .collect()
+}
+
+/// Cloud metadata endpoints that no `allowed_cidrs` entry can unlock.
+fn is_metadata_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(ip) => {
+            matches!(
+                ip.octets(),
+                [169, 254, 169, 254]
+                    | [169, 254, 170, 2]
+                    | [169, 254, 169, 253]
+                    | [100, 100, 100, 200]
+                    | [192, 0, 0, 192]
+            )
+        }
+        IpAddr::V6(ip) => {
+            ip.to_ipv4_mapped()
+                .is_some_and(|v4| is_metadata_ip(IpAddr::V4(v4)))
+                || ip == "fd00:ec2::254".parse::<std::net::Ipv6Addr>().unwrap()
+        }
+    }
+}
+
+/// Private, LAN, VPN/CGNAT, ULA and link-local addresses, the only restricted
+/// classes `allowed_cidrs` can unlock (never loopback, unspecified, multicast
+/// or reserved space).
+fn is_lan_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(ip) => {
+            let [first, second, ..] = ip.octets();
+            first == 10
+                || (first == 172 && (16..=31).contains(&second))
+                || (first == 192 && second == 168)
+                || (first == 100 && (64..=127).contains(&second))
+                || (first == 169 && second == 254)
+        }
+        IpAddr::V6(ip) => {
+            if let Some(v4) = ip.to_ipv4_mapped() {
+                return is_lan_ip(IpAddr::V4(v4));
+            }
+            let first = ip.segments()[0];
+            first & 0xfe00 == 0xfc00 || first & 0xffc0 == 0xfe80
+        }
+    }
+}
+
+pub(super) fn validate_resolved_addresses_in(
+    addresses: &[IpAddr],
+    allowed: &[AllowedCidr],
+) -> anyhow::Result<()> {
     if addresses.is_empty() {
         anyhow::bail!("MCP server host did not resolve to an IP address");
     }
 
     for address in addresses {
-        if is_restricted_ip(*address) {
+        if !is_restricted_ip(*address) {
+            continue;
+        }
+        let unlocked = !is_metadata_ip(*address)
+            && is_lan_ip(*address)
+            && allowed.iter().any(|cidr| cidr.contains(*address));
+        if !unlocked {
             anyhow::bail!(
-                "MCP server URL resolves to non-public address {address}; use a publicly routable HTTP(S) API endpoint"
+                "MCP server URL resolves to non-public address {address}; use a publicly routable HTTP(S) API endpoint, or list its range in this server's `allowed_cidrs` (user config only) to permit a private network"
             );
         }
     }
@@ -1800,6 +1943,97 @@ mod local_policy_tests {
             Box::pin(async move { Ok(addresses) })
         })
     }
+    // mini-agent-ygcvf: private ranges are opt-in per server, keep DNS pinning
+    // and the metadata block, and the refusal names the option.
+    #[tokio::test]
+    async fn allowed_cidrs_unlock_only_listed_private_ranges_and_never_metadata() {
+        let cidrs = |list: &[&str]| list.iter().map(|c| (*c).to_owned()).collect::<Vec<_>>();
+        let one = |ip: &str| lookup(vec![ip.parse().unwrap()]);
+        // Default closed: no option, no private reach, and the notice says how.
+        let error = validate_mcp_server_url_policy_with_cidrs(
+            "http://wiki.corp/mcp",
+            false,
+            &[],
+            &one("10.1.2.3"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("allowed_cidrs"), "{error}");
+        // Listed ranges connect, pinned to the validated answers.
+        for (ip, list) in [
+            ("10.1.2.3", vec!["10.0.0.0/8"]),
+            ("192.168.7.9", vec!["192.168.0.0/16", "10.0.0.0/8"]),
+            ("172.20.0.5", vec!["172.16.0.0/12"]),
+            ("100.101.102.103", vec!["100.64.0.0/10"]),
+            ("fd12::5", vec!["fd00::/8"]),
+            ("10.9.9.9", vec!["10.9.9.9"]),
+        ] {
+            let endpoint = validate_mcp_server_url_policy_with_cidrs(
+                "https://internal.corp/mcp",
+                false,
+                &cidrs(&list),
+                &one(ip),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{ip}: {e}"));
+            assert_eq!(endpoint.addresses(), vec![ip.parse::<IpAddr>().unwrap()]);
+        }
+        // Outside the listed range, or a mixed answer with one unlisted address.
+        for (ips, list) in [
+            (vec!["10.1.2.3"], vec!["192.168.0.0/16"]),
+            (vec!["10.1.2.3", "192.168.1.1"], vec!["10.0.0.0/8"]),
+            (vec!["10.1.2.3", "93.184.216.34"], vec![]),
+        ] {
+            let dns = lookup(ips.iter().map(|ip| ip.parse().unwrap()).collect());
+            let result = validate_mcp_server_url_policy_with_cidrs(
+                "https://internal.corp/mcp",
+                false,
+                &cidrs(&list),
+                &dns,
+            )
+            .await;
+            assert!(result.is_err(), "{ips:?} {list:?}");
+        }
+        // Metadata, loopback, unspecified, multicast and reserved space stay
+        // refused even under the widest ranges.
+        for ip in [
+            "169.254.169.254",
+            "169.254.170.2",
+            "100.100.100.200",
+            "fd00:ec2::254",
+            "::ffff:169.254.169.254",
+            "127.0.0.1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "255.255.255.255",
+            "::1",
+        ] {
+            let result = validate_mcp_server_url_policy_with_cidrs(
+                "https://internal.corp/mcp",
+                false,
+                &cidrs(&["0.0.0.0/0", "::/0"]),
+                &one(ip),
+            )
+            .await;
+            assert!(result.is_err(), "{ip} must stay blocked");
+        }
+        // Malformed entries are rejected, not ignored.
+        for bad in ["10.0.0.0/33", "nope", "10.0.0.0/x", "::/129"] {
+            assert!(
+                validate_mcp_server_url_policy_with_cidrs(
+                    "https://internal.corp/mcp",
+                    false,
+                    &cidrs(&[bad]),
+                    &one("93.184.216.34"),
+                )
+                .await
+                .is_err(),
+                "{bad}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn explicit_local_policy_accepts_only_pinned_loopback_and_does_not_widen_private_networks()
      {
