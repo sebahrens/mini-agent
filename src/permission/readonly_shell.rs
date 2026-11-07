@@ -158,6 +158,45 @@ fn arg_ok(arg: &str, working_dir: &str) -> bool {
     path_ok(arg, working_dir)
 }
 
+/// GNU/BSD `getopt_long` accepts any unambiguous prefix of a long option, so a
+/// blocked option must also match its abbreviations (`--der` for
+/// `--dereference-recursive`). `arg` matches when its name (before any `=`)
+/// is a non-empty prefix of `full`; ambiguous prefixes are over-blocked on
+/// purpose (the command would fail anyway).
+fn long_opt_is(arg: &str, full: &str) -> bool {
+    let Some(long) = arg.strip_prefix("--") else {
+        return false;
+    };
+    let name = long.split_once('=').map_or(long, |(name, _)| name);
+    !name.is_empty() && full.starts_with(name)
+}
+
+/// Values attached to a short option inside a cluster (`-f/etc/x`, `-nf.env`).
+/// Only options whose value is a file path are returned; every other
+/// value-taking option swallows the rest of the cluster without yielding it.
+fn attached_short_path_values<'a>(
+    args: &'a [String],
+    takes_value: &str,
+    file: char,
+) -> Vec<&'a str> {
+    let mut values = Vec::new();
+    for arg in args {
+        if !arg.starts_with('-') || arg.starts_with("--") {
+            continue;
+        }
+        for (index, c) in arg.char_indices().skip(1) {
+            if takes_value.contains(c) {
+                let rest = &arg[index + c.len_utf8()..];
+                if c == file && !rest.is_empty() {
+                    values.push(rest);
+                }
+                break;
+            }
+        }
+    }
+    values
+}
+
 fn short_cluster_has(arg: &str, letters: &[char]) -> bool {
     arg.starts_with('-')
         && !arg.starts_with("--")
@@ -192,29 +231,47 @@ fn command_is_read_only(
             report.paths.push(arg.clone());
         }
     }
+    // `-f/path` / `-nf.env`: the file operand is attached to the short option.
+    let attached = match command.as_str() {
+        "grep" => attached_short_path_values(args, "efmABCdD", 'f'),
+        "rg" => attached_short_path_values(args, "efgmrtTABCjMEd", 'f'),
+        _ => Vec::new(),
+    };
+    for value in attached {
+        if !path_ok(value, working_dir) {
+            return false;
+        }
+        report.paths.push(value.to_string());
+    }
     match command.as_str() {
-        "ls" => !args
-            .iter()
-            .any(|a| short_cluster_has(a, &['L', 'H']) || a.starts_with("--dereference")),
+        "ls" => {
+            report.recursive |= args
+                .iter()
+                .any(|a| short_cluster_has(a, &['R']) || long_opt_is(a, "recursive"));
+            !args.iter().any(|a| {
+                short_cluster_has(a, &['L', 'H']) || long_opt_is(a, "dereference-command-line")
+            }) && !args.iter().any(|a| a.starts_with("--deref"))
+        }
         "cat" | "head" | "wc" => true,
         "grep" => {
             if args
                 .iter()
-                .any(|a| short_cluster_has(a, &['R']) || a == "--dereference-recursive")
+                .any(|a| short_cluster_has(a, &['R']) || long_opt_is(a, "dereference-recursive"))
             {
                 return false;
             }
-            report.recursive |= args
-                .iter()
-                .any(|a| short_cluster_has(a, &['r']) || a == "--recursive" || a == "recurse");
+            // `--directories=recurse` / `-d recurse` / `-drecurse` traverse too.
+            report.recursive |= args.iter().any(|a| {
+                short_cluster_has(a, &['r'])
+                    || long_opt_is(a, "recursive")
+                    || a == "recurse"
+                    || (a.starts_with('-') && a.ends_with("recurse"))
+            });
             true
         }
-        "tail" => {
-            !args
-                .iter()
-                .any(|a| short_cluster_has(a, &['f', 'F']) || a.starts_with("--follow"))
-                && !args.iter().any(|a| a.starts_with("--retry"))
-        }
+        "tail" => !args.iter().any(|a| {
+            short_cluster_has(a, &['f', 'F']) || long_opt_is(a, "follow") || long_opt_is(a, "retry")
+        }),
         "rg" => {
             report.recursive = true;
             !args.iter().any(|a| {
@@ -449,6 +506,51 @@ mod tests {
         ] {
             no(script);
         }
+    }
+
+    #[test]
+    fn abbreviated_and_attached_options_cannot_evade_the_screen() {
+        for script in [
+            "grep --der -n . link",
+            "grep --dereference-r foo .",
+            "tail --fol app.log",
+            "tail --foll app.log",
+            "tail --ret app.log",
+            "tail --retr app.log",
+            "ls --deref",
+            "ls --dereference-command-line",
+            "grep -f/etc/x foo",
+            "grep -nf/etc/x foo",
+            "grep -f../x foo",
+            "rg -f/etc/x foo",
+        ] {
+            no(script);
+        }
+        yes("grep -fpats foo src");
+        let report = |s: &str| super::classify(s, WD, true).unwrap();
+        for script in [
+            "grep --rec -n foo src",
+            "grep --recu foo src",
+            "grep --directories=recurse -n foo src",
+            "grep -drecurse foo src",
+            "grep -d recurse foo src",
+            "ls -R .",
+            "ls --recursive .",
+            "ls --rec .",
+        ] {
+            assert!(report(script).recursive, "should be recursive: {script}");
+        }
+        assert!(!report("ls -la src").recursive);
+        assert!(
+            report("grep -f.env foo src")
+                .paths
+                .contains(&".env".to_string())
+        );
+        assert!(
+            report("grep -nf.env foo src")
+                .paths
+                .contains(&".env".to_string())
+        );
     }
 
     #[test]
