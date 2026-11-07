@@ -8,6 +8,7 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Added
 
+- `--stream-json-schema claude` partial streams now frame `message_start`/`content_block_start`/`content_block_stop`/`message_delta`/`message_stop` with per-block indexes; turn-budget exhaustion reports `error_max_turns`; results carry `uuid`, `duration_api_ms` and `permission_denials`, and records a `uuid` (mini-agent-5ux7e).
 - Headless JSON and stream-json `result` records carry `duration_ms`, `num_turns`, `is_error` and `total_cost_usd` (alongside `cost`) (mini-agent-494ld).
 - `--stream-json-schema claude` (opt-in; default output unchanged) emits Claude Code SDK-shaped `assistant`, `user`, `stream_event` and `result` messages for `-p --output stream-json`, with a mapping table in GET_STARTED.md (mini-agent-wfso7).
 - Persona frontmatter `background: true` (delegations detach as background tasks), `memory: user|project|local` (private notes directory injected at start and writable through an `agent_memory` tool) and `hooks:` (scoped to the child's tool calls) are now implemented; memory and hooks are opt-in via `[subagents] agent_memory` / `agent_hooks` (mini-agent-scu2y).

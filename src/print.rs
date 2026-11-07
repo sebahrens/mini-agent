@@ -214,7 +214,40 @@ static COMPLETIONS_FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 /// time spent waiting for the driver's next line is not counted.
 static RUN_SPAN_START: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
+/// Time spent waiting on model completions this turn (for the SDK's
+/// `duration_api_ms`): from the turn start, or the last tool result, to the
+/// completion's usage record. Tool execution time is excluded.
+static API_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static API_SPAN_START: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+fn begin_api_span() {
+    *API_SPAN_START
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::time::Instant::now());
+}
+
+fn end_api_span() {
+    let began = API_SPAN_START
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(began) = began {
+        let ms = u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX);
+        API_MS.fetch_add(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn take_api_duration_ms() -> u64 {
+    let ms = API_MS.swap(0, std::sync::atomic::Ordering::Relaxed);
+    begin_api_span();
+    ms
+}
+
 pub(crate) fn mark_headless_run_start() {
+    API_SPAN_START
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_or_insert_with(std::time::Instant::now);
     let mut start = RUN_SPAN_START
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -224,6 +257,8 @@ pub(crate) fn mark_headless_run_start() {
 /// Restart the `duration_ms` span at the start of a turn (a user line was
 /// accepted), discarding idle time waiting for it (mini-agent-gkuap).
 pub(crate) fn restart_headless_run_span() {
+    API_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+    begin_api_span();
     *RUN_SPAN_START
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::time::Instant::now());
@@ -246,6 +281,81 @@ fn claude_schema() -> bool {
     CLAUDE_SCHEMA.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Streaming-message bookkeeping for `--stream-json-schema claude` with
+/// partial messages: which message and content block are open, so deltas carry
+/// per-block indexes and every message gets its start/stop events.
+#[derive(Default)]
+struct ClaudeStreamState {
+    message_open: bool,
+    /// Index and kind (`text` / `thinking`) of the open content block.
+    block: Option<(u32, &'static str)>,
+    next_index: u32,
+    model: Option<String>,
+}
+
+static CLAUDE_STREAM: std::sync::Mutex<ClaudeStreamState> =
+    std::sync::Mutex::new(ClaudeStreamState {
+        message_open: false,
+        block: None,
+        next_index: 0,
+        model: None,
+    });
+
+fn claude_stream_event(
+    event: serde_json::Value,
+    session_id: &serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type":"stream_event", "event":event,
+        "message_id":current_message_id(),
+        "parent_tool_use_id":null, "session_id":session_id,
+        "uuid":uuid::Uuid::new_v4().to_string(),
+    })
+}
+
+/// End the open content block and message (if any) with SDK stop events.
+fn claude_close_message(
+    state: &mut ClaudeStreamState,
+    session_id: &serde_json::Value,
+    stop_reason: &str,
+) -> Vec<serde_json::Value> {
+    use serde_json::json;
+    let mut out = Vec::new();
+    if let Some((index, _)) = state.block.take() {
+        out.push(claude_stream_event(
+            json!({"type":"content_block_stop", "index":index}),
+            session_id,
+        ));
+    }
+    if std::mem::take(&mut state.message_open) {
+        out.push(claude_stream_event(
+            json!({"type":"message_delta",
+                "delta":{"stop_reason":stop_reason, "stop_sequence":null},
+                "usage":{"output_tokens":0}}),
+            session_id,
+        ));
+        out.push(claude_stream_event(
+            json!({"type":"message_stop"}),
+            session_id,
+        ));
+    }
+    state.next_index = 0;
+    out
+}
+
+/// Stop events for a message still open when the run's result is emitted.
+pub(crate) fn claude_close_open_message() -> Vec<serde_json::Value> {
+    let session_id = CLAUDE_SESSION_ID
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .map_or(serde_json::Value::Null, serde_json::Value::from);
+    let mut state = CLAUDE_STREAM
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    claude_close_message(&mut state, &session_id, "end_turn")
+}
+
 /// Rewrite one native stream-json record as Claude Code SDK records
 /// (mini-agent-wfso7). Records with no Claude counterpart (`usage`,
 /// `file_mutation`, `goal`, `control_request`, ...) pass through unchanged.
@@ -265,6 +375,7 @@ pub(crate) fn claude_stream_records(event: serde_json::Value) -> Vec<serde_json:
                 "content":[block],
             },
             "parent_tool_use_id":null, "session_id":session_id,
+            "uuid":uuid::Uuid::new_v4().to_string(),
         });
         if truncated {
             record["truncated"] = true.into();
@@ -286,13 +397,37 @@ pub(crate) fn claude_stream_records(event: serde_json::Value) -> Vec<serde_json:
             if let Some(mode) = event.get("permission_mode").cloned() {
                 event["permissionMode"] = mode;
             }
+            CLAUDE_STREAM
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .model = event
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
             vec![event]
         }
-        Some("assistant_text") => vec![assistant(
-            json!({"type":"text", "text":event["text"]}),
-            truncated,
-        )],
+        Some("assistant_text") => {
+            let mut records = claude_close_message(
+                &mut CLAUDE_STREAM
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                &session_id,
+                "end_turn",
+            );
+            records.push(assistant(
+                json!({"type":"text", "text":event["text"]}),
+                truncated,
+            ));
+            records
+        }
         Some("tool_call") => {
+            let mut records = claude_close_message(
+                &mut CLAUDE_STREAM
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                &session_id,
+                "tool_use",
+            );
             let mut record = assistant(
                 json!({
                     "type":"tool_use", "id":event["id"], "name":event["name"],
@@ -301,7 +436,8 @@ pub(crate) fn claude_stream_records(event: serde_json::Value) -> Vec<serde_json:
                 truncated,
             );
             record["provider_call_id"] = event["provider_call_id"].clone();
-            vec![record]
+            records.push(record);
+            records
         }
         Some("tool_result") => {
             let mut record = json!({
@@ -312,25 +448,71 @@ pub(crate) fn claude_stream_records(event: serde_json::Value) -> Vec<serde_json:
                     "is_error":event["is_error"],
                 }]},
                 "parent_tool_use_id":null, "session_id":session_id,
+                "uuid":uuid::Uuid::new_v4().to_string(),
             });
             if truncated {
                 record["truncated"] = true.into();
             }
-            vec![record]
+            let mut records = claude_close_message(
+                &mut CLAUDE_STREAM
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                &session_id,
+                "end_turn",
+            );
+            records.push(record);
+            records
         }
         Some(kind @ ("text_delta" | "reasoning_delta")) => {
-            let (delta_type, field) = if kind == "text_delta" {
-                ("text_delta", "text")
+            let (delta_type, field, block_kind) = if kind == "text_delta" {
+                ("text_delta", "text", "text")
             } else {
-                ("thinking_delta", "thinking")
+                ("thinking_delta", "thinking", "thinking")
             };
-            vec![json!({
-                "type":"stream_event",
-                "event":{"type":"content_block_delta", "index":0,
-                    "delta":{"type":delta_type, field:event["text"]}},
-                "message_id":event["message_id"],
-                "parent_tool_use_id":null, "session_id":session_id,
-            })]
+            let mut state = CLAUDE_STREAM
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut records = Vec::new();
+            if !state.message_open {
+                state.message_open = true;
+                state.next_index = 0;
+                records.push(claude_stream_event(
+                    json!({"type":"message_start", "message":{
+                        "id":current_message_id(), "type":"message", "role":"assistant",
+                        "content":[], "model":state.model, "stop_reason":null,
+                        "stop_sequence":null,
+                        "usage":{"input_tokens":0, "output_tokens":0},
+                    }}),
+                    &session_id,
+                ));
+            }
+            // A change of block kind ends the open block and opens the next
+            // one at its own index, so thinking and text never merge.
+            if state.block.map(|(_, open)| open) != Some(block_kind) {
+                if let Some((index, _)) = state.block.take() {
+                    records.push(claude_stream_event(
+                        json!({"type":"content_block_stop", "index":index}),
+                        &session_id,
+                    ));
+                }
+                let index = state.next_index;
+                state.next_index += 1;
+                state.block = Some((index, block_kind));
+                records.push(claude_stream_event(
+                    json!({"type":"content_block_start", "index":index,
+                        "content_block":{"type":block_kind, field:""}}),
+                    &session_id,
+                ));
+            }
+            let index = state.block.map_or(0, |(index, _)| index);
+            let mut delta = claude_stream_event(
+                json!({"type":"content_block_delta", "index":index,
+                    "delta":{"type":delta_type, field:event["text"]}}),
+                &session_id,
+            );
+            delta["message_id"] = event["message_id"].clone();
+            records.push(delta);
+            records
         }
         _ => vec![event],
     }
@@ -343,12 +525,23 @@ fn claude_result_record(value: &mut serde_json::Value) {
         .and_then(serde_json::Value::as_str)
         .unwrap_or("completed")
         .to_owned();
+    // Turn-budget exhaustion is a failed run whose message carries the
+    // shared hint; the SDK names it `error_max_turns`.
+    let max_turns = value
+        .get("result")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|text| text.contains(crate::cli::MAX_AGENT_TURNS_HINT));
     value["subtype"] = match reason.as_str() {
         "completed" | "goal_met" => "success",
         "budget" => "error_max_budget_usd",
+        _ if max_turns => "error_max_turns",
         _ => "error_during_execution",
     }
     .into();
+    value["uuid"] = uuid::Uuid::new_v4().to_string().into();
+    // Denied tool calls are reported inline as error tool results; the SDK's
+    // structured list is always present, and empty here.
+    value["permission_denials"] = serde_json::json!([]);
     if let Some(cached) = value["usage"].get("cached_input_tokens").cloned() {
         value["usage"]["cache_read_input_tokens"] = cached;
     }
@@ -531,6 +724,7 @@ impl HeadlessOutputPolicy {
         output: &str,
         is_error: bool,
     ) -> anyhow::Result<()> {
+        begin_api_span();
         let (bounded, output_truncated) = bounded_progress(output, progress_bytes());
         let (event_name, name_truncated) = bounded_progress(name, 256);
         let truncated = output_truncated || name_truncated;
@@ -569,6 +763,7 @@ impl HeadlessOutputPolicy {
         cumulative: Usage,
     ) -> anyhow::Result<()> {
         COMPLETIONS_FINISHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        end_api_span();
         if delta.has_values() {
             let delta: Usage = delta.into();
             self.emit_event(
@@ -914,7 +1109,12 @@ pub(crate) async fn emit_headless_result(
     if format == cli::OutputFormat::StreamJson {
         value["type"] = "result".into();
         if claude_schema() {
+            value["duration_api_ms"] = take_api_duration_ms().into();
             claude_result_record(&mut value);
+            // A message left open (partial stream cut short) ends before the result.
+            for record in claude_close_open_message() {
+                headless_stdout_async(format!("{}\n", terminal_safe_json(&record))).await?;
+            }
         }
     }
     HEADLESS_RESULT_EMITTED.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -3932,8 +4132,35 @@ mod tests {
         let delta = super::claude_stream_records(json!({
             "type":"reasoning_delta","message_id":"msg_1","text":"hmm","truncated":false
         }));
-        assert_eq!(delta[0]["type"], "stream_event");
-        assert_eq!(delta[0]["event"]["delta"]["thinking"], "hmm");
+        // message_start, content_block_start (index 0), then the delta.
+        assert_eq!(delta[0]["event"]["type"], "message_start");
+        assert_eq!(delta[1]["event"]["type"], "content_block_start");
+        assert_eq!(delta[1]["event"]["content_block"]["type"], "thinking");
+        assert_eq!(delta[2]["type"], "stream_event");
+        assert_eq!(delta[2]["event"]["index"], 0);
+        assert_eq!(delta[2]["event"]["delta"]["thinking"], "hmm");
+        // Text after thinking opens a new block at the next index.
+        let text_delta = super::claude_stream_records(json!({
+            "type":"text_delta","message_id":"msg_1","text":"ok","truncated":false
+        }));
+        assert_eq!(text_delta[0]["event"]["type"], "content_block_stop");
+        assert_eq!(text_delta[0]["event"]["index"], 0);
+        assert_eq!(text_delta[1]["event"]["type"], "content_block_start");
+        assert_eq!(text_delta[1]["event"]["index"], 1);
+        assert_eq!(text_delta[2]["event"]["index"], 1);
+        // The final assistant record closes the streamed message.
+        let closed = super::claude_stream_records(json!({
+            "type":"assistant_text","text":"ok","truncated":false
+        }));
+        let kinds: Vec<_> = closed
+            .iter()
+            .map(|row| row["event"]["type"].as_str().or(row["type"].as_str()).unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            ["content_block_stop", "message_delta", "message_stop", "assistant"]
+        );
+        assert!(closed[3]["uuid"].is_string());
 
         // Records with no Claude counterpart pass through byte-identical.
         for passthrough in [
@@ -3962,6 +4189,13 @@ mod tests {
         let mut budget = json!({"stop_reason":"budget","usage":{}});
         super::claude_result_record(&mut budget);
         assert_eq!(budget["subtype"], "error_max_budget_usd");
+        let mut turns = json!({"stop_reason":"failed","usage":{},"is_error":true,
+            "result":format!("Agent exhausted its maximum turn budget (3) before completing.{}",
+                crate::cli::MAX_AGENT_TURNS_HINT)});
+        super::claude_result_record(&mut turns);
+        assert_eq!(turns["subtype"], "error_max_turns");
+        assert!(turns["uuid"].is_string());
+        assert_eq!(turns["permission_denials"], json!([]));
     }
 
     #[test]

@@ -2865,7 +2865,7 @@ fn stream_json_schema_claude_emits_sdk_messages_and_default_stays_native() {
         let mut command = root.provider_command("write");
         command.args(["-p", "--output", "stream-json", "--no-session"]);
         if claude {
-            command.args(["--stream-json-schema", "claude"]);
+            command.args(["--stream-json-schema", "claude", "--include-partial-messages"]);
         }
         command.arg("write the file");
         let output = bounded_output(command);
@@ -2906,6 +2906,26 @@ fn stream_json_schema_claude_emits_sdk_messages_and_default_stays_native() {
     assert!(result["num_turns"].is_u64() && result["duration_ms"].is_u64());
     assert!(result["total_cost_usd"].is_number());
     assert!(result["usage"]["cache_read_input_tokens"].is_u64());
+    // SDK completeness: uuid, duration_api_ms, permission_denials, and
+    // message/block start-stop framing around partial deltas.
+    assert!(result["uuid"].is_string() && result["duration_api_ms"].is_u64());
+    assert_eq!(result["permission_denials"], serde_json::json!([]));
+    assert!(text["uuid"].is_string());
+    let events: Vec<&serde_json::Value> = claude
+        .iter()
+        .filter(|row| row["type"] == "stream_event")
+        .collect();
+    let kinds: Vec<&str> = events
+        .iter()
+        .map(|row| row["event"]["type"].as_str().unwrap())
+        .collect();
+    assert!(!kinds.is_empty(), "partial stream events expected: {claude:?}");
+    assert_eq!(kinds[0], "message_start", "{kinds:?}");
+    assert_eq!(kinds.last().copied(), Some("message_stop"), "{kinds:?}");
+    let starts = kinds.iter().filter(|k| **k == "content_block_start").count();
+    let stops = kinds.iter().filter(|k| **k == "content_block_stop").count();
+    assert_eq!(starts, stops, "{kinds:?}");
+    assert!(starts >= 1, "{kinds:?}");
 }
 
 /// A child whose stdin the test writes to while it reads stdout line by line.
