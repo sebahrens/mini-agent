@@ -828,6 +828,8 @@ fn clear_session_mutation(session: &mut crate::session::Session) -> Option<()> {
     session.total_output_tokens = 0;
     session.reset_calibration();
     session.compactions.clear();
+    // The futile-compaction byte floor described the cleared history.
+    session.bytes_after_last_compaction = None;
     session.rewind_undo = None;
     session.mark_history_changed();
     session.read_tracker.clear();
@@ -1536,6 +1538,14 @@ mod session_persistence_tests {
 
     fn reload(snapshot: &RefCell<Option<String>>) -> Session {
         serde_json::from_str(snapshot.borrow().as_deref().expect("snapshot must exist")).unwrap()
+    }
+
+    #[test]
+    fn clear_session_mutation_drops_the_stale_futile_compaction_byte_floor() {
+        let mut session = session_with_turn();
+        session.bytes_after_last_compaction = Some(26 * 1024 * 1024);
+        clear_session_mutation(&mut session);
+        assert!(session.bytes_after_last_compaction.is_none());
     }
 
     #[test]
