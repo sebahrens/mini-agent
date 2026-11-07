@@ -8,6 +8,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- `--no-session` keeps resumable subagent conversations in memory only: no `subagent-resume-store-*.json` is created under the tool-output directory (mini-agent-6myt0).
+- `.claude/rules` discovery is deterministic (sorted traversal) and reports every skipped or truncated rule, directory, link and glob with the limit hit in a `Rule discovery notices` block and a warning; a rule whose `paths:` scope is oversized or unparseable is skipped instead of becoming an always-on rule (mini-agent-z8719).
+- With `user_instruction_files = true`, `~/.claude/rules/**/*.md` is loaded (path-scoped delivery included) and rule symlinks whose canonical target is inside the workspace or `~/.claude/rules` are followed; other links are skipped with a notice (mini-agent-zyifs).
 - Managed policy: `/sandbox <profile>` (the only run-time profile switch) now refuses a profile above `max_profile`
   naming the managed file (mini-agent-el299); `max_profile` also clears explicit sandbox read/write/toolchain/Windows
   roots outside a new `sandbox.allowed_roots` allowance, and `allowed_hosts` caps `sandbox-network` at `allowlist`

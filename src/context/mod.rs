@@ -13,6 +13,7 @@ pub(crate) mod instructions;
 #[cfg(any(test, feature = "subagents"))]
 pub(crate) mod mentions;
 pub mod prompts;
+pub(crate) mod rule_scan;
 pub(crate) mod rules;
 pub mod themes;
 
@@ -525,6 +526,25 @@ fn walk_bound_context_files(
     Option<String>,
     Vec<instructions::InstructionRoot>,
 ) {
+    // Opt-in: the user-level compat files (and rule symlinks) are read only
+    // when `user_instruction_files` is on.
+    let home = USER_INSTRUCTION_FILES
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .then(dirs::home_dir)
+        .flatten();
+    walk_bound_context_files_in(workspace, home.as_deref())
+}
+
+/// [`walk_bound_context_files`] with the opt-in home explicit: `None` keeps
+/// every user-level file and every rule symlink closed.
+fn walk_bound_context_files_in(
+    workspace: &crate::paths::WorkspaceBinding,
+    home: Option<&Path>,
+) -> (
+    Option<String>,
+    Option<String>,
+    Vec<instructions::InstructionRoot>,
+) {
     let mut agent_parts: SmallVec<[String; 4]> = SmallVec::new();
     #[cfg_attr(not(feature = "archmd"), allow(unused_mut))]
     let mut arch_parts: SmallVec<[String; 4]> = SmallVec::new();
@@ -544,10 +564,36 @@ fn walk_bound_context_files(
     // Opt-in compat: the user-level files Claude Code and Codex users already
     // maintain, after mini-agent's own global file and under the same budget
     // and capture rules (mini-agent-4l9rf).
-    if USER_INSTRUCTION_FILES.load(std::sync::atomic::Ordering::Relaxed)
-        && let Some(home) = dirs::home_dir()
-    {
-        load_user_instruction_files(&home, &mut budget, &mut roots, &mut agent_parts);
+    let user_claude = home.and_then(rule_scan::UserClaudeDir::capture);
+    if let Some(home) = home {
+        load_user_instruction_files(home, &mut budget, &mut roots, &mut agent_parts);
+    }
+    // `.claude/rules` discovery is sorted and reports what it could not load.
+    let (project_rules, user_rules) = rule_scan::scan(
+        workspace,
+        Path::new(rules::RULES_DIR),
+        user_claude.as_ref(),
+        home.is_some(),
+        rule_scan::Limits {
+            depth: rules::MAX_RULE_DEPTH,
+            entries: rules::MAX_RULE_ENTRIES,
+            files: rules::MAX_RULE_FILES,
+        },
+    );
+    let mut rule_notes = project_rules.notes;
+    rule_notes.extend(user_rules.notes.iter().map(|note| format!("user {note}")));
+    if let Some(user) = &user_claude {
+        for file in &user_rules.files {
+            admit_rule_file(
+                workspace,
+                Some(user),
+                file,
+                &mut budget,
+                &mut roots,
+                &mut agent_parts,
+                &mut rule_notes,
+            );
+        }
     }
     #[cfg(feature = "archmd")]
     if let Some((content, truncated, _, _, _)) =
@@ -595,49 +641,47 @@ fn walk_bound_context_files(
     // files under `.claude/rules/`. Unconditional ones join the root context
     // here; rules scoped by `paths:` are registered for first-touch delivery
     // (mini-agent-dzrup). Same budget and data framing as CLAUDE.md.
-    let claude_dir_files = std::iter::once(PathBuf::from(".claude/CLAUDE.md")).chain(
-        workspace.relative_markdown_files(
-            Path::new(rules::RULES_DIR),
-            rules::MAX_RULE_DEPTH,
-            rules::MAX_RULE_ENTRIES,
-            rules::MAX_RULE_FILES,
-        ),
-    );
-    for relative in claude_dir_files {
-        let Some((content, truncated, identity)) =
-            workspace.read_relative_context_file(&relative, MAX_ANCESTOR_CONTEXT_BYTES)
-        else {
-            continue;
-        };
-        let name = relative.to_string_lossy().replace('\\', "/");
-        let (content, patterns) = if rules::is_rule_path(&relative) {
-            let rule = rules::parse_rule(&content);
-            (rule.body, rule.patterns)
-        } else {
-            (content, None)
-        };
-        if let Some(patterns) = patterns {
-            if let Ok(root) =
-                instructions::InstructionRoot::workspace(workspace, relative.clone(), "")
-            {
-                roots.push(root.scoped_to(patterns).with_identity(identity));
-            }
-            continue;
+    if let Some((content, truncated, identity)) = workspace
+        .read_relative_context_file(Path::new(".claude/CLAUDE.md"), MAX_ANCESTOR_CONTEXT_BYTES)
+    {
+        let relative = PathBuf::from(".claude/CLAUDE.md");
+        if let Some(content) = budget.admit(".claude/CLAUDE.md", content, truncated)
+            && let Ok(root) =
+                instructions::InstructionRoot::workspace(workspace, relative, &content)
+        {
+            roots.push(root.with_identity(identity));
+            agent_parts.push(format!(
+                "# .claude/CLAUDE.md ({})\n{}",
+                workspace.root().display(),
+                content
+            ));
         }
-        let Some(content) = budget.admit(&name, content, truncated) else {
-            continue;
-        };
-        let Ok(root) =
-            instructions::InstructionRoot::workspace(workspace, relative.clone(), &content)
-        else {
-            continue;
-        };
-        roots.push(root.with_identity(identity));
+    }
+    // A user rule reached through a project link loads once, as a user rule.
+    for file in project_rules.files.iter().filter(|file| {
+        !user_rules
+            .files
+            .iter()
+            .any(|user| user.origin == file.origin && user.real == file.real)
+    }) {
+        admit_rule_file(
+            workspace,
+            user_claude.as_ref(),
+            file,
+            &mut budget,
+            &mut roots,
+            &mut agent_parts,
+            &mut rule_notes,
+        );
+    }
+    if !rule_notes.is_empty() {
         agent_parts.push(format!(
-            "# {} ({})\n{}",
-            name,
-            workspace.root().display(),
-            content
+            "# Rule discovery notices (harness-generated; these rules were not loaded as written)\n{}",
+            rule_notes
+                .iter()
+                .map(|note| format!("- {note}"))
+                .collect::<Vec<_>>()
+                .join("\n")
         ));
     }
     (
@@ -646,6 +690,78 @@ fn walk_bound_context_files(
         roots,
     )
 }
+/// Reads one discovered rule file and either joins it to the root context
+/// (unconditional) or registers it for first-touch delivery (`paths:`-scoped).
+/// A rule whose scope cannot be honoured is skipped with a note.
+fn admit_rule_file(
+    workspace: &crate::paths::WorkspaceBinding,
+    user: Option<&rule_scan::UserClaudeDir>,
+    file: &rule_scan::RuleFile,
+    budget: &mut ContextBudget,
+    roots: &mut Vec<instructions::InstructionRoot>,
+    agent_parts: &mut SmallVec<[String; 4]>,
+    notes: &mut Vec<String>,
+) {
+    let from_user = file.origin == rule_scan::RuleOrigin::User;
+    let binding: &crate::paths::WorkspaceBinding = if from_user {
+        match user {
+            Some(user) => &user.binding,
+            None => return,
+        }
+    } else {
+        workspace
+    };
+    let name = file.display.to_string_lossy().replace('\\', "/");
+    let name = if from_user {
+        format!("user ~/.claude/{name}")
+    } else {
+        name
+    };
+    let Some((content, truncated, identity)) =
+        binding.read_relative_context_file(&file.real, MAX_ANCESTOR_CONTEXT_BYTES)
+    else {
+        notes.push(format!(
+            "rule {name} skipped: not readable as a UTF-8 regular file"
+        ));
+        return;
+    };
+    let rule = rules::parse_rule(&content);
+    notes.extend(rule.notes.iter().map(|note| format!("rule {name}: {note}")));
+    if let Some(reason) = &rule.skipped {
+        tracing::warn!("rule {name} skipped: {reason}");
+        notes.push(format!("rule {name} skipped: {reason}"));
+        return;
+    }
+    let make = |text: &str| -> Option<instructions::InstructionRoot> {
+        if from_user {
+            let user = user?;
+            Some(instructions::InstructionRoot::global(
+                user.binding.clone(),
+                file.real.clone(),
+                text,
+            ))
+        } else {
+            instructions::InstructionRoot::workspace(workspace, file.real.clone(), text).ok()
+        }
+    };
+    if let Some(patterns) = rule.patterns {
+        if let Some(root) = make("") {
+            roots.push(root.scoped_to(patterns).with_identity(identity));
+        }
+        return;
+    }
+    let Some(content) = budget.admit(&name, rule.body, truncated) else {
+        return;
+    };
+    let Some(root) = make(&content) else { return };
+    roots.push(root.with_identity(identity));
+    agent_parts.push(format!(
+        "# {name} ({})\n{}",
+        binding.root().join(&file.real).display(),
+        content
+    ));
+}
+
 fn load_captured_global_file(
     path: &Path,
 ) -> Option<(
@@ -1404,6 +1520,215 @@ mod claude_layout_tests {
         let agents = agents.unwrap();
         assert_eq!(roots.len(), rules::MAX_RULE_FILES);
         assert!(agents.contains("RULE_000") && !agents.contains("RULE_083"));
+        assert!(agents.contains("Rule discovery notices"), "{agents}");
+    }
+
+    fn rules_fixture(name: &str) -> (crate::tests::OwnedTestDirectory, PathBuf) {
+        let root = crate::tests::OwnedTestDirectory::new(name);
+        let workspace = root.path().join("ws");
+        std::fs::create_dir_all(workspace.join(".claude/rules")).unwrap();
+        (root, workspace)
+    }
+
+    // mini-agent-z8719: a dropped rule is named with the limit that dropped
+    // it, and which rules survive does not depend on creation order.
+    #[test]
+    fn truncated_rules_are_reported_and_the_survivors_are_sorted() {
+        let (_root, workspace) = rules_fixture("rules-notice");
+        for index in (0..(rules::MAX_RULE_FILES + 3)).rev() {
+            std::fs::write(
+                workspace.join(format!(".claude/rules/r{index:03}.md")),
+                format!("RULE_{index:03}"),
+            )
+            .unwrap();
+        }
+        let (agents, _, _) = walk_bound_context_files_in(&bound(&workspace), None);
+        let agents = agents.unwrap();
+        assert!(agents.contains("RULE_063") && !agents.contains("RULE_064"));
+        assert!(agents.contains("# Rule discovery notices"), "{agents}");
+        assert!(
+            agents.contains("3 rule files")
+                && agents.contains("r064.md")
+                && agents.contains("64 files (limit)"),
+            "{agents}"
+        );
+    }
+
+    #[test]
+    fn oversized_or_broken_scope_never_becomes_an_always_on_rule() {
+        let (_root, workspace) = rules_fixture("rules-scope");
+        let rules_dir = workspace.join(".claude/rules");
+        std::fs::write(
+            rules_dir.join("big.md"),
+            format!(
+                "---\npaths: [\"src/**\"]\nx: {}\n---\nBIG_SCOPED_BODY",
+                "y".repeat(8192)
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            rules_dir.join("bad.md"),
+            "---\npaths: [unterminated\n---\nBAD_SCOPED_BODY",
+        )
+        .unwrap();
+        std::fs::write(rules_dir.join("ok.md"), "OK_BODY").unwrap();
+        let (agents, _, roots) = walk_bound_context_files_in(&bound(&workspace), None);
+        let agents = agents.unwrap();
+        assert!(agents.contains("OK_BODY"));
+        assert!(
+            !agents.contains("BIG_SCOPED_BODY")
+                && !agents.contains("BAD_SCOPED_BODY")
+                && !agents.contains("yyyy"),
+            "{agents}"
+        );
+        assert!(
+            agents.contains("rule .claude/rules/big.md skipped"),
+            "{agents}"
+        );
+        assert!(
+            agents.contains("rule .claude/rules/bad.md skipped"),
+            "{agents}"
+        );
+        assert_eq!(roots.len(), 1);
+    }
+
+    #[test]
+    fn entry_cap_is_deterministic_and_reported() {
+        let (_root, workspace) = rules_fixture("rules-entry-cap");
+        let dir = workspace.join(".claude/rules");
+        for index in 0..5 {
+            std::fs::write(dir.join(format!("a{index}.md")), format!("A_{index}")).unwrap();
+        }
+        let (scan, _) = rule_scan::scan(
+            &bound(&workspace),
+            Path::new(rules::RULES_DIR),
+            None,
+            false,
+            rule_scan::Limits {
+                depth: 4,
+                entries: 3,
+                files: 64,
+            },
+        );
+        assert_eq!(scan.files.len(), 3);
+        assert!(
+            scan.notes
+                .iter()
+                .any(|note| note.contains("3 directory entries")),
+            "{:?}",
+            scan.notes
+        );
+        let (deep, _) = rule_scan::scan(
+            &bound(&workspace),
+            Path::new(rules::RULES_DIR),
+            None,
+            false,
+            rule_scan::Limits {
+                depth: 1,
+                entries: 100,
+                files: 64,
+            },
+        );
+        assert_eq!(deep.files.len(), 5);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let (deep, _) = rule_scan::scan(
+            &bound(&workspace),
+            Path::new(rules::RULES_DIR),
+            None,
+            false,
+            rule_scan::Limits {
+                depth: 1,
+                entries: 100,
+                files: 64,
+            },
+        );
+        assert!(
+            deep.notes
+                .iter()
+                .any(|note| note.contains("deeper than 1 levels"))
+        );
+    }
+
+    // mini-agent-zyifs: user-level rules load only with the opt-in home, with
+    // the project's rule limits, and the link policy is closed by default.
+    #[cfg(unix)]
+    #[test]
+    fn user_rules_and_in_scope_symlinks_load_only_with_the_opt_in() {
+        let root = crate::tests::OwnedTestDirectory::new("rules-user-links");
+        let home = root.path().join("home");
+        let workspace = root.path().join("ws");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(home.join(".claude/rules/team")).unwrap();
+        std::fs::create_dir_all(workspace.join(".claude/rules")).unwrap();
+        std::fs::create_dir_all(workspace.join("shared")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(home.join(".claude/rules/personal.md"), "USER_RULE").unwrap();
+        std::fs::write(
+            home.join(".claude/rules/team/scoped.md"),
+            "---\npaths: [\"src/**\"]\n---\nUSER_SCOPED",
+        )
+        .unwrap();
+        std::fs::write(workspace.join("shared/one.md"), "SHARED_IN_WORKSPACE").unwrap();
+        std::fs::write(outside.join("secret.md"), "OUTSIDE_SECRET").unwrap();
+        std::fs::write(home.join(".claude/settings.json"), "{}").unwrap();
+        std::fs::write(home.join(".claude/creds.md"), "HOME_NOT_RULES").unwrap();
+        let rules = workspace.join(".claude/rules");
+        std::os::unix::fs::symlink(workspace.join("shared/one.md"), rules.join("one.md")).unwrap();
+        std::os::unix::fs::symlink(workspace.join("shared"), rules.join("dir")).unwrap();
+        std::os::unix::fs::symlink(home.join(".claude/rules/team"), rules.join("team")).unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.md"), rules.join("out.md")).unwrap();
+        std::os::unix::fs::symlink(home.join(".claude/creds.md"), rules.join("creds.md")).unwrap();
+        std::os::unix::fs::symlink(&rules, rules.join("loop")).unwrap();
+
+        // Default closed: nothing from home, every link skipped with a notice.
+        let (agents, _, roots) = walk_bound_context_files_in(&bound(&workspace), None);
+        let agents = agents.unwrap();
+        for hidden in [
+            "USER_RULE",
+            "SHARED_IN_WORKSPACE",
+            "OUTSIDE_SECRET",
+            "USER_SCOPED",
+        ] {
+            assert!(!agents.contains(hidden), "{hidden}: {agents}");
+        }
+        assert!(roots.is_empty());
+        assert!(
+            agents.contains("rule symlink .claude/rules/one.md skipped"),
+            "{agents}"
+        );
+        assert!(agents.contains("user_instruction_files"), "{agents}");
+
+        // Opted in.
+        let (agents, _, roots) = walk_bound_context_files_in(&bound(&workspace), Some(&home));
+        let agents = agents.unwrap();
+        assert!(
+            agents.contains("# user ~/.claude/rules/personal.md"),
+            "{agents}"
+        );
+        assert!(agents.contains("USER_RULE"));
+        assert!(
+            agents.contains("SHARED_IN_WORKSPACE"),
+            "workspace link target: {agents}"
+        );
+        assert!(
+            !agents.contains("OUTSIDE_SECRET") && !agents.contains("HOME_NOT_RULES"),
+            "targets outside the workspace and ~/.claude/rules stay refused: {agents}"
+        );
+        assert!(
+            agents.contains("rule symlink .claude/rules/out.md skipped"),
+            "{agents}"
+        );
+        assert!(
+            agents.contains("rule symlink .claude/rules/creds.md skipped"),
+            "{agents}"
+        );
+        assert!(
+            !agents.contains("USER_SCOPED"),
+            "scoped rules are held back"
+        );
+        // personal.md, one.md (deduped with dir/one.md) and team/scoped.md
+        // (deduped with the link to it).
+        assert_eq!(roots.len(), 3, "{roots:?}");
     }
 
     // mini-agent-4l9rf: the user-level compat files load in a fixed order from

@@ -247,6 +247,9 @@ struct Initial {
 struct ScopedRule {
     path: PathBuf,
     globs: globset::GlobSet,
+    /// `None`: a workspace rule (project config). `Some`: a user-level rule
+    /// read through its own `~/.claude` capability (not project config).
+    binding: Option<Arc<WorkspaceBinding>>,
 }
 #[derive(Debug)]
 struct RootMetadata {
@@ -542,20 +545,26 @@ impl WorkspaceInstructions {
         // `.claude/rules` files scoped by `paths:` globs are delivered on the
         // first touch of a matching file, subject to the same caches, budgets
         // and authorization as a nested directory's sources (mini-agent-dzrup).
-        let matching_rules: Vec<PathBuf> = {
+        let matching_rules: Vec<(PathBuf, Option<Arc<WorkspaceBinding>>)> = {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state
                 .initial
                 .scoped_rules
                 .iter()
                 .filter(|rule| rule.globs.is_match(target))
-                .map(|rule| rule.path.clone())
+                .map(|rule| (rule.path.clone(), rule.binding.clone()))
                 .collect()
         };
-        for rule in matching_rules {
+        for (rule, binding) in matching_rules {
+            // User-level rules cache under a key no workspace path can equal.
+            let key = if binding.is_some() {
+                Path::new("\u{0}user-claude-rules").join(&rule)
+            } else {
+                rule.clone()
+            };
             self.collect_cached(
-                rule,
-                |this, key| this.load_rule(key),
+                key,
+                |this, _| this.load_rule(&rule, binding.as_ref()),
                 &mut result,
                 &mut omitted,
             )?;
@@ -650,13 +659,17 @@ impl WorkspaceInstructions {
         Ok(())
     }
 
-    fn load_rule(&self, path: &Path) -> Result<Vec<Source>, String> {
+    fn load_rule(
+        &self,
+        path: &Path,
+        user: Option<&Arc<WorkspaceBinding>>,
+    ) -> Result<Vec<Source>, String> {
         let mut loaded = Vec::new();
         let mut seen = BTreeSet::new();
         let mut nodes = 0;
         self.load_tree(
-            &self.workspace,
-            true,
+            user.unwrap_or(&self.workspace),
+            user.is_none(),
             path,
             self.workspace.root(),
             0,
@@ -743,6 +756,20 @@ impl WorkspaceInstructions {
             )?;
         }
         Ok(loaded)
+    }
+    /// Whether `path` under `binding` is a registered `paths:`-scoped rule
+    /// (its frontmatter is scope metadata, not guidance).
+    fn is_scoped_rule(&self, binding: &Arc<WorkspaceBinding>, path: &Path) -> bool {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.initial.scoped_rules.iter().any(|rule| {
+            rule.path == path
+                && rule
+                    .binding
+                    .as_ref()
+                    .map_or(Arc::ptr_eq(binding, &self.workspace), |own| {
+                        own.root() == binding.root()
+                    })
+        })
     }
     #[allow(clippy::too_many_arguments)]
     fn load_tree(
@@ -849,7 +876,9 @@ impl WorkspaceInstructions {
             return Err(BUDGET_EXHAUSTED.into());
         }
         // Rule frontmatter scopes a rule; it is not guidance for the model.
-        let text = if super::rules::is_rule_path(&source.path) {
+        let text = if super::rules::is_rule_path(&source.path)
+            || (depth == 0 && self.is_scoped_rule(binding, &source.path))
+        {
             super::rules::strip_frontmatter(&text)
         } else {
             text
@@ -971,6 +1000,10 @@ impl WorkspaceInstructions {
                     scoped_rules.push(ScopedRule {
                         path: normal_relative(&root.path)?,
                         globs,
+                        binding: match &root.origin {
+                            RootOrigin::Global(binding) => Some(binding.clone()),
+                            RootOrigin::Workspace { .. } => None,
+                        },
                     });
                 }
                 continue;
@@ -1825,6 +1858,30 @@ mod tests {
         assert_eq!(service.load(&root.join("src/api/x.ts")).unwrap().len(), 1);
         // Reported by /context metadata once delivered.
         assert!(service.diagnostics().unwrap().source_count >= 1);
+    }
+
+    // mini-agent-zyifs: a user-level scoped rule is read through its own
+    // `~/.claude` capability, delivered on a matching touch, frontmatter
+    // stripped, and is not project config.
+    #[test]
+    fn user_level_scoped_rule_is_delivered_from_its_own_capability() {
+        let (_owned, service) = fixture();
+        let home = crate::tests::OwnedTestDirectory::new("user-scoped-rule");
+        std::fs::create_dir_all(home.path().join("rules")).unwrap();
+        std::fs::write(
+            home.path().join("rules/ts.md"),
+            "---\npaths: [\"src/**/*.ts\"]\n---\nUSER_TS_RULE\n",
+        )
+        .unwrap();
+        let binding = Arc::new(WorkspaceBinding::capture(home.path()).unwrap());
+        let root = InstructionRoot::global(binding, PathBuf::from("rules/ts.md"), "")
+            .scoped_to(vec!["src/**/*.ts".to_owned()]);
+        service.capture_initial(vec![root], 0).unwrap();
+        assert!(service.load(Path::new("docs/a.md")).unwrap().is_empty());
+        let delivered = service.load(Path::new("src/a.ts")).unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(&*delivered[0].text, "USER_TS_RULE\n");
+        assert!(!delivered[0].project);
     }
 
     // The same trust gate as a nested CLAUDE.md: an untrusted project config

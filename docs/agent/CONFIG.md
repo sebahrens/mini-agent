@@ -3435,9 +3435,20 @@ whole, and files after the budget is spent are skipped.
 
 Claude Code's modular project layout is read too. The root also loads `.claude/CLAUDE.md`
 (after `CLAUDE.md`) and every `.md` file under `.claude/rules/` (recursively, at most 64
-files and 4 levels, symlinks skipped) through the same budget, trust and data framing as
-`CLAUDE.md`, framed with their relative path. A rule without frontmatter, or whose
-frontmatter does not parse, is unconditional and loads at session start. A rule whose YAML
+files, 4 levels and 1024 scanned directory entries, visited in sorted name order so the
+survivors never depend on directory order) through the same budget, trust and data framing as
+`CLAUDE.md`, framed with their relative path. A rule without a `paths:` key is unconditional and
+loads at session start. Nothing is dropped silently: every skipped file, directory, link or
+ignored glob (and the limit it hit) is logged as a warning and listed in a
+`# Rule discovery notices` block of the loaded instruction context (visible in `/context`). A rule
+whose `paths:` scope cannot be honoured (frontmatter over 4096 bytes, YAML that does not parse,
+`paths:` of the wrong type, or no usable glob) is skipped with a notice instead of becoming an
+always-on rule; at most 32 globs of 512 bytes are honoured per rule, extras are reported. With
+`user_instruction_files = true` the same walk, caps and delivery apply to `~/.claude/rules/**/*.md`
+(framed `user ~/.claude/rules/...`, loaded before the project's rules, not project config), and
+symlinked rule files and directories are followed when their canonical target is inside the
+workspace (not `.git`) or inside `~/.claude/rules`, opened through the real location; any other
+target is skipped with a notice. Without the opt-in, rule symlinks are skipped with a notice. A rule whose YAML
 frontmatter has a `paths:` list (or a comma-separated string) of globs, for example
 `paths: ["src/api/**/*.ts"]`, is instead delivered the first time `read`, `edit`, `write` or
 `notebook_edit` touches a workspace-relative path matching one of the globs (`*` does not cross
