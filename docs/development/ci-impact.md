@@ -33,6 +33,11 @@ production hook compatibility can consume it from the workspace.
 
 Git diffs disable rename detection and use NUL-delimited paths: moving source
 into a review directory still removes a production input and runs the matrix.
+Pull requests compare their head with a unique merge base, so unrelated changes
+on the target branch do not turn a documentation PR into a full run. For changed
+Rust tests, platform markers from the current target revision are retained too.
+Pushes compare their exact before/after revisions. Missing or ambiguous PR
+ancestry conservatively runs the full matrix.
 Tags, scheduled drift checks, full manual runs, and unresolved history retain
 their existing full/fail-open policy. The explicit Windows manual proof scopes
 are unchanged. The formatting job executes the scope, fingerprint, and workflow

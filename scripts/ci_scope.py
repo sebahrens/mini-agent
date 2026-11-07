@@ -145,6 +145,7 @@ def resolve(env: dict[str, str], run=subprocess.run, report: Callable[[str], Non
     head = env.get("HEAD_SHA", "")
     if not base or set(base) == {"0"} or not head:
         return decided(FULL, "missing base/head revision; running the full matrix")
+    source_revisions = (base, head)
     try:
         run(
             ["git", "cat-file", "-e", f"{base}^{{commit}}"],
@@ -152,6 +153,17 @@ def resolve(env: dict[str, str], run=subprocess.run, report: Callable[[str], Non
             text=True,
             check=True,
         )
+        if event == "pull_request":
+            common = run(
+                ["git", "merge-base", "--all", base, head],
+                capture_output=True, text=True, check=True,
+            ).stdout.split()
+            if len(common) != 1 or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", common[0]):
+                return decided(FULL, "PR merge base unavailable or ambiguous; running the full matrix")
+            # Only PR-owned changes select jobs. For a changed Rust test, also
+            # retain markers added on the target branch that the merge inherits.
+            source_revisions = tuple(dict.fromkeys((common[0], base, head)))
+            base = common[0]
         diff = run(
             ["git", "diff", "--no-renames", "--name-only", "-z", base, head, "--"],
             capture_output=True,
@@ -171,7 +183,7 @@ def resolve(env: dict[str, str], run=subprocess.run, report: Callable[[str], Non
         if not path.endswith(".rs"):
             return None
         versions = []
-        for revision in (base, head):
+        for revision in source_revisions:
             entry = run(
                 ["git", "--literal-pathspecs", "ls-tree", "-z", revision, "--", path],
                 capture_output=True, text=True, encoding="utf-8", errors="replace", check=True,

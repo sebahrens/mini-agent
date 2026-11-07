@@ -1,0 +1,17 @@
+F
+======================================================================
+FAIL: test_pr_excludes_target_only_changes_but_keeps_target_platform_markers (scripts.tests.test_ci_scope.GitDiffTests.test_pr_excludes_target_only_changes_but_keeps_target_platform_markers)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<repository>/scripts/tests/test_ci_scope.py", line 222, in test_pr_excludes_target_only_changes_but_keeps_target_platform_markers
+    self.assertEqual("docs", scope(target, docs_head).scope)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'docs' != 'code'
+- docs
++ code
+
+
+----------------------------------------------------------------------
+Ran 1 test in 0.181s
+
+FAILED (failures=1)

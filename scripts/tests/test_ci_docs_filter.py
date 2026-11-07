@@ -44,7 +44,7 @@ class CiDocsFilterTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.script = filter_script()
 
-    def classify(self, *changed: str, event="pull_request", scope="", base=BASE, ref="refs/pull/1/merge", missing_base=False, missing_diff=False, broken_python=False) -> str:
+    def classify(self, *changed: str, event="pull_request", scope="", base=BASE, ref="refs/pull/1/merge", missing_base=False, missing_diff=False, broken_python=False, merge_base=BASE) -> str:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             stub = root / "git"
@@ -52,6 +52,7 @@ class CiDocsFilterTests(unittest.TestCase):
                 "#!/bin/sh\n"
                 'case "$1" in\n'
                 '  cat-file) exit "$FILTER_MISSING_BASE" ;;\n'
+                '  merge-base) [ -n "$FILTER_MERGE_BASE" ] || exit 1; printf "%s\\n" "$FILTER_MERGE_BASE" ;;\n'
                 '  diff) [ "$FILTER_MISSING_DIFF" = "0" ] || exit 2; cat "$FILTER_CHANGED" ;;\n'
                 "  *) exit 2 ;;\n"
                 "esac\n",
@@ -76,6 +77,7 @@ class CiDocsFilterTests(unittest.TestCase):
                 SCOPE=scope,
                 FILTER_MISSING_BASE=str(int(missing_base)),
                 FILTER_MISSING_DIFF=str(int(missing_diff)),
+                FILTER_MERGE_BASE=merge_base,
                 BASE_SHA=base,
                 HEAD_SHA=HEAD,
             )
@@ -114,6 +116,10 @@ class CiDocsFilterTests(unittest.TestCase):
     def test_plain_documentation_skips_the_matrix(self) -> None:
         self.assertEqual("false", self.classify("README.md", "docs/plans/idea.md"))
         self.assertEqual("false", self.classify(".beads/issues.jsonl", "editors/vscode/README.md"))
+
+    def test_missing_or_ambiguous_pr_ancestry_runs_the_matrix(self) -> None:
+        for merge_base in ("", BASE + "\n" + HEAD):
+            self.assertEqual("true", self.classify("README.md", merge_base=merge_base))
 
     def test_code_changes_run_the_matrix(self) -> None:
         self.assertEqual("true", self.classify("docs/plans/idea.md", "src/main.rs"))

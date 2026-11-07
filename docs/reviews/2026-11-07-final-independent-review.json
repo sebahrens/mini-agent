@@ -1,0 +1,46 @@
+{
+  "baseline": "ee568b4bb5149989abfc2e44126ce7c7b2cd4485",
+  "parent": "mini-agent-5eiss",
+  "scope": [
+    "CI event routing, merge ancestry, platform test selection, pass fingerprints and aggregate gates",
+    "Independent spot-check of ledger serialization/deduplication/acknowledgement and OAuth credential-lock wait/cancellation"
+  ],
+  "findings": [
+    {
+      "bead": "mini-agent-5eiss.1",
+      "priority": 4,
+      "title": "Do not charge target-only changes to a documentation pull request",
+      "reproduction": "A real divergent Git history with a README-only PR and an unrelated target-side source addition selected the full matrix.",
+      "correction": "PR-owned changed paths use the unique merge base. Changed Rust tests retain common-ancestor, target and head platform markers. Pushes retain exact before/after semantics. Missing, ambiguous or malformed ancestry runs the full matrix.",
+      "status": "implemented; local validation passed; hosted owning checks pending"
+    }
+  ],
+  "validation": {
+    "focused_python": {
+      "tests": 65,
+      "result": "passed"
+    },
+    "broader_python": {
+      "command": "python3 -m unittest discover -s scripts/tests -p 'test_*ci*.py'",
+      "tests": 197,
+      "result": "passed"
+    },
+    "negative_control": {
+      "baseline": "ee568b4b",
+      "tests": 1,
+      "expected_assertion_failures": 1,
+      "errors": 0,
+      "evidence": "2026-11-07-final-independent-evidence/negative-control.log"
+    },
+    "formatting": "cargo fmt and git diff --check passed",
+    "scope_rationale": "Only CI Python policy/tests and nonembedded development documentation changed. Reuse unchanged Rust logic/dependency coverage from full source CI 42408094543 and the prior debug installation/smoke documented in 2026-11-07-additional-p4-review.json. scripts/ changes affect the build identity digest but not Rust runtime behavior; rebuilding or rerunning runtime suites would not test the changed CI semantics."
+  },
+  "root_final_review": {
+    "additional_confirmed_findings": [],
+    "assessment": "After the correction, no further confirmed P0-P4 issue in the reviewed paths. This is a scoped review, not proof that the repository has no defects."
+  },
+  "hosted_validation": {
+    "status": "pending"
+  },
+  "status": "awaiting hosted owning checks and publication"
+}

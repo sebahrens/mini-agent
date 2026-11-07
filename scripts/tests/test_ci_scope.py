@@ -106,12 +106,16 @@ class ClassifyTests(unittest.TestCase):
 
 
 class ResolveTests(unittest.TestCase):
-    def resolve(self, paths, report=None, **env):
+    def resolve(self, paths, report=None, merge_bases=(BASE,), **env):
         def run(cmd, **kwargs):
             if isinstance(paths, Exception):
                 raise paths
             if cmd[1] == "diff":
                 output = "".join(f"{p}\0" for p in paths)
+            elif cmd[1] == "merge-base":
+                if isinstance(merge_bases, Exception):
+                    raise merge_bases
+                output = "\n".join(merge_bases)
             elif cmd[1] == "--literal-pathspecs":
                 output = f"100644 blob {'0' * 40}\t{cmd[-1]}\0"
             else:
@@ -139,6 +143,12 @@ class ResolveTests(unittest.TestCase):
 
     def test_docs_verdict_is_shared_with_the_workflow_filter(self) -> None:
         self.assertEqual("docs", self.resolve(["README.md", "docs/reviews/final.json"]).scope)
+
+    def test_pr_ancestry_requires_one_valid_common_revision(self) -> None:
+        for merge_bases in ((), (BASE, HEAD), ("not-a-revision",), subprocess.CalledProcessError(1, "git")):
+            with self.subTest(merge_bases=merge_bases):
+                self.assertEqual(ci_scope.FULL, self.resolve(["README.md"], merge_bases=merge_bases))
+        self.assertEqual("docs", self.resolve(["README.md"], merge_bases=(), EVENT="push").scope)
 
     def test_diagnostics_explain_scope_fallback_and_bound_escaped_paths(self) -> None:
         messages = []
@@ -182,6 +192,46 @@ class DocsFilterEquivalenceTests(unittest.TestCase):
 
 
 class GitDiffTests(unittest.TestCase):
+    def test_pr_excludes_target_only_changes_but_keeps_target_platform_markers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            def git(*args):
+                return subprocess.run(["git", *args], cwd=root, check=True, text=True, capture_output=True).stdout.strip()
+            def commit():
+                git("add", "-A")
+                git("-c", "user.name=CI Test", "-c", "user.email=ci@example.invalid", "commit", "-qm", "fixture")
+                return git("rev-parse", "HEAD")
+            def scope(base, head, event="pull_request"):
+                def run(cmd, **kwargs):
+                    return subprocess.run(cmd, cwd=root, **kwargs)
+                return ci_scope.resolve({"EVENT": event, "BASE_SHA": base, "HEAD_SHA": head}, run=run)
+
+            git("init", "-q")
+            (root / "README.md").write_text("baseline\n")
+            native = root / "tests/native_contract.rs"
+            native.parent.mkdir()
+            native.write_text("fn checks() {}\n")
+            fork = commit()
+            (root / "README.md").write_text("PR documentation\n")
+            docs_head = commit()
+            git("switch", "--detach", fork)
+            (root / "src").mkdir()
+            (root / "src/main.rs").write_text("fn main() {}\n")
+            native.write_text("#[cfg(windows)]\nfn checks() {}\n")
+            target = commit()
+            self.assertEqual("docs", scope(target, docs_head).scope)
+            # The exact same endpoints on a force-push remove target code;
+            # push classification must not use PR ancestry semantics.
+            self.assertEqual("code", scope(target, docs_head, "push").scope)
+            git("switch", "--detach", docs_head)
+            native.write_text("fn checks() { assert_eq!(1, 1); }\n")
+            tests_head = commit()
+            self.assertEqual(ci_scope.Scope("tests", False, True), scope(target, tests_head))
+            (root / "src").mkdir(exist_ok=True)
+            (root / "src/main.rs").write_text("fn main() { println!(\"changed\"); }\n")
+            code_head = commit()
+            self.assertEqual("code", scope(target, code_head).scope)
+
     def test_real_git_changes_preserve_both_sides_of_moves_and_unusual_names(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
