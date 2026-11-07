@@ -436,9 +436,21 @@ fn git_is_read_only(args: &[String]) -> bool {
     ) {
         return false;
     }
+    // `-O<orderfile>` (attached, or inside a short cluster such as `-pO<file>`)
+    // and `--orderfile[=<file>]` read an arbitrary file operand that is never
+    // screened as a path; git accepts unambiguous abbreviations of long
+    // options, so `--orderf=` and `--outp=` count too. Refuse them all.
+    let long_name_is_prefix_of = |arg: &str, full: &str| {
+        arg.strip_prefix("--").is_some_and(|rest| {
+            let name = rest.split('=').next().unwrap_or_default();
+            !name.is_empty() && full.starts_with(name)
+        })
+    };
     !rest.iter().any(|a| {
         a == "-c"
-            || a == "-O"
+            || (a.starts_with('-') && !a.starts_with("--") && a.contains('O'))
+            || long_name_is_prefix_of(a, "orderfile")
+            || long_name_is_prefix_of(a, "output")
             || a.starts_with("--output")
             || a.starts_with("--ext-diff")
             || a.starts_with("--textconv")
@@ -533,6 +545,13 @@ mod tests {
             "git commit -m x",
             "git push",
             "git diff --output=out",
+            "git diff -O/etc/shadow",
+            "git diff -O../../x",
+            "git diff -pO/etc/shadow",
+            "git log -O/etc/passwd",
+            "git diff --orderfile=/etc/shadow",
+            "git diff --orderf=/etc/shadow",
+            "git diff --outp=out",
             "git diff --ext-diff",
             "git log --upload-pack=x",
             "rg --pre 'sh -c x' foo",

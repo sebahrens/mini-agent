@@ -84,6 +84,14 @@ impl SpoolPolicy {
             log_limit: SHELL_HARD_OUTPUT_BYTES,
         }
     }
+    /// Capture for a foreground command that may still be promoted to a
+    /// background job (`shell_auto_background`): it reads exactly like a
+    /// foreground result (same retention, same 64 MiB ceiling, a log only on
+    /// overflow) until [`SpooledCapture::promote_to_background`] switches it to
+    /// background semantics.
+    pub(crate) fn auto_background(log: Option<PathBuf>) -> Self {
+        Self::foreground_shell(log)
+    }
     pub(crate) fn background(log: Option<PathBuf>) -> Self {
         Self {
             head_bytes: BACKGROUND_HEAD_BYTES,
@@ -201,6 +209,27 @@ impl SpooledCapture {
             capture.open_log(&path);
         }
         capture
+    }
+
+    /// The command outlived its foreground deadline and became a background
+    /// job: lift the foreground ceiling, grow the log limit to the background
+    /// one and make sure the complete stream is being logged from here on.
+    pub(crate) fn promote_to_background(&mut self) {
+        self.policy.hard_limit = None;
+        self.policy.log_limit = BACKGROUND_LOG_LIMIT_BYTES;
+        if let LogPolicy::OnOverflow(path) = self.policy.log.clone() {
+            if matches!(self.log, LogState::NotStarted) {
+                self.open_log(&path);
+                let retained: Vec<u8> = self
+                    .head
+                    .iter()
+                    .chain(self.tail.iter())
+                    .flat_map(|(_, chunk)| chunk.iter().copied())
+                    .collect();
+                self.write_log(&retained);
+            }
+            self.policy.log = LogPolicy::Always(path);
+        }
     }
 
     fn log_path(&self) -> Option<&Path> {
@@ -541,6 +570,25 @@ mod tests {
             transcript.channel_bytes(OutputChannel::Stderr),
             b"cd\n[... 4 bytes omitted ...]\nkl".to_vec()
         );
+    }
+
+    #[test]
+    fn promotion_lifts_the_ceiling_and_logs_the_retained_output() {
+        let dir = std::env::temp_dir().join(format!("promote-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("job.log");
+        let mut capture =
+            SpooledCapture::new(policy(4, 4, Some(10), LogPolicy::OnOverflow(path.clone())));
+        capture.push(OutputChannel::Stdout, b"abc").unwrap();
+        assert!(!path.exists(), "no log while everything is retained");
+        capture.promote_to_background();
+        assert_eq!(std::fs::read(&path).unwrap(), b"abc");
+        capture
+            .push(OutputChannel::Stdout, b"0123456789abcdef")
+            .unwrap();
+        assert_eq!(capture.total_bytes(), 19);
+        assert_eq!(std::fs::read(&path).unwrap().len(), 19);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
