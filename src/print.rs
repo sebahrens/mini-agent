@@ -2028,6 +2028,22 @@ pub(crate) async fn capture_workspace_change_baseline(
     root: &Path,
 ) -> Option<WorkspaceChangeBaseline> {
     let runner = crate::git::runner::GitRunner::discover().ok()?;
+    // `status --porcelain` prints repository-root-relative paths and covers the
+    // whole repository. The workspace may be a subdirectory, so learn its
+    // prefix, limit status to it (pathspec `.`) and strip the prefix so every
+    // path is workspace-relative like the tool-derived ones.
+    let prefix = runner
+        .run(
+            root,
+            "headless-output-prefix",
+            ["rev-parse", "--show-prefix"],
+            crate::git::runner::QUERY_LIMITS,
+        )
+        .await
+        .ok()?;
+    let prefix = String::from_utf8_lossy(&prefix.stdout)
+        .trim_end_matches(['\n', '\r'])
+        .to_owned();
     let output = runner
         .run(
             root,
@@ -2040,13 +2056,15 @@ pub(crate) async fn capture_workspace_change_baseline(
                 "--no-renames",
                 // Never spawn Git inside a (model-writable) nested repository.
                 "--ignore-submodules=dirty",
+                "--",
+                ".",
             ],
             crate::git::runner::QUERY_LIMITS,
         )
         .await
         .ok()?;
     let root = root.to_path_buf();
-    let statuses = parse_git_status(&output.stdout);
+    let statuses = strip_workspace_prefix(parse_git_status(&output.stdout), &prefix);
     let paths = tokio::task::spawn_blocking(move || {
         statuses
             .into_iter()
@@ -2742,43 +2760,70 @@ pub(crate) fn print_sessions(
     all: bool,
 ) -> anyhow::Result<()> {
     let catalogue = session::catalogue::list(workspace, all)?;
-    if catalogue.rows.is_empty() {
-        println!(
-            "no saved sessions in {}",
-            if all {
-                "any workspace"
-            } else {
-                "the current workspace"
-            }
-        );
-    } else {
-        println!(
-            "recent sessions ({}; {}):",
-            catalogue.rows.len(),
-            if all {
-                "all workspaces"
-            } else {
-                "current workspace"
-            }
-        );
-        for row in &catalogue.rows {
-            println!(
-                "  {}  {}  {}msgs  {}/{}  workspace:{}  {}",
-                short_session_id(&row.id),
-                crate::ui::pickers::sessions::relative_time(&row.updated_at),
-                row.message_count,
-                crate::ui::events::sanitize_output(&row.provider),
-                crate::ui::events::sanitize_output(&row.model),
-                crate::ui::events::sanitize_output(&row.working_dir),
-                row.title
-            );
-        }
-        println!(
-            "Use --session <id-or-name> to load a session; --resume-all includes other workspaces."
-        );
+    let stdout = io::stdout();
+    let stderr = io::stderr();
+    write_sessions(&mut stdout.lock(), &mut stderr.lock(), &catalogue, all)
+}
+
+/// A reader that exits early (`| head -1`) is success, not a panic.
+fn tolerate_closed_pipe(result: io::Result<()>) -> anyhow::Result<()> {
+    match result {
+        Err(error) if error.kind() != io::ErrorKind::BrokenPipe => Err(error.into()),
+        _ => Ok(()),
     }
+}
+
+fn write_sessions(
+    out: &mut impl io::Write,
+    err: &mut impl io::Write,
+    catalogue: &session::catalogue::Catalogue,
+    all: bool,
+) -> anyhow::Result<()> {
+    let listing = (|| -> io::Result<()> {
+        if catalogue.rows.is_empty() {
+            writeln!(
+                out,
+                "no saved sessions in {}",
+                if all {
+                    "any workspace"
+                } else {
+                    "the current workspace"
+                }
+            )?;
+        } else {
+            writeln!(
+                out,
+                "recent sessions ({}; {}):",
+                catalogue.rows.len(),
+                if all {
+                    "all workspaces"
+                } else {
+                    "current workspace"
+                }
+            )?;
+            for row in &catalogue.rows {
+                writeln!(
+                    out,
+                    "  {}  {}  {}msgs  {}/{}  workspace:{}  {}",
+                    short_session_id(&row.id),
+                    crate::ui::pickers::sessions::relative_time(&row.updated_at),
+                    row.message_count,
+                    crate::ui::events::sanitize_output(&row.provider),
+                    crate::ui::events::sanitize_output(&row.model),
+                    crate::ui::events::sanitize_output(&row.working_dir),
+                    row.title
+                )?;
+            }
+            writeln!(
+                out,
+                "Use --session <id-or-name> to load a session; --resume-all includes other workspaces."
+            )?;
+        }
+        out.flush()
+    })();
+    tolerate_closed_pipe(listing)?;
     if let Some(notice) = catalogue.notice() {
-        eprintln!("session catalogue limited: {notice}");
+        tolerate_closed_pipe(writeln!(err, "session catalogue limited: {notice}"))?;
     }
     Ok(())
 }
