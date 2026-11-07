@@ -2457,7 +2457,7 @@ mod tests {
         let mut authorization = parent_authorization(root, ask);
         let configs = PermissionConfigs {
             glob: serde_json::from_value(
-                serde_json::json!({"read":"allow", "edit":"ask", "write":"deny", "shell":"deny"}),
+                serde_json::json!({"read":"allow", "edit":"ask", "write":"ask", "shell":"deny"}),
             )
             .unwrap(),
             ..Default::default()
