@@ -52,6 +52,15 @@ describe('client file access', () => {
     await expect(writeTextFile(untrusted, { sessionId: 's', path: '/work/space/a', content: 'x' })).rejects.toThrow(/not trusted/);
   });
 
+  // mini-agent-uxsfz: a child whose name merely begins with '..' is inside the workspace.
+  it('accepts workspace files whose name begins with two dots', async () => {
+    const ctx = context();
+    expect(await readTextFile(ctx, request('/work/space/..notes.txt'))).toEqual({ content: 'dirty buffer\nline 2\nline 3' });
+    await writeTextFile(ctx, { sessionId: 's', path: '/work/space/..notes.txt', content: 'ok' });
+    expect(ctx.writes).toEqual(['/work/space/..notes.txt=ok']);
+    await expect(readTextFile(ctx, request('/work/space/../notes.txt'))).rejects.toThrow();
+  });
+
   it('writes through the editor, creating files only inside existing workspace directories', async () => {
     const ctx = context();
     await writeTextFile(ctx, { sessionId: 's', path: '/work/space/new.txt', content: 'hi' });
