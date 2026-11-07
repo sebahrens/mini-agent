@@ -829,6 +829,11 @@ async fn compact_headless_session_if_needed(
         pending_tokens,
         instructions,
         false,
+        // The turn's agent is built only after this pre-turn compaction (it
+        // needs the MCP connection and the post-compaction context), so no
+        // agent exists whose request prefix a fork could reuse
+        // (mini-agent-o2nut).
+        None,
     )
     .await
     .map(|(usage, _)| usage)
@@ -895,6 +900,10 @@ async fn settle_housekeeping(handle: Option<std::thread::JoinHandle<()>>) {
 /// Compact the headless session; `force` is context relief (see
 /// [`headless_compaction_plan_with`]). Returns the summarizer usage (already
 /// charged to the session) and whether any history was compacted.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "headless compaction context plus the optional fork agent"
+)]
 async fn compact_headless_session(
     session: &mut Session,
     client: &AnyClient,
@@ -903,6 +912,7 @@ async fn compact_headless_session(
     pending_tokens: u64,
     instructions: Option<&str>,
     force: bool,
+    agent: Option<&provider::AnyAgent>,
 ) -> anyhow::Result<(crate::event::UsageDelta, bool)> {
     let spend =
         crate::spend::run::Run::for_session(session, cfg, crate::spend::RequestKind::Compaction);
@@ -927,6 +937,33 @@ async fn compact_headless_session(
     );
     let observed = crate::spend::run::UsageObserver::with_run(spend.clone());
     let request_observer = observed.clone();
+    // Same model on a native prompt-cache route: fork the conversation's own
+    // request instead of re-serializing it (mini-agent-o2nut).
+    let fork: Option<HeadlessFork<'_>> = agent
+        .filter(|agent| compaction_model.is_none() && agent.supports_cache_fork())
+        .map(|agent| {
+            let observed = observed.clone();
+            Box::new(
+                move |history, messages_included, input_token_budget, response_token_budget| {
+                    let (input_token_budget, response_token_budget) =
+                        crate::config::CompactionBudgetCap::apply(
+                            budget_cap,
+                            input_token_budget,
+                            response_token_budget,
+                        );
+                    Box::pin(agent.compress_forked(
+                        history,
+                        messages_included,
+                        instructions,
+                        input_token_budget,
+                        response_token_budget,
+                        &cfg.retry,
+                        observed,
+                        cfg.resolve_compaction_timeout(),
+                    )) as futures::future::BoxFuture<'_, _>
+                },
+            ) as HeadlessFork<'_>
+        });
     let compacted = compact_headless_session_with_force(
         session,
         cfg,
@@ -934,6 +971,7 @@ async fn compact_headless_session(
         #[cfg(feature = "memory")]
         memory,
         force,
+        fork,
         |model, messages, previous_summary, input_token_budget, response_token_budget| async move {
             #[cfg(feature = "hooks")]
             crate::startup::heap_future(|| {
@@ -1006,6 +1044,20 @@ async fn compact_headless_session(
     ))
 }
 
+/// A cache-reusing summarizer for headless compaction: takes the converted
+/// conversation prefix, the number of session messages it covers and the
+/// (input, response) token budgets.
+type HeadlessFork<'a> = Box<
+    dyn FnOnce(
+            Vec<rig::completion::Message>,
+            usize,
+            u64,
+            u64,
+        )
+            -> futures::future::BoxFuture<'a, anyhow::Result<provider::CompactionOutput>>
+        + 'a,
+>;
+
 /// A completed headless compaction: the summary, where the kept history now
 /// starts, and the summarizer usage already charged to the session
 /// (normalized for the session's provider).
@@ -1038,6 +1090,7 @@ where
         #[cfg(feature = "memory")]
         memory,
         false,
+        None,
         summarize,
     )
     .await
@@ -1049,6 +1102,7 @@ async fn compact_headless_session_with_force<S, F>(
     pending_tokens: u64,
     #[cfg(feature = "memory")] memory: Option<&str>,
     force: bool,
+    fork: Option<HeadlessFork<'_>>,
     summarize: S,
 ) -> anyhow::Result<Option<HeadlessCompaction>>
 where
@@ -1079,19 +1133,51 @@ where
         .compactions
         .last()
         .map(|compaction| compaction.summary.to_string());
+    let keep_recent_tool_results = cfg.resolve_keep_recent_tool_results();
+    let mut output = None;
+    if let Some(fork) = fork
+        && let Some(history) = crate::agent::runner::cache_fork_history(
+            session,
+            plan.cut_idx,
+            keep_recent_tool_results,
+            plan.input_token_budget,
+        )
+    {
+        match fork(
+            history,
+            messages.len(),
+            plan.input_token_budget,
+            plan.response_token_budget,
+        )
+        .await
+        {
+            Ok(forked) => output = Some(forked),
+            Err(error) => {
+                tracing::warn!(
+                    "cache-reusing compaction failed, using the text summarizer: {error}"
+                )
+            }
+        }
+    }
+    let output = match output {
+        Some(output) => output,
+        None => {
+            summarize(
+                model,
+                messages,
+                previous_summary,
+                plan.input_token_budget,
+                plan.response_token_budget,
+            )
+            .await?
+        }
+    };
     let provider::CompactionOutput {
         summary,
         summary_byte_budget,
         messages_included,
         usage,
-    } = summarize(
-        model,
-        messages,
-        previous_summary,
-        plan.input_token_budget,
-        plan.response_token_budget,
-    )
-    .await?;
+    } = output;
     // Every rolling summarizer request ran on the session's model, so it is
     // charged at the session's prices like any other completion
     // (mini-agent-i6q98).
@@ -4042,6 +4128,9 @@ async fn relieve_native_headless_segment(
         pending_tokens,
         cli.compact_instructions.as_deref(),
         true,
+        // Native sessions carry a thinking chain, which a cache fork cannot
+        // replay: they always take the text summarizer.
+        None,
     )
     .await
     {
@@ -4963,6 +5052,7 @@ async fn run_relieved_headless_turn(
                     pending_tokens,
                     cli.compact_instructions.as_deref(),
                     true,
+                    Some(agent),
                 )
             })
             .await?;
@@ -6194,6 +6284,153 @@ mod tests {
         assert_eq!(session.compactions.len(), 1);
         assert_eq!(session.messages[0].content, "HEADLESS_SUMMARY");
         assert_eq!(session.messages.len(), 2);
+    }
+
+    fn fork_test_session() -> (crate::session::Session, crate::config::Config) {
+        let mut session = crate::session::Session::new("anthropic", "model", 10_000, "");
+        session.overhead_tokens = 8_900;
+        session.add_message(crate::session::MessageRole::User, "first question");
+        session.add_message(crate::session::MessageRole::Assistant, "first answer");
+        session.add_message(crate::session::MessageRole::User, &"b".repeat(400));
+        session.add_message(crate::session::MessageRole::Assistant, &"c".repeat(400));
+        let cfg = crate::config::Config {
+            compact_enabled: Some(true),
+            reserve_tokens: Some(1_000),
+            keep_recent_tokens: Some(5),
+            ..crate::config::Config::default()
+        };
+        (session, cfg)
+    }
+
+    // mini-agent-o2nut: headless compaction forks the conversation's own
+    // request: same system prompt and tools, the prefix the conversation sent,
+    // the summarize instruction as the final user turn, tools disabled.
+    #[tokio::test]
+    async fn headless_compaction_fork_request_shares_the_conversation_prefix() {
+        use rig::agent::AgentBuilder;
+        use rig::completion::Message;
+        use rig::test_utils::{MockCompletionModel, MockStreamEvent};
+        let (mut session, cfg) = fork_test_session();
+        let plan = super::headless_compaction_plan_with(
+            &session,
+            &cfg,
+            0,
+            #[cfg(feature = "memory")]
+            None,
+            false,
+        )
+        .expect("the session is over budget");
+        let keep = cfg.resolve_keep_recent_tool_results();
+        // What the conversation itself sends for the compacted prefix.
+        let mut conversation = session.clone();
+        conversation.messages.truncate(plan.cut_idx);
+        let conversation_history =
+            crate::agent::runner::convert_history_with_tool_result_retention(&conversation, keep);
+        let model = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::text("FORKED_SUMMARY"),
+            MockStreamEvent::final_response(rig::completion::Usage {
+                input_tokens: 40,
+                cached_input_tokens: 30,
+                output_tokens: 5,
+                total_tokens: 45,
+                ..Default::default()
+            }),
+        ]]);
+        let agent = AgentBuilder::new(model.clone())
+            .preamble("MAIN SYSTEM PROMPT")
+            .max_tokens(8000)
+            .build();
+        let agent = &agent;
+        let fork: super::HeadlessFork<'_> =
+            Box::new(move |history, included, _input, _response| {
+                Box::pin(async move {
+                    let (summary, usage) = crate::provider::run_forked_summarizer(
+                        agent,
+                        history,
+                        crate::provider::fork_instruction(None),
+                        512,
+                        &crate::retry::RetryConfig::default(),
+                        Default::default(),
+                    )
+                    .await?;
+                    Ok(crate::provider::CompactionOutput {
+                        summary,
+                        summary_byte_budget: 16 * 1024,
+                        messages_included: included,
+                        usage: usage.into(),
+                    })
+                })
+            });
+        let result = super::compact_headless_session_with_force(
+            &mut session,
+            &cfg,
+            0,
+            #[cfg(feature = "memory")]
+            None,
+            false,
+            Some(fork),
+            |_, _, _, _, _| async { panic!("the text summarizer must not run") },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.summary, "FORKED_SUMMARY");
+        assert_eq!(result.usage.cached_input_tokens, 30);
+        assert_eq!(session.compactions.len(), 1);
+        let requests = model.requests();
+        assert_eq!(requests.len(), 1);
+        let sent: Vec<Message> = requests[0].chat_history.clone().into_iter().collect();
+        assert!(matches!(&sent[0], Message::System { content } if content == "MAIN SYSTEM PROMPT"));
+        let last = sent.len() - 1;
+        assert_eq!(
+            &sent[1..last],
+            &conversation_history[..],
+            "the request prefix is the conversation's own"
+        );
+        assert!(
+            serde_json::to_string(&sent[last])
+                .unwrap()
+                .contains("summarization request")
+        );
+        assert_eq!(
+            requests[0].tool_choice,
+            Some(rig::message::ToolChoice::None)
+        );
+    }
+
+    #[tokio::test]
+    async fn headless_compaction_fork_failure_falls_back_to_the_text_summarizer() {
+        let (mut session, cfg) = fork_test_session();
+        let fork: super::HeadlessFork<'_> =
+            Box::new(|_, _, _, _| Box::pin(async { Err(anyhow::anyhow!("fork refused")) }));
+        let result = super::compact_headless_session_with_force(
+            &mut session,
+            &cfg,
+            0,
+            #[cfg(feature = "memory")]
+            None,
+            false,
+            Some(fork),
+            |_, messages, _, _, _| async move {
+                Ok(crate::provider::CompactionOutput {
+                    summary_byte_budget: 16 * 1024,
+                    summary: "TEXT_SUMMARY".to_string(),
+                    messages_included: messages.len(),
+                    usage: crate::event::UsageDelta::default(),
+                })
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.summary, "TEXT_SUMMARY");
+    }
+
+    #[test]
+    fn headless_cache_fork_requires_a_prefix_that_fits_the_summarizer_budget() {
+        let (session, _) = fork_test_session();
+        assert!(crate::agent::runner::cache_fork_history(&session, 2, 0, 9_000).is_some());
+        assert!(crate::agent::runner::cache_fork_history(&session, 2, 0, 1_000).is_none());
     }
 
     // mini-agent-i6q98: the summarizer's requests are charged to the session

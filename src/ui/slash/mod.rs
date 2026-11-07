@@ -812,32 +812,17 @@ async fn cache_fork_input(
     input_token_budget: u64,
     reasoning_enabled: bool,
 ) -> Option<(crate::provider::AnyAgent, Vec<rig::completion::Message>)> {
-    if ui.session.native_history_snapshot().is_some() || ui.session.prefix_has_images(cut_idx) {
-        return None;
-    }
-    let first_live = ui.session.compacted_context().1;
-    let tokens: u64 = ui.session.messages[first_live.min(cut_idx)..cut_idx]
-        .iter()
-        .map(|message| message.estimated_tokens)
-        .sum();
-    // Leave room for the instruction and the estimator's error.
-    if tokens.saturating_add(2_000) > input_token_budget / 10 * 9 {
-        return None;
-    }
+    let history = crate::agent::runner::cache_fork_history(
+        ui.session,
+        cut_idx,
+        keep_recent_tool_results,
+        input_token_budget,
+    )?;
     let agent = ui
         .agent_build_ctx()
         .rebuild_agent(&ui.session.model, reasoning_enabled)
         .await;
-    agent.supports_cache_fork().then(|| {
-        (
-            agent,
-            crate::agent::runner::convert_history_prefix(
-                ui.session,
-                cut_idx,
-                keep_recent_tool_results,
-            ),
-        )
-    })
+    agent.supports_cache_fork().then_some((agent, history))
 }
 
 /// As [`compact_session_with`], re-attaching the newest file windows read in
