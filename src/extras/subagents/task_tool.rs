@@ -4553,9 +4553,11 @@ mod tests {
         let off = crate::config::types::SubagentPolicy::default();
         assert_eq!(opt_in_notices(&extras, Some(&off)).len(), 2);
         // Enabled opt-ins produce no notice; undeclared features never do.
-        let mut on = crate::config::types::SubagentPolicy::default();
-        on.agent_memory = true;
-        on.agent_hooks = true;
+        let on = crate::config::types::SubagentPolicy {
+            agent_memory: true,
+            agent_hooks: true,
+            ..Default::default()
+        };
         assert!(opt_in_notices(&extras, Some(&on)).is_empty());
         assert!(opt_in_notices(&AgentExtras::default(), None).is_empty());
         let merged = with_opt_in_notices(Some("[a]".into()), &extras, None).unwrap();
