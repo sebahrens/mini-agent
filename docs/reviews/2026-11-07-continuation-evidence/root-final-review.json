@@ -3,14 +3,9 @@
   "baseline": "eef3001c6d0bba40fad24ecd595fa60fd5db0289",
   "findings": [
     {
-      "bead": "mini-agent-p0h9g.7",
-      "priority": 2,
-      "status": "Native Windows failure corrected in source; fresh native acceptance pending"
-    },
-    {
-      "bead": "mini-agent-gkqd4.26",
-      "priority": 2,
-      "status": "External Windows cwd boundary corrected; native comparison and helper acceptance pending; historical timeout attribution unconfirmed"
+      "bead": "mini-agent-gkqd4.27",
+      "priority": 4,
+      "status": "Actual-binary Windows fixture setup corrected; native acceptance pending."
     }
   ],
   "scope": [
@@ -40,9 +35,9 @@
     "Stalled-output fixtures handle512-byte pipes and stale startup notices while preserving original negative-control failures",
     "Windows workspace-service drop explicitly terminates the exact retained Job despite process-wrap registry behavior"
   ],
-  "assessment": "Root reviewed the focused Windows external-path correction, required canonical identity preservation for ambiguous names, and corrected an unguarded process launch in its native regression. No further confirmed source finding in the reviewed paths; final clearance remains withheld pending native Windows helper, discovery and full hosted acceptance.",
+  "assessment": "Final focused source review found no additional confirmed P0-P3 issue. Native Windows helper/server descendant and path-control unit regressions now pass. Root reclassified the cwd item to P4 after native comparison disproved attribution to that spelling. Both actual-binary fixture cases pass locally after private-root isolation and diagnostic capture; final clearance remains withheld pending native integration/discovery and full hosted acceptance.",
   "residual_risks": [
-    "Native Windows process lifecycle requires the new CI tests; local execution is macOS.",
+    "Native Windows actual-binary shutdown fixture still requires acceptance after setup correction; local execution is macOS.",
     "A speculative model-hook workspace identity replacement race lacked a reproduced contract violation and was retained as unverified in the follow-on report.",
     "Unrelated historical deferred features and beads are outside this review wave."
   ],

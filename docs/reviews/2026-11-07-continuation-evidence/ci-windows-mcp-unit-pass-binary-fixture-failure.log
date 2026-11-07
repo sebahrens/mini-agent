@@ -1,0 +1,13 @@
+2026-11-07T19:39:44.4628826Z test extras::mcp::client::tests::mcp_stdio_external_cwd_retains_names_that_cannot_round_trip ... ok
+2026-11-07T19:39:44.9841671Z MCP external cwd legacy=false, launch="C:\\Users\\runneradmin\\AppData\\Local\\Temp\\mini-agent-mcp-external-cwd-91a9ac20-67c8-484a-b064-7d81566a2924", output="C:\\Users\\runneradmin\\AppData\\Local\\Temp\\mini-agent-mcp-external-cwd-91a9ac20-67c8-484a-b064-7d81566a2924\nTrue\nTrue", status=exit code: 0, stderr=
+2026-11-07T19:39:45.2755514Z MCP external cwd legacy=true, launch="\\\\?\\C:\\Users\\runneradmin\\AppData\\Local\\Temp\\mini-agent-mcp-external-cwd-91a9ac20-67c8-484a-b064-7d81566a2924", output="C:\\Users\\runneradmin\\AppData\\Local\\Temp\\mini-agent-mcp-external-cwd-91a9ac20-67c8-484a-b064-7d81566a2924\nTrue\nTrue", status=exit code: 0, stderr=
+2026-11-07T19:39:45.2764552Z test extras::mcp::client::tests::mcp_stdio_external_cwd_uses_ordinary_windows_spelling ... ok
+2026-11-07T19:39:45.2768531Z test sandbox::workspace_job_drop_tests::mcp_stdio_workspace_job_drop_and_unwrap_keep_job_lifecycle_dispatch ... ok
+2026-11-07T19:40:01.5127449Z test extras::mcp::headers_helper::windows_tree_tests::mcp_stdio_headers_helper_owns_windows_descendants_on_success_timeout_and_drop ... ok
+2026-11-07T19:40:02.2744771Z test extras::mcp::server::windows_tree_tests::mcp_stdio_server_owns_windows_descendants_on_success_timeout_cancel_and_drop ... ok
+2026-11-07T19:40:04.9077783Z test result: ok. 45 passed; 0 failed; 0 ignored; 0 measured; 3789 filtered out; finished in 20.45s
+2026-11-07T19:40:05.1786595Z thread 'mcp_stdio_actual_binary_exits_on_writer_deadline_while_stdin_stays_open' (6712) panicked at tests\mcp_server_stdio_shutdown.rs:70:52:
+2026-11-07T19:40:05.1788150Z called `Result::unwrap()` on an `Err` value: Os { code: 109, kind: BrokenPipe, message: "The pipe has been ended." }
+2026-11-07T19:40:05.1975064Z thread 'mcp_stdio_actual_binary_exits_on_eof_with_physically_backpressured_stdout' (2868) panicked at tests\mcp_server_stdio_shutdown.rs:70:52:
+2026-11-07T19:40:05.1975702Z called `Result::unwrap()` on an `Err` value: Os { code: 109, kind: BrokenPipe, message: "The pipe has been ended." }
+2026-11-07T19:40:05.1994962Z test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.23s

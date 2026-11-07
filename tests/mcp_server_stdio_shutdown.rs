@@ -12,6 +12,17 @@ mod temp;
 struct OwnedProbe {
     child: Child,
     reader: Option<std::thread::JoinHandle<()>>,
+    stderr_path: std::path::PathBuf,
+}
+impl OwnedProbe {
+    fn diagnostics(&mut self) -> String {
+        format!(
+            "status={:?}, stderr={:?}",
+            self.child.try_wait(),
+            std::fs::read_to_string(&self.stderr_path)
+                .unwrap_or_else(|error| format!("unavailable: {error}"))
+        )
+    }
 }
 impl Drop for OwnedProbe {
     fn drop(&mut self) {
@@ -42,18 +53,23 @@ fn probe(close_input: bool) {
         "MINI_AGENT_CACHE_DIR",
         "MINI_AGENT_CREDENTIALS_DIR",
     ] {
-        command.env(name, root.path());
+        // Let startup create each private root with its native ACL. The
+        // scratch workspace may have an administrative owner on elevated Windows.
+        command.env(name, root.join(name.to_ascii_lowercase()));
     }
+    let stderr_path = root.join("server.stderr");
+    let stderr = std::fs::File::create(&stderr_path).unwrap();
     let child = command
         .args(["--mcp-server", "--no-tools", "--no-context-files"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(stderr))
         .spawn()
         .unwrap();
     let mut owner = OwnedProbe {
         child,
         reader: None,
+        stderr_path,
     };
     let mut input = Some(owner.child.stdin.take().unwrap());
     let mut output = owner.child.stdout.take().unwrap();
@@ -67,12 +83,27 @@ fn probe(close_input: bool) {
     // reached physical stdout before input is closed or left parked open.
     let request =
         serde_json::json!({"jsonrpc":"2.0","id":"x".repeat(2 * 1024 * 1024),"method":"ping"});
-    writeln!(input.as_mut().unwrap(), "{request}").unwrap();
-    input.as_mut().unwrap().flush().unwrap();
+    writeln!(input.as_mut().unwrap(), "{request}").unwrap_or_else(|error| {
+        panic!(
+            "write backpressure request: {error}; {}",
+            owner.diagnostics()
+        )
+    });
+    input.as_mut().unwrap().flush().unwrap_or_else(|error| {
+        panic!(
+            "flush backpressure request: {error}; {}",
+            owner.diagnostics()
+        )
+    });
     let (read, _unread_output) = received
         .recv_timeout(Duration::from_secs(15))
-        .expect("server began writing its response");
-    read.expect("first response byte");
+        .unwrap_or_else(|error| {
+            panic!(
+                "server response did not begin: {error}; {}",
+                owner.diagnostics()
+            )
+        });
+    read.unwrap_or_else(|error| panic!("first response byte: {error}; {}", owner.diagnostics()));
     owner.reader.take().unwrap().join().unwrap();
     if close_input {
         drop(input.take());
@@ -84,16 +115,22 @@ fn probe(close_input: bool) {
         }
         assert!(
             Instant::now() < deadline,
-            "MCP process remained alive after bounded transport retirement (close_input={close_input})"
+            "MCP process remained alive after bounded transport retirement (close_input={close_input}); {}",
+            owner.diagnostics()
         );
         std::thread::sleep(Duration::from_millis(10));
     };
     if close_input {
-        assert!(status.success(), "EOF is ordinary client retirement");
+        assert!(
+            status.success(),
+            "EOF is ordinary client retirement: {status}; {}",
+            owner.diagnostics()
+        );
     } else {
         assert!(
             !status.success(),
-            "a backpressured writer deadline is a transport failure"
+            "a backpressured writer deadline is a transport failure; {}",
+            owner.diagnostics()
         );
     }
 }

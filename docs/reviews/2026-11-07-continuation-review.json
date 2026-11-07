@@ -1,6 +1,6 @@
 {
   "baseline": "eef3001c",
-  "scope": "26 continuation review items plus eight prior post-fix findings (34 total). Native Windows helper follow-up remains under investigation; closure requires fresh hosted acceptance.",
+  "scope": "27 continuation review items plus eight prior post-fix findings (35 total). Native Windows MCP unit regressions now pass; actual-binary fixture follow-up and final hosted acceptance remain pending.",
   "findings": [
     {
       "id": "BOUNDARIES-A-1",
@@ -759,19 +759,32 @@
     {
       "id": "windows-mcp-external-cwd",
       "bead": "mini-agent-gkqd4.26",
-      "priority": 2,
+      "priority": 4,
       "title": "Normalize external Windows MCP program and working-directory spelling while preserving canonical identity",
       "evidence": [
         "Native helper normal-success timeout persists after explicit PowerShell environment prerequisites. Stage is child-started while Rust has read child.pid and retained the live child.",
         "Unsandboxed stdio_command passes canonical Windows cwd directly to external runtimes; native sandbox launcher and established foreground fixtures project external path spellings."
       ],
-      "implementation_status": "Implemented and root-reviewed;71 affected reduced-feature tests, strict reduced all-targets Clippy and228 workflow/metadata policy tests passed. Native Windows comparison/acceptance pending.",
+      "implementation_status": "Native ordinary-cwd and ambiguous-name controls passed. Reclassified P4: both ordinary and legacy cwd comparisons had the same successful runtime lookup, so this is not evidence of a P2 cwd cause for the old helper timeout.",
       "correction": "Project final executable/cwd spellings only when canonical roundtrip preserves identity; retain trailing-dot/space components and non-roundtripping paths. Production environment clearing and executable resolution policy unchanged.",
       "native_tests": [
         "mcp_stdio_external_cwd_uses_ordinary_windows_spelling",
         "mcp_stdio_external_cwd_retains_names_that_cannot_round_trip"
       ],
       "comparison_limit": "Former canonical-cwd launch is observational; its failure is not asserted. Fixture wait now uses Thread.Sleep to remove PowerShell module-autoload uncertainty. Existing helper/server descendant assertions and deadlines remain unchanged."
+    },
+    {
+      "id": "windows-mcp-private-fixture",
+      "bead": "mini-agent-gkqd4.27",
+      "priority": 4,
+      "title": "Use application-created private roots and retain diagnostics in the Windows MCP actual-binary fixture",
+      "evidence": [
+        "Native Windows unit45/45 passed, then both actual-binary tests exited before receiving the first request; their discarded stderr hid the cause.",
+        "The fixture reused a plain pre-created TempDir as all six private app roots. Windows private-directory repair requires current-user ownership; elevated default directory owners can be Administrators."
+      ],
+      "correction": "Use nonexistent per-purpose roots, allowing startup to create its explicit private ownership, and retain stderr/exit status on failures. Physical unread stdout and15s/10s bounds unchanged.",
+      "implementation_status": "Both actual-binary cases and shared temp helper passed locally (3 tests); strict owning Clippy passed. Native acceptance pending.",
+      "confidence_limit": "Exact prior startup error was hidden. The fixture correction addresses ownership setup without weakening production private-path validation."
     }
   ],
   "validation": {
@@ -869,7 +882,20 @@
         "build_id": "73f63c6d4fa02b7d967dc0979427294f002f8a010cc27f7cf4324247ef612101",
         "native_js": "PASS (2)",
         "connectivity": "Prior live-provider pass reused; production change is Windows-only."
-      }
+      },
+      "native": "664e823a native Windows job128499992348:45 unit tests passed, including helper/server descendants, Job dispatch, both cwd controls. Both cwd spellings produced ordinary runtime paths and successful relative/absolute File.Exists. Later actual-binary integration0passed2failed on early BrokenPipe; gkqd4.27 corrects fixture ownership and captures stderr."
+    },
+    "windows_private_fixture_followup": {
+      "local": "cargo test --locked --test mcp_server_stdio_shutdown:3 passed5.40s (both actual-binary cases plus temp helper); strict owning Clippy passed.",
+      "native_pending": true,
+      "build_reuse": "Installed production build73f63c6d and its PASS2 smoke reused: change is integration-test setup/diagnostics only."
+    },
+    "windows_discovery_acceptance": {
+      "run": "https://github.com/sebahrens/mini-agent/actions/runs/42404621394",
+      "commit": "664e823a8c04473668590e715481d3005112ba08",
+      "step": "Test Windows linked-worktree discovery and hook exclusions",
+      "result": "completed success; owning job still running subsequent storage checks at observation",
+      "tests": 5
     }
   },
   "status": "local_ci_corrections_validated_native_ci_pending",
