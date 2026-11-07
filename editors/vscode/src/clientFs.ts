@@ -10,6 +10,8 @@ export interface ClientFsHost {
   /** Replace the file's text through the editor (undo stack, dirty state) and save it. */
   writeText(fsPath: string, text: string): Promise<void>;
   realpath(fsPath: string): Promise<string>;
+  /** True when the final path component is itself a symlink (dangling ones included); false when absent. */
+  isSymlink(fsPath: string): Promise<boolean>;
 }
 
 export interface ClientFsContext {
@@ -46,6 +48,12 @@ async function containedPath(context: ClientFsContext, requested: string, mayCre
     resolved = await context.host.realpath(requested);
   } catch {
     if (!mayCreate) { throw new ClientFsError('file not found'); }
+    // realpath failed, so the path either does not exist or is a dangling link.
+    // A dangling link would be followed by the write and create its target, which
+    // may lie outside the workspace; refuse it rather than guess where it points.
+    if (await context.host.isSymlink(requested)) {
+      throw new ClientFsError('path is a dangling symbolic link');
+    }
     const parent = await context.host.realpath(path.dirname(requested)).catch(() => {
       throw new ClientFsError('directory not found');
     });

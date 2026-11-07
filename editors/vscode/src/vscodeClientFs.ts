@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { realpath } from 'node:fs/promises';
+import { lstat, realpath } from 'node:fs/promises';
 import type { ClientFsHost } from './clientFs';
 
 /** Whether the user opted in. Machine scope: workspace settings cannot turn it on. */
@@ -29,4 +29,7 @@ export const vscodeClientFsHost: ClientFsHost = {
     if (!(await document.save())) { throw new Error('the editor could not save the file'); }
   },
   realpath: path => realpath(path),
+  isSymlink: async path => {
+    try { return (await lstat(path)).isSymbolicLink(); } catch { return false; }
+  },
 };

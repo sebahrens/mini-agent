@@ -19,6 +19,7 @@ function context(overrides: Partial<ClientFsContext> = {}, files: Record<string,
         if (p.includes('escape-link')) { return '/etc/passwd'; }
         return p;
       },
+      isSymlink: async p => p.includes('dangling-link'),
     },
     writes,
     ...overrides,
@@ -67,6 +68,19 @@ describe('client file access', () => {
     expect(ctx.writes).toEqual(['/work/space/new.txt=hi']);
     await expect(readTextFile(ctx, request('/work/space/missing.txt'))).rejects.toThrow(/not found/);
     await expect(writeTextFile(ctx, { sessionId: 's', path: '/work/space/missing/dir/x.txt', content: 'x' })).rejects.toThrow(/directory not found/);
+  });
+
+  // mini-agent-z7zva
+  it('refuses to write through a dangling symlink whose target is unknown', async () => {
+    const ctx = context();
+    // realpath of the link fails (its target is absent) but its directory is inside the workspace.
+    const host = { ...ctx.host, realpath: async (p: string) => {
+      if (p.includes('dangling-link')) { throw new Error('ENOENT'); }
+      return p;
+    } };
+    await expect(writeTextFile({ ...ctx, host },
+      { sessionId: 's', path: '/work/space/dangling-link', content: 'x' })).rejects.toThrow(/symbolic link/);
+    expect(ctx.writes).toEqual([]);
   });
 
   it('bounds read and write sizes', async () => {
