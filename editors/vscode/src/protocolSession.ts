@@ -8,6 +8,8 @@ export const MAX_COMMANDS = 256;
 /** One connection's current conversation, with bounded load-time update routing. */
 export class SessionUpdateRouter {
   private current: PublicProtocolSession | undefined;
+  /** Called for each update that arrives while no prompt is active (for example a /cron fire). */
+  reportIdle?: (sessionId: string, update: acp.SessionUpdate) => void;
   private loading: { expectedId?: string; updates: acp.SessionNotification[]; bytes: number; overflow: boolean } | undefined;
 
   begin(expectedId?: string): void {
@@ -60,6 +62,10 @@ export class PublicProtocolSession implements ConversationSession {
   private subscriber: ((update: acp.SessionUpdate) => void) | undefined;
   private activePrompt: Promise<acp.PromptResponse> | undefined;
   private disposed = false;
+  private idleUpdates = 0;
+  private idleBytes = 0;
+  private idleDropped = 0;
+  private idleOverflow = false;
 
   constructor(private readonly client: acp.ClientContext, readonly sessionId: string,
     private readonly router: SessionUpdateRouter, private replay: acp.SessionUpdate[],
@@ -80,7 +86,40 @@ export class PublicProtocolSession implements ConversationSession {
       this.availableCommands = update.availableCommands.slice(0, MAX_COMMANDS);
       this.commandsDropped = Math.max(0, update.availableCommands.length - MAX_COMMANDS);
     }
-    this.subscriber?.(update);
+    if (this.subscriber) { this.subscriber(update); return; }
+    this.bufferIdleUpdate(update);
+    this.router.reportIdle?.(this.sessionId, update);
+  }
+
+  /**
+   * Server-initiated turns (for example a /cron fire) stream content while no
+   * prompt() is active. Keep that content so the next prompt shows it, within
+   * the same bounds as load-time replay; anything beyond them is counted and
+   * announced instead of vanishing.
+   */
+  private bufferIdleUpdate(update: acp.SessionUpdate): void {
+    switch (update.sessionUpdate) {
+      case 'agent_message_chunk': case 'agent_thought_chunk': case 'tool_call':
+      case 'tool_call_update': case 'plan': break;
+      default: return;
+    }
+    const bytes = Buffer.byteLength(JSON.stringify(update), 'utf8');
+    if (this.idleOverflow || this.idleUpdates >= MAX_REPLAY_UPDATES || this.idleBytes + bytes > MAX_REPLAY_BYTES) {
+      this.idleOverflow = true;
+      this.idleDropped += 1;
+      return;
+    }
+    this.idleUpdates += 1;
+    this.idleBytes += bytes;
+    this.replay.push(update);
+  }
+
+  private takeIdleNotice(): acp.SessionUpdate | undefined {
+    const dropped = this.idleDropped;
+    this.idleUpdates = 0; this.idleBytes = 0; this.idleDropped = 0; this.idleOverflow = false;
+    if (dropped === 0) { return undefined; }
+    return { sessionUpdate: 'agent_message_chunk',
+      content: { type: 'text', text: `\n\n_${dropped} update${dropped === 1 ? '' : 's'} from a server-started turn were too large to keep and were dropped._\n\n` } };
   }
 
   modes(): acp.SessionModeState | undefined { return this.modeState; }
@@ -115,11 +154,20 @@ export class PublicProtocolSession implements ConversationSession {
     signal: AbortSignal): Promise<acp.StopReason> {
     if (signal.aborted) { return 'cancelled'; }
     if (this.disposed || this.activePrompt) { throw new Error('ACP conversation is unavailable or busy.'); }
-    this.subscriber = onUpdate;
-    try { for (const update of this.replay) { onUpdate(update); } }
-    catch (error) { this.subscriber = undefined; this.replay = []; throw error; }
-    this.replay = [];
-    if (signal.aborted) { this.subscriber = undefined; return 'cancelled'; }
+    // Buffered server-started output is delivered only once the prompt is
+    // accepted (first live update or settlement). A prompt the agent refuses
+    // keeps it buffered instead of replaying it into a failed response.
+    let flushed = false;
+    const flush = (): void => {
+      if (flushed) { return; }
+      flushed = true;
+      const notice = this.takeIdleNotice();
+      if (notice) { this.replay.push(notice); }
+      const pendingReplay = this.replay;
+      this.replay = [];
+      for (const update of pendingReplay) { onUpdate(update); }
+    };
+    this.subscriber = update => { flush(); onUpdate(update); };
     let cancellationSent = false;
     const cancel = (): void => {
       if (cancellationSent) { return; }
@@ -134,15 +182,21 @@ export class PublicProtocolSession implements ConversationSession {
       prompt: typeof content === 'string' ? [{ type: 'text', text: content }] : [...content],
     });
     this.activePrompt = pending;
-    try { return (await pending).stopReason; }
+    let refused = false;
+    try { const stopReason = (await pending).stopReason; flush(); return stopReason; }
     catch (error) {
       if (error instanceof acp.RequestError && error.code === -32602 && error.message.includes('unknown ACP session')) { throw new SessionUnavailableError(); }
+      if (error instanceof Error && error.message.includes('already has an active prompt')) {
+        refused = true;
+        throw new Error('Mini Agent is still running a turn it started itself (for example a /cron fire). Its output will appear in the next reply; try again when it finishes.');
+      }
       throw error;
     }
     finally {
       signal.removeEventListener('abort', cancel);
       this.activePrompt = undefined;
       this.subscriber = undefined;
+      if (!refused) { try { flush(); } catch { /* the consumer already failed */ } }
     }
   }
 

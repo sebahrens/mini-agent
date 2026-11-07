@@ -69,6 +69,15 @@ describe('buildPromptBlocks', () => {
     expect(built.notes.join()).toMatch(/5 more were dropped/);
   });
 
+  it('counts only references cut by the cap, not earlier skipped ones', async () => {
+    const refs: ReferenceInput[] = [
+      ...Array.from({ length: 5 }, (_, index) => ({ kind: 'unsupported', name: `u${index}`, reason: 'nope' }) as ReferenceInput),
+      ...Array.from({ length: MAX_REFERENCES + 3 }, (_, index) => ({ kind: 'file', fsPath: `/work/space/f${index}` }) as ReferenceInput),
+    ];
+    const built = await buildPromptBlocks(options(refs));
+    expect(built.notes.join()).toMatch(/3 more were dropped/);
+  });
+
   it('clips oversized snippets visibly at a character boundary and bounds the total', async () => {
     const big = '雪'.repeat(MAX_SNIPPET_BYTES);
     const built = await buildPromptBlocks(options(Array.from({ length: 6 },

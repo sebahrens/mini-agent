@@ -106,6 +106,16 @@ export class AgentSession {
     this.statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
     this.statusBar.command = 'mini-agent.stop';
     this.conversation = new Conversation(() => this.createProtocolSession());
+    // Server-started turns (for example /cron) have no prompt to render into;
+    // surface them in the output channel as they happen. The chat also shows
+    // them with the next reply.
+    this.updates.reportIdle = (_id, update) => {
+      if (update.sessionUpdate === 'agent_message_chunk' && update.content.type === 'text') {
+        log.info(`Server-started turn output: ${update.content.text}`);
+      } else if (update.sessionUpdate === 'tool_call') {
+        log.info(`Server-started turn tool call: ${update.title}`);
+      }
+    };
   }
 
   get workspaceFolder(): vscode.WorkspaceFolder { return this.folder; }

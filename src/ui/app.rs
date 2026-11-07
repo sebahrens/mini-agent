@@ -4777,7 +4777,7 @@ impl<'a> App<'a> {
             && let Some(threshold) = self.ui.cfg.resolve_mid_turn_trigger_threshold(
                 self.ui
                     .session
-                    .size_pressure(self.ui.cfg.resolve_compact_size_fraction()),
+                    .mid_turn_size_pressure(self.ui.cfg.resolve_compact_size_fraction()),
             ) {
             // Image-heavy sessions hit the byte ceiling long before the token
             // threshold: byte pressure makes any boundary a compaction point.
@@ -4808,9 +4808,9 @@ impl<'a> App<'a> {
                         .ui
                         .cfg
                         .resolve_mid_turn_trigger_threshold(
-                            self.ui
-                                .session
-                                .size_pressure(self.ui.cfg.resolve_compact_size_fraction()),
+                            self.ui.session.mid_turn_size_pressure(
+                                self.ui.cfg.resolve_compact_size_fraction(),
+                            ),
                         )
                         .unwrap_or(0.0),
                     anthropic_native: self.ui.cfg.is_anthropic_native(&self.ui.session.provider),
