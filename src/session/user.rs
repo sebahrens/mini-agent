@@ -288,6 +288,38 @@ mod tests {
         assert!(session.mid_turn_size_pressure(Some(0.75)));
     }
     #[test]
+    fn rewind_and_redo_clear_the_stale_futile_compaction_byte_floor() {
+        let mut session = crate::session::Session::new("logical", "model", 1_000_000, "");
+        let raw = vec![7u8; 1_900_000];
+        for _ in 0..7 {
+            session.add_user_message(
+                PersistedUserMessage::new(vec![image(&raw), image(&raw)]).unwrap(),
+            );
+        }
+        session.compress("recap".to_owned(), 1, 0);
+        assert!(session.bytes_after_last_compaction.is_some());
+        assert!(!session.mid_turn_size_pressure(Some(0.75)));
+        // Rewind to a small history, then regrow just past the threshold,
+        // below floor + re-arm growth.
+        let live = session.messages.len();
+        session.rewind_to(live - 3);
+        assert!(session.bytes_after_last_compaction.is_none());
+        session.truncate_to(2);
+        for _ in 0..5 {
+            session.add_user_message(
+                PersistedUserMessage::new(vec![image(&raw), image(&raw)]).unwrap(),
+            );
+        }
+        assert!(session.size_pressure(Some(0.75)));
+        assert!(session.mid_turn_size_pressure(Some(0.75)));
+        // redo of a rewind also drops the floor.
+        session.bytes_after_last_compaction = Some(usize::MAX / 2);
+        session.rewind_to(1);
+        session.bytes_after_last_compaction = Some(usize::MAX / 2);
+        assert!(session.redo());
+        assert!(session.bytes_after_last_compaction.is_none());
+    }
+    #[test]
     fn history_prefix_conversion_leaves_the_session_cache_and_messages_alone() {
         let mut session = crate::session::Session::new("logical", "model", 32_000, "");
         session.add_user_message(

@@ -2489,6 +2489,9 @@ impl Session {
         }
         self.file_checkpoints.retire_from(new_len);
         self.messages.truncate(new_len);
+        // The futile-compaction byte floor described the dropped history; a
+        // rewound session must re-evaluate mid-turn byte pressure from scratch.
+        self.bytes_after_last_compaction = None;
         self.retain_visible_replay_metadata();
         self.total_estimated_tokens = self.messages.iter().map(|m| m.estimated_tokens).sum();
         self.read_tracker.clear();
@@ -2542,6 +2545,8 @@ impl Session {
                     self.tool_call_provenance = provenance;
                 }
                 self.mark_history_changed();
+                // Restored messages invalidate the recorded compaction floor.
+                self.bytes_after_last_compaction = None;
                 self.total_estimated_tokens = u.total_estimated_tokens;
                 self.calibrated_tokens = u.calibrated_tokens;
                 self.calibrated_msg_count = u.calibrated_msg_count;
