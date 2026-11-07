@@ -1660,9 +1660,12 @@ mod tests {
         std::fs::write(root.join("secret.txt"), "needle\n").unwrap();
         std::fs::create_dir(root.join("sub")).unwrap();
         std::fs::write(root.join("sub/x.txt"), "needle\n").unwrap();
-        std::fs::set_permissions(root.join("secret.txt"), std::fs::Permissions::from_mode(0))
-            .unwrap();
-        std::fs::set_permissions(root.join("sub"), std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(
+            root.join("secret.txt"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        std::fs::set_permissions(root.join("sub"), std::fs::Permissions::from_mode(0o000)).unwrap();
         let can_open = std::fs::File::open(root.join("secret.txt")).is_ok();
         let output = GrepTool::new(None, None, 50)
             .with_workspace(&root)
