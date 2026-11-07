@@ -675,10 +675,10 @@ pub(crate) fn run_bounded(
             finished_streams += 1;
             if overflow {
                 teardown(&mut child);
-                return Err(Error::new(
-                    ErrorKind::Other,
-                    format!("output exceeded {} bytes", limits.max_output),
-                ));
+                return Err(Error::other(format!(
+                    "output exceeded {} bytes",
+                    limits.max_output
+                )));
             }
             if is_stdout {
                 stdout = data
