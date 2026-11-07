@@ -1344,6 +1344,7 @@ impl Startup {
             cfg.context_files_max_bytes,
         ));
         context::set_user_instruction_files(cfg.user_instruction_files == Some(true));
+        context::set_rule_external_symlinks(cfg.rule_external_symlinks == Some(true));
         if let Err(error) = crate::key_command::configure(cfg.api_key_commands.as_ref()) {
             anyhow::bail!(error);
         }

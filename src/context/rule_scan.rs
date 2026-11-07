@@ -1,16 +1,21 @@
 //! Deterministic, reporting discovery of `.claude/rules/**/*.md` files.
 //!
-//! The walk visits directories and entries in sorted name order, so which
-//! rules survive a cap never depends on `read_dir` order. Anything the walk
+//! The walk reads every entry name of a directory (bounded by a hard limit of
+//! sixteen times the entry cap), sorts them and only then applies the entry
+//! cap, so which rules survive a cap never depends on `read_dir` order. A
+//! directory larger than the hard limit is reported as order dependent.
+//! Anything the walk
 //! cannot honour (file-count, depth or entry caps, links it refuses) is
 //! returned as a note naming the item and the limit, so the caller can show it
 //! instead of silently dropping the rule.
 //!
-//! Symlinked rule files and directories are followed only when explicitly
-//! allowed (`user_instruction_files`) and only when the canonical target is
-//! inside the workspace or inside the user's `~/.claude/rules`; the target is
-//! then opened through a capability on its real location, never through the
-//! link.
+//! Symlinked rule files and directories (and a symlinked rules root such as a
+//! stow-managed `~/.claude/rules`) are followed when the canonical target is
+//! inside the workspace (never `.git`), or inside the user's `~/.claude/rules`
+//! (only with `user_instruction_files`), or, with the opt-in
+//! `rule_external_symlinks`, inside the user's home directory; the target is
+//! opened through a capability on its real location, never through the link.
+//! Every refused link or root is reported as a note.
 use crate::paths::WorkspaceBinding;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -26,10 +31,13 @@ pub(crate) enum RuleOrigin {
     Workspace,
     /// The `~/.claude` binding (user-level rules).
     User,
+    /// A link target outside both, inside the opted-in external root; read
+    /// through [`RuleFile::external`].
+    External,
 }
 
 /// One discovered rule file.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub(crate) struct RuleFile {
     /// The spelled path used for display and labels
     /// (`.claude/rules/a.md`, `rules/a.md` for user rules).
@@ -37,6 +45,19 @@ pub(crate) struct RuleFile {
     pub(crate) origin: RuleOrigin,
     /// The link-free path under the origin's binding the file is read from.
     pub(crate) real: PathBuf,
+    /// The capability `real` is relative to, for [`RuleOrigin::External`].
+    pub(crate) external: Option<Arc<WorkspaceBinding>>,
+}
+
+impl RuleFile {
+    /// What identifies the physical file: the same one reached through two
+    /// links loads once.
+    pub(crate) fn identity(&self) -> (RuleOrigin, PathBuf) {
+        match &self.external {
+            Some(binding) => (self.origin, binding.root().join(&self.real)),
+            None => (self.origin, self.real.clone()),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -72,7 +93,7 @@ pub(crate) struct Limits {
 struct Walk<'a> {
     workspace: &'a WorkspaceBinding,
     user: Option<&'a UserClaudeDir>,
-    follow_links: bool,
+    external_root: Option<&'a Path>,
     limits: Limits,
     scanned: usize,
     visited: HashSet<(RuleOrigin, PathBuf)>,
@@ -86,21 +107,24 @@ struct Item {
     real: PathBuf,
     display: PathBuf,
     depth: usize,
+    external: Option<Arc<WorkspaceBinding>>,
 }
 
 /// Scans `rules_dir` (workspace relative, e.g. `.claude/rules`) and, when
 /// `user` is given, the user's `rules` directory with the same limits.
+/// `external_root` is the directory outside the workspace that links may
+/// resolve into (the opt-in `rule_external_symlinks`); `None` keeps it closed.
 pub(crate) fn scan(
     workspace: &WorkspaceBinding,
     rules_dir: &Path,
     user: Option<&UserClaudeDir>,
-    follow_links: bool,
+    external_root: Option<&Path>,
     limits: Limits,
 ) -> (RuleScan, RuleScan) {
     let project = scan_unit(
         workspace,
         user,
-        follow_links,
+        external_root,
         limits,
         RuleOrigin::Workspace,
         rules_dir,
@@ -109,7 +133,7 @@ pub(crate) fn scan(
         Some(user) => scan_unit(
             workspace,
             Some(user),
-            follow_links,
+            external_root,
             limits,
             RuleOrigin::User,
             Path::new("rules"),
@@ -122,7 +146,7 @@ pub(crate) fn scan(
 fn scan_unit(
     workspace: &WorkspaceBinding,
     user: Option<&UserClaudeDir>,
-    follow_links: bool,
+    external_root: Option<&Path>,
     limits: Limits,
     origin: RuleOrigin,
     base: &Path,
@@ -130,7 +154,7 @@ fn scan_unit(
     let mut walk = Walk {
         workspace,
         user,
-        follow_links,
+        external_root,
         limits,
         scanned: 0,
         visited: HashSet::new(),
@@ -139,12 +163,8 @@ fn scan_unit(
         dropped_notes: 0,
     };
     walk.visited.insert((origin, base.to_path_buf()));
-    let mut pending = vec![Item {
-        origin,
-        real: base.to_path_buf(),
-        display: base.to_path_buf(),
-        depth: 0,
-    }];
+    let root = walk.root_item(origin, base);
+    let mut pending: Vec<Item> = root.into_iter().collect();
     while let Some(item) = pending.pop() {
         walk.visit(item, &mut pending);
     }
@@ -152,10 +172,100 @@ fn scan_unit(
 }
 
 impl Walk<'_> {
-    fn binding(&self, origin: RuleOrigin) -> Option<&WorkspaceBinding> {
+    fn binding<'b>(
+        &'b self,
+        origin: RuleOrigin,
+        external: Option<&'b Arc<WorkspaceBinding>>,
+    ) -> Option<&'b WorkspaceBinding> {
         match origin {
             RuleOrigin::Workspace => Some(self.workspace),
             RuleOrigin::User => self.user.map(|user| &*user.binding),
+            RuleOrigin::External => external.map(|binding| &**binding),
+        }
+    }
+
+    /// The key a directory is visited at most once under.
+    fn key(
+        &self,
+        origin: RuleOrigin,
+        external: Option<&Arc<WorkspaceBinding>>,
+        real: &Path,
+    ) -> (RuleOrigin, PathBuf) {
+        match external {
+            Some(binding) => (origin, binding.root().join(real)),
+            None => (origin, real.to_path_buf()),
+        }
+    }
+
+    /// The starting directory of a scan. When the rules root itself is a
+    /// symlink it is resolved under the same containment policy as any other
+    /// link and reported when refused; a missing root is silent.
+    fn root_item(&mut self, origin: RuleOrigin, base: &Path) -> Option<Item> {
+        let direct = Item {
+            origin,
+            real: base.to_path_buf(),
+            display: base.to_path_buf(),
+            depth: 0,
+            external: None,
+        };
+        let binding = self.binding(origin, None)?;
+        if binding.open_dir_relative(base).is_ok() {
+            return Some(direct);
+        }
+        let disk = self.disk_path(origin, None, base);
+        let shown = match origin {
+            RuleOrigin::User => format!("~/.claude/{}", base.display()),
+            _ => base.display().to_string(),
+        };
+        let metadata = std::fs::symlink_metadata(&disk).ok()?;
+        if !metadata.file_type().is_symlink() {
+            // Some other component is a link, or the path is not a directory.
+            if metadata.is_dir() {
+                self.note(format!(
+                    "rule directory {shown} could not be opened; its rules were not loaded"
+                ));
+            }
+            return None;
+        }
+        match self.resolve(origin, None, base) {
+            Some((target_origin, real, external)) => {
+                let is_dir =
+                    std::fs::metadata(self.disk_path(target_origin, external.as_ref(), &real))
+                        .is_ok_and(|m| m.is_dir());
+                if !is_dir {
+                    self.note(format!(
+                        "rule directory {shown} is a symlink to something that is not a directory"
+                    ));
+                    return None;
+                }
+                self.visited
+                    .insert(self.key(target_origin, external.as_ref(), &real));
+                Some(Item {
+                    origin: target_origin,
+                    real,
+                    display: base.to_path_buf(),
+                    depth: 0,
+                    external,
+                })
+            }
+            None => {
+                self.note(format!(
+                    "rule directory {shown} is a symlink and was not followed: {}",
+                    self.refusal()
+                ));
+                None
+            }
+        }
+    }
+
+    /// Why a link target was refused, naming the opt-ins that would widen it.
+    fn refusal(&self) -> &'static str {
+        if self.external_root.is_some() {
+            "its target is outside the workspace, ~/.claude/rules and the home directory \
+             (or unreadable, or inside .git)"
+        } else {
+            "its target is outside the workspace and ~/.claude/rules (or unreadable); \
+             rule_external_symlinks = true allows targets inside the home directory"
         }
     }
 
@@ -169,7 +279,7 @@ impl Walk<'_> {
     }
 
     fn visit(&mut self, item: Item, pending: &mut Vec<Item>) {
-        let Some(binding) = self.binding(item.origin) else {
+        let Some(binding) = self.binding(item.origin, item.external.as_ref()) else {
             return;
         };
         let Ok(directory) = binding.open_dir_relative(&item.real) else {
@@ -178,12 +288,14 @@ impl Walk<'_> {
         let Ok(entries) = directory.read_dir(".") else {
             return;
         };
+        // Names first, sorted, and only then the cap: which entries survive
+        // never depends on `read_dir` order. The hard limit bounds memory.
+        let hard_limit = self.limits.entries.saturating_mul(16).max(1);
         let mut found = Vec::new();
-        let mut capped = false;
+        let mut unsorted_tail = false;
         for entry in entries {
-            self.scanned += 1;
-            if self.scanned > self.limits.entries {
-                capped = true;
+            if found.len() >= hard_limit {
+                unsorted_tail = true;
                 break;
             }
             let Ok(entry) = entry else { continue };
@@ -193,12 +305,24 @@ impl Walk<'_> {
             found.push((entry.file_name(), kind));
         }
         found.sort_by(|a, b| a.0.cmp(&b.0));
-        if capped {
+        let allowed = self.limits.entries.saturating_sub(self.scanned);
+        if found.len() > allowed {
+            let first_dropped = found[allowed].0.to_string_lossy().into_owned();
+            found.truncate(allowed);
             self.note(format!(
                 "rule scan stopped after {} directory entries (limit) while reading {}; \
-                 rules not yet reached were not loaded and the result may depend on directory \
-                 order: split or prune the directory",
+                 entries in sorted order from {first_dropped} onwards were not loaded: \
+                 split or prune the directory",
                 self.limits.entries,
+                item.display.display()
+            ));
+        }
+        self.scanned += found.len();
+        if unsorted_tail {
+            self.note(format!(
+                "{} has more than {hard_limit} entries; only the first {hard_limit} in \
+                 directory order were considered, so which rules loaded may depend on \
+                 directory order: split or prune the directory",
                 item.display.display()
             ));
         }
@@ -208,12 +332,16 @@ impl Walk<'_> {
             let real = item.real.join(&name);
             if kind.is_dir() {
                 if item.depth + 1 < self.limits.depth {
-                    if self.visited.insert((item.origin, real.clone())) {
+                    if self
+                        .visited
+                        .insert(self.key(item.origin, item.external.as_ref(), &real))
+                    {
                         children.push(Item {
                             origin: item.origin,
                             real,
                             display,
                             depth: item.depth + 1,
+                            external: item.external.clone(),
                         });
                     }
                 } else {
@@ -229,6 +357,7 @@ impl Walk<'_> {
                         display,
                         origin: item.origin,
                         real,
+                        external: item.external.clone(),
                     });
                 }
             } else if kind.is_symlink() {
@@ -247,28 +376,23 @@ impl Walk<'_> {
         depth: usize,
         children: &mut Vec<Item>,
     ) {
-        if !self.follow_links {
+        let Some((origin, target, external)) =
+            self.resolve(item.origin, item.external.as_ref(), real)
+        else {
             // A dangling or non-markdown link is not worth a notice.
+            let disk = self.disk_path(item.origin, item.external.as_ref(), real);
             if is_markdown(display.file_name().unwrap_or_default())
-                || std::fs::metadata(self.disk_path(item.origin, real)).is_ok_and(|m| m.is_dir())
+                || std::fs::metadata(disk).is_ok_and(|m| m.is_dir())
             {
                 self.note(format!(
-                    "rule symlink {} skipped: following rule symlinks requires \
-                     user_instruction_files = true",
-                    display.display()
+                    "rule symlink {} skipped: {}",
+                    display.display(),
+                    self.refusal()
                 ));
             }
             return;
-        }
-        let Some((origin, target)) = self.resolve(item.origin, real) else {
-            self.note(format!(
-                "rule symlink {} skipped: its target is outside the workspace and ~/.claude/rules \
-                 (or unreadable)",
-                display.display()
-            ));
-            return;
         };
-        let disk = self.disk_path(origin, &target);
+        let disk = self.disk_path(origin, external.as_ref(), &target);
         let Ok(metadata) = std::fs::metadata(&disk) else {
             return;
         };
@@ -279,12 +403,16 @@ impl Walk<'_> {
                     display.display(),
                     self.limits.depth
                 ));
-            } else if self.visited.insert((origin, target.clone())) {
+            } else if self
+                .visited
+                .insert(self.key(origin, external.as_ref(), &target))
+            {
                 children.push(Item {
                     origin,
                     real: target,
                     display,
                     depth: depth + 1,
+                    external,
                 });
             }
         } else if metadata.is_file() && is_markdown(display.file_name().unwrap_or_default()) {
@@ -299,42 +427,72 @@ impl Walk<'_> {
                 display,
                 origin,
                 real: target,
+                external,
             });
         }
     }
 
-    fn disk_path(&self, origin: RuleOrigin, real: &Path) -> PathBuf {
+    fn disk_path(
+        &self,
+        origin: RuleOrigin,
+        external: Option<&Arc<WorkspaceBinding>>,
+        real: &Path,
+    ) -> PathBuf {
         match origin {
             RuleOrigin::Workspace => self.workspace.root().join(real),
             RuleOrigin::User => self
                 .user
                 .map(|user| user.binding.root().join(real))
                 .unwrap_or_default(),
+            RuleOrigin::External => external
+                .map(|binding| binding.root().join(real))
+                .unwrap_or_default(),
         }
     }
 
     /// The canonical location of the link at `real` under `origin`, when it
-    /// is inside the workspace (not `.git`) or the user's `~/.claude/rules`.
-    fn resolve(&self, origin: RuleOrigin, real: &Path) -> Option<(RuleOrigin, PathBuf)> {
-        let canonical = std::fs::canonicalize(self.disk_path(origin, real)).ok()?;
-        if let Ok(inside) = canonical.strip_prefix(self.workspace.root()) {
-            let hidden_git = inside.components().any(|part| part.as_os_str() == ".git");
-            if origin == RuleOrigin::Workspace && !hidden_git && !inside.as_os_str().is_empty() {
-                return Some((RuleOrigin::Workspace, inside.to_path_buf()));
-            }
+    /// is inside the workspace (not `.git`), the user's `~/.claude/rules`, or
+    /// the opted-in external root (not `.git`). External targets are opened
+    /// through a capability on their canonical parent directory.
+    fn resolve(
+        &self,
+        origin: RuleOrigin,
+        external: Option<&Arc<WorkspaceBinding>>,
+        real: &Path,
+    ) -> Option<(RuleOrigin, PathBuf, Option<Arc<WorkspaceBinding>>)> {
+        let canonical = std::fs::canonicalize(self.disk_path(origin, external, real)).ok()?;
+        let hidden_git = |path: &Path| path.components().any(|part| part.as_os_str() == ".git");
+        if let Ok(inside) = canonical.strip_prefix(self.workspace.root())
+            && origin == RuleOrigin::Workspace
+            && !hidden_git(inside)
+            && !inside.as_os_str().is_empty()
+        {
+            return Some((RuleOrigin::Workspace, inside.to_path_buf(), None));
         }
-        let user = self.user?;
-        let inside = canonical.strip_prefix(user.binding.root()).ok()?;
-        inside
-            .starts_with("rules")
-            .then(|| (RuleOrigin::User, inside.to_path_buf()))
+        if let Some(user) = self.user
+            && let Ok(inside) = canonical.strip_prefix(user.binding.root())
+            && inside.starts_with("rules")
+        {
+            return Some((RuleOrigin::User, inside.to_path_buf(), None));
+        }
+        let root = self.external_root?;
+        if hidden_git(&canonical) {
+            return None;
+        }
+        let root = std::fs::canonicalize(root).ok()?;
+        let inside = canonical.strip_prefix(&root).ok()?;
+        if inside.as_os_str().is_empty() || hidden_git(inside) {
+            return None;
+        }
+        let parent = WorkspaceBinding::capture(canonical.parent()?).ok()?;
+        let name = PathBuf::from(canonical.file_name()?);
+        Some((RuleOrigin::External, name, Some(Arc::new(parent))))
     }
 
     fn finish(mut self, origin: RuleOrigin, base: &Path) -> RuleScan {
         let mut seen = HashSet::new();
         // The same physical file reached through two links loads once.
-        self.files
-            .retain(|file| seen.insert((file.origin, file.real.clone())));
+        self.files.retain(|file| seen.insert(file.identity()));
         self.files.sort_by(|a, b| a.display.cmp(&b.display));
         if self.files.len() > self.limits.files {
             let skipped: Vec<String> = self

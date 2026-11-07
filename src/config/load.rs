@@ -3743,6 +3743,22 @@ mod project_config_trust_tests {
     }
 
     #[test]
+    fn project_config_cannot_enable_rule_external_symlinks_without_trust() {
+        let (benign, _, sensitive) =
+            split_project_override("rule_external_symlinks = true\nmax_tokens = 1\n").unwrap();
+        assert!(
+            sensitive.contains("rule_external_symlinks"),
+            "{sensitive:?}"
+        );
+        assert!(benign.get("rule_external_symlinks").is_none());
+        // Closed unless configured.
+        assert_eq!(
+            crate::config::Config::default().rule_external_symlinks,
+            None
+        );
+    }
+
+    #[test]
     fn project_config_cannot_enable_user_instruction_files_without_trust() {
         let (benign, _, sensitive) =
             split_project_override("user_instruction_files = true\nmax_tokens = 1\n").unwrap();

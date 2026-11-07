@@ -8,6 +8,7 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- `.claude/rules`: a rule skipped because the context budget is spent is named in the `Rule discovery notices` block, user rules now load after the workspace `AGENTS.md`/`CLAUDE.md`/`.claude/CLAUDE.md` so they cannot starve them, the 1024-entry cap is applied after sorting so survivors never depend on `read_dir` order, a symlinked `.claude/rules` or `~/.claude/rules` directory is followed or reported, and symlinks whose target is inside the workspace load without `user_instruction_files`. New opt-in `rule_external_symlinks` (default off, trust-gated) follows rule links into the home directory (mini-agent-8g87g, mini-agent-vbb4t, mini-agent-uyghh, mini-agent-fddr2).
 - `--no-session` keeps resumable subagent conversations in memory only: no `subagent-resume-store-*.json` is created under the tool-output directory (mini-agent-6myt0).
 - `.claude/rules` discovery is deterministic (sorted traversal) and reports every skipped or truncated rule, directory, link and glob with the limit hit in a `Rule discovery notices` block and a warning; a rule whose `paths:` scope is oversized or unparseable is skipped instead of becoming an always-on rule (mini-agent-z8719).
 - With `user_instruction_files = true`, `~/.claude/rules/**/*.md` is loaded (path-scoped delivery included) and rule symlinks whose canonical target is inside the workspace or `~/.claude/rules` are followed; other links are skipped with a notice (mini-agent-zyifs).

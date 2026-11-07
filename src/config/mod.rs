@@ -999,6 +999,12 @@ pub struct Config {
     /// (mini-agent-4l9rf).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_instruction_files: Option<bool>,
+    /// Opt in to following `.claude/rules` (and `~/.claude/rules`) symlinks
+    /// whose canonical target is anywhere inside the user's home directory
+    /// (never `.git`, markdown files and directories only). Default off; a
+    /// project config can only set it after project trust (mini-agent-fddr2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule_external_symlinks: Option<bool>,
     /// Tool calls of one model turn that run at once (default 4, clamped to 1..=16).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_concurrency: Option<usize>,
