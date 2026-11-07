@@ -863,6 +863,8 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     // perf 2026-10-19: test-only kill/status, thread spawns and a signature type.
     ("src/sandbox.rs", ".spawn(move || {", 2, "NON-PROCESS"),
+    // 2026-11-07: Cli::parse_command_line runs clap on an 8 MiB thread (stack headroom); a thread, not a process.
+    ("src/cli.rs", ".spawn(parse)", 1, "NON-PROCESS"),
     // perf 2026-10-19: test-only kill/status, thread spawns and a signature type.
     (
         "src/sandbox.rs",
@@ -5650,6 +5652,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     // perf 2026-10-19 sites (see UNIFORM_SITES).
     ("src/extras/acp/mod.rs", ".status()", 1, "TEST-ONLY"),
     ("src/sandbox.rs", ".spawn(move || {", 2, "NON-PROCESS"),
+    ("src/cli.rs", ".spawn(parse)", 1, "NON-PROCESS"),
     (
         "src/extras/hooks/subprocess.rs",
         "output.started,",
