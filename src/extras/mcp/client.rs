@@ -1195,11 +1195,14 @@ impl McpClientHandle {
     /// The cached listing of this connection generation, listing (and
     /// bounding) once on first use. Same cell the agent build fills.
     pub async fn cached_tools(&self) -> Result<Arc<ListedTools>, ServiceError> {
-        let peer = self.running_service.peer();
+        // The live generation's peer (like the agent build path): after a
+        // reconnect the original peer is closed and listing on it would fail
+        // and consume the reconnect staleness flag.
+        let peer = self.live_peer();
         self.tools
             .get_or_list(|| {
                 list_bounded_tools(
-                    peer,
+                    &peer,
                     self.options.list_timeout(MCP_LIST_TOOLS_TIMEOUT),
                     &self.options,
                     self.defer,
