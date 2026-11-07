@@ -4556,7 +4556,10 @@ async fn run_headless_goal_rounds_inner(
         .await;
         round_prompt = relieved.prompt;
         relief_usage = relieved.relief_usage;
-        relief_interactions = relieved.relief_interactions;
+        #[cfg(feature = "goal")]
+        {
+            relief_interactions = relieved.relief_interactions;
+        }
         (relieved.turn, relieved.persisted)
     };
     #[cfg(feature = "goal")]
@@ -4991,6 +4994,7 @@ pub(crate) struct RelievedHeadlessTurn {
     pub persisted: bool,
     /// Tool traffic of earlier segments, already persisted; kept so a goal
     /// round counts all of its tool calls (mini-agent-yt0mb).
+    #[cfg_attr(not(feature = "goal"), allow(dead_code))]
     pub relief_interactions: Vec<rig::completion::Message>,
     /// Usage of earlier segments and relief compactions, already charged to
     /// the session; reported with the turn but never charged again.
