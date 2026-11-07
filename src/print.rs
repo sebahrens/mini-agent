@@ -146,6 +146,10 @@ pub(crate) fn spawn_control_reader(
                 break;
             }
         }
+        // No driver can answer from here on: deny pending and future asks.
+        if let Some(state) = crate::headless_control::state() {
+            state.close();
+        }
     });
     rx
 }

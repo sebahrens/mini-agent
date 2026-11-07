@@ -177,6 +177,9 @@ pub(crate) fn classify_line(line: &str) -> Option<ControlLine> {
 
 pub(crate) struct ControlState {
     pending: Mutex<HashMap<String, oneshot::Sender<Reply>>>,
+    /// Set (under the `pending` lock) once stdin is exhausted; later asks are
+    /// denied at once because no driver can answer them.
+    closed: std::sync::atomic::AtomicBool,
     next_id: AtomicU64,
     interrupt: Notify,
     permission: Mutex<Option<PermCheck>>,
@@ -208,6 +211,7 @@ impl ControlState {
     ) -> Self {
         Self {
             pending: Mutex::new(HashMap::new()),
+            closed: std::sync::atomic::AtomicBool::new(false),
             next_id: AtomicU64::new(1),
             interrupt: Notify::new(),
             permission: Mutex::new(permission),
@@ -229,10 +233,13 @@ impl ControlState {
     async fn ask_raw(&self, tool: &str, input: &str) -> Reply {
         let id = format!("perm_{}", self.next_id.fetch_add(1, Ordering::Relaxed));
         let (tx, rx) = oneshot::channel();
-        self.pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(id.clone(), tx);
+        {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            if self.closed.load(Ordering::SeqCst) {
+                return Reply::Deny("the control channel closed".into());
+            }
+            pending.insert(id.clone(), tx);
+        }
         let _guard = PendingGuard {
             state: self,
             id: id.clone(),
@@ -260,6 +267,15 @@ impl ControlState {
                 self.timeout.as_secs()
             )),
         }
+    }
+
+    /// Marks the channel closed (stdin EOF or read error): every pending ask
+    /// is denied now and later asks are denied on arrival.
+    pub(crate) fn close(&self) {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        self.closed.store(true, Ordering::SeqCst);
+        // Dropping the senders resolves each waiter to a deny.
+        pending.clear();
     }
 
     /// Asks the driver to approve running a command outside the sandbox. The
@@ -681,5 +697,23 @@ mod tests {
         let id = pending_id(&state).await;
         state.handle(classify_line(&response(&id, "allow")).unwrap());
         assert_eq!(task.await.unwrap(), Reply::Allow);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn closing_the_channel_denies_pending_and_later_asks_even_with_no_timeout() {
+        let state = std::sync::Arc::new(state(Duration::ZERO));
+        let waiting = std::sync::Arc::clone(&state);
+        let task = tokio::spawn(async move { waiting.ask("write", "x").await });
+        let _ = pending_id(&state).await;
+        state.close();
+        assert_eq!(
+            task.await.unwrap(),
+            Reply::Deny("the control channel closed".into())
+        );
+        assert_eq!(
+            state.ask("bash", "touch x").await,
+            Reply::Deny("the control channel closed".into())
+        );
+        assert!(state.pending_ids().is_empty());
     }
 }
