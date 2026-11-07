@@ -1033,9 +1033,10 @@ fn id_key(id: &Value) -> String {
     id.to_string()
 }
 
-/// Serve until the client closes its end of the stream. Runs still executing
-/// at end of input are allowed to finish and answer; a failed write (client
-/// gone) cancels them.
+/// Serve until the client closes its end of the stream. End of input is
+/// transport retirement: runs still executing are cancelled (and their process
+/// groups killed) at once, since no client remains to read their answers.
+/// Replies already queued by completed work are flushed first.
 pub(crate) async fn serve(
     command: RunCommand,
     input: impl AsyncRead + Send + Unpin + 'static,
@@ -1074,8 +1075,9 @@ pub(crate) async fn serve(
     let mut input_open = true;
     let outcome: anyhow::Result<()> = async {
         loop {
-            if !input_open && tasks.is_empty() {
-                // Calls answer through `reply_rx`; flush what is queued.
+            if !input_open {
+                // Calls answer through `reply_rx`; flush what is queued. Runs
+                // still active are cancelled by the teardown after this loop.
                 while let Ok(reply) = reply_rx.try_recv() {
                     write_message(&mut output, &reply).await?;
                 }
@@ -1451,6 +1453,59 @@ mod tests {
         }
         let _ = std::fs::remove_file(&marker);
         assert!(!survived, "grandchild {grandchild} survived client loss");
+    }
+
+    /// Closing the client's input (EOF, no oversize line, no progress token so
+    /// the silent run never writes) must retire the active run and its whole
+    /// process group at once.
+    #[tokio::test]
+    async fn stdin_eof_retires_a_silent_running_call_and_its_process_group() {
+        let marker = std::env::temp_dir().join(format!(
+            "mini-agent-mcp-eof-{}-{}.pid",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let script = format!("sleep 300 & echo $! > '{}'; wait", marker.display());
+        let (mut client_in, server_in) = tokio::io::duplex(1 << 16);
+        let (server_out, _client_out) = tokio::io::duplex(1 << 16);
+        let server = tokio::spawn(serve(shell(&script), server_in, server_out));
+        let mut bytes = serde_json::to_vec(&call(7, json!({"prompt":"x"}))).unwrap();
+        bytes.push(b'\n');
+        client_in.write_all(&bytes).await.unwrap();
+        for _ in 0..200 {
+            if marker.exists() && !std::fs::read_to_string(&marker).unwrap().trim().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let grandchild: i32 = std::fs::read_to_string(&marker)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        drop(client_in);
+        let served = tokio::time::timeout(Duration::from_secs(10), server).await;
+        let alive =
+            |pid: i32| nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok();
+        for _ in 0..200 {
+            if !alive(grandchild) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let survived = alive(grandchild);
+        if survived {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(grandchild),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        let _ = std::fs::remove_file(&marker);
+        assert!(served.is_ok(), "serve() did not return after stdin EOF");
+        assert!(!survived, "grandchild {grandchild} survived stdin EOF");
     }
 
     #[tokio::test]

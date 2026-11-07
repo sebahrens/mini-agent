@@ -29,6 +29,43 @@ const CLIENT_FS_TIMEOUT: Duration = Duration::from_secs(30);
 const CAN_READ: u8 = 0b01;
 const CAN_WRITE: u8 = 0b10;
 
+/// `_meta` namespace shared with the editor extension for the conditional
+/// write contract. The client advertises
+/// `clientCapabilities._meta.miniAgent.conditionalWriteTextFile = true`, and
+/// every `fs/write_text_file` carries
+/// `_meta.miniAgent.expectedSha256` (lowercase hex SHA-256 of the UTF-8 text
+/// the change was computed from) which the editor must compare against the
+/// live buffer in the same operation that applies the replacement.
+const META_NAMESPACE: &str = "miniAgent";
+const META_CONDITIONAL_CAPABILITY: &str = "conditionalWriteTextFile";
+const META_EXPECTED_SHA256: &str = "expectedSha256";
+
+fn advertises_conditional_write(capabilities: &ClientCapabilities) -> bool {
+    capabilities
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.get(META_NAMESPACE))
+        .and_then(|namespace| namespace.get(META_CONDITIONAL_CAPABILITY))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+}
+
+fn expected_meta(expected: &str) -> agent_client_protocol::schema::v1::Meta {
+    use sha2::{Digest as _, Sha256};
+    let digest = crate::hex::encode_lower(Sha256::digest(expected.as_bytes()));
+    let mut namespace = serde_json::Map::new();
+    namespace.insert(
+        META_EXPECTED_SHA256.to_owned(),
+        serde_json::Value::String(digest),
+    );
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        META_NAMESPACE.to_owned(),
+        serde_json::Value::Object(namespace),
+    );
+    meta
+}
+
 /// Opt-in plus the capabilities the connected client advertised.
 #[derive(Debug, Default)]
 pub(super) struct ClientFsGate {
@@ -54,7 +91,9 @@ impl ClientFsGate {
         if capabilities.fs.read_text_file {
             bits |= CAN_READ;
         }
-        if capabilities.fs.write_text_file {
+        // A plain `writeTextFile` replaces the whole buffer unconditionally, so
+        // it is usable only together with the conditional-write extension.
+        if capabilities.fs.write_text_file && advertises_conditional_write(capabilities) {
             bits |= CAN_WRITE;
         }
         self.advertised.store(bits, Ordering::Release);
@@ -128,13 +167,19 @@ impl ClientFileAccess for AcpClientFs {
         })
     }
 
-    fn write_text<'a>(&'a self, path: &'a Path, content: &'a str) -> ClientFsFuture<'a, ()> {
+    fn write_text<'a>(
+        &'a self,
+        path: &'a Path,
+        content: &'a str,
+        expected: &'a str,
+    ) -> ClientFsFuture<'a, ()> {
         Box::pin(async move {
             let request = WriteTextFileRequest::new(
                 self.session_id.clone(),
                 path.to_path_buf(),
                 content.to_string(),
-            );
+            )
+            .meta(expected_meta(expected));
             tokio::time::timeout(
                 CLIENT_FS_TIMEOUT,
                 self.connection.send_request(request).block_task(),
@@ -153,9 +198,29 @@ mod tests {
     use agent_client_protocol::schema::v1::FileSystemCapabilities;
 
     fn advertising(read: bool, write: bool) -> ClientCapabilities {
+        let mut namespace = serde_json::Map::new();
+        namespace.insert(META_CONDITIONAL_CAPABILITY.into(), true.into());
+        let mut meta = serde_json::Map::new();
+        meta.insert(META_NAMESPACE.into(), namespace.into());
+        ClientCapabilities::new()
+            .fs(FileSystemCapabilities::new()
+                .read_text_file(read)
+                .write_text_file(write))
+            .meta(meta)
+    }
+
+    /// `writeTextFile` without the conditional-write extension.
+    fn advertising_plain_write() -> ClientCapabilities {
         ClientCapabilities::new().fs(FileSystemCapabilities::new()
-            .read_text_file(read)
-            .write_text_file(write))
+            .read_text_file(true)
+            .write_text_file(true))
+    }
+
+    #[test]
+    fn an_unconditional_write_capability_alone_never_opens_the_write_side() {
+        let gate = ClientFsGate::new(true);
+        gate.record(&advertising_plain_write());
+        assert_eq!(gate.advertised.load(Ordering::Acquire), CAN_READ);
     }
 
     #[test]
@@ -193,6 +258,7 @@ mod tests {
         StopReason, WriteTextFileResponse,
     };
     use agent_client_protocol::{Agent, ConnectTo, on_receive_request};
+    use sha2::Digest as _;
     use std::sync::Mutex;
 
     /// A minimal agent that opens the gate on `initialize` and, on `prompt`,
@@ -231,8 +297,9 @@ mod tests {
                                 None => "closed".to_string(),
                                 Some(fs) => {
                                     let read = fs.read_text(Path::new("/ws/a.txt")).await;
-                                    let wrote =
-                                        fs.write_text(Path::new("/ws/a.txt"), "after").await;
+                                    let wrote = fs
+                                        .write_text(Path::new("/ws/a.txt"), "after", "buffer text")
+                                        .await;
                                     format!("{read:?} {wrote:?}")
                                 }
                             };
@@ -267,8 +334,15 @@ mod tests {
             )
             .on_receive_request(
                 async move |req: WriteTextFileRequest, responder, _cx| {
+                    let expected = req
+                        .meta
+                        .as_ref()
+                        .and_then(|meta| meta.get("miniAgent")?.get("expectedSha256"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("missing")
+                        .to_owned();
                     saw_write.lock().unwrap().push(format!(
-                        "write {} {}",
+                        "write {} {} expected={expected}",
                         req.path.display(),
                         req.content
                     ));
@@ -309,7 +383,15 @@ mod tests {
     #[tokio::test]
     async fn open_gate_round_trips_read_and_write_over_the_protocol() {
         let (log, seen) = drive(true, true).await;
-        assert_eq!(seen, ["read /ws/a.txt", "write /ws/a.txt after"]);
+        // sha256("buffer text"): the write carries its precondition.
+        let digest = crate::hex::encode_lower(sha2::Sha256::digest(b"buffer text"));
+        assert_eq!(
+            seen,
+            [
+                "read /ws/a.txt".to_string(),
+                format!("write /ws/a.txt after expected={digest}")
+            ]
+        );
         assert_eq!(log, ["Ok(\"buffer text\") Ok(())"]);
     }
 

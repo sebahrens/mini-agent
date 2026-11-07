@@ -164,6 +164,65 @@ async fn edit_refuses_when_the_buffer_changed_after_it_was_read() {
 }
 
 #[tokio::test]
+async fn overwrite_refuses_when_the_buffer_changes_after_the_read_and_before_the_write_lands() {
+    let fixture = Fixture::new();
+    let path = fixture.disk("a.txt", "disk\n");
+    let client = FakeClient::with(path.clone(), "buffer\n");
+    let tracker = Fixture::tracker(&client);
+    fixture
+        .read(&tracker, "a.txt")
+        .call(read_args("a.txt"))
+        .await
+        .unwrap();
+    // The user types after the agent's last read; the write request then
+    // arrives carrying the old preimage.
+    *client.typed_meanwhile.lock().unwrap() = Some("buffer\nuser typed this\n".into());
+    let error = WriteTool::new_with_tracker(None, None, None, tracker)
+        .with_workspace(fixture.workspace.clone())
+        .call(WriteArgs {
+            path: "a.txt".into(),
+            content: "agent replacement\n".into(),
+            overwrite: true,
+        })
+        .await
+        .map(|_| ())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("changed in the editor"), "{error}");
+    assert_eq!(
+        client.files.lock().unwrap()[&path],
+        "buffer\nuser typed this\n",
+        "the user's text must survive"
+    );
+    assert!(client.writes.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_client_without_the_conditional_write_extension_never_receives_a_write() {
+    let fixture = Fixture::new();
+    let path = fixture.disk("a.txt", "one\n");
+    let client = Arc::new(FakeClient {
+        unconditional_only: true,
+        ..FakeClient::default()
+    });
+    client
+        .files
+        .lock()
+        .unwrap()
+        .insert(path.clone(), "one\ntwo\n".into());
+    let tracker = Fixture::tracker(&client);
+    let _ = EditTool::new_with_tracker(None, None, None, tracker)
+        .with_workspace(fixture.workspace.clone())
+        .call(edit_args("a.txt", "one", "uno"))
+        .await;
+    assert!(
+        client.writes.lock().unwrap().is_empty(),
+        "an unconditional editor write could clobber text typed after the read"
+    );
+    assert_eq!(client.files.lock().unwrap()[&path], "one\ntwo\n");
+}
+
+#[tokio::test]
 async fn a_refused_editor_write_is_reported_and_changes_nothing() {
     let fixture = Fixture::new();
     let path = fixture.disk("a.txt", "one\n");
