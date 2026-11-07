@@ -6884,10 +6884,12 @@ mod tests {
         .await
         .start_interactive();
         let terminal = loop {
-            match runner.event_rx.recv().await.expect("terminal event") {
-                event @ (crate::event::AgentEvent::Done { .. }
-                | crate::event::AgentEvent::Error { .. }) => break event,
-                _ => {}
+            let event = runner.event_rx.recv().await.expect("terminal event");
+            if matches!(
+                event,
+                crate::event::AgentEvent::Done { .. } | crate::event::AgentEvent::Error { .. }
+            ) {
+                break event;
             }
         };
         assert!(
