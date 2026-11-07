@@ -302,6 +302,7 @@ impl McpClientManager {
     pub(crate) fn configured_count(&self) -> Option<usize> {
         self.configured_count
     }
+    #[cfg_attr(not(feature = "acp"), allow(dead_code))]
     pub(crate) fn connectable_count(&self) -> Option<usize> {
         self.connectable_count
     }
