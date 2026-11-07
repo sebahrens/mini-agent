@@ -1064,6 +1064,10 @@ impl BoundDirectory {
         };
         chain = chain.append(global_ignore_matchers(&self.approved_root));
         chain = chain.append(parent_ignore_matchers(&self.approved_root));
+        // Same order as BoundWalker::new and list_entries.
+        if let Some(matcher) = root_exclude_matcher(&self.root, &self.approved_root) {
+            chain = chain.append(vec![matcher]);
+        }
         let mut local_matchers = Vec::new();
         for ignore_name in [".gitignore", ".ignore"] {
             if let Some(matcher) =
@@ -1252,8 +1256,47 @@ impl SkippedDirectories {
     }
 }
 
+/// Bounded record of entries the walk found but could not open (permission
+/// denied, removed mid-walk) or descend into. Callers that promise coverage
+/// (grep) report them instead of treating them as match-free.
+#[derive(Default)]
+pub(super) struct UnopenedEntries {
+    examples: Vec<PathBuf>,
+    count: usize,
+}
+
+impl UnopenedEntries {
+    fn record(&mut self, relative: &Path) {
+        self.count += 1;
+        if self.examples.len() < 5 {
+            self.examples.push(relative.to_path_buf());
+        }
+    }
+
+    /// One-line notice; empty when every entry could be opened.
+    pub(super) fn notice(&self) -> String {
+        if self.count == 0 {
+            return String::new();
+        }
+        let mut names: Vec<String> = self
+            .examples
+            .iter()
+            .map(|path| path.to_string_lossy().replace('\\', "/"))
+            .collect();
+        if self.count > names.len() {
+            names.push(format!("+{} more", self.count - names.len()));
+        }
+        format!(
+            "\n[could not open {} files or directories (permission denied or removed during the walk), so they were not searched: {}; absence of a match does not cover them]",
+            self.count,
+            names.join(", ")
+        )
+    }
+}
+
 pub(crate) struct BoundWalker {
     approved_root: PathBuf,
+    unopened: UnopenedEntries,
     stack: Vec<DirectoryFrame>,
     hidden: Option<PathFilter>,
     remaining_entries: Option<usize>,
@@ -1308,6 +1351,7 @@ impl BoundWalker {
             scratch_relative: PathBuf::new(),
             scratch_approved: PathBuf::new(),
             skipped_directories: SkippedDirectories::default(),
+            unopened: UnopenedEntries::default(),
             stop_path: None,
         })
     }
@@ -1321,6 +1365,10 @@ impl BoundWalker {
     /// Directories this walk skipped as dependency/build output.
     pub(super) fn skipped_directories(&self) -> &SkippedDirectories {
         &self.skipped_directories
+    }
+
+    pub(super) fn unopened(&self) -> &UnopenedEntries {
+        &self.unopened
     }
 }
 
@@ -1440,7 +1488,10 @@ impl Iterator for BoundWalker {
                     }
                     let child = match bound_platform::open_child(&frame.directory, &name) {
                         Ok(child) => child,
-                        Err(_) => continue,
+                        Err(_) => {
+                            self.unopened.record(relative_path);
+                            continue;
+                        }
                     };
                     let metadata = match child.metadata() {
                         Ok(metadata)
@@ -1456,7 +1507,10 @@ impl Iterator for BoundWalker {
                 EntryKind::Unknown => {
                     let child = match bound_platform::open_child(&frame.directory, &name) {
                         Ok(child) => child,
-                        Err(_) => continue,
+                        Err(_) => {
+                            self.unopened.record(relative_path);
+                            continue;
+                        }
                     };
                     let metadata = match child.metadata() {
                         Ok(metadata) if bound_platform::is_safe_entry(&metadata) => metadata,
@@ -1478,10 +1532,14 @@ impl Iterator for BoundWalker {
                     continue;
                 }
                 let matchers = frame.matchers.clone();
-                if let Ok(child_frame) =
-                    DirectoryFrame::new(child, relative_path.clone(), matchers, &self.approved_root)
-                {
-                    self.stack.push(child_frame);
+                match DirectoryFrame::new(
+                    child,
+                    relative_path.clone(),
+                    matchers,
+                    &self.approved_root,
+                ) {
+                    Ok(child_frame) => self.stack.push(child_frame),
+                    Err(_) => self.unopened.record(relative_path),
                 }
                 continue;
             }
@@ -1900,7 +1958,8 @@ impl FindFilesTool {
         FindFilesTool {
             permission,
             ask_tx,
-            max_results,
+            // A zero cap would panic `clamp(1, cap)` and page forever.
+            max_results: max_results.max(1),
             workspace: None,
         }
     }
@@ -3041,6 +3100,32 @@ mod tests {
         assert!(output.starts_with("4 files found (showing first 2):"));
     }
 
+    /// mini-agent-sx8pj: a zero cap used to panic `limit.clamp(1, cap)` and,
+    /// without a limit, page forever with `offset=0`.
+    #[tokio::test]
+    async fn zero_result_cap_does_not_panic_or_return_an_empty_page() {
+        let dir = TempDir::new("zero_cap");
+        for name in ["a.txt", "b.txt"] {
+            std::fs::write(dir.path().join(name), "").unwrap();
+        }
+        for limit in [Some(1), None] {
+            let output = FindFilesTool::new(None, None, 0)
+                .call(FindFilesArgs {
+                    no_ignore: false,
+                    offset: None,
+                    limit,
+                    sort: crate::agent::tools::FindFilesSort::Name,
+                    mode: crate::agent::tools::FindFilesMode::Regex,
+                    pattern: r"\.txt$".to_string(),
+                    path: Some(dir.path().to_string_lossy().into_owned()),
+                })
+                .await
+                .unwrap();
+            assert!(output.contains("a.txt"), "{output}");
+            assert!(!output.contains("offset=0"), "{output}");
+        }
+    }
+
     #[tokio::test]
     async fn mtime_sort_retains_newest_paths_with_stable_ties_and_name_default() {
         let directory = crate::tests::OwnedTestDirectory::new("find-files-mtime");
@@ -3105,6 +3190,34 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// mini-agent-iddn9: the JS directory listing honours `.git/info/exclude`
+    /// like list_dir, and `.gitignore` still outranks it.
+    #[cfg(feature = "js")]
+    #[test]
+    fn js_discovery_listing_honours_git_info_exclude() {
+        let directory = crate::tests::OwnedTestDirectory::new("find-files-js-exclude");
+        std::fs::create_dir_all(directory.path().join(".git/info")).unwrap();
+        std::fs::write(
+            directory.path().join(".git/info/exclude"),
+            "secret.txt\nkept.txt\n",
+        )
+        .unwrap();
+        std::fs::write(directory.path().join(".gitignore"), "!kept.txt\n").unwrap();
+        for name in ["secret.txt", "kept.txt", "plain.txt"] {
+            std::fs::write(directory.path().join(name), "x").unwrap();
+        }
+        let metadata = crate::fs::checked_path_metadata(directory.path()).unwrap();
+        let bound = BoundDirectory::open(directory.path(), &metadata).unwrap();
+        let (entries, _) = bound.list_entries_bounded(100).unwrap();
+        let names: Vec<String> = entries
+            .iter()
+            .map(|entry| entry.file_name.to_string_lossy().into_owned())
+            .collect();
+        assert!(!names.contains(&"secret.txt".to_string()), "{names:?}");
+        assert!(names.contains(&"kept.txt".to_string()), "{names:?}");
+        assert!(names.contains(&"plain.txt".to_string()), "{names:?}");
     }
 
     #[test]

@@ -127,7 +127,7 @@ impl ListDirTool {
         ListDirTool {
             permission,
             ask_tx,
-            max_entries,
+            max_entries: max_entries.map(|cap| cap.max(1)),
             workspace: None,
         }
     }
