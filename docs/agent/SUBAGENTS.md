@@ -71,6 +71,13 @@ identity again after waiting for that lane. Time a call's children spend
 waiting for a lane is not charged to its deadline (see
 [Configuration](#configuration)).
 
+`task_result {"id":"…","wait_secs":120}` blocks (1-600 seconds) until that task settles, so
+the model does not spend a round trip per poll; expiry leaves the task running and the row says
+so. A headless run (`-p`, stream-json) has no later turn: when the model replies while
+background tasks are still running, the process waits up to
+`[subagents] headless_exit_wait_secs` (default 300, at most 3600, `0` cancels at once) for them,
+says so on stderr, and names any that were cancelled when the wait ran out.
+
 Use `task_list`, `task_result {"id":"…"}`, `task_cancel {"id":"…"}` and `task_send` from an
 agent (and `task_evidence`, see [Evidence handles](#evidence-handles)), or `/tasks`, `/tasks result <id>`, `/tasks cancel <id>` and `/tasks clear` from the TUI.
 `task_send {"id":"…","message":"…","task":2}` sends a follow-up message
@@ -1218,6 +1225,7 @@ normal TOML/YAML/JSON mini-agent configuration described in
 | `task_cost_overrides`       | `object` | `{}`                     | Weighting/weights by exact selected quick-model alias |
 | `task_timeout_secs`         | `u64`    | `300`                    | Whole-call wall-clock deadline of foreground calls; completed sibling results and in-flight narration are retained when it expires |
 | `[subagents] task_background_timeout_secs` | `u64` | `3600` | Whole-call deadline of `run_in_background` calls (at most 86400) |
+| `[subagents] headless_exit_wait_secs` | `u64` | `300` | Seconds a headless run waits at exit for running background tasks before cancelling them (at most 3600; `0` cancels at once) |
 | `[subagents] task_max_turns_ceiling` | `usize` | `100` | Highest per-call or persona `max_turns`; larger values are rejected |
 | `[subagents] task_unverified_bytes` | `usize` | `6144` | Raw text of a host-replaced report kept for `/tasks result` (at most 16384) |
 | `[subagents] task_timeout_ceiling_secs` | `u64` | `3600` | Highest per-call or persona `timeout_secs` (at most 86400); larger values are rejected |

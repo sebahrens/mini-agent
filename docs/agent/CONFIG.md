@@ -4703,6 +4703,10 @@ contract entirely and returns the child's text verbatim.
 the host-recorded child evidence store; see
 [Evidence handles](SUBAGENTS.md#evidence-handles) for ceilings and effects.
 
+`[subagents] headless_exit_wait_secs` (default 300, at most 3600; `0` cancels at once) is how
+long a headless run waits at exit for still-running background `task` jobs; see
+[SUBAGENTS.md](SUBAGENTS.md).
+
 `[subagents] task_resume_max_children` (default 16, at most 256) and
 `task_resume_max_bytes` (default 8388608, at most 256 MiB) bound the in-memory
 child conversations that `task {"resume": id}` can continue. A child over the

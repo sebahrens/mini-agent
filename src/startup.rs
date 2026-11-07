@@ -876,6 +876,10 @@ pub(crate) fn spawn_noninteractive_housekeeping(
 
 /// Give a short-lived headless process a moment to finish housekeeping before
 /// it exits; never blocks longer than two seconds.
+/// Default `[subagents] headless_exit_wait_secs`.
+#[cfg(feature = "subagents")]
+const DEFAULT_HEADLESS_EXIT_WAIT_SECS: u64 = 300;
+
 async fn settle_housekeeping(handle: Option<std::thread::JoinHandle<()>>) {
     let Some(handle) = handle else { return };
     for _ in 0..100 {
@@ -2305,6 +2309,39 @@ impl Startup {
         self.session.note_stale_child_ids(self.session_resumed);
     }
 
+    /// Headless runs have no later turn: give still-running background `task`
+    /// jobs a bounded time to finish (`[subagents] headless_exit_wait_secs`,
+    /// default 300, `0` cancels at once) and say so on stderr, including the
+    /// jobs that are then cancelled.
+    #[cfg(feature = "subagents")]
+    async fn wait_background_tasks_before_exit(&self) {
+        let secs = self
+            .cfg
+            .subagents
+            .as_ref()
+            .and_then(|policy| policy.headless_exit_wait_secs)
+            .unwrap_or(DEFAULT_HEADLESS_EXIT_WAIT_SECS)
+            .min(3600);
+        let (active, _) = self.session.background_task_counts();
+        if active == 0 || secs == 0 {
+            return;
+        }
+        eprintln!(
+            "waiting up to {secs} s for {active} background task(s) to finish \
+             ([subagents] headless_exit_wait_secs)"
+        );
+        let left = self
+            .session
+            .wait_background_tasks_within(std::time::Duration::from_secs(secs))
+            .await;
+        if left > 0 {
+            eprintln!(
+                "warning: {left} background task(s) still running after {secs} s were cancelled; \
+                 their results are not in the session"
+            );
+        }
+    }
+
     async fn dispatch_inner(mut self: Box<Self>) -> anyhow::Result<()> {
         session::storage::report_pending_save_notices(&mut self.session, |notice| {
             eprintln!("warning: {notice}")
@@ -2360,6 +2397,8 @@ impl Startup {
                 heap_future(|| self.dispatch_print()).await
             };
             settle_housekeeping(housekeeping).await;
+            #[cfg(feature = "subagents")]
+            self.wait_background_tasks_before_exit().await;
             #[cfg(feature = "subagents")]
             self.session.close_background_tasks().await;
             // Every headless exit ends the session: a failed turn, a
@@ -3170,6 +3209,8 @@ impl Startup {
                     });
             }
         }
+        #[cfg(feature = "subagents")]
+        self.wait_background_tasks_before_exit().await;
         #[cfg(feature = "subagents")]
         self.session.close_background_tasks().await;
         if let Some(owner) = &mut self.native_headless {

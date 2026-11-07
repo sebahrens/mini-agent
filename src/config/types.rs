@@ -63,6 +63,11 @@ pub struct SubagentPolicy {
     /// at most 256 MiB). A larger child gets a host note instead of an id.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_resume_max_bytes: Option<usize>,
+    /// Seconds a headless run (`-p`, stream-json) waits at exit for background
+    /// `task` jobs that are still running before cancelling them (default
+    /// 300, at most 3600; `0` cancels immediately, the previous behaviour).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headless_exit_wait_secs: Option<u64>,
 }
 
 #[cfg(feature = "subagents")]
