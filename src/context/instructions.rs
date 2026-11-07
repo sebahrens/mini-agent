@@ -1121,6 +1121,9 @@ impl WorkspaceInstructions {
         target: &Path,
         extensions: &ToolCallExtensions,
     ) -> Result<Option<ContextNotice>, ToolError> {
+        // The file the agent works on can activate `paths:`-scoped skills.
+        #[cfg(feature = "agent-skills")]
+        crate::extras::skills::touched::record(self.workspace.root(), target);
         let cache = self.clone();
         let target = target.to_owned();
         let (sources, omitted) = instruction_blocking(move || cache.load_with_omissions(&target))

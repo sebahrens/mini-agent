@@ -104,9 +104,13 @@ that `context: fork` was not applied. Frontmatter keys beyond that:
   unconfigured model; the main conversation keeps the session model. Without `context: fork` the
   key is reported as not applied.
 - `paths` (list or comma string of globs, at most 32): scoped activation. Such a skill joins
-  automatic selection only when the request names a file matching one of the globs; `/<name>`
-  pinning and `skills_search` are unaffected. Invalid globs are dropped and an unusable value is
-  reported.
+  automatic selection only when (a) the request names a matching file (relative, `@`-mention,
+  absolute under the workspace, or a bare filename such as `lib.rs` that fits a glob's final
+  segment; the whole request up to 256 KiB is scanned, not only the 8 KiB retrieval window), or
+  (b) the session already read, edited, wrote or listed a matching workspace file (re-evaluated at
+  every turn; the record is bounded to 512 files per workspace and holds only workspace-relative
+  paths). It activates from the next turn after the file was touched. `/<name>` pinning and
+  `skills_search` are unaffected. Invalid globs are dropped and an unusable value is reported.
 - `effort` and `hooks` are reported with a reason and not applied: a task child has no per-call
   reasoning effort and an inline skill must not change the session effort; skill-scoped hooks would
   run commands named by the skill package, so use the user-configured `[hooks]` instead. Builtins and custom command templates take precedence;
