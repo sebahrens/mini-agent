@@ -3646,7 +3646,7 @@ mod project_config_trust_tests {
         };
         let local: toml::Value =
             toml::from_str("max_read_lines = 0\nmax_grep_results = 0\n").unwrap();
-        let mut merged = super::merge_config_value(&base, local).unwrap();
+        let merged = super::merge_config_value(&base, local).unwrap();
         assert_eq!(merged.max_read_lines, Some(500));
         assert_eq!(merged.max_grep_results, None);
         assert!(merged.validate_tool_limits().is_ok());
