@@ -1734,6 +1734,60 @@ async fn mcp_tool_call_with_progress_outlives_the_idle_timeout_but_not_the_ceili
     fixture.cleanup();
 }
 
+// mini-agent-ys16l: an abandoned call must still finish its request inside rmcp,
+// which is what removes the progress-reset watcher from the peer.
+#[tokio::test]
+async fn mcp_abandoned_call_still_completes_its_request_so_the_watcher_is_released() {
+    let fixture = FixtureBuild::compile();
+    let lease = fixture.lease("hang-tools-call");
+    let handle = McpClientHandle::connect(
+        CompactString::new("fixture"),
+        &fixture.config(
+            fixture.executable.display().to_string(),
+            Vec::new(),
+            "hang-tools-call",
+            &lease,
+        ),
+    )
+    .await
+    .unwrap();
+    let params =
+        || rmcp::model::CallToolRequestParams::new("probe").with_arguments(serde_json::Map::new());
+    let metrics = tokio::runtime::Handle::current().metrics();
+    let baseline = metrics.num_alive_tasks();
+    let peer = handle.peer();
+    let _ = tokio::time::timeout(
+        Duration::from_millis(100),
+        crate::extras::mcp::client::call_tool_with_ceiling(
+            &peer,
+            params(),
+            Duration::from_millis(600),
+            Duration::from_secs(30),
+        ),
+    )
+    .await;
+    // Right after the drop the request is still owned by a task that will run
+    // rmcp's own cleanup...
+    assert!(
+        metrics.num_alive_tasks() > baseline,
+        "the abandoned request must stay owned until rmcp releases its watcher"
+    );
+    // ...and it ends once the idle timeout fires.
+    let mut ended = false;
+    for _ in 0..40 {
+        if metrics.num_alive_tasks() <= baseline + 1 {
+            ended = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(ended, "the abandoned request must end at the idle timeout");
+    McpClientManager::from_handles(vec![handle])
+        .shutdown()
+        .await;
+    fixture.cleanup();
+}
+
 #[tokio::test]
 async fn mcp_progress_notifications_become_live_previews_for_the_call() {
     let fixture = FixtureBuild::compile();

@@ -1424,7 +1424,17 @@ async fn call_tool_with_display(
     // (a user interrupt or a cancelled turn) would leave a side-effecting tool
     // running. The guard sends `notifications/cancelled` unless the call ended.
     let mut guard = CancelOnDrop::new(peer, handle.id.clone());
-    let outcome = handle.await_response().await;
+    // `await_response` is the only code that removes the progress-reset watcher
+    // from the peer (its map is private), and it cannot be resumed once its
+    // future is dropped. So the wait runs in its own task: abandoning this call
+    // sends the cancel notification, while the task still ends the request on
+    // its own (the server's reply to the cancel, or the idle/ceiling timeout)
+    // and removes the watcher, instead of leaking one entry per abandoned call.
+    let (done, outcome) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let _ = done.send(handle.await_response().await);
+    });
+    let outcome = outcome.await.unwrap_or(Err(ServiceError::TransportClosed));
     guard.disarm();
     match outcome? {
         ServerResult::CallToolResult(result) => Ok(result),
