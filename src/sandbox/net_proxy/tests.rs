@@ -372,6 +372,8 @@ async fn unix_socket_route_applies_the_same_token_and_destination_rules() {
         NetworkProxy::start_with_socket(rules(&["localhost", "169.254.169.254"]), Arc::default())
             .unwrap();
     let path = proxy.socket_path().unwrap().to_path_buf();
+    // No host loopback listener: the token alone must not make it reachable.
+    assert_eq!(proxy.port(), 0, "socket-only proxy must not bind TCP");
     let dir_mode = std::fs::metadata(path.parent().unwrap())
         .unwrap()
         .permissions()

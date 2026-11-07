@@ -4488,9 +4488,7 @@ impl Sandbox {
         let mut cmd = Command::new(bwrap);
         cmd.env_clear();
         cmd.arg("--clearenv");
-        for (key, value) in env {
-            cmd.arg("--setenv").arg(key).arg(value);
-        }
+        bwrap_set_env(&mut cmd, env)?;
         if self.profile != SandboxProfile::Workspace {
             cmd.args([
                 if self.profile == SandboxProfile::HostFull {
@@ -4761,15 +4759,28 @@ impl Sandbox {
         git_metadata: git_metadata::BwrapGitMetadataBinds,
         read_roots: &read_roots::BwrapReadRoots,
     ) -> Result<Command, String> {
-        let mut cmd =
-            self.build_bwrap_base_command(bwrap, cwd, cache_dir, git_metadata, read_roots)?;
-        let sandbox_cwd = self.sandbox_cwd(cwd);
-        let deny_network = !self.network.allows();
         // `sandbox-network = "allowlist"`: the namespace stays empty
         // (`--unshare-net`); the only way out is a Unix socket to the host
         // filtering proxy, relayed onto the namespace's own loopback by the
         // forwarder helper that starts the command.
         let proxy = self.network_proxy()?;
+        #[cfg(unix)]
+        let proxy_env = proxy
+            .as_deref()
+            .map(bwrap_forwarder_env)
+            .unwrap_or_default();
+        #[cfg(not(unix))]
+        let proxy_env: Vec<(OsString, OsString)> = Vec::new();
+        let mut cmd = self.build_bwrap_base_command(
+            bwrap,
+            cwd,
+            cache_dir,
+            git_metadata,
+            read_roots,
+            &proxy_env,
+        )?;
+        let sandbox_cwd = self.sandbox_cwd(cwd);
+        let deny_network = !self.network.allows();
         if (!deny_network || proxy.is_some()) && self.profile == SandboxProfile::Workspace {
             // The workspace profile exposes only a synthetic /etc; resolver
             // and CA configuration must be visible for the opt-in to work.
@@ -4824,7 +4835,7 @@ impl Sandbox {
         read_roots: &read_roots::BwrapReadRoots,
     ) -> Result<Command, String> {
         let mut cmd =
-            self.build_bwrap_base_command(bwrap, cwd, cache_dir, git_metadata, read_roots)?;
+            self.build_bwrap_base_command(bwrap, cwd, cache_dir, git_metadata, read_roots, &[])?;
         let executable = if self.profile == SandboxProfile::Workspace {
             cmd.args(["--dir", "/run", "--dir", "/run/mini-agent"]);
             SNAPSHOT_EXECUTABLE_PATH
@@ -4856,6 +4867,7 @@ impl Sandbox {
         cache_dir: &Path,
         git_metadata: git_metadata::BwrapGitMetadataBinds,
         read_roots: &read_roots::BwrapReadRoots,
+        extra_env: &[(OsString, OsString)],
     ) -> Result<Command, String> {
         let layout =
             workspace_layout::WorkspaceLayout::new(self.workspace_binding.as_deref(), cwd)?;
@@ -4875,6 +4887,7 @@ impl Sandbox {
         }
         let mut cmd = Command::new(bwrap);
         cmd.arg("--clearenv");
+        let mut sandbox_env: Vec<(OsString, OsString)> = Vec::new();
         let mut host_path = None;
         let extra = self.shell_env_extra();
         let layered = self
@@ -4891,12 +4904,15 @@ impl Sandbox {
                 host_path = Some(value);
                 continue;
             }
-            cmd.arg("--setenv").arg(key).arg(value);
+            sandbox_env.push((OsString::from(key), OsString::from(value)));
         }
         if let Some(path) = read_roots.sandbox_path(host_path.map(OsStr::new)) {
-            cmd.arg("--setenv").arg("PATH").arg(path);
+            sandbox_env.push((OsString::from("PATH"), path));
         }
-        cmd.args(["--setenv", "TMPDIR", "/tmp"]);
+        sandbox_env.push((OsString::from("TMPDIR"), OsString::from("/tmp")));
+        sandbox_env.extend(extra_env.iter().cloned());
+        // Values (opt-in secrets, the proxy token) stay out of argv.
+        bwrap_set_env(&mut cmd, &sandbox_env)?;
         if host {
             cmd.args([
                 if self.profile == SandboxProfile::HostFull {
@@ -7697,6 +7713,93 @@ fn append_bwrap_isolation(
     command.arg("--chdir").arg(cwd);
 }
 
+/// Descriptor number that carries bwrap's `--args` block.
+#[cfg(target_os = "linux")]
+const BWRAP_ARGS_FD: i32 = 196;
+
+#[cfg(test)]
+thread_local! {
+    /// The environment most recently routed through a bwrap `--args` block on
+    /// this thread, so tests can inspect what no longer appears in argv.
+    static LAST_BWRAP_ENV: std::cell::RefCell<Vec<(OsString, OsString)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Set the sandbox environment for bwrap without putting it in argv.
+///
+/// `/proc/<pid>/cmdline` of the long-lived bwrap process is world-readable,
+/// so `--setenv KEY VALUE` there would leak opt-in secrets and the network
+/// proxy token to every local user. bwrap reads the same `--setenv` triples
+/// from an anonymous in-memory file passed as `--args FD` instead. Must come
+/// after `--clearenv`.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn bwrap_set_env(cmd: &mut Command, env: &[(OsString, OsString)]) -> Result<(), String> {
+    use std::io::{Seek, SeekFrom, Write};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::process::CommandExt;
+
+    #[cfg(test)]
+    LAST_BWRAP_ENV.with(|last| *last.borrow_mut() = env.to_vec());
+    let mut bytes = Vec::new();
+    for (key, value) in env {
+        if key.as_bytes().contains(&0) || value.as_bytes().contains(&0) {
+            return Err("sandbox: environment entries must not contain NUL".into());
+        }
+        bytes.extend_from_slice(b"--setenv\0");
+        bytes.extend_from_slice(key.as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(value.as_bytes());
+        bytes.push(0);
+    }
+    // SAFETY: memfd_create returns a fresh descriptor that we own.
+    let raw = unsafe { libc::memfd_create(c"mini-agent-bwrap-env".as_ptr(), libc::MFD_CLOEXEC) };
+    if raw == -1 {
+        return Err(format!(
+            "sandbox: failed to create the bwrap environment block: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: `raw` is a valid descriptor not owned by anything else.
+    let mut file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(raw) });
+    file.write_all(&bytes)
+        .and_then(|()| file.seek(SeekFrom::Start(0)).map(drop))
+        .map_err(|error| format!("sandbox: failed to stage the bwrap environment: {error}"))?;
+    let fd = file.as_raw_fd();
+    // SAFETY: only async-signal-safe libc calls run between fork and exec.
+    unsafe {
+        cmd.as_std_mut().pre_exec(move || {
+            let _keep_block_alive = &file;
+            if libc::dup2(fd, BWRAP_ARGS_FD) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // dup2 is a no-op when the descriptors are equal; clear CLOEXEC either way.
+            let flags = libc::fcntl(BWRAP_ARGS_FD, libc::F_GETFD);
+            if flags == -1
+                || libc::fcntl(BWRAP_ARGS_FD, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    cmd.arg("--args").arg(BWRAP_ARGS_FD.to_string());
+    Ok(())
+}
+
+/// bwrap only runs on Linux; elsewhere (unit tests that inspect the command
+/// line) the arguments are spelled out directly.
+#[cfg(not(target_os = "linux"))]
+fn bwrap_set_env(cmd: &mut Command, env: &[(OsString, OsString)]) -> Result<(), String> {
+    #[cfg(test)]
+    LAST_BWRAP_ENV.with(|last| *last.borrow_mut() = env.to_vec());
+    for (key, value) in env {
+        cmd.arg("--setenv").arg(key).arg(value);
+    }
+    Ok(())
+}
+
 /// Where the forwarder helper and the proxy socket appear inside a `bwrap`
 /// namespace. `/dev` is a fresh tmpfs under every profile.
 #[cfg(unix)]
@@ -7704,9 +7807,29 @@ const BWRAP_FORWARDER_EXECUTABLE: &str = "/dev/mini-agent-net-forwarder";
 #[cfg(unix)]
 const BWRAP_FORWARDER_SOCKET: &str = "/dev/mini-agent-net-proxy.sock";
 
-/// Mount the proxy socket and this executable (read-only) into the namespace,
-/// export the proxy variables, and return the argv prefix that runs the
-/// command behind the forwarder. Must come after `--dev /dev`.
+/// Proxy variables (including the per-process token) for a command behind the
+/// forwarder; routed through bwrap's `--args` block, never argv.
+#[cfg(unix)]
+fn bwrap_forwarder_env(proxy: &net_proxy::NetworkProxy) -> Vec<(OsString, OsString)> {
+    let mut env: Vec<(OsString, OsString)> = proxy
+        .env_for_forwarder()
+        .into_iter()
+        .map(|(key, value)| (OsString::from(key), OsString::from(value)))
+        .collect();
+    // Operator-set relay cap (host environment only; never project config).
+    if let Ok(raw) = std::env::var(net_forwarder::MAX_RELAYS_ENV) {
+        env.push((
+            OsString::from(net_forwarder::MAX_RELAYS_ENV),
+            OsString::from(net_forwarder::parse_max_relays(Some(&raw)).to_string()),
+        ));
+    }
+    env
+}
+
+/// Mount the proxy socket and this executable (read-only) into the namespace
+/// and return the argv prefix that runs the command behind the forwarder
+/// (its environment comes from [`bwrap_forwarder_env`]). Must come after
+/// `--dev /dev`.
 #[cfg(unix)]
 fn bwrap_forwarder_launcher(
     cmd: &mut Command,
@@ -7725,15 +7848,6 @@ fn bwrap_forwarder_launcher(
         .arg(&executable)
         .arg(BWRAP_FORWARDER_EXECUTABLE);
     cmd.arg("--bind").arg(socket).arg(BWRAP_FORWARDER_SOCKET);
-    for (key, value) in proxy.env_for_forwarder() {
-        cmd.arg("--setenv").arg(key).arg(value);
-    }
-    // Operator-set relay cap (host environment only; never project config).
-    if let Ok(raw) = std::env::var(net_forwarder::MAX_RELAYS_ENV) {
-        cmd.arg("--setenv")
-            .arg(net_forwarder::MAX_RELAYS_ENV)
-            .arg(net_forwarder::parse_max_relays(Some(&raw)).to_string());
-    }
     Ok(vec![
         OsString::from(BWRAP_FORWARDER_EXECUTABLE),
         OsString::from(net_forwarder::FORWARDER_ARG),
@@ -9832,10 +9946,12 @@ mod sandbox_tests {
             );
         }
 
-        let path = args
-            .windows(3)
-            .find(|w| w[0] == "--setenv" && w[1] == "PATH")
-            .map(|w| w[2].clone());
+        // The environment travels through bwrap's `--args` block, never argv.
+        let routed = LAST_BWRAP_ENV.with(|last| last.borrow().clone());
+        let path = routed
+            .iter()
+            .find(|(key, _)| key == "PATH")
+            .map(|(_, value)| value.to_string_lossy().into_owned());
         let host_path = sandbox
             .get_essential_env()
             .iter()
@@ -9845,10 +9961,7 @@ mod sandbox_tests {
             path.map(OsString::from),
             read_roots.sandbox_path(host_path.as_deref().map(OsStr::new))
         );
-        let path_settings = args
-            .windows(2)
-            .filter(|w| w[0] == "--setenv" && w[1] == "PATH")
-            .count();
+        let path_settings = routed.iter().filter(|(key, _)| key == "PATH").count();
         assert!(path_settings <= 1, "PATH is set at most once: {args:?}");
         if host_path.is_some() {
             assert_eq!(path_settings, 1);

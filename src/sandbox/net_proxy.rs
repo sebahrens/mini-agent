@@ -351,9 +351,20 @@ impl NetworkProxy {
         } else {
             (None, None)
         };
-        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
-        listener.set_nonblocking(true)?;
-        let port = listener.local_addr()?.port();
+        // A Unix-socket proxy (bwrap) needs no host loopback listener: binding
+        // one would let any local process that learns the token borrow it.
+        #[cfg(unix)]
+        let tcp_needed = !with_socket;
+        #[cfg(not(unix))]
+        let tcp_needed = true;
+        let (listener, port) = if tcp_needed {
+            let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+            listener.set_nonblocking(true)?;
+            let port = listener.local_addr()?.port();
+            (Some(listener), port)
+        } else {
+            (None, 0)
+        };
         let token = uuid::Uuid::new_v4().simple().to_string();
         let expected_auth = format!(
             "Basic {}",
@@ -397,6 +408,10 @@ impl NetworkProxy {
                             }
                         });
                     }
+                    let Some(listener) = listener else {
+                        // Socket-only proxy: keep serving the Unix listener.
+                        return std::future::pending().await;
+                    };
                     let Ok(listener) = TcpListener::from_std(listener) else {
                         return;
                     };
