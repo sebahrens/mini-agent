@@ -109,6 +109,7 @@ fn scope_cap(scope: &str, default_cap: usize) -> usize {
 }
 
 /// Effective cap of the active provider/model scope.
+#[cfg(test)]
 pub(crate) fn image_cap() -> usize {
     let (scope, default_cap) = lock(&ACTIVE)
         .clone()

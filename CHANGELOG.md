@@ -8,6 +8,8 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Added
 
+- `compact_size_fraction` (default 0.75; `0` disables) starts automatic compaction, between turns and at tool-batch boundaries, when the encoded session nears the 32 MiB save ceiling, so image-heavy sessions compact before saving stops (mini-agent-fmmhs).
+- TUI compaction on the session model over Anthropic or OpenAI forks the conversation's own request (same system prompt, tools and prefix, tools disabled) so the summary reads the prompt cache; other routes, a `compaction_model`, sessions with images or native replay history keep the text summarizer (mini-agent-o2nut).
 - Headless JSON and stream-json `result` records carry `duration_ms`, `num_turns`, `is_error` and `total_cost_usd` (alongside `cost`) (mini-agent-494ld).
 - `--stream-json-schema claude` (opt-in; default output unchanged) emits Claude Code SDK-shaped `assistant`, `user`, `stream_event` and `result` messages for `-p --output stream-json`, with a mapping table in GET_STARTED.md (mini-agent-wfso7).
 - Persona frontmatter `background: true` (delegations detach as background tasks), `memory: user|project|local` (private notes directory injected at start and writable through an `agent_memory` tool) and `hooks:` (scoped to the child's tool calls) are now implemented; memory and hooks are opt-in via `[subagents] agent_memory` / `agent_hooks` (mini-agent-scu2y).
@@ -16,6 +18,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- Gemini per-minute `429 RESOURCE_EXHAUSTED` ("You exceeded your current quota") is retried instead of reported as exhausted billing; daily limits and bodies with no retry hint stay terminal. A `RetryInfo.retryDelay` or "Please retry/try again in Ns" body hint now sets the retry wait (clamped by the hint ceiling), and every 5xx except 501 (Cloudflare 520-524/530 included) plus truncated-body transport errors are retried (mini-agent-vmolg, mini-agent-97op2, mini-agent-jhkei).
+- The image request cap is tracked per provider/model instead of process-wide (OpenAI and Gemini start at 100 images), omitted older images are announced as a notice, and a prompt carrying more images than the provider accepts is refused with a clear message (mini-agent-2ogpw).
+- Session titles on reasoning models no longer come back empty: the request drops Anthropic thinking, lowers high reasoning effort to `low`, allows 1024 output tokens and retries once with 4096 on an empty reply (mini-agent-mc9cb).
 - Remote MCP servers: a mid-session transport drop is now repaired automatically before the next tool call (5 attempts, 1 s doubling backoff, shown as pending then failed in `/mcp`; in-flight calls are never replayed; stdio stays manual), and the first HTTP connection is retried up to 3 times on timeouts, refused connections and 5xx (auth and 4xx are final) (mini-agent-tj7na, mini-agent-kxtgo).
 - Persona `memory:`/`hooks:` declared while `[subagents] agent_memory`/`agent_hooks` are off now say so in the `task` result, and persona hooks name every dropped event (e.g. `PostToolUse`, `Stop`) or non-command handler at load; SUBAGENTS.md states handlers are forced into the hook sandbox (mini-agent-uree1, mini-agent-j4qhn).
 - Skills: positional `$N` is substituted only when arguments were given and never inside fenced code (`$$1` is a literal `$1`); `context: fork` renders inline with a notice when the `task` tool is not advertised (mini-agent-jvods, mini-agent-ey4o7).

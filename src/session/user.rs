@@ -256,6 +256,37 @@ mod tests {
         assert!(!small.size_pressure(Some(0.75)));
     }
     #[test]
+    fn history_prefix_conversion_leaves_the_session_cache_and_messages_alone() {
+        let mut session = crate::session::Session::new("logical", "model", 32_000, "");
+        session.add_user_message(
+            PersistedUserMessage::new(vec![UserBlock::Text { text: "one".into() }]).unwrap(),
+        );
+        session.add_message(crate::session::MessageRole::Assistant, "two");
+        session.add_user_message(
+            PersistedUserMessage::new(vec![UserBlock::Text {
+                text: "three".into(),
+            }])
+            .unwrap(),
+        );
+        assert!(!session.prefix_has_images(3));
+        let full = crate::agent::runner::convert_history_shared_with_tool_result_retention(
+            &session,
+            usize::MAX,
+        );
+        let prefix = crate::agent::runner::convert_history_prefix(&session, 2, usize::MAX);
+        assert_eq!(prefix.len(), 2);
+        assert_eq!(session.messages.len(), 3);
+        let again = crate::agent::runner::convert_history_shared_with_tool_result_retention(
+            &session,
+            usize::MAX,
+        );
+        assert_eq!(again.len(), full.len(), "the full history is still served");
+        assert_eq!(full.len(), 3);
+        session.add_user_message(PersistedUserMessage::new(vec![image(b"px")]).unwrap());
+        assert!(session.prefix_has_images(4));
+        assert!(!session.prefix_has_images(3));
+    }
+    #[test]
     fn canonical_user53_order_survives_storage_and_converter() {
         let user = PersistedUserMessage::new(vec![
             UserBlock::Text {

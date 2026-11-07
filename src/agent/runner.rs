@@ -3157,6 +3157,20 @@ pub fn convert_history_shared_with_tool_result_retention(
     history
 }
 
+/// The history the conversation sent for the first `end` session messages, for
+/// a cache-reusing compaction fork. Never touches the session's conversion
+/// cache: the truncated copy would otherwise poison it.
+pub(crate) fn convert_history_prefix(
+    session: &Session,
+    end: usize,
+    keep_recent_tool_results: usize,
+) -> Vec<Message> {
+    let mut prefix = session.clone();
+    prefix.messages.truncate(end);
+    prefix.mark_history_changed();
+    convert_history_uncached(&prefix, keep_recent_tool_results, false)
+}
+
 /// Rewrites a persisted tool identity into one that is safe to replay on its
 /// own.
 ///

@@ -1427,6 +1427,7 @@ impl AnyClient {
 
     /// A title-only completion with an observed-usage ledger surviving failure
     /// or cancellation. No tools, suffix, session history, or detached work.
+    #[cfg(test)]
     pub(crate) async fn title_completion(
         &self,
         request: &crate::session::title::TitleRequest,
@@ -2352,30 +2353,53 @@ where
     M: CompletionModel + 'static,
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
 {
+    run_summarizer_with(
+        || {
+            let request = model
+                .completion_request(prompt.clone())
+                .preamble(preamble.clone())
+                .max_tokens(max_output_tokens);
+            async move { Ok(request) }
+        },
+        retry_config,
+        observed,
+    )
+    .await
+}
+
+async fn run_summarizer_with<M, F, Fut>(
+    make_request: F,
+    retry_config: &RetryConfig,
+    observed: crate::spend::run::UsageObserver,
+) -> anyhow::Result<(String, rig::completion::Usage)>
+where
+    M: CompletionModel + 'static,
+    M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
+    F: Fn() -> Fut,
+    Fut: std::future::Future<
+            Output = Result<
+                rig::completion::CompletionRequestBuilder<M>,
+                rig::completion::CompletionError,
+            >,
+        > + Send
+        + 'static,
+{
     let config = retry_config.bounded();
     let max_backoff = Duration::from_millis(config.max_backoff_ms);
     let mut backoff = Duration::from_millis(config.initial_backoff_ms);
     let mut attempt = 0usize;
     loop {
         attempt += 1;
-        match run_summarizer_attempt(
-            &model,
-            &prompt,
-            &preamble,
-            max_output_tokens,
-            retry_config,
-            &observed,
-            |error| {
-                (attempt < config.max_attempts && retry::is_retryable(error)).then(|| {
-                    retry::retry_delay_for_error_with_hint_ceiling(
-                        backoff,
-                        max_backoff,
-                        config.hint_ceiling(),
-                        error,
-                    )
-                })
-            },
-        )
+        match run_summarizer_attempt(&make_request, retry_config, &observed, |error| {
+            (attempt < config.max_attempts && retry::is_retryable(error)).then(|| {
+                retry::retry_delay_for_error_with_hint_ceiling(
+                    backoff,
+                    max_backoff,
+                    config.hint_ceiling(),
+                    error,
+                )
+            })
+        })
         .await
         {
             Ok(done) => return Ok(done),
@@ -2393,11 +2417,44 @@ where
     }
 }
 
-async fn run_summarizer_attempt<M>(
-    model: &M,
-    prompt: &str,
-    preamble: &str,
+/// Cache-safe fork summary: the main agent's own request (system prompt, tool
+/// definitions, sampling parameters) over `history`, with the summarize
+/// instruction appended as the final user turn and tool calls disabled. The
+/// prefix matches the conversation's earlier requests, so a native
+/// prompt-cache route bills it at the cache-read rate (mini-agent-o2nut).
+async fn run_forked_summarizer<M>(
+    agent: &rig::agent::Agent<M>,
+    history: Vec<Message>,
+    instruction: String,
     max_output_tokens: u64,
+    retry_config: &RetryConfig,
+    observed: crate::spend::run::UsageObserver,
+) -> anyhow::Result<(String, rig::completion::Usage)>
+where
+    M: CompletionModel + 'static,
+    M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
+{
+    use rig::completion::Completion as _;
+    run_summarizer_with(
+        || {
+            let (agent, history, instruction) =
+                (agent.clone(), history.clone(), instruction.clone());
+            async move {
+                Ok(agent
+                    .completion(Message::user(instruction), history)
+                    .await?
+                    .tool_choice(rig::message::ToolChoice::None)
+                    .max_tokens(max_output_tokens))
+            }
+        },
+        retry_config,
+        observed,
+    )
+    .await
+}
+
+async fn run_summarizer_attempt<M, F, Fut>(
+    make_request: &F,
     retry_config: &RetryConfig,
     observed: &crate::spend::run::UsageObserver,
     midstream_delay: impl Fn(&rig::completion::CompletionError) -> Option<Duration>,
@@ -2405,8 +2462,16 @@ async fn run_summarizer_attempt<M>(
 where
     M: CompletionModel + 'static,
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
+    F: Fn() -> Fut,
+    Fut: std::future::Future<
+            Output = Result<
+                rig::completion::CompletionRequestBuilder<M>,
+                rig::completion::CompletionError,
+            >,
+        > + Send
+        + 'static,
 {
-    let (prompt, preamble, observed) = (prompt.to_owned(), preamble.to_owned(), observed.clone());
+    let observed = observed.clone();
     use futures::{StreamExt, TryStreamExt};
     use rig::completion::GetTokenUsage;
     use rig::streaming::StreamedAssistantContent;
@@ -2414,10 +2479,7 @@ where
     // usage event. These requests never have tools: consume one raw stream and
     // observe its canonical Final before validation, just like title requests.
     let mut stream = retry::retry_stream_chat(retry_config, || {
-        let request = model
-            .completion_request(prompt.clone())
-            .preamble(preamble.clone())
-            .max_tokens(max_output_tokens);
+        let request = make_request();
         let observed = observed.clone();
         async move {
             let prior =
@@ -2431,7 +2493,7 @@ where
                         crate::spend::run::BUDGET_STOP.into(),
                     )
                 })?;
-                let stream = request.stream().await?;
+                let stream = request.await?.stream().await?;
                 opening.opened();
                 Ok::<_, rig::completion::CompletionError>(stream)
             })
@@ -2693,6 +2755,26 @@ where
         "Git proposal stream lacked a final response or requested tools"
     );
     Ok(answer)
+}
+
+/// The final user turn of a forked (cache-reusing) summarization request: the
+/// summarizer contract plus the user's compression preference, applied to the
+/// conversation that precedes it.
+fn fork_instruction(instructions: Option<&str>) -> String {
+    let mut text = summarizer_preamble();
+    text.push_str(
+        "\n\n---\n\nThis message is a summarization request, not a continuation of the work. \
+         Do not call tools and do not answer the conversation. Summarize the entire conversation \
+         above, including any earlier compaction summary it begins with, following the contract above.",
+    );
+    if let Some(instructions) = instructions {
+        text.push_str(
+            "\n\nUser compression preference (lower priority than the summarization contract above):\n<user_instructions>\n",
+        );
+        text.push_str(&defang_closing_tags(instructions, COMPACTION_MESSAGE_TAGS));
+        text.push_str("\n</user_instructions>");
+    }
+    text
 }
 
 fn summarizer_preamble() -> String {
@@ -3932,6 +4014,83 @@ impl NativeTurnBinding {
 }
 
 impl AnyAgent {
+    /// Whether this agent's route has a native prompt cache a forked
+    /// summarization request can reuse (Anthropic `cache_control`, OpenAI
+    /// `prompt_cache_key`). Other routes keep the text-serialized summarizer.
+    pub(crate) fn supports_cache_fork(&self) -> bool {
+        matches!(
+            self.inner,
+            AnyAgentInner::Anthropic(_) | AnyAgentInner::OpenAI(_)
+        )
+    }
+
+    /// Cache-safe fork compaction (mini-agent-o2nut): summarizes `history`
+    /// (the converted prefix the conversation already sent) through this very
+    /// agent, so the system prompt, tool definitions and message prefix match
+    /// earlier requests and bill at the cache-read rate. The summarize
+    /// instruction is the final user turn and tool calls are disabled.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Mirrors compress_messages_observed_with_timeout"
+    )]
+    pub(crate) async fn compress_forked(
+        &self,
+        history: Vec<Message>,
+        messages_included: usize,
+        instructions: Option<&str>,
+        input_token_budget: u64,
+        response_token_budget: u64,
+        retry_config: &RetryConfig,
+        observed: crate::spend::run::UsageObserver,
+        request_timeout: Option<Duration>,
+    ) -> anyhow::Result<CompactionOutput> {
+        let request_timeout = request_timeout
+            .unwrap_or_else(|| default_compaction_request_timeout(input_token_budget));
+        let instruction = fork_instruction(instructions);
+        let (prompt_budget, max_output_tokens) =
+            compaction_request_limits(input_token_budget, response_token_budget, instruction.len());
+        let summary_byte_cap =
+            rolling_summary_byte_cap(input_token_budget.saturating_add(response_token_budget));
+        let summary_byte_budget =
+            compaction_payload_budgets_capped(instructions, prompt_budget, summary_byte_cap)?.0;
+        macro_rules! fork {
+            ($agent:expr) => {
+                run_forked_summarizer(
+                    $agent,
+                    history,
+                    instruction,
+                    max_output_tokens,
+                    retry_config,
+                    observed,
+                )
+            };
+        }
+        let work = async {
+            match &self.inner {
+                AnyAgentInner::Anthropic(agent) => fork!(agent).await,
+                AnyAgentInner::OpenAI(OpenAiAgent::Responses(agent)) => fork!(agent).await,
+                AnyAgentInner::OpenAI(OpenAiAgent::Completions(agent)) => fork!(agent).await,
+                _ => Err(anyhow::anyhow!(
+                    "this provider route has no native prompt cache to fork"
+                )),
+            }
+        };
+        let (summary, usage) = tokio::time::timeout(request_timeout, work)
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Compression request timed out after {} seconds; raise `compaction_timeout_secs`",
+                    request_timeout.as_secs()
+                )
+            })??;
+        Ok(CompactionOutput {
+            summary: prefix_at_most(&summary, summary_byte_budget).to_string(),
+            summary_byte_budget,
+            messages_included,
+            usage: usage.into(),
+        })
+    }
+
     /// Bind native framing to the actual adapter and this precise Session,
     /// keeping normal permissions, QuestionTurn and spend profiles separate.
     #[allow(
@@ -7785,6 +7944,82 @@ mod compaction_quality_tests {
     use rig::tool::Tool;
 
     #[tokio::test]
+    async fn forked_summary_reuses_the_main_agent_request_prefix_and_disables_tools() {
+        use rig::message::ToolChoice;
+        struct Probe;
+        impl rig::tool::Tool for Probe {
+            const NAME: &'static str = "probe";
+            type Error = std::convert::Infallible;
+            type Args = serde_json::Value;
+            type Output = String;
+            fn description(&self) -> String {
+                "probe".into()
+            }
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({"type":"object"})
+            }
+            async fn call(&self, _: Self::Args) -> Result<String, Self::Error> {
+                Ok("probed".into())
+            }
+        }
+        let reported = rig::completion::Usage {
+            input_tokens: 40,
+            cached_input_tokens: 30,
+            output_tokens: 5,
+            total_tokens: 45,
+            ..Default::default()
+        };
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::text("## Task\nforked"),
+                MockStreamEvent::final_response(reported),
+            ],
+            vec![
+                MockStreamEvent::text("unused"),
+                MockStreamEvent::final_response(Default::default()),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .preamble("MAIN SYSTEM PROMPT")
+            .tool(Probe)
+            .max_tokens(8000)
+            .build();
+        let history = vec![Message::user("first"), Message::assistant("second")];
+        let (summary, usage) = run_forked_summarizer(
+            &agent,
+            history.clone(),
+            fork_instruction(Some("keep file names")),
+            512,
+            &RetryConfig::default(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(summary, "## Task\nforked");
+        assert_eq!(usage.cached_input_tokens, 30);
+        let requests = model.requests();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert!(request.tools.iter().any(|tool| tool.name == "probe"));
+        assert_eq!(request.tool_choice, Some(ToolChoice::None));
+        assert_eq!(request.max_tokens, Some(512));
+        let sent: Vec<Message> = request.chat_history.clone().into_iter().collect();
+        assert!(
+            matches!(&sent[0], Message::System { content } if content == "MAIN SYSTEM PROMPT"),
+            "the main system prompt leads the request"
+        );
+        assert_eq!(
+            &sent[1..3],
+            &history[..],
+            "the conversation prefix is unchanged"
+        );
+        let last = serde_json::to_string(sent.last().unwrap()).unwrap();
+        assert!(last.contains("summarization request"));
+        assert!(last.contains("keep file names"));
+        assert_eq!(sent.len(), 4);
+    }
+
+    #[tokio::test]
     async fn five_native_reads_survive_unpruned_fake_provider_compaction_and_history_roundtrip() {
         let root = crate::tests::OwnedTestDirectory::new("five-read-compaction");
         let mut session =
@@ -7994,7 +8229,7 @@ mod session_title_completion_tests {
         use super::title_request_params;
         use crate::session::title::{TITLE_FIRST_REQUEST_TOKENS, TITLE_MAX_TOKENS};
         // Reasoning allowance is part of the first request's cap.
-        assert!(TITLE_FIRST_REQUEST_TOKENS >= TITLE_MAX_TOKENS + 512);
+        const { assert!(TITLE_FIRST_REQUEST_TOKENS >= TITLE_MAX_TOKENS + 512) };
         // Gemini 2.5: no provider params to strip; the cap carries the allowance.
         assert_eq!(title_request_params(None), None);
         // OpenAI Responses with reasoning.effort = high.

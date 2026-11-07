@@ -2684,6 +2684,15 @@ impl Session {
         effective
     }
 
+    /// Whether any of the first `end` messages carries an image (user prompt
+    /// or tool result).
+    pub(crate) fn prefix_has_images(&self, end: usize) -> bool {
+        self.messages.iter().take(end).any(|message| {
+            message.user.as_ref().is_some_and(user::PersistedUserMessage::has_images)
+                || matches!(&message.tool, Some(PersistedToolMessage::Result { images, .. }) if !images.is_empty())
+        })
+    }
+
     /// Cheap estimate of the encoded session size, dominated by base64 images
     /// (user prompts and tool results) and message text. Never serializes.
     pub(crate) fn approx_persisted_bytes(&self) -> usize {
