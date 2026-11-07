@@ -476,7 +476,10 @@ async fn usd_budget_native_title_captured_profile_charges_once_and_blocks_withou
     assert_eq!(wire.calls.load(Ordering::Acquire), 1);
     assert_eq!(ledger.summary().unwrap().all_time.records, 1);
     assert!((run.account.snapshot().recorded_spend() - 0.00007).abs() < 1e-12);
-    assert_eq!(wire.bodies.lock().unwrap()[0]["max_tokens"], 64);
+    assert_eq!(
+        wire.bodies.lock().unwrap()[0]["max_tokens"],
+        crate::session::title::TITLE_FIRST_REQUEST_TOKENS
+    );
 }
 
 #[cfg(feature = "git-worktree")]

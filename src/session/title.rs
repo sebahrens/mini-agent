@@ -15,6 +15,12 @@ const USER_EXCERPT_BYTES: usize = 2_000;
 const REPLY_EXCERPT_BYTES: usize = 1_000;
 /// Response budget: a title is a handful of words.
 pub const TITLE_MAX_TOKENS: u64 = 64;
+/// Output cap of the first title request: the visible answer plus room for the
+/// hidden reasoning that OpenAI reasoning models and Gemini 2.5/3 count against
+/// the cap and cannot fully switch off (mini-agent-mc9cb).
+pub const TITLE_FIRST_REQUEST_TOKENS: u64 = TITLE_MAX_TOKENS + 960;
+/// Output cap of the single retry after an empty (reasoning-consumed) reply.
+pub const TITLE_RETRY_REQUEST_TOKENS: u64 = 4096;
 
 /// What to ask, and which model to ask it of.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,13 +132,20 @@ pub async fn generate(
     cfg: &crate::config::Config,
     ledger: UsageLedger,
 ) -> anyhow::Result<CompactString> {
-    let raw = tokio::time::timeout(
-        std::time::Duration::from_secs(20),
-        client.title_completion(request, cfg, ledger),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("session title generation timed out"))??;
-    clean_title(&raw).ok_or_else(|| anyhow::anyhow!("the title model returned no usable title"))
+    // An empty reply usually means hidden reasoning consumed the cap: retry once
+    // with a larger one rather than leaving the session without a title.
+    for cap in [TITLE_FIRST_REQUEST_TOKENS, TITLE_RETRY_REQUEST_TOKENS] {
+        let raw = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            client.title_completion_with_cap(request, cfg, ledger.clone(), cap),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("session title generation timed out"))??;
+        if let Some(title) = clean_title(&raw) {
+            return Ok(title);
+        }
+    }
+    Err(anyhow::anyhow!("the title model returned no usable title"))
 }
 
 /// Usage is published by the provider stream observer before any title

@@ -902,6 +902,37 @@ pub(crate) fn passive_provider_request_params(
     Ok(provider_request_params(model, cfg, generation, session_id))
 }
 
+/// Minimizes hidden reasoning for a session-title request. A title is a few
+/// words, so Anthropic `thinking` is omitted and a reasoning effort above `low`
+/// (`reasoning_effort`, `reasoning.effort`) is lowered to `low`, which every
+/// reasoning model accepts. Gemini 2.5/3 cannot fully disable thinking, so the
+/// caller raises the output cap to cover a minimal reasoning allowance instead.
+pub(crate) fn title_request_params(params: Option<serde_json::Value>) -> Option<serde_json::Value> {
+    let mut params = params?;
+    if let Some(object) = params.as_object_mut() {
+        object.remove("thinking");
+        let lower = |value: &mut serde_json::Value| {
+            if value
+                .as_str()
+                .is_some_and(|effort| !matches!(effort, "none" | "minimal" | "low"))
+            {
+                *value = serde_json::Value::from("low");
+            }
+        };
+        if let Some(effort) = object.get_mut("reasoning_effort") {
+            lower(effort);
+        }
+        if let Some(effort) = object
+            .get_mut("reasoning")
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|reasoning| reasoning.get_mut("effort"))
+        {
+            lower(effort);
+        }
+    }
+    Some(params)
+}
+
 /// Provider request-body parameters for a secondary agent (subagent, advisor)
 /// built directly on an [`AnyModel`]: the same per-provider shape the main
 /// agent builds in `build_agent_in_workspace`, so every request keeps the
@@ -1402,6 +1433,24 @@ impl AnyClient {
         cfg: &Config,
         ledger: crate::session::title::UsageLedger,
     ) -> anyhow::Result<String> {
+        self.title_completion_with_cap(
+            request,
+            cfg,
+            ledger,
+            crate::session::title::TITLE_FIRST_REQUEST_TOKENS,
+        )
+        .await
+    }
+
+    /// [`Self::title_completion`] with an explicit output cap, so a retry after
+    /// an empty reasoning-consumed reply can use a larger one.
+    pub(crate) async fn title_completion_with_cap(
+        &self,
+        request: &crate::session::title::TitleRequest,
+        cfg: &Config,
+        ledger: crate::session::title::UsageLedger,
+        max_output_tokens: u64,
+    ) -> anyhow::Result<String> {
         let model = self.completion_model_with_cache_ttl(
             request.model.to_string(),
             cfg.cache_ttl.unwrap_or_default(),
@@ -1416,13 +1465,13 @@ impl AnyClient {
             .and_then(|entry| entry.extra_body.clone())
             .or_else(|| cfg.resolve_extra_body(&request.model, quick));
         let options = TitleCompletionOptions {
-            params: passive_provider_request_params(
+            params: title_request_params(passive_provider_request_params(
                 &model,
                 cfg,
                 raw,
                 &request.session_id,
-                crate::session::title::TITLE_MAX_TOKENS,
-            )?,
+                max_output_tokens,
+            )?),
             temperature: alias
                 .and_then(|entry| entry.temperature)
                 .or_else(|| {
@@ -1443,7 +1492,6 @@ impl AnyClient {
         };
         let prompt = request.prompt.clone();
         let preamble = crate::session::title::preamble();
-        let max_output_tokens = crate::session::title::TITLE_MAX_TOKENS;
         let retry = &cfg.retry;
         macro_rules! complete {
             ($model:expr) => {
@@ -7941,6 +7989,38 @@ mod compaction_quality_tests {
 
 #[cfg(test)]
 mod session_title_completion_tests {
+    #[test]
+    fn title_params_minimize_thinking_for_each_provider_family() {
+        use super::title_request_params;
+        use crate::session::title::{TITLE_FIRST_REQUEST_TOKENS, TITLE_MAX_TOKENS};
+        // Reasoning allowance is part of the first request's cap.
+        assert!(TITLE_FIRST_REQUEST_TOKENS >= TITLE_MAX_TOKENS + 512);
+        // Gemini 2.5: no provider params to strip; the cap carries the allowance.
+        assert_eq!(title_request_params(None), None);
+        // OpenAI Responses with reasoning.effort = high.
+        let openai = title_request_params(Some(serde_json::json!({
+            "reasoning": {"effort": "high", "summary": "auto"},
+            "prompt_cache_key": "k"
+        })))
+        .unwrap();
+        assert_eq!(openai["reasoning"]["effort"], "low");
+        assert_eq!(openai["reasoning"]["summary"], "auto");
+        assert_eq!(openai["prompt_cache_key"], "k");
+        let completions =
+            title_request_params(Some(serde_json::json!({"reasoning_effort": "xhigh"}))).unwrap();
+        assert_eq!(completions["reasoning_effort"], "low");
+        let minimal =
+            title_request_params(Some(serde_json::json!({"reasoning_effort": "minimal"}))).unwrap();
+        assert_eq!(minimal["reasoning_effort"], "minimal");
+        // Anthropic adaptive thinking is omitted.
+        let anthropic = title_request_params(Some(serde_json::json!({
+            "thinking": {"type": "adaptive"}, "top_p": 0.9
+        })))
+        .unwrap();
+        assert!(anthropic.get("thinking").is_none());
+        assert_eq!(anthropic["top_p"], 0.9);
+    }
+
     use super::*;
     use rig::completion::Usage;
     use rig::test_utils::{MockCompletionModel, MockStreamEvent};
@@ -8153,7 +8233,10 @@ mod session_title_completion_tests {
         let body = actor.task.take().unwrap().join().unwrap().unwrap();
         assert_eq!(title.unwrap(), "Title wire proof");
         assert_eq!(body["model"], "fixture");
-        assert_eq!(body["max_tokens"], 64);
+        assert_eq!(
+            body["max_tokens"],
+            crate::session::title::TITLE_FIRST_REQUEST_TOKENS
+        );
         assert_eq!(body["stream"], true);
         assert_eq!(body["temperature"], 0.25);
         if protocol == "openai" {
