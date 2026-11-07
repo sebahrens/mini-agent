@@ -597,10 +597,12 @@ pub(crate) struct FetchTransport {
 
 #[cfg(all(feature = "js", feature = "sandbox"))]
 impl FetchTransport {
+    #[cfg(test)]
     pub(crate) fn new(resolved_host: Option<(&str, &[SocketAddr])>) -> Result<Self, FetchError> {
         Self::with_limits(FetchLimits::default(), resolved_host)
     }
 
+    #[cfg(test)]
     pub(crate) fn with_limits(
         limits: FetchLimits,
         resolved_host: Option<(&str, &[SocketAddr])>,

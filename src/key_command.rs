@@ -240,7 +240,7 @@ impl CommandCredential {
                 let state = self.lock();
                 let candidates = query_key_candidates(uri);
                 !candidates.is_empty()
-                    && !candidates.iter().any(|value| *value == current)
+                    && !candidates.contains(&current)
                     && candidates
                         .iter()
                         .any(|value| state.known.iter().any(|known| known == value))

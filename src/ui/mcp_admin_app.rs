@@ -388,7 +388,7 @@ impl App<'_> {
                 ),
             );
             handle.spawn_auxiliary_discovery();
-            Ok(Completion::Connected(handle))
+            Ok(Completion::Connected(Box::new(handle)))
         })?;
         self.mcp_state().work.as_mut().unwrap().attempt = Some(attempt);
         self.renderer
@@ -909,7 +909,7 @@ impl App<'_> {
                     self.refresh()?;
                     return Ok(());
                 }
-                manager.handles.push(handle);
+                manager.handles.push(*handle);
                 manager
                     .handles
                     .sort_by(|a, b| a.server_name.cmp(&b.server_name));

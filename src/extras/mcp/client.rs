@@ -1370,6 +1370,7 @@ pub(crate) async fn validate_mcp_server_url(value: &str) -> anyhow::Result<Valid
     validate_mcp_server_url_policy(value, false).await
 }
 
+#[cfg(test)]
 pub(crate) async fn validate_mcp_server_url_policy(
     value: &str,
     allow_local: bool,
@@ -1401,6 +1402,7 @@ pub(super) async fn validate_mcp_server_url_with(
     validate_mcp_server_url_policy_with(value, false, lookup).await
 }
 
+#[cfg(test)]
 pub(super) async fn validate_mcp_server_url_policy_with(
     value: &str,
     allow_local: bool,

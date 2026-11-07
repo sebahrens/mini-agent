@@ -204,7 +204,7 @@ pub(super) enum Completion {
         approval: Option<(String, String)>,
         remove: bool,
     },
-    Connected(McpClientHandle),
+    Connected(Box<McpClientHandle>),
     LoginReady(Box<crate::extras::mcp::oauth::LoginSession>),
     Authorized,
     LoggedOut {
