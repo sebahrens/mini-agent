@@ -83,7 +83,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
-      code: ${{ steps.filter.outputs.code }}
+      code: ${{ steps.filter.outputs.code || 'true' }}
       # Test-impact scope (mini-agent-m7wn5). Every default fails open: when
       # the scope step is skipped or fails, the full matrix runs.
       scope: ${{ steps.scope.outputs.scope || 'code' }}
@@ -105,72 +105,9 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         shell: bash
         run: |
-          set -uo pipefail
-
-          run_everything() {
-            echo "code=true" >> "$GITHUB_OUTPUT"
-            echo "Running the full matrix: $1"
-            exit 0
-          }
-
-          # Explicit owning Windows proofs reuse one job without the matrix.
-          # Every other event/scope retains the fail-open classification.
-          if [ "$EVENT" = "workflow_dispatch" ]; then
-            case "${SCOPE:-}" in
-              windows-command-family|windows-session-storage)
-                echo "code=false" >> "$GITHUB_OUTPUT"
-                echo "Running only the selected Windows proof: $SCOPE."
-                exit 0 ;;
-            esac
-          fi
-
-          case "$EVENT" in
-            schedule|workflow_dispatch) run_everything "event is $EVENT" ;;
-          esac
-          case "$GITHUB_REF" in
-            refs/tags/*) run_everything "tag build" ;;
-          esac
-
-          # An all-zero or empty base is a branch creation or an unresolvable
-          # history; either way we cannot trust a diff.
-          case "$BASE_SHA" in
-            ""|0000000000000000000000000000000000000000)
-              run_everything "no resolvable base revision" ;;
-          esac
-          git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null \
-            || run_everything "base revision $BASE_SHA is not present"
-
-          changed=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- 2>/dev/null) \
-            || run_everything "could not diff $BASE_SHA..$HEAD_SHA"
-          if [ -z "$changed" ]; then
-            echo "code=false" >> "$GITHUB_OUTPUT"
-            echo "No files changed."
-            exit 0
-          fi
-
-          echo "Changed files:"
-          echo "$changed" | sed 's/^/  /'
-
-          # Anything outside this documentation set is treated as code.
-          docs_only='^(docs/|\.beads/|[^/]*\.md$|editors/vscode/.*\.md$)'
-          # Documentation that the binary embeds or tests read is code too, or a
-          # docs-only change could merge green and break the next code change:
-          # docs/agent/ and docs/vscode-acp-setup.md are embedded by src/docs.rs,
-          # docs/specs/ is include_str!'d and read by tests, docs/benchmarks/
-          # holds a test baseline, non-Markdown files under docs/ are data, and
-          # SOURCE.md and LICENSE ship in every release archive.
-          consumed_docs='^(docs/agent/|docs/specs/|docs/benchmarks/|docs/vscode-acp-setup\.md$|SOURCE\.md$|LICENSE)'
-          # grep exits 1 when nothing matches; under `-o pipefail` that would fail the step.
-          docs_data=$(echo "$changed" | grep -E '^docs/' | grep -vE '\.md$' || true)
-          if echo "$changed" | grep -qvE "$docs_only" \
-            || echo "$changed" | grep -qE "$consumed_docs" \
-            || [ -n "$docs_data" ]; then
-            echo "code=true" >> "$GITHUB_OUTPUT"
-            echo "Code paths changed; running the full matrix."
-          else
-            echo "code=false" >> "$GITHUB_OUTPUT"
-            echo "Documentation-only change; skipping build, lint, and test jobs."
-          fi
+          # One classifier owns the filter and pass-cache exclusions. Missing
+          # Python, script errors and unresolved history all run the matrix.
+          python3 scripts/ci_scope.py --filter || echo "code=true" >> "$GITHUB_OUTPUT"
 
       # Refines code=true: a push or pull request whose every non-docs path is
       # test-only by path gets scope=tests (fmt/policy, Linux clippy and the
@@ -222,7 +159,9 @@ jobs:
         run: python3 -m unittest scripts.tests.test_vscode_ci_workflow
 
       - name: Test CI documentation-only filter
-        run: python3 -m unittest scripts.tests.test_ci_docs_filter
+        run: >-
+          python3 -m unittest scripts.tests.test_ci_docs_filter
+          scripts.tests.test_ci_scope scripts.tests.test_ci_fingerprint
 
       - name: Test target-directory sweep script
         run: python3 -m unittest scripts.tests.test_sweep_target

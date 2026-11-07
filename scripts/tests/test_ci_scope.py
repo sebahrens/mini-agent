@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -39,6 +40,10 @@ class ClassifyTests(unittest.TestCase):
 
     def test_docs_do_not_turn_a_test_diff_into_code(self) -> None:
         self.assertEqual("tests", self.scope("src/tests/a.rs", "docs/plans/idea.md").scope)
+        self.assertEqual(
+            ci_scope.Scope("tests", False, True),
+            self.scope("src/tests/windows_tests.rs", "docs/reviews/acceptance.json", ".github/ISSUE_TEMPLATE/config.yml"),
+        )
 
     def test_production_file_with_inline_tests_is_code(self) -> None:
         self.assertEqual("code", self.scope("src/permission.rs").scope)
@@ -89,7 +94,8 @@ class ResolveTests(unittest.TestCase):
         def run(cmd, **kwargs):
             if isinstance(paths, Exception):
                 raise paths
-            return subprocess.CompletedProcess(cmd, 0, stdout="".join(f"{p}\n" for p in paths))
+            output = "" if cmd[1] == "cat-file" else "".join(f"{p}\0" for p in paths)
+            return subprocess.CompletedProcess(cmd, 0, stdout=output)
 
         base = {"EVENT": "pull_request", "GITHUB_REF": "refs/pull/1/merge", "BASE_SHA": BASE, "HEAD_SHA": HEAD}
         base.update(env)
@@ -110,14 +116,59 @@ class ResolveTests(unittest.TestCase):
         self.assertEqual(ci_scope.FULL, self.resolve(subprocess.CalledProcessError(1, "git")))
         self.assertEqual(ci_scope.FULL, self.resolve(OSError("no git")))
 
-    def test_docs_verdict_after_a_code_verdict_fails_open(self) -> None:
-        self.assertEqual(ci_scope.FULL, self.resolve(["README.md"]))
+    def test_docs_verdict_is_shared_with_the_workflow_filter(self) -> None:
+        self.assertEqual("docs", self.resolve(["README.md", "docs/reviews/final.json"]).scope)
 
 
 class DocsFilterEquivalenceTests(unittest.TestCase):
-    def test_python_docs_rule_matches_the_shell_filter_regexes(self) -> None:
-        for pattern in (ci_scope.DOCS_ONLY.pattern, ci_scope.CONSUMED_DOCS.pattern):
-            self.assertIn(pattern.replace("\\", "\\"), WORKFLOW)
+    def test_workflow_uses_the_shared_classifier(self) -> None:
+        self.assertIn('python3 scripts/ci_scope.py --filter || echo "code=true"', WORKFLOW)
+        self.assertNotIn("docs_only=", WORKFLOW)
+        self.assertNotIn("consumed_docs=", WORKFLOW)
+
+
+class GitDiffTests(unittest.TestCase):
+    def test_real_git_changes_preserve_both_sides_of_moves_and_unusual_names(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def git(*args):
+                return subprocess.run(["git", *args], cwd=root, check=True, text=True, capture_output=True).stdout.strip()
+
+            def commit():
+                git("add", "-A")
+                git("-c", "user.name=CI Test", "-c", "user.email=ci@example.invalid", "commit", "-qm", "fixture")
+                return git("rev-parse", "HEAD")
+
+            def scope(base, head):
+                def run(cmd, **kwargs):
+                    return subprocess.run(cmd, cwd=root, **kwargs)
+                return ci_scope.resolve({"EVENT": "push", "GITHUB_REF": "refs/heads/main", "BASE_SHA": base, "HEAD_SHA": head}, run=run)
+
+            git("init", "-q")
+            (root / "src").mkdir()
+            source = root / "src/main.rs"
+            source.write_text("fn main() {}\n")
+            baseline = commit()
+            review = root / 'docs/reviews/a\nquoted"file.json'
+            review.parent.mkdir(parents=True)
+            review.write_text("{}\n")
+            addition = commit()
+            self.assertEqual("docs", scope(baseline, addition).scope)
+            review.write_text('{"result":"pass"}\n')
+            edit = commit()
+            self.assertEqual("docs", scope(addition, edit).scope)
+            review.unlink()
+            deletion = commit()
+            self.assertEqual("docs", scope(edit, deletion).scope)
+            # Git detects this as a 100% rename. It must still count the removed
+            # production path, even though the destination is exempt evidence.
+            source.rename(review)
+            moved_out = commit()
+            self.assertEqual("code", scope(deletion, moved_out).scope)
+            review.rename(source)
+            moved_in = commit()
+            self.assertEqual("code", scope(moved_out, moved_in).scope)
 
 
 class WorkflowWiringTests(unittest.TestCase):
@@ -129,6 +180,7 @@ class WorkflowWiringTests(unittest.TestCase):
     def test_changes_job_fails_open_by_default(self) -> None:
         header = self.job("changes").split("    steps:\n", 1)[0]
         for default in (
+            "code: ${{ steps.filter.outputs.code || 'true' }}",
             "scope: ${{ steps.scope.outputs.scope || 'code' }}",
             "full: ${{ steps.scope.outputs.full || 'true' }}",
             "macos: ${{ steps.scope.outputs.macos || 'true' }}",

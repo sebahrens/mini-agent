@@ -70,6 +70,31 @@ class FingerprintInputSetTests(unittest.TestCase):
         for input_class in fp.CLASSES:
             self.assertNotEqual(compute(entries(), input_class), compute(entries(spec="changed"), input_class))
 
+    def test_evidence_and_metadata_add_edit_delete_do_not_invalidate_passes(self) -> None:
+        for input_class in fp.CLASSES:
+            before = compute(entries(), input_class)
+            for path in (
+                "docs/reviews/final.json", "docs/reviews/evidence/native.log",
+                "docs/plans/diagram.svg", "docs/decisions/record.json",
+                ".beads/issues.jsonl", ".github/ISSUE_TEMPLATE/config.yml",
+                ".github/PULL_REQUEST_TEMPLATE.md", ".github/CODEOWNERS",
+                ".github/dependabot.yml", ".claude/settings.json",
+            ):
+                with self.subTest(input_class=input_class, path=path):
+                    for content in ("original", "changed"):
+                        self.assertEqual(before, compute(sorted(entries() + [(path, content)]), input_class))
+
+    def test_unknown_data_consumed_docs_and_build_configuration_invalidate_passes(self) -> None:
+        for input_class in fp.CLASSES:
+            for path in (
+                "docs/acp-registry.json", "docs/agent/config.json",
+                "docs/benchmarks/baseline.json", "docs/new-data.json",
+                "docs/reviews-new/data.json", ".cargo/config.toml",
+                ".github/actions/example/action.yml", ".gitignore", "build.rs",
+            ):
+                with self.subTest(input_class=input_class, path=path):
+                    self.assertNotEqual(compute(entries(), input_class), compute(entries() + [(path, "new")], input_class))
+
     def test_test_change_changes_only_production_plus_tests(self) -> None:
         for change in ({"test": "changed"}, {"feed": "changed"}):
             with self.subTest(change=change):

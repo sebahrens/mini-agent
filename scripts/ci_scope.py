@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Classify a CI diff as `docs`, `tests` or `code` (mini-agent-m7wn5).
 
-The `changes` job in .github/workflows/ci.yml keeps its shell filter for the
-docs-only decision. When that filter reports code, this script refines the
+The `changes` job and pass fingerprints share the non-build input rules here.
+The workflow first uses --filter for the docs-only decision, then refines the
 answer: a diff whose every non-documentation path is test-only *by path* gets
 the `tests` scope, which runs fmt/policy, Linux clippy and the Linux test rows
 and skips the macOS/Windows rows, platform smokes, packaging, install, VS Code
@@ -17,17 +17,23 @@ platform enabled, which is the full matrix.
 
 from __future__ import annotations
 
+import argparse
 import os
 import re
 import subprocess
 import sys
 from typing import Callable, Iterable, NamedTuple
 
-# Keep in sync with the documentation filter in the `changes` job
-# (scripts/tests/test_ci_scope.py pins the equivalence).
+# Only known, non-build data is exempt. Unknown JSON and other data still run
+# the matrix; extensions alone cannot distinguish evidence from fixtures.
 DOCS_ONLY = re.compile(r"^(docs/|\.beads/|[^/]*\.md$|editors/vscode/.*\.md$)")
 CONSUMED_DOCS = re.compile(
     r"^(docs/agent/|docs/specs/|docs/benchmarks/|docs/vscode-acp-setup\.md$|SOURCE\.md$|LICENSE)"
+)
+RECORDS = re.compile(r"^docs/(reviews|plans|decisions)/")
+REPOSITORY_METADATA = re.compile(
+    r"^(\.github/(ISSUE_TEMPLATE/|PULL_REQUEST_TEMPLATE/|PULL_REQUEST_TEMPLATE\.md$|"
+    r"CODEOWNERS$|dependabot\.yml$)|\.claude/settings\.json$)"
 )
 TEST_PATH = re.compile(r"^(src/tests/|src/.+/tests/|tests/)|_tests\.rs$")
 PLATFORM_NAMES = {
@@ -53,9 +59,13 @@ FULL = Scope("code", True, True)
 
 
 def is_docs(path: str) -> bool:
-    """A documentation path that nothing embeds or tests read."""
+    """Inputs that need only the unconditional formatting/repository policy job."""
 
-    if not DOCS_ONLY.match(path) or CONSUMED_DOCS.match(path):
+    if CONSUMED_DOCS.match(path):
+        return False
+    if RECORDS.match(path) or REPOSITORY_METADATA.match(path):
+        return True
+    if not DOCS_ONLY.match(path):
         return False
     return not (path.startswith("docs/") and not path.endswith(".md"))
 
@@ -109,6 +119,10 @@ def resolve(env: dict[str, str], run=subprocess.run) -> Scope:
     """Scope for a workflow event; anything doubtful is the full matrix."""
 
     event = env.get("EVENT", "")
+    if event == "workflow_dispatch" and env.get("SCOPE") in (
+        "windows-command-family", "windows-session-storage"
+    ):
+        return Scope("docs", False, False)
     if event not in ("push", "pull_request"):
         return FULL
     if env.get("GITHUB_REF", "").startswith("refs/tags/"):
@@ -118,15 +132,23 @@ def resolve(env: dict[str, str], run=subprocess.run) -> Scope:
     if not base or set(base) == {"0"} or not head:
         return FULL
     try:
+        run(
+            ["git", "cat-file", "-e", f"{base}^{{commit}}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
         diff = run(
-            ["git", "diff", "--name-only", base, head, "--"],
+            ["git", "diff", "--no-renames", "--name-only", "-z", base, head, "--"],
             capture_output=True,
             text=True,
             check=True,
         )
     except (OSError, subprocess.CalledProcessError):
         return FULL
-    paths = [line for line in diff.stdout.splitlines() if line]
+    # Include both sides of moves: moving code into reviews still removes code.
+    # NUL delimiters preserve filenames with newlines or Git quoting characters.
+    paths = [path for path in diff.stdout.split("\0") if path]
 
     def read(path: str) -> str | None:
         try:
@@ -135,9 +157,7 @@ def resolve(env: dict[str, str], run=subprocess.run) -> Scope:
         except OSError:
             return None
 
-    scope = classify(paths, read)
-    # The shell filter already said "code"; a docs verdict contradicts it.
-    return FULL if scope.scope == "docs" else scope
+    return classify(paths, read)
 
 
 def render(scope: Scope) -> str:
@@ -153,12 +173,20 @@ def render(scope: Scope) -> str:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--filter", action="store_true", help="Emit the workflow code filter")
+    args = parser.parse_args()
     try:
         scope = resolve(dict(os.environ))
     except Exception as error:  # fail open on any doubt
         print(f"scope classification failed ({error}); running the full matrix")
         scope = FULL
-    text = render(scope)
+    # The second workflow step runs only after code=true. Fail open if it gets
+    # a contradictory docs result; docs-only runs leave its defaults untouched.
+    text = (
+        f"code={str(scope.scope != 'docs').lower()}\n"
+        if args.filter else render(FULL if scope.scope == "docs" else scope)
+    )
     print(text, end="")
     output = os.environ.get("GITHUB_OUTPUT")
     if output:

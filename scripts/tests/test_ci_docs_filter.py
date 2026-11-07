@@ -31,7 +31,7 @@ def filter_script() -> str:
         raise AssertionError("the changes job's filter step is missing")
     body = match.group("body")
     # Never run more than the filter step itself.
-    if "code=false" not in body or "\n  " + "fmt:" in body or len(body.splitlines()) > 150:
+    if "scripts/ci_scope.py --filter" not in body or "\n  " + "fmt:" in body or len(body.splitlines()) > 20:
         raise AssertionError("extracted filter script is not exactly the filter step")
     return "".join(
         line[10:] if line.startswith(" " * 10) else "\n"
@@ -44,7 +44,7 @@ class CiDocsFilterTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.script = filter_script()
 
-    def classify(self, *changed: str, event="pull_request", scope="", base=BASE, ref="refs/pull/1/merge", missing_base=False, missing_diff=False) -> str:
+    def classify(self, *changed: str, event="pull_request", scope="", base=BASE, ref="refs/pull/1/merge", missing_base=False, missing_diff=False, broken_python=False) -> str:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             stub = root / "git"
@@ -58,8 +58,12 @@ class CiDocsFilterTests(unittest.TestCase):
                 encoding="utf-8",
             )
             stub.chmod(0o755)
+            if broken_python:
+                python = root / "python3"
+                python.write_text("#!/bin/sh\nexit 127\n", encoding="utf-8")
+                python.chmod(0o755)
             changed_file = root / "changed"
-            changed_file.write_text("".join(f"{path}\n" for path in changed), encoding="utf-8")
+            changed_file.write_text("".join(f"{path}\0" for path in changed), encoding="utf-8")
             output = root / "output"
             output.touch()
             env = os.environ.copy()
@@ -79,6 +83,7 @@ class CiDocsFilterTests(unittest.TestCase):
                 # GitHub Actions runs `run:` steps as `bash -e -o pipefail`.
                 ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", self.script],
                 env=env,
+                cwd=REPOSITORY_ROOT,
                 capture_output=True,
                 text=True,
             )
@@ -100,7 +105,7 @@ class CiDocsFilterTests(unittest.TestCase):
                     self.assertEqual("true", self.classify("src/main.rs", event=event, scope=scope))
 
     def test_unresolved_history_and_tags_still_fail_open(self) -> None:
-        for options in ({"base": ""}, {"base": "0" * 40}, {"missing_base": True}, {"missing_diff": True}, {"ref": "refs/tags/v1"}):
+        for options in ({"base": ""}, {"base": "0" * 40}, {"missing_base": True}, {"missing_diff": True}, {"ref": "refs/tags/v1"}, {"broken_python": True}):
             with self.subTest(options=options):
                 self.assertEqual("true", self.classify("README.md", **options))
 
@@ -110,6 +115,31 @@ class CiDocsFilterTests(unittest.TestCase):
 
     def test_code_changes_run_the_matrix(self) -> None:
         self.assertEqual("true", self.classify("docs/plans/idea.md", "src/main.rs"))
+
+    def test_review_records_and_repository_metadata_skip_the_matrix(self) -> None:
+        for path in (
+            "docs/reviews/final.json", "docs/reviews/evidence/native.log",
+            "docs/reviews/evidence/chart.png", "docs/plans/design.json",
+            "docs/decisions/diagram.svg", ".github/ISSUE_TEMPLATE/config.yml",
+            ".github/ISSUE_TEMPLATE/bug_report.md", ".github/PULL_REQUEST_TEMPLATE.md",
+            ".github/CODEOWNERS", ".github/dependabot.yml", ".claude/settings.json",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual("false", self.classify(path))
+                self.assertEqual("true", self.classify(path, "src/main.rs"))
+
+    def test_unknown_data_and_executable_configuration_remain_code(self) -> None:
+        for path in (
+            "docs/new-data.json", "docs/reviews-new/data.json", "tests/fixtures/input.json",
+            ".github/actions/example/action.yml", ".github/workflows/ci.yml",
+            ".cargo/config.toml", ".gitignore", "build.rs",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual("true", self.classify(path))
+
+    def test_empty_diff_and_unusual_review_filenames(self) -> None:
+        self.assertEqual("false", self.classify())
+        self.assertEqual("false", self.classify('docs/reviews/a\nquoted"file.json'))
 
     def test_documentation_consumed_by_the_build_or_tests_runs_the_matrix(self) -> None:
         for path in (

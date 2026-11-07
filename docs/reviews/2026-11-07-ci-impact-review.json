@@ -1,0 +1,37 @@
+{
+  "bead": "mini-agent-3vcth",
+  "baseline": "b399f697344559e4879343004a691bcf5eddf7cd",
+  "problem": "Unconsumed review JSON/logs triggered the entire CI matrix and invalidated all pass fingerprints; shell and Python classifiers duplicated the same overly broad rule.",
+  "changes": [
+    "Shared Python classifier for workflow filtering and pass fingerprints.",
+    "Explicit non-build record and repository-metadata exclusions; consumed documentation and unknown data remain inputs.",
+    "NUL-delimited, rename-disabled diffs preserve removed production inputs and unusual filenames.",
+    "Scope and fingerprint regression suites now execute in the unconditional policy job."
+  ],
+  "local_validation": {
+    "focused_tests": 58,
+    "all_ci_policy_tests": 190,
+    "package_and_feature_policy_tests": 145,
+    "latest_focused_result": "58 passed in4.818s after final test additions",
+    "historical_negative_control": "Exact6617aaeb..b399f697 diff: original classifier=code, repaired=docs. Original production and production+tests fingerprints change; repaired fingerprints remain equal.",
+    "real_git_controls": "Add/edit/delete review evidence with newline and quote in filename skips matrix; moving identical source into and back out of evidence requires code checks.",
+    "failure_controls": "Missing Python, unavailable history, unknown paths, tags and full manual/scheduled events remain conservative.",
+    "format": "cargo fmt and git diff --check passed."
+  },
+  "root_review": {
+    "reviewers": [
+      "testing",
+      "adversarial"
+    ],
+    "findings": [],
+    "assessment": "No additional confirmed issue after tracing workflow outputs, skip acceptance, input exclusions, rename handling and cache invalidation. Metadata policy checks remain unconditional; no JSON-wide exemption."
+  },
+  "hosted_validation": {
+    "status": "pending",
+    "acceptance": "CI for the classifier/workflow change must pass, followed by a records-only closure push proving the expensive matrix is skipped."
+  },
+  "limits": [
+    "This is path-based impact classification. Unknown inputs remain conservative; adding consumers of exempt artifacts requires updating the rules and tests.",
+    "Tag, schedule and explicit manual proof policies are unchanged."
+  ]
+}

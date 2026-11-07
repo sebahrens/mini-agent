@@ -6,8 +6,8 @@ are identical to an already-green commit. A job fingerprint is the SHA-256 of
 the tracked files in the job's input class plus the job id, feature row,
 runner OS/image/arch, toolchain, Cargo.lock and the workflow file:
 
-* `production`: every tracked file except documentation that nothing embeds or
-  reads, and test-only paths (src/tests/**, *_tests.rs, src/**/tests/**,
+* `production`: every tracked file except non-build documentation, review records,
+  repository metadata covered by the unconditional policy job, and test-only paths (src/tests/**, *_tests.rs, src/**/tests/**,
   tests/**).
 * `production+tests`: the same without removing test-only paths, for jobs that
   run or lint tests.
