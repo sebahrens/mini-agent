@@ -961,6 +961,10 @@ fn effect_hint(tool: &str, code: &str) -> Option<String> {
             "limits: 256 paths, 1 MiB per file, 6 MiB total; read fewer files per call or use grep()",
         ),
         ("write_file", "too_large") => fixed("limit 1 MiB per write"),
+        ("spawn", "too_large") => Some(format!(
+            "causes: program binary over {} MiB, or more than {SPAWN_ARGUMENT_MAX_COUNT} arguments; use the shell tool instead",
+            crate::extras::js::broker::MAX_SPAWN_EXECUTABLE_BYTES / (1024 * 1024)
+        )),
         ("grep", "invalid_target" | "not_found") => {
             fixed("path must be an existing directory or regular file; use include to filter files")
         }
@@ -1025,6 +1029,15 @@ fn throw_effect_exception(ctx: &Ctx<'_>, message: &str, code: &'static str) -> r
 #[cfg(test)]
 mod effect_error_tests {
     use super::*;
+
+    #[test]
+    fn spawn_too_large_hint_names_causes_and_shell_alternative() {
+        let hint = effect_hint("spawn", "too_large").expect("spawn too_large hint");
+        assert!(hint.contains("64 MiB"), "{hint}");
+        assert!(hint.contains("4096 arguments"), "{hint}");
+        assert!(hint.contains("shell tool"), "{hint}");
+        assert!(effect_hint("spawn", "timed_out").is_none());
+    }
 
     #[test]
     fn effect_dispatch_rejects_caught_oom_without_waiting_for_an_interrupt() {

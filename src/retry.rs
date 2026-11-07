@@ -493,7 +493,11 @@ fn is_provider_timeout(error: &(dyn std::error::Error + 'static)) -> bool {
 }
 
 pub fn with_context_length_hint(message: &str) -> String {
-    if is_context_length_error_message(message) {
+    if crate::agent::image_budget::is_image_limit_error_message(message) {
+        format!(
+            "{message}\nThe request carried too many images. Older images are replaced by a placeholder automatically (at most 20 per request); retry, or start a new turn after /compress."
+        )
+    } else if is_context_length_error_message(message) {
         format!(
             "{message}\nContext limit reached. Run /compress before retrying. Automatic compaction requires compact_enabled = true (the default)."
         )
@@ -540,6 +544,7 @@ where
     let mut attempt: usize = 0;
     let mut backoff = Duration::from_millis(config.initial_backoff_ms);
     let max_backoff = Duration::from_millis(config.max_backoff_ms);
+    let mut image_budget_retry_used = false;
 
     loop {
         attempt += 1;
@@ -552,6 +557,22 @@ where
                     .boxed());
             }
             Some(Err(e)) => {
+                // A "many-image requests" rejection: shrink the per-request
+                // image budget and rebuild the request once (mini-agent-xql2b).
+                // It is not an ordinary retry, so it costs no attempt or delay.
+                if !image_budget_retry_used
+                    && error_sources(&e).any(|c| {
+                        crate::agent::image_budget::is_image_limit_error_message(&c.to_string())
+                    })
+                    && crate::agent::image_budget::tighten_after_provider_rejection()
+                {
+                    image_budget_retry_used = true;
+                    attempt -= 1;
+                    tracing::warn!(
+                        "provider rejected the image count; retrying with fewer images: {e}"
+                    );
+                    continue;
+                }
                 if attempt >= config.max_attempts || !is_retryable(&e) {
                     return Err(e);
                 }
@@ -586,6 +607,59 @@ mod tests {
     use super::*;
     use std::io;
     use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn many_image_rejection_tightens_the_budget_and_retries_once_without_a_delay() {
+        let _guard = crate::agent::image_budget::CAP_TEST_LOCK.lock().await;
+        crate::agent::image_budget::reset_cap_for_tests();
+        let calls = Arc::new(Mutex::new(0usize));
+        let observed = Arc::clone(&calls);
+        let config = RetryConfig {
+            max_attempts: 1,
+            ..RetryConfig::default()
+        };
+        let stream = retry_stream_chat(&config, || {
+            let calls = Arc::clone(&observed);
+            async move {
+                let mut calls = calls.lock().unwrap();
+                *calls += 1;
+                let item: Result<u8, io::Error> = if *calls == 1 {
+                    Err(io::Error::other(
+                        "invalid_request_error: image dimensions exceed max allowed size for many-image requests: 2000 pixels",
+                    ))
+                } else {
+                    Ok(7)
+                };
+                futures::stream::iter(vec![item])
+            }
+        })
+        .await
+        .expect("second attempt succeeds");
+        let items: Vec<_> = stream.collect().await;
+        assert_eq!(items.len(), 1);
+        assert_eq!(*calls.lock().unwrap(), 2);
+        assert_eq!(
+            crate::agent::image_budget::image_cap(),
+            crate::agent::image_budget::MAX_REQUEST_IMAGES / 2
+        );
+        crate::agent::image_budget::reset_cap_for_tests();
+        // A second rejection is surfaced rather than retried again.
+        let failures = Arc::new(Mutex::new(0usize));
+        let seen = Arc::clone(&failures);
+        let error = retry_stream_chat(&config, || {
+            let seen = Arc::clone(&seen);
+            async move {
+                *seen.lock().unwrap() += 1;
+                futures::stream::iter(vec![Err::<u8, _>(io::Error::other("Too many images"))])
+            }
+        })
+        .await
+        .err()
+        .expect("persistent rejection fails");
+        assert!(error.to_string().contains("Too many images"));
+        assert_eq!(*failures.lock().unwrap(), 2);
+        crate::agent::image_budget::reset_cap_for_tests();
+    }
 
     #[test]
     fn retry_after_seconds_http_dates_and_invalid_values_are_parsed_without_waiting() {

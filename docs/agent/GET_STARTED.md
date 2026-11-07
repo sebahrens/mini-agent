@@ -341,6 +341,7 @@ If you want to use mini-agent from scripts or other programs, these CLI flags ar
 | `--input-format text\|stream-json` | With `-p`, `stream-json` reads newline-delimited JSON user messages from stdin and runs each as a turn in one session (requires `--output stream-json`; see below). |
 | `-i`, `--image FILE` | With `-p`, attach an image (png, jpeg, gif, webp); repeatable (at most 8, 2 MiB each and 4 MiB in total after the same downscaling `/add` applies). Sent with the first turn and saved in the session like a pasted image. A model the catalog lists as text-only refuses the run before any request; images cannot be combined with a `!` command. With the Anthropic provider the images travel with the prompt as one ordered user message that the persisted provider-native history keeps, so `--continue` replays them exactly once. |
 | `--stream-json-preview-bytes N` | With `-p`, cap stream-json text, tool-argument, tool-result and diff previews at `N` bytes (256–1,048,576; default 8,192). |
+| `--stream-json-schema native\|claude` | With `-p --output stream-json`: `claude` emits Claude Code SDK-shaped records instead of the native ones (default `native`; default output is unchanged). See "Claude-shaped stream-json output". |
 | `--include-partial-messages` | With `-p --output stream-json`, also emit `{"type":"text_delta"\|"reasoning_delta","message_id":"msg_<n>","text":...,"truncated":bool}` records as the model streams (coalesced per ready burst, each bounded by `--stream-json-preview-bytes`). `message_id` names the completion in progress. `assistant_text`, `usage` and `result` are unchanged, so each fragment also appears as `assistant_text`; without the flag the output is byte-identical to before. |
 | `--stream-json-control` | With `-p --input-format stream-json --output stream-json`, opt in to the stdin control channel (see below). Default off: control lines are ordinary `input_error`s and headless asks stay denied. |
 | `--max-stdin-bytes N` | With `-p`, piped-stdin limit (per input line with `--input-format stream-json`; 1,024–67,108,864; default 1,048,576). |
@@ -412,6 +413,27 @@ reports `omitted_events` explicitly if a larger atomic batch overflows it. Text 
 retain their existing schemas. Diagnostics stay on stderr. A terminal failure still
 emits a final result and retains the existing nonzero exit status. Closing stdout stops output
 while allowing owned work cleanup and session persistence to finish.
+
+#### Claude-shaped stream-json output
+
+`--stream-json-schema claude` rewrites the stream into Claude Code SDK messages so a harness that
+already speaks that protocol can parse replies without an adapter. The default (`native`) is
+unchanged. Mapping:
+
+| Native record | Claude-shaped record |
+|---|---|
+| `system` `init` | unchanged, plus `permissionMode` |
+| `assistant_text` | `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":...}]},"session_id":...}` |
+| `tool_call` | `assistant` message with a `tool_use` block (`id`, `name`, `input`); `provider_call_id` rides on the record |
+| `tool_result` | `{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":...,"content":...,"is_error":...}]}}` |
+| `text_delta` / `reasoning_delta` (`--include-partial-messages`) | `{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta"\|"thinking_delta",...}}}` |
+| `result` | same fields plus `subtype` (`success`, `error_max_budget_usd`, `error_during_execution`) and `usage.cache_read_input_tokens`; `duration_ms`, `num_turns`, `is_error`, `total_cost_usd` as above |
+| `usage`, `file_mutation`, `file_mutation_gap`, `goal`, `system` `capabilities`, `input_error`, `control_request` | pass through unchanged (extension records without a Claude counterpart; consumers should ignore unknown types) |
+
+A record whose text or arguments were cut at `--stream-json-preview-bytes` carries `"truncated":true`.
+`id` and `tool_use_id` are mini-agent's call id (the provider id is `provider_call_id`), and
+`duration_api_ms` is not reported. This is wire-shape compatibility for parsing, not a promise of
+every Claude Code field.
 
 #### Multi-turn stream-json input
 
@@ -498,10 +520,15 @@ logical identity only; it makes no claim that the session has been saved.
 `-p --output json` reserves stdout for exactly one JSON object when a turn result is available:
 
 ```json
-{"session_id":"saved-session-id","session_name":"docs update","session_persisted":true,"result":"done","files_changed":["src/main.rs"],"tool_calls":{"total":2,"by_name":{"edit":1,"read":1}},"usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120,"cached_input_tokens":0,"cache_creation_input_tokens":0,"tool_use_prompt_tokens":0,"reasoning_tokens":0},"cost":0.00042,"stop_reason":"completed"}
+{"session_id":"saved-session-id","session_name":"docs update","session_persisted":true,"result":"done","files_changed":["src/main.rs"],"tool_calls":{"total":2,"by_name":{"edit":1,"read":1}},"usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120,"cached_input_tokens":0,"cache_creation_input_tokens":0,"tool_use_prompt_tokens":0,"reasoning_tokens":0},"cost":0.00042,"total_cost_usd":0.00042,"num_turns":2,"is_error":false,"duration_ms":4120,"stop_reason":"completed"}
 ```
 
-The object is the first and only line on stdout. `usage` and `cost` cover the turn's requests and
+The object is the first and only line on stdout. `duration_ms` is the wall clock of the run (for a
+multi-turn stream-json run, since the previous `result`), `num_turns` counts the provider rounds in
+the run's transcript (assistant messages; 0 when no model round ran, such as an explicit `!command`
+or a preflight failure), and `is_error` is `true` for every `stop_reason` other than `completed`
+(a met goal, `goal_met`, is not an error). `total_cost_usd` repeats `cost` under Claude Code's
+result-message name; `cost` stays. `usage` and `cost` cover the turn's requests and
 an automatic compaction that ran before the turn. `result` is the text of the turn's final
 completion: text the agent wrote before a tool call is saved as its own message in the session but
 is not prepended to `result`, matching the interactive transcript. A goal round that ends with an

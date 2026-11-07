@@ -10137,18 +10137,12 @@ mod tests {
                 },
                 _ => Message::user("ordinary input"),
             };
-            let patch = rig::agent::RequestPatch::new().append_input([input]);
-            Flow::patch_request(if self.0 == 3 {
-                patch.history([Message::user("replacement")])
-            } else {
-                patch
-            })
+            Flow::patch_request(rig::agent::RequestPatch::new().append_input([input]))
         }
     }
     #[tokio::test]
-    async fn steering_canonical_primitive_rejects_authority_and_history_replacement_before_dispatch()
-     {
-        for case in 0..4 {
+    async fn steering_canonical_primitive_rejects_authority_before_dispatch() {
+        for case in 0..3 {
             let model = MockCompletionModel::from_stream_turns(vec![vec![
                 MockStreamEvent::tool_call("guard-tool", CountingTool::NAME, serde_json::json!({})),
                 MockStreamEvent::final_response_with_default_usage(),
@@ -10165,17 +10159,68 @@ mod tests {
             let mut rejected = false;
             while let Some(item) = stream.next().await {
                 if let Err(error) = item {
-                    assert!(error.to_string().contains(if case == 3 {
-                        "history replacement"
-                    } else {
-                        "ordinary text"
-                    }));
+                    assert!(error.to_string().contains("ordinary text"));
                     rejected = true;
                 }
             }
             assert!(rejected);
             assert_eq!(model.requests().len(), 1);
         }
+    }
+
+    /// Injects ordinary input and replaces the prior history in one turn
+    /// (the image budget plus steering): the replacement covers the prior
+    /// history only; the previous prompt and the injected input follow it.
+    struct InjectAndReplace;
+    impl<M: CompletionModel> AgentHook<M> for InjectAndReplace {
+        async fn on_event(&self, _: &HookContext, event: StepEvent<'_, M>) -> Flow {
+            if !matches!(event, StepEvent::CompletionCall { turn: 2, .. }) {
+                return Flow::Continue;
+            }
+            Flow::patch_request(
+                rig::agent::RequestPatch::new()
+                    .append_input([Message::user("ordinary input")])
+                    .history([Message::user("replacement")]),
+            )
+        }
+    }
+    #[tokio::test]
+    async fn injected_input_and_history_replacement_combine_without_dropping_either() {
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call("guard-tool", CountingTool::NAME, serde_json::json!({})),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("done"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .tool(CountingTool(Arc::new(AtomicUsize::new(0))))
+            .default_max_turns(3)
+            .build();
+        let mut stream = agent
+            .stream_chat(Message::user("original"), vec![Message::user("older")])
+            .add_hook(InjectAndReplace)
+            .await;
+        use futures::StreamExt;
+        while let Some(item) = stream.next().await {
+            item.expect("combined injection and replacement must not fail the run");
+        }
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        let second: Vec<Message> = requests[1].chat_history.clone().into_iter().collect();
+        // The replacement stands in for the prior history ("older", "original",
+        // the assistant call); the previous prompt (the tool result) follows it
+        // and the injected input is the newest message.
+        assert_eq!(second.len(), 3, "{second:?}");
+        assert_eq!(second[0], Message::user("replacement"));
+        assert!(matches!(
+            &second[1],
+            Message::User { content } if matches!(content.first_ref(), UserContent::ToolResult(_))
+        ));
+        assert_eq!(second[2], Message::user("ordinary input"));
     }
 
     #[tokio::test]

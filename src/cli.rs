@@ -73,6 +73,17 @@ pub enum OutputFormat {
     StreamJson,
 }
 
+/// `--stream-json-schema`: record shapes of `--output stream-json`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum StreamJsonSchema {
+    /// mini-agent's own records (`assistant_text`, `tool_call`, ...).
+    #[default]
+    Native,
+    /// Claude Code SDK messages: `assistant`/`user` with content blocks,
+    /// `stream_event` deltas and a `result` message.
+    Claude,
+}
+
 /// `--input-format`: how `-p` reads its prompt(s).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum InputFormat {
@@ -211,6 +222,15 @@ pub struct Cli {
         help = "With -p: cap for stream-json text, tool argument, tool result and diff previews (default 8192)"
     )]
     pub stream_json_preview_bytes: Option<u32>,
+
+    #[arg(
+        long = "stream-json-schema",
+        value_name = "SCHEMA",
+        value_enum,
+        requires = "print",
+        help = "With -p --output stream-json: record schema, native (default) or claude (Claude Code SDK-shaped assistant/user/stream_event/result messages; default output is unchanged)"
+    )]
+    pub stream_json_schema: Option<StreamJsonSchema>,
 
     #[arg(
         long = "include-partial-messages",

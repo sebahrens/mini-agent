@@ -1231,8 +1231,10 @@ impl Tool for JsTool {
         }
         if self.sandbox.owns_complete_process_tree() {
             globals.push(format!(
-                "`spawn(program: string, args: string[]): {{stdout: string, stderr: string, code: number, timed_out: boolean, stdout_truncated: boolean, stderr_truncated: boolean}}` (synchronous; stdout and stderr max {} MiB each; `args` must be an array and no shell parsing occurs). Example: `const p = spawn('git', ['status', '--short']); console.log(p.code, p.stdout);`",
-                SPAWN_STDOUT_MAX_BYTES.min(SPAWN_STDERR_MAX_BYTES) / (1024 * 1024)
+                "`spawn(program: string, args: string[]): {{stdout: string, stderr: string, code: number, timed_out: boolean, stdout_truncated: boolean, stderr_truncated: boolean}}` (synchronous; stdout and stderr max {} MiB each; program binary max {} MiB and at most {} arguments, otherwise too_large (use the shell tool); `args` must be an array and no shell parsing occurs). Example: `const p = spawn('git', ['status', '--short']); console.log(p.code, p.stdout);`",
+                SPAWN_STDOUT_MAX_BYTES.min(SPAWN_STDERR_MAX_BYTES) / (1024 * 1024),
+                crate::extras::js::broker::MAX_SPAWN_EXECUTABLE_BYTES / (1024 * 1024),
+                crate::extras::js::types::SPAWN_ARGUMENT_MAX_COUNT
             ));
         }
         #[cfg(feature = "skills")]

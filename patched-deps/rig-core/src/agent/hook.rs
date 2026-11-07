@@ -702,7 +702,7 @@ impl<M: CompletionModel> StepEvent<'_, M> {
 /// | `temperature`, `max_tokens`, `tool_choice` | last writer wins (warns on conflict) | replaces |
 /// | `active_tools` | set **intersection** (warns when empty) | narrows the advertised set |
 /// | `history` | last writer wins (warns on conflict) | replaces the messages sent this turn |
-/// | `append_input` | append in hook order | appends to canonical input; incompatible with `history` |
+/// | `append_input` | append in hook order | appends to canonical input; with `history`, the replacement covers the prior history and the previous prompt plus the injected input follow it |
 ///
 /// `active_tools` intersects rather than last-writer-wins because it is an
 /// allow-list guardrail: two narrowing hooks must compose as *narrowing*. All

@@ -1355,6 +1355,11 @@ fn provider_print_json_retains_progress_and_reports_terminal_failures() {
             },
             "{outcome}"
         );
+        // mini-agent-494ld: parity fields on success and failure alike.
+        assert_eq!(value["is_error"], outcome != "completed", "{outcome}");
+        assert!(value["duration_ms"].is_u64(), "{outcome}: {value}");
+        assert!(value["num_turns"].is_u64(), "{outcome}: {value}");
+        assert_eq!(value["total_cost_usd"], value["cost"], "{outcome}");
         assert_eq!(
             value["usage"]["total_tokens"],
             if outcome == "initial_failure" { 0 } else { 120 }
@@ -2850,6 +2855,57 @@ fn include_partial_messages_adds_deltas_and_leaves_default_output_unchanged() {
             .iter()
             .any(|row| row["type"] == "assistant_text" && row["text"] == "partial reply")
     );
+}
+
+#[test]
+fn stream_json_schema_claude_emits_sdk_messages_and_default_stays_native() {
+    let run = |claude: bool| -> Vec<serde_json::Value> {
+        let root = TempRoot::new();
+        let server = root.local_provider("tool_completed");
+        let mut command = root.provider_command("write");
+        command.args(["-p", "--output", "stream-json", "--no-session"]);
+        if claude {
+            command.args(["--stream-json-schema", "claude"]);
+        }
+        command.arg("write the file");
+        let output = bounded_output(command);
+        server.join().unwrap().unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    };
+    let native = run(false);
+    assert!(native.iter().any(|row| row["type"] == "assistant_text"));
+    assert!(!native.iter().any(|row| row["type"] == "assistant"));
+    let claude = run(true);
+    assert!(!claude.iter().any(|row| row["type"] == "assistant_text"));
+    let text = claude
+        .iter()
+        .find(|row| row["type"] == "assistant" && row["message"]["content"][0]["type"] == "text")
+        .expect("assistant text message");
+    assert_eq!(text["message"]["content"][0]["text"], "partial reply");
+    let tool_use = claude
+        .iter()
+        .find(|row| row["message"]["content"][0]["type"] == "tool_use")
+        .expect("tool_use message");
+    let tool_result = claude
+        .iter()
+        .find(|row| row["type"] == "user" && row["message"]["content"][0]["type"] == "tool_result")
+        .expect("tool_result message");
+    assert_eq!(
+        tool_use["message"]["content"][0]["id"],
+        tool_result["message"]["content"][0]["tool_use_id"]
+    );
+    let result = claude.last().unwrap();
+    assert_eq!(result["type"], "result");
+    assert_eq!(result["subtype"], "success");
+    assert_eq!(result["is_error"], false);
+    assert!(result["num_turns"].is_u64() && result["duration_ms"].is_u64());
+    assert!(result["total_cost_usd"].is_number());
+    assert!(result["usage"]["cache_read_input_tokens"].is_u64());
 }
 
 /// A child whose stdin the test writes to while it reads stdout line by line.
