@@ -41,7 +41,7 @@ fn frame(payload: serde_json::Value) -> Vec<u8> {
 
 fn hello() -> Vec<u8> {
     frame(serde_json::json!({
-        "protocol_version": 11,
+        "protocol_version": 12,
         "build_id": BUILD_ID,
         "invocation_id": null,
         "sequence": 0,
@@ -51,7 +51,7 @@ fn hello() -> Vec<u8> {
 
 fn shutdown() -> Vec<u8> {
     frame(serde_json::json!({
-        "protocol_version": 11,
+        "protocol_version": 12,
         "build_id": BUILD_ID,
         "invocation_id": null,
         "sequence": 2,

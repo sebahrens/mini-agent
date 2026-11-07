@@ -1302,27 +1302,59 @@ fn default_provider(
         .unwrap_or_else(|| CompactString::new("openrouter"))
 }
 
+/// Stack for work that must not depend on the platform's main-thread default
+/// (1 MiB on Windows, and the budget the startup tests enforce).
+const ROOMY_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+/// Runs `work` on a thread with [`ROOMY_STACK_SIZE`] and returns its result,
+/// re-raising its panic. Falls back to the calling thread if the thread cannot
+/// be created.
+pub(crate) fn on_roomy_stack<T, F>(work: F) -> T
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(work)));
+    let parse = {
+        let slot = std::sync::Arc::clone(&slot);
+        move || {
+            let work = slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+                .expect("roomy-stack work runs once");
+            work()
+        }
+    };
+    match std::thread::Builder::new()
+        .name("roomy-stack".into())
+        .stack_size(ROOMY_STACK_SIZE)
+        .spawn(parse)
+    {
+        Ok(handle) => handle
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+        Err(_) => {
+            let work = slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+                .expect("roomy-stack work was not started");
+            work()
+        }
+    }
+}
+
 impl Cli {
     pub fn parse_command_line() -> Self {
         // Clap's derived argument builder is one enormous frame in an
         // unoptimized build and grows with every flag and feature (about 1 MiB
         // with `skills`), which does not fit the 1 MiB Windows main-thread
         // stack. Build it on a short-lived thread with room to spare.
-        const PARSE_STACK_SIZE: usize = 8 * 1024 * 1024;
         let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
-        let parse =
-            move || Self::try_parse_command_line_from(args).unwrap_or_else(|error| error.exit());
-        match std::thread::Builder::new()
-            .name("cli-parse".into())
-            .stack_size(PARSE_STACK_SIZE)
-            .spawn(parse)
-        {
-            Ok(handle) => handle
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
-            Err(_) => Self::try_parse_command_line_from(std::env::args_os())
-                .unwrap_or_else(|error| error.exit()),
-        }
+        on_roomy_stack(move || {
+            Self::try_parse_command_line_from(args).unwrap_or_else(|error| error.exit())
+        })
     }
 
     fn try_parse_command_line_from(

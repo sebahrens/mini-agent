@@ -103,7 +103,18 @@ fn main() -> anyhow::Result<ExitCode> {
         }
         return Ok(ExitCode::SUCCESS);
     }
-    let runtime_headless = cli.is_headless();
+    if cli.is_headless() {
+        // Headless turns nest the provider stream, tool execution and output
+        // futures on whichever thread drives the runtime, and each round of
+        // relief, compaction and restart adds frames. Run them on a sized
+        // thread so the platform's main-thread default (1 MiB on Windows)
+        // does not bound a turn's depth.
+        return cli::on_roomy_stack(move || run_on_runtime(cli, true));
+    }
+    run_on_runtime(cli, false)
+}
+
+fn run_on_runtime(cli: cli::Cli, runtime_headless: bool) -> anyhow::Result<ExitCode> {
     let runtime = normal_runtime().context("failed to initialize the async runtime")?;
     // Runtime adapters otherwise copy the entire startup future into their
     // own stack frames before polling it.
