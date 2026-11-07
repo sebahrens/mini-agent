@@ -12,6 +12,22 @@ export interface ChatStopResult {
   readonly errorDetails?: { readonly message: string };
 }
 
+/** Splits oversized text into several chunks (never mid surrogate pair) instead of truncating it. */
+function chunked(value: string): string[] {
+  const parts: string[] = [];
+  let start = 0;
+  while (start < value.length) {
+    let end = Math.min(value.length, start + MAX_RENDER_CHARS);
+    if (end < value.length) {
+      const code = value.charCodeAt(end - 1);
+      if (code >= 0xd800 && code <= 0xdbff) { end -= 1; }
+    }
+    parts.push(value.slice(start, end));
+    start = end;
+  }
+  return parts;
+}
+
 function bounded(value: string): string {
   if (value.length <= MAX_RENDER_CHARS) { return value; }
   return `${value.slice(0, MAX_RENDER_CHARS)}\n\n…update truncated…`;
@@ -36,7 +52,7 @@ export class ChatUpdateRenderer {
     switch (update.sessionUpdate) {
       case 'agent_message_chunk': {
         const text = contentText(update.content);
-        return text ? [{ kind: 'markdown', value: bounded(text) }] : [];
+        return text ? chunked(text).map(value => ({ kind: 'markdown' as const, value })) : [];
       }
       case 'agent_thought_chunk': {
         const text = contentText(update.content);

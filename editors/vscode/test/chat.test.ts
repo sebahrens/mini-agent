@@ -39,16 +39,21 @@ describe('ChatUpdateRenderer', () => {
     }]);
   });
 
-  it('bounds individual large updates', () => {
+  it('splits an oversized chunk into several markdown events without losing text', () => {
     const renderer = new ChatUpdateRenderer();
-    const [event] = renderer.render({
-      sessionUpdate: 'agent_message_chunk',
-      content: { type: 'text', text: 'x'.repeat(MAX_RENDER_CHARS + 100) },
-    });
+    const text = 'x'.repeat(MAX_RENDER_CHARS * 2 + 100);
+    const events = renderer.render({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } });
+    expect(events.length).toBe(3);
+    expect(events.every(event => event.kind === 'markdown' && event.value.length <= MAX_RENDER_CHARS)).toBe(true);
+    expect(events.map(event => event.value).join('')).toBe(text);
+  });
 
-    expect(event.kind).toBe('markdown');
-    expect(event.value.length).toBeLessThan(MAX_RENDER_CHARS + 40);
-    expect(event.value).toContain('update truncated');
+  it('does not split a surrogate pair when chunking', () => {
+    const renderer = new ChatUpdateRenderer();
+    const text = 'x'.repeat(MAX_RENDER_CHARS - 1) + '\u{1F600}tail';
+    const events = renderer.render({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } });
+    expect(events.map(event => event.value).join('')).toBe(text);
+    expect(events[0]?.value.endsWith('x')).toBe(true);
   });
 });
 
