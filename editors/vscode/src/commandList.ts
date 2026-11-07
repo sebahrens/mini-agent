@@ -20,7 +20,7 @@ export function describeServerCommands(
   const page = Number.isFinite(requested) ? Math.min(Math.max(requested, 1), pages) : 1;
   const start = (page - 1) * COMMANDS_PAGE_SIZE;
   const shown = commands.slice(start, start + COMMANDS_PAGE_SIZE);
-  const lines = shown.map(command => `- \`/${command.name.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\s]/gu, '?')}\`: ${command.description.replace(/[\r\n]+/gu, ' ').slice(0, 200)}`);
+  const lines = shown.map(command => `- \`/${command.name.replace(/[^\p{L}\p{N}\p{M}_:.-]/gu, '?')}\`: ${command.description.replace(/[\r\n]+/gu, ' ').slice(0, 200)}`);
   const notes: string[] = [];
   if (commands.length > shown.length) {
     const hidden = commands.length - shown.length;

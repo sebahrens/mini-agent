@@ -169,6 +169,13 @@ describe('long command lists', () => {
     expect(describeServerCommands([{ name: 'bad\u0007name', description: 'd' }])).toContain('`/bad?name`');
   });
 
+  it('neutralises markdown in a command name so it cannot break out of the code span', () => {
+    const listed = describeServerCommands([{ name: 'x`[a](http://evil)', description: 'd' }, { name: 'caf\u00e9-\u65e5\u672c', description: 'd' }]);
+    expect(listed).toContain('`/x??a??http:??evil?`');
+    expect(listed).not.toContain('](http');
+    expect(listed).toContain('`/caf\u00e9-\u65e5\u672c`');
+  });
+
   it('stays silent for a list that fits and reports commands the session could not keep', () => {
     expect(describeServerCommands(advertised(5))).not.toContain('not shown');
     expect(describeServerCommands(advertised(5))).not.toContain('could not be kept');
