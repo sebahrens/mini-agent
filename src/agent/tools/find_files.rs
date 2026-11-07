@@ -865,6 +865,11 @@ impl BoundDirectory {
         };
         chain = chain.append(global_ignore_matchers(&self.approved_root));
         chain = chain.append(parent_ignore_matchers(&self.approved_root));
+        // Same order as BoundWalker::new: .git/info/exclude is lower priority
+        // than the local .gitignore/.ignore, as in git itself.
+        if let Some(matcher) = root_exclude_matcher(&self.root, &self.approved_root) {
+            chain = chain.append(vec![matcher]);
+        }
         let mut local_matchers = Vec::new();
         for ignore_name in [".gitignore", ".ignore"] {
             if let Some(matcher) =
@@ -874,9 +879,6 @@ impl BoundDirectory {
             }
         }
         chain = chain.append(local_matchers);
-        if let Some(matcher) = root_exclude_matcher(&self.root, &self.approved_root) {
-            chain = chain.append(vec![matcher]);
-        }
 
         let mut entries = Vec::new();
         for DirectoryName { name, kind } in bound_platform::read_directory(&self.root)? {

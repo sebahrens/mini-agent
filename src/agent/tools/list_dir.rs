@@ -435,6 +435,32 @@ mod tests {
         std::fs::remove_dir_all(temp).unwrap();
     }
 
+    /// mini-agent-a2e1g: `.gitignore` outranks `.git/info/exclude`, exactly as
+    /// in the walker behind grep/find_files.
+    #[tokio::test]
+    async fn gitignore_negation_outranks_info_exclude() {
+        let temp = std::env::temp_dir().join(format!(
+            "mini-agent-list-dir-exclude-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(temp.join(".git/info")).unwrap();
+        std::fs::write(temp.join(".git/info/exclude"), "secret.txt\n").unwrap();
+        std::fs::write(temp.join(".gitignore"), "!secret.txt\n").unwrap();
+        std::fs::write(temp.join("secret.txt"), "x").unwrap();
+        let listing = ListDirTool::new(None, None, None)
+            .with_workspace(&temp)
+            .call(ListDirArgs {
+                path: None,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(listing.contains("secret.txt"), "{listing}");
+        assert!(!listing.contains("gitignored"), "{listing}");
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
     #[tokio::test]
     async fn flat_listing_pages_past_ten_thousand_entries() {
         let temp = std::env::temp_dir().join(format!(
