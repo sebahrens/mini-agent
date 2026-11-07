@@ -989,7 +989,11 @@ pub(crate) fn apply_shell_resource_limits(cmd: &mut Command, limits: ShellResour
             if libc::getrlimit(resource as _, &mut current) != 0 {
                 return;
             }
-            let value = (wanted as libc::rlim_t).min(current.rlim_max);
+            // Only ever lower: never raise a soft limit the operator already
+            // set below the configured cap (RLIM_INFINITY is the largest value).
+            let value = (wanted as libc::rlim_t)
+                .min(current.rlim_cur)
+                .min(current.rlim_max);
             let lowered = libc::rlimit {
                 rlim_cur: value,
                 rlim_max: current.rlim_max,
@@ -13219,3 +13223,41 @@ echo PRIVATE_TEMP_PASS"#,
         }
     }
 }
+        #[tokio::test]
+        #[allow(unsafe_code)]
+        async fn an_operator_soft_limit_below_the_cap_is_not_raised() {
+            use std::os::unix::process::CommandExt;
+            let dir = crate::tests::OwnedTestDirectory::new("shell-fsize-soft");
+            let file = dir.path().join("big");
+            let mut cmd = Command::new("/bin/sh");
+            cmd.arg("-c").arg(format!(
+                "dd if=/dev/zero of='{}' bs=1024 count=4096 2>&1",
+                file.display()
+            ));
+            // The operator's own shell: soft limit 1 MiB, hard limit unchanged.
+            // SAFETY: only async-signal-safe libc calls between fork and exec.
+            unsafe {
+                cmd.as_std_mut().pre_exec(|| {
+                    let mut current: libc::rlimit = std::mem::zeroed();
+                    libc::getrlimit(libc::RLIMIT_FSIZE as _, &mut current);
+                    current.rlim_cur = 1024 * 1024;
+                    libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+                    libc::setrlimit(libc::RLIMIT_FSIZE as _, &current);
+                    Ok(())
+                });
+            }
+            apply_shell_resource_limits(
+                &mut cmd,
+                ShellResourceLimits {
+                    max_processes: None,
+                    max_file_bytes: Some(1024 * 1024 * 1024),
+                },
+            );
+            let _ = cmd.output().await.unwrap();
+            assert_eq!(
+                std::fs::metadata(&file).unwrap().len(),
+                1024 * 1024,
+                "the inherited lower soft limit must still apply"
+            );
+        }
+
