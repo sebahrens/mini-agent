@@ -1420,9 +1420,53 @@ async fn call_tool_with_display(
     let _display = display.and_then(|(registry, id, events)| {
         registry.register(handle.progress_token.clone(), id, events)
     });
-    match handle.await_response().await? {
+    // rmcp only notifies the server on its own timeouts; dropping this future
+    // (a user interrupt or a cancelled turn) would leave a side-effecting tool
+    // running. The guard sends `notifications/cancelled` unless the call ended.
+    let mut guard = CancelOnDrop::new(peer, handle.id.clone());
+    let outcome = handle.await_response().await;
+    guard.disarm();
+    match outcome? {
         ServerResult::CallToolResult(result) => Ok(result),
         _ => Err(ServiceError::UnexpectedResponse),
+    }
+}
+
+/// Sends `notifications/cancelled` for an in-flight request when dropped
+/// before [`CancelOnDrop::disarm`].
+struct CancelOnDrop {
+    armed: Option<(Peer<RoleClient>, rmcp::model::RequestId)>,
+}
+
+impl CancelOnDrop {
+    fn new(peer: &Peer<RoleClient>, id: rmcp::model::RequestId) -> Self {
+        Self {
+            armed: Some((peer.clone(), id)),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = None;
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        let Some((peer, id)) = self.armed.take() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        runtime.spawn(async move {
+            let notification = rmcp::model::CancelledNotification::new(
+                rmcp::model::CancelledNotificationParam::new(
+                    Some(id),
+                    Some("the client abandoned the call".to_owned()),
+                ),
+            );
+            let _ = peer.send_notification(notification.into()).await;
+        });
     }
 }
 

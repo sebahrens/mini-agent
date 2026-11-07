@@ -168,7 +168,7 @@ fn main() {
     for line in stdin.lock().lines() {
         let line = line.unwrap();
         let compact = line.replace(' ', "").replace('\t', "");
-        if mode.starts_with("aux") {
+        if mode.starts_with("aux") || mode == "hang-tools-call" {
             let lease=std::path::PathBuf::from(env::var_os("MCP_FIXTURE_LEASE_FILE").unwrap());
             let mut trace=OpenOptions::new().create(true).append(true).open(lease.with_extension("rpc")).unwrap();
             writeln!(trace,"{line}").unwrap();
@@ -1818,6 +1818,55 @@ async fn mcp_tool_call_hang_times_out_with_tool_error() {
     assert!(message.contains("probe"), "{message}");
     assert!(message.contains("mcp_tool_timeout_secs"), "{message}");
 
+    let pid = wait_for_pid(&lease).await;
+    shutdown(manager).await;
+    assert_process_reaped(pid).await;
+    fixture.cleanup();
+}
+
+#[tokio::test]
+async fn mcp_tool_call_dropped_mid_flight_sends_notifications_cancelled() {
+    let fixture = FixtureBuild::compile();
+    let lease = fixture.lease("hang-tools-call");
+    let handle = McpClientHandle::connect(
+        CompactString::new("fixture"),
+        &fixture.config(
+            fixture.executable.display().to_string(),
+            Vec::new(),
+            "hang-tools-call",
+            &lease,
+        ),
+    )
+    .await
+    .unwrap();
+    let manager = McpClientManager::from_handles(vec![handle]);
+    let mut tools = manager
+        .collect_tools_with_timeouts(
+            Some(permission_for(Action::Allow)),
+            None,
+            McpToolTimeouts {
+                list: Duration::from_secs(5),
+                call: Duration::from_secs(60),
+            },
+        )
+        .await;
+    let tool = tools
+        .iter_mut()
+        .find(|tool| tool.name() == "probe")
+        .expect("fixture tool must be listed");
+    // The turn is cancelled: the call future is dropped well inside the bound.
+    let _ = tokio::time::timeout(Duration::from_millis(500), tool.call("{}".to_string())).await;
+    let trace = lease.with_extension("rpc");
+    let mut seen = false;
+    for _ in 0..50 {
+        let text = std::fs::read_to_string(&trace).unwrap_or_default();
+        if text.contains("notifications/cancelled") {
+            seen = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(seen, "dropping an in-flight call must cancel it on the server");
     let pid = wait_for_pid(&lease).await;
     shutdown(manager).await;
     assert_process_reaped(pid).await;
