@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { lstat, realpath } from 'node:fs/promises';
-import { ClientFsConflict, sha256Hex, type ClientFsHost } from './clientFs';
+import { ClientFsAppliedUnsaved, ClientFsConflict, sha256Hex, type ClientFsHost } from './clientFs';
 
 /** Whether the user opted in. Machine scope: workspace settings cannot turn it on. */
 export function clientFileAccessEnabled(): boolean {
@@ -32,7 +32,7 @@ export const vscodeClientFsHost: ClientFsHost = {
     // and the main thread applying it.
     // The replacement already landed (and can be undone); never save over it.
     if (document.version > version + 1) {
-      throw new ClientFsConflict();
+      throw new ClientFsAppliedUnsaved();
     }
     // save() resolves false for a document that is not dirty: an identical write,
     // or auto-save winning the race. That is success; only a still-dirty document failed.

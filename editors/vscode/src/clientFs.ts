@@ -37,6 +37,17 @@ export class ClientFsConflict extends ClientFsError {
   }
 }
 
+/**
+ * The replacement was applied to the live buffer but the user typed during the
+ * apply window, so it was not saved. Unlike {@link ClientFsConflict}, the
+ * buffer did change.
+ */
+export class ClientFsAppliedUnsaved extends ClientFsError {
+  constructor() {
+    super('the file changed in the editor while the replacement was being applied; the replacement is in the editor buffer but was NOT saved (undo it to restore the previous text). Re-read the file and retry');
+  }
+}
+
 /** `_meta` namespace of the conditional-write extension (see the agent's acp/client_fs.rs). */
 export const META_NAMESPACE = 'miniAgent';
 

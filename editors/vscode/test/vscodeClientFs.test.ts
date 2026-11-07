@@ -44,7 +44,7 @@ vi.mock('vscode', () => {
   };
 });
 
-import { ClientFsConflict, sha256Hex } from '../src/clientFs';
+import { ClientFsAppliedUnsaved, ClientFsConflict, sha256Hex } from '../src/clientFs';
 import { vscodeClientFsHost } from '../src/vscodeClientFs';
 
 const reset = () => {
@@ -95,7 +95,11 @@ describe('vscodeClientFsHost.writeText', () => {
   it('does not save over a replacement the user typed into while it was being applied', async () => {
     reset();
     state.duringApply = () => { state.version += 2; };
-    await expect(vscodeClientFsHost.writeText('/w/a.ts', 'agent replacement', before)).rejects.toBeInstanceOf(ClientFsConflict);
+    const failure = vscodeClientFsHost.writeText('/w/a.ts', 'agent replacement', before);
+    await expect(failure).rejects.toBeInstanceOf(ClientFsAppliedUnsaved);
+    // Must not claim that nothing changed: the replacement is in the buffer.
+    await expect(failure).rejects.not.toThrow(/no changes were applied/);
+    await expect(failure).rejects.toThrow(/NOT saved/);
     expect(state.saves).toBe(0);
   });
 });
