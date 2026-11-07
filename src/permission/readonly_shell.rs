@@ -164,6 +164,60 @@ fn short_cluster_has(arg: &str, letters: &[char]) -> bool {
         && arg.chars().skip(1).any(|c| letters.contains(&c))
 }
 
+/// True when `arg` is a GNU getopt long option naming `full`, including any
+/// unambiguous abbreviation of at least `min` characters (`--rec`, `--recur`).
+fn grep_long_is(arg: &str, full: &str, min: usize) -> bool {
+    let Some(long) = arg.strip_prefix("--") else {
+        return false;
+    };
+    let name = long.split_once('=').map_or(long, |(name, _)| name);
+    name.len() >= min && full.starts_with(name)
+}
+
+/// `grep -d ACTION` / `--directories=ACTION` where ACTION (or an
+/// abbreviation of it) is `recurse`.
+fn is_recurse_action(value: &str) -> bool {
+    !value.is_empty() && "recurse".starts_with(value)
+}
+
+/// Whether the grep arguments select directory recursion by any spelling:
+/// `-r`, `--recursive` and abbreviations, `--directories=recurse`,
+/// `--directories recurse`, `-d recurse`, `-drecurse`, `-nrdrecurse`.
+fn grep_selects_recursion(args: &[String]) -> bool {
+    for (i, arg) in args.iter().enumerate() {
+        if short_cluster_has(arg, &['r']) || grep_long_is(arg, "recursive", 2) {
+            return true;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            if let Some((name, value)) = long.split_once('=') {
+                if "directories".starts_with(name) && name.len() >= 3 && is_recurse_action(value) {
+                    return true;
+                }
+            } else if grep_long_is(arg, "directories", 3)
+                && args.get(i + 1).is_some_and(|v| is_recurse_action(v))
+            {
+                return true;
+            }
+        } else if arg.starts_with('-') && arg.len() > 1 {
+            // `d` takes an argument: the rest of the cluster, or the next word.
+            if let Some(pos) = arg[1..].find('d') {
+                let rest = &arg[1 + pos + 1..];
+                if rest.is_empty() {
+                    if args.get(i + 1).is_some_and(|v| is_recurse_action(v)) {
+                        return true;
+                    }
+                } else if is_recurse_action(rest) {
+                    return true;
+                }
+            }
+        }
+        if arg == "recurse" {
+            return true;
+        }
+    }
+    false
+}
+
 fn command_is_read_only(
     words: &[String],
     working_dir: &str,
@@ -198,15 +252,12 @@ fn command_is_read_only(
             .any(|a| short_cluster_has(a, &['L', 'H']) || a.starts_with("--dereference")),
         "cat" | "head" | "wc" => true,
         "grep" => {
-            if args
-                .iter()
-                .any(|a| short_cluster_has(a, &['R']) || a == "--dereference-recursive")
-            {
+            if args.iter().any(|a| {
+                short_cluster_has(a, &['R']) || grep_long_is(a, "dereference-recursive", 3)
+            }) {
                 return false;
             }
-            report.recursive |= args
-                .iter()
-                .any(|a| short_cluster_has(a, &['r']) || a == "--recursive" || a == "recurse");
+            report.recursive |= grep_selects_recursion(args);
             true
         }
         "tail" => {
@@ -459,6 +510,33 @@ mod tests {
         assert!(report("find . -name x"));
         assert!(!report("grep foo src/main.rs"));
         assert!(!report("cat a | head"));
+        for script in [
+            "grep --directories=recurse -n KEY .",
+            "grep --directories recurse KEY .",
+            "grep -drecurse KEY .",
+            "grep -d recurse KEY .",
+            "grep -nd recurse KEY .",
+            "grep -ndrecurse KEY .",
+            "grep --dir=rec KEY .",
+            "grep --rec KEY .",
+            "grep --recur KEY .",
+            "grep --recursive KEY .",
+        ] {
+            assert!(report(script), "{script}");
+        }
+        assert!(!report("grep --directories=skip KEY file"));
+        assert!(!report("grep -d skip KEY file"));
+    }
+
+    #[test]
+    fn abbreviated_dereference_recursive_asks() {
+        for script in [
+            "grep --dereference-rec foo .",
+            "grep --dereference-recur foo .",
+            "grep --der foo .",
+        ] {
+            no(script);
+        }
     }
 
     #[test]
