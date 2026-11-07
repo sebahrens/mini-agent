@@ -403,6 +403,40 @@ impl ChildEvidence {
     }
 }
 
+/// Re-judge one recorded call by the parent's current rules, as if the parent
+/// made the call itself: every path-bearing check by its tool rule and a
+/// recorded MCP call by the parent's `mcp_tool` rules. Shared by
+/// `task_evidence` and the inline image lane so neither widens access. With
+/// `ask` unset a rule that would ask is a refusal.
+pub(crate) async fn rejudge(
+    meta: &EvidenceMeta,
+    permission: &Option<crate::permission::checker::PermCheck>,
+    ask: &Option<crate::permission::ask::AskSender>,
+) -> Result<(), crate::agent::tools::ToolError> {
+    for (rule, target) in &meta.path_checks {
+        crate::agent::tools::check_perm_path(permission, ask, rule, target).await?;
+    }
+    #[cfg(feature = "mcp")]
+    if let Some((server, tool)) = &meta.mcp {
+        crate::agent::tools::check_mcp_perm(
+            permission,
+            ask,
+            &format!("mcp_tool:{server}:{tool}"),
+            None,
+            tool,
+        )
+        .await?;
+    }
+    #[cfg(not(feature = "mcp"))]
+    if meta.mcp.is_some() {
+        return Err(crate::agent::tools::ToolError::Msg(
+            "task_evidence: this record came from an MCP tool and MCP support is not built in"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// The permission re-checks one recorded call needs. Search-style tools with
 /// no `path` run at the child's directory, so that directory is the subject.
 /// Paths are stored absolute and canonical (lexically normalized when they do
@@ -972,6 +1006,84 @@ mod tests {
         assert!(!index.was_evicted("task-never"));
         assert!(index.get(&format!("task-{MAX_EVIDENCE_TASKS}")).is_some());
         assert!(!path.exists(), "evicted evidence content is deleted");
+    }
+
+    #[tokio::test]
+    async fn inline_image_lane_rejudges_mcp_and_path_rules_like_task_evidence() {
+        let session = format!("inline-rejudge-{}", uuid::Uuid::new_v4());
+        let root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let mut evidence = ChildEvidence::default().with_child_context(
+            Some(root.clone()),
+            vec![("shots".into(), "screenshot".into())],
+        );
+        evidence.record_history(&[
+            call("m", "screenshot", serde_json::json!({})),
+            result("m", vec![text("shot"), png_part()]),
+            call("r", "read", serde_json::json!({"path": "shot.png"})),
+            result("r", vec![text("Image shot.png"), png_part()]),
+        ]);
+        let stored = EvidenceIndex::default()
+            .store(&session, "task-x".into(), evidence)
+            .await;
+        let checker = |rules: serde_json::Value| {
+            let mut config = crate::config::Config {
+                permission: Some(rules),
+                ..crate::config::Config::default()
+            };
+            config.permission_modes = Some(vec!["standard".to_string()]);
+            let permission_config = config.build_permission_config().unwrap();
+            Some(Arc::new(std::sync::Mutex::new(
+                crate::permission::checker::PermissionChecker::new(
+                    &permission_config,
+                    crate::permission::SecurityMode::Standard,
+                    Some(root.clone()),
+                    config.permission_modes.clone(),
+                )
+                .unwrap(),
+            )))
+        };
+        let run = |rules: serde_json::Value| {
+            let permission = checker(rules);
+            let stored = stored.clone();
+            let session = session.clone();
+            async move {
+                let call = super::super::inline_images::CallBudget::default();
+                let lane = super::super::inline_images::Lane {
+                    cap: 2,
+                    parent: None,
+                    call: &call,
+                    session_id: &session,
+                    permission: &permission,
+                };
+                super::super::inline_images::select(
+                    lane,
+                    &stored,
+                    "## Findings\n- x [evidence: E1] [attach: E1, E2]\n",
+                    |_| true,
+                )
+                .await
+            }
+        };
+        let denied = run(serde_json::json!({"*": "allow", "mcp_tool": "deny"})).await;
+        assert!(denied.images.is_empty());
+        assert!(
+            denied.notes[0].contains("permission rules do not allow"),
+            "{:?}",
+            denied.notes
+        );
+        let read_denied = run(serde_json::json!({"*": "allow", "read": "deny"})).await;
+        assert!(
+            read_denied.notes[1].contains("permission rules do not allow"),
+            "{:?}",
+            read_denied.notes
+        );
+        // Control: with everything allowed the permission gate is not the reason.
+        let allowed = run(serde_json::json!({"*": "allow"})).await;
+        assert!(
+            !allowed.notes[1].contains("permission rules do not allow"),
+            "{:?}",
+            allowed.notes
+        );
     }
 
     #[tokio::test]
