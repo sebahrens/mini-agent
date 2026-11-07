@@ -2593,10 +2593,9 @@ applies whether or not `bash` rules are configured, and a configured rule that
 matches the script (for example an exact `"rm -rf target": allow`) decides
 instead. Like other Bash patterns it is a best-effort guard rail, not a
 containment boundary, and in non-interactive runs the ask is refused. Note
-that configuring any `bash` rule replaces the built-in `bash` rule list
-(including its pattern-based denies such as `rm -rf /**` and `dd **`); only
-the built-in `^rm\s+.*\*` deny is always kept, so copy any built-in denies you
-still want into your own rules.
+that configuring any `bash` rule replaces only the built-in convenience
+allows; the built-in destructive denies (such as `rm -rf /**`, `dd **` and
+`^rm\s+.*\*`) always remain in force and cannot be replaced by user rules.
 
 `planwrite` is read-only except for the narrow built-in plan-file exception:
 `write`, `edit`, and `js/write_file` may modify `PLAN*.md` only when the

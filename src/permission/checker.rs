@@ -3811,6 +3811,26 @@ mod tests {
         assert_eq!(checker.check_path("edit", &target), CheckResult::Ask);
     }
 
+    // mini-agent-6syvp: a configured bash rule replaces only the convenience
+    // allows; the built-in destructive denies stay (documented in CONFIG.md).
+    #[test]
+    fn configured_bash_rule_keeps_builtin_destructive_denies() {
+        let configs = PermissionConfigs::from(PermissionConfig {
+            allow_entries: Some([("bash".to_owned(), vec!["cargo test".to_owned()])].into()),
+            ..PermissionConfig::default()
+        });
+        let mut checker =
+            PermissionChecker::new(&configs, SecurityMode::Standard, None, None).unwrap();
+        assert!(matches!(
+            checker.check("shell", "dd if=/dev/zero of=x"),
+            CheckResult::Denied(_)
+        ));
+        assert!(matches!(
+            checker.check("shell", "rm -rf /tmp/x/*"),
+            CheckResult::Denied(_)
+        ));
+    }
+
     #[test]
     fn js_fetch_permissions_fail_closed_by_mode_and_honor_explicit_rules() {
         let new_checker = |mode, config| {
