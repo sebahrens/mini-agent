@@ -182,7 +182,7 @@ impl ProviderHttpClient {
         let response = builder
             .send()
             .await
-            .map_err(|error| http_client::Error::Instance(Box::new(error)))?;
+            .map_err(transport_error)?;
         if response.status() != http::StatusCode::UNAUTHORIZED
             || applied.is_empty()
             || !crate::key_command::renew_after_unauthorized(&applied).await
@@ -193,7 +193,7 @@ impl ProviderHttpClient {
             .await?
             .send()
             .await
-            .map_err(|error| http_client::Error::Instance(Box::new(error)))
+            .map_err(transport_error)
     }
 
     async fn prepare_request_applied(
@@ -400,9 +400,17 @@ where
             .bytes()
             .await
             .map(U::from)
-            .map_err(|error| http_client::Error::Instance(Box::new(error)))
+            .map_err(transport_error)
     });
     builder.body(body).map_err(http_client::Error::Protocol)
+}
+
+/// Wraps a reqwest failure without its request URL. rig puts the Gemini API key
+/// (and any command-issued secret rewritten into it) in the query string, and
+/// reqwest's `Display` appends ` for url (...)`; stripping the URL keeps the key
+/// out of error text, logs and session records (mini-agent-h6wfe).
+fn transport_error(error: reqwest::Error) -> http_client::Error {
+    http_client::Error::Instance(Box::new(error.without_url()))
 }
 
 impl HttpClientExt for ProviderHttpClient {
@@ -426,7 +434,7 @@ impl HttpClientExt for ProviderHttpClient {
                 while let Some(chunk) = response
                     .chunk()
                     .await
-                    .map_err(|e| http_client::Error::Instance(Box::new(e)))?
+                    .map_err(transport_error)?
                 {
                     if chunk.len() > crate::auth::openai_plan::MAX_BODY.saturating_sub(bytes.len())
                     {
@@ -484,7 +492,7 @@ impl HttpClientExt for ProviderHttpClient {
             let response = request
                 .send()
                 .await
-                .map_err(|error| http_client::Error::Instance(Box::new(error)))?;
+                .map_err(transport_error)?;
             if !response.status().is_success() {
                 return Err(response_error(response, None).await);
             }
@@ -530,7 +538,7 @@ impl HttpClientExt for ProviderHttpClient {
             use futures::StreamExt;
             let body: http_client::sse::BoxedStream =
                 Box::pin(response.bytes_stream().map(|chunk| {
-                    chunk.map_err(|error| http_client::Error::Instance(Box::new(error)))
+                    chunk.map_err(transport_error)
                 }));
             builder.body(body).map_err(http_client::Error::Protocol)
         }
@@ -716,6 +724,34 @@ pub(crate) mod tests {
         })
         .await
         .unwrap();
+    }
+
+    // mini-agent-h6wfe: a connection failure must not echo the key= query.
+    #[tokio::test]
+    async fn transport_error_text_never_contains_the_url_query_key() {
+        let port = {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let client = ProviderHttpClient::new(reqwest::Client::new());
+        let secret = "AIzaSECRETKEY123";
+        let build = || {
+            Request::builder()
+                .uri(format!("http://127.0.0.1:{port}/v1beta/m?alt=sse&key={secret}"))
+                .body(Vec::<u8>::new())
+                .unwrap()
+        };
+        let streaming = client.send_streaming(build()).await.err().expect("refused");
+        let buffered = client
+            .send::<Vec<u8>, Bytes>(build())
+            .await
+            .err()
+            .expect("refused");
+        for error in [streaming, buffered] {
+            let text = format!("{error} / {error:?}");
+            assert!(!text.contains(secret), "key leaked: {text}");
+            assert!(!text.contains("key="), "query leaked: {text}");
+        }
     }
 
     #[tokio::test]
