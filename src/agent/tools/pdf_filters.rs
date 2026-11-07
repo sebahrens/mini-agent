@@ -483,6 +483,24 @@ mod tests {
     }
 
     #[test]
+    fn lzw_decodes_an_independent_early_change_zero_stream() {
+        // 64x64 palette image encoded by PIL's GIF writer. GIF LZW has no
+        // early change, so the codes (re-packed most significant bit first,
+        // with the widths the GIF decoder uses) are an independent
+        // EarlyChange 0 stream crossing 9->10->11->12 bit widths.
+        let strip = include_bytes!("fixtures/gif_lzw_early0_strip.bin");
+        let mut state = 987_654_321u32;
+        let expected: Vec<u8> = (0..4096)
+            .map(|_| {
+                state = state.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                (state >> 16) as u8
+            })
+            .collect();
+        assert_eq!(lzw(strip, false, 1 << 20).unwrap(), expected);
+        assert_ne!(lzw(strip, true, 1 << 20).ok(), Some(expected));
+    }
+
+    #[test]
     fn lzw_decodes_a_real_libtiff_strip() {
         // 64x64 gray strip written by PIL/libtiff (tiff_lzw, EarlyChange 1
         // semantics), passing through the 9->10->11->12 bit width changes.
