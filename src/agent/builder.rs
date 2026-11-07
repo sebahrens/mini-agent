@@ -50,7 +50,7 @@ mod subagent_registration_tests {
 }
 
 #[cfg(any(feature = "mcp", all(test, feature = "goal", feature = "js")))]
-fn is_reserved_builtin_tool_name(name: &str) -> bool {
+pub(crate) fn is_reserved_builtin_tool_name(name: &str) -> bool {
     matches!(
         name,
         "read"

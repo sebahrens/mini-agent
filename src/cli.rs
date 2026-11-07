@@ -1591,55 +1591,12 @@ impl Cli {
 
     #[cfg(feature = "mcp")]
     pub(crate) fn mcp_is_eligible(&self, cfg: &config::Config) -> bool {
-        const BUILTIN_TOOLS: &[&str] = &[
-            "read",
-            "write",
-            "edit",
-            "grep",
-            "find_files",
-            "list_dir",
-            "todo_write",
-            "todo_read",
-            "shell",
-            "bash",
-            #[cfg(feature = "js")]
-            "js",
-            #[cfg(feature = "subagents")]
-            "task",
-            #[cfg(feature = "subagents")]
-            "task_result",
-            #[cfg(feature = "subagents")]
-            "task_list",
-            #[cfg(feature = "subagents")]
-            "task_cancel",
-            #[cfg(feature = "subagents")]
-            "task_send",
-            #[cfg(feature = "subagents")]
-            "task_evidence",
-            #[cfg(feature = "memory")]
-            "memory_write",
-            #[cfg(feature = "memory")]
-            "memory_edit",
-            #[cfg(feature = "memory")]
-            "memory_read",
-            #[cfg(feature = "memory")]
-            "memory_search",
-            #[cfg(feature = "advisor")]
-            "advisor",
-            #[cfg(feature = "lsp")]
-            "lsp_diagnostics",
-            #[cfg(feature = "lsp")]
-            "lsp_navigate",
-            "web_fetch",
-            "web_search",
-        ];
-
         !self.resolve_no_tools(cfg)
             && (self.tools.is_empty()
                 || self
                     .tools
                     .iter()
-                    .any(|name| !BUILTIN_TOOLS.contains(&name.as_str())))
+                    .any(|name| !is_non_mcp_builtin_tool_name(name)))
     }
 
     /// Sandboxing is on unless explicitly refused. `--no-sandbox` outranks
@@ -1836,6 +1793,17 @@ impl Cli {
             .or_else(|| cfg.advisor.as_ref().map(|a| a.advisor_kilobytes_limit))
             .unwrap_or(256)
     }
+}
+
+/// Names the builder registers itself (from its single reserved-name
+/// registry), excluding the MCP meta tools: allowlisting only these must not
+/// connect MCP servers.
+#[cfg(feature = "mcp")]
+fn is_non_mcp_builtin_tool_name(name: &str) -> bool {
+    !matches!(
+        name,
+        "mcp_search" | "list_mcp_resources" | "read_mcp_resource"
+    ) && crate::agent::builder::is_reserved_builtin_tool_name(name)
 }
 
 fn canonical_tool_name(name: &str) -> &str {
@@ -2658,6 +2626,37 @@ output_token_cost = 0.0
             };
             assert!(mcp_only.mcp_is_eligible(&cfg));
         }
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn builtin_only_allowlists_do_not_make_mcp_eligible() {
+        let cfg = config::Config::default();
+        for names in [
+            vec!["git", "read"],
+            vec!["notebook_edit"],
+            vec!["job_status"],
+            vec!["ask_user_question"],
+            vec!["skills_search"],
+            vec!["goal_report"],
+            vec!["git", "notebook_edit", "job_status"],
+        ] {
+            let cli = Cli {
+                tools: names.iter().map(|n| n.to_string()).collect(),
+                ..Cli::default()
+            };
+            assert!(!cli.mcp_is_eligible(&cfg), "{names:?}");
+        }
+        let mixed = Cli {
+            tools: vec!["git".to_string(), "github_search".to_string()],
+            ..Cli::default()
+        };
+        assert!(mixed.mcp_is_eligible(&cfg));
+        let meta = Cli {
+            tools: vec!["mcp_search".to_string()],
+            ..Cli::default()
+        };
+        assert!(meta.mcp_is_eligible(&cfg));
     }
 
     #[test]
