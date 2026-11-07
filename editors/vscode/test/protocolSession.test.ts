@@ -110,6 +110,41 @@ describe('public ACP conversation adapter', () => {
   });
 });
 
+describe('server-started turns between prompts', () => {
+  const chunk = (text: string): acp.SessionUpdate => ({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } });
+
+  it('keeps updates that arrive while no prompt is active and shows them on the next prompt', async () => {
+    const router = new SessionUpdateRouter();
+    router.begin();
+    const client = { request: vi.fn(async () => ({ stopReason: 'end_turn' })), notify: vi.fn() } as unknown as acp.ClientContext;
+    const session = router.finish(client, 's1');
+    router.receive({ sessionId: 's1', update: chunk('cron output') });
+    const seen: acp.SessionUpdate[] = [];
+    await session.prompt('hi', u => seen.push(u), new AbortController().signal);
+    expect(seen).toEqual([chunk('cron output')]);
+  });
+
+  it('announces updates it had to drop instead of discarding them silently', async () => {
+    const router = new SessionUpdateRouter();
+    router.begin();
+    const client = { request: vi.fn(async () => ({ stopReason: 'end_turn' })), notify: vi.fn() } as unknown as acp.ClientContext;
+    const session = router.finish(client, 's1');
+    for (let i = 0; i < 100_002; i++) { router.receive({ sessionId: 's1', update: chunk('x') }); }
+    const seen: acp.SessionUpdate[] = [];
+    await session.prompt('hi', u => seen.push(u), new AbortController().signal);
+    expect(seen).toHaveLength(100_001);
+    expect(JSON.stringify(seen[100_000])).toContain('2 updates');
+  });
+
+  it('explains a refused prompt while the server runs its own turn', async () => {
+    const router = new SessionUpdateRouter();
+    router.begin();
+    const client = { request: vi.fn(async () => { throw new Error('ACP session already has an active prompt'); }), notify: vi.fn() } as unknown as acp.ClientContext;
+    const session = router.finish(client, 's1');
+    await expect(session.prompt('hi', () => undefined, new AbortController().signal)).rejects.toThrow(/\/cron fire/);
+  });
+});
+
 describe('permission modes, commands and content-block prompts', () => {
   const modes: acp.SessionModeState = {
     currentModeId: 'default',
