@@ -287,6 +287,48 @@ mod tests {
         assert!(session.size_pressure(Some(0.75)));
         assert!(session.mid_turn_size_pressure(Some(0.75)));
     }
+    fn image_session(prompts: usize) -> crate::session::Session {
+        let mut session = crate::session::Session::new("logical", "model", 1_000_000, "");
+        let raw = vec![7u8; 1_900_000];
+        for _ in 0..prompts {
+            session.add_user_message(
+                PersistedUserMessage::new(vec![image(&raw), image(&raw)]).unwrap(),
+            );
+        }
+        session
+    }
+    #[test]
+    fn compaction_floor_is_lowered_when_messages_are_removed() {
+        // mini-agent-24lo9
+        let mut session = image_session(7);
+        session.compress("recap".to_owned(), 1, 0);
+        assert!(
+            session
+                .bytes_after_last_compaction
+                .is_some_and(|f| f > 24 << 20)
+        );
+        session.truncate_to(0);
+        let floor = session.bytes_after_last_compaction.unwrap();
+        assert!(floor <= session.approx_persisted_bytes());
+        // Regrow past the threshold: relief must arm again.
+        let raw = vec![7u8; 1_900_000];
+        for _ in 0..6 {
+            session.add_user_message(
+                PersistedUserMessage::new(vec![image(&raw), image(&raw)]).unwrap(),
+            );
+        }
+        assert!(session.size_pressure(Some(0.75)));
+        assert!(session.mid_turn_size_pressure(Some(0.75)));
+    }
+    #[test]
+    fn redo_discards_a_floor_measured_before_the_restore() {
+        let mut session = image_session(7);
+        session.compress("recap".to_owned(), 1, 0);
+        session.bytes_after_last_compaction = Some(40 << 20);
+        session.rewind_to(1);
+        session.redo();
+        assert_eq!(session.bytes_after_last_compaction, None);
+    }
     #[test]
     fn history_prefix_conversion_leaves_the_session_cache_and_messages_alone() {
         let mut session = crate::session::Session::new("logical", "model", 32_000, "");

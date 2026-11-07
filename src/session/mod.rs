@@ -2489,6 +2489,7 @@ impl Session {
         }
         self.file_checkpoints.retire_from(new_len);
         self.messages.truncate(new_len);
+        self.clamp_compaction_floor();
         self.retain_visible_replay_metadata();
         self.total_estimated_tokens = self.messages.iter().map(|m| m.estimated_tokens).sum();
         self.read_tracker.clear();
@@ -2542,6 +2543,8 @@ impl Session {
                     self.tool_call_provenance = provenance;
                 }
                 self.mark_history_changed();
+                // Restored content was not measured by the last compaction.
+                self.bytes_after_last_compaction = None;
                 self.total_estimated_tokens = u.total_estimated_tokens;
                 self.calibrated_tokens = u.calibrated_tokens;
                 self.calibrated_msg_count = u.calibrated_msg_count;
@@ -2743,6 +2746,14 @@ impl Session {
                 )
             });
         messages.saturating_add(images).saturating_add(native)
+    }
+
+    /// The futility floor describes content that may no longer exist. Lower it
+    /// to the current size whenever messages are removed (mini-agent-24lo9).
+    pub(crate) fn clamp_compaction_floor(&mut self) {
+        if let Some(floor) = self.bytes_after_last_compaction {
+            self.bytes_after_last_compaction = Some(floor.min(self.approx_persisted_bytes()));
+        }
     }
 
     /// Whether the encoded session passed `fraction` of the persisted-session
