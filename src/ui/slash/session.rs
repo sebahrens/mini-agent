@@ -1548,6 +1548,7 @@ mod session_persistence_tests {
         assert!(session.bytes_after_last_compaction.is_none());
     }
 
+    #[test]
     fn clear_drops_the_compaction_futility_floor() {
         // mini-agent-24lo9
         let mut session = session_with_turn();
