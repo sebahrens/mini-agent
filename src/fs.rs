@@ -879,7 +879,7 @@ fn path_changed_error(path: &Path) -> std::io::Error {
     )
 }
 
-#[cfg(any(feature = "js", test))]
+#[cfg(any(feature = "js", all(test, unix)))]
 pub(crate) fn is_path_changed_error(error: &std::io::Error) -> bool {
     error
         .get_ref()

@@ -1558,6 +1558,8 @@ async fn lsp_process_query_timeout_is_status_unknown_and_wait_ms_extends_it() {
     let long = call(Some(20_000)).await.unwrap();
     assert!(long.contains("fixture delayed diagnostic"), "{long}");
     manager.shutdown().await;
+    drop(query);
+    drop(manager);
     fixture.cleanup().await;
 }
 
@@ -2665,12 +2667,14 @@ async fn lsp_process_navigate_retries_content_modified_once() {
     let nav = NavFixture::new("nav-modified-once", "modified-once");
     let tool = LspNavigateTool::new(nav.manager.clone(), None, None);
     let retried = tool.call(NavFixture::args("definition")).await;
+    drop(tool);
     nav.finish().await;
     assert_eq!(retried.unwrap(), "src/nav.rs:3:5");
 
     let nav = NavFixture::new("nav-always-modified", "always-modified");
     let tool = LspNavigateTool::new(nav.manager.clone(), None, None);
     let failed = tool.call(NavFixture::args("definition")).await;
+    drop(tool);
     nav.finish().await;
     let failed = failed.unwrap_err().to_string();
     assert!(failed.contains("again after one retry"), "{failed}");
@@ -2682,6 +2686,7 @@ async fn lsp_process_navigate_waits_for_indexing_and_reports_still_indexing() {
     let nav = NavFixture::new("nav-indexing-ready", "indexing-then-ready");
     let tool = LspNavigateTool::new(nav.manager.clone(), None, None);
     let ready = tool.call(NavFixture::args("definition")).await;
+    drop(tool);
     nav.finish().await;
     // The empty first answer waited for progress to end, then asked again.
     assert_eq!(ready.unwrap(), "src/nav.rs:3:5");
@@ -2689,6 +2694,7 @@ async fn lsp_process_navigate_waits_for_indexing_and_reports_still_indexing() {
     let nav = NavFixture::new("nav-indexing-forever", "indexing-forever");
     let tool = LspNavigateTool::new(nav.manager.clone(), None, None);
     let stuck = tool.call(NavFixture::args("definition")).await;
+    drop(tool);
     nav.finish().await;
     let stuck = stuck.unwrap();
     assert!(stuck.contains("No results."), "{stuck}");
@@ -2761,6 +2767,8 @@ async fn lsp_process_navigate_call_hierarchy_rename_preview_and_code_actions() {
         })
         .await;
     let read_op_allowed = guarded.call(NavFixture::args("incoming_calls")).await;
+    drop(guarded);
+    drop(tool);
     nav.finish().await;
 
     assert_eq!(incoming, "function caller — src/nav.rs:5:4");

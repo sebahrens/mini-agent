@@ -755,13 +755,7 @@ impl LspNavigateTool {
                 denied += 1;
                 continue;
             }
-            let shown = item
-                .path
-                .strip_prefix(&root)
-                .unwrap_or(&item.path)
-                .display()
-                .to_string()
-                .replace('\\', "/");
+            let shown = workspace_relative_display(&item.path, &root);
             let mut location = format!("{shown}:{}:{}", item.line + 1, item.character + 1);
             if item.external {
                 location.push_str(" (outside workspace)");
@@ -885,13 +879,7 @@ pub(crate) fn render_edit_preview_with(
     for file in &visible {
         let mut edits: Vec<_> = file.edits.iter().collect();
         edits.sort_by_key(|edit| (edit.start, edit.end));
-        let shown = file
-            .path
-            .strip_prefix(root)
-            .unwrap_or(&file.path)
-            .display()
-            .to_string()
-            .replace('\\', "/");
+        let shown = workspace_relative_display(&file.path, root);
         let last = edits.len().saturating_sub(1);
         for (index, edit) in edits.into_iter().enumerate() {
             let omitted = (index == last && file.omitted_edits > 0).then_some(file.omitted_edits);
@@ -1139,6 +1127,36 @@ fn normalize_directory_filter(dir: &Path) -> Option<std::path::PathBuf> {
         .filter(|c| matches!(c, std::path::Component::Normal(_)))
         .collect();
     (!normalized.as_os_str().is_empty()).then_some(normalized)
+}
+
+/// Workspace-relative display form of `path` with `/` separators. On Windows
+/// the workspace root is a verbatim (`\\?\C:\...`) path while paths decoded
+/// from `file:` URIs are not, so the comparison retries with the verbatim
+/// prefix removed from both.
+fn workspace_relative_display(path: &Path, root: &Path) -> String {
+    let relative = path
+        .strip_prefix(root)
+        .map(Path::to_path_buf)
+        .ok()
+        .or_else(|| {
+            strip_verbatim_prefix(path)
+                .strip_prefix(strip_verbatim_prefix(root))
+                .ok()
+                .map(Path::to_path_buf)
+        })
+        .unwrap_or_else(|| path.to_path_buf());
+    relative.display().to_string().replace('\\', "/")
+}
+
+fn strip_verbatim_prefix(path: &Path) -> std::path::PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        std::path::PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        std::path::PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
+    }
 }
 
 #[cfg(test)]
