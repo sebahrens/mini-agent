@@ -1935,6 +1935,23 @@ async fn mcp_enabled_and_disabled_tools_apply_before_the_cap_and_enabled_false_s
     shutdown(McpClientManager::from_handles(vec![handle])).await;
     assert_process_reaped(pid).await;
 
+    // mini-agent-nj0d0: exactly the cap, listed to the end, lost nothing.
+    let McpServerConfig::Command { options, .. } = &mut config else {
+        unreachable!()
+    };
+    options.disabled_tools = (0..72).map(|index| format!("t{index}")).collect();
+    let handle = McpClientHandle::connect(CompactString::new("fixture"), &config)
+        .await
+        .unwrap();
+    let listed = handle.cached_tools().await.unwrap();
+    assert_eq!(listed.entries.len(), 128);
+    assert_eq!(listed.over_cap.count, 0);
+    assert!(listed.over_cap.exact);
+    assert!(!listed.reached_tool_cap, "nothing was omitted");
+    let pid = wait_for_pid(&lease).await;
+    shutdown(McpClientManager::from_handles(vec![handle])).await;
+    assert_process_reaped(pid).await;
+
     // enabled = false never launches the server.
     let _ = std::fs::remove_file(&lease);
     let McpServerConfig::Command { options, .. } = &mut config else {

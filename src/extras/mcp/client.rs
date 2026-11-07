@@ -239,22 +239,21 @@ pub(crate) async fn list_bounded_tools(
     options: &super::config::McpServerOptions,
     defer: super::config::McpDefer,
 ) -> Result<Arc<ListedTools>, ServiceError> {
-    let found = list_all_tools_selected(
-        peer,
-        timeout,
-        &|name| options.admits_tool(name),
-        tool_cap_for(defer),
-    )
-    .await?;
-    let mut listed = bound_listed_tools_capped(found.tools, tool_cap_for(defer));
+    let cap = tool_cap_for(defer);
+    let found =
+        list_all_tools_selected(peer, timeout, &|name| options.admits_tool(name), cap).await?;
+    let mut listed = bound_listed_tools(found.tools);
     listed.filtered_by_config = found.filtered;
     listed.over_cap = found.over_cap;
-    listed.reached_tool_cap |= listed.over_cap.count > 0;
+    // A catalogue of exactly the cap that was listed to the end lost nothing;
+    // report a cut only when tools were counted past the cap or the listing
+    // stopped before the server's last page.
+    listed.reached_tool_cap =
+        listed.over_cap.count > 0 || (listed.entries.len() >= cap && !listed.over_cap.exact);
     Ok(Arc::new(listed))
 }
 
-pub(crate) fn bound_listed_tools_capped(tools: Vec<Tool>, cap: usize) -> ListedTools {
-    let reached_tool_cap = tools.len() == cap;
+pub(crate) fn bound_listed_tools(tools: Vec<Tool>) -> ListedTools {
     let entries = tools
         .into_iter()
         .map(|definition| {
@@ -274,7 +273,7 @@ pub(crate) fn bound_listed_tools_capped(tools: Vec<Tool>, cap: usize) -> ListedT
         .collect();
     ListedTools {
         entries,
-        reached_tool_cap,
+        reached_tool_cap: false,
         over_cap: OverCap::default(),
         filtered_by_config: 0,
     }
