@@ -92,22 +92,22 @@ persist between calls. The permission key is the script with the directory
 change (`cd -- '<dir>' || exit 1; <command>`), so allow rules and approvals are
 per directory, while a deny rule on the bare command still applies.
 
-`pty = true` and `job_status action=input`/`keys` exist on Unix only. There is
-no ConPTY path, so on Windows the tool schemas omit them and the model is never
-offered a pseudo-terminal; a call that still sends `pty = true` is refused with
-a message saying so. The Windows `shell` description states the limitation
-(REPLs, prompting installers, `python -i`, ssh/gh login cannot be driven; use
-non-interactive flags) instead of leaving the model to discover it. A ConPTY
-path is not implemented: the AppContainer helper is started through
-`std::process::Command` with a private launch request on its stdin and an
-attested inherited-handle list, and attaching a pseudo console
-(`PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`) needs a separate, Windows-tested launch
-path that reimplements that attestation.
-
-`pty = true` and `job_status action=input`/`keys` exist on Unix only. There is
-no ConPTY path, so on Windows the tool schemas omit them and the model is never
-offered a pseudo-terminal; a call that still sends `pty = true` is refused with
-a message saying so.
+`pty = true` and `job_status action=input`/`keys` exist on Unix and, on
+Windows, under the AppContainer sandbox backend. On Windows the AppContainer
+helper hosts a ConPTY (`CreatePseudoConsole`) and creates the target with
+`PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` in the same attribute list that carries
+the exact inherited-handle list (only the unused null input stays listed; the
+pipe-backed stdout/stderr are not inherited) and the AppContainer security
+capabilities, so the helper's inherited-handle attestation is preserved. The
+helper relays terminal output to its stdout and reads terminal input from its
+private request pipe after the launch request; the parent keeps that pipe open
+for a `pty = true` job and writes `job_status` input into it. With the sandbox
+disabled or another backend, a Windows `pty = true` call is refused with a
+message saying so (no pseudo-terminal is hosted outside the helper). Hosts
+without Unix or Windows have no pseudo-terminal: the schemas omit the
+parameters and the `shell` description states the limitation. The Windows path
+is exercised only by the `cfg(windows)` tests on the Windows CI runners
+(`src/sandbox/conpty.rs`, `src/sandbox/pty_windows.rs`).
 
 `job_status action=input` refuses C0 control bytes other than LF and CR (Tab,
 Ctrl-U, backspace, ESC, DEL, ...) and shell history expansion (`!` followed by
@@ -194,7 +194,7 @@ combined; byte_cap: 67108864; ...]` with the partial transcript. The
 `max_bash_output_lines` head/tail line cap still bounds the rendered text; the
 log footer is appended after it so it is never cut. Hook, validation and other
 sandbox command classes keep their existing bounded 1 MiB/1.5 MiB capture.
-`pty = true` (Unix only) runs the command under a fresh pseudo-terminal
+`pty = true` (Unix, and Windows under the AppContainer backend) runs the command under a fresh pseudo-terminal
 (120x40 unless the mini-agent process environment sets `LINES` (5-500) and/or
 `COLUMNS` (20-1000); anything else keeps the default for that axis) instead of pipes: its stdin, stdout and stderr are one TTY, so
 `isatty()` is true and colour/progress/prompt behaviour matches an interactive
