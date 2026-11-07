@@ -16,6 +16,14 @@ const MAX_MODEL_DETAILS: usize = 128;
 // Below the existing five-second actor retirement grace. This bounds lock
 // contention only; filesystem calls keep their existing scoped I/O ownership.
 const WRITE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StateLock {
+    Read,
+    Append,
+    Rotate,
+}
+
+const LOCK_FILE: &str = "usage.lock";
 const WRITE_LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
 
 #[derive(Debug, Clone, Default)]
@@ -251,9 +259,6 @@ pub(crate) struct Ledger {
     /// file identity, length and modification time it was taken at. Read and
     /// replaced under the writer lock only.
     flush_cache: Mutex<Option<FlushCache>>,
-    /// Set once this process has folded any archive segment a crashed
-    /// rotation left unrolled (see [`Ledger::recover_unrolled`]).
-    recovered: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     pre_sync_gate: Option<Arc<PreSyncGate>>,
     #[cfg(test)]
@@ -333,7 +338,6 @@ impl Ledger {
             directory: Mutex::new(None),
             io: Mutex::new(()),
             flush_cache: Mutex::new(None),
-            recovered: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             pre_sync_gate: PRE_SYNC_GATE.try_with(Clone::clone).ok(),
             #[cfg(test)]
@@ -415,7 +419,10 @@ impl Ledger {
                 return Ok(None);
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                match crate::fs::private_atomic_create_sync(&path, b"") {
+                // O_EXCL creation of the empty segment: concurrent writers
+                // (e.g. right after a rotation) cannot publish over a file
+                // another writer has already appended to.
+                match create_empty_private(&path) {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                     Err(_) => anyhow::bail!("usage ledger creation failed"),
@@ -427,6 +434,76 @@ impl Ledger {
         };
         Self::revalidate(&binding, &file)?;
         Ok(Some((file, binding)))
+    }
+    /// The stable cross-process coordination lock (`usage.lock`). Unlike the
+    /// active segment, whose inode is replaced by rotation, this file is never
+    /// renamed, so one lock spans active-file generation, archive and rollup
+    /// publication, recovery and every summary snapshot. Writers hold it
+    /// shared for a flush that only appends; summaries hold it shared until the
+    /// rollup is merged. Appending writers hold it shared (the active-file
+    /// lock still serializes them against each other and against readers'
+    /// scans); only a rotation takes it exclusively, so it also excludes every
+    /// in-flight summary snapshot. Returns `None` for a read-only caller when no ledger
+    /// storage exists yet, or when the directory cannot hold the lock file
+    /// (then no writer can exist either).
+    fn lock_state(
+        &self,
+        binding: &crate::paths::WorkspaceBinding,
+        mode: StateLock,
+    ) -> anyhow::Result<Option<LockedLedgerFile>> {
+        let write = mode != StateLock::Read;
+        let path = binding.root().join(LOCK_FILE);
+        let open =
+            || crate::fs::open_private_file_checked(&path, crate::fs::PrivateFileAccess::Append);
+        let file = match open() {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let storage_exists = write
+                    || binding.root().join("usage.jsonl").exists()
+                    || binding.root().join(ROLLUP_FILE).exists();
+                if !storage_exists {
+                    return Ok(None);
+                }
+                // O_EXCL creation never replaces an inode another process may
+                // already hold locked (an atomic rename publication would).
+                // Whoever loses the race opens the winner's file.
+                match create_empty_private(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(_) if !write => return Ok(None),
+                    Err(_) => anyhow::bail!("usage ledger coordination lock creation failed"),
+                }
+                open().map_err(|_| anyhow::anyhow!("usage ledger private validation failed"))?
+            }
+            Err(_) => anyhow::bail!("usage ledger private validation failed"),
+        };
+        crate::fs::validate_private_file(&file)
+            .map_err(|_| anyhow::anyhow!("usage ledger private validation failed"))?;
+        if write {
+            let started = std::time::Instant::now();
+            loop {
+                let attempt = if mode == StateLock::Rotate {
+                    file.try_lock()
+                } else {
+                    file.try_lock_shared()
+                };
+                match attempt {
+                    Ok(()) => break,
+                    Err(std::fs::TryLockError::WouldBlock) => {
+                        let remaining = WRITE_LOCK_WAIT.saturating_sub(started.elapsed());
+                        anyhow::ensure!(!remaining.is_zero(), "usage ledger lock wait expired");
+                        std::thread::sleep(WRITE_LOCK_RETRY.min(remaining));
+                    }
+                    Err(std::fs::TryLockError::Error(_)) => {
+                        anyhow::bail!("usage ledger locking failed")
+                    }
+                }
+            }
+        } else {
+            file.try_lock_shared()
+                .map_err(|_| anyhow::anyhow!("usage ledger is busy"))?;
+        }
+        Ok(Some(LockedLedgerFile::new(file)))
     }
     fn revalidate(binding: &crate::paths::WorkspaceBinding, file: &File) -> anyhow::Result<()> {
         binding
@@ -497,6 +574,10 @@ impl Ledger {
             .io
             .lock()
             .map_err(|_| anyhow::anyhow!("usage ledger serialization failed"))?;
+        let _state_lock = match self.binding(false)? {
+            Some(binding) => self.lock_state(&binding, StateLock::Read)?,
+            None => None,
+        };
         let Some((file, binding)) = self.open(false)? else {
             return self.with_rollup(LedgerSummary::default(), Some(session_id));
         };
@@ -567,6 +648,10 @@ impl Ledger {
             .io
             .lock()
             .map_err(|_| anyhow::anyhow!("usage ledger serialization failed"))?;
+        let _state_lock = match self.binding(false)? {
+            Some(binding) => self.lock_state(&binding, StateLock::Read)?,
+            None => None,
+        };
         let Some((file, binding)) = self.open(false)? else {
             return self.with_rollup(LedgerSummary::default(), session_id);
         };
@@ -693,22 +778,36 @@ impl Ledger {
         scan(file, None)
     }
     fn flush_rows(&self, account: &Account, pending: &[Arc<Row>]) -> anyhow::Result<()> {
-        // A full active segment is rotated away once; the batch is then
-        // appended to the fresh segment.
-        match self.flush_rows_once(account, pending, true)? {
+        // A full active segment is rotated away once, under the exclusive
+        // coordination lock; the batch is then appended to the fresh segment.
+        match self.flush_rows_once(account, pending, StateLock::Append)? {
+            FlushOutcome::Flushed => return Ok(()),
+            FlushOutcome::NeedsRotation => {}
+            FlushOutcome::Rotated => unreachable!("append pass never rotates"),
+        }
+        match self.flush_rows_once(account, pending, StateLock::Rotate)? {
+            // Another process rotated first, so this pass appended directly.
+            FlushOutcome::Flushed => return Ok(()),
+            FlushOutcome::Rotated => {}
+            FlushOutcome::NeedsRotation => unreachable!("rotate pass rotates"),
+        }
+        match self.flush_rows_once(account, pending, StateLock::Append)? {
             FlushOutcome::Flushed => Ok(()),
-            FlushOutcome::Rotated => match self.flush_rows_once(account, pending, false)? {
-                FlushOutcome::Flushed => Ok(()),
-                FlushOutcome::Rotated => anyhow::bail!("usage ledger capacity reached"),
-            },
+            _ => anyhow::bail!("usage ledger capacity reached"),
         }
     }
     fn flush_rows_once(
         &self,
         account: &Account,
         pending: &[Arc<Row>],
-        may_rotate: bool,
+        mode: StateLock,
     ) -> anyhow::Result<FlushOutcome> {
+        let write_binding = self
+            .binding(true)?
+            .ok_or_else(|| anyhow::anyhow!("usage ledger unavailable"))?;
+        // Taken before the active segment is opened, so a rotation by another
+        // process can never leave this writer locking an already-renamed file.
+        let _state_lock = self.lock_state(&write_binding, mode)?;
         let (file, binding) = self
             .open(true)?
             .ok_or_else(|| anyhow::anyhow!("usage ledger unavailable"))?;
@@ -717,11 +816,6 @@ impl Ledger {
         #[cfg(all(test, unix))]
         self.pause_lock_for_test(&file);
         Self::revalidate(&binding, &file)?;
-        if !self.recovered.load(std::sync::atomic::Ordering::Acquire) {
-            recover_unrolled(binding.root())?;
-            self.recovered
-                .store(true, std::sync::atomic::Ordering::Release);
-        }
         let mut scanned = self.flush_scan(&binding, &mut file)?;
         // A receipt already in the checkpointed prefix has no fingerprint yet:
         // rescan fully so a conflicting duplicate fails exactly as before.
@@ -748,7 +842,9 @@ impl Ledger {
             scanned.records += 1;
             scanned.bytes += bytes.len() + 1;
             if scanned.records > MAX_LEDGER_RECORDS || scanned.bytes > MAX_LEDGER_BYTES {
-                anyhow::ensure!(may_rotate, "usage ledger capacity reached");
+                if mode != StateLock::Rotate {
+                    return Ok(FlushOutcome::NeedsRotation);
+                }
                 let records = scanned.records - 1;
                 self.rotate(&binding, &mut file).map_err(|error| {
                     anyhow::anyhow!(
@@ -814,6 +910,9 @@ impl Ledger {
         file: &mut File,
     ) -> anyhow::Result<()> {
         let root = binding.root();
+        // A crashed rotation by another process may have left an unrolled
+        // archive; fold it before choosing the next sequence.
+        recover_unrolled(root)?;
         let mut state = load_rollup(root)?.unwrap_or_default();
         fold_segment(file, &mut state)?;
         state.sequence = state
@@ -837,13 +936,9 @@ impl Ledger {
             .unwrap_or_else(|error| error.into_inner()) = None;
         // The checkpoint is identity-bound to the archived file; drop it.
         let _ = std::fs::remove_file(root.join(CHECKPOINT_FILE));
-        if let Err(error) = store_rollup(root, &state) {
-            // Leave the archive for recovery by the next flush.
-            self.recovered
-                .store(false, std::sync::atomic::Ordering::Release);
-            return Err(error);
-        }
-        Ok(())
+        // On failure the archive stays; the next rotation or any summary
+        // folds it (see `load_rollup_recovered`).
+        store_rollup(root, &state)
     }
     /// Merge the rolled-up totals of rotated segments into a summary.
     fn with_rollup(
@@ -854,7 +949,10 @@ impl Ledger {
         let Some(parent) = self.path.parent() else {
             return Ok(summary);
         };
-        let Some(rollup) = load_rollup(parent)? else {
+        // Called under the shared coordination lock: no rotation is in flight,
+        // and an archive newer than the rollup is a crashed rotation whose
+        // receipts are folded in memory (fail closed on an unreadable one).
+        let (Some(rollup), _) = load_rollup_recovered(parent)? else {
             return Ok(summary);
         };
         rollup.apply(&mut summary, session_id)?;
@@ -864,12 +962,22 @@ impl Ledger {
 
 enum FlushOutcome {
     Flushed,
+    NeedsRotation,
     Rotated,
 }
 
 const ROLLUP_FILE: &str = "usage.rollup";
 const ROLLUP_VERSION: u32 = 1;
 const MAX_ROLLUP_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Create an empty private file with O_EXCL semantics; never replaces.
+fn create_empty_private(path: &Path) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path).map(drop)
+}
 
 fn archive_name(sequence: u64) -> String {
     format!("usage.{sequence:010}.archive.jsonl")
@@ -1157,13 +1265,17 @@ fn fold_segment(file: &mut File, state: &mut RollupState) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Fold archive segments newer than the rollup (left by a rotation that
-/// crashed between the rename and the rollup write) into the rollup.
-fn recover_unrolled(dir: &Path) -> anyhow::Result<()> {
+/// The rollup with every archive segment newer than it (left by a rotation
+/// that crashed between the rename and the rollup write) folded in, in memory
+/// only. The flag reports whether any segment was folded, so a writer holding
+/// the coordination lock can persist the result. Readers never write.
+fn load_rollup_recovered(dir: &Path) -> anyhow::Result<(Option<RollupState>, bool)> {
     let mut found = Vec::new();
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((load_rollup(dir)?, false));
+        }
         Err(_) => anyhow::bail!("usage ledger directory unreadable"),
     };
     for entry in entries.flatten() {
@@ -1171,11 +1283,12 @@ fn recover_unrolled(dir: &Path) -> anyhow::Result<()> {
             found.push(sequence);
         }
     }
+    let loaded = load_rollup(dir)?;
     if found.is_empty() {
-        return Ok(());
+        return Ok((loaded, false));
     }
     found.sort_unstable();
-    let mut state = load_rollup(dir)?.unwrap_or_default();
+    let mut state = loaded.unwrap_or_default();
     let mut changed = false;
     let rolled = state.sequence;
     for sequence in found.into_iter().filter(|sequence| *sequence > rolled) {
@@ -1187,7 +1300,14 @@ fn recover_unrolled(dir: &Path) -> anyhow::Result<()> {
         state.sequence = sequence;
         changed = true;
     }
-    if changed {
+    Ok((Some(state), changed))
+}
+
+/// Persist archive segments a crashed rotation left unrolled. Callers hold the
+/// exclusive coordination lock.
+fn recover_unrolled(dir: &Path) -> anyhow::Result<()> {
+    let (state, changed) = load_rollup_recovered(dir)?;
+    if changed && let Some(state) = state {
         store_rollup(dir, &state)?;
     }
     Ok(())
@@ -2580,5 +2700,95 @@ mod tests {
         assert_eq!(archive_sequence("usage.0000000001.archive.jsonl"), Some(1));
         assert_eq!(archive_sequence("usage.1.archive.jsonl"), None);
         assert_eq!(archive_sequence("usage.00000000x1.archive.jsonl"), None);
+    }
+
+    #[test]
+    fn summary_after_rotation_crash_keeps_archived_usage_read_only() {
+        let root = crate::tests::OwnedTestDirectory::new("spend-ledger-crash-readonly");
+        let state = root.path().join("state");
+        crate::fs::ensure_private_directory(&state).unwrap();
+        let ledger = Ledger::new(&state);
+        flush_receipt(&ledger, &one_receipt("a", 10)).unwrap();
+        // Crash window: archive renamed, rollup never written.
+        std::fs::rename(state.join("usage.jsonl"), state.join(archive_name(1))).unwrap();
+        let reader = Ledger::new(&state);
+        assert_eq!(reader.session_summary("a").unwrap().session.records, 1);
+        let full = reader.summary_for_session("a").unwrap();
+        assert_eq!((full.all_time.records, full.session.records), (1, 1));
+        assert!(
+            !state.join(ROLLUP_FILE).exists(),
+            "readers recover in memory and never write the rollup"
+        );
+        // A later writer folds it exactly once.
+        flush_receipt(&Ledger::new(&state), &one_receipt("a", 1)).unwrap();
+        assert_eq!(Ledger::new(&state).summary().unwrap().all_time.records, 2);
+    }
+
+    #[test]
+    fn summary_racing_a_real_rotation_counts_each_receipt_exactly_once() {
+        let root = crate::tests::OwnedTestDirectory::new("spend-ledger-rotation-race");
+        let state = root.path().join("state");
+        crate::fs::ensure_private_directory(&state).unwrap();
+        synthetic_full_ledger(&state, MAX_LEDGER_RECORDS);
+        let (scanned_tx, scanned_rx) = std::sync::mpsc::sync_channel(1);
+        let (released_tx, released_rx) = std::sync::mpsc::sync_channel(1);
+        let reader = Ledger::new(&state).with_summary_gate(scanned_tx, released_rx);
+        let reading = std::thread::spawn(move || reader.session_summary("a"));
+        scanned_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
+        // The reader is paused after releasing the active-file lock. A real
+        // flush that rotates must wait for the reader's whole snapshot.
+        let writer_state = state.clone();
+        let writing = std::thread::spawn(move || {
+            flush_receipt(&Ledger::new(&writer_state), &one_receipt("a", 5))
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        released_tx.send(()).unwrap();
+        let summary = reading.join().unwrap().unwrap();
+        assert_eq!(summary.session.records, MAX_LEDGER_RECORDS / 2);
+        assert_eq!(summary.all_time.records, MAX_LEDGER_RECORDS);
+        writing.join().unwrap().unwrap();
+        let after = Ledger::new(&state).session_summary("a").unwrap();
+        assert_eq!(after.session.records, MAX_LEDGER_RECORDS / 2 + 1);
+        assert_eq!(after.all_time.records, MAX_LEDGER_RECORDS + 1);
+    }
+
+    #[test]
+    fn concurrent_rotating_writers_do_not_lose_a_rollup_generation() {
+        let root = crate::tests::OwnedTestDirectory::new("spend-ledger-rotation-writers");
+        let state = root.path().join("state");
+        crate::fs::ensure_private_directory(&state).unwrap();
+        synthetic_full_ledger(&state, MAX_LEDGER_RECORDS);
+        let handles: Vec<_> = (0..2)
+            .map(|index| {
+                let state = state.clone();
+                std::thread::spawn(move || {
+                    // A waiter may outlast the bounded lock wait while the
+                    // first rotation parses the full segment; it retries.
+                    let ledger = Ledger::new(&state);
+                    let receipt = one_receipt("a", 3 + index);
+                    let account = Account::new("a", None, 0.0).unwrap();
+                    account.observe(&receipt).unwrap();
+                    loop {
+                        match ledger.flush(&account) {
+                            Err(error) if error.to_string().contains("lock wait expired") => {
+                                std::thread::sleep(std::time::Duration::from_millis(
+                                    150 * (index + 1),
+                                ));
+                            }
+                            other => return other,
+                        }
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        let summary = Ledger::new(&state).summary().unwrap();
+        assert_eq!(summary.all_time.records, MAX_LEDGER_RECORDS + 2);
+        assert!(state.join(archive_name(1)).exists());
+        assert!(!state.join(archive_name(2)).exists());
     }
 }
