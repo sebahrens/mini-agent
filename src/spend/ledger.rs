@@ -979,6 +979,17 @@ const MAX_ROLLUP_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Create an empty private file with O_EXCL semantics; never replaces.
 fn create_empty_private(path: &Path) -> std::io::Result<()> {
+    // Windows has no creation mode: a plain create inherits the directory's
+    // ACL, which the closed private-DACL validation rejects. Publish through
+    // the private create path (private descriptor, non-replacing rename).
+    #[cfg(windows)]
+    return crate::fs::private_atomic_create_sync(path, b"");
+    #[cfg(not(windows))]
+    create_empty_private_posix(path)
+}
+
+#[cfg(not(windows))]
+fn create_empty_private_posix(path: &Path) -> std::io::Result<()> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
