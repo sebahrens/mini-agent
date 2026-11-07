@@ -4087,7 +4087,12 @@ code-action and workspace-edit capabilities. `rename` and a previewed code
 action return the server's workspace edit as a bounded review of up to 500
 files, 5000 edits per file and 10000 edits in total, paged by `offset`/`limit`
 over the edits (200 per page, files in path order; the truncation line names the
-`next_offset`), replacement text cut at 200 bytes (marked), files outside
+`next_offset`). Every edit is numbered (`#N`); the listing shows the first 200 bytes of a
+replacement and marks a longer one with its full size, and `edit`=N returns that edit's complete
+replacement text (paged 32 KiB at a time with `text_offset`, byte-faithful, control characters
+escaped) while `full_text`=true lists every replacement in full (a page ends early at a 48 KiB
+budget and names the `next_offset`). Up to 1 MiB of replacement text is retained per edit and 16 MiB per
+preview; anything past that is stated as not retained. Files outside
 the workspace counted but never named, `read`-denied files hidden); **no file is
 modified**. `rename` additionally requires `edit` permission for `path`
 (deny/ask rules for `edit` apply) so a project that forbids edits cannot even

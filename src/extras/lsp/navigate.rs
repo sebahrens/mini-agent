@@ -32,8 +32,14 @@ pub(crate) const MAX_EDITS_PER_FILE: usize = 5_000;
 pub(crate) const MAX_EDITS_TOTAL: usize = 10_000;
 /// Most code actions listed.
 pub(crate) const MAX_ACTIONS: usize = 50;
-/// Replacement text in a preview is cut at this many bytes.
-pub(crate) const MAX_EDIT_TEXT_BYTES: usize = 200;
+/// Replacement text in the compact preview line is cut at this many bytes; the
+/// full text stays retrievable (`edit` / `full_text`).
+pub(crate) const EDIT_SUMMARY_BYTES: usize = 200;
+/// Replacement text retained per edit (the rest is reported as not retained).
+pub(crate) const MAX_EDIT_TEXT_RETAINED: usize = 1024 * 1024;
+/// Replacement text retained across one preview; edits past it keep only the
+/// summary prefix and say so.
+pub(crate) const MAX_EDIT_TEXT_TOTAL: usize = 16 * 1024 * 1024;
 /// Longest accepted `new_name`.
 pub(crate) const MAX_NEW_NAME_BYTES: usize = 256;
 /// Hard bound on locations or symbols retained for one request; the tool pages
@@ -175,8 +181,11 @@ pub(crate) enum NavAnswer {
 pub(crate) struct EditView {
     pub start: (u32, u32),
     pub end: (u32, u32),
+    /// Replacement text as retained (the whole text unless `cut`).
     pub new_text: String,
-    /// `new_text` was cut at [`MAX_EDIT_TEXT_BYTES`].
+    /// Bytes of the server's replacement text before any retention cut.
+    pub full_len: usize,
+    /// `new_text` is shorter than `full_len` (a retention bound was hit).
     pub cut: bool,
 }
 
@@ -488,6 +497,12 @@ pub(crate) fn edit_preview(edit: &Value, map: &dyn Fn(&str) -> Option<PathBuf>) 
             }
         };
         let shown_total: usize = preview.files.iter().map(|file| file.edits.len()).sum();
+        let mut retained_text: usize = preview
+            .files
+            .iter()
+            .flat_map(|file| &file.edits)
+            .map(|edit| edit.new_text.len())
+            .sum();
         let file = &mut preview.files[index];
         for (offset, entry) in entries.iter().enumerate() {
             let range = entry.get("range");
@@ -501,14 +516,19 @@ pub(crate) fn edit_preview(edit: &Value, map: &dyn Fn(&str) -> Option<PathBuf>) 
                     .and_then(Value::as_u64)
                     .map_or(0, |value| value.min(u64::from(u32::MAX)) as u32)
             };
-            let (new_text, cut) = truncate(
-                entry.get("newText").and_then(Value::as_str).unwrap_or(""),
-                MAX_EDIT_TEXT_BYTES,
-            );
+            let full = entry.get("newText").and_then(Value::as_str).unwrap_or("");
+            let budget = if retained_text >= MAX_EDIT_TEXT_TOTAL {
+                EDIT_SUMMARY_BYTES
+            } else {
+                MAX_EDIT_TEXT_RETAINED
+            };
+            let (new_text, cut) = truncate(full, budget);
+            retained_text += new_text.len();
             file.edits.push(EditView {
                 start: position_of(range),
                 end: (get("line"), get("character")),
                 new_text,
+                full_len: full.len(),
                 cut,
             });
         }

@@ -398,6 +398,17 @@ pub struct LspNavigateArgs {
     /// most 1000).
     #[serde(default)]
     pub limit: Option<usize>,
+    /// rename / a code action's edit: show the complete replacement text of
+    /// the edit with this 1-based number from the listing.
+    #[serde(default)]
+    pub edit: Option<usize>,
+    /// rename / a code action's edit: show every replacement in full (a page
+    /// ends early at a byte budget and names the `next_offset`).
+    #[serde(default)]
+    pub full_text: Option<bool>,
+    /// With `edit`: byte offset into that edit's replacement text.
+    #[serde(default)]
+    pub text_offset: Option<usize>,
 }
 
 /// Largest `limit` of an `lsp_navigate` page.
@@ -427,7 +438,7 @@ impl Tool for LspNavigateTool {
     type Output = String;
 
     fn description(&self) -> String {
-        "Semantic code navigation through the project's language server. `op`: definition, type_definition, implementation, references (need `line` and `column`, 1-based, pointing at the symbol), hover (type/docs at that position), symbols (outline of `path`), workspace_symbols (search by `query`; `path` selects the language server), incoming_calls / outgoing_calls (call hierarchy of the function at `line`/`column`), rename (needs `new_name`; returns the server's workspace edit as a preview and changes NO file; it needs `edit` permission for `path`; apply the edits yourself with `edit`) and code_actions (quick fixes and refactors for `line`/`column`, optionally through `end_line`/`end_column`; pass `action`=N to preview that action's edit; server commands are never executed). An empty answer from a server that is still indexing says so instead of reporting no results. Returns workspace-relative `path:line:column` locations (1-based), sorted by path and position (symbols keep outline order), 100 per page: pass `offset` (the `next_offset` a truncation line names) and optionally `limit` (at most 1000) to read the rest; at most 5000 results are retained per request. Rename and code-action edit previews page the same way over their edits (200 per page, up to 10000 edits in 500 files). Definitions in dependencies or the standard library come back as absolute paths marked `(outside workspace)`; open them with `read` (subject to read permission).".to_string()
+        "Semantic code navigation through the project's language server. `op`: definition, type_definition, implementation, references (need `line` and `column`, 1-based, pointing at the symbol), hover (type/docs at that position), symbols (outline of `path`), workspace_symbols (search by `query`; `path` selects the language server), incoming_calls / outgoing_calls (call hierarchy of the function at `line`/`column`), rename (needs `new_name`; returns the server's workspace edit as a preview and changes NO file; it needs `edit` permission for `path`; apply the edits yourself with `edit`, using the complete replacement text from `edit`=N / `full_text`) and code_actions (quick fixes and refactors for `line`/`column`, optionally through `end_line`/`end_column`; pass `action`=N to preview that action's edit; server commands are never executed). An empty answer from a server that is still indexing says so instead of reporting no results. Returns workspace-relative `path:line:column` locations (1-based), sorted by path and position (symbols keep outline order), 100 per page: pass `offset` (the `next_offset` a truncation line names) and optionally `limit` (at most 1000) to read the rest; at most 5000 results are retained per request. Rename and code-action edit previews page the same way over their edits (200 per page, up to 10000 edits in 500 files); each edit is numbered and long replacement text is cut in the listing with a note: pass `edit`=N for that edit's complete replacement text (continue with `text_offset`), or `full_text`=true for complete text on every edit of the page. Definitions in dependencies or the standard library come back as absolute paths marked `(outside workspace)`; open them with `read` (subject to read permission).".to_string()
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -447,7 +458,10 @@ impl Tool for LspNavigateTool {
                 "end_column": { "type": "integer", "minimum": 1, "description": "code_actions: 1-based end column of the range" },
                 "action": { "type": "integer", "minimum": 1, "description": "code_actions: preview the edit of this action number" },
                 "offset": { "type": "integer", "minimum": 0, "description": "Results (rename / action previews: edits) to skip; pass the next_offset of the previous page" },
-                "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Most results or edits per page (default 100 results, 200 edits)" }
+                "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Most results or edits per page (default 100 results, 200 edits)" },
+                "edit": { "type": "integer", "minimum": 1, "description": "rename / code action edit: complete replacement text of the edit with this number from the listing" },
+                "full_text": { "type": "boolean", "description": "rename / code action edit: show every replacement in full (pages end early at a byte budget; continue with next_offset)" },
+                "text_offset": { "type": "integer", "minimum": 0, "description": "With edit: byte offset into that edit's replacement text (continuation)" }
             },
             "required": ["op", "path"]
         })
@@ -513,6 +527,32 @@ impl Tool for LspNavigateTool {
                 "action is supported only by code_actions.".to_string(),
             ));
         }
+        let edit_preview_call =
+            op == NavOp::Rename || (op == NavOp::CodeActions && args.action.is_some());
+        if !edit_preview_call
+            && (args.edit.is_some() || args.full_text.is_some() || args.text_offset.is_some())
+        {
+            return Err(ToolError::Msg(
+                "edit, full_text and text_offset apply only to rename and to code_actions with `action`.".to_string(),
+            ));
+        }
+        if args.edit == Some(0) {
+            return Err(ToolError::Msg("edit is a 1-based edit number.".to_string()));
+        }
+        if args.text_offset.is_some() && args.edit.is_none() {
+            return Err(ToolError::Msg("text_offset needs `edit`.".to_string()));
+        }
+        if args.edit.is_some() && args.full_text == Some(true) {
+            return Err(ToolError::Msg(
+                "pass either edit (one edit in full) or full_text (a page in full), not both."
+                    .to_string(),
+            ));
+        }
+        let text_view = TextView {
+            full: args.full_text.unwrap_or(false),
+            edit: args.edit,
+            text_offset: args.text_offset.unwrap_or(0),
+        };
         let pages = match op {
             NavOp::Hover => false,
             NavOp::CodeActions => args.action.is_some(),
@@ -629,13 +669,14 @@ impl Tool for LspNavigateTool {
             } => self.render_items(items, outside, truncated, op, (offset, limit)),
             NavAnswer::Edit(preview) => {
                 let deny = super::walk_deny_filter(&self.permission, "read", Some(&root));
-                render_edit_preview(
+                render_edit_preview_with(
                     &preview,
                     &root,
                     deny.as_ref(),
                     op == NavOp::Rename,
                     &query.new_name,
                     (offset, limit),
+                    text_view,
                 )
             }
             NavAnswer::Actions { actions, truncated } => {
@@ -771,14 +812,61 @@ impl LspNavigateTool {
     }
 }
 
+/// How replacement text is shown in an edit preview.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct TextView {
+    /// Show every replacement in full instead of a compact prefix; a page ends
+    /// early at [`FULL_PAGE_BYTES`] and names the `next_offset`.
+    pub full: bool,
+    /// Show only this edit (1-based, the number printed in the listing) with
+    /// its complete replacement text.
+    pub edit: Option<usize>,
+    /// Byte offset into that edit's replacement text.
+    pub text_offset: usize,
+}
+
+/// Replacement text emitted per page in `full_text` mode before the page ends.
+const FULL_PAGE_BYTES: usize = 48 * 1024;
+/// Bytes of one edit's replacement text per `edit` call.
+const EDIT_TEXT_PAGE_BYTES: usize = 32 * 1024;
+
+fn char_floor(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
 pub(crate) fn render_edit_preview(
     preview: &crate::extras::lsp::navigate::EditPreview,
     root: &Path,
     deny: Option<&super::find_files::PathFilter>,
     rename: bool,
     new_name: &str,
-    (offset, limit): (usize, usize),
+    window: (usize, usize),
 ) -> String {
+    render_edit_preview_with(
+        preview,
+        root,
+        deny,
+        rename,
+        new_name,
+        window,
+        TextView::default(),
+    )
+}
+
+pub(crate) fn render_edit_preview_with(
+    preview: &crate::extras::lsp::navigate::EditPreview,
+    root: &Path,
+    deny: Option<&super::find_files::PathFilter>,
+    rename: bool,
+    new_name: &str,
+    (offset, limit): (usize, usize),
+    view: TextView,
+) -> String {
+    use crate::extras::lsp::navigate::{EDIT_SUMMARY_BYTES, EditView};
     let mut hidden = 0usize;
     let mut visible: Vec<&crate::extras::lsp::navigate::FileEdits> = Vec::new();
     for file in &preview.files {
@@ -791,20 +879,11 @@ pub(crate) fn render_edit_preview(
     // Stable order across calls (path, then position) so pages do not overlap.
     visible.sort_by(|a, b| a.path.cmp(&b.path));
     let files = visible.len();
-    let shown_edits: usize = visible.iter().map(|file| file.edits.len()).sum();
-    let end = offset.saturating_add(limit).min(shown_edits);
-    let mut body = String::new();
-    let mut position = 0usize;
-    let mut files_in_page = 0usize;
+    // Every previewable edit in listing order: (file, edit, omitted-after).
+    let mut flat: Vec<(String, &EditView, Option<usize>)> = Vec::new();
     for file in &visible {
         let mut edits: Vec<_> = file.edits.iter().collect();
         edits.sort_by_key(|edit| (edit.start, edit.end));
-        let first = position;
-        position += edits.len();
-        if position <= offset || first >= end {
-            continue;
-        }
-        files_in_page += 1;
         let shown = file
             .path
             .strip_prefix(root)
@@ -812,32 +891,82 @@ pub(crate) fn render_edit_preview(
             .display()
             .to_string()
             .replace('\\', "/");
-        body.push_str(&format!("{shown}\n"));
-        for (index, edit) in edits.iter().enumerate() {
-            if !(offset..end).contains(&(first + index)) {
-                continue;
-            }
-            body.push_str(&format!(
-                "  {}:{}-{}:{} -> {:?}{}\n",
-                edit.start.0 + 1,
-                edit.start.1 + 1,
-                edit.end.0 + 1,
-                edit.end.1 + 1,
-                edit.new_text,
-                if edit.cut {
-                    format!(
-                        " [replacement text cut at {} bytes]",
-                        crate::extras::lsp::navigate::MAX_EDIT_TEXT_BYTES
-                    )
-                } else {
-                    String::new()
-                }
+        let last = edits.len().saturating_sub(1);
+        for (index, edit) in edits.into_iter().enumerate() {
+            let omitted = (index == last && file.omitted_edits > 0).then_some(file.omitted_edits);
+            flat.push((shown.clone(), edit, omitted));
+        }
+    }
+    let shown_edits = flat.len();
+    let heading = if rename {
+        format!(
+            "Rename to `{new_name}`: {} edits in {files} files. PREVIEW ONLY, no file was modified; apply the edits with `edit` (use `edit`=N or `full_text`=true here for complete replacement text).",
+            preview.total_edits
+        )
+    } else {
+        format!(
+            "Code action edit: {} edits in {files} files. PREVIEW ONLY, no file was modified; apply the edits with `edit` (use `edit`=N or `full_text`=true here for complete replacement text).",
+            preview.total_edits
+        )
+    };
+    if let Some(number) = view.edit {
+        return render_single_edit(&heading, &flat, number, view.text_offset);
+    }
+    let end = offset.saturating_add(limit).min(shown_edits);
+    let mut body = String::new();
+    let mut page_end = end;
+    let mut emitted_text = 0usize;
+    let mut last_file: Option<&str> = None;
+    let mut files_in_page = 0usize;
+    for (position, (file, edit, omitted)) in flat.iter().enumerate().take(end).skip(offset) {
+        let text_cost = if view.full {
+            edit.new_text.len()
+        } else {
+            edit.new_text.len().min(EDIT_SUMMARY_BYTES)
+        };
+        if view.full && emitted_text > 0 && emitted_text + text_cost > FULL_PAGE_BYTES {
+            page_end = position;
+            break;
+        }
+        emitted_text += text_cost;
+        if last_file != Some(file.as_str()) {
+            files_in_page += 1;
+            body.push_str(&format!("{file}\n"));
+            last_file = Some(file.as_str());
+        }
+        let shown_text = if view.full {
+            edit.new_text.as_str()
+        } else {
+            &edit.new_text[..char_floor(&edit.new_text, EDIT_SUMMARY_BYTES)]
+        };
+        let mut note = String::new();
+        if !view.full && edit.full_len > shown_text.len() {
+            note.push_str(&format!(
+                " [text cut at {} of {} bytes; pass edit={} for the full replacement or full_text=true]",
+                shown_text.len(),
+                edit.full_len,
+                position + 1
             ));
         }
-        if file.omitted_edits > 0 && position - 1 < end && position > offset {
+        if edit.cut {
+            note.push_str(&format!(
+                " [only the first {} of {} bytes of the replacement are retained]",
+                edit.new_text.len(),
+                edit.full_len
+            ));
+        }
+        body.push_str(&format!(
+            "  #{} {}:{}-{}:{} -> {:?}{note}\n",
+            position + 1,
+            edit.start.0 + 1,
+            edit.start.1 + 1,
+            edit.end.0 + 1,
+            edit.end.1 + 1,
+            shown_text,
+        ));
+        if let Some(omitted) = omitted {
             body.push_str(&format!(
-                "  [{} more edits in this file beyond the {}-edit bound are not previewable]\n",
-                file.omitted_edits,
+                "  [{omitted} more edits in this file beyond the {}-edit bound are not previewable]\n",
                 crate::extras::lsp::navigate::MAX_EDITS_PER_FILE
             ));
         }
@@ -847,17 +976,6 @@ pub(crate) fn render_edit_preview(
             body.push_str(&format!("file operation: {operation}\n"));
         }
     }
-    let heading = if rename {
-        format!(
-            "Rename to `{new_name}`: {} edits in {files} files. PREVIEW ONLY, no file was modified; apply the edits with `edit`.",
-            preview.total_edits
-        )
-    } else {
-        format!(
-            "Code action edit: {} edits in {files} files. PREVIEW ONLY, no file was modified; apply the edits with `edit`.",
-            preview.total_edits
-        )
-    };
     let mut out = if files == 0 && preview.file_ops.is_empty() {
         format!("{heading}\n(the server returned no edits)")
     } else if offset >= shown_edits && shown_edits > 0 {
@@ -865,9 +983,14 @@ pub(crate) fn render_edit_preview(
     } else {
         format!("{heading}\n{body}")
     };
-    if offset < shown_edits && end < shown_edits {
+    if offset < shown_edits && page_end < shown_edits {
+        let reason = if page_end < end {
+            " (page ended early at the full-text byte budget)"
+        } else {
+            ""
+        };
         out.push_str(&format!(
-            "[showing edits {}-{end} of {shown_edits} across {files} files ({files_in_page} in this page); next_offset={end}: pass offset={end} to continue]\n",
+            "[showing edits {}-{page_end} of {shown_edits} across {files} files ({files_in_page} in this page){reason}; next_offset={page_end}: pass offset={page_end} to continue]\n",
             offset + 1
         ));
     }
@@ -886,6 +1009,77 @@ pub(crate) fn render_edit_preview(
     }
     if hidden > 0 {
         out.push_str(&format!("[{hidden} files hidden by permission rules]\n"));
+    }
+    out.trim_end().to_string()
+}
+
+/// One edit's complete replacement text, paged by bytes.
+fn render_single_edit(
+    heading: &str,
+    flat: &[(
+        String,
+        &crate::extras::lsp::navigate::EditView,
+        Option<usize>,
+    )],
+    number: usize,
+    text_offset: usize,
+) -> String {
+    let Some((file, edit, _)) = number.checked_sub(1).and_then(|index| flat.get(index)) else {
+        return format!(
+            "{heading}\nNo edit number {number}; the listing has {} previewable edits (numbered #1.. in the order shown).",
+            flat.len()
+        );
+    };
+    let text = edit.new_text.as_str();
+    let start = if text_offset >= text.len() {
+        text.len()
+    } else {
+        char_floor(text, text_offset)
+    };
+    let stop = if start + EDIT_TEXT_PAGE_BYTES >= text.len() {
+        text.len()
+    } else {
+        char_floor(text, start + EDIT_TEXT_PAGE_BYTES)
+    };
+    // Control characters other than newline and tab (terminal escapes) are
+    // shown as escapes so server text cannot drive the terminal.
+    let mut controls = 0usize;
+    let shown: String = text[start..stop]
+        .chars()
+        .flat_map(|ch| {
+            if ch.is_control() && !matches!(ch, '\n' | '\t') {
+                controls += 1;
+                ch.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![ch]
+            }
+        })
+        .collect();
+    let mut out = format!(
+        "{heading}\nEdit #{number} in {file}: replace {}:{}-{}:{} with the following text (bytes {start}-{stop} of {}):\n<<<<<<< REPLACEMENT\n{}\n>>>>>>> END\n",
+        edit.start.0 + 1,
+        edit.start.1 + 1,
+        edit.end.0 + 1,
+        edit.end.1 + 1,
+        edit.full_len,
+        shown,
+    );
+    if controls > 0 {
+        out.push_str(&format!(
+            "[{controls} control characters are shown as escapes]\n"
+        ));
+    }
+    if stop < text.len() {
+        out.push_str(&format!(
+            "[more replacement text follows; next text_offset={stop}: pass edit={number}, text_offset={stop} to continue]\n"
+        ));
+    }
+    if edit.cut {
+        out.push_str(&format!(
+            "[only the first {} of {} bytes of this replacement are retained; the rest cannot be shown]\n",
+            edit.new_text.len(),
+            edit.full_len
+        ));
     }
     out.trim_end().to_string()
 }
