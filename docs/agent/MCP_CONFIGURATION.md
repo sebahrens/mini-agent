@@ -53,7 +53,21 @@ to another reader already authorized to read that file.
 
 Project URL servers may use `"type": "http"` or `"streamable-http"`; the legacy
 `"type": "sse"` (and `ws`) is rejected with a message naming the `http`
-alternative. For auth headers sourced from the environment, `bearerTokenEnvVar`
+alternative.
+
+Decision (mini-agent-ufqu7): the legacy HTTP+SSE transport (the 2024-11-05
+protocol: a long-lived `GET` event stream announcing a separate `POST` endpoint)
+is deliberately **not supported**. It was replaced by streamable HTTP in the
+2025-03-26 MCP specification, the locked `rmcp` client offers only streamable
+HTTP, and a hand-written second transport would need its own copy of the pinned
+DNS, same-origin redirect, header-helper, OAuth and body-bound controls that the
+streamable client already carries, widening the audited network surface for a
+deprecated protocol. A server that only speaks legacy SSE can be reached through
+a streamable-HTTP bridge or gateway placed in front of it. The refusal names the
+`http` alternative so the configured entry can be corrected. Revisit if `rmcp`
+ships a maintained SSE client that can run on the pinned egress layer.
+
+For auth headers sourced from the environment, `bearerTokenEnvVar`
 (`Authorization: Bearer ${VAR}`) and `envHttpHeaders` (`{"Header": "VAR"}`) are
 folded into `headers` as ordinary `${VAR}` references, with the same
 substitution, bounds and missing-variable behavior. `headersHelper` (also `headers_helper`; a command that mints headers) is
