@@ -1682,8 +1682,10 @@ traffic does not enter the session's token estimate, so a single long turn relie
 on mid-turn compaction (real provider usage) rather than the between-turn check.
 
 The summarizer processes oversized history as bounded recent chunks with a
-rolling summary, at most 16 provider requests, and a five-minute aggregate
-deadline. Request byte budgets use the same conservative 3.25-character token
+rolling summary, at most 16 provider requests. Each request has its own
+timeout (`compaction_timeout_secs`); there is no aggregate deadline for the whole
+compaction, so a 16-request compaction can run for many times the per-request
+limit. Request byte budgets use the same conservative 3.25-character token
 estimate as session accounting. The summary response and the stored rolling
 summary scale with the context window: the response may use up to
 `context_window / 32` tokens (at least 4,096, at most 20,000, and never more than
