@@ -310,6 +310,13 @@ impl Tool for ListDirTool {
             total_entries.min(start.saturating_add(cap))
         });
         let page = &rows[start..end];
+        // Listed files can activate `paths:`-scoped skills (workspace-bound listings only).
+        #[cfg(feature = "agent-skills")]
+        if let Some(workspace) = bound_workspace {
+            for row in page.iter().filter(|row| row.kind == "file") {
+                crate::extras::skills::touched::record(workspace.root(), &relative.join(&row.name));
+            }
+        }
         let total_label = if incomplete {
             format!("at least {total_entries}")
         } else {

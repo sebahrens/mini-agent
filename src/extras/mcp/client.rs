@@ -287,6 +287,9 @@ pub(crate) fn bound_listed_tools_capped(tools: Vec<Tool>, cap: usize) -> ListedT
 pub(crate) struct ToolListCache {
     cell: Mutex<Arc<tokio::sync::OnceCell<Arc<ListedTools>>>>,
     changed: Arc<std::sync::atomic::AtomicBool>,
+    /// `tools/list_changed` flag of a reconnect replacement connection; read
+    /// and consumed together with `changed`.
+    adopted: Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>,
 }
 
 /// Outcome of a cached listing; `kept_previous` is set when a relist after
@@ -301,7 +304,17 @@ impl ToolListCache {
         Self {
             cell: Mutex::default(),
             changed,
+            adopted: Mutex::default(),
         }
+    }
+
+    /// After a reconnect: marks the cached listing stale (the next collection
+    /// relists from the new connection, keeping the previous set if that
+    /// fails) and follows the replacement connection's `list_changed` flag.
+    pub(crate) fn adopt_replacement(&self, flag: Arc<std::sync::atomic::AtomicBool>) {
+        *self.adopted.lock().unwrap_or_else(|e| e.into_inner()) = Some(flag);
+        self.changed
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     fn current(&self) -> Arc<tokio::sync::OnceCell<Arc<ListedTools>>> {
@@ -311,6 +324,12 @@ impl ToolListCache {
     /// Whether the server announced a changed tool list since the last listing.
     pub(crate) fn is_stale(&self) -> bool {
         self.changed.load(std::sync::atomic::Ordering::Acquire)
+            || self
+                .adopted
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
     }
 
     #[cfg(test)]
@@ -333,9 +352,16 @@ impl ToolListCache {
         Fut: std::future::Future<Output = Result<Arc<ListedTools>, ServiceError>>,
     {
         let mut previous = None;
+        let adopted = self
+            .adopted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|flag| flag.swap(false, std::sync::atomic::Ordering::AcqRel));
         if self
             .changed
             .swap(false, std::sync::atomic::Ordering::AcqRel)
+            || adopted
         {
             let mut cell = self.cell.lock().unwrap_or_else(|e| e.into_inner());
             previous = cell.get().cloned();
@@ -1058,6 +1084,15 @@ impl McpClientHandle {
         self.running_service.peer().clone()
     }
 
+    /// The peer of the live connection generation: the reconnect link's
+    /// current peer for a URL server, otherwise this handle's own.
+    pub(crate) fn live_peer(&self) -> rmcp::service::Peer<RoleClient> {
+        match &self.link {
+            Some(link) => link.conn().peer,
+            None => self.peer(),
+        }
+    }
+
     pub(crate) fn with_source_proof(mut self, proof: super::project::ServerSourceProof) -> Self {
         let proof = std::sync::Arc::new(proof);
         self.link = self.reconnect_link(&proof);
@@ -1100,6 +1135,8 @@ impl McpClientHandle {
             super::reconnect::Conn {
                 peer: self.peer(),
                 elicitation: self.elicitation.clone(),
+                tools: Arc::clone(&self.tools),
+                auxiliary: Arc::clone(&self.auxiliary),
             },
             connector,
             super::reconnect::RECONNECT_BASE_DELAY,

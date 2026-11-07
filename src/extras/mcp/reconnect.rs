@@ -36,6 +36,12 @@ pub(crate) const RECONNECT_BASE_DELAY: Duration = Duration::from_secs(1);
 pub(crate) struct Conn {
     pub(crate) peer: Peer<RoleClient>,
     pub(crate) elicitation: super::elicitation::Handler,
+    /// The server's tool-list and prompt/resource caches. They belong to the
+    /// original handle and survive reconnects (so registered resource tools
+    /// keep one catalogue); a reconnect marks them stale and makes them follow
+    /// the replacement connection's `list_changed` notifications.
+    pub(crate) tools: Arc<super::client::ToolListCache>,
+    pub(crate) auxiliary: Arc<super::catalogue::AuxiliaryCache>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -168,9 +174,17 @@ impl ServerLink {
                     if self.retired.load(Ordering::Acquire) {
                         return Err(retired());
                     }
+                    // The caches stay the original ones: relist/rediscover from the
+                    // new connection at next use and follow its notifications.
+                    conn.tools
+                        .adopt_replacement(handle.elicitation.tools_changed.clone());
+                    conn.auxiliary
+                        .adopt_replacement(handle.elicitation.auxiliary_changed.clone());
                     let fresh = Conn {
                         peer: handle.peer(),
                         elicitation: handle.elicitation.clone(),
+                        tools: Arc::clone(&conn.tools),
+                        auxiliary: Arc::clone(&conn.auxiliary),
                     };
                     let previous = lock(&self.replacement).replace(handle);
                     drop(previous);
@@ -333,6 +347,8 @@ mod tests {
         Conn {
             peer: handle.peer(),
             elicitation: handle.elicitation.clone(),
+            tools: Arc::clone(&handle.tools),
+            auxiliary: Arc::clone(&handle.auxiliary),
         }
     }
 
@@ -450,6 +466,213 @@ mod tests {
         let _ = link.ensure_connected().await;
         // 20 + 40 + 80 + 160 + 320 ms of sleeping at least.
         assert!(started.elapsed() >= Duration::from_millis(620));
+    }
+
+    /// Like [`serve`] but with tools, resources and a per-connection tool name:
+    /// `tool_v<N>` where N is the number of `initialize` requests so far, so a
+    /// reconnect to a restarted server visibly exposes a different tool set.
+    async fn serve_catalogue() -> Option<(String, Arc<AtomicUsize>)> {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return None,
+            Err(error) => panic!("loopback bind failed: {error}"),
+        };
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let initializes = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&initializes);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let counter = Arc::clone(&counter);
+                tokio::spawn(async move {
+                    let Some((method, body)) = read_request(&mut stream).await else {
+                        return;
+                    };
+                    let json = |value: serde_json::Value| {
+                        http_response(
+                            "200 OK",
+                            "application/json",
+                            &serde_json::to_vec(&value).unwrap(),
+                        )
+                    };
+                    let response = match (method.as_str(), body.get("id")) {
+                        ("POST", None) => http_response("202 Accepted", "text/plain", b""),
+                        ("POST", Some(id)) => {
+                            let generation = counter.load(Ordering::SeqCst);
+                            match body["method"].as_str() {
+                                Some("initialize") => {
+                                    counter.fetch_add(1, Ordering::SeqCst);
+                                    json(serde_json::json!({
+                                        "jsonrpc": "2.0", "id": id,
+                                        "result": {
+                                            "protocolVersion": body["params"]["protocolVersion"],
+                                            "capabilities": {"tools": {"listChanged": true}, "resources": {}},
+                                            "serverInfo": {"name": "t", "version": "0"}
+                                        }
+                                    }))
+                                }
+                                Some("tools/list") => json(serde_json::json!({
+                                    "jsonrpc": "2.0", "id": id,
+                                    "result": {"tools": [{
+                                        "name": format!("tool_v{generation}"),
+                                        "inputSchema": {"type": "object"}
+                                    }]}
+                                })),
+                                Some("resources/list") => json(serde_json::json!({
+                                    "jsonrpc": "2.0", "id": id,
+                                    "result": {"resources": [{
+                                        "uri": format!("mem://doc{generation}"), "name": "doc"
+                                    }]}
+                                })),
+                                Some("resources/templates/list") => json(serde_json::json!({
+                                    "jsonrpc": "2.0", "id": id,
+                                    "result": {"resourceTemplates": []}
+                                })),
+                                _ => http_response("404 Not Found", "text/plain", b""),
+                            }
+                        }
+                        _ => http_response("405 Method Not Allowed", "text/plain", b""),
+                    };
+                    let _ = stream.write_all(&response).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        Some((url, initializes))
+    }
+
+    async fn dropped(handle: &McpClientHandle) {
+        handle.running_service.cancellation_token().cancel();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !handle.peer().is_transport_closed() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A link-managed handle for `url`, with the link installed on it.
+    async fn linked(url: &str) -> McpClientHandle {
+        let mut original = connect(url).await.unwrap();
+        let connector_url = url.to_owned();
+        let connector: Connector = Arc::new(move || {
+            let url = connector_url.clone();
+            async move { connect(&url).await }.boxed()
+        });
+        original.link = Some(ServerLink::new(
+            "t".into(),
+            conn_of(&original),
+            connector,
+            Duration::from_millis(5),
+        ));
+        original
+    }
+
+    // mini-agent-bu3wp: resource/prompt discovery and reads reconnect like tools/call.
+    #[tokio::test]
+    async fn resource_catalogue_reaches_the_replacement_connection_after_a_drop() {
+        let Some((url, initializes)) = serve_catalogue().await else {
+            return;
+        };
+        let original = linked(&url).await;
+        let client = crate::extras::mcp::catalogue::RpcClient::capture(&original);
+        dropped(&original).await;
+        // A link-managed server stays usable after the drop (the old guard
+        // refused with Cancelled for ever).
+        assert!(client.is_current());
+        original
+            .auxiliary
+            .ensure(&client, Duration::from_secs(5))
+            .await;
+        let found = original.auxiliary.get().expect("catalogue discovered");
+        assert_eq!(initializes.load(Ordering::SeqCst), 2, "one reconnect");
+        assert_eq!(found.resources.len(), 1);
+        assert_eq!(found.resources[0].uri, "mem://doc2");
+        assert!(!client.live_peer().is_transport_closed());
+    }
+
+    // mini-agent-omfna: the tool list is relisted from the replacement and its
+    // list_changed notifications are observed.
+    #[tokio::test]
+    async fn reconnect_relists_tools_and_follows_the_replacements_list_changed() {
+        let Some((url, _)) = serve_catalogue().await else {
+            return;
+        };
+        let original = linked(&url).await;
+        let list = |handle: &McpClientHandle| {
+            let peer = handle.live_peer();
+            let options = handle.options.clone();
+            let tools = Arc::clone(&handle.tools);
+            let defer = handle.defer;
+            async move {
+                tools
+                    .get_or_list(|| {
+                        super::super::client::list_bounded_tools(
+                            &peer,
+                            Duration::from_secs(5),
+                            &options,
+                            defer,
+                        )
+                    })
+                    .await
+                    .map(|cached| {
+                        cached
+                            .listed
+                            .entries
+                            .iter()
+                            .map(|e| e.definition.name.to_string())
+                            .collect::<Vec<_>>()
+                    })
+            }
+        };
+        assert_eq!(list(&original).await.unwrap(), ["tool_v1"]);
+        assert!(!original.tools.is_stale());
+        dropped(&original).await;
+        let link = original.link.clone().unwrap();
+        link.ensure_connected().await.unwrap();
+        // The manager sees the change without any notification.
+        assert!(original.tools.is_stale(), "reconnect marks tools stale");
+        assert!(original.auxiliary.is_stale());
+        assert_eq!(list(&original).await.unwrap(), ["tool_v2"]);
+        assert!(!original.tools.is_stale());
+        // A list_changed notification on the replacement connection is observed.
+        link.conn()
+            .elicitation
+            .tools_changed
+            .store(true, Ordering::Release);
+        assert!(original.tools.is_stale());
+        let _ = list(&original).await.unwrap();
+        assert!(!original.tools.is_stale());
+        link.conn()
+            .elicitation
+            .auxiliary_changed
+            .store(true, Ordering::Release);
+        assert!(original.auxiliary.is_stale());
+    }
+
+    // mini-agent-bu3wp: mcp_tool hooks reconnect instead of "not connected".
+    #[cfg(feature = "hooks")]
+    #[tokio::test]
+    async fn mcp_tool_hook_reaches_the_server_after_a_transport_drop() {
+        let Some((url, initializes)) = serve_catalogue().await else {
+            return;
+        };
+        let mut original = linked(&url).await;
+        original.server_name = "bu3wp-hook-server".into();
+        crate::extras::hooks::backend::register_mcp_peers(std::slice::from_ref(&original));
+        dropped(&original).await;
+        let result = crate::extras::hooks::backend::call_mcp(
+            "bu3wp-hook-server",
+            "tool_v2",
+            serde_json::Map::new(),
+            Duration::from_secs(5),
+        )
+        .await;
+        let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
+        // It reached the replacement: the read-only gate (not the connectivity
+        // gate) is what refuses an unannotated tool.
+        assert!(stderr.contains("not annotated readOnlyHint"), "{stderr}");
+        assert_eq!(initializes.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

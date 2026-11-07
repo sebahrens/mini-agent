@@ -9,6 +9,7 @@
 //! `skills_shell_placeholders = false` leaves the span literal. A forked
 //! skill's body is handed to the `task` tool, which applies its own agent
 //! type, permissions and budget.
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::selection::{AgentSection, InstructionSelection};
@@ -38,14 +39,28 @@ pub(crate) struct PinRender<'a> {
     pub(crate) model: Option<&'a str>,
 }
 
-/// Whether a `paths:`-scoped skill applies to `query`: unscoped skills always
-/// do; scoped ones only when some whitespace-separated word of the request,
-/// stripped of quotes and trailing punctuation, matches one of the globs.
-pub(crate) fn paths_match_query(patterns: &[String], query: &str) -> bool {
+/// Longest prefix of a request scanned for file names, so a pasted log cannot
+/// make scoping quadratic while a path after the 8 KiB retrieval cut still counts.
+const PATH_SCAN_LIMIT: usize = 256 * 1024;
+/// Longest single word considered a path.
+const PATH_WORD_LIMIT: usize = 1024;
+
+/// Whether a `paths:`-scoped skill applies: unscoped skills always do; scoped
+/// ones when (a) some whitespace-separated word of `request` names a matching
+/// file (relative, `@`-mention, `./`, absolute under `root`, or a bare filename
+/// whose name fits a pattern's last segment), or (b) a file in `touched`
+/// (workspace-relative, read/edited/listed earlier in the session) matches.
+pub(crate) fn paths_match_request(
+    patterns: &[String],
+    request: &str,
+    root: &Path,
+    touched: &[String],
+) -> bool {
     if patterns.is_empty() {
         return true;
     }
     let mut builder = globset::GlobSetBuilder::new();
+    let mut name_builder = globset::GlobSetBuilder::new();
     for pattern in patterns {
         match globset::Glob::new(pattern) {
             Ok(glob) => {
@@ -54,21 +69,44 @@ pub(crate) fn paths_match_query(patterns: &[String], query: &str) -> bool {
             // A pattern that cannot compile scopes nothing in.
             Err(_) => return false,
         }
+        // Bare filenames are tested against the pattern's final segment, except
+        // for catch-all segments that would match any word.
+        let last = pattern.rsplit('/').next().unwrap_or(pattern);
+        if !matches!(last, "" | "*" | "**")
+            && let Ok(glob) = globset::Glob::new(last)
+        {
+            name_builder.add(glob);
+        }
     }
-    let Ok(set) = builder.build() else {
+    let (Ok(set), Ok(names)) = (builder.build(), name_builder.build()) else {
         return false;
     };
-    query.split_whitespace().any(|word| {
+    if touched.iter().any(|file| set.is_match(file.as_str())) {
+        return true;
+    }
+    let mut end = request.len().min(PATH_SCAN_LIMIT);
+    while !request.is_char_boundary(end) {
+        end -= 1;
+    }
+    request[..end].split_whitespace().any(|word| {
+        if word.len() > PATH_WORD_LIMIT {
+            return false;
+        }
         let word = word
-            .trim_start_matches(['"', '\'', '`', '(', '[', '<'])
+            .trim_start_matches(['"', '\'', '`', '(', '[', '<', '@'])
             .trim_end_matches(|c: char| {
                 matches!(
                     c,
                     '"' | '\'' | '`' | ')' | ']' | '>' | ',' | ';' | ':' | '.' | '!' | '?'
                 )
             });
-        let word = word.strip_prefix("./").unwrap_or(word);
-        !word.is_empty() && !word.contains("..") && set.is_match(word)
+        let Some(relative) = super::touched::relative_to_workspace(root, Path::new(word)) else {
+            return false;
+        };
+        set.is_match(relative.as_str())
+            || (!relative.contains('/')
+                && relative.trim_start_matches('.').contains('.')
+                && names.is_match(relative.as_str()))
     })
 }
 
@@ -322,16 +360,31 @@ fn render_section(section: &mut AgentSection, render: &PinRender<'_>) {
         Some(agent) => format!("agent_type \"{agent}\""),
         None => "no agent_type (the default explorer)".to_owned(),
     };
+    // Claude-style values degrade instead of failing the fork: `inherit` means
+    // "no override"; any other value the task tool refuses (a raw model id, an
+    // unknown alias, an agent type that pins its own model) is retried once
+    // without a model so the child uses the session or persona model.
     let model = match render.model {
+        Some(model) if model.eq_ignore_ascii_case("inherit") => String::new(),
         Some(model) => format!(
             " and model \"{model}\" (the task tool only accepts a configured quick-model alias; \
-             if it rejects the model, tell the user instead of retrying without it)"
+             if it rejects the model argument, call task once more with the same agent_type and prompt \
+             and no model so the child uses its default model, and add a one-line note to your \
+             reply that the skill's model was not applied)"
         ),
         None => String::new(),
     };
+    let once = if render
+        .model
+        .is_some_and(|m| !m.eq_ignore_ascii_case("inherit"))
+    {
+        "Call the task tool once"
+    } else {
+        "Call the task tool exactly once"
+    };
     section.markdown = format!(
         "This skill is configured with context: fork. Do not follow its instructions yourself. \
-         Call the task tool exactly once with {agent}{model} and a single prompt that is exactly the \
+         {once} with {agent}{model} and a single prompt that is exactly the \
          text between the skill_task_prompt markers below, then relay the child's report to \
          the user.\n<skill_task_prompt>\n{}\n</skill_task_prompt>\n",
         body.trim_end()
@@ -489,13 +542,78 @@ mod tests {
 
     #[test]
     fn paths_scope_selection_to_requests_naming_a_matching_file() {
-        let scoped = vec!["src/**/*.rs".to_owned(), "docs/*.md".to_owned()];
-        assert!(paths_match_query(&[], "anything"));
-        assert!(paths_match_query(&scoped, "please fix `src/a/b.rs`."));
-        assert!(paths_match_query(&scoped, "edit ./docs/x.md now"));
-        assert!(!paths_match_query(&scoped, "fix the bug in lib.rs"));
-        assert!(!paths_match_query(&scoped, "tests/a.rs"));
-        // A traversal-looking word never matches a scope.
-        assert!(!paths_match_query(&scoped, "src/../../etc/passwd.rs"));
+        let root = Path::new("/work/proj");
+        let m = |q: &str| paths_match_request(&scoped(), q, root, &[]);
+        fn scoped() -> Vec<String> {
+            vec!["src/**/*.rs".to_owned(), "docs/*.md".to_owned()]
+        }
+        assert!(paths_match_request(&[], "anything", root, &[]));
+        assert!(m("please fix `src/a/b.rs`."));
+        assert!(m("edit ./docs/x.md now"));
+        // @mention, absolute under the workspace, and a bare filename.
+        assert!(m("look at @src/a.rs"));
+        assert!(m("open /work/proj/src/a/b.rs please"));
+        assert!(m("fix the bug in lib.rs"));
+        // Non-matching sessions stay excluded.
+        assert!(!m("fix the bug in the parser"));
+        assert!(!m("tests/a.rs"));
+        assert!(!m("/other/proj/src/a.rs"));
+        assert!(!m("notes.txt"));
+        // A traversal component never matches a scope, but `..` inside a name is fine.
+        assert!(!m("src/../../etc/passwd.rs"));
+        assert!(m("src/a..b.rs"));
+        // A path beyond the 8 KiB retrieval cut still counts.
+        let long = format!("{} src/late.rs", "word ".repeat(4000));
+        assert!(m(&long));
+        // Catch-all patterns do not match arbitrary bare words.
+        let wide = vec!["src/**".to_owned()];
+        assert!(!paths_match_request(&wide, "update lib.rs", root, &[]));
+        // A file the agent touched earlier activates the skill without being named.
+        let touched = vec!["src/deep/mod.rs".to_owned()];
+        assert!(paths_match_request(&scoped(), "continue", root, &touched));
+        assert!(!paths_match_request(
+            &scoped(),
+            "continue",
+            root,
+            &["README.md".to_owned()]
+        ));
+    }
+
+    #[test]
+    fn fork_model_values_from_claude_degrade_instead_of_failing() {
+        let render = |model: &str| {
+            let mut section = AgentSection {
+                digest: "d".into(),
+                markdown: "---\nname: s\ncontext: fork\n---\nGo\n".into(),
+                resources: Vec::new(),
+                #[cfg(feature = "skills")]
+                learned_js: Vec::new(),
+                score: 1.0,
+                rank: 0,
+            };
+            render_section(
+                &mut section,
+                &PinRender {
+                    arguments: "",
+                    skill_dir: "/d",
+                    fork: true,
+                    task_available: true,
+                    agent: None,
+                    model: Some(model),
+                },
+            );
+            section.markdown
+        };
+        // `inherit` passes no model at all.
+        let inherit = render("Inherit");
+        assert!(!inherit.contains("model \""), "{inherit}");
+        assert!(inherit.contains("exactly once"), "{inherit}");
+        // A raw id / unknown alias is tried, then retried once without it.
+        for value in ["opus", "claude-sonnet-4-5"] {
+            let text = render(value);
+            assert!(text.contains(&format!("model \"{value}\"")), "{text}");
+            assert!(text.contains("and no model"), "{text}");
+            assert!(!text.contains("instead of retrying"), "{text}");
+        }
     }
 }

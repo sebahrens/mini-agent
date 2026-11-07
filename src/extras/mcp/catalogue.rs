@@ -26,6 +26,9 @@ pub(crate) struct RpcClient {
     source: Option<std::sync::Arc<super::project::ServerSourceProof>>,
     live: std::sync::Weak<()>,
     elicitation: super::elicitation::Handler,
+    /// Reconnect link of a URL server: the live peer and elicitation handler
+    /// come from it, and a dropped transport is re-established before use.
+    link: Option<std::sync::Arc<super::reconnect::ServerLink>>,
 }
 
 impl RpcClient {
@@ -37,11 +40,42 @@ impl RpcClient {
             source: client.source_proof.clone(),
             live: std::sync::Arc::downgrade(&client.liveness),
             elicitation: client.elicitation.clone(),
+            link: client.link.clone(),
+        }
+    }
+    /// The peer of the live connection generation (not reconnecting).
+    pub(crate) fn live_peer(&self) -> rmcp::service::Peer<rmcp::service::RoleClient> {
+        self.link
+            .as_ref()
+            .map_or_else(|| self.peer.clone(), |link| link.conn().peer)
+    }
+    /// The live connection, re-established first when a link-managed
+    /// server's transport dropped. The same bounded attempts as a tool call.
+    pub(crate) async fn connected(
+        &self,
+    ) -> Result<
+        (
+            rmcp::service::Peer<rmcp::service::RoleClient>,
+            super::elicitation::Handler,
+        ),
+        ServiceError,
+    > {
+        match &self.link {
+            Some(link) => {
+                let conn = link
+                    .ensure_connected()
+                    .await
+                    .map_err(|_| ServiceError::Cancelled { reason: None })?;
+                Ok((conn.peer, conn.elicitation))
+            }
+            None => Ok((self.peer.clone(), self.elicitation.clone())),
         }
     }
     pub(crate) fn is_current(&self) -> bool {
+        // A link-managed server may have a closed transport that the next
+        // call re-establishes, so only handle retirement counts for it.
         self.live.upgrade().is_some()
-            && !self.peer.is_transport_closed()
+            && (self.link.is_some() || !self.peer.is_transport_closed())
             && self.source.as_ref().is_none_or(|proof| proof.is_current())
             && !crate::agent::runner::current_work_scope_is_cancelled()
     }
@@ -144,6 +178,8 @@ pub(crate) struct Catalogue {
 pub(crate) struct AuxiliaryCache {
     current: std::sync::RwLock<Option<std::sync::Arc<Catalogue>>>,
     stale: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// List-changed flag of a reconnect replacement connection.
+    adopted: std::sync::Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
     gate: tokio::sync::Mutex<()>,
 }
 
@@ -172,6 +208,19 @@ impl AuxiliaryCache {
     /// the catalogue was last discovered.
     pub(crate) fn is_stale(&self) -> bool {
         self.stale.load(std::sync::atomic::Ordering::Acquire)
+            || self
+                .adopted
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// After a reconnect: the catalogue is stale (rediscovered from the new
+    /// connection at next use) and follows the replacement's list-changed flag.
+    pub(crate) fn adopt_replacement(&self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        *self.adopted.lock().unwrap_or_else(|e| e.into_inner()) = Some(flag);
+        self.stale.store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Discovers on first use or after a list-changed notification. A failed
@@ -182,12 +231,18 @@ impl AuxiliaryCache {
             return;
         }
         let _gate = self.gate.lock().await;
-        let refreshing = self.stale.swap(false, std::sync::atomic::Ordering::AcqRel);
+        let adopted = self
+            .adopted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|flag| flag.swap(false, std::sync::atomic::Ordering::AcqRel));
+        let refreshing = self.stale.swap(false, std::sync::atomic::Ordering::AcqRel) || adopted;
         if self.initialized() && !refreshing {
             return;
         }
         let capabilities = client
-            .peer
+            .live_peer()
             .peer_info()
             .map(|info| info.capabilities.clone());
         let mut fresh = discover_captured(client, capabilities, timeout).await;
@@ -365,7 +420,11 @@ async fn request(
     if !client.is_current() {
         return Err(ServiceError::Cancelled { reason: None });
     }
-    let peer = &client.peer;
+    let (peer, _) = tokio::select! {
+        biased;
+        _ = crate::agent::runner::current_work_scope_cancelled() => return Err(ServiceError::Cancelled { reason: None }),
+        connected = client.connected() => connected?,
+    };
     let reply = tokio::select! {
         biased;
         _ = crate::agent::runner::current_work_scope_cancelled() => return Err(ServiceError::Cancelled { reason: None }),
@@ -671,7 +730,8 @@ pub(crate) async fn get_prompt(
         .authorize("prompts/get", &prompt.name, permission, ask, owner.clone())
         .await?;
     let proof = client.clone();
-    let _lease = client.elicitation.enter(
+    let (_, elicitation) = client.connected().await?;
+    let _lease = elicitation.enter(
         client.server_name.to_string(),
         ask.clone(),
         std::sync::Arc::new(move || proof.is_current()),
@@ -784,7 +844,8 @@ pub(crate) async fn read_resource_text(
         )
         .await?;
     let proof = client.clone();
-    let _lease = client.elicitation.enter(
+    let (_, elicitation) = client.connected().await?;
+    let _lease = elicitation.enter(
         client.server_name.to_string(),
         ask.clone(),
         std::sync::Arc::new(move || proof.is_current()),

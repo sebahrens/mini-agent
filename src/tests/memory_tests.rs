@@ -2176,6 +2176,38 @@ fn plain_append_refuses_symlink_hardlink_and_directory_targets() {
     cleanup(&m);
 }
 
+// mini-agent-vatkx: only a missing file is empty; other read errors never rewrite it.
+#[cfg(unix)]
+#[test]
+fn vatkx_append_refuses_to_rewrite_a_file_that_cannot_be_read() {
+    use std::os::unix::fs::PermissionsExt;
+    let m = fresh("vatkx-unreadable");
+    let path = memory_md(&m);
+    fs::write(&path, "curated\n").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(&path).is_ok() {
+        // Running with privileges that ignore modes (root): nothing to assert.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        cleanup(&m);
+        return;
+    }
+    for mode in [WriteMode::Append, WriteMode::AppendFacts] {
+        assert!(
+            m.write(WriteTarget::LongTerm, "new fact", mode, None)
+                .is_err(),
+            "unreadable MEMORY.md must not be rewritten"
+        );
+    }
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), "curated\n");
+    // A missing file is still empty and is created.
+    fs::remove_file(&path).unwrap();
+    m.write(WriteTarget::LongTerm, "first", WriteMode::Append, None)
+        .unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), "first\n");
+    cleanup(&m);
+}
+
 // mini-agent-esuz5: newest-first, partial index with a count, 500 notes.
 #[test]
 fn esuz5_notes_index_lists_newest_first_and_survives_500_notes() {

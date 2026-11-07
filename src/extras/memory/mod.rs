@@ -55,7 +55,8 @@ fn read_text(path: &Path) -> std::io::Result<String> {
     }
 }
 
-/// Current text of a file about to be rewritten. A missing file is empty; a file
+/// Current text of a file about to be rewritten. Only a missing file is empty;
+/// any other read error (permission, EISDIR, EIO) propagates unchanged. A file
 /// that is not valid UTF-8 is an error, never "empty": treating it as empty
 /// would overwrite the user's memory with only the new text.
 fn read_text_for_update(path: &Path) -> std::io::Result<String> {
@@ -69,7 +70,8 @@ fn read_text_for_update(path: &Path) -> std::io::Result<String> {
                     .unwrap_or("memory file")
             ),
         )),
-        Err(_) => Ok(String::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error),
         Ok(text) => Ok(text),
     }
 }

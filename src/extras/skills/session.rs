@@ -702,6 +702,10 @@ impl InstructionServices {
         {
             return Err("pinned skill source changed or lost current read/trust authority".into());
         }
+        // `paths:` scoping scans the raw request: the 8 KiB retrieval cut must not hide a path.
+        let raw_request = query.to_owned();
+        let workspace_root = self.workspace.root().to_path_buf();
+        let touched = super::touched::snapshot(&workspace_root);
         let query = super::retrieval::normalize_query(query);
         #[cfg(feature = "skills")]
         let vector = if let Some(embedder) = &embedder {
@@ -737,10 +741,16 @@ impl InstructionServices {
                 })
                 .collect();
             // `paths:` scoping: a scoped skill joins automatic selection only
-            // when the request names a matching file. A pin always keeps it.
+            // when the request names a matching file or the session already
+            // read/edited/listed one. A pin always keeps it.
             records.retain(|record| {
                 pin.as_ref().is_some_and(|pin| pin.digest == record.digest)
-                    || super::placeholders::paths_match_query(&record.paths, &query)
+                    || super::placeholders::paths_match_request(
+                        &record.paths,
+                        &raw_request,
+                        &workspace_root,
+                        &touched,
+                    )
             });
             #[cfg(feature = "skills")]
             let semantic_model = if vector.is_some() {
@@ -2302,6 +2312,32 @@ mod discovery_tests {
             .await
             .unwrap();
         assert!(names(&on), "a named matching file activates the skill");
+        // Absolute-under-workspace, @mention and bare-filename requests (j2acy).
+        let root = fixture.services.workspace.root().to_path_buf();
+        for request in [
+            format!("style rules for modules in {}/src/a/b.rs", root.display()),
+            "style rules for modules in @src/a/b.rs".to_owned(),
+            "style rules for modules in b.rs".to_owned(),
+        ] {
+            let selection = fixture.services.select(&request, None).await.unwrap();
+            assert!(names(&selection), "{request}");
+        }
+        // A file a tool touched earlier activates it on a later turn; a
+        // non-matching touched file does not.
+        super::super::touched::record(&root, std::path::Path::new("README.md"));
+        let still_off = fixture
+            .services
+            .select("style rules for modules", None)
+            .await
+            .unwrap();
+        assert!(!names(&still_off));
+        super::super::touched::record(&root, &root.join("src/deep/lib.rs"));
+        let touched_on = fixture
+            .services
+            .select("style rules for modules", None)
+            .await
+            .unwrap();
+        assert!(names(&touched_on), "a tool-touched matching file activates");
         // A pin keeps working regardless of paths.
         let pin = fixture.services.pin("rust-style").await.unwrap();
         let pinned = fixture
