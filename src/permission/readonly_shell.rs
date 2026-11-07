@@ -539,4 +539,43 @@ mod tests {
         yes("grep 'a*' f");
         yes("grep \"a?[b]\" f");
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn glob_and_read_deny_rules_block_shell_auto_allow() {
+        use crate::permission::checker::CheckResult;
+        use crate::permission::{
+            Action, PermissionConfig, PermissionConfigs, SandboxResolution::*, SecurityMode,
+            ToolPerm,
+        };
+        let fixture = crate::tests::OwnedTestDirectory::new("readonly-shell-deny");
+        let work = fixture.path().canonicalize().unwrap();
+        std::fs::write(work.join(".env"), b"s").unwrap();
+        std::fs::write(work.join("Cargo.toml"), b"c").unwrap();
+        let make = |deny: bool| {
+            let mut configs = PermissionConfigs::default();
+            if deny {
+                configs.glob.read = Some(ToolPerm::Granular(
+                    [("**/.env".to_string(), Action::Deny)].into(),
+                ));
+            }
+            crate::permission::checker::PermissionChecker::new_for_sandbox(
+                &configs,
+                SecurityMode::Standard,
+                Some(work.clone()),
+                None,
+                Enforced,
+            )
+            .unwrap()
+        };
+        let mut denied = make(true);
+        assert_eq!(denied.check("bash", "cat .e*"), CheckResult::Ask);
+        assert_eq!(denied.check("bash", "grep -rn x ."), CheckResult::Ask);
+        assert_eq!(denied.check("bash", "rg x"), CheckResult::Ask);
+        assert_eq!(denied.check("bash", "find . -name '*.pem'"), CheckResult::Ask);
+        assert_eq!(denied.check("bash", "cat Cargo.toml"), CheckResult::Allowed);
+        let mut open = make(false);
+        assert_eq!(open.check("bash", "grep -rn x ."), CheckResult::Allowed);
+        assert_eq!(open.check("bash", "cat .e*"), CheckResult::Ask);
+    }
 }

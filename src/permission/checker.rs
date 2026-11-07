@@ -1480,6 +1480,12 @@ impl PermissionChecker {
         if report.recursive && !self.readonly_contained {
             return false;
         }
+        // Only the argument strings are screened below; a recursive command
+        // also reads everything beneath them. When any read deny rule exists
+        // the traversal could surface denied files, so fall back to ask.
+        if report.recursive && !self.path_deny_probe("grep").is_empty() {
+            return false;
+        }
         let Some(cwd) = self.cached_resolved_cwd.as_deref() else {
             return false;
         };
