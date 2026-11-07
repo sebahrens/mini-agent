@@ -695,6 +695,19 @@ fn page_markdown(input: &str, base: Option<&reqwest::Url>) -> String {
             break;
         }
         let rest = &input[position..];
+        if let Some(name) = ignored.as_deref() {
+            // Raw-text element: only its matching end tag matters. No tag
+            // tokenising or quote tracking, so `i < n` or a stray apostrophe
+            // in script cannot swallow the end tag.
+            match find_raw_text_end(rest, name) {
+                Some(len) => {
+                    position += len;
+                    ignored = None;
+                    continue;
+                }
+                None => break,
+            }
+        }
         if rest.starts_with("<!--") {
             match rest.find("-->") {
                 Some(end) => {
@@ -704,7 +717,12 @@ fn page_markdown(input: &str, base: Option<&reqwest::Url>) -> String {
                 None => break,
             }
         }
-        if rest.starts_with('<') {
+        if rest.starts_with('<')
+            && rest[1..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || matches!(c, '/' | '!' | '?'))
+        {
             let mut quoted = None;
             let mut end = None;
             for (offset, c) in rest.char_indices().skip(1) {
@@ -728,13 +746,9 @@ fn page_markdown(input: &str, base: Option<&reqwest::Url>) -> String {
                 .next()
                 .unwrap_or("")
                 .trim_end_matches('/');
-            if ignored.as_deref().is_some_and(|n| name == format!("/{n}")) {
-                ignored = None;
-            } else if ignored.is_none()
-                && matches!(name, "script" | "style" | "noscript" | "template")
-            {
+            if matches!(name, "script" | "style" | "noscript" | "template") {
                 ignored = Some(name.to_owned());
-            } else if ignored.is_none() {
+            } else {
                 writer.tag(raw, name, base);
             }
             position += end + 1;
@@ -759,6 +773,32 @@ fn page_markdown(input: &str, base: Option<&reqwest::Url>) -> String {
         text.pop();
     }
     safe_text(text.trim_start_matches('\n'))
+}
+
+/// Byte length of `rest` up to and including the `>` of the first
+/// case-insensitive `</name` end tag, or `None` when the element never closes.
+fn find_raw_text_end(rest: &str, name: &str) -> Option<usize> {
+    let bytes = rest.as_bytes();
+    let needle = name.as_bytes();
+    let mut from = 0;
+    while let Some(lt) = rest[from..].find("</") {
+        let start = from + lt;
+        let name_end = start + 2 + needle.len();
+        if bytes.len() >= name_end
+            && bytes[start + 2..name_end].eq_ignore_ascii_case(needle)
+            && bytes
+                .get(name_end)
+                .is_none_or(|b| b.is_ascii_whitespace() || matches!(b, b'>' | b'/'))
+        {
+            return Some(
+                rest[name_end..]
+                    .find('>')
+                    .map_or(rest.len(), |g| name_end + g + 1),
+            );
+        }
+        from = start + 2;
+    }
+    None
 }
 
 /// Dropping a cancelled save waiter destroys the returned uncommitted artifact
@@ -818,6 +858,15 @@ mod web_fetch_tests {
         let large = format!("<p>{}</p>", "&".repeat(1024 * 1024 - 7));
         assert_eq!(page_text(&large).trim().len(), 1024 * 1024 - 7);
         assert_eq!(page_text("<p title='unfinished"), "");
+    }
+    #[test]
+    fn web_fetch_script_with_less_than_does_not_swallow_page() {
+        let page = page_markdown("<script>for(var i=0;i<n;i++){x()}</script>Hello", None);
+        assert!(page.contains("Hello"), "{page}");
+        let page = page_markdown("<STYLE>a{content:'}</Style><p>After it's", None);
+        assert!(page.contains("After"), "{page}");
+        assert!(page_markdown("<p>1 < 2 and x<y</p>", None).contains("1 < 2"));
+        assert!(!page_markdown("<script>a</scripts>b</script>c", None).contains('b'));
     }
     #[test]
     fn web_fetch_html_renders_markdown_links_headings_lists_code_and_tables() {

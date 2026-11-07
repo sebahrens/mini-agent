@@ -329,9 +329,24 @@ impl Drop for BoundDiagnosticPath {
     }
 }
 
+/// Ascending sort rank of a severity: error, warning, information, hint.
+fn severity_rank(severity: DiagnosticSeverity) -> u32 {
+    if severity == DiagnosticSeverity::ERROR {
+        1
+    } else if severity == DiagnosticSeverity::WARNING {
+        2
+    } else if severity == DiagnosticSeverity::INFORMATION {
+        3
+    } else {
+        4
+    }
+}
+
 pub(crate) struct DiagnosticSnapshot {
     uri: String,
     lines: Vec<String>,
+    /// Severity of each entry of `lines`, for the cross-file ordering.
+    severities: Vec<Option<DiagnosticSeverity>>,
     #[cfg(test)]
     truncated: bool,
     /// Diagnostics the cache dropped at storage time (per-file cap).
@@ -1115,14 +1130,16 @@ impl LspManager {
         interesting.sort_by_key(|d| (d.severity, d.range.start.line, d.range.start.character));
         #[cfg(test)]
         let truncated = interesting.len() > remaining_lines;
-        let lines: Vec<String> = interesting
+        let kept: Vec<_> = interesting.into_iter().take(remaining_lines).collect();
+        let severities = kept.iter().map(|diagnostic| diagnostic.severity).collect();
+        let lines: Vec<String> = kept
             .into_iter()
-            .take(remaining_lines)
             .map(|diagnostic| format_diag_line(&display, diagnostic))
             .collect();
         Some(DiagnosticSnapshot {
             uri: binding.uri.clone(),
             lines,
+            severities,
             #[cfg(test)]
             truncated,
             omitted: cached.omitted,
@@ -1158,10 +1175,10 @@ impl LspManager {
         if out.is_empty() { None } else { Some(out) }
     }
 
-    /// Window `[offset, offset + limit)` over the diagnostics of `snapshots`
-    /// (files in URI order, diagnostics in severity/line order within a file).
-    /// The footer states how many diagnostics and files are hidden and the
-    /// `offset` that continues the listing.
+    /// Window `[offset, offset + limit)` over the diagnostics of `snapshots`,
+    /// ordered errors first across all files (then URI, then line order
+    /// within a file). The footer states how many diagnostics and files are
+    /// hidden and the `offset` that continues the listing.
     pub(crate) fn diagnostics_page_for_snapshots(
         &self,
         snapshots: &[DiagnosticSnapshot],
@@ -1170,29 +1187,42 @@ impl LspManager {
     ) -> Option<String> {
         let mut entries: Vec<_> = snapshots.iter().filter(|s| !s.lines.is_empty()).collect();
         entries.sort_by(|a, b| a.uri.cmp(&b.uri));
-        let total: usize = entries.iter().map(|s| s.lines.len()).sum();
+        // (severity rank, file, index within file); sorted stably so files
+        // stay in URI order and a file's own order is preserved per severity.
+        let mut order: Vec<(u32, usize, usize)> = Vec::new();
+        for (file, snapshot) in entries.iter().enumerate() {
+            for index in 0..snapshot.lines.len() {
+                let rank = snapshot
+                    .severities
+                    .get(index)
+                    .copied()
+                    .flatten()
+                    .map_or(u32::MAX, severity_rank);
+                order.push((rank, file, index));
+            }
+        }
+        order.sort();
+        let total = order.len();
         if total == 0 {
             return None;
         }
         let end = offset.saturating_add(limit).min(total);
         let mut out = String::new();
-        let mut position = 0;
-        let mut files_hidden = 0;
-        for snapshot in &entries {
-            let first = position;
-            position += snapshot.lines.len();
-            for (index, line) in snapshot.lines.iter().enumerate() {
-                if (offset..end).contains(&(first + index)) {
-                    out.push_str(line);
-                }
+        let mut last_position = vec![0usize; entries.len()];
+        for (position, &(_, file, _)) in order.iter().enumerate() {
+            last_position[file] = position;
+        }
+        for (position, &(_, file, index)) in order.iter().enumerate() {
+            if !(offset..end).contains(&position) {
+                continue;
             }
-            if snapshot.omitted > 0 && (offset..end).contains(&(position - 1)) {
+            out.push_str(&entries[file].lines[index]);
+            let snapshot = entries[file];
+            if snapshot.omitted > 0 && last_position[file] == position {
                 out.push_str(&omitted_notice(&snapshot.uri, snapshot.omitted));
             }
-            if position > end {
-                files_hidden += 1;
-            }
         }
+        let files_hidden = last_position.iter().filter(|last| **last >= end).count();
         if offset >= total {
             out.push_str(&format!(
                 "\n  … no diagnostics at offset {offset} ({total} in {} files in total)",

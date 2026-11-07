@@ -1,7 +1,7 @@
 //! Fixed-provider native search. Credentials are captured at agent construction
 //! and sent only to Exa's fixed HTTPS search endpoint; redirects are rejected.
 use super::web_fetch::{quote_reference, safe_text};
-use super::web_http::{FetchPolicy, FetchRequest, NativeWebClient, normalize_fetch_url};
+use super::web_http::{FetchPolicy, FetchRequest, NativeWebClient, normalize_fetch_url_with};
 use super::{AskSender, PermCheck, ToolError};
 use rig::tool::Tool;
 use serde::Deserialize;
@@ -296,6 +296,7 @@ fn render_results_with_credential(
         String::from("Untrusted ranked web search references (returned URLs were not visited):\n");
     let mut retained = 0;
     let mut filtered = 0;
+    let mut unusable = 0;
     for result in results.iter().take(MAX_RESULTS) {
         if retained == options.num_results {
             break;
@@ -310,7 +311,10 @@ fn render_results_with_credential(
         if credential.is_some_and(|secret| raw_url.contains(secret)) {
             continue;
         }
-        let Ok(url) = normalize_fetch_url(raw_url, true) else {
+        // Fragments are never sent to servers; strip them as web_fetch does
+        // rather than dropping an otherwise valid page.
+        let Ok(url) = normalize_fetch_url_with(raw_url, true, true) else {
+            unusable += 1;
             continue;
         };
         if !options.admits(&url) {
@@ -347,6 +351,11 @@ fn render_results_with_credential(
             "{filtered} result(s) outside the requested domain filter were dropped.\n"
         ));
     }
+    if unusable > 0 {
+        output.push_str(&format!(
+            "{unusable} result(s) with an unusable URL (not a plain public http(s) URL) were dropped.\n"
+        ));
+    }
     Ok(output)
 }
 
@@ -354,6 +363,16 @@ fn render_results_with_credential(
 mod web_search_tests {
     use super::super::web_http::web_http_tests::{Peer, fixture_client};
     use super::*;
+    #[test]
+    fn web_search_lists_fragment_urls_without_the_fragment_and_counts_unusable() {
+        let out = render_results(&serde_json::json!({"results":[
+            {"title":"t","url":"https://docs.rs/x#section","text":"s"},
+            {"title":"u","url":"ftp://example.com/a","text":"s"}]}))
+        .unwrap();
+        assert!(out.contains("URL: https://docs.rs/x\n"), "{out}");
+        assert!(!out.contains("#section"), "{out}");
+        assert!(out.contains("1 result(s) with an unusable URL"), "{out}");
+    }
     #[tokio::test]
     async fn web_search_actual_native_tool_posts_only_fixed_exa_request_and_bounds_results() {
         // This peer is reached through a test-only pinned transport seam; the

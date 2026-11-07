@@ -1122,13 +1122,26 @@ impl ReadTool {
             total_lines,
             end - start,
         );
-        self.read_tracker.record_read(
-            &permission_path,
-            offset,
-            limit,
-            &metadata,
-            served_content_crc,
-        );
+        let any_clipped = excerpt_lines
+            .iter()
+            .any(|line| line.chars().nth(clip_width).is_some());
+        if any_clipped {
+            self.read_tracker.record_clipped_read(
+                &permission_path,
+                offset,
+                limit,
+                &metadata,
+                served_content_crc,
+            );
+        } else {
+            self.read_tracker.record_read(
+                &permission_path,
+                offset,
+                limit,
+                &metadata,
+                served_content_crc,
+            );
+        }
         Ok(info)
     }
 }
@@ -1906,6 +1919,42 @@ mod tests {
         let tag = crate::agent::tools::crc::crc32_hex(line.as_bytes());
         assert!(tagged.contains(&format!("  1|{tag} ")), "{tagged:.300}");
         assert!(tagged.contains(&marker), "{tagged:.300}");
+    }
+
+    /// mini-agent-3vutj: a read in which a line was clipped never authorizes
+    /// an overwrite; an unclipped complete read still does.
+    #[tokio::test]
+    async fn clipped_line_read_does_not_authorize_overwrite() {
+        let dir = crate::tests::support::temp::TempDir::new("read-clip-overwrite");
+        let dir_path = dir.path().canonicalize().unwrap();
+        let width = crate::agent::tools::limits::DEFAULT_MAX_READ_LINE_CHARS;
+        let long = dir_path.join("a.txt");
+        let content = "x".repeat(width + 3000);
+        std::fs::write(&long, &content).unwrap();
+        let short = dir_path.join("b.txt");
+        std::fs::write(&short, "short\n").unwrap();
+        let tracker = crate::agent::tools::ReadTracker::new(true);
+        let tool = ReadTool::new_with_tracker(None, None, None, 2000, tracker.clone());
+        let output = tool.call(read_args(&long)).await.unwrap();
+        assert!(output.contains("truncated"), "{output:.200}");
+        let (long_crc, _) =
+            crate::agent::tools::write::full_text_fingerprint(content.as_bytes()).unwrap();
+        assert!(!tracker.permits_full_overwrite(
+            &long.to_string_lossy(),
+            &std::fs::metadata(&long).unwrap(),
+            long_crc,
+            1
+        ));
+        // A repeat of the same window is still deduplicated.
+        assert!(tool.call(read_args(&long)).await.is_err());
+        tool.call(read_args(&short)).await.unwrap();
+        let (served, _) = crate::agent::tools::write::full_text_fingerprint(b"short\n").unwrap();
+        assert!(tracker.permits_full_overwrite(
+            &short.to_string_lossy(),
+            &std::fs::metadata(&short).unwrap(),
+            served,
+            1
+        ));
     }
 
     /// mini-agent-qsttm: notebooks have their own size limit, so a 3 MiB

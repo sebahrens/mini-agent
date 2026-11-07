@@ -438,10 +438,9 @@ impl GrepSearch {
     /// Returns `Break` once the result or work limit stops the search.
     fn visit(&mut self, entry: BoundFile, include_root: &Path) -> ControlFlow<()> {
         let options = self.options;
-        if self.emitted_results >= options.max_results {
-            self.limit_hit = true;
-            return ControlFlow::Break(());
-        }
+        // At the result cap, later files are still searched: only a file that
+        // really yields a result proves the output is truncated.
+        let at_limit = self.emitted_results >= options.max_results;
 
         // The walker already applies the include glob for a directory walk
         // (see `search_target`), before a matching file is even opened; this
@@ -519,6 +518,10 @@ impl GrepSearch {
 
         if match_lines.is_empty() {
             return ControlFlow::Continue(());
+        }
+        if at_limit {
+            self.limit_hit = true;
+            return ControlFlow::Break(());
         }
         self.files_with_matches += 1;
         let path_str = entry.path.to_string_lossy().to_string();
@@ -1950,6 +1953,39 @@ mod tests {
 
         assert!(!output.contains("[truncated after"));
         assert!(output.starts_with("2 results (searched 1 files):"));
+    }
+
+    /// mini-agent-3z44m: later files that merely exist (or do not match) do
+    /// not make an exactly-filled result look truncated; a later match does.
+    #[tokio::test]
+    async fn exact_cap_followed_by_non_matching_file_is_not_truncated() {
+        let tool = GrepTool::new(None, None, 2);
+        let run = |dir: &TempDir| {
+            let args = GrepArgs {
+                no_ignore: false,
+                offset: None,
+                max_results: None,
+                multiline: false,
+                pattern: "needle".to_string(),
+                path: Some(dir.path().to_string_lossy().into_owned()),
+                include: None,
+                context_lines: None,
+                case_insensitive: false,
+                files_only: false,
+                count: false,
+            };
+            tool.call(args)
+        };
+        let dir = TempDir::new("exact-limit-later-file");
+        std::fs::write(dir.path().join("a.txt"), "needle\nneedle\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "nothing here\n").unwrap();
+        std::fs::write(dir.path().join("c.bin"), b"\0\0needle").unwrap();
+        let output = run(&dir).await.unwrap();
+        assert!(!output.contains("[truncated after"), "{output}");
+
+        std::fs::write(dir.path().join("d.txt"), "needle\n").unwrap();
+        let output = run(&dir).await.unwrap();
+        assert!(output.contains("[truncated after 2"), "{output}");
     }
 
     #[tokio::test]

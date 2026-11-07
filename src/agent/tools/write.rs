@@ -41,7 +41,7 @@ pub(crate) fn full_text_fingerprint(bytes: &[u8]) -> Result<(u32, usize), ToolEr
 
 fn overwrite_not_authorized(path: &str) -> ToolError {
     ToolError::Msg(format!(
-        "Cannot overwrite '{path}': overwrite=true requires a complete current read of the file. Read it from offset 1 through EOF, then retry without any intervening change."
+        "Cannot overwrite '{path}': overwrite=true requires a complete current read of the file. Read it from offset 1 through EOF, then retry without any intervening change. A read that clipped long lines (marked 'line N truncated') never authorizes overwrite because the clipped text was not seen: read those lines with character_offset windows and use edit for changes, or replace the file with the shell tool."
     ))
 }
 

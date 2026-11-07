@@ -8,6 +8,8 @@
 
 use std::io::Cursor;
 
+use image::ImageDecoder;
+
 use super::read_image::ImageFormat;
 
 /// Longest edge, in pixels, of a downscaled image (provider-friendly size).
@@ -85,9 +87,27 @@ pub(crate) fn fit(bytes: &[u8], max_bytes: usize, max_side: u32) -> Result<Fitte
     limits.max_image_height = Some(MAX_DECODE_SIDE);
     limits.max_alloc = Some(MAX_DECODE_ALLOC);
     reader.limits(limits);
-    let decoded = reader
-        .decode()
+    let mut decoder = reader
+        .into_decoder()
         .map_err(|error| format!("Image could not be decoded for resizing: {error}"))?;
+    // Re-encoding drops EXIF, so bake the stored orientation into the pixels
+    // or a sideways phone photo would reach the model rotated.
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    // `from_decoder` allocates the whole pixel buffer without consulting the
+    // limits, so enforce the allocation cap here before it happens.
+    let decoded_bytes = decoder.total_bytes();
+    if decoded_bytes > MAX_DECODE_ALLOC {
+        return Err(format!(
+            "Image is too large to decode for resizing ({} MiB decoded, limit {} MiB)",
+            decoded_bytes / (1024 * 1024),
+            MAX_DECODE_ALLOC / (1024 * 1024)
+        ));
+    }
+    let mut decoded = image::DynamicImage::from_decoder(decoder)
+        .map_err(|error| format!("Image could not be decoded for resizing: {error}"))?;
+    decoded.apply_orientation(orientation);
     let (original_width, original_height) = (decoded.width(), decoded.height());
     let has_alpha = decoded.color().has_alpha();
     let mut long_edge = FIT_LONG_EDGE
@@ -145,6 +165,83 @@ pub(crate) mod tests {
             .write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png)
             .unwrap();
         out
+    }
+
+    /// A wide JPEG whose EXIF Orientation tag says "rotate 90 degrees".
+    fn exif_rotated_jpeg(width: u32, height: u32, orientation: u16) -> Vec<u8> {
+        let image = image::RgbImage::from_pixel(width, height, image::Rgb([200, 30, 30]));
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 80)
+            .encode_image(&image)
+            .unwrap();
+        let mut tiff = b"II*\0\x08\0\0\0\x01\0".to_vec();
+        tiff.extend_from_slice(&[0x12, 0x01, 0x03, 0x00, 1, 0, 0, 0]);
+        tiff.extend_from_slice(&orientation.to_le_bytes());
+        tiff.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        let mut segment = b"Exif\0\0".to_vec();
+        segment.extend_from_slice(&tiff);
+        let mut out = jpeg[..2].to_vec();
+        out.extend_from_slice(&[0xff, 0xe1]);
+        out.extend_from_slice(&((segment.len() + 2) as u16).to_be_bytes());
+        out.extend_from_slice(&segment);
+        out.extend_from_slice(&jpeg[2..]);
+        out
+    }
+
+    /// A tiny PNG whose header declares huge dimensions (no pixel data).
+    fn png_header_only(width: u32, height: u32) -> Vec<u8> {
+        fn crc32(data: &[u8]) -> u32 {
+            let mut crc = !0u32;
+            for byte in data {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    crc = if crc & 1 != 0 {
+                        (crc >> 1) ^ 0xedb8_8320
+                    } else {
+                        crc >> 1
+                    };
+                }
+            }
+            !crc
+        }
+        let mut ihdr = b"IHDR".to_vec();
+        ihdr.extend_from_slice(&width.to_be_bytes());
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+        let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+        out.extend_from_slice(&13u32.to_be_bytes());
+        out.extend_from_slice(&ihdr);
+        out.extend_from_slice(&crc32(&ihdr).to_be_bytes());
+        // One truncated IDAT so the decoder finishes reading the header.
+        let idat = b"IDAT\x78\x9c\x01\x00".to_vec();
+        out.extend_from_slice(&4u32.to_be_bytes());
+        out.extend_from_slice(&idat);
+        out.extend_from_slice(&crc32(&idat).to_be_bytes());
+        out
+    }
+
+    /// mini-agent-y0bp5 (adversarial): an image inside the side limit but
+    /// whose decoded size exceeds the allocation cap is refused up front.
+    #[test]
+    fn decoded_size_over_alloc_cap_is_refused_before_allocating() {
+        // 20000 x 20000 RGB8 = 1.2 GB > 768 MiB, sides within 30000.
+        let error = fit(&png_header_only(20_000, 20_000), 5 * 1024 * 1024, 8_000).unwrap_err();
+        assert!(error.contains("too large to decode"), "{error}");
+    }
+
+    /// mini-agent-y0bp5: a downscaled photo keeps its displayed orientation.
+    #[test]
+    fn downscaled_jpeg_applies_exif_orientation() {
+        let jpeg = exif_rotated_jpeg(3000, 1000, 6);
+        let fitted = fit(&jpeg, 5 * 1024 * 1024, 8_000).unwrap();
+        assert!(
+            fitted.height > fitted.width,
+            "{} x {}",
+            fitted.width,
+            fitted.height
+        );
+        let upright = fit(&exif_rotated_jpeg(3000, 1000, 1), 5 * 1024 * 1024, 8_000).unwrap();
+        assert!(upright.width > upright.height);
     }
 
     #[test]
