@@ -453,8 +453,15 @@ impl Ledger {
     ) -> anyhow::Result<Option<LockedLedgerFile>> {
         let write = mode != StateLock::Read;
         let path = binding.root().join(LOCK_FILE);
-        let open =
-            || crate::fs::open_private_file_checked(&path, crate::fs::PrivateFileAccess::Append);
+        // Read-only callers only need a shared flock, which a read handle can
+        // take; opening for append would fail on a read-only lock file or
+        // state directory that inspection must still tolerate.
+        let access = if write {
+            crate::fs::PrivateFileAccess::Append
+        } else {
+            crate::fs::PrivateFileAccess::Read
+        };
+        let open = || crate::fs::open_private_file_checked(&path, access);
         let file = match open() {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1953,6 +1960,24 @@ mod tests {
                 false,
             ),
         )
+    }
+    #[cfg(unix)]
+    #[test]
+    fn summary_tolerates_read_only_coordination_lock() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::tests::OwnedTestDirectory::new("spend-ledger-readonly-lock");
+        let state = root.path().join("state");
+        crate::fs::ensure_private_directory(&state).unwrap();
+        let ledger = Ledger::new(&state);
+        let account = Account::new("s", None, 0.0).unwrap();
+        account.observe(&receipt(RequestKind::Turn)).unwrap();
+        ledger.flush(&account).unwrap();
+        let lock = state.join(LOCK_FILE);
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let reader = Ledger::new(&state);
+        assert_eq!(reader.session_summary("s").unwrap().session.records, 1);
+        assert_eq!(reader.summary().unwrap().all_time.records, 1);
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
     #[test]
     fn startup_session_summary_equals_full_scan_session_totals() {
