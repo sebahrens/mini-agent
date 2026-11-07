@@ -4070,13 +4070,54 @@ fn leading_confidence_label(content: &str) -> Option<String> {
     None
 }
 
+/// Advances Markdown fence state for one raw line; true when the line is a
+/// fence delimiter or inside a fenced block (so its text must stay verbatim).
+fn in_report_fence(original: &str, fence: &mut Option<(u8, usize)>) -> bool {
+    let stripped = original.trim_start_matches(' ');
+    let indent = original.len() - stripped.len();
+    let bytes = stripped.as_bytes();
+    let delimiter = bytes.first().copied();
+    let run = delimiter.map_or(0, |c| bytes.iter().take_while(|&&b| b == c).count());
+    if let Some((kind, width)) = *fence {
+        if indent <= 3
+            && delimiter == Some(kind)
+            && run >= width
+            && stripped[run..].trim().is_empty()
+        {
+            *fence = None;
+        }
+        return true;
+    }
+    if indent <= 3
+        && matches!(delimiter, Some(b'`' | b'~'))
+        && run >= 3
+        && (delimiter != Some(b'`') || !stripped[run..].contains('`'))
+    {
+        *fence = Some((delimiter.unwrap(), run));
+        return true;
+    }
+    false
+}
+
 fn normalize_report_contract(response: &str) -> Option<String> {
-    let lines = response.lines().map(str::trim).collect::<Vec<_>>();
-    let start = lines.iter().position(|line| *line == "## Findings")?;
+    let mut fence = None;
+    let lines = response
+        .lines()
+        .map(|line| (line, in_report_fence(line, &mut fence)))
+        .collect::<Vec<_>>();
+    let start = lines
+        .iter()
+        .position(|(line, code)| !code && line.trim() == "## Findings")?;
     let mut section = "before";
     let mut normalized = Vec::new();
-    for line in &lines[start..] {
-        section = match *line {
+    for (line, code) in &lines[start..] {
+        if *code {
+            // Fenced extracts are evidence: keep indentation and text exactly.
+            normalized.push((*line).to_owned());
+            continue;
+        }
+        let line = line.trim();
+        section = match line {
             "## Findings" => "findings",
             "## Unverified" => "unverified",
             "## Coverage" => "coverage",
@@ -4803,6 +4844,25 @@ mod tests {
         assert!(!normalized.contains("Here is the requested report"));
         assert!(!normalized.contains("Raw child response"));
         assert!(normalized.len() < response.len());
+    }
+
+    #[test]
+    fn report_normalization_keeps_fenced_extracts_verbatim() {
+        let response = "## Findings\n\
+                        - **Confidence: High**: Verified issue.\n\
+                        ```python\n\
+                        def f():\n\
+                        \x20   - covered: x\n\
+                        ```\n\n\
+                        ## Unverified\n\
+                        - None.\n\n\
+                        ## Coverage\n\
+                        - **Covered:** a.\n\
+                        - **Skipped:** None.";
+        let normalized = enforce_report_contract(response);
+        assert!(normalized.contains("- [confidence: high] Verified issue."));
+        assert!(normalized.contains("def f():\n    - covered: x\n```"));
+        assert!(!normalized.contains("- Covered: x"));
     }
 
     #[test]

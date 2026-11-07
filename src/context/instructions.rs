@@ -61,7 +61,7 @@ fn fit_instruction_source(
         return Err("Workspace instructions exceed the bounded UTF-8 source limit".into());
     }
     let target = room - notice_cost;
-    while escaped(&text) > target {
+    while !text.is_empty() && escaped(&text) > target {
         let over = escaped(&text) - target;
         let mut end = text.len().saturating_sub(over.max(1));
         while !text.is_char_boundary(end) {
@@ -787,14 +787,25 @@ impl WorkspaceInstructions {
         if depth > MAX_INCLUDE_DEPTH {
             return Err("Workspace instruction include depth limit reached".into());
         }
-        let path = normal_relative(path)?;
+        let path = match normal_relative(path) {
+            Ok(path) => path,
+            // An unusable optional/authored include is literal text.
+            Err(_) if optional => return Ok(()),
+            Err(error) => return Err(error),
+        };
         let key = (binding.root().to_owned(), path.clone());
         if seen.contains(&key) {
             return Ok(());
         }
         let file = match binding.open_regular_relative(&path) {
             Ok(file) => file,
-            Err(error) if optional && error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            // An authored `@word` that is missing, a directory, a symlink, or
+            // otherwise not a regular file is prose; refusing to load it is
+            // already the safe outcome, so it must not end the turn.
+            Err(_) if depth > 0 => return Ok(()),
+            Err(error) if optional && error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(());
+            }
             Err(_) => return Err("Could not safely open workspace instruction source".into()),
         };
         #[cfg(unix)]
@@ -899,7 +910,7 @@ impl WorkspaceInstructions {
             ]
             .concat(),
         ));
-        let includes = include_paths(&source.text)?;
+        let includes = include_paths(&source.text);
         let parent = source.path.parent().unwrap_or(Path::new("")).to_owned();
         loaded.push(source);
         for include in includes {
@@ -909,7 +920,7 @@ impl WorkspaceInstructions {
                 &parent.join(include),
                 scope,
                 depth + 1,
-                false,
+                true,
                 seen,
                 nodes,
                 loaded,
@@ -1023,7 +1034,7 @@ impl WorkspaceInstructions {
                 project,
                 bytes: root.text.len(),
             });
-            let includes = include_paths(&root.text)?;
+            let includes = include_paths(&root.text);
             if includes.is_empty() {
                 continue;
             }
@@ -1057,7 +1068,7 @@ impl WorkspaceInstructions {
                     &root.path.parent().unwrap_or(Path::new("")).join(include),
                     self.workspace.root(),
                     1,
-                    false,
+                    true,
                     &mut seen,
                     &mut nodes,
                     &mut loaded,
@@ -1631,51 +1642,128 @@ fn normal_relative(path: &Path) -> Result<PathBuf, String> {
     }
     Ok(result)
 }
-fn include_paths(text: &str) -> Result<Vec<PathBuf>, String> {
+/// `text` with fenced and inline code bytes replaced by `x` (same length), so
+/// example `@word` tokens inside code are never read as includes.
+fn mask_code(text: &str) -> String {
+    let mut masked = text.as_bytes().to_vec();
+    let mut fence: Option<(u8, usize)> = None;
+    let mut start = 0;
+    for line in text.split_inclusive('\n') {
+        let end = start + line.len();
+        // The line terminator stays visible so a token on the next line is
+        // still line-initial.
+        let body_end = end - usize::from(line.ends_with('\n'));
+        let trimmed = line.trim_start_matches(' ');
+        let indent = line.len() - trimmed.len();
+        let marker = trimmed.bytes().next().filter(|b| matches!(b, b'`' | b'~'));
+        let run = marker.map_or(0, |m| trimmed.bytes().take_while(|b| *b == m).count());
+        let fence_line = indent <= 3 && run >= 3;
+        match fence {
+            Some((m, len)) => {
+                masked[start..body_end].fill(b'x');
+                if fence_line && marker == Some(m) && run >= len && trimmed[run..].trim().is_empty()
+                {
+                    fence = None;
+                }
+            }
+            None if fence_line && !(marker == Some(b'`') && trimmed[run..].contains('`')) => {
+                masked[start..body_end].fill(b'x');
+                fence = marker.map(|m| (m, run));
+            }
+            None => mask_inline_code(line, &mut masked[start..end]),
+        }
+        start = end;
+    }
+    String::from_utf8(masked).unwrap_or_default()
+}
+fn mask_inline_code(line: &str, masked: &mut [u8]) {
+    let bytes = line.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] != b'`' {
+            at += 1;
+            continue;
+        }
+        let run = bytes[at..].iter().take_while(|b| **b == b'`').count();
+        let mut scan = at + run;
+        let mut close = None;
+        while scan < bytes.len() {
+            if bytes[scan] == b'`' {
+                let len = bytes[scan..].iter().take_while(|b| **b == b'`').count();
+                if len == run {
+                    close = Some(scan + len);
+                    break;
+                }
+                scan += len;
+            } else {
+                scan += 1;
+            }
+        }
+        match close {
+            Some(end) => {
+                masked[at..end].fill(b'x');
+                at = end;
+            }
+            None => at += run,
+        }
+    }
+}
+/// Authored `@path` includes outside code. Malformed or unusable tokens are
+/// literal text, never an error; a missing target is skipped at load time.
+fn include_paths(text: &str) -> Vec<PathBuf> {
+    let masked = mask_code(text);
     let mut result = Vec::new();
     let mut at = 0;
-    while at < text.len() {
-        let rest = &text[at..];
+    while at < masked.len() {
+        let rest = &masked[at..];
         if rest.starts_with("@@") {
             at += 2;
             continue;
         }
         if rest.starts_with('@')
             && (at == 0
-                || text[..at]
+                || masked[..at]
                     .chars()
                     .next_back()
                     .is_some_and(char::is_whitespace))
         {
             let (used, path) = if let Some(braced) = rest.strip_prefix("@{") {
-                let end = braced
+                match braced
                     .find('}')
-                    .ok_or("Unterminated authored instruction include")?;
-                (end + 3, &braced[..end])
+                    .filter(|end| !braced[..*end].contains('\n'))
+                {
+                    Some(end) => (end + 3, &text[at + 2..at + 2 + end]),
+                    None => {
+                        at += 2;
+                        continue;
+                    }
+                }
             } else {
                 let end = rest[1..]
                     .find(char::is_whitespace)
                     .unwrap_or(rest.len() - 1);
-                (end + 1, &rest[1..end + 1])
+                (end + 1, &text[at + 1..at + 1 + end])
             };
+            at += used;
             if path.is_empty()
                 || path.len() > MAX_PATH_BYTES
                 || path.contains('\\')
                 || path.chars().any(char::is_control)
                 || Path::new(path).is_absolute()
             {
-                return Err("Instruction include must be a bounded relative path".into());
+                continue;
             }
-            result.push(PathBuf::from(path));
-            if result.len() > MAX_INCLUDE_NODES {
-                return Err("Workspace instruction include node limit reached".into());
+            let path = PathBuf::from(path);
+            // Tokens are bounded by the source size; only files that exist
+            // count toward the (visible) include node limit at load time.
+            if !result.contains(&path) {
+                result.push(path);
             }
-            at += used;
         } else {
             at += rest.chars().next().unwrap().len_utf8();
         }
     }
-    Ok(result)
+    result
 }
 
 #[cfg(test)]
@@ -1965,7 +2053,8 @@ mod tests {
         let authored = (0..=MAX_INCLUDE_NODES)
             .map(|i| format!("@source{i}.md "))
             .collect::<String>();
-        assert!(include_paths(&authored).unwrap_err().contains("node limit"));
+        // Prose tokens never terminate a turn; only existing files count.
+        assert_eq!(include_paths(&authored).len(), MAX_INCLUDE_NODES + 1);
         let target = (0..=MAX_DIRECTORY_DEPTH)
             .map(|_| "nested/")
             .collect::<String>()
@@ -2122,6 +2211,64 @@ mod tests {
         assert!(Arc::ptr_eq(&sources[0].text, &reused[0].text));
     }
     #[test]
+    fn include_paths_ignore_code_and_malformed_tokens() {
+        let text = "ask @alice\n```py\n @pytest.fixture\n```\n~~~\n @x\n~~~\n`@a` ``b @c`` @ \n@{unclosed @/abs\n @real.md @{b c.md}";
+        let found = include_paths(text);
+        let found: Vec<_> = found.iter().map(|p| p.to_str().unwrap()).collect();
+        assert_eq!(found, ["alice", "real.md", "b c.md"]);
+    }
+    #[test]
+    fn include_after_closing_fence_is_line_initial() {
+        let found = include_paths("```\ncode\n```\n@rules.md\n~~~\nx\n~~~\n@b.md");
+        assert_eq!(found, [PathBuf::from("rules.md"), PathBuf::from("b.md")]);
+    }
+    #[test]
+    fn prose_mentions_of_directories_files_and_symlinks_are_literal_text() {
+        let (_root, service) = fixture();
+        let root = service.workspace.root();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("afile"), "x").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/etc/hosts", root.join("link")).unwrap();
+        let many = (0..100).map(|i| format!("@m{i} ")).collect::<String>();
+        let text = format!("ask @src or @afile/b @link {many}\n@real.md");
+        std::fs::write(root.join("real.md"), "REAL\n").unwrap();
+        service
+            .capture_initial(
+                vec![
+                    InstructionRoot::workspace(
+                        &service.workspace,
+                        PathBuf::from("AGENTS.md"),
+                        &text,
+                    )
+                    .unwrap(),
+                ],
+                0,
+            )
+            .unwrap();
+        let state = service.state.lock().unwrap();
+        assert!(
+            state
+                .initial
+                .sources
+                .iter()
+                .any(|s| s.text.contains("REAL"))
+        );
+    }
+    #[test]
+    fn fit_instruction_source_terminates_when_room_is_notice_cost_plus_one() {
+        let notice_cost = serde_json::to_string(SOURCE_TRUNCATION_NOTICE)
+            .unwrap()
+            .len();
+        for extra in 0..4 {
+            let out = fit_instruction_source("x".repeat(500), false, notice_cost + 1 + extra);
+            assert!(
+                out.unwrap()
+                    .ends_with("truncated: it exceeds the per-source instruction limit]")
+            );
+        }
+    }
+    #[test]
     fn context63_include_cycles_depth_missing_escape_and_postescape_budget_are_bounded() {
         let (_root, service) = fixture();
         let root = service.workspace.root();
@@ -2146,6 +2293,7 @@ mod tests {
             "@/absolute.md",
             "@missing.md",
             "@{unclosed",
+            "ask @alice and @ here\n```\n@pytest.fixture\n```\nuse `@Override` now",
         ] {
             let (_other, service) = fixture();
             let result = service.capture_initial(
@@ -2159,8 +2307,9 @@ mod tests {
                 ],
                 0,
             );
-            assert!(result.is_err(), "{malformed}");
-            assert!(service.initial_overlay().is_empty());
+            assert!(result.is_ok(), "{malformed}");
+            assert_eq!(service.state.lock().unwrap().initial.sources.len(), 0);
+            assert!(service.state.lock().unwrap().initial.error.is_none());
         }
         let (_other, service) = fixture();
         for index in 0..=MAX_INCLUDE_DEPTH + 1 {
