@@ -16,8 +16,8 @@ use crate::session::{self, Session};
 
 /// Invalid headless input is a local usage error, before provider/session setup.
 #[derive(Debug, thiserror::Error)]
-#[error("no prompt given")]
-pub(crate) struct HeadlessUsageError;
+#[error("{0}")]
+pub(crate) struct HeadlessUsageError(pub(crate) String);
 
 async fn validate_headless_prompt(cli: &Cli, workspace: &std::path::Path) -> anyhow::Result<()> {
     if !cli.print
@@ -27,7 +27,7 @@ async fn validate_headless_prompt(cli: &Cli, workspace: &std::path::Path) -> any
         return Ok(());
     }
     crate::print::emit_headless_preflight_failure(cli, workspace, "no prompt given").await?;
-    Err(HeadlessUsageError.into())
+    Err(HeadlessUsageError("no prompt given".to_owned()).into())
 }
 
 /// Resolve `@agent:<name>` mentions in an `-p` prompt when the operator
@@ -1417,7 +1417,16 @@ impl Startup {
             )];
         }
 
-        cli.validate_quick_model(&cfg)?;
+        if let Err(error) = cli.validate_quick_model(&cfg) {
+            if !cli.print {
+                return Err(error);
+            }
+            // Headless: a usage error (exit 2) with a machine-readable
+            // failure record, before any provider/session setup.
+            let message = error.to_string();
+            crate::print::emit_headless_preflight_failure(&cli, workspace.root(), &message).await?;
+            return Err(HeadlessUsageError(message).into());
+        }
         let max_budget_usd = cli.resolve_max_budget_usd(&cfg)?;
         cfg.max_budget_usd = max_budget_usd;
         if let Some(warning) =
