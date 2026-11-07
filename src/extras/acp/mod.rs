@@ -5066,7 +5066,13 @@ async fn execute_prompt(
         let mid_turn = state
             .cfg
             .mid_turn_compact_threshold
-            .and(state.cfg.resolve_mid_turn_compact_threshold())
+            .and(
+                state.cfg.resolve_mid_turn_trigger_threshold(
+                    history
+                        .session
+                        .size_pressure(state.cfg.resolve_compact_size_fraction()),
+                ),
+            )
             .filter(|_| mid_turn_enabled)
             .map(|threshold| AcpMidTurn {
                 window: 1000,
@@ -5593,7 +5599,13 @@ async fn execute_prompt(
     let mid_turn = mid_turn_enabled
         .then(|| {
             let pressure = history.limits.token_pressure?;
-            let threshold = state.cfg.resolve_mid_turn_compact_threshold()?;
+            // Byte pressure (images) arms the boundary even when the token
+            // threshold is disabled with `0` (mini-agent-m8wyy).
+            let threshold = state.cfg.resolve_mid_turn_trigger_threshold(
+                history
+                    .session
+                    .size_pressure(state.cfg.resolve_compact_size_fraction()),
+            )?;
             Some(AcpMidTurn {
                 window: pressure.window,
                 threshold,
@@ -9170,6 +9182,16 @@ mod protocol_tests {
         cfg: Config,
         first_input: u64,
     ) -> (Vec<(String, usize)>, Vec<SessionNotification>) {
+        mid_turn_acp_prompt_after(cfg, first_input, false).await
+    }
+
+    /// As [`mid_turn_acp_prompt`]; `warmup` first runs a plain prompt so the
+    /// session already holds bytes (the warm-up segment is not returned).
+    async fn mid_turn_acp_prompt_after(
+        cfg: Config,
+        first_input: u64,
+        warmup: bool,
+    ) -> (Vec<(String, usize)>, Vec<SessionNotification>) {
         let segments = Arc::new(StdMutex::new(Vec::<(String, usize)>::new()));
         let fixture: RunnerFixture = {
             let segments = segments.clone();
@@ -9179,7 +9201,8 @@ mod protocol_tests {
                     let first = {
                         let mut segments = segments.lock().unwrap();
                         segments.push((prompt.clone(), history.len()));
-                        segments.len() == 1
+                        prompt == "do the long task"
+                            && segments.iter().filter(|(p, _)| p == &prompt).count() == 1
                     };
                     let turns = if first {
                         vec![
@@ -9249,6 +9272,11 @@ mod protocol_tests {
                     .block_task()
                     .await?
                     .session_id;
+                if warmup {
+                    cx.send_request(prompt(session.clone(), "warm up the session"))
+                        .block_task()
+                        .await?;
+                }
                 let outcome = cx
                     .send_request(prompt(session, "do the long task"))
                     .block_task()
@@ -9263,7 +9291,10 @@ mod protocol_tests {
             .await
             .unwrap()
             .unwrap();
-        let segments = segments.lock().unwrap().clone();
+        let mut segments = segments.lock().unwrap().clone();
+        if warmup {
+            segments.remove(0);
+        }
         let notifications = notifications.lock().unwrap().clone();
         (segments, notifications)
     }
@@ -9641,6 +9672,19 @@ mod protocol_tests {
         };
         let (segments, _) = mid_turn_acp_prompt(cfg, 100).await;
         assert_eq!(segments.len(), 1, "{segments:?}");
+    }
+
+    // mini-agent-m8wyy: byte pressure arms the ACP boundary with the token
+    // threshold disabled.
+    #[tokio::test]
+    async fn acp_mid_turn_byte_pressure_arms_with_zero_token_threshold() {
+        let cfg = Config {
+            mid_turn_compact_threshold: Some(0.0),
+            compact_size_fraction: Some(1e-12),
+            ..Config::default()
+        };
+        let (segments, _) = mid_turn_acp_prompt_after(cfg, 900, true).await;
+        assert_eq!(segments.len(), 2, "{segments:?}");
     }
 
     #[tokio::test]

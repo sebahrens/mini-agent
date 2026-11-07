@@ -171,6 +171,16 @@ pub(crate) fn rolling_summary_byte_cap(context_window: u64) -> usize {
         .max(MAX_ROLLING_SUMMARY_BYTES)
 }
 
+/// Largest summarizer response the stream consumer buffers: eight bytes per
+/// allowed response token (twice the stored-summary allowance), never below
+/// 64 KiB, so a model that uses its whole response cap is truncated by
+/// `bound_summary` instead of failing the compaction (mini-agent-99koa).
+pub(crate) fn summarizer_stream_byte_limit(max_output_tokens: u64) -> usize {
+    usize::try_from(max_output_tokens.saturating_mul(8))
+        .unwrap_or(usize::MAX)
+        .max(64 * 1024)
+}
+
 pub(crate) fn compaction_request_limits(
     input_token_budget: u64,
     response_token_budget: u64,
@@ -2361,6 +2371,7 @@ where
                 .max_tokens(max_output_tokens);
             async move { Ok(request) }
         },
+        max_output_tokens,
         retry_config,
         observed,
     )
@@ -2369,6 +2380,7 @@ where
 
 async fn run_summarizer_with<M, F, Fut>(
     make_request: F,
+    max_output_tokens: u64,
     retry_config: &RetryConfig,
     observed: crate::spend::run::UsageObserver,
 ) -> anyhow::Result<(String, rig::completion::Usage)>
@@ -2390,16 +2402,22 @@ where
     let mut attempt = 0usize;
     loop {
         attempt += 1;
-        match run_summarizer_attempt(&make_request, retry_config, &observed, |error| {
-            (attempt < config.max_attempts && retry::is_retryable(error)).then(|| {
-                retry::retry_delay_for_error_with_hint_ceiling(
-                    backoff,
-                    max_backoff,
-                    config.hint_ceiling(),
-                    error,
-                )
-            })
-        })
+        match run_summarizer_attempt(
+            &make_request,
+            max_output_tokens,
+            retry_config,
+            &observed,
+            |error| {
+                (attempt < config.max_attempts && retry::is_retryable(error)).then(|| {
+                    retry::retry_delay_for_error_with_hint_ceiling(
+                        backoff,
+                        max_backoff,
+                        config.hint_ceiling(),
+                        error,
+                    )
+                })
+            },
+        )
         .await
         {
             Ok(done) => return Ok(done),
@@ -2447,6 +2465,7 @@ where
                     .max_tokens(max_output_tokens))
             }
         },
+        max_output_tokens,
         retry_config,
         observed,
     )
@@ -2455,6 +2474,7 @@ where
 
 async fn run_summarizer_attempt<M, F, Fut>(
     make_request: &F,
+    max_output_tokens: u64,
     retry_config: &RetryConfig,
     observed: &crate::spend::run::UsageObserver,
     midstream_delay: impl Fn(&rig::completion::CompletionError) -> Option<Duration>,
@@ -2535,7 +2555,9 @@ where
     while let Some(item) = stream.next().await {
         match item {
             Ok(StreamedAssistantContent::Text(text)) => {
-                if response.len().saturating_add(text.text.len()) > 64 * 1024 {
+                if response.len().saturating_add(text.text.len())
+                    > summarizer_stream_byte_limit(max_output_tokens)
+                {
                     return Err(anyhow::anyhow!("Compression output exceeds byte budget").into());
                 }
                 response.push_str(&text.text);
@@ -7942,6 +7964,28 @@ mod compaction_quality_tests {
     use rig::streaming::StreamingChat;
     use rig::test_utils::{MockCompletionModel, MockStreamEvent};
     use rig::tool::Tool;
+
+    #[tokio::test]
+    async fn forked_summary_accepts_output_up_to_the_scaled_response_cap() {
+        let big = "s".repeat(70 * 1024);
+        let model = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::text(&big),
+            MockStreamEvent::final_response(Default::default()),
+        ]]);
+        let agent = AgentBuilder::new(model).preamble("p").build();
+        let (summary, _) = run_forked_summarizer(
+            &agent,
+            vec![Message::user("a")],
+            fork_instruction(None),
+            20_000,
+            &RetryConfig::default(),
+            Default::default(),
+        )
+        .await
+        .expect("70 KiB is within a 20,000-token response cap");
+        assert_eq!(summary.len(), big.len());
+        assert!(summarizer_stream_byte_limit(20_000) >= 80_000);
+    }
 
     #[tokio::test]
     async fn forked_summary_reuses_the_main_agent_request_prefix_and_disables_tools() {

@@ -1545,6 +1545,18 @@ impl Config {
         }
     }
 
+    /// Threshold that arms the mid-turn boundary right now: byte pressure
+    /// (`compact_size_fraction`) makes any tool-batch boundary a compaction
+    /// point even when the token threshold is disabled with `0`
+    /// (mini-agent-m8wyy); otherwise the token threshold, if enabled.
+    pub fn resolve_mid_turn_trigger_threshold(&self, size_pressure: bool) -> Option<f64> {
+        if size_pressure {
+            Some(f64::MIN_POSITIVE)
+        } else {
+            self.resolve_mid_turn_compact_threshold()
+        }
+    }
+
     /// Byte-pressure compaction trigger as a fraction of the persisted-session
     /// ceiling; `None` when disabled (`0` or out of range).
     pub fn resolve_compact_size_fraction(&self) -> Option<f64> {
