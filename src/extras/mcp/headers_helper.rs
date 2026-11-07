@@ -76,6 +76,21 @@ pub(crate) async fn merged_headers(
     Ok(merged)
 }
 
+/// Owns the helper's process group for the life of `run()`. Dropping the
+/// `run()` future (connection or reconnect cancellation) skips the ordinary
+/// whole-group kill that follows the timeout, and `kill_on_drop` alone signals
+/// only the direct child, so descendants of a credential helper would survive.
+struct GroupKillOnDrop(#[cfg_attr(not(unix), allow(dead_code))] Option<u32>);
+
+impl Drop for GroupKillOnDrop {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.0 {
+            crate::sandbox::kill_process_group_if_live(pid);
+        }
+    }
+}
+
 async fn run(
     server_name: &str,
     helper: &McpHeadersHelper,
@@ -116,6 +131,7 @@ async fn run(
         anyhow::anyhow!("MCP server '{server_name}' headersHelper cannot start: {error}")
     })?;
     let pid = child.id();
+    let _group_guard = GroupKillOnDrop(pid);
     let mut stdout = child.stdout.take().expect("piped stdout");
     let work = async {
         let mut output = Vec::new();
@@ -314,6 +330,99 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(headers.get("x-env").map(String::as_str), Some("[]"));
+    }
+
+    fn alive(pid: i32) -> bool {
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+    }
+
+    async fn read_pids(marker: &Path) -> (i32, i32) {
+        for _ in 0..200 {
+            if let Ok(text) = std::fs::read_to_string(marker) {
+                let pids: Vec<i32> = text.split_whitespace().filter_map(|p| p.parse().ok()).collect();
+                if let [a, b] = pids[..] {
+                    return (a, b);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("helper never recorded its pids");
+    }
+
+    async fn assert_gone(pids: [i32; 2], context: &str) {
+        for _ in 0..200 {
+            if !pids.iter().any(|pid| alive(*pid)) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        for pid in pids {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        panic!("helper process survived {context}: {pids:?}");
+    }
+
+    /// Dropping the future mid-run (what connection cancellation does) must
+    /// take the helper's descendants down with it.
+    #[tokio::test]
+    async fn dropping_the_helper_future_kills_its_descendants() {
+        let work = dir();
+        let marker = work.join("pids");
+        let script = format!(
+            "sleep 300 & echo \"$$ $!\" > '{}'; wait",
+            marker.display()
+        );
+        let probe = helper(&script);
+        let statics = HashMap::new();
+        let cancelled = tokio::select! {
+            _ = async {
+                read_pids(&marker).await;
+            } => true,
+            _ = merged_headers("srv", &probe, &statics, &work, true, Duration::from_secs(60)) => false,
+        };
+        assert!(cancelled, "the helper must still be running when cancelled");
+        let (leader, grandchild) = read_pids(&marker).await;
+        assert_gone([leader, grandchild], "dropping merged_headers").await;
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// The same, through the cancelled-work-scope race the MCP client uses.
+    #[tokio::test]
+    async fn work_scope_cancellation_kills_the_helper_descendants() {
+        let work = dir();
+        let marker = work.join("pids");
+        let script = format!(
+            "sleep 300 & echo \"$$ $!\" > '{}'; wait",
+            marker.display()
+        );
+        let probe = helper(&script);
+        let scope = crate::agent::runner::AgentWorkScope::new();
+        let handle = scope.cancellation_handle();
+        let canceller = {
+            let marker = marker.clone();
+            tokio::spawn(async move {
+                read_pids(&marker).await;
+                handle.cancel();
+            })
+        };
+        let statics = HashMap::new();
+        let outcome = scope
+            .run(async {
+                tokio::select! {
+                    biased;
+                    _ = crate::agent::runner::current_work_scope_cancelled() => None,
+                    result = merged_headers("srv", &probe, &statics, &work, true, Duration::from_secs(60)) => Some(result),
+                }
+            })
+            .await;
+        assert!(outcome.is_none(), "cancellation must win the race");
+        canceller.await.unwrap();
+        let (leader, grandchild) = read_pids(&marker).await;
+        assert_gone([leader, grandchild], "work-scope cancellation").await;
+        let _ = std::fs::remove_dir_all(&work);
     }
 
     #[tokio::test]
