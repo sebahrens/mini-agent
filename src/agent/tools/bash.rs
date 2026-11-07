@@ -402,6 +402,7 @@ impl Tool for ShellTool {
         if self.sandbox.shell_private_tmp() {
             description.push_str(SHELL_PRIVATE_TMP_NOTE);
         }
+        description = with_pty_limitation_note(description, PTY_SUPPORTED);
         if self.allow_escalation {
             description.push_str(
                 " If the sandbox blocks a command that must run (network, a write outside the workspace), retry that one command with escalate=true and a justification: the user is asked to approve it every time, and only that command runs without the sandbox.",
@@ -449,7 +450,7 @@ impl Tool for ShellTool {
                 },
                 "pty": {
                     "type": "boolean",
-                    "description": "Run under a pseudo-terminal so isatty() is true and stdin/stdout/stderr are one 120x40 TTY (Unix only; default false). With background=true, job_status action=input types into it, e.g. for REPLs or prompts."
+                    "description": "Run under a pseudo-terminal so isatty() is true and stdin/stdout/stderr are one TTY, 120x40 unless the mini-agent process sets COLUMNS/LINES (Unix only; default false). With background=true, job_status action=input types into it, e.g. for REPLs or prompts."
                 }
             },
             "required": ["command"]
@@ -1061,6 +1062,18 @@ async fn forward_progress<T>(
 /// only: there is no ConPTY path, so on Windows the model is never offered
 /// `pty`, terminal input or named keys (mini-agent-jguj1).
 const PTY_SUPPORTED: bool = cfg!(unix);
+
+/// Added to the shell description where `pty` is not offered, so the model
+/// knows why and what to do instead of guessing (mini-agent-msr4t).
+const NO_PTY_NOTE: &str = " This platform has no pseudo-terminal (Windows has no ConPTY path): commands that need a TTY, such as REPLs, installers that prompt, `python -i`, or ssh/gh login flows, cannot be driven and may hang or refuse to run. Use their non-interactive flags, pass answers on the command line or through files, or ask the user to run them.";
+
+/// The shell description, plus the no-terminal limitation where `pty` is not offered.
+fn with_pty_limitation_note(mut description: String, pty_supported: bool) -> String {
+    if !pty_supported {
+        description.push_str(NO_PTY_NOTE);
+    }
+    description
+}
 
 /// Remove the pseudo-terminal parameters from a `shell` or `job_status` tool
 /// schema when the platform cannot honour them.
@@ -4104,6 +4117,21 @@ mod tests {
             "{actions:?}"
         );
         assert!(status["properties"].get("timeout_ms").is_some());
+    }
+
+    #[test]
+    fn platforms_without_a_pty_tell_the_model_why_and_what_to_do() {
+        let base = "Execute a command.".to_string();
+        assert_eq!(with_pty_limitation_note(base.clone(), true), base);
+        let note = with_pty_limitation_note(base.clone(), false);
+        assert!(note.starts_with(&base));
+        assert!(note.contains("no pseudo-terminal") && note.contains("non-interactive flags"));
+        // The unsupported schema also drops the parameters the note replaces.
+        let schema = without_unsupported_pty(
+            serde_json::json!({"properties": {"pty": {}, "command": {}}}),
+            false,
+        );
+        assert!(schema["properties"].get("pty").is_none());
     }
 
     #[test]

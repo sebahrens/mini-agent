@@ -95,7 +95,14 @@ per directory, while a deny rule on the bare command still applies.
 `pty = true` and `job_status action=input`/`keys` exist on Unix only. There is
 no ConPTY path, so on Windows the tool schemas omit them and the model is never
 offered a pseudo-terminal; a call that still sends `pty = true` is refused with
-a message saying so.
+a message saying so. The Windows `shell` description states the limitation
+(REPLs, prompting installers, `python -i`, ssh/gh login cannot be driven; use
+non-interactive flags) instead of leaving the model to discover it. A ConPTY
+path is not implemented: the AppContainer helper is started through
+`std::process::Command` with a private launch request on its stdin and an
+attested inherited-handle list, and attaching a pseudo console
+(`PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`) needs a separate, Windows-tested launch
+path that reimplements that attestation.
 
 `pty = true` and `job_status action=input`/`keys` exist on Unix only. There is
 no ConPTY path, so on Windows the tool schemas omit them and the model is never
@@ -187,8 +194,9 @@ combined; byte_cap: 67108864; ...]` with the partial transcript. The
 `max_bash_output_lines` head/tail line cap still bounds the rendered text; the
 log footer is appended after it so it is never cut. Hook, validation and other
 sandbox command classes keep their existing bounded 1 MiB/1.5 MiB capture.
-`pty = true` (Unix only) runs the command under a fresh 120x40
-pseudo-terminal instead of pipes: its stdin, stdout and stderr are one TTY, so
+`pty = true` (Unix only) runs the command under a fresh pseudo-terminal
+(120x40 unless the mini-agent process environment sets `LINES` (5-500) and/or
+`COLUMNS` (20-1000); anything else keeps the default for that axis) instead of pipes: its stdin, stdout and stderr are one TTY, so
 `isatty()` is true and colour/progress/prompt behaviour matches an interactive
 terminal. The output is one merged, unlabelled stream. The terminal belongs to
 the command; it is never the user's terminal, the command still gets a new
