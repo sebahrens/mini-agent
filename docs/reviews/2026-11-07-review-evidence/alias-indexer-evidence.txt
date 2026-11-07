@@ -1,0 +1,119 @@
+=== search wire_value --file src/extras/acp/model_options.rs ===
+{
+  "count": 1,
+  "page": {
+    "detail": "signatures",
+    "estimated_tokens": 214,
+    "has_more": false,
+    "limit": 50,
+    "next_offset": null,
+    "offset": 0,
+    "returned_count": 1,
+    "steering": null,
+    "token_cap": 6250,
+    "total_count": 1,
+    "truncated": false
+  },
+  "symbols": [
+    {
+      "byte_range": [
+        1914,
+        2080
+      ],
+      "file": "/Users/seb/projects/mini-agent/src/extras/acp/model_options.rs",
+      "kind": "function",
+      "language": "rust",
+      "line": 50,
+      "line_range": [
+        50,
+        56
+      ],
+      "location": {
+        "byte_end": 2080,
+        "byte_start": 1914,
+        "file": "/Users/seb/projects/mini-agent/src/extras/acp/model_options.rs",
+        "line_end": 56,
+        "line_start": 50,
+        "relative_file": "src/extras/acp/model_options.rs"
+      },
+      "name": "wire_value",
+      "relative_file": "src/extras/acp/model_options.rs",
+      "semantic_id": "/Users/seb/projects/mini-agent/src/extras/acp/model_options.rs:50:wire_value",
+      "signature": "fn wire_value(alias: &str) -> String {"
+    }
+  ]
+}
+
+=== callers parse_model --file src/extras/acp/model_options.rs --limit 10 ===
+{
+  "callers": [
+    {
+      "file": "/Users/seb/projects/mini-agent/src/extras/acp/mod.rs",
+      "line": 2213,
+      "location": {
+        "byte_end": 0,
+        "byte_start": 0,
+        "file": "/Users/seb/projects/mini-agent/src/extras/acp/mod.rs",
+        "line_end": 2213,
+        "line_start": 2213,
+        "relative_file": "src/extras/acp/mod.rs"
+      },
+      "relative_file": "src/extras/acp/mod.rs",
+      "semantic_id": "/Users/seb/projects/mini-agent/src/extras/acp/mod.rs:2213:caller",
+      "text": "next.model = model_options::parse_model(&state.cfg, value).map_err(invalid)?;"
+    }
+  ],
+  "count": 1,
+  "page": {
+    "detail": "signatures",
+    "estimated_tokens": 184,
+    "has_more": false,
+    "limit": 10,
+    "next_offset": null,
+    "offset": 0,
+    "returned_count": 1,
+    "steering": null,
+    "token_cap": 6250,
+    "total_count": 1,
+    "truncated": false
+  }
+}
+
+=== peek src/extras/acp/model_options.rs --start 124 --end 138 --detail full ===
+{
+  "page": {
+    "detail": "full",
+    "estimated_tokens": 356,
+    "has_more": false,
+    "limit": 1,
+    "next_offset": null,
+    "offset": 0,
+    "returned_count": 1,
+    "steering": null,
+    "token_cap": 10000,
+    "total_count": 1,
+    "truncated": false
+  },
+  "peek": {
+    "file": "/Users/seb/projects/mini-agent/src/extras/acp/model_options.rs",
+    "line_end": 138,
+    "line_start": 125,
+    "location": {
+      "byte_end": 0,
+      "byte_start": 0,
+      "file": "/Users/seb/projects/mini-agent/src/extras/acp/model_options.rs",
+      "line_end": 138,
+      "line_start": 125,
+      "relative_file": "src/extras/acp/model_options.rs"
+    },
+    "relative_file": "src/extras/acp/model_options.rs",
+    "semantic_id": "/Users/seb/projects/mini-agent/src/extras/acp/model_options.rs:125:slice",
+    "slice": {
+      "line_end": 138,
+      "line_start": 125,
+      "source": "   125 \u2502 pub(super) fn parse_model(cfg: &Config, value: &str) -> Result<Option<String>, String> {\n   126 \u2502     if value == DEFAULT_VALUE {\n   127 \u2502         return Ok(None);\n   128 \u2502     }\n   129 \u2502     let quick = crate::config::quick_models_map(cfg);\n   130 \u2502     if quick.contains_key(value) {\n   131 \u2502         return Ok(Some(value.to_owned()));\n   132 \u2502     }\n   133 \u2502     if let Some(alias) = value.strip_prefix(RESERVED_ALIAS_PREFIX)\n   134 \u2502         && alias == DEFAULT_VALUE\n   135 \u2502         && quick.contains_key(alias)\n   136 \u2502     {\n   137 \u2502         return Ok(Some(alias.to_owned()));\n   138 \u2502     }"
+    },
+    "total_lines": 294
+  }
+}
+

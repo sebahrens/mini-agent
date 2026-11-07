@@ -1,0 +1,33 @@
+   Compiling mini-agent v1.12.0 (/Users/seb/projects/mini-agent)
+    Finished `test` profile [unoptimized] target(s) in 39.53s
+     Running unittests src/main.rs (target/debug/deps/mini_agent-eb54318180c9c0b0)
+
+running 2 tests
+test spend::ledger::tests::review_probe_summary_after_rotation_crash_keeps_archived_usage ... FAILED
+test spend::ledger::tests::review_probe_summary_racing_rotation_does_not_double_count ... FAILED
+
+failures:
+
+---- spend::ledger::tests::review_probe_summary_after_rotation_crash_keeps_archived_usage stdout ----
+
+thread 'spend::ledger::tests::review_probe_summary_after_rotation_crash_keeps_archived_usage' (65859859) panicked at src/spend/ledger.rs:2592:9:
+assertion `left == right` failed: startup must not lose durable usage before the first post-crash write
+  left: 0
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- spend::ledger::tests::review_probe_summary_racing_rotation_does_not_double_count stdout ----
+
+thread 'spend::ledger::tests::review_probe_summary_racing_rotation_does_not_double_count' (65859860) panicked at src/spend/ledger.rs:2615:9:
+assertion `left == right` failed: one receipt must not count in both snapshot and rollup
+  left: 2
+ right: 1
+
+
+failures:
+    spend::ledger::tests::review_probe_summary_after_rotation_crash_keeps_archived_usage
+    spend::ledger::tests::review_probe_summary_racing_rotation_does_not_double_count
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 6201 filtered out; finished in 0.27s
+
+error: test failed, to rerun pass `--bin mini-agent`

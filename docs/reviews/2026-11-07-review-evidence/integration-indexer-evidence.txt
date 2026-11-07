@@ -1,0 +1,198 @@
+=== peek src/extras/mcp/server.rs --start 1074 --end 1088 --detail full ===
+{
+  "page": {
+    "detail": "full",
+    "estimated_tokens": 400,
+    "has_more": false,
+    "limit": 1,
+    "next_offset": null,
+    "offset": 0,
+    "returned_count": 1,
+    "steering": null,
+    "token_cap": 10000,
+    "total_count": 1,
+    "truncated": false
+  },
+  "peek": {
+    "file": "/Users/seb/projects/mini-agent/src/extras/mcp/server.rs",
+    "line_end": 1088,
+    "line_start": 1075,
+    "location": {
+      "byte_end": 0,
+      "byte_start": 0,
+      "file": "/Users/seb/projects/mini-agent/src/extras/mcp/server.rs",
+      "line_end": 1088,
+      "line_start": 1075,
+      "relative_file": "src/extras/mcp/server.rs"
+    },
+    "relative_file": "src/extras/mcp/server.rs",
+    "semantic_id": "/Users/seb/projects/mini-agent/src/extras/mcp/server.rs:1075:slice",
+    "slice": {
+      "line_end": 1088,
+      "line_start": 1075,
+      "source": "  1075 \u2502     let outcome: anyhow::Result<()> = async {\n  1076 \u2502         loop {\n  1077 \u2502             if !input_open && tasks.is_empty() {\n  1078 \u2502                 // Calls answer through `reply_rx`; flush what is queued.\n  1079 \u2502                 while let Ok(reply) = reply_rx.try_recv() {\n  1080 \u2502                     write_message(&mut output, &reply).await?;\n  1081 \u2502                 }\n  1082 \u2502                 return Ok(());\n  1083 \u2502             }\n  1084 \u2502             tokio::select! {\n  1085 \u2502                 item = line_rx.recv(), if input_open => {\n  1086 \u2502                     let Some(item) = item else { input_open = false; continue };\n  1087 \u2502                     let Some(line) = item? else { input_open = false; continue };\n  1088 \u2502                     if line.iter().all(u8::is_ascii_whitespace) {"
+    },
+    "total_lines": 2049
+  }
+}
+
+=== peek src/extras/mcp/headers_helper.rs --start 109 --end 143 --detail full ===
+{
+  "page": {
+    "detail": "full",
+    "estimated_tokens": 597,
+    "has_more": false,
+    "limit": 1,
+    "next_offset": null,
+    "offset": 0,
+    "returned_count": 1,
+    "steering": null,
+    "token_cap": 10000,
+    "total_count": 1,
+    "truncated": false
+  },
+  "peek": {
+    "file": "/Users/seb/projects/mini-agent/src/extras/mcp/headers_helper.rs",
+    "line_end": 143,
+    "line_start": 110,
+    "location": {
+      "byte_end": 0,
+      "byte_start": 0,
+      "file": "/Users/seb/projects/mini-agent/src/extras/mcp/headers_helper.rs",
+      "line_end": 143,
+      "line_start": 110,
+      "relative_file": "src/extras/mcp/headers_helper.rs"
+    },
+    "relative_file": "src/extras/mcp/headers_helper.rs",
+    "semantic_id": "/Users/seb/projects/mini-agent/src/extras/mcp/headers_helper.rs:110:slice",
+    "slice": {
+      "line_end": 143,
+      "line_start": 110,
+      "source": "   110 \u2502         .stdout(std::process::Stdio::piped())\n   111 \u2502         .stderr(std::process::Stdio::null())\n   112 \u2502         .kill_on_drop(true);\n   113 \u2502     #[cfg(unix)]\n   114 \u2502     command.process_group(0);\n   115 \u2502     let mut child = command.spawn_guarded().map_err(|error| {\n   116 \u2502         anyhow::anyhow!(\"MCP server '{server_name}' headersHelper cannot start: {error}\")\n   117 \u2502     })?;\n   118 \u2502     let pid = child.id();\n   119 \u2502     let mut stdout = child.stdout.take().expect(\"piped stdout\");\n   120 \u2502     let work = async {\n   121 \u2502         let mut output = Vec::new();\n   122 \u2502         let read = (&mut stdout)\n   123 \u2502             .take(MAX_OUTPUT_BYTES as u64 + 1)\n   124 \u2502             .read_to_end(&mut output)\n   125 \u2502             .await;\n   126 \u2502         // Closing the pipe early (output over the cap) must not wait on a\n   127 \u2502         // child that is still writing.\n   128 \u2502         let status = if output.len() > MAX_OUTPUT_BYTES {\n   129 \u2502             None\n   130 \u2502         } else {\n   131 \u2502             Some(child.wait().await)\n   132 \u2502         };\n   133 \u2502         (read, output, status)\n   134 \u2502     };\n   135 \u2502     let finished = tokio::time::timeout(timeout, work).await;\n   136 \u2502     #[cfg(unix)]\n   137 \u2502     if let Some(pid) = pid {\n   138 \u2502         crate::sandbox::kill_process_group(pid);\n   139 \u2502     }\n   140 \u2502     #[cfg(not(unix))]\n   141 \u2502     let _ = pid;\n   142 \u2502     let _ = child.start_kill();\n   143 \u2502     let Ok((read, output, status)) = finished else {"
+    },
+    "total_lines": 367
+  }
+}
+
+=== peek src/extras/lsp/client.rs --start 1876 --end 1885 --detail full ===
+{
+  "page": {
+    "detail": "full",
+    "estimated_tokens": 299,
+    "has_more": false,
+    "limit": 1,
+    "next_offset": null,
+    "offset": 0,
+    "returned_count": 1,
+    "steering": null,
+    "token_cap": 10000,
+    "total_count": 1,
+    "truncated": false
+  },
+  "peek": {
+    "file": "/Users/seb/projects/mini-agent/src/extras/lsp/client.rs",
+    "line_end": 1885,
+    "line_start": 1877,
+    "location": {
+      "byte_end": 0,
+      "byte_start": 0,
+      "file": "/Users/seb/projects/mini-agent/src/extras/lsp/client.rs",
+      "line_end": 1885,
+      "line_start": 1877,
+      "relative_file": "src/extras/lsp/client.rs"
+    },
+    "relative_file": "src/extras/lsp/client.rs",
+    "semantic_id": "/Users/seb/projects/mini-agent/src/extras/lsp/client.rs:1877:slice",
+    "slice": {
+      "line_end": 1885,
+      "line_start": 1877,
+      "source": "  1877 \u2502     let parent = workspace.root().join(relative);\n  1878 \u2502     // Reject symlink aliases, traversal and non-canonical spellings before\n  1879 \u2502     // attaching a server message to the parent's diagnostic cache identity.\n  1880 \u2502     if std::fs::canonicalize(&parent).ok()? != parent {\n  1881 \u2502         return None;\n  1882 \u2502     }\n  1883 \u2502     workspace.validate().ok()?;\n  1884 \u2502     file_uri(&parent)\n  1885 \u2502 }"
+    },
+    "total_lines": 2562
+  }
+}
+
+=== peek src/agent/tools/client_fs.rs --start 83 --end 98 --detail full ===
+{
+  "page": {
+    "detail": "full",
+    "estimated_tokens": 361,
+    "has_more": false,
+    "limit": 1,
+    "next_offset": null,
+    "offset": 0,
+    "returned_count": 1,
+    "steering": null,
+    "token_cap": 10000,
+    "total_count": 1,
+    "truncated": false
+  },
+  "peek": {
+    "file": "/Users/seb/projects/mini-agent/src/agent/tools/client_fs.rs",
+    "line_end": 98,
+    "line_start": 84,
+    "location": {
+      "byte_end": 0,
+      "byte_start": 0,
+      "file": "/Users/seb/projects/mini-agent/src/agent/tools/client_fs.rs",
+      "line_end": 98,
+      "line_start": 84,
+      "relative_file": "src/agent/tools/client_fs.rs"
+    },
+    "relative_file": "src/agent/tools/client_fs.rs",
+    "semantic_id": "/Users/seb/projects/mini-agent/src/agent/tools/client_fs.rs:84:slice",
+    "slice": {
+      "line_end": 98,
+      "line_start": 84,
+      "source": "    84 \u2502     let current = client\n    85 \u2502         .read_text(path)\n    86 \u2502         .await\n    87 \u2502         .map_err(|error| format!(\"could not re-read the editor text before writing: {error}\"))?;\n    88 \u2502     if current != expected {\n    89 \u2502         return Err(\n    90 \u2502             \"the file changed in the editor after it was read; no changes were applied. Re-read it and retry\"\n    91 \u2502                 .to_string(),\n    92 \u2502         );\n    93 \u2502     }\n    94 \u2502     client\n    95 \u2502         .write_text(path, content)\n    96 \u2502         .await\n    97 \u2502         .map_err(|error| format!(\"the editor refused the write: {error}\"))\n    98 \u2502 }"
+    },
+    "total_lines": 180
+  }
+}
+
+=== search GroupKillOnDrop --file src/extras/mcp/server.rs ===
+{
+  "count": 1,
+  "page": {
+    "detail": "signatures",
+    "estimated_tokens": 220,
+    "has_more": false,
+    "limit": 50,
+    "next_offset": null,
+    "offset": 0,
+    "returned_count": 1,
+    "steering": null,
+    "token_cap": 6250,
+    "total_count": 1,
+    "truncated": false
+  },
+  "symbols": [
+    {
+      "byte_range": [
+        22591,
+        22668
+      ],
+      "file": "/Users/seb/projects/mini-agent/src/extras/mcp/server.rs",
+      "kind": "struct",
+      "language": "rust",
+      "line": 549,
+      "line_range": [
+        549,
+        549
+      ],
+      "location": {
+        "byte_end": 22668,
+        "byte_start": 22591,
+        "file": "/Users/seb/projects/mini-agent/src/extras/mcp/server.rs",
+        "line_end": 549,
+        "line_start": 549,
+        "relative_file": "src/extras/mcp/server.rs"
+      },
+      "name": "GroupKillOnDrop",
+      "relative_file": "src/extras/mcp/server.rs",
+      "semantic_id": "/Users/seb/projects/mini-agent/src/extras/mcp/server.rs:549:GroupKillOnDrop",
+      "signature": "struct GroupKillOnDrop(#[cfg_attr(not(unix), allow(dead_code))] Option<u32>);"
+    }
+  ]
+}
+

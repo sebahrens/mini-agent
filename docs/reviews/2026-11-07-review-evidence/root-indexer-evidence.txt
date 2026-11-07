@@ -1,0 +1,138 @@
+=== search fetch_with --file src/agent/tools/web_fetch.rs ===
+{
+  "count": 0,
+  "page": {
+    "detail": "signatures",
+    "estimated_tokens": 69,
+    "has_more": false,
+    "limit": 50,
+    "next_offset": null,
+    "offset": 0,
+    "returned_count": 0,
+    "steering": null,
+    "token_cap": 6250,
+    "total_count": 0,
+    "truncated": false
+  },
+  "symbols": []
+}
+
+=== search read_body --file src/agent/tools/web_http.rs ===
+{
+  "count": 0,
+  "page": {
+    "detail": "signatures",
+    "estimated_tokens": 69,
+    "has_more": false,
+    "limit": 50,
+    "next_offset": null,
+    "offset": 0,
+    "returned_count": 0,
+    "steering": null,
+    "token_cap": 6250,
+    "total_count": 0,
+    "truncated": false
+  },
+  "symbols": []
+}
+
+=== search OutputTruncation --file src/agent/output_truncation.rs ===
+{
+  "count": 1,
+  "page": {
+    "detail": "signatures",
+    "estimated_tokens": 215,
+    "has_more": false,
+    "limit": 50,
+    "next_offset": null,
+    "offset": 0,
+    "returned_count": 1,
+    "steering": null,
+    "token_cap": 6250,
+    "total_count": 1,
+    "truncated": false
+  },
+  "symbols": [
+    {
+      "byte_range": [
+        1754,
+        1876
+      ],
+      "file": "/Users/seb/projects/mini-agent/src/agent/output_truncation.rs",
+      "kind": "struct",
+      "language": "rust",
+      "line": 38,
+      "line_range": [
+        38,
+        42
+      ],
+      "location": {
+        "byte_end": 1876,
+        "byte_start": 1754,
+        "file": "/Users/seb/projects/mini-agent/src/agent/output_truncation.rs",
+        "line_end": 42,
+        "line_start": 38,
+        "relative_file": "src/agent/output_truncation.rs"
+      },
+      "name": "OutputTruncation",
+      "relative_file": "src/agent/output_truncation.rs",
+      "semantic_id": "/Users/seb/projects/mini-agent/src/agent/output_truncation.rs:38:OutputTruncation",
+      "signature": "pub(crate) struct OutputTruncation {"
+    }
+  ]
+}
+
+=== callers write_guarded_path --file src/extras/js/host.rs ===
+{
+  "callers": [
+    {
+      "file": "/Users/seb/projects/mini-agent/src/extras/js/host.rs",
+      "line": 2053,
+      "location": {
+        "byte_end": 0,
+        "byte_start": 0,
+        "file": "/Users/seb/projects/mini-agent/src/extras/js/host.rs",
+        "line_end": 2053,
+        "line_start": 2053,
+        "relative_file": "src/extras/js/host.rs"
+      },
+      "relative_file": "src/extras/js/host.rs",
+      "semantic_id": "/Users/seb/projects/mini-agent/src/extras/js/host.rs:2053:caller",
+      "text": "write_guarded_path(guard, target, content, write_cancellation).await"
+    }
+  ],
+  "count": 1,
+  "page": {
+    "detail": "signatures",
+    "estimated_tokens": 182,
+    "has_more": false,
+    "limit": 50,
+    "next_offset": null,
+    "offset": 0,
+    "returned_count": 1,
+    "steering": null,
+    "token_cap": 6250,
+    "total_count": 1,
+    "truncated": false
+  }
+}
+
+=== search parent_diagnostic_uri --file src/extras/lsp/registry.rs ===
+{
+  "count": 0,
+  "page": {
+    "detail": "signatures",
+    "estimated_tokens": 69,
+    "has_more": false,
+    "limit": 50,
+    "next_offset": null,
+    "offset": 0,
+    "returned_count": 0,
+    "steering": null,
+    "token_cap": 6250,
+    "total_count": 0,
+    "truncated": false
+  },
+  "symbols": []
+}
+

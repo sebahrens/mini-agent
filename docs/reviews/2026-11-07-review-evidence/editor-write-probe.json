@@ -1,0 +1,7 @@
+{
+  "source": "editors/vscode/src/vscodeClientFs.ts at 83cee733",
+  "reread": "before",
+  "userTextBeforeWrite": "before\nuser added valuable text",
+  "userEditPreserved": false,
+  "finalText": "agent replacement"
+}

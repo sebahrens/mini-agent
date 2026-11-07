@@ -1,0 +1,46 @@
+   Compiling mini-agent v1.12.0 (/Users/seb/projects/mini-agent)
+    Finished `test` profile [unoptimized] target(s) in 36.38s
+     Running unittests src/main.rs (target/debug/deps/mini_agent-eb54318180c9c0b0)
+
+running 38 tests
+test agent::tools::lsp::directory_filter_tests::curdir_forms_do_not_hide_cached_diagnostics ... ok
+test agent::tools::lsp::directory_filter_tests::directory_filter_still_excludes_other_trees ... ok
+test extras::acp::model_options::tests::effort_option_is_thought_level_and_model_option_absent_without_quick_models ... ok
+test extras::acp::model_options::tests::model_option_lists_default_then_sorted_quick_models_with_providers ... ok
+test extras::acp::model_options::tests::parse_rejects_unknown_values_and_clears_on_default ... ok
+test extras::acp::model_options::tests::quick_model_named_default_is_selectable_under_a_distinct_value ... ok
+test key_command::tests::a_401_queued_behind_a_refresh_is_resent_without_rerunning_the_command ... ok
+test key_command::tests::a_hung_command_is_killed_at_the_timeout ... ok
+test key_command::tests::an_expired_token_is_refreshed_once_on_401_and_the_request_succeeds ... ok
+test key_command::tests::an_expired_ttl_refreshes_before_the_request ... ok
+test key_command::tests::an_unchanged_token_after_refresh_surfaces_the_401_without_a_resend ... ok
+test key_command::tests::async_timeout_kills_grandchildren_and_success_ignores_daemons ... ok
+test key_command::tests::blocking_success_does_not_wait_for_a_backgrounded_daemon ... ok
+test key_command::tests::blocking_timeout_returns_promptly_and_kills_grandchildren ... ok
+test key_command::tests::command_failures_name_the_command_and_never_echo_its_output ... ok
+test key_command::tests::configure_rejects_invalid_entries_and_looks_providers_up_case_insensitively ... ok
+test key_command::tests::credential_commands_are_closed_by_default_and_rank_below_the_cli_key ... ok
+test key_command::tests::gemini_query_string_key_is_refreshed_and_renewed_on_401 ... ok
+test key_command::tests::output_must_be_one_clean_line_within_the_bound ... ok
+test key_command::tests::query_key_is_found_and_rewritten_without_touching_other_parameters ... ok
+test key_command::tests::query_key_rewrite_percent_encodes_reserved_characters ... ok
+test key_command::tests::results_are_cached_for_the_ttl ... ok
+test key_command::tests::spec_validation_is_structural_and_never_echoes_values ... ok
+test session::compaction::tests::actual_native_and_jsonl_imports_mark_request_inventory_untrusted ... ok
+test session::compaction::tests::attach_keeps_large_window_summary_budget ... ok
+test session::compaction::tests::compaction_restores_no_read_windows_when_disabled ... ok
+test session::compaction::tests::compaction_restores_recent_read_windows_within_the_budget ... ok
+test session::compaction::tests::compaction_retains_bounded_spill_recovery_references_without_opening_them ... ok
+test session::compaction::tests::imported_inventory_is_bounded_and_optional_for_legacy_compactions ... ok
+test session::compaction::tests::inventory_uses_only_the_drained_prefix_and_survives_repeated_compaction_and_redo ... ok
+test session::compaction::tests::nested_requests_are_distinct_historical_scope_not_parent_effects ... ok
+test session::compaction::tests::request_inventory_caps_records_bytes_and_rendering_without_guessing_effects ... ok
+test ui::slash::compaction_budget_tests::compaction_summarizer_sees_retained_results_and_their_calls ... ok
+test ui::slash::compaction_budget_tests::known_exhausted_window_does_not_use_unknown_window_fallback ... ok
+test ui::slash::compaction_budget_tests::manual_compress_skips_the_budget_gate_but_respects_keep_recent ... ok
+test ui::slash::compaction_budget_tests::tui_compaction_drains_whole_cut_and_second_pass_is_a_noop ... ok
+test ui::slash::compaction_budget_tests::tui_compaction_rejects_a_summary_that_covers_nothing ... ok
+test ui::slash::compaction_budget_tests::tui_compaction_with_partial_coverage_keeps_unsummarized_messages ... ok
+
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 6163 filtered out; finished in 5.51s
+

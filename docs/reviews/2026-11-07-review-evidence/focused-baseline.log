@@ -1,0 +1,69 @@
+   Compiling mini-agent v1.12.0 (/Users/seb/projects/mini-agent)
+    Finished `test` profile [unoptimized] target(s) in 39.23s
+     Running unittests src/main.rs (target/debug/deps/mini_agent-eb54318180c9c0b0)
+
+running 61 tests
+test models_catalog::tests::bedrock_and_vertex_claude_ids_use_native_metadata ... ok
+test models_catalog::tests::catalog_cache_pricing_accepts_legacy_missing_and_explicit_zero_tiers ... ok
+test models_catalog::tests::catalog_max_output_is_parsed_and_embedded ... ok
+test models_catalog::tests::malformed_catalog_falls_back_to_empty ... ok
+test models_catalog::tests::models_dev_transform_mirrors_the_generator_filters ... ok
+test models_catalog::tests::newer_cache_overlay_replaces_listed_providers ... ok
+test models_catalog::tests::older_or_corrupt_cache_keeps_the_embedded_snapshot ... ok
+test retry::tests::body_retry_hints_honour_compound_and_hour_waits ... ok
+test retry::tests::body_retry_hints_parse_prose_and_retry_info ... ok
+test retry::tests::broad_5xx_statuses_are_retryable_except_not_implemented ... ok
+test retry::tests::context_length_classifier_covers_provider_variants ... ok
+test retry::tests::context_length_hint_names_manual_and_automatic_recovery ... ok
+test retry::tests::context_length_token_counts_never_trigger_status_fallback ... ok
+test retry::tests::cyclic_error_sources_are_bounded_for_classification_and_delay ... ok
+test retry::tests::first_retry_delay_never_exceeds_max_backoff ... ok
+test retry::tests::gemini_daily_or_unhinted_exhaustion_stays_terminal ... ok
+test retry::tests::gemini_per_minute_429_is_retried_with_the_body_delay ... ok
+test retry::tests::many_image_rejection_tightens_the_budget_and_retries_once_without_a_delay ... ok
+test retry::tests::provider_retry_after_may_exceed_max_backoff_up_to_the_hint_ceiling ... ok
+test retry::tests::quota_exhausted_429_is_not_retried_and_says_to_check_billing ... ok
+test retry::tests::rate_limit_reset_headers_are_used_when_retry_after_is_missing ... ok
+test retry::tests::retry_after_ceiling_is_clamped_and_project_capped ... ok
+test retry::tests::retry_after_ms_takes_precedence_over_retry_after ... ok
+test retry::tests::retry_after_seconds_http_dates_and_invalid_values_are_parsed_without_waiting ... ok
+test retry::tests::retry_config_cap_only_tightens_toward_the_ceiling ... ok
+test retry::tests::retry_config_clamps_extreme_values_to_the_safety_envelope ... ok
+test retry::tests::retry_notice_text_names_the_actual_wait ... ok
+test retry::tests::retryable_request_statuses_schedule_a_bounded_stream_retry ... ok
+test retry::tests::shared_retry_primitive_bounds_an_unclamped_config ... ok
+test retry::tests::shared_retry_primitive_caps_a_huge_initial_backoff ... ok
+test retry::tests::shared_retry_primitive_emits_one_notice_per_scheduled_retry ... ok
+test retry::tests::structured_status_message_fallbacks_remain_retryable ... ok
+test retry::tests::test_is_not_retryable_generic ... ok
+test retry::tests::test_is_not_retryable_parse_error ... ok
+test retry::tests::test_is_retryable_anthropic_529_from_provider_status ... ok
+test retry::tests::test_is_retryable_anthropic_overload_message_fallback ... ok
+test retry::tests::test_is_retryable_connection_error ... ok
+test retry::tests::test_is_retryable_http_408_409_and_425 ... ok
+test retry::tests::test_is_retryable_http_429 ... ok
+test retry::tests::test_is_retryable_http_500 ... ok
+test retry::tests::test_is_retryable_timeout ... ok
+test retry::tests::test_is_retryable_walks_source_chain ... ok
+test retry::tests::test_prompt_error_forwards_retryable_provider_status ... ok
+test retry::tests::test_provider_status_takes_precedence_over_message_fallback ... ok
+test retry::tests::test_retry_config_defaults ... ok
+test retry::tests::truncated_body_transport_errors_are_retryable ... ok
+test retry::tests::unhinted_429_keeps_ordinary_backoff ... ok
+test retry::tests::unrelated_digits_and_connection_words_are_not_retryable ... ok
+test retry::tests::x_should_retry_header_overrides_status_classification ... ok
+test self_update::tests::a_verified_archive_yields_only_the_exact_executable ... ok
+test self_update::tests::attestation_uses_gh_and_only_a_rejection_by_a_working_gh_aborts ... ok
+test self_update::tests::hostile_archives_and_manifests_install_nothing ... ok
+test self_update::tests::install_replaces_atomically_and_keeps_a_running_inode_intact ... ok
+test self_update::tests::manifest_rules_match_install_sh ... ok
+test self_update::tests::notices_from_the_archive_replace_installed_ones_when_the_directory_exists ... ok
+test self_update::tests::only_the_exact_update_forms_are_a_subcommand ... ok
+test self_update::tests::package_managed_and_build_paths_are_refused_with_a_command ... ok
+test self_update::tests::unattested_installs_need_the_flag_or_a_confirmation ... ok
+test self_update::tests::version_probe_requires_a_whole_version_token ... ok
+test spend::ledger::tests::full_ledger_rotates_and_keeps_all_time_session_and_model_totals ... ok
+test spend::ledger::tests::rotation_that_crashed_before_the_rollup_write_is_recovered_without_double_counting ... ok
+
+test result: ok. 61 passed; 0 failed; 0 ignored; 0 measured; 6140 filtered out; finished in 2.45s
+

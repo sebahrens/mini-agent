@@ -1,0 +1,127 @@
+--- a/src/spend/ledger.rs
++++ b/src/spend/ledger.rs
+@@ -2581,4 +2581,38 @@
+         assert_eq!(archive_sequence("usage.1.archive.jsonl"), None);
+         assert_eq!(archive_sequence("usage.00000000x1.archive.jsonl"), None);
+     }
+-}
++    #[test]
++    fn review_probe_summary_after_rotation_crash_keeps_archived_usage() {
++        let root = crate::tests::OwnedTestDirectory::new("review-ledger-crash");
++        let state = root.path().join("state");
++        crate::fs::ensure_private_directory(&state).unwrap();
++        let ledger = Ledger::new(&state);
++        flush_receipt(&ledger, &one_receipt("a", 10)).unwrap();
++        std::fs::rename(state.join("usage.jsonl"), state.join(archive_name(1))).unwrap();
++        assert_eq!(Ledger::new(&state).session_summary("a").unwrap().session.records, 1,
++            "startup must not lose durable usage before the first post-crash write");
++    }
++
++    #[test]
++    fn review_probe_summary_racing_rotation_does_not_double_count() {
++        let root = crate::tests::OwnedTestDirectory::new("review-ledger-race");
++        let state = root.path().join("state");
++        crate::fs::ensure_private_directory(&state).unwrap();
++        let writer = Ledger::new(&state);
++        flush_receipt(&writer, &one_receipt("a", 10)).unwrap();
++        let (scanned_tx, scanned_rx) = std::sync::mpsc::sync_channel(1);
++        let (released_tx, released_rx) = std::sync::mpsc::sync_channel(1);
++        let reader = Ledger::new(&state).with_summary_gate(scanned_tx, released_rx);
++        let reading = std::thread::spawn(move || reader.session_summary("a"));
++        scanned_rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
++        let (file, binding) = writer.open(true).unwrap().unwrap();
++        writer.lock_writer(&binding, &file).unwrap();
++        let mut file = LockedLedgerFile::new(file);
++        writer.rotate(&binding, &mut file).unwrap();
++        drop(file);
++        released_tx.send(()).unwrap();
++        let summary = reading.join().unwrap().unwrap();
++        assert_eq!(summary.session.records, 1, "one receipt must not count in both snapshot and rollup");
++    }
++
++}
+--- a/src/session/compaction.rs
++++ b/src/session/compaction.rs
+@@ -633,3 +633,19 @@
+     let restored: FileRequests = serde_json::from_str(&encoded).unwrap();
+     assert_eq!(restored.render(4096), rendered);
+ }
++
++#[cfg(test)]
++mod final_review_probes {
++    use super::*;
++    #[test]
++    fn final_review_probe_repeated_read_ids_preserve_path() {
++        let mut session = crate::session::Session::new("test", "test", 128_000, "");
++        session.add_tool_call_with_id("same", "read", &serde_json::json!({"path":"a.txt"}));
++        session.add_tool_result_with_id("same", "read", "unique-a-content");
++        session.add_tool_call_with_id("same", "read", &serde_json::json!({"path":"b.txt"}));
++        session.add_tool_result_with_id("same", "read", "Error: absent");
++        let out = restored_read_windows(&session.messages, 500).unwrap();
++        assert!(out.contains("a.txt"), "successful a read lost its path: {out}");
++        assert!(!out.contains("b.txt"), "failed b read must not acquire a content: {out}");
++    }
++}
+--- a/src/key_command.rs
++++ b/src/key_command.rs
+@@ -1271,3 +1271,21 @@
+         configure(None).unwrap();
+     }
+ }
++
++#[cfg(test)]
++mod final_review_probes {
++    use super::*;
++    #[tokio::test]
++    async fn final_review_probe_original_client_token_survives_rotation() {
++        let credential = CommandCredential::new("fixture", ApiKeyCommandSpec {
++            command: vec!["unused".into()], ttl_secs: Some(0), timeout_secs: Some(1)
++        });
++        credential.store("fixture-original".into());
++        for index in 0..MAX_KNOWN_SECRETS { credential.store(format!("fixture-rotation-{index}")); }
++        let mut headers = HeaderMap::new();
++        headers.insert("authorization", HeaderValue::from_static("Bearer fixture-original"));
++        let mut uri = "https://fixture.invalid/".parse().unwrap();
++        assert!(credential.apply(&mut headers, &mut uri).await.is_some(), "live client's seed token lost its credential binding");
++        assert_eq!(headers["authorization"], "Bearer fixture-rotation-7");
++    }
++}
+--- a/src/agent/tools/lsp.rs
++++ b/src/agent/tools/lsp.rs
+@@ -1189,3 +1189,17 @@
+         assert_eq!(normalize_directory_filter(Path::new(".")), None);
+     }
+ }
++
++#[cfg(all(test, feature = "lsp"))]
++mod final_review_probes {
++    use super::*;
++    #[test]
++    fn final_review_probe_file_operations_honor_read_deny() {
++        let preview = crate::extras::lsp::navigate::EditPreview {
++            file_ops: vec!["delete /workspace/hidden-name.rs".into()], ..Default::default()
++        };
++        let deny: super::super::find_files::PathFilter = std::sync::Arc::new(|_, _| true);
++        let out = render_edit_preview_with(&preview, Path::new("/workspace"), Some(&deny), false, "", (0, 100), TextView::default());
++        assert!(!out.contains("hidden-name.rs"), "read-denied file operation leaked: {out}");
++    }
++}
+--- a/src/ui/slash/mod.rs
++++ b/src/ui/slash/mod.rs
+@@ -1497,3 +1497,16 @@
+         );
+     }
+ }
++
++#[cfg(test)]
++mod final_review_probes {
++    use super::*;
++    #[test]
++    fn final_review_probe_byte_pressure_reaches_compaction_gate() {
++        let mut session = Session::new("openai", "model", 1_000_000, "");
++        session.add_message(crate::session::MessageRole::User, &"x".repeat(400_000));
++        session.add_message(crate::session::MessageRole::Assistant, "recent");
++        assert!(session.actionable_size_pressure(Some(0.01)));
++        assert!(matches!(plan_tui_compaction(&session, true, 900_000, 1, crate::session::DEFAULT_KEEP_RECENT_TOOL_RESULTS), TuiCompactionGate::Cut(_)), "byte pressure was vetoed by token-only gate");
++    }
++}
