@@ -77,7 +77,14 @@ pub(crate) fn is_transient_connect_error(error: &anyhow::Error) -> bool {
         text.get(at + 5..at + 8)
             .and_then(|digits| digits.parse::<u16>().ok())
     }) {
-        return (500..600).contains(&code);
+        // 408 and 429 are retried too (a rate-limited first connect is
+        // common); other 4xx responses are final.
+        return (500..600).contains(&code) || matches!(code, 408 | 429);
+    }
+    // A hung handshake already consumed its whole attempt budget: retrying it
+    // would multiply the startup timeout (mini-agent-0yrql).
+    if lower.contains("initialization timed out") {
+        return false;
     }
     const TRANSIENT: [&str; 6] = [
         "timed out",
@@ -90,23 +97,51 @@ pub(crate) fn is_transient_connect_error(error: &anyhow::Error) -> bool {
     TRANSIENT.iter().any(|marker| lower.contains(marker))
 }
 
+/// Server-requested wait (`Retry-After` seconds) recorded in an HTTP error
+/// message as `[retry-after: N]`.
+fn retry_after_hint(error: &anyhow::Error) -> Option<Duration> {
+    let text = format!("{error:#}");
+    let rest = text.split_once("[retry-after: ")?.1;
+    let seconds = rest.split_once(']')?.0.trim().parse::<u64>().ok()?;
+    Some(Duration::from_secs(seconds))
+}
+
 /// Runs `attempt`, retrying a transient failure up to `retries` times with a
-/// doubling backoff from `base`. Cancellation of the work scope ends it.
+/// doubling backoff from `base` (or the server's `Retry-After` when longer).
+/// The whole sequence, attempts and waits included, is bounded by `budget`
+/// (the configured startup timeout): an attempt is cut off when it runs out
+/// and no retry is started whose wait would not fit. Cancellation of the work
+/// scope ends it.
 pub(crate) async fn retry_transient_connect<T, F, Fut>(
     mut attempt: F,
     retries: usize,
     base: Duration,
+    budget: Duration,
 ) -> anyhow::Result<T>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = anyhow::Result<T>>,
 {
     let mut tried = 0usize;
+    let deadline = tokio::time::Instant::now() + budget;
     loop {
-        match attempt().await {
+        let result = match tokio::time::timeout_at(deadline, attempt()).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "MCP HTTP connection failed: initialization timed out after {} ms (startup budget)",
+                budget.as_millis()
+            )),
+        };
+        match result {
             Ok(value) => return Ok(value),
             Err(error) if tried < retries && is_transient_connect_error(&error) => {
-                let delay = base.saturating_mul(1u32 << tried.min(16));
+                let mut delay = base.saturating_mul(1u32 << tried.min(16));
+                if let Some(hint) = retry_after_hint(&error) {
+                    delay = delay.max(hint);
+                }
+                if tokio::time::Instant::now() + delay >= deadline {
+                    return Err(error);
+                }
                 tracing::debug!(
                     "MCP first connection failed transiently; retry {} of {retries}",
                     tried + 1
@@ -143,6 +178,7 @@ pub(crate) async fn connect_http_retrying_for_test(
         },
         MCP_CONNECT_RETRIES,
         base,
+        Duration::from_secs(5),
     )
     .await
 }
@@ -876,6 +912,7 @@ impl McpClientHandle {
                     },
                     retries,
                     MCP_CONNECT_RETRY_BASE,
+                    initialize_timeout,
                 )
                 .await?;
                 handle.trusted_identity = config.trusted_identity();
@@ -899,6 +936,7 @@ impl McpClientHandle {
                     },
                     retries,
                     MCP_CONNECT_RETRY_BASE,
+                    initialize_timeout,
                 )
                 .await?;
                 handle.trusted_identity = config.trusted_identity();

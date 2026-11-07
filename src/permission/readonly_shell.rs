@@ -620,7 +620,10 @@ mod tests {
         assert_eq!(denied.check("bash", "git status"), CheckResult::Allowed);
         let mut open = make(false);
         assert_eq!(open.check("bash", "git log -p"), CheckResult::Allowed);
-        assert_eq!(open.check("bash", "git show HEAD:Cargo.toml"), CheckResult::Allowed);
+        assert_eq!(
+            open.check("bash", "git show HEAD:Cargo.toml"),
+            CheckResult::Allowed
+        );
         assert_eq!(open.check("bash", "grep -rn x ."), CheckResult::Allowed);
         assert_eq!(open.check("bash", "cat .e*"), CheckResult::Ask);
     }

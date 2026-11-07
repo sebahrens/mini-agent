@@ -614,6 +614,11 @@ impl StreamableHttpClient for BoundedHttpClient {
         if code == StatusCode::NOT_FOUND && session_was_attached {
             return Err(StreamableHttpError::SessionExpired);
         }
+        let retry_after_seconds = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok());
         let content_type = response
             .headers()
             .get(CONTENT_TYPE)
@@ -647,8 +652,17 @@ impl StreamableHttpClient for BoundedHttpClient {
             {
                 return Ok(StreamableHttpPostResponse::Json(error, response_session_id));
             }
+            // Surface a numeric `Retry-After` so the first-connect retry can
+            // honour it for 408/429/503.
+            let retry_after = if matches!(code.as_u16(), 408 | 429 | 503) {
+                retry_after_seconds
+                    .map(|seconds| format!(" [retry-after: {seconds}]"))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
             return Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
-                format!("HTTP {code}: {}", error_body_excerpt(&body)),
+                format!("HTTP {code}{retry_after}: {}", error_body_excerpt(&body)),
             )));
         }
         if starts_with_mime(content_type.as_deref(), EVENT_STREAM_MIME_TYPE) {

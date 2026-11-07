@@ -229,10 +229,12 @@ clamped to 1..=3600). Built-in registrations use the defaults.
 Remote (URL and built-in HTTP) servers only; stdio servers are never retried or
 reconnected automatically (use the `/mcp` reconnect action).
 
-- **First connection.** A transient failure (timeout, connection refused or reset, HTTP 5xx)
-  is retried up to 3 times with a doubling backoff (0.5 s, 1 s, 2 s) before the server is marked
-  failed. Authentication problems, other 4xx responses, refused redirects and cancellation are not
-  retried. Each attempt has the full `startup_timeout_sec`.
+- **First connection.** A transient failure (connection refused or reset, HTTP 5xx, 408 or 429)
+  is retried up to 3 times with a doubling backoff (0.5 s, 1 s, 2 s; a numeric `Retry-After`
+  on 408/429/503 raises the wait) before the server is marked failed. Authentication problems,
+  other 4xx responses, refused redirects and cancellation are not retried. A handshake that
+  times out is not retried. The whole first connection, attempts and waits together, is bounded
+  by `startup_timeout_sec`; a retry whose wait would not fit in the remaining time is skipped.
 - **Dropped connection.** When a connected server's transport closes mid-session (server restart,
   network drop, expired session), the next tool call to it reconnects first, from the exact
   definition and source that connected: up to 5 attempts, waiting 1 s, 2 s, 4 s, 8 s, 16 s

@@ -484,4 +484,76 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(initializes.load(Ordering::SeqCst), 4);
     }
+
+    #[tokio::test]
+    async fn first_connect_total_time_is_bounded_by_the_startup_budget() {
+        use super::super::client::retry_transient_connect;
+        // A hanging attempt is cut off at the budget and never retried.
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&attempts);
+        let started = std::time::Instant::now();
+        let result: anyhow::Result<()> = retry_transient_connect(
+            || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                async {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    Ok(())
+                }
+            },
+            3,
+            Duration::from_millis(5),
+            Duration::from_millis(100),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        // A server-requested wait longer than the remaining budget stops retries.
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&attempts);
+        let result: anyhow::Result<()> = retry_transient_connect(
+            || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Err(anyhow::anyhow!(
+                        "HTTP 429 Too Many Requests [retry-after: 30]: slow down"
+                    ))
+                }
+            },
+            3,
+            Duration::from_millis(5),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn first_connect_retries_429_and_408_and_honours_retry_after() {
+        use super::super::client::retry_transient_connect;
+        for status in ["HTTP 429 Too Many Requests", "HTTP 408 Request Timeout"] {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&attempts);
+            let result: anyhow::Result<u8> = retry_transient_connect(
+                || {
+                    let n = counter.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if n == 0 {
+                            Err(anyhow::anyhow!("{status} [retry-after: 0]: later"))
+                        } else {
+                            Ok(7)
+                        }
+                    }
+                },
+                3,
+                Duration::from_millis(5),
+                Duration::from_secs(5),
+            )
+            .await;
+            assert_eq!(result.unwrap(), 7, "{status}");
+            assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        }
+    }
 }
