@@ -47,4 +47,12 @@ describe('collectReferences', () => {
     expect(out[0]).toMatchObject({ kind: 'image', mimeType: 'image/png' });
     expect(out[1]).toMatchObject({ kind: 'unsupported', name: 'doc.pdf' });
   });
+
+  // mini-agent-yjxk5
+  it('keeps every attached reference so the builder can report the real drop count', async () => {
+    const references = Array.from({ length: 40 }, (_, index) => (
+      { id: `r${index}`, name: `f${index}.ts`, value: uri('file', `/w/f${index}.ts`) }));
+    const out = await collectReferences({ references: references as never }, false);
+    expect(out).toHaveLength(40);
+  });
 });

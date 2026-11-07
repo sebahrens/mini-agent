@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { MAX_REFERENCES, type ReferenceInput } from './references';
+import type { ReferenceInput } from './references';
 
 interface UriLike { readonly scheme: string; readonly fsPath: string }
 interface BinaryLike { readonly mimeType: string; data(): PromiseLike<Uint8Array> }
@@ -38,7 +38,9 @@ export async function collectReferences(
   includeSelection: boolean,
 ): Promise<ReferenceInput[]> {
   const out: ReferenceInput[] = [];
-  for (const reference of request.references.slice(0, MAX_REFERENCES + 1)) {
+  // Every attached reference is kept: the builder applies the count cap and
+  // reports the real number it dropped.
+  for (const reference of request.references) {
     const value: unknown = reference.value;
     const name: unknown = (reference as { name?: unknown }).name;
     const named = typeof name === 'string' && name ? { name } : {};

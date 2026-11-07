@@ -78,6 +78,14 @@ describe('buildPromptBlocks', () => {
     expect(built.notes.join()).toMatch(/3 more were dropped/);
   });
 
+  // mini-agent-yjxk5
+  it('reports every reference beyond the cap, not just one', async () => {
+    const many: ReferenceInput[] = Array.from({ length: 40 },
+      (_, index) => ({ kind: 'file', fsPath: `/work/space/f${index}` }));
+    const built = await buildPromptBlocks(options(many));
+    expect(built.notes.join()).toMatch(/20 more were dropped/);
+  });
+
   it('clips oversized snippets visibly at a character boundary and bounds the total', async () => {
     const big = '雪'.repeat(MAX_SNIPPET_BYTES);
     const built = await buildPromptBlocks(options(Array.from({ length: 6 },
