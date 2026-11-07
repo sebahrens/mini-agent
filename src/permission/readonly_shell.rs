@@ -18,6 +18,10 @@ pub(crate) struct ReadOnlyScript {
     pub(crate) paths: Vec<String>,
     /// Some command traverses directories; auto-allow only under an active sandbox.
     pub(crate) recursive: bool,
+    /// A `git log|show|diff|blame` can print blob contents of every tracked
+    /// file in history, not only the arguments: with any read deny rule
+    /// present the checker asks instead of auto-allowing (mini-agent-qc4cf).
+    pub(crate) reads_history: bool,
 }
 
 /// Classify `script`; `None` unless it consists solely of allowlisted
@@ -232,7 +236,29 @@ fn command_is_read_only(
             })
         }
         "sed" => sed_is_read_only(args),
-        "git" => allow_git && git_is_read_only(args),
+        "git" => {
+            if !(allow_git && git_is_read_only(args)) {
+                return false;
+            }
+            if matches!(
+                args.first().map(String::as_str),
+                Some("log" | "show" | "diff" | "blame")
+            ) {
+                report.reads_history = true;
+            }
+            // `REV:path` names a blob; screen both sides as paths so the
+            // path part is matched against read deny rules.
+            for arg in args.iter().filter(|a| !a.starts_with('-')) {
+                if let Some((rev, path)) = arg.split_once(':') {
+                    for part in [rev, path] {
+                        if !part.is_empty() {
+                            report.paths.push(part.to_string());
+                        }
+                    }
+                }
+            }
+            true
+        }
         _ => false,
     }
 }
@@ -576,7 +602,25 @@ mod tests {
             CheckResult::Ask
         );
         assert_eq!(denied.check("bash", "cat Cargo.toml"), CheckResult::Allowed);
+        // History readers print denied blobs the argument screen cannot see.
+        for script in [
+            "git show HEAD:.env",
+            "git show :.env",
+            "git log -p",
+            "git show",
+            "git show HEAD",
+            "git diff",
+            "git diff HEAD~1",
+            "git blame .env",
+            "git blame Cargo.toml",
+            "git log -p | head",
+        ] {
+            assert_eq!(denied.check("bash", script), CheckResult::Ask, "{script}");
+        }
+        assert_eq!(denied.check("bash", "git status"), CheckResult::Allowed);
         let mut open = make(false);
+        assert_eq!(open.check("bash", "git log -p"), CheckResult::Allowed);
+        assert_eq!(open.check("bash", "git show HEAD:Cargo.toml"), CheckResult::Allowed);
         assert_eq!(open.check("bash", "grep -rn x ."), CheckResult::Allowed);
         assert_eq!(open.check("bash", "cat .e*"), CheckResult::Ask);
     }

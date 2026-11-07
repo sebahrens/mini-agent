@@ -1486,6 +1486,11 @@ impl PermissionChecker {
         if report.recursive && !self.path_deny_probe("grep").is_empty() {
             return false;
         }
+        // `git log -p`, `git show`, `git diff` and `git blame` print history
+        // contents the argument screen cannot see (mini-agent-qc4cf).
+        if report.reads_history && !self.path_deny_probe("grep").is_empty() {
+            return false;
+        }
         let Some(cwd) = self.cached_resolved_cwd.as_deref() else {
             return false;
         };
