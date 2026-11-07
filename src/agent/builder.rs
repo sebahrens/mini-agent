@@ -1791,7 +1791,10 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         .add_hook(crate::agent::runner::ToolLoopGuard)
         .add_hook(tools::mutation_diff::MutationDiffHook)
         .add_hook(tools::bash::ShellCallIdHook)
-        .add_hook(crate::agent::image_budget::ImageBudgetHook);
+        .add_hook({
+            let (provider, model_id) = cli.resolve_provider_and_model(cfg);
+            crate::agent::image_budget::ImageBudgetHook::for_provider(&provider, &model_id)
+        });
     // Restates the objective every few tool results, so a long tool-heavy
     // round cannot drift away from it between provider calls.
     #[cfg(feature = "goal")]

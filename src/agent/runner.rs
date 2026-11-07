@@ -4513,6 +4513,15 @@ where
                             }
                         };
                         completed_interactions.extend(completed_delta);
+                        // Tell the user when older images were left out of a request.
+                        for notice in crate::agent::image_budget::take_notices() {
+                            tracing::warn!("{notice}");
+                            let _ = event_tx
+                                .send(AgentEvent::OutputTruncated {
+                                    message: CompactString::from(notice),
+                                })
+                                .await;
+                        }
                         let usage = res.usage();
                         let context_complete = !usage_ledger.stream_has_observed_usage();
                         let terminal_delta = reconcile_terminal_usage(&mut usage_ledger, usage);
