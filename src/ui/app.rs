@@ -7098,14 +7098,20 @@ impl<'a> App<'a> {
         {
             self.run.next_turn_first_request_tool = Some(crate::agent::first_tool::TASK_TOOL_NAME);
         }
-        let turn =
-            crate::extras::skills::session::InstructionTurn::new(services, Some(pin.clone()));
         crate::ui::ensure_agent(
             &mut self.run.agent,
             &mut self.ui,
             self.slash.reasoning_enabled,
         )
         .await;
+        // A forked skill delegates through `task`; without it the skill
+        // renders inline with a notice instead of naming a missing tool.
+        pin.task_available = match self.run.agent.as_ref() {
+            Some(agent) => agent.advertises_tool("task").await,
+            None => false,
+        };
+        let turn =
+            crate::extras::skills::session::InstructionTurn::new(services, Some(pin.clone()));
         let preflight = self
             .run
             .agent

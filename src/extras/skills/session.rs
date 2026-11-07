@@ -19,6 +19,9 @@ pub(crate) struct Pin {
     /// The text typed after `/<name>`, for `$ARGUMENTS`, `$N` and
     /// `$ARGUMENTS[N]` in the skill body. Empty for an argument-less pin.
     pub(crate) arguments: String,
+    /// Whether the turn advertises the `task` tool (set by the caller once the
+    /// agent exists); a `context: fork` skill renders inline when it does not.
+    pub(crate) task_available: bool,
     scope: uuid::Uuid,
 }
 
@@ -662,6 +665,7 @@ impl InstructionServices {
             digest: package.record.digest.clone(),
             origin: package.origin,
             arguments: String::new(),
+            task_available: true,
             scope: self.scope,
         })
     }
@@ -777,6 +781,7 @@ impl InstructionServices {
                         arguments: &pin.arguments,
                         skill_dir: &skill_dir,
                         fork: package.record.context_fork,
+                        task_available: pin.task_available,
                         agent: package.record.agent.as_deref(),
                         model: package.record.model.as_deref(),
                     },

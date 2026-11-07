@@ -100,32 +100,74 @@ fn truncated_meta() -> serde_json::Map<String, Value> {
 /// Diff shown in the approval dialog, computed from the proposed arguments
 /// only. `edit` with `edits` operations has no text-level preview before it
 /// runs; its recorded mutation preview follows the result.
+#[cfg(test)]
 pub(super) fn pending_diffs(tool: &str, args: &Value) -> Vec<ToolCallContent> {
+    pending_preview(tool, args).0
+}
+
+/// Approval-dialog content: the diffs of [`pending_diffs`] followed, when any
+/// part of the proposed change is not shown, by a visible text block saying
+/// what is missing. `_meta` markers are ignored by IDE clients, so the notice
+/// is ordinary content.
+pub(super) fn pending_content(tool: &str, args: &Value) -> Vec<ToolCallContent> {
+    let (mut content, notice) = pending_preview(tool, args);
+    if let Some(notice) = notice {
+        content.push(ToolCallContent::from(
+            agent_client_protocol::schema::v1::ContentBlock::Text(
+                agent_client_protocol::schema::v1::TextContent::new(notice),
+            ),
+        ));
+    }
+    content
+}
+
+fn pending_preview(tool: &str, args: &Value) -> (Vec<ToolCallContent>, Option<String>) {
     let Some(path) = str_arg(args, "path") else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
     match tool {
         "write" => {
             let Some(content) = args.get("content").and_then(Value::as_str) else {
-                return Vec::new();
+                return (Vec::new(), None);
             };
             let (text, truncated) = bounded_text(content);
             let mut diff = Diff::new(path, text);
+            let mut notice = None;
             if truncated {
                 diff.meta = Some(truncated_meta());
+                notice = Some(format!(
+                    "Preview truncated: file content beyond {} KiB is not shown ({} bytes total). \
+                     Approve only if you trust the whole write.",
+                    MAX_DIFF_BYTES / 1024,
+                    content.len()
+                ));
             }
-            vec![ToolCallContent::Diff(diff)]
+            (vec![ToolCallContent::Diff(diff)], notice)
         }
         "edit" => {
             let Some(raw) = str_arg(args, "block") else {
-                return Vec::new();
+                return (
+                    Vec::new(),
+                    Some(
+                        "No text preview is available for this edit; review the request below."
+                            .to_owned(),
+                    ),
+                );
             };
             let Ok(blocks) = crate::agent::tools::edit::parse_blocks(raw) else {
-                return Vec::new();
+                return (
+                    Vec::new(),
+                    Some(
+                        "Preview unavailable: the edit blocks could not be parsed, so no diff is \
+                         shown. Review the request below."
+                            .to_owned(),
+                    ),
+                );
             };
             let total = blocks.len();
             let mut budget = MAX_DIFF_BYTES;
             let mut out = Vec::new();
+            let mut cut_blocks = 0usize;
             for block in blocks.into_iter().take(MAX_PREVIEW_BLOCKS) {
                 if budget == 0 {
                     break;
@@ -136,6 +178,7 @@ pub(super) fn pending_diffs(tool: &str, args: &Value) -> Vec<ToolCallContent> {
                 let mut diff = Diff::new(path, new).old_text(old);
                 if old_cut || new_cut {
                     diff.meta = Some(truncated_meta());
+                    cut_blocks += 1;
                 }
                 out.push(ToolCallContent::Diff(diff));
             }
@@ -152,9 +195,25 @@ pub(super) fn pending_diffs(tool: &str, args: &Value) -> Vec<ToolCallContent> {
                     Value::from(skipped as u64),
                 );
             }
-            out
+            let mut parts = Vec::new();
+            if skipped > 0 {
+                parts.push(format!("{skipped} more edit block(s) not shown"));
+            }
+            if cut_blocks > 0 {
+                parts.push(format!(
+                    "{cut_blocks} block(s) cut at {} KiB",
+                    MAX_DIFF_BYTES / 1024
+                ));
+            }
+            let notice = (!parts.is_empty()).then(|| {
+                format!(
+                    "Preview truncated: {}. The change being approved is larger than shown.",
+                    parts.join("; ")
+                )
+            });
+            (out, notice)
         }
-        _ => Vec::new(),
+        _ => (Vec::new(), None),
     }
 }
 
@@ -331,6 +390,38 @@ mod tests {
         assert!(pending_diffs("edit", &json!({"block": block})).is_empty());
         assert!(pending_diffs("write", &json!({"path": 5, "content": "x"})).is_empty());
         assert!(pending_diffs("shell", &json!({"path": "a"})).is_empty());
+    }
+
+    fn text_blocks(out: &[ToolCallContent]) -> Vec<String> {
+        out.iter()
+            .filter_map(|c| match c {
+                ToolCallContent::Content(content) => match &content.content {
+                    agent_client_protocol::schema::v1::ContentBlock::Text(t) => {
+                        Some(t.text.clone())
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn omissions_add_a_visible_text_block_not_just_meta() {
+        let big = "y".repeat(MAX_DIFF_BYTES * 2);
+        let w = pending_content("write", &json!({"path": "a", "content": big}));
+        assert!(text_blocks(&w)[0].contains("beyond 64 KiB is not shown"));
+        let e = pending_content("edit", &json!({"path": "a.rs", "block": blocks(20, "")}));
+        assert!(text_blocks(&e)[0].contains("4 more edit block(s) not shown"));
+        let bad = pending_content("edit", &json!({"path": "a.rs", "block": "garbage"}));
+        assert!(text_blocks(&bad)[0].contains("could not be parsed"));
+        let ops = pending_content("edit", &json!({"path": "a.rs", "edits": []}));
+        assert!(text_blocks(&ops)[0].contains("No text preview"));
+        // A complete preview adds no notice.
+        let ok = pending_content("edit", &json!({"path": "a.rs", "block": blocks(2, "")}));
+        assert!(text_blocks(&ok).is_empty());
+        let small = pending_content("write", &json!({"path": "a", "content": "x"}));
+        assert!(text_blocks(&small).is_empty());
     }
 
     #[test]

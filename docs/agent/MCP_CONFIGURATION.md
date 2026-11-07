@@ -224,6 +224,24 @@ clamped to 1..=3600). Built-in registrations use the defaults.
   "startup_timeout_sec": 60, "tool_timeout_sec": 300}}}
 ```
 
+## Connection retry and automatic reconnection
+
+Remote (URL and built-in HTTP) servers only; stdio servers are never retried or
+reconnected automatically (use the `/mcp` reconnect action).
+
+- **First connection.** A transient failure (timeout, connection refused or reset, HTTP 5xx)
+  is retried up to 3 times with a doubling backoff (0.5 s, 1 s, 2 s) before the server is marked
+  failed. Authentication problems, other 4xx responses, refused redirects and cancellation are not
+  retried. Each attempt has the full `startup_timeout_sec`.
+- **Dropped connection.** When a connected server's transport closes mid-session (server restart,
+  network drop, expired session), the next tool call to it reconnects first, from the exact
+  definition and source that connected: up to 5 attempts, waiting 1 s, 2 s, 4 s, 8 s, 16 s
+  before them. While this runs the server shows as `pending`; after the last failed attempt it
+  shows as `failed` ("reconnect from /mcp") and further calls fail fast until you reconnect it by
+  hand. A call that was already in flight when the connection dropped is never replayed (it
+  reports the drop; the following call reconnects), so a non-idempotent tool does not run twice.
+  A changed or revoked source, or a retired connection, never reconnects.
+
 ## Per-server tool selection and enable toggle
 
 Command and URL entries also accept:

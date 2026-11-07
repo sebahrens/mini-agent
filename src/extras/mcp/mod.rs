@@ -11,6 +11,7 @@ pub(crate) mod health;
 pub mod oauth;
 pub(crate) mod progress;
 pub(crate) mod project;
+pub(crate) mod reconnect;
 pub(crate) mod resource_tools;
 pub(crate) mod server;
 pub mod tool;
@@ -225,8 +226,20 @@ impl McpClientManager {
                     .get(name)
                     .and_then(|server| server.connection)
                     .map(|attempt| attempt.outcome);
+                // A remote server whose dropped transport is being (or could
+                // not be) re-established is not simply "connected".
+                let link = self
+                    .handles
+                    .iter()
+                    .find(|handle| handle.server_name.as_str() == name.as_str())
+                    .and_then(|handle| handle.link.as_ref());
+                let link_state = link.map(|link| link.state());
                 let status = if !enabled {
                     "disabled"
+                } else if connected && link_state == Some(reconnect::LinkState::Reconnecting) {
+                    "pending"
+                } else if connected && link_state == Some(reconnect::LinkState::Failed) {
+                    "failed"
                 } else if connected {
                     "connected"
                 } else {
@@ -243,7 +256,13 @@ impl McpClientManager {
                     name: name.clone(),
                     status,
                     error: (status != "connected")
-                        .then(|| self.connect_errors.get(name).cloned())
+                        .then(|| {
+                            self.connect_errors.get(name).cloned().or_else(|| {
+                                (link_state == Some(reconnect::LinkState::Failed))
+                                    .then(|| link.map(|link| link.failure_message()))
+                                    .flatten()
+                            })
+                        })
                         .flatten(),
                 }
             })
@@ -654,8 +673,16 @@ impl McpClientManager {
                 let options = handle.options.clone();
                 let defer = handle.defer;
                 let live_peer = peer.clone();
+                let reconnect = handle.link.clone();
+                if let Some(link) = &reconnect {
+                    link.bind_health(self.health.clone());
+                }
+                // A link-managed server may have a closed transport that the
+                // tool re-establishes before sending, so only handle
+                // retirement counts as not live for it.
+                let reconnects = reconnect.is_some();
                 let client_is_live: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
-                    liveness.upgrade().is_some() && !live_peer.is_transport_closed()
+                    liveness.upgrade().is_some() && (reconnects || !live_peer.is_transport_closed())
                 });
                 let attempt = self
                     .health
@@ -683,6 +710,7 @@ impl McpClientManager {
                         source_proof,
                         elicitation,
                         client_is_live,
+                        reconnect,
                         peer,
                         result,
                         (list_timeout, call_timeout),
@@ -701,6 +729,7 @@ impl McpClientManager {
             source_proof,
             elicitation,
             client_is_live,
+            reconnect,
             peer,
             result,
             (list_timeout, call_timeout),
@@ -746,6 +775,7 @@ impl McpClientManager {
                             source_proof: source_proof.clone(),
                             client_is_live: client_is_live.clone(),
                             elicitation: elicitation.clone(),
+                            reconnect: reconnect.clone(),
                             registered_name: CompactString::new(definition.name.as_ref()),
                             definition,
                             model_description: Arc::clone(&bounded.description),

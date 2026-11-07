@@ -36,6 +36,8 @@ pub struct McpTool {
     pub(crate) source_proof: Option<std::sync::Arc<super::project::ServerSourceProof>>,
     pub(crate) client_is_live: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
     pub(crate) elicitation: super::elicitation::Handler,
+    /// Auto-reconnect link of a remote server; `None` for stdio servers.
+    pub(crate) reconnect: Option<std::sync::Arc<super::reconnect::ServerLink>>,
     pub definition: rmcp::model::Tool,
     pub(super) model_description: Arc<str>,
     pub(super) model_parameters: Arc<serde_json::Value>,
@@ -379,6 +381,7 @@ impl ToolDyn for McpTool {
         let source_proof = self.source_proof.clone();
         let client_is_live = self.client_is_live.clone();
         let elicitation = self.elicitation.clone();
+        let reconnect = self.reconnect.clone();
 
         Box::pin(async move {
             ensure_client_current(source_proof.as_deref(), client_is_live.as_ref())?;
@@ -429,6 +432,20 @@ impl ToolDyn for McpTool {
             } else if !client_is_live() {
                 return Err(client_retired_error());
             }
+            // A remote server whose transport dropped is re-established here,
+            // after permission and source checks and before the request is
+            // sent; an in-flight call is never replayed.
+            let (peer, elicitation) = match &reconnect {
+                Some(link) => {
+                    let conn = link.ensure_connected().await.map_err(|message| {
+                        ToolError::ToolCallError(Box::new(McpToolError(CompactString::new(
+                            message,
+                        ))))
+                    })?;
+                    (conn.peer, conn.elicitation)
+                }
+                None => (peer, elicitation),
+            };
             let proof = source_proof.clone();
             let live = client_is_live.clone();
             let _elicitation_lease = elicitation.enter(
@@ -461,6 +478,9 @@ impl ToolDyn for McpTool {
                              `mcp_tool_timeout_secs` (or this server's `tool_timeout_sec`) in the \
                              config.",
                             call_timeout.as_millis()
+                        ),
+                        other if reconnect.is_some() && peer.is_transport_closed() => format!(
+                            "MCP tool error: {other}; the connection to '{server_name}' dropped and will be re-established on the next call"
                         ),
                         other => format!("MCP tool error: {other}"),
                     };

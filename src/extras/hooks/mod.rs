@@ -315,8 +315,44 @@ pub(crate) fn wrap_from_global(
 /// the hook sandbox: other events are dropped, only `command` handlers stay,
 /// and every handler is forced to `trust: sandboxed` whatever the file says.
 #[cfg(feature = "subagents")]
+const PERSONA_HOOK_EVENTS: [&str; 2] = ["PreToolUse", "PostToolUseFailure"];
+
+/// `[specialist metadata: hooks not applied: ...]` notices for every event and
+/// handler type [`scope_persona_hooks`] will drop from a validated persona
+/// `hooks:` mapping, so a guard the author wrote never disappears silently.
+#[cfg(feature = "subagents")]
+pub(crate) fn persona_dropped_hook_notices(config: &settings::HooksConfig) -> Vec<String> {
+    let mut events: Vec<&String> = config.keys().collect();
+    events.sort();
+    let mut notices = Vec::new();
+    for event in events {
+        if !PERSONA_HOOK_EVENTS.contains(&event.as_str()) {
+            notices.push(format!(
+                "[specialist metadata: hooks not applied: {event} is not supported in persona hooks (only {} run)]",
+                PERSONA_HOOK_EVENTS.join(" and ")
+            ));
+            continue;
+        }
+        let mut kinds: Vec<&str> = config[event]
+            .iter()
+            .flat_map(|group| group.hooks.iter())
+            .filter(|handler| handler.kind != "command")
+            .map(|handler| handler.kind.as_str())
+            .collect();
+        kinds.sort_unstable();
+        kinds.dedup();
+        for kind in kinds {
+            notices.push(format!(
+                "[specialist metadata: hooks not applied: {event} {kind} handler(s) are not supported in persona hooks (only command handlers run, in the hook sandbox)]"
+            ));
+        }
+    }
+    notices
+}
+
+#[cfg(feature = "subagents")]
 fn scope_persona_hooks(mut config: settings::HooksConfig) -> settings::HooksConfig {
-    config.retain(|event, _| matches!(event.as_str(), "PreToolUse" | "PostToolUseFailure"));
+    config.retain(|event, _| PERSONA_HOOK_EVENTS.contains(&event.as_str()));
     for groups in config.values_mut() {
         for group in groups.iter_mut() {
             group.hooks.retain(|handler| handler.kind == "command");

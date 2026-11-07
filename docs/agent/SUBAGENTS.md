@@ -627,8 +627,15 @@ mode: review
     other tools, permissions and sandbox are unchanged.
   - `[subagents] agent_hooks = true` runs the persona's Claude-format `hooks:` mapping around that
     child's tool calls (`PreToolUse`, `PostToolUseFailure`), inside the global hooks, and only for
-    that child's lifetime. Hook commands run like user hooks; a mapping that does not validate is
-    reported as `hooks not applied`.
+    that child's lifetime. Only `command` handlers run, and every handler is forced into the hook
+    sandbox (`trust: sandboxed`) whatever the file says. Any other event (for example `PostToolUse`
+    or `Stop`), any non-`command` handler, and a mapping that does not validate are reported as
+    `[specialist metadata: hooks not applied: ...]` notices when the persona loads.
+  - With either opt-in off (the default, or a project config that was not trusted), a persona that
+    declares `memory:` or `hooks:` still loads, and the `task` result carries
+    `[specialist metadata: memory not applied: set [subagents] agent_memory = true ...]` (or
+    `hooks not applied: set [subagents] agent_hooks = true ...`), so a guard-rail hook is never
+    dropped silently.
   `permissionMode` is recognised but has no effect and produces a
   `[specialist metadata: permissionMode not applied: ...]` notice.
 - `model` is first resolved as a configured quick-model alias, including its

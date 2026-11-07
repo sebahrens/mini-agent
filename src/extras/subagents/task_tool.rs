@@ -921,6 +921,44 @@ fn hook_identity(
     )
 }
 
+/// Appends a visible notice for each persona `memory:` / `hooks:` feature that
+/// is declared but not applied because its `[subagents]` opt-in is off (the
+/// default, or a project config refused for lack of trust). Silently dropping
+/// a guard-rail hook would leave the child running unprotected.
+fn opt_in_notices(
+    extras: &crate::context::agents::AgentExtras,
+    policy: Option<&crate::config::types::SubagentPolicy>,
+) -> Vec<String> {
+    let mut notices = Vec::new();
+    if extras.memory.is_some() && !policy.is_some_and(|policy| policy.agent_memory) {
+        notices.push(
+            "[specialist metadata: memory not applied: set [subagents] agent_memory = true (in trusted configuration) to enable persona memory]"
+                .to_owned(),
+        );
+    }
+    if extras.hooks.is_some() && !policy.is_some_and(|policy| policy.agent_hooks) {
+        notices.push(
+            "[specialist metadata: hooks not applied: set [subagents] agent_hooks = true (in trusted configuration) to enable persona hooks; this child runs WITHOUT them]"
+                .to_owned(),
+        );
+    }
+    notices
+}
+
+fn with_opt_in_notices(
+    notice: Option<String>,
+    extras: &crate::context::agents::AgentExtras,
+    policy: Option<&crate::config::types::SubagentPolicy>,
+) -> Option<String> {
+    let extra = opt_in_notices(extras, policy);
+    if extra.is_empty() {
+        return notice;
+    }
+    let mut lines: Vec<String> = notice.into_iter().collect();
+    lines.extend(extra);
+    Some(lines.join("\n"))
+}
+
 fn resolve_specialization(
     agent_type: Option<&str>,
     workspace: Option<&crate::paths::WorkspaceBinding>,
@@ -1587,9 +1625,13 @@ editing in a known location, grepping for a literal you will act on immediately.
         #[cfg(feature = "hooks")]
         let (hook_agent_type, hook_agent_source) =
             hook_identity(agent_type.as_deref(), specialization.as_ref());
-        let result_notice = specialization
-            .as_ref()
-            .and_then(|resolved| resolved.result_notice.clone());
+        let result_notice = specialization.as_ref().and_then(|resolved| {
+            with_opt_in_notices(
+                resolved.result_notice.clone(),
+                &resolved.extras,
+                config.subagents.as_ref(),
+            )
+        });
         let mut runtime = resolve_persona_runtime(
             client,
             &provider_name,
@@ -4494,6 +4536,34 @@ fn truncate_total_bytes(value: &str, max_bytes: usize, marker: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn declared_memory_and_hooks_report_a_notice_when_opt_ins_are_off() {
+        use crate::context::agents::{AgentExtras, AgentMemoryScope};
+        let extras = AgentExtras {
+            background: false,
+            memory: Some(AgentMemoryScope::Project),
+            hooks: Some("{}".to_owned()),
+        };
+        // Default (no [subagents] table) and an explicit all-off policy.
+        let default_off = opt_in_notices(&extras, None).join("\n");
+        assert!(default_off.contains("memory not applied"), "{default_off}");
+        assert!(default_off.contains("agent_memory = true"), "{default_off}");
+        assert!(default_off.contains("hooks not applied"), "{default_off}");
+        assert!(default_off.contains("agent_hooks = true"), "{default_off}");
+        let off = crate::config::types::SubagentPolicy::default();
+        assert_eq!(opt_in_notices(&extras, Some(&off)).len(), 2);
+        // Enabled opt-ins produce no notice; undeclared features never do.
+        let on = crate::config::types::SubagentPolicy {
+            agent_memory: true,
+            agent_hooks: true,
+            ..Default::default()
+        };
+        assert!(opt_in_notices(&extras, Some(&on)).is_empty());
+        assert!(opt_in_notices(&AgentExtras::default(), None).is_empty());
+        let merged = with_opt_in_notices(Some("[a]".into()), &extras, None).unwrap();
+        assert!(merged.starts_with("[a]\n[specialist metadata: memory"));
+    }
+
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
