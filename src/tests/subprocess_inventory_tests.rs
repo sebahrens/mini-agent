@@ -7296,18 +7296,18 @@ fn process_creation_raw_terminals_are_exact_and_guard_dominated() {
         .expect("process creation source must be readable");
     let expected = BTreeMap::from([
         (
-            "output_guarded|std::process::Command::output(self)".to_string(),
+            "output_std_once|std::process::Command::output(command)".to_string(),
             1,
         ),
-        ("spawn_guarded|TokioCommand::spawn(self)".to_string(), 1),
+        ("spawn_tokio_once|TokioCommand::spawn(command)".to_string(), 1),
         ("spawn_guarded_until|TokioCommand::spawn(self)".to_string(), 1),
         ("launch_tokio_with_creation_guard_until|let child = TokioCommand::spawn(command)?;".to_string(), 1),
         (
-            "spawn_guarded|process_wrap::tokio::CommandWrap::spawn(self)".to_string(),
+            "spawn_wrap_once|process_wrap::tokio::CommandWrap::spawn(command)".to_string(),
             1,
         ),
         (
-            "spawn_guarded|std::process::Command::spawn(self)".to_string(),
+            "spawn_std_once|std::process::Command::spawn(command)".to_string(),
             1,
         ),
         (

@@ -136,6 +136,61 @@ pub(crate) fn launch_tokio_with_creation_guard_until<R>(
     finish(child).map_err(io::Error::other)
 }
 
+/// Retry a spawn that raced a concurrent fork holding a write descriptor to the
+/// executable being exec'd.
+///
+/// On Linux, `execve` of a file that any process still has open for writing
+/// fails with `ETXTBSY`. A freshly materialized executable (for example the
+/// guarded Git runtime) has its writer closed before first use, but another
+/// thread's `fork` can briefly duplicate that descriptor into a child that has
+/// not yet reached its own `exec` (which closes close-on-exec descriptors).
+/// The condition clears within microseconds to milliseconds, so a short bounded
+/// retry is the only fully robust remedy: no lock can cover every fork in the
+/// process. Other platforms and other errors are returned unchanged.
+fn retry_text_file_busy<T>(mut spawn: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    #[cfg(target_os = "linux")]
+    {
+        const ETXTBSY: i32 = 26;
+        const ATTEMPTS: u32 = 40;
+        let mut delay = std::time::Duration::from_millis(1);
+        for _ in 1..ATTEMPTS {
+            match spawn() {
+                Err(error) if error.raw_os_error() == Some(ETXTBSY) => {
+                    std::thread::sleep(delay);
+                    delay = (delay * 2).min(std::time::Duration::from_millis(50));
+                }
+                other => return other,
+            }
+        }
+    }
+    spawn()
+}
+
+// One creation attempt per call: the guard is taken and released around each
+// attempt, so ETXTBSY back-off never sleeps while holding the creation lock.
+fn spawn_std_once(command: &mut std::process::Command) -> io::Result<Child> {
+    let _guard = creation_guard()?;
+    std::process::Command::spawn(command)
+}
+
+fn output_std_once(command: &mut std::process::Command) -> io::Result<Output> {
+    let _guard = creation_guard()?;
+    std::process::Command::output(command)
+}
+
+fn spawn_tokio_once(command: &mut TokioCommand) -> io::Result<TokioChild> {
+    let _guard = creation_guard()?;
+    TokioCommand::spawn(command)
+}
+
+#[cfg(any(feature = "lsp", feature = "mcp"))]
+fn spawn_wrap_once(
+    command: &mut process_wrap::tokio::CommandWrap,
+) -> io::Result<Box<dyn process_wrap::tokio::ChildWrapper>> {
+    let _guard = creation_guard()?;
+    process_wrap::tokio::CommandWrap::spawn(command)
+}
+
 pub(crate) trait StdCommandCreationExt {
     fn spawn_guarded(&mut self) -> io::Result<Child>;
     #[cfg(windows)]
@@ -149,8 +204,7 @@ pub(crate) trait StdCommandCreationExt {
 
 impl StdCommandCreationExt for std::process::Command {
     fn spawn_guarded(&mut self) -> io::Result<Child> {
-        let _guard = creation_guard()?;
-        std::process::Command::spawn(self)
+        retry_text_file_busy(|| spawn_std_once(self))
     }
 
     #[cfg(windows)]
@@ -175,8 +229,7 @@ impl StdCommandCreationExt for std::process::Command {
         // standard-library terminal is therefore required to preserve explicit stdio and reuse of
         // the same builder. This synchronous path holds the outer Windows lock until `output`
         // returns; it never crosses an async suspension.
-        let _guard = creation_guard()?;
-        std::process::Command::output(self)
+        retry_text_file_busy(|| output_std_once(self))
     }
 }
 
@@ -188,8 +241,7 @@ pub(crate) trait TokioCommandCreationExt {
 
 impl TokioCommandCreationExt for TokioCommand {
     fn spawn_guarded(&mut self) -> io::Result<TokioChild> {
-        let _guard = creation_guard()?;
-        TokioCommand::spawn(self)
+        retry_text_file_busy(|| spawn_tokio_once(self))
     }
     #[cfg(windows)]
     fn spawn_guarded_until(&mut self, deadline: Instant) -> io::Result<TokioChild> {
@@ -220,8 +272,7 @@ pub(crate) trait CommandWrapCreationExt {
 #[cfg(any(feature = "lsp", feature = "mcp"))]
 impl CommandWrapCreationExt for process_wrap::tokio::CommandWrap {
     fn spawn_guarded(&mut self) -> io::Result<Box<dyn process_wrap::tokio::ChildWrapper>> {
-        let _guard = creation_guard()?;
-        process_wrap::tokio::CommandWrap::spawn(self)
+        retry_text_file_busy(|| spawn_wrap_once(self))
     }
 }
 
@@ -286,5 +337,30 @@ mod tests {
                 "explicit stderr must not be replaced"
             );
         }
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spawn_retries_while_executable_is_briefly_open_for_writing() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("etxtbsy-retry-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("tool.sh");
+        let mut writer = std::fs::File::create(&script).unwrap();
+        writer.write_all(b"#!/bin/sh\nexit 0\n").unwrap();
+        writer
+            .set_permissions(std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            drop(writer);
+        });
+        let exit = Command::new(&script)
+            .stdin(Stdio::null())
+            .status_guarded()
+            .expect("spawn should outlast a transient ETXTBSY");
+        assert!(exit.success());
+        closer.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

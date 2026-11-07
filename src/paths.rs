@@ -721,6 +721,10 @@ impl WorkspaceBinding {
             }
             file.write_all(content)?;
             file.flush()?;
+            // Close the writer before the file becomes reachable by its final
+            // name so it is never open for writing while another thread can
+            // exec it (ETXTBSY).
+            drop(file);
             parent.hard_link(&temp, &parent, &name)?;
             Ok(())
         })();
