@@ -2100,6 +2100,15 @@ impl PermissionChecker {
     }
 
     fn is_session_allowed(&self, tool: &str, input: &str) -> bool {
+        // ReadOnly and PlanWrite mean "allow reads, deny everything else": a
+        // grant made under a broader mode (restored with a resumed session, a
+        // persisted project approval, or kept across `/mode`) must not widen
+        // them. PlanWrite plan-file writes are decided by the mode itself.
+        if matches!(self.mode, SecurityMode::ReadOnly | SecurityMode::PlanWrite)
+            && !self.is_read_tool(tool)
+        {
+            return false;
+        }
         for (allowed_tool, pattern) in &self.session_allowlist {
             // Path scopes and explicitly decoded native web origins have
             // generated literal matchers. Every other AllowAlways key (shell
@@ -5382,8 +5391,13 @@ fn format45_retained_approval_query_preserves_doom_state_and_normal_revocation_p
     assert!(!checker.retains_shell_approval(script));
     checker.add_session_allowlist("shell".into(), script);
     assert!(
+        !checker.retains_shell_approval(script),
+        "a session grant never widens ReadOnly (mini-agent-o6mrz)"
+    );
+    checker.set_mode(SecurityMode::Standard);
+    assert!(
         checker.retains_shell_approval(script),
-        "existing exact session grant precedence is preserved"
+        "the exact session grant applies again in the mode it was granted under"
     );
     let checker = PermissionChecker::new(
         &PermissionConfigs::from(PermissionConfig {
@@ -5682,5 +5696,53 @@ mod proc_secret_and_external_ask_tests {
         let mut yolo = checker(&workspace, SecurityMode::Yolo, config);
         let other = base.join("other.md").to_string_lossy().into_owned();
         assert_eq!(yolo.check_path("read", &other), CheckResult::Allowed);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn restored_session_grants_never_widen_readonly_or_planwrite_modes() {
+    // mini-agent-o6mrz: a grant restored from a resumed session or persisted
+    // project approvals must not bypass the narrower mode's contract.
+    let root = crate::tests::OwnedTestDirectory::new("o6mrz-grants");
+    let src = root.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let target = src.join("x.rs");
+    std::fs::write(&target, "x").unwrap();
+    let target = target.canonicalize().unwrap().to_string_lossy().to_string();
+    for mode in [SecurityMode::ReadOnly, SecurityMode::PlanWrite] {
+        let mut checker = PermissionChecker::new(
+            &PermissionConfigs::default(),
+            SecurityMode::Standard,
+            Some(root.path().to_path_buf()),
+            None,
+        )
+        .unwrap();
+        checker.add_session_allowlist("write".into(), &target);
+        checker.add_session_allowlist("edit".into(), &target);
+        checker.add_session_allowlist("shell".into(), "touch pwned");
+        checker.add_session_allowlist("mcp_tool".into(), "srv/danger");
+        checker.set_mode(mode);
+        for tool in ["write", "edit"] {
+            assert!(
+                matches!(checker.check_path(tool, &target), CheckResult::Denied(_)),
+                "{mode:?} {tool}: {:?}",
+                checker.check_path(tool, &target)
+            );
+        }
+        assert!(
+            matches!(
+                checker.check("shell", "touch pwned"),
+                CheckResult::Denied(_)
+            ),
+            "{mode:?} shell"
+        );
+        assert!(
+            !matches!(
+                checker.check("mcp_tool", "srv/danger"),
+                CheckResult::Allowed
+            ),
+            "{mode:?} mcp"
+        );
     }
 }
