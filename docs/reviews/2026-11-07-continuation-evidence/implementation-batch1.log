@@ -154,4 +154,3 @@ ok
 test ui::app::plan_approval_tests::tui_byte_pressure_below_token_pressure_compacts_once ... ok
 
 test result: ok. 142 passed; 0 failed; 0 ignored; 0 measured; 6119 filtered out; finished in 21.02s
-

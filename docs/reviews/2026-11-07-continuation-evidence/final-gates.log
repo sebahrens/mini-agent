@@ -9,4 +9,3 @@ test tests::subprocess_inventory_tests::production_subprocess_sites_have_a_trust
 test tests::subprocess_inventory_tests::windows_capable_production_process_terminals_use_creation_boundary ... ok
 
 test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 6272 filtered out; finished in 54.64s
-

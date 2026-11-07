@@ -739,7 +739,8 @@
       "connectivity": "Installed binary --no-session --no-tools --no-context-files -p request completed with final response Hello; exit 0."
     },
     "format": "cargo fmt and cargo fmt --check passed; git diff --check passed.",
-    "reused_results_rationale": "Final changes after the full run affected hook/MCP/discovery/JS caller paths; these received the 360-test affected batch and passing four-test correction gate. Runtime/ACP/TUI/TaskTool/loop fixes passed the 43-test correction batch, except its unrelated worker fixture and inventory failures, which subsequently passed. Root ledger/OAuth/checkpoint/trust passing results and original-size stack passes remain valid. Default+skills compilation and reduced hooks/minimal rows cover conditional boundaries; CI supplies remaining supported feature/platform rows."
+    "reused_results_rationale": "Final changes after the full run affected hook/MCP/discovery/JS caller paths; these received the 360-test affected batch and passing four-test correction gate. Runtime/ACP/TUI/TaskTool/loop fixes passed the 43-test correction batch, except its unrelated worker fixture and inventory failures, which subsequently passed. Root ledger/OAuth/checkpoint/trust passing results and original-size stack passes remain valid. Default+skills compilation and reduced hooks/minimal rows cover conditional boundaries; CI supplies remaining supported feature/platform rows.",
+    "evidence_format": "Stored logs normalize trailing whitespace and terminal empty lines; original command logs remain under /private/tmp during the session."
   },
   "status": "local_validation_complete_ci_pending",
   "final_root_review": "2026-11-07-continuation-evidence/root-final-review.json"

@@ -16,4 +16,3 @@ test mcp_stdio_actual_binary_exits_on_writer_deadline_while_stdin_stays_open ...
 test temp::temp_dir_is_unique_exclusive_and_removed_on_drop ... ok
 
 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.95s
-

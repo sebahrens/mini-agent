@@ -77,4 +77,3 @@ test paths::bound_special_file_tests::bound_file_open_refuses_fifo_before_a_writ
 test paths::generic_workspace_open_tests::generic_workspace_open_preserves_directory_type_information ... ok
 
 test result: ok. 72 passed; 0 failed; 0 ignored; 0 measured; 3929 filtered out; finished in 0.60s
-

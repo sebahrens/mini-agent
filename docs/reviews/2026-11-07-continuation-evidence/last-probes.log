@@ -13,7 +13,7 @@ failures:
 ---- session::file_checkpoints::continuation_runtime_p4_probes::continuation_p4_rewind_drops_the_retired_skip_reason stdout ----
 
 thread 'session::file_checkpoints::continuation_runtime_p4_probes::continuation_p4_rewind_drops_the_retired_skip_reason' (66706577) panicked at src/session/file_checkpoints.rs:1943:9:
-the only surviving unavailable edit was READ-denied, but the summary names a retired size failure: 0 files; unavailable checkpoints: 1 edit not restorable (the file is larger than the 12345-byte checkpoint limit (file_checkpoints.max_file_bytes)): 
+the only surviving unavailable edit was READ-denied, but the summary names a retired size failure: 0 files; unavailable checkpoints: 1 edit not restorable (the file is larger than the 12345-byte checkpoint limit (file_checkpoints.max_file_bytes)):
 note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
 
 ---- startup::continuation_runtime_a_probes::continuation_runtime_a_probe_failed_goal_save_does_not_duplicate_final_round stdout ----

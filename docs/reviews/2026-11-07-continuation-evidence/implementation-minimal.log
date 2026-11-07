@@ -63,4 +63,3 @@ test spend::ledger::tests::summary_tolerates_read_only_coordination_lock ... ok
 test spend::ledger::tests::usd_budget_concurrent_profile_receipts_share_io_and_never_double_or_drop_charges ... ok
 
 test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured; 3700 filtered out; finished in 14.88s
-

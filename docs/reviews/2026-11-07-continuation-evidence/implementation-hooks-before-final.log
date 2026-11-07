@@ -33,4 +33,3 @@ test extras::hooks::subprocess::launch_prep_tests::launch_preparation_runs_off_t
 test extras::hooks::trust::confirmation_tests::confirmation_displays_event_and_matcher_that_are_bound_by_the_hash ... ok
 
 test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 3966 filtered out; finished in 0.11s
-

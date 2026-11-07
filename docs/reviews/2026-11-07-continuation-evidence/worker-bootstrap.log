@@ -12,4 +12,3 @@ test worker_bootstrap_production_main_rejects_regular_file_stdio ... ok
 test worker_bootstrap_production_main_rejects_socket_stdio ... ok
 
 test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
-

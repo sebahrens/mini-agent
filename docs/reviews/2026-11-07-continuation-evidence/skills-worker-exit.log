@@ -12,4 +12,3 @@ running 1 test
 test extras::js::supervisor::worker_exit_tests::buffered_terminal_survives_clean_exit_and_keeps_validation ... ok
 
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6836 filtered out; finished in 0.13s
-

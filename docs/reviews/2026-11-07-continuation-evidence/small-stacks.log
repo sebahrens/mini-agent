@@ -11,7 +11,7 @@ test provider::effort_tests::instruction_wire_tests::context63_actual_streamed_n
 test provider::effort_tests::replay_probe::effort46_actual_headless_frontend_on_one_mib ... first completed answer
 second completed answer
 ok
-test provider::effort_tests::replay_probe::effort46_shared_binding_and_denial_on_one_mib ... 
+test provider::effort_tests::replay_probe::effort46_shared_binding_and_denial_on_one_mib ...
 observed completed answer
 ok
 test startup::native_publication_startup_tests::native_publication_actual_startup_idle_zero_cap_preserves_denial_on_one_mib ... Reading piped stdin (limit 1048576 bytes)
@@ -29,4 +29,3 @@ test ui::app::workspace_session_picker_tests::worktree116_actual_app_switch_and_
 test ui::terminal::tests::title_stack_is_left_alone_unless_title_status_is_enabled ... ok
 
 test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 6252 filtered out; finished in 6.21s
-
