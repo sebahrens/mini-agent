@@ -1523,8 +1523,19 @@ fn post_tool_feedback(value: &serde_json::Value) -> Vec<String> {
 /// tool's own result: feedback is prepended, the (redacted) result follows
 /// intact so trailing delivery notices keep matching.
 fn merge_post_tool_use_decisions(outputs: &[HookOutput], tool_response: &str) -> Decision {
+    // An image result travels as a JSON envelope that rig lifts into image
+    // parts only when the whole string parses. Feedback and redaction then
+    // apply to the envelope's text and keep its parts intact.
+    let mut envelope = image_envelope(tool_response);
+    let text_view: &str = match &envelope {
+        Some(value) => value
+            .get("response")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(""),
+        None => tool_response,
+    };
     // Only copy the response once a redaction literal actually matches.
-    let mut redacted = std::borrow::Cow::Borrowed(tool_response);
+    let mut redacted = std::borrow::Cow::Borrowed(text_view);
     let mut changed = false;
     let mut feedback: Vec<String> = Vec::new();
 
@@ -1547,10 +1558,17 @@ fn merge_post_tool_use_decisions(outputs: &[HookOutput], tool_response: &str) ->
         }
     }
 
+    let finish = |text: String, envelope: &mut Option<serde_json::Value>| match envelope.take() {
+        Some(mut value) => {
+            value["response"] = serde_json::Value::String(text);
+            value.to_string()
+        }
+        None => text,
+    };
     if feedback.is_empty() {
         return if changed {
             Decision::Rewrite {
-                content: redacted.into_owned(),
+                content: finish(redacted.into_owned(), &mut envelope),
             }
         } else {
             Decision::Continue
@@ -1562,11 +1580,30 @@ fn merge_post_tool_use_decisions(outputs: &[HookOutput], tool_response: &str) ->
     if truncated {
         text.push_str("\n[hook feedback truncated at 32 KiB]");
     }
+    let body = if envelope.is_some() && redacted.is_empty() {
+        format!("{POST_TOOL_FEEDBACK_HEADER}\n{text}\n[end of hook feedback]")
+    } else {
+        format!("{POST_TOOL_FEEDBACK_HEADER}\n{text}\n[end of hook feedback]\n\n{redacted}")
+    };
     Decision::Rewrite {
-        content: format!(
-            "{POST_TOOL_FEEDBACK_HEADER}\n{text}\n[end of hook feedback]\n\n{redacted}"
-        ),
+        content: finish(body, &mut envelope),
     }
+}
+
+/// The tool result as a hybrid image envelope (`{"response", "parts"}`), when
+/// it is one. A lone `{"type":"image"}` result is wrapped as one part so text
+/// can be attached without losing the image.
+fn image_envelope(tool_response: &str) -> Option<serde_json::Value> {
+    if !tool_response.trim_start().starts_with('{') {
+        return None;
+    }
+    let value = serde_json::from_str::<serde_json::Value>(tool_response).ok()?;
+    let object = value.as_object()?;
+    if object.contains_key("response") || object.contains_key("parts") {
+        return Some(value);
+    }
+    (object.get("type").and_then(serde_json::Value::as_str) == Some("image"))
+        .then(|| serde_json::json!({ "parts": [value] }))
 }
 
 /// PermissionRequest output that answers the pending approval, honored only
@@ -1665,6 +1702,40 @@ mod tests {
 
     fn json_output(value: serde_json::Value) -> super::HookOutput {
         fixture_output(0, &serde_json::to_vec(&value).unwrap(), b"")
+    }
+
+    #[test]
+    fn post_tool_feedback_keeps_image_envelopes_parseable() {
+        let image = serde_json::json!({"type":"image","data":"AAAA","mimeType":"image/png"});
+        let hybrid = serde_json::json!({"response":"Image a.png secret","parts":[image.clone()]})
+            .to_string();
+        let feedback = json_output(serde_json::json!({
+            "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "note"},
+            "redactions": ["secret"]
+        }));
+        for response in [hybrid, image.to_string()] {
+            let super::Decision::Rewrite { content } =
+                super::merge_post_tool_use_decisions(std::slice::from_ref(&feedback), &response)
+            else {
+                panic!("expected rewrite");
+            };
+            let parts = rig::message::ToolResultContent::from_tool_output(content.clone());
+            assert!(
+                parts
+                    .iter()
+                    .any(|part| matches!(part, rig::message::ToolResultContent::Image(_))),
+                "the image must survive: {content}"
+            );
+            let text: String = parts
+                .iter()
+                .filter_map(|part| match part {
+                    rig::message::ToolResultContent::Text(text) => Some(text.text.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert!(text.contains(super::POST_TOOL_FEEDBACK_HEADER), "{text}");
+            assert!(!text.contains("secret"), "{text}");
+        }
     }
 
     #[test]
