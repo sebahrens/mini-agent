@@ -745,7 +745,7 @@ impl PermissionChecker {
                                     "invalid `{config_field}` rule for tool `{tool_name}` pattern `{pat}`: {error}"
                                 )
                             })?
-                        } else if tool_name == "js/fetch" && *action == Action::Deny {
+                        } else if is_url_identity_tool(tool_name) && *action == Action::Deny {
                             Pattern::new(&fetch_deny_glob(pat))
                         } else {
                             Pattern::new(pat)
@@ -997,7 +997,7 @@ impl PermissionChecker {
                                 entry.push((Pattern::new_path(&canonical), action));
                             }
                             Pattern::new_path(pat)
-                        } else if alias == "js/fetch" && action == Action::Deny {
+                        } else if is_url_identity_tool(alias) && action == Action::Deny {
                             Pattern::new(&fetch_deny_glob(pat))
                         } else {
                             Pattern::new(pat)
@@ -2017,11 +2017,29 @@ impl PermissionChecker {
                 break;
             }
         }
+        // `write`, `edit` and `notebook_edit` are separate rule keys for one
+        // capability (modifying files). A deny or ask on a sibling key must
+        // not be bypassed by choosing another tool (mini-agent-9tnk6); a
+        // sibling allow never widens.
+        for sibling in write_family_siblings(tool) {
+            if let Some(rules) = self.rules.get(*sibling) {
+                for (pattern, action) in rules {
+                    if *action != Action::Allow
+                        && inputs.iter().any(|input| pattern.matches_path(input))
+                    {
+                        matched.push((pattern.specificity(), *action));
+                    }
+                }
+            }
+        }
         matched
     }
 
     fn matches_deny_rule(&self, tool: &str, inputs: &[&str]) -> bool {
-        for name in std::iter::once(tool).chain((tool == "notebook_edit").then_some("edit")) {
+        for name in std::iter::once(tool)
+            .chain((tool == "notebook_edit").then_some("edit"))
+            .chain(write_family_siblings(tool).iter().copied())
+        {
             let Some(rules) = self.rules.get(name) else {
                 continue;
             };
@@ -2100,6 +2118,15 @@ impl PermissionChecker {
     }
 
     fn is_session_allowed(&self, tool: &str, input: &str) -> bool {
+        // ReadOnly and PlanWrite mean "allow reads, deny everything else": a
+        // grant made under a broader mode (restored with a resumed session, a
+        // persisted project approval, or kept across `/mode`) must not widen
+        // them. PlanWrite plan-file writes are decided by the mode itself.
+        if matches!(self.mode, SecurityMode::ReadOnly | SecurityMode::PlanWrite)
+            && !self.is_read_tool(tool)
+        {
+            return false;
+        }
         for (allowed_tool, pattern) in &self.session_allowlist {
             // Path scopes and explicitly decoded native web origins have
             // generated literal matchers. Every other AllowAlways key (shell
@@ -2968,10 +2995,16 @@ pub(crate) fn exact_allow_scope_for_input(tool: &str, input: &str) -> Option<Str
     ))
 }
 
-/// A `js/fetch` deny glob with every `*` run widened to `**`. Fetch identities
+/// Tools whose permission identity is a URL (or URL-shaped destination list),
+/// so their deny globs use [`fetch_deny_glob`] widening.
+fn is_url_identity_tool(tool: &str) -> bool {
+    matches!(tool, "js/fetch" | "web_fetch" | "web_search")
+}
+
+/// A URL-identity (`js/fetch`, `web_fetch`, `web_search`) deny glob with every `*` run widened to `**`. Fetch identities
 /// are URLs, so a deny of `https://example.com/*` or `*` must not stop matching
 /// at the first `/` (mini-agent-ewqgo); a narrower deny would let a path through.
-fn fetch_deny_glob(pattern: &str) -> String {
+pub(crate) fn fetch_deny_glob(pattern: &str) -> String {
     let mut out = String::with_capacity(pattern.len() + 2);
     let mut chars = pattern.chars().peekable();
     while let Some(c) = chars.next() {
@@ -3002,6 +3035,16 @@ fn is_path_tool_name(tool: &str) -> bool {
             | "lsp_diagnostics"
             | "lsp_navigate"
     )
+}
+
+/// The other file-modifying rule keys that share `tool`'s capability.
+fn write_family_siblings(tool: &str) -> &'static [&'static str] {
+    match tool {
+        "write" => &["edit", "notebook_edit"],
+        "edit" => &["write", "notebook_edit"],
+        "notebook_edit" => &["write", "edit"],
+        _ => &[],
+    }
 }
 
 fn permission_tool_aliases(tool: &str) -> &'static [&'static str] {
@@ -3690,6 +3733,82 @@ mod tests {
             );
         }
         assert_eq!(fetch_deny_glob("a*b***c?"), "a**b**c?");
+    }
+
+    // mini-agent-y45pa: web_fetch identities are URL-shaped too.
+    #[test]
+    fn single_star_web_fetch_deny_matches_deeper_urls() {
+        let identity = "https://evil.example/a/b destinations=[93.184.216.34:443]";
+        for pattern in ["https://evil.example/*", "*evil.example*", "*"] {
+            for tool in ["web_fetch", "web_search"] {
+                let deny_entries = Some([(tool.to_owned(), vec![pattern.to_owned()])].into());
+                let configs = PermissionConfigs::from(PermissionConfig {
+                    deny_entries,
+                    ..PermissionConfig::default()
+                });
+                let mut checker =
+                    PermissionChecker::new(&configs, SecurityMode::Yolo, None, None).unwrap();
+                assert!(
+                    matches!(checker.check(tool, identity), CheckResult::Denied(_)),
+                    "deny `{tool}:{pattern}` must deny {identity}"
+                );
+            }
+        }
+        // Granular config form (compile_config) widens identically.
+        let configs = PermissionConfigs::from(PermissionConfig {
+            web_fetch: Some(ToolPerm::Granular(
+                [("https://evil.example/*".to_owned(), Action::Deny)].into(),
+            )),
+            ..PermissionConfig::default()
+        });
+        let mut checker = PermissionChecker::new(&configs, SecurityMode::Yolo, None, None).unwrap();
+        assert!(matches!(
+            checker.check("web_fetch", identity),
+            CheckResult::Denied(_)
+        ));
+    }
+
+    // mini-agent-9tnk6: a deny/ask on one file-modifying key covers its siblings.
+    #[test]
+    fn write_family_deny_and_ask_cover_edit_and_notebook_edit() {
+        let root = crate::tests::OwnedTestDirectory::new("9tnk6-family");
+        let env_file = root.path().canonicalize().unwrap().join("prod.env");
+        std::fs::write(&env_file, "x").unwrap();
+        let target = env_file.to_string_lossy().to_string();
+        for denied in ["write", "edit", "notebook_edit"] {
+            let deny_entries = Some([(denied.to_owned(), vec!["**/*.env".to_owned()])].into());
+            let configs = PermissionConfigs::from(PermissionConfig {
+                deny_entries,
+                ..PermissionConfig::default()
+            });
+            let mut checker = PermissionChecker::new(
+                &configs,
+                SecurityMode::Standard,
+                Some(root.path().to_path_buf()),
+                None,
+            )
+            .unwrap();
+            for tool in ["write", "edit", "notebook_edit"] {
+                assert!(
+                    matches!(checker.check_path(tool, &target), CheckResult::Denied(_)),
+                    "deny `{denied}` must deny {tool}"
+                );
+            }
+        }
+        let ask_entries = Some([("write".to_owned(), vec!["**/*.env".to_owned()])].into());
+        let configs = PermissionConfigs::from(PermissionConfig {
+            ask_entries,
+            default: Some(Action::Allow),
+            ..PermissionConfig::default()
+        });
+        let mut checker = PermissionChecker::new(
+            &configs,
+            SecurityMode::Standard,
+            Some(root.path().to_path_buf()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(checker.check_path("edit", &target), CheckResult::Ask);
     }
 
     #[test]
@@ -5382,8 +5501,13 @@ fn format45_retained_approval_query_preserves_doom_state_and_normal_revocation_p
     assert!(!checker.retains_shell_approval(script));
     checker.add_session_allowlist("shell".into(), script);
     assert!(
+        !checker.retains_shell_approval(script),
+        "a session grant never widens ReadOnly (mini-agent-o6mrz)"
+    );
+    checker.set_mode(SecurityMode::Standard);
+    assert!(
         checker.retains_shell_approval(script),
-        "existing exact session grant precedence is preserved"
+        "the exact session grant applies again in the mode it was granted under"
     );
     let checker = PermissionChecker::new(
         &PermissionConfigs::from(PermissionConfig {
@@ -5682,5 +5806,53 @@ mod proc_secret_and_external_ask_tests {
         let mut yolo = checker(&workspace, SecurityMode::Yolo, config);
         let other = base.join("other.md").to_string_lossy().into_owned();
         assert_eq!(yolo.check_path("read", &other), CheckResult::Allowed);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn restored_session_grants_never_widen_readonly_or_planwrite_modes() {
+    // mini-agent-o6mrz: a grant restored from a resumed session or persisted
+    // project approvals must not bypass the narrower mode's contract.
+    let root = crate::tests::OwnedTestDirectory::new("o6mrz-grants");
+    let src = root.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let target = src.join("x.rs");
+    std::fs::write(&target, "x").unwrap();
+    let target = target.canonicalize().unwrap().to_string_lossy().to_string();
+    for mode in [SecurityMode::ReadOnly, SecurityMode::PlanWrite] {
+        let mut checker = PermissionChecker::new(
+            &PermissionConfigs::default(),
+            SecurityMode::Standard,
+            Some(root.path().to_path_buf()),
+            None,
+        )
+        .unwrap();
+        checker.add_session_allowlist("write".into(), &target);
+        checker.add_session_allowlist("edit".into(), &target);
+        checker.add_session_allowlist("shell".into(), "touch pwned");
+        checker.add_session_allowlist("mcp_tool".into(), "srv/danger");
+        checker.set_mode(mode);
+        for tool in ["write", "edit"] {
+            assert!(
+                matches!(checker.check_path(tool, &target), CheckResult::Denied(_)),
+                "{mode:?} {tool}: {:?}",
+                checker.check_path(tool, &target)
+            );
+        }
+        assert!(
+            matches!(
+                checker.check("shell", "touch pwned"),
+                CheckResult::Denied(_)
+            ),
+            "{mode:?} shell"
+        );
+        assert!(
+            !matches!(
+                checker.check("mcp_tool", "srv/danger"),
+                CheckResult::Allowed
+            ),
+            "{mode:?} mcp"
+        );
     }
 }

@@ -76,19 +76,21 @@ pub(crate) fn github_latest_url(repository: &str) -> Option<String> {
     ))
 }
 
-fn notice(version: Option<&str>, current: &str) -> Option<String> {
+fn running_channel(version: &str) -> crate::self_update::InstallChannel {
     let exe = std::env::current_exe()
         .and_then(|path| path.canonicalize())
         .ok();
     let home = std::env::var("HOME").ok();
-    let channel = match &exe {
-        Some(exe) => crate::self_update::classify_install(
-            &exe.to_string_lossy(),
-            home.as_deref(),
-            version.unwrap_or(current),
-        ),
+    match &exe {
+        Some(exe) => {
+            crate::self_update::classify_install(&exe.to_string_lossy(), home.as_deref(), version)
+        }
         None => crate::self_update::InstallChannel::SelfManaged,
-    };
+    }
+}
+
+fn notice(version: Option<&str>, current: &str) -> Option<String> {
+    let channel = running_channel(version.unwrap_or(current));
     notice_for(version, current, &channel)
 }
 
@@ -153,10 +155,19 @@ pub(crate) fn headless_notice(
 }
 
 fn cached_headless_notice(state: &Path, current: &str) -> Option<String> {
+    cached_headless_notice_with(state, current, running_channel)
+}
+
+/// Same install-channel classification as the interactive notice, so a
+/// managed install is told its package manager's command, not `update`.
+fn cached_headless_notice_with(
+    state: &Path,
+    current: &str,
+    channel: impl FnOnce(&str) -> crate::self_update::InstallChannel,
+) -> Option<String> {
     let cache = read_cache(&state.join("update").join("latest.json")).ok()??;
-    let version = normalized_version(cache.latest_version.as_deref()?)?;
-    (stable_version(&version)? > stable_version(current)?)
-        .then(|| format!("[update] v{version} available; run `mini-agent update`."))
+    let latest = cache.latest_version.as_deref()?;
+    notice_for(Some(latest), current, &channel(latest))
 }
 
 static PENDING_STARTUP_NOTICE: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<String>>> =
@@ -271,7 +282,12 @@ fn save_cache(path: &Path, cache: &Cache) -> io::Result<()> {
 }
 
 fn recently_checked(checked_at: u64, now: u64) -> bool {
-    now.saturating_sub(checked_at) < CHECK_INTERVAL_SECS
+    // A small clock rollback still counts as recent (no retry storm), but a
+    // `checked_at` further ahead than one interval (a clock that was far
+    // ahead, or an edited file) is stale, not "checked just now" until the
+    // clock catches up.
+    checked_at.saturating_sub(now) <= CHECK_INTERVAL_SECS
+        && now.saturating_sub(checked_at) < CHECK_INTERVAL_SECS
 }
 
 async fn check_cached<F, Fut>(
@@ -454,13 +470,39 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    fn self_managed(_: &str) -> crate::self_update::InstallChannel {
+        crate::self_update::InstallChannel::SelfManaged
+    }
+
+    // mini-agent-z7jcp: a managed install gets its channel instruction in
+    // headless runs, never `mini-agent update`.
+    #[test]
+    fn headless_notice_uses_the_install_channel_instruction() {
+        let dir =
+            std::env::temp_dir().join(format!("update-headless-channel-{}", uuid::Uuid::new_v4()));
+        let update = dir.join("update");
+        std::fs::create_dir_all(&update).unwrap();
+        let cache = Cache {
+            schema: 1,
+            checked_at: 1,
+            latest_version: Some("9.9.9".into()),
+        };
+        save_cache(&update.join("latest.json"), &cache).unwrap();
+        let managed =
+            |_: &str| crate::self_update::InstallChannel::Managed("Run `brew upgrade foo`.".into());
+        let text = cached_headless_notice_with(&dir, "1.0.0", managed).unwrap();
+        assert_eq!(text, "[update] v9.9.9 available. Run `brew upgrade foo`.");
+        assert!(!text.contains("mini-agent update"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn headless_notice_reads_only_the_cache_and_ignores_stale_or_hostile_values() {
         let dir = std::env::temp_dir().join(format!("update-notice-{}", uuid::Uuid::new_v4()));
         let update = dir.join("update");
         crate::fs::ensure_private_directory(&update).unwrap();
         assert_eq!(
-            cached_headless_notice(&dir, "1.0.0"),
+            cached_headless_notice_with(&dir, "1.0.0", self_managed),
             None,
             "no cache, no network"
         );
@@ -474,17 +516,26 @@ mod tests {
         };
         write("1.2.0");
         assert_eq!(
-            cached_headless_notice(&dir, "1.0.0").as_deref(),
+            cached_headless_notice_with(&dir, "1.0.0", self_managed).as_deref(),
             Some("[update] v1.2.0 available; run `mini-agent update`.")
         );
-        assert_eq!(cached_headless_notice(&dir, "1.2.0"), None);
-        assert_eq!(cached_headless_notice(&dir, "2.0.0"), None);
+        assert_eq!(
+            cached_headless_notice_with(&dir, "1.2.0", self_managed),
+            None
+        );
+        assert_eq!(
+            cached_headless_notice_with(&dir, "2.0.0", self_managed),
+            None
+        );
         std::fs::write(
             update.join("latest.json"),
             br#"{"schema":1,"checked_at":1,"latest_version":"1.2.0; rm -rf /"}"#,
         )
         .unwrap();
-        assert_eq!(cached_headless_notice(&dir, "1.0.0"), None);
+        assert_eq!(
+            cached_headless_notice_with(&dir, "1.0.0", self_managed),
+            None
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -614,6 +665,11 @@ mod tests {
         assert!(recently_checked(100, 100 + CHECK_INTERVAL_SECS - 1));
         assert!(!recently_checked(100, 100 + CHECK_INTERVAL_SECS));
         assert!(!recently_checked(100, u64::MAX));
+        // mini-agent-u7rlk: a cache stamped in the future is stale.
+        assert!(recently_checked(101, 100));
+        assert!(recently_checked(100 + CHECK_INTERVAL_SECS, 100));
+        assert!(!recently_checked(101 + CHECK_INTERVAL_SECS, 100));
+        assert!(!recently_checked(99_999_999_999, 1_700_000_000));
     }
 
     #[test]
@@ -685,6 +741,28 @@ mod tests {
             !state.exists(),
             "excluded modes must not even create cache state"
         );
+    }
+
+    // mini-agent-u7rlk
+    #[tokio::test]
+    async fn update_cache_stamped_in_the_future_is_refreshed() {
+        let root = crate::tests::OwnedTestDirectory::new("update-cache-future");
+        let update = root.path().join("update");
+        std::fs::create_dir_all(&update).unwrap();
+        std::fs::write(
+            update.join("latest.json"),
+            br#"{"schema":1,"checked_at":99999999999,"latest_version":null}"#,
+        )
+        .unwrap();
+        let calls = AtomicUsize::new(0);
+        let notice = check_cached(root.path(), 1_700_000_000, "1.9.4", || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Some("v1.10.0".into())
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "future cache must refresh");
+        assert!(notice.unwrap().contains("v1.10.0 available"));
     }
 
     #[tokio::test]

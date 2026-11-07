@@ -5930,3 +5930,30 @@ fn stream_json_input_requires_stream_json_output() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("requires --output stream-json"));
 }
+
+/// mini-agent-rgdf5: an unknown `--quick-model` in headless mode is a usage
+/// error (exit 2) with a failure record, before any provider call.
+#[test]
+fn unknown_quick_model_headless_is_exit_2_with_failure_record() {
+    for format in ["text", "json", "stream-json"] {
+        let root = TempRoot::new();
+        let mut command = root.command();
+        command.args(["--quick-model", "sonet", "-p", "--output", format, "reply"]);
+        let output = bounded_output(command);
+        assert_eq!(output.status.code(), Some(2), "{format}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("unknown quick model: 'sonet'"), "{stderr}");
+        if format != "text" {
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(value["stop_reason"], "failed", "{format}");
+            assert!(
+                value["result"]
+                    .as_str()
+                    .unwrap()
+                    .contains("unknown quick model: 'sonet'"),
+                "{value}"
+            );
+        }
+        assert!(!root.0.join("sessions").exists());
+    }
+}

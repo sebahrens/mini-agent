@@ -1141,6 +1141,7 @@ layer. A missing file means no managed policy.
 [permissions]
 deny = { shell = ["rm -rf *"], write = ["/etc/**"] }  # appended to permission-deny; wins over allow rules
 # a deny on write, edit or notebook_edit applies to all three (and js/write_file)
+# in a shell deny, `*` crosses `/` (it is widened to `**`), so "rm -rf *" denies `rm -rf build/out`
 allowed_modes = ["standard", "guarded", "readonly"]   # security modes users may select (default: all)
 disable_yolo = true                                   # shorthand: remove `yolo` from the modes
 require_permission_checks = true                      # refuse --dangerously-skip-permissions (implied by deny, allowed_modes, disable_yolo)
@@ -4869,6 +4870,12 @@ proxy's policy. The native connect timeout is a third of `web-fetch-timeout-secs
 A `#fragment` on a native `web_fetch` URL (or a redirect target) is dropped, since
 fragments are never sent to servers; the tool output notes it. The JS `fetch()`
 broker still refuses fragments.
+
+A deny on any of `write`, `edit` or `notebook_edit` (config, `--deny`, project
+layers, managed policy) applies to all three; an `ask` on one also prompts for
+its siblings. An `allow` on one never widens the others. Deny globs for the
+URL-shaped tools (`js/fetch`, `web_fetch`, `web_search`) widen every `*` to `**`,
+so `https://host/*` denies deeper paths.
 
 Native network permission keys are `web_fetch` and `web_search`. They accept
 simple allow/ask/deny values or granular glob/regex rules, and the existing
