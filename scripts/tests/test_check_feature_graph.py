@@ -132,6 +132,7 @@ class FeatureGraphTests(unittest.TestCase):
             {
                 "fastembed",
                 "hnsw_rs",
+                "image",
                 "matrixmultiply",
                 "ort",
                 "rquickjs",
@@ -148,7 +149,9 @@ class FeatureGraphTests(unittest.TestCase):
             {"hooks", "advisor", "lsp", "multimodal", "pdf"},
             set(extras.features.split(",")),
         )
-        self.assertEqual({"lsp-types", "process-wrap", "url", "which"}, extras.required)
+        self.assertEqual(
+            {"image", "lsp-types", "process-wrap", "url", "which"}, extras.required
+        )
         self.assertNotIn("skills-embed", extras.features)
         for job, names in (
             ("test", feature_graph.TEST_MATRIX_ROWS),
