@@ -3731,7 +3731,7 @@ async fn drive_permission_bridge(
         let recalled = ask.tool_call_id.as_deref().and_then(toolcall::recall_args);
         let mut content = recalled
             .as_ref()
-            .map(|args| toolcall::pending_diffs(&ask.tool, args))
+            .map(|args| toolcall::pending_content(&ask.tool, args))
             .unwrap_or_default();
         content.push(ToolCallContent::from(ContentBlock::Text(TextContent::new(
             ask.input.clone(),
