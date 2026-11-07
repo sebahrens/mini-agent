@@ -2215,7 +2215,7 @@ async fn write_guarded_path(
     crate::session::file_checkpoints::skipped();
     let after = crate::fs::ContentDigest::of(content.as_bytes());
     let recorded = content.clone();
-    write_approved_file_cancellable(target, content, base.clone(), cancellation).await?;
+    write_approved_file_cancellable(target, content, base, cancellation).await?;
     crate::session::file_checkpoints::published();
     guard.tracker.untrack_read_path(&key);
     let show_before = before.as_deref().filter(|text| {
@@ -10279,7 +10279,7 @@ mod tests {
         let error = write_approved_file_cancellable(
             target,
             "model".to_string(),
-            Some(base.clone()),
+            Some(base),
             crate::fs::AtomicWriteCancellation::default(),
         )
         .await
