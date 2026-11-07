@@ -196,8 +196,16 @@ impl CommandCredential {
         Ok(secret)
     }
 
-    async fn refresh(&self, force: bool) -> Result<bool, String> {
+    /// Re-runs the command. `rejected` is the generation a `401` rejected: when
+    /// another request already advanced past it while this one waited on the
+    /// gate, the newer secret is reported without running the command again.
+    async fn refresh(&self, force: bool, rejected: Option<u64>) -> Result<bool, String> {
         let _gate = self.gate.lock().await;
+        if let Some(rejected) = rejected
+            && self.lock().generation > rejected
+        {
+            return Ok(true);
+        }
         if !force && self.is_fresh(&self.lock()) {
             return Ok(false);
         }
@@ -229,7 +237,7 @@ impl CommandCredential {
                 return None;
             }
             let expired = !self.is_fresh(&self.lock());
-            if expired && let Err(error) = self.refresh(false).await {
+            if expired && let Err(error) = self.refresh(false, None).await {
                 tracing::warn!("{error}");
             }
             let (current, generation) = {
@@ -271,11 +279,9 @@ impl CommandCredential {
     /// worthwhile.
     async fn unauthorized(&self, generation: u64) -> bool {
         {
-            // Another request already refreshed past the rejected secret.
-            if self.lock().generation > generation {
-                return true;
-            }
-            match self.refresh(true).await {
+            // The generation is re-checked inside the gate, so a request that
+            // waited behind another refresh is resent with the new secret.
+            match self.refresh(true, Some(generation)).await {
                 Ok(changed) => changed,
                 Err(error) => {
                     tracing::warn!("{error}");
@@ -1044,6 +1050,31 @@ mod tests {
             .expect("expired token renewed before sending");
         assert_eq!(*seen.lock().unwrap(), ["ttl-2"]);
         configure(None).unwrap();
+    }
+
+    // A second 401 carrying the same rejected secret waits on the gate while
+    // another request renews; it must be resent with that secret, not re-run
+    // the command and report "unchanged".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_401_queued_behind_a_refresh_is_resent_without_rerunning_the_command() {
+        let dir = crate::tests::OwnedTestDirectory::new("key-command-queued-401");
+        let counter = dir.path().join("runs");
+        let script = format!("echo run >> '{}'; echo S2", counter.display());
+        let credential = CommandCredential::new("queued", spec(&script));
+        credential.store("S1".to_owned());
+        let rejected = credential.lock().generation;
+        let gate = credential.gate.lock().await;
+        let waiter = {
+            let credential = credential.clone();
+            tokio::spawn(async move { credential.unauthorized(rejected).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The first request's refresh lands while the second waits.
+        assert!(credential.store("S2".to_owned()));
+        drop(gate);
+        assert!(waiter.await.unwrap(), "queued 401 is resent with S2");
+        assert!(!counter.exists(), "no redundant command run");
     }
 
     #[cfg(unix)]
