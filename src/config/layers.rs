@@ -192,11 +192,26 @@ fn validate_toml_bounds_at(
                 index = index.saturating_add(2);
                 continue;
             }
-            if byte == delimiter
-                && (!triple || bytes.get(index..index + 3) == Some(&[delimiter; 3]))
-            {
-                quote = None;
-                index += if triple { 3 } else { 1 };
+            if byte == delimiter {
+                if !triple {
+                    quote = None;
+                    index += 1;
+                    continue;
+                }
+                // TOML allows one or two quote characters of content directly
+                // before the closing triple delimiter, so the closer is the
+                // last three of a run of at most five.
+                let run = bytes[index..]
+                    .iter()
+                    .take(5)
+                    .take_while(|&&b| b == delimiter)
+                    .count();
+                if run >= 3 {
+                    quote = None;
+                    index += run;
+                    continue;
+                }
+                index += run;
                 continue;
             }
             index += 1;
@@ -686,6 +701,29 @@ mod tests {
                 .cloned()
                 .collect();
             let scanned = validate_toml_bounds_diagnostic(document, MAX_LAYER_BYTES).unwrap();
+            assert_eq!(scanned, expected, "{document:?}");
+        }
+    }
+
+    #[test]
+    fn multiline_strings_may_end_in_quote_characters() {
+        let documents = [
+            "default_prompt = \"\"\"say \"hi\"\"\"\"\nmodel = \"x\"\n",
+            "a = \"\"\"\"This,\" she said, \"is just a pointless statement.\"\"\"\"\nb = 1\n",
+            "a = \'\'\'x\'\'\'\'\'\nb = 1\n",
+            "a = \'\'\'x\'\'\'\'\nb = 1\n",
+            "a = \"\"\"x\"\"\"\"\"\nb = 1\n",
+            "a = \"\"\"x \"\" y\"\"\"\nb = 1\n",
+        ];
+        for document in documents {
+            let expected: Vec<String> = document
+                .parse::<toml::Table>()
+                .unwrap_or_else(|error| panic!("{document:?}: {error}"))
+                .keys()
+                .cloned()
+                .collect();
+            let scanned = validate_toml_bounds_diagnostic(document, MAX_LAYER_BYTES)
+                .unwrap_or_else(|error| panic!("{document:?}: {error:?}"));
             assert_eq!(scanned, expected, "{document:?}");
         }
     }
