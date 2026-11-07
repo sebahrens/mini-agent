@@ -212,15 +212,19 @@ fn command_is_read_only(
     let Some((command, args)) = words.split_first() else {
         return false;
     };
-    // A sed address such as `/start/,/end/p` is a script, not a path.
+    // A sed address such as `/start/,/end/p` is a script, not a path; only the
+    // one operand `sed_is_read_only` selects as the script is exempt, so a
+    // file operand like `/etc/p` is still confined and screened.
+    let sed_script = (command == "sed").then(|| sed_script_index(args)).flatten();
     if !args
         .iter()
-        .all(|arg| (command == "sed" && is_sed_script(arg)) || arg_ok(arg, working_dir))
+        .enumerate()
+        .all(|(index, arg)| sed_script == Some(index) || arg_ok(arg, working_dir))
     {
         return false;
     }
-    for arg in args {
-        if command == "sed" && is_sed_script(arg) {
+    for (index, arg) in args.iter().enumerate() {
+        if sed_script == Some(index) {
             continue;
         }
         if let Some(long) = arg.strip_prefix("--") {
@@ -324,17 +328,27 @@ fn command_is_read_only(
 /// or write/execute command is expressible.
 fn sed_is_read_only(args: &[String]) -> bool {
     let mut quiet = false;
-    let mut script: Option<&str> = None;
     for arg in args {
         match arg.as_str() {
             "-n" | "--quiet" | "--silent" => quiet = true,
             "-E" | "-r" | "--regexp-extended" => {}
+            // GNU getopt permutes, so a flag after the script counts too.
             flag if flag.starts_with('-') && flag != "-" => return false,
-            other if script.is_none() => script = Some(other),
             _ => {}
         }
     }
-    quiet && script.is_some_and(is_sed_script)
+    quiet && sed_script_index(args).is_some_and(|index| is_sed_script(&args[index]))
+}
+
+/// Index of the first operand that is not one of the accepted sed flags: the
+/// script. Every later operand is a file.
+fn sed_script_index(args: &[String]) -> Option<usize> {
+    args.iter().position(|arg| {
+        !matches!(
+            arg.as_str(),
+            "-n" | "--quiet" | "--silent" | "-E" | "-r" | "--regexp-extended"
+        ) && (!arg.starts_with('-') || arg == "-")
+    })
 }
 
 fn is_sed_script(script: &str) -> bool {
@@ -551,6 +565,23 @@ mod tests {
                 .paths
                 .contains(&".env".to_string())
         );
+    }
+
+    #[test]
+    fn sed_file_operands_that_look_like_scripts_are_still_screened() {
+        for script in [
+            "sed -n 1p /etc/p",
+            "sed -n 1p /tmp/p",
+            "sed -n 1p /root/p",
+            "sed -n 1,2p /home/p",
+            "sed -n 1p src/a /etc/p",
+            "sed -n 1p f -i",
+        ] {
+            no(script);
+        }
+        let report = super::classify("sed -n 1p /work/repo/p", WD, true).unwrap();
+        assert_eq!(report.paths, vec!["/work/repo/p".to_string()]);
+        yes("sed -n '/start/,/end/p' src/lib.rs");
     }
 
     #[test]
