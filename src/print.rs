@@ -4154,11 +4154,21 @@ mod tests {
         }));
         let kinds: Vec<_> = closed
             .iter()
-            .map(|row| row["event"]["type"].as_str().or(row["type"].as_str()).unwrap())
+            .map(|row| {
+                row["event"]["type"]
+                    .as_str()
+                    .or(row["type"].as_str())
+                    .unwrap()
+            })
             .collect();
         assert_eq!(
             kinds,
-            ["content_block_stop", "message_delta", "message_stop", "assistant"]
+            [
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+                "assistant"
+            ]
         );
         assert!(closed[3]["uuid"].is_string());
 

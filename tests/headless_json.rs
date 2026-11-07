@@ -2865,7 +2865,11 @@ fn stream_json_schema_claude_emits_sdk_messages_and_default_stays_native() {
         let mut command = root.provider_command("write");
         command.args(["-p", "--output", "stream-json", "--no-session"]);
         if claude {
-            command.args(["--stream-json-schema", "claude", "--include-partial-messages"]);
+            command.args([
+                "--stream-json-schema",
+                "claude",
+                "--include-partial-messages",
+            ]);
         }
         command.arg("write the file");
         let output = bounded_output(command);
@@ -2919,10 +2923,16 @@ fn stream_json_schema_claude_emits_sdk_messages_and_default_stays_native() {
         .iter()
         .map(|row| row["event"]["type"].as_str().unwrap())
         .collect();
-    assert!(!kinds.is_empty(), "partial stream events expected: {claude:?}");
+    assert!(
+        !kinds.is_empty(),
+        "partial stream events expected: {claude:?}"
+    );
     assert_eq!(kinds[0], "message_start", "{kinds:?}");
     assert_eq!(kinds.last().copied(), Some("message_stop"), "{kinds:?}");
-    let starts = kinds.iter().filter(|k| **k == "content_block_start").count();
+    let starts = kinds
+        .iter()
+        .filter(|k| **k == "content_block_start")
+        .count();
     let stops = kinds.iter().filter(|k| **k == "content_block_stop").count();
     assert_eq!(starts, stops, "{kinds:?}");
     assert!(starts >= 1, "{kinds:?}");

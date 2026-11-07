@@ -808,7 +808,9 @@ impl GitTool {
         result["submodules_notice"] = serde_json::json!(if complete {
             SUBMODULES_NOTICE.to_string()
         } else {
-            format!("{SUBMODULES_NOTICE} (the index could not be fully listed, so submodule presence is unknown)")
+            format!(
+                "{SUBMODULES_NOTICE} (the index could not be fully listed, so submodule presence is unknown)"
+            )
         });
     }
 
