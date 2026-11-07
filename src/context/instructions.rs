@@ -61,7 +61,7 @@ fn fit_instruction_source(
         return Err("Workspace instructions exceed the bounded UTF-8 source limit".into());
     }
     let target = room - notice_cost;
-    while escaped(&text) > target {
+    while !text.is_empty() && escaped(&text) > target {
         let over = escaped(&text) - target;
         let mut end = text.len().saturating_sub(over.max(1));
         while !text.is_char_boundary(end) {
@@ -2204,6 +2204,19 @@ mod tests {
         let found = include_paths(text).unwrap();
         let found: Vec<_> = found.iter().map(|p| p.to_str().unwrap()).collect();
         assert_eq!(found, ["alice", "real.md", "b c.md"]);
+    }
+    #[test]
+    fn fit_instruction_source_terminates_when_room_is_notice_cost_plus_one() {
+        let notice_cost = serde_json::to_string(SOURCE_TRUNCATION_NOTICE)
+            .unwrap()
+            .len();
+        for extra in 0..4 {
+            let out = fit_instruction_source("x".repeat(500), false, notice_cost + 1 + extra);
+            assert!(
+                out.unwrap()
+                    .ends_with("truncated: it exceeds the per-source instruction limit]")
+            );
+        }
     }
     #[test]
     fn context63_include_cycles_depth_missing_escape_and_postescape_budget_are_bounded() {
