@@ -1790,7 +1790,8 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         .default_max_turns(cli.resolve_max_agent_turns(cfg))
         .add_hook(crate::agent::runner::ToolLoopGuard)
         .add_hook(tools::mutation_diff::MutationDiffHook)
-        .add_hook(tools::bash::ShellCallIdHook);
+        .add_hook(tools::bash::ShellCallIdHook)
+        .add_hook(crate::agent::image_budget::ImageBudgetHook);
     // Restates the objective every few tool results, so a long tool-heavy
     // round cannot drift away from it between provider calls.
     #[cfg(feature = "goal")]

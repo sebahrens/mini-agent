@@ -397,3 +397,14 @@ SDK's own `cargo test --lib` target did not compile before this change (stale fi
 Anthropic streaming and OpenAI completion tests), so the application tests in
 `src/tests/pdf_page_image_tests.rs` exercise the Anthropic, Responses and Gemini conversions.
 
+
+## History replacement combined with injected input (mini-agent-xql2b)
+
+`drive_agent` in `agent/prompt_request/streaming.rs` used to terminate the run with
+"canonical input injection cannot combine with a history replacement" when one turn's merged
+`RequestPatch` carried both `append_input` (steering, subagent inbox) and `history` (the
+application's per-request image budget). It now appends the input to the run as before and extends
+the replacement with the messages after the prior history the hook saw (the previous prompt and the
+injected input, in order), so nothing is dropped or reordered. A patch without both fields behaves
+exactly as before. The application regression combines a steering injection with an image-budget
+replacement. No dependency version, checksum, license or source-input policy changes.

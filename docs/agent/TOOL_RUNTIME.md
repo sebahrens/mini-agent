@@ -1788,6 +1788,18 @@ transport formats return an explicit error. Exact image data survives canonical
 save/reload and backend tool follow-ups, within existing native/session envelope
 limits. See [Image reads](IMAGE_READ.md) for protocol, capability and replay limits.
 
+**Per-request image budget.** Each model request carries at most 20 images (history, pasted
+images, tool-result images and the newest message together) and 16 MiB of encoded image data.
+Beyond that the *oldest* images are replaced, for that request only, by a text placeholder naming
+the budget, so the session never wedges on the provider's "many-image requests" rejection (more
+than 20 images tightens the per-image dimension limit to 2000-3000 px). The count-based drop is
+rounded up to blocks of 5 images so consecutive requests share a stable prefix for prompt caching;
+compaction image evidence is dropped only after every other image. The saved transcript keeps the
+real images, and re-reading the file brings one back. If a provider still rejects the request with
+a many-image / too-many-images error, the cap is halved for the rest of the process and the request
+is rebuilt once. The elision is logged at `warn` level and the placeholder tells the model what
+happened.
+
 
 ### Opt-in writing subagents
 

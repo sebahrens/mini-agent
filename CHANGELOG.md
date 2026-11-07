@@ -16,6 +16,7 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- Model requests now carry at most 20 images and 16 MiB of encoded image data: older images are replaced by a text placeholder for that request (the saved transcript is unchanged), and a provider "many-image requests" rejection halves the cap and rebuilds the request once. The vendored Rig no longer fails a turn that combines injected input with a history replacement (mini-agent-xql2b).
 - JS `spawn` `too_large` now carries a hint (program binary over 64 MiB or more than 4096 arguments; use the shell tool) and the spawn description states the executable limit (mini-agent-sebpw).
 - `git` `log` commits now include a bounded `body` (2 KiB, `body_truncated`) with trailers, records use a per-call unforgeable terminator, and an output-capped page offers `next_skip` (mini-agent-umewt).
 - Background `task` jobs: `task_result` takes `wait_secs` (1-600) to block until the job settles, and headless runs wait up to `[subagents] headless_exit_wait_secs` (default 300; `0` restores immediate cancel) for running background tasks before exit, reporting any cancelled on stderr (mini-agent-5ezmf).

@@ -509,7 +509,7 @@ where
                     }
                     hook_ctx.set_turn(turn);
 
-                    let request_patch =
+                    let mut request_patch =
                         match resolve_completion_call(&runner.hooks, &hook_ctx, &prompt, &history, turn).await {
                             CompletionCallOutcome::Terminate(reason) => {
                                 yield Err(StreamingError::Prompt(Box::new(run.cancel_error(reason))));
@@ -518,21 +518,29 @@ where
                             CompletionCallOutcome::Proceed(request_patch) => request_patch,
                         };
 
-                    if let Some(patch) = &request_patch
-                        && !patch.append_input.is_empty()
-                    {
-                        if patch.history.is_some() {
-                            yield Err(StreamingError::Prompt(Box::new(run.cancel_error("canonical input injection cannot combine with a history replacement"))));
-                            break 'outer;
-                        }
-                        if let Err(error) = run.append_input(&patch.append_input) {
+                    let injected_input = request_patch
+                        .as_ref()
+                        .map(|patch| patch.append_input.clone())
+                        .filter(|input| !input.is_empty());
+                    if let Some(append_input) = injected_input {
+                        let replaced_prior_len = history.len();
+                        if let Err(error) = run.append_input(&append_input) {
                             yield Err(StreamingError::Prompt(Box::new(error)));
                             break 'outer;
                         }
                         let mut full = run.full_history();
                         prompt = full.pop().expect("injected input is nonempty");
                         history = full;
-                        yield Ok(DriveItem::Item(MultiTurnStreamItem::InputInjected(patch.append_input.clone())));
+                        // A history replacement covers only the prior history the
+                        // hook saw; the previous prompt and the injected input follow
+                        // it so they are neither dropped nor reordered
+                        // (mini-agent-xql2b).
+                        if let Some(patch) = request_patch.as_mut()
+                            && let Some(replacement) = patch.history.as_mut()
+                        {
+                            replacement.extend(history.iter().skip(replaced_prior_len).cloned());
+                        }
+                        yield Ok(DriveItem::Item(MultiTurnStreamItem::InputInjected(append_input)));
                     }
 
                     // Record this turn's base system prompt — the patched-or-baseline
