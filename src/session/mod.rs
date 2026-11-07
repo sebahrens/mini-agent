@@ -945,6 +945,12 @@ pub struct Session {
     /// clones cannot borrow a newer revision from the shared frontier cell.
     #[serde(skip)]
     pub(crate) native_publication: Option<native_publication::NativePublication>,
+    /// Estimated persisted bytes right after the most recent compaction
+    /// (runtime only). Retained image pixels survive summarizing, so when this
+    /// is still over the byte-pressure threshold another compaction cannot
+    /// relieve the pressure (mini-agent-cbjft).
+    #[serde(skip)]
+    pub(crate) bytes_after_last_compaction: Option<usize>,
     /// Exact runtime background-job provenance. Data restored from JSON never
     /// installs an observation owner or makes an imported task live.
     #[cfg(feature = "subagents")]
@@ -1518,6 +1524,7 @@ impl Session {
             retired_native_history: Vec::new(),
             native_frontier: native_replay::NativeFrontier::default(),
             native_publication: None,
+            bytes_after_last_compaction: None,
             #[cfg(feature = "subagents")]
             background_observations: None,
             #[cfg(feature = "subagents")]
@@ -2728,6 +2735,21 @@ impl Session {
         })
     }
 
+    /// Byte pressure for arming the mid-turn boundary. Unlike
+    /// [`size_pressure`](Self::size_pressure) it is false when the last
+    /// compaction already left the session over the threshold: the remaining
+    /// bytes are retained pixels that summarizing cannot shrink, so stopping
+    /// at every tool batch would only re-run a futile compaction each segment
+    /// (mini-agent-cbjft).
+    pub(crate) fn mid_turn_size_pressure(&self, fraction: Option<f64>) -> bool {
+        self.size_pressure(fraction)
+            && fraction.is_some_and(|fraction| {
+                self.bytes_after_last_compaction.is_none_or(|floor| {
+                    floor as f64 <= storage::MAX_SESSION_BYTES as f64 * fraction
+                })
+            })
+    }
+
     pub fn needs_compaction_after_tool_result_pruning(
         &self,
         reserve_tokens: u64,
@@ -3053,6 +3075,7 @@ impl Session {
         self.rewind_undo = None;
         self.mark_history_changed();
         self.read_tracker.clear();
+        self.bytes_after_last_compaction = Some(self.approx_persisted_bytes());
         self.updated_at = CompactString::new(chrono::Utc::now().to_rfc3339());
     }
 

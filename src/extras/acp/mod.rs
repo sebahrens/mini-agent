@@ -492,6 +492,11 @@ impl SessionHistory {
             // Retained pixels cannot be shrunk by repeatedly summarizing a recap.
             // Let the caller report the remaining fixed evidence pressure.
             if cut <= self.live_start() {
+                // Nothing left to summarize: later byte-pressure checks must
+                // know a further relief cannot shrink what remains
+                // (mini-agent-cbjft).
+                self.session.bytes_after_last_compaction =
+                    Some(self.session.approx_persisted_bytes());
                 return Some(usage);
             }
             let previous = self.session.compacted_context().0.map(str::to_owned);
@@ -5070,7 +5075,7 @@ async fn execute_prompt(
                 state.cfg.resolve_mid_turn_trigger_threshold(
                     history
                         .session
-                        .size_pressure(state.cfg.resolve_compact_size_fraction()),
+                        .mid_turn_size_pressure(state.cfg.resolve_compact_size_fraction()),
                 ),
             )
             .filter(|_| mid_turn_enabled)
@@ -5604,7 +5609,7 @@ async fn execute_prompt(
             let threshold = state.cfg.resolve_mid_turn_trigger_threshold(
                 history
                     .session
-                    .size_pressure(state.cfg.resolve_compact_size_fraction()),
+                    .mid_turn_size_pressure(state.cfg.resolve_compact_size_fraction()),
             )?;
             Some(AcpMidTurn {
                 window: pressure.window,

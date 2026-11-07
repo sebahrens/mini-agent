@@ -256,6 +256,33 @@ mod tests {
         assert!(!small.size_pressure(Some(0.75)));
     }
     #[test]
+    fn mid_turn_byte_pressure_stops_when_compaction_cannot_shrink_retained_images() {
+        let mut session = crate::session::Session::new("logical", "model", 1_000_000, "");
+        let raw = vec![7u8; 1_900_000];
+        for _ in 0..7 {
+            session.add_user_message(
+                PersistedUserMessage::new(vec![image(&raw), image(&raw)]).unwrap(),
+            );
+        }
+        assert!(session.mid_turn_size_pressure(Some(0.75)));
+        // A relief that summarizes one prompt leaves the kept images over the
+        // threshold: arming at every tool batch would only repeat it.
+        session.compress("recap".to_owned(), 1, 0);
+        assert!(session.size_pressure(Some(0.75)));
+        assert!(!session.mid_turn_size_pressure(Some(0.75)));
+        // A compaction that does bring the session under the threshold keeps
+        // the trigger meaningful for later growth.
+        session.compress("recap".to_owned(), 5, 0);
+        assert!(!session.size_pressure(Some(0.75)));
+        for _ in 0..3 {
+            session.add_user_message(
+                PersistedUserMessage::new(vec![image(&raw), image(&raw)]).unwrap(),
+            );
+        }
+        assert!(session.size_pressure(Some(0.75)));
+        assert!(session.mid_turn_size_pressure(Some(0.75)));
+    }
+    #[test]
     fn history_prefix_conversion_leaves_the_session_cache_and_messages_alone() {
         let mut session = crate::session::Session::new("logical", "model", 32_000, "");
         session.add_user_message(

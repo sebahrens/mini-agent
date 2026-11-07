@@ -3973,7 +3973,7 @@ async fn run_bound_headless_segment(
             // Byte pressure (images) ends the segment at the next boundary,
             // even when the token threshold is disabled.
             cfg.resolve_mid_turn_trigger_threshold(
-                session.size_pressure(cfg.resolve_compact_size_fraction()),
+                session.mid_turn_size_pressure(cfg.resolve_compact_size_fraction()),
             )
         })
         .flatten()
@@ -5149,7 +5149,7 @@ async fn relieve_headless_turn(
             (mid_turn_available && cfg.resolve_compact_enabled() && session.context_window > 0)
                 .then(|| {
                     cfg.resolve_mid_turn_trigger_threshold(
-                        session.size_pressure(cfg.resolve_compact_size_fraction()),
+                        session.mid_turn_size_pressure(cfg.resolve_compact_size_fraction()),
                     )
                 })
                 .flatten()
