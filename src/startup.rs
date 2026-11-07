@@ -4191,6 +4191,8 @@ async fn run_bound_headless_round(
     native_ticket: &mut Option<crate::session::native_publication::NativePublicationTicket>,
     native_owner: &mut Option<provider::NativeRunOwner>,
     relief_usage: &mut crate::event::UsageDelta,
+    // Tool traffic of the earlier segments of this round (mini-agent-yt0mb).
+    relief_interactions: &mut Vec<rig::completion::Message>,
     #[cfg(feature = "hooks")] startup_context: &mut Option<
         crate::extras::hooks::OwnedSessionStartContext,
     >,
@@ -4295,6 +4297,7 @@ async fn run_bound_headless_round(
                 reliefs += 1;
                 last_freed_nothing = !freed;
                 *relief_usage = relief_usage.saturating_add(usage);
+                relief_interactions.append(&mut turn.interactions);
                 prompt = crate::agent::runner::HEADLESS_CONTEXT_RELIEF_PROMPT.to_owned();
                 history = crate::agent::runner::convert_history_shared_with_tool_result_retention(
                     session,
@@ -4358,6 +4361,7 @@ async fn run_headless_goal_rounds(
             crate::print::HeadlessOutputPolicy::from_cli(cli)
         };
         let mut native_relief_usage = crate::event::UsageDelta::default();
+        let mut native_relief_interactions = Vec::new();
         let (turn, persisted) = if agent.history_protocol()
             == crate::session::native_replay::HistoryProtocol::AnthropicMessages
             || session.native_history_snapshot().is_some()
@@ -4376,6 +4380,7 @@ async fn run_headless_goal_rounds(
                     native_ticket,
                     native_owner,
                     &mut native_relief_usage,
+                    &mut native_relief_interactions,
                     #[cfg(feature = "hooks")]
                     startup_context,
                     #[cfg(feature = "agent-skills")]
@@ -4489,6 +4494,10 @@ async fn run_headless_goal_rounds_inner(
     let mut round_prompt = message.to_string();
     // Earlier segments of a relieved round, already charged to the session.
     let mut relief_usage = crate::event::UsageDelta::default();
+    // This round's earlier segments: their usage (also in `relief_usage`) and
+    // tool traffic, which the final segment's own turn does not carry.
+    #[cfg_attr(not(feature = "goal"), allow(unused_mut, unused_variables))]
+    let mut relief_interactions: Vec<rig::completion::Message> = Vec::new();
 
     // A goal's time bound measures how long the agent worked. Headless runs
     // never wait on a permission prompt, so the round's wall clock is its
@@ -4516,6 +4525,7 @@ async fn run_headless_goal_rounds_inner(
                 native_ticket,
                 native_owner,
                 &mut relief_usage,
+                &mut relief_interactions,
                 #[cfg(feature = "hooks")]
                 startup_context,
                 #[cfg(feature = "agent-skills")]
@@ -4546,6 +4556,7 @@ async fn run_headless_goal_rounds_inner(
         .await;
         round_prompt = relieved.prompt;
         relief_usage = relieved.relief_usage;
+        relief_interactions = relieved.relief_interactions;
         (relieved.turn, relieved.persisted)
     };
     #[cfg(feature = "goal")]
@@ -4562,6 +4573,9 @@ async fn run_headless_goal_rounds_inner(
         let mut pending_compaction_tokens = compaction_usage
             .input_tokens
             .saturating_add(compaction_usage.output_tokens);
+        // Usage of this round's earlier context-relief segments and their
+        // compactions; the final segment's own usage is `turn.usage`.
+        let mut round_relief_usage = relief_usage;
 
         loop {
             let Some(goal) = session.goal_store.snapshot() else {
@@ -4585,9 +4599,24 @@ async fn run_headless_goal_rounds_inner(
                 .iter()
                 .filter(|item| !matches!(item.status.as_str(), "completed" | "cancelled"))
                 .count();
+            // Earlier relief segments ran tools and spent tokens in this same
+            // round: the made-progress / blocked-streak logic and the goal's
+            // `max_tokens` bound must see all of it (mini-agent-yt0mb).
+            let round_interactions: std::borrow::Cow<'_, [rig::completion::Message]> =
+                if relief_interactions.is_empty() {
+                    std::borrow::Cow::Borrowed(&turn.interactions[..])
+                } else {
+                    std::borrow::Cow::Owned(
+                        relief_interactions
+                            .iter()
+                            .chain(turn.interactions.iter())
+                            .cloned()
+                            .collect(),
+                    )
+                };
             let mut summary = driver::summary_from_headless_turn(
                 &goal,
-                &turn.interactions,
+                &round_interactions,
                 &driver::RoundCost {
                     usage: turn.usage,
                     active: round_elapsed,
@@ -4600,7 +4629,12 @@ async fn run_headless_goal_rounds_inner(
             // work, so its tokens join that round's count, exactly once.
             summary.tokens_used = summary
                 .tokens_used
-                .saturating_add(std::mem::take(&mut pending_compaction_tokens));
+                .saturating_add(std::mem::take(&mut pending_compaction_tokens))
+                .saturating_add(
+                    round_relief_usage
+                        .input_tokens
+                        .saturating_add(round_relief_usage.output_tokens),
+                );
 
             if let Some(question) = turn
                 .failure
@@ -4932,6 +4966,8 @@ async fn run_headless_goal_rounds_inner(
             round_prompt = next.prompt;
             persisted = next.persisted;
             relief_usage = relief_usage.saturating_add(next.relief_usage);
+            round_relief_usage = next.relief_usage;
+            relief_interactions = next.relief_interactions;
             turn = next.turn;
         }
     }
@@ -4953,6 +4989,9 @@ pub(crate) struct RelievedHeadlessTurn {
     /// relief that recorded progress).
     pub prompt: String,
     pub persisted: bool,
+    /// Tool traffic of earlier segments, already persisted; kept so a goal
+    /// round counts all of its tool calls (mini-agent-yt0mb).
+    pub relief_interactions: Vec<rig::completion::Message>,
     /// Usage of earlier segments and relief compactions, already charged to
     /// the session; reported with the turn but never charged again.
     pub relief_usage: crate::event::UsageDelta,
@@ -5089,6 +5128,7 @@ async fn relieve_headless_turn(
     let mut prompt = message.to_owned();
     let mut history = history;
     let mut relief_usage = crate::event::UsageDelta::default();
+    let mut relief_interactions: Vec<rig::completion::Message> = Vec::new();
     // There is no fixed number of reliefs per turn (mini-agent-sfbv9): a long
     // autonomous run may legitimately fill the window many times. Relief
     // continues while each compaction frees space and tools run between
@@ -5129,6 +5169,7 @@ async fn relieve_headless_turn(
                 turn,
                 prompt,
                 persisted: false,
+                relief_interactions,
                 relief_usage,
             };
         };
@@ -5147,6 +5188,7 @@ async fn relieve_headless_turn(
                 turn,
                 prompt,
                 persisted: false,
+                relief_interactions,
                 relief_usage,
             };
         }
@@ -5178,22 +5220,30 @@ async fn relieve_headless_turn(
         } else {
             Session::estimate_tokens(&prompt)
         };
-        let surfaced =
-            |failure: Option<anyhow::Error>, prompt: String, relief_usage| RelievedHeadlessTurn {
-                turn: crate::agent::runner::HeadlessTurn {
-                    response: response.clone(),
-                    usage: Default::default(),
-                    interactions: interactions.clone(),
-                    failure,
-                },
-                prompt,
-                persisted: made_progress,
-                relief_usage,
-            };
+        let surfaced = |failure: Option<anyhow::Error>,
+                        prompt: String,
+                        relief_usage,
+                        relief_interactions| RelievedHeadlessTurn {
+            turn: crate::agent::runner::HeadlessTurn {
+                response: response.clone(),
+                usage: Default::default(),
+                interactions: interactions.clone(),
+                failure,
+            },
+            prompt,
+            persisted: made_progress,
+            relief_interactions,
+            relief_usage,
+        };
         if crate::print::headless_force_stopped() {
             let failure = failure
                 .or_else(|| Some(anyhow::anyhow!(crate::agent::runner::HEADLESS_INTERRUPTED)));
-            return surfaced(failure, prompt, relief_usage);
+            return surfaced(
+                failure,
+                prompt,
+                relief_usage,
+                std::mem::take(&mut relief_interactions),
+            );
         }
         let notice = match cause {
             HeadlessReliefCause::ContextLength => {
@@ -5204,7 +5254,12 @@ async fn relieve_headless_turn(
             }
         };
         if let Err(error) = crate::print::headless_stderr_async(notice.to_string()).await {
-            return surfaced(Some(error), prompt, relief_usage);
+            return surfaced(
+                Some(error),
+                prompt,
+                relief_usage,
+                std::mem::take(&mut relief_interactions),
+            );
         }
         match compact(session, pending_tokens).await {
             Ok((usage, true)) => relief_usage = relief_usage.saturating_add(usage),
@@ -5213,7 +5268,12 @@ async fn relieve_headless_turn(
                 if cause == HeadlessReliefCause::ContextLength {
                     // Nothing older than the kept recent history: retrying
                     // would send the same request again.
-                    return surfaced(failure, prompt, relief_usage);
+                    return surfaced(
+                        failure,
+                        prompt,
+                        relief_usage,
+                        std::mem::take(&mut relief_interactions),
+                    );
                 }
                 // Nothing to compact yet: continue without the mid-turn
                 // trigger rather than stopping at every batch.
@@ -5227,7 +5287,12 @@ async fn relieve_headless_turn(
                     Some(failure) => failure.context(format!("context relief failed: {error:#}")),
                     None => error,
                 };
-                return surfaced(Some(error), prompt, relief_usage);
+                return surfaced(
+                    Some(error),
+                    prompt,
+                    relief_usage,
+                    std::mem::take(&mut relief_interactions),
+                );
             }
         }
         if !no_session
@@ -5235,8 +5300,14 @@ async fn relieve_headless_turn(
                 eprintln!("warning: {notice}")
             })
         {
-            return surfaced(Some(error), prompt, relief_usage);
+            return surfaced(
+                Some(error),
+                prompt,
+                relief_usage,
+                std::mem::take(&mut relief_interactions),
+            );
         }
+        relief_interactions.extend(interactions);
         if made_progress {
             prompt = crate::agent::runner::HEADLESS_CONTEXT_RELIEF_PROMPT.to_owned();
         }
@@ -6126,6 +6197,13 @@ mod tests {
             relieved.turn.failure
         );
         assert_eq!((segments, compactions), (11, 10));
+        // mini-agent-yt0mb: earlier segments' tool traffic is carried so a
+        // goal round counts all of it.
+        assert_eq!(
+            relieved.relief_interactions.len(),
+            10 * boundary_turn(true).interactions.len()
+        );
+        assert!(!relieved.relief_interactions.is_empty());
     }
 
     // Two consecutive reliefs with no tool progress in between stop the turn
