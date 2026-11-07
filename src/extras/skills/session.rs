@@ -2384,15 +2384,26 @@ mod discovery_tests {
         }
         let snapshot = fixture.services.refresh(false).await.unwrap();
         assert_eq!(snapshot.packages.len(), 64);
+        // The cap is shared by every root, but the budget is fair per root
+        // (mini-agent-hi8rm): the one-skill home root keeps its skill and the
+        // overfull project root is the one truncated, with a visible note.
         assert!(
-            snapshot
-                .diagnostics
-                .iter()
-                .any(|line| line == "skill package limit exceeded")
+            snapshot.diagnostics.iter().any(|line| line
+                .starts_with("skill package limit reached (64 packages): 2 skills skipped")),
+            "{:?}",
+            snapshot.diagnostics
         );
         assert!(
-            !snapshot.packages.contains_key("home-skill"),
-            "lower priority root cannot escape shared cap"
+            snapshot.packages.contains_key("home-skill"),
+            "a small lower-priority root keeps its fair share of the cap"
+        );
+        assert_eq!(
+            snapshot
+                .packages
+                .values()
+                .filter(|package| package.origin != "user .claude")
+                .count(),
+            63
         );
     }
 

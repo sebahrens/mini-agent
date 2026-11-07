@@ -2772,29 +2772,52 @@ mod tests {
         out
     }
 
-    fn assert_fast(data: &[u8]) {
-        let started = std::time::Instant::now();
-        let _ = Document::parse(data);
+    fn best_parse_time(data: &[u8], runs: usize) -> std::time::Duration {
+        (0..runs)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                let _ = Document::parse(data);
+                started.elapsed()
+            })
+            .min()
+            .expect("at least one run")
+    }
+
+    /// Asserts that `measured` (an 8x larger input than `baseline`) stays
+    /// within a linear-growth bound instead of a wall-clock budget, which
+    /// flakes on slow shared CI runners. A linear parser costs about 8x the
+    /// baseline, a quadratic one about 64x; the 24x bound plus fixed slack
+    /// absorbs scheduler noise while still rejecting quadratic behaviour.
+    fn assert_linear_growth(label: &str, small: &[u8], large: &[u8]) {
+        let baseline = best_parse_time(small, 3);
+        let measured = best_parse_time(large, 2);
+        let bound = baseline * 24 + std::time::Duration::from_millis(250);
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
-            "parse took {:?}",
-            started.elapsed()
+            measured <= bound,
+            "parse of {label:?} is not linear: {measured:?} for the large input vs {baseline:?} for the 8x smaller one (bound {bound:?})"
         );
+    }
+
+    fn assert_linear(unit: &str) {
+        assert_linear_growth(unit, &repeated(unit, 1 << 17), &repeated(unit, 1 << 20));
     }
 
     #[test]
     fn unterminated_streams_and_strings_parse_in_linear_time() {
-        assert_fast(&repeated("<</Length 0>>stream\n", 1 << 20));
-        assert_fast(&repeated("(", 1 << 20));
-        assert_fast(&repeated("<", 1 << 20));
-        assert_fast(&repeated("[", 1 << 20));
-        assert_fast(&repeated("[(", 1 << 20));
-        assert_fast(&repeated("<</A [", 1 << 20));
-        let mut trailers = b"%PDF-1.7\n".to_vec();
-        while trailers.len() < (1 << 20) {
-            trailers.extend_from_slice(b"trailer(");
-        }
-        assert_fast(&trailers);
+        assert_linear("<</Length 0>>stream\n");
+        assert_linear("(");
+        assert_linear("<");
+        assert_linear("[");
+        assert_linear("[(");
+        assert_linear("<</A [");
+        let trailers = |bytes: usize| {
+            let mut data = b"%PDF-1.7\n".to_vec();
+            while data.len() < bytes {
+                data.extend_from_slice(b"trailer(");
+            }
+            data
+        };
+        assert_linear_growth("trailer(", &trailers(1 << 17), &trailers(1 << 20));
     }
 
     #[test]

@@ -950,7 +950,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/acp/commands.rs",
         "AvailableCommand::new(",
-        2,
+        4,
         "NON-PROCESS",
     ),
     (
@@ -2039,6 +2039,56 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/ui/slash/memory.rs",
         "let status = std::process::Command::new(shell)",
+        1,
+        "TC-SUPPORT-UTILITY",
+    ),
+    (
+        "src/extras/mcp/headers_helper.rs",
+        "let mut child = command.spawn().map_err(|error| {",
+        1,
+        "TC-MCP-STDIO",
+    ),
+    (
+        "src/extras/mcp/server.rs",
+        "async fn kill_tree(child: &mut tokio::process::Child, pid: Option<u32>) {",
+        1,
+        "TC-SUPPORT-UTILITY",
+    ),
+    (
+        "src/extras/mcp/server.rs",
+        "mut stdin: Option<tokio::process::ChildStdin>,",
+        1,
+        "TC-SUPPORT-UTILITY",
+    ),
+    ("src/key_command.rs", ".spawn()", 2, "TC-CREDENTIAL-HELPER"),
+    (
+        "src/key_command.rs",
+        "let mut command = Command::new(&spec.command[0]);",
+        1,
+        "TC-CREDENTIAL-HELPER",
+    ),
+    (
+        "src/key_command.rs",
+        "let mut command = tokio::process::Command::new(&spec.command[0]);",
+        1,
+        "TC-CREDENTIAL-HELPER",
+    ),
+    (
+        "src/sandbox/net_forwarder.rs",
+        "let error = std::process::Command::new(&command[0])",
+        1,
+        "TC-LIFECYCLE-HELPER",
+    ),
+    ("src/self_update.rs", ".output()", 2, "TC-SUPPORT-UTILITY"),
+    (
+        "src/self_update.rs",
+        "let output = std::process::Command::new(&probe_clone)",
+        1,
+        "TC-SUPPORT-UTILITY",
+    ),
+    (
+        "src/self_update.rs",
+        "std::process::Command::new(program)",
         1,
         "TC-SUPPORT-UTILITY",
     ),
@@ -3346,12 +3396,6 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     (
-        "src/extras/acp/mod.rs",
-        "TextContent::new(output.to_string()),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
         "src/extras/export.rs",
         "anyhow::bail!(\"GitHub API returned {}: {}\", status, text.trim());",
         1,
@@ -3364,7 +3408,7 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     ("src/extras/js/host.rs", "output.status,", 2, "NON-PROCESS"),
-    ("src/agent/tools/web_http.rs", "status,", 3, "NON-PROCESS"),
+    ("src/agent/tools/web_http.rs", "status,", 4, "NON-PROCESS"),
     ("src/extras/js/host.rs", "status: 200,", 7, "NON-PROCESS"),
     ("src/extras/js/host.rs", "status: 204,", 1, "NON-PROCESS"),
     ("src/extras/js/host.rs", "status: 304,", 1, "NON-PROCESS"),
@@ -3679,17 +3723,206 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/git/tool.rs",
-        "\"truncated\": matches!(output.status, CommandStatus::OutputLimitExceeded(_)),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/git/tool.rs",
         "let output = Command::new(\"git\")",
         1,
         "TEST-ONLY",
     ),
     ("src/git/tool.rs", ".output()", 1, "TEST-ONLY"),
+    (
+        "src/extras/acp/commands.rs",
+        "AvailableCommand::new(\"cost\", \"Show this session's cost and context use\"),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/acp/commands.rs",
+        "let mut command = AvailableCommand::new(name, description);",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/acp/mod.rs",
+        "ToolCallUpdateFields::new().status(ToolCallStatus::InProgress),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/hooks/dispatcher.rs",
+        "let exit_code = if response.status().is_success() { 0 } else { 1 };",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/mcp/server.rs",
+        "tasks.spawn(async move {",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/provider.rs",
+        "if !response.status().is_success() {",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/provider_http.rs",
+        "if response.status() != http::StatusCode::UNAUTHORIZED",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox/conpty.rs",
+        ".spawn(move || {",
+        2,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox/net_forwarder.rs",
+        ".spawn(move || {",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox/net_proxy.rs",
+        ".spawn(move || {",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/self_update.rs",
+        "if !response.status().is_success() {",
+        1,
+        "NON-PROCESS",
+    ),
+    ("src/self_update.rs", "response.status()", 1, "NON-PROCESS"),
+    (
+        "src/update.rs",
+        "return Err(format!(\"{endpoint} answered HTTP {}\", response.status()));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/client_fs_tests.rs",
+        "assert!(!output.contains(\"client claims\"), \"{name}: {output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/client_fs_tests.rs",
+        "assert!(!output.contains(\"client claims\"), \"{output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/mcp/headers_helper.rs",
+        "output.len() <= MAX_OUTPUT_BYTES,",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/mcp/headers_helper.rs",
+        "status",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/mcp/server.rs",
+        "write_message(&mut output, &error(&Value::Null, -32700, \"parse error\")).await?;",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/mcp/server.rs",
+        "write_message(&mut output, &handle_simple(&command, &id, method, &params)).await?;",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/mcp/server.rs",
+        "write_message(&mut output, &error(&id, -32602, \"unknown tool; only `run` is offered\")).await?;",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/mcp/server.rs",
+        "write_message(&mut output, &error(&id, -32602, &message)).await?;",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/mcp/server.rs",
+        "write_message(&mut output, &error(&id, -32000, &format!(\"too many concurrent `run` calls (limit {}, --mcp-server-max-runs); retry when one finishes\", command.max_runs.max(1)))).await?;",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/mcp/server.rs",
+        "write_message(&mut output, &reply).await?;",
+        2,
+        "NON-PROCESS",
+    ),
+    (
+        "src/git/tool.rs",
+        "if matches!(output.status, CommandStatus::OutputLimitExceeded(_))",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/git/tool.rs",
+        "let truncated = matches!(output.status, CommandStatus::OutputLimitExceeded(_));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/git/tool.rs",
+        "let limit_hit = matches!(output.status, CommandStatus::OutputLimitExceeded(_));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/git/tool.rs",
+        "let output_limited = matches!(output.status, CommandStatus::OutputLimitExceeded(_));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/key_command.rs",
+        "status = child.wait() => {",
+        1,
+        "NON-PROCESS",
+    ),
+    ("src/key_command.rs", "status", 1, "NON-PROCESS"),
+    ("src/provider.rs", "output,", 9, "NON-PROCESS"),
+    (
+        "src/provider_effort_tests.rs",
+        "Self::spawn(responses, \"/v1/messages\", true)",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/provider_effort_tests.rs",
+        "Self::spawn(responses, path, false)",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/retry.rs",
+        ".filter(|status| matches!(status.as_u16(), 429 | 503))",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox/network_tests.rs",
+        "assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), \"200\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/spend/request_tests.rs",
+        "assert_eq!(output.summary, \"A retried summary\");",
+        1,
+        "NON-PROCESS",
+    ),
 ];
 
 /// SHA-256 of the length-framed structural macro path and complete token tree.
@@ -4642,14 +4875,6 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
                 "5e6b7deef53c9bbc937e9b5f2643396b1eb7a0dd176f3db52719403e9047f84e",
                 1,
             ),
-            (
-                "f916c2d7ba7a437738651f8bb303850276f6a20d3e50b876e924540be5a586e5",
-                1,
-            ),
-            (
-                "295618629907043194c80029881ca6c0c7fd6c758a98c278f3d845cdf7e45f7f",
-                1,
-            ),
         ],
     ),
     (
@@ -5190,13 +5415,6 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         ],
     ),
     (
-        "src/git/tool.rs",
-        &[(
-            "a8b477f08aa5c038c7d3892b7bda9395807cacfdcb17158cba72ecaecf0ae1a2",
-            1,
-        )],
-    ),
-    (
         "src/docs.rs",
         &[(
             "eaf04cf21084dd8d714729cf31f39143471900f5d86a880cffc12bbfe31be9a0",
@@ -5237,6 +5455,97 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
                 1,
             ),
         ],
+    ),
+    (
+        "src/agent/tools/client_fs_tests.rs",
+        &[(
+            "c194291ac0ae72fc669bfb3f7b559222e88020ffeb12f5291b3b091c9171f12b",
+            1,
+        )],
+    ),
+    (
+        "src/agent/tools/client_fs_tests.rs",
+        &[(
+            "d0da8140489dd16ca649043fe075375777f240e3459395ce6628c9f6498d6960",
+            1,
+        )],
+    ),
+    (
+        "src/extras/mcp/headers_helper.rs",
+        &[(
+            "799a331a350925d5bf10f3be8ab35494422be724608e4aff3caf7aa21852bbfe",
+            1,
+        )],
+    ),
+    (
+        "src/extras/mcp/headers_helper.rs",
+        &[(
+            "d64637dd113937a5405720028943ee1109608e5a2244f4176e70ba0ece55c032",
+            1,
+        )],
+    ),
+    (
+        "src/extras/mcp/server.rs",
+        &[(
+            "53a4f97814def03d94a095312857f27d4297cb2fdac03c1004660cf68861a654",
+            1,
+        )],
+    ),
+    (
+        "src/key_command.rs",
+        &[(
+            "f57825fbb17eff02fef2a1cd49c1cf7a35125d5fa1961b87863a18b6cdc58159",
+            1,
+        )],
+    ),
+    (
+        "src/provider.rs",
+        &[(
+            "2544a43f58db98f7e0aa66a33286959c9587ce7dd8ee92935ac05d7f8b6a2484",
+            1,
+        )],
+    ),
+    (
+        "src/retry.rs",
+        &[(
+            "67d9213dd8a4e10e89130deed01449bee3c0b852bdb5b3eb9c84de7bd6163978",
+            1,
+        )],
+    ),
+    (
+        "src/sandbox/network_tests.rs",
+        &[(
+            "6fc8e2858b0d0c2a80bfcd744f4bdd583bc0f23e515e66b4c70ecb8e86499d33",
+            1,
+        )],
+    ),
+    (
+        "src/self_update.rs",
+        &[(
+            "d6ca57f4bacf12246c753e4844e96388bc16a0703953a6150782adea1958b2ea",
+            1,
+        )],
+    ),
+    (
+        "src/spend/request_tests.rs",
+        &[(
+            "18b8e284ef24da195128cd56be0b34177307739c1f57795638fc788c6a6750f7",
+            1,
+        )],
+    ),
+    (
+        "src/update.rs",
+        &[(
+            "fd6a7fea2777cec3193c620b5076e42fc813fd793ca7f909ed003c722e72009a",
+            1,
+        )],
+    ),
+    (
+        "src/git/tool.rs",
+        &[(
+            "bb8b0f921bc2afe7c1a0fdd7d97dc264237bdbe93e6c7aff99554fb104933299",
+            4,
+        )],
     ),
 ];
 
@@ -5330,6 +5639,7 @@ const ALLOWED_CURRENT_CLASSES: &[&str] = &[
     "TC-MCP-STDIO",
     "TC-MODEL-ACTION",
     "TC-BROKER-JS-WORKER",
+    "TC-CREDENTIAL-HELPER",
     "TC-PROJECT-AUTOMATION",
     "TC-SUPPORT-UTILITY",
 ];
@@ -5484,7 +5794,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/acp/commands.rs",
         "AvailableCommand::new(",
-        2,
+        4,
         "NON-PROCESS",
     ),
     (
@@ -6374,6 +6684,56 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/ui/app.rs",
         "let mut probe = tokio::process::Command::new(\"lazygit\");",
+        1,
+        "TC-SUPPORT-UTILITY",
+    ),
+    (
+        "src/extras/mcp/headers_helper.rs",
+        "let mut child = command.spawn().map_err(|error| {",
+        1,
+        "TC-MCP-STDIO",
+    ),
+    (
+        "src/extras/mcp/server.rs",
+        "async fn kill_tree(child: &mut tokio::process::Child, pid: Option<u32>) {",
+        1,
+        "TC-SUPPORT-UTILITY",
+    ),
+    (
+        "src/extras/mcp/server.rs",
+        "mut stdin: Option<tokio::process::ChildStdin>,",
+        1,
+        "TC-SUPPORT-UTILITY",
+    ),
+    ("src/key_command.rs", ".spawn()", 2, "TC-CREDENTIAL-HELPER"),
+    (
+        "src/key_command.rs",
+        "let mut command = Command::new(&spec.command[0]);",
+        1,
+        "TC-CREDENTIAL-HELPER",
+    ),
+    (
+        "src/key_command.rs",
+        "let mut command = tokio::process::Command::new(&spec.command[0]);",
+        1,
+        "TC-CREDENTIAL-HELPER",
+    ),
+    (
+        "src/sandbox/net_forwarder.rs",
+        "let error = std::process::Command::new(&command[0])",
+        1,
+        "TC-LIFECYCLE-HELPER",
+    ),
+    ("src/self_update.rs", ".output()", 2, "TC-SUPPORT-UTILITY"),
+    (
+        "src/self_update.rs",
+        "let output = std::process::Command::new(&probe_clone)",
+        1,
+        "TC-SUPPORT-UTILITY",
+    ),
+    (
+        "src/self_update.rs",
+        "std::process::Command::new(program)",
         1,
         "TC-SUPPORT-UTILITY",
     ),

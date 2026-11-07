@@ -433,6 +433,7 @@ impl Drop for GroupKill {
 }
 
 fn run_blocking(credential: &CommandCredential) -> Result<String, String> {
+    use crate::process_creation::StdCommandCreationExt as _;
     use std::io::Read as _;
     use std::process::{Command, Stdio};
     let spec = &credential.spec;
@@ -448,7 +449,7 @@ fn run_blocking(credential: &CommandCredential) -> Result<String, String> {
         command.process_group(0);
     }
     let mut child = command
-        .spawn()
+        .spawn_guarded()
         .map_err(|error| credential.failure(&format!("could not start ({:?})", error.kind())))?;
     let group = GroupKill::new(Some(child.id()));
     let mut stdout = child.stdout.take().expect("piped stdout");
@@ -496,6 +497,7 @@ fn run_blocking(credential: &CommandCredential) -> Result<String, String> {
 }
 
 async fn run_async(credential: &CommandCredential) -> Result<String, String> {
+    use crate::process_creation::TokioCommandCreationExt as _;
     use tokio::io::AsyncReadExt as _;
     let spec = &credential.spec;
     let mut command = tokio::process::Command::new(&spec.command[0]);
@@ -508,7 +510,7 @@ async fn run_async(credential: &CommandCredential) -> Result<String, String> {
     #[cfg(unix)]
     command.process_group(0);
     let mut child = command
-        .spawn()
+        .spawn_guarded()
         .map_err(|error| credential.failure(&format!("could not start ({:?})", error.kind())))?;
     // Dropping this (timeout, cancellation, or normal return) kills the group.
     let group = GroupKill::new(child.id());
