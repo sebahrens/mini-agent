@@ -1304,7 +1304,25 @@ fn default_provider(
 
 impl Cli {
     pub fn parse_command_line() -> Self {
-        Self::try_parse_command_line_from(std::env::args_os()).unwrap_or_else(|error| error.exit())
+        // Clap's derived argument builder is one enormous frame in an
+        // unoptimized build and grows with every flag and feature (about 1 MiB
+        // with `skills`), which does not fit the 1 MiB Windows main-thread
+        // stack. Build it on a short-lived thread with room to spare.
+        const PARSE_STACK_SIZE: usize = 8 * 1024 * 1024;
+        let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+        let parse =
+            move || Self::try_parse_command_line_from(args).unwrap_or_else(|error| error.exit());
+        match std::thread::Builder::new()
+            .name("cli-parse".into())
+            .stack_size(PARSE_STACK_SIZE)
+            .spawn(parse)
+        {
+            Ok(handle) => handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            Err(_) => Self::try_parse_command_line_from(std::env::args_os())
+                .unwrap_or_else(|error| error.exit()),
+        }
     }
 
     fn try_parse_command_line_from(

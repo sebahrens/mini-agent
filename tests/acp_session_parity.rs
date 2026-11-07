@@ -704,7 +704,7 @@ fn acp53_stdio_native_turns_publish_restore_and_refuse_prefix_rewrite() {
         .filter(|update| update["sessionUpdate"] == "tool_call")
         .collect();
     assert_eq!(live_calls.len(), 1, "one actual read is dispatched");
-    assert_eq!(live_calls[0]["title"], "read");
+    assert_eq!(live_calls[0]["title"], "read native-read.txt");
     assert_eq!(live_calls[0]["rawInput"]["path"], "native-read.txt");
     let live_id = live_calls[0]["toolCallId"].as_str().unwrap();
     assert!(!live_id.is_empty());
