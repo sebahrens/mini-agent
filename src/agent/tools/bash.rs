@@ -2158,6 +2158,21 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn foreground_spawn_failure_reports_its_reason() {
+        let sandbox = Sandbox::new(false, "bwrap").with_working_dir("/nonexistent-mini-agent-cwd");
+        let error = BashTool::new(None, None, sandbox, None)
+            .call(BashArgs {
+                command: "echo hi".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("failed to spawn command"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn shell_commands_start_with_a_non_interactive_environment() {
         let output = test_tool()
             .call(BashArgs {

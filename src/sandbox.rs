@@ -5743,6 +5743,7 @@ impl Sandbox {
             cwd: None,
         };
         let capture = capture.0.clone();
+        let failure_capture = capture.clone();
         std::mem::drop(crate::agent::runner::spawn_async_scoped(
             crate::startup::heap_future(|| async move {
                 sandbox
@@ -5762,9 +5763,19 @@ impl Sandbox {
                     .await;
             }),
         ));
-        response_rx.await.map_err(|_| {
+        let output = response_rx.await.map_err(|_| {
             std::io::Error::other("command output worker stopped before returning a result")
-        })
+        })?;
+        if output.status == CommandStatus::Failed && failure_capture.total_bytes() == 0 {
+            // Preparation/spawn failures report through stderr without ever
+            // reaching the capture; keep the reason visible to the caller.
+            let _ = failure_capture.push(
+                CommandOutputStream::Stderr,
+                &output.stderr,
+                DEFAULT_COMMAND_LIMITS,
+            );
+        }
+        Ok(output)
     }
 
     async fn output_command_with_limits_scoped(
