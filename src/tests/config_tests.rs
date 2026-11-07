@@ -58,6 +58,26 @@ fn mid_turn_threshold_defaults_when_unset() {
     );
 }
 
+// mini-agent-m8wyy: byte pressure arms the mid-turn boundary even when the
+// token threshold is switched off with 0.
+#[test]
+fn byte_pressure_arms_mid_turn_trigger_when_token_threshold_is_disabled() {
+    let cfg = Config {
+        mid_turn_compact_threshold: Some(0.0),
+        ..Config::default()
+    };
+    assert_eq!(cfg.resolve_mid_turn_trigger_threshold(false), None);
+    assert_eq!(
+        cfg.resolve_mid_turn_trigger_threshold(true),
+        Some(f64::MIN_POSITIVE)
+    );
+    let on = Config::default();
+    assert_eq!(
+        on.resolve_mid_turn_trigger_threshold(false),
+        on.resolve_mid_turn_compact_threshold()
+    );
+}
+
 #[test]
 fn mid_turn_threshold_valid_value_passes_through() {
     let cfg = Config {

@@ -3969,16 +3969,17 @@ async fn run_bound_headless_segment(
     // `run_bound_headless_round` then closes the native epoch, compacts the
     // saved transcript and resumes in a new epoch (mini-agent-tmysj).
     let mid_turn = (mid_turn_armed && cfg.resolve_compact_enabled() && session.context_window > 0)
-        .then(|| cfg.resolve_mid_turn_compact_threshold())
+        .then(|| {
+            // Byte pressure (images) ends the segment at the next boundary,
+            // even when the token threshold is disabled.
+            cfg.resolve_mid_turn_trigger_threshold(
+                session.size_pressure(cfg.resolve_compact_size_fraction()),
+            )
+        })
         .flatten()
         .map(|threshold| crate::agent::runner::HeadlessMidTurnPolicy {
             window: session.context_window,
-            // Byte pressure (images) ends the segment at the next boundary.
-            threshold: if session.size_pressure(cfg.resolve_compact_size_fraction()) {
-                f64::MIN_POSITIVE
-            } else {
-                threshold
-            },
+            threshold,
             anthropic_native: cfg.is_anthropic_native(&session.provider),
         });
     let mut turn = heap_future(|| {
@@ -5102,15 +5103,15 @@ async fn relieve_headless_turn(
     loop {
         let mid_turn =
             (mid_turn_available && cfg.resolve_compact_enabled() && session.context_window > 0)
-                .then(|| cfg.resolve_mid_turn_compact_threshold())
+                .then(|| {
+                    cfg.resolve_mid_turn_trigger_threshold(
+                        session.size_pressure(cfg.resolve_compact_size_fraction()),
+                    )
+                })
                 .flatten()
                 .map(|threshold| crate::agent::runner::HeadlessMidTurnPolicy {
                     window: session.context_window,
-                    threshold: if session.size_pressure(cfg.resolve_compact_size_fraction()) {
-                        f64::MIN_POSITIVE
-                    } else {
-                        threshold
-                    },
+                    threshold,
                     anthropic_native: cfg.is_anthropic_native(&session.provider),
                 });
         let turn = crate::agent::runner::with_headless_budget_carry(
