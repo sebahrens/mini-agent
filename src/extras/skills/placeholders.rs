@@ -360,16 +360,31 @@ fn render_section(section: &mut AgentSection, render: &PinRender<'_>) {
         Some(agent) => format!("agent_type \"{agent}\""),
         None => "no agent_type (the default explorer)".to_owned(),
     };
+    // Claude-style values degrade instead of failing the fork: `inherit` means
+    // "no override"; any other value the task tool refuses (a raw model id, an
+    // unknown alias, an agent type that pins its own model) is retried once
+    // without a model so the child uses the session or persona model.
     let model = match render.model {
+        Some(model) if model.eq_ignore_ascii_case("inherit") => String::new(),
         Some(model) => format!(
             " and model \"{model}\" (the task tool only accepts a configured quick-model alias; \
-             if it rejects the model, tell the user instead of retrying without it)"
+             if it rejects the model argument, call task once more with the same agent_type and prompt \
+             and no model so the child uses its default model, and add a one-line note to your \
+             reply that the skill's model was not applied)"
         ),
         None => String::new(),
     };
+    let once = if render
+        .model
+        .is_some_and(|m| !m.eq_ignore_ascii_case("inherit"))
+    {
+        "Call the task tool once"
+    } else {
+        "Call the task tool exactly once"
+    };
     section.markdown = format!(
         "This skill is configured with context: fork. Do not follow its instructions yourself. \
-         Call the task tool exactly once with {agent}{model} and a single prompt that is exactly the \
+         {once} with {agent}{model} and a single prompt that is exactly the \
          text between the skill_task_prompt markers below, then relay the child's report to \
          the user.\n<skill_task_prompt>\n{}\n</skill_task_prompt>\n",
         body.trim_end()
@@ -562,5 +577,43 @@ mod tests {
             root,
             &["README.md".to_owned()]
         ));
+    }
+
+    #[test]
+    fn fork_model_values_from_claude_degrade_instead_of_failing() {
+        let render = |model: &str| {
+            let mut section = AgentSection {
+                digest: "d".into(),
+                markdown: "---\nname: s\ncontext: fork\n---\nGo\n".into(),
+                resources: Vec::new(),
+                #[cfg(feature = "skills")]
+                learned_js: Vec::new(),
+                score: 1.0,
+                rank: 0,
+            };
+            render_section(
+                &mut section,
+                &PinRender {
+                    arguments: "",
+                    skill_dir: "/d",
+                    fork: true,
+                    task_available: true,
+                    agent: None,
+                    model: Some(model),
+                },
+            );
+            section.markdown
+        };
+        // `inherit` passes no model at all.
+        let inherit = render("Inherit");
+        assert!(!inherit.contains("model \""), "{inherit}");
+        assert!(inherit.contains("exactly once"), "{inherit}");
+        // A raw id / unknown alias is tried, then retried once without it.
+        for value in ["opus", "claude-sonnet-4-5"] {
+            let text = render(value);
+            assert!(text.contains(&format!("model \"{value}\"")), "{text}");
+            assert!(text.contains("and no model"), "{text}");
+            assert!(!text.contains("instead of retrying"), "{text}");
+        }
     }
 }

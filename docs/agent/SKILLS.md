@@ -100,9 +100,12 @@ that `context: fork` was not applied. Frontmatter keys beyond that:
 
 - `model` (with `context: fork` only): the forked `task` call carries `model`, which the task tool
   accepts only when it names a configured `[quick_models]` alias. Raw model ids, unknown aliases and
-  any override of an agent type that pins its own `model:` are refused, so a skill cannot reach an
-  unconfigured model; the main conversation keeps the session model. Without `context: fork` the
-  key is reported as not applied.
+  any override of an agent type that pins its own `model:` are refused by the task tool, so a skill
+  cannot reach an unconfigured model. Claude-style values degrade instead of failing the fork:
+  `inherit` passes no model, and any value the task tool refuses (`opus`, a full id, a persona pin)
+  is retried once with the same prompt and no model, so the child uses the default (or persona)
+  model, with a one-line note in the reply. The main conversation keeps the session model. Without
+  `context: fork` the key is reported as not applied.
 - `paths` (list or comma string of globs, at most 32): scoped activation. Such a skill joins
   automatic selection only when (a) the request names a matching file (relative, `@`-mention,
   absolute under the workspace, or a bare filename such as `lib.rs` that fits a glob's final
