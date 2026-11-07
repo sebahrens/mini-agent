@@ -83,7 +83,9 @@ continuations. The pinned body is rendered with the arguments before it reaches 
 left-to-right pass (substituted text is never expanded again): `$ARGUMENTS` is the whole argument
 text, `$ARGUMENTS[N]` and `$N` are the zero-based shell-style words (`"two words"` and `'two words'`
 are one word; a missing word is empty; at most 127), and `${CLAUDE_SKILL_DIR}` is the skill's
-directory. When the body mentions none of the argument forms the arguments are appended as
+directory. Positional `$N` is substituted only when arguments were given and never inside fenced
+code blocks (so `awk '{print $1}'` is untouched); write `$$1` for a literal `$1` (likewise
+`$$ARGUMENTS`). When the body mentions none of the argument forms the arguments are appended as
 `ARGUMENTS: ...`. Arguments over 32 KiB are refused. Automatically selected skills and
 `skills_search` results are not rendered: their placeholders stay literal. A ``!`command` `` span in
 a pinned body is rewritten into an instruction for the model to run the command with its shell
@@ -92,7 +94,9 @@ tool, so the normal shell permission check and sandbox apply; the harness itself
 (optionally `agent: <agent type>`) is not followed inline: its rendered body is wrapped as the single
 prompt of one `task` call (the first request of the turn forces the `task` tool where the provider
 allows it), so the child runs with the agent type's tools, permissions and its own task budget and
-only its report returns to the main conversation. Frontmatter keys beyond that:
+only its report returns to the main conversation. When the `task` tool is not advertised in the
+turn (no `subagents` build, or a child without it) the skill renders inline with a one-line notice
+that `context: fork` was not applied. Frontmatter keys beyond that:
 
 - `model` (with `context: fork` only): the forked `task` call carries `model`, which the task tool
   accepts only when it names a configured `[quick_models]` alias. Raw model ids, unknown aliases and

@@ -4651,6 +4651,12 @@ impl AnyAgent {
         }
     }
 
+    /// Whether the agent's tool server currently advertises the static tool
+    /// `name` in its request tool list.
+    pub(crate) async fn advertises_tool(&self, name: &str) -> bool {
+        self.tool_server().advertises_static_tool(name).await
+    }
+
     /// Register a harness control tool for one turn only (the dynamic
     /// `/cron` `schedule_wakeup`). The caller removes it with
     /// [`Self::remove_turn_tool`] when that turn ends.

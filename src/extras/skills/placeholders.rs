@@ -30,6 +30,9 @@ pub(crate) struct PinRender<'a> {
     pub(crate) arguments: &'a str,
     pub(crate) skill_dir: &'a str,
     pub(crate) fork: bool,
+    /// Whether the turn advertises the `task` tool. A forked skill renders
+    /// inline (with a notice) when it does not.
+    pub(crate) task_available: bool,
     pub(crate) agent: Option<&'a str>,
     /// `model:` of a forked skill, passed to `task` as its `model` argument.
     pub(crate) model: Option<&'a str>,
@@ -106,15 +109,31 @@ pub(crate) fn split_arguments(arguments: &str) -> Vec<String> {
 /// Claude Code skills) and `${CLAUDE_SKILL_DIR}` in one left-to-right pass, so
 /// substituted text is never scanned again. When the body never mentions the
 /// arguments but some were given, they are appended as `ARGUMENTS: ...`.
+///
+/// Positional `$N` is substituted only when arguments were supplied, and never
+/// inside fenced code blocks (so `awk '{print $1}'` survives). `$$N`,
+/// `$$ARGUMENTS` and `$${CLAUDE_SKILL_DIR}` escape to a literal `$N`,
+/// `$ARGUMENTS` and `${CLAUDE_SKILL_DIR}`.
 pub(crate) fn substitute(body: &str, arguments: &str, skill_dir: &str) -> String {
     let words = split_arguments(arguments);
+    let positional = !arguments.trim().is_empty();
+    let fences = fenced_ranges(body);
     let mut output = String::with_capacity(body.len() + arguments.len());
     let mut used_arguments = false;
     let mut rest = body;
     while let Some(at) = rest.find('$') {
         output.push_str(&rest[..at]);
         rest = &rest[at..];
-        if let Some(after) = rest.strip_prefix("${CLAUDE_SKILL_DIR}") {
+        let offset = body.len() - rest.len();
+        if let Some(after) = rest.strip_prefix("$$")
+            && (after.starts_with(|c: char| c.is_ascii_digit())
+                || after.starts_with("ARGUMENTS")
+                || after.starts_with("{CLAUDE_SKILL_DIR}"))
+        {
+            // Escape: `$$1` is a literal `$1`; the token is copied raw.
+            output.push('$');
+            rest = after;
+        } else if let Some(after) = rest.strip_prefix("${CLAUDE_SKILL_DIR}") {
             output.push_str(skill_dir);
             rest = after;
         } else if let Some(after) = rest.strip_prefix("$ARGUMENTS") {
@@ -136,7 +155,13 @@ pub(crate) fn substitute(body: &str, arguments: &str, skill_dir: &str) -> String
         } else {
             let digits = rest[1..].bytes().take_while(u8::is_ascii_digit).count();
             match rest[1..1 + digits].parse::<usize>() {
-                Ok(index) if digits > 0 && digits <= 3 && index <= MAX_POSITIONAL => {
+                Ok(index)
+                    if positional
+                        && digits > 0
+                        && digits <= 3
+                        && index <= MAX_POSITIONAL
+                        && !fences.iter().any(|r| r.contains(&offset)) =>
+                {
                     used_arguments = true;
                     output.push_str(words.get(index).map_or("", String::as_str));
                     rest = &rest[1 + digits..];
@@ -158,6 +183,31 @@ pub(crate) fn substitute(body: &str, arguments: &str, skill_dir: &str) -> String
         output.push('\n');
     }
     output
+}
+
+/// Byte ranges of fenced code blocks (``` or ~~~), fence lines included. An
+/// unterminated fence runs to the end of the body.
+fn fenced_ranges(body: &str) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut open: Option<(usize, &str)> = None;
+    let mut offset = 0;
+    for line in body.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        let marker = ["```", "~~~"].into_iter().find(|m| trimmed.starts_with(m));
+        match (open, marker) {
+            (None, Some(m)) => open = Some((offset, m)),
+            (Some((start, open_marker)), Some(m)) if m == open_marker => {
+                ranges.push(start..offset + line.len());
+                open = None;
+            }
+            _ => {}
+        }
+        offset += line.len();
+    }
+    if let Some((start, _)) = open {
+        ranges.push(start..body.len());
+    }
+    ranges
 }
 
 /// `[N]` directly after `$ARGUMENTS`.
@@ -255,6 +305,17 @@ fn render_section(section: &mut AgentSection, render: &PinRender<'_>) {
         // Keep the frontmatter so the skill reads as authored.
         let header_len = section.markdown.len() - body_after_frontmatter(&section.markdown).len();
         section.markdown = format!("{}{body}", &section.markdown[..header_len]);
+        return;
+    }
+    if !render.task_available {
+        // Delegation is impossible without the `task` tool: run the skill
+        // inline instead of telling the model to call a tool it lacks.
+        let header_len = section.markdown.len() - body_after_frontmatter(&section.markdown).len();
+        section.markdown = format!(
+            "{}Note: this skill asks for context: fork, but the task tool is unavailable in this turn, so \
+             it was not forked; follow it inline.\n\n{body}",
+            &section.markdown[..header_len]
+        );
         return;
     }
     let agent = match render.agent {
@@ -364,6 +425,7 @@ mod tests {
                 arguments: "src/lib.rs",
                 skill_dir: "/d",
                 fork: true,
+                task_available: true,
                 agent: Some("reviewer"),
                 model: Some("fast"),
             },
@@ -380,6 +442,49 @@ mod tests {
             "frontmatter is not part of the prompt"
         );
         assert!(section.resources.is_empty());
+    }
+
+    #[test]
+    fn fork_without_task_tool_renders_inline_with_a_notice() {
+        let mut section = AgentSection {
+            digest: "d".into(),
+            markdown: "---\nname: s\ncontext: fork\n---\nReview $ARGUMENTS now\n".into(),
+            resources: vec![("r.md".into(), 1, "x".into(), None)],
+            #[cfg(feature = "skills")]
+            learned_js: Vec::new(),
+            score: 1.0,
+            rank: 0,
+        };
+        render_section(
+            &mut section,
+            &PinRender {
+                arguments: "a.rs",
+                skill_dir: "/d",
+                fork: true,
+                task_available: false,
+                agent: Some("reviewer"),
+                model: None,
+            },
+        );
+        assert!(section.markdown.contains("task tool is unavailable"));
+        assert!(section.markdown.contains("Review a.rs now"));
+        assert!(!section.markdown.contains("Call the task tool"));
+        assert!(!section.resources.is_empty());
+    }
+
+    #[test]
+    fn positional_tokens_need_arguments_and_skip_fences_and_honour_escape() {
+        let awk = "Run:\n```sh\nawk '{print $1}' f\n```\ncosts $5 and $$1 and $$ARGUMENTS";
+        // No arguments: nothing positional is rewritten.
+        let none = substitute(awk, "", "/d");
+        assert!(none.contains("awk '{print $1}' f"), "{none}");
+        assert!(none.contains("costs $5 and $1 and $ARGUMENTS"), "{none}");
+        // With arguments: prose `$N` substitutes, the fenced one survives.
+        let some = substitute(awk, "x y", "/d");
+        assert!(some.contains("awk '{print $1}' f"), "{some}");
+        assert!(some.contains("costs  and $1 and $ARGUMENTS"), "{some}");
+        // `$ARGUMENTS` inside a fence still substitutes.
+        assert!(substitute("```\n$ARGUMENTS\n```", "q", "/d").contains("\nq\n"));
     }
 
     #[test]
