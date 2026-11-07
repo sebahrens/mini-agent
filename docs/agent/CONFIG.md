@@ -2506,7 +2506,11 @@ command (`ls`, `cat`, `head`, `tail` without `-f`, `wc`, `grep`, `rg` without
 `--pre`/`-z`, `find` without `-exec`/`-delete`/`-fprint*`, `sed -n 'ADDRp'`, and
 `git log|show|diff|status|blame|rev-parse|ls-files`) runs without a prompt when
 paths stay inside the working directory. Redirections, `$`/backtick expansion,
-subshells, `tee`, `xargs`, env assignments, `&` and any other command still ask.
+subshells, `tee`, `xargs`, env assignments, `&`, unquoted glob characters
+(`*`, `?`, `[`: the shell would expand them to paths the checker never saw; quote
+them to keep a literal) and any other command still ask. Recursive `grep -r`,
+`rg` and `find` also ask whenever any `read`/`grep` deny rule (or `external_directory`
+deny) exists, because the traversal could surface denied files below the named directory.
 Git is withheld in the unsandboxed fallback. See `src/permission/readonly_shell.rs`.
 On Linux, procfs process secrets are denied by a built-in baseline in every
 mode that no rule or session grant can lift (only
@@ -4843,13 +4847,13 @@ native web settings does not widen the JS broker's grant or worker authority.
 
 Proxies: native `web_fetch`, `web_search` and the JS `fetch()` broker honour
 `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` (and lowercase forms; `http`/`https` proxy
-URLs only) with `NO_PROXY` exclusions (`*`, host or `.domain` suffix, `host:port`,
+URLs only; a set but unusable value such as `socks5://...` or an unparsable one makes the web call fail closed with a message naming the variable, never a silent direct connection, unless `NO_PROXY` or loopback exempts the destination) with `NO_PROXY` exclusions (`*`, host or `.domain` suffix, `host:port`,
 IPv4 CIDR). Loopback and `localhost` destinations never use a proxy. Trade-off:
 the proxy resolves DNS names itself, so for a proxied name there is no local
 resolution, no address pinning and no private-address check on the answer; the
 approval key then reads `destinations=[via-proxy]`. mini-agent instead refuses
 `localhost`, single-label names and `.local`/`.localhost`/`.localdomain`/
-`.internal`/`.lan`/`.home.arpa`/`.intranet` names before any request, still
+`.internal`/`.lan`/`.home.arpa`/`.intranet` names (a trailing root dot such as `localhost.` is ignored) before any request, still
 validates IP literals, and re-applies origin policy, approval, redirect checks and
 body/time bounds on every hop; what a proxied public name may reach is then the
 proxy's policy. The native connect timeout is a third of `web-fetch-timeout-secs`

@@ -545,8 +545,7 @@ mod tests {
     fn glob_and_read_deny_rules_block_shell_auto_allow() {
         use crate::permission::checker::CheckResult;
         use crate::permission::{
-            Action, PermissionConfig, PermissionConfigs, SandboxResolution::*, SecurityMode,
-            ToolPerm,
+            Action, PermissionConfigs, SandboxResolution::*, SecurityMode, ToolPerm,
         };
         let fixture = crate::tests::OwnedTestDirectory::new("readonly-shell-deny");
         let work = fixture.path().canonicalize().unwrap();
@@ -572,7 +571,10 @@ mod tests {
         assert_eq!(denied.check("bash", "cat .e*"), CheckResult::Ask);
         assert_eq!(denied.check("bash", "grep -rn x ."), CheckResult::Ask);
         assert_eq!(denied.check("bash", "rg x"), CheckResult::Ask);
-        assert_eq!(denied.check("bash", "find . -name '*.pem'"), CheckResult::Ask);
+        assert_eq!(
+            denied.check("bash", "find . -name '*.pem'"),
+            CheckResult::Ask
+        );
         assert_eq!(denied.check("bash", "cat Cargo.toml"), CheckResult::Allowed);
         let mut open = make(false);
         assert_eq!(open.check("bash", "grep -rn x ."), CheckResult::Allowed);

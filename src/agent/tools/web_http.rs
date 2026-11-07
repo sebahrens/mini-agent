@@ -371,6 +371,8 @@ pub(crate) enum FetchError {
     UnauditedRedirectDenied,
     InvalidOptions(String),
     ClientBuild(String),
+    /// An environment proxy variable (named here, never its value) is set but unusable.
+    ProxyUnusable(String),
     Cancelled,
     TimedOut,
     #[cfg(all(feature = "js", feature = "sandbox"))]
@@ -425,6 +427,10 @@ impl std::fmt::Display for FetchError {
             }
             Self::InvalidOptions(message) => write!(formatter, "invalid fetch options: {message}"),
             Self::ClientBuild(message) => write!(formatter, "fetch client setup failed: {message}"),
+            Self::ProxyUnusable(variable) => write!(
+                formatter,
+                "{variable} is set but is not a usable http(s) proxy URL (socks5:// is not supported); refusing a direct connection. Unset it or use http://host:port"
+            ),
             Self::Cancelled => formatter.write_str("fetch cancelled"),
             Self::TimedOut => formatter.write_str("fetch timed out"),
             #[cfg(all(feature = "js", feature = "sandbox"))]
@@ -1167,7 +1173,7 @@ pub(crate) async fn send_async(
         return Err(FetchError::RequestBodyTooLarge);
     }
     let host = url.host_str().ok_or(FetchError::MissingHost)?;
-    let proxy = super::web_proxy::proxy_for_url(&url);
+    let proxy = super::web_proxy::proxy_for_url(&url)?;
     if addresses.is_empty() && proxy.is_none() {
         return Err(FetchError::DestinationDenied);
     }
@@ -1449,7 +1455,8 @@ impl NativeWebClient {
                 // Behind an environment proxy the proxy resolves DNS names, so
                 // there is nothing to pin: screen the name instead and leave the
                 // destination set empty (see `web_proxy`).
-                let proxied_name = super::web_proxy::proxied_dns_name(&url);
+                let proxied_name =
+                    super::web_proxy::proxied_dns_name(&url).map_err(native_error)?;
                 let addresses = if proxied_name {
                     super::web_proxy::validate_proxied_host_name(
                         url.host_str()
@@ -1934,6 +1941,39 @@ pub(crate) mod web_http_tests {
             let message=client.execute("http://fixture.invalid/search",&request,"web_search",false).await.unwrap_err().to_string();
             assert!(message.contains(expected),"{message}"); assert!(!message.contains("owned-secret"));assert_eq!(peer.count(),1);
         }
+    }
+    // mini-agent-85nur: an unusable proxy variable fails the call closed
+    // (naming the variable) instead of silently connecting directly.
+    #[tokio::test]
+    async fn web_http_unusable_env_proxy_fails_closed_without_direct_connection() {
+        use super::super::web_proxy::{ProxyEnv, set_test_proxy_env};
+        let peer = Peer::new(vec![Peer::response("direct")]);
+        let env = ProxyEnv::from_lookup(|name| {
+            (name == "ALL_PROXY").then(|| "socks5://127.0.0.1:1080".to_owned())
+        });
+        let client = NativeWebClient::new(
+            FetchPolicy::from_settings(None, true),
+            Some(allowed_permission()),
+            None,
+        );
+        let _guard = set_test_proxy_env(env);
+        let error = client
+            .execute(
+                "http://docs.unresolvable-name.test/page",
+                &FetchRequest::get(),
+                "web_fetch",
+                true,
+            )
+            .await
+            .expect_err("unusable proxy must not fall back to direct");
+        assert_eq!(peer.count(), 0);
+        let message = format!("{error:?}");
+        assert!(message.contains("ALL_PROXY"), "{message}");
+        assert!(
+            message.contains("refusing a direct connection"),
+            "{message}"
+        );
+        assert!(!message.contains("127.0.0.1"), "{message}");
     }
     // mini-agent-788z5: a name behind an environment proxy is sent to the
     // proxy (absolute-form request), unresolved locally; NO_PROXY and loopback

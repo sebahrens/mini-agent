@@ -782,7 +782,7 @@ impl FetchSender for BoundFetchSender {
         permission_bridge: &PermissionBridge,
     ) -> Result<FetchTransportOutcome, FetchError> {
         let host = url.host_str().ok_or(FetchError::MissingHost)?;
-        let proxy = crate::agent::tools::web_proxy::proxy_for_url(&url);
+        let proxy = crate::agent::tools::web_proxy::proxy_for_url(&url)?;
         // A proxied DNS name has no pinned addresses; the proxy resolves it.
         let resolved = (!addresses.is_empty()).then_some((host, addresses));
         let transport =
@@ -1035,7 +1035,7 @@ impl FetchExecutor {
     ) -> Result<PreparedFetchTarget, FetchError> {
         let host = url.host_str().ok_or(FetchError::MissingHost)?;
         let port = url.port_or_known_default().ok_or(FetchError::MissingPort)?;
-        let addresses = if crate::agent::tools::web_proxy::proxied_dns_name(&url) {
+        let addresses = if crate::agent::tools::web_proxy::proxied_dns_name(&url)? {
             // The environment proxy resolves the name: screen it, do not pin.
             crate::agent::tools::web_proxy::validate_proxied_host_name(host)?;
             Vec::new()
@@ -2477,6 +2477,7 @@ fn fetch_service_error(error: &FetchError) -> EffectServiceError {
         FetchError::DnsResolutionFailed
         | FetchError::TooManyRedirects
         | FetchError::ClientBuild(_)
+        | FetchError::ProxyUnusable(_)
         | FetchError::RequestFailed(_)
         | FetchError::UnsupportedContentEncoding => EffectServiceError::BackendFailure,
     }
