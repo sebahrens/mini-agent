@@ -787,6 +787,7 @@ impl LspManager {
             .await
     }
 
+    #[cfg(test)]
     /// [`Self::diagnostics_block_since`] for an explicit query: `page` selects
     /// the window and the truncation footer states what is hidden.
     pub(crate) async fn diagnostics_query_since(
@@ -801,6 +802,7 @@ impl LspManager {
             .0
     }
 
+    #[cfg(test)]
     /// Like [`Self::diagnostics_block_since`], also reporting whether the
     /// awaited publish arrived (`None` when no wait took place).
     async fn diagnostics_block_observed(

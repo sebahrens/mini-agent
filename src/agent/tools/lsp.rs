@@ -838,6 +838,7 @@ fn char_floor(text: &str, mut index: usize) -> usize {
     index
 }
 
+#[cfg(test)]
 pub(crate) fn render_edit_preview(
     preview: &crate::extras::lsp::navigate::EditPreview,
     root: &Path,
