@@ -1,0 +1,37 @@
+   Compiling mini-agent v1.12.0 (/Users/seb/projects/mini-agent)
+    Finished `test` profile [unoptimized] target(s) in 33.93s
+     Running unittests src/main.rs (target/debug/deps/mini_agent-eb54318180c9c0b0)
+
+running 3 tests
+test extras::mcp::server::tests::rereview_eof_retires_runs_while_stdout_is_backpressured ... FAILED
+test ui::slash::rereview_token_boundary_probes::rereview_token_boundary_control_has_a_legal_compaction_cut ... FAILED
+test ui::slash::rereview_token_boundary_probes::rereview_token_boundary_real_pressure_must_not_be_vetoed_by_local_gate ... FAILED
+
+failures:
+
+---- extras::mcp::server::tests::rereview_eof_retires_runs_while_stdout_is_backpressured stdout ----
+
+thread 'extras::mcp::server::tests::rereview_eof_retires_runs_while_stdout_is_backpressured' (66624469) panicked at src/extras/mcp/server.rs:2129:9:
+stdin EOF did not retire a backpressured server: retired=false, child_live=true
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- ui::slash::rereview_token_boundary_probes::rereview_token_boundary_control_has_a_legal_compaction_cut stdout ----
+
+thread 'ui::slash::rereview_token_boundary_probes::rereview_token_boundary_control_has_a_legal_compaction_cut' (66624477) panicked at src/ui/slash/mod.rs:1598:9:
+assertion failed: matches!(plan_tui_compaction(&session, false, false, 90_000, 1_000,
+    usize::MAX), TuiCompactionGate::Cut(_))
+
+---- ui::slash::rereview_token_boundary_probes::rereview_token_boundary_real_pressure_must_not_be_vetoed_by_local_gate stdout ----
+
+thread 'ui::slash::rereview_token_boundary_probes::rereview_token_boundary_real_pressure_must_not_be_vetoed_by_local_gate' (66624478) panicked at src/ui/slash/mod.rs:1625:9:
+A real provider boundary has a legal old prefix, but the TUI performed no compaction: WithinBudget
+
+
+failures:
+    extras::mcp::server::tests::rereview_eof_retires_runs_while_stdout_is_backpressured
+    ui::slash::rereview_token_boundary_probes::rereview_token_boundary_control_has_a_legal_compaction_cut
+    ui::slash::rereview_token_boundary_probes::rereview_token_boundary_real_pressure_must_not_be_vetoed_by_local_gate
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 6231 filtered out; finished in 0.64s
+
+error: test failed, to rerun pass `--bin mini-agent`

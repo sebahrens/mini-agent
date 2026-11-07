@@ -1,0 +1,33 @@
+   Compiling mini-agent v1.12.0 (/Users/seb/projects/mini-agent)
+    Finished `test` profile [unoptimized] target(s) in 27.71s
+     Running unittests src/main.rs (target/debug/deps/mini_agent-eb54318180c9c0b0)
+
+running 2 tests
+test spend::ledger::tests::rereview_retry_across_rotation_counts_receipt_once ... FAILED
+test spend::ledger::tests::rereview_rollup_keeps_untracked_session_charge ... FAILED
+
+failures:
+
+---- spend::ledger::tests::rereview_retry_across_rotation_counts_receipt_once stdout ----
+
+thread 'spend::ledger::tests::rereview_retry_across_rotation_counts_receipt_once' (66620340) panicked at src/spend/ledger.rs:2840:9:
+assertion `left == right` failed: retried receipt must stay exactly once across rotation
+  left: 3
+ right: 2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- spend::ledger::tests::rereview_rollup_keeps_untracked_session_charge stdout ----
+
+thread 'spend::ledger::tests::rereview_rollup_keeps_untracked_session_charge' (66620591) panicked at src/spend/ledger.rs:2858:9:
+assertion `left == right` failed: session detail cap must not report an incurred charge as zero
+  left: 0
+ right: 1
+
+
+failures:
+    spend::ledger::tests::rereview_retry_across_rotation_counts_receipt_once
+    spend::ledger::tests::rereview_rollup_keeps_untracked_session_charge
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 6231 filtered out; finished in 2.00s
+
+error: test failed, to rerun pass `--bin mini-agent`

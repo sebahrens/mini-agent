@@ -1,0 +1,46 @@
+   Compiling mini-agent v1.12.0 (/Users/seb/projects/mini-agent)
+    Finished `test` profile [unoptimized] target(s) in 17.66s
+     Running unittests src/main.rs (target/debug/deps/mini_agent-eb54318180c9c0b0)
+
+running 38 tests
+test models_catalog::tests::bedrock_and_vertex_claude_ids_use_native_metadata ... ok
+test models_catalog::tests::catalog_cache_pricing_accepts_legacy_missing_and_explicit_zero_tiers ... ok
+test models_catalog::tests::catalog_max_output_is_parsed_and_embedded ... ok
+test models_catalog::tests::future_dated_overlay_is_ignored_and_triggers_refresh_after_clock_rollback ... ok
+test models_catalog::tests::malformed_catalog_falls_back_to_empty ... ok
+test models_catalog::tests::models_dev_transform_mirrors_the_generator_filters ... ok
+test models_catalog::tests::newer_cache_overlay_replaces_listed_providers ... ok
+test models_catalog::tests::older_or_corrupt_cache_keeps_the_embedded_snapshot ... ok
+test self_update::tests::a_verified_archive_yields_only_the_exact_executable ... ok
+test self_update::tests::attestation_uses_gh_and_only_a_rejection_by_a_working_gh_aborts ... ok
+test self_update::tests::hostile_archives_and_manifests_install_nothing ... ok
+test self_update::tests::install_replaces_atomically_and_keeps_a_running_inode_intact ... ok
+test self_update::tests::manifest_rules_match_install_sh ... ok
+test self_update::tests::notices_from_the_archive_replace_installed_ones_when_the_directory_exists ... ok
+test self_update::tests::only_the_exact_update_forms_are_a_subcommand ... ok
+test self_update::tests::package_managed_and_build_paths_are_refused_with_a_command ... ok
+test self_update::tests::stalled_gh_times_out_without_surviving_descendants ... ok
+test self_update::tests::unattested_installs_need_the_flag_or_a_confirmation ... ok
+test self_update::tests::version_probe_requires_a_whole_version_token ... ok
+test self_update::tests::version_probe_that_never_exits_or_floods_is_bounded ... ok
+test spend::ledger::tests::concurrent_rotating_writers_do_not_lose_a_rollup_generation ... ok
+test spend::ledger::tests::corrupt_rollup_fails_closed_instead_of_dropping_history ... ok
+test spend::ledger::tests::first_flush_seeds_from_the_checkpoint_and_still_detects_prefix_conflicts ... ok
+test spend::ledger::tests::full_ledger_rotates_and_keeps_all_time_session_and_model_totals ... ok
+test spend::ledger::tests::repeated_flushes_do_not_reread_the_ledger_prefix ... ok
+test spend::ledger::tests::rotation_that_crashed_before_the_rollup_write_is_recovered_without_double_counting ... ok
+test spend::ledger::tests::spend_ledger_concurrent_lock_is_bounded_and_directory_replacement_is_refused ... ok
+test spend::ledger::tests::spend_ledger_corrupt_tail_preserves_bytes_pending_and_incurred_charge ... ok
+test spend::ledger::tests::spend_ledger_malformed_or_duplicate_rows_are_not_silently_repaired ... ok
+test spend::ledger::tests::spend_ledger_records_only_new_usage_and_repeated_saves_are_idempotent ... ok
+test spend::ledger::tests::spend_ledger_recovers_post_checkpoint_charges_without_importing_or_doubling_rows ... ok
+test spend::ledger::tests::spend_ledger_refuses_public_hardlinked_symlink_and_nonregular_files_without_mutation ... ok
+test spend::ledger::tests::startup_checkpoint_scans_only_the_tail_and_equals_a_full_scan ... ok
+test spend::ledger::tests::startup_session_summary_equals_full_scan_session_totals ... ok
+test spend::ledger::tests::summary_after_rotation_crash_keeps_archived_usage_read_only ... ok
+test spend::ledger::tests::summary_racing_a_real_rotation_counts_each_receipt_exactly_once ... ok
+test spend::ledger::tests::summary_tolerates_read_only_coordination_lock ... ok
+test spend::ledger::tests::usd_budget_concurrent_profile_receipts_share_io_and_never_double_or_drop_charges ... ok
+
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 6193 filtered out; finished in 12.32s
+

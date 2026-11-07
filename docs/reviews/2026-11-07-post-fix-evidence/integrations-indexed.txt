@@ -1,0 +1,322 @@
+=== status ===
+{
+  "server": {
+    "active_sessions": 3,
+    "max_projects": 5,
+    "parse_failures": 0,
+    "projects": 3,
+    "status": "ok"
+  },
+  "session": {
+    "session_id": "a6f20d12-c099-43b3-b630-67fc7c085479",
+    "host": "127.0.0.1",
+    "port": 3000,
+    "project": "/Users/seb/projects/mini-agent",
+    "created_at": "2026-11-07T12:16:18.461906+00:00"
+  },
+  "session_details": {
+    "created_at": "2026-11-07T12:16:18.461906+00:00",
+    "history_count": 43,
+    "last_active": "2026-11-07T14:48:57.955073+00:00",
+    "project": "/Users/seb/projects/mini-agent",
+    "session_id": "a6f20d12-c099-43b3-b630-67fc7c085479"
+  }
+}
+
+=== peek src/extras/mcp/server.rs --start 1074 --end 1088 --detail full ===
+{
+  "page": {
+    "detail": "full",
+    "estimated_tokens": 387,
+    "has_more": false,
+    "limit": 1,
+    "next_offset": null,
+    "offset": 0,
+    "returned_count": 1,
+    "steering": null,
+    "token_cap": 10000,
+    "total_count": 1,
+    "truncated": false
+  },
+  "peek": {
+    "file": "/Users/seb/projects/mini-agent/src/extras/mcp/server.rs",
+    "line_end": 1088,
+    "line_start": 1075,
+    "location": {
+      "byte_end": 0,
+      "byte_start": 0,
+      "file": "/Users/seb/projects/mini-agent/src/extras/mcp/server.rs",
+      "line_end": 1088,
+      "line_start": 1075,
+      "relative_file": "src/extras/mcp/server.rs"
+    },
+    "relative_file": "src/extras/mcp/server.rs",
+    "semantic_id": "/Users/seb/projects/mini-agent/src/extras/mcp/server.rs:1075:slice",
+    "slice": {
+      "line_end": 1088,
+      "line_start": 1075,
+      "source": "  1075 \u2502     let mut input_open = true;\n  1076 \u2502     let outcome: anyhow::Result<()> = async {\n  1077 \u2502         loop {\n  1078 \u2502             if !input_open {\n  1079 \u2502                 // Calls answer through `reply_rx`; flush what is queued. Runs\n  1080 \u2502                 // still active are cancelled by the teardown after this loop.\n  1081 \u2502                 while let Ok(reply) = reply_rx.try_recv() {\n  1082 \u2502                     write_message(&mut output, &reply).await?;\n  1083 \u2502                 }\n  1084 \u2502                 return Ok(());\n  1085 \u2502             }\n  1086 \u2502             tokio::select! {\n  1087 \u2502                 item = line_rx.recv(), if input_open => {\n  1088 \u2502                     let Some(item) = item else { input_open = false; continue };"
+    },
+    "total_lines": 2104
+  }
+}
+
+=== peek src/extras/acp/model_options.rs --start 124 --end 140 --detail full ===
+{
+  "page": {
+    "detail": "full",
+    "estimated_tokens": 428,
+    "has_more": false,
+    "limit": 1,
+    "next_offset": null,
+    "offset": 0,
+    "returned_count": 1,
+    "steering": null,
+    "token_cap": 10000,
+    "total_count": 1,
+    "truncated": false
+  },
+  "peek": {
+    "file": "/Users/seb/projects/mini-agent/src/extras/acp/model_options.rs",
+    "line_end": 140,
+    "line_start": 125,
+    "location": {
+      "byte_end": 0,
+      "byte_start": 0,
+      "file": "/Users/seb/projects/mini-agent/src/extras/acp/model_options.rs",
+      "line_end": 140,
+      "line_start": 125,
+      "relative_file": "src/extras/acp/model_options.rs"
+    },
+    "relative_file": "src/extras/acp/model_options.rs",
+    "semantic_id": "/Users/seb/projects/mini-agent/src/extras/acp/model_options.rs:125:slice",
+    "slice": {
+      "line_end": 140,
+      "line_start": 125,
+      "source": "   125 \u2502 \n   126 \u2502 /// `default` clears the override; otherwise `value` must be a configured\n   127 \u2502 /// quick-model alias.\n   128 \u2502 pub(super) fn parse_model(cfg: &Config, value: &str) -> Result<Option<String>, String> {\n   129 \u2502     if value == DEFAULT_VALUE {\n   130 \u2502         return Ok(None);\n   131 \u2502     }\n   132 \u2502     // Decode before any lookup, so a configured alias that looks like an\n   133 \u2502     // escaped value can never shadow the alias the value actually names.\n   134 \u2502     let alias = value.strip_prefix(RESERVED_ALIAS_PREFIX).unwrap_or(value);\n   135 \u2502     if wire_value(alias) == value && crate::config::quick_models_map(cfg).contains_key(alias) {\n   136 \u2502         return Ok(Some(alias.to_owned()));\n   137 \u2502     }\n   138 \u2502     Err(bounded_message(&format!(\n   139 \u2502         \"unknown ACP model '{value}'; choose default or a configured quick model\"\n   140 \u2502     )))"
+    },
+    "total_lines": 337
+  }
+}
+
+=== callers set_model_override --file src/extras/acp/mod.rs --limit 8 ===
+{
+  "callers": [
+    {
+      "file": "/Users/seb/projects/mini-agent/src/extras/acp/mod.rs",
+      "line": 2322,
+      "location": {
+        "byte_end": 0,
+        "byte_start": 0,
+        "file": "/Users/seb/projects/mini-agent/src/extras/acp/mod.rs",
+        "line_end": 2322,
+        "line_start": 2322,
+        "relative_file": "src/extras/acp/mod.rs"
+      },
+      "relative_file": "src/extras/acp/mod.rs",
+      "semantic_id": "/Users/seb/projects/mini-agent/src/extras/acp/mod.rs:2322:caller",
+      "text": "set_model_override(state, &req.session_id, &config_id, &value, native).await"
+    },
+    {
+      "file": "/Users/seb/projects/mini-agent/src/extras/acp/mod.rs",
+      "line": 4077,
+      "location": {
+        "byte_end": 0,
+        "byte_start": 0,
+        "file": "/Users/seb/projects/mini-agent/src/extras/acp/mod.rs",
+        "line_end": 4077,
+        "line_start": 4077,
+        "relative_file": "src/extras/acp/mod.rs"
+      },
+      "relative_file": "src/extras/acp/mod.rs",
+      "semantic_id": "/Users/seb/projects/mini-agent/src/extras/acp/mod.rs:4077:caller",
+      "text": "match set_model_override(state, &session_id, config_id, argument, native).await"
+    }
+  ],
+  "count": 2,
+  "page": {
+    "detail": "signatures",
+    "estimated_tokens": 300,
+    "has_more": false,
+    "limit": 8,
+    "next_offset": null,
+    "offset": 0,
+    "returned_count": 2,
+    "steering": null,
+    "token_cap": 6250,
+    "total_count": 2,
+    "truncated": false
+  }
+}
+
+=== callers parse_model --file src/extras/acp/model_options.rs --limit 8 ===
+{
+  "callers": [
+    {
+      "file": "/Users/seb/projects/mini-agent/src/extras/acp/mod.rs",
+      "line": 2213,
+      "location": {
+        "byte_end": 0,
+        "byte_start": 0,
+        "file": "/Users/seb/projects/mini-agent/src/extras/acp/mod.rs",
+        "line_end": 2213,
+        "line_start": 2213,
+        "relative_file": "src/extras/acp/mod.rs"
+      },
+      "relative_file": "src/extras/acp/mod.rs",
+      "semantic_id": "/Users/seb/projects/mini-agent/src/extras/acp/mod.rs:2213:caller",
+      "text": "next.model = model_options::parse_model(&state.cfg, value).map_err(invalid)?;"
+    },
+    {
+      "file": "/Users/seb/projects/mini-agent/docs/reviews/2026-11-07-review-evidence/alias-indexer-evidence.txt",
+      "line": 47,
+      "location": {
+        "byte_end": 0,
+        "byte_start": 0,
+        "file": "/Users/seb/projects/mini-agent/docs/reviews/2026-11-07-review-evidence/alias-indexer-evidence.txt",
+        "line_end": 47,
+        "line_start": 47,
+        "relative_file": "docs/reviews/2026-11-07-review-evidence/alias-indexer-evidence.txt"
+      },
+      "relative_file": "docs/reviews/2026-11-07-review-evidence/alias-indexer-evidence.txt",
+      "semantic_id": "/Users/seb/projects/mini-agent/docs/reviews/2026-11-07-review-evidence/alias-indexer-evidence.txt:47:caller",
+      "text": "=== callers parse_model --file src/extras/acp/model_options.rs --limit 10 ==="
+    },
+    {
+      "file": "/Users/seb/projects/mini-agent/docs/reviews/2026-11-07-review-evidence/alias-indexer-evidence.txt",
+      "line": 63,
+      "location": {
+        "byte_end": 0,
+        "byte_start": 0,
+        "file": "/Users/seb/projects/mini-agent/docs/reviews/2026-11-07-review-evidence/alias-indexer-evidence.txt",
+        "line_end": 63,
+        "line_start": 63,
+        "relative_file": "docs/reviews/2026-11-07-review-evidence/alias-indexer-evidence.txt"
+      },
+      "relative_file": "docs/reviews/2026-11-07-review-evidence/alias-indexer-evidence.txt",
+      "semantic_id": "/Users/seb/projects/mini-agent/docs/reviews/2026-11-07-review-evidence/alias-indexer-evidence.txt:63:caller",
+      "text": "\"text\": \"next.model = model_options::parse_model(&state.cfg, value).map_err(invalid)?;\""
+    },
+    {
+      "file": "/Users/seb/projects/mini-agent/docs/reviews/2026-11-07-review-evidence/alias-indexer-evidence.txt",
+      "line": 114,
+      "location": {
+        "byte_end": 0,
+        "byte_start": 0,
+        "file": "/Users/seb/projects/mini-agent/docs/reviews/2026-11-07-review-evidence/alias-indexer-evidence.txt",
+        "line_end": 114,
+        "line_start": 114,
+        "relative_file": "docs/reviews/2026-11-07-review-evidence/alias-indexer-evidence.txt"
+      },
+      "relative_file": "docs/reviews/2026-11-07-review-evidence/alias-indexer-evidence.txt",
+      "semantic_id": "/Users/seb/projects/mini-agent/docs/reviews/2026-11-07-review-evidence/alias-indexer-evidence.txt:114:caller",
+      "text": "\"source\": \"   125 \\u2502 pub(super) fn parse_model(cfg: &Config, value: &str) -> Result<Option<String>, String> {\\n   126 \\u2502     if value == DEFAULT_VALUE {\\n   127 \\u2502         return Ok(None);\\n   128 \\u2502     }\\n   129 \\u2502     let quick = crate::config::quick_models_map(cfg);\\n   130 \\u2502     if quick.contains_key(value) {\\n   131 \\u2502         return Ok(Some(value.to_owned()));\\n   132 \\u2502     }\\n   133 \\u2502     if let Some(alias) = value.strip_prefix(RESERVED_ALIAS_PREFIX)\\n   134 \\u2502         && alias == DEFAULT_VALUE\\n   135 \\u2502         && quick.contains_key(alias)\\n   136 \\u2502     {\\n   137 \\u2502         return Ok(Some(alias.to_owned()));\\n   138 \\u2502     }\""
+    },
+    {
+      "file": "/Users/seb/projects/mini-agent/src/extras/acp/model_options.rs",
+      "line": 290,
+      "location": {
+        "byte_end": 0,
+        "byte_start": 0,
+        "file": "/Users/seb/projects/mini-agent/src/extras/acp/model_options.rs",
+        "line_end": 290,
+        "line_start": 290,
+        "relative_file": "src/extras/acp/model_options.rs"
+      },
+      "relative_file": "src/extras/acp/model_options.rs",
+      "semantic_id": "/Users/seb/projects/mini-agent/src/extras/acp/model_options.rs:290:caller",
+      "text": "let selected = parse_model(&cfg, &wire_value(alias)).unwrap().unwrap();"
+    }
+  ],
+  "count": 5,
+  "page": {
+    "detail": "signatures",
+    "estimated_tokens": 987,
+    "has_more": false,
+    "limit": 8,
+    "next_offset": null,
+    "offset": 0,
+    "returned_count": 5,
+    "steering": null,
+    "token_cap": 6250,
+    "total_count": 5,
+    "truncated": false
+  }
+}
+
+=== peek src/extras/mcp/headers_helper.rs --start 78 --end 95 --detail full ===
+{
+  "page": {
+    "detail": "full",
+    "estimated_tokens": 399,
+    "has_more": false,
+    "limit": 1,
+    "next_offset": null,
+    "offset": 0,
+    "returned_count": 1,
+    "steering": null,
+    "token_cap": 10000,
+    "total_count": 1,
+    "truncated": false
+  },
+  "peek": {
+    "file": "/Users/seb/projects/mini-agent/src/extras/mcp/headers_helper.rs",
+    "line_end": 95,
+    "line_start": 79,
+    "location": {
+      "byte_end": 0,
+      "byte_start": 0,
+      "file": "/Users/seb/projects/mini-agent/src/extras/mcp/headers_helper.rs",
+      "line_end": 95,
+      "line_start": 79,
+      "relative_file": "src/extras/mcp/headers_helper.rs"
+    },
+    "relative_file": "src/extras/mcp/headers_helper.rs",
+    "semantic_id": "/Users/seb/projects/mini-agent/src/extras/mcp/headers_helper.rs:79:slice",
+    "slice": {
+      "line_end": 95,
+      "line_start": 79,
+      "source": "    79 \u2502 /// Owns the helper's process group for the life of `run()`. Dropping the\n    80 \u2502 /// `run()` future (connection or reconnect cancellation) skips the ordinary\n    81 \u2502 /// whole-group kill that follows the timeout, and `kill_on_drop` alone signals\n    82 \u2502 /// only the direct child, so descendants of a credential helper would survive.\n    83 \u2502 struct GroupKillOnDrop(#[cfg_attr(not(unix), allow(dead_code))] Option<u32>);\n    84 \u2502 \n    85 \u2502 impl Drop for GroupKillOnDrop {\n    86 \u2502     fn drop(&mut self) {\n    87 \u2502         #[cfg(unix)]\n    88 \u2502         if let Some(pid) = self.0 {\n    89 \u2502             crate::sandbox::kill_process_group_if_live(pid);\n    90 \u2502         }\n    91 \u2502     }\n    92 \u2502 }\n    93 \u2502 \n    94 \u2502 async fn run(\n    95 \u2502     server_name: &str,"
+    },
+    "total_lines": 473
+  }
+}
+
+=== peek src/extras/mcp/server.rs --start 1187 --end 1197 --detail full ===
+{
+  "page": {
+    "detail": "full",
+    "estimated_tokens": 278,
+    "has_more": false,
+    "limit": 1,
+    "next_offset": null,
+    "offset": 0,
+    "returned_count": 1,
+    "steering": null,
+    "token_cap": 10000,
+    "total_count": 1,
+    "truncated": false
+  },
+  "peek": {
+    "file": "/Users/seb/projects/mini-agent/src/extras/mcp/server.rs",
+    "line_end": 1197,
+    "line_start": 1188,
+    "location": {
+      "byte_end": 0,
+      "byte_start": 0,
+      "file": "/Users/seb/projects/mini-agent/src/extras/mcp/server.rs",
+      "line_end": 1197,
+      "line_start": 1188,
+      "relative_file": "src/extras/mcp/server.rs"
+    },
+    "relative_file": "src/extras/mcp/server.rs",
+    "semantic_id": "/Users/seb/projects/mini-agent/src/extras/mcp/server.rs:1188:slice",
+    "slice": {
+      "line_end": 1197,
+      "line_start": 1188,
+      "source": "  1188 \u2502     output: &mut (impl AsyncWrite + Unpin),\n  1189 \u2502     message: &Value,\n  1190 \u2502 ) -> anyhow::Result<()> {\n  1191 \u2502     let mut bytes = serde_json::to_vec(message)?;\n  1192 \u2502     bytes.push(b'\\n');\n  1193 \u2502     output.write_all(&bytes).await?;\n  1194 \u2502     output.flush().await?;\n  1195 \u2502     Ok(())\n  1196 \u2502 }\n  1197 \u2502 "
+    },
+    "total_lines": 2132
+  }
+}
+

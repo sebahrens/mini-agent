@@ -1,0 +1,11 @@
+    Finished `test` profile [unoptimized] target(s) in 0.83s
+     Running unittests src/main.rs (target/debug/deps/mini_agent-eb54318180c9c0b0)
+
+running 4 tests
+test key_command::tests::an_expired_token_is_refreshed_once_on_401_and_the_request_succeeds ... ok
+test key_command::tests::an_expired_ttl_refreshes_before_the_request ... ok
+test key_command::tests::an_unchanged_token_after_refresh_surfaces_the_401_without_a_resend ... ok
+test key_command::tests::gemini_query_string_key_is_refreshed_and_renewed_on_401 ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 6227 filtered out; finished in 1.32s
+

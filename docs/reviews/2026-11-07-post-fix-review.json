@@ -1,0 +1,848 @@
+{
+  "date": "2026-11-07",
+  "reviewed_head": "282e1e1b4bb4f508671a1da9698ee63bf5a49ab9",
+  "baseline": "6358fdae2bd9acc76588a7352b4c2340551ea044",
+  "tracking_epic": "mini-agent-p0h9g",
+  "request": "Re-review implemented xorxl fixes and surrounding code for previously unidentified P0-P3 issues, with a thorough independent root pass; file verified defects.",
+  "conclusion": {
+    "confirmed_new_findings": 8,
+    "priorities": {
+      "P0": 0,
+      "P1": 0,
+      "P2": 7,
+      "P3": 1
+    },
+    "clearance": "Not clear of P0-P3: eight open child beads require implementation. Absence of additional findings is not a proof of defect-free code."
+  },
+  "scope": {
+    "changed_files": 36,
+    "diff_additions": 2515,
+    "diff_deletions": 242,
+    "old_findings": 16,
+    "old_findings_status": "All16 original xorxl children were closed before review; targeted source mechanisms were rechecked. New sibling and platform paths remain as listed.",
+    "root_independent_review": [
+      "Ledger stable lock, append/rotation/recovery, rollup limits, receipt identity and startup/admission reconciliation.",
+      "Model-catalog clock policy and refresh callers; update helper deadline/output/tree behavior.",
+      "TUI real-pressure gate and legal compaction cut, runner budget carry and child continuation callback contracts.",
+      "MCP writer/dispatch/EOF/task ownership and Windows process-creation branches.",
+      "Credential first-request query construction, ownership and refresh; ACP raw slash aliases versus wire decoder.",
+      "JS guarded digest propagation, typed filesystem error mapping, canonical Phase6 checklist; LSP absent mapping and resource-operation disclosure; editor conditional-write integration."
+    ],
+    "method": "Root performed direct source/caller review and executed targeted positive and negative controls. Three sol-6.1 reviewers independently reviewed runtime, boundary, and integration areas; root checked each accepted finding. Code indexer calls matched current source; integration reviewer also recorded HTTP-index evidence."
+  },
+  "findings": [
+    {
+      "priority": 2,
+      "confidence": 1.0,
+      "title": "Preserve receipt deduplication across ledger rotation and retry",
+      "file": "src/spend/ledger.rs",
+      "line_start": 787,
+      "line_end": 803,
+      "scenario": "An append reaches disk but fails before acknowledgement (for example fsync/revalidation failure). The original account retains that receipt and gains a second receipt. At the active-segment capacity boundary, the retry rotates the first receipt into the archive and then appends the entire pending batch to the new segment.",
+      "evidence": [
+        "flush_rows_once checks receipt identities only in the active segment; matching rows are skipped but not removed from pending before the next rotation pass.",
+        "flush_rows invokes its final Append pass with the original pending slice after rotate archived the already-written receipt. The fresh active segment has no identity for it.",
+        "Root executed rereview_retry_across_rotation_counts_receipt_once against HEAD: expected two session receipts, observed three. Probe uses one valid persisted row plus that same unacknowledged pending row and one fresh row; it does not require an invalid ledger."
+      ],
+      "fix": "Retain durable deduplication across generation changes, including retries after another writer rotates. Do not acknowledge a receipt before its durable state is established; do not rely only on the new segment identity map.",
+      "acceptance_tests": [
+        "Regression reproduces a complete persisted but unacknowledged receipt at rotation and proves all-time/session/model tokens and cost count it exactly once.",
+        "Cover mixed old/new pending batches in both iteration orders, a concurrent second writer rotating before retry, and conflicting receipt identities across retained segments.",
+        "Existing rotation, crash recovery, and idempotent-save tests keep passing."
+      ],
+      "related_beads": [
+        "mini-agent-xorxl.1",
+        "mini-agent-oykaz"
+      ],
+      "validation": "Root Rust negative-control test failed as expected: session.records=3, expected2. See ledger-probes.log and ledger-probes.rs.",
+      "bead_id": "mini-agent-p0h9g.1"
+    },
+    {
+      "priority": 2,
+      "confidence": 1.0,
+      "title": "Recover archived session totals when the rollup detail cap omits a session",
+      "file": "src/spend/ledger.rs",
+      "line_start": 1027,
+      "line_end": 1035,
+      "scenario": "After archived history spans more than4096 distinct sessions, RollupState drops later session details. Startup reconciliation of a dropped session still succeeds with zero archived session usage. A rollup exceeding16MiB similarly discards all per-session details.",
+      "evidence": [
+        "RollupState::add sets sessions_dropped when the4096-session map fills; store_rollup can also serialize an empty session map to fit the16MiB cap.",
+        "RollupState::apply only merges sessions.get(id) and never checks sessions_dropped or scans archived receipts for a missing session.",
+        "startup.rs1645 passes the incomplete summary.session into Account::reconcile, which marks ledger_ready and uses its token/cost totals. Saved legacy cost can preserve previously saved monetary estimates, but cannot recover charges after the last save; session token reconciliation also loses omitted archived usage.",
+        "Root probe writes a valid archive containing4097 distinct sessions and calls session_summary for the last: it returns0 records although that session has one receipt."
+      ],
+      "fix": "Treat omitted session detail as incomplete. Recover the requested session from archives or maintain a bounded exact lookup; otherwise fail closed for admission rather than returning an exact-looking zero.",
+      "acceptance_tests": [
+        "With4097 sessions across rotated segments, both session_summary and summary_for_session recover the last session's exact tokens/cost or explicitly refuse incomplete accounting.",
+        "Exercise rollup size fallback and a requested session with both archived and active receipts.",
+        "A resumed session with a token or USD cap cannot admit work using silently omitted archived charges; retain the monotonic saved-estimate behavior."
+      ],
+      "related_beads": [
+        "mini-agent-xorxl.1",
+        "mini-agent-oykaz"
+      ],
+      "validation": "Root Rust negative-control test failed as expected: session.records=0, expected1. See ledger-probes.log and ledger-probes.rs.",
+      "bead_id": "mini-agent-p0h9g.2"
+    },
+    {
+      "id": "runtime-rereview-1",
+      "priority": 2,
+      "confidence": 0.99,
+      "title": "Real token-pressure relief can be skipped and then falsely classified as irreducible context",
+      "locations": [
+        {
+          "file": "src/ui/mod.rs",
+          "start_line": 1919,
+          "end_line": 1927
+        },
+        {
+          "file": "src/ui/slash/mod.rs",
+          "start_line": 553,
+          "end_line": 561
+        },
+        {
+          "file": "src/ui/slash/mod.rs",
+          "start_line": 803,
+          "end_line": 809
+        },
+        {
+          "file": "src/ui/app.rs",
+          "start_line": 4910,
+          "end_line": 4927
+        }
+      ],
+      "scenario": "Configure mid_turn_compact_threshold=0.80 and a 100k context window with a 10k reserve. A tool-bearing completion reports 81k real prompt tokens, while the local session estimate stays below the normal 90k between-turn budget and has a legal old prefix. The real-pressure boundary requests compaction. compact_and_respawn(Some(.81)) passes force=false, and the inner planner returns WithinBudget because byte pressure is false and local tokens<=90k. No summarizer runs. The app nonetheless marks awaiting_compaction_relief=true. On the next completion still above .80 it stops with StopContextExhausted and claims compaction ran/the floor is irreducible, despite never trying the available legal cut.",
+      "evidence": [
+        "App::handle_agent_event derives mid_turn_pressure from provider usage divided by context_window and the configured threshold (app.rs4773-4801).",
+        "compact_and_respawn passes pressure.is_none() as force; all ordinary token and byte boundaries carry Some(pressure), so their force=false (ui/mod.rs1919-1927).",
+        "handle_compress_unfloored passes auto&&!force and byte_pressure into plan_tui_compaction (slash/mod.rs553-560). The planner still skips below its independent window-minus-reserve token budget if no byte pressure (803-809).",
+        "App sets awaiting_compaction_relief=true after the handler regardless of whether any compaction occurred (app.rs4918). mid_turn_pressure_action returns StopContextExhausted when awaiting and still over threshold (app.rs820-833); stop text says compaction ran (ui/mod.rs2039 onward).",
+        "This differs from fixed xorxl.6: actionable byte pressure now bypasses the local gate correctly, but real token pressure still does not. Headless relief force-compacts on measured pressure and does not make this token-gate assumption."
+      ],
+      "regression_artifact": "/private/tmp/mini-agent-rereview-compaction-probes.rs",
+      "regression_tests": [
+        "Review-only pure-function control proves a legal old cut with force and an ordinary WithinBudget result without real pressure; negative probe applies the actual compact_and_respawn argument choices for Some(.81) and expects a Cut. Root can append the provided module to slash/mod.rs and run filter rereview_token_boundary.",
+        "Final production regression should drive actual App token-pressure boundary at threshold0.80 while local count<window-reserve; assert summarizer receives the old prefix and the following prompt continues below threshold rather than stopping as irreducible.",
+        "Add no-old-prefix and summarizer-failure cases: do not mark compaction successfully performed when it did not occur, and preserve already completed effects."
+      ],
+      "related_bead_ids": [
+        "mini-agent-xorxl.6",
+        "mini-agent-cj9oh",
+        "mini-agent-sgzh0"
+      ],
+      "validation": "Root executed corrected review-only probes: control PASS (legal old compaction cut exists and ordinary auto remains WithinBudget), regression FAIL with WithinBudget when actual real-pressure caller arguments should reach that cut. Log /private/tmp/mini-agent-rereview-final-probes.log. Initial control fixture mistake was corrected before this accepted result. This agent ran no Cargo.",
+      "reviewer": "runtime",
+      "bead_id": "mini-agent-p0h9g.3"
+    },
+    {
+      "id": "runtime-rereview-2",
+      "priority": 2,
+      "confidence": 1.0,
+      "title": "A SubagentStop hook grants fresh exploration turns after the child max_turns budget is exhausted",
+      "locations": [
+        {
+          "file": "src/extras/subagents/task_tool.rs",
+          "start_line": 2222,
+          "end_line": 2248
+        },
+        {
+          "file": "src/extras/hooks/mod.rs",
+          "start_line": 943,
+          "end_line": 966
+        }
+      ],
+      "scenario": "Enable hooks and configure a global SubagentStop hook that returns a block/continue reason. Set task max_turns=1. A child uses its one allowed turn on a tool call and returns Ok(partial: turn budget exhausted). Because the branch checks only task weighted units and response Ok, the stop hook requests continuation. task_tool then starts a fresh run_subagent with max_turns=1 again, permitting another exploration/tool round. A successful child that used any smaller positive portion of the cap also receives the full cap rather than the remainder.",
+      "evidence": [
+        "SUBAGENTS.md169 defines max_turns as the child model-turn budget; table1240 calls it max agent turns per subagent;1545 defines exhausted turn budget as an Ok partial result. New child relief comment task_tool.rs4247 explicitly states max_turns bounds the whole task.",
+        "run_subagent_with_history maps MaxTurnsError to turn_budget_exhausted=true and Ok partial response (runner.rs6260 onward), so budget exhaustion does not exclude the hook branch.",
+        "Global SubagentStop Decision::Block maps to SubagentStopGate::Continue at hooks/mod.rs964. task_tool.rs2222-2230 checks only !task_budget.exhausted() and Ok response, then run_subagent(...max_turns...) at2234-2242 restarts the full exploration allowance.",
+        "merge_forced_continuation_run sums the extra turns after they have occurred; it does not enforce the cap. This is an exploration-cap bypass, separate from the deliberate one-turn tool-free summary/write-up/repair exceptions.",
+        "Outer bounds still apply: LiveTaskBudget tracks weighted units (task_tool.rs1869,1900-1915,1955) and the scheduler whole-call deadline (3505,3540 onward) includes the branch. Defaults4m units and300s do not stop two quick low-token requests, so they do not enforce the independent max_turns=1 contract. This is at most one extra full exploration segment, not an unbounded loop."
+      ],
+      "regression_tests": [
+        "Use actual task tool execution with hooks enabled and a global SubagentStop Block hook, max_turns=1, large weighted-unit budget, and generous deadline. Script a tool-bearing first completion followed by a second tool-bearing completion; assert the second provider exploration request/tool never executes.",
+        "With max_turns=3 and two initial exploration completions, a forced continuation may get at most one remaining turn. Assert total exploration turns in ChildDetails never exceed3 and already completed tool effects/evidence remain retained.",
+        "Keep tool-free report repair/write-up separately bounded as documented; retain existing weighted-unit and whole-call timeout protections."
+      ],
+      "related_bead_ids": [
+        "mini-agent-xorxl.5",
+        "mini-agent-djjua"
+      ],
+      "validation": "Deterministic control-flow proof; indexed dispatcher caller confirmed. No Cargo run by this agent.",
+      "reviewer": "runtime",
+      "bead_id": "mini-agent-p0h9g.4"
+    },
+    {
+      "id": "BOUNDARIES-REREVIEW-1",
+      "priority": 2,
+      "confidence": 0.98,
+      "title": "Initial Gemini command credentials still bypass query encoding and can lose renewal ownership",
+      "file": "src/key_command.rs",
+      "start_line": 274,
+      "end_line": 282,
+      "related_locations": [
+        {
+          "file": "patched-deps/rig-core/src/providers/gemini/client.rs",
+          "start_line": 74,
+          "end_line": 83
+        },
+        {
+          "file": "src/key_command.rs",
+          "start_line": 322,
+          "end_line": 325
+        },
+        {
+          "file": "src/key_command.rs",
+          "start_line": 263,
+          "end_line": 264
+        }
+      ],
+      "origin": "Adjacent remaining defect; predates this corrective diff. This is not a regression introduced by the xorxl.9 fix.",
+      "scenario": "A custom Gemini-compatible gateway uses a command-issued token containing a reserved query character. These characters are accepted by credential_from_output and are explicitly covered by the existing reserved-character encoding contract. The SDK constructs its initial request using that token directly in the key query field.",
+      "evidence": [
+        "GeminiExt::build_uri formats self.api_key directly into the URL for both normal and streaming requests; it does not encode the query value.",
+        "CommandCredential::apply rewrites a query only when candidates does not contain current. Therefore a current construction-time token with a plus sign bypasses with_query_key and remains raw on the wire, where normal query decoding changes its value.",
+        "An ampersand in that initial token is worse: query_key splits the raw query at ampersands, so ownership sees only a prefix; apply returns None and the request loses the credential renewal/resend path as well as transmitting the wrong token.",
+        "query_key_rewrite_percent_encodes_reserved_characters tests with_query_key directly. gemini_query_string_key_is_refreshed_and_renewed_on_401 uses safe construction/rotation tokens, so neither exercises the initial SDK-built reserved-character token."
+      ],
+      "mitigation": "Encode the credential when the SDK initially builds the URL, or use Gemini header authentication so the full original token is never parsed out of an already ambiguous raw query. Canonicalizing only stale query credentials is insufficient.",
+      "regression_test_acceptance": [
+        "Construct an actual custom Gemini SDK client once with a command helper whose first token contains reserved query characters; loopback assertions verify that both streaming and non-streaming requests contain exactly the original token after normal query decoding, with no unintended parameters.",
+        "Include initial plus, ampersand, percent, hash and space cases. Exercise a 401 followed by rotation and prove ownership/renewal remains attached.",
+        "Preserve the existing multi-rotation coverage and confirm safe tokens and unrelated query parameters remain unchanged."
+      ],
+      "related_beads": [
+        "mini-agent-07f21",
+        "mini-agent-dxbuy",
+        "mini-agent-xorxl.9"
+      ],
+      "validation": "Static call-path and indexed implementation review. No credential command, live provider request, exploit, or new proof-of-concept was executed.",
+      "reviewer": "boundaries",
+      "root_verification": "Root also executed two synthetic initial-token probes: raw plus remained unencoded; ampersand lost renewal ownership. No real credentials or external requests used.",
+      "bead_id": "mini-agent-p0h9g.5"
+    },
+    {
+      "priority": 2,
+      "title": "Keep MCP cancellation and EOF handling live while stdout is backpressured",
+      "file": "src/extras/mcp/server.rs",
+      "line_start": 1081,
+      "line_end": 1082,
+      "confidence": 0.99,
+      "scenario": "Start a silent long-running run, then let a ping/finished-run reply fill the MCP stdout pipe while the client stops reading. Close stdin or send notifications/cancelled. The dispatch task is stuck awaiting write_message and cannot receive the queued EOF/cancel; active model/tool work keeps running until its independent run timeout. The new EOF branch can also block flushing queued replies before the cancellation teardown.",
+      "evidence": [
+        "serve awaits write_message inside its dispatch select arms (1127,1169); write_message uses unbounded output.write_all and flush awaits at1193-1194. The reader task can enqueue EOF/cancel, but the dispatch task cannot poll line_rx while blocked in a write.",
+        "The new EOF handler itself flushes all reply_rx entries through the same unbounded await before return (1081-1082). Active runs are cancelled only after this enclosing async block returns, at1179-1182.",
+        "The new stdin_eof_retires_a_silent_running_call_and_its_process_group test keeps stdout empty, so it proves idle EOF but not EOF/cancellation during a response write.",
+        "A deterministic source-level probe for the existing tests module is saved at /private/tmp/mini-agent-rereview-mcp-backpressure-probe.rs. It uses a one-byte output duplex, starts the existing shell fixture, confirms a ping response entered write_message by reading its first byte, then leaves stdout unread and closes stdin. Root may run it with coordinated Cargo; no Rust probe execution is claimed by this subagent.",
+        "Root independently executed the supplied current-source backpressure regression probe and observed retired=false, child_live=true; the blocked server was then aborted for cleanup. This confirms the concrete failure, beyond static path analysis."
+      ],
+      "fix": "Decouple/bound the output writer so transport retirement and notifications/cancelled can run while output is stalled; cancel and join active runs before any EOF reply drain, and bound that drain.",
+      "acceptance_tests": [
+        "Run the supplied fixture and assert EOF retires serve and the whole child tree despite an open, unread stdout stream. Repeat using notifications/cancelled while a reply is blocked, and cover a large completed reply queued alongside an active run."
+      ],
+      "related_beads": [
+        "mini-agent-xorxl.12",
+        "mini-agent-5gljs",
+        "mini-agent-h5xae"
+      ],
+      "indexed_evidence": "/private/tmp/mini-agent-rereview-integrations-indexed.txt",
+      "validation": "Root independently reproduced: retired=false child_live=true; cleanup completed.",
+      "reviewer": "integrations",
+      "bead_id": "mini-agent-p0h9g.6"
+    },
+    {
+      "priority": 2,
+      "title": "Own Windows helper and run descendants instead of killing only the direct process",
+      "file": "src/extras/mcp/headers_helper.rs",
+      "line_start": 85,
+      "line_end": 92,
+      "confidence": 0.97,
+      "scenario": "On Windows, an opted-in unsandboxed headersHelper launches a credential subprocess and waits. Cancel the MCP connect/reconnect or let the helper time out. The helper is killed, but the subprocess survives. The MCP server run process has the same direct-child-only ownership when a run is cancelled/retired.",
+      "evidence": [
+        "The new GroupKillOnDrop has an empty Drop implementation outside Unix: its only action is under #[cfg(unix)] at headers_helper.rs87-90. command.process_group(0) is Unix-only too.",
+        "An unsandboxed helper comes from stdio_command as a plain tokio Command (client.rs1612-1618), then uses .kill_on_drop(true) and spawn_guarded (headers_helper.rs127-131). process_creation::spawn_tokio_once and TokioCommandCreationExt only acquire the creation lock and call TokioCommand::spawn; they never attach a Job Object.",
+        "The ordinary helper timeout/completion cleanup uses child.start_kill on non-Unix at headers_helper.rs156-158, so even waiting for the internal deadline does not terminate descendants.",
+        "server.rs run_prompt likewise launches a plain tokio Child with kill_on_drop, and its group guard is Unix-only. kill_tree on non-Unix calls only child.start_kill. Thus the new EOF teardown does not establish descendant retirement on Windows.",
+        "The repository already has owned_workspace_service_tree in sandbox.rs834-841, which wraps Windows workspace services in JobObject; these two paths bypass it. All new helper and MCP EOF fixtures are cfg(unix), leaving the platform branch unproved."
+      ],
+      "fix": "Use a Windows kill-on-close Job/owned process-tree wrapper for the helper and the MCP server run, retained through normal completion, timeout, cancellation and future drop. Preserve the Unix group guard.",
+      "acceptance_tests": [
+        "On native Windows, have a helper and an MCP run each start a child that records its pid, then test cancellation, EOF, timeout and dropped-future paths; both the direct and descendant processes must be gone. Test the default unsandboxed trusted helper path."
+      ],
+      "related_beads": [
+        "mini-agent-xorxl.13",
+        "mini-agent-xorxl.12",
+        "mini-agent-5gljs"
+      ],
+      "limitation": "No native Windows execution performed; the missing Job ownership and cfg branches are directly visible.",
+      "reviewer": "integrations",
+      "bead_id": "mini-agent-p0h9g.7"
+    },
+    {
+      "priority": 3,
+      "title": "Parse raw aliases separately from encoded IDs in the ACP /model command",
+      "file": "src/extras/acp/model_options.rs",
+      "line_start": 134,
+      "line_end": 135,
+      "confidence": 0.99,
+      "scenario": "Configure a quick-model alias named alias:fast. /model lists that raw name and advertises /model [alias|default], but typing /model alias:fast now fails because the wire decoder strips the prefix. If both default and alias:default exist, typing the displayed alias:default instead selects the default alias/provider.",
+      "evidence": [
+        "The new parse_model correctly strips exactly one reserved prefix and validates the canonical wire encoding (134-135), making the selector IDs injective.",
+        "The slash command passes its raw argument directly to set_model_override at acp/mod.rs4077, which calls the same parse_model at2213; no encoding step distinguishes literal command aliases from session/set_config_option wire values.",
+        "selection_summary explicitly lists quick_models raw keys at acp/mod.rs4680-4692; commands.rs and the advertised available command describe /model [alias|default].",
+        "The new reserved_prefix_aliases_get_unique_wire_values_that_round_trip test exercises parse_model(wire_value(alias)) only, bypassing this real slash-command caller."
+      ],
+      "fix": "Give the slash-command entry point raw-alias parsing/encoding while keeping the protocol selector on canonical encoded IDs, or consistently display and document the encoded command operand. Ensure a displayed selection cannot route to another configured model.",
+      "acceptance_tests": [
+        "Configure default, alias:default and alias:fast with different routes, obtain /model summary, then invoke the displayed aliases through PromptRequest slash commands and assert their exact configured routes. Keep the selector wire-ID round-trip test."
+      ],
+      "related_beads": [
+        "mini-agent-xorxl.16",
+        "mini-agent-qao1k"
+      ],
+      "indexed_evidence": "/private/tmp/mini-agent-rereview-integrations-indexed.txt",
+      "reviewer": "integrations",
+      "bead_id": "mini-agent-p0h9g.8"
+    }
+  ],
+  "validation": {
+    "existing_rust_tests": {
+      "passed": 208,
+      "detail": "38 accounting/catalog/update tests;166 regression tests passed in sandbox, four credential loopback tests initially blocked at bind by sandbox, all four passed when rerun with local socket access. No production failures remain in these selected checks."
+    },
+    "existing_typescript_tests": {
+      "passed": 40,
+      "files": 4,
+      "command": "./node_modules/.bin/vitest run test/clientFs.test.ts test/vscodeClientFs.test.ts test/persona.test.ts test/session.test.ts",
+      "cwd": "editors/vscode",
+      "executed_by": "integrations reviewer"
+    },
+    "new_probes": {
+      "expected_failures": 6,
+      "passing_control": 1,
+      "detail": "Two ledger probes, one MCP backpressure probe, two initial Gemini-token probes, one real-pressure compaction probe failed in the predicted ways. Corrected legal-cut control passed. Probes are review artifacts, not permanent production tests.",
+      "fixture_correction": "The first compaction control retained all history because its newest suffix was shorter than keep_recent. That failure is not product evidence. The corrected suffix produced a legal cut; corrected control passed and pressure gate still failed. cross-probes.log retains the original run for transparency; final-probes.log is the authoritative corrected compaction run.",
+      "ledger_fixture_correction": "An initial retry probe reused an already charged Receipt and therefore did not create the pending state. The corrected probe simulates a complete persisted row before acknowledgement, then observes it once into the pending account. ledger-probes.log is the corrected run."
+    },
+    "source_restoration": "All temporary test insertions were removed; production source diff was empty before review artifacts were written. No production code was changed by this review.",
+    "platform_limits": [
+      "Native execution on this macOS host only. Windows descendant ownership finding is established by source/cfg paths; Windows native execution is required by its acceptance criteria.",
+      "No fresh live-provider, whole-repository test suite, full feature matrix, Windows/Linux containment CI or release build was performed. No dependencies/features changed during this review."
+    ],
+    "evidence_directory": "docs/reviews/2026-11-07-post-fix-evidence"
+  },
+  "suppressed_hypotheses": [
+    {
+      "hypothesis": "Child context relief overwrites earlier usage totals",
+      "resolution": "Production callbacks share one relief usage ledger; each next.usage includes prior summary and continuation usage. The apparent overwrite is correct."
+    },
+    {
+      "hypothesis": "VS Code edit can silently overwrite an intervening document version at applyEdit",
+      "resolution": "The reviewed VS Code path carries document version to the main-thread application check. No additional pre-apply race was established."
+    },
+    {
+      "hypothesis": "New self-update bound is universally unbounded or loses all timeout descendants",
+      "resolution": "Existing Unix timeout/flood/tree tests passed; no further concrete portable defect was established in this pass."
+    }
+  ],
+  "prior_backlog": "Existing blocked/deferred tracker items were retained and deduplicated, not represented as resolved by this review.",
+  "reviewer_reports": {
+    "runtime": {
+      "reviewer": "runtime-subagents-session-context",
+      "head": "282e1e1b",
+      "base": "6358fdae",
+      "findings": [
+        {
+          "id": "runtime-rereview-1",
+          "priority": 2,
+          "confidence": 0.99,
+          "title": "Real token-pressure relief can be skipped and then falsely classified as irreducible context",
+          "locations": [
+            {
+              "file": "src/ui/mod.rs",
+              "start_line": 1919,
+              "end_line": 1927
+            },
+            {
+              "file": "src/ui/slash/mod.rs",
+              "start_line": 553,
+              "end_line": 561
+            },
+            {
+              "file": "src/ui/slash/mod.rs",
+              "start_line": 803,
+              "end_line": 809
+            },
+            {
+              "file": "src/ui/app.rs",
+              "start_line": 4910,
+              "end_line": 4927
+            }
+          ],
+          "scenario": "Configure mid_turn_compact_threshold=0.80 and a 100k context window with a 10k reserve. A tool-bearing completion reports 81k real prompt tokens, while the local session estimate stays below the normal 90k between-turn budget and has a legal old prefix. The real-pressure boundary requests compaction. compact_and_respawn(Some(.81)) passes force=false, and the inner planner returns WithinBudget because byte pressure is false and local tokens<=90k. No summarizer runs. The app nonetheless marks awaiting_compaction_relief=true. On the next completion still above .80 it stops with StopContextExhausted and claims compaction ran/the floor is irreducible, despite never trying the available legal cut.",
+          "evidence": [
+            "App::handle_agent_event derives mid_turn_pressure from provider usage divided by context_window and the configured threshold (app.rs4773-4801).",
+            "compact_and_respawn passes pressure.is_none() as force; all ordinary token and byte boundaries carry Some(pressure), so their force=false (ui/mod.rs1919-1927).",
+            "handle_compress_unfloored passes auto&&!force and byte_pressure into plan_tui_compaction (slash/mod.rs553-560). The planner still skips below its independent window-minus-reserve token budget if no byte pressure (803-809).",
+            "App sets awaiting_compaction_relief=true after the handler regardless of whether any compaction occurred (app.rs4918). mid_turn_pressure_action returns StopContextExhausted when awaiting and still over threshold (app.rs820-833); stop text says compaction ran (ui/mod.rs2039 onward).",
+            "This differs from fixed xorxl.6: actionable byte pressure now bypasses the local gate correctly, but real token pressure still does not. Headless relief force-compacts on measured pressure and does not make this token-gate assumption."
+          ],
+          "regression_artifact": "/private/tmp/mini-agent-rereview-compaction-probes.rs",
+          "regression_tests": [
+            "Review-only pure-function control proves a legal old cut with force and an ordinary WithinBudget result without real pressure; negative probe applies the actual compact_and_respawn argument choices for Some(.81) and expects a Cut. Root can append the provided module to slash/mod.rs and run filter rereview_token_boundary.",
+            "Final production regression should drive actual App token-pressure boundary at threshold0.80 while local count<window-reserve; assert summarizer receives the old prefix and the following prompt continues below threshold rather than stopping as irreducible.",
+            "Add no-old-prefix and summarizer-failure cases: do not mark compaction successfully performed when it did not occur, and preserve already completed effects."
+          ],
+          "related_bead_ids": [
+            "mini-agent-xorxl.6",
+            "mini-agent-cj9oh",
+            "mini-agent-sgzh0"
+          ],
+          "validation": "Root executed corrected review-only probes: control PASS (legal old compaction cut exists and ordinary auto remains WithinBudget), regression FAIL with WithinBudget when actual real-pressure caller arguments should reach that cut. Log /private/tmp/mini-agent-rereview-final-probes.log. Initial control fixture mistake was corrected before this accepted result. This agent ran no Cargo."
+        },
+        {
+          "id": "runtime-rereview-2",
+          "priority": 2,
+          "confidence": 1.0,
+          "title": "A SubagentStop hook grants fresh exploration turns after the child max_turns budget is exhausted",
+          "locations": [
+            {
+              "file": "src/extras/subagents/task_tool.rs",
+              "start_line": 2222,
+              "end_line": 2248
+            },
+            {
+              "file": "src/extras/hooks/mod.rs",
+              "start_line": 943,
+              "end_line": 966
+            }
+          ],
+          "scenario": "Enable hooks and configure a global SubagentStop hook that returns a block/continue reason. Set task max_turns=1. A child uses its one allowed turn on a tool call and returns Ok(partial: turn budget exhausted). Because the branch checks only task weighted units and response Ok, the stop hook requests continuation. task_tool then starts a fresh run_subagent with max_turns=1 again, permitting another exploration/tool round. A successful child that used any smaller positive portion of the cap also receives the full cap rather than the remainder.",
+          "evidence": [
+            "SUBAGENTS.md169 defines max_turns as the child model-turn budget; table1240 calls it max agent turns per subagent;1545 defines exhausted turn budget as an Ok partial result. New child relief comment task_tool.rs4247 explicitly states max_turns bounds the whole task.",
+            "run_subagent_with_history maps MaxTurnsError to turn_budget_exhausted=true and Ok partial response (runner.rs6260 onward), so budget exhaustion does not exclude the hook branch.",
+            "Global SubagentStop Decision::Block maps to SubagentStopGate::Continue at hooks/mod.rs964. task_tool.rs2222-2230 checks only !task_budget.exhausted() and Ok response, then run_subagent(...max_turns...) at2234-2242 restarts the full exploration allowance.",
+            "merge_forced_continuation_run sums the extra turns after they have occurred; it does not enforce the cap. This is an exploration-cap bypass, separate from the deliberate one-turn tool-free summary/write-up/repair exceptions.",
+            "Outer bounds still apply: LiveTaskBudget tracks weighted units (task_tool.rs1869,1900-1915,1955) and the scheduler whole-call deadline (3505,3540 onward) includes the branch. Defaults4m units and300s do not stop two quick low-token requests, so they do not enforce the independent max_turns=1 contract. This is at most one extra full exploration segment, not an unbounded loop."
+          ],
+          "regression_tests": [
+            "Use actual task tool execution with hooks enabled and a global SubagentStop Block hook, max_turns=1, large weighted-unit budget, and generous deadline. Script a tool-bearing first completion followed by a second tool-bearing completion; assert the second provider exploration request/tool never executes.",
+            "With max_turns=3 and two initial exploration completions, a forced continuation may get at most one remaining turn. Assert total exploration turns in ChildDetails never exceed3 and already completed tool effects/evidence remain retained.",
+            "Keep tool-free report repair/write-up separately bounded as documented; retain existing weighted-unit and whole-call timeout protections."
+          ],
+          "related_bead_ids": [
+            "mini-agent-xorxl.5",
+            "mini-agent-djjua"
+          ],
+          "validation": "Deterministic control-flow proof; indexed dispatcher caller confirmed. No Cargo run by this agent."
+        }
+      ],
+      "original_fix_validation": [
+        {
+          "bead": "mini-agent-xorxl.5",
+          "assessment": "The originally identified context-relief seams are corrected in source. AnyAgent carries Arc<HeadlessBudgetCarry> into spawned interactive runner setup; every inspected TUI main/goal/loop start initializes a fresh carry, compact_and_respawn reuses it, begin_segment folds per-segment totals and subtracts them, and child relief passes max_turns-run.turns. Separately bounded one-turn tool-free summary exception is explicit. New tests cover runner-level remainder/token checks and child remainder/no-remaining-turn cases. The remaining SubagentStop sibling bypass is reported separately; no live App budget-respawn execution was performed here."
+        },
+        {
+          "bead": "mini-agent-xorxl.6",
+          "assessment": "Original byte-only trigger veto is corrected: planner accepts byte_pressure, no-prefix and failed byte compaction install a futility floor, and a TUI handler integration test proves low-local-token byte pressure reaches the scripted summarizer and unchanged second pass avoids re-spend. Test uses text with a lowered byte threshold rather than literal images; existing Session image-floor tests cover image arithmetic. Ordinary real token-boundary bypass remains as runtime-rereview-1."
+        },
+        {
+          "bead": "mini-agent-xorxl.7",
+          "assessment": "Original repeated-id misattribution is corrected: one ordered traversal pairs calls/results before reverse newest-path selection; non-read calls occupy pairing slots and ambiguous simultaneous duplicate ids are discarded rather than guessed. Added tests include successful+failed reused-id reads, both successful reads, non-read reuse and actual headless persistence. Source review found no further concrete pairing bug in valid transcript ordering."
+        }
+      ],
+      "testing_gaps": [
+        {
+          "description": "The current TUI byte integration test does not cover the distinct real-token boundary below the local between-turn threshold; that missing caller path permits a no-op followed by false irreducible hard stop.",
+          "covered_by_finding": "runtime-rereview-1"
+        },
+        {
+          "description": "SubagentStop coverage tests dispatch and saturated post-hoc merging independently, not task max_turns across the actual hook continuation branch.",
+          "covered_by_finding": "runtime-rereview-2"
+        },
+        {
+          "description": "Original interactive cap tests exercise two spawned runner segments and synthetic prior token publication rather than the full App summarization/respawn path. Inspection found carry wiring at all enumerated TUI spawn sites, but end-to-end token/turn-cap evidence remains limited.",
+          "classification": "verification limitation; no separate bug alleged"
+        }
+      ],
+      "coverage": {
+        "reviewed": "All production diff hunks in runner.rs, provider.rs budget wiring, subagents/task_tool.rs, session/compaction.rs, ui/mod.rs, ui/state.rs, ui/event_handler.rs, ui/slash/mod.rs; added tests in those files; relevant app spawn/start, pressure-trigger, boundary and post-relief hard-stop paths; global hooks dispatcher SubagentStop mapping; weighted-unit admission and outer task deadline; SUBAGENTS/CONFIG contracts.",
+        "method": "Testing/adversarial/reliability skills already read in same session and applied; deterministic source/data-flow review with indexed symbol/implementation/caller cross-checks. No source or bead mutations, no Cargo.",
+        "indexer": {
+          "mcp": "Search tried first and still reported indexing.",
+          "fallback": "Existing HTTP CLI via parent-provided /private/tmp/mini-agent-review-indexer state, local server127.0.0.1:3000.",
+          "queries": [
+            "status",
+            "search with_interactive_budget_carry",
+            "impl plan_tui_compaction",
+            "callers dispatch_subagent_stop"
+          ],
+          "freshness": "Returned new carry symbol at runner.rs1090 and current byte_pressure-aware planner at slash/mod.rs795-815; exact code matched current HEAD disk. Session status gives no source SHA, so freshness established only for queried evidence."
+        },
+        "unexecuted": "No live TUI, live provider, Cargo, full-suite, alternate feature row or native platform execution by this reviewer. Root coordinates actual probes. This review does not establish absence of other P0-P3 defects."
+      },
+      "excluded_hypotheses": [
+        {
+          "hypothesis": "Repeated child relief iterations lose summary/prior continuation usage due to run.usage overwrite.",
+          "disposition": "Rejected: production uses one shared relief_usage SharedUsageLedger cloned into every summary/continue callback, and run_subagent_with_history outputs cumulative ledger total. initial_usage+next.usage includes all earlier relief requests. Existing shared-ledger relief test asserts initial10+summary20+continue30. New turn-grant-only test uses per-callback ledgers but is not evidence against production usage accounting."
+        },
+        {
+          "hypothesis": "New interactive carry misses EOF turn charges when a later segment starts.",
+          "disposition": "No concrete bypass found: a compaction boundary requires a later completion whose note_segment publishes cumulative turns_used, including prior EOF charges. Terminal-only exits start a fresh logical prompt, so prior ended scope should not carry."
+        },
+        {
+          "hypothesis": "Ambiguous concurrent duplicate provider ids are misattributed by the new restore pairing.",
+          "disposition": "Rejected for valid transcript ordering: multiple pending calls sharing an id are discarded on the first result; later results see no pending call until the completed batch allows a new provider call. No wrong-path restoration proven."
+        },
+        {
+          "hypothesis": "SubagentStop fresh empty-history continuation can reset child-visible evidence numbering while host continues numbering across both histories.",
+          "disposition": "Residual concern only: branch indeed uses run_subagent with empty history; previous response may or may not preserve sufficient context. No independent probe completed, so not filed separately. When fixing remaining-turn enforcement, continuing prior history would preserve the surrounding contract."
+        },
+        {
+          "hypothesis": "Chain phases should inherit one budget from the original prompt.",
+          "disposition": "Not flagged: new code explicitly declares each start/chain phase a fresh budget scope and tests this chosen policy. Review focuses on bounded context-relief/child scopes whose intended contract is unambiguous."
+        }
+      ],
+      "review_artifacts": [
+        "/private/tmp/mini-agent-rereview-compaction-probes.rs",
+        "/private/tmp/mini-agent-rereview-final-probes.log (root corrected probe execution; control PASS, real-pressure regression FAIL WithinBudget)"
+      ],
+      "root_peer_review": "Root independently accepted both findings after final checks; child summary-usage hypothesis suppressed because shared relief ledger includes all requests."
+    },
+    "boundaries": {
+      "reviewer": "boundaries / testing / adversarial / reliability",
+      "baseline": "6358fdae",
+      "head": "282e1e1b",
+      "findings": [
+        {
+          "id": "BOUNDARIES-REREVIEW-1",
+          "priority": 2,
+          "confidence": 0.98,
+          "title": "Initial Gemini command credentials still bypass query encoding and can lose renewal ownership",
+          "file": "src/key_command.rs",
+          "start_line": 274,
+          "end_line": 282,
+          "related_locations": [
+            {
+              "file": "patched-deps/rig-core/src/providers/gemini/client.rs",
+              "start_line": 74,
+              "end_line": 83
+            },
+            {
+              "file": "src/key_command.rs",
+              "start_line": 322,
+              "end_line": 325
+            },
+            {
+              "file": "src/key_command.rs",
+              "start_line": 263,
+              "end_line": 264
+            }
+          ],
+          "origin": "Adjacent remaining defect; predates this corrective diff. This is not a regression introduced by the xorxl.9 fix.",
+          "scenario": "A custom Gemini-compatible gateway uses a command-issued token containing a reserved query character. These characters are accepted by credential_from_output and are explicitly covered by the existing reserved-character encoding contract. The SDK constructs its initial request using that token directly in the key query field.",
+          "evidence": [
+            "GeminiExt::build_uri formats self.api_key directly into the URL for both normal and streaming requests; it does not encode the query value.",
+            "CommandCredential::apply rewrites a query only when candidates does not contain current. Therefore a current construction-time token with a plus sign bypasses with_query_key and remains raw on the wire, where normal query decoding changes its value.",
+            "An ampersand in that initial token is worse: query_key splits the raw query at ampersands, so ownership sees only a prefix; apply returns None and the request loses the credential renewal/resend path as well as transmitting the wrong token.",
+            "query_key_rewrite_percent_encodes_reserved_characters tests with_query_key directly. gemini_query_string_key_is_refreshed_and_renewed_on_401 uses safe construction/rotation tokens, so neither exercises the initial SDK-built reserved-character token."
+          ],
+          "mitigation": "Encode the credential when the SDK initially builds the URL, or use Gemini header authentication so the full original token is never parsed out of an already ambiguous raw query. Canonicalizing only stale query credentials is insufficient.",
+          "regression_test_acceptance": [
+            "Construct an actual custom Gemini SDK client once with a command helper whose first token contains reserved query characters; loopback assertions verify that both streaming and non-streaming requests contain exactly the original token after normal query decoding, with no unintended parameters.",
+            "Include initial plus, ampersand, percent, hash and space cases. Exercise a 401 followed by rotation and prove ownership/renewal remains attached.",
+            "Preserve the existing multi-rotation coverage and confirm safe tokens and unrelated query parameters remain unchanged."
+          ],
+          "related_beads": [
+            "mini-agent-07f21",
+            "mini-agent-dxbuy",
+            "mini-agent-xorxl.9"
+          ],
+          "validation": "Static call-path and indexed implementation review. No credential command, live provider request, exploit, or new proof-of-concept was executed."
+        }
+      ],
+      "original_fix_assessments": [
+        {
+          "bead": "mini-agent-xorxl.8",
+          "assessment": "Original split-history defect is repaired in source.",
+          "source_evidence": [
+            "bash.rs1649 validates history triggers on cumulative pending+input inside the epoch loop, so a changed approval baseline is revalidated.",
+            "bash.rs1275 validates lines submitted by named Enter.",
+            "Existing input control-byte, edited-line and partial-write tracking paths remain in place."
+          ],
+          "tests_reviewed": [
+            "split_history_designator_is_refused_against_the_cumulative_line (bash.rs4843)",
+            "history_expansion_triggers_are_detected",
+            "input_is_rejudged_when_another_input_lands_during_its_prompt"
+          ],
+          "remaining_test_limits": [
+            "The new real-PTY test covers several split event-designator shapes; concurrent prompt-baseline changes are proved by a separate existing permission test, rather than a single combined expansion-plus-prompt test.",
+            "Named-key Enter history rejection is source-verified, but the new test exercises text newline submission."
+          ]
+        },
+        {
+          "bead": "mini-agent-xorxl.9",
+          "assessment": "Original eight-token ownership horizon is repaired in source.",
+          "source_evidence": [
+            "key_command.rs101-128 retains distinct tokens issued to constructed clients in issued; owns consults both rolling known and issued.",
+            "resolve_blocking records issued aliases on both cache-hit and fresh-helper branches (lines210-223).",
+            "apply uses owns for header detection, query detection and actual replacement, while unauthorized continues checking generation under its refresh gate."
+          ],
+          "tests_reviewed": [
+            "long_lived_client_token_survives_more_rotations_than_the_rolling_window (key_command.rs973)",
+            "Existing actual-SDK one-rotation and Gemini 401 tests"
+          ],
+          "remaining_test_limits": [
+            "The new long-horizon test reconstructs SDK-shaped headers/URIs around the same seed, rather than driving a single SDK completion object for every rotation. Source and existing shorter SDK integration tests bridge this contract.",
+            "Initial reserved-character Gemini credentials remain a separate concrete finding above."
+          ]
+        },
+        {
+          "bead": "mini-agent-xorxl.10",
+          "assessment": "Original quadratic dense-mask allocation defect is repaired in source.",
+          "source_evidence": [
+            "edit.rs430 keeps pattern construction lazy until a candidate passes its histogram bound.",
+            "BitParallelPattern::new checks distinct-character count times block count times u64 size using checked multiplication and refuses above64MiB before masks.resize.",
+            "The pre-existing64M distance-work limit remains active after preprocessing."
+          ],
+          "tests_reviewed": [
+            "many_distinct_unicode_scalars_fail_closed_without_a_dense_mask_table (edit.rs2337)",
+            "bit-parallel distance equivalence tests and fuzzy work-budget tests"
+          ],
+          "remaining_test_limits": [
+            "The new test proves the over-budget constructor returns None and viable/nonviable outcomes; it does not independently measure peak RSS. Vec capacity growth may exceed the logical64MiB table size by a constant factor, but the original unbounded quadratic allocation is removed."
+          ]
+        },
+        {
+          "bead": "mini-agent-xorxl.11",
+          "assessment": "Original JS ambient preimage-publication defect is repaired in source.",
+          "source_evidence": [
+            "write_guarded_path passes its checked base digest at host.rs2218.",
+            "write_approved_file_cancellable selects atomic_write_resolved_expecting_cancellable for replacements with a base (host.rs1652-1661).",
+            "file_path_error maps typed stale-content errors to TargetChanged; the new fs::StaleContentError preserves the existing operator-facing message without exposing it through JS closed diagnostics.",
+            "Create-only and intentionally unguarded paths remain distinct; bound JS replacements already used exact-content publication."
+          ],
+          "tests_reviewed": [
+            "approved_replace_with_base_rejects_a_changed_target (host.rs10265)",
+            "Existing JS write-guard tests and fs exact-content publication paths"
+          ],
+          "remaining_test_limits": [
+            "The regression test directly calls the new publication helper with a base, not the complete write_guarded_path guard-to-publication path. A future accidental omission of the digest at the production call site would escape this test; source currently passes it correctly.",
+            "No native-platform execution or cancellation rerun was performed by this reviewer."
+          ]
+        }
+      ],
+      "coverage": {
+        "reviewed_in_depth": [
+          "Complete6358fdae..282e1e1b diffs for src/agent/tools/bash.rs, src/agent/tools/edit.rs, src/key_command.rs, src/extras/js/host.rs and src/fs.rs.",
+          "Current PTY text/key submission, epoch recheck, partial-write and history classification call paths.",
+          "Credential construction/cache/issued ownership, TTL and401 refresh, header/query rewriting and initial Gemini SDK URL construction.",
+          "Fuzzy normalization/histogram candidate gating, mask preprocessing, work budget and new regression tests.",
+          "Guarded ambient and bound JS create/replace paths, typed fs errors, exact-content atomic publication and new test."
+        ],
+        "adjacent_targeted": [
+          "Native edit client-fs seam and newly conditional ACP write contract read for interaction context; editor implementation belongs to the parallel root/editor review.",
+          "ProviderHttpClient renewal dispatch and AuthResolver command-credential precedence."
+        ],
+        "not_exhaustive": [
+          "No full re-audit of arbitrary interactive program keybindings or every shell dialect.",
+          "No native Windows/Linux/macOS containment or concurrent filesystem stress execution.",
+          "No full read/grep/PDF/notebook/git module re-audit in this corrective rereview."
+        ]
+      },
+      "suppressed_hypotheses": [
+        {
+          "hypothesis": "Persistent issued aliases could grow with repeated provider client constructions.",
+          "reason": "Growth is tied to distinct explicitly constructed client seeds, not every TTL rotation; no concrete P0-P3 failure under expected construction rates established."
+        },
+        {
+          "hypothesis": "Blocking credential resolution does not use the async refresh gate despite its serialization comment.",
+          "reason": "This predates the corrective diff; a complete harmful caller schedule and final unrecoverable consequence was not established. No new finding reported."
+        },
+        {
+          "hypothesis": "Custom interactive terminal keybindings or shell multiline parser state could differ from tracked text.",
+          "reason": "No additional complete supported-default failure scenario was established in this read-only pass. Existing opaque-edited-line and approval behavior prevents an unconditional claim."
+        }
+      ],
+      "testing_gaps": [
+        "Full production guard-to-publication JS test would better protect xorxl.11 wiring than a lower-level helper-only test.",
+        "Long-horizon credential SDK integration and initial reserved-character token tests would close the identified transport ownership gap.",
+        "A combined PTY history-designator split plus approval-baseline interleaving test would protect the exact interaction in xorxl.8."
+      ],
+      "verification": {
+        "cargo_runs": 0,
+        "source_mutations": 0,
+        "bead_mutations": 0,
+        "new_proof_of_concepts": 0,
+        "instructions": "Previously read testing/adversarial/reliability reviewer skills reused; canonical Phase6 security checklist reread.",
+        "code_indexer": "MCP initially returned indexing, then succeeded. Current indexed history_expansion_trigger callers1275/1621/1649, remember_issued, BitParallelPattern::new533 and write_guarded_path2193 match current corrective source. Indexed full apply body reviewed.",
+        "test_status": "Tests were inspected, not run. Root coordinates Cargo and must supply runtime results."
+      },
+      "residual_risks": [
+        "This targeted review confirms the four original source mechanisms and identifies one adjacent remaining transport defect; it does not certify absence of every P0-P3 across the repository.",
+        "No new source changes or external effects were made."
+      ]
+    },
+    "integrations": {
+      "reviewer": "integrations (testing/adversarial/reliability)",
+      "base": "6358fdae",
+      "head": "282e1e1b",
+      "findings": [
+        {
+          "priority": 2,
+          "title": "Keep MCP cancellation and EOF handling live while stdout is backpressured",
+          "file": "src/extras/mcp/server.rs",
+          "line_start": 1081,
+          "line_end": 1082,
+          "confidence": 0.99,
+          "scenario": "Start a silent long-running run, then let a ping/finished-run reply fill the MCP stdout pipe while the client stops reading. Close stdin or send notifications/cancelled. The dispatch task is stuck awaiting write_message and cannot receive the queued EOF/cancel; active model/tool work keeps running until its independent run timeout. The new EOF branch can also block flushing queued replies before the cancellation teardown.",
+          "evidence": [
+            "serve awaits write_message inside its dispatch select arms (1127,1169); write_message uses unbounded output.write_all and flush awaits at1193-1194. The reader task can enqueue EOF/cancel, but the dispatch task cannot poll line_rx while blocked in a write.",
+            "The new EOF handler itself flushes all reply_rx entries through the same unbounded await before return (1081-1082). Active runs are cancelled only after this enclosing async block returns, at1179-1182.",
+            "The new stdin_eof_retires_a_silent_running_call_and_its_process_group test keeps stdout empty, so it proves idle EOF but not EOF/cancellation during a response write.",
+            "A deterministic source-level probe for the existing tests module is saved at /private/tmp/mini-agent-rereview-mcp-backpressure-probe.rs. It uses a one-byte output duplex, starts the existing shell fixture, confirms a ping response entered write_message by reading its first byte, then leaves stdout unread and closes stdin. Root may run it with coordinated Cargo; no Rust probe execution is claimed by this subagent.",
+            "Root independently executed the supplied current-source backpressure regression probe and observed retired=false, child_live=true; the blocked server was then aborted for cleanup. This confirms the concrete failure, beyond static path analysis."
+          ],
+          "fix": "Decouple/bound the output writer so transport retirement and notifications/cancelled can run while output is stalled; cancel and join active runs before any EOF reply drain, and bound that drain.",
+          "acceptance_tests": [
+            "Run the supplied fixture and assert EOF retires serve and the whole child tree despite an open, unread stdout stream. Repeat using notifications/cancelled while a reply is blocked, and cover a large completed reply queued alongside an active run."
+          ],
+          "related_beads": [
+            "mini-agent-xorxl.12",
+            "mini-agent-5gljs",
+            "mini-agent-h5xae"
+          ],
+          "indexed_evidence": "/private/tmp/mini-agent-rereview-integrations-indexed.txt",
+          "validation": "Root independently reproduced: retired=false child_live=true; cleanup completed."
+        },
+        {
+          "priority": 2,
+          "title": "Own Windows helper and run descendants instead of killing only the direct process",
+          "file": "src/extras/mcp/headers_helper.rs",
+          "line_start": 85,
+          "line_end": 92,
+          "confidence": 0.97,
+          "scenario": "On Windows, an opted-in unsandboxed headersHelper launches a credential subprocess and waits. Cancel the MCP connect/reconnect or let the helper time out. The helper is killed, but the subprocess survives. The MCP server run process has the same direct-child-only ownership when a run is cancelled/retired.",
+          "evidence": [
+            "The new GroupKillOnDrop has an empty Drop implementation outside Unix: its only action is under #[cfg(unix)] at headers_helper.rs87-90. command.process_group(0) is Unix-only too.",
+            "An unsandboxed helper comes from stdio_command as a plain tokio Command (client.rs1612-1618), then uses .kill_on_drop(true) and spawn_guarded (headers_helper.rs127-131). process_creation::spawn_tokio_once and TokioCommandCreationExt only acquire the creation lock and call TokioCommand::spawn; they never attach a Job Object.",
+            "The ordinary helper timeout/completion cleanup uses child.start_kill on non-Unix at headers_helper.rs156-158, so even waiting for the internal deadline does not terminate descendants.",
+            "server.rs run_prompt likewise launches a plain tokio Child with kill_on_drop, and its group guard is Unix-only. kill_tree on non-Unix calls only child.start_kill. Thus the new EOF teardown does not establish descendant retirement on Windows.",
+            "The repository already has owned_workspace_service_tree in sandbox.rs834-841, which wraps Windows workspace services in JobObject; these two paths bypass it. All new helper and MCP EOF fixtures are cfg(unix), leaving the platform branch unproved."
+          ],
+          "fix": "Use a Windows kill-on-close Job/owned process-tree wrapper for the helper and the MCP server run, retained through normal completion, timeout, cancellation and future drop. Preserve the Unix group guard.",
+          "acceptance_tests": [
+            "On native Windows, have a helper and an MCP run each start a child that records its pid, then test cancellation, EOF, timeout and dropped-future paths; both the direct and descendant processes must be gone. Test the default unsandboxed trusted helper path."
+          ],
+          "related_beads": [
+            "mini-agent-xorxl.13",
+            "mini-agent-xorxl.12",
+            "mini-agent-5gljs"
+          ],
+          "limitation": "No native Windows execution performed; the missing Job ownership and cfg branches are directly visible."
+        },
+        {
+          "priority": 3,
+          "title": "Parse raw aliases separately from encoded IDs in the ACP /model command",
+          "file": "src/extras/acp/model_options.rs",
+          "line_start": 134,
+          "line_end": 135,
+          "confidence": 0.99,
+          "scenario": "Configure a quick-model alias named alias:fast. /model lists that raw name and advertises /model [alias|default], but typing /model alias:fast now fails because the wire decoder strips the prefix. If both default and alias:default exist, typing the displayed alias:default instead selects the default alias/provider.",
+          "evidence": [
+            "The new parse_model correctly strips exactly one reserved prefix and validates the canonical wire encoding (134-135), making the selector IDs injective.",
+            "The slash command passes its raw argument directly to set_model_override at acp/mod.rs4077, which calls the same parse_model at2213; no encoding step distinguishes literal command aliases from session/set_config_option wire values.",
+            "selection_summary explicitly lists quick_models raw keys at acp/mod.rs4680-4692; commands.rs and the advertised available command describe /model [alias|default].",
+            "The new reserved_prefix_aliases_get_unique_wire_values_that_round_trip test exercises parse_model(wire_value(alias)) only, bypassing this real slash-command caller."
+          ],
+          "fix": "Give the slash-command entry point raw-alias parsing/encoding while keeping the protocol selector on canonical encoded IDs, or consistently display and document the encoded command operand. Ensure a displayed selection cannot route to another configured model.",
+          "acceptance_tests": [
+            "Configure default, alias:default and alias:fast with different routes, obtain /model summary, then invoke the displayed aliases through PromptRequest slash commands and assert their exact configured routes. Keep the selector wire-ID round-trip test."
+          ],
+          "related_beads": [
+            "mini-agent-xorxl.16",
+            "mini-agent-qao1k"
+          ],
+          "indexed_evidence": "/private/tmp/mini-agent-rereview-integrations-indexed.txt"
+        }
+      ],
+      "old_fix_validation": [
+        {
+          "bead": "mini-agent-xorxl.4",
+          "status": "Original LSP file_ops leak addressed",
+          "evidence": "FileOp retains structured paths, renderer checks every rename source/destination through deny before describing. New tests cover denied source/destination/delete/edit in compact/full/single-edit views."
+        },
+        {
+          "bead": "mini-agent-xorxl.12",
+          "status": "Idle EOF addressed; stdout-backpressure retirement remains",
+          "evidence": "EOF exits without waiting for tasks.is_empty, then shutdown drops process guards. Queued/output writes can still prevent reaching this teardown; see finding1."
+        },
+        {
+          "bead": "mini-agent-xorxl.13",
+          "status": "Unix cancellation addressed; Windows ownership remains",
+          "evidence": "GroupKillOnDrop is retained immediately after spawn and runs when merged_headers is dropped. New direct/work-scope cancellation fixtures prove Unix descendants conceptually; Windows guard is empty."
+        },
+        {
+          "bead": "mini-agent-xorxl.14",
+          "status": "Original cross-RPC stale-buffer overwrite addressed",
+          "evidence": "Rust writes carry SHA-256 preimage metadata, capability requires conditional-write support, TypeScript validates digest after all document-open awaits and immediately invokes applyEdit. Existing typed-before-request/during-open tests cover original scenario. Official VS Code source shows applyWorkspaceEdit serializes current document version into text edits, and bulkTextEdits validates that version immediately before application; a speculative remaining pre-apply main-thread race is therefore suppressed."
+        },
+        {
+          "bead": "mini-agent-xorxl.15",
+          "status": "Absent in-workspace edit destinations addressed",
+          "evidence": "Separate parent_edit_path/absent_edit_path maps plain missing tails under canonical retained ancestors; diagnostics keep strict existing-file mapper. Boundary tests cover missing nested paths, external/traversal/root/symlink/dangling paths."
+        },
+        {
+          "bead": "mini-agent-xorxl.16",
+          "status": "Wire selector IDs addressed; slash raw-alias caller remains",
+          "evidence": "wire_value escapes default and all reserved-prefix aliases, parse_model decodes before lookup. New roundtrip test covers all collisions, but PromptRequest slash path uses raw names."
+        }
+      ],
+      "coverage": {
+        "inspected": "All changed MCP server/helper, ACP client-fs/model selection, VS Code client-fs, LSP mapper/preview/renderer sources and relevant test diffs, plus caller boundaries in process_creation/sandbox/ACP command dispatch.",
+        "tests_run": [
+          {
+            "command": "./node_modules/.bin/vitest run test/clientFs.test.ts test/vscodeClientFs.test.ts test/persona.test.ts test/session.test.ts",
+            "cwd": "editors/vscode",
+            "result": "4 files,40 tests passed"
+          }
+        ],
+        "cargo": "None run; root coordinates Cargo. No repository source/bead changes.",
+        "code_indexer": "MCP endpoint still reports indexing. Existing isolated local HTTP index works; status/callers/peek saved at /private/tmp/mini-agent-rereview-integrations-indexed.txt. Indexed slices include current EOF branch and new canonical alias decoder.",
+        "root_validation": "MCP backpressure probe failed as predicted (retired=false child_live=true); root independently confirmed Windows cfg branches and slash alias caller mismatch."
+      },
+      "external_source_checks": [
+        {
+          "url": "https://raw.githubusercontent.com/microsoft/vscode/main/src/vs/workbench/api/common/extHostBulkEdits.ts",
+          "supports": "applyWorkspaceEdit immediately serializes with document-version provider"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/microsoft/vscode/main/src/vs/workbench/api/common/extHostTypeConverters.ts",
+          "supports": "WorkspaceEdit.from attaches document versionId for text edits"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/microsoft/vscode/main/src/vs/workbench/contrib/bulkEdit/browser/bulkTextEdits.ts",
+          "supports": "Version validated before model edits apply"
+        }
+      ],
+      "suppressed_hypotheses": [
+        {
+          "hypothesis": "New conditional write still clobbers a user edit between applyEdit submission and main-thread application.",
+          "reason": "Official current VS Code implementation adds versionId at submission and validates before apply; source promises are backed by the editor API behavior. Do not relabel an unrealistic unconditional mock as actual editor behavior."
+        },
+        {
+          "hypothesis": "Absent LSP URI mapping could traverse symlink ancestors or normalize .. into workspace escapes.",
+          "reason": "Round-trip URI spelling, normal-only components, strict existing-ancestor canonical equality and workspace validation close the concrete paths examined."
+        },
+        {
+          "hypothesis": "Client lacking conditional-write extension now falls back to disk despite read capability.",
+          "reason": "Explicit documented policy, not an unintentional regression. No new failing scenario beyond that chosen behavior established."
+        }
+      ],
+      "residual_risks": [
+        "No actual VS Code integration window, Windows runtime or live remote MCP/OAuth endpoint was exercised.",
+        "Review is risk-directed and does not establish the absence of all further P0-P3 integration bugs."
+      ]
+    }
+  }
+}

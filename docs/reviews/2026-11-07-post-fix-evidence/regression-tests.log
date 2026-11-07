@@ -1,0 +1,209 @@
+   Compiling mini-agent v1.12.0 (/Users/seb/projects/mini-agent)
+    Finished `test` profile [unoptimized] target(s) in 32.93s
+     Running unittests src/main.rs (target/debug/deps/mini_agent-eb54318180c9c0b0)
+
+running 170 tests
+test agent::runner::tests::interactive_relief_segment_charges_prior_tokens_to_the_budget ... ok
+test agent::runner::tests::interactive_relief_segment_gets_only_the_remaining_turn_budget ... ok
+test agent::tools::bash::tests::split_history_designator_is_refused_against_the_cumulative_line ... ok
+test agent::tools::client_fs_tests::a_client_cannot_widen_authority_outside_or_through_links ... ok
+test agent::tools::client_fs_tests::a_client_without_the_conditional_write_extension_never_receives_a_write ... ok
+test agent::tools::client_fs_tests::a_read_only_client_never_receives_a_write_and_edit_stays_on_disk ... ok
+test agent::tools::client_fs_tests::a_refused_editor_write_is_reported_and_changes_nothing ... ok
+test agent::tools::client_fs_tests::an_oversized_or_failing_client_degrades_to_the_disk_file ... ok
+test agent::tools::client_fs_tests::closed_by_default_the_tools_use_the_disk_and_never_consult_a_client ... ok
+test agent::tools::client_fs_tests::edit_computes_against_the_buffer_and_writes_through_the_editor ... ok
+test agent::tools::client_fs_tests::edit_refuses_when_the_buffer_changed_after_it_was_read ... ok
+test agent::tools::client_fs_tests::overwrite_after_a_read_publishes_through_the_editor ... ok
+test agent::tools::client_fs_tests::overwrite_refuses_when_the_buffer_changes_after_the_read_and_before_the_write_lands ... ok
+test agent::tools::client_fs_tests::overwrite_without_a_read_of_the_editor_text_is_still_refused ... ok
+test agent::tools::client_fs_tests::permission_denial_stops_before_the_client_is_asked ... ok
+test agent::tools::client_fs_tests::read_serves_the_unsaved_editor_text_not_the_disk_text ... ok
+test agent::tools::edit::tests::many_distinct_unicode_scalars_fail_closed_without_a_dense_mask_table ... ok
+test agent::tools::lsp::directory_filter_tests::curdir_forms_do_not_hide_cached_diagnostics ... ok
+test agent::tools::lsp::directory_filter_tests::directory_filter_still_excludes_other_trees ... ok
+test extras::acp::client_fs::tests::an_unconditional_write_capability_alone_never_opens_the_write_side ... ok
+test extras::acp::client_fs::tests::closed_when_opted_in_but_the_client_advertises_nothing ... ok
+test extras::acp::client_fs::tests::closed_without_operator_opt_in_even_when_the_client_advertises ... ok
+test extras::acp::client_fs::tests::default_closed_never_sends_a_file_request_even_when_advertised ... ok
+test extras::acp::client_fs::tests::open_gate_round_trips_read_and_write_over_the_protocol ... ok
+test extras::acp::client_fs::tests::opens_only_with_opt_in_and_a_matching_advertisement ... ok
+test extras::acp::client_fs::tests::opted_in_but_unadvertised_never_sends_a_file_request ... ok
+test extras::acp::model_options::tests::effort_option_is_thought_level_and_model_option_absent_without_quick_models ... ok
+test extras::acp::model_options::tests::model_option_lists_default_then_sorted_quick_models_with_providers ... ok
+test extras::acp::model_options::tests::parse_rejects_unknown_values_and_clears_on_default ... ok
+test extras::acp::model_options::tests::quick_model_named_default_is_selectable_under_a_distinct_value ... ok
+test extras::acp::model_options::tests::reserved_prefix_aliases_get_unique_wire_values_that_round_trip ... ok
+test extras::js::host::tests::approved_replace_with_base_rejects_a_changed_target ... ok
+test extras::lsp::client::boundary_tests::edit_preview_mapping_accepts_absent_in_workspace_destinations_only ... ok
+test extras::mcp::headers_helper::tests::a_url_server_with_a_helper_does_not_run_it_without_the_opt_in ... ok
+test extras::mcp::headers_helper::tests::adversarial_output_exit_and_environment_are_contained ... ok
+test extras::mcp::headers_helper::tests::default_closed_runs_nothing ... ok
+test extras::mcp::headers_helper::tests::definitions_accept_string_argv_and_table_forms_with_bounds ... ok
+test extras::mcp::headers_helper::tests::dropping_the_helper_future_kills_its_descendants ... ok
+test extras::mcp::headers_helper::tests::enabled_helper_headers_override_static_ones_case_insensitively ... ok
+test extras::mcp::headers_helper::tests::work_scope_cancellation_kills_the_helper_descendants ... ok
+test extras::mcp::server::tests::a_permission_ask_is_forwarded_as_elicitation_and_only_an_explicit_accept_allows ... ok
+test extras::mcp::server::tests::a_returned_session_id_is_remembered_for_the_next_call ... ok
+test extras::mcp::server::tests::a_timed_out_run_reports_stderr_and_the_session_it_saved ... ok
+test extras::mcp::server::tests::approvals_are_not_forwarded_by_default_or_without_client_support ... ok
+test extras::mcp::server::tests::bang_prompts_are_refused_and_never_reach_the_child ... ok
+test extras::mcp::server::tests::client_loss_kills_the_whole_process_group_of_a_running_call ... ok
+test extras::mcp::server::tests::concurrent_runs_beyond_the_limit_are_refused_not_queued ... ok
+test extras::mcp::server::tests::crafted_session_and_model_arguments_are_rejected_and_model_override_is_default_closed ... ok
+test extras::mcp::server::tests::cwd_override_is_default_closed_and_confined_to_the_workspace ... ok
+test extras::mcp::server::tests::envelope_parsing_falls_back_to_plain_text_and_truncates_on_char_boundaries ... ok
+test extras::mcp::server::tests::forwarded_args_drop_output_and_override_flags_but_keep_the_rest ... ok
+test extras::mcp::server::tests::initialize_answers_a_supported_version_or_the_newest ... ok
+test extras::mcp::server::tests::issued_session_ids_survive_a_restart_and_eviction_keeps_recent_ones ... ok
+test extras::mcp::server::tests::max_runs_and_timeout_are_configurable_and_advertised ... ok
+test extras::mcp::server::tests::mcp_server_forwards_every_flag_except_its_own_mode_flag ... ok
+test extras::mcp::server::tests::mcp_server_initializes_lists_run_and_executes_a_headless_child ... ok
+test extras::mcp::server::tests::mcp_server_mode_is_off_by_default_and_excludes_print_prompts ... ok
+test extras::mcp::server::tests::mcp_server_reports_failed_and_timed_out_runs_as_tool_errors ... ok
+test extras::mcp::server::tests::only_session_ids_this_server_issued_can_be_resumed ... ok
+test extras::mcp::server::tests::ping_is_answered_and_cancel_kills_the_whole_process_group_without_a_reply ... ok
+test extras::mcp::server::tests::protocol_version_is_negotiated_not_echoed ... ok
+test extras::mcp::server::tests::run_emits_progress_for_a_token_and_returns_the_continuation_session_id ... ok
+test extras::mcp::server::tests::stdin_eof_retires_a_silent_running_call_and_its_process_group ... ok
+test extras::mcp::server::tests::unpersisted_sessions_are_not_offered_and_session_id_is_passed_to_the_child ... ok
+test extras::subagents::task_tool::child_continuation_tests::child_context_relief_continues_with_only_the_remaining_turns ... ok
+test extras::subagents::task_tool::child_continuation_tests::child_context_relief_stops_when_no_turns_remain ... ok
+test key_command::tests::a_401_queued_behind_a_refresh_is_resent_without_rerunning_the_command ... ok
+test key_command::tests::a_hung_command_is_killed_at_the_timeout ... ok
+test key_command::tests::an_expired_token_is_refreshed_once_on_401_and_the_request_succeeds ... FAILED
+test key_command::tests::an_expired_ttl_refreshes_before_the_request ... FAILED
+test key_command::tests::an_unchanged_token_after_refresh_surfaces_the_401_without_a_resend ... FAILED
+test key_command::tests::async_timeout_kills_grandchildren_and_success_ignores_daemons ... ok
+test key_command::tests::blocking_success_does_not_wait_for_a_backgrounded_daemon ... ok
+test key_command::tests::blocking_timeout_returns_promptly_and_kills_grandchildren ... ok
+test key_command::tests::command_failures_name_the_command_and_never_echo_its_output ... ok
+test key_command::tests::configure_rejects_invalid_entries_and_looks_providers_up_case_insensitively ... ok
+test key_command::tests::credential_commands_are_closed_by_default_and_rank_below_the_cli_key ... ok
+test key_command::tests::gemini_query_string_key_is_refreshed_and_renewed_on_401 ... FAILED
+test key_command::tests::long_lived_client_token_survives_more_rotations_than_the_rolling_window ... ok
+test key_command::tests::output_must_be_one_clean_line_within_the_bound ... ok
+test key_command::tests::query_key_is_found_and_rewritten_without_touching_other_parameters ... ok
+test key_command::tests::query_key_rewrite_percent_encodes_reserved_characters ... ok
+test key_command::tests::results_are_cached_for_the_ttl ... ok
+test key_command::tests::spec_validation_is_structural_and_never_echoes_values ... ok
+test session::compaction::tests::a_non_read_call_sharing_the_id_never_masquerades_as_a_file_window ... ok
+test session::compaction::tests::actual_native_and_jsonl_imports_mark_request_inventory_untrusted ... ok
+test session::compaction::tests::attach_keeps_large_window_summary_budget ... ok
+test session::compaction::tests::compaction_restores_no_read_windows_when_disabled ... ok
+test session::compaction::tests::compaction_restores_recent_read_windows_within_the_budget ... ok
+test session::compaction::tests::compaction_retains_bounded_spill_recovery_references_without_opening_them ... ok
+test session::compaction::tests::headless_persistence_with_reused_call_ids_compacts_without_misattribution ... ok
+test session::compaction::tests::imported_inventory_is_bounded_and_optional_for_legacy_compactions ... ok
+test session::compaction::tests::inventory_uses_only_the_drained_prefix_and_survives_repeated_compaction_and_redo ... ok
+test session::compaction::tests::nested_requests_are_distinct_historical_scope_not_parent_effects ... ok
+test session::compaction::tests::request_inventory_caps_records_bytes_and_rendering_without_guessing_effects ... ok
+test session::compaction::tests::reused_call_id_never_restores_a_body_under_the_wrong_path ... ok
+test tests::lsp_tests::aggregate_allow_always_treats_bracket_in_project_root_literally ... ok
+test tests::lsp_tests::aggregate_allow_always_treats_question_in_project_root_literally ... ok
+test tests::lsp_tests::aggregate_allow_always_treats_star_in_project_root_literally ... ok
+test tests::lsp_tests::aggregate_authorization_bounds_open_handles_and_preserves_sorted_results ... ok
+test tests::lsp_tests::aggregate_binding_swap_restore_keeps_permission_and_result_on_cached_inode ... ok
+test tests::lsp_tests::aggregate_rejects_symlink_alias_uri_variants_and_stale_retargets ... ok
+test tests::lsp_tests::aggregate_snapshot_caps_high_cardinality_high_volume_diagnostics_before_cloning ... ok
+test tests::lsp_tests::atomic_edit_waits_for_publish_bound_to_replacement_identity ... ok
+test tests::lsp_tests::builtin_matches_rust_extension ... ok
+test tests::lsp_tests::cancelled_lsp_validation_remains_owned_until_disk_work_finishes ... ok
+test tests::lsp_tests::clean_project_reports_nothing ... ok
+test tests::lsp_tests::custom_server_is_added ... ok
+test tests::lsp_tests::diagnostic_cache_hard_cap_bounds_candidate_sort_cardinality ... ok
+test tests::lsp_tests::diagnostic_cache_sanitizes_entries_and_enforces_global_byte_budget_on_updates ... ok
+test tests::lsp_tests::diagnostic_file_uri_rejects_non_file_and_malformed_inputs ... ok
+test tests::lsp_tests::diagnostic_file_uri_round_trips_permission_paths ... ok
+test tests::lsp_tests::disabled_removes_builtin ... ok
+test tests::lsp_tests::dropped_lsp_ask_reply_fails_closed_before_manager_access ... ok
+test tests::lsp_tests::edit_diagnostics_require_existing_read_authority ... ok
+test tests::lsp_tests::edit_preview_file_operations_never_name_read_denied_paths ... ok
+test tests::lsp_tests::edit_preview_text_is_complete_on_request_and_visibly_cut_otherwise ... ok
+test tests::lsp_tests::edit_wait_defaults_to_one_second_and_is_clamped ... ok
+test tests::lsp_tests::edit_wait_shortens_after_a_missed_publish_and_recovers_after_a_late_one ... ok
+test tests::lsp_tests::empty_command_is_dropped ... ok
+test tests::lsp_tests::explicit_denial_prevents_sync_or_server_launch_and_cached_disclosure ... ok
+test tests::lsp_tests::explicit_external_path_obeys_external_directory_allow_deny_and_ask ... ok
+test tests::lsp_tests::explicit_fifo_is_rejected_promptly_before_lsp_client_access ... ok
+test tests::lsp_tests::explicit_in_root_path_obeys_read_allow_deny_and_ask ... ok
+test tests::lsp_tests::explicit_lsp_allow_always_suppresses_later_asks ... ok
+test tests::lsp_tests::explicit_project_diagnostics_page_with_exact_hidden_counts ... ok
+test tests::lsp_tests::first_empty_publish_completes_wait_without_deadline_delay ... ok
+test tests::lsp_tests::frame_eof_mid_message_errors ... ok
+test tests::lsp_tests::frame_missing_content_length_errors ... ok
+test tests::lsp_tests::frame_roundtrip ... ok
+test tests::lsp_tests::full_cache_evicts_clean_entries_first_and_clean_publishes_never_displace_errors ... ok
+test tests::lsp_tests::idle_timeout_defaults_to_fifteen_minutes_and_zero_disables_retirement ... ok
+test tests::lsp_tests::injected_diagnostics_format_errors_first ... ok
+test tests::lsp_tests::lsp44_activation_roundtrips_bool_auto_and_rejects_unknown_values ... ok
+test tests::lsp_tests::lsp44_auto_path_admission_preserves_overrides_and_ignores_relative_or_oversized_search ... ok
+test tests::lsp_tests::lsp44_resolve_lsp_preserves_auto_and_explicit_off ... ok
+test tests::lsp_tests::lsp_allow_always_uses_canonical_path_pattern_and_deny_still_wins ... ok
+test tests::lsp_tests::lsp_config_validation_reports_ignored_settings_and_clamped_timeouts ... ok
+test tests::lsp_tests::lsp_permission_path_rejects_lossy_non_utf8_collision ... ok
+test tests::lsp_tests::lsp_process_diagnostic_store_is_scoped_and_cumulatively_bounded ... ok
+test tests::lsp_tests::lsp_process_frames_reject_header_flood_and_invalid_utf8 ... ok
+test tests::lsp_tests::lsp_process_frames_reject_oversized_inbound_and_outbound_bodies ... ok
+test tests::lsp_tests::lsp_settings_must_be_a_small_object ... ok
+test tests::lsp_tests::lsp_timeouts_have_documented_defaults_and_are_clamped ... ok
+test tests::lsp_tests::lsp_user_extension_ties_follow_name_order_and_disabled_entries_are_excluded ... ok
+test tests::lsp_tests::lsp_user_server_wins_extension_overlap_deterministically ... ok
+test tests::lsp_tests::navigate_edit_arguments_are_validated ... ok
+test tests::lsp_tests::navigate_references_page_over_250_results_in_stable_order ... ok
+test tests::lsp_tests::oversized_existing_publish_invalidates_stale_diagnostics_and_advances_version ... ok
+test tests::lsp_tests::per_file_query_distinguishes_unsynced_unavailable_and_unhandled_files ... ok
+test tests::lsp_tests::project_diagnostics_list_errors_before_warnings_across_files ... ok
+test tests::lsp_tests::project_query_filters_diagnostics_for_denied_files ... ok
+test tests::lsp_tests::project_query_obeys_read_allow_deny_and_ask_before_cache_disclosure ... ok
+test tests::lsp_tests::project_wide_listing_discloses_files_dropped_from_a_full_cache ... ok
+test tests::lsp_tests::publication_during_content_validation_discards_the_old_bound_snapshot ... ok
+test tests::lsp_tests::query_wait_ms_is_validated_and_per_file_only ... ok
+test tests::lsp_tests::re_created_entry_version_stays_above_the_evicted_one ... ok
+test tests::lsp_tests::rename_preview_is_bounded_and_never_names_outside_files ... ok
+test tests::lsp_tests::rename_preview_pages_through_every_edit_up_to_the_hard_bound ... ok
+test tests::lsp_tests::single_file_diagnostics_page_states_hidden_count_and_post_edit_cap_stays_20 ... ok
+test tests::lsp_tests::unhandled_extension_yields_nothing ... ok
+test tests::lsp_tests::user_override_replaces_builtin ... ok
+test tests::lsp_tests::versionless_initial_publish_and_clear_are_accepted_within_unchanged_epoch ... ok
+test ui::slash::compaction_budget_tests::auto_gate_honours_byte_pressure_below_the_token_budget ... ok
+test ui::slash::compaction_budget_tests::compaction_summarizer_sees_retained_results_and_their_calls ... ok
+test ui::slash::compaction_budget_tests::known_exhausted_window_does_not_use_unknown_window_fallback ... ok
+test ui::slash::compaction_budget_tests::manual_compress_skips_the_budget_gate_but_respects_keep_recent ... ok
+test ui::slash::compaction_budget_tests::tui_compaction_drains_whole_cut_and_second_pass_is_a_noop ... ok
+test ui::slash::compaction_budget_tests::tui_compaction_rejects_a_summary_that_covers_nothing ... ok
+test ui::slash::compaction_budget_tests::tui_compaction_with_partial_coverage_keeps_unsummarized_messages ... ok
+
+failures:
+
+---- key_command::tests::an_expired_token_is_refreshed_once_on_401_and_the_request_succeeds stdout ----
+
+thread 'key_command::tests::an_expired_token_is_refreshed_once_on_401_and_the_request_succeeds' (66632473) panicked at src/tests/support/loopback_http.rs:65:63:
+called `Result::unwrap()` on an `Err` value: Os { code: 1, kind: PermissionDenied, message: "Operation not permitted" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- key_command::tests::an_expired_ttl_refreshes_before_the_request stdout ----
+
+thread 'key_command::tests::an_expired_ttl_refreshes_before_the_request' (66632474) panicked at src/tests/support/loopback_http.rs:65:63:
+called `Result::unwrap()` on an `Err` value: Os { code: 1, kind: PermissionDenied, message: "Operation not permitted" }
+
+---- key_command::tests::an_unchanged_token_after_refresh_surfaces_the_401_without_a_resend stdout ----
+
+thread 'key_command::tests::an_unchanged_token_after_refresh_surfaces_the_401_without_a_resend' (66632476) panicked at src/tests/support/loopback_http.rs:65:63:
+called `Result::unwrap()` on an `Err` value: Os { code: 1, kind: PermissionDenied, message: "Operation not permitted" }
+
+---- key_command::tests::gemini_query_string_key_is_refreshed_and_renewed_on_401 stdout ----
+
+thread 'key_command::tests::gemini_query_string_key_is_refreshed_and_renewed_on_401' (66632746) panicked at src/tests/support/loopback_http.rs:65:63:
+called `Result::unwrap()` on an `Err` value: Os { code: 1, kind: PermissionDenied, message: "Operation not permitted" }
+
+
+failures:
+    key_command::tests::an_expired_token_is_refreshed_once_on_401_and_the_request_succeeds
+    key_command::tests::an_expired_ttl_refreshes_before_the_request
+    key_command::tests::an_unchanged_token_after_refresh_surfaces_the_401_without_a_resend
+    key_command::tests::gemini_query_string_key_is_refreshed_and_renewed_on_401
+
+test result: FAILED. 166 passed; 4 failed; 0 ignored; 0 measured; 6061 filtered out; finished in 15.02s
+
+error: test failed, to rerun pass `--bin mini-agent`
