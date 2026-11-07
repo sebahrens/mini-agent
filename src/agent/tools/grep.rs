@@ -63,7 +63,7 @@ impl SkippedFiles {
         }
         if self.binary > 0 {
             parts.push(format!(
-                "{} binary (NUL byte in the first 8 KiB)",
+                "{} binary (NUL byte in the first 8 KiB, not BOM-marked UTF-16)",
                 self.binary
             ));
         }
@@ -88,7 +88,7 @@ impl SkippedFiles {
         }
         if self.binary > 0 {
             return Some(ToolError::Msg(format!(
-                "grep did not search '{path}': it looks binary (NUL byte in the first 8 KiB; UTF-16 text also triggers this). Use a binary-aware shell command such as `strings` or `iconv` before searching."
+                "grep did not search '{path}': it looks binary (NUL byte in the first 8 KiB and not valid UTF-16 with a byte-order mark). Use a binary-aware shell command such as `strings` or `iconv` before searching."
             )));
         }
         if self.unreadable > 0 {
@@ -269,13 +269,30 @@ impl GrepTool {
         buf.clear();
         buf.reserve(capacity.min(MAX_SEARCH_FILE_BYTES as usize));
         reader.by_ref().take(BINARY_SNIFF_BYTES).read_to_end(buf)?;
-        if Self::is_binary(buf) {
+        // A UTF-16 BOM is checked before the NUL sniff: such files are full of
+        // NUL bytes but are text that read and edit already support.
+        let utf16_bom = matches!(buf.as_slice(), [0xFF, 0xFE, ..] | [0xFE, 0xFF, ..]);
+        if !utf16_bom && Self::is_binary(buf) {
             return Ok(false);
         }
         reader
             .take(MAX_SEARCH_FILE_BYTES + 1 - buf.len() as u64)
             .read_to_end(buf)?;
-        Ok(buf.len() as u64 <= MAX_SEARCH_FILE_BYTES)
+        if buf.len() as u64 > MAX_SEARCH_FILE_BYTES {
+            return Ok(false);
+        }
+        if utf16_bom {
+            match super::text_encoding::decode_utf16_bom(buf) {
+                Some(Ok((text, _))) => {
+                    *buf = text.into_bytes();
+                }
+                // Invalid UTF-16 (odd length, unpaired surrogate) is not text:
+                // with NUL bytes it counts as binary, as before.
+                _ if Self::is_binary(buf) => return Ok(false),
+                _ => {}
+            }
+        }
+        Ok(true)
     }
 }
 

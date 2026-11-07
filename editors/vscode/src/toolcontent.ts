@@ -23,7 +23,7 @@ export function inlineCode(text: string): string {
 }
 
 /** Line diff trimmed to the changed region plus a little context; bounded and never silent about it. */
-export function diffText(diff: acp.Diff): string {
+export function diffText(diff: acp.Diff, full = false): string {
   const oldLines = diff.oldText == null ? [] : diff.oldText.split('\n');
   const newLines = diff.newText.split('\n');
   let prefix = 0;
@@ -47,20 +47,23 @@ export function diffText(diff: acp.Diff): string {
     notes.push(`${Math.floor(omittedBlocks)} more edit block${omittedBlocks === 1 ? '' : 's'} not shown`);
   }
   // Bound lines, line length and total size so a fenced block always closes.
-  let budget = MAX_DIFF_CHARS;
-  let kept = 0;
-  for (const row of rows) {
-    if (kept >= MAX_DIFF_LINES || budget <= 0) { break; }
-    const clipped = row.length > MAX_ROW_CHARS ? `${row.slice(0, MAX_ROW_CHARS)}…` : row;
-    rows[kept] = clipped;
-    budget -= clipped.length + 1;
-    kept += 1;
+  // The full (approval) view applies no cap: every row is shown unclipped.
+  if (!full) {
+    let budget = MAX_DIFF_CHARS;
+    let kept = 0;
+    for (const row of rows) {
+      if (kept >= MAX_DIFF_LINES || budget <= 0) { break; }
+      const clipped = row.length > MAX_ROW_CHARS ? `${row.slice(0, MAX_ROW_CHARS)}…` : row;
+      rows[kept] = clipped;
+      budget -= clipped.length + 1;
+      kept += 1;
+    }
+    if (kept < rows.length) {
+      notes.push(`${rows.length - kept} more diff lines not shown`);
+      rows.length = kept;
+    }
   }
-  if (kept < rows.length) {
-    notes.push(`${rows.length - kept} more diff lines not shown`);
-    rows.length = kept;
-  }
-  return [header.slice(0, MAX_ROW_CHARS), ...rows, ...(notes.length ? [`(${notes.join('; ')})`] : [])].join('\n');
+  return [full ? header : header.slice(0, MAX_ROW_CHARS), ...rows, ...(notes.length ? [`(${notes.join('; ')})`] : [])].join('\n');
 }
 
 /** Markdown for the result content of a finished tool call; empty when there is none. */

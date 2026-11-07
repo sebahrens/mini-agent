@@ -268,6 +268,24 @@ fn mark_hooks_and_signing_skipped(result: &mut serde_json::Value) {
     result["notice"] = serde_json::json!(HOOKS_SIGNING_NOTICE);
 }
 
+/// Disclosure attached to status/diff/show results when the repository holds
+/// gitlinks: Git is never run inside a (model-writable) nested repository, so
+/// submodule changes are excluded from these results.
+const SUBMODULES_NOTICE: &str = "submodules_ignored: submodule (gitlink) changes are not reported by status, diff or show because Git is never run inside nested repositories; a modified, advanced or dirty submodule can exist even when this result shows no change. Check the listed submodule_paths yourself if they matter";
+
+/// Gitlink paths recorded in an index listing (`ls-files --stage -z`); mode
+/// 160000 entries only.
+fn gitlink_paths(stage_listing: &[u8]) -> Vec<String> {
+    stage_listing
+        .split(|byte| *byte == 0)
+        .filter_map(|record| {
+            let record = std::str::from_utf8(record).ok()?;
+            let (meta, path) = record.split_once('\t')?;
+            meta.starts_with("160000 ").then(|| path.to_string())
+        })
+        .collect()
+}
+
 pub(crate) struct GitTool {
     runner: GitRunner,
     workspace: Arc<crate::paths::WorkspaceBinding>,
@@ -757,6 +775,43 @@ impl GitTool {
             );
         }
         Ok(value)
+    }
+
+    /// Adds `submodules_ignored` plus a notice when the index holds gitlinks.
+    /// Uses `ls-files --stage`, which only reads the index and never enters a
+    /// nested repository. If the listing cannot be read completely the result
+    /// is marked conservatively.
+    async fn disclose_submodules(&self, result: &mut serde_json::Value) {
+        let listing = self
+            .run(
+                "list-gitlinks",
+                vec!["ls-files".into(), "--stage".into(), "-z".into()],
+                FILTER_PROBE_LIMITS,
+                true,
+            )
+            .await;
+        let (paths, complete) = match &listing {
+            Ok(output) if output.status == CommandStatus::Completed => {
+                (gitlink_paths(&output.stdout), true)
+            }
+            Ok(output) => (gitlink_paths(&output.stdout), false),
+            Err(_) => (Vec::new(), false),
+        };
+        if paths.is_empty() && complete {
+            return;
+        }
+        result["submodules_ignored"] = serde_json::json!(true);
+        result["submodule_paths"] = serde_json::json!(paths.iter().take(50).collect::<Vec<_>>());
+        if paths.len() > 50 {
+            result["submodule_paths_truncated"] = serde_json::json!(true);
+        }
+        result["submodules_notice"] = serde_json::json!(if complete {
+            SUBMODULES_NOTICE.to_string()
+        } else {
+            format!(
+                "{SUBMODULES_NOTICE} (the index could not be fully listed, so submodule presence is unknown)"
+            )
+        });
     }
 
     async fn head_id(&self) -> Option<String> {
@@ -1650,6 +1705,7 @@ impl GitTool {
                 let coaching = self.permission("git/status", &identity).await?;
                 let guard = self.filter_guard("status").await?;
                 let mut value = self.status_snapshot_for(&guard, &paths).await?;
+                self.disclose_submodules(&mut value).await;
                 value["operation"] = serde_json::json!("status");
                 value["coaching"] = serde_json::json!(coaching);
                 Ok(value)
@@ -1698,13 +1754,15 @@ impl GitTool {
                 command.extend(paths);
                 // Without `--cached` every diff reads the working tree.
                 let guard = self.filter_guard("diff").await?;
-                render_paged_text_result(
+                let mut result = render_paged_text_result(
                     "diff",
                     coaching,
                     self.run("diff", guarded(&guard, command), PAGED_TEXT_LIMITS, true)
                         .await?,
                     args.offset,
-                )
+                )?;
+                self.disclose_submodules(&mut result).await;
+                Ok(result)
             }
             GitOperation::Log => {
                 reject_irrelevant_fields(&args, false, true, true)?;
@@ -1791,12 +1849,14 @@ impl GitTool {
                 command.push(revision.to_string());
                 command.push("--".into());
                 command.extend(paths);
-                render_paged_text_result(
+                let mut result = render_paged_text_result(
                     "show",
                     coaching,
                     self.run("show", command, PAGED_TEXT_LIMITS, true).await?,
                     args.offset,
-                )
+                )?;
+                self.disclose_submodules(&mut result).await;
+                Ok(result)
             }
             GitOperation::Blame => {
                 let timeout = query_timeout(&args)?;
@@ -1960,9 +2020,9 @@ impl Tool for GitTool {
 
     fn description(&self) -> String {
         if self.read_only {
-            return "Inspect the bound Git repository through fixed read-only operations: status (collapsed untracked dirs; optional paths narrow it; truncated is flagged), diff (revision may be a range a..b or a...b; revision_to for a two-commit diff; staged for the index), show (format patch|stat|name_status; at most 192 KiB per call, page with offset/next_offset or narrow with paths), log (revision may be a range; skip/next_skip pages past 100 commits; each commit carries subject plus a body of at most 2 KiB with body_truncated, use show for the full message; author/grep are fixed strings matched against the whole message), blame (one path, optional start_line/end_line/revision, paged like diff), branches (scope local|remote|all|tags; page with skip/max_count and next_skip) and stash_list. Nothing can be changed and nothing is fetched. No shell, raw argv, remotes, or network access is available.".to_string();
+            return "Inspect the bound Git repository through fixed read-only operations: status (collapsed untracked dirs; optional paths narrow it; truncated is flagged; submodule changes are never reported, results carry submodules_ignored when the repository has submodules), diff (revision may be a range a..b or a...b; revision_to for a two-commit diff; staged for the index), show (format patch|stat|name_status; at most 192 KiB per call, page with offset/next_offset or narrow with paths), log (revision may be a range; skip/next_skip pages past 100 commits; each commit carries subject plus a body of at most 2 KiB with body_truncated, use show for the full message; author/grep are fixed strings matched against the whole message), blame (one path, optional start_line/end_line/revision, paged like diff), branches (scope local|remote|all|tags; page with skip/max_count and next_skip) and stash_list. Nothing can be changed and nothing is fetched. No shell, raw argv, remotes, or network access is available.".to_string();
         }
-        "Inspect and update the bound Git repository through fixed structured operations: status (collapsed untracked dirs; optional paths narrow it; truncated is flagged), diff (revision may be a range a..b or a...b; revision_to for a two-commit diff; staged for the index) and show (format patch|stat|name_status; at most 192 KiB per call, page with offset/next_offset or narrow with paths), log (revision may be a range; skip/next_skip pages past 100 commits; each commit carries subject plus a body of at most 2 KiB with body_truncated, use show for the full message; author/grep are fixed strings matched against the whole message; a query that exceeds its 30 s budget returns the commits found so far, and log, blame, branches and stash_list accept timeout_secs up to 120), blame (one path, optional start_line/end_line/revision, paged like diff), stage, unstage, commit (optional signoff, allow_empty and a guarded amend of an unpushed HEAD; hooks and signing are never run and the result says so), branches (scope local|remote|all|tags lists remote-tracking branches or tags without network access; page with skip/max_count and next_skip), branch_create (name, optional start revision), switch (name of an existing branch), stash_push (optional message/paths), stash_pop, stash_list, tag (name, optional revision; message makes it annotated) and restore (discard working-tree changes of paths, from the index or revision). Every mutation has its own git/<operation> permission key. No shell, raw argv, remotes, or network access is available; reset, revert, cherry-pick, merge, rebase, fetch, pull and push are intentionally not offered.".to_string()
+        "Inspect and update the bound Git repository through fixed structured operations: status (collapsed untracked dirs; optional paths narrow it; truncated is flagged; submodule changes are never reported, results carry submodules_ignored when the repository has submodules), diff (revision may be a range a..b or a...b; revision_to for a two-commit diff; staged for the index) and show (format patch|stat|name_status; at most 192 KiB per call, page with offset/next_offset or narrow with paths), log (revision may be a range; skip/next_skip pages past 100 commits; each commit carries subject plus a body of at most 2 KiB with body_truncated, use show for the full message; author/grep are fixed strings matched against the whole message; a query that exceeds its 30 s budget returns the commits found so far, and log, blame, branches and stash_list accept timeout_secs up to 120), blame (one path, optional start_line/end_line/revision, paged like diff), stage, unstage, commit (optional signoff, allow_empty and a guarded amend of an unpushed HEAD; hooks and signing are never run and the result says so), branches (scope local|remote|all|tags lists remote-tracking branches or tags without network access; page with skip/max_count and next_skip), branch_create (name, optional start revision), switch (name of an existing branch), stash_push (optional message/paths), stash_pop, stash_list, tag (name, optional revision; message makes it annotated) and restore (discard working-tree changes of paths, from the index or revision). Every mutation has its own git/<operation> permission key. No shell, raw argv, remotes, or network access is available; reset, revert, cherry-pick, merge, rebase, fetch, pull and push are intentionally not offered.".to_string()
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -2970,6 +3030,51 @@ mod tests {
                 "{record}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn status_diff_show_disclose_ignored_submodules() {
+        let repo = TestRepo::new();
+        repo.write("a.txt", "a\n");
+        repo.git(["add", "."]);
+        repo.git(["commit", "--quiet", "-m", "base"]);
+        let plain = repo
+            .tool()
+            .call(args(GitOperation::Status, &[], None))
+            .await
+            .expect("status");
+        assert!(plain.get("submodules_ignored").is_none(), "{plain}");
+        // A gitlink (mode 160000) recorded without any nested repository.
+        let head = repo.git(["rev-parse", "HEAD"]);
+        let cacheinfo = format!("160000,{},vendor/lib", head.trim());
+        repo.git(["update-index", "--add", "--cacheinfo", &cacheinfo]);
+        repo.git(["commit", "--quiet", "-m", "add submodule pointer"]);
+        let status = repo
+            .tool()
+            .call(args(GitOperation::Status, &[], None))
+            .await
+            .expect("status");
+        assert_eq!(status["submodules_ignored"], true, "{status}");
+        assert_eq!(status["submodule_paths"][0], "vendor/lib", "{status}");
+        assert!(
+            status["submodules_notice"]
+                .as_str()
+                .unwrap()
+                .contains("submodule"),
+            "{status}"
+        );
+        let mut show = args(GitOperation::Show, &[], None);
+        show.revision = Some("HEAD".to_string());
+        let show = repo.tool().call(show).await.expect("show");
+        assert_eq!(show["submodules_ignored"], true, "{show}");
+        let diff = repo
+            .tool()
+            .call(args(GitOperation::Diff, &[], None))
+            .await
+            .expect("diff");
+        assert_eq!(diff["submodules_ignored"], true, "{diff}");
+        let description = repo.tool().description();
+        assert!(description.contains("submodules_ignored"), "{description}");
     }
 
     #[tokio::test]

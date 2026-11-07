@@ -147,6 +147,30 @@ describe('buildPermissionDetail', () => {
     expect(permissionOmittedChars(small)).toBe(0);
   });
 
+  it('full view of a diff is unclipped, keeps indentation, and the warning counts row-clipped characters', () => {
+    const longLine = 'x'.repeat(5000);
+    const request = serverRequest('', {
+      content: [{ type: 'diff', path: '/repo/a.min.js', oldText: 'a\n  keep\n\nz', newText: `${longLine}\n  keep\n\nz` }],
+    });
+    const full = permissionFullText(request);
+    expect(full).toContain(`+${longLine}`);
+    expect(full).toContain('\n   keep');
+    expect(full).toContain('\n \n');
+    expect(permissionOmittedChars(request)).toBeGreaterThanOrEqual(4000);
+    expect(buildPermissionDetail(request)).toContain('WARNING:');
+  });
+
+  it('full view of a 500-line edit shows every row', () => {
+    const lines = Array.from({ length: 500 }, (_, i) => `line ${i}`);
+    const request = serverRequest('', {
+      content: [{ type: 'diff', path: '/repo/b.txt', oldText: null, newText: lines.join('\n') }],
+    });
+    const full = permissionFullText(request);
+    expect(full).toContain('+line 499');
+    expect(full).not.toContain('more diff lines not shown');
+    expect(permissionOmittedChars(request)).toBeGreaterThan(0);
+  });
+
   it('reports edit blocks the agent skipped from the preview', () => {
     const request = serverRequest('', {
       content: [{ type: 'diff', path: '/repo/a.txt', oldText: 'a', newText: 'b', _meta: { 'mini-agent-truncated': true, 'mini-agent-omitted-blocks': 4 } }],

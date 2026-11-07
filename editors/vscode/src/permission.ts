@@ -54,6 +54,8 @@ function stringifyRawInput(rawInput: unknown): string | undefined {
 /** Human-readable lines describing what the tool call is about to do. */
 export function toolCallInputLines(toolCall: acp.ToolCallUpdate, full = false): string[] {
   const lines: string[] = [];
+  // Full view keeps diff rows verbatim (indentation, blank context rows); others are trimmed.
+  const verbatim = new Set<number>();
   for (const entry of toolCall.content ?? []) {
     switch (entry.type) {
       case 'content': {
@@ -65,7 +67,11 @@ export function toolCallInputLines(toolCall: acp.ToolCallUpdate, full = false): 
       }
       case 'diff':
         // The modal detail gets the 12-row summary; the full view gets every row the server sent.
-        lines.push(`edit ${entry.path}`, ...(full ? diffText(entry).split('\n') : diffSummaryLines(entry)).slice(1));
+        lines.push(`edit ${entry.path}`);
+        for (const row of (full ? diffText(entry, true).split('\n') : diffSummaryLines(entry)).slice(1)) {
+          if (full) { verbatim.add(lines.length); }
+          lines.push(row);
+        }
         break;
       case 'terminal':
         lines.push(`terminal ${entry.terminalId}`);
@@ -79,7 +85,8 @@ export function toolCallInputLines(toolCall: acp.ToolCallUpdate, full = false): 
   if (raw && !lines.some(line => line.trim() === raw.trim())) {
     lines.push(`input: ${raw}`);
   }
-  return lines.map(line => line.trim()).filter(Boolean);
+  return lines.map((line, index) => (verbatim.has(index) ? line : line.trim()))
+    .filter((line, index) => verbatim.has(index) || line.length > 0);
 }
 
 /** The complete input text of the tool call (what an allow authorises). */
@@ -103,7 +110,9 @@ export function permissionOmittedChars(
   request: acp.RequestPermissionRequest,
   limit: number = PERMISSION_DETAIL_LIMIT,
 ): number {
-  const input = permissionInputText(request).trim();
+  // Indentation kept in the full view is not "omitted" text: compare with whitespace trimmed per row,
+  // so only characters lost to row/line clipping count.
+  const input = toolCallInputLines(request.toolCall, true).map(line => line.trim()).join('\n').trim();
   // The modal shows the clipped summary (diffs are cut to a few rows), so measure against that.
   const shown = Math.min(toolCallInputLines(request.toolCall).join('\n').trim().length, limit);
   const pattern = allowAlwaysPattern(request)?.trim() ?? '';

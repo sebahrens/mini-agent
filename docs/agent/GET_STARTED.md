@@ -426,13 +426,13 @@ unchanged. Mapping:
 | `assistant_text` | `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":...}]},"session_id":...}` |
 | `tool_call` | `assistant` message with a `tool_use` block (`id`, `name`, `input`); `provider_call_id` rides on the record |
 | `tool_result` | `{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":...,"content":...,"is_error":...}]}}` |
-| `text_delta` / `reasoning_delta` (`--include-partial-messages`) | `{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta"\|"thinking_delta",...}}}` |
-| `result` | same fields plus `subtype` (`success`, `error_max_budget_usd`, `error_during_execution`) and `usage.cache_read_input_tokens`; `duration_ms`, `num_turns`, `is_error`, `total_cost_usd` as above |
+| `text_delta` / `reasoning_delta` (`--include-partial-messages`) | `stream_event` records framed per message: `message_start`, then per content block `content_block_start` (own `index`; thinking and text never share one), `content_block_delta` with that `index`, `content_block_stop`, and `message_delta` + `message_stop` when the final `assistant` record (or the `result`) arrives |
+| `result` | same fields plus `subtype` (`success`, `error_max_turns` for turn-budget exhaustion, `error_max_budget_usd`, `error_during_execution`), `uuid`, `duration_api_ms` (model-wait time; tool execution excluded), `permission_denials` (always `[]`; denied calls appear as error tool results) and `usage.cache_read_input_tokens`; `duration_ms`, `num_turns`, `is_error`, `total_cost_usd` as above |
 | `usage`, `file_mutation`, `file_mutation_gap`, `goal`, `system` `capabilities`, `input_error`, `control_request` | pass through unchanged (extension records without a Claude counterpart; consumers should ignore unknown types) |
 
 A record whose text or arguments were cut at `--stream-json-preview-bytes` carries `"truncated":true`.
 `id` and `tool_use_id` are mini-agent's call id (the provider id is `provider_call_id`), and
-`duration_api_ms` is not reported. This is wire-shape compatibility for parsing, not a promise of
+`assistant`, `user` and `stream_event` records carry a `uuid`. This is wire-shape compatibility for parsing, not a promise of
 every Claude Code field.
 
 #### Multi-turn stream-json input
