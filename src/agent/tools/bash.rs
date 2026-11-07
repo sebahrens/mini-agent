@@ -4199,6 +4199,39 @@ mod tests {
                 ..Default::default()
             })
             .await
+    /// When bwrap remaps the workspace to `/workspace`, `cd` must use that
+    /// path and the advertised alias spelling must be accepted.
+    #[cfg(unix)]
+    #[test]
+    fn workdir_uses_the_sandbox_workspace_alias() {
+        let fixture = workdir_fixture("alias").canonicalize().unwrap();
+        let sandbox = Sandbox::new(false, "bwrap").with_working_dir(&fixture);
+        let alias = std::path::Path::new("/workspace");
+        let relative = sandbox
+            .command_in_workdir_aliased("sub", "ls", Some(alias))
+            .unwrap();
+        assert_eq!(relative, "cd -- '/workspace/sub' || exit 1; ls");
+        let spelled = sandbox
+            .command_in_workdir_aliased("/workspace/sub/deep", "ls", Some(alias))
+            .unwrap();
+        assert_eq!(spelled, "cd -- '/workspace/sub/deep' || exit 1; ls");
+        let root = sandbox
+            .command_in_workdir_aliased("/workspace", "ls", Some(alias))
+            .unwrap();
+        assert_eq!(root, "cd -- '/workspace' || exit 1; ls");
+        // The alias spelling cannot be used to leave the workspace.
+        let escape = sandbox
+            .command_in_workdir_aliased("/workspace/../..", "ls", Some(alias))
+            .unwrap_err();
+        assert!(escape.contains("outside the workspace"), "{escape}");
+        // Without an alias the host path is still emitted.
+        let host = sandbox
+            .command_in_workdir_aliased("sub", "ls", None)
+            .unwrap();
+        assert!(host.contains(&fixture.join("sub").to_string_lossy().into_owned()));
+        std::fs::remove_dir_all(&fixture).ok();
+    }
+
             .unwrap();
         assert!(out.contains("deep"), "{out}");
         // cd does not persist; the next call starts at the workspace root.

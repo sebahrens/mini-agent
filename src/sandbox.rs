@@ -3567,6 +3567,19 @@ impl Sandbox {
         command: &str,
     ) -> Result<String, String> {
         let workdir = workdir.trim();
+    ) -> Result<String, String> {
+        self.command_in_workdir_aliased(workdir, command, self.shell_cwd_alias().as_deref())
+    }
+
+    /// `alias` is where the sandbox mounts the workspace when it differs from
+    /// the host path (bwrap `/workspace`): an absolute `workdir` spelled with
+    /// it maps back to the host root, and the emitted `cd` targets the
+    /// namespace path, which is the only one that exists inside the sandbox.
+    pub(crate) fn command_in_workdir_aliased(
+        &self,
+        workdir: &str,
+        command: &str,
+        alias: Option<&Path>,
         if workdir.is_empty() || workdir.contains('\0') {
             return Err("workdir must be a non-empty path".into());
         }
@@ -3578,7 +3591,10 @@ impl Sandbox {
                 .map_err(|error| format!("workdir: cannot resolve the workspace: {error}"))?,
         };
         let requested = Path::new(workdir);
-        let joined = if requested.is_absolute() {
+        let aliased = alias.and_then(|alias| requested.strip_prefix(alias).ok());
+        let joined = if let Some(inner) = aliased {
+            root.join(inner)
+        } else if requested.is_absolute() {
             requested.to_path_buf()
         } else {
             root.join(requested)
@@ -3595,7 +3611,19 @@ impl Sandbox {
         if !resolved.is_dir() {
             return Err(format!("workdir {workdir:?} is not a directory"));
         }
-        let shown = resolved.to_string_lossy();
+        let namespace_path;
+        let shown = match alias {
+            Some(alias) => {
+                let inner = resolved.strip_prefix(&root).unwrap_or(Path::new(""));
+                namespace_path = if inner.as_os_str().is_empty() {
+                    alias.to_path_buf()
+                } else {
+                    alias.join(inner)
+                };
+                namespace_path.to_string_lossy()
+            }
+            None => resolved.to_string_lossy(),
+        };
         let dialect = self
             .shell_capability()
             .map_or(ShellDialect::Posix, ShellCapability::dialect);
