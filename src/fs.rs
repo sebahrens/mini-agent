@@ -876,11 +876,32 @@ fn reopen_for_content_read(file: &std::fs::File) -> std::io::Result<std::fs::Fil
 pub(crate) fn stale_content_error(path: &Path) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::InvalidData,
-        format!(
-            "File changed after it was read: {}. Re-read the file and retry; the newer contents were kept.",
-            path.display()
-        ),
+        StaleContentError(path.to_path_buf()),
     )
+}
+
+#[derive(Debug)]
+struct StaleContentError(PathBuf);
+
+impl std::fmt::Display for StaleContentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "File changed after it was read: {}. Re-read the file and retry; the newer contents were kept.",
+            self.0.display()
+        )
+    }
+}
+
+impl std::error::Error for StaleContentError {}
+
+/// Whether `error` reports that the target no longer holds the bytes the
+/// replacement was computed from.
+#[cfg(feature = "js")]
+pub(crate) fn is_stale_content_error(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|source| source.downcast_ref::<StaleContentError>().is_some())
 }
 
 #[derive(Debug)]
