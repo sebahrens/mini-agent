@@ -1141,7 +1141,7 @@ fn helper_globals_doc() -> [String; 4] {
         "`toml_parse(text: string): object` and `csv_parse(text: string, {header?: boolean}): string[][] | object[]` (pure; 4 MiB max; TOML inline tables/arrays of tables/quoted keys, CSV quotes/CRLF; integers beyond 2^53 are BigInt)."
             .to_string(),
         format!(
-            "`read_lines(path: string, from: number, count?: number): {{lines: string[], eof: boolean}}` (synchronous; one read effect; 1-based `from`, negative = last N lines, found by seeking back from the end of the file so a log of any size can be tailed (eof=true); files over {} MiB ok, a forward scan or the tail itself covers max {} MiB, count max {}, about {} MiB returned else eof=false, lines cut at {} KiB). Example: `read_lines('app.log', -50).lines`.",
+            "`read_lines(path: string, from: number, count?: number): {{lines: string[], eof: boolean}}` (synchronous; one read effect; 1-based `from`, negative = last N lines, seeks back from EOF (any file size); files over {} MiB ok, scans max {} MiB, count max {}, about {} MiB returned else eof=false, lines cut at {} KiB). Example: `read_lines('app.log', -50).lines`.",
             READ_FILE_MAX_BYTES / (1024 * 1024),
             READ_LINES_MAX_SCAN_BYTES / (1024 * 1024),
             READ_LINES_MAX_COUNT,
@@ -1199,7 +1199,7 @@ impl Tool for JsTool {
             "`glob(pattern: string, options?: {path?: string}): {paths: string[], truncated: boolean}` (synchronous, recursive, respects ignore files). Example: `const files = glob('**/*.rs').paths;`".to_string(),
             "`grep(pattern: string, options?: {path?: string, include?: string, case_sensitive?: boolean}): {matches: {path: string, line: number, text: string}[], truncated: boolean, skipped: {large: number, binary: number, non_utf8: number, unreadable: number}}` (synchronous Rust regex search; case-sensitive by default; matched lines only; invalid UTF-8 decoded lossily; `skipped` counts files NOT searched (large >10 MiB, binary, unreadable) and non_utf8 files searched lossily: no matches with skipped>0 is not proof of absence).".to_string(),
             format!(
-                "`write_file(path: string, content: string): void` (synchronous; max {} MiB; replacing an existing file requires reading its complete current contents with the `read` tool first, like `write`; replaced files are checkpointed for /rewind). Example: `write_file('out.txt', 'done\\n');`",
+                "`write_file(path: string, content: string): void` (synchronous; max {} MiB; overwriting needs a prior full `read` tool read, like `write`; /rewind-checkpointed). Example: `write_file('out.txt', 'done\\n');`",
                 WRITE_FILE_MAX_BYTES / (1024 * 1024)
             ),
             format!(
@@ -3688,11 +3688,13 @@ mod js_permission_bridge {
         // by exactly the 43 bytes of " Other pure helpers are listed by `help()`." (4999 measured).
         // The oversized-result note " (excess is cut with a size note)" adds 33 bytes.
         // The grep `skipped` counts (mini-agent-azgi7) add 290 bytes.
+        // The write_file overwrite guard and the read_lines EOF-seek note add 95 bytes
+        // (mini-agent-ad4rl, mini-agent-s17nk).
         let full = helper_tool(ModelEffectProfile::Full, &root)
             .description()
             .len();
         assert!(
-            full < 3384 + 1350 + 230 + 43 + 33 + 290,
+            full < 3384 + 1350 + 230 + 43 + 33 + 290 + 100,
             "full description is {full} bytes"
         );
     }
