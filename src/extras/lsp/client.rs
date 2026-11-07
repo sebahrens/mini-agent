@@ -233,7 +233,7 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const STDERR_LIMIT: usize = 64 * 1024;
-const MAX_DOCUMENT_BYTES: u64 = 4 * 1024 * 1024;
+pub(crate) const MAX_DOCUMENT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_DIAGNOSTIC_FILES_PER_SERVER: usize = 128;
 pub(crate) const MAX_DIAGNOSTICS_PER_FILE: usize = 50;
 /// Abuse ceiling for one publish. Larger lists are still data to truncate to

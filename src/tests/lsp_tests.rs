@@ -478,10 +478,19 @@ async fn unhandled_extension_yields_nothing() {
     );
 }
 
+/// `rust` is a build-evaluating built-in withheld in untrusted workspaces; these
+/// fixtures opt in through the user-config switch.
+fn rust_opt_in() -> LspConfig {
+    LspConfig {
+        trust_builtins: vec!["rust".into()],
+        ..Default::default()
+    }
+}
+
 #[tokio::test]
 async fn injected_diagnostics_format_errors_first() {
     let manager = LspManager::new(
-        &LspConfig::default(),
+        &rust_opt_in(),
         std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(Path::new("/tmp")).unwrap()),
     );
     let path = Path::new("/tmp/x.rs");
@@ -576,15 +585,15 @@ async fn versionless_initial_publish_and_clear_are_accepted_within_unchanged_epo
             .contains("initial versionless diagnostic")
     );
     assert!(manager.publish_synced_diagnostics_for_test(&uri, "rust", None, Vec::new()));
-    assert_eq!(
+    assert!(
         LspTool::new(manager.clone(), None, None)
             .call(LspArgs {
                 path: None,
                 ..Default::default()
             })
             .await
-            .unwrap(),
-        "No diagnostics."
+            .unwrap()
+            .starts_with("No diagnostics."),
     );
 }
 
@@ -758,15 +767,15 @@ async fn atomic_edit_waits_for_publish_bound_to_replacement_identity() {
         manager.publish_synced_diagnostics_for_test(&uri, "guarded", None, Vec::new()),
         "an exact version anchor permits a later versionless clear in the unchanged epoch"
     );
-    assert_eq!(
+    assert!(
         LspTool::new(manager.clone(), None, None)
             .call(LspArgs {
                 path: None,
                 ..Default::default()
             })
             .await
-            .unwrap(),
-        "No diagnostics."
+            .unwrap()
+            .starts_with("No diagnostics."),
     );
 }
 
@@ -775,15 +784,15 @@ async fn clean_project_reports_nothing() {
     let root = TempDir::new("clean-project");
     let manager = LspManager::new(&LspConfig::default(), root.path().to_path_buf());
     let query = LspTool::new(manager.clone(), None, None);
-    assert_eq!(
+    assert!(
         query
             .call(LspArgs {
                 path: None,
                 ..Default::default()
             })
             .await
-            .unwrap(),
-        "No diagnostics."
+            .unwrap()
+            .starts_with("No diagnostics."),
     );
     let source = root.path().join("x.rs");
     std::fs::write(&source, "document").unwrap();
@@ -870,7 +879,7 @@ async fn cancelled_lsp_validation_remains_owned_until_disk_work_finishes() {
     std::fs::write(&source, "document").unwrap();
     let source = source.canonicalize().unwrap();
     let uri = crate::extras::lsp::client::file_uri(&source).unwrap();
-    let manager = LspManager::new(&LspConfig::default(), root.path().to_path_buf());
+    let manager = LspManager::new(&rust_opt_in(), root.path().to_path_buf());
     manager.set_synced_document_for_test(&uri, 1, true);
     assert!(manager.publish_synced_diagnostics_for_test(
         &uri,
@@ -961,7 +970,11 @@ async fn explicit_in_root_path_obeys_read_allow_deny_and_ask() {
         })
         .await
         .unwrap();
-    assert!(output.starts_with("No diagnostics for "), "{output}");
+    assert!(
+        output.starts_with("Not checked: no language server is configured for ")
+            && output.contains("not a clean result"),
+        "{output}"
+    );
 
     let (deny, _, _) = lsp_tool(root.path(), read_permission(Action::Deny));
     let error = deny
@@ -1048,15 +1061,15 @@ async fn project_query_obeys_read_allow_deny_and_ask_before_cache_disclosure() {
     let canonical_root = root.path().canonicalize().unwrap();
 
     let (allow, _, _) = lsp_tool(root.path(), read_permission(Action::Allow));
-    assert_eq!(
+    assert!(
         allow
             .call(LspArgs {
                 path: None,
                 ..Default::default()
             })
             .await
-            .unwrap(),
-        "No diagnostics."
+            .unwrap()
+            .starts_with("No diagnostics."),
     );
 
     let (deny, _, manager) = lsp_tool(root.path(), read_permission(Action::Deny));
@@ -1089,7 +1102,7 @@ async fn project_query_obeys_read_allow_deny_and_ask_before_cache_disclosure() {
         }),
         answer_once(ask_rx.unwrap(), &canonical_root),
     );
-    assert_eq!(result.unwrap(), "No diagnostics.");
+    assert!(result.unwrap().starts_with("No diagnostics."),);
 }
 
 #[tokio::test]
@@ -1878,7 +1891,7 @@ async fn project_wide_listing_discloses_files_dropped_from_a_full_cache() {
 #[tokio::test]
 async fn oversized_existing_publish_invalidates_stale_diagnostics_and_advances_version() {
     let root = TempDir::new("oversized-existing-publish");
-    let manager = LspManager::new(&LspConfig::default(), root.path().to_path_buf());
+    let manager = LspManager::new(&rust_opt_in(), root.path().to_path_buf());
     let victim = root.path().join("victim.rs");
     std::fs::write(&victim, "contents").unwrap();
     let victim = victim.canonicalize().unwrap();
@@ -2323,15 +2336,15 @@ async fn aggregate_rejects_symlink_alias_uri_variants_and_stale_retargets() {
         Some(permission(root.path(), PermissionConfig::default())),
         None,
     );
-    assert_eq!(
+    assert!(
         replacement_tool
             .call(LspArgs {
                 path: None,
                 ..Default::default()
             })
             .await
-            .unwrap(),
-        "No diagnostics.",
+            .unwrap()
+            .starts_with("No diagnostics."),
         "a same-path inode replacement must invalidate cached diagnostics"
     );
 
@@ -2353,7 +2366,7 @@ async fn aggregate_rejects_symlink_alias_uri_variants_and_stale_retargets() {
         })
         .await
         .unwrap();
-    assert_eq!(output, "No diagnostics.");
+    assert!(output.starts_with("No diagnostics."), "{output}");
 }
 
 #[test]
@@ -2535,6 +2548,60 @@ fn lsp_settings_must_be_a_small_object() {
     assert!(cfg.workspace_settings().is_some());
 }
 
+// mini-agent-rqy76: ignored settings and clamped timeouts are reported, naming
+// the server and the limit, without echoing the settings content.
+#[test]
+fn lsp_config_validation_reports_ignored_settings_and_clamped_timeouts() {
+    let mut cfg = LspConfig::default();
+    cfg.servers.insert(
+        "py".into(),
+        LspServerConfig {
+            settings: Some(serde_json::json!("SECRET-not-an-object")),
+            startup_timeout_ms: Some(500),
+            request_timeout_ms: Some(600_000),
+            wait_ms: Some(LspServerConfig::MAX_WAIT_MS + 1),
+            ..Default::default()
+        },
+    );
+    cfg.servers.insert(
+        "big".into(),
+        LspServerConfig {
+            settings: Some(
+                serde_json::json!({"blob": "x".repeat(LspServerConfig::MAX_SETTINGS_BYTES)}),
+            ),
+            ..Default::default()
+        },
+    );
+    cfg.trust_builtins = vec!["rust".into(), "clangd".into()];
+    let warnings = cfg.validation_warnings();
+    let joined = warnings.join("\n");
+    assert!(
+        joined.contains("lsp.servers.py.settings must be a table"),
+        "{joined}"
+    );
+    assert!(
+        joined.contains("lsp.servers.big.settings exceeds 65536"),
+        "{joined}"
+    );
+    assert!(joined.contains("startup_timeout_ms = 500") && joined.contains("1000 ms is used"));
+    assert!(joined.contains("request_timeout_ms = 600000") && joined.contains("300000 ms is used"));
+    assert!(joined.contains("wait_ms"));
+    assert!(joined.contains("trust_builtins names 'clangd'"));
+    assert!(!joined.contains("SECRET"));
+    assert_eq!(warnings.len(), 6, "{joined}");
+    let mut config = crate::config::Config::default();
+    assert!(config.lsp_config_warnings().is_empty());
+    config.lsp = Some(cfg);
+    assert_eq!(config.lsp_config_warnings().len(), 6);
+    // Valid values warn about nothing.
+    let ok = LspServerConfig {
+        settings: Some(serde_json::json!({"a": 1})),
+        startup_timeout_ms: Some(2000),
+        ..Default::default()
+    };
+    assert!(ok.validation_warnings("ok").is_empty());
+}
+
 #[test]
 fn idle_timeout_defaults_to_fifteen_minutes_and_zero_disables_retirement() {
     let mut cfg = LspConfig::default();
@@ -2584,8 +2651,8 @@ fn rename_preview_is_bounded_and_never_names_outside_files() {
             .files
             .iter()
             .flat_map(|file| &file.edits)
-            .all(|edit| edit.new_text.len() <= 200),
-        "replacement text is cut"
+            .all(|edit| edit.new_text.len() == edit.full_len && !edit.cut),
+        "replacement text is retained in full within the retention bounds"
     );
     // File operations outside the workspace are counted, never named.
     let ops = edit_preview(
@@ -2874,6 +2941,7 @@ fn rename_preview_pages_through_every_edit_up_to_the_hard_bound() {
         start: (n, 0),
         end: (n, 3),
         new_text: "renamed".into(),
+        full_len: 7,
         cut: false,
     };
     // 120 sites in one file and 60 files of 3 sites: past the old caps of 50
@@ -2943,4 +3011,261 @@ fn rename_preview_pages_through_every_edit_up_to_the_hard_bound() {
         text.contains("9 more edits in this file beyond the 5000-edit bound"),
         "{text}"
     );
+}
+
+// mini-agent-lk8yo: every non-answer of the per-file query is distinguishable
+// from a clean file, and the project-wide form states its coverage.
+#[tokio::test]
+async fn per_file_query_distinguishes_unsynced_unavailable_and_unhandled_files() {
+    let root = TempDir::new("query-statuses");
+    let mut cfg = LspConfig::default();
+    cfg.servers.insert(
+        "ghost".into(),
+        LspServerConfig {
+            command: "/nonexistent/ghost-ls".into(),
+            extensions: vec![".ghost".into()],
+            ..Default::default()
+        },
+    );
+    let manager = LspManager::new(&cfg, root.path().to_path_buf());
+    let tool = LspTool::new(manager.clone(), None, None);
+    let query = |name: &str| {
+        let path = root.path().join(name).display().to_string();
+        tool.call(LspArgs {
+            path: Some(path),
+            ..Default::default()
+        })
+    };
+
+    std::fs::write(root.path().join("plain.txt"), "x").unwrap();
+    let unhandled = query("plain.txt").await.unwrap();
+    assert!(
+        unhandled.starts_with("Not checked: no language server is configured")
+            && unhandled.contains(".txt")
+            && unhandled.contains("not a clean result"),
+        "{unhandled}"
+    );
+
+    let big = std::fs::File::create(root.path().join("big.ghost")).unwrap();
+    big.set_len(5 * 1024 * 1024).unwrap();
+    let big = query("big.ghost").await.unwrap();
+    assert!(
+        big.starts_with("Not checked:")
+            && big.contains("not synchronized")
+            && big.contains("4 MiB")
+            && big.contains("ghost"),
+        "{big}"
+    );
+
+    std::fs::write(root.path().join("binary.ghost"), [0xff, 0xfe, 0x00, 0x80]).unwrap();
+    let binary = query("binary.ghost").await.unwrap();
+    assert!(
+        binary.contains("not synchronized") && binary.contains("UTF-8"),
+        "{binary}"
+    );
+
+    std::fs::write(root.path().join("ok.ghost"), "fine").unwrap();
+    let down = query("ok.ghost").await.unwrap();
+    assert!(
+        down.starts_with("Not checked: LSP (ghost) is unavailable")
+            && down.contains("not a clean result"),
+        "{down}"
+    );
+
+    let project = tool.call(LspArgs::default()).await.unwrap();
+    assert!(
+        project.starts_with("No diagnostics.")
+            && project.contains("only files a language server has published")
+            && project.contains("Running servers: none")
+            && project.contains("ghost"),
+        "{project}"
+    );
+}
+
+#[tokio::test]
+async fn query_wait_ms_is_validated_and_per_file_only() {
+    let root = TempDir::new("query-wait-validation");
+    let manager = LspManager::new(&LspConfig::default(), root.path().to_path_buf());
+    let tool = LspTool::new(manager, None, None);
+    std::fs::write(root.path().join("a.txt"), "x").unwrap();
+    for (path, wait) in [
+        (Some(root.path().join("a.txt").display().to_string()), 0),
+        (
+            Some(root.path().join("a.txt").display().to_string()),
+            60_001,
+        ),
+        (None, 100),
+    ] {
+        let error = tool
+            .call(LspArgs {
+                path,
+                wait_ms: Some(wait),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("wait_ms"), "{error}");
+    }
+}
+
+// mini-agent-5pb74: the compact listing cuts long replacements visibly, and the
+// complete text of any edit is retrievable (paged by bytes) and faithful.
+#[test]
+fn edit_preview_text_is_complete_on_request_and_visibly_cut_otherwise() {
+    use crate::agent::tools::lsp::{TextView, render_edit_preview_with};
+    use crate::extras::lsp::navigate::{MAX_EDIT_TEXT_RETAINED, edit_preview};
+    let root = std::path::PathBuf::from("/ws");
+    let map = |uri: &str| uri.strip_prefix("file:///ws/").map(|rest| root.join(rest));
+    let big: String = (0..2000)
+        .map(|line| format!("    fn generated_{line}() {{}}\n"))
+        .collect();
+    let edits = serde_json::json!({"changes": {
+        "file:///ws/a.rs": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}, "newText": "short"},
+            {"range": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 2}}, "newText": big.clone()},
+            {"range": {"start": {"line": 9, "character": 0}, "end": {"line": 9, "character": 0}}, "newText": "esc\u{1b}[31m end"},
+        ]
+    }});
+    let preview = edit_preview(&edits, &map);
+    let view = |view: TextView, window| {
+        render_edit_preview_with(&preview, &root, None, false, "", window, view)
+    };
+    // Listing: numbered, the long one cut with a visible way to continue.
+    let listing = view(TextView::default(), (0, 100));
+    assert!(listing.contains("#1 1:1-1:1 -> \"short\""), "{listing}");
+    assert!(
+        listing.contains(&format!(
+            "[text cut at 200 of {} bytes; pass edit=2",
+            big.len()
+        )),
+        "{listing}"
+    );
+    // One edit in full, paged by bytes until the whole text is reassembled.
+    let mut rebuilt = String::new();
+    let mut text_offset = 0;
+    loop {
+        let page = view(
+            TextView {
+                edit: Some(2),
+                text_offset,
+                ..Default::default()
+            },
+            (0, 100),
+        );
+        let body = page
+            .split("<<<<<<< REPLACEMENT\n")
+            .nth(1)
+            .and_then(|rest| rest.split("\n>>>>>>> END").next())
+            .unwrap_or_else(|| panic!("{page}"));
+        rebuilt.push_str(body);
+        match page.split("next text_offset=").nth(1) {
+            Some(rest) => text_offset = rest.split(':').next().unwrap().parse().unwrap(),
+            None => break,
+        }
+    }
+    assert_eq!(rebuilt, big, "paged text must be byte-faithful");
+    // Control characters are escaped; unknown edit numbers are explained.
+    let escaped = view(
+        TextView {
+            edit: Some(3),
+            ..Default::default()
+        },
+        (0, 100),
+    );
+    assert!(
+        escaped.contains("esc\\u{1b}[31m end") && !escaped.contains('\u{1b}'),
+        "{escaped:?}"
+    );
+    assert!(escaped.contains("1 control characters"), "{escaped}");
+    let missing = view(
+        TextView {
+            edit: Some(9),
+            ..Default::default()
+        },
+        (0, 100),
+    );
+    assert!(missing.contains("No edit number 9"), "{missing}");
+    // full_text pages end at a byte budget and name the next offset.
+    let full = view(
+        TextView {
+            full: true,
+            ..Default::default()
+        },
+        (0, 100),
+    );
+    assert!(
+        full.contains("page ended early at the full-text byte budget"),
+        "{full}"
+    );
+    assert!(full.contains("next_offset=1"), "{full}");
+    assert!(!full.contains("text cut at 200"), "{full}");
+    // The retained text per edit is bounded and said so.
+    let huge = edit_preview(
+        &serde_json::json!({"changes": {"file:///ws/h.rs": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+             "newText": "y".repeat(MAX_EDIT_TEXT_RETAINED + 10)}
+        ]}}),
+        &map,
+    );
+    let edit = &huge.files[0].edits[0];
+    assert!(edit.cut && edit.full_len == MAX_EDIT_TEXT_RETAINED + 10);
+    let note =
+        render_edit_preview_with(&huge, &root, None, false, "", (0, 10), TextView::default());
+    assert!(
+        note.contains("bytes of the replacement are retained"),
+        "{note}"
+    );
+}
+
+#[tokio::test]
+async fn navigate_edit_arguments_are_validated() {
+    use crate::agent::tools::lsp::{LspNavigateArgs, LspNavigateTool};
+    let root = TempDir::new("nav-edit-args");
+    let manager = LspManager::new(&LspConfig::default(), root.path().to_path_buf());
+    let tool = LspNavigateTool::new(manager, None, None);
+    let file = root.path().join("a.rs").display().to_string();
+    for args in [
+        LspNavigateArgs {
+            op: "hover".into(),
+            path: file.clone(),
+            line: Some(1),
+            column: Some(1),
+            edit: Some(1),
+            ..Default::default()
+        },
+        LspNavigateArgs {
+            op: "rename".into(),
+            path: file.clone(),
+            line: Some(1),
+            column: Some(1),
+            new_name: Some("n".into()),
+            edit: Some(1),
+            full_text: Some(true),
+            ..Default::default()
+        },
+        LspNavigateArgs {
+            op: "rename".into(),
+            path: file.clone(),
+            line: Some(1),
+            column: Some(1),
+            new_name: Some("n".into()),
+            text_offset: Some(4),
+            ..Default::default()
+        },
+        LspNavigateArgs {
+            op: "code_actions".into(),
+            path: file.clone(),
+            line: Some(1),
+            column: Some(1),
+            full_text: Some(true),
+            ..Default::default()
+        },
+    ] {
+        let error = tool.call(args).await.unwrap_err().to_string();
+        assert!(
+            error.contains("edit") || error.contains("text_offset"),
+            "{error}"
+        );
+    }
 }

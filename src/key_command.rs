@@ -24,7 +24,7 @@
 //!
 //! The swap happens in the provider HTTP layer (`ProviderHttpClient`): a
 //! request that carries a secret this module issued gets the current secret in
-//! its place, so clients built earlier with an older token keep working without
+//! its place (in a header value, or in the URL's `key=` parameter for Gemini), so clients built earlier with an older token keep working without
 //! a restart. Bedrock, Vertex and Copilot use their own credential
 //! flows and ignore this table.
 use std::collections::HashMap;
@@ -210,7 +210,7 @@ impl CommandCredential {
     /// Rewrites a secret this credential issued in `headers` to the current
     /// one, renewing it first when its TTL ran out. `Some(generation)` when
     /// the request carries one of this credential's secrets.
-    async fn apply(&self, headers: &mut HeaderMap) -> Option<u64> {
+    async fn apply(&self, headers: &mut HeaderMap, uri: &mut http::Uri) -> Option<u64> {
         {
             let owns = |headers: &HeaderMap, state: &State| {
                 headers.values().any(|value| {
@@ -220,7 +220,10 @@ impl CommandCredential {
                     })
                 })
             };
-            if !owns(headers, &self.lock()) {
+            let owns_query = |uri: &http::Uri, state: &State| {
+                query_key(uri).is_some_and(|value| state.known.iter().any(|known| known == value))
+            };
+            if !owns(headers, &self.lock()) && !owns_query(uri, &self.lock()) {
                 return None;
             }
             let expired = !self.is_fresh(&self.lock());
@@ -231,6 +234,13 @@ impl CommandCredential {
                 let state = self.lock();
                 (state.current.clone()?, state.generation)
             };
+            if let Some(value) = query_key(uri)
+                && value != current
+                && self.lock().known.iter().any(|known| known == value)
+                && let Some(rewritten) = with_query_key(uri, &current)
+            {
+                *uri = rewritten;
+            }
             for value in headers.values_mut() {
                 let Ok(text) = value.to_str() else { continue };
                 let (prefix, secret) = match text.strip_prefix("Bearer ") {
@@ -269,6 +279,34 @@ impl CommandCredential {
     }
 }
 
+/// The value of the `key=` query parameter (Gemini passes its API key in the
+/// URL, not a header), if the URI has one.
+fn query_key(uri: &http::Uri) -> Option<&str> {
+    uri.query()?
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("key="))
+}
+
+/// `uri` with its `key=` query parameter replaced by `secret`. `None` when the
+/// result is not a valid URI (a credential with URL-unsafe characters).
+fn with_query_key(uri: &http::Uri, secret: &str) -> Option<http::Uri> {
+    let query = uri.query()?;
+    let rebuilt: Vec<String> = query
+        .split('&')
+        .map(|pair| match pair.strip_prefix("key=") {
+            Some(_) => format!("key={secret}"),
+            None => pair.to_owned(),
+        })
+        .collect();
+    let mut parts = uri.clone().into_parts();
+    parts.path_and_query = Some(
+        format!("{}?{}", uri.path(), rebuilt.join("&"))
+            .parse()
+            .ok()?,
+    );
+    http::Uri::from_parts(parts).ok()
+}
+
 /// Whether `output` is acceptable as a credential: one nonempty line without
 /// control characters. The text is returned trimmed.
 fn credential_from_output(output: &[u8]) -> Result<String, &'static str> {
@@ -293,26 +331,83 @@ fn exit_reason(status: std::process::ExitStatus) -> String {
     }
 }
 
+/// Kills the credential command's whole process group when dropped (or on
+/// demand), so `sh -c` wrappers cannot leave a grandchild running or holding
+/// the stdout pipe open past the deadline. The command is spawned as the
+/// leader of its own group; on non-Unix targets only the direct child is
+/// killed by the callers.
+struct GroupKill {
+    #[cfg(unix)]
+    pgid: Option<i32>,
+}
+
+impl GroupKill {
+    fn new(pid: Option<u32>) -> Self {
+        #[cfg(unix)]
+        {
+            Self {
+                pgid: pid
+                    .and_then(|pid| i32::try_from(pid).ok())
+                    .filter(|pid| *pid > 1),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+            Self {}
+        }
+    }
+
+    fn kill(&self) {
+        #[cfg(unix)]
+        if let Some(pgid) = self.pgid {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pgid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    }
+}
+
+impl Drop for GroupKill {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
 fn run_blocking(credential: &CommandCredential) -> Result<String, String> {
     use std::io::Read as _;
     use std::process::{Command, Stdio};
     let spec = &credential.spec;
-    let mut child = Command::new(&spec.command[0])
+    let mut command = Command::new(&spec.command[0]);
+    command
         .args(&spec.command[1..])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let mut child = command
         .spawn()
         .map_err(|error| credential.failure(&format!("could not start ({:?})", error.kind())))?;
+    let group = GroupKill::new(Some(child.id()));
     let mut stdout = child.stdout.take().expect("piped stdout");
-    let reader = std::thread::spawn(move || {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    // Never joined: a descendant that escaped the group and still holds the
+    // pipe only keeps this detached thread alive, not the caller.
+    std::thread::spawn(move || {
         let mut output = Vec::new();
         let _ = (&mut stdout)
             .take(MAX_OUTPUT_BYTES as u64 + 1)
             .read_to_end(&mut output);
-        output
+        let _ = sender.send(output);
     });
     let deadline = Instant::now() + spec.timeout();
+    let timed_out =
+        || credential.failure(&format!("timed out after {} s", spec.timeout().as_secs()));
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -320,17 +415,23 @@ fn run_blocking(credential: &CommandCredential) -> Result<String, String> {
                 std::thread::sleep(Duration::from_millis(10));
             }
             Ok(None) => {
+                group.kill();
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = reader.join();
-                return Err(
-                    credential.failure(&format!("timed out after {} s", spec.timeout().as_secs()))
-                );
+                return Err(timed_out());
             }
-            Err(_) => return Err(credential.failure("could not be waited on")),
+            Err(_) => {
+                group.kill();
+                return Err(credential.failure("could not be waited on"));
+            }
         }
     };
-    let output = reader.join().unwrap_or_default();
+    // The helper exited: end anything it left behind so the pipe closes.
+    group.kill();
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let Ok(output) = receiver.recv_timeout(remaining.max(Duration::from_millis(200))) else {
+        return Err(timed_out());
+    };
     if !status.success() {
         return Err(credential.failure(&exit_reason(status)));
     }
@@ -340,33 +441,49 @@ fn run_blocking(credential: &CommandCredential) -> Result<String, String> {
 async fn run_async(credential: &CommandCredential) -> Result<String, String> {
     use tokio::io::AsyncReadExt as _;
     let spec = &credential.spec;
-    let mut child = tokio::process::Command::new(&spec.command[0])
+    let mut command = tokio::process::Command::new(&spec.command[0]);
+    command
         .args(&spec.command[1..])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
         .spawn()
         .map_err(|error| credential.failure(&format!("could not start ({:?})", error.kind())))?;
+    // Dropping this (timeout, cancellation, or normal return) kills the group.
+    let group = GroupKill::new(child.id());
     let mut stdout = child.stdout.take().expect("piped stdout");
     let run = async {
         let mut output = Vec::new();
-        (&mut stdout)
-            .take(MAX_OUTPUT_BYTES as u64 + 1)
-            .read_to_end(&mut output)
-            .await
-            .map_err(|_| credential.failure("output could not be read"))?;
-        let status = child
-            .wait()
-            .await
-            .map_err(|_| credential.failure("could not be waited on"))?;
+        let status = {
+            let mut limited = (&mut stdout).take(MAX_OUTPUT_BYTES as u64 + 1);
+            let mut read = Box::pin(limited.read_to_end(&mut output));
+            let status = tokio::select! {
+                read_result = &mut read => {
+                    read_result.map_err(|_| credential.failure("output could not be read"))?;
+                    child.wait().await
+                }
+                status = child.wait() => {
+                    // The helper exited: end what it left behind so the pipe
+                    // closes instead of stalling on a backgrounded daemon.
+                    group.kill();
+                    read.await
+                        .map_err(|_| credential.failure("output could not be read"))?;
+                    status
+                }
+            };
+            status.map_err(|_| credential.failure("could not be waited on"))?
+        };
         Ok::<_, String>((output, status))
     };
-    let (output, status) = tokio::time::timeout(spec.timeout(), run)
-        .await
-        .map_err(|_| {
-            credential.failure(&format!("timed out after {} s", spec.timeout().as_secs()))
-        })??;
+    let result = tokio::time::timeout(spec.timeout(), run).await;
+    group.kill();
+    let (output, status) = result.map_err(|_| {
+        credential.failure(&format!("timed out after {} s", spec.timeout().as_secs()))
+    })??;
     if !status.success() {
         return Err(credential.failure(&exit_reason(status)));
     }
@@ -415,8 +532,8 @@ pub(crate) struct Applied {
 }
 
 /// Swaps every configured command credential's issued secrets in `headers`
-/// for the current ones. Empty (and free) when no command is configured.
-pub(crate) async fn apply_all(headers: &mut HeaderMap) -> Vec<Applied> {
+/// (and the `key=` query parameter, which Gemini uses) for the current ones. Empty (and free) when no command is configured.
+pub(crate) async fn apply_all(headers: &mut HeaderMap, uri: &mut http::Uri) -> Vec<Applied> {
     let credentials: Vec<Arc<CommandCredential>> = REGISTRY
         .read()
         .unwrap_or_else(|error| error.into_inner())
@@ -425,7 +542,7 @@ pub(crate) async fn apply_all(headers: &mut HeaderMap) -> Vec<Applied> {
         .unwrap_or_default();
     let mut applied = Vec::new();
     for credential in credentials {
-        if let Some(generation) = credential.apply(headers).await {
+        if let Some(generation) = credential.apply(headers, uri).await {
             applied.push(Applied {
                 credential,
                 generation,
@@ -867,6 +984,172 @@ mod tests {
             .await
             .expect("expired token renewed before sending");
         assert_eq!(*seen.lock().unwrap(), ["ttl-2"]);
+        configure(None).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn process_alive(marker: &str) -> bool {
+        std::process::Command::new("pgrep")
+            .args(["-f", marker])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blocking_timeout_returns_promptly_and_kills_grandchildren() {
+        let marker = "sleep 30.4817";
+        let credential = CommandCredential::new(
+            "gw",
+            ApiKeyCommandSpec {
+                command: vec!["sh".into(), "-c".into(), format!("{marker}; echo tok")],
+                ttl_secs: Some(0),
+                timeout_secs: Some(1),
+            },
+        );
+        let started = Instant::now();
+        let error = run_blocking(&credential).unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "{:?}",
+            started.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!process_alive(marker), "grandchild survived the timeout");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blocking_success_does_not_wait_for_a_backgrounded_daemon() {
+        let marker = "sleep 31.5291";
+        let credential = CommandCredential::new(
+            "gw",
+            ApiKeyCommandSpec {
+                command: vec!["sh".into(), "-c".into(), format!("{marker} & echo tok")],
+                ttl_secs: Some(0),
+                timeout_secs: Some(5),
+            },
+        );
+        let started = Instant::now();
+        assert_eq!(run_blocking(&credential).unwrap(), "tok");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!process_alive(marker), "daemon survived the helper");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn async_timeout_kills_grandchildren_and_success_ignores_daemons() {
+        let marker = "sleep 32.6113";
+        let hung = CommandCredential::new(
+            "gw",
+            ApiKeyCommandSpec {
+                command: vec!["sh".into(), "-c".into(), format!("{marker}; echo tok")],
+                ttl_secs: Some(0),
+                timeout_secs: Some(1),
+            },
+        );
+        let started = Instant::now();
+        assert!(run_async(&hung).await.unwrap_err().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(4));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!process_alive(marker));
+        let marker = "sleep 33.7127";
+        let daemon = CommandCredential::new(
+            "gw",
+            ApiKeyCommandSpec {
+                command: vec!["sh".into(), "-c".into(), format!("{marker} & echo tok")],
+                ttl_secs: Some(0),
+                timeout_secs: Some(5),
+            },
+        );
+        assert_eq!(run_async(&daemon).await.unwrap(), "tok");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!process_alive(marker));
+    }
+
+    #[test]
+    fn query_key_is_found_and_rewritten_without_touching_other_parameters() {
+        let uri: http::Uri = "http://h/v1beta/models/m:streamGenerateContent?alt=sse&key=old-1&x=y"
+            .parse()
+            .unwrap();
+        assert_eq!(query_key(&uri), Some("old-1"));
+        let rewritten = with_query_key(&uri, "new-2").unwrap();
+        assert_eq!(
+            rewritten.to_string(),
+            "http://h/v1beta/models/m:streamGenerateContent?alt=sse&key=new-2&x=y"
+        );
+        let plain: http::Uri = "http://h/p?monkey=1".parse().unwrap();
+        assert_eq!(query_key(&plain), None);
+        // A credential that cannot form a URI is refused, not smuggled in.
+        assert!(with_query_key(&uri, "a b\r\nHost: evil").is_none());
+    }
+
+    // mini-agent-dxbuy: Gemini carries its key in the URL; a stale key there is
+    // swapped for the current one and a 401 renews it and resends once.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gemini_query_string_key_is_refreshed_and_renewed_on_401() {
+        use crate::tests::support::loopback_http::asynchronous as http;
+        use rig::completion::CompletionModel as _;
+        let _turn = REGISTRY_TESTS.lock().await;
+        let dir = crate::tests::OwnedTestDirectory::new("key-command-gemini");
+        let (listener, base) = http::bind().await;
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recorded = seen.clone();
+        tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut socket, request) = http::accept_request(&listener).await;
+                let line = request.head.lines().next().unwrap_or_default().to_owned();
+                let key = line
+                    .split(['?', '&', ' '])
+                    .find_map(|part| part.strip_prefix("key=").map(str::to_owned))
+                    .unwrap_or_default();
+                recorded.lock().unwrap().push(key.clone());
+                if key != "gem-2" {
+                    http::respond(
+                        &mut socket,
+                        "401 Unauthorized",
+                        "application/json",
+                        r#"{"error":{"code":401,"message":"expired","status":"UNAUTHENTICATED"}}"#,
+                    )
+                    .await;
+                } else {
+                    http::respond_json(&mut socket,
+                        r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}"#).await;
+                }
+            }
+        });
+        let mut specs = HashMap::new();
+        specs.insert(
+            "gem-gw".to_owned(),
+            counting_command(dir.path(), "gem", true),
+        );
+        configure(Some(&specs)).unwrap();
+        let config: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "custom_providers":{"gem-gw":{"provider_type":"gemini","base_url":base}}
+        }))
+        .unwrap();
+        let crate::provider::AnyClient::Gemini(client) =
+            crate::provider::create_client("gem-gw", None, config.custom_providers_map(), None)
+                .unwrap()
+        else {
+            panic!("gemini route")
+        };
+        let model = rig::providers::gemini::completion::CompletionModel::new(client, "gemini-test");
+        let request = || model.completion_request("hello").build();
+        model
+            .completion(request())
+            .await
+            .expect("renewed request succeeds");
+        assert_eq!(*seen.lock().unwrap(), ["gem-1", "gem-2"]);
+        model
+            .completion(request())
+            .await
+            .expect("next request carries the new key");
+        assert_eq!(*seen.lock().unwrap(), ["gem-1", "gem-2", "gem-2"]);
         configure(None).unwrap();
     }
 }

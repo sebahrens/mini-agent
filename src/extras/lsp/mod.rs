@@ -8,6 +8,7 @@
 
 pub(crate) mod client;
 pub(crate) mod navigate;
+pub(crate) mod query;
 pub(crate) mod registry;
 pub mod rpc;
 
@@ -419,6 +420,7 @@ impl LspManager {
         let (servers, withheld) = registry::split_untrusted_builtins(
             registry::resolve_servers(&cfg.servers),
             &cfg.servers,
+            &cfg.trust_builtins,
             || workspace_is_trusted(&workspace),
         );
         let manager = Self::with_servers_withheld(servers, withheld, workspace);
@@ -455,6 +457,7 @@ impl LspManager {
             LspActivation::Auto => {
                 let manager = Self::prepare_automatic(
                     cfg.servers.clone(),
+                    cfg.trust_builtins.clone(),
                     std::env::var_os("PATH"),
                     workspace,
                     crate::agent::runner::AgentWorkScope::new(),
@@ -483,6 +486,7 @@ impl LspManager {
 
     async fn prepare_automatic(
         configured: HashMap<String, crate::config::types::LspServerConfig>,
+        trust_builtins: Vec<String>,
         search: Option<std::ffi::OsString>,
         workspace: Arc<crate::paths::WorkspaceBinding>,
         scope: Arc<crate::agent::runner::AgentWorkScope>,
@@ -503,7 +507,9 @@ impl LspManager {
         cleanup.settle().await;
         let servers = result.ok()?;
         let (servers, withheld) =
-            registry::split_untrusted_builtins(servers, &user, || workspace_is_trusted(&workspace));
+            registry::split_untrusted_builtins(servers, &user, &trust_builtins, || {
+                workspace_is_trusted(&workspace)
+            });
         // A manager with only withheld servers is still returned so the `lsp`
         // tool and `/doctor` can say why nothing runs.
         if cancelled || (servers.is_empty() && withheld.is_empty()) || workspace.validate().is_err()
@@ -781,6 +787,7 @@ impl LspManager {
             .await
     }
 
+    #[cfg(test)]
     /// [`Self::diagnostics_block_since`] for an explicit query: `page` selects
     /// the window and the truncation footer states what is hidden.
     pub(crate) async fn diagnostics_query_since(
@@ -795,6 +802,7 @@ impl LspManager {
             .0
     }
 
+    #[cfg(test)]
     /// Like [`Self::diagnostics_block_since`], also reporting whether the
     /// awaited publish arrived (`None` when no wait took place).
     async fn diagnostics_block_observed(
@@ -963,18 +971,6 @@ impl LspManager {
             });
         }
         output
-    }
-
-    pub(crate) async fn diagnostics_query_relative(
-        &self,
-        relative: &Path,
-        wait: Duration,
-        baseline: Option<u64>,
-        page: DiagPage,
-    ) -> Option<String> {
-        let parent = self.resolve_relative(relative)?;
-        self.diagnostics_query_since(&parent, wait, baseline, page)
-            .await
     }
 
     fn resolve_relative(&self, relative: &Path) -> Option<PathBuf> {
@@ -1666,6 +1662,7 @@ mod default44_ownership_tests {
         let outer = crate::agent::runner::AgentWorkScope::new();
         let mut preparation = Box::pin(outer.run(LspManager::prepare_automatic(
             HashMap::new(),
+            Vec::new(),
             None,
             workspace,
             scope.clone(),
@@ -1723,6 +1720,7 @@ mod untrusted_builtin_tests {
         std::fs::write(fixture.workspace.join("A.kt"), "fun main() {}\n").unwrap();
         let manager = LspManager::prepare_automatic(
             HashMap::new(),
+            Vec::new(),
             Some(fixture.bin.clone().into_os_string()),
             workspace.clone(),
             crate::agent::runner::AgentWorkScope::new(),
@@ -1769,10 +1767,37 @@ mod untrusted_builtin_tests {
                 ..Default::default()
             },
         );
-        let configured = LspManager::new(&cfg, workspace)
+        let configured = LspManager::new(&cfg, workspace.clone())
             .diagnostic_snapshot()
             .configured_names;
         assert!(configured.iter().any(|n| n == "kotlin"));
         assert!(!configured.iter().any(|n| n == "java"));
+
+        // mini-agent-n529g: the user-config opt-in starts exactly the named
+        // built-in without trust (explicit and automatic); the rest stay withheld.
+        let opted = LspConfig {
+            trust_builtins: vec!["zig".into()],
+            ..Default::default()
+        };
+        let names = LspManager::new(&opted, workspace.clone())
+            .diagnostic_snapshot()
+            .configured_names;
+        assert!(names.iter().any(|n| n == "zig"), "{names:?}");
+        assert!(
+            !names.iter().any(|n| n == "java" || n == "rust"),
+            "{names:?}"
+        );
+        let automatic = LspManager::prepare_automatic(
+            HashMap::new(),
+            vec!["zig".into()],
+            Some(fixture.bin.clone().into_os_string()),
+            workspace.clone(),
+            crate::agent::runner::AgentWorkScope::new(),
+        )
+        .await
+        .expect("zls is available");
+        let snapshot = automatic.diagnostic_snapshot();
+        assert_eq!(snapshot.configured_names, ["zig"], "{snapshot:?}");
+        assert!(snapshot.withheld.iter().any(|w| w.contains("'rust'")));
     }
 }

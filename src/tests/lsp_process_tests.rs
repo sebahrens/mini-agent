@@ -1321,7 +1321,7 @@ async fn lsp_process_diagnostics_reach_real_write_edit_and_query_tools() {
             bound.is_none(),
             "stale diagnostics survived rewrite during permission wait"
         );
-        assert_eq!(aggregate.unwrap(), "No diagnostics.");
+        assert!(aggregate.unwrap().starts_with("No diagnostics."),);
     }
     for (edited, content, diagnostic) in rejected_edits {
         let error = edited.expect_err("Windows checked edit must refuse publication");
@@ -1515,6 +1515,50 @@ async fn lsp_process_configured_wait_admits_slow_publish_and_timeout_is_reported
         !timed_out.contains("fixture delayed diagnostic"),
         "{timed_out}"
     );
+}
+
+// mini-agent-lk8yo: a server that misses the wait is "status unknown", never a
+// clean file, and `wait_ms` lets the caller wait long enough to get the answer.
+#[tokio::test]
+async fn lsp_process_query_timeout_is_status_unknown_and_wait_ms_extends_it() {
+    use crate::agent::tools::lsp::{LspArgs, LspTool};
+    let fixture = FixtureBuild::compile("query-wait");
+    let workspace = fixture.workspace("workspace").canonicalize().unwrap();
+    let lease = fixture.path("query-wait.lease");
+    let mut server = fixture.config("delayed-diagnostics", &lease);
+    server.extensions = vec![".rs".into()];
+    server
+        .env
+        .insert("LSP_FIXTURE_PUBLISH_DELAY_MS".into(), "1500".into());
+    let manager = LspManager::new(
+        &LspConfig {
+            servers: HashMap::from([("fixture".into(), server)]),
+            ..Default::default()
+        },
+        Arc::new(crate::paths::WorkspaceBinding::capture(&workspace).unwrap()),
+    );
+    let file = workspace.join("slow.rs");
+    fs::write(&file, "before").unwrap();
+    let query = LspTool::new(manager.clone(), None, None);
+    let call = |wait_ms: Option<u64>| {
+        query.call(LspArgs {
+            path: Some(file.display().to_string()),
+            wait_ms,
+            ..Default::default()
+        })
+    };
+    let short = call(Some(200)).await.unwrap();
+    assert!(short.starts_with("Status unknown:"), "{short}");
+    assert!(
+        short.contains("LSP (fixture)") && short.contains("200 ms") && short.contains("wait_ms"),
+        "{short}"
+    );
+    assert!(!short.starts_with("No diagnostics"), "{short}");
+    fs::write(&file, "after!").unwrap();
+    let long = call(Some(20_000)).await.unwrap();
+    assert!(long.contains("fixture delayed diagnostic"), "{long}");
+    manager.shutdown().await;
+    fixture.cleanup().await;
 }
 
 #[tokio::test]
@@ -1820,7 +1864,7 @@ async fn lsp_process_permission_wait_rejects_leaf_and_parent_symlink_retargets()
                     "{case}: unapproved retarget reached the language server: {sent}"
                 );
                 assert!(
-                    output.starts_with("No diagnostics for "),
+                    output.starts_with("Not checked:") && !output.contains("published diagnostics"),
                     "{case}: {output}"
                 );
             }
@@ -2521,6 +2565,7 @@ async fn lsp_process_idle_server_is_retired_and_respawned_without_cooldown() {
             enabled: true.into(),
             servers: HashMap::from([("fixture".to_string(), server)]),
             idle_timeout_secs: Some(1),
+            ..Default::default()
         },
         workspace.clone(),
     );

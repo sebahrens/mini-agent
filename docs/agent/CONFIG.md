@@ -4098,7 +4098,12 @@ code-action and workspace-edit capabilities. `rename` and a previewed code
 action return the server's workspace edit as a bounded review of up to 500
 files, 5000 edits per file and 10000 edits in total, paged by `offset`/`limit`
 over the edits (200 per page, files in path order; the truncation line names the
-`next_offset`), replacement text cut at 200 bytes (marked), files outside
+`next_offset`). Every edit is numbered (`#N`); the listing shows the first 200 bytes of a
+replacement and marks a longer one with its full size, and `edit`=N returns that edit's complete
+replacement text (paged 32 KiB at a time with `text_offset`, byte-faithful, control characters
+escaped) while `full_text`=true lists every replacement in full (a page ends early at a 48 KiB
+budget and names the `next_offset`). Up to 1 MiB of replacement text is retained per edit and 16 MiB per
+preview; anything past that is stated as not retained. Files outside
 the workspace counted but never named, `read`-denied files hidden); **no file is
 modified**. `rename` additionally requires `edit` permission for `path`
 (deny/ask rules for `edit` apply) so a project that forbids edits cannot even
@@ -4109,6 +4114,15 @@ asks once more, and a still-empty answer is annotated "the language server is
 still indexing" instead of reading as a true negative. A `ContentModified`
 (-32801) or `ServerCancelled` (-32802) reply is retried once, then reported
 as such.
+
+A per-file `lsp_diagnostics` result never reads as clean unless the server published:
+`No diagnostics for <file>. LSP (<server>) published ...` means clean; `Not checked: ...` says
+no server handles the extension (with the withheld-built-in remedy when that is the cause), the
+file was not synchronized (over 4 MiB, not UTF-8, unreadable), or the server is unavailable or
+cooling down; `Status unknown: ...` names the server and the wait that elapsed without a publish.
+The wait defaults to 3 s (or the server's `wait_ms`) and the `wait_ms` argument raises it up to
+60000. The project-wide form appends a note that it covers only files a server has published
+diagnostics for, and lists the running and configured servers.
 
 `lsp_diagnostics` uses the existing `read` permission policy. A file query
 checks the canonical file path before synchronizing it or starting a language
@@ -4228,6 +4242,7 @@ archive recipe.
 [lsp]
 enabled = "auto"          # omitted also means auto; false disables, true is explicit lazy mode
 # idle_timeout_secs = 900  # stop a server unused this long (default 900); 0 never retires
+# trust_builtins = ["rust", "python"]  # start these build-evaluating built-ins in every workspace (default: none)
 
 [lsp.servers.rust]          # override a built-in default
 command = "rust-analyzer"
@@ -4290,6 +4305,22 @@ a repository cannot make them run just by being opened and edited. To use one an
 trusting the project, define it yourself in your user config (for example `[lsp.servers.rust]` with
 `command = "rust-analyzer"` and `extensions = [".rs"]`): a same-named user entry is your explicit
 choice and is never withheld. `clangd`, `bash`, `lua` and `php` keep their existing behaviour.
+
+**Opting in without a project config.** `[lsp] trust_builtins = ["rust", "python"]` in your user
+config starts exactly the named built-ins (from `java`, `csharp`, `ruby`, `kotlin`, `swift`,
+`zig`, `rust`, `python`, `typescript`, `go`) in every workspace, trusted or not, without
+redefining them. It is default closed (empty), part of the `lsp` table (a project
+`.mini-agent/config.toml` can set it only once that project is trusted, so a repository cannot
+opt itself in), and unknown names are reported as a startup warning and by `--doctor`/`/doctor`.
+The withheld message in `/doctor` and the `lsp` tool prints this exact snippet. Opting in means
+that server runs the repository's build code (`build.rs`, the selected interpreter, plugins)
+outside the shell sandbox for every repository you open, so name only the languages you accept
+that for.
+
+**Ignored and clamped settings are reported.** A non-object `settings`, `settings` over 64 KiB
+serialized, `startup_timeout_ms`/`request_timeout_ms` outside 1000..=300000 and `wait_ms` over
+60000 are applied as the limit (or ignored) but now raise a startup warning (also in `load_warnings`
+and `--doctor`/`/doctor` as `lsp config`) naming the server and the limit.
 
 Behavior notes:
 

@@ -865,11 +865,39 @@ pub struct LspConfig {
     /// to reclaim its memory; the next edit restarts it. Absent selects
     /// [`LspConfig::DEFAULT_IDLE_TIMEOUT_SECS`]; `0` never retires servers.
     pub idle_timeout_secs: Option<u64>,
+    /// Build-evaluating built-in servers (see
+    /// `extras::lsp::registry::BUILD_EVALUATING_BUILTINS`, for example
+    /// `"rust"`) started in every workspace, including those without a trusted
+    /// project config. Closed by default; part of the `lsp` table, so a
+    /// project config can set it only after the project is trusted. Unknown
+    /// names are reported by config validation.
+    pub trust_builtins: Vec<String>,
 }
 
 #[cfg(feature = "lsp")]
 impl LspConfig {
     pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 900;
+
+    /// Settings that are ignored or clamped instead of rejected: per-server
+    /// `settings`/timeout problems and unknown `trust_builtins` names.
+    pub fn validation_warnings(&self) -> Vec<String> {
+        let mut names: Vec<_> = self.servers.keys().collect();
+        names.sort();
+        let mut warnings: Vec<String> = names
+            .into_iter()
+            .flat_map(|name| self.servers[name].validation_warnings(name))
+            .collect();
+        for entry in &self.trust_builtins {
+            if !crate::extras::lsp::registry::BUILD_EVALUATING_BUILTINS.contains(&entry.as_str()) {
+                warnings.push(format!(
+                    "lsp.trust_builtins names '{}', which is not a build-evaluating built-in ({}); it has no effect",
+                    entry.chars().take(40).collect::<String>(),
+                    crate::extras::lsp::registry::BUILD_EVALUATING_BUILTINS.join(", ")
+                ));
+            }
+        }
+        warnings
+    }
 
     /// The effective idle timeout, `None` when servers are never retired.
     pub fn idle_timeout(&self) -> Option<std::time::Duration> {
@@ -961,6 +989,52 @@ impl LspServerConfig {
                 && serde_json::to_vec(value)
                     .is_ok_and(|bytes| bytes.len() <= Self::MAX_SETTINGS_BYTES)
         })
+    }
+
+    /// Human-readable problems with this server's settings and timeouts that
+    /// are otherwise silently ignored or clamped. Names the server and the
+    /// limit; never echoes `settings` content.
+    pub fn validation_warnings(&self, name: &str) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if let Some(settings) = &self.settings {
+            if !settings.is_object() {
+                warnings.push(format!(
+                    "lsp.servers.{name}.settings must be a table/object; it is ignored (no workspace/configuration or didChangeConfiguration)"
+                ));
+            } else if serde_json::to_vec(settings)
+                .map_or(true, |bytes| bytes.len() > Self::MAX_SETTINGS_BYTES)
+            {
+                warnings.push(format!(
+                    "lsp.servers.{name}.settings exceeds {} bytes serialized; it is ignored",
+                    Self::MAX_SETTINGS_BYTES
+                ));
+            }
+        }
+        for (field, value) in [
+            ("startup_timeout_ms", self.startup_timeout_ms),
+            ("request_timeout_ms", self.request_timeout_ms),
+        ] {
+            if let Some(value) = value
+                && !(Self::MIN_TIMEOUT_MS..=Self::MAX_TIMEOUT_MS).contains(&value)
+            {
+                let used = value.clamp(Self::MIN_TIMEOUT_MS, Self::MAX_TIMEOUT_MS);
+                warnings.push(format!(
+                    "lsp.servers.{name}.{field} = {value} is outside {}..={} ms; {used} ms is used",
+                    Self::MIN_TIMEOUT_MS,
+                    Self::MAX_TIMEOUT_MS
+                ));
+            }
+        }
+        if let Some(wait) = self.wait_ms
+            && wait > Self::MAX_WAIT_MS
+        {
+            warnings.push(format!(
+                "lsp.servers.{name}.wait_ms = {wait} exceeds {} ms; {} ms is used",
+                Self::MAX_WAIT_MS,
+                Self::MAX_WAIT_MS
+            ));
+        }
+        warnings
     }
 
     /// The effective post-edit diagnostics wait.

@@ -379,7 +379,7 @@ that gets HTTP `401` re-runs the command once and is resent once with the new cr
 every later request from already-built clients carries it as well, so an expired token does not
 end the session. If the command prints the same rejected credential the `401` is returned
 unchanged. A failing, timing-out or malformed command is reported by provider and program name
-only. The credential is not written to logs or saved sessions. `--doctor` names the command as
+only. The command runs as its own process group; on timeout, and after the command exits, the whole group is killed (so `sh -c` wrappers leave no grandchild) and the output pipe is never waited on past the deadline. The credential is swapped in request headers and, for Gemini, in the `key=` URL query parameter. It is not written to logs or saved sessions. `--doctor` names the command as
 the credential source without running it. Bedrock, Vertex and the Copilot login use their own
 flows and ignore this table.
 
