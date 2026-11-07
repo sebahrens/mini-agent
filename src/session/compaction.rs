@@ -244,7 +244,6 @@ impl FileRequests {
         if self.is_empty() {
             return summary.to_string();
         }
-        let budget = budget.min(MAX_BYTES);
         let files = self.render((budget / 3).min(4096));
         let text_budget = budget.saturating_sub(files.len()).saturating_sub(2);
         let mut result = crate::provider::bound_summary(summary, text_budget);
@@ -356,6 +355,20 @@ mod tests {
 
     // mini-agent-xzt6g: after compaction the next request carries the newest
     // file windows, quoted as untrusted data, within the configured budget.
+    #[test]
+    fn attach_keeps_large_window_summary_budget() {
+        let mut inventory = FileRequests::default();
+        inventory.add(FileRequest {
+            nested: false,
+            tool: "read".into(),
+            path: "src/a.rs".into(),
+        });
+        let summary = "x".repeat(60_000);
+        let out = inventory.attach(&summary, 80_000);
+        assert!(out.len() > 40_000, "len {}", out.len());
+        assert!(out.len() <= 80_000);
+    }
+
     #[test]
     fn compaction_restores_recent_read_windows_within_the_budget() {
         let contents = [
