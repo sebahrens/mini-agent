@@ -1147,6 +1147,10 @@ pub struct JobStatusTool {
     /// is judged on this plus the next chunk, so a command split across calls
     /// is seen whole.
     pending_input: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// Bumped whenever any input reaches a job's terminal. A permission prompt
+    /// gives the exclusive lease back, so another input may land while one is
+    /// open; the prompting call compares this to notice its baseline is stale.
+    input_epoch: std::sync::atomic::AtomicU64,
     /// Jobs whose unterminated line was edited with cursor, history or escape
     /// keys, so the typed text is no longer the line the program will run.
     edited_lines: std::sync::Mutex<std::collections::HashSet<String>>,
@@ -1203,6 +1207,7 @@ impl JobStatusTool {
             permission: None,
             ask_tx: None,
             pending_input: std::sync::Mutex::new(std::collections::HashMap::new()),
+            input_epoch: std::sync::atomic::AtomicU64::new(0),
             edited_lines: std::sync::Mutex::new(std::collections::HashSet::new()),
             job_scope: None,
         }
@@ -1244,33 +1249,46 @@ impl JobStatusTool {
         self.sandbox
             .background_job_input_handle(id, bytes.len())
             .map(drop)?;
-        let mut text = self
-            .pending_input
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .get(id)
-            .cloned()
-            .unwrap_or_default();
-        let mut edited = self
-            .edited_lines
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .contains(id);
-        let (lines, start_text, start_edited) = apply_job_keys_from(keys, &mut text, &mut edited)?;
-        for line in lines {
-            if line.trim().is_empty() {
-                continue;
+        // The pending line is read, judged and then written. A prompt releases
+        // the exclusive lease, so if other input reached a terminal while it
+        // was open the baseline is stale: read it again and judge again.
+        let (text, edited, start_text, start_edited) = loop {
+            let epoch = self.input_epoch.load(std::sync::atomic::Ordering::SeqCst);
+            let mut text = self
+                .pending_input
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(id)
+                .cloned()
+                .unwrap_or_default();
+            let mut edited = self
+                .edited_lines
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .contains(id);
+            let (lines, start_text, start_edited) =
+                apply_job_keys_from(keys, &mut text, &mut edited)?;
+            for line in lines {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let (checked, _released) = super::concurrency::prompt_unlocked(check_perm(
+                    &self.permission,
+                    &self.ask_tx,
+                    "shell",
+                    &line,
+                ))
+                .await;
+                checked.map_err(|error| error.to_string())?;
             }
-            let (checked, _released) = super::concurrency::prompt_unlocked(check_perm(
-                &self.permission,
-                &self.ask_tx,
-                "shell",
-                &line,
-            ))
-            .await;
-            checked.map_err(|error| error.to_string())?;
-        }
-        if let Err(error) = self.sandbox.write_background_job_input(id, &bytes).await {
+            if epoch == self.input_epoch.load(std::sync::atomic::Ordering::SeqCst) {
+                break (text, edited, start_text, start_edited);
+            }
+        };
+        let written = self.sandbox.write_background_job_input(id, &bytes).await;
+        self.input_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Err(error) = written {
             if error.written > 0 {
                 // Only the keys the program already received count; a key cut
                 // mid-sequence leaves the line unknowable (edited).
@@ -1608,8 +1626,10 @@ impl JobStatusTool {
                     .background_job_input_handle(id, input.len())
                     .map(drop)
                     .map_err(ToolError::Msg)?;
+                let (pending, tail) = loop {
                 // The line being typed spans calls: judge it with the unterminated
                 // text already sent, so `to` then `uch x\n` is `touch x`.
+                let epoch = self.input_epoch.load(std::sync::atomic::Ordering::SeqCst);
                 let pending = self
                     .pending_input
                     .lock()
@@ -1648,11 +1668,20 @@ impl JobStatusTool {
                 ))
                 .await;
                 checked?;
-                match self
+                if epoch != self.input_epoch.load(std::sync::atomic::Ordering::SeqCst) {
+                    // Another input landed while the prompt was open (it gave
+                    // the lease back): judge this one against the new line.
+                    continue;
+                }
+                break (pending, tail);
+            };
+                let written = self
                     .sandbox
                     .write_background_job_input(id, input.as_bytes())
-                    .await
-                {
+                    .await;
+                self.input_epoch
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                match written {
                     Ok(()) => {
                         self.pending_input
                             .lock()
@@ -3577,13 +3606,19 @@ mod tests {
             next: 26,
         };
         let (hit, _) = scan_for_pattern(&regex, &window);
-        assert_eq!(hit.expect("mid-chunk line matches").line, "Listening on 8080");
+        assert_eq!(
+            hit.expect("mid-chunk line matches").line,
+            "Listening on 8080"
+        );
         let end = OutputWindow {
             head: b"x\nserver ready\nmore\n".to_vec(),
             next: 21,
             ..window
         };
-        assert_eq!(scan_for_pattern(&regex, &end).0.unwrap().line, "server ready");
+        assert_eq!(
+            scan_for_pattern(&regex, &end).0.unwrap().line,
+            "server ready"
+        );
     }
 
     #[test]
@@ -4798,6 +4833,54 @@ mod tests {
 
     /// Default closed: with an ask policy and nobody to ask, typed input is
     /// refused rather than written.
+    // A permission prompt gives the lease back, so a second input can land
+    // while the first waits for an answer. The first must be judged again
+    // against the line the terminal really holds, not the stale baseline.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn input_is_rejudged_when_another_input_lands_during_its_prompt() {
+        use crate::permission::ask::UserDecision;
+        use crate::permission::{Action, PermissionConfig, ToolPerm};
+        let shell = test_tool();
+        let id = start_pty_job(&shell, "cat").await;
+        let permission = shell_permission(
+            PermissionConfig {
+                bash: Some(ToolPerm::Simple(Action::Ask)),
+                ..Default::default()
+            },
+            crate::permission::SecurityMode::Standard,
+        );
+        let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(4);
+        let status = JobStatusTool::new(shell.sandbox.clone(), None)
+            .with_permission(Some(permission), Some(ask_tx));
+        let first = job_input(&status, &id, "rm ");
+        let driver = async {
+            let a = ask_rx.recv().await.expect("first prompt").into_permission();
+            assert_eq!(a.input, "rm ");
+            // The second fragment is typed while the first prompt is open.
+            let second = job_input(&status, &id, "x");
+            let answer_second = async {
+                let b = ask_rx
+                    .recv()
+                    .await
+                    .expect("second prompt")
+                    .into_permission();
+                assert_eq!(b.input, "x");
+                b.reply.send(UserDecision::AllowOnce).unwrap();
+            };
+            let (second, ()) = tokio::join!(second, answer_second);
+            second.unwrap();
+            a.reply.send(UserDecision::AllowOnce).unwrap();
+            // The first fragment is judged again with the text now on the line.
+            let again = ask_rx.recv().await.expect("re-judged").into_permission();
+            assert_eq!(again.input, "xrm ");
+            again.reply.send(UserDecision::AllowOnce).unwrap();
+        };
+        let (first, ()) = tokio::join!(first, driver);
+        first.unwrap();
+        shell.sandbox.stop_background_job(&id).await.unwrap();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn job_input_is_refused_when_approval_is_required_and_unavailable() {
