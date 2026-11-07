@@ -245,9 +245,7 @@ impl CommandCredential {
                         .iter()
                         .any(|value| state.known.iter().any(|known| known == value))
             };
-            if stale_query
-                && let Some(rewritten) = with_query_key(uri, &current)
-            {
+            if stale_query && let Some(rewritten) = with_query_key(uri, &current) {
                 *uri = rewritten;
             }
             for value in headers.values_mut() {
@@ -1166,7 +1164,10 @@ mod tests {
             );
             // Exactly the original parameters survive; nothing was injected.
             assert_eq!(rewritten.query().unwrap().split('&').count(), 3);
-            assert_eq!(percent_decode(query_key(&rewritten).unwrap()).unwrap(), secret);
+            assert_eq!(
+                percent_decode(query_key(&rewritten).unwrap()).unwrap(),
+                secret
+            );
             assert!(query_key_candidates(&rewritten).iter().any(|c| c == secret));
         }
     }

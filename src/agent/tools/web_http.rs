@@ -44,6 +44,8 @@ pub(crate) enum FetchOriginPolicy {
 pub(crate) struct FetchPolicy {
     pub(crate) origins: FetchOriginPolicy,
     pub(crate) allow_http: bool,
+    /// Drop `#fragment`s instead of refusing them (native tools only).
+    pub(crate) strip_fragments: bool,
 }
 
 impl Default for FetchPolicy {
@@ -51,6 +53,7 @@ impl Default for FetchPolicy {
         Self {
             origins: FetchOriginPolicy::Unrestricted,
             allow_http: false,
+            strip_fragments: false,
         }
     }
 }
@@ -67,6 +70,7 @@ impl FetchPolicy {
             return Self {
                 origins: FetchOriginPolicy::Deny,
                 allow_http,
+                strip_fragments: false,
             };
         }
         let parsed = origins
@@ -78,11 +82,12 @@ impl FetchPolicy {
                 .map(FetchOriginPolicy::Exact)
                 .unwrap_or(FetchOriginPolicy::Deny),
             allow_http,
+            strip_fragments: false,
         }
     }
 
     pub(crate) fn authorize(&self, raw_url: &str) -> Result<Url, FetchError> {
-        let url = normalize_fetch_url(raw_url, true)?;
+        let url = normalize_fetch_url_with(raw_url, true, self.strip_fragments)?;
         self.authorize_normalized(url)
     }
 
@@ -111,6 +116,16 @@ pub(crate) fn parse_configured_origin(
 }
 
 pub(crate) fn normalize_fetch_url(raw: &str, allow_http: bool) -> Result<Url, FetchError> {
+    normalize_fetch_url_with(raw, allow_http, false)
+}
+
+/// As [`normalize_fetch_url`]; with `strip_fragment` a `#fragment` is dropped
+/// instead of refused. The JS broker keeps the strict contract.
+pub(crate) fn normalize_fetch_url_with(
+    raw: &str,
+    allow_http: bool,
+    strip_fragment: bool,
+) -> Result<Url, FetchError> {
     let mut url = Url::parse(raw).map_err(|_| FetchError::InvalidUrl)?;
     match url.scheme() {
         "https" => {}
@@ -121,7 +136,11 @@ pub(crate) fn normalize_fetch_url(raw: &str, allow_http: bool) -> Result<Url, Fe
         return Err(FetchError::EmbeddedCredentials);
     }
     if url.fragment().is_some() {
-        return Err(FetchError::FragmentDenied);
+        if !strip_fragment {
+            return Err(FetchError::FragmentDenied);
+        }
+        // Fragments are never sent to servers (mini-agent-f4610).
+        url.set_fragment(None);
     }
     let host = url.host_str().ok_or(FetchError::MissingHost)?;
     if host.is_empty() || host.ends_with('.') {
@@ -371,10 +390,10 @@ impl std::fmt::Display for FetchError {
         match self {
             Self::InvalidUrl => formatter.write_str("fetch URL is invalid or ambiguous"),
             Self::SchemeDenied => formatter.write_str("fetch URL scheme is not allowed"),
+            Self::FragmentDenied => formatter.write_str("fetch URL fragments are not supported"),
             Self::EmbeddedCredentials => {
                 formatter.write_str("fetch URL must not contain embedded credentials")
             }
-            Self::FragmentDenied => formatter.write_str("fetch URL fragments are not supported"),
             Self::MissingHost => formatter.write_str("fetch URL has no host"),
             Self::InvalidHost => formatter.write_str("fetch URL host is invalid or ambiguous"),
             Self::MissingPort => formatter.write_str("fetch URL has no effective port"),
@@ -1283,6 +1302,8 @@ impl NativeWebClient {
         permission: Option<super::PermCheck>,
         ask_tx: Option<super::AskSender>,
     ) -> Self {
+        let mut policy = policy;
+        policy.strip_fragments = true;
         Self {
             policy,
             limits: NativeFetchLimits::default(),
@@ -1299,6 +1320,11 @@ impl NativeWebClient {
     pub(crate) fn with_limits(mut self, limits: NativeFetchLimits) -> Self {
         self.limits = limits;
         self
+    }
+
+    /// Whether plaintext `http://` fetches are permitted by policy.
+    pub(crate) fn allows_http(&self) -> bool {
+        self.policy.allow_http
     }
 
     /// Whether a response cached for `raw_url` may be served without a new
@@ -1852,11 +1878,35 @@ pub(crate) mod web_http_tests {
         }
     }
     #[test]
+    fn web_http_fragment_is_stripped_not_refused() {
+        let strict = FetchPolicy::default();
+        assert_eq!(
+            strict.authorize("https://example.com/#x"),
+            Err(FetchError::FragmentDenied)
+        );
+        let strip = FetchPolicy {
+            strip_fragments: true,
+            ..FetchPolicy::default()
+        };
+        let url = strip
+            .authorize("https://example.com/docs?q=1#section-2")
+            .unwrap();
+        assert_eq!(url.as_str(), "https://example.com/docs?q=1");
+        let mut exact = FetchPolicy::from_settings(Some(&["https://docs.rs".into()]), false);
+        exact.strip_fragments = true;
+        assert!(exact.authorize("https://docs.rs/a#frag").is_ok());
+        // The fragment never lets a denied origin through.
+        assert!(
+            exact
+                .authorize("https://evil.invalid/#https://docs.rs")
+                .is_err()
+        );
+    }
+    #[test]
     fn web_http_native_public_policy_and_request_scope_are_not_weakened_by_allow() {
         for url in [
             "file:///etc/passwd",
             "https://user:secret@example.com",
-            "https://example.com/#fragment",
             "https://example.com./",
         ] {
             assert!(FetchPolicy::default().authorize(url).is_err());

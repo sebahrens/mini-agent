@@ -4804,7 +4804,7 @@ untrusted project config cannot enable it.
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `web-fetch-origins` (`web_fetch_origins`) | omitted | Exact permitted HTTP(S) origins; omitted accepts any otherwise-safe public origin, an empty/invalid list denies all. This restriction does not grant permission. |
-| `web-fetch-allow-http` (`web_fetch_allow_http`) | `false` | Permit plaintext HTTP to otherwise-safe public destinations. Private addresses remain denied. |
+| `web-fetch-allow-http` (`web_fetch_allow_http`) | `false` | Permit plaintext HTTP to otherwise-safe public destinations. Private addresses remain denied. While `false`, an `http://` URL given to `web_fetch` is upgraded to `https://` and the output says so. |
 | `web-search-provider` (`web_search_provider`) | `"exa"` | Fixed-endpoint Exa search, or `"off"` to omit the tool. Other provider names fail visibly before I/O. |
 | `hosted-web-search` (`hosted_web_search`) | `false` | Opt in to the Anthropic or OpenAI Responses provider-hosted web search instead of native Exa. Bypasses per-call `web_search` permission; see above. |
 | `hosted-web-search-allowed-domains` / `-blocked-domains` / `-max-uses` | omitted / omitted / `5` | Domain filters and the Anthropic `max_uses` cap for hosted search (see above). Authority-sensitive: need project trust. |
@@ -4814,6 +4814,10 @@ untrusted project config cannot enable it.
 These are authority-sensitive project config keys and require existing project
 trust. They are independent of `js-fetch-origins`/`js-fetch-allow-http`; changing
 native web settings does not widen the JS broker's grant or worker authority.
+
+A `#fragment` on a native `web_fetch` URL (or a redirect target) is dropped, since
+fragments are never sent to servers; the tool output notes it. The JS `fetch()`
+broker still refuses fragments.
 
 Native network permission keys are `web_fetch` and `web_search`. They accept
 simple allow/ask/deny values or granular glob/regex rules, and the existing

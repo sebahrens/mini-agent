@@ -179,10 +179,7 @@ impl ProviderHttpClient {
         let (builder, applied) = self
             .prepare_request_applied(rebuild(original_headers.clone())?)
             .await?;
-        let response = builder
-            .send()
-            .await
-            .map_err(transport_error)?;
+        let response = builder.send().await.map_err(transport_error)?;
         if response.status() != http::StatusCode::UNAUTHORIZED
             || applied.is_empty()
             || !crate::key_command::renew_after_unauthorized(&applied).await
@@ -395,13 +392,8 @@ where
     if let Some(headers) = builder.headers_mut() {
         *headers = response.headers().clone();
     }
-    let body: LazyBody<U> = Box::pin(async move {
-        response
-            .bytes()
-            .await
-            .map(U::from)
-            .map_err(transport_error)
-    });
+    let body: LazyBody<U> =
+        Box::pin(async move { response.bytes().await.map(U::from).map_err(transport_error) });
     builder.body(body).map_err(http_client::Error::Protocol)
 }
 
@@ -431,11 +423,7 @@ impl HttpClientExt for ProviderHttpClient {
             }
             if this.is_chatgpt() {
                 let mut bytes = Vec::new();
-                while let Some(chunk) = response
-                    .chunk()
-                    .await
-                    .map_err(transport_error)?
-                {
+                while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
                     if chunk.len() > crate::auth::openai_plan::MAX_BODY.saturating_sub(bytes.len())
                     {
                         return Err(http_client::Error::Instance(
@@ -489,10 +477,7 @@ impl HttpClientExt for ProviderHttpClient {
                     .into(),
                 ));
             }
-            let response = request
-                .send()
-                .await
-                .map_err(transport_error)?;
+            let response = request.send().await.map_err(transport_error)?;
             if !response.status().is_success() {
                 return Err(response_error(response, None).await);
             }
@@ -536,10 +521,11 @@ impl HttpClientExt for ProviderHttpClient {
                 *headers = response.headers().clone();
             }
             use futures::StreamExt;
-            let body: http_client::sse::BoxedStream =
-                Box::pin(response.bytes_stream().map(|chunk| {
-                    chunk.map_err(transport_error)
-                }));
+            let body: http_client::sse::BoxedStream = Box::pin(
+                response
+                    .bytes_stream()
+                    .map(|chunk| chunk.map_err(transport_error)),
+            );
             builder.body(body).map_err(http_client::Error::Protocol)
         }
     }
@@ -737,7 +723,9 @@ pub(crate) mod tests {
         let secret = "AIzaSECRETKEY123";
         let build = || {
             Request::builder()
-                .uri(format!("http://127.0.0.1:{port}/v1beta/m?alt=sse&key={secret}"))
+                .uri(format!(
+                    "http://127.0.0.1:{port}/v1beta/m?alt=sse&key={secret}"
+                ))
                 .body(Vec::<u8>::new())
                 .unwrap()
         };
