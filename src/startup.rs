@@ -2301,7 +2301,7 @@ impl Startup {
             &self.cfg,
         );
         self.session.sync_environment(now, self.session_resumed);
-        // Resumable child conversations do not survive a restart.
+        // Resumable child conversations restore only within the count/byte limits.
         self.session.note_stale_child_ids(self.session_resumed);
     }
 

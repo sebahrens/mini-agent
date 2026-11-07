@@ -1282,7 +1282,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                 },
                 "resume": {
                     "type": "string",
-                    "description": "Optional child id printed after an earlier child's report ([child id: …]). Continues that child's conversation, tool results included, with the single prompt as a follow-up; same agent_type, permissions and budgets. Ids are in memory only and expire after the most recent children (default 16, [subagents] task_resume_max_children) or a restart."
+                    "description": "Optional child id printed after an earlier child's report ([child id: …]). Continues that child's conversation, tool results included, with the single prompt as a follow-up; same agent_type, permissions and budgets. Ids expire after the most recent children (default 16, [subagents] task_resume_max_children) or when a conversation exceeds [subagents] task_resume_max_bytes; a session's ids are restored by --continue/--resume subject to those count/byte limits, but not by a fresh session."
                 },
                 "run_in_background": {
                     "type": "boolean",
@@ -1364,7 +1364,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                 }
                 let stored = resume_store.get(id).ok_or_else(|| {
                     ToolError::Msg(format!(
-                        "task: unknown or expired resume id '{id}'; child conversations are kept in memory for the most recent children of this session ([subagents] task_resume_max_children, default {}), only when under [subagents] task_resume_max_bytes (default 8 MiB), and do not survive a restart; start a new task instead",
+                        "task: unknown or expired resume id '{id}'; child conversations are kept in memory for the most recent children of this session ([subagents] task_resume_max_children, default {}), only when under [subagents] task_resume_max_bytes (default 8 MiB), and a session's ids are restored by --continue/--resume subject to those limits but not by a fresh session; start a new task instead",
                         super::resume::MAX_RESUMABLE_CHILDREN
                     ))
                 })?;
