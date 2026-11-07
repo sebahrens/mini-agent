@@ -19310,6 +19310,89 @@ mod plan_approval_tests {
         (surfaced_errors, done)
     }
 
+    /// mini-agent-xorxl.6: an image-heavy session past `compact_size_fraction`
+    /// but far below the token budget reaches the summarizer through the same
+    /// handler the Done path uses; a second pass on the unchanged result must
+    /// not spend another summarizer request.
+    #[tokio::test]
+    async fn tui_byte_pressure_below_token_pressure_compacts_once() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let roots = Roots::new();
+        let provider = Provider::new(vec!["BYTE_SUMMARY"]).await;
+        let mut cfg = provider.config();
+        cfg.compact_enabled = Some(true);
+        cfg.compact_size_fraction = Some(0.001);
+        cfg.keep_recent_tokens = Some(1_000);
+        let cli = crate::cli::Cli {
+            no_tools: true,
+            ..Default::default()
+        };
+        let workspace = roots.workspace();
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new(
+            "plan80",
+            "owned-model",
+            1_000_000,
+            workspace.root().to_str().unwrap(),
+        );
+        session.add_message(MessageRole::User, &"x".repeat(40_000));
+        session.add_message(MessageRole::Assistant, &"y".repeat(40_000));
+        session.add_message(MessageRole::User, &"z".repeat(8_000));
+        let ui = ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace.clone(),
+            SecurityMode::Standard,
+        );
+        let mut app = owned_app(ui);
+        let inner = &mut app.0;
+        assert!(
+            inner
+                .ui
+                .session
+                .actionable_size_pressure(inner.ui.cfg.resolve_compact_size_fraction())
+        );
+        crate::ui::slash::handle_compress(
+            None,
+            true,
+            &mut inner.run,
+            &mut inner.renderer,
+            &mut inner.ui,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            provider.calls().len(),
+            1,
+            "byte pressure reached the summarizer"
+        );
+        assert!(
+            inner
+                .ui
+                .session
+                .messages
+                .iter()
+                .any(|m| m.content.contains("BYTE_SUMMARY"))
+        );
+        // Unchanged (futile) result: the floor stops a second paid request.
+        crate::ui::slash::handle_compress(
+            None,
+            true,
+            &mut inner.run,
+            &mut inner.renderer,
+            &mut inner.ui,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(provider.calls().len(), 1, "no summarizer re-spend");
+        provider.finish().await;
+    }
+
     /// mini-agent-cj9oh: a provider context-length 400 compacts once and resumes
     /// the TUI turn; a second rejection (or `compact_enabled = false`) surfaces.
     #[tokio::test]
