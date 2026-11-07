@@ -158,64 +158,111 @@ fn arg_ok(arg: &str, working_dir: &str) -> bool {
     path_ok(arg, working_dir)
 }
 
+/// GNU/BSD `getopt_long` accepts any unambiguous prefix of a long option, so a
+/// blocked option must also match its abbreviations (`--der` for
+/// `--dereference-recursive`). `arg` matches when its name (before any `=`)
+/// is a non-empty prefix of `full`; ambiguous prefixes are over-blocked on
+/// purpose (the command would fail anyway).
+fn long_opt_is(arg: &str, full: &str) -> bool {
+    let Some(long) = arg.strip_prefix("--") else {
+        return false;
+    };
+    let name = long.split_once('=').map_or(long, |(name, _)| name);
+    !name.is_empty() && full.starts_with(name)
+}
+
+/// Values attached to a short option inside a cluster (`-f/etc/x`, `-nf.env`).
+/// Only options whose value is a file path are returned; every other
+/// value-taking option swallows the rest of the cluster without yielding it.
+fn attached_short_path_values<'a>(
+    args: &'a [String],
+    takes_value: &str,
+    file: char,
+) -> Vec<&'a str> {
+    let mut values = Vec::new();
+    for arg in args {
+        if !arg.starts_with('-') || arg.starts_with("--") {
+            continue;
+        }
+        for (index, c) in arg.char_indices().skip(1) {
+            if takes_value.contains(c) {
+                let rest = &arg[index + c.len_utf8()..];
+                if c == file && !rest.is_empty() {
+                    values.push(rest);
+                }
+                break;
+            }
+        }
+    }
+    values
+}
+
 fn short_cluster_has(arg: &str, letters: &[char]) -> bool {
     arg.starts_with('-')
         && !arg.starts_with("--")
         && arg.chars().skip(1).any(|c| letters.contains(&c))
 }
 
-/// True when `arg` is a GNU getopt long option naming `full`, including any
-/// unambiguous abbreviation of at least `min` characters (`--rec`, `--recur`).
-fn grep_long_is(arg: &str, full: &str, min: usize) -> bool {
-    let Some(long) = arg.strip_prefix("--") else {
-        return false;
-    };
-    let name = long.split_once('=').map_or(long, |(name, _)| name);
-    name.len() >= min && full.starts_with(name)
-}
-
-/// `grep -d ACTION` / `--directories=ACTION` where ACTION (or an
-/// abbreviation of it) is `recurse`.
-fn is_recurse_action(value: &str) -> bool {
-    !value.is_empty() && "recurse".starts_with(value)
-}
-
-/// Whether the grep arguments select directory recursion by any spelling:
-/// `-r`, `--recursive` and abbreviations, `--directories=recurse`,
-/// `--directories recurse`, `-d recurse`, `-drecurse`, `-nrdrecurse`.
-fn grep_selects_recursion(args: &[String]) -> bool {
-    for (i, arg) in args.iter().enumerate() {
-        if short_cluster_has(arg, &['r']) || grep_long_is(arg, "recursive", 2) {
-            return true;
+/// GNU grep parses the `-d`/`--directories` ACTION with argmatch, which accepts
+/// unambiguous abbreviations (`rec`, `recu`, ...). Treat any action other than
+/// the exact non-traversing `read`/`skip` as a recursive walk (fail closed).
+fn grep_directories_action_may_recurse(args: &[String]) -> bool {
+    let non_traversing = |v: &str| v == "read" || v == "skip";
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        i += 1;
+        if a == "--" {
+            break;
         }
-        if let Some(long) = arg.strip_prefix("--") {
-            if let Some((name, value)) = long.split_once('=') {
-                if "directories".starts_with(name) && name.len() >= 3 && is_recurse_action(value) {
+        if let Some(long) = a.strip_prefix("--") {
+            let (name, value) = match long.split_once('=') {
+                Some((n, v)) => (n, Some(v)),
+                None => (long, None),
+            };
+            if !name.is_empty() && "directories".starts_with(name) {
+                let v = match value {
+                    Some(v) => v,
+                    None => {
+                        let v = args.get(i).map(String::as_str).unwrap_or("");
+                        i += 1;
+                        v
+                    }
+                };
+                if !non_traversing(v) {
                     return true;
                 }
-            } else if grep_long_is(arg, "directories", 3)
-                && args.get(i + 1).is_some_and(|v| is_recurse_action(v))
-            {
+            }
+        } else if let Some(cluster) = a.strip_prefix('-')
+            && let Some(pos) = cluster.find('d')
+        {
+            let rest = &cluster[pos + 1..];
+            let v = if rest.is_empty() {
+                let v = args.get(i).map(String::as_str).unwrap_or("");
+                i += 1;
+                v
+            } else {
+                rest
+            };
+            if !non_traversing(v) {
                 return true;
             }
-        } else if arg.starts_with('-') && arg.len() > 1 {
-            // `d` takes an argument: the rest of the cluster, or the next word.
-            if let Some(pos) = arg[1..].find('d') {
-                let rest = &arg[1 + pos + 1..];
-                if rest.is_empty() {
-                    if args.get(i + 1).is_some_and(|v| is_recurse_action(v)) {
-                        return true;
-                    }
-                } else if is_recurse_action(rest) {
-                    return true;
-                }
-            }
-        }
-        if arg == "recurse" {
-            return true;
         }
     }
     false
+}
+
+/// Whether the grep arguments select directory recursion by any spelling:
+/// `-r`, `--recursive` and abbreviations, any non-`read`/`skip` `--directories`
+/// action (`-d recurse`, `-drecurse`, `--dir=rec`), or a bare `recurse` word.
+/// Fail closed: the union of every spelling we know to traverse.
+fn grep_selects_recursion(args: &[String]) -> bool {
+    args.iter().any(|a| {
+        short_cluster_has(a, &['r'])
+            || long_opt_is(a, "recursive")
+            || a == "recurse"
+            || (a.starts_with('-') && a.ends_with("recurse"))
+    }) || grep_directories_action_may_recurse(args)
 }
 
 fn command_is_read_only(
@@ -227,15 +274,19 @@ fn command_is_read_only(
     let Some((command, args)) = words.split_first() else {
         return false;
     };
-    // A sed address such as `/start/,/end/p` is a script, not a path.
+    // A sed address such as `/start/,/end/p` is a script, not a path; only the
+    // one operand `sed_is_read_only` selects as the script is exempt, so a
+    // file operand like `/etc/p` is still confined and screened.
+    let sed_script = (command == "sed").then(|| sed_script_index(args)).flatten();
     if !args
         .iter()
-        .all(|arg| (command == "sed" && is_sed_script(arg)) || arg_ok(arg, working_dir))
+        .enumerate()
+        .all(|(index, arg)| sed_script == Some(index) || arg_ok(arg, working_dir))
     {
         return false;
     }
-    for arg in args {
-        if command == "sed" && is_sed_script(arg) {
+    for (index, arg) in args.iter().enumerate() {
+        if sed_script == Some(index) {
             continue;
         }
         if let Some(long) = arg.strip_prefix("--") {
@@ -246,26 +297,41 @@ fn command_is_read_only(
             report.paths.push(arg.clone());
         }
     }
+    // `-f/path` / `-nf.env`: the file operand is attached to the short option.
+    let attached = match command.as_str() {
+        "grep" => attached_short_path_values(args, "efmABCdD", 'f'),
+        "rg" => attached_short_path_values(args, "efgmrtTABCjMEd", 'f'),
+        _ => Vec::new(),
+    };
+    for value in attached {
+        if !path_ok(value, working_dir) {
+            return false;
+        }
+        report.paths.push(value.to_string());
+    }
     match command.as_str() {
-        "ls" => !args
-            .iter()
-            .any(|a| short_cluster_has(a, &['L', 'H']) || a.starts_with("--dereference")),
+        "ls" => {
+            report.recursive |= args
+                .iter()
+                .any(|a| short_cluster_has(a, &['R']) || long_opt_is(a, "recursive"));
+            !args.iter().any(|a| {
+                short_cluster_has(a, &['L', 'H']) || long_opt_is(a, "dereference-command-line")
+            }) && !args.iter().any(|a| a.starts_with("--deref"))
+        }
         "cat" | "head" | "wc" => true,
         "grep" => {
-            if args.iter().any(|a| {
-                short_cluster_has(a, &['R']) || grep_long_is(a, "dereference-recursive", 3)
-            }) {
+            if args
+                .iter()
+                .any(|a| short_cluster_has(a, &['R']) || long_opt_is(a, "dereference-recursive"))
+            {
                 return false;
             }
             report.recursive |= grep_selects_recursion(args);
             true
         }
-        "tail" => {
-            !args
-                .iter()
-                .any(|a| short_cluster_has(a, &['f', 'F']) || a.starts_with("--follow"))
-                && !args.iter().any(|a| a.starts_with("--retry"))
-        }
+        "tail" => !args.iter().any(|a| {
+            short_cluster_has(a, &['f', 'F']) || long_opt_is(a, "follow") || long_opt_is(a, "retry")
+        }),
         "rg" => {
             report.recursive = true;
             !args.iter().any(|a| {
@@ -318,17 +384,27 @@ fn command_is_read_only(
 /// or write/execute command is expressible.
 fn sed_is_read_only(args: &[String]) -> bool {
     let mut quiet = false;
-    let mut script: Option<&str> = None;
     for arg in args {
         match arg.as_str() {
             "-n" | "--quiet" | "--silent" => quiet = true,
             "-E" | "-r" | "--regexp-extended" => {}
+            // GNU getopt permutes, so a flag after the script counts too.
             flag if flag.starts_with('-') && flag != "-" => return false,
-            other if script.is_none() => script = Some(other),
             _ => {}
         }
     }
-    quiet && script.is_some_and(is_sed_script)
+    quiet && sed_script_index(args).is_some_and(|index| is_sed_script(&args[index]))
+}
+
+/// Index of the first operand that is not one of the accepted sed flags: the
+/// script. Every later operand is a file.
+fn sed_script_index(args: &[String]) -> Option<usize> {
+    args.iter().position(|arg| {
+        !matches!(
+            arg.as_str(),
+            "-n" | "--quiet" | "--silent" | "-E" | "-r" | "--regexp-extended"
+        ) && (!arg.starts_with('-') || arg == "-")
+    })
 }
 
 fn is_sed_script(script: &str) -> bool {
@@ -500,6 +576,82 @@ mod tests {
         ] {
             no(script);
         }
+    }
+
+    #[test]
+    fn abbreviated_and_attached_options_cannot_evade_the_screen() {
+        for script in [
+            "grep --der -n . link",
+            "grep --dereference-r foo .",
+            "tail --fol app.log",
+            "tail --foll app.log",
+            "tail --ret app.log",
+            "tail --retr app.log",
+            "ls --deref",
+            "ls --dereference-command-line",
+            "grep -f/etc/x foo",
+            "grep -nf/etc/x foo",
+            "grep -f../x foo",
+            "rg -f/etc/x foo",
+        ] {
+            no(script);
+        }
+        yes("grep -fpats foo src");
+        let report = |s: &str| super::classify(s, WD, true).unwrap();
+        for script in [
+            "grep --rec -n foo src",
+            "grep --recu foo src",
+            "grep --directories=recurse -n foo src",
+            "grep -drecurse foo src",
+            "grep -d recurse foo src",
+            "grep -d rec -n SECRET .",
+            "grep -drec foo src",
+            "grep --directories=rec foo src",
+            "grep --dir=recu foo src",
+            "grep --directories rec foo src",
+            "grep -nd rec foo src",
+            "grep -ndrec foo src",
+            "ls -R .",
+            "ls --recursive .",
+            "ls --rec .",
+        ] {
+            assert!(report(script).recursive, "should be recursive: {script}");
+        }
+        assert!(!report("ls -la src").recursive);
+        for script in [
+            "grep -d read foo src",
+            "grep -d skip foo src",
+            "grep --directories=skip foo src",
+        ] {
+            assert!(!report(script).recursive, "not recursive: {script}");
+        }
+        assert!(
+            report("grep -f.env foo src")
+                .paths
+                .contains(&".env".to_string())
+        );
+        assert!(
+            report("grep -nf.env foo src")
+                .paths
+                .contains(&".env".to_string())
+        );
+    }
+
+    #[test]
+    fn sed_file_operands_that_look_like_scripts_are_still_screened() {
+        for script in [
+            "sed -n 1p /etc/p",
+            "sed -n 1p /tmp/p",
+            "sed -n 1p /root/p",
+            "sed -n 1,2p /home/p",
+            "sed -n 1p src/a /etc/p",
+            "sed -n 1p f -i",
+        ] {
+            no(script);
+        }
+        let report = super::classify("sed -n 1p /work/repo/p", WD, true).unwrap();
+        assert_eq!(report.paths, vec!["/work/repo/p".to_string()]);
+        yes("sed -n '/start/,/end/p' src/lib.rs");
     }
 
     #[test]

@@ -332,15 +332,27 @@ fn sandbox_network_allowlist_bwrap_keeps_the_empty_namespace_and_only_adds_the_p
             .any(|w| w[0] == "--ro-bind" && w[2] == BWRAP_FORWARDER_EXECUTABLE)
     );
     // Proxy variables point at the in-namespace forwarder, with a credential.
-    let proxy_setenv = args
-        .windows(3)
-        .find(|w| w[0] == "--setenv" && w[1] == "HTTPS_PROXY")
-        .expect("proxy variable is exported");
+    let routed = LAST_BWRAP_ENV.with(|last| last.borrow().clone());
+    let proxy_url = routed
+        .iter()
+        .find(|(key, _)| key == "HTTPS_PROXY")
+        .expect("proxy variable is exported")
+        .1
+        .to_string_lossy()
+        .into_owned();
     assert!(
-        proxy_setenv[2].starts_with("http://mini-agent:")
-            && proxy_setenv[2].ends_with(&format!("@127.0.0.1:{}", net_proxy::FORWARDER_PORT)),
-        "{proxy_setenv:?}"
+        proxy_url.starts_with("http://mini-agent:")
+            && proxy_url.ends_with(&format!("@127.0.0.1:{}", net_proxy::FORWARDER_PORT)),
+        "{proxy_url:?}"
     );
+    // The token must not be readable from the world-readable bwrap cmdline.
+    // (bwrap only runs on Linux; other hosts spell the arguments out.)
+    if cfg!(target_os = "linux") {
+        assert!(
+            !args.iter().any(|arg| arg.contains("mini-agent:")),
+            "{args:?}"
+        );
+    }
     // The command runs behind the forwarder, after the bwrap options.
     let separator = args.iter().position(|arg| arg == "--").unwrap();
     assert_eq!(args[separator + 1], BWRAP_FORWARDER_EXECUTABLE);
@@ -466,4 +478,39 @@ async fn sandbox_network_allowlist_bwrap_native_only_the_proxy_is_reachable() {
     let out = run("printf '%s' \"$HTTPS_PROXY\"".into()).await;
     assert!(out.contains("@127.0.0.1:3128"), "{out}");
     let _ = std::fs::remove_dir_all(root);
+}
+
+/// `/proc/<pid>/cmdline` of the long-lived bwrap process is world-readable:
+/// opt-in secrets and the proxy token must reach the sandbox another way.
+#[cfg(target_os = "linux")]
+#[test]
+fn bwrap_argv_never_carries_environment_values() {
+    let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
+    let sandbox = Sandbox::new(true, "bwrap")
+        .with_network(SandboxNetwork::Allowlist)
+        .with_network_hosts(vec!["registry.npmjs.org".to_string()])
+        .with_shell_env(ShellEnvPolicy {
+            set: [(
+                "GH_TOKEN".to_string(),
+                "adversarial-secret-value".to_string(),
+            )]
+            .into(),
+            allow_secrets: true,
+            ..ShellEnvPolicy::default()
+        });
+    let args = bwrap_shell_args(&sandbox);
+    let routed = LAST_BWRAP_ENV.with(|last| last.borrow().clone());
+    assert!(
+        routed
+            .iter()
+            .any(|(key, value)| key == "GH_TOKEN" && value == "adversarial-secret-value"),
+        "the secret must still reach the sandbox: {routed:?}"
+    );
+    assert!(
+        !args.iter().any(|arg| arg == "--setenv"
+            || arg.contains("adversarial-secret-value")
+            || arg.contains("mini-agent:")),
+        "{args:?}"
+    );
+    assert!(args.windows(2).any(|w| w[0] == "--args"));
 }

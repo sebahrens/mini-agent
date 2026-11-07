@@ -480,7 +480,7 @@ impl Tool for ShellTool {
     async fn call(&self, args: BashArgs) -> Result<String, ToolError> {
         self.execute(args)
             .await
-            .map(|(text, _)| append_job_notices(&self.sandbox, text))
+            .map(|(text, _)| self.with_job_notices(text))
     }
     #[cfg(any(feature = "git-worktree", test))]
     async fn call_structured(
@@ -489,7 +489,7 @@ impl Tool for ShellTool {
         _extensions: &rig::tool::ToolCallExtensions,
     ) -> Result<rig::tool::ToolReturn<String>, ToolError> {
         self.execute(args).await.map(|(text, metadata)| {
-            let result = rig::tool::ToolReturn::success(append_job_notices(&self.sandbox, text));
+            let result = rig::tool::ToolReturn::success(self.with_job_notices(text));
             match metadata {
                 Some(metadata) => result.with_extension(metadata),
                 None => result,
@@ -499,6 +499,16 @@ impl Tool for ShellTool {
 }
 
 impl ShellTool {
+    /// Append the session's pending job notices. A scoped (subagent) shell
+    /// shares its parent's sandbox and so its notice queue, which belongs to
+    /// the parent session: draining it here would lose the notices for good.
+    fn with_job_notices(&self, text: String) -> String {
+        if self.job_scope.is_some() {
+            return text;
+        }
+        append_job_notices(&self.sandbox, text)
+    }
+
     /// `escalate = true`: validate, judge deny rules, require a fresh
     /// interactive approval, audit, then run this one command on a clone whose
     /// sandbox is off (environment still cleared). The clone shares the job
@@ -955,11 +965,16 @@ impl ShellTool {
                 "[status: descendants_escaped; direct command result preserved; containment cleanup incomplete]",
             );
         }
-        if let Some(code) = snapshot.exit_code.filter(|code| *code != 0) {
+        let ended = snapshot
+            .exit_code
+            .filter(|code| *code != 0)
+            .map(|code| format!("Exit code: {code}"))
+            .or_else(|| snapshot.signal.map(describe_signal));
+        if let Some(ended) = ended {
             if !result.is_empty() && !result.ends_with('\n') {
                 result.push('\n');
             }
-            result.push_str(&format!("Exit code: {code}"));
+            result.push_str(&ended);
         }
         let transcript = self.spill_line_capped_output(transcript, &result);
         let mut result = bound_output_lines(result, self.max_output_lines);
@@ -1240,52 +1255,7 @@ impl JobStatusTool {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .contains(id);
-        let mut lines = Vec::new();
-        for key in keys {
-            match key {
-                JobKey::CtrlC => {
-                    text.clear();
-                    edited = false;
-                }
-                JobKey::CtrlD => {
-                    if !text.is_empty() {
-                        edited = true;
-                    }
-                }
-                JobKey::Backspace => {
-                    if !edited {
-                        text.pop();
-                    }
-                }
-                JobKey::Left | JobKey::Right | JobKey::CtrlZ => {
-                    if !text.is_empty() || edited {
-                        edited = true;
-                    }
-                }
-                // Redraw only: the line editor's buffer is unchanged.
-                JobKey::CtrlL => {}
-                JobKey::Tab => {
-                    if !text.is_empty() || edited {
-                        return Err("job_status keys: tab on a partly typed line lets the shell complete it into a different command than was permission-checked. Send the full text instead, or press ctrl_c first.".into());
-                    }
-                }
-                JobKey::Enter => {
-                    lines.push(if edited {
-                        EDITED_LINE_JUDGED_AS.to_string()
-                    } else {
-                        std::mem::take(&mut text)
-                    });
-                    text.clear();
-                    edited = false;
-                }
-                // Arrows, history, paging, Home/End/Delete, Shift-Tab, F-keys, Esc.
-                other => {
-                    if other.edits_line() {
-                        edited = true;
-                    }
-                }
-            }
-        }
+        let lines = apply_job_keys(keys, &mut text, &mut edited)?;
         for line in lines {
             if line.trim().is_empty() {
                 continue;
@@ -1299,7 +1269,24 @@ impl JobStatusTool {
             .await;
             checked.map_err(|error| error.to_string())?;
         }
-        self.sandbox.write_background_job_input(id, &bytes).await?;
+        let start_text = text.clone();
+        let start_edited = edited;
+        if let Err(error) = self.sandbox.write_background_job_input(id, &bytes).await {
+            if error.written > 0 {
+                // Only the keys the program already received count; a key cut
+                // mid-sequence leaves the line unknowable (edited).
+                let (text, edited) =
+                    line_after_partial_keys(keys, error.written, start_text, start_edited);
+                self.record_pending_input(id, text, edited);
+            }
+            return Err(error.message);
+        }
+        self.record_pending_input(id, text, edited);
+        self.settle_after_input(id).await;
+        Ok(())
+    }
+
+    fn record_pending_input(&self, id: &str, text: String, edited: bool) {
         self.pending_input
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -1315,8 +1302,6 @@ impl JobStatusTool {
                 set.remove(id);
             }
         }
-        self.settle_after_input(id).await;
-        Ok(())
     }
 
     /// Wait until the job's output goes quiet after input, bounded.
@@ -1679,7 +1664,28 @@ impl JobStatusTool {
                         self.settle_after_input(id).await;
                         Ok(())
                     }
-                    Err(error) => Err(error),
+                    Err(error) => {
+                        if error.written > 0 {
+                            // The program already received a prefix: record it
+                            // so the follow-up is judged with the real line.
+                            let accepted = String::from_utf8_lossy(
+                                &input.as_bytes()[..error.written.min(input.len())],
+                            );
+                            let combined = format!("{pending}{accepted}");
+                            let tail = combined.rsplit(['\n', '\r']).next().unwrap_or_default();
+                            self.pending_input
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .insert(id.to_string(), tail.to_string());
+                            if accepted.contains(['\n', '\r']) {
+                                self.edited_lines
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner())
+                                    .remove(id);
+                            }
+                        }
+                        Err(error.message)
+                    }
                 }
             }
             JobAction::List => unreachable!("list returned before id lookup"),
@@ -1695,6 +1701,88 @@ impl JobStatusTool {
             None => rendered,
         })
     }
+}
+
+/// Track the line a key sequence leaves typed: `text` is the unterminated
+/// text, `edited` marks a line rewritten by editing keys, and the returned
+/// lines are the ones Enter submitted (to be permission-judged).
+fn apply_job_keys(
+    keys: &[JobKey],
+    text: &mut String,
+    edited: &mut bool,
+) -> Result<Vec<String>, String> {
+    let mut lines = Vec::new();
+    for key in keys {
+        match key {
+            JobKey::CtrlC => {
+                text.clear();
+                *edited = false;
+            }
+            JobKey::CtrlD => {
+                if !text.is_empty() {
+                    *edited = true;
+                }
+            }
+            JobKey::Backspace => {
+                if !*edited {
+                    text.pop();
+                }
+            }
+            JobKey::Left | JobKey::Right | JobKey::CtrlZ => {
+                if !text.is_empty() || *edited {
+                    *edited = true;
+                }
+            }
+            // Redraw only: the line editor's buffer is unchanged.
+            JobKey::CtrlL => {}
+            JobKey::Tab => {
+                if !text.is_empty() || *edited {
+                    return Err("job_status keys: tab on a partly typed line lets the shell complete it into a different command than was permission-checked. Send the full text instead, or press ctrl_c first.".into());
+                }
+            }
+            JobKey::Enter => {
+                lines.push(if *edited {
+                    EDITED_LINE_JUDGED_AS.to_string()
+                } else {
+                    std::mem::take(text)
+                });
+                text.clear();
+                *edited = false;
+            }
+            // Arrows, history, paging, Home/End/Delete, Shift-Tab, F-keys, Esc.
+            other => {
+                if other.edits_line() {
+                    *edited = true;
+                }
+            }
+        }
+    }
+    Ok(lines)
+}
+
+/// The typed line after only the first `written` bytes of `keys` reached the
+/// program. A key cut mid-sequence leaves the line unknowable (edited).
+fn line_after_partial_keys(
+    keys: &[JobKey],
+    written: usize,
+    mut text: String,
+    mut edited: bool,
+) -> (String, bool) {
+    let mut sent = 0usize;
+    let mut applied = 0usize;
+    for key in keys {
+        let next = sent + key.bytes().len();
+        if next > written {
+            break;
+        }
+        sent = next;
+        applied += 1;
+    }
+    let _ = apply_job_keys(&keys[..applied], &mut text, &mut edited);
+    if sent < written {
+        edited = true;
+    }
+    (text, edited)
 }
 
 /// Longest `until` regex source accepted.
@@ -1808,22 +1896,26 @@ fn scan_for_pattern_chunked(
 #[cfg(test)]
 pub type BashTool = ShellTool;
 
+/// `Terminated by signal: SIGKILL (9)`; shared by foreground results, job
+/// status, auto-background results and completion notices.
+pub(crate) fn describe_signal(number: i32) -> String {
+    #[cfg(unix)]
+    let name = nix::sys::signal::Signal::try_from(number)
+        .map(|signal| format!("{signal:?}"))
+        .unwrap_or_else(|_| "UNKNOWN".to_string());
+    #[cfg(not(unix))]
+    let name = "UNKNOWN".to_string();
+    format!("Terminated by signal: {name} ({number})")
+}
+
 fn render_termination(status: Option<std::process::ExitStatus>) -> Option<String> {
     let status = status?;
     if let Some(code) = status.code() {
         return (code != 0).then(|| format!("Exit code: {code}"));
     }
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-
-        if let Some(number) = status.signal() {
-            let name = nix::sys::signal::Signal::try_from(number)
-                .map(|signal| format!("{signal:?}"))
-                .unwrap_or_else(|_| "UNKNOWN".to_string());
-            return Some(format!("Terminated by signal: {name} ({number})"));
-        }
+    if let Some(number) = crate::sandbox::exit_signal(status) {
+        return Some(describe_signal(number));
     }
 
     Some("Process terminated without an exit code".to_string())
@@ -1906,6 +1998,8 @@ fn render_background_job(output: BackgroundJobOutput, max_output_lines: Option<u
     );
     if let Some(exit_code) = snapshot.exit_code {
         result.push_str(&format!("\nExit code: {exit_code}"));
+    } else if let Some(signal) = snapshot.signal {
+        result.push_str(&format!("\n{}", describe_signal(signal)));
     }
     if snapshot.descendants_escaped {
         result.push_str(
@@ -2154,6 +2248,21 @@ mod tests {
 
     fn test_tool() -> BashTool {
         BashTool::new(None, None, Sandbox::new(false, "bwrap"), None)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn foreground_spawn_failure_reports_its_reason() {
+        let sandbox = Sandbox::new(false, "bwrap").with_working_dir("/nonexistent-mini-agent-cwd");
+        let error = BashTool::new(None, None, sandbox, None)
+            .call(BashArgs {
+                command: "echo hi".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("failed to spawn command"), "{error}");
     }
 
     #[cfg(unix)]
@@ -3725,6 +3834,52 @@ mod tests {
         background_id(&started)
     }
 
+    #[test]
+    fn partial_key_writes_track_only_the_bytes_the_program_received() {
+        let enter = JobKey::Enter.bytes().len();
+        // A key cut mid-sequence leaves the line unknowable.
+        let cut = JobKey::Up.bytes().len() - 1;
+        assert!(cut > 0);
+        let (text, edited) =
+            line_after_partial_keys(&[JobKey::Up], cut, "rm -rf build".to_string(), false);
+        assert_eq!((text.as_str(), edited), ("rm -rf build", true));
+        // Nothing delivered: state is unchanged.
+        let (text, edited) =
+            line_after_partial_keys(&[JobKey::Enter], 0, "rm -rf build".to_string(), false);
+        assert_eq!((text.as_str(), edited), ("rm -rf build", false));
+        // Enter fully delivered: the line was submitted.
+        let (text, edited) =
+            line_after_partial_keys(&[JobKey::Enter], enter, "rm -rf build".to_string(), false);
+        assert_eq!((text.as_str(), edited), ("", false));
+    }
+
+    /// A write that times out after the terminal accepted a prefix must still
+    /// record that prefix, so the follow-up chunk is judged with the real line.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn partially_written_job_input_is_tracked_as_pending_text() {
+        let shell = test_tool();
+        let status = JobStatusTool::new(shell.sandbox.clone(), None);
+        // `sleep` never reads, so the tty input queue fills up.
+        let id = start_pty_job(&shell, "sleep 30").await;
+        let input = format!("rm -rf {}", "x".repeat(15_000));
+        let Err(error) = job_input(&status, &id, &input).await else {
+            // This platform buffered or dropped the overflow instead of blocking.
+            shell.sandbox.stop_background_job(&id).await.unwrap();
+            return;
+        };
+        assert!(error.to_string().contains("bytes were accepted"), "{error}");
+        let pending = status
+            .pending_input
+            .lock()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .unwrap_or_default();
+        assert!(pending.starts_with("rm -rf x"), "{pending:?}");
+        shell.sandbox.stop_background_job(&id).await.unwrap();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn job_input_honours_shell_deny_rules_and_never_reaches_the_terminal() {
@@ -3901,6 +4056,87 @@ mod tests {
             .await
             .unwrap();
         assert!(!again.contains("Background shell job"), "{again}");
+    }
+
+    /// A subagent shell shares the parent's notice queue but must not drain it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn subagent_shell_results_leave_the_parent_notices_queued() {
+        let parent = test_tool();
+        let id = start_job(&parent, "echo parent-job-marker").await;
+        wait_for_notice(&parent).await;
+        let scope = JobScope::new(parent.sandbox.clone());
+        let child = BashTool::new(None, None, parent.sandbox.clone(), None).with_job_scope(scope);
+        let child_result = child
+            .call(BashArgs {
+                command: "echo child".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            !child_result.contains("Background shell job"),
+            "{child_result}"
+        );
+        assert_eq!(parent.sandbox.job_notice_queue().len(), 1);
+        let parent_result = parent
+            .call(BashArgs {
+                command: "echo parent".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            parent_result.contains(&format!("Background shell job {id} completed")),
+            "{parent_result}"
+        );
+    }
+
+    /// A job killed by a signal has no exit code; every surface must still
+    /// say how it ended.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signal_killed_background_job_reports_the_signal() {
+        let shell = test_tool();
+        let status = JobStatusTool::new(shell.sandbox.clone(), None);
+        let id = start_job(&shell, "kill -9 $$").await;
+        let terminal = wait_for_terminal_job(&status, &id).await;
+        assert!(
+            terminal.contains("Terminated by signal: SIGKILL (9)"),
+            "{terminal}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signal_killed_job_notice_and_auto_background_result_name_the_signal() {
+        let shell = test_tool();
+        start_job(&shell, "kill -9 $$").await;
+        wait_for_notice(&shell).await;
+        let notice = shell
+            .call(BashArgs {
+                command: "echo next".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            notice.contains("Terminated by signal: SIGKILL (9)"),
+            "{notice}"
+        );
+        let shell = test_tool().with_auto_background(true);
+        let result = shell
+            .call(BashArgs {
+                command: "kill -9 $$".into(),
+                auto_background: Some(true),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            result.contains("Terminated by signal: SIGKILL (9)"),
+            "{result}"
+        );
     }
 
     /// Reading the terminal state, stopping a job, or turning notices off
