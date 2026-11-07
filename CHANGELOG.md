@@ -8,6 +8,7 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- VS Code `/commands` pages the server command list (100 per page, `/commands 2` for the next) and states how many commands are not shown on the page; commands beyond the 256 the session stores are counted, reported by `/commands` and warned about once in the Output log instead of vanishing (mini-agent-vr2qc).
 - `job_status` `keys` also accepts `page_up`, `page_down`, `home`, `end`, `delete`, `shift_tab`, `ctrl_l`, `ctrl_z` and `f1`..`f12` (fixed escape sequences rendered by the tool; line-rewriting keys mark the next Enter as an opaque edited line like the arrows; the 64-key limit is unchanged), so pagers, TUIs and REPL history/search can be driven and a fresh frame requested with `ctrl_l` (mini-agent-ydmv1).
 - The `js` tool's `read_lines(path, -N)` tail read seeks backwards from the end of the file instead of scanning from byte 0, so the last lines of logs over 64 MiB (or any size) are returned with `eof: true`; only a tail longer than the 64 MiB scan limit measured from the end is refused (mini-agent-s17nk).
 - `lsp_diagnostics` `directory` accepts `.`, `./src`, `src/` and `src//sub`: `.` components are dropped and an empty result means no filter, instead of silently listing nothing and answering "No diagnostics." (mini-agent-6ti22).

@@ -3,7 +3,7 @@ import { SessionUnavailableError, type ConversationSession } from './conversatio
 
 const MAX_REPLAY_UPDATES = 100_000;
 const MAX_REPLAY_BYTES = 48 * 1024 * 1024;
-const MAX_COMMANDS = 256;
+export const MAX_COMMANDS = 256;
 
 /** One connection's current conversation, with bounded load-time update routing. */
 export class SessionUpdateRouter {
@@ -67,6 +67,7 @@ export class PublicProtocolSession implements ConversationSession {
     private modeState: acp.SessionModeState | undefined = undefined) {}
 
   private availableCommands: readonly acp.AvailableCommand[] = [];
+  private commandsDropped = 0;
 
   receive(update: acp.SessionUpdate): void {
     // Routing is exact-ID scoped. Late updates cannot be adopted by a new owner.
@@ -77,6 +78,7 @@ export class PublicProtocolSession implements ConversationSession {
     }
     if (update.sessionUpdate === 'available_commands_update') {
       this.availableCommands = update.availableCommands.slice(0, MAX_COMMANDS);
+      this.commandsDropped = Math.max(0, update.availableCommands.length - MAX_COMMANDS);
     }
     this.subscriber?.(update);
   }
@@ -84,6 +86,9 @@ export class PublicProtocolSession implements ConversationSession {
   modes(): acp.SessionModeState | undefined { return this.modeState; }
 
   commands(): readonly acp.AvailableCommand[] { return this.availableCommands; }
+
+  /** Advertised commands beyond the stored limit (not runnable through `/run`). */
+  droppedCommands(): number { return this.commandsDropped; }
 
   /** Switch the permission mode; the agent confirms it with a current_mode_update. */
   async setMode(modeId: string): Promise<void> {

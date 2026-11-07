@@ -36,7 +36,7 @@
         "isSticky": true,
         "commands": [
           { "name": "selection", "description": "Include the active editor selection as context" },
-          { "name": "commands", "description": "List the slash commands the Mini Agent server offers" },
+          { "name": "commands", "description": "List the slash commands the Mini Agent server offers (100 per page; /commands 2 for the next page)" },
           { "name": "run", "description": "Run a Mini Agent server command, e.g. /run compact" }
         ]
       }

@@ -10,6 +10,7 @@ import {
   permissionOptionTitle,
 } from './permission';
 import { AgentSession } from './session';
+import { describeServerCommands } from './commandList';
 import { buildPromptBlocks } from './references';
 import { collectReferences } from './vscodeReferences';
 import { log, setLogLevel, showOutput } from './log';
@@ -173,7 +174,7 @@ function registerChatParticipant(context: vscode.ExtensionContext): vscode.ChatP
 
       try {
         if (request.command === 'commands') {
-          response.markdown(await describeCommands(active));
+          response.markdown(await describeCommands(active, request.prompt));
           return { metadata: { stopReason: 'end_turn' } };
         }
         let promptText = request.prompt;
@@ -215,11 +216,9 @@ function registerChatParticipant(context: vscode.ExtensionContext): vscode.ChatP
   return participant;
 }
 
-async function describeCommands(active: AgentSession): Promise<string> {
+async function describeCommands(active: AgentSession, pageArgument: string): Promise<string> {
   const commands = await active.availableCommands();
-  if (commands.length === 0) { return 'The Mini Agent server has not advertised any commands yet.'; }
-  const lines = commands.slice(0, 100).map(command => `- \`/${command.name.replace(/[^\w-]/gu, '?')}\`: ${command.description.replace(/[\r\n]+/gu, ' ').slice(0, 200)}`);
-  return `Server commands (run one with \`/run <command>\`):\n\n${lines.join('\n')}\n`;
+  return describeServerCommands(commands, active.droppedCommands(), pageArgument);
 }
 
 /** `/run name args` becomes the prompt `/name args`, only for a command the server advertised. */
