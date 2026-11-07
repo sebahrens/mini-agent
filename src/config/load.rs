@@ -2290,6 +2290,14 @@ pub(super) fn merge_config_value_layer(
     merged.provenance = provenance;
     merged.load_warnings = base.load_warnings.clone();
     if matches!(layer, ConfigLayer::Project | ConfigLayer::Local) {
+        let source = match layer {
+            ConfigLayer::Local => "local config",
+            _ => "project config",
+        };
+        let reverted = merged.revert_zero_tool_limits(base, source);
+        merged.load_warnings.extend(reverted);
+    }
+    if matches!(layer, ConfigLayer::Project | ConfigLayer::Local) {
         // A project layer may only add home masks, never drop inherited ones.
         let mut masks = base.sandbox_home_masks.clone();
         for mask in std::mem::take(&mut merged.sandbox_home_masks) {
@@ -3628,6 +3636,26 @@ mod project_config_trust_tests {
         let trust = root.join("state/config/trusted-project-configs.json");
         std::fs::create_dir_all(config.parent().unwrap()).unwrap();
         (root, config, trust)
+    }
+
+    #[test]
+    fn project_zero_tool_limit_is_reverted_with_warning_not_fatal() {
+        let base = Config {
+            max_read_lines: Some(500),
+            ..Default::default()
+        };
+        let local: toml::Value =
+            toml::from_str("max_read_lines = 0\nmax_grep_results = 0\n").unwrap();
+        let mut merged = super::merge_config_value(&base, local).unwrap();
+        assert_eq!(merged.max_read_lines, Some(500));
+        assert_eq!(merged.max_grep_results, None);
+        assert!(merged.validate_tool_limits().is_ok());
+        let warnings = merged.load_warnings.join("\n");
+        assert!(
+            warnings.contains("project config: max_read_lines = 0"),
+            "{warnings}"
+        );
+        assert!(warnings.contains("max_grep_results"), "{warnings}");
     }
 
     #[test]
