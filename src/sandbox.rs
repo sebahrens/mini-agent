@@ -5472,11 +5472,13 @@ impl Sandbox {
         input: &pty::PtyInput,
         bytes: &[u8],
         timeout: std::time::Duration,
-    ) -> Result<(), String> {
+    ) -> Result<(), InputWriteError> {
         input
             .write_all(bytes, timeout)
             .await
-            .map_err(|error| match error.failure {
+            .map_err(|error| InputWriteError {
+                written: error.written,
+                message: match error.failure {
                 pty::PtyWriteFailure::TimedOut => format!(
                     "the program is not reading its terminal input: {} of {} bytes were accepted within {} s and the rest was not sent. Wait for it to finish its current work (job_status action=wait) and send the remainder in a smaller input.",
                     error.written,
@@ -5484,6 +5486,7 @@ impl Sandbox {
                     timeout.as_secs()
                 ),
                 pty::PtyWriteFailure::Io(error) => format!("failed to write job input: {error}"),
+                },
             })
     }
 
@@ -5525,7 +5528,7 @@ impl Sandbox {
         &self,
         id: &str,
         bytes: &[u8],
-    ) -> Result<(), String> {
+    ) -> Result<(), InputWriteError> {
         let input = self.background_job_input_handle(id, bytes.len())?;
         #[cfg(any(unix, windows))]
         {
@@ -5535,7 +5538,7 @@ impl Sandbox {
         #[cfg(not(any(unix, windows)))]
         {
             let _ = (input, bytes);
-            Err("pseudo-terminal input is not supported on this platform".into())
+            Err(String::from("pseudo-terminal input is not supported on this platform").into())
         }
     }
 
@@ -6917,6 +6920,30 @@ enum CommandCapture {
 /// omitted-byte count and the full-output log location.
 #[derive(Clone, Debug)]
 pub(crate) struct ShellOutputCapture(SharedCommandCapture);
+
+/// A failed write of job input. `written` is how many leading bytes the
+/// program already received (a lower bound), so the caller can still track
+/// the partially typed line it must judge the follow-up against.
+#[derive(Debug)]
+pub(crate) struct InputWriteError {
+    pub(crate) message: String,
+    pub(crate) written: usize,
+}
+
+impl From<String> for InputWriteError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            written: 0,
+        }
+    }
+}
+
+impl From<InputWriteError> for String {
+    fn from(error: InputWriteError) -> Self {
+        error.message
+    }
+}
 
 impl ShellOutputCapture {
     pub(crate) fn new(policy: SpoolPolicy) -> Self {
