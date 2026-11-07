@@ -208,6 +208,151 @@ static PARTIAL_MESSAGES: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 /// completion in progress (`msg_<n>`, 1-based), so a driver can group deltas.
 static COMPLETIONS_FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Start of the span the next final result's `duration_ms` covers: process
+/// start for the first result, the previous result for each later turn of a
+/// multi-turn stream-json run.
+static RUN_SPAN_START: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+pub(crate) fn mark_headless_run_start() {
+    let mut start = RUN_SPAN_START
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    start.get_or_insert_with(std::time::Instant::now);
+}
+
+fn take_run_duration_ms() -> u64 {
+    let now = std::time::Instant::now();
+    let mut start = RUN_SPAN_START
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let began = start.replace(now).unwrap_or(now);
+    u64::try_from(now.duration_since(began).as_millis()).unwrap_or(u64::MAX)
+}
+
+/// `--stream-json-schema claude`: emit Claude Code SDK-shaped records.
+static CLAUDE_SCHEMA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static CLAUDE_SESSION_ID: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn claude_schema() -> bool {
+    CLAUDE_SCHEMA.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Rewrite one native stream-json record as Claude Code SDK records
+/// (mini-agent-wfso7). Records with no Claude counterpart (`usage`,
+/// `file_mutation`, `goal`, `control_request`, ...) pass through unchanged.
+pub(crate) fn claude_stream_records(event: serde_json::Value) -> Vec<serde_json::Value> {
+    use serde_json::json;
+    let kind = event.get("type").and_then(serde_json::Value::as_str);
+    let session_id = CLAUDE_SESSION_ID
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let session_id = session_id.map_or(serde_json::Value::Null, serde_json::Value::from);
+    let assistant = |block: serde_json::Value, truncated: bool| {
+        let mut record = json!({
+            "type":"assistant",
+            "message":{
+                "id":current_message_id(), "type":"message", "role":"assistant",
+                "content":[block],
+            },
+            "parent_tool_use_id":null, "session_id":session_id,
+        });
+        if truncated {
+            record["truncated"] = true.into();
+        }
+        record
+    };
+    let truncated = event
+        .get("truncated")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    match kind {
+        Some("system") if event.get("subtype") == Some(&json!("init")) => {
+            let mut event = event;
+            if let Some(id) = event.get("session_id").and_then(serde_json::Value::as_str) {
+                *CLAUDE_SESSION_ID
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(id.to_owned());
+            }
+            if let Some(mode) = event.get("permission_mode").cloned() {
+                event["permissionMode"] = mode;
+            }
+            vec![event]
+        }
+        Some("assistant_text") => vec![assistant(
+            json!({"type":"text", "text":event["text"]}),
+            truncated,
+        )],
+        Some("tool_call") => {
+            let mut record = assistant(
+                json!({
+                    "type":"tool_use", "id":event["id"], "name":event["name"],
+                    "input":event["args"],
+                }),
+                truncated,
+            );
+            record["provider_call_id"] = event["provider_call_id"].clone();
+            vec![record]
+        }
+        Some("tool_result") => {
+            let mut record = json!({
+                "type":"user",
+                "message":{"role":"user", "content":[{
+                    "type":"tool_result", "tool_use_id":event["id"],
+                    "content":event["output"],
+                    "is_error":event["is_error"],
+                }]},
+                "parent_tool_use_id":null, "session_id":session_id,
+            });
+            if truncated {
+                record["truncated"] = true.into();
+            }
+            vec![record]
+        }
+        Some(kind @ ("text_delta" | "reasoning_delta")) => {
+            let (delta_type, field) = if kind == "text_delta" {
+                ("text_delta", "text")
+            } else {
+                ("thinking_delta", "thinking")
+            };
+            vec![json!({
+                "type":"stream_event",
+                "event":{"type":"content_block_delta", "index":0,
+                    "delta":{"type":delta_type, field:event["text"]}},
+                "message_id":event["message_id"],
+                "parent_tool_use_id":null, "session_id":session_id,
+            })]
+        }
+        _ => vec![event],
+    }
+}
+
+/// Claude Code's `result` message: `subtype`, and usage under its names.
+fn claude_result_record(value: &mut serde_json::Value) {
+    let reason = value
+        .get("stop_reason")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("completed")
+        .to_owned();
+    value["subtype"] = match reason.as_str() {
+        "completed" | "goal_met" => "success",
+        "budget" => "error_max_budget_usd",
+        _ => "error_during_execution",
+    }
+    .into();
+    if let Some(cached) = value["usage"].get("cached_input_tokens").cloned() {
+        value["usage"]["cache_read_input_tokens"] = cached;
+    }
+    if value.get("session_id").is_some_and(|id| id.is_null())
+        && let Some(id) = CLAUDE_SESSION_ID
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    {
+        value["session_id"] = id.into();
+    }
+}
+
 fn partial_messages() -> bool {
     PARTIAL_MESSAGES.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -222,6 +367,11 @@ fn current_message_id() -> String {
 /// Apply `--stream-json-preview-bytes` / `--max-stdin-bytes` (clap already
 /// enforced their ranges) and `--include-partial-messages`.
 pub(crate) fn configure_headless_limits(cli: &cli::Cli) {
+    mark_headless_run_start();
+    CLAUDE_SCHEMA.store(
+        cli.stream_json_schema == Some(cli::StreamJsonSchema::Claude),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     PARTIAL_MESSAGES.store(
         cli.include_partial_messages,
         std::sync::atomic::Ordering::Relaxed,
@@ -292,7 +442,13 @@ impl HeadlessOutputPolicy {
         if self.format == cli::OutputFormat::StreamJson
             && !HEADLESS_STDOUT_CLOSED.load(std::sync::atomic::Ordering::Relaxed)
         {
-            headless_stdout_async(format!("{}\n", terminal_safe_json(&event))).await?;
+            if claude_schema() {
+                for record in claude_stream_records(event) {
+                    headless_stdout_async(format!("{}\n", terminal_safe_json(&record))).await?;
+                }
+            } else {
+                headless_stdout_async(format!("{}\n", terminal_safe_json(&event))).await?;
+            }
         }
         Ok(())
     }
@@ -745,8 +901,12 @@ pub(crate) async fn emit_headless_result(
     value["session_id"] = session.map_or(serde_json::Value::Null, |(id, _)| id.into());
     value["session_name"] = session.map_or(serde_json::Value::Null, |(_, name)| name.into());
     value["session_persisted"] = persisted.into();
+    value["duration_ms"] = take_run_duration_ms().into();
     if format == cli::OutputFormat::StreamJson {
         value["type"] = "result".into();
+        if claude_schema() {
+            claude_result_record(&mut value);
+        }
     }
     HEADLESS_RESULT_EMITTED.store(true, std::sync::atomic::Ordering::Relaxed);
     headless_stdout_async(format!("{}\n", terminal_safe_json(&value))).await?;
@@ -1431,6 +1591,13 @@ pub(crate) struct HeadlessJsonOutput {
     pub tool_calls: HeadlessToolCalls,
     pub usage: Usage,
     pub cost: f64,
+    /// Same value as `cost`, under Claude Code's result-message name
+    /// (mini-agent-494ld).
+    pub total_cost_usd: f64,
+    /// Provider rounds in this run: assistant messages in its transcript.
+    pub num_turns: u64,
+    /// True for every stop reason other than `completed` (and a met goal).
+    pub is_error: bool,
     /// Present (true) only when the model has no known token price, so a
     /// `cost` of 0 means "not priced" rather than "free" (mini-agent-ftrhc).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -1507,6 +1674,19 @@ pub(crate) enum HeadlessStopReason {
     GoalPaused,
     #[cfg(feature = "goal")]
     GoalBudgetLimited,
+}
+
+impl HeadlessStopReason {
+    /// `is_error` in the final result: anything but a normal completion.
+    /// A met goal is a success.
+    pub(crate) fn is_error(self) -> bool {
+        match self {
+            Self::Completed => false,
+            #[cfg(feature = "goal")]
+            Self::GoalMet => false,
+            _ => true,
+        }
+    }
 }
 
 #[cfg(feature = "goal")]
@@ -1777,6 +1957,12 @@ pub(crate) fn render_headless_json(
         tool_calls,
         usage,
         cost,
+        total_cost_usd: cost,
+        num_turns: interactions
+            .iter()
+            .filter(|message| matches!(message, Message::Assistant { .. }))
+            .count() as u64,
+        is_error: stop_reason.is_error(),
         cost_unpriced: pricing.is_unpriced(),
         stop_reason,
         #[cfg(feature = "goal")]
@@ -3636,6 +3822,129 @@ mod tests {
             serde_json::json!(["docs/report.md", "git-only.rs", "src/lib.rs"])
         );
         assert!((value["cost"].as_f64().unwrap() - 0.01128).abs() < f64::EPSILON);
+        assert_eq!(value["total_cost_usd"], value["cost"]);
+        assert_eq!(value["num_turns"], 3);
+        assert_eq!(value["is_error"], false);
+    }
+
+    #[test]
+    fn headless_json_marks_every_non_completed_stop_as_error() {
+        let pricing = || super::HeadlessPricing {
+            anthropic_native: false,
+            input_token_cost: 0.0,
+            output_token_cost: 0.0,
+            cache_prices: crate::pricing::CachePrices::default(),
+        };
+        for (reason, expected) in [
+            (super::HeadlessStopReason::Completed, false),
+            (super::HeadlessStopReason::Failed, true),
+            (super::HeadlessStopReason::Budget, true),
+            (super::HeadlessStopReason::SchemaFailed, true),
+            (super::HeadlessStopReason::AwaitingUser, true),
+        ] {
+            let rendered = render_headless_json(
+                std::path::Path::new("."),
+                "x",
+                &[],
+                Usage::default(),
+                Vec::new(),
+                pricing(),
+                reason,
+                #[cfg(feature = "goal")]
+                None,
+            )
+            .unwrap();
+            let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+            assert_eq!(value["is_error"], expected, "{reason:?}");
+            assert_eq!(value["num_turns"], 0);
+            assert_eq!(value["total_cost_usd"], 0.0);
+        }
+    }
+
+    #[test]
+    fn run_duration_is_wall_clock_since_the_previous_result() {
+        super::mark_headless_run_start();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert!(super::take_run_duration_ms() >= 30);
+        // The span restarts at each result.
+        assert!(super::take_run_duration_ms() < 30);
+    }
+
+    #[test]
+    fn claude_schema_maps_events_to_sdk_messages() {
+        use serde_json::json;
+        let init = super::claude_stream_records(json!({
+            "type":"system","subtype":"init","session_id":"s-1","permission_mode":"standard"
+        }));
+        assert_eq!(init[0]["permissionMode"], "standard");
+        assert_eq!(init[0]["subtype"], "init");
+
+        let text = super::claude_stream_records(json!({
+            "type":"assistant_text","text":"hi","truncated":false
+        }));
+        assert_eq!(text.len(), 1);
+        assert_eq!(text[0]["type"], "assistant");
+        assert_eq!(text[0]["message"]["role"], "assistant");
+        assert_eq!(
+            text[0]["message"]["content"][0],
+            json!({"type":"text","text":"hi"})
+        );
+        assert!(text[0].get("truncated").is_none());
+
+        let call = super::claude_stream_records(json!({
+            "type":"tool_call","id":"c1","provider_call_id":"toolu_1","name":"read",
+            "args":{"path":"a"},"truncated":true
+        }));
+        let block = &call[0]["message"]["content"][0];
+        assert_eq!(block["type"], "tool_use");
+        assert_eq!(block["id"], "c1");
+        assert_eq!(block["input"], json!({"path":"a"}));
+        assert_eq!(call[0]["truncated"], true);
+
+        let result = super::claude_stream_records(json!({
+            "type":"tool_result","id":"c1","name":"read","output":"body",
+            "truncated":false,"is_error":true
+        }));
+        assert_eq!(result[0]["type"], "user");
+        let block = &result[0]["message"]["content"][0];
+        assert_eq!(block["type"], "tool_result");
+        assert_eq!(block["tool_use_id"], "c1");
+        assert_eq!(block["content"], "body");
+        assert_eq!(block["is_error"], true);
+
+        let delta = super::claude_stream_records(json!({
+            "type":"reasoning_delta","message_id":"msg_1","text":"hmm","truncated":false
+        }));
+        assert_eq!(delta[0]["type"], "stream_event");
+        assert_eq!(delta[0]["event"]["delta"]["thinking"], "hmm");
+
+        // Records with no Claude counterpart pass through byte-identical.
+        for passthrough in [
+            json!({"type":"usage","usage":{},"cumulative":{}}),
+            json!({"type":"control_request","request_id":"perm_1"}),
+            json!({"type":"file_mutation","id":"x"}),
+        ] {
+            assert_eq!(
+                super::claude_stream_records(passthrough.clone()),
+                vec![passthrough]
+            );
+        }
+    }
+
+    #[test]
+    fn claude_result_record_adds_subtype_and_cache_read_tokens() {
+        use serde_json::json;
+        let mut ok =
+            json!({"stop_reason":"completed","usage":{"cached_input_tokens":7},"is_error":false});
+        super::claude_result_record(&mut ok);
+        assert_eq!(ok["subtype"], "success");
+        assert_eq!(ok["usage"]["cache_read_input_tokens"], 7);
+        let mut failed = json!({"stop_reason":"failed","usage":{},"is_error":true});
+        super::claude_result_record(&mut failed);
+        assert_eq!(failed["subtype"], "error_during_execution");
+        let mut budget = json!({"stop_reason":"budget","usage":{}});
+        super::claude_result_record(&mut budget);
+        assert_eq!(budget["subtype"], "error_max_budget_usd");
     }
 
     #[test]
