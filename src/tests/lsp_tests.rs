@@ -478,10 +478,19 @@ async fn unhandled_extension_yields_nothing() {
     );
 }
 
+/// `rust` is a build-evaluating built-in withheld in untrusted workspaces; these
+/// fixtures opt in through the user-config switch.
+fn rust_opt_in() -> LspConfig {
+    LspConfig {
+        trust_builtins: vec!["rust".into()],
+        ..Default::default()
+    }
+}
+
 #[tokio::test]
 async fn injected_diagnostics_format_errors_first() {
     let manager = LspManager::new(
-        &LspConfig::default(),
+        &rust_opt_in(),
         std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(Path::new("/tmp")).unwrap()),
     );
     let path = Path::new("/tmp/x.rs");
@@ -576,15 +585,15 @@ async fn versionless_initial_publish_and_clear_are_accepted_within_unchanged_epo
             .contains("initial versionless diagnostic")
     );
     assert!(manager.publish_synced_diagnostics_for_test(&uri, "rust", None, Vec::new()));
-    assert_eq!(
+    assert!(
         LspTool::new(manager.clone(), None, None)
             .call(LspArgs {
                 path: None,
                 ..Default::default()
             })
             .await
-            .unwrap(),
-        "No diagnostics."
+            .unwrap()
+            .starts_with("No diagnostics."),
     );
 }
 
@@ -758,15 +767,15 @@ async fn atomic_edit_waits_for_publish_bound_to_replacement_identity() {
         manager.publish_synced_diagnostics_for_test(&uri, "guarded", None, Vec::new()),
         "an exact version anchor permits a later versionless clear in the unchanged epoch"
     );
-    assert_eq!(
+    assert!(
         LspTool::new(manager.clone(), None, None)
             .call(LspArgs {
                 path: None,
                 ..Default::default()
             })
             .await
-            .unwrap(),
-        "No diagnostics."
+            .unwrap()
+            .starts_with("No diagnostics."),
     );
 }
 
@@ -775,15 +784,15 @@ async fn clean_project_reports_nothing() {
     let root = TempDir::new("clean-project");
     let manager = LspManager::new(&LspConfig::default(), root.path().to_path_buf());
     let query = LspTool::new(manager.clone(), None, None);
-    assert_eq!(
+    assert!(
         query
             .call(LspArgs {
                 path: None,
                 ..Default::default()
             })
             .await
-            .unwrap(),
-        "No diagnostics."
+            .unwrap()
+            .starts_with("No diagnostics."),
     );
     let source = root.path().join("x.rs");
     std::fs::write(&source, "document").unwrap();
@@ -870,7 +879,7 @@ async fn cancelled_lsp_validation_remains_owned_until_disk_work_finishes() {
     std::fs::write(&source, "document").unwrap();
     let source = source.canonicalize().unwrap();
     let uri = crate::extras::lsp::client::file_uri(&source).unwrap();
-    let manager = LspManager::new(&LspConfig::default(), root.path().to_path_buf());
+    let manager = LspManager::new(&rust_opt_in(), root.path().to_path_buf());
     manager.set_synced_document_for_test(&uri, 1, true);
     assert!(manager.publish_synced_diagnostics_for_test(
         &uri,
@@ -961,7 +970,11 @@ async fn explicit_in_root_path_obeys_read_allow_deny_and_ask() {
         })
         .await
         .unwrap();
-    assert!(output.starts_with("No diagnostics for "), "{output}");
+    assert!(
+        output.starts_with("Not checked: no language server is configured for ")
+            && output.contains("not a clean result"),
+        "{output}"
+    );
 
     let (deny, _, _) = lsp_tool(root.path(), read_permission(Action::Deny));
     let error = deny
@@ -1048,15 +1061,15 @@ async fn project_query_obeys_read_allow_deny_and_ask_before_cache_disclosure() {
     let canonical_root = root.path().canonicalize().unwrap();
 
     let (allow, _, _) = lsp_tool(root.path(), read_permission(Action::Allow));
-    assert_eq!(
+    assert!(
         allow
             .call(LspArgs {
                 path: None,
                 ..Default::default()
             })
             .await
-            .unwrap(),
-        "No diagnostics."
+            .unwrap()
+            .starts_with("No diagnostics."),
     );
 
     let (deny, _, manager) = lsp_tool(root.path(), read_permission(Action::Deny));
@@ -1089,7 +1102,7 @@ async fn project_query_obeys_read_allow_deny_and_ask_before_cache_disclosure() {
         }),
         answer_once(ask_rx.unwrap(), &canonical_root),
     );
-    assert_eq!(result.unwrap(), "No diagnostics.");
+    assert!(result.unwrap().starts_with("No diagnostics."),);
 }
 
 #[tokio::test]
@@ -1878,7 +1891,7 @@ async fn project_wide_listing_discloses_files_dropped_from_a_full_cache() {
 #[tokio::test]
 async fn oversized_existing_publish_invalidates_stale_diagnostics_and_advances_version() {
     let root = TempDir::new("oversized-existing-publish");
-    let manager = LspManager::new(&LspConfig::default(), root.path().to_path_buf());
+    let manager = LspManager::new(&rust_opt_in(), root.path().to_path_buf());
     let victim = root.path().join("victim.rs");
     std::fs::write(&victim, "contents").unwrap();
     let victim = victim.canonicalize().unwrap();
@@ -2323,15 +2336,15 @@ async fn aggregate_rejects_symlink_alias_uri_variants_and_stale_retargets() {
         Some(permission(root.path(), PermissionConfig::default())),
         None,
     );
-    assert_eq!(
+    assert!(
         replacement_tool
             .call(LspArgs {
                 path: None,
                 ..Default::default()
             })
             .await
-            .unwrap(),
-        "No diagnostics.",
+            .unwrap()
+            .starts_with("No diagnostics."),
         "a same-path inode replacement must invalidate cached diagnostics"
     );
 
@@ -2353,7 +2366,7 @@ async fn aggregate_rejects_symlink_alias_uri_variants_and_stale_retargets() {
         })
         .await
         .unwrap();
-    assert_eq!(output, "No diagnostics.");
+    assert!(output.starts_with("No diagnostics."), "{output}");
 }
 
 #[test]
@@ -2997,4 +3010,100 @@ fn rename_preview_pages_through_every_edit_up_to_the_hard_bound() {
         text.contains("9 more edits in this file beyond the 5000-edit bound"),
         "{text}"
     );
+}
+
+// mini-agent-lk8yo: every non-answer of the per-file query is distinguishable
+// from a clean file, and the project-wide form states its coverage.
+#[tokio::test]
+async fn per_file_query_distinguishes_unsynced_unavailable_and_unhandled_files() {
+    let root = TempDir::new("query-statuses");
+    let mut cfg = LspConfig::default();
+    cfg.servers.insert(
+        "ghost".into(),
+        LspServerConfig {
+            command: "/nonexistent/ghost-ls".into(),
+            extensions: vec![".ghost".into()],
+            ..Default::default()
+        },
+    );
+    let manager = LspManager::new(&cfg, root.path().to_path_buf());
+    let tool = LspTool::new(manager.clone(), None, None);
+    let query = |name: &str| {
+        let path = root.path().join(name).display().to_string();
+        tool.call(LspArgs {
+            path: Some(path),
+            ..Default::default()
+        })
+    };
+
+    std::fs::write(root.path().join("plain.txt"), "x").unwrap();
+    let unhandled = query("plain.txt").await.unwrap();
+    assert!(
+        unhandled.starts_with("Not checked: no language server is configured")
+            && unhandled.contains(".txt")
+            && unhandled.contains("not a clean result"),
+        "{unhandled}"
+    );
+
+    let big = std::fs::File::create(root.path().join("big.ghost")).unwrap();
+    big.set_len(5 * 1024 * 1024).unwrap();
+    let big = query("big.ghost").await.unwrap();
+    assert!(
+        big.starts_with("Not checked:")
+            && big.contains("not synchronized")
+            && big.contains("4 MiB")
+            && big.contains("ghost"),
+        "{big}"
+    );
+
+    std::fs::write(root.path().join("binary.ghost"), [0xff, 0xfe, 0x00, 0x80]).unwrap();
+    let binary = query("binary.ghost").await.unwrap();
+    assert!(
+        binary.contains("not synchronized") && binary.contains("UTF-8"),
+        "{binary}"
+    );
+
+    std::fs::write(root.path().join("ok.ghost"), "fine").unwrap();
+    let down = query("ok.ghost").await.unwrap();
+    assert!(
+        down.starts_with("Not checked: LSP (ghost) is unavailable")
+            && down.contains("not a clean result"),
+        "{down}"
+    );
+
+    let project = tool.call(LspArgs::default()).await.unwrap();
+    assert!(
+        project.starts_with("No diagnostics.")
+            && project.contains("only files a language server has published")
+            && project.contains("Running servers: none")
+            && project.contains("ghost"),
+        "{project}"
+    );
+}
+
+#[tokio::test]
+async fn query_wait_ms_is_validated_and_per_file_only() {
+    let root = TempDir::new("query-wait-validation");
+    let manager = LspManager::new(&LspConfig::default(), root.path().to_path_buf());
+    let tool = LspTool::new(manager, None, None);
+    std::fs::write(root.path().join("a.txt"), "x").unwrap();
+    for (path, wait) in [
+        (Some(root.path().join("a.txt").display().to_string()), 0),
+        (
+            Some(root.path().join("a.txt").display().to_string()),
+            60_001,
+        ),
+        (None, 100),
+    ] {
+        let error = tool
+            .call(LspArgs {
+                path,
+                wait_ms: Some(wait),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("wait_ms"), "{error}");
+    }
 }

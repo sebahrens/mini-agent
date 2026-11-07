@@ -6,6 +6,8 @@
 use std::path::Path;
 use std::time::Duration;
 
+use crate::extras::lsp::query::{DiagTarget, FileDiagStatus, MAX_QUERY_WAIT};
+
 use rig::tool::Tool;
 use serde::Deserialize;
 
@@ -13,10 +15,6 @@ use crate::agent::tools::{
     AskSender, PermCheck, ToolError, check_perm_canonical_path, check_perm_path_with_suggestion,
 };
 use crate::extras::lsp::LspManager;
-
-/// Longer than the post-edit wait: an explicit query justifies giving the
-/// server more time to catch up.
-const QUERY_WAIT: Duration = Duration::from_secs(3);
 
 pub struct LspTool {
     pub manager: LspManager,
@@ -43,6 +41,10 @@ pub struct LspArgs {
     /// workspace-relative directory.
     #[serde(default)]
     pub directory: Option<String>,
+    /// Per-file query only: milliseconds to wait for the server to publish
+    /// (default 3000, or the server's `wait_ms`; at most 60000).
+    #[serde(default)]
+    pub wait_ms: Option<u64>,
 }
 
 #[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -74,7 +76,7 @@ impl Tool for LspTool {
     type Output = String;
 
     fn description(&self) -> String {
-        "Get language-server diagnostics (errors/warnings). With `path`: diagnostics for that file, synced from disk first. Without: every file that currently has diagnostics (optionally under `directory`). Up to 200 diagnostics are returned per call (`limit`, at most 1000), errors first; a truncation line states how many diagnostics and files are hidden and the `offset` to continue with. `severity` narrows to errors or warnings.".to_string()
+        "Get language-server diagnostics (errors/warnings). With `path`: diagnostics for that file, synced from disk first. Without: every file that currently has diagnostics (optionally under `directory`). Up to 200 diagnostics are returned per call (`limit`, at most 1000), errors first; a truncation line states how many diagnostics and files are hidden and the `offset` to continue with. `severity` narrows to errors or warnings. A per-file result says explicitly when the file is clean (the server published nothing to report) versus when no server handles it, the file could not be synchronized, the server is unavailable, or the server did not answer within the wait (status unknown; retry with a larger `wait_ms`, at most 60000). The project-wide form covers only files a server has published diagnostics for.".to_string()
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -85,7 +87,8 @@ impl Tool for LspTool {
                 "offset": { "type": "integer", "minimum": 0, "description": "Diagnostics to skip; pass the offset named by the previous truncation line" },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Most diagnostics to return (default 200)" },
                 "severity": { "type": "string", "enum": ["error", "warning"], "description": "Only diagnostics of this severity" },
-                "directory": { "type": "string", "description": "Project-wide listing only: workspace-relative directory to restrict to" }
+                "directory": { "type": "string", "description": "Project-wide listing only: workspace-relative directory to restrict to" },
+                "wait_ms": { "type": "integer", "minimum": 1, "maximum": 60000, "description": "Per-file query only: milliseconds to wait for the server to publish (default 3000 or the server's wait_ms)" }
             }
         })
     }
@@ -109,6 +112,21 @@ impl Tool for LspTool {
             offset,
             limit,
             severity,
+        };
+        let wait = match args.wait_ms {
+            None => None,
+            Some(_) if args.path.is_none() => {
+                return Err(ToolError::Msg(
+                    "wait_ms applies only to a per-file query; pass path".to_string(),
+                ));
+            }
+            Some(ms) if ms == 0 || u128::from(ms) > MAX_QUERY_WAIT.as_millis() => {
+                return Err(ToolError::Msg(format!(
+                    "wait_ms must be between 1 and {}",
+                    MAX_QUERY_WAIT.as_millis()
+                )));
+            }
+            Some(ms) => Some(Duration::from_millis(ms)),
         };
         if args.path.is_some() && args.directory.is_some() {
             return Err(ToolError::Msg(
@@ -164,23 +182,16 @@ impl Tool for LspTool {
 
                 // Manager access begins only after the capability-bound read
                 // path is authorized. Operational LSP failure remains open.
-                let baseline = if bound_relative {
-                    self.manager.notify_changed_relative(relative).await
+                let target = if bound_relative {
+                    DiagTarget::Relative(relative)
                 } else {
-                    self.manager.notify_changed(&path).await
+                    DiagTarget::Absolute(&path)
                 };
-                let diagnostics = if bound_relative {
-                    self.manager
-                        .diagnostics_query_relative(relative, QUERY_WAIT, baseline, page)
-                        .await
-                } else {
-                    self.manager
-                        .diagnostics_query_since(&path, QUERY_WAIT, baseline, page)
-                        .await
-                };
-                let output = diagnostics
-                    .map(|block| block.trim_start().to_string())
-                    .unwrap_or_else(|| format!("No diagnostics for {expanded}."));
+                let status = self
+                    .manager
+                    .file_diagnostics_status(target, wait, page)
+                    .await;
+                let output = render_file_status(&expanded, status, page);
                 Ok(with_coaching(coaching, output))
             }
             None => {
@@ -242,6 +253,8 @@ impl Tool for LspTool {
                     .diagnostics_page_for_snapshots(&snapshots, offset, limit)
                     .map(|block| format!("Files with diagnostics:\n{block}"))
                     .unwrap_or_else(|| "No diagnostics.".to_string());
+                output.push('\n');
+                output.push_str(&self.manager.project_listing_scope_note());
                 let dropped = self.manager.dropped_diagnostic_files();
                 if dropped > 0 {
                     output.push_str(&format!(
@@ -249,6 +262,77 @@ impl Tool for LspTool {
                     ));
                 }
                 Ok(with_coaching(coaching, output))
+            }
+        }
+    }
+}
+
+/// Text for one per-file outcome; only `Clean` reads as a clean file.
+fn render_file_status(
+    path: &str,
+    status: FileDiagStatus,
+    page: crate::extras::lsp::DiagPage,
+) -> String {
+    match status {
+        FileDiagStatus::Diagnostics(block) => block.trim_start().to_string(),
+        FileDiagStatus::Clean { server } => {
+            let filtered = if page.severity.is_some() || page.offset > 0 {
+                " (nothing matched the severity/offset window)"
+            } else {
+                ""
+            };
+            format!(
+                "No diagnostics for {path}. LSP ({server}) published diagnostics for it and none were reported{filtered}."
+            )
+        }
+        FileDiagStatus::NoServer {
+            outside_workspace: true,
+            ..
+        } => format!(
+            "Not checked: {path} is outside the workspace, so no language server handles it. This is not a clean result."
+        ),
+        FileDiagStatus::NoServer {
+            extension,
+            withheld,
+            ..
+        } => {
+            let kind = extension.unwrap_or_else(|| "no extension".to_string());
+            match withheld {
+                Some(why) => format!(
+                    "Not checked: no language server is running for {path} ({kind}): {why}. This is not a clean result."
+                ),
+                None => format!(
+                    "Not checked: no language server is configured for {path} ({kind} files). Add one under [lsp.servers.<name>] with `command` and `extensions`. This is not a clean result."
+                ),
+            }
+        }
+        FileDiagStatus::NotSynced { server, reason } => format!(
+            "Not checked: {path} was not synchronized to LSP ({server}): {reason}. This is not a clean result."
+        ),
+        FileDiagStatus::Unavailable {
+            server,
+            retry_in_ms,
+        } => {
+            let retry = match retry_in_ms {
+                Some(ms) => format!("; it is cooling down after a failure, retry in about {ms} ms"),
+                None => "; it could not be started (is the binary on PATH?)".to_string(),
+            };
+            format!(
+                "Not checked: LSP ({server}) is unavailable for {path}{retry}. This is not a clean result."
+            )
+        }
+        FileDiagStatus::TimedOut {
+            server,
+            wait_ms,
+            partial,
+        } => {
+            let notice = format!(
+                "LSP ({server}) did not publish diagnostics for {path} within {wait_ms} ms; the file's status is unknown (the server may still be checking). Retry with a larger `wait_ms` (at most {}).",
+                MAX_QUERY_WAIT.as_millis()
+            );
+            match partial {
+                Some(block) => format!("{}\n\n{notice}", block.trim_start()),
+                None => format!("Status unknown: {notice}"),
             }
         }
     }

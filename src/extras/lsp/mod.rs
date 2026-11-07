@@ -8,6 +8,7 @@
 
 pub(crate) mod client;
 pub(crate) mod navigate;
+pub(crate) mod query;
 pub(crate) mod registry;
 pub mod rpc;
 
@@ -968,18 +969,6 @@ impl LspManager {
             });
         }
         output
-    }
-
-    pub(crate) async fn diagnostics_query_relative(
-        &self,
-        relative: &Path,
-        wait: Duration,
-        baseline: Option<u64>,
-        page: DiagPage,
-    ) -> Option<String> {
-        let parent = self.resolve_relative(relative)?;
-        self.diagnostics_query_since(&parent, wait, baseline, page)
-            .await
     }
 
     fn resolve_relative(&self, relative: &Path) -> Option<PathBuf> {

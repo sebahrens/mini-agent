@@ -8694,7 +8694,10 @@ mod lsp_health_agent_tests {
             )
             .await
             .unwrap();
-        assert!(result.contains("No diagnostics"), "{result}");
+        assert!(
+            result.starts_with("Not checked:") && result.contains("not a clean result"),
+            "{result}"
+        );
         let snapshot = manager.diagnostic_snapshot();
         assert_eq!(snapshot.failure_count, Some(1));
         let failures = snapshot.failures.unwrap();

@@ -4099,6 +4099,15 @@ still indexing" instead of reading as a true negative. A `ContentModified`
 (-32801) or `ServerCancelled` (-32802) reply is retried once, then reported
 as such.
 
+A per-file `lsp_diagnostics` result never reads as clean unless the server published:
+`No diagnostics for <file>. LSP (<server>) published ...` means clean; `Not checked: ...` says
+no server handles the extension (with the withheld-built-in remedy when that is the cause), the
+file was not synchronized (over 4 MiB, not UTF-8, unreadable), or the server is unavailable or
+cooling down; `Status unknown: ...` names the server and the wait that elapsed without a publish.
+The wait defaults to 3 s (or the server's `wait_ms`) and the `wait_ms` argument raises it up to
+60000. The project-wide form appends a note that it covers only files a server has published
+diagnostics for, and lists the running and configured servers.
+
 `lsp_diagnostics` uses the existing `read` permission policy. A file query
 checks the canonical file path before synchronizing it or starting a language
 server. Canonical paths must be UTF-8 and regular files; other filesystem node
