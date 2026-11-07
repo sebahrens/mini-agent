@@ -706,7 +706,7 @@ fn headless_compaction_plan_with(
             pending_tokens,
             cfg.resolve_keep_recent_tool_results(),
         )
-        && !session.size_pressure(cfg.resolve_compact_size_fraction())
+        && !session.actionable_size_pressure(cfg.resolve_compact_size_fraction())
     {
         return None;
     }
@@ -6518,6 +6518,31 @@ mod tests {
             ..crate::config::Config::default()
         };
         (session, cfg)
+    }
+
+    // mini-agent-stgyu: a compaction that left the session over the byte
+    // threshold must not re-arm a paid summarizer for every later prompt.
+    #[test]
+    fn headless_byte_pressure_honours_the_futility_floor() {
+        let (mut session, mut cfg) = fork_test_session();
+        cfg.reserve_tokens = Some(0);
+        cfg.compact_size_fraction = Some(0.00001);
+        let plan = |session: &Session| {
+            super::headless_compaction_plan_with(
+                session,
+                &cfg,
+                0,
+                #[cfg(feature = "memory")]
+                None,
+                false,
+            )
+        };
+        session.bytes_after_last_compaction = None;
+        let bytes = session.approx_persisted_bytes();
+        assert!(session.size_pressure(Some(0.00001)), "{bytes}");
+        assert!(plan(&session).is_some(), "first pressure compacts");
+        session.bytes_after_last_compaction = Some(bytes);
+        assert!(plan(&session).is_none());
     }
 
     // mini-agent-agmr4: a zero context window (auto-compaction off) still

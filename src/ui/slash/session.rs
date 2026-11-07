@@ -1548,6 +1548,14 @@ mod session_persistence_tests {
         assert!(session.bytes_after_last_compaction.is_none());
     }
 
+    fn clear_drops_the_compaction_futility_floor() {
+        // mini-agent-24lo9
+        let mut session = session_with_turn();
+        session.bytes_after_last_compaction = Some(30 << 20);
+        clear_session_mutation(&mut session);
+        assert_eq!(session.bytes_after_last_compaction, None);
+    }
+
     #[test]
     fn slash_session_mutation_persistence_survives_immediate_reload() {
         let snapshot = RefCell::new(None);

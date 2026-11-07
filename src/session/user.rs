@@ -287,6 +287,84 @@ mod tests {
         assert!(session.size_pressure(Some(0.75)));
         assert!(session.mid_turn_size_pressure(Some(0.75)));
     }
+    fn image_session(prompts: usize) -> crate::session::Session {
+        let mut session = crate::session::Session::new("logical", "model", 1_000_000, "");
+        let raw = vec![7u8; 1_900_000];
+        for _ in 0..prompts {
+            session.add_user_message(
+                PersistedUserMessage::new(vec![image(&raw), image(&raw)]).unwrap(),
+            );
+        }
+        session
+    }
+    #[test]
+    fn compaction_floor_is_lowered_when_messages_are_removed() {
+        // mini-agent-24lo9
+        let mut session = image_session(7);
+        session.compress("recap".to_owned(), 1, 0);
+        assert!(
+            session
+                .bytes_after_last_compaction
+                .is_some_and(|f| f > 24 << 20)
+        );
+        session.truncate_to(0);
+        let floor = session.bytes_after_last_compaction.unwrap();
+        assert!(floor <= session.approx_persisted_bytes());
+        // Regrow past the threshold: relief must arm again.
+        let raw = vec![7u8; 1_900_000];
+        for _ in 0..6 {
+            session.add_user_message(
+                PersistedUserMessage::new(vec![image(&raw), image(&raw)]).unwrap(),
+            );
+        }
+        assert!(session.size_pressure(Some(0.75)));
+        assert!(session.mid_turn_size_pressure(Some(0.75)));
+    }
+    #[test]
+    fn compaction_floor_is_lowered_after_retained_images_are_dropped() {
+        // mini-agent-24lo9: the floor must be measured after the rewind drops
+        // the compaction (and the PNGs it retained), not before.
+        const PNG: &[u8] = include_bytes!("../agent/tools/fixtures/read-image64/3x2.png");
+        let mut session = crate::session::Session::new("logical", "model", 1_000_000, "");
+        for n in 0..3u8 {
+            let mut bytes = PNG.to_vec();
+            bytes.resize(1_500_000, 0);
+            bytes.push(n);
+            session.add_user_message(PersistedUserMessage::new(vec![image(&bytes)]).unwrap());
+        }
+        session.compress("recap".to_owned(), 2, 0);
+        assert!(
+            session.compactions.iter().any(|c| !c.images.is_empty()),
+            "fixture must retain images"
+        );
+        let before = session.bytes_after_last_compaction.unwrap();
+        assert!(before > 1_000_000);
+        session.truncate_to(0);
+        assert!(session.compactions.is_empty());
+        let floor = session.bytes_after_last_compaction.unwrap();
+        assert!(floor <= session.approx_persisted_bytes(), "floor={floor}");
+    }
+    #[test]
+    fn redo_discards_a_floor_measured_before_the_restore() {
+        let mut session = image_session(7);
+        session.compress("recap".to_owned(), 1, 0);
+        session.bytes_after_last_compaction = Some(40 << 20);
+        session.rewind_to(1);
+        session.redo();
+        assert_eq!(session.bytes_after_last_compaction, None);
+    }
+    #[test]
+    fn between_turn_pressure_honours_the_futility_floor() {
+        // mini-agent-stgyu
+        let mut session = image_session(7);
+        assert!(session.actionable_size_pressure(Some(0.75)));
+        session.compress("recap".to_owned(), 1, 0);
+        assert!(session.size_pressure(Some(0.75)));
+        assert!(
+            !session.actionable_size_pressure(Some(0.75)),
+            "a futile compaction must not re-arm the paid summarizer every turn"
+        );
+    }
     #[test]
     fn rewind_and_redo_clear_the_stale_futile_compaction_byte_floor() {
         let mut session = crate::session::Session::new("logical", "model", 1_000_000, "");

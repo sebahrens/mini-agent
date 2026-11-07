@@ -131,6 +131,18 @@ impl Images {
         }
     }
 
+    /// Cheap encoded-size estimate of the pixels this record serializes: the
+    /// base64 payloads only, and nothing once archived (mini-agent-g4bww).
+    pub(crate) fn approx_encoded_bytes(&self) -> usize {
+        if self.archived {
+            return 0;
+        }
+        self.entries
+            .iter()
+            .filter_map(|entry| entry.image.as_ref())
+            .fold(0usize, |sum, image| sum.saturating_add(image.encoded_len()))
+    }
+
     #[cfg(any(feature = "export", test))]
     pub(crate) fn mark_imported(&mut self) {
         self.imported = true;
@@ -560,6 +572,42 @@ mod tests {
                 && rendered.contains("may have been retained again above")
         );
         assert!(!rendered.contains("Historical images not retained due"));
+    }
+
+    #[test]
+    fn approx_persisted_bytes_counts_retained_compaction_images() {
+        // mini-agent-g4bww
+        let mut session = Session::new("test", "test", 128_000, "");
+        let mut bytes = PNG.to_vec();
+        bytes.resize(1_500_000, 0);
+        session.add_message(MessageRole::User, "earlier");
+        session.add_tool_call_with_id("a", "read", &serde_json::json!({"path":"a.png"}));
+        session.add_tool_result_with_images("a", "read", "image", vec![image_bytes(&bytes, None)]);
+        session.add_message(MessageRole::User, "later");
+        session.compress("recap".into(), 3, 0);
+        let retained = session
+            .compactions
+            .last()
+            .unwrap()
+            .images
+            .approx_encoded_bytes();
+        assert!(
+            retained > 1_900_000,
+            "the compaction retains pixels: {retained}"
+        );
+        let approx = session.approx_persisted_bytes();
+        // The drained prefix no longer counts as messages, yet its pixels live on
+        // in the compaction record, so the estimate must not collapse.
+        assert!(approx >= retained);
+        let real = serde_json::to_vec(&session).unwrap().len();
+        assert!(
+            approx <= real,
+            "never above the real file: {approx} vs {real}"
+        );
+        assert!(
+            real - approx < real / 10,
+            "tracks the real file: {approx} vs {real}"
+        );
     }
 
     #[test]

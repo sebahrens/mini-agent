@@ -1898,6 +1898,9 @@ impl Session {
         if self.compacted_context().0.is_none() {
             self.compactions.clear();
         }
+        // Clamp after the compactions (and their retained images) are dropped,
+        // so every caller that cuts history measures the final size.
+        self.clamp_compaction_floor();
         self.mark_history_changed();
     }
 
@@ -2546,6 +2549,7 @@ impl Session {
                 }
                 self.mark_history_changed();
                 // Restored messages invalidate the recorded compaction floor.
+                // Restored content was not measured by the last compaction.
                 self.bytes_after_last_compaction = None;
                 self.total_estimated_tokens = u.total_estimated_tokens;
                 self.calibrated_tokens = u.calibrated_tokens;
@@ -2706,9 +2710,10 @@ impl Session {
     }
 
     /// Cheap estimate of the encoded session size, dominated by base64 images
-    /// (user prompts and tool results) and message text. Never serializes.
+    /// (user prompts and tool results), message text, retained compaction
+    /// pixels and the native replay payload (counted, never copied).
     pub(crate) fn approx_persisted_bytes(&self) -> usize {
-        self.messages.iter().fold(0usize, |total, message| {
+        let messages = self.messages.iter().fold(0usize, |total, message| {
             let user = message.user.as_ref().map_or(0, |user| {
                 user.blocks().iter().fold(0usize, |sum, block| {
                     sum.saturating_add(match block {
@@ -2729,7 +2734,32 @@ impl Session {
                 .saturating_add(message.content.len())
                 .saturating_add(user)
                 .saturating_add(tool)
-        })
+        });
+        // The persisted JSON also carries the active compaction's retained
+        // pixels and the native replay payload; leaving them out hid up to
+        // ~11 MiB of the real file from the trigger (mini-agent-g4bww).
+        let images = self.compactions.iter().fold(0usize, |sum, record| {
+            sum.saturating_add(record.images.approx_encoded_bytes())
+        });
+        let native = self
+            .native_history
+            .iter()
+            .chain(self.retired_native_history.iter())
+            .fold(0usize, |sum, history| {
+                sum.saturating_add(
+                    native_replay::bounded_serialized(history, native_replay::MAX_NATIVE_PAYLOAD)
+                        .unwrap_or(native_replay::MAX_NATIVE_PAYLOAD),
+                )
+            });
+        messages.saturating_add(images).saturating_add(native)
+    }
+
+    /// The futility floor describes content that may no longer exist. Lower it
+    /// to the current size whenever messages are removed (mini-agent-24lo9).
+    pub(crate) fn clamp_compaction_floor(&mut self) {
+        if let Some(floor) = self.bytes_after_last_compaction {
+            self.bytes_after_last_compaction = Some(floor.min(self.approx_persisted_bytes()));
+        }
     }
 
     /// Whether the encoded session passed `fraction` of the persisted-session
@@ -2747,6 +2777,14 @@ impl Session {
     /// at every tool batch would only re-run a futile compaction each segment
     /// (mini-agent-cbjft).
     pub(crate) fn mid_turn_size_pressure(&self, fraction: Option<f64>) -> bool {
+        self.actionable_size_pressure(fraction)
+    }
+
+    /// Byte pressure that a further compaction can still relieve. Every
+    /// auto-compaction decision (mid-turn, between turns, headless) uses it so
+    /// a session pinned over the threshold by retained pixels does not pay for
+    /// a futile summarizer request each turn (mini-agent-stgyu).
+    pub(crate) fn actionable_size_pressure(&self, fraction: Option<f64>) -> bool {
         self.size_pressure(fraction)
             && fraction.is_some_and(|fraction| {
                 self.bytes_after_last_compaction.is_none_or(|floor| {
