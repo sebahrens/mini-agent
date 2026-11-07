@@ -2017,11 +2017,29 @@ impl PermissionChecker {
                 break;
             }
         }
+        // `write`, `edit` and `notebook_edit` are separate rule keys for one
+        // capability (modifying files). A deny or ask on a sibling key must
+        // not be bypassed by choosing another tool (mini-agent-9tnk6); a
+        // sibling allow never widens.
+        for sibling in write_family_siblings(tool) {
+            if let Some(rules) = self.rules.get(*sibling) {
+                for (pattern, action) in rules {
+                    if *action != Action::Allow
+                        && inputs.iter().any(|input| pattern.matches_path(input))
+                    {
+                        matched.push((pattern.specificity(), *action));
+                    }
+                }
+            }
+        }
         matched
     }
 
     fn matches_deny_rule(&self, tool: &str, inputs: &[&str]) -> bool {
-        for name in std::iter::once(tool).chain((tool == "notebook_edit").then_some("edit")) {
+        for name in std::iter::once(tool)
+            .chain((tool == "notebook_edit").then_some("edit"))
+            .chain(write_family_siblings(tool).iter().copied())
+        {
             let Some(rules) = self.rules.get(name) else {
                 continue;
             };
@@ -2986,7 +3004,7 @@ fn is_url_identity_tool(tool: &str) -> bool {
 /// A URL-identity (`js/fetch`, `web_fetch`, `web_search`) deny glob with every `*` run widened to `**`. Fetch identities
 /// are URLs, so a deny of `https://example.com/*` or `*` must not stop matching
 /// at the first `/` (mini-agent-ewqgo); a narrower deny would let a path through.
-fn fetch_deny_glob(pattern: &str) -> String {
+pub(crate) fn fetch_deny_glob(pattern: &str) -> String {
     let mut out = String::with_capacity(pattern.len() + 2);
     let mut chars = pattern.chars().peekable();
     while let Some(c) = chars.next() {
@@ -3017,6 +3035,16 @@ fn is_path_tool_name(tool: &str) -> bool {
             | "lsp_diagnostics"
             | "lsp_navigate"
     )
+}
+
+/// The other file-modifying rule keys that share `tool`'s capability.
+fn write_family_siblings(tool: &str) -> &'static [&'static str] {
+    match tool {
+        "write" => &["edit", "notebook_edit"],
+        "edit" => &["write", "notebook_edit"],
+        "notebook_edit" => &["write", "edit"],
+        _ => &[],
+    }
 }
 
 fn permission_tool_aliases(tool: &str) -> &'static [&'static str] {
@@ -3738,6 +3766,49 @@ mod tests {
             checker.check("web_fetch", identity),
             CheckResult::Denied(_)
         ));
+    }
+
+    // mini-agent-9tnk6: a deny/ask on one file-modifying key covers its siblings.
+    #[test]
+    fn write_family_deny_and_ask_cover_edit_and_notebook_edit() {
+        let root = crate::tests::OwnedTestDirectory::new("9tnk6-family");
+        let env_file = root.path().canonicalize().unwrap().join("prod.env");
+        std::fs::write(&env_file, "x").unwrap();
+        let target = env_file.to_string_lossy().to_string();
+        for denied in ["write", "edit", "notebook_edit"] {
+            let deny_entries = Some([(denied.to_owned(), vec!["**/*.env".to_owned()])].into());
+            let configs = PermissionConfigs::from(PermissionConfig {
+                deny_entries,
+                ..PermissionConfig::default()
+            });
+            let mut checker = PermissionChecker::new(
+                &configs,
+                SecurityMode::Standard,
+                Some(root.path().to_path_buf()),
+                None,
+            )
+            .unwrap();
+            for tool in ["write", "edit", "notebook_edit"] {
+                assert!(
+                    matches!(checker.check_path(tool, &target), CheckResult::Denied(_)),
+                    "deny `{denied}` must deny {tool}"
+                );
+            }
+        }
+        let ask_entries = Some([("write".to_owned(), vec!["**/*.env".to_owned()])].into());
+        let configs = PermissionConfigs::from(PermissionConfig {
+            ask_entries,
+            default: Some(Action::Allow),
+            ..PermissionConfig::default()
+        });
+        let mut checker = PermissionChecker::new(
+            &configs,
+            SecurityMode::Standard,
+            Some(root.path().to_path_buf()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(checker.check_path("edit", &target), CheckResult::Ask);
     }
 
     #[test]
