@@ -1139,7 +1139,8 @@ mod tests {
     fn resource_text_of_exactly_the_fetch_bound_is_not_truncated() {
         let exact = "x".repeat(MAX_FETCH_BYTES);
         let read = resource_text(ReadResourceResult::new(vec![ResourceContents::text(
-            exact, "urn:exact",
+            exact,
+            "urn:exact",
         )]))
         .unwrap();
         assert!(!read.fetch_truncated);

@@ -1866,7 +1866,10 @@ async fn mcp_tool_call_dropped_mid_flight_sends_notifications_cancelled() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(seen, "dropping an in-flight call must cancel it on the server");
+    assert!(
+        seen,
+        "dropping an in-flight call must cancel it on the server"
+    );
     let pid = wait_for_pid(&lease).await;
     shutdown(manager).await;
     assert_process_reaped(pid).await;

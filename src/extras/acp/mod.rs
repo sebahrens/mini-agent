@@ -3294,11 +3294,8 @@ mod typed_prompt_tests {
     fn acp_image_prompt_with_blank_text_blocks_is_accepted() {
         let image = || ContentBlock::Image(ImageContent::new("aW5lcnQ=", "image/png"));
         // Image-only after an empty typed-text block.
-        let prompt = parse_prompt_blocks(&[
-            ContentBlock::Text(TextContent::new("")),
-            image(),
-        ])
-        .unwrap();
+        let prompt =
+            parse_prompt_blocks(&[ContentBlock::Text(TextContent::new("")), image()]).unwrap();
         assert_eq!(prompt.literal_text(), "");
         // /selection: blank text, a snippet, then the image.
         let prompt = parse_prompt_blocks(&[
