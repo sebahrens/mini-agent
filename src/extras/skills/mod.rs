@@ -62,6 +62,7 @@ pub(crate) mod selection;
 #[cfg(feature = "agent-skills")]
 pub(crate) mod session;
 
+#[cfg(feature = "agent-skills")]
 pub(crate) mod touched;
 
 #[cfg(feature = "agent-skills")]

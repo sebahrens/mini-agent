@@ -125,9 +125,16 @@ pub(super) async fn run_backend_hook(
 /// Peers of the MCP servers connected in this process, by server name. A later
 /// connection of the same name replaces the earlier one.
 #[cfg(feature = "mcp")]
-static MCP_PEERS: Mutex<
-    Option<std::collections::HashMap<String, rmcp::service::Peer<rmcp::service::RoleClient>>>,
-> = Mutex::new(None);
+static MCP_PEERS: Mutex<Option<std::collections::HashMap<String, McpPeer>>> = Mutex::new(None);
+
+/// A connected server as `mcp_tool` hooks reach it: its peer plus, for a URL
+/// server, the reconnect link that re-establishes a dropped transport.
+#[cfg(feature = "mcp")]
+#[derive(Clone)]
+struct McpPeer {
+    peer: rmcp::service::Peer<rmcp::service::RoleClient>,
+    link: Option<std::sync::Arc<crate::extras::mcp::reconnect::ServerLink>>,
+}
 
 /// Records the connected servers' peers so `mcp_tool` hooks can reach them.
 #[cfg(feature = "mcp")]
@@ -137,7 +144,10 @@ pub(crate) fn register_mcp_peers(handles: &[crate::extras::mcp::client::McpClien
     for handle in handles {
         map.insert(
             handle.server_name.to_string(),
-            handle.running_service.peer().clone(),
+            McpPeer {
+                peer: handle.running_service.peer().clone(),
+                link: handle.link.clone(),
+            },
         );
     }
 }
@@ -204,7 +214,7 @@ async fn run_mcp_tool(handler: &HookHandler, envelope: &[u8], timeout: Duration)
 }
 
 #[cfg(feature = "mcp")]
-async fn call_mcp(
+pub(crate) async fn call_mcp(
     server: &str,
     tool: &str,
     arguments: serde_json::Map<String, serde_json::Value>,
@@ -216,10 +226,23 @@ async fn call_mcp(
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .and_then(|map| map.get(server).cloned());
-    let Some(peer) = peer.filter(|peer| !peer.is_transport_closed()) else {
-        return failed(format!(
+    let not_connected = || {
+        failed(format!(
             "mcp_tool hook: MCP server '{server}' is not connected"
-        ));
+        ))
+    };
+    let Some(registered) = peer else {
+        return not_connected();
+    };
+    // A link-managed server whose transport dropped is re-established (the
+    // same bounded attempts as a tool call) instead of refusing forever.
+    let peer = match &registered.link {
+        Some(link) => match link.ensure_connected().await {
+            Ok(conn) => conn.peer,
+            Err(_) => return not_connected(),
+        },
+        None if registered.peer.is_transport_closed() => return not_connected(),
+        None => registered.peer.clone(),
     };
     if !MCP_UNPROMPTED.load(std::sync::atomic::Ordering::Relaxed) {
         // Default closed: a hook has no per-call prompt, so it may only reach
@@ -291,7 +314,7 @@ fn tool_is_read_only(tool: &rmcp::model::Tool) -> bool {
 }
 
 #[cfg(not(feature = "mcp"))]
-async fn call_mcp(
+pub(crate) async fn call_mcp(
     _server: &str,
     _tool: &str,
     _arguments: serde_json::Map<String, serde_json::Value>,

@@ -292,7 +292,7 @@ impl McpClientManager {
     pub(crate) fn all_connections_open(&self) -> bool {
         self.handles
             .iter()
-            .all(|handle| !handle.running_service.peer().is_transport_closed())
+            .all(|handle| !handle.live_peer().is_transport_closed())
     }
     pub(crate) fn configured_count(&self) -> Option<usize> {
         self.configured_count
@@ -577,7 +577,7 @@ impl McpClientManager {
             .iter()
             .filter(|handle| {
                 handle
-                    .peer()
+                    .live_peer()
                     .peer_info()
                     .is_some_and(|info| info.capabilities.resources.is_some())
             })
@@ -661,7 +661,9 @@ impl McpClientManager {
             .iter()
             .map(|handle| {
                 let sem = sem.clone();
-                let peer = handle.peer();
+                // The live generation's peer: after a reconnect, tools are
+                // relisted from the replacement connection.
+                let peer = handle.live_peer();
                 let listed = handle.tools.clone();
                 let server_name = handle.server_name.clone();
                 let trusted_identity = handle.trusted_identity;

@@ -241,6 +241,13 @@ reconnected automatically (use the `/mcp` reconnect action).
   hand. A call that was already in flight when the connection dropped is never replayed (it
   reports the drop; the following call reconnects), so a non-idempotent tool does not run twice.
   A changed or revoked source, or a retired connection, never reconnects.
+- **What reconnects.** The first of any of these after a drop reconnects: a tool call, a
+  `list_mcp_resources` / `read_mcp_resource` call or prompt use, and an `mcp_tool` hook. The tool
+  list, the prompt/resource catalogue and `list_changed` tracking follow the replacement
+  connection: a reconnect marks them stale, so the next agent build relists the server's tools
+  (keeping the previous set, with a notice, if relisting fails) and the catalogue is rediscovered
+  at its next use; later `tools/list_changed`, `prompts/list_changed` and `resources/list_changed`
+  notifications from the new session are observed.
 
 ## Per-server tool selection and enable toggle
 
