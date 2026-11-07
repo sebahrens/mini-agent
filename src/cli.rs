@@ -1429,6 +1429,30 @@ impl Cli {
         cfg.quick_models.as_ref().and_then(|m| m.get(name))
     }
 
+    /// Reject a `--quick-model` name that is not in `[quick_models]` instead of
+    /// silently falling through to the default provider/model.
+    pub fn validate_quick_model(&self, cfg: &config::Config) -> anyhow::Result<()> {
+        let Some(name) = self.quick_model.as_deref() else {
+            return Ok(());
+        };
+        if self.resolve_quick_model(cfg).is_some() {
+            return Ok(());
+        }
+        let mut known: Vec<&str> = cfg
+            .quick_models
+            .as_ref()
+            .map(|m| m.keys().map(|k| k.as_ref()).collect())
+            .unwrap_or_default();
+        known.sort_unstable();
+        if known.is_empty() {
+            anyhow::bail!("unknown quick model: '{name}' (no [quick_models] are configured)");
+        }
+        anyhow::bail!(
+            "unknown quick model: '{name}' (available: {})",
+            known.join(", ")
+        );
+    }
+
     pub fn resolve_model(&self, cfg: &config::Config) -> CompactString {
         self.resolve_model_with_env(cfg, std::env::var("OPENROUTER_MODEL").ok().as_deref())
     }
@@ -2223,6 +2247,20 @@ model = "claude-sonnet-test"
 input_token_cost = 0.0
 output_token_cost = 0.0
 "#;
+
+    // mini-agent-rgdf5: an unknown --quick-model is a usage error, never a
+    // silent fall-through to the default provider/model.
+    #[test]
+    fn unknown_quick_model_is_rejected_with_available_names() {
+        let cfg: config::Config = toml::from_str(DEFAULT_LIKE_CONFIG).unwrap();
+        let typo = Cli::try_parse_from(["mini-agent", "--quick-model", "sonet"]).unwrap();
+        let error = typo.validate_quick_model(&cfg).unwrap_err().to_string();
+        assert!(error.contains("unknown quick model: 'sonet'"), "{error}");
+        assert!(error.contains("sonnet"), "{error}");
+        let ok = Cli::try_parse_from(["mini-agent", "--quick-model", "sonnet"]).unwrap();
+        ok.validate_quick_model(&cfg).unwrap();
+        Cli::default().validate_quick_model(&cfg).unwrap();
+    }
 
     fn resolved(config: &str, args: &[&str], env: Option<&str>) -> (String, String) {
         let cfg: config::Config = toml::from_str(config).unwrap();

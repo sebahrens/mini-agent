@@ -1417,6 +1417,7 @@ impl Startup {
             )];
         }
 
+        cli.validate_quick_model(&cfg)?;
         let max_budget_usd = cli.resolve_max_budget_usd(&cfg)?;
         cfg.max_budget_usd = max_budget_usd;
         if let Some(warning) =
