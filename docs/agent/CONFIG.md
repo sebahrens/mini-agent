@@ -3344,9 +3344,17 @@ comes from and goes to. Every workspace, symlink and permission check still
 runs first on the on-disk path, and only workspace-relative targets are routed:
 absolute paths, paths outside the workspace, notebooks, images, PDFs, UTF-16
 and non-UTF-8 files stay on disk. `read` serves the editor text; `edit` and
-`write` (overwrite) compute against that text, re-read it immediately before
-publishing, and refuse with no change if the editor text moved in the meantime
-(there is no silent clobber of a buffer edited after the read). Creating a new
+`write` (overwrite) compute against that text and publish it as a *conditional*
+write: the `fs/write_text_file` request carries `_meta.miniAgent.expectedSha256`
+(SHA-256 of the text the change was computed from) and the editor compares it
+with the live buffer in the same step that applies the replacement, refusing
+with no change on a mismatch. The write side is therefore open only for clients
+that advertise `_meta.miniAgent.conditionalWriteTextFile` next to
+`fs.writeTextFile` (the VS Code extension does); for any other client the tools
+use the on-disk path and an unconditional editor write is never sent. Residual
+gap: the VS Code binding checks the buffer immediately before handing the edit
+to the editor and does not save if the document advanced by more than the edit,
+but the replacement itself is applied by the editor afterwards. Creating a new
 file still goes through the normal on-disk path. Each transfer is capped at
 2 MiB. A read the client refuses, fails or answers late (30 s) falls back to the
 disk file; a refused or unconfirmed write is reported as not applied. Shell

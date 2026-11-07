@@ -25,12 +25,24 @@ pub(crate) type ClientFsFuture<'a, T> =
 pub(crate) trait ClientFileAccess: Send + Sync + std::fmt::Debug {
     /// Whether the client advertised `fs.readTextFile`.
     fn can_read(&self) -> bool;
-    /// Whether the client advertised `fs.writeTextFile`.
+    /// Whether the client can replace a file's text *conditionally*: it
+    /// advertised `fs.writeTextFile` and the `miniAgent.conditionalWriteTextFile`
+    /// extension, so it applies a write only when the buffer still holds the
+    /// preimage the change was computed from. An unconditional write is never
+    /// sent, so a client without the extension is treated as read-only.
     fn can_write(&self) -> bool;
     /// The whole current text of `path`, unsaved editor changes included.
     fn read_text<'a>(&'a self, path: &'a Path) -> ClientFsFuture<'a, String>;
-    /// Replace the whole text of `path` through the editor.
-    fn write_text<'a>(&'a self, path: &'a Path, content: &'a str) -> ClientFsFuture<'a, ()>;
+    /// Replace the whole text of `path` through the editor, but only if its
+    /// current text is exactly `expected`. The comparison must happen in the
+    /// same operation that applies the edit (not in a separate earlier read),
+    /// otherwise text typed in between would be silently deleted.
+    fn write_text<'a>(
+        &'a self,
+        path: &'a Path,
+        content: &'a str,
+        expected: &'a str,
+    ) -> ClientFsFuture<'a, ()>;
 }
 
 pub(crate) type ClientFs = Arc<dyn ClientFileAccess>;
@@ -63,9 +75,11 @@ pub(crate) async fn read_client_text(client: &ClientFs, path: &Path) -> Option<S
     }
 }
 
-/// Publish `content` through the client after confirming the client still
-/// holds exactly `expected` (the text the change was computed from). A buffer
-/// edited in the meantime is never overwritten with a stale computation.
+/// Publish `content` through the client as a conditional write against
+/// `expected` (the text the change was computed from). The editor compares the
+/// preimage in the same operation that applies the edit, so a buffer edited at
+/// any point before the replacement lands is never overwritten with a stale
+/// computation; the editor answers with a conflict instead.
 pub(crate) async fn write_client_text(
     client: &ClientFs,
     path: &Path,
@@ -73,7 +87,12 @@ pub(crate) async fn write_client_text(
     content: &str,
 ) -> Result<(), String> {
     if !client.can_write() {
-        return Err("the client does not support fs/write_text_file".to_string());
+        return Err(
+            "the client cannot apply a conditional fs/write_text_file (it does not advertise \
+             the miniAgent conditionalWriteTextFile extension), so the buffer cannot be \
+             protected from edits made after the read"
+                .to_string(),
+        );
     }
     if content.len() > MAX_CLIENT_TRANSFER_BYTES {
         return Err(format!(
@@ -81,18 +100,8 @@ pub(crate) async fn write_client_text(
             content.len()
         ));
     }
-    let current = client
-        .read_text(path)
-        .await
-        .map_err(|error| format!("could not re-read the editor text before writing: {error}"))?;
-    if current != expected {
-        return Err(
-            "the file changed in the editor after it was read; no changes were applied. Re-read it and retry"
-                .to_string(),
-        );
-    }
     client
-        .write_text(path, content)
+        .write_text(path, content, expected)
         .await
         .map_err(|error| format!("the editor refused the write: {error}"))
 }
@@ -117,9 +126,12 @@ pub(crate) mod fake {
         pub(crate) fail_writes: std::sync::atomic::AtomicBool,
         pub(crate) fail_reads: std::sync::atomic::AtomicBool,
         pub(crate) read_only: bool,
-        /// When set, every read after the first returns this text, as if the
-        /// user kept typing between the agent's read and its write.
+        /// When set, the buffer becomes this text right after the first read
+        /// returns, as if the user kept typing between the agent's read and
+        /// the write request being applied.
         pub(crate) typed_meanwhile: Mutex<Option<String>>,
+        /// Whether the client advertises the conditional-write extension.
+        pub(crate) unconditional_only: bool,
     }
 
     impl FakeClient {
@@ -138,41 +150,44 @@ pub(crate) mod fake {
             true
         }
         fn can_write(&self) -> bool {
-            !self.read_only
+            !self.read_only && !self.unconditional_only
         }
         fn read_text<'a>(&'a self, path: &'a Path) -> ClientFsFuture<'a, String> {
             Box::pin(async move {
-                let seen = {
-                    let mut reads = self.reads.lock().unwrap();
-                    reads.push(path.to_path_buf());
-                    reads.len()
-                };
-                if seen > 1
-                    && let Some(text) = self.typed_meanwhile.lock().unwrap().clone()
-                {
-                    return Ok(text);
-                }
+                self.reads.lock().unwrap().push(path.to_path_buf());
                 if self.fail_reads.load(std::sync::atomic::Ordering::SeqCst) {
                     return Err("read refused".to_string());
                 }
-                self.files
+                let text = self
+                    .files
                     .lock()
                     .unwrap()
                     .get(path)
                     .cloned()
-                    .ok_or_else(|| "not open".to_string())
+                    .ok_or_else(|| "not open".to_string())?;
+                if let Some(typed) = self.typed_meanwhile.lock().unwrap().take() {
+                    self.files.lock().unwrap().insert(path.to_path_buf(), typed);
+                }
+                Ok(text)
             })
         }
-        fn write_text<'a>(&'a self, path: &'a Path, content: &'a str) -> ClientFsFuture<'a, ()> {
+        fn write_text<'a>(
+            &'a self,
+            path: &'a Path,
+            content: &'a str,
+            expected: &'a str,
+        ) -> ClientFsFuture<'a, ()> {
             Box::pin(async move {
-                self.writes.lock().unwrap().push(path.to_path_buf());
                 if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+                    self.writes.lock().unwrap().push(path.to_path_buf());
                     return Err("write refused".to_string());
                 }
-                self.files
-                    .lock()
-                    .unwrap()
-                    .insert(path.to_path_buf(), content.to_string());
+                let mut files = self.files.lock().unwrap();
+                if files.get(path).map(String::as_str) != Some(expected) {
+                    return Err("the file changed in the editor after it was read; no changes were applied. Re-read it and retry".to_string());
+                }
+                self.writes.lock().unwrap().push(path.to_path_buf());
+                files.insert(path.to_path_buf(), content.to_string());
                 Ok(())
             })
         }

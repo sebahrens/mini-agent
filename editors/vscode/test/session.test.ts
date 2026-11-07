@@ -594,7 +594,10 @@ describe('editor-backed client file access', () => {
     clientFiles.enabled = false;
     expect(await initializeCapabilities()).toEqual({});
     clientFiles.enabled = true;
-    expect(await initializeCapabilities()).toEqual({ fs: { readTextFile: true, writeTextFile: true } });
+    expect(await initializeCapabilities()).toEqual({
+      fs: { readTextFile: true, writeTextFile: true },
+      _meta: { miniAgent: { conditionalWriteTextFile: true } },
+    });
     expect(clientFiles.registered).toEqual(expect.arrayContaining(['fs/read_text_file', 'fs/write_text_file']));
   });
 });

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import * as path from 'node:path';
 import type * as acp from '@agentclientprotocol/sdk';
 
@@ -7,8 +8,15 @@ export const MAX_CLIENT_FILE_BYTES = 2 * 1024 * 1024;
 export interface ClientFsHost {
   /** Current text of the file, including unsaved editor changes. */
   readText(fsPath: string): Promise<string>;
-  /** Replace the file's text through the editor (undo stack, dirty state) and save it. */
-  writeText(fsPath: string, text: string): Promise<void>;
+  /**
+   * Replace the file's text through the editor (undo stack, dirty state) and
+   * save it, but only if the live buffer's SHA-256 still equals
+   * `expectedSha256`. The comparison must be made after the document is opened
+   * and in the same step that applies the edit (no await in between), and must
+   * throw {@link ClientFsConflict} on a mismatch without changing or saving
+   * anything. A file that no longer exists is also a conflict.
+   */
+  writeText(fsPath: string, text: string, expectedSha256: string): Promise<void>;
   realpath(fsPath: string): Promise<string>;
   /** True when the final path component is itself a symlink (dangling ones included); false when absent. */
   isSymlink(fsPath: string): Promise<boolean>;
@@ -22,9 +30,30 @@ export interface ClientFsContext {
 
 export class ClientFsError extends Error {}
 
+/** The buffer no longer holds the text the agent computed its change from. */
+export class ClientFsConflict extends ClientFsError {
+  constructor() {
+    super('the file changed in the editor after it was read; no changes were applied. Re-read it and retry');
+  }
+}
+
+/** `_meta` namespace of the conditional-write extension (see the agent's acp/client_fs.rs). */
+export const META_NAMESPACE = 'miniAgent';
+
+export function sha256Hex(text: string): string {
+  return createHash('sha256').update(text, 'utf8').digest('hex');
+}
+
 /** Capabilities to advertise: closed unless the user turned `mini-agent.clientFileAccess` on. */
 export function clientCapabilities(enabled: boolean): acp.ClientCapabilities {
-  return enabled ? { fs: { readTextFile: true, writeTextFile: true } } : {};
+  return enabled
+    ? {
+      fs: { readTextFile: true, writeTextFile: true },
+      // Without this the agent never sends a write: a plain writeTextFile
+      // replaces the whole buffer and cannot protect text typed after the read.
+      _meta: { [META_NAMESPACE]: { conditionalWriteTextFile: true } },
+    }
+    : {};
 }
 
 function inside(root: string, target: string): boolean {
@@ -85,14 +114,23 @@ export async function readTextFile(
   return { content: lines.slice(start, end).join('\n') };
 }
 
-/** `fs/write_text_file`: replaces the whole file through the editor. */
+/**
+ * `fs/write_text_file`: replaces the whole file through the editor, only when
+ * the request carries the SHA-256 of the text it was computed from
+ * (`_meta.miniAgent.expectedSha256`) and the live buffer still matches it.
+ */
 export async function writeTextFile(
   context: ClientFsContext, params: acp.WriteTextFileRequest,
 ): Promise<acp.WriteTextFileResponse> {
   if (Buffer.byteLength(params.content, 'utf8') > MAX_CLIENT_FILE_BYTES) {
     throw new ClientFsError(`content is larger than ${MAX_CLIENT_FILE_BYTES} bytes`);
   }
+  const meta = params._meta as Record<string, Record<string, unknown> | undefined> | null | undefined;
+  const expectedSha256 = meta?.[META_NAMESPACE]?.expectedSha256;
+  if (typeof expectedSha256 !== 'string' || !/^[0-9a-f]{64}$/.test(expectedSha256)) {
+    throw new ClientFsError('unconditional writes are refused: the request must carry _meta.miniAgent.expectedSha256');
+  }
   const target = await containedPath(context, params.path, true);
-  await context.host.writeText(target, params.content);
+  await context.host.writeText(target, params.content, expectedSha256);
   return {};
 }
