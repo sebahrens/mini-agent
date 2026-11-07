@@ -42,7 +42,11 @@ const MAX_TIMEOUT_SECS: u64 = 120;
 const MAX_OUTPUT_BYTES: usize = 16 * 1024;
 const MAX_ARGS: usize = 32;
 const MAX_ARG_BYTES: usize = 4096;
-/// Earlier secrets kept so clients built with an older token still match.
+/// Recently rotated secrets kept as a convenience for in-flight requests. This
+/// is not the ownership boundary: secrets baked into a provider client are
+/// tracked in `State::issued` for the life of the process, because a
+/// long-lived client keeps sending its construction-time token no matter how
+/// many times the helper has rotated since.
 const MAX_KNOWN_SECRETS: usize = 8;
 
 /// One provider's credential command, from the `api_key_commands` table.
@@ -99,8 +103,29 @@ struct State {
     /// Every secret issued recently, current included; a request carrying any
     /// of them is ours.
     known: Vec<String>,
+    /// Every secret handed to a provider client at construction, kept until
+    /// exit (one entry per distinct client-construction token, so growth is
+    /// bounded by client constructions, not by TTL refreshes). A client built
+    /// with one keeps sending it, so a request carrying it is ours however
+    /// many rotations have happened since.
+    issued: Vec<String>,
     generation: u64,
     fetched_at: Option<Instant>,
+}
+
+impl State {
+    fn remember_issued(&mut self, secret: &str) {
+        if !self.issued.iter().any(|issued| issued == secret) {
+            self.issued.push(secret.to_owned());
+        }
+    }
+    /// Whether `secret` was issued by this credential's command.
+    fn owns(&self, secret: &str) -> bool {
+        self.known
+            .iter()
+            .chain(&self.issued)
+            .any(|known| known == secret)
+    }
 }
 
 /// One provider's cached, refreshable credential.
@@ -189,10 +214,12 @@ impl CommandCredential {
                 .then(|| state.current.clone())
                 .flatten()
         } {
+            self.lock().remember_issued(&secret);
             return Ok(secret);
         }
         let secret = run_blocking(self)?;
         self.store(secret.clone());
+        self.lock().remember_issued(&secret);
         Ok(secret)
     }
 
@@ -224,14 +251,14 @@ impl CommandCredential {
                 headers.values().any(|value| {
                     value.to_str().is_ok_and(|text| {
                         let secret = text.strip_prefix("Bearer ").unwrap_or(text);
-                        state.known.iter().any(|known| known == secret)
+                        state.owns(secret)
                     })
                 })
             };
             let owns_query = |uri: &http::Uri, state: &State| {
                 query_key_candidates(uri)
                     .iter()
-                    .any(|value| state.known.iter().any(|known| known == value))
+                    .any(|value| state.owns(value))
             };
             if !owns(headers, &self.lock()) && !owns_query(uri, &self.lock()) {
                 return None;
@@ -249,9 +276,7 @@ impl CommandCredential {
                 let candidates = query_key_candidates(uri);
                 !candidates.is_empty()
                     && !candidates.contains(&current)
-                    && candidates
-                        .iter()
-                        .any(|value| state.known.iter().any(|known| known == value))
+                    && candidates.iter().any(|value| state.owns(value))
             };
             if stale_query && let Some(rewritten) = with_query_key(uri, &current) {
                 *uri = rewritten;
@@ -262,7 +287,7 @@ impl CommandCredential {
                     Some(secret) => ("Bearer ", secret),
                     None => ("", text),
                 };
-                if secret == current || !self.lock().known.iter().any(|known| known == secret) {
+                if secret == current || !self.lock().owns(secret) {
                     continue;
                 }
                 if let Ok(mut replacement) = HeaderValue::from_str(&format!("{prefix}{current}")) {
@@ -936,6 +961,68 @@ mod tests {
             ],
             ttl_secs: Some(0),
             timeout_secs: Some(5),
+        }
+    }
+
+    // mini-agent-xorxl.9: a client keeps sending the token it was built with.
+    // Past MAX_KNOWN_SECRETS helper-issued rotations the original token used to
+    // fall out of the rolling window, so the request lost its credential
+    // binding and a 401 could no longer renew or resend.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn long_lived_client_token_survives_more_rotations_than_the_rolling_window() {
+        let dir = crate::tests::OwnedTestDirectory::new("key-command-long-lived");
+        let credential = CommandCredential::new("gw", counting_command(dir.path(), "rot", true));
+        // The provider client is built once and bakes in the first token.
+        let seed = credential.resolve_blocking().unwrap();
+        assert_eq!(seed, "rot-1");
+        for rotation in 1..=(MAX_KNOWN_SECRETS * 2) {
+            let newest = format!("rot-{}", rotation + 1);
+            for shape in ["bearer", "x-api-key", "gemini-query"] {
+                let mut headers = HeaderMap::new();
+                let mut uri: http::Uri = "https://gw.invalid/v1/messages".parse().unwrap();
+                match shape {
+                    "bearer" => {
+                        headers.insert(
+                            "authorization",
+                            HeaderValue::from_str(&format!("Bearer {seed}")).unwrap(),
+                        );
+                    }
+                    "x-api-key" => {
+                        headers.insert("x-api-key", HeaderValue::from_str(&seed).unwrap());
+                    }
+                    _ => {
+                        uri = format!("https://gw.invalid/v1/m?key={seed}")
+                            .parse()
+                            .unwrap()
+                    }
+                }
+                let generation = credential
+                    .apply(&mut headers, &mut uri)
+                    .await
+                    .unwrap_or_else(|| {
+                        panic!("{shape}: client token lost its binding at rotation {rotation}")
+                    });
+                match shape {
+                    "bearer" => assert_eq!(
+                        headers["authorization"],
+                        format!("Bearer {}", credential.lock().current.clone().unwrap()).as_str()
+                    ),
+                    "x-api-key" => assert_eq!(
+                        headers["x-api-key"],
+                        credential.lock().current.clone().unwrap().as_str()
+                    ),
+                    _ => assert_eq!(query_key(&uri), credential.lock().current.as_deref()),
+                }
+                if shape == "gemini-query" {
+                    // The 401 for the oldest-client request renews and resends.
+                    assert!(
+                        credential.unauthorized(generation).await,
+                        "{shape}: no renewal at rotation {rotation}"
+                    );
+                    assert_eq!(credential.lock().current.as_deref(), Some(newest.as_str()));
+                }
+            }
         }
     }
 
