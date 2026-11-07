@@ -1488,7 +1488,8 @@ mod tests {
             .unwrap();
         drop(client_in);
         let served = tokio::time::timeout(Duration::from_secs(10), server).await;
-        let alive = |pid: i32| nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok();
+        let alive =
+            |pid: i32| nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok();
         for _ in 0..200 {
             if !alive(grandchild) {
                 break;

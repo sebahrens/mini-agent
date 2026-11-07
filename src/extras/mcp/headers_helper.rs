@@ -339,7 +339,10 @@ mod tests {
     async fn read_pids(marker: &Path) -> (i32, i32) {
         for _ in 0..200 {
             if let Ok(text) = std::fs::read_to_string(marker) {
-                let pids: Vec<i32> = text.split_whitespace().filter_map(|p| p.parse().ok()).collect();
+                let pids: Vec<i32> = text
+                    .split_whitespace()
+                    .filter_map(|p| p.parse().ok())
+                    .collect();
                 if let [a, b] = pids[..] {
                     return (a, b);
                 }
@@ -371,10 +374,7 @@ mod tests {
     async fn dropping_the_helper_future_kills_its_descendants() {
         let work = dir();
         let marker = work.join("pids");
-        let script = format!(
-            "sleep 300 & echo \"$$ $!\" > '{}'; wait",
-            marker.display()
-        );
+        let script = format!("sleep 300 & echo \"$$ $!\" > '{}'; wait", marker.display());
         let probe = helper(&script);
         let statics = HashMap::new();
         let cancelled = tokio::select! {
@@ -394,10 +394,7 @@ mod tests {
     async fn work_scope_cancellation_kills_the_helper_descendants() {
         let work = dir();
         let marker = work.join("pids");
-        let script = format!(
-            "sleep 300 & echo \"$$ $!\" > '{}'; wait",
-            marker.display()
-        );
+        let script = format!("sleep 300 & echo \"$$ $!\" > '{}'; wait", marker.display());
         let probe = helper(&script);
         let scope = crate::agent::runner::AgentWorkScope::new();
         let handle = scope.cancellation_handle();
