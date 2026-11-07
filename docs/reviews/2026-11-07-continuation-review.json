@@ -826,6 +826,14 @@
         "connectivity": "Installed binary exited0 with final hello from the live provider; no session/tools/context-file mode."
       },
       "final_git_fixture": "11 linked-worktree/discovery/hook/containment-profile regressions passed after normalizing Windows Git child path spellings."
+    },
+    "ci_native_followup": {
+      "run": "https://github.com/sebahrens/mini-agent/actions/runs/42399538709",
+      "commit": "86aa9b3fb55e7104fb62bf65b8797956b45c443d",
+      "status": "Windows helper normal-success timeout remains; other matrix jobs still progressing",
+      "windows_mcp": "Native server success/inherited-pipe/timeout/cancel/drop descendant cases and Job lifecycle-dispatch regression passed. Helper normal-success case timed out15s;42passed1failed in owning job.",
+      "investigation": "Root and reviewer traced direct-leader wait through spawn_guarded and both Job wrappers; no further production wait defect established. Test-only follow-up delegates established PowerShell runtime prerequisites SystemRoot/PATH/TEMP/TMP and records parent stages/capture completion. Production environment clearing and15s/20s/5s bounds unchanged.",
+      "local_acceptance": "78 affected helper/stdio/subprocess-inventory Rust tests and117 package-metadata policy tests passed. cargo fmt and diff check passed. Production debug-install/smoke reused because follow-up is cfg(test) only."
     }
   },
   "status": "local_ci_corrections_validated_native_ci_pending",

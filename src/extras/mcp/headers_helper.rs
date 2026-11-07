@@ -41,6 +41,13 @@ const FORBIDDEN: &[&str] = &[
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
+// Fixture-only observation: distinguish a still-open output pipe from waiting
+// for leader exit after EOF, without changing production lifecycle behavior.
+#[cfg(all(test, windows))]
+tokio::task_local! {
+    static HELPER_READ_FINISHED: std::sync::Arc<AtomicBool>;
+}
+
 /// Record the `mcp_headers_helper` opt-in of the configuration that is about
 /// to connect servers. Defaults to closed.
 pub(crate) fn set_enabled(enabled: bool) {
@@ -139,6 +146,9 @@ async fn run(
                 .take(MAX_OUTPUT_BYTES as u64 + 1)
                 .read_to_end(&mut output)
                 .await;
+            #[cfg(all(test, windows))]
+            let _ =
+                HELPER_READ_FINISHED.try_with(|finished| finished.store(true, Ordering::SeqCst));
             (read, output)
         };
         tokio::pin!(read);
@@ -516,12 +526,25 @@ mod windows_tree_tests {
             };
             let helper = McpHeadersHelper {
                 command: fixture.argv(),
-                inherit_env: vec!["SystemRoot".into()],
+                // Match the explicitly delegated prerequisites of the existing
+                // native PowerShell process fixtures; the helper still clears
+                // all environment entries not named here.
+                inherit_env: ["SystemRoot", "PATH", "TEMP", "TMP"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
                 sandbox: None,
             };
             let root = fixture.root().to_path_buf();
+            let read_finished = std::sync::Arc::new(AtomicBool::new(false));
+            let observed = read_finished.clone();
             let task = tokio::spawn(async move {
-                run("tree-test", &helper, &root, Duration::from_secs(15)).await
+                HELPER_READ_FINISHED
+                    .scope(
+                        observed,
+                        run("tree-test", &helper, &root, Duration::from_secs(15)),
+                    )
+                    .await
             });
             let _task_owner = AbortOnDrop(task.abort_handle());
             let descendant = fixture.ready(action).await;
@@ -532,12 +555,22 @@ mod windows_tree_tests {
             }
             let result = tokio::time::timeout(Duration::from_secs(20), task)
                 .await
-                .unwrap_or_else(|error| panic!("MCP helper failed to retire in {action}: {error}"));
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "MCP helper failed to retire in {action}: {error}; {}; read_finished={}",
+                        fixture.diagnostics(),
+                        read_finished.load(Ordering::SeqCst)
+                    )
+                });
             match action {
                 "success" | "success-inherited" => {
-                    result
-                        .unwrap()
-                        .unwrap_or_else(|error| panic!("MCP helper {action} failed: {error:#}"));
+                    result.unwrap().unwrap_or_else(|error| {
+                        panic!(
+                            "MCP helper {action} failed: {error:#}; {}; read_finished={}",
+                            fixture.diagnostics(),
+                            read_finished.load(Ordering::SeqCst)
+                        )
+                    });
                 }
                 "timeout" => assert!(
                     result.unwrap().is_err(),

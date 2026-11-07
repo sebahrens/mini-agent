@@ -2353,6 +2353,9 @@ pub(crate) mod windows_tree_tests {
             // broker or shell escaping the Job. Output is separate owned files.
             let script = format!(
                 r#"
+function Set-FixtureStage($stage) {{ [IO.File]::WriteAllText('{}', $stage) }}
+[IO.File]::WriteAllText('{}', $PID.ToString());
+Set-FixtureStage 'started';
 $i=[System.Diagnostics.ProcessStartInfo]::new();
 $i.FileName='{}';
 $i.Arguments='-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{}"';
@@ -2360,12 +2363,19 @@ $i.UseShellExecute=$false;
 $i.RedirectStandardOutput=$true; $i.RedirectStandardError=$true;
 $p=[System.Diagnostics.Process]::new(); $p.StartInfo=$i;
 if(-not $p.Start()) {{ exit 9 }}
+Set-FixtureStage 'child-started';
 while(-not [IO.File]::Exists('{}')) {{ Start-Sleep -Milliseconds 10 }}
+Set-FixtureStage 'child-ready';
 while(-not [IO.File]::Exists('{}')) {{ Start-Sleep -Milliseconds 10 }}
+Set-FixtureStage 'released';
 $bytes=[System.Text.Encoding]::UTF8.GetBytes('{{}}');
 $stdout=[Console]::OpenStandardOutput();
+Set-FixtureStage 'stdout-open';
 $stdout.Write($bytes,0,$bytes.Length); $stdout.Flush();
+Set-FixtureStage 'returning';
 "#,
+                quote(&dir.path().join("parent.stage")),
+                quote(&dir.path().join("parent.pid")),
                 quote(&program),
                 quote(&child),
                 quote(&dir.path().join("child.pid")),
@@ -2401,6 +2411,18 @@ $stdout.Write($bytes,0,$bytes.Length); $stdout.Flush();
         }
         pub(crate) fn root(&self) -> &std::path::Path {
             self.dir.path()
+        }
+        pub(crate) fn diagnostics(&self) -> String {
+            let read = |name| {
+                std::fs::read_to_string(self.dir.path().join(name))
+                    .unwrap_or_else(|_| "unavailable".into())
+            };
+            format!(
+                "parent_stage={}, parent_pid={}, release_present={}",
+                read("parent.stage"),
+                read("parent.pid"),
+                self.dir.path().join("release").exists()
+            )
         }
         pub(crate) fn release(&self) {
             std::fs::write(self.dir.path().join("release"), "go").unwrap();

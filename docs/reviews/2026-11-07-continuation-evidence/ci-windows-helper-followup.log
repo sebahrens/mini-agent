@@ -1,0 +1,4 @@
+2026-11-07T18:14:55.7009407Z test sandbox::workspace_job_drop_tests::mcp_stdio_workspace_job_drop_and_unwrap_keep_job_lifecycle_dispatch ... ok
+2026-11-07T18:15:12.7496582Z test extras::mcp::server::windows_tree_tests::mcp_stdio_server_owns_windows_descendants_on_success_timeout_cancel_and_drop ... ok
+2026-11-07T18:15:17.4629727Z MCP helper success failed: MCP server 'tree-test' headersHelper timed out after 15 s
+2026-11-07T18:15:17.4642656Z test result: FAILED. 42 passed; 1 failed; 0 ignored; 0 measured; 3789 filtered out; finished in 21.76s
