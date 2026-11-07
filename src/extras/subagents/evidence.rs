@@ -255,8 +255,13 @@ impl ChildEvidence {
     /// a second conversation of the same child).
     pub(crate) fn record_history(&mut self, history: &[Message]) {
         let mut calls: Vec<&rig::message::ToolCall> = Vec::new();
-        let mut results: std::collections::HashMap<&str, &rig::message::ToolResult> =
-            std::collections::HashMap::new();
+        // Results per id in history order: providers such as Gemini and Ollama
+        // use the function name as the call id, so an id can repeat and the
+        // k-th call of an id pairs with the k-th result of that id.
+        let mut results: std::collections::HashMap<
+            &str,
+            std::collections::VecDeque<&rig::message::ToolResult>,
+        > = std::collections::HashMap::new();
         for message in history {
             match message {
                 Message::Assistant { content, .. } => {
@@ -269,9 +274,14 @@ impl ChildEvidence {
                 Message::User { content } => {
                     for item in content.iter() {
                         if let UserContent::ToolResult(result) = item {
-                            results.entry(result.id.as_str()).or_insert(result);
-                            if let Some(call_id) = result.call_id.as_deref() {
-                                results.entry(call_id).or_insert(result);
+                            results
+                                .entry(result.id.as_str())
+                                .or_default()
+                                .push_back(result);
+                            if let Some(call_id) = result.call_id.as_deref()
+                                && call_id != result.id
+                            {
+                                results.entry(call_id).or_default().push_back(result);
                             }
                         }
                     }
@@ -281,18 +291,27 @@ impl ChildEvidence {
         }
         let mut used = std::collections::HashSet::new();
         for call in calls {
-            let result = results.get(call.id.as_str()).copied().or_else(|| {
-                call.call_id
-                    .as_deref()
-                    .and_then(|id| results.get(id).copied())
-            });
-            let Some(result) = result else {
+            let keys = [Some(call.id.as_str()), call.call_id.as_deref()];
+            let mut found = None;
+            for key in keys.into_iter().flatten() {
+                let Some(queue) = results.get_mut(key) else {
+                    continue;
+                };
+                // One result answers one call; skip results already paired
+                // through their other id.
+                while let Some(candidate) = queue.pop_front() {
+                    if used.insert(std::ptr::from_ref(candidate)) {
+                        found = Some(candidate);
+                        break;
+                    }
+                }
+                if found.is_some() {
+                    break;
+                }
+            }
+            let Some(result) = found else {
                 continue;
             };
-            // One result answers one call, even if an ID repeats.
-            if !used.insert(std::ptr::from_ref(result)) {
-                continue;
-            }
             self.record(&call.function.name, &call.function.arguments, result);
         }
     }
@@ -785,6 +804,32 @@ mod tests {
             result("d", vec![text("a\nb")]),
         ]);
         assert_eq!(evidence.metas().last().unwrap().id(), "E3");
+    }
+
+    #[test]
+    fn repeated_provider_call_ids_pair_in_order() {
+        // Gemini and Ollama use the function name as the call id.
+        let history = vec![
+            call("read", "read", serde_json::json!({"path": "a.rs"})),
+            result("read", vec![text("first")]),
+            call("read", "read", serde_json::json!({"path": "b.rs"})),
+            result("read", vec![text("second")]),
+        ];
+        let mut evidence = ChildEvidence::default();
+        evidence.record_history(&history);
+        assert_eq!(evidence.unrecorded(), 0);
+        let texts: Vec<_> = evidence
+            .records
+            .iter()
+            .map(|(meta, content)| (meta.id(), content.as_ref().unwrap().text.clone()))
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                ("E1".to_owned(), "first".to_owned()),
+                ("E2".to_owned(), "second".to_owned())
+            ]
+        );
     }
 
     #[test]
