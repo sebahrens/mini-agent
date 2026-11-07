@@ -255,8 +255,13 @@ impl ChildEvidence {
     /// a second conversation of the same child).
     pub(crate) fn record_history(&mut self, history: &[Message]) {
         let mut calls: Vec<&rig::message::ToolCall> = Vec::new();
-        let mut results: std::collections::HashMap<&str, &rig::message::ToolResult> =
-            std::collections::HashMap::new();
+        // Results per id in history order: providers such as Gemini and Ollama
+        // use the function name as the call id, so an id can repeat and the
+        // k-th call of an id pairs with the k-th result of that id.
+        let mut results: std::collections::HashMap<
+            &str,
+            std::collections::VecDeque<&rig::message::ToolResult>,
+        > = std::collections::HashMap::new();
         for message in history {
             match message {
                 Message::Assistant { content, .. } => {
@@ -269,9 +274,14 @@ impl ChildEvidence {
                 Message::User { content } => {
                     for item in content.iter() {
                         if let UserContent::ToolResult(result) = item {
-                            results.entry(result.id.as_str()).or_insert(result);
-                            if let Some(call_id) = result.call_id.as_deref() {
-                                results.entry(call_id).or_insert(result);
+                            results
+                                .entry(result.id.as_str())
+                                .or_default()
+                                .push_back(result);
+                            if let Some(call_id) = result.call_id.as_deref()
+                                && call_id != result.id
+                            {
+                                results.entry(call_id).or_default().push_back(result);
                             }
                         }
                     }
@@ -281,18 +291,27 @@ impl ChildEvidence {
         }
         let mut used = std::collections::HashSet::new();
         for call in calls {
-            let result = results.get(call.id.as_str()).copied().or_else(|| {
-                call.call_id
-                    .as_deref()
-                    .and_then(|id| results.get(id).copied())
-            });
-            let Some(result) = result else {
+            let keys = [Some(call.id.as_str()), call.call_id.as_deref()];
+            let mut found = None;
+            for key in keys.into_iter().flatten() {
+                let Some(queue) = results.get_mut(key) else {
+                    continue;
+                };
+                // One result answers one call; skip results already paired
+                // through their other id.
+                while let Some(candidate) = queue.pop_front() {
+                    if used.insert(std::ptr::from_ref(candidate)) {
+                        found = Some(candidate);
+                        break;
+                    }
+                }
+                if found.is_some() {
+                    break;
+                }
+            }
+            let Some(result) = found else {
                 continue;
             };
-            // One result answers one call, even if an ID repeats.
-            if !used.insert(std::ptr::from_ref(result)) {
-                continue;
-            }
             self.record(&call.function.name, &call.function.arguments, result);
         }
     }
@@ -384,6 +403,40 @@ impl ChildEvidence {
     }
 }
 
+/// Re-judge one recorded call by the parent's current rules, as if the parent
+/// made the call itself: every path-bearing check by its tool rule and a
+/// recorded MCP call by the parent's `mcp_tool` rules. Shared by
+/// `task_evidence` and the inline image lane so neither widens access. With
+/// `ask` unset a rule that would ask is a refusal.
+pub(crate) async fn rejudge(
+    meta: &EvidenceMeta,
+    permission: &Option<crate::permission::checker::PermCheck>,
+    ask: &Option<crate::permission::ask::AskSender>,
+) -> Result<(), crate::agent::tools::ToolError> {
+    for (rule, target) in &meta.path_checks {
+        crate::agent::tools::check_perm_path(permission, ask, rule, target).await?;
+    }
+    #[cfg(feature = "mcp")]
+    if let Some((server, tool)) = &meta.mcp {
+        crate::agent::tools::check_mcp_perm(
+            permission,
+            ask,
+            &format!("mcp_tool:{server}:{tool}"),
+            None,
+            tool,
+        )
+        .await?;
+    }
+    #[cfg(not(feature = "mcp"))]
+    if meta.mcp.is_some() {
+        return Err(crate::agent::tools::ToolError::Msg(
+            "task_evidence: this record came from an MCP tool and MCP support is not built in"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// The permission re-checks one recorded call needs. Search-style tools with
 /// no `path` run at the child's directory, so that directory is the subject.
 /// Paths are stored absolute and canonical (lexically normalized when they do
@@ -398,13 +451,25 @@ fn path_checks(
         "grep" => ("grep", true),
         "find_files" => ("find_files", true),
         "list_dir" => ("list_dir", true),
-        "lsp_diagnostics" | "lsp_navigate" | "notebook_edit" | "notebook_read" => ("read", false),
+        // Without a path, diagnostics are project-wide (optionally restricted
+        // by `directory`), so the root or that directory is the subject.
+        "lsp_diagnostics" => ("read", true),
+        "lsp_navigate" | "notebook_edit" | "notebook_read" => ("read", false),
         _ => return Vec::new(),
     };
-    let raw = arguments
-        .get("path")
-        .and_then(serde_json::Value::as_str)
-        .filter(|path| !path.is_empty());
+    let string_arg = |name: &str| {
+        arguments
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+    };
+    let raw = string_arg("path").or_else(|| {
+        if tool == "lsp_diagnostics" {
+            string_arg("directory")
+        } else {
+            None
+        }
+    });
     let raw = match raw {
         Some(raw) => raw,
         None if default_to_root => ".",
@@ -788,6 +853,57 @@ mod tests {
     }
 
     #[test]
+    fn repeated_provider_call_ids_pair_in_order() {
+        // Gemini and Ollama use the function name as the call id.
+        let history = vec![
+            call("read", "read", serde_json::json!({"path": "a.rs"})),
+            result("read", vec![text("first")]),
+            call("read", "read", serde_json::json!({"path": "b.rs"})),
+            result("read", vec![text("second")]),
+        ];
+        let mut evidence = ChildEvidence::default();
+        evidence.record_history(&history);
+        assert_eq!(evidence.unrecorded(), 0);
+        let texts: Vec<_> = evidence
+            .records
+            .iter()
+            .map(|(meta, content)| (meta.id(), content.as_ref().unwrap().text.clone()))
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                ("E1".to_owned(), "first".to_owned()),
+                ("E2".to_owned(), "second".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn workspace_wide_lsp_diagnostics_are_rejudged_at_the_root() {
+        let root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let mut evidence = ChildEvidence::default().with_child_context(Some(root.clone()), vec![]);
+        evidence.record_history(&[
+            call("a", "lsp_diagnostics", serde_json::json!({})),
+            result("a", vec![text("diag")]),
+            call(
+                "b",
+                "lsp_diagnostics",
+                serde_json::json!({"directory": "src"}),
+            ),
+            result("b", vec![text("diag")]),
+        ]);
+        let metas: Vec<_> = evidence.metas().cloned().collect();
+        assert_eq!(
+            metas[0].path_checks,
+            vec![("read", root.to_str().unwrap().to_owned())]
+        );
+        assert_eq!(
+            metas[1].path_checks,
+            vec![("read", root.join("src").to_str().unwrap().to_owned())]
+        );
+    }
+
+    #[test]
     fn evidence_store_is_bounded_and_rejects_invalid_images() {
         let mut history = Vec::new();
         for index in 0..(MAX_EVIDENCE_RECORDS + 3) {
@@ -890,6 +1006,84 @@ mod tests {
         assert!(!index.was_evicted("task-never"));
         assert!(index.get(&format!("task-{MAX_EVIDENCE_TASKS}")).is_some());
         assert!(!path.exists(), "evicted evidence content is deleted");
+    }
+
+    #[tokio::test]
+    async fn inline_image_lane_rejudges_mcp_and_path_rules_like_task_evidence() {
+        let session = format!("inline-rejudge-{}", uuid::Uuid::new_v4());
+        let root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let mut evidence = ChildEvidence::default().with_child_context(
+            Some(root.clone()),
+            vec![("shots".into(), "screenshot".into())],
+        );
+        evidence.record_history(&[
+            call("m", "screenshot", serde_json::json!({})),
+            result("m", vec![text("shot"), png_part()]),
+            call("r", "read", serde_json::json!({"path": "shot.png"})),
+            result("r", vec![text("Image shot.png"), png_part()]),
+        ]);
+        let stored = EvidenceIndex::default()
+            .store(&session, "task-x".into(), evidence)
+            .await;
+        let checker = |rules: serde_json::Value| {
+            let mut config = crate::config::Config {
+                permission: Some(rules),
+                ..crate::config::Config::default()
+            };
+            config.permission_modes = Some(vec!["standard".to_string()]);
+            let permission_config = config.build_permission_config().unwrap();
+            Some(Arc::new(std::sync::Mutex::new(
+                crate::permission::checker::PermissionChecker::new(
+                    &permission_config,
+                    crate::permission::SecurityMode::Standard,
+                    Some(root.clone()),
+                    config.permission_modes.clone(),
+                )
+                .unwrap(),
+            )))
+        };
+        let run = |rules: serde_json::Value| {
+            let permission = checker(rules);
+            let stored = stored.clone();
+            let session = session.clone();
+            async move {
+                let call = super::super::inline_images::CallBudget::default();
+                let lane = super::super::inline_images::Lane {
+                    cap: 2,
+                    parent: None,
+                    call: &call,
+                    session_id: &session,
+                    permission: &permission,
+                };
+                super::super::inline_images::select(
+                    lane,
+                    &stored,
+                    "## Findings\n- x [evidence: E1] [attach: E1, E2]\n",
+                    |_| true,
+                )
+                .await
+            }
+        };
+        let denied = run(serde_json::json!({"*": "allow", "mcp_tool": "deny"})).await;
+        assert!(denied.images.is_empty());
+        assert!(
+            denied.notes[0].contains("permission rules do not allow"),
+            "{:?}",
+            denied.notes
+        );
+        let read_denied = run(serde_json::json!({"*": "allow", "read": "deny"})).await;
+        assert!(
+            read_denied.notes[1].contains("permission rules do not allow"),
+            "{:?}",
+            read_denied.notes
+        );
+        // Control: with everything allowed the permission gate is not the reason.
+        let allowed = run(serde_json::json!({"*": "allow"})).await;
+        assert!(
+            !allowed.notes[1].contains("permission rules do not allow"),
+            "{:?}",
+            allowed.notes
+        );
     }
 
     #[tokio::test]

@@ -5925,6 +5925,9 @@ pub(crate) struct SubagentRunOutput {
     /// The child's next request would exceed its context window
     /// ([`CHILD_CONTEXT_REFUSAL`]); `history` is the conversation so far.
     pub context_exhausted: bool,
+    /// Conversations replaced by context compaction, oldest first. Their tool
+    /// results are still evidence the child gathered.
+    pub compacted_histories: Vec<Vec<Message>>,
 }
 
 #[cfg(feature = "subagents")]
@@ -5940,6 +5943,7 @@ impl SubagentRunOutput {
             tool_log: Vec::new(),
             turn_budget_exhausted: false,
             context_exhausted: false,
+            compacted_histories: Vec::new(),
         }
     }
 }
@@ -6100,6 +6104,7 @@ where
                 tool_log,
                 turn_budget_exhausted,
                 context_exhausted: false,
+                compacted_histories: Vec::new(),
             }
         };
     }

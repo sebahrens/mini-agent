@@ -235,15 +235,15 @@ pub(crate) async fn select(
                 .push(format!("{id}: not inlined, its content was not retained"));
             continue;
         };
-        // Inherit, never widen: the parent's own read rule must allow the
-        // recorded path without asking, exactly as if it read it itself.
-        if let Some(target) = &meta.path
-            && crate::agent::tools::check_perm_path(lane.permission, &None, "read", target)
-                .await
-                .is_err()
+        // Inherit, never widen: the parent's own rules must allow every
+        // recorded path check and MCP call without asking, exactly as
+        // `task_evidence` re-judges the same record.
+        if super::evidence::rejudge(meta, lane.permission, &None)
+            .await
+            .is_err()
         {
             selection.notes.push(format!(
-                "{id}: not inlined, the parent's read rule does not allow it without asking; {}",
+                "{id}: not inlined, the parent's permission rules do not allow it without asking; {}",
                 fetch(&id)
             ));
             continue;
