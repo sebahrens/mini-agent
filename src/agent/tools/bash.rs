@@ -4262,8 +4262,15 @@ mod tests {
         let shell = test_tool();
         let status = JobStatusTool::new(shell.sandbox.clone(), None);
         let id = start_pty_job(&shell, "python3 -i -q").await;
-        let seen = job_input(&status, &id, "print(6*7)\n").await.unwrap();
-        assert!(seen.contains("42"), "{seen}");
+        let mut seen = job_input(&status, &id, "print(6*7)\n").await.unwrap();
+        // Python's startup can outlast the write: poll for the answer, which
+        // the echo of the typed line does not contain.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !seen.contains("42") {
+            assert!(Instant::now() < deadline, "REPL never answered: {seen}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            seen.push_str(&poll_job(&status, &id, None).await);
+        }
         job_keys(&status, &id, &[JobKey::CtrlD]).await.unwrap();
         let terminal = wait_for_terminal_job(&status, &id).await;
         assert!(terminal.contains("Status: completed"), "{terminal}");
@@ -4273,10 +4280,17 @@ mod tests {
         job_input(&status, &id, "sleep 300\n").await.unwrap();
         let started = Instant::now();
         job_keys(&status, &id, &[JobKey::CtrlC]).await.unwrap();
-        let seen = job_input(&status, &id, "echo after-$((20+1))\n")
+        let mut seen = job_input(&status, &id, "echo after-$((20+1))\n")
             .await
             .unwrap();
-        assert!(seen.contains("after-21"), "{seen}");
+        while !seen.contains("after-21") {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "shell never answered after the interrupt: {seen}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            seen.push_str(&poll_job(&status, &id, None).await);
+        }
         assert!(started.elapsed() < Duration::from_secs(20));
         shell.sandbox.stop_background_job(&id).await.unwrap();
     }

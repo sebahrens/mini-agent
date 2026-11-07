@@ -886,6 +886,7 @@ pub struct LspConfig {
     /// project config. Closed by default; part of the `lsp` table, so a
     /// project config can set it only after the project is trusted. Unknown
     /// names are reported by config validation.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub trust_builtins: Vec<String>,
 }
 

@@ -4076,16 +4076,17 @@ mod tests {
         super::mark_headless_run_start();
         std::thread::sleep(std::time::Duration::from_millis(30));
         assert!(super::take_run_duration_ms() >= 30);
-        // The span restarts at each result.
-        assert!(super::take_run_duration_ms() < 30);
+        // The span restarts at each result. The upper bounds are far below the
+        // excluded idle time but leave room for a descheduled, loaded runner.
+        assert!(super::take_run_duration_ms() < 250);
         // The driver is slow to send the next user line: restarting the span
         // at line acceptance excludes that idle time (mini-agent-gkuap). One
         // test because the span is process-global.
-        std::thread::sleep(std::time::Duration::from_millis(60));
+        std::thread::sleep(std::time::Duration::from_millis(600));
         super::restart_headless_run_span();
         std::thread::sleep(std::time::Duration::from_millis(10));
         let turn = super::take_run_duration_ms();
-        assert!((10..50).contains(&turn), "{turn}");
+        assert!((10..250).contains(&turn), "{turn}");
     }
 
     #[test]

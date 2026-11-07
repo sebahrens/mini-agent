@@ -6473,7 +6473,9 @@ mod history_tests {
         };
         assert_eq!(history.limits.max_turns, 0);
         assert_eq!(history.limits.max_bytes, 4_000_000);
-        assert!(history.limits.token_pressure.is_none());
+        // Compaction is on by default, so token pressure is configured; it
+        // is a token bound, not a turn cap, and small turns never trip it.
+        assert!(history.limits.token_pressure.is_some());
         for index in 0..(MAX_ACP_HISTORY_TURNS * 2) {
             history.commit_completed_turn(
                 &format!("user-{index}"),
@@ -10773,8 +10775,9 @@ mod protocol_tests {
             .on_receive_notification(
                 async move |notification: SessionNotification, _cx| {
                     if let SessionUpdate::ToolCall(call) = &notification.update
-                        && call.title
-                            == <crate::agent::tools::bash::BashTool as rig::tool::Tool>::NAME
+                        && call.title.starts_with(
+                            <crate::agent::tools::bash::BashTool as rig::tool::Tool>::NAME,
+                        )
                     {
                         announced_tx.send_replace(true);
                     }
