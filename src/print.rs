@@ -2125,17 +2125,23 @@ fn normalize_tool_path(root: &Path, raw: &str) -> Option<String> {
     } else {
         path.to_path_buf()
     };
-    let mut normalized = PathBuf::new();
+    // Join with '/' on every platform so these match the Git-derived paths.
+    let mut normalized = String::new();
     for component in relative.components() {
         match component {
-            std::path::Component::Normal(component) => normalized.push(component),
+            std::path::Component::Normal(component) => {
+                if !normalized.is_empty() {
+                    normalized.push('/');
+                }
+                normalized.push_str(&component.to_string_lossy());
+            }
             std::path::Component::CurDir => {}
             std::path::Component::ParentDir
             | std::path::Component::RootDir
             | std::path::Component::Prefix(_) => return None,
         }
     }
-    (!normalized.as_os_str().is_empty()).then(|| normalized.to_string_lossy().into_owned())
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 fn interaction_summary(
@@ -3415,6 +3421,27 @@ fn system_instruction_entries(cli: &cli::Cli) -> Vec<(&'static str, String)> {
 
 #[cfg(test)]
 mod tests {
+    use super::{Path, normalize_tool_path};
+
+    #[test]
+    fn tool_paths_use_forward_slashes() {
+        let root = Path::new(if cfg!(windows) { "C:\\ws" } else { "/ws" });
+        assert_eq!(
+            normalize_tool_path(root, "src/./lib/a.rs").as_deref(),
+            Some("src/lib/a.rs")
+        );
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                normalize_tool_path(root, "src\\lib\\a.rs").as_deref(),
+                Some("src/lib/a.rs")
+            );
+            assert_eq!(
+                normalize_tool_path(root, "C:\\ws\\src\\a.rs").as_deref(),
+                Some("src/a.rs")
+            );
+        }
+    }
 
     use crate::print::{HeadlessOutputPolicy, control_reader_loop};
 
