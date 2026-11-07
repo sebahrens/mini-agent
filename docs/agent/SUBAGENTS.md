@@ -71,6 +71,13 @@ identity again after waiting for that lane. Time a call's children spend
 waiting for a lane is not charged to its deadline (see
 [Configuration](#configuration)).
 
+`task_result {"id":"…","wait_secs":120}` blocks (1-600 seconds) until that task settles, so
+the model does not spend a round trip per poll; expiry leaves the task running and the row says
+so. A headless run (`-p`, stream-json) has no later turn: when the model replies while
+background tasks are still running, the process waits up to
+`[subagents] headless_exit_wait_secs` (default 300, at most 3600, `0` cancels at once) for them,
+says so on stderr, and names any that were cancelled when the wait ran out.
+
 Use `task_list`, `task_result {"id":"…"}`, `task_cancel {"id":"…"}` and `task_send` from an
 agent (and `task_evidence`, see [Evidence handles](#evidence-handles)), or `/tasks`, `/tasks result <id>`, `/tasks cancel <id>` and `/tasks clear` from the TUI.
 `task_send {"id":"…","message":"…","task":2}` sends a follow-up message
@@ -606,9 +613,24 @@ mode: review
   authorized, invalid, or does not fit the budget is skipped with a
   `[skill preload: ...]` notice in the child's prompt (and a log warning); the child can still call
   `skills_search` when granted. Preloaded text never grants permissions.
-  `permissionMode`, `background`, `memory` and `hooks` are recognised but have no effect;
-  each produces a `[specialist metadata: <key> not applied: ...]` notice naming the behaviour that
-  is missing.
+  `background: true` makes every `task` delegation to the persona detach as a background task
+  (as if `run_in_background` were set) whenever the session has a background pool; a resumed child
+  stays foreground. `memory: user|project|local` and `hooks:` widen what a child can do, so they
+  are opt-in (default closed, `[subagents]` needs project trust):
+  - `[subagents] agent_memory = true` gives the persona a private notes directory (`user`:
+    `<data dir>/agent-memory/<agent>/`, `project`: `<workspace>/.mini-agent/agent-memory/<agent>/`,
+    `local`: `<workspace>/.mini-agent/agent-memory-local/<agent>/`; keep the last out of version
+    control). The first 200 lines (16 KiB) of its `MEMORY.md` are injected into the child's system
+    prompt as quoted data, and the child gets one extra tool, `agent_memory` (`read`, `write`,
+    `append`, `list`), limited to `*.md` files in that directory (at most 64 files of 64 KiB, no
+    link followed, owner-only directory, symlinked project notes directories refused). The child's
+    other tools, permissions and sandbox are unchanged.
+  - `[subagents] agent_hooks = true` runs the persona's Claude-format `hooks:` mapping around that
+    child's tool calls (`PreToolUse`, `PostToolUseFailure`), inside the global hooks, and only for
+    that child's lifetime. Hook commands run like user hooks; a mapping that does not validate is
+    reported as `hooks not applied`.
+  `permissionMode` is recognised but has no effect and produces a
+  `[specialist metadata: permissionMode not applied: ...]` notice.
 - `model` is first resolved as a configured quick-model alias, including its
   provider and `extra_body`. Otherwise it is a raw model ID on the current
   subagent provider. A provider switch that cannot authenticate fails the task
@@ -1218,6 +1240,8 @@ normal TOML/YAML/JSON mini-agent configuration described in
 | `task_cost_overrides`       | `object` | `{}`                     | Weighting/weights by exact selected quick-model alias |
 | `task_timeout_secs`         | `u64`    | `300`                    | Whole-call wall-clock deadline of foreground calls; completed sibling results and in-flight narration are retained when it expires |
 | `[subagents] task_background_timeout_secs` | `u64` | `3600` | Whole-call deadline of `run_in_background` calls (at most 86400) |
+| `[subagents] agent_memory` / `agent_hooks` | `bool` | `false` | Opt in to a persona's `memory:` notes directory and `hooks:` frontmatter (project config needs trust) |
+| `[subagents] headless_exit_wait_secs` | `u64` | `300` | Seconds a headless run waits at exit for running background tasks before cancelling them (at most 3600; `0` cancels at once) |
 | `[subagents] task_max_turns_ceiling` | `usize` | `100` | Highest per-call or persona `max_turns`; larger values are rejected |
 | `[subagents] task_unverified_bytes` | `usize` | `6144` | Raw text of a host-replaced report kept for `/tasks result` (at most 16384) |
 | `[subagents] task_timeout_ceiling_secs` | `u64` | `3600` | Highest per-call or persona `timeout_secs` (at most 86400); larger values are rejected |

@@ -6,8 +6,17 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Persona frontmatter `background: true` (delegations detach as background tasks), `memory: user|project|local` (private notes directory injected at start and writable through an `agent_memory` tool) and `hooks:` (scoped to the child's tool calls) are now implemented; memory and hooks are opt-in via `[subagents] agent_memory` / `agent_hooks` (mini-agent-scu2y).
+- Skills run with `/<name> args` now substitute `$ARGUMENTS`, `$ARGUMENTS[N]`, `$N` and `${CLAUDE_SKILL_DIR}`, rewrite ``!`cmd` `` spans into shell-tool instructions (`skills_shell_placeholders`), and honour `context: fork` with `agent:` by delegating the body to one `task` child (mini-agent-h7wxv).
+
 ### Fixed
 
+- Background `task` jobs: `task_result` takes `wait_secs` (1-600) to block until the job settles, and headless runs wait up to `[subagents] headless_exit_wait_secs` (default 300; `0` restores immediate cancel) for running background tasks before exit, reporting any cancelled on stderr (mini-agent-5ezmf).
+- `skills_search` no longer fails when the selected skills' JSON exceeds 8192 bytes: lowest-ranked entries are omitted with an `omitted` count and a note to narrow the query (mini-agent-zwa2o).
+- The `task` tool's `resume` schema text and unknown-id error now say a session's resumable ids are restored on `--continue`/`--resume` within the count/byte limits instead of claiming they do not survive a restart (mini-agent-sw1ug).
+- `.claude/rules`: a rule skipped because the context budget is spent is named in the `Rule discovery notices` block, user rules now load after the workspace `AGENTS.md`/`CLAUDE.md`/`.claude/CLAUDE.md` so they cannot starve them, the 1024-entry cap is applied after sorting so survivors never depend on `read_dir` order, a symlinked `.claude/rules` or `~/.claude/rules` directory is followed or reported, and symlinks whose target is inside the workspace load without `user_instruction_files`. New opt-in `rule_external_symlinks` (default off, trust-gated) follows rule links into the home directory (mini-agent-8g87g, mini-agent-vbb4t, mini-agent-uyghh, mini-agent-fddr2).
 - `--no-session` keeps resumable subagent conversations in memory only: no `subagent-resume-store-*.json` is created under the tool-output directory (mini-agent-6myt0).
 - `.claude/rules` discovery is deterministic (sorted traversal) and reports every skipped or truncated rule, directory, link and glob with the limit hit in a `Rule discovery notices` block and a warning; a rule whose `paths:` scope is oversized or unparseable is skipped instead of becoming an always-on rule (mini-agent-z8719).
 - With `user_instruction_files = true`, `~/.claude/rules/**/*.md` is loaded (path-scoped delivery included) and rule symlinks whose canonical target is inside the workspace or `~/.claude/rules` are followed; other links are skipped with a notice (mini-agent-zyifs).

@@ -674,6 +674,10 @@ struct ResolvedSpecialization {
     /// Frontmatter `max_turns` / `timeout_secs`.
     run: crate::context::agents::AgentRunSettings,
     skills: Vec<String>,
+    /// `background`, `memory` and `hooks` frontmatter.
+    extras: crate::context::agents::AgentExtras,
+    /// The `agent_type` this was resolved from (names the notes directory).
+    agent_name: String,
     #[cfg(feature = "mcp")]
     mcp_servers: Option<std::collections::BTreeMap<String, Vec<String>>>,
 }
@@ -813,6 +817,24 @@ fn resolve_persona_runtime_with(
             provider_extra_body: crate::config::resolve_extra_body(config, &model_name),
             additional_params,
             skills: specialization.skills.clone(),
+            // The widening features run only under their opt-ins.
+            memory: specialization
+                .extras
+                .memory
+                .filter(|_| {
+                    config
+                        .subagents
+                        .as_ref()
+                        .is_some_and(|policy| policy.agent_memory)
+                })
+                .map(|scope| (scope, specialization.agent_name.clone())),
+            hooks: specialization.extras.hooks.clone().filter(|_| {
+                config
+                    .subagents
+                    .as_ref()
+                    .is_some_and(|policy| policy.agent_hooks)
+            }),
+            memory_dir: None,
             #[cfg(feature = "mcp")]
             mcp_servers: specialization.mcp_servers.clone(),
         },
@@ -873,6 +895,8 @@ fn resolve_specialization(
         inline_images: definition.inline_images,
         run: definition.run,
         skills: definition.skills,
+        extras: definition.extras,
+        agent_name: agent_type.to_string(),
         #[cfg(feature = "mcp")]
         mcp_servers: definition.mcp_servers,
     }))
@@ -1282,7 +1306,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                 },
                 "resume": {
                     "type": "string",
-                    "description": "Optional child id printed after an earlier child's report ([child id: …]). Continues that child's conversation, tool results included, with the single prompt as a follow-up; same agent_type, permissions and budgets. Ids are in memory only and expire after the most recent children (default 16, [subagents] task_resume_max_children) or a restart."
+                    "description": "Optional child id printed after an earlier child's report ([child id: …]). Continues that child's conversation, tool results included, with the single prompt as a follow-up; same agent_type, permissions and budgets. Ids expire after the most recent children (default 16, [subagents] task_resume_max_children) or when a conversation exceeds [subagents] task_resume_max_bytes; a session's ids are restored by --continue/--resume subject to those count/byte limits, but not by a fresh session."
                 },
                 "run_in_background": {
                     "type": "boolean",
@@ -1304,7 +1328,7 @@ editing in a known location, grepping for a literal you will act on immediately.
         })
     }
 
-    async fn call(&self, args: TaskArgs) -> Result<String, ToolError> {
+    async fn call(&self, mut args: TaskArgs) -> Result<String, ToolError> {
         if let Some(workspace) = &self.workspace {
             workspace.validate().map_err(ToolError::Msg)?;
         }
@@ -1349,7 +1373,7 @@ editing in a known location, grepping for a literal you will act on immediately.
         if args.run_in_background {
             limits = limits.for_background(&config)?;
         }
-        let prompts = prepare_task_prompts(&args, limits)?;
+        let mut prompts = prepare_task_prompts(&args, limits)?;
 
         // `resume` continues one stored child conversation as the same
         // agent type; the call is otherwise an ordinary, re-authorized task.
@@ -1364,7 +1388,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                 }
                 let stored = resume_store.get(id).ok_or_else(|| {
                     ToolError::Msg(format!(
-                        "task: unknown or expired resume id '{id}'; child conversations are kept in memory for the most recent children of this session ([subagents] task_resume_max_children, default {}), only when under [subagents] task_resume_max_bytes (default 8 MiB), and do not survive a restart; start a new task instead",
+                        "task: unknown or expired resume id '{id}'; child conversations are kept in memory for the most recent children of this session ([subagents] task_resume_max_children, default {}), only when under [subagents] task_resume_max_bytes (default 8 MiB), and a session's ids are restored by --continue/--resume subject to those limits but not by a fresh session; start a new task instead",
                         super::resume::MAX_RESUMABLE_CHILDREN
                     ))
                 })?;
@@ -1402,6 +1426,22 @@ editing in a known location, grepping for a literal you will act on immediately.
         // not read them until the delegation itself has been authorized.
         let specialization =
             resolve_specialization(agent_type.as_deref(), self.workspace.as_deref())?;
+        // Persona `background: true`: detach as a background task whenever the
+        // session can host one (a resumed child keeps its foreground call).
+        if specialization
+            .as_ref()
+            .is_some_and(|persona| persona.extras.background)
+            && !args.run_in_background
+            && resumed.is_none()
+            && crate::spend::run::Run::current()
+                .and_then(|run| run.background_pool())
+                .is_some()
+            && crate::session::file_checkpoints::current().is_some()
+        {
+            args.run_in_background = true;
+            limits = limits.for_background(&config)?;
+            prompts = prepare_task_prompts(&args, limits)?;
+        }
         let write_mode = specialization
             .as_ref()
             .is_some_and(|persona| persona.write_mode);
@@ -5282,6 +5322,8 @@ mod tests {
     fn hook_identity_uses_the_resolved_specialist_and_source() {
         let specialization = ResolvedSpecialization {
             skills: Vec::new(),
+            extras: Default::default(),
+            agent_name: String::new(),
             write_mode: false,
             isolation_worktree: false,
             prompt: "review carefully".into(),
@@ -5321,6 +5363,8 @@ mod tests {
     fn runtime_specialization() -> ResolvedSpecialization {
         ResolvedSpecialization {
             skills: Vec::new(),
+            extras: Default::default(),
+            agent_name: String::new(),
             write_mode: false,
             isolation_worktree: false,
             prompt: "review carefully".into(),
@@ -6228,6 +6272,8 @@ mod tests {
             });
         let persona = |write_mode: bool| ResolvedSpecialization {
             skills: Vec::new(),
+            extras: Default::default(),
+            agent_name: String::new(),
             write_mode,
             isolation_worktree: false,
             prompt: "p".into(),

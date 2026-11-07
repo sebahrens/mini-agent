@@ -3743,6 +3743,34 @@ mod project_config_trust_tests {
     }
 
     #[test]
+    #[cfg(feature = "subagents")]
+    fn project_config_cannot_enable_agent_memory_or_hooks_without_trust() {
+        let (benign, _, sensitive) =
+            split_project_override("[subagents]\nagent_memory = true\nagent_hooks = true\n")
+                .unwrap();
+        assert!(sensitive.contains("subagents"), "{sensitive:?}");
+        assert!(benign.get("subagents").is_none());
+        let policy = crate::config::SubagentPolicy::default();
+        assert!(!policy.agent_memory && !policy.agent_hooks);
+    }
+
+    #[test]
+    fn project_config_cannot_enable_rule_external_symlinks_without_trust() {
+        let (benign, _, sensitive) =
+            split_project_override("rule_external_symlinks = true\nmax_tokens = 1\n").unwrap();
+        assert!(
+            sensitive.contains("rule_external_symlinks"),
+            "{sensitive:?}"
+        );
+        assert!(benign.get("rule_external_symlinks").is_none());
+        // Closed unless configured.
+        assert_eq!(
+            crate::config::Config::default().rule_external_symlinks,
+            None
+        );
+    }
+
+    #[test]
     fn project_config_cannot_enable_user_instruction_files_without_trust() {
         let (benign, _, sensitive) =
             split_project_override("user_instruction_files = true\nmax_tokens = 1\n").unwrap();

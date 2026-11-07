@@ -422,6 +422,11 @@ type AskFactory = dyn Fn(
     + Send
     + Sync;
 
+/// How often a blocking wait re-reads job state.
+const WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+/// Longest single `task_result` wait, in seconds.
+const MAX_WAIT_SECS: u64 = 600;
+
 pub(crate) struct Pool {
     session: String,
     workspace_path: std::path::PathBuf,
@@ -911,6 +916,41 @@ impl Pool {
             .values()
             .filter(|entry| entry.saved.status.is_active())
             .count()
+    }
+
+    /// Waits until job `id` leaves the active states, `timeout` passes or the
+    /// current run is cancelled, then returns its row. Polls, so concurrent
+    /// waiters never steal each other's wake-up.
+    pub(crate) async fn wait_result(
+        &self,
+        id: &str,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<SavedTask> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let cancel = crate::agent::runner::current_work_cancellation();
+        loop {
+            let saved = self.result(id)?;
+            if !saved.status.is_active()
+                || tokio::time::Instant::now() >= deadline
+                || cancel.as_ref().is_some_and(|cancel| cancel.is_cancelled())
+            {
+                return Ok(saved);
+            }
+            tokio::time::sleep(WAIT_POLL.min(deadline - tokio::time::Instant::now())).await;
+        }
+    }
+
+    /// Waits until no job is active or `timeout` passes; returns how many
+    /// jobs are still active.
+    pub(crate) async fn wait_idle(&self, timeout: std::time::Duration) -> usize {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let active = self.counts().0;
+            if active == 0 || tokio::time::Instant::now() >= deadline {
+                return active;
+            }
+            tokio::time::sleep(WAIT_POLL.min(deadline - tokio::time::Instant::now())).await;
+        }
     }
 
     pub(crate) fn counts(&self) -> (usize, usize) {
@@ -1432,6 +1472,81 @@ mod tests {
         // A distinct binding of the same directory still compares identities.
         let other = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
         pool.validate_workspace(&other).unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_result_blocks_until_the_job_settles_or_the_timeout() {
+        let root = crate::tests::OwnedTestDirectory::new("background-wait-result");
+        let (session, pool, workspace, run, recorder) = fixture(&root);
+        let quick = pool
+            .reserve(&workspace, &run, &recorder)
+            .unwrap()
+            .start(
+                async {
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    Ok("quick report".into())
+                },
+                run.clone(),
+            )
+            .unwrap();
+        assert!(pool.result(&quick).unwrap().status.is_active());
+        let waited = pool
+            .wait_result(&quick, std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(!waited.status.is_active(), "{:?}", waited.status);
+        assert_eq!(pool.counts().0, 0);
+
+        let slow = pool
+            .reserve(&workspace, &run, &recorder)
+            .unwrap()
+            .start(
+                async {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    Ok("slow report".into())
+                },
+                run.clone(),
+            )
+            .unwrap();
+        let started = std::time::Instant::now();
+        let waited = pool
+            .wait_result(&slow, std::time::Duration::from_millis(120))
+            .await
+            .unwrap();
+        assert!(waited.status.is_active(), "expiry leaves the job running");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(
+            pool.wait_idle(std::time::Duration::from_millis(60)).await,
+            1
+        );
+        assert!(
+            pool.wait_result("missing", std::time::Duration::ZERO)
+                .await
+                .is_err()
+        );
+        // Exit still cancels what is left.
+        assert!(
+            session
+                .close_background_tasks_within(std::time::Duration::from_secs(5))
+                .await
+        );
+        assert_eq!(pool.wait_idle(std::time::Duration::from_secs(1)).await, 0);
+    }
+
+    #[test]
+    fn only_task_result_advertises_and_accepts_wait_secs() {
+        let root = crate::tests::OwnedTestDirectory::new("background-wait-schema");
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let result = ResultTool::new(None, None, workspace.clone());
+        let schema = rig::tool::Tool::parameters(&result);
+        assert_eq!(schema["properties"]["wait_secs"]["maximum"], MAX_WAIT_SECS);
+        let cancel = CancelTool::new(None, None, workspace);
+        let schema = rig::tool::Tool::parameters(&cancel);
+        assert!(schema["properties"].get("wait_secs").is_none());
+        assert!(
+            rig::tool::Tool::description(&result).contains("wait_secs"),
+            "headless guidance"
+        );
     }
 
     async fn settled(pool: &Pool, id: &str) -> SavedTask {
@@ -2016,6 +2131,10 @@ mod tests {
 pub(crate) struct ControlArgs {
     #[serde(default)]
     id: Option<String>,
+    /// Only `task_result`: block up to this many seconds for the task to
+    /// settle (1..=600). Expiry leaves the task running.
+    #[serde(default)]
+    wait_secs: Option<u64>,
 }
 
 pub(crate) struct ControlTool<const OP: u8> {
@@ -2057,7 +2176,7 @@ impl<const OP: u8> rig::tool::Tool for ControlTool<OP> {
     type Output = String;
     fn description(&self) -> String {
         match OP {
-            0 => "Read the bounded result/status of a background task ID belonging to this session. Running tasks return immediately; use task_list to check completion.".into(),
+            0 => "Read the bounded result/status of a background task ID belonging to this session. A running task returns immediately unless wait_secs (1-600) is given: then the call blocks until the task settles or the time expires (expiry leaves it running; call again to keep waiting). In headless -p runs there is no later turn, so wait with wait_secs for results you need before replying.".into(),
             1 => "List this session's background task IDs and current statuses. This never waits for jobs or creates model work.".into(),
             2 => "Request cancellation of one background task belonging to this session. Cancelling is not terminal until its owned model/effects retire; inspect task_result or task_list.".into(),
             _ => "Invalid internal operation".into(),
@@ -2066,6 +2185,8 @@ impl<const OP: u8> rig::tool::Tool for ControlTool<OP> {
     fn parameters(&self) -> serde_json::Value {
         if OP == 1 {
             serde_json::json!({"type":"object", "properties":{}, "additionalProperties":false})
+        } else if OP == 0 {
+            serde_json::json!({"type":"object", "properties":{"id":{"type":"string", "maxLength":64,"description":"Exact task ID returned by task or task_list"},"wait_secs":{"type":"integer","minimum":1,"maximum":MAX_WAIT_SECS,"description":"Block up to this many seconds until the task finishes. Expiry leaves the task running."}},"required":["id"],"additionalProperties":false})
         } else {
             serde_json::json!({"type":"object", "properties":{"id":{"type":"string", "maxLength":64,"description":"Exact task ID returned by task or task_list"}},"required":["id"],"additionalProperties":false})
         }
@@ -2085,6 +2206,13 @@ impl<const OP: u8> rig::tool::Tool for ControlTool<OP> {
             pool.validate_workspace(&self.workspace)
         };
         validate().map_err(|error| ToolError::Msg(error.to_string()))?;
+        if let Some(secs) = args.wait_secs
+            && (OP != 0 || !(1..=MAX_WAIT_SECS).contains(&secs))
+        {
+            return Err(ToolError::Msg(format!(
+                "wait_secs is only valid for task_result and must be between 1 and {MAX_WAIT_SECS}"
+            )));
+        }
         let id = match OP {
             1 if args.id.is_none() => "",
             0 | 2 => args
@@ -2099,11 +2227,28 @@ impl<const OP: u8> rig::tool::Tool for ControlTool<OP> {
         let value = match OP {
             // Tool logs and unverified raw child text are for the user's
             // `/tasks` view only; the model-facing row never carries them.
-            0 => serde_json::to_value(
-                pool.result(id)
-                    .map(model_visible)
-                    .map_err(|error| ToolError::Msg(error.to_string()))?,
-            ),
+            0 => {
+                let saved = match args.wait_secs {
+                    Some(secs) => {
+                        pool.wait_result(id, std::time::Duration::from_secs(secs))
+                            .await
+                    }
+                    None => pool.result(id),
+                }
+                .map(model_visible)
+                .map_err(|error| ToolError::Msg(error.to_string()))?;
+                let still_running = args.wait_secs.is_some() && saved.status.is_active();
+                serde_json::to_value(saved).map(|mut value| {
+                    if still_running && let Some(object) = value.as_object_mut() {
+                        object.insert(
+                            "wait_note".into(),
+                            "wait expired and the task is still running; call task_result with wait_secs again to keep waiting"
+                                .into(),
+                        );
+                    }
+                    value
+                })
+            }
             1 => Ok(serde_json::Value::Array(
                 pool.list()
                     .into_iter()

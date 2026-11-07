@@ -346,6 +346,8 @@ const CLI_KEY: &str = "sk-ant-cli-key-must-never-reach-glm";
 fn alias_persona(alias: &str) -> ResolvedSpecialization {
     ResolvedSpecialization {
         skills: Vec::new(),
+        extras: Default::default(),
+        agent_name: String::new(),
         write_mode: false,
         isolation_worktree: false,
         prompt: "persona".into(),
@@ -444,4 +446,62 @@ fn cli_key_still_reaches_a_persona_on_the_session_provider() {
         *factory.keys.borrow(),
         vec![("openrouter".to_owned(), Some(CLI_KEY.to_owned()))]
     );
+}
+
+/// Persona `memory:` and `hooks:` widen what a child can do: they reach the
+/// child only under `[subagents] agent_memory` / `agent_hooks`, and are closed
+/// by default.
+#[test]
+fn persona_memory_and_hooks_are_closed_unless_the_subagent_opt_ins_are_set() {
+    let mut persona = alias_persona("glm");
+    persona.agent_name = "reviewer".into();
+    persona.extras = crate::context::agents::AgentExtras {
+        background: true,
+        memory: Some(crate::context::agents::AgentMemoryScope::Project),
+        hooks: Some(r#"{"PreToolUse":[]}"#.into()),
+    };
+    let resolve = |config: &crate::config::Config| {
+        let factory = RecordingFactory::new();
+        super::resolve_persona_runtime_with(
+            cli_key_parent(config),
+            "anthropic",
+            "anthropic",
+            "example-opus-model".into(),
+            20,
+            Some(CLI_KEY),
+            config,
+            Some(&persona),
+            &factory.build(Some(GLM_KEY)),
+        )
+        .unwrap()
+        .execution
+    };
+
+    let closed = resolve(&fixture_config());
+    assert!(
+        closed.memory.is_none() && closed.hooks.is_none(),
+        "{closed:?}"
+    );
+
+    let mut config = fixture_config();
+    config.subagents = Some(crate::config::SubagentPolicy {
+        agent_memory: true,
+        ..Default::default()
+    });
+    let memory_only = resolve(&config);
+    assert_eq!(
+        memory_only.memory,
+        Some((
+            crate::context::agents::AgentMemoryScope::Project,
+            "reviewer".into()
+        ))
+    );
+    assert!(memory_only.hooks.is_none(), "hooks need their own opt-in");
+
+    config.subagents = Some(crate::config::SubagentPolicy {
+        agent_hooks: true,
+        ..Default::default()
+    });
+    let hooks_only = resolve(&config);
+    assert!(hooks_only.memory.is_none() && hooks_only.hooks.is_some());
 }

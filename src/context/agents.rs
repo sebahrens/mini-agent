@@ -218,8 +218,47 @@ const MAX_FRONTMATTER_TURNS: u64 = 10_000;
 /// Largest `timeout_secs` frontmatter value accepted while parsing.
 const MAX_FRONTMATTER_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 
+/// Where a persona's persistent notes live (Claude Code `memory:`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum AgentMemoryScope {
+    /// Shared by every workspace: `<data dir>/agent-memory/<agent>/`.
+    User,
+    /// This workspace, meant to be committed:
+    /// `<workspace>/.mini-agent/agent-memory/<agent>/`.
+    Project,
+    /// This workspace, meant to stay out of version control:
+    /// `<workspace>/.mini-agent/agent-memory-local/<agent>/`.
+    Local,
+}
+
+impl AgentMemoryScope {
+    #[cfg_attr(not(feature = "subagents"), allow(dead_code))]
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Project => "project",
+            Self::Local => "local",
+        }
+    }
+}
+
+/// Claude Code persona frontmatter that changes how a delegation runs:
+/// `background`, `memory` and `hooks`. The last two widen what a child can do
+/// and are applied only under `[subagents] agent_memory` / `agent_hooks`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AgentExtras {
+    /// `background: true`: delegations to this persona detach as background
+    /// tasks (when the session has a background pool).
+    pub(crate) background: bool,
+    /// `memory: user|project|local`.
+    pub(crate) memory: Option<AgentMemoryScope>,
+    /// `hooks:` as validated hook-configuration JSON text.
+    pub(crate) hooks: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct AgentMetadata {
+    extras: AgentExtras,
     mode: Option<String>,
     description: Option<String>,
     tools: Option<Vec<AgentTool>>,
@@ -521,6 +560,7 @@ fn normalize_agent_definition(
                 .into(),
         );
     }
+    let extras = parse_agent_extras(mapping, &mut compat_notices);
     // Claude Code keys with no mini-agent equivalent: say what is not applied
     // rather than only listing them as unknown.
     for (key, behaviour) in UNSUPPORTED_CLAUDE_KEYS {
@@ -596,6 +636,7 @@ fn normalize_agent_definition(
                 name,
                 body.to_string(),
                 AgentMetadata {
+                    extras,
                     mode,
                     description,
                     tools,
@@ -658,21 +699,56 @@ fn parse_agent_skills(value: &serde_yaml_ng::Value, notices: &mut Vec<String>) -
 
 /// Claude Code frontmatter keys that are recognised but have no effect here,
 /// with the behaviour that is not applied.
-const UNSUPPORTED_CLAUDE_KEYS: &[(&str, &str)] = &[
-    (
-        "permissionMode",
-        "the child always uses the parent's permission rules and prompts",
-    ),
-    (
-        "background",
-        "delegations run in the foreground unless the task call sets run_in_background",
-    ),
-    (
-        "memory",
-        "no persistent per-agent memory directory is created",
-    ),
-    ("hooks", "agent-scoped lifecycle hooks are not run"),
-];
+const UNSUPPORTED_CLAUDE_KEYS: &[(&str, &str)] = &[(
+    "permissionMode",
+    "the child always uses the parent's permission rules and prompts",
+)];
+
+/// `background`, `memory` and `hooks`. A malformed value is dropped with a
+/// notice; it never rejects the persona.
+fn parse_agent_extras(mapping: &serde_yaml_ng::Mapping, notices: &mut Vec<String>) -> AgentExtras {
+    let get = |key: &str| mapping.get(serde_yaml_ng::Value::String(key.into()));
+    let mut extras = AgentExtras::default();
+    match get("background") {
+        None => {}
+        Some(serde_yaml_ng::Value::Bool(flag)) => extras.background = *flag,
+        Some(_) => notices
+            .push("[specialist metadata: background not applied: it must be true or false]".into()),
+    }
+    match get("memory").map(|value| value.as_str()) {
+        None => {}
+        Some(Some("user")) => extras.memory = Some(AgentMemoryScope::User),
+        Some(Some("project")) => extras.memory = Some(AgentMemoryScope::Project),
+        Some(Some("local")) => extras.memory = Some(AgentMemoryScope::Local),
+        Some(_) => notices.push(
+            "[specialist metadata: memory not applied: it must be user, project or local]".into(),
+        ),
+    }
+    if let Some(value) = get("hooks") {
+        match serde_yaml_ng::from_value::<serde_json::Value>(value.clone()) {
+            Ok(json) if json.is_object() => {
+                #[cfg(feature = "hooks")]
+                match crate::extras::hooks::settings::parse_hooks_config(&json) {
+                    Ok(_) => extras.hooks = Some(json.to_string()),
+                    Err(error) => notices.push(format!(
+                        "[specialist metadata: hooks not applied: {}]",
+                        error.chars().take(200).collect::<String>()
+                    )),
+                }
+                #[cfg(not(feature = "hooks"))]
+                notices.push(
+                    "[specialist metadata: hooks not applied: hook support is not compiled into this build]"
+                        .into(),
+                );
+            }
+            _ => notices.push(
+                "[specialist metadata: hooks not applied: it must be a mapping of event names]"
+                    .into(),
+            ),
+        }
+    }
+    extras
+}
 
 /// Tools a persona child gets with no `tools` narrowing: the read set (plus
 /// the optional capabilities compiled in) and, for write personas, the
@@ -1079,6 +1155,8 @@ pub struct AgentDefinition {
     /// `skills:` names preloaded into the child's system prompt.
     #[cfg_attr(not(feature = "subagents"), allow(dead_code))]
     pub(crate) skills: Vec<String>,
+    /// `background`, `memory` and `hooks` frontmatter.
+    pub(crate) extras: AgentExtras,
     pub source: AgentDefinitionSource,
     project_notes_path: Option<PathBuf>,
     ignored_definition_notices: Vec<String>,
@@ -1108,6 +1186,7 @@ fn merge_definitions(
                 inline_images: metadata.inline_images,
                 run: metadata.run,
                 skills: metadata.skills,
+                extras: metadata.extras,
                 source: source.clone(),
                 project_notes_path: None,
                 ignored_definition_notices: notices,
@@ -1153,6 +1232,7 @@ impl AgentDefinition {
             inline_images: None,
             run: AgentRunSettings::default(),
             skills: Vec::new(),
+            extras: AgentExtras::default(),
             source: AgentDefinitionSource::Embedded,
             project_notes_path: None,
             ignored_definition_notices: Vec::new(),
@@ -1532,6 +1612,7 @@ fn merge_external_definitions(
                         inline_images: metadata.inline_images,
                         run: metadata.run,
                         skills: metadata.skills,
+                        extras: metadata.extras,
                         source: source.clone(),
                         project_notes_path: None,
                         ignored_definition_notices: notices,
@@ -3080,15 +3161,62 @@ pub(crate) mod tests {
                 .2;
         assert!(parsed.unknown_keys.is_empty());
         assert_eq!(parsed.skills, vec!["a".to_string()]);
-        for key in ["permissionMode", "background", "memory"] {
-            assert!(
-                parsed
-                    .compat_notices
-                    .iter()
-                    .any(|notice| notice.contains(&format!("{key} not applied"))),
-                "{key}: {:?}",
-                parsed.compat_notices
+        // permissionMode is still reported; background and memory are parsed.
+        assert!(
+            parsed
+                .compat_notices
+                .iter()
+                .any(|notice| notice.contains("permissionMode not applied")),
+            "{:?}",
+            parsed.compat_notices
+        );
+        assert!(parsed.extras.background);
+        assert_eq!(parsed.extras.memory, Some(AgentMemoryScope::User));
+        assert!(
+            !parsed
+                .compat_notices
+                .iter()
+                .any(|notice| notice.contains("background") || notice.contains("memory")),
+            "{:?}",
+            parsed.compat_notices
+        );
+    }
+
+    #[test]
+    fn persona_extras_frontmatter_validates_background_memory_and_hooks() {
+        let parse = |frontmatter: &str| {
+            normalize_agent_definition("cc".into(), format!("---\n{frontmatter}\n---\nbody"))
+                .unwrap()
+                .2
+        };
+        let bad = parse("background: sometimes\nmemory: everywhere");
+        assert!(!bad.extras.background && bad.extras.memory.is_none());
+        assert_eq!(bad.compat_notices.len(), 2, "{:?}", bad.compat_notices);
+        for scope in ["user", "project", "local"] {
+            assert_eq!(
+                parse(&format!("memory: {scope}"))
+                    .extras
+                    .memory
+                    .map(AgentMemoryScope::as_str),
+                Some(scope)
             );
+        }
+        let not_a_map = parse("hooks: nope");
+        assert!(not_a_map.extras.hooks.is_none());
+        assert!(
+            not_a_map
+                .compat_notices
+                .iter()
+                .any(|n| n.contains("hooks not applied")),
+            "{:?}",
+            not_a_map.compat_notices
+        );
+        #[cfg(feature = "hooks")]
+        {
+            let hooked = parse(
+                "hooks:\n  PreToolUse:\n    - matcher: Bash\n      hooks:\n        - type: command\n          command: echo hi",
+            );
+            assert!(hooked.extras.hooks.is_some(), "{:?}", hooked.compat_notices);
         }
     }
 
@@ -3423,6 +3551,7 @@ pub(crate) mod tests {
     fn permission_source_descriptions_cover_non_project_layers() {
         let embedded = AgentDefinition {
             skills: Vec::new(),
+            extras: AgentExtras::default(),
             prompt: "embedded".into(),
             mode: None,
             description: None,
@@ -3441,6 +3570,7 @@ pub(crate) mod tests {
         };
         let user = AgentDefinition {
             skills: Vec::new(),
+            extras: AgentExtras::default(),
             prompt: "user".into(),
             mode: None,
             description: None,
@@ -3465,6 +3595,7 @@ pub(crate) mod tests {
         );
         let long = AgentDefinition {
             skills: Vec::new(),
+            extras: AgentExtras::default(),
             prompt: format!("You are a specialist with {}", "detail ".repeat(80)),
             mode: None,
             description: None,

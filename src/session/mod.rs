@@ -1236,6 +1236,16 @@ impl Session {
         }
     }
 
+    /// Headless exit: waits up to `timeout` for running background jobs to
+    /// settle and returns how many are still running.
+    #[cfg(feature = "subagents")]
+    pub(crate) async fn wait_background_tasks_within(&self, timeout: std::time::Duration) -> usize {
+        match &self.background_pool {
+            Some(pool) => pool.wait_idle(timeout).await,
+            None => 0,
+        }
+    }
+
     /// Process-exit close: admission is closed and every job is cancelled at
     /// once, but waiting for a cancelled job's in-flight blocking work (a
     /// spill write, a directory walk) is bounded by `timeout`. On expiry the

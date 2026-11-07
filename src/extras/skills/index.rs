@@ -35,6 +35,10 @@ pub struct AgentSkillRecord {
     pub user_invocable: bool,
     /// `argument-hint` text for the `/skills` listing.
     pub argument_hint: Option<String>,
+    /// `context: fork`: a pinned run delegates the body to a `task` child.
+    pub context_fork: bool,
+    /// `agent` of a forked skill (the `task` agent type).
+    pub agent: Option<String>,
     /// Unsupported Claude Code key diagnostics, surfaced by `/skills`.
     pub diagnostics: Vec<String>,
     pub(crate) embedding: Vec<f32>,
@@ -350,6 +354,8 @@ mod tests {
             disable_model_invocation: false,
             user_invocable: true,
             argument_hint: None,
+            context_fork: false,
+            agent: None,
             diagnostics: Vec::new(),
             embedding,
         }

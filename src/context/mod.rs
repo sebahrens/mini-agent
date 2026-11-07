@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -532,14 +532,24 @@ fn walk_bound_context_files(
         .load(std::sync::atomic::Ordering::Relaxed)
         .then(dirs::home_dir)
         .flatten();
-    walk_bound_context_files_in(workspace, home.as_deref())
+    // A second, separate opt-in lets rule symlinks resolve anywhere inside the
+    // home directory (`rule_external_symlinks`).
+    let external = RULE_EXTERNAL_SYMLINKS
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .then(dirs::home_dir)
+        .flatten();
+    walk_bound_context_files_in(workspace, home.as_deref(), external.as_deref())
 }
 
 /// [`walk_bound_context_files`] with the opt-in home explicit: `None` keeps
-/// every user-level file and every rule symlink closed.
+/// every user-level file closed. `external_links` is the directory rule
+/// symlinks may resolve into outside the workspace and `~/.claude/rules`
+/// (`rule_external_symlinks`); `None` keeps that closed. Links whose target is
+/// inside the workspace always load.
 fn walk_bound_context_files_in(
     workspace: &crate::paths::WorkspaceBinding,
     home: Option<&Path>,
+    external_links: Option<&Path>,
 ) -> (
     Option<String>,
     Option<String>,
@@ -573,7 +583,7 @@ fn walk_bound_context_files_in(
         workspace,
         Path::new(rules::RULES_DIR),
         user_claude.as_ref(),
-        home.is_some(),
+        external_links,
         rule_scan::Limits {
             depth: rules::MAX_RULE_DEPTH,
             entries: rules::MAX_RULE_ENTRIES,
@@ -582,19 +592,6 @@ fn walk_bound_context_files_in(
     );
     let mut rule_notes = project_rules.notes;
     rule_notes.extend(user_rules.notes.iter().map(|note| format!("user {note}")));
-    if let Some(user) = &user_claude {
-        for file in &user_rules.files {
-            admit_rule_file(
-                workspace,
-                Some(user),
-                file,
-                &mut budget,
-                &mut roots,
-                &mut agent_parts,
-                &mut rule_notes,
-            );
-        }
-    }
     #[cfg(feature = "archmd")]
     if let Some((content, truncated, _, _, _)) =
         load_captured_global_file(&storage::architecture_path())
@@ -657,13 +654,33 @@ fn walk_bound_context_files_in(
             ));
         }
     }
+    // User rules come after the workspace's own AGENTS.md, CLAUDE.md and
+    // `.claude/CLAUDE.md`, so a large personal rule set can never use up the
+    // budget the project's root instruction files need (mini-agent-8g87g).
+    if let Some(user) = &user_claude {
+        for file in &user_rules.files {
+            admit_rule_file(
+                workspace,
+                Some(user),
+                file,
+                &mut budget,
+                &mut roots,
+                &mut agent_parts,
+                &mut rule_notes,
+            );
+        }
+    }
     // A user rule reached through a project link loads once, as a user rule.
-    for file in project_rules.files.iter().filter(|file| {
-        !user_rules
-            .files
-            .iter()
-            .any(|user| user.origin == file.origin && user.real == file.real)
-    }) {
+    let user_identities: HashSet<_> = user_rules
+        .files
+        .iter()
+        .map(|user| user.identity())
+        .collect();
+    for file in project_rules
+        .files
+        .iter()
+        .filter(|file| !user_identities.contains(&file.identity()))
+    {
         admit_rule_file(
             workspace,
             user_claude.as_ref(),
@@ -702,20 +719,26 @@ fn admit_rule_file(
     agent_parts: &mut SmallVec<[String; 4]>,
     notes: &mut Vec<String>,
 ) {
-    let from_user = file.origin == rule_scan::RuleOrigin::User;
-    let binding: &crate::paths::WorkspaceBinding = if from_user {
-        match user {
+    use rule_scan::RuleOrigin;
+    // Rules read through their own capability (user or external) are framed
+    // as global roots; only workspace rules are workspace roots.
+    let own_capability = file.origin != RuleOrigin::Workspace;
+    let binding: &crate::paths::WorkspaceBinding = match file.origin {
+        RuleOrigin::Workspace => workspace,
+        RuleOrigin::User => match user {
             Some(user) => &user.binding,
             None => return,
-        }
-    } else {
-        workspace
+        },
+        RuleOrigin::External => match &file.external {
+            Some(binding) => binding,
+            None => return,
+        },
     };
     let name = file.display.to_string_lossy().replace('\\', "/");
-    let name = if from_user {
-        format!("user ~/.claude/{name}")
-    } else {
-        name
+    let name = match file.origin {
+        RuleOrigin::Workspace => name,
+        RuleOrigin::User => format!("user ~/.claude/{name}"),
+        RuleOrigin::External => format!("external {name}"),
     };
     let Some((content, truncated, identity)) =
         binding.read_relative_context_file(&file.real, MAX_ANCESTOR_CONTEXT_BYTES)
@@ -733,10 +756,13 @@ fn admit_rule_file(
         return;
     }
     let make = |text: &str| -> Option<instructions::InstructionRoot> {
-        if from_user {
-            let user = user?;
+        if own_capability {
+            let own = match file.origin {
+                RuleOrigin::User => user?.binding.clone(),
+                _ => file.external.clone()?,
+            };
             Some(instructions::InstructionRoot::global(
-                user.binding.clone(),
+                own,
                 file.real.clone(),
                 text,
             ))
@@ -750,7 +776,14 @@ fn admit_rule_file(
         }
         return;
     }
+    let blank = rule.body.trim().is_empty();
     let Some(content) = budget.admit(&name, rule.body, truncated) else {
+        if !blank {
+            notes.push(format!(
+                "rule {name} skipped: context files exceed {} bytes (see context_files_max_bytes)",
+                budget.limit
+            ));
+        }
         return;
     };
     let Some(root) = make(&content) else { return };
@@ -930,6 +963,18 @@ const CONTEXT_TRUNCATION_NOTICE: &str =
 /// project is trusted (mini-agent-4l9rf).
 static USER_INSTRUCTION_FILES: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Whether rule symlinks may resolve anywhere inside the home directory
+/// (`rule_external_symlinks`). Closed by default; set at startup from the
+/// effective configuration, which a project layer can only change after the
+/// project is trusted.
+static RULE_EXTERNAL_SYMLINKS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Install the `rule_external_symlinks` opt-in used by later loads.
+pub(crate) fn set_rule_external_symlinks(enabled: bool) {
+    RULE_EXTERNAL_SYMLINKS.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// Install the `user_instruction_files` opt-in used by later loads.
 pub(crate) fn set_user_instruction_files(enabled: bool) {
@@ -1542,7 +1587,7 @@ mod claude_layout_tests {
             )
             .unwrap();
         }
-        let (agents, _, _) = walk_bound_context_files_in(&bound(&workspace), None);
+        let (agents, _, _) = walk_bound_context_files_in(&bound(&workspace), None, None);
         let agents = agents.unwrap();
         assert!(agents.contains("RULE_063") && !agents.contains("RULE_064"));
         assert!(agents.contains("# Rule discovery notices"), "{agents}");
@@ -1572,7 +1617,7 @@ mod claude_layout_tests {
         )
         .unwrap();
         std::fs::write(rules_dir.join("ok.md"), "OK_BODY").unwrap();
-        let (agents, _, roots) = walk_bound_context_files_in(&bound(&workspace), None);
+        let (agents, _, roots) = walk_bound_context_files_in(&bound(&workspace), None, None);
         let agents = agents.unwrap();
         assert!(agents.contains("OK_BODY"));
         assert!(
@@ -1603,7 +1648,7 @@ mod claude_layout_tests {
             &bound(&workspace),
             Path::new(rules::RULES_DIR),
             None,
-            false,
+            None,
             rule_scan::Limits {
                 depth: 4,
                 entries: 3,
@@ -1611,6 +1656,26 @@ mod claude_layout_tests {
             },
         );
         assert_eq!(scan.files.len(), 3);
+        // The survivors are the first three in sorted order, whatever order
+        // the filesystem listed them in (mini-agent-vbb4t).
+        let survivors: Vec<_> = scan
+            .files
+            .iter()
+            .map(|file| file.display.display().to_string())
+            .collect();
+        assert_eq!(
+            survivors,
+            [
+                ".claude/rules/a0.md",
+                ".claude/rules/a1.md",
+                ".claude/rules/a2.md"
+            ]
+        );
+        assert!(
+            scan.notes.iter().any(|note| note.contains("from a3.md")),
+            "{:?}",
+            scan.notes
+        );
         assert!(
             scan.notes
                 .iter()
@@ -1622,7 +1687,7 @@ mod claude_layout_tests {
             &bound(&workspace),
             Path::new(rules::RULES_DIR),
             None,
-            false,
+            None,
             rule_scan::Limits {
                 depth: 1,
                 entries: 100,
@@ -1635,7 +1700,7 @@ mod claude_layout_tests {
             &bound(&workspace),
             Path::new(rules::RULES_DIR),
             None,
-            false,
+            None,
             rule_scan::Limits {
                 depth: 1,
                 entries: 100,
@@ -1680,26 +1745,24 @@ mod claude_layout_tests {
         std::os::unix::fs::symlink(home.join(".claude/creds.md"), rules.join("creds.md")).unwrap();
         std::os::unix::fs::symlink(&rules, rules.join("loop")).unwrap();
 
-        // Default closed: nothing from home, every link skipped with a notice.
-        let (agents, _, roots) = walk_bound_context_files_in(&bound(&workspace), None);
+        // Default closed: nothing from home, links leaving the workspace are
+        // skipped with a notice naming the opt-in; links inside it load
+        // without any opt-in (mini-agent-fddr2).
+        let (agents, _, roots) = walk_bound_context_files_in(&bound(&workspace), None, None);
         let agents = agents.unwrap();
-        for hidden in [
-            "USER_RULE",
-            "SHARED_IN_WORKSPACE",
-            "OUTSIDE_SECRET",
-            "USER_SCOPED",
-        ] {
+        for hidden in ["USER_RULE", "OUTSIDE_SECRET", "USER_SCOPED"] {
             assert!(!agents.contains(hidden), "{hidden}: {agents}");
         }
-        assert!(roots.is_empty());
+        assert!(agents.contains("SHARED_IN_WORKSPACE"), "{agents}");
+        assert_eq!(roots.len(), 1, "{roots:?}");
         assert!(
-            agents.contains("rule symlink .claude/rules/one.md skipped"),
+            agents.contains("rule symlink .claude/rules/out.md skipped"),
             "{agents}"
         );
-        assert!(agents.contains("user_instruction_files"), "{agents}");
+        assert!(agents.contains("rule_external_symlinks"), "{agents}");
 
         // Opted in.
-        let (agents, _, roots) = walk_bound_context_files_in(&bound(&workspace), Some(&home));
+        let (agents, _, roots) = walk_bound_context_files_in(&bound(&workspace), Some(&home), None);
         let agents = agents.unwrap();
         assert!(
             agents.contains("# user ~/.claude/rules/personal.md"),
@@ -1729,6 +1792,164 @@ mod claude_layout_tests {
         // personal.md, one.md (deduped with dir/one.md) and team/scoped.md
         // (deduped with the link to it).
         assert_eq!(roots.len(), 3, "{roots:?}");
+    }
+
+    // mini-agent-fddr2: external rule symlinks are an opt-in, contained to the
+    // opted-in root, never `.git`, markdown only.
+    #[cfg(unix)]
+    #[test]
+    fn external_rule_symlinks_are_opt_in_and_contained() {
+        let root = crate::tests::OwnedTestDirectory::new("rules-external-links");
+        let home = root.path().join("home");
+        let workspace = root.path().join("ws");
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::create_dir_all(home.join("dotfiles/rules/sub")).unwrap();
+        std::fs::create_dir_all(home.join("repo/.git")).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::create_dir_all(workspace.join(".claude/rules")).unwrap();
+        std::fs::write(home.join("dotfiles/rules/shared.md"), "DOTFILES_RULE").unwrap();
+        std::fs::write(home.join("dotfiles/rules/sub/deep.md"), "DOTFILES_DEEP").unwrap();
+        std::fs::write(home.join("dotfiles/notes.txt"), "NOT_MARKDOWN_TARGET").unwrap();
+        std::fs::write(home.join("repo/.git/hook.md"), "GIT_INTERNALS").unwrap();
+        std::fs::write(elsewhere.join("away.md"), "AWAY_FROM_HOME").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, home.join("dotfiles/rules/escape")).unwrap();
+        let rules = workspace.join(".claude/rules");
+        std::os::unix::fs::symlink(home.join("dotfiles/rules"), rules.join("team")).unwrap();
+        std::os::unix::fs::symlink(home.join("dotfiles/notes.txt"), rules.join("n.md")).unwrap();
+        std::os::unix::fs::symlink(home.join("repo/.git/hook.md"), rules.join("git.md")).unwrap();
+        std::os::unix::fs::symlink(elsewhere.join("away.md"), rules.join("away.md")).unwrap();
+
+        // Closed by default: nothing external loads, each link is reported.
+        let (agents, _, _) = walk_bound_context_files_in(&bound(&workspace), None, None);
+        let agents = agents.unwrap_or_default();
+        for hidden in [
+            "DOTFILES_RULE",
+            "DOTFILES_DEEP",
+            "GIT_INTERNALS",
+            "AWAY_FROM_HOME",
+        ] {
+            assert!(!agents.contains(hidden), "{hidden}: {agents}");
+        }
+        assert!(
+            agents.contains("rule symlink .claude/rules/team skipped"),
+            "{agents}"
+        );
+
+        // Opted in: the home directory is the containment root.
+        let (agents, _, roots) = walk_bound_context_files_in(&bound(&workspace), None, Some(&home));
+        let agents = agents.unwrap();
+        assert!(agents.contains("DOTFILES_RULE"), "{agents}");
+        assert!(agents.contains("DOTFILES_DEEP"), "{agents}");
+        assert!(
+            agents.contains("# external .claude/rules/team/shared.md"),
+            "{agents}"
+        );
+        for hidden in ["GIT_INTERNALS", "AWAY_FROM_HOME", "NOT_MARKDOWN_TARGET"] {
+            assert!(!agents.contains(hidden), "{hidden}: {agents}");
+        }
+        assert!(
+            agents.contains("rule symlink .claude/rules/away.md skipped"),
+            "{agents}"
+        );
+        assert!(
+            agents.contains("rule symlink .claude/rules/git.md skipped"),
+            "{agents}"
+        );
+        // A link inside an external directory that leaves the root is refused too.
+        assert!(
+            agents.contains("rule symlink .claude/rules/team/escape skipped"),
+            "{agents}"
+        );
+        assert_eq!(roots.len(), 2, "{roots:?}");
+    }
+
+    // mini-agent-uyghh: a symlinked rules directory is resolved under the same
+    // policy or reported, never silently ignored.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_rules_roots_load_or_are_reported() {
+        let root = crate::tests::OwnedTestDirectory::new("rules-root-links");
+        let home = root.path().join("home");
+        let workspace = root.path().join("ws");
+        std::fs::create_dir_all(home.join("dotfiles/rules")).unwrap();
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::create_dir_all(workspace.join(".claude")).unwrap();
+        std::fs::create_dir_all(workspace.join("shared-rules")).unwrap();
+        std::fs::write(workspace.join("shared-rules/in.md"), "WORKSPACE_ROOT_LINK").unwrap();
+        std::fs::write(home.join("dotfiles/rules/user.md"), "STOW_USER_RULE").unwrap();
+        std::os::unix::fs::symlink(
+            workspace.join("shared-rules"),
+            workspace.join(".claude/rules"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(home.join("dotfiles/rules"), home.join(".claude/rules"))
+            .unwrap();
+
+        // In-workspace root link loads by default; the stow-style user root
+        // is reported with the opt-in that would allow it.
+        let (agents, _, _) = walk_bound_context_files_in(&bound(&workspace), Some(&home), None);
+        let agents = agents.unwrap();
+        assert!(agents.contains("WORKSPACE_ROOT_LINK"), "{agents}");
+        assert!(!agents.contains("STOW_USER_RULE"), "{agents}");
+        assert!(
+            agents
+                .contains("user rule directory ~/.claude/rules is a symlink and was not followed"),
+            "{agents}"
+        );
+        assert!(agents.contains("rule_external_symlinks"), "{agents}");
+
+        // Opted in: the user's rules directory resolves through the link.
+        let (agents, _, _) =
+            walk_bound_context_files_in(&bound(&workspace), Some(&home), Some(&home));
+        let agents = agents.unwrap();
+        assert!(agents.contains("STOW_USER_RULE"), "{agents}");
+        assert!(agents.contains("# external rules/user.md"), "{agents}");
+
+        // A project rules root linking outside the opted-in root is refused.
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("away.md"), "AWAY_ROOT").unwrap();
+        std::fs::remove_file(workspace.join(".claude/rules")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, workspace.join(".claude/rules")).unwrap();
+        let (agents, _, _) =
+            walk_bound_context_files_in(&bound(&workspace), Some(&home), Some(&home));
+        let agents = agents.unwrap();
+        assert!(!agents.contains("AWAY_ROOT"), "{agents}");
+        assert!(
+            agents.contains("rule directory .claude/rules is a symlink and was not followed"),
+            "{agents}"
+        );
+    }
+
+    // mini-agent-8g87g: project instruction files are admitted before user
+    // rules, and a rule dropped for budget is named in the notices.
+    #[cfg(unix)]
+    #[test]
+    fn user_rules_cannot_starve_project_files_and_budget_skips_are_reported() {
+        let root = crate::tests::OwnedTestDirectory::new("rules-budget");
+        let home = root.path().join("home");
+        let workspace = root.path().join("ws");
+        std::fs::create_dir_all(home.join(".claude/rules")).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("AGENTS.md"), "PROJECT_AGENTS_BODY").unwrap();
+        std::fs::write(workspace.join("CLAUDE.md"), "PROJECT_CLAUDE_BODY").unwrap();
+        std::fs::write(
+            home.join(".claude/rules/a_big.md"),
+            "U".repeat(MAX_ANCESTOR_CONTEXT_BYTES + 1000),
+        )
+        .unwrap();
+        std::fs::write(home.join(".claude/rules/b_dropped.md"), "DROPPED_BODY").unwrap();
+        let (agents, _, _) = walk_bound_context_files_in(&bound(&workspace), Some(&home), None);
+        let agents = agents.unwrap();
+        assert!(agents.contains("PROJECT_AGENTS_BODY"), "{agents}");
+        assert!(agents.contains("PROJECT_CLAUDE_BODY"), "{agents}");
+        assert!(!agents.contains("DROPPED_BODY"), "{agents}");
+        let notices = agents.split("# Rule discovery notices").nth(1).unwrap();
+        assert!(
+            notices
+                .contains("rule user ~/.claude/rules/b_dropped.md skipped: context files exceed"),
+            "{notices}"
+        );
     }
 
     // mini-agent-4l9rf: the user-level compat files load in a fixed order from

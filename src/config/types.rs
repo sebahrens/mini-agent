@@ -35,6 +35,16 @@ pub struct SubagentPolicy {
     /// (sandboxed, writes only to a private scratch directory). Default false.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub allow_read_only_shell: bool,
+    /// Opt-in: a persona with `memory: user|project|local` gets a private
+    /// notes directory (injected at child start, writable only through the
+    /// `agent_memory` tool). Default false; a project config needs trust.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub agent_memory: bool,
+    /// Opt-in: a persona's `hooks:` frontmatter runs around that persona's
+    /// child tool calls (PreToolUse, PostToolUseFailure). Hook commands run
+    /// like user hooks. Default false; a project config needs trust.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub agent_hooks: bool,
     /// Opt-in: a persona that names `web_fetch`/`web_search` gets the
     /// parent's eligible web tools under its permissions. Default false.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -63,6 +73,11 @@ pub struct SubagentPolicy {
     /// at most 256 MiB). A larger child gets a host note instead of an id.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_resume_max_bytes: Option<usize>,
+    /// Seconds a headless run (`-p`, stream-json) waits at exit for background
+    /// `task` jobs that are still running before cancelling them (default
+    /// 300, at most 3600; `0` cancels immediately, the previous behaviour).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headless_exit_wait_secs: Option<u64>,
 }
 
 #[cfg(feature = "subagents")]

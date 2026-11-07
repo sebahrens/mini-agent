@@ -7069,7 +7069,7 @@ impl<'a> App<'a> {
             )?;
             return Ok(true);
         }
-        let pin = match services.pin(name).await {
+        let mut pin = match services.pin(name).await {
             Ok(pin) => pin,
             Err(error) => {
                 self.renderer
@@ -7087,6 +7087,17 @@ impl<'a> App<'a> {
         } else {
             arguments.to_string()
         };
+        pin.arguments = arguments.to_string();
+        // `context: fork`: the turn's first request must delegate the skill
+        // body to a `task` child (a no-op where `task` is not available).
+        #[cfg(feature = "subagents")]
+        if snapshot
+            .packages
+            .get(name)
+            .is_some_and(|package| package.record.context_fork)
+        {
+            self.run.next_turn_first_request_tool = Some(crate::agent::first_tool::TASK_TOOL_NAME);
+        }
         let turn =
             crate::extras::skills::session::InstructionTurn::new(services, Some(pin.clone()));
         crate::ui::ensure_agent(

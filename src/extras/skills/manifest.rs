@@ -24,6 +24,12 @@ pub struct AgentSkillManifest {
     pub user_invocable: bool,
     /// Claude Code `argument-hint`, shown in the `/skills` listing only.
     pub argument_hint: Option<String>,
+    /// Claude Code `context: fork`: a pinned (`/<name>`) run delegates the
+    /// skill body to a `task` child instead of following it inline.
+    pub context_fork: bool,
+    /// Claude Code `agent`: the `task` agent type a forked skill runs as.
+    /// Used only with `context: fork`.
+    pub agent: Option<String>,
     /// One diagnostic per recognised-but-unsupported Claude Code key (for
     /// example `context: fork not applied; skill runs inline`). Unknown
     /// non-Claude keys stay quiet. Display only; never grants anything.
@@ -74,12 +80,39 @@ struct RawManifest {
     user_invocable: Option<bool>,
     #[serde(default, rename = "argument-hint", deserialize_with = "lenient_hint")]
     argument_hint: Option<String>,
+    #[serde(default, deserialize_with = "lenient_word")]
+    context: Option<String>,
+    #[serde(default, deserialize_with = "lenient_word")]
+    agent: Option<String>,
     /// Filled by `unsupported_diagnostics`, never read from YAML directly.
     #[serde(skip)]
     diagnostics: Vec<String>,
 }
 
 const MAX_HINT_CHARS: usize = 80;
+
+/// A short single-token scalar (`fork`, an agent type name): control
+/// characters and anything over 64 characters are rejected as absent.
+fn clean_word(text: &str) -> Option<String> {
+    let text = text.trim();
+    (!text.is_empty()
+        && text.chars().count() <= 64
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+    .then(|| text.to_owned())
+}
+
+fn lenient_word<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: Option<serde_yaml_ng::Value> = Option::deserialize(deserializer)?;
+    Ok(raw
+        .as_ref()
+        .and_then(scalar_to_string)
+        .and_then(|text| clean_word(&text)))
+}
 
 fn clean_hint(text: &str) -> Option<String> {
     let cleaned: String = text
@@ -103,14 +136,15 @@ where
 }
 
 /// Claude Code skill keys that are recognised but have no effect here.
-fn unsupported_message(key: &str, value: Option<&str>) -> Option<String> {
+fn unsupported_message(key: &str, value: Option<&str>, fork: bool) -> Option<String> {
     Some(match key {
-        "context" => match value {
-            Some("fork") => "context: fork not applied; skill runs inline".to_owned(),
-            _ => "context not applied; skill runs inline".to_owned(),
-        },
-        "agent" => "agent not applied; skill runs inline with the current agent".to_owned(),
-        "model" => "model not applied; skill uses the session model".to_owned(),
+        // `context: fork` and its `agent` are honoured for pinned runs.
+        "context" if value == Some("fork") => return None,
+        "context" => "context not applied; skill runs inline".to_owned(),
+        "agent" if fork => return None,
+        "agent" => "agent not applied without context: fork; skill runs inline with the current agent"
+            .to_owned(),
+        "model" => "model not applied; skill uses the session model (a forked skill's model comes from its agent persona)".to_owned(),
         "effort" => "effort not applied; skill uses the session effort".to_owned(),
         "paths" => "paths not applied; skill is not limited to matching files".to_owned(),
         "hooks" => "hooks not applied; skill hooks never run".to_owned(),
@@ -124,8 +158,12 @@ fn unsupported_diagnostics<'a>(
     keys: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
 ) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
+    let keys: Vec<_> = keys.into_iter().collect();
+    let fork = keys
+        .iter()
+        .any(|(key, value)| key.trim() == "context" && value.map(str::trim) == Some("fork"));
     for (key, value) in keys {
-        if let Some(message) = unsupported_message(key.trim(), value.map(str::trim))
+        if let Some(message) = unsupported_message(key.trim(), value.map(str::trim), fork)
             && !out.contains(&message)
         {
             out.push(message);
@@ -304,6 +342,8 @@ fn empty_raw() -> RawManifest {
         disable_model_invocation: None,
         user_invocable: None,
         argument_hint: None,
+        context: None,
+        agent: None,
         diagnostics: Vec::new(),
     }
 }
@@ -339,6 +379,8 @@ fn scan_simple_keys(yaml: &str) -> RawManifest {
             "disable-model-invocation" => raw.disable_model_invocation = flag(),
             "user-invocable" => raw.user_invocable = flag(),
             "argument-hint" => raw.argument_hint = clean_hint(value),
+            "context" => raw.context = clean_word(value),
+            "agent" => raw.agent = clean_word(value),
             other => pairs.push((other.to_owned(), value.to_owned())),
         }
     }
@@ -389,6 +431,8 @@ fn finish_manifest(
         disable_model_invocation: raw.disable_model_invocation.unwrap_or(false),
         user_invocable: raw.user_invocable.unwrap_or(true),
         argument_hint: raw.argument_hint,
+        context_fork: raw.context.as_deref() == Some("fork"),
+        agent: raw.agent,
         diagnostics: raw.diagnostics,
     })
 }
@@ -546,12 +590,22 @@ mod tests {
         let markdown = b"---\nname: s\ndescription: d\ncontext: fork\nagent: Explore\nmodel: opus\neffort: high\npaths:\n  - src/**\nhooks:\n  PreToolUse: []\nargument-hint: \"[issue]\"\nvendor-thing: 1\n---\n";
         let manifest = parse_skill_markdown(markdown).unwrap();
         assert_eq!(manifest.argument_hint.as_deref(), Some("[issue]"));
-        assert_eq!(manifest.diagnostics.len(), 6);
+        // `context: fork` and its `agent` are honoured; the rest are reported.
+        assert_eq!(manifest.diagnostics.len(), 4);
+        assert!(manifest.context_fork);
+        assert_eq!(manifest.agent.as_deref(), Some("Explore"));
         assert!(
             manifest
                 .diagnostics
-                .contains(&"context: fork not applied; skill runs inline".to_owned())
+                .iter()
+                .all(|d| !d.starts_with("context"))
         );
+        let inline = parse_skill_markdown(
+            b"---\nname: s\ndescription: d\nagent: Explore\ncontext: inline\n---\n",
+        )
+        .unwrap();
+        assert!(!inline.context_fork);
+        assert_eq!(inline.diagnostics.len(), 2, "{:?}", inline.diagnostics);
         assert!(manifest.diagnostics.iter().all(|d| !d.contains("vendor")));
         // Malformed YAML falls back to the line scan and still reports.
         let lenient = parse_skill_markdown_lenient(
@@ -559,7 +613,8 @@ mod tests {
             "s",
         )
         .unwrap();
-        assert_eq!(lenient.diagnostics.len(), 2);
+        assert_eq!(lenient.diagnostics.len(), 1);
+        assert!(lenient.context_fork);
         let plain = parse_skill_markdown(b"---\nname: p\ndescription: d\n---\n").unwrap();
         assert!(plain.diagnostics.is_empty() && plain.argument_hint.is_none());
         // Control characters and length are neutralised in the hint.

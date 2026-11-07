@@ -311,6 +311,50 @@ pub(crate) fn wrap_from_global(
     }
 }
 
+/// A persona's hooks may only observe its child's tool calls and never leave
+/// the hook sandbox: other events are dropped, only `command` handlers stay,
+/// and every handler is forced to `trust: sandboxed` whatever the file says.
+#[cfg(feature = "subagents")]
+fn scope_persona_hooks(mut config: settings::HooksConfig) -> settings::HooksConfig {
+    config.retain(|event, _| matches!(event.as_str(), "PreToolUse" | "PostToolUseFailure"));
+    for groups in config.values_mut() {
+        for group in groups.iter_mut() {
+            group.hooks.retain(|handler| handler.kind == "command");
+            for handler in &mut group.hooks {
+                handler.trust = settings::HookTrust::Sandboxed;
+            }
+        }
+        groups.retain(|group| !group.hooks.is_empty());
+    }
+    config
+}
+
+/// Wraps `tools` with hooks from a persona's `hooks:` frontmatter (validated
+/// hook-configuration JSON), scoped to those tools only. Unusable
+/// configuration is logged and the tools are returned unwrapped.
+#[cfg(feature = "subagents")]
+pub(crate) fn wrap_with_scoped_config(
+    tools: Vec<Box<dyn rig::tool::ToolDyn>>,
+    json: &str,
+    permission: Option<crate::permission::checker::PermCheck>,
+    ask_tx: Option<crate::permission::ask::AskSender>,
+) -> Vec<Box<dyn rig::tool::ToolDyn>> {
+    let dispatcher = serde_json::from_str::<serde_json::Value>(json)
+        .map_err(|error| error.to_string())
+        .and_then(|value| settings::parse_hooks_config(&value))
+        .map(scope_persona_hooks)
+        .and_then(|config| dispatcher::HookDispatcher::from_config(&config));
+    match dispatcher {
+        Ok(dispatcher) => {
+            decorator::wrap_all(tools, std::sync::Arc::new(dispatcher), permission, ask_tx)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "persona hooks unusable; the child runs without them");
+            tools
+        }
+    }
+}
+
 /// Builder-owned MCP provenance, captured while concrete `McpTool` fields
 /// remain available. Other tools retain the legacy wrapper API and envelopes.
 #[cfg(feature = "mcp")]
@@ -1116,5 +1160,32 @@ mod event60_tests {
                 event["tool_name"] == "read" && event["tool_input"] == "pending.txt"
             }));
         }
+    }
+}
+
+#[cfg(all(test, feature = "subagents"))]
+mod persona_hook_scope_tests {
+    use super::*;
+
+    #[test]
+    fn persona_hooks_are_limited_to_sandboxed_tool_command_hooks() {
+        let json = serde_json::json!({
+            "PreToolUse": [{"matcher": "bash", "hooks": [
+                {"type": "command", "command": "guard", "trust": "trusted"},
+                {"type": "http", "command": "ignored"}
+            ]}],
+            "PostToolUseFailure": [{"hooks": [{"type": "command", "command": "note"}]}],
+            "SessionStart": [{"hooks": [{"type": "command", "command": "other"}]}],
+            "Stop": [{"hooks": [{"type": "command", "command": "other"}]}]
+        });
+        let config = scope_persona_hooks(settings::parse_hooks_config(&json).unwrap());
+        let mut events: Vec<_> = config.keys().cloned().collect();
+        events.sort();
+        assert_eq!(events, ["PostToolUseFailure", "PreToolUse"]);
+        let handlers = &config["PreToolUse"][0].hooks;
+        assert_eq!(handlers.len(), 1, "non-command handlers are dropped");
+        assert_eq!(handlers[0].trust, settings::HookTrust::Sandboxed);
+        // Unusable configuration leaves the tools untouched rather than failing.
+        assert!(wrap_with_scoped_config(Vec::new(), "not json", None, None).is_empty());
     }
 }
