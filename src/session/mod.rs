@@ -1898,6 +1898,9 @@ impl Session {
         if self.compacted_context().0.is_none() {
             self.compactions.clear();
         }
+        // Clamp after the compactions (and their retained images) are dropped,
+        // so every caller that cuts history measures the final size.
+        self.clamp_compaction_floor();
         self.mark_history_changed();
     }
 
@@ -2489,7 +2492,6 @@ impl Session {
         }
         self.file_checkpoints.retire_from(new_len);
         self.messages.truncate(new_len);
-        self.clamp_compaction_floor();
         self.retain_visible_replay_metadata();
         self.total_estimated_tokens = self.messages.iter().map(|m| m.estimated_tokens).sum();
         self.read_tracker.clear();

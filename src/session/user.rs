@@ -321,6 +321,30 @@ mod tests {
         assert!(session.mid_turn_size_pressure(Some(0.75)));
     }
     #[test]
+    fn compaction_floor_is_lowered_after_retained_images_are_dropped() {
+        // mini-agent-24lo9: the floor must be measured after the rewind drops
+        // the compaction (and the PNGs it retained), not before.
+        const PNG: &[u8] = include_bytes!("../agent/tools/fixtures/read-image64/3x2.png");
+        let mut session = crate::session::Session::new("logical", "model", 1_000_000, "");
+        for n in 0..3u8 {
+            let mut bytes = PNG.to_vec();
+            bytes.resize(1_500_000, 0);
+            bytes.push(n);
+            session.add_user_message(PersistedUserMessage::new(vec![image(&bytes)]).unwrap());
+        }
+        session.compress("recap".to_owned(), 2, 0);
+        assert!(
+            session.compactions.iter().any(|c| !c.images.is_empty()),
+            "fixture must retain images"
+        );
+        let before = session.bytes_after_last_compaction.unwrap();
+        assert!(before > 1_000_000);
+        session.truncate_to(0);
+        assert!(session.compactions.is_empty());
+        let floor = session.bytes_after_last_compaction.unwrap();
+        assert!(floor <= session.approx_persisted_bytes(), "floor={floor}");
+    }
+    #[test]
     fn redo_discards_a_floor_measured_before_the_restore() {
         let mut session = image_session(7);
         session.compress("recap".to_owned(), 1, 0);
