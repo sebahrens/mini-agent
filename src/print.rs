@@ -209,8 +209,9 @@ static PARTIAL_MESSAGES: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 static COMPLETIONS_FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Start of the span the next final result's `duration_ms` covers: process
-/// start for the first result, the previous result for each later turn of a
-/// multi-turn stream-json run.
+/// start for a single-turn run; for a multi-turn stream-json run, the moment
+/// the turn's user line was accepted (see [`restart_headless_run_span`]), so
+/// time spent waiting for the driver's next line is not counted.
 static RUN_SPAN_START: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
 pub(crate) fn mark_headless_run_start() {
@@ -218,6 +219,14 @@ pub(crate) fn mark_headless_run_start() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     start.get_or_insert_with(std::time::Instant::now);
+}
+
+/// Restart the `duration_ms` span at the start of a turn (a user line was
+/// accepted), discarding idle time waiting for it (mini-agent-gkuap).
+pub(crate) fn restart_headless_run_span() {
+    *RUN_SPAN_START
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::time::Instant::now());
 }
 
 fn take_run_duration_ms() -> u64 {
@@ -3868,6 +3877,14 @@ mod tests {
         assert!(super::take_run_duration_ms() >= 30);
         // The span restarts at each result.
         assert!(super::take_run_duration_ms() < 30);
+        // The driver is slow to send the next user line: restarting the span
+        // at line acceptance excludes that idle time (mini-agent-gkuap). One
+        // test because the span is process-global.
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        super::restart_headless_run_span();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let turn = super::take_run_duration_ms();
+        assert!((10..50).contains(&turn), "{turn}");
     }
 
     #[test]

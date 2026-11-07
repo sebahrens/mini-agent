@@ -2512,6 +2512,8 @@ impl Startup {
             }
             self.cli.message = vec![prompt];
             crate::print::reset_headless_result_emitted();
+            // duration_ms covers this turn only, not the wait for its line.
+            crate::print::restart_headless_run_span();
             if turn_index > 0
                 && let Err(error) = self.reopen_native_turn().await
             {
