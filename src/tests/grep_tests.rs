@@ -580,3 +580,80 @@ async fn search_skips_only_build_target_and_node_modules_and_names_them() {
         .unwrap();
     assert!(explicit.contains("debug/build.rs:1:needle"), "{explicit}");
 }
+
+fn utf16_bytes(text: &str, little: bool) -> Vec<u8> {
+    let mut out = if little {
+        vec![0xFF, 0xFE]
+    } else {
+        vec![0xFE, 0xFF]
+    };
+    for unit in text.encode_utf16() {
+        out.extend_from_slice(&if little {
+            unit.to_le_bytes()
+        } else {
+            unit.to_be_bytes()
+        });
+    }
+    out
+}
+
+#[test]
+fn read_non_binary_decodes_bom_utf16_and_still_rejects_invalid_or_bomless_nul() {
+    let mut buf = Vec::new();
+    for little in [true, false] {
+        let mut file = std::io::Cursor::new(utf16_bytes("alpha\nneedle é\n", little));
+        assert!(GrepTool::read_non_binary(&mut file, &mut buf, 64).unwrap());
+        assert_eq!(buf, "alpha\nneedle é\n".as_bytes());
+    }
+    // Unpaired surrogate after a BOM is not text.
+    let mut bad = vec![0xFF, 0xFE, 0x00, 0xD8, 0x41, 0x00];
+    bad.extend_from_slice(&[0, 0]);
+    let mut file = std::io::Cursor::new(bad);
+    assert!(!GrepTool::read_non_binary(&mut file, &mut buf, 64).unwrap());
+    // NULs without a BOM remain binary.
+    let mut file = std::io::Cursor::new(b"n\0e\0e\0d\0l\0e\0".to_vec());
+    assert!(!GrepTool::read_non_binary(&mut file, &mut buf, 64).unwrap());
+}
+
+#[tokio::test]
+async fn grep_finds_needle_in_bom_utf16_files_by_directory_and_explicit_path() {
+    use rig::tool::Tool;
+    let root = crate::tests::OwnedTestDirectory::new("grep-utf16");
+    std::fs::write(
+        root.path().join("app.rc"),
+        utf16_bytes("first\nIDS_needle here\n", true),
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("be.reg"),
+        utf16_bytes("x\nneedle in be\n", false),
+    )
+    .unwrap();
+    std::fs::write(root.path().join("blob.bin"), b"nee\0dle\0\0").unwrap();
+    let tool = GrepTool::new(None, None, 20);
+    let dir = tool
+        .call(search_args(
+            root.path(),
+            serde_json::json!({"pattern":"needle"}),
+        ))
+        .await
+        .unwrap();
+    assert!(dir.contains("app.rc:2:IDS_needle here"), "{dir}");
+    assert!(dir.contains("be.reg:2:needle in be"), "{dir}");
+    assert!(dir.contains("1 binary"), "{dir}");
+    let explicit = tool
+        .call(search_args(
+            &root.path().join("app.rc"),
+            serde_json::json!({"pattern":"needle"}),
+        ))
+        .await
+        .unwrap();
+    assert!(explicit.contains("IDS_needle here"), "{explicit}");
+    let blob = tool
+        .call(search_args(
+            &root.path().join("blob.bin"),
+            serde_json::json!({"pattern":"needle"}),
+        ))
+        .await;
+    assert!(blob.is_err());
+}
