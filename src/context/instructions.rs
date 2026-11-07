@@ -799,7 +799,13 @@ impl WorkspaceInstructions {
         }
         let file = match binding.open_regular_relative(&path) {
             Ok(file) => file,
-            Err(error) if optional && error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            // An authored `@word` that is missing, a directory, a symlink, or
+            // otherwise not a regular file is prose; refusing to load it is
+            // already the safe outcome, so it must not end the turn.
+            Err(_) if depth > 0 => return Ok(()),
+            Err(error) if optional && error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(());
+            }
             Err(_) => return Err("Could not safely open workspace instruction source".into()),
         };
         #[cfg(unix)]
@@ -904,7 +910,7 @@ impl WorkspaceInstructions {
             ]
             .concat(),
         ));
-        let includes = include_paths(&source.text)?;
+        let includes = include_paths(&source.text);
         let parent = source.path.parent().unwrap_or(Path::new("")).to_owned();
         loaded.push(source);
         for include in includes {
@@ -1028,7 +1034,7 @@ impl WorkspaceInstructions {
                 project,
                 bytes: root.text.len(),
             });
-            let includes = include_paths(&root.text)?;
+            let includes = include_paths(&root.text);
             if includes.is_empty() {
                 continue;
             }
@@ -1644,6 +1650,9 @@ fn mask_code(text: &str) -> String {
     let mut start = 0;
     for line in text.split_inclusive('\n') {
         let end = start + line.len();
+        // The line terminator stays visible so a token on the next line is
+        // still line-initial.
+        let body_end = end - usize::from(line.ends_with('\n'));
         let trimmed = line.trim_start_matches(' ');
         let indent = line.len() - trimmed.len();
         let marker = trimmed.bytes().next().filter(|b| matches!(b, b'`' | b'~'));
@@ -1651,14 +1660,14 @@ fn mask_code(text: &str) -> String {
         let fence_line = indent <= 3 && run >= 3;
         match fence {
             Some((m, len)) => {
-                masked[start..end].fill(b'x');
+                masked[start..body_end].fill(b'x');
                 if fence_line && marker == Some(m) && run >= len && trimmed[run..].trim().is_empty()
                 {
                     fence = None;
                 }
             }
             None if fence_line && !(marker == Some(b'`') && trimmed[run..].contains('`')) => {
-                masked[start..end].fill(b'x');
+                masked[start..body_end].fill(b'x');
                 fence = marker.map(|m| (m, run));
             }
             None => mask_inline_code(line, &mut masked[start..end]),
@@ -1701,7 +1710,7 @@ fn mask_inline_code(line: &str, masked: &mut [u8]) {
 }
 /// Authored `@path` includes outside code. Malformed or unusable tokens are
 /// literal text, never an error; a missing target is skipped at load time.
-fn include_paths(text: &str) -> Result<Vec<PathBuf>, String> {
+fn include_paths(text: &str) -> Vec<PathBuf> {
     let masked = mask_code(text);
     let mut result = Vec::new();
     let mut at = 0;
@@ -1744,15 +1753,17 @@ fn include_paths(text: &str) -> Result<Vec<PathBuf>, String> {
             {
                 continue;
             }
-            result.push(PathBuf::from(path));
-            if result.len() > MAX_INCLUDE_NODES {
-                return Err("Workspace instruction include node limit reached".into());
+            let path = PathBuf::from(path);
+            // Tokens are bounded by the source size; only files that exist
+            // count toward the (visible) include node limit at load time.
+            if !result.contains(&path) {
+                result.push(path);
             }
         } else {
             at += rest.chars().next().unwrap().len_utf8();
         }
     }
-    Ok(result)
+    result
 }
 
 #[cfg(test)]
@@ -2042,7 +2053,8 @@ mod tests {
         let authored = (0..=MAX_INCLUDE_NODES)
             .map(|i| format!("@source{i}.md "))
             .collect::<String>();
-        assert!(include_paths(&authored).unwrap_err().contains("node limit"));
+        // Prose tokens never terminate a turn; only existing files count.
+        assert_eq!(include_paths(&authored).len(), MAX_INCLUDE_NODES + 1);
         let target = (0..=MAX_DIRECTORY_DEPTH)
             .map(|_| "nested/")
             .collect::<String>()
@@ -2201,9 +2213,47 @@ mod tests {
     #[test]
     fn include_paths_ignore_code_and_malformed_tokens() {
         let text = "ask @alice\n```py\n @pytest.fixture\n```\n~~~\n @x\n~~~\n`@a` ``b @c`` @ \n@{unclosed @/abs\n @real.md @{b c.md}";
-        let found = include_paths(text).unwrap();
+        let found = include_paths(text);
         let found: Vec<_> = found.iter().map(|p| p.to_str().unwrap()).collect();
         assert_eq!(found, ["alice", "real.md", "b c.md"]);
+    }
+    #[test]
+    fn include_after_closing_fence_is_line_initial() {
+        let found = include_paths("```\ncode\n```\n@rules.md\n~~~\nx\n~~~\n@b.md");
+        assert_eq!(found, [PathBuf::from("rules.md"), PathBuf::from("b.md")]);
+    }
+    #[test]
+    fn prose_mentions_of_directories_files_and_symlinks_are_literal_text() {
+        let (_root, service) = fixture();
+        let root = service.workspace.root();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("afile"), "x").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/etc/hosts", root.join("link")).unwrap();
+        let many = (0..100).map(|i| format!("@m{i} ")).collect::<String>();
+        let text = format!("ask @src or @afile/b @link {many}\n@real.md");
+        std::fs::write(root.join("real.md"), "REAL\n").unwrap();
+        service
+            .capture_initial(
+                vec![
+                    InstructionRoot::workspace(
+                        &service.workspace,
+                        PathBuf::from("AGENTS.md"),
+                        &text,
+                    )
+                    .unwrap(),
+                ],
+                0,
+            )
+            .unwrap();
+        let state = service.state.lock().unwrap();
+        assert!(
+            state
+                .initial
+                .sources
+                .iter()
+                .any(|s| s.text.contains("REAL"))
+        );
     }
     #[test]
     fn fit_instruction_source_terminates_when_room_is_notice_cost_plus_one() {
