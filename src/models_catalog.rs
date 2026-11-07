@@ -91,8 +91,23 @@ static CATALOG: LazyLock<Catalog> = LazyLock::new(|| {
     let overlay = cache_path();
     #[cfg(test)]
     let overlay: Option<std::path::PathBuf> = None;
-    load_catalog(CATALOG_JSON, EMBEDDED_GENERATED_AT, overlay.as_deref())
+    load_catalog(
+        CATALOG_JSON,
+        EMBEDDED_GENERATED_AT,
+        overlay.as_deref(),
+        chrono::Utc::now(),
+    )
 });
+
+/// Clock-skew policy for a cache stamped ahead of the host clock: up to one
+/// day ahead is tolerated (ordinary skew between machines). Anything later was
+/// written while the clock was wrong and would otherwise outrank the embedded
+/// snapshot, and suppress every refresh, until real time caught up.
+const MAX_FUTURE_SKEW_DAYS: i64 = 1;
+
+fn is_future_dated(at: chrono::DateTime<chrono::Utc>, now: chrono::DateTime<chrono::Utc>) -> bool {
+    at > now + chrono::Duration::days(MAX_FUTURE_SKEW_DAYS)
+}
 
 fn parse_instant(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::parse_from_rfc3339(value.trim())
@@ -140,6 +155,7 @@ fn load_catalog(
     embedded_json: &str,
     embedded_generated_at: &str,
     overlay_path: Option<&std::path::Path>,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Catalog {
     let mut raw: RawCatalog = match serde_json::from_str(embedded_json) {
         Ok(raw) => raw,
@@ -157,7 +173,11 @@ fn load_catalog(
         && let Some(overlay) = read_overlay(path)
     {
         let overlay_at = parse_instant(&overlay.generated_at);
-        if overlay_at > embedded_at && !overlay.providers.is_empty() {
+        if overlay_at.is_some_and(|at| is_future_dated(at, now)) {
+            tracing::warn!(
+                "model catalog cache is dated in the future; using the embedded snapshot"
+            );
+        } else if overlay_at > embedded_at && !overlay.providers.is_empty() {
             for (provider, models) in overlay.providers {
                 raw.insert(provider, models);
             }
@@ -580,6 +600,20 @@ pub(crate) async fn refresh_cache() -> anyhow::Result<(std::path::PathBuf, usize
     Ok((path, count))
 }
 
+/// Whether the cache at `path` needs a refresh at `now`: it is missing,
+/// unreadable, future-dated beyond the skew policy, or at least `days` old.
+fn refresh_due(path: &std::path::Path, days: u64, now: chrono::DateTime<chrono::Utc>) -> bool {
+    let ttl = chrono::Duration::days(
+        i64::try_from(days)
+            .unwrap_or(i64::MAX / 86_400_000)
+            .min(36_500),
+    );
+    let fresh = read_overlay(path)
+        .and_then(|overlay| parse_instant(&overlay.generated_at))
+        .is_some_and(|at| !is_future_dated(at, now) && (now - at) < ttl);
+    !fresh
+}
+
 /// The opt-in `models_catalog_refresh_days` startup refresh: when the cache
 /// is missing or older than `days`, refresh it in the background. Network
 /// failures only log; the embedded snapshot stays in use.
@@ -590,17 +624,7 @@ pub(crate) fn spawn_refresh_if_stale(days: Option<u64>) {
     let Some(path) = cache_path() else {
         return;
     };
-    let fresh = read_overlay(&path)
-        .and_then(|overlay| parse_instant(&overlay.generated_at))
-        .is_some_and(|at| {
-            (chrono::Utc::now() - at)
-                < chrono::Duration::days(
-                    i64::try_from(days)
-                        .unwrap_or(i64::MAX / 86_400_000)
-                        .min(36_500),
-                )
-        });
-    if fresh {
+    if !refresh_due(&path, days, chrono::Utc::now()) {
         return;
     }
     tokio::spawn(async {
@@ -630,6 +654,10 @@ mod tests {
         .to_string()
     }
 
+    /// The single explicit clock value every catalog decision in these tests uses.
+    const NOW: chrono::DateTime<chrono::Utc> =
+        chrono::DateTime::from_timestamp(1_797_292_800, 0).unwrap(); // 2026-12-15
+
     const EMBEDDED: &str = r#"{"anthropic":[{"id":"claude-old","name":"Old","context":1000}],"openai":[{"id":"gpt-x","name":"X","context":2000}]}"#;
 
     #[test]
@@ -637,7 +665,7 @@ mod tests {
         let root = crate::tests::OwnedTestDirectory::new("catalog-overlay");
         let path = root.path().join("models-catalog.json");
         std::fs::write(&path, overlay_json("2026-12-01T00:00:00Z")).unwrap();
-        let catalog = super::load_catalog(EMBEDDED, "2026-11-01T00:00:00Z", Some(&path));
+        let catalog = super::load_catalog(EMBEDDED, "2026-11-01T00:00:00Z", Some(&path), NOW);
         assert_eq!(catalog.source, super::CatalogSource::Cache(path.clone()));
         let anthropic = &catalog.entries["anthropic"];
         assert_eq!(
@@ -673,12 +701,12 @@ mod tests {
             "[]".to_string(),
         ] {
             std::fs::write(&path, content).unwrap();
-            let catalog = super::load_catalog(EMBEDDED, "2026-11-01T00:00:00Z", Some(&path));
+            let catalog = super::load_catalog(EMBEDDED, "2026-11-01T00:00:00Z", Some(&path), NOW);
             assert_eq!(catalog.source, super::CatalogSource::Embedded);
             assert_eq!(catalog.entries["anthropic"][0].id, "claude-old");
         }
         let missing = root.path().join("absent.json");
-        let catalog = super::load_catalog(EMBEDDED, "2026-11-01T00:00:00Z", Some(&missing));
+        let catalog = super::load_catalog(EMBEDDED, "2026-11-01T00:00:00Z", Some(&missing), NOW);
         assert_eq!(catalog.source, super::CatalogSource::Embedded);
         let line = super::describe_age(
             &catalog.source,
@@ -689,6 +717,35 @@ mod tests {
             line.contains("embedded snapshot from 2026-11-01 (1 day old"),
             "{line}"
         );
+    }
+
+    #[test]
+    fn future_dated_overlay_is_ignored_and_triggers_refresh_after_clock_rollback() {
+        let root = crate::tests::OwnedTestDirectory::new("catalog-overlay-future");
+        let path = root.path().join("models-catalog.json");
+        let embedded_at = "2026-11-01T00:00:00Z";
+        // (generated_at, selected over embedded, refresh due with 7-day TTL)
+        for (stamp, selected, due) in [
+            ("2026-12-14T00:00:00Z", true, false), // current: one day old
+            ("2026-12-15T12:00:00Z", true, false), // within the skew allowance
+            ("2026-12-10T00:00:00Z", true, false), // fresh
+            ("2026-12-01T00:00:00Z", true, true),  // expired
+            ("2027-06-01T00:00:00Z", false, true), // clock was ahead: future
+            ("9999-01-01T00:00:00Z", false, true),
+            ("2026-10-01T00:00:00Z", false, true), // embedded newer
+            ("not a date", false, true),           // invalid
+        ] {
+            std::fs::write(&path, overlay_json(stamp)).unwrap();
+            let catalog = super::load_catalog(EMBEDDED, embedded_at, Some(&path), NOW);
+            assert_eq!(
+                catalog.source == super::CatalogSource::Cache(path.clone()),
+                selected,
+                "{stamp}"
+            );
+            assert_eq!(super::refresh_due(&path, 7, NOW), due, "{stamp}");
+        }
+        std::fs::remove_file(&path).unwrap();
+        assert!(super::refresh_due(&path, 7, NOW), "missing cache refreshes");
     }
 
     #[test]
@@ -783,7 +840,7 @@ mod tests {
 
     #[test]
     fn malformed_catalog_falls_back_to_empty() {
-        let catalog = super::load_catalog("{not valid json", "", None);
+        let catalog = super::load_catalog("{not valid json", "", None, NOW);
 
         assert!(catalog.entries.is_empty());
         assert!(parse_catalog("{not valid json").is_empty());
