@@ -782,7 +782,11 @@ impl FetchSender for BoundFetchSender {
         permission_bridge: &PermissionBridge,
     ) -> Result<FetchTransportOutcome, FetchError> {
         let host = url.host_str().ok_or(FetchError::MissingHost)?;
-        let transport = FetchTransport::new(Some((host, addresses)))?;
+        let proxy = crate::agent::tools::web_proxy::proxy_for_url(&url);
+        // A proxied DNS name has no pinned addresses; the proxy resolves it.
+        let resolved = (!addresses.is_empty()).then_some((host, addresses));
+        let transport =
+            FetchTransport::with_proxy(FetchLimits::default(), resolved, proxy.as_deref())?;
         transport.execute(url, request, || permission_bridge.is_cancelled())
     }
 }
@@ -1031,10 +1035,17 @@ impl FetchExecutor {
     ) -> Result<PreparedFetchTarget, FetchError> {
         let host = url.host_str().ok_or(FetchError::MissingHost)?;
         let port = url.port_or_known_default().ok_or(FetchError::MissingPort)?;
-        let mut addresses = self.resolver.resolve(host, port, permission_bridge)?;
-        addresses.sort_unstable();
-        addresses.dedup();
-        validate_public_destinations(&addresses)?;
+        let addresses = if crate::agent::tools::web_proxy::proxied_dns_name(&url) {
+            // The environment proxy resolves the name: screen it, do not pin.
+            crate::agent::tools::web_proxy::validate_proxied_host_name(host)?;
+            Vec::new()
+        } else {
+            let mut addresses = self.resolver.resolve(host, port, permission_bridge)?;
+            addresses.sort_unstable();
+            addresses.dedup();
+            validate_public_destinations(&addresses)?;
+            addresses
+        };
         let permission_key = fetch_permission_key(&url, &addresses);
         permission_bridge
             .check("js/fetch", &permission_key)
@@ -1087,11 +1098,15 @@ impl FetchExecutor {
 
 #[cfg(feature = "sandbox")]
 fn fetch_permission_key(url: &Url, addresses: &[SocketAddr]) -> String {
-    let destinations = addresses
-        .iter()
-        .map(SocketAddr::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
+    let destinations = if addresses.is_empty() {
+        "via-proxy".to_owned()
+    } else {
+        addresses
+            .iter()
+            .map(SocketAddr::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    };
     format!("{} destinations=[{destinations}]", url.as_str())
 }
 

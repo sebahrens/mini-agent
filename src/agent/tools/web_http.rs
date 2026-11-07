@@ -605,10 +605,19 @@ impl FetchTransport {
         limits: FetchLimits,
         resolved_host: Option<(&str, &[SocketAddr])>,
     ) -> Result<Self, FetchError> {
+        Self::with_proxy(limits, resolved_host, None)
+    }
+
+    /// As [`Self::with_limits`], routing through `proxy` (an environment proxy
+    /// URL from `web_proxy`) when given; `None` connects directly.
+    pub(crate) fn with_proxy(
+        limits: FetchLimits,
+        resolved_host: Option<(&str, &[SocketAddr])>,
+        proxy: Option<&str>,
+    ) -> Result<Self, FetchError> {
         let build = |resolved_host: Option<(&str, &[SocketAddr])>| {
             let mut builder = reqwest::blocking::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
-                .no_proxy()
                 .no_gzip()
                 .no_brotli()
                 .no_zstd()
@@ -621,6 +630,10 @@ impl FetchTransport {
                 // the total wall-clock deadline across all successful reads.
                 .timeout(limits.read_timeout)
                 .user_agent(concat!("mini-agent-js-fetch/", env!("CARGO_PKG_VERSION")));
+            builder = match proxy {
+                Some(proxy) => builder.proxy(super::web_proxy::proxy_config(proxy)?),
+                None => builder.no_proxy(),
+            };
             if let Some((host, addresses)) = resolved_host {
                 builder = builder.resolve_to_addrs(host, addresses);
             }
@@ -633,9 +646,10 @@ impl FetchTransport {
         let client = match resolved_host {
             Some((host, addresses)) => {
                 let key = format!(
-                    "{host}|{}|{}",
+                    "{host}|{}|{}|{}",
                     limits.connect_timeout.as_nanos(),
-                    limits.read_timeout.as_nanos()
+                    limits.read_timeout.as_nanos(),
+                    proxy.unwrap_or("")
                 );
                 BLOCKING_CLIENTS.get_or_build(&key, addresses, || build(resolved_host))?
             }
@@ -855,6 +869,9 @@ pub(crate) struct NativeFetchLimits {
     pub(crate) total_timeout: Duration,
     /// Longest idle gap allowed between two body reads.
     pub(crate) read_timeout: Duration,
+    /// Bound on establishing the connection (to the destination or, behind an
+    /// environment proxy, to the proxy).
+    pub(crate) connect_timeout: Duration,
     /// Decode malformed text with replacement characters instead of failing.
     pub(crate) lossy_text: bool,
     /// Do not download a body whose content type is binary (see
@@ -875,6 +892,7 @@ impl Default for NativeFetchLimits {
             truncate_body: false,
             total_timeout: FETCH_TOTAL_TIMEOUT,
             read_timeout: FETCH_READ_TIMEOUT,
+            connect_timeout: FETCH_CONNECT_TIMEOUT,
             lossy_text: false,
             skip_binary_body: false,
             accept_pdf: false,
@@ -901,6 +919,11 @@ impl NativeFetchLimits {
         self.total_timeout = Duration::from_secs(secs);
         self.read_timeout = (self.total_timeout / 2)
             .max(FETCH_READ_TIMEOUT)
+            .min(self.total_timeout);
+        // The connect bound scales too: a third of the total, never below the
+        // historical three seconds nor above the total (mini-agent-788z5).
+        self.connect_timeout = (self.total_timeout / 3)
+            .max(FETCH_CONNECT_TIMEOUT)
             .min(self.total_timeout);
         self
     }
@@ -1142,12 +1165,19 @@ pub(crate) async fn send_async(
         return Err(FetchError::RequestBodyTooLarge);
     }
     let host = url.host_str().ok_or(FetchError::MissingHost)?;
-    // Header/body caps are compile-time defaults. The pinned client also bakes in the idle-read and total bounds, so they
-    // are part of the cache key alongside the host.
+    let proxy = super::web_proxy::proxy_for_url(&url);
+    if addresses.is_empty() && proxy.is_none() {
+        return Err(FetchError::DestinationDenied);
+    }
+    let connect_timeout = native.connect_timeout;
+    // Header/body caps are compile-time defaults. The pinned client also bakes in the idle-read, connect and total bounds, so they
+    // are part of the cache key alongside the host and the proxy.
     let key = format!(
-        "{host}|{}|{}",
+        "{host}|{}|{}|{}|{}",
         native.read_timeout.as_millis(),
-        native.total_timeout.as_millis()
+        native.total_timeout.as_millis(),
+        connect_timeout.as_millis(),
+        proxy.as_deref().unwrap_or("")
     );
     let client = if let Some(client) = ASYNC_CLIENTS.lookup(&key, addresses) {
         client
@@ -1161,21 +1191,28 @@ pub(crate) async fn send_async(
         let host_owned = host.to_string();
         let addresses_owned = addresses.to_vec();
         let (read_timeout, total_timeout) = (native.read_timeout, native.total_timeout);
+        let proxy_owned = proxy.clone();
         let built = tokio::task::spawn_blocking(move || {
-            reqwest::Client::builder()
+            let mut builder = reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
-                .no_proxy()
                 .no_gzip()
                 .no_brotli()
                 .no_zstd()
                 .no_deflate()
                 .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
                 .pool_idle_timeout(POOL_IDLE_TIMEOUT)
-                .connect_timeout(limits.connect_timeout)
+                .connect_timeout(connect_timeout)
                 .read_timeout(read_timeout)
                 .timeout(total_timeout)
-                .user_agent(concat!("mini-agent-web/", env!("CARGO_PKG_VERSION")))
-                .resolve_to_addrs(&host_owned, &addresses_owned)
+                .user_agent(concat!("mini-agent-web/", env!("CARGO_PKG_VERSION")));
+            builder = match &proxy_owned {
+                Some(proxy) => builder.proxy(super::web_proxy::proxy_config(proxy)?),
+                None => builder.no_proxy(),
+            };
+            if !addresses_owned.is_empty() {
+                builder = builder.resolve_to_addrs(&host_owned, &addresses_owned);
+            }
+            builder
                 .build()
                 .map_err(|e| FetchError::ClientBuild(e.to_string()))
         })
@@ -1407,21 +1444,40 @@ impl NativeWebClient {
                         "web URL exceeds the 8192-byte normalized URL limit".into(),
                     ));
                 }
-                let mut addresses = self.resolve(&url).await.map_err(native_error)?;
-                addresses.sort_unstable();
-                addresses.dedup();
-                validate_public_destinations(&addresses).map_err(native_error)?;
+                // Behind an environment proxy the proxy resolves DNS names, so
+                // there is nothing to pin: screen the name instead and leave the
+                // destination set empty (see `web_proxy`).
+                let proxied_name = super::web_proxy::proxied_dns_name(&url);
+                let addresses = if proxied_name {
+                    super::web_proxy::validate_proxied_host_name(
+                        url.host_str()
+                            .ok_or(FetchError::MissingHost)
+                            .map_err(native_error)?,
+                    )
+                    .map_err(native_error)?;
+                    Vec::new()
+                } else {
+                    let mut addresses = self.resolve(&url).await.map_err(native_error)?;
+                    addresses.sort_unstable();
+                    addresses.dedup();
+                    validate_public_destinations(&addresses).map_err(native_error)?;
+                    addresses
+                };
                 // The approval includes the normalized URL and complete public
                 // answer. A host-wide grant never skips DNS/redirect validation.
-                let key = format!(
-                    "{} destinations=[{}]",
-                    url.as_str(),
-                    addresses
-                        .iter()
-                        .map(SocketAddr::to_string)
-                        .collect::<Vec<_>>()
-                        .join(",")
-                );
+                let key = if proxied_name {
+                    format!("{} destinations=[via-proxy]", url.as_str())
+                } else {
+                    format!(
+                        "{} destinations=[{}]",
+                        url.as_str(),
+                        addresses
+                            .iter()
+                            .map(SocketAddr::to_string)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                };
                 let origin_scope = crate::permission::pattern::web_origin_pattern(&url);
                 super::check_perm_with_suggestion(
                     &self.permission,
@@ -1876,6 +1932,99 @@ pub(crate) mod web_http_tests {
             let message=client.execute("http://fixture.invalid/search",&request,"web_search",false).await.unwrap_err().to_string();
             assert!(message.contains(expected),"{message}"); assert!(!message.contains("owned-secret"));assert_eq!(peer.count(),1);
         }
+    }
+    // mini-agent-788z5: a name behind an environment proxy is sent to the
+    // proxy (absolute-form request), unresolved locally; NO_PROXY and loopback
+    // stay direct; local-looking names are refused before any I/O.
+    #[tokio::test]
+    async fn web_http_env_proxy_receives_name_destinations_without_local_dns() {
+        use super::super::web_proxy::{ProxyEnv, set_test_proxy_env};
+        let proxy = Peer::new(vec![Peer::response("via proxy")]);
+        let env = ProxyEnv::from_lookup(|name| {
+            (name == "HTTP_PROXY").then(|| format!("http://{}", proxy.address))
+        });
+        let client = NativeWebClient::new(
+            FetchPolicy::from_settings(None, true),
+            Some(allowed_permission()),
+            None,
+        );
+        let guard = set_test_proxy_env(env);
+        let (_, page) = client
+            .execute(
+                "http://docs.unresolvable-name.test/page?q=1",
+                &FetchRequest::get(),
+                "web_fetch",
+                true,
+            )
+            .await
+            .expect("proxied fetch");
+        assert_eq!(page.text, "via proxy");
+        let seen = proxy.requests.lock().unwrap()[0].clone();
+        assert!(
+            seen.starts_with("GET http://docs.unresolvable-name.test/page?q=1 HTTP/1.1"),
+            "{seen}"
+        );
+        for local in [
+            "http://localhost/",
+            "http://printer.local/",
+            "http://intranet/",
+        ] {
+            let before = proxy.count();
+            let denied = client
+                .execute(local, &FetchRequest::get(), "web_fetch", true)
+                .await;
+            assert!(denied.is_err(), "{local}");
+            assert_eq!(proxy.count(), before, "{local} reached the proxy");
+        }
+        drop(guard);
+        // Without a proxy the unresolvable name fails locally, never via proxy.
+        let before = proxy.count();
+        let direct = client
+            .execute(
+                "http://docs.unresolvable-name.test/",
+                &FetchRequest::get(),
+                "web_fetch",
+                true,
+            )
+            .await;
+        assert!(direct.is_err());
+        assert_eq!(proxy.count(), before);
+    }
+    #[cfg(all(feature = "js", feature = "sandbox"))]
+    #[test]
+    fn web_http_js_transport_routes_through_given_proxy() {
+        let proxy = Peer::new(vec![Peer::response("js via proxy")]);
+        let transport = FetchTransport::with_proxy(
+            FetchLimits::default(),
+            None,
+            Some(&format!("http://{}", proxy.address)),
+        )
+        .unwrap();
+        let request = FetchRequest::get();
+        let outcome = transport
+            .execute(
+                Url::parse("http://js.unresolvable-name.test/x").unwrap(),
+                &request,
+                || false,
+            )
+            .unwrap();
+        assert!(matches!(outcome, FetchTransportOutcome::Complete(_)));
+        let seen = proxy.requests.lock().unwrap()[0].clone();
+        assert!(
+            seen.starts_with("GET http://js.unresolvable-name.test/x HTTP/1.1"),
+            "{seen}"
+        );
+    }
+    #[test]
+    fn web_http_connect_timeout_scales_with_configured_total() {
+        let default = NativeFetchLimits::default();
+        assert_eq!(default.connect_timeout, FETCH_CONNECT_TIMEOUT);
+        let scaled = NativeFetchLimits::default().with_total_timeout_secs(Some(300));
+        assert_eq!(scaled.connect_timeout, Duration::from_secs(100));
+        let short = NativeFetchLimits::default().with_total_timeout_secs(Some(1));
+        assert_eq!(short.connect_timeout, Duration::from_secs(1));
+        let normal = NativeFetchLimits::default().with_total_timeout_secs(None);
+        assert_eq!(normal.connect_timeout, Duration::from_secs(10));
     }
     #[test]
     fn web_http_fragment_is_stripped_not_refused() {

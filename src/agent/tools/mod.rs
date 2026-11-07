@@ -34,6 +34,7 @@ pub(crate) mod text_encoding;
 pub(crate) mod todo;
 pub(crate) mod web_fetch;
 pub(crate) mod web_http;
+pub(crate) mod web_proxy;
 pub(crate) mod web_search;
 pub(crate) mod write;
 

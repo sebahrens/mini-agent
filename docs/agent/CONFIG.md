@@ -4815,6 +4815,21 @@ These are authority-sensitive project config keys and require existing project
 trust. They are independent of `js-fetch-origins`/`js-fetch-allow-http`; changing
 native web settings does not widen the JS broker's grant or worker authority.
 
+Proxies: native `web_fetch`, `web_search` and the JS `fetch()` broker honour
+`HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` (and lowercase forms; `http`/`https` proxy
+URLs only) with `NO_PROXY` exclusions (`*`, host or `.domain` suffix, `host:port`,
+IPv4 CIDR). Loopback and `localhost` destinations never use a proxy. Trade-off:
+the proxy resolves DNS names itself, so for a proxied name there is no local
+resolution, no address pinning and no private-address check on the answer; the
+approval key then reads `destinations=[via-proxy]`. mini-agent instead refuses
+`localhost`, single-label names and `.local`/`.localhost`/`.localdomain`/
+`.internal`/`.lan`/`.home.arpa`/`.intranet` names before any request, still
+validates IP literals, and re-applies origin policy, approval, redirect checks and
+body/time bounds on every hop; what a proxied public name may reach is then the
+proxy's policy. The native connect timeout is a third of `web-fetch-timeout-secs`
+(at least 3 s, at most the total), so raising the deadline raises it too; JS
+`fetch()` keeps 3 s.
+
 A `#fragment` on a native `web_fetch` URL (or a redirect target) is dropped, since
 fragments are never sent to servers; the tool output notes it. The JS `fetch()`
 broker still refuses fragments.
