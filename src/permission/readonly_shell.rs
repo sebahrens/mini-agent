@@ -203,6 +203,55 @@ fn short_cluster_has(arg: &str, letters: &[char]) -> bool {
         && arg.chars().skip(1).any(|c| letters.contains(&c))
 }
 
+/// GNU grep parses the `-d`/`--directories` ACTION with argmatch, which accepts
+/// unambiguous abbreviations (`rec`, `recu`, ...). Treat any action other than
+/// the exact non-traversing `read`/`skip` as a recursive walk (fail closed).
+fn grep_directories_action_may_recurse(args: &[String]) -> bool {
+    let non_traversing = |v: &str| v == "read" || v == "skip";
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        i += 1;
+        if a == "--" {
+            break;
+        }
+        if let Some(long) = a.strip_prefix("--") {
+            let (name, value) = match long.split_once('=') {
+                Some((n, v)) => (n, Some(v)),
+                None => (long, None),
+            };
+            if !name.is_empty() && "directories".starts_with(name) {
+                let v = match value {
+                    Some(v) => v,
+                    None => {
+                        let v = args.get(i).map(String::as_str).unwrap_or("");
+                        i += 1;
+                        v
+                    }
+                };
+                if !non_traversing(v) {
+                    return true;
+                }
+            }
+        } else if let Some(cluster) = a.strip_prefix('-') {
+            if let Some(pos) = cluster.find('d') {
+                let rest = &cluster[pos + 1..];
+                let v = if rest.is_empty() {
+                    let v = args.get(i).map(String::as_str).unwrap_or("");
+                    i += 1;
+                    v
+                } else {
+                    rest
+                };
+                if !non_traversing(v) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn command_is_read_only(
     words: &[String],
     working_dir: &str,
@@ -270,7 +319,7 @@ fn command_is_read_only(
                     || long_opt_is(a, "recursive")
                     || a == "recurse"
                     || (a.starts_with('-') && a.ends_with("recurse"))
-            });
+            }) || grep_directories_action_may_recurse(args);
             true
         }
         "tail" => !args.iter().any(|a| {
@@ -548,6 +597,13 @@ mod tests {
             "grep --directories=recurse -n foo src",
             "grep -drecurse foo src",
             "grep -d recurse foo src",
+            "grep -d rec -n SECRET .",
+            "grep -drec foo src",
+            "grep --directories=rec foo src",
+            "grep --dir=recu foo src",
+            "grep --directories rec foo src",
+            "grep -nd rec foo src",
+            "grep -ndrec foo src",
             "ls -R .",
             "ls --recursive .",
             "ls --rec .",
@@ -555,6 +611,13 @@ mod tests {
             assert!(report(script).recursive, "should be recursive: {script}");
         }
         assert!(!report("ls -la src").recursive);
+        for script in [
+            "grep -d read foo src",
+            "grep -d skip foo src",
+            "grep --directories=skip foo src",
+        ] {
+            assert!(!report(script).recursive, "not recursive: {script}");
+        }
         assert!(
             report("grep -f.env foo src")
                 .paths
