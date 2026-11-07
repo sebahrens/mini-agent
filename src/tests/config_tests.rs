@@ -757,7 +757,10 @@ fn local_override_partial_retry() {
     let merged = merge_config_override(&base, "[retry]\nmax_attempts = 9").unwrap();
     assert_eq!(merged.retry.max_attempts, 9);
     assert_eq!(merged.retry.initial_backoff_ms, 500);
-    assert_eq!(merged.retry.max_backoff_ms, 10_000);
+    assert_eq!(
+        merged.retry.max_backoff_ms,
+        crate::retry::DEFAULT_MAX_BACKOFF_MS
+    );
 }
 
 #[test]

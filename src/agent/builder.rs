@@ -2210,7 +2210,17 @@ mod extra_file_tests {
             crate::sandbox::Sandbox::new(false, "bwrap"),
             None,
         );
-        assert_eq!(normal.description(), uncontained.description());
+        // A contained Linux shell discloses its private /tmp; without a
+        // fallback that is the only difference from an uncontained shell.
+        let note = if sandbox.shell_private_tmp() {
+            crate::agent::tools::bash::SHELL_PRIVATE_TMP_NOTE
+        } else {
+            ""
+        };
+        assert_eq!(
+            normal.description(),
+            format!("{}{note}", uncontained.description())
+        );
     }
 
     #[cfg(target_os = "linux")]

@@ -10811,9 +10811,14 @@ mod permission_loop_tests {
             sent(&asks, ask.into()).await;
             drain(&mut app).await;
             assert_eq!(
+                // The unwrapped prompt text: the painted frame hard-wraps at
+                // the terminal width and can split the hint across rows.
                 app.renderer
-                    .captured_output()
-                    .contains("(p) always allow in this project"),
+                    .permission_prompt
+                    .as_ref()
+                    .is_some_and(|prompt| prompt
+                        .options
+                        .contains("(p) always allow in this project")),
                 enabled
             );
             sent(

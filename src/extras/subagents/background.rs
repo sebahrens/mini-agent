@@ -3065,9 +3065,18 @@ mod evidence_tool_tests {
         };
         // Everything allowed: every record opens.
         for id in ["E1", "E2", "E3", "E4", "E5", "E6", "E7"] {
-            open(serde_json::json!({"*": "allow"}), id)
-                .await
-                .unwrap_or_else(|error| panic!("{id}: {error}"));
+            let opened = open(serde_json::json!({"*": "allow"}), id).await;
+            // Without MCP support a record from an MCP tool cannot be
+            // re-judged, so it is refused rather than shown.
+            if cfg!(not(feature = "mcp")) && matches!(id, "E5" | "E6") {
+                let error = opened.expect_err("MCP records are refused without MCP support");
+                assert!(
+                    error.to_string().contains("MCP support is not built in"),
+                    "{error}"
+                );
+            } else {
+                opened.unwrap_or_else(|error| panic!("{id}: {error}"));
+            }
         }
         // A denied tool rule now blocks records that previously slipped by
         // because only recorded `read` calls were re-judged.

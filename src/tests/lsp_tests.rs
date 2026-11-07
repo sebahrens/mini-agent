@@ -2623,9 +2623,11 @@ fn rename_preview_is_bounded_and_never_names_outside_files() {
             "newText": format!("line one\nforged {}", "x".repeat(300)),
         })
     };
+    // `serde_json::Map` iterates in key order unless another feature enables
+    // `preserve_order`; "a-many.rs" is retained first under either ordering.
     let mut changes = serde_json::Map::new();
     changes.insert(
-        "file:///ws/many.rs".into(),
+        "file:///ws/a-many.rs".into(),
         serde_json::Value::Array((0..MAX_EDITS_PER_FILE + 200).map(edit).collect()),
     );
     for index in 0..(MAX_EDIT_FILES + 5) {
@@ -2642,7 +2644,7 @@ fn rename_preview_is_bounded_and_never_names_outside_files() {
     let many = preview
         .files
         .iter()
-        .find(|file| file.path.ends_with("many.rs"))
+        .find(|file| file.path.ends_with("a-many.rs"))
         .unwrap();
     assert_eq!(many.edits.len(), MAX_EDITS_PER_FILE);
     assert_eq!(many.omitted_edits, 200);
