@@ -222,27 +222,45 @@ async fn checked_notice(state: &Path) -> Option<String> {
     }
 }
 
-fn read_cache(path: &Path) -> io::Result<Option<Cache>> {
+/// What the cache file held: nothing, a trusted cache, or content that cannot
+/// be trusted (oversize, bad JSON, unsupported schema, invalid version).
+enum CacheState {
+    Absent,
+    Valid(Cache),
+    Invalid(&'static str),
+}
+
+fn read_cache_state(path: &Path) -> io::Result<CacheState> {
     let file = match crate::fs::open_private_file(path) {
         Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(CacheState::Absent),
         Err(error) => return Err(error),
     };
     let mut bytes = Vec::new();
     file.take(MAX_CACHE_BYTES + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_CACHE_BYTES {
-        return Err(io::Error::other("update cache exceeds its bound"));
+        return Ok(CacheState::Invalid("update cache exceeds its bound"));
     }
-    let cache: Cache = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+    let Ok(cache) = serde_json::from_slice::<Cache>(&bytes) else {
+        return Ok(CacheState::Invalid("update cache is not valid"));
+    };
     if cache.schema != 1
         || cache
             .latest_version
             .as_deref()
             .is_some_and(|v| stable_version(v).is_none())
     {
-        return Err(io::Error::other("unsupported update cache"));
+        return Ok(CacheState::Invalid("unsupported update cache"));
     }
-    Ok(Some(cache))
+    Ok(CacheState::Valid(cache))
+}
+
+fn read_cache(path: &Path) -> io::Result<Option<Cache>> {
+    match read_cache_state(path)? {
+        CacheState::Absent => Ok(None),
+        CacheState::Valid(cache) => Ok(Some(cache)),
+        CacheState::Invalid(reason) => Err(io::Error::other(reason)),
+    }
 }
 
 fn save_cache(path: &Path, cache: &Cache) -> io::Result<()> {
@@ -281,7 +299,17 @@ where
         Err(std::fs::TryLockError::Error(error)) => return Err(error),
     }
     let cache_path = directory.join("latest.json");
-    let previous = read_cache(&cache_path)?;
+    // Unusable content is treated as absent and overwritten below, so one bad
+    // write cannot disable the notice until the file is removed by hand. An
+    // unreadable or untrusted file (permissions, symlink) still fails closed.
+    let previous = match read_cache_state(&cache_path)? {
+        CacheState::Valid(cache) => Some(cache),
+        CacheState::Absent => None,
+        CacheState::Invalid(reason) => {
+            tracing::debug!(reason, "discarding unusable update cache");
+            None
+        }
+    };
     if let Some(cache) = &previous
         && recently_checked(cache.checked_at, now)
     {
@@ -735,14 +763,24 @@ mod tests {
             br#"{"schema":1,"checked_at":0,"latest_version":"1.2.3;evil"}"#.to_vec(),
         ] {
             crate::fs::private_atomic_write_sync(&path, &contents).unwrap();
-            assert!(
-                check_cached(root.path(), 100, "1.0.0", || async {
-                    panic!("invalid cache must not cause network work")
-                })
-                .await
-                .is_err()
-            );
+            assert!(read_cache(&path).is_err());
+            // Unusable content is discarded and rewritten, never fatal.
+            let notice = check_cached(root.path(), 100, "1.0.0", || async {
+                Some("1.2.0".to_string())
+            })
+            .await
+            .unwrap();
+            assert_eq!(notice.as_deref().map(|n| n.contains("1.2.0")), Some(true));
+            let healed = read_cache(&path).unwrap().unwrap();
+            assert_eq!(healed.checked_at, 100);
+            assert_eq!(healed.latest_version.as_deref(), Some("1.2.0"));
         }
+        // An empty object (the reported repro) heals the same way.
+        crate::fs::private_atomic_write_sync(&path, b"{}").unwrap();
+        check_cached(root.path(), 100, "1.0.0", || async { None })
+            .await
+            .unwrap();
+        assert!(read_cache(&path).unwrap().is_some());
         #[cfg(unix)]
         {
             let target = root.path().join("other.json");
