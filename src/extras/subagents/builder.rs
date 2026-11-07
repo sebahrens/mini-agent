@@ -219,6 +219,15 @@ pub(crate) struct PersonaExecution {
     /// the authorized skill catalogue.
     #[cfg_attr(not(feature = "agent-skills"), allow(dead_code))]
     pub(crate) skills: Vec<String>,
+    /// `memory:` request that passed `[subagents] agent_memory`: scope and the
+    /// persona name. Resolved into `memory_dir` when the child is built.
+    pub(crate) memory: Option<(crate::context::agents::AgentMemoryScope, String)>,
+    /// `hooks:` frontmatter (hook-configuration JSON) that passed
+    /// `[subagents] agent_hooks`.
+    #[cfg_attr(not(feature = "hooks"), allow(dead_code))]
+    pub(crate) hooks: Option<String>,
+    /// The opened notes directory; adds the `agent_memory` tool.
+    pub(crate) memory_dir: Option<std::sync::Arc<super::agent_memory::AgentMemory>>,
     /// Exact server -> wire-level tool names granted to this persona. `None`
     /// means no MCP authority; outer-agent connections are never inherited.
     #[cfg(feature = "mcp")]
@@ -888,6 +897,11 @@ pub(crate) fn persona_tools(
                 .filter_map(|(tool, kind)| kinds.contains(&kind).then_some(tool)),
         );
     }
+    if let Some(memory) = &persona.memory_dir {
+        tools.push(Box::new(super::agent_memory::AgentMemoryTool::new(
+            std::sync::Arc::clone(memory),
+        )));
+    }
     #[cfg(feature = "skills")]
     if kinds.contains(&AgentTool::SkillsSearch)
         && let Some(services) = skill_services
@@ -1114,6 +1128,18 @@ fn build_explore_agent_inner_with_suffix<M: CompletionModel + 'static>(
     tools.append(&mut additional_tools);
     let tools = tools::memoize::definitions(tools);
 
+    // The persona's own hooks wrap closest to the tools; the global hooks
+    // wrap outside them, so a global deny still comes first.
+    #[cfg(feature = "hooks")]
+    let tools = match persona.hooks.as_deref() {
+        Some(json) => crate::extras::hooks::wrap_with_scoped_config(
+            tools,
+            json,
+            authorization.permission.clone(),
+            authorization.ask_tx.clone(),
+        ),
+        None => tools,
+    };
     #[cfg(feature = "hooks")]
     let tools = crate::extras::hooks::wrap_from_global(
         tools,
@@ -1247,12 +1273,46 @@ pub(crate) async fn build_explore_agent_with_suffix(
     #[cfg(feature = "archmd")] architecture: Option<String>,
     specialization: Option<String>,
     suffix: Option<&str>,
-    persona: PersonaExecution,
+    mut persona: PersonaExecution,
     #[cfg(feature = "mcp")] mcp_tools: Vec<Box<dyn rig::tool::ToolDyn>>,
     #[cfg(feature = "skills")] skill_services: Option<
         std::sync::Arc<crate::extras::js::skills::session::SkillSessionServices>,
     >,
 ) -> AnyAgent {
+    // Opt-in persistent notes: open the directory once per child and put its
+    // index in front of the persona text (as quoted data).
+    let mut specialization = specialization;
+    if let Some((scope, agent)) = persona.memory.clone()
+        && persona.memory_dir.is_none()
+    {
+        let opened = authorization
+            .workspace
+            .as_deref()
+            .zip(crate::paths::process_paths().ok())
+            .ok_or_else(|| "no workspace or application directories".to_string())
+            .and_then(|(workspace, paths)| {
+                super::agent_memory::AgentMemory::open(scope, &agent, workspace, &paths.data_dir)
+                    .map_err(|error| error.to_string())
+            });
+        match opened {
+            Ok(memory) => {
+                specialization = Some(format!(
+                    "{}{}",
+                    specialization.unwrap_or_default(),
+                    memory.context_block()
+                ));
+                persona.memory_dir = Some(std::sync::Arc::new(memory));
+            }
+            Err(error) => {
+                tracing::warn!(agent = %agent, %error, "persona memory unavailable");
+                specialization = Some(format!(
+                    "{}\n[agent memory unavailable: {}]\n",
+                    specialization.unwrap_or_default(),
+                    error.replace('\n', " ")
+                ));
+            }
+        }
+    }
     let max_tokens = cfg
         .max_tokens
         .into_iter()
@@ -2948,6 +3008,9 @@ mod provider_param_tests {
             inline_images: 0,
             provider_extra_body: config.extra_body.clone(),
             additional_params: Some(serde_json::json!({"user": "persona-tenant"})),
+            memory: None,
+            hooks: None,
+            memory_dir: None,
             #[cfg(feature = "mcp")]
             mcp_servers: None,
         }
@@ -3346,5 +3409,46 @@ mod settings127_context_tests {
                 assert_eq!(model.requests()[0].tools.len(), 1);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod agent_memory_tool_tests {
+    use super::*;
+
+    #[test]
+    fn the_notes_tool_is_installed_only_for_a_persona_with_an_opened_directory() {
+        let root = crate::tests::OwnedTestDirectory::new("persona-memory-tools");
+        let workspace = crate::paths::WorkspaceBinding::capture(root.path()).unwrap();
+        let memory = super::super::agent_memory::AgentMemory::open(
+            crate::context::agents::AgentMemoryScope::User,
+            "reviewer",
+            &workspace,
+            &root.path().join("data"),
+        )
+        .unwrap();
+        let authorization = SubagentAuthorization::new(None, None, false);
+        let names = |persona: &PersonaExecution| -> Vec<String> {
+            persona_tools(
+                &authorization,
+                persona,
+                1024,
+                10,
+                10,
+                10,
+                None,
+                #[cfg(feature = "skills")]
+                None,
+            )
+            .iter()
+            .map(|tool| tool.name())
+            .collect()
+        };
+        assert!(!names(&PersonaExecution::default()).contains(&"agent_memory".to_owned()));
+        let granted = PersonaExecution {
+            memory_dir: Some(std::sync::Arc::new(memory)),
+            ..Default::default()
+        };
+        assert!(names(&granted).contains(&"agent_memory".to_owned()));
     }
 }

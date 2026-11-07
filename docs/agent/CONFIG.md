@@ -4704,6 +4704,10 @@ contract entirely and returns the child's text verbatim.
 the host-recorded child evidence store; see
 [Evidence handles](SUBAGENTS.md#evidence-handles) for ceilings and effects.
 
+`[subagents] agent_memory = true` and `agent_hooks = true` (both default false; a project config
+needs trust) enable a persona's `memory:` notes directory and `hooks:` frontmatter; see
+[SUBAGENTS.md](SUBAGENTS.md#specialist-agent-types).
+
 `[subagents] headless_exit_wait_secs` (default 300, at most 3600; `0` cancels at once) is how
 long a headless run waits at exit for still-running background `task` jobs; see
 [SUBAGENTS.md](SUBAGENTS.md).

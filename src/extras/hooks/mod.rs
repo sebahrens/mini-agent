@@ -311,6 +311,30 @@ pub(crate) fn wrap_from_global(
     }
 }
 
+/// Wraps `tools` with hooks from a persona's `hooks:` frontmatter (validated
+/// hook-configuration JSON), scoped to those tools only. Unusable
+/// configuration is logged and the tools are returned unwrapped.
+pub(crate) fn wrap_with_scoped_config(
+    tools: Vec<Box<dyn rig::tool::ToolDyn>>,
+    json: &str,
+    permission: Option<crate::permission::checker::PermCheck>,
+    ask_tx: Option<crate::permission::ask::AskSender>,
+) -> Vec<Box<dyn rig::tool::ToolDyn>> {
+    let dispatcher = serde_json::from_str::<serde_json::Value>(json)
+        .map_err(|error| error.to_string())
+        .and_then(|value| settings::parse_hooks_config(&value))
+        .and_then(|config| dispatcher::HookDispatcher::from_config(&config));
+    match dispatcher {
+        Ok(dispatcher) => {
+            decorator::wrap_all(tools, std::sync::Arc::new(dispatcher), permission, ask_tx)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "persona hooks unusable; the child runs without them");
+            tools
+        }
+    }
+}
+
 /// Builder-owned MCP provenance, captured while concrete `McpTool` fields
 /// remain available. Other tools retain the legacy wrapper API and envelopes.
 #[cfg(feature = "mcp")]
