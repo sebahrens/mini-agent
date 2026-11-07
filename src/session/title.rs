@@ -135,6 +135,7 @@ pub async fn generate(
     // An empty reply usually means hidden reasoning consumed the cap: retry once
     // with a larger one rather than leaving the session without a title.
     for cap in [TITLE_FIRST_REQUEST_TOKENS, TITLE_RETRY_REQUEST_TOKENS] {
+        ledger.begin_request();
         let raw = tokio::time::timeout(
             std::time::Duration::from_secs(20),
             client.title_completion_with_cap(request, cfg, ledger.clone(), cap),
@@ -152,7 +153,7 @@ pub async fn generate(
 /// parsing or cancellation boundary. Taking the ledger makes charging once-only.
 #[derive(Clone, Default)]
 pub(crate) struct UsageLedger(
-    std::sync::Arc<std::sync::Mutex<crate::event::UsageDelta>>,
+    std::sync::Arc<std::sync::Mutex<(crate::event::UsageDelta, crate::event::UsageDelta)>>,
     Option<std::sync::Arc<crate::spend::run::Run>>,
     std::sync::Arc<std::sync::atomic::AtomicBool>,
 );
@@ -167,7 +168,16 @@ impl UsageLedger {
     #[cfg(test)]
     pub(crate) fn observe(&self, usage: rig::completion::Usage) {
         let mut total = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
-        *total = total.saturating_add(usage.into());
+        total.1 = total.1.saturating_add(usage.into());
+    }
+    /// Start a new billed request: usage reported so far becomes final and
+    /// `aggregate` stops max-merging into it, so a retry's separate call is
+    /// summed rather than hidden behind the first call's larger fields.
+    pub(crate) fn begin_request(&self) {
+        let mut total = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
+        total.0 = total.0.saturating_add(total.1);
+        total.1 = Default::default();
+        self.2.store(false, std::sync::atomic::Ordering::Release);
     }
     pub(crate) async fn admit(&self) -> anyhow::Result<()> {
         match &self.1 {
@@ -186,19 +196,21 @@ impl UsageLedger {
     pub(crate) fn aggregate(&self, usage: rig::completion::Usage) {
         let usage: crate::event::UsageDelta = usage.into();
         let mut total = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
-        let before = *total;
-        total.input_tokens = total.input_tokens.max(usage.input_tokens);
-        total.output_tokens = total.output_tokens.max(usage.output_tokens);
-        total.total_tokens = total.total_tokens.max(usage.total_tokens);
-        total.cached_input_tokens = total.cached_input_tokens.max(usage.cached_input_tokens);
-        total.cache_creation_input_tokens = total
+        let before = total.1;
+        total.1.input_tokens = total.1.input_tokens.max(usage.input_tokens);
+        total.1.output_tokens = total.1.output_tokens.max(usage.output_tokens);
+        total.1.total_tokens = total.1.total_tokens.max(usage.total_tokens);
+        total.1.cached_input_tokens = total.1.cached_input_tokens.max(usage.cached_input_tokens);
+        total.1.cache_creation_input_tokens = total
+            .1
             .cache_creation_input_tokens
             .max(usage.cache_creation_input_tokens);
-        total.tool_use_prompt_tokens = total
+        total.1.tool_use_prompt_tokens = total
+            .1
             .tool_use_prompt_tokens
             .max(usage.tool_use_prompt_tokens);
-        total.reasoning_tokens = total.reasoning_tokens.max(usage.reasoning_tokens);
-        let delta = total.nonnegative_difference(before);
+        total.1.reasoning_tokens = total.1.reasoning_tokens.max(usage.reasoning_tokens);
+        let delta = total.1.nonnegative_difference(before);
         let first = !self.2.swap(true, std::sync::atomic::Ordering::AcqRel);
         drop(total);
         if let Some(run) = &self.1
@@ -208,7 +220,10 @@ impl UsageLedger {
         }
     }
     pub(crate) fn take(&self) -> crate::event::UsageDelta {
-        std::mem::take(&mut *self.0.lock().unwrap_or_else(|poison| poison.into_inner()))
+        let mut total = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
+        let all = total.0.saturating_add(total.1);
+        *total = Default::default();
+        all
     }
 }
 
@@ -368,6 +383,27 @@ pub fn apply(session: &mut Session, session_id: &str, title: CompactString) -> b
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn title_retry_requests_are_summed_not_max_merged() {
+        let ledger = UsageLedger::default();
+        let usage = |input, output| rig::completion::Usage {
+            input_tokens: input,
+            output_tokens: output,
+            total_tokens: input + output,
+            ..Default::default()
+        };
+        ledger.begin_request();
+        ledger.aggregate(usage(300, 1024));
+        // A repeated Final inside one stream still max-merges.
+        ledger.aggregate(usage(300, 1024));
+        ledger.begin_request();
+        ledger.aggregate(usage(300, 1500));
+        let total = ledger.take();
+        assert_eq!(total.input_tokens, 600);
+        assert_eq!(total.output_tokens, 2524);
+        assert!(!ledger.take().has_values());
+    }
+
     use super::*;
     use crate::config::types::QuickModelConfig;
 
