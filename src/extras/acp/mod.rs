@@ -4613,7 +4613,10 @@ async fn run_prompt(
         let _ = respond_terminal(registration, responder, outcome.reason);
     }
     if title_eligible {
-        generate_session_title(state, &mut history, &session_id, &cx).await;
+        crate::startup::heap_future(|| {
+            generate_session_title(state, &mut history, &session_id, &cx)
+        })
+        .await;
     }
     Ok(())
 }
@@ -4741,12 +4744,14 @@ async fn generate_session_title(
     if matches!(client, crate::provider::AnyClient::Anthropic(_)) {
         return;
     }
-    let _ = crate::session::title::generate_for_session_in(
-        &mut history.session,
-        &state.cfg,
-        &client,
-        false,
-    )
+    let _ = crate::startup::heap_future(|| {
+        crate::session::title::generate_for_session_in(
+            &mut history.session,
+            &state.cfg,
+            &client,
+            false,
+        )
+    })
     .await;
     if history.session.generated_title.is_none() {
         return;

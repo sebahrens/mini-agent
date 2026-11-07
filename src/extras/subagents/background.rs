@@ -1287,7 +1287,10 @@ impl Admission {
             .with_background_pool(&self.pool)
             .with_background_observation(self.observation.clone());
         let recorder = self.recorder.clone();
-        let work = crate::session::file_checkpoints::scope(Some(recorder), work);
+        // Heap the caller's future: it is moved by value through the scope
+        // wrappers and `tokio::spawn`, and a large one multiplies into
+        // megabyte-sized unoptimized frames on a 2 MiB test thread.
+        let work = crate::session::file_checkpoints::scope(Some(recorder), Box::pin(work));
         let scope = self.pool.producer_scope();
         let job_scope = self.job_scope.clone();
         let root = scope.clone();

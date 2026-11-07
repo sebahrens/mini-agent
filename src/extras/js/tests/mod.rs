@@ -315,7 +315,7 @@ async fn tool_result_contract_guides_explicit_json_stringification() {
         })
         .await
         .expect("worker should return a closed invalid-result diagnostic");
-    assert!(rejected.contains("return a string/plain JSON value"));
+    assert!(rejected.contains("accessor-free plain JSON value"));
     assert!(rejected.contains("JSON.stringify(value)"));
 
     let explicit = tool

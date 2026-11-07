@@ -174,8 +174,10 @@ async fn js_tool_error_message_is_not_disclosed() {
 
 #[tokio::test]
 async fn js_tool_limit_errors_state_the_limit_and_remedy() {
+    // Oversized strings are truncated with a size marker (mini-agent-6tcp3).
     let big = run("'x'.repeat(65537)").await;
-    assert!(big.contains("at most 64 KiB"), "{big}");
+    assert!(big.contains("capped at 65536 bytes"), "{big}");
+    assert!(big.contains("65537 UTF-8 bytes in total"), "{big}");
 
     let stack = run("function f(){return f()} f()").await;
     assert!(

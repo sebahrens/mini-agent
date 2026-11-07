@@ -319,7 +319,14 @@ printf '%s\n' "$*" >> "$GH_TEST_LOG"
 case "$1 $2" in
   "auth status") exit 0 ;;
   "attestation verify")
-    [[ "${3:-}" == "--help" ]] && exit 0
+    if [[ "${3:-}" == "--help" ]]; then
+      # The installer probes the help text for the pin flags it will pass.
+      printf '%s\n' \
+        '      --cert-identity-regex string   Regex of the signing certificate identity' \
+        '      --signer-workflow string       Workflow that signed the attestation' \
+        '      --source-ref string            Source ref of the signing workflow'
+      exit 0
+    fi
     [[ "$GH_TEST_ATTESTATION" == pass ]] && exit 0
     echo "Error: no attestations matched the artifact digest" >&2
     exit 1

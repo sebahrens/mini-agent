@@ -1176,7 +1176,19 @@ fn worker_runtime_strict_clone_rejects_accessors_cycles_depth_and_bytes_without_
         10_000,
         10_000,
     );
-    for result in &results[..6] {
+    for (index, result) in results[..6].iter().enumerate() {
+        if index == 3 || index == 5 {
+            // An oversized string or encoded value is truncated with a size marker
+            // (mini-agent-6tcp3) rather than rejected; it must stay bounded.
+            match &result.outcome {
+                StepOutcome::Value(text) => assert!(
+                    text.len() <= crate::extras::js::protocol::MAX_RESULT_BYTES,
+                    "oversized result was not bounded"
+                ),
+                outcome => panic!("expected bounded value, got {outcome:?}"),
+            }
+            continue;
+        }
         assert_closed_error(
             result,
             JsErrorCode::InvalidResult,
