@@ -122,7 +122,7 @@ class CiDocsFilterTests(unittest.TestCase):
             "docs/reviews/evidence/chart.png", "docs/plans/design.json",
             "docs/decisions/diagram.svg", ".github/ISSUE_TEMPLATE/config.yml",
             ".github/ISSUE_TEMPLATE/bug_report.md", ".github/PULL_REQUEST_TEMPLATE.md",
-            ".github/CODEOWNERS", ".github/dependabot.yml", ".claude/settings.json",
+            ".github/CODEOWNERS", ".github/dependabot.yml",
         ):
             with self.subTest(path=path):
                 self.assertEqual("false", self.classify(path))
@@ -132,7 +132,7 @@ class CiDocsFilterTests(unittest.TestCase):
         for path in (
             "docs/new-data.json", "docs/reviews-new/data.json", "tests/fixtures/input.json",
             ".github/actions/example/action.yml", ".github/workflows/ci.yml",
-            ".cargo/config.toml", ".gitignore", "build.rs",
+            ".cargo/config.toml", ".gitignore", "build.rs", ".claude/settings.json",
         ):
             with self.subTest(path=path):
                 self.assertEqual("true", self.classify(path))

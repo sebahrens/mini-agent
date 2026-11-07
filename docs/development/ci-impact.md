@@ -8,8 +8,8 @@ policy job, and the required `ci-success` aggregate:
 - Unconsumed Markdown documentation and `.beads/` issue records.
 - Review evidence, plans, and decision records under `docs/reviews/`,
   `docs/plans/`, and `docs/decisions/`, including JSON, logs, and images.
-- GitHub issue/PR templates, `CODEOWNERS`, Dependabot configuration, and the
-  repository's `.claude/settings.json`. Repository policy checks still validate
+- GitHub issue/PR templates, `CODEOWNERS`, and Dependabot configuration.
+  Repository policy checks still validate
   security contact routing and dependency-update configuration.
 
 These paths also leave production and test pass fingerprints unchanged, so
@@ -22,6 +22,9 @@ registry, release source/license documents, unknown data files, build settings,
 workflow actions, and production source remain inputs. Test-only changes retain
 their existing test scope and platform rules. A mixed change retains the checks
 required by its code or tests.
+
+Agent configuration such as `.claude/settings.json` remains an input because
+production hook compatibility can consume it from the workspace.
 
 Git diffs disable rename detection and use NUL-delimited paths: moving source
 into a review directory still removes a production input and runs the matrix.

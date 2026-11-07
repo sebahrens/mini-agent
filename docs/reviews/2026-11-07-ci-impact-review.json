@@ -17,7 +17,8 @@
     "real_git_controls": "Add/edit/delete review evidence with newline and quote in filename skips matrix; moving identical source into and back out of evidence requires code checks.",
     "failure_controls": "Missing Python, unavailable history, unknown paths, tags and full manual/scheduled events remain conservative.",
     "format": "cargo fmt and git diff --check passed.",
-    "affected_rust_test": "cargo test --locked test_workflow_only_headless_relevance_check_executes_embedded_policy:1 passed,0 failed; default-feature compilation passed."
+    "affected_rust_test": "cargo test --locked test_workflow_only_headless_relevance_check_executes_embedded_policy:1 passed,0 failed; default-feature compilation passed.",
+    "final_configuration_control": "All58 focused scope/filter/fingerprint tests passed after retaining production hook configuration as an input."
   },
   "root_review": {
     "reviewers": [
@@ -25,10 +26,11 @@
       "adversarial"
     ],
     "findings": [],
-    "assessment": "No additional confirmed issue after tracing workflow outputs, skip acceptance, input exclusions, rename handling and cache invalidation. Metadata policy checks remain unconditional; no JSON-wide exemption."
+    "assessment": "No additional confirmed issue after tracing workflow outputs, skip acceptance, input exclusions, rename handling and cache invalidation. Metadata policy checks remain unconditional; no JSON-wide exemption.",
+    "correction": "Final consumer audit found src/extras/hooks/trust.rs reads workspace .claude/settings.json. Removed that proposed metadata exemption; workflow and fingerprint regressions require it to remain an input."
   },
   "hosted_validation": {
-    "status": "owning_policy_checks_passed_records_push_pending",
+    "status": "records_only_acceptance_passed_final_configuration_control_pending",
     "rule_change_run": "https://github.com/sebahrens/mini-agent/actions/runs/42416033909",
     "acceptance": "Hosted changes/fmt must pass, then a records-only push must finish green with the expensive matrix skipped. The unrelated matrix from the rule-change run is superseded after the owning policy checks pass.",
     "changes": {
@@ -39,7 +41,46 @@
       "job": 128534220672,
       "conclusion": "success"
     },
-    "runtime_matrix": "Cancelled after owning policy acceptance; unchanged runtime source reuses the green6617aaeb matrix."
+    "runtime_matrix": "Cancelled after owning policy acceptance; unchanged runtime source reuses the green6617aaeb matrix.",
+    "records_only": {
+      "headSha": "92c150c69c4c4d2ff7b288eed3f56c2f3ee8d903",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42416317022",
+      "status": "completed",
+      "conclusion": "success",
+      "successful_jobs": [
+        "changes",
+        "fmt",
+        "ci-success"
+      ],
+      "skipped_job_groups": [
+        "windows-default-compile",
+        "test",
+        "clippy",
+        "lsp-lifecycle",
+        "corresponding-source",
+        "platform-path-negative-controls",
+        "windows-general-sandbox-policy",
+        "vscode",
+        "macos-gym-ownership",
+        "windows-hooks-compile",
+        "package-compliance-smoke",
+        "all-features",
+        "platform-paths",
+        "harness-regression",
+        "mcp-stdio",
+        "windows-msi",
+        "platform-path-install-smoke",
+        "linux-sandbox-policy",
+        "macos-worker-containment-gate",
+        "parallel-test-smoke",
+        "windows-worker-launcher-unit",
+        "package",
+        "windows-worker-containment-gate",
+        "dependency-policy",
+        "install",
+        "phase6-cross-platform-gate"
+      ]
+    }
   },
   "limits": [
     "This is path-based impact classification. Unknown inputs remain conservative; adding consumers of exempt artifacts requires updating the rules and tests.",

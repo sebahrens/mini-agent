@@ -33,7 +33,7 @@ CONSUMED_DOCS = re.compile(
 RECORDS = re.compile(r"^docs/(reviews|plans|decisions)/")
 REPOSITORY_METADATA = re.compile(
     r"^(\.github/(ISSUE_TEMPLATE/|PULL_REQUEST_TEMPLATE/|PULL_REQUEST_TEMPLATE\.md$|"
-    r"CODEOWNERS$|dependabot\.yml$)|\.claude/settings\.json$)"
+    r"CODEOWNERS$|dependabot\.yml$))"
 )
 TEST_PATH = re.compile(r"^(src/tests/|src/.+/tests/|tests/)|_tests\.rs$")
 PLATFORM_NAMES = {

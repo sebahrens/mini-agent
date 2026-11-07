@@ -78,7 +78,7 @@ class FingerprintInputSetTests(unittest.TestCase):
                 "docs/plans/diagram.svg", "docs/decisions/record.json",
                 ".beads/issues.jsonl", ".github/ISSUE_TEMPLATE/config.yml",
                 ".github/PULL_REQUEST_TEMPLATE.md", ".github/CODEOWNERS",
-                ".github/dependabot.yml", ".claude/settings.json",
+                ".github/dependabot.yml",
             ):
                 with self.subTest(input_class=input_class, path=path):
                     for content in ("original", "changed"):
@@ -90,7 +90,7 @@ class FingerprintInputSetTests(unittest.TestCase):
                 "docs/acp-registry.json", "docs/agent/config.json",
                 "docs/benchmarks/baseline.json", "docs/new-data.json",
                 "docs/reviews-new/data.json", ".cargo/config.toml",
-                ".github/actions/example/action.yml", ".gitignore", "build.rs",
+                ".github/actions/example/action.yml", ".gitignore", "build.rs", ".claude/settings.json",
             ):
                 with self.subTest(input_class=input_class, path=path):
                     self.assertNotEqual(compute(entries(), input_class), compute(entries() + [(path, "new")], input_class))
