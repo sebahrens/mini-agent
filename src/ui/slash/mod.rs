@@ -193,6 +193,28 @@ impl SlashCtx<'_> {
         *self.client = next_client;
         *self.agent = Some(next_agent);
         *self.session = session;
+        #[cfg(feature = "hooks")]
+        {
+            crate::extras::hooks::set_active_session(&self.session.id);
+            if let Some(scope) = crate::agent::runner::current_hook_work_scope() {
+                let mode = self
+                    .permission
+                    .as_ref()
+                    .map(|permission| {
+                        permission
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .mode()
+                            .to_string()
+                    })
+                    .unwrap_or_else(|| "standard".into());
+                scope.set_hook_session_context(crate::extras::hooks::context_for_session(
+                    &self.session.id,
+                    self.workspace.root(),
+                    &mode,
+                ));
+            }
+        }
         // Hooks are told about the goal of the session that is now current.
         // The published record is process-wide, so without this a `Stop` hook
         // would keep describing the goal of the session just left behind.

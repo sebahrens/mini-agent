@@ -1,0 +1,19 @@
+   Compiling mini-agent v1.12.0 (/Users/seb/projects/mini-agent)
+    Finished `test` profile [unoptimized] target(s) in 15.61s
+     Running tests/mcp_server.rs (target/debug/deps/mcp_server-d2a21b41500916b5)
+
+running 2 tests
+test mcp_server_mode_initializes_lists_run_and_executes_a_headless_prompt ... ok
+test temp::temp_dir_is_unique_exclusive_and_removed_on_drop ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+
+     Running tests/mcp_server_stdio_shutdown.rs (target/debug/deps/mcp_server_stdio_shutdown-9b33b14e1129bec7)
+
+running 3 tests
+test mcp_stdio_actual_binary_exits_on_eof_with_physically_backpressured_stdout ... ok
+test mcp_stdio_actual_binary_exits_on_writer_deadline_while_stdin_stays_open ... ok
+test temp::temp_dir_is_unique_exclusive_and_removed_on_drop ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.95s
+

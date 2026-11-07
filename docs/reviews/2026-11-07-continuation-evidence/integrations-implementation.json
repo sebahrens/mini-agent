@@ -1,0 +1,198 @@
+{
+  "production_frozen": true,
+  "validation_owner": "root",
+  "source_edit_status": "complete; pending coordinated batch rerun and native Windows CI",
+  "beads": [
+    {
+      "id": "mini-agent-p0h9g.6",
+      "files": [
+        "src/extras/mcp/server.rs",
+        "src/main.rs",
+        "tests/mcp_server_stdio_shutdown.rs"
+      ],
+      "change": "Bounded independent writer; bounded response queue; EOF/protocol failure cancels and retires active work before bounded reply drain; reader/writer task abort guards prevent detached IO tasks. Run semaphore permit remains held until bounded response queue owns completed payload; cooperative task drain bounded before abort fallback. Dedicated MCP runtime bounds shutdown of uncancellable Tokio stdio pool after serve cleanup; real process tests prove physical pipe backpressure rather than only Duplex behavior.",
+      "tests": [
+        "eof_retires_runs_while_stdout_is_backpressured",
+        "stdin_eof_retires_a_silent_running_call_and_its_process_group",
+        "ping_is_answered_and_cancel_kills_the_whole_process_group_without_a_reply",
+        "completed_run_keeps_its_slot_until_reply_enters_bounded_queue",
+        "mcp_stdio_actual_binary_exits_on_eof_with_physically_backpressured_stdout",
+        "mcp_stdio_actual_binary_exits_on_writer_deadline_while_stdin_stays_open"
+      ],
+      "risks": [
+        "Completed replies are best-effort after client EOF; writer expires after 5s and EOF drain after 250ms."
+      ]
+    },
+    {
+      "id": "mini-agent-p0h9g.7",
+      "files": [
+        "src/extras/mcp/server.rs",
+        "src/extras/mcp/headers_helper.rs",
+        "src/tests/subprocess_inventory_tests.rs",
+        "docs/specs/subprocess-trust.md"
+      ],
+      "change": "Use existing guarded workspace service ownership (Unix new session and Windows Job Object); await direct leader while preserving outer tree owner so success cannot wait forever for surviving descendants. Direct-child exit triggers whole-tree retirement before bounded pipe EOF drain, including inherited pipes; Windows fixture now tests inherited stream success. Trust inventory tracks guarded CommandWrap launch and exact non-process select/JSON token contexts; stale synchronous writer/raw child fingerprints removed, no broad exemptions.",
+      "tests": [
+        "mcp_stdio_server_owns_windows_descendants_on_success_timeout_cancel_and_drop",
+        "mcp_stdio_headers_helper_owns_windows_descendants_on_success_timeout_and_drop",
+        "existing Unix helper cancellation/timeout and server cancellation tests",
+        "successful_leader_exit_retires_descendants_that_inherit_capture_pipes",
+        "successful_helper_leader_exit_retires_descendants_holding_stdout",
+        "production_subprocess_sites_have_a_trust_classification",
+        "windows_capable_production_process_terminals_use_creation_boundary"
+      ],
+      "risks": [
+        "Native Windows tests require CI Windows; existing mcp-stdio matrix command includes both because names contain mcp_stdio. Each test retains exact descendant handle before retirement and requires signal."
+      ]
+    },
+    {
+      "id": "mini-agent-p0h9g.8",
+      "files": [
+        "src/extras/acp/model_options.rs",
+        "src/extras/acp/mod.rs"
+      ],
+      "change": "Encode raw slash alias spelling once before shared canonical picker parser; literal default remains clear command, picker still selects alias named default.",
+      "tests": [
+        "model_slash_uses_raw_aliases_while_picker_uses_encoded_ids",
+        "existing alias-prefix picker roundtrip test extended with command conversion"
+      ],
+      "risks": []
+    },
+    {
+      "id": "mini-agent-gkqd4.7",
+      "files": [
+        "src/extras/hooks/backend.rs",
+        "src/extras/mcp/mod.rs",
+        "src/extras/mcp/reconnect.rs",
+        "src/agent/runner.rs",
+        "src/provider.rs",
+        "src/extras/acp/mod.rs",
+        "src/ui/mod.rs",
+        "src/ui/app.rs",
+        "src/extras/js/tool.rs",
+        "src/extras/subagents/builder.rs",
+        "src/extras/subagents/task_tool.rs"
+      ],
+      "change": "Manager-local immutable registry of source/liveness-bound RpcClient; captured on AnyAgent/build and AgentWorkScope; no global from_handles replacement; exact MCP manager explicitly bound at frontend lifecycle seams. Keep services alive through SessionEnd after work/pool retirement. Per-agent bindings are immutable task-local overlays over the existing work owner, avoiding shared scope mutation. Every AnyAgent run/spawn entry and runner side-question spawn restores immutable routing; child builder and TaskTool explicitly bind child policy/persona MCP manager.",
+      "tests": [
+        "hook_registry_stays_bound_to_live_parent_when_same_named_child_retires",
+        "mcp_tool_hook_reaches_the_server_after_a_transport_drop",
+        "immutable_agent_bindings_share_cancellation_owner_without_cross_contamination",
+        "js_permission_bridge_restores_invocation_hook_identity_outside_agent_task",
+        "runtime agent actual plain/stream EOF SessionEnd MCP lifetime test",
+        "report_contract_actual_task_requests_once_for_code_and_twice_for_repair (actual same-name parent/child MCP route + SubagentStop)"
+      ],
+      "risks": [
+        "Lifecycle scope setup coordinated with runtime agent startup/ui changes; parent should review composition."
+      ]
+    },
+    {
+      "id": "mini-agent-gkqd4.8",
+      "files": [
+        "src/agent/runner.rs",
+        "src/extras/hooks/mod.rs",
+        "src/provider.rs",
+        "src/extras/acp/mod.rs"
+      ],
+      "change": "Replaceable scope HookCtx snapshots inherited by children; with_main_session binds logical identity before prompts; ACP binds its own ID and empty transcript path. runtime agent updates startup/session replacement/SessionEnd seams. Current permission checker is retained separately from logical identity; ACP explicitly overrides canonical transcript identity after common session setup. Lifecycle work scopes retain current permission checker, distinguishing explicit unchecked policy from unbound legacy calls.",
+      "tests": [
+        "scoped_session_context_is_independent_and_inherited",
+        "runtime agent frontend lifecycle tests",
+        "actual_acp_prompt_hook_envelope_uses_protocol_id_and_empty_session_path",
+        "immutable_agent_bindings_share_cancellation_owner_without_cross_contamination",
+        "js_permission_bridge_restores_invocation_hook_identity_outside_agent_task"
+      ],
+      "risks": []
+    },
+    {
+      "id": "mini-agent-gkqd4.9",
+      "files": [
+        "src/extras/hooks/backend.rs"
+      ],
+      "change": "Evaluate ignore rules for each parent before entering it; honor ignore > gitignore > info/exclude priority; allow legitimate visible-parent child whitelists.",
+      "tests": [
+        "ignored_parent_cannot_be_reincluded_and_root_rule_beats_info_exclude",
+        "agent_file_reads_refuse_gitignored_and_unlisted_credential_files"
+      ],
+      "risks": []
+    },
+    {
+      "id": "mini-agent-gkqd4.11",
+      "files": [
+        "src/git/tool.rs",
+        "src/ui/slash/git.rs"
+      ],
+      "change": "Add lossless structured path_records directly from NUL porcelain bytes; native guard checks rename origin and destination independently and never consumes following status entry; reject truncated/non-UTF8/incomplete paths.",
+      "tests": [
+        "native_commit_guard_accepts_real_rename_operands_losslessly",
+        "unrelated_staged_paths_and_rename_sources_are_refused"
+      ],
+      "risks": [
+        "New path_records additive status field; legacy display records preserved. Native guard intentionally refuses legacy-only synthetic status."
+      ]
+    },
+    {
+      "id": "mini-agent-gkqd4.12",
+      "files": [
+        "src/extras/hooks/backend.rs"
+      ],
+      "change": "Aggregate 1MiB exact escaped JSON/model prompt expansion budget checked before appending; non-string placeholder serialization uses bounded writer; reject before provider creation/call.",
+      "tests": [
+        "aggregate_expansion_budget_covers_repetition_nested_values_and_utf8",
+        "the_event_is_fenced_bounded_and_cannot_close_its_fence"
+      ],
+      "risks": []
+    },
+    {
+      "id": "mini-agent-gkqd4.18",
+      "files": [
+        "src/extras/hooks/backend.rs",
+        "src/agent/runner.rs",
+        "src/provider.rs",
+        "src/extras/acp/mod.rs"
+      ],
+      "change": "Hook-agent file reads use current invocation permission binding; only unbound legacy calls fall back to startup runner policy. An explicitly absent invocation checker stays absent.",
+      "tests": [
+        "agent_backend_uses_current_read_deny_instead_of_startup_allow",
+        "same actual backend test includes unbound capture\u2192spawn startup-deny and explicitly unchecked positive control (6 HTTP requests)"
+      ],
+      "risks": [
+        "Actual backend regression uses owned loopback provider; root coordinates sandbox/network test execution."
+      ]
+    }
+  ],
+  "final_scoped_review": {
+    "new_P0_P3": 0,
+    "scope": [
+      "MCP writer/dispatch/EOF/task ownership and process-wrap composition",
+      "registry trust/source/liveness and frontend lifecycle bindings",
+      "ACP slash-vs-wire aliases",
+      "Git raw porcelain producer to native authorization consumer",
+      "hook ignore parent/precedence semantics",
+      "expansion bounded allocation/exact wire accounting"
+    ],
+    "limitations": [
+      "Not an absence claim outside owned scope; native Windows execution pending."
+    ]
+  },
+  "docs_patch": "/private/tmp/mini-agent-integrations-config-docs.patch",
+  "validation_update": "Root correction batch: ACP actual envelope, backend current-deny/unbound/unchecked read policy, actual TaskTool same-name MCP routing, and TUI fixes passed. 41 passed; remaining inventory second-layer fingerprints now corrected. Root owns worker fixture failure. Physical stdio integration/native Windows pending.",
+  "final_source_corrections": [
+    "Immutable task-local HookBindings prevent per-agent writes to shared cancellation scope; runner and spawned async lifecycle tasks capture binding.",
+    "HookBindings retain current permission checker for per-hook permission_mode reads.",
+    "ACP explicitly reapplies protocol HookCtx after with_main_session; production protocol hook envelope test checks protocol ID and empty path.",
+    "Explicit child start_kill followed by bounded 5s tree wait; serve cooperatively drains tasks under 5s bound before abort fallback.",
+    "Direct-child work wait skips tree-wide wrapper wait while retaining owner, allowing success to close surviving descendants.",
+    "Protocol callbacks and parent JS permission receiver retain immutable HookBindings alongside existing work owner; no worker wire/grants modified.",
+    "Direct leader status now initiates tree cleanup before pipe drain, including inherited stream success.",
+    "Every AnyAgent subagent/side-question entry and actual side-question spawn capture immutable routing; child builder and TaskTool bind child checker and exact manager explicitly.",
+    "Invocation read checker controls hook-agent backend file reads instead of startup checker; lifecycle scopes retain live checker for metadata.",
+    "HookBindings::run factory boxes metadata scope off caller stack; runner wraps already boxed model future before native owner state. All 18 small-stack regressions passed.",
+    "HookBindings permission preserves unbound/explicit unchecked/bound checker tri-state; capture/spawn never convert unbound into unchecked.",
+    "PermissionBridge invocation routing always captures exact receiver checker, including setup outside an agent overlay.",
+    "Actual binary MCP stdio probes prove first output byte from2MiB reply, keep output unread, require bounded EOF/writer-deadline exit. MCP-only runtime shutdown_timeout handles Tokio uncancellable blocking IO after owned cleanup.",
+    "Backend regression replies now match production streaming SSE contract; ACP fixture tests its actual canonical/protocol identity equivalence plus empty path.",
+    "Subprocess inventory requires both exact source-line/occurrence and full-token macro digest; added11 data-only line identities after second-layer failure, without changing parser or exemption rules."
+  ],
+  "coordinator_status": "Local validation complete. Later coordinator corrections and test results are authoritative in ../2026-11-07-continuation-review.json; hosted CI pending."
+}

@@ -1,0 +1,141 @@
+{
+  "reviewer": "boundaries",
+  "reviewed_production_head": "282e1e1b",
+  "phase": "P4 follow-up after final no-new P0-P3 stabilization",
+  "findings": [
+    {
+      "id": "BOUNDARIES-P4-1",
+      "priority": 4,
+      "confidence": 1.0,
+      "title": "Exercise guarded absolute JS publication through its production caller in the regression test",
+      "file": "src/extras/js/host.rs",
+      "start_line": 10265,
+      "end_line": 10285,
+      "related_locations": [
+        {
+          "file": "src/extras/js/host.rs",
+          "start_line": 2218,
+          "end_line": 2218
+        },
+        {
+          "file": "src/extras/js/tests/write_file_guard.rs",
+          "start_line": 121,
+          "end_line": 138
+        }
+      ],
+      "problem": "The xorxl.11 regression directly supplies Some(base) to write_approved_file_cancellable. It would still pass if production write_guarded_path again forgot to forward the checked digest, which was the original defect.",
+      "evidence": [
+        "The new test computes base itself and calls the lower-level helper with Some(base) at10279-10283.",
+        "Production forwarding is a separate call at2218. No inspected test invokes that call while mutating the target between guard authorization and publication.",
+        "Existing a_file_changed_after_the_read_is_refused mutates a relative-path file before invoking the JS tool; it protects stale read authorization, not the later absolute-path publication boundary."
+      ],
+      "fix": "Add one deterministic behavioral test through write_guarded_path or the parent effect service, using an absolute path and a controlled mutation after overwrite authorization but before atomic publication. Reuse the existing helper test as lower-level coverage.",
+      "acceptance_tests": [
+        "After a complete read, the guarded production absolute-path call encounters a same-length intervening change, returns TargetChanged and preserves those newer bytes.",
+        "The corresponding unchanged absolute-path overwrite succeeds.",
+        "Negative control: temporarily dropping only the production forwarded digest makes the new regression fail while the lower-level helper test still passes.",
+        "Use a bounded test-only seam; no sleep-dependent race or production behavior change."
+      ],
+      "related_beads": [
+        "mini-agent-xorxl.11",
+        "mini-agent-ad4rl"
+      ],
+      "category": "regression coverage",
+      "current_production_status": "Source fix is correct; this is missing protection against recurrence."
+    },
+    {
+      "id": "BOUNDARIES-P4-2",
+      "priority": 4,
+      "confidence": 0.98,
+      "title": "Report unreadable listing entries and subtrees instead of presenting complete or empty results",
+      "file": "src/agent/tools/find_files.rs",
+      "start_line": 927,
+      "end_line": 942,
+      "related_locations": [
+        {
+          "file": "src/agent/tools/list_dir.rs",
+          "start_line": 94,
+          "end_line": 107
+        },
+        {
+          "file": "src/agent/tools/list_dir.rs",
+          "start_line": 293,
+          "end_line": 299
+        }
+      ],
+      "problem": "list_dir silently drops a directory when its child descriptor cannot be opened, converts child-count read failure to0, and ignores recursive collect_level errors without setting incomplete. A readable parent containing unreadable children can therefore be shown as empty or complete with no omission notice.",
+      "evidence": [
+        "BoundDirectory::list_entries continues on open_child failure at928-929 and uses unwrap_or(0) for a child read_directory failure at940-942.",
+        "collect_level discards recursive errors at99-106 without changing its incomplete flag.",
+        "The result path emits (empty directory) for an empty rows vector at294-295, while its incomplete notices are currently reserved for row caps."
+      ],
+      "fix": "Keep a bounded record of unreadable entry/subtree omissions and unknown child counts, and disclose incomplete coverage in list_dir results; do not disclose paths hidden by permission-deny filters or ignored-directory policy.",
+      "acceptance_tests": [
+        "Under a non-root Unix test account, a readable parent with one chmod000 child does not produce an unqualified empty/complete listing; restore permissions with guaranteed cleanup.",
+        "A subtree that becomes unreadable during depth2/3 collection is reported as incomplete; a failed count is shown as unknown rather than exact zero.",
+        "Permission-denied policy paths remain hidden and ordinary count/offset paging stays unchanged."
+      ],
+      "related_beads": [
+        "mini-agent-vs169 (grep reporting; this is list_dir)"
+      ],
+      "category": "low-priority result accuracy"
+    },
+    {
+      "id": "BOUNDARIES-P4-3",
+      "priority": 4,
+      "confidence": 1.0,
+      "title": "Update the obsolete seven-operation Git description",
+      "file": "docs/agent/CONFIG.md",
+      "start_line": 2560,
+      "end_line": 2564,
+      "related_locations": [
+        {
+          "file": "src/git/tool.rs",
+          "start_line": 60,
+          "end_line": 94
+        }
+      ],
+      "problem": "The permission documentation says the structured Git tool accepts only seven fixed local operations. Its current enum has16 local operations, including blame, branch creation/switching, stash, tag and restore. Operators following the paragraph get an incomplete account of available mutations and permission keys.",
+      "evidence": [
+        "CONFIG.md2560 states the obsolete seven-operation contract.",
+        "GitOperation currently defines16 operations, including BranchCreate, Switch, StashPush, StashPop, Tag and Restore. The no-network/remotes statement in the following sentence remains accurate and should be retained."
+      ],
+      "fix": "Replace the stale operation count/list with the current operation and authorization model or link to its maintained owning section. Preserve accurate local-only, literal pathspec, filter-driver and commit behavior statements.",
+      "acceptance_tests": [
+        "Review the paragraph against GitOperation and the actual parameters/permission keys, including the newer local mutations.",
+        "Search operator docs for the same obsolete seven-operation claim and reconcile exact duplicates; preserve the accurate no-network boundary. No feature change or runtime test is required."
+      ],
+      "related_beads": [
+        "mini-agent-k4fem"
+      ],
+      "category": "operator documentation correctness"
+    }
+  ],
+  "coverage": [
+    "Original xorxl.8 history cumulative/key and prompt-baseline regression composition",
+    "Original xorxl.9 issued-credential long-rotation test and shorter real-SDK tests",
+    "Original xorxl.10 Unicode masks/work-budget regressions",
+    "Original xorxl.11 guarded-write helper, production forwarding and worker-facing tests",
+    "Previously deferred list_dir unreadable-coverage behavior",
+    "Previously deferred stale Git operation documentation"
+  ],
+  "suppressed_candidates": [
+    {
+      "candidate": "Separate P4s for every missing combined PTY or full-SDK long-rotation test.",
+      "reason": "Existing complementary tests plus current source protect those behaviors sufficiently; no separate concrete regression blind spot comparable to xorxl.11 established."
+    },
+    {
+      "candidate": "Peak-RSS test for fuzzy masks.",
+      "reason": "Checked sizing and an over-budget constructor test already exercise the dangerous allocation boundary; no need to add a platform-sensitive RSS gate solely for completeness."
+    }
+  ],
+  "verification": {
+    "cargo_runs": 0,
+    "source_edits": 0,
+    "bead_writes": 0,
+    "runtime_probes": 0,
+    "code_indexer": "Current callers of write_approved_file_cancellable and collect_level location confirmed; exact source inspected.",
+    "note": "P4 findings are actionable follow-up quality gaps; current production xorxl.11 fix is not reported as broken."
+  },
+  "ready_for_implementation_assignment": true
+}

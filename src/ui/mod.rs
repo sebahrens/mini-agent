@@ -808,6 +808,8 @@ pub(crate) async fn ensure_mcp_manager<'a>(
     if mcp.is_none() && cfg.mcp_servers.is_some() {
         *mcp = Some(McpClientManager::connect_config_in_binding(cfg, workspace).await);
     }
+    #[cfg(feature = "hooks")]
+    bind_current_mcp_hook_peers(mcp.as_ref());
     mcp.as_ref()
 }
 
@@ -831,6 +833,19 @@ pub(crate) async fn rebind_mcp_manager(
         *mcp = Some(manager);
     } else {
         shutdown.await;
+    }
+    #[cfg(feature = "hooks")]
+    bind_current_mcp_hook_peers(mcp.as_ref());
+}
+
+#[cfg(all(feature = "hooks", feature = "mcp"))]
+pub(crate) fn bind_current_mcp_hook_peers(manager: Option<&McpClientManager>) {
+    if let Some(scope) = crate::agent::runner::current_hook_work_scope() {
+        scope.set_hook_mcp_peers(
+            manager
+                .map(McpClientManager::hook_peers)
+                .unwrap_or_default(),
+        );
     }
 }
 
@@ -1215,6 +1230,8 @@ pub(crate) async fn adopt_prebuild(
         let current = current && ui.mcp_manager.is_none();
         if ui.mcp_manager.is_none() {
             ui.mcp_manager = manager;
+            #[cfg(feature = "hooks")]
+            bind_current_mcp_hook_peers(ui.mcp_manager.as_ref());
         } else if let Some(manager) = manager {
             // A newer foreground connection remains authoritative. The stale
             // agent must release its clients before retiring duplicate services.
@@ -1852,6 +1869,12 @@ pub(crate) async fn reactive_compact_and_respawn(
     compact_and_respawn(None, interactions, renderer, run, ui, slash).await
 }
 
+/// A model/admission failure is recoverable at the turn boundary. Keep it
+/// distinct from a renderer or runner-preparation failure for the App owner.
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub(crate) struct ContextReliefFailure(anyhow::Error);
+
 async fn compact_and_respawn(
     pressure: Option<f64>,
     interactions: &[rig::message::Message],
@@ -1914,21 +1937,29 @@ async fn compact_and_respawn(
         )?,
     }
 
-    // 3. Compact the session (no-op if its text history is under the limit;
-    // a provider rejection forces it past the local budget estimate).
-    let compress_result = crate::ui::slash::handle_compress_with_force(
+    // Measured provider pressure is authoritative even when the local
+    // window-minus-reserve estimate is lower (mini-agent-p0h9g.3).
+    let compactions_before = ui.session.compactions.len();
+    crate::ui::slash::handle_compress_with_force(
         None,
         true,
-        pressure.is_none(),
+        true,
         run,
         renderer,
         ui,
         slash.reasoning_enabled,
     )
-    .await;
-    if let Err(e) = compress_result {
-        renderer.write_line(&format!("mid-turn compact error: {}", e), C_ERROR)?;
-    }
+    .await
+    .map_err(|error| {
+        if error.is::<std::io::Error>() {
+            error
+        } else {
+            ContextReliefFailure(error).into()
+        }
+    })?;
+    // No old prefix is a legitimate no-op, not a successful relief. Continue
+    // this prompt without repeatedly stopping at the same irreducible batch.
+    run.mid_turn_compaction_disabled = ui.session.compactions.len() == compactions_before;
 
     // 4. Respawn on the compacted history with the continuation prompt.
     ensure_agent(&mut run.agent, ui, slash.reasoning_enabled).await;
@@ -2125,6 +2156,7 @@ pub async fn run_interactive(
     let result = result.and(crate::startup::heap_future(|| app.finish_session_end()).await);
     #[cfg(feature = "subagents")]
     let result = result.and(app.persist_background_state());
+    app.shutdown_services().await;
     result
 }
 
@@ -2636,7 +2668,10 @@ mod main_start_budget_carry_tests {
             crate::question::QuestionOrigin::NewUserTurn,
             crate::question::QuestionOrigin::Scheduled,
         ] {
+            run.mid_turn_compaction_disabled = true;
+            run.awaiting_compaction_relief = true;
             let carry = main_start_budget_carry(&mut run, origin);
+            assert!(!run.mid_turn_compaction_disabled && !run.awaiting_compaction_relief);
             assert!(!std::sync::Arc::ptr_eq(&carry, &previous));
             assert!(std::sync::Arc::ptr_eq(&carry, &run.budget_carry));
             run.budget_carry = std::sync::Arc::clone(&previous);

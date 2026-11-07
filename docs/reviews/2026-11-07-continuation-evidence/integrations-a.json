@@ -1,0 +1,143 @@
+{
+  "reviewer": "integrations continuation A (testing/adversarial/reliability)",
+  "reviewed_head": "befd7c7c (production source 282e1e1b)",
+  "excluded_existing_findings": "All eight p0h9g.* findings in docs/reviews/2026-11-07-post-fix-review.json were deduplicated.",
+  "findings": [
+    {
+      "priority": 2,
+      "title": "Bind MCP hook routes to the owning manager instead of a global server-name slot",
+      "file": "src/extras/hooks/backend.rs",
+      "line_start": 141,
+      "line_end": 150,
+      "confidence": 0.99,
+      "scenario": "A parent owns an MCP server named guard. A persona child or second ACP session connects another guard instance; from_handles overwrites the global registry entry. Parent hooks now reach the child/other workspace server. When that manager is dropped, parent hooks report not connected permanently even though the parent manager remains live.",
+      "evidence": [
+        "MCP_PEERS is a process-global HashMap<String,McpPeer> keyed only by server name (backend.rs125-136); register_mcp_peers unconditionally inserts/replaces by that name (141-151).",
+        "Every McpClientManager::from_handles calls this registration (mcp/mod.rs169), including independently connected persona managers (subagents/builder.rs693). ACP session managers likewise each connect with their captured workspace.",
+        "call_mcp resolves only that global name (backend.rs224-228), with no current work-scope/workspace/manager key. Dropping the newer handle retires its ServerLink; no unregister/restoration exists. ensure_connected then returns retired and call_mcp reports not connected (239-245), ignoring the live parent.",
+        "The registry also stores only peer/link and drops the retained source/liveness witnesses ordinary McpTool and RpcClient use. A scoped capture should retain those checks rather than introducing another raw-peer route.",
+        "Existing mini-agent-bu3wp reconnect fixture exercises one registered server only; it cannot expose multiple manager ownership."
+      ],
+      "fix": "Capture a manager/session-scoped hook capability registry in the work scope/dispatcher and resolve hooks through that owner, retaining the same source and liveness witnesses as ordinary MCP operations. Retiring a child must not alter parent routes.",
+      "acceptance_tests": [
+        "Use two local fixture MCP connections with identical names and distinct labels/workspaces. Parent and child hooks must reach their own connection concurrently. Drop the child, then prove parent hooks still reach its live manager. Cover replacing/removing/revoking one manager without affecting the other."
+      ],
+      "probe": "/private/tmp/mini-agent-continuation-mcp-hook-probe.rs (insert into existing reconnect tests; local fixture only)",
+      "related_beads": [
+        "mini-agent-bu3wp",
+        "mini-agent-omfna",
+        "mini-agent-pm3rh",
+        "mini-agent-su92b"
+      ]
+    },
+    {
+      "priority": 2,
+      "title": "Carry the current logical session identity into generic hook envelopes",
+      "file": "src/extras/hooks/mod.rs",
+      "line_start": 188,
+      "line_end": 199,
+      "confidence": 0.99,
+      "scenario": "Resume/import another TUI session, or run ordinary tools in two ACP sessions. Generic PreToolUse/PostToolUse/PermissionRequest/Stop hooks continue receiving the startup session id and transcript path, or a shared process UUID and empty path in ACP. A hook reading session_path evaluates the wrong conversation; per-session state and audit correlation mix sessions.",
+      "evidence": [
+        "session_context reads process-global ACTIVE_SESSION_CONTEXT, otherwise a OnceLock PROCESS_SESSION_ID and empty path (188-199). HookedTool::build_ctx calls it at decorator.rs45; best_effort_ctx calls it at mod.rs500 and feeds Stop/PermissionRequest/etc.",
+        "The only production set_active_session caller is startup.rs2204, confirmed by rg and code-indexer callers. There is no per-turn session identity in the current work-scope binding.",
+        "SlashCtx::replace_session replaces self.session at ui/slash/mod.rs195 and updates current goal/advisor, but never updates hook session identity. ACP creates per-session histories and sets only work_scope.set_hook_execution_root (acp/mod.rs5236).",
+        "ACP native SessionStart builds an explicit correct HookCtx at5418; generic later tool hooks read the global fallback, so those envelopes disagree for the same turn.",
+        "Closed pm3rh/su92b fix task-local cwd only (dispatcher::policy_context changes ctx.cwd); azbn wired the initial startup session_path, not session replacement/ACP correlation. c75u1.21 covers goal metadata rather than the session identity fields."
+      ],
+      "fix": "Bind session id, session path and relevant permission mode to each turn/work scope, with exact captured session identity for deferred lifecycle work. Update the process fallback on successful TUI replacement without letting concurrent ACP/child turns overwrite one another.",
+      "acceptance_tests": [
+        "Capture actual hook envelopes before and after SlashCtx session replacement and assert the new id/path. Run two ACP fixture sessions concurrently and assert each generic PreToolUse and Stop envelope matches its own ACP SessionId and saved transcript path. Include deferred async hooks so old work cannot adopt a successor identity."
+      ],
+      "related_beads": [
+        "mini-agent-azbn",
+        "mini-agent-pm3rh",
+        "mini-agent-su92b",
+        "mini-agent-c75u1.21"
+      ]
+    },
+    {
+      "priority": 2,
+      "title": "Preserve Git ignore ancestor and precedence rules in hook-agent reads",
+      "file": "src/extras/hooks/backend.rs",
+      "line_start": 585,
+      "line_end": 590,
+      "confidence": 0.99,
+      "scenario": "The workspace root excludes build/ in .gitignore. build/.gitignore contains !config.json. Git still ignores build/config.json because an excluded parent directory cannot be reopened by an ignore file inside it, but is_vcs_ignored resets ignored=false and read_hook_file sends that otherwise ignored file to the hook model.",
+      "evidence": [
+        "is_vcs_ignored independently loads every ancestor directory ignore file, including files inside an already excluded directory, and lets any deeper whitelist reset ignored=false (556-593).",
+        "read_hook_file relies on this boolean as its only VCS-ignore refusal at617, before opening and returning the file text. A normally named config.json with private generated values avoids the separate filename heuristic.",
+        "Scratch Git fixture at /private/tmp/mini-agent-hook-ignore-probe-bwhti9ci confirms git check-ignore -v build/config.json exits0 and attributes exclusion to root .gitignore:1:build/. Evidence at /private/tmp/mini-agent-hook-ignore-fixture.txt.",
+        "The existing test covers *.log followed by sub/!keep.log under a visible parent, which is legal, but does not cover a wholly excluded parent directory.",
+        "The same implementation adds .git/info/exclude after .gitignore and .ignore (571-574), letting its lower-priority patterns override root whitelist rules. Preserve this precedence too when replacing the hand-rolled aggregation."
+      ],
+      "fix": "Use an ignore-policy evaluation that preserves excluded ancestors and the intended .ignore/.gitignore/info-exclude precedence. A nested file whitelist must not reopen an excluded directory; permitted re-inclusion must explicitly reopen the directory from a visible ancestor.",
+      "acceptance_tests": [
+        "Run the supplied actual read_hook_file probe: root build/ plus nested !config.json must refuse. Keep the existing visible-parent *.log/!keep.log success. Add an explicit legal parent reopening case and root .gitignore whitelist overriding .git/info/exclude."
+      ],
+      "probe": "/private/tmp/mini-agent-continuation-hook-ignore-probe.rs (insert into backend tests)",
+      "related_beads": [
+        "mini-agent-m9txi"
+      ]
+    }
+  ],
+  "coverage": {
+    "sweep1": [
+      "Git model-facing operations: revision/ref/path validation, literal argv, permissions, filter guards, directory staging, mutation result capture, paging",
+      "Hook backend MCP route registry, manager caller paths, model handler boundaries and bounded reads",
+      "Hook dispatcher launch ownership, conditions, once reservations, async task paths, redaction/verdict interpretation"
+    ],
+    "sweep2": [
+      "Worktree creation target/ref reservations and rollback, merge cleanup/ref CAS, ignored/untracked file preservation, subagent commit/report/discard paths",
+      "Export JSON/JSONL import projection, HTML/Markdown escaping and URL scheme validation, gist request boundaries",
+      "Hook session envelope sources, session replacement and ACP work-scope bindings",
+      "Discovered ignored-parent reopening as the third distinct cause"
+    ],
+    "final_zero_new_sweep": [
+      "Native /diff,/commit,/pr fixed operands, normal permission routing, observed result/URL capture and actor retirement",
+      "Git argument hardening/ref queries and output truncation edge cases",
+      "Rechecked worktree destructive cleanup and import replay projection",
+      "Hook model/MCP request bounds, async/once failure paths, SessionStart documented connected-server limitation"
+    ],
+    "final_zero_new_result": "After the ignored-parent discovery, the final risk-directed pass identified zero additional distinct P0-P3 causes in this assigned scope. This is scoped review evidence, not a proof that the entire repository has no bugs.",
+    "code_indexer": "Direct MCP code-indexer tools now work. Used search/get_impl/find_callers; register_mcp_peers caller is McpClientManager::from_handles and set_active_session has only startup.rs2204 production caller; indexed implementations match current source.",
+    "commands": "No Cargo, source or bead mutation. Only scratch fixture/probe artifacts written; Git check-ignore fixture executed locally."
+  },
+  "p4_candidates_held_separately": [
+    {
+      "title": "Avoid consuming backend once hooks when no backend effect could start",
+      "file": "src/extras/hooks/backend.rs",
+      "line_start": 76,
+      "line_end": 104,
+      "detail": "output() unconditionally marks started=true, including failed() before a peer/provider exists. OnceReservation consumes that slot, unlike a command spawn failure. Consider distinct no-start/error metadata; low-impact retry semantics, not asserted as a P0-P3 finding."
+    },
+    {
+      "title": "Bound aggregate placeholder expansion and ignore-file parsing work in model/MCP hooks",
+      "file": "src/extras/hooks/backend.rs",
+      "detail": "Static MCP templates are capped, but repeated event placeholders can multiply a large event before dispatch; ignore files are parsed synchronously without a dedicated byte cap. Resource-hardening candidate; no consequential normal-use failure reproduced."
+    }
+  ],
+  "suppressed_hypotheses": [
+    {
+      "hypothesis": "Git read deny must automatically apply to git/diff and all working-tree mutation operations.",
+      "reason": "Git has explicit independent operation capabilities documented in TOOL_RUNTIME; treating distinct permission keys as an implicit global path deny would invent a contract."
+    },
+    {
+      "hypothesis": "MCP hooks on cold SessionStart can fail before connection prebuild completes.",
+      "reason": "Docs explicitly constrain mcp_tool hooks to already-connected servers and startup intentionally overlaps cold prebuild. Kept as a documented limitation rather than another defect."
+    },
+    {
+      "hypothesis": "Native commit/PR confirmation must freeze every file byte and external branch state.",
+      "reason": "Current documented confirmation freezes selected literal operands/title/body. No complete violated stronger snapshot contract established."
+    },
+    {
+      "hypothesis": "Export imports bypass native replay validation.",
+      "reason": "External import controller clears runtime grants/undo and retains only visible replay metadata, with native validation at later publication boundaries. No concrete accepted-invalid execution reproduced."
+    }
+  ],
+  "residual_risks": [
+    "Root coordinates actual Rust regressions; no new Rust probe executed by this subagent.",
+    "No real network/account endpoint, remote Git mutation, live OAuth credential or native Windows process was used.",
+    "Per-session MCP hook registry and generic hook identity remain the principal ownership seams found; root independently validates them before filing."
+  ]
+}

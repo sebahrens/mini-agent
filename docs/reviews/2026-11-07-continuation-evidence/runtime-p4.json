@@ -1,0 +1,97 @@
+{
+  "reviewer": "runtime-p4",
+  "head": "befd7c7c plus active implementation work (no production edits by reviewer)",
+  "findings": [
+    {
+      "id": "runtime-p4-1",
+      "priority": 4,
+      "confidence": 1.0,
+      "title": "Goal and compaction docs advertise native automatic headless goal/loop support that the runtime explicitly refuses",
+      "locations": [
+        {
+          "file": "docs/agent/CONFIG.md",
+          "line_start": 1741,
+          "line_end": 1746
+        },
+        {
+          "file": "docs/agent/GOALS.md",
+          "line_start": 7,
+          "line_end": 20
+        },
+        {
+          "file": "src/startup.rs",
+          "line_start": 3883,
+          "line_end": 3884
+        },
+        {
+          "file": "src/startup.rs",
+          "line_start": 3916,
+          "line_end": 3920
+        }
+      ],
+      "evidence": [
+        "CONFIG.md1746 explicitly says native replay relief resumes headless --loop and goal rounds. GOALS.md gives unqualified --goal headless examples.",
+        "run_bound_headless_segment refuses live native goals before provider dispatch (startup3916-3920); native loop path passes no publication ticket and fails startup-owner guard (3883-3884). Historical native-headless review identifies automatic native goal/loop ownership as unimplemented, which was deliberately excluded as a new functional defect in PassA."
+      ],
+      "impact": "Operators following the guide on a native Anthropic session select a currently unavailable execution path and receive an ownership error. This finding asks only to describe the existing boundary accurately, not implement the deferred feature.",
+      "acceptance": [
+        "Correct the provider/surface statement in CONFIG compaction section; add a concise supported-provider/history limitation and compatible-provider example beside headless GOALS examples.",
+        "Keep ordinary native print and supported TUI/ACP behavior described accurately without broad unsupported claims. No new runtime behavior required."
+      ],
+      "related_beads": [],
+      "validation": "Documentation/source contradiction directly checked; no runtime execution needed."
+    },
+    {
+      "id": "runtime-p4-2",
+      "priority": 4,
+      "confidence": 1.0,
+      "title": "Rewinding away the newest uncaptured edit leaves its skip reason attached to earlier unavailable checkpoints",
+      "locations": [
+        {
+          "file": "src/session/file_checkpoints.rs",
+          "line_start": 438,
+          "line_end": 453
+        },
+        {
+          "file": "src/session/file_checkpoints.rs",
+          "line_start": 462,
+          "line_end": 472
+        },
+        {
+          "file": "src/session/file_checkpoints.rs",
+          "line_start": 1084,
+          "line_end": 1086
+        }
+      ],
+      "scenario": "Turn1 has a READ-disallowed mutation and turn2 has an oversized mutation. skip() stores only the most recent global skip_reason, the turn2 size error. Rewind truncates turn2 and retire_from removes its skipped count, leaving turn1 alone. summary_from still appends the retired size error to the one surviving unavailable edit, even though READ authority was its actual reason.",
+      "evidence": [
+        "skip overwrites Data.skip_reason globally on every uncaptured mutation (1084-1086).",
+        "retire_from prunes skipped counts by turn but never updates/clears skip_reason (462-472). Session::truncate_to invokes this on rewind/undo.",
+        "summary_from counts only skipped.range(index..) but displays the unscoped global skip_reason (438-453). File restoration remains correctly fail-closed; only the diagnostic is wrong."
+      ],
+      "acceptance": [
+        "After removing the turn that supplied the latest skip reason, do not report that retired reason for surviving unavailable edits. Report their accurate reason if retained, otherwise omit the optional reason.",
+        "Add a small regression with two distinct skip reasons, retire the latest turn, and assert count remains1 while the removed size reason is absent."
+      ],
+      "probe_artifact": "/private/tmp/mini-agent-continuation-runtime-p4-probes.rs",
+      "validation": "Complete in-memory data-flow proof; review-only probe supplied, not executed by this agent. Indexed retire_from implementation matched disk."
+    }
+  ],
+  "coverage": [
+    "Runtime diagnostic reason retention across checkpoint rewind",
+    "Goal guide headless examples vs native publication guards",
+    "Compaction support statements vs explicit native automatic-round ownership boundary",
+    "Existing checkpoint diagnostic tests, retirement and summary call paths"
+  ],
+  "excluded": [
+    "No style preferences or feature wishlists filed.",
+    "The native automatic goal/loop implementation gap itself remains an acknowledged historical limitation, not a new P0-P3 issue.",
+    "Existing P2 commit/save/pool-lifetime issues and previous p0h9g findings were not duplicated."
+  ],
+  "verification": {
+    "cargo": "No Cargo by this reviewer.",
+    "mutations": "Only /private/tmp report/probe artifacts written; no source/bead edits.",
+    "indexer": "MCP symbol search and exact FileCheckpoints::retire_from implementation verified current file/lines."
+  },
+  "status": "P4 review complete; available for delegated implementation."
+}

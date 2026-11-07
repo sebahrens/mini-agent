@@ -1,0 +1,144 @@
+{
+  "role": "runtime implementation and scoped final audit",
+  "date": "2026-11-07",
+  "source_status": "Edits coherent and frozen for coordinated Cargo validation; no agent Cargo, bd, commit or global fmt.",
+  "files": [
+    "src/ui/app.rs",
+    "src/ui/mod.rs",
+    "src/ui/state.rs",
+    "src/extras/subagents/task_tool.rs",
+    "src/extras/subagents/builder.rs",
+    "src/startup.rs",
+    "src/extras/goal/driver.rs",
+    "src/extras/loop/headless.rs",
+    "src/session/file_checkpoints.rs",
+    "src/ui/slash/mod.rs",
+    "tests/headless_json.rs",
+    "docs/agent/GOALS.md",
+    "docs/agent/SUBAGENTS.md"
+  ],
+  "beads": [
+    {
+      "id": "mini-agent-p0h9g.3",
+      "change": "Measured token pressure forces the TUI compaction gate; no eligible prefix disables repeated no-op relief until growth or new budget. Failed summary/admission retires only the turn and clears relief state, while preserving TUI usability.",
+      "tests": [
+        "ui::app::plan_approval_tests::real_token_boundary_below_local_budget_compacts_and_continues",
+        "ui::app::plan_approval_tests::token_boundary_with_no_old_prefix_disables_repeated_noop_relief",
+        "ui::main_start_budget_carry_tests::chain_continuation_starts_with_a_fresh_budget_scope",
+        "ui::app::plan_approval_tests::usd_budget_actual_midturn_compaction_reuses_account_and_prices_before_http_and_write",
+        "ui::app::plan_approval_tests::ask_user_actual_pressure_restart_preserves_the_preclaimed_main_slot_and_budget_profile",
+        "ui::app::plan_approval_tests::context_length_rejection_compacts_once_and_resumes_the_tui_turn"
+      ],
+      "evidence": "Batch2 passed real/no-prefix boundary tests. Two older pressure fixtures failed because they supplied a tool-call response where real compaction now requires a paid tool-free summary; explicit summary rows and cost assertions added. Matrix now includes actual parked-boundary admission failure after sibling tracked usage and verifies no extra HTTP/write, no successful relief latch, and operator input. Reactive matrix includes provider summary failure. Latest fixture/production failure-path edits await next batch."
+    },
+    {
+      "id": "mini-agent-p0h9g.4",
+      "change": "SubagentStop still runs at the exploration cap, but Continue uses only remaining turns and exact prior history; evidence/image counts only incorporate new suffix.",
+      "tests": [
+        "extras::subagents::task_tool::tests::report_contract_actual_task_requests_once_for_code_and_twice_for_repair",
+        "extras::subagents::task_tool::child_continuation_tests::stop_hook_continuation_keeps_history_and_only_remaining_exploration_turns"
+      ],
+      "evidence": "Batch2 passed actual TaskTool at-cap lifecycle hook marker and no second HTTP request. Positive SDK remainder/history test is outside the task_tool::tests filter and awaits explicit next batch. At-cap marker now uses a natively compiled Rust fixture rather than sh, preserving Windows portability; awaiting rerun."
+    },
+    {
+      "id": "mini-agent-gkqd4.2",
+      "change": "--no-session records in-memory messages, exact interactions and usage; only disk/history append is skipped.",
+      "tests": [
+        "startup::headless_session_lifetime_tests::ephemeral_finalizer_keeps_in_memory_history",
+        "startup::headless_session_lifetime_tests::ephemeral_goal_round_keeps_retained_history",
+        "ephemeral_stream_json_retains_prior_prompt_reply_and_tool_result"
+      ],
+      "evidence": "Both direct production recorder/finalizer tests passed batch1. New binary+HTTP two-input stream fixture inspects the actual second-turn request for first prompt, reply and tool result and absence of session files; awaiting next batch.",
+      "limit": "Automatic ephemeral goal composition is validated at production persist_round and source-audited next_round caller, not a second HTTP goal request."
+    },
+    {
+      "id": "mini-agent-gkqd4.3",
+      "change": "Goal round live recording commits once even if persistence fails; finalizer retries disk without duplicating transcript, usage or chat entry.",
+      "tests": [
+        "startup::headless_session_lifetime_tests::failed_goal_save_does_not_duplicate_final_round"
+      ],
+      "evidence": "Passed batch1 using a blocked sessions path, repaired storage and real finalizer retry."
+    },
+    {
+      "id": "mini-agent-gkqd4.4",
+      "change": "Shared stream input keeps its session pool alive between turns; EOF/error gives configured grace then cancels/joins exact jobs. Final loop wrapper does the same and persists terminal background state. Native actors still settle per turn and retain an EOF SessionEnd permit.",
+      "tests": [
+        "startup::headless_session_lifetime_tests::stream_turn_does_not_permanently_close_task_pool",
+        "extras::r#loop::headless::persistence_tests::final_loop_iteration_honours_background_exit_grace_and_zero_wait"
+      ],
+      "evidence": "Stream finalizer/actual EOF closure test passed batch1. Actual one-iteration HTTP loop uses a cfg(test) task-local gate at shared exit-wait admission: positive grace releases the still-pending job only at this boundary; zero grace retains it until cancellation. Verifies helper entry, terminal report/status, zero active jobs and saved row. No timing assumption. Awaits next batch.",
+      "limit": "Native ownership semantics were independently source-audited against checked_retired_publication/RetiredSessionEndPermit. No new native background+EOF end-to-end fixture added in this shard."
+    },
+    {
+      "id": "mini-agent-gkqd4.13",
+      "change": "GOALS and root-applied CONFIG paragraph patch explain native headless automatic-round restrictions and explicit nonnative route; docs explain ephemeral history, save retry, task continuation caps and pool lifetime.",
+      "evidence": "Source matched against runtime entry guards; proposed CONFIG patch /private/tmp/mini-agent-runtime-config-proposed.patch was applied by root, who also corrected stale judge wording."
+    },
+    {
+      "id": "mini-agent-gkqd4.14",
+      "change": "Checkpoint retirement drops the coarse newest skip_reason when removing skipped entries so it cannot mislabel remaining older unavailable checkpoints.",
+      "tests": [
+        "session::file_checkpoints::retired_checkpoint_reason_tests::rewind_drops_the_retired_skip_reason"
+      ],
+      "evidence": "Passed batch1."
+    },
+    {
+      "id": "mini-agent-gkqd4.7 / mini-agent-gkqd4.8 integration seam",
+      "change": "Startup SessionStart/root logical identity binding and successful TUI replace_session refresh; exact manager peers bound after connect. Headless manager now retained across stream turns and through final hooks, then shut down. Native final hooks capture immutable current HookBindings while preserving native cancellation owner scopes. Root logical scope retains live permission checker for lifecycle metadata. Child builder explicitly captures its checker and empty peers for direct callers; actual TaskTool overrides with exact persona MCP peers and uses matching immutable Stop routing.",
+      "tests": [
+        "headless_mcp_session_end_keeps_the_connection_through_plain_exit_and_stream_eof",
+        "extras::subagents::task_tool::tests::report_contract_actual_task_requests_once_for_code_and_twice_for_repair"
+      ],
+      "evidence": "New actual binary regression runs ordinary and two-turn stream input against a repository-owned stdio MCP fixture, checks a single connection and exact logical SessionEnd envelope. Standalone fixture compiled successfully with rustc; Cargo/binary regression awaits next batch. Actual TaskTool fixture now additionally sets up same-name independent parent/child MCP managers: parent positive control, child real Read tool hook, and capped Stop lifecycle; parent must stay at one call and child get exactly two. Catches missing actual child AnyAgent routing setter and missing Stop overlay; awaiting coordinated run.",
+      "limit": "Integration agent owns broader HookBindings/provider/ACP policy tests. New plain+stream MCP EOF fixture uses custom OpenAI, not native Anthropic HTTP. Child policy consumer regression is provided separately by integration; this shard composes actual production TaskTool peer routing."
+    }
+  ],
+  "validation": {
+    "batch1": {
+      "result": "142 passed",
+      "log": "/private/tmp/mini-agent-review-fixes-batch1.log",
+      "scope": "root coordinated; ledger/oauth/file credentials/checkpoint and four direct session lifetime fixtures"
+    },
+    "batch2": {
+      "result": "604 passed, 2 failed before correction",
+      "log": "/private/tmp/mini-agent-review-fixes-batch2.log",
+      "failures": "two TUI pressure scripts omitted now-required paid summary; corrected with explicit billed rows and production graceful failure path hardening"
+    },
+    "local": "git diff --check passed; extracted standalone MCP and portable TaskTool marker fixtures compiled via rustc; no Cargo run by subagent.",
+    "pending": "Root focused rerun of three fixed runtime failures and affected compaction controls, then any remaining gates root chooses; no shard Cargo.",
+    "full_suite_attempt": {
+      "result": "6244 passed, 10 failed, 16 ignored",
+      "log": "/private/tmp/mini-agent-review-fixes-full.log",
+      "runtime_failures": [
+        "TaskTool portable marker omitted required args:[] in direct dispatcher configuration; fixed.",
+        "Reactive failed-summary fixture omitted the text fallback after a failed cache fork; added third scripted 400 and precise case flag.",
+        "Broad graceful compaction error catch swallowed initial renderer error; tagged actual compactor/model/admission failures and preserved propagation for outer renderer/respawn/direct IO failures."
+      ],
+      "status": "Awaiting focused coordinated rerun. Other 7 failures owned by root/integration."
+    },
+    "latest_binary_feedback": "Root reports ephemeral_stream_json_retains_prior_prompt_reply_and_tool_result passed. New MCP EOF binary fixture hit shared helper piped-stdin assertion; fixed stream branch to explicitly set Stdio::piped. Process inspection found no remaining matching fixture or mini-agent process. Awaiting MCP fixture rerun."
+  },
+  "final_scoped_audit": {
+    "status": "No further distinct P0-P4 finding identified in this shard after accepted fixes and final caller-contract sweep; this is scoped evidence, not an exhaustive absence claim.",
+    "reviewed": [
+      "TUI parked-boundary decisions, real token vs local budget, no-prefix/growth rearming, error/turn retirement and input usability",
+      "child max-turn accounting, stop-hook lifecycle dispatch, suffix evidence, history-preserving bounded continuation",
+      "live vs disk goal/headless recording, failed-save retry idempotence",
+      "shared-session task ownership vs model-turn owners; EOF/error/loop final grace and cancellation",
+      "native per-turn finish and retired EOF publication authority; final hook scope routing",
+      "MCP manager strong ownership through EOF hooks vs weak exact-source registry",
+      "checkpoint retirement reason and docs/runtime route contracts"
+    ],
+    "excluded_hypotheses": [
+      "Repeated subagent summary usage omission was suppressed earlier after outward retry-ledger accounting analysis.",
+      "At-cap lifecycle hook suppression was corrected; Continue is suppressed only after hook notification.",
+      "No-prefix compaction is an intentional physical no-op and must not claim successful relief."
+    ],
+    "residual_risks": [
+      "Latest focused tests must pass before marking full implementation validated.",
+      "Ephemeral goal next HTTP request and native EOF background observation composition are source-audited rather than new end-to-end fixtures in this shard.",
+      "Final source includes peer edits; root independently audits combined HookBindings and SessionEnd behavior."
+    ]
+  },
+  "coordinator_status": "Local validation complete. Later coordinator corrections and test results are authoritative in ../2026-11-07-continuation-review.json; hosted CI pending."
+}

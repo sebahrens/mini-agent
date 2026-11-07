@@ -1,0 +1,32 @@
+{
+  "reviewer": "root-final",
+  "baseline": "eef3001c6d0bba40fad24ecd595fa60fd5db0289",
+  "findings": [],
+  "scope": [
+    "ledger retry/rotation/session rollup exactness and OAuth lock wait/cancellation",
+    "invocation-local hook manager/read policy/logical session identity across ACP, main agents, child agents, and JS permission callbacks",
+    "headless/goal in-memory history, single accounting commit and final session retirement",
+    "TUI compaction, continuation budget and presentation failure semantics",
+    "MCP writer backpressure, owned process trees and runtime shutdown",
+    "capability-bound discovery root denies, linked Git common excludes, nested search roots, optional ancestor ignore compatibility and special-file handling",
+    "structured Git rename operands, Gemini first-request credential encoding, project model/provider trust",
+    "behavioral regression assertions, fixture ownership and feature-gated symbols"
+  ],
+  "resolved_during_final_review": [
+    "JS single-file traversal selector was separated from policy admission",
+    "MCP physical stdio shutdown was bounded after owned run retirement",
+    "immutable hook binding propagation and explicit unchecked/unbound policy were corrected",
+    "model-hook read checker follows the invoking agent",
+    "TUI failures distinguish recoverable compaction/admission from renderer errors",
+    "linked worktree common excludes now cover root and nested searches; ordinary ancestor aliases and execute-only parents preserved",
+    "ancestor optional ignore files open nonblocking and reject special nodes",
+    "worker exit-before-read fixture reduced to one diagnostic, preserving protocol and closed-diagnostic assertions"
+  ],
+  "assessment": "No additional confirmed P0-P3 finding remains in the reviewed source paths after the final corrections. Local affected regressions, strict lint rows, locked debug install, production native JS preflight and connectivity smoke passed. Hosted CI remains pending; this is a scoped assessment, not proof of absence of all defects.",
+  "residual_risks": [
+    "Native Windows process lifecycle requires the new CI tests; local execution is macOS.",
+    "A speculative model-hook workspace identity replacement race lacked a reproduced contract violation and was retained as unverified in the follow-on report.",
+    "Unrelated historical deferred features and beads are outside this review wave."
+  ],
+  "local_validation_manifest": "../2026-11-07-continuation-review.json"
+}

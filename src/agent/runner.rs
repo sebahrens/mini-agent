@@ -1164,6 +1164,45 @@ tokio::task_local! {
     static AGENT_WORK_SCOPE: Arc<AgentWorkScope>;
 }
 
+#[cfg(feature = "hooks")]
+tokio::task_local! { static HOOK_BINDINGS: HookBindings; }
+
+/// Immutable per-agent hook routing, independent of the shared cancellation
+/// and child-work owner. Concurrent auxiliary agents cannot mutate each other.
+#[cfg(feature = "hooks")]
+#[derive(Clone, Default)]
+pub(crate) struct HookBindings {
+    pub(crate) context: Option<crate::extras::hooks::HookCtx>,
+    /// None is legacy/unbound; Some(None) is explicitly unchecked.
+    pub(crate) permission: Option<Option<crate::permission::checker::PermCheck>>,
+    #[cfg(feature = "mcp")]
+    pub(crate) peers: Option<Arc<crate::extras::hooks::backend::McpPeers>>,
+}
+
+#[cfg(feature = "hooks")]
+impl HookBindings {
+    pub(crate) fn capture() -> Self {
+        Self {
+            context: current_hook_session_context(),
+            permission: current_hook_permission_binding(),
+            #[cfg(feature = "mcp")]
+            peers: current_hook_mcp_peers(),
+        }
+    }
+    /// Keep scope wrapping off the caller stack: model futures are large in
+    /// debug builds, including before their first poll.
+    #[inline(never)]
+    pub(crate) fn run<F: std::future::Future>(
+        self,
+        future: F,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = F::Output>>> {
+        crate::startup::heap_future(|| HOOK_BINDINGS.scope(self, future))
+    }
+    pub(crate) fn run_sync<T>(self, operation: impl FnOnce() -> T) -> T {
+        HOOK_BINDINGS.sync_scope(self, operation)
+    }
+}
+
 /// Tracks child work which can outlive the future that started it (notably
 /// `spawn_blocking`). ACP cancellation signals the scope, drops provider/tool
 /// polling, and waits for every registered child before closing the event
@@ -1187,6 +1226,12 @@ pub(crate) struct AgentWorkScope {
     /// scope created inside another scope inherits it.
     #[cfg(feature = "hooks")]
     hook_execution_root: std::sync::OnceLock<std::path::PathBuf>,
+    #[cfg(feature = "hooks")]
+    hook_session_context: std::sync::Mutex<Option<crate::extras::hooks::HookCtx>>,
+    #[cfg(feature = "hooks")]
+    hook_permission: std::sync::Mutex<Option<Option<crate::permission::checker::PermCheck>>>,
+    #[cfg(all(feature = "hooks", feature = "mcp"))]
+    hook_mcp_peers: std::sync::Mutex<Option<Arc<crate::extras::hooks::backend::McpPeers>>>,
     #[cfg(test)]
     blocking_gate: Option<Arc<BlockingTestGate>>,
 }
@@ -1206,9 +1251,42 @@ impl AgentWorkScope {
             idle: Notify::new(),
             #[cfg(feature = "hooks")]
             hook_execution_root: inherited_hook_execution_root(),
+            #[cfg(feature = "hooks")]
+            hook_session_context: std::sync::Mutex::new(current_hook_session_context()),
+            #[cfg(feature = "hooks")]
+            hook_permission: std::sync::Mutex::new(current_hook_permission_binding()),
+            #[cfg(all(feature = "hooks", feature = "mcp"))]
+            hook_mcp_peers: std::sync::Mutex::new(current_hook_mcp_peers()),
             #[cfg(test)]
             blocking_gate: None,
         })
+    }
+
+    #[cfg(feature = "hooks")]
+    pub(crate) fn set_hook_session_context(&self, context: crate::extras::hooks::HookCtx) {
+        *self
+            .hook_session_context
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(context);
+    }
+
+    #[cfg(feature = "hooks")]
+    pub(crate) fn set_hook_permission(
+        &self,
+        permission: Option<crate::permission::checker::PermCheck>,
+    ) {
+        *self
+            .hook_permission
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(permission);
+    }
+
+    #[cfg(all(feature = "hooks", feature = "mcp"))]
+    pub(crate) fn set_hook_mcp_peers(&self, peers: Arc<crate::extras::hooks::backend::McpPeers>) {
+        *self
+            .hook_mcp_peers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(peers);
     }
 
     /// Binds hook dispatch inside this scope to `root`. The first binding
@@ -1247,6 +1325,12 @@ impl AgentWorkScope {
                 idle: Notify::new(),
                 #[cfg(feature = "hooks")]
                 hook_execution_root: inherited_hook_execution_root(),
+                #[cfg(feature = "hooks")]
+                hook_session_context: std::sync::Mutex::new(current_hook_session_context()),
+                #[cfg(feature = "hooks")]
+                hook_permission: std::sync::Mutex::new(current_hook_permission_binding()),
+                #[cfg(all(feature = "hooks", feature = "mcp"))]
+                hook_mcp_peers: std::sync::Mutex::new(current_hook_mcp_peers()),
                 blocking_gate: Some(gate),
             }),
             started_rx,
@@ -1268,6 +1352,8 @@ impl AgentWorkScope {
     pub(crate) fn cancellation_handle(self: &Arc<Self>) -> AgentWorkCancellation {
         AgentWorkCancellation {
             scope: Arc::clone(self),
+            #[cfg(all(feature = "hooks", feature = "mcp"))]
+            hook_bindings: HookBindings::capture(),
         }
     }
 
@@ -1317,6 +1403,8 @@ impl AgentWorkScope {
 #[derive(Clone)]
 pub(crate) struct AgentWorkCancellation {
     scope: Arc<AgentWorkScope>,
+    #[cfg(all(feature = "hooks", feature = "mcp"))]
+    hook_bindings: HookBindings,
 }
 
 impl AgentWorkCancellation {
@@ -1331,6 +1419,8 @@ impl AgentWorkCancellation {
     #[cfg(feature = "mcp")]
     pub(crate) async fn run_callback<F: std::future::Future>(&self, future: F) -> F::Output {
         let _child = self.scope.register();
+        #[cfg(feature = "hooks")]
+        let future = self.hook_bindings.clone().run(future);
         self.scope.run(future).await
     }
     pub(crate) fn cancel(&self) {
@@ -1484,6 +1574,8 @@ where
     F::Output: Send + 'static,
 {
     let future = crate::spend::run::scope(crate::spend::run::Run::current(), future);
+    #[cfg(feature = "hooks")]
+    let future = HookBindings::capture().run(future);
     if let Ok(scope) = AGENT_WORK_SCOPE.try_with(Arc::clone) {
         let guard = scope.register();
         tokio::spawn(async move {
@@ -1603,6 +1695,64 @@ pub(crate) fn current_hook_execution_root() -> Option<std::path::PathBuf> {
         .flatten()
 }
 
+#[cfg(feature = "hooks")]
+pub(crate) fn current_hook_session_context() -> Option<crate::extras::hooks::HookCtx> {
+    if let Ok(Some(context)) = HOOK_BINDINGS.try_with(|binding| binding.context.clone()) {
+        return Some(context);
+    }
+    AGENT_WORK_SCOPE
+        .try_with(|scope| {
+            scope
+                .hook_session_context
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        })
+        .ok()
+        .flatten()
+}
+
+#[cfg(feature = "hooks")]
+pub(crate) fn current_hook_permission() -> Option<crate::permission::checker::PermCheck> {
+    current_hook_permission_binding().flatten()
+}
+
+/// Distinguish an explicitly unchecked invocation from legacy unbound calls.
+#[cfg(feature = "hooks")]
+pub(crate) fn current_hook_permission_binding()
+-> Option<Option<crate::permission::checker::PermCheck>> {
+    if let Ok(permission) = HOOK_BINDINGS.try_with(|binding| binding.permission.clone()) {
+        return permission;
+    }
+    AGENT_WORK_SCOPE
+        .try_with(|scope| {
+            scope
+                .hook_permission
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        })
+        .ok()
+        .flatten()
+}
+
+#[cfg(all(feature = "hooks", feature = "mcp"))]
+pub(crate) fn current_hook_mcp_peers() -> Option<Arc<crate::extras::hooks::backend::McpPeers>> {
+    if let Ok(Some(peers)) = HOOK_BINDINGS.try_with(|binding| binding.peers.clone()) {
+        return Some(peers);
+    }
+    AGENT_WORK_SCOPE
+        .try_with(|scope| {
+            scope
+                .hook_mcp_peers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        })
+        .ok()
+        .flatten()
+}
+
 pub(crate) fn current_headless_diagnostics() -> Option<(
     Arc<crate::logging::HeadlessDiagnostics>,
     AgentWorkCancellation,
@@ -1622,7 +1772,7 @@ pub(crate) fn current_headless_diagnostics() -> Option<(
 
 /// Parent-local ownership for hook work crossing the JS permission receiver.
 /// This reference is never serialized or passed into a worker.
-#[cfg(any(all(feature = "hooks", feature = "js"), feature = "subagents"))]
+#[cfg(any(feature = "hooks", feature = "subagents"))]
 pub(crate) fn current_hook_work_scope() -> Option<Arc<AgentWorkScope>> {
     AGENT_WORK_SCOPE.try_with(Arc::clone).ok()
 }
@@ -3059,7 +3209,7 @@ where
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
 {
     let spend = crate::spend::run::Run::current();
-    let btw_future = async move {
+    let btw_future = crate::startup::heap_future(|| async move {
         let stream_result = {
             let agent_ref = &agent;
             retry::retry_stream_chat(&retry_config, move || {
@@ -3151,9 +3301,11 @@ where
                 message: CompactString::new("side question ended without a response"),
             })
             .await;
-    };
+    });
     let btw_future = crate::spend::run::scope(spend, btw_future);
     let btw_future = crate::question::scope(None, btw_future);
+    #[cfg(feature = "hooks")]
+    let btw_future = HookBindings::capture().run(btw_future);
     let work_scope = AgentWorkScope::new();
     let task_scope = Arc::clone(&work_scope);
     let join = tokio::spawn(async move {
@@ -5075,6 +5227,8 @@ where
         }
     });
 
+    #[cfg(feature = "hooks")]
+    let agent_future = HookBindings::capture().run(agent_future);
     let task_scope = Arc::clone(&work_scope);
     // Construct before spawning so abort-before-first-poll still drops the
     // guard and transfers cleanup ownership.

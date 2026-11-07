@@ -1,0 +1,32 @@
+   Compiling mini-agent v1.12.0 (/Users/seb/projects/mini-agent)
+    Finished `test` profile [unoptimized] target(s) in 30.21s
+     Running unittests src/main.rs (target/debug/deps/mini_agent-eb54318180c9c0b0)
+
+running 18 tests
+test agent::runner::tests::spawning_a_turn_keeps_the_turn_state_machine_off_the_caller_stack ... ok
+test extras::js::tests::worker_runtime::worker_runtime_exception_inspector_uses_captured_intrinsics_and_bounded_stack_data ... ok
+test extras::js::tests::worker_runtime::worker_supervisor_real_stack_limit_recycles_generation ... ok
+test extras::js::tool::js_permission_bridge::read_lines_reads_ranges_and_tails_files_larger_than_one_mib ... ok
+test provider::effort_tests::instruction_wire_tests::context63_actual_streamed_native_delivery_and_effect_settle_on_one_mib ... ok
+test provider::effort_tests::replay_probe::effort46_actual_headless_frontend_on_one_mib ... first completed answer
+second completed answer
+ok
+test provider::effort_tests::replay_probe::effort46_shared_binding_and_denial_on_one_mib ... 
+observed completed answer
+ok
+test startup::native_publication_startup_tests::native_publication_actual_startup_idle_zero_cap_preserves_denial_on_one_mib ... Reading piped stdin (limit 1048576 bytes)
+Reading piped stdin (limit 1048576 bytes)
+ok
+test tests::hooks::decorator_tests::actual_sdk_wrapper_stack_preserves_typed_results_outcomes_and_exact_call_ids ... ok
+test ui::app::config_editor68_tests::config68_actual_app_busy_listing_save_and_live_display_are_pure_on_one_mib ... ok
+test ui::app::git_confirmation_stack_tests::actual_combined_context_and_git_confirmation_event_loop_runs_on_one_mib_stack ... ok
+test ui::app::plan_approval_tests::actual_plan_confirmation_event_loop_runs_on_one_mib_stack ... ok
+test ui::app::plan_approval_tests::actual_skills_pin_literal_turn_and_busy_list_are_owned_on_one_mib ... ok
+test ui::app::plan_approval_tests::model_listing48_actual_refresh_and_picker_keep_session_and_do_not_call_model_on_one_mib_stack ... ok
+test ui::app::workspace_session_picker_tests::actual_session_picker_event_loop_runs_on_one_mib_stack ... ok
+test ui::app::workspace_session_picker_tests::actual_standard_app_event_loop_runs_on_one_mib_stack ... ok
+test ui::app::workspace_session_picker_tests::worktree116_actual_app_switch_and_mcp_rebind_run_on_one_mib_stack ... ok
+test ui::terminal::tests::title_stack_is_left_alone_unless_title_status_is_enabled ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 6252 filtered out; finished in 6.21s
+

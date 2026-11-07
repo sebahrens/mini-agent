@@ -466,10 +466,17 @@ impl FileCheckpoints {
                 r.retired = true;
             }
         }
+        let skipped_before = state.data.skipped.len();
         state
             .data
             .skipped
             .retain(|turn, _| *turn < index || *turn == usize::MAX);
+        if state.data.skipped.len() != skipped_before {
+            // The one optional reason describes the latest uncaptured edit.
+            // Once its suffix is removed it cannot describe an earlier one;
+            // omit it rather than inventing a reason (mini-agent-gkqd4.14).
+            state.data.skip_reason = None;
+        }
     }
     /// The summary replaces a prefix, so surviving user rows move together
     /// with their exact checkpoints. Pruned turns cannot become later turns.
@@ -1921,5 +1928,27 @@ mod tests {
         assert_eq!(state.data.blobs.len(), 6, "orphan merged plus five new");
         drop(state);
         assert_eq!(std::fs::read_dir(&blobs).unwrap().count(), 6);
+    }
+}
+
+#[cfg(test)]
+mod retired_checkpoint_reason_tests {
+    use super::*;
+
+    #[test]
+    fn rewind_drops_the_retired_skip_reason() {
+        let checkpoints = FileCheckpoints::default();
+        {
+            let mut state = checkpoints.edit();
+            skip(&mut state, 1, SkipReason::ReadPolicy);
+            skip(&mut state, 2, SkipReason::FileSize(12345));
+        }
+        checkpoints.retire_from(2);
+        let summary = checkpoints.summary_from("session", 1);
+        assert!(summary.contains("1 edit not restorable"), "{summary}");
+        assert!(
+            !summary.contains("12345-byte"),
+            "the only surviving unavailable edit was READ-denied, but the summary names a retired size failure: {summary}"
+        );
     }
 }

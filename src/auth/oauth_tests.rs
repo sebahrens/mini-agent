@@ -326,7 +326,10 @@ async fn oauth47_actual_loopback_exchange_refresh_and_logout_keep_registration_p
             client_id: "oaiapp_own".into(),
             endpoints: Some(endpoints),
         };
-        assert_eq!(registration.access_token().await.unwrap(), "access-2");
+        let (first, second) =
+            tokio::join!(registration.access_token(), registration.access_token());
+        assert_eq!(first.unwrap(), "access-2");
+        assert_eq!(second.unwrap(), "access-2");
         let signout_root = root.clone();
         let revoke = format!("{origin}/revoke");
         let message =
@@ -1075,4 +1078,89 @@ async fn a_valid_access_token_is_served_without_reopening_the_locked_store() {
     store.save().unwrap();
     drop(store);
     assert!(registration.access_token().await.is_err());
+}
+
+#[tokio::test]
+async fn oauth_refresh_waiter_uses_the_completed_refresh() {
+    let roots = crate::tests::OwnedTestDirectory::new("review-oauth-refresh-contention");
+    let root = roots.path().join("credentials");
+    let mut store = LockedStore::open(root.clone(), true).unwrap().unwrap();
+    store.data.accounts.push(Account {
+        client_id: "oaiapp_review".into(),
+        subject: "review-subject".into(),
+        email: None,
+        tokens: Some(Tokens {
+            access: "old-fixture-token".into(),
+            refresh: "fixture-refresh".into(),
+            id: "fixture-id".into(),
+            scopes: SCOPES.into(),
+            expires: now().unwrap(),
+        }),
+    });
+    store.data.active = Some("oaiapp_review".into());
+    store.save().unwrap();
+    // The lock holder models the first caller completing its refresh. A
+    // concurrent caller must wait for that bounded refresh, not fail forever.
+    let owner = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        let token = store.data.accounts[0].tokens.as_mut().unwrap();
+        token.access = "new-fixture-token".into();
+        token.expires = now().unwrap() + 3600;
+        store.save().unwrap();
+    });
+    let registration = Registration {
+        root,
+        client_id: "oaiapp_review".into(),
+        endpoints: None,
+    };
+    let result = registration.access_token().await;
+    owner.join().unwrap();
+    if let Err(error) = &result {
+        assert!(
+            !crate::retry::is_retryable(error.as_ref()),
+            "control: current lock-busy failure must be nonretryable"
+        );
+    }
+    assert_eq!(result.unwrap(), "new-fixture-token");
+}
+
+#[tokio::test]
+async fn oauth_refresh_wait_is_bounded_cancellable_and_rechecks_logout() {
+    let roots = crate::tests::OwnedTestDirectory::new("oauth-refresh-wait-fences");
+    let root = roots.path().join("credentials");
+    let store = LockedStore::open(root.clone(), true).unwrap().unwrap();
+    let registration = Registration {
+        root: root.clone(),
+        client_id: "oaiapp_wait".into(),
+        endpoints: None,
+    };
+    let result = registration
+        .access_token_with_wait(Duration::from_millis(30))
+        .await;
+    assert!(result.unwrap_err().to_string().contains("timed out"));
+    let scope = crate::agent::runner::AgentWorkScope::new();
+    let cancel = scope.cancellation_handle();
+    let waiter = scope.run(registration.access_token());
+    let cancellation = async {
+        tokio::task::yield_now().await;
+        cancel.cancel();
+    };
+    let (result, ()) = tokio::join!(waiter, cancellation);
+    assert!(result.unwrap_err().to_string().contains("cancelled"));
+    scope.wait_idle().await;
+    drop(store);
+    // Once a contended logout completes, the same captured registration must
+    // inspect the new active-account fence, not reuse any pre-wait snapshot.
+    let mut store = LockedStore::open(root, false).unwrap().unwrap();
+    store.data.active = None;
+    store.save().unwrap();
+    drop(store);
+    assert!(
+        registration
+            .access_token()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("account changed")
+    );
 }

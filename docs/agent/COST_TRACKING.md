@@ -218,9 +218,15 @@ renamed to `usage.<10-digit sequence>.archive.jsonl` and its all-time, per-model
 per-session (up to 4,096 sessions) and last-day totals are folded into the private
 sidecar `usage.rollup`, which every summary (`/cost`, session budget reconciliation)
 adds back, so all-time totals stay exact. A rotation that crashed between the rename
-and the rollup write is completed by the next writer. Archives are an audit trail only
-and may be deleted or moved; deleting `usage.rollup` forgets rolled-up history. Receipt
-IDs are only de-duplicated within a segment. If rotation itself fails, the error names
+and the rollup write is completed by the next writer. Retain the archives: receipt
+retries consult them when a prior append may have reached disk before acknowledgement,
+and session reconciliation reads them when the rollup's session-count or byte cap
+omitted details. A partially retained session entry is recovered from the full archive
+history too. Missing or invalid required archives fail reconciliation instead of
+reporting zero or partial spend. Fresh, parent-minted receipts do not scan old archives;
+retry metadata is bounded by the pending queue and survives replacement of the ledger
+handle. Deleting `usage.rollup` forgets rolled-up history unless the archives remain
+available for recovery. If rotation itself fails, the error names
 the ledger (not the budget) and the remediation. Pending receipts
 are limited to 1,024; detailed model aggregates to 128 identities. Receipt token
 counts are capped at 10^15 per field and cost/aggregate amounts at 10^18 USD.

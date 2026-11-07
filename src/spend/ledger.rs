@@ -686,15 +686,21 @@ impl Ledger {
     /// Persist only parent-minted new receipts. A repeated flush observes each
     /// matching ID once; a conflicting ID or crash tail fails without repair.
     pub(crate) fn flush(&self, account: &Account) -> anyhow::Result<()> {
+        // One account can be handed to a replacement Ledger while another
+        // flush is settling. Serialize it before deciding which rows are new.
+        let account_io = account.flush_serialization();
+        let _account_io = account_io
+            .lock()
+            .map_err(|_| anyhow::anyhow!("usage account serialization failed"))?;
         let _io = self
             .io
             .lock()
             .map_err(|_| anyhow::anyhow!("usage ledger serialization failed"))?;
-        let pending = account.pending();
+        let (pending, retries) = account.begin_flush();
         if pending.is_empty() {
             return Ok(());
         }
-        let result = self.flush_rows(account, &pending);
+        let result = self.flush_rows(account, &pending, &retries);
         if result.is_err() {
             account.tracking_failed();
         }
@@ -784,21 +790,30 @@ impl Ledger {
         }
         scan(file, None)
     }
-    fn flush_rows(&self, account: &Account, pending: &[Arc<Row>]) -> anyhow::Result<()> {
+    fn flush_rows(
+        &self,
+        account: &Account,
+        pending: &[Arc<Row>],
+        retries: &std::collections::HashSet<Uuid>,
+    ) -> anyhow::Result<()> {
         // A full active segment is rotated away once, under the exclusive
         // coordination lock; the batch is then appended to the fresh segment.
-        match self.flush_rows_once(account, pending, StateLock::Append)? {
+        match self.flush_rows_once(account, pending, retries, StateLock::Append)? {
             FlushOutcome::Flushed => return Ok(()),
             FlushOutcome::NeedsRotation => {}
             FlushOutcome::Rotated => unreachable!("append pass never rotates"),
         }
-        match self.flush_rows_once(account, pending, StateLock::Rotate)? {
+        // A competing writer can rotate between lock acquisitions too.
+        let retries = pending.iter().map(|row| row.id).collect();
+        match self.flush_rows_once(account, pending, &retries, StateLock::Rotate)? {
             // Another process rotated first, so this pass appended directly.
             FlushOutcome::Flushed => return Ok(()),
             FlushOutcome::Rotated => {}
             FlushOutcome::NeedsRotation => unreachable!("rotate pass rotates"),
         }
-        match self.flush_rows_once(account, pending, StateLock::Append)? {
+        // This batch may already contain receipts in the segment just archived.
+        // Recheck all of it, including a formerly complete but unacknowledged row.
+        match self.flush_rows_once(account, pending, &retries, StateLock::Append)? {
             FlushOutcome::Flushed => Ok(()),
             _ => anyhow::bail!("usage ledger capacity reached"),
         }
@@ -807,6 +822,7 @@ impl Ledger {
         &self,
         account: &Account,
         pending: &[Arc<Row>],
+        retries: &std::collections::HashSet<Uuid>,
         mode: StateLock,
     ) -> anyhow::Result<FlushOutcome> {
         let write_binding = self
@@ -832,6 +848,13 @@ impl Ledger {
         {
             scanned = scan(&mut file, None)?;
         }
+        let archived = archived_receipts(binding.root(), retries)?;
+        anyhow::ensure!(
+            archived
+                .keys()
+                .all(|id| !scanned.identities.contains_key(id) && !scanned.prefix_ids.contains(id)),
+            "usage ledger contains duplicate receipts"
+        );
         // Validate the entire pending batch before appending any of it.
         let mut additions = Vec::new();
         for row in pending {
@@ -842,7 +865,11 @@ impl Ledger {
                 "usage ledger row exceeds limits"
             );
             let fingerprint = Sha256::digest(&bytes).into();
-            if let Some(previous) = scanned.identities.get(&row.id) {
+            if let Some(previous) = scanned
+                .identities
+                .get(&row.id)
+                .or_else(|| archived.get(&row.id))
+            {
                 anyhow::ensure!(*previous == fingerprint, "conflicting usage ledger receipt");
                 continue;
             }
@@ -922,6 +949,8 @@ impl Ledger {
         recover_unrolled(root)?;
         let mut state = load_rollup(root)?.unwrap_or_default();
         fold_segment(file, &mut state)?;
+        file.sync_all()
+            .map_err(|_| anyhow::anyhow!("usage ledger sync failed"))?;
         state.sequence = state
             .sequence
             .checked_add(1)
@@ -962,9 +991,96 @@ impl Ledger {
         let (Some(rollup), _) = load_rollup_recovered(parent)? else {
             return Ok(summary);
         };
-        rollup.apply(&mut summary, session_id)?;
+        if rollup.sessions_dropped {
+            // Even a retained entry may be partial after the size fallback
+            // discarded older details. Recover the requested session in full.
+            rollup.apply(&mut summary, None)?;
+            if let Some(id) = session_id {
+                let session = archived_session(parent, rollup.sequence, id)?;
+                let recovered = RollupState {
+                    sessions: BTreeMap::from([(id.to_owned(), session)]),
+                    ..Default::default()
+                };
+                recovered.apply(&mut summary, Some(id))?;
+            }
+        } else {
+            rollup.apply(&mut summary, session_id)?;
+        }
         Ok(summary)
     }
+}
+
+// Fresh receipts are parent-minted and have never been offered to any writer.
+// Only retries need historical membership checks. The account retains that fact
+// across Ledger instances and errors, with memory bounded by its pending queue.
+fn archived_receipts(
+    dir: &Path,
+    requested: &std::collections::HashSet<Uuid>,
+) -> anyhow::Result<BTreeMap<Uuid, [u8; 32]>> {
+    let mut found = BTreeMap::new();
+    if requested.is_empty() {
+        return Ok(found);
+    }
+    let (Some(rollup), _) = load_rollup_recovered(dir)? else {
+        return Ok(found);
+    };
+    for sequence in 1..=rollup.sequence {
+        let mut file = crate::fs::open_private_file_checked(
+            &dir.join(archive_name(sequence)),
+            crate::fs::PrivateFileAccess::Append,
+        )
+        .map_err(|_| {
+            anyhow::anyhow!("usage ledger archive unavailable for receipt reconciliation")
+        })?;
+        let scanned = scan(&mut file, None)?;
+        let mut matched = false;
+        for id in requested {
+            if let Some(fingerprint) = scanned.identities.get(id) {
+                anyhow::ensure!(
+                    found.insert(*id, *fingerprint).is_none(),
+                    "usage ledger contains duplicate receipts"
+                );
+                matched = true;
+            }
+        }
+        if matched {
+            file.sync_all()
+                .map_err(|_| anyhow::anyhow!("usage ledger archive sync failed"))?;
+        }
+    }
+    Ok(found)
+}
+
+fn archived_session(dir: &Path, sequence: u64, id: &str) -> anyhow::Result<SessionTotals> {
+    let mut session = SessionTotals::default();
+    for sequence in 1..=sequence {
+        let mut file = crate::fs::open_private_file_checked(
+            &dir.join(archive_name(sequence)),
+            crate::fs::PrivateFileAccess::Read,
+        )
+        .map_err(|_| {
+            anyhow::anyhow!("usage ledger archive unavailable for session reconciliation")
+        })?;
+        let scanned = scan_with(&mut file, Some(id), ScanMode::SessionOnly)?.summary;
+        session.totals.merge(&scanned.session)?;
+        session.capped |= scanned.session_model_details_capped;
+        for (key, totals) in scanned.session_by_model {
+            if session.by_model.contains_key(&key) || session.by_model.len() < MAX_MODEL_DETAILS {
+                session.by_model.entry(key).or_default().merge(&totals)?;
+            } else {
+                session.capped = true;
+            }
+        }
+        if let Some(last) = scanned.last_session_request
+            && session
+                .last
+                .as_ref()
+                .is_none_or(|old| (last.timestamp, last.id) > (old.timestamp, old.id))
+        {
+            session.last = Some(last);
+        }
+    }
+    Ok(session)
 }
 
 enum FlushOutcome {
@@ -2826,5 +2942,182 @@ mod tests {
         assert_eq!(summary.all_time.records, MAX_LEDGER_RECORDS + 2);
         assert!(state.join(archive_name(1)).exists());
         assert!(!state.join(archive_name(2)).exists());
+    }
+
+    #[test]
+    fn spend_ledger_retry_across_rotation_counts_receipt_once() {
+        let root = crate::tests::OwnedTestDirectory::new("rereview-retry-rotation");
+        let state = root.path().join("state");
+        crate::fs::ensure_private_directory(&state).unwrap();
+        synthetic_full_ledger(&state, MAX_LEDGER_RECORDS - 1);
+        let ledger = Ledger::new(&state);
+        let retry = one_receipt("retry-session", 11);
+        let mut persisted = std::fs::OpenOptions::new()
+            .append(true)
+            .open(state.join("usage.jsonl"))
+            .unwrap();
+        persisted
+            .write_all(&serde_json::to_vec(retry.row.as_ref()).unwrap())
+            .unwrap();
+        persisted.write_all(b"\n").unwrap();
+        persisted.sync_all().unwrap();
+        drop(persisted);
+        // The first write reached disk but its acknowledgement was lost; its
+        // original account still carries the same immutable pending receipt.
+        let account = Account::new("retry-session", None, 0.0).unwrap();
+        account.observe(&retry).unwrap();
+        let fresh = one_receipt("retry-session", 13);
+        account.observe(&fresh).unwrap();
+        ledger.flush(&account).unwrap();
+        let summary = ledger.summary_for_session("retry-session").unwrap();
+        assert_eq!(
+            summary.session.records, 2,
+            "retried receipt must stay exactly once across rotation"
+        );
+        assert_eq!(summary.session.input_tokens, 24);
+    }
+
+    #[test]
+    fn spend_ledger_rollup_keeps_untracked_session_charge() {
+        let root = crate::tests::OwnedTestDirectory::new("rereview-rollup-session-cap");
+        let state = root.path().join("state");
+        crate::fs::ensure_private_directory(&state).unwrap();
+        let mut bytes = Vec::new();
+        for i in 0..=MAX_CHECKPOINT_SESSIONS {
+            let r = one_receipt(&format!("session-{i}"), 11);
+            bytes.extend_from_slice(&serde_json::to_vec(r.row.as_ref()).unwrap());
+            bytes.push(b'\n');
+        }
+        // Valid archive left by rotation; recovered in memory as at startup.
+        crate::fs::private_atomic_create_sync(&state.join(archive_name(1)), &bytes).unwrap();
+        let summary = Ledger::new(&state)
+            .session_summary(&format!("session-{MAX_CHECKPOINT_SESSIONS}"))
+            .unwrap();
+        assert_eq!(
+            summary.session.records, 1,
+            "session detail cap must not report an incurred charge as zero"
+        );
+    }
+
+    #[test]
+    fn spend_ledger_retry_after_another_writer_rotates_is_exact_and_conflicts_fail_closed() {
+        for conflict in [false, true] {
+            let root = crate::tests::OwnedTestDirectory::new("ledger-external-rotation-retry");
+            let state = root.path().join("state");
+            crate::fs::ensure_private_directory(&state).unwrap();
+            let pending = one_receipt("retry", 11);
+            let account = Account::new("retry", None, 0.0).unwrap();
+            account.observe(&pending).unwrap();
+            let (_, retries) = account.begin_flush();
+            assert!(retries.is_empty());
+            // A complete append escaped its failed sync/ack, then another
+            // writer rotated it. The retry uses a new Ledger instance.
+            let mut archived = (*pending.row).clone();
+            if conflict {
+                archived.model = "conflicting-model".into();
+            }
+            let mut bytes = serde_json::to_vec(&archived).unwrap();
+            bytes.push(b'\n');
+            crate::fs::private_atomic_create_sync(&state.join(archive_name(1)), &bytes).unwrap();
+            let ledger = Ledger::new(&state);
+            let result = ledger.flush(&account);
+            if conflict {
+                assert!(result.unwrap_err().to_string().contains("conflicting"));
+                assert_eq!(account.pending().len(), 1);
+            } else {
+                result.unwrap();
+                assert!(account.pending().is_empty());
+                assert_eq!(
+                    ledger.summary_for_session("retry").unwrap().session.records,
+                    1
+                );
+            }
+            assert_eq!(std::fs::read(&ledger.path).unwrap(), b"");
+            assert_eq!(std::fs::read(state.join(archive_name(1))).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn spend_ledger_dropped_rollup_details_recover_whole_session_not_partial_cache() {
+        let root = crate::tests::OwnedTestDirectory::new("ledger-rollup-size-fallback");
+        let state = root.path().join("state");
+        crate::fs::ensure_private_directory(&state).unwrap();
+        let first = one_receipt("resumed", 11);
+        let second = one_receipt("resumed", 13);
+        let active = one_receipt("resumed", 17);
+        let mut rollup = RollupState::default();
+        for (i, receipt) in [&first, &second].iter().enumerate() {
+            let mut bytes = serde_json::to_vec(receipt.row.as_ref()).unwrap();
+            bytes.push(b'\n');
+            crate::fs::private_atomic_create_sync(&state.join(archive_name(i as u64 + 1)), &bytes)
+                .unwrap();
+            rollup.add(&receipt.row).unwrap();
+            rollup.sequence = i as u64 + 1;
+            if i == 0 {
+                // Same on-disk representation as the rollup's byte-cap fallback.
+                crate::fs::private_atomic_write_sync(
+                    &state.join(ROLLUP_FILE),
+                    &serde_json::to_vec(&rollup_record(&rollup, false)).unwrap(),
+                )
+                .unwrap();
+                rollup = load_rollup(&state).unwrap().unwrap();
+            }
+        }
+        assert!(rollup.sessions_dropped);
+        assert_eq!(rollup.sessions["resumed"].totals.input_tokens, 13);
+        store_rollup(&state, &rollup).unwrap();
+        let ledger = Ledger::new(&state);
+        flush_receipt(&ledger, &active).unwrap();
+        for summary in [
+            ledger.session_summary("resumed").unwrap(),
+            ledger.summary_for_session("resumed").unwrap(),
+        ] {
+            assert_eq!(summary.session.input_tokens, 41);
+            assert_eq!(summary.session.records, 3);
+            assert_eq!(summary.all_time.records, 3);
+            assert_eq!(
+                summary
+                    .session_by_model
+                    .values()
+                    .next()
+                    .unwrap()
+                    .input_tokens,
+                41
+            );
+            assert_eq!(summary.last_session_request.unwrap().id, active.id());
+        }
+        std::fs::remove_file(state.join(archive_name(1))).unwrap();
+        assert!(
+            ledger.session_summary("resumed").is_err(),
+            "missing history must not be reported as zero or partial spend"
+        );
+    }
+
+    #[test]
+    fn spend_ledger_shared_account_serializes_across_ledger_instances() {
+        let root = crate::tests::OwnedTestDirectory::new("ledger-shared-account");
+        let state = root.path().join("state");
+        let account = Account::new("shared", None, 0.0).unwrap();
+        for _ in 0..16 {
+            account.observe(&one_receipt("shared", 3)).unwrap();
+        }
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        std::thread::scope(|scope| {
+            let left = scope.spawn(|| {
+                barrier.wait();
+                Ledger::new(&state).flush(&account)
+            });
+            let right = scope.spawn(|| {
+                barrier.wait();
+                Ledger::new(&state).flush(&account)
+            });
+            let results = (left.join().unwrap(), right.join().unwrap());
+            results.0.unwrap();
+            results.1.unwrap();
+        });
+        assert!(account.pending().is_empty());
+        let summary = Ledger::new(&state).summary_for_session("shared").unwrap();
+        assert_eq!(summary.session.records, 16);
+        assert_eq!(summary.session.input_tokens, 48);
     }
 }

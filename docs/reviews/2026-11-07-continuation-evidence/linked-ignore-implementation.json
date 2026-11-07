@@ -1,0 +1,50 @@
+{
+  "beads": [
+    "gkqd4.9",
+    "gkqd4.6"
+  ],
+  "source_frozen": true,
+  "source_files": [
+    "src/agent/tools/find_files.rs",
+    "src/extras/hooks/backend.rs"
+  ],
+  "evidence": "/private/tmp/mini-agent-hook-linked-ignore-probe.json",
+  "behavior": [
+    "Native directory/walker/JS listing and hook reads resolve linked gitfile + optional common directory to repository info/exclude.",
+    "Native nested roots resolve ancestor common excludes through the same bounded pointer/common-directory helper.",
+    "Root descriptor still supplies the initial gitfile; only exact read-only Git metadata is delegated outside a linked workspace.",
+    "Git pointers capped at4KiB; repository info/exclude and hook-local ignore metadata capped at1MiB. Invalid/unreadable/oversized Git metadata fail closed.",
+    "no_ignore skips metadata parsing entirely; policy deny filters still apply.",
+    "Native ordinary ancestor ignore files preserve optional-file and symlink behavior. They now acquire nonblocking handles and reject non-regular sources before read.",
+    "Ancestor metadata uses known paths and does not require ancestor directory listing permission."
+  ],
+  "authority": "Exact external common info/exclude metadata only, consistent with sandbox/git_metadata GitMetadataLayout common metadata discovery. Existing resolver is pathname-based/private; shared capability-aware reader keeps initial root handle and mirrors the same gitdir/commondir grammar. No new production module.",
+  "new_tests": [
+    "linked_worktree_common_exclude_applies_to_native_discovery",
+    "invalid_linked_git_metadata_refuses_discovery_before_exposing_entries",
+    "linked_git_metadata_rejects_symlink_sources",
+    "ancestor_ignore_fifo_never_waits_for_a_writer",
+    "ancestor_ignore_accepts_execute_only_parent_and_symlinked_dotfile",
+    "linked_worktree_hook_reads_honor_common_exclude_and_root_negation"
+  ],
+  "coverage": [
+    "Actual temporary Git init/worktree fixture; FindFiles/ListDir/Grep and bounded JS listing; common metadata exclusions + higher-precedence negation.",
+    "Explicit nested native roots; malformed ancestor + no_ignore control.",
+    "Malformed/oversized gitfile/commondir, nonexistent gitdir, oversized excludes; deny filter remains effective under include_ignored.",
+    "Controlled parent-ignore FIFO with release-before-assert cleanup on negative case.",
+    "Execute-only parent plus symlinked .gitignore compatibility.",
+    "Hook read refusal, allowed siblings/negation, malformed-layout refusal even with whitelist."
+  ],
+  "docs": "/private/tmp/mini-agent-linked-ignore-docs.txt",
+  "cfg_audit": "with_entry_filter is cfg(feature=js) and only called from js/host; metadata_ignore_matcher is cfg(feature=hooks) and called from hook backend. Other shared helpers have native callers in all feature rows.",
+  "validation": [
+    "Git-only isolated fixture probe passed; no Git mutations to main repo.",
+    "find_files selected rustfmt and git diff --check clean.",
+    "No Cargo or bead writes; root coordinates final formatting/test batch."
+  ],
+  "residuals": [
+    "Platform execution belongs to parent batch/CI; Windows no-follow/reparse helpers not run here.",
+    "Ordinary ancestor ignore aliases/optional errors retain established behavior; strict new validation applies to Git metadata and hook-local metadata."
+  ],
+  "coordinator_status": "Local validation complete. Later coordinator corrections and test results are authoritative in ../2026-11-07-continuation-review.json; hosted CI pending."
+}

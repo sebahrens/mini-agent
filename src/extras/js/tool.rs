@@ -103,6 +103,8 @@ struct PermissionEnvelope {
     invocation_cancellation: Option<PermCancellation>,
     #[cfg(feature = "hooks")]
     hook_work_scope: Option<Arc<crate::agent::runner::AgentWorkScope>>,
+    #[cfg(feature = "hooks")]
+    hook_bindings: Option<crate::agent::runner::HookBindings>,
     reply: PermissionReply,
 }
 
@@ -113,6 +115,8 @@ pub(crate) struct PermissionBridge {
     invocation_cancellation: Option<PermCancellation>,
     #[cfg(feature = "hooks")]
     hook_work_scope: Option<Arc<crate::agent::runner::AgentWorkScope>>,
+    #[cfg(feature = "hooks")]
+    hook_bindings: Option<crate::agent::runner::HookBindings>,
     host_call_cancellation: Option<PermCancellation>,
     timeout: Duration,
     /// The same checker the receiver task consults, read only for the
@@ -134,6 +138,8 @@ impl PermissionBridge {
             invocation_cancellation: None,
             #[cfg(feature = "hooks")]
             hook_work_scope: None,
+            #[cfg(feature = "hooks")]
+            hook_bindings: None,
             host_call_cancellation: None,
             timeout,
             deny_source: None,
@@ -163,6 +169,11 @@ impl PermissionBridge {
         #[cfg(feature = "hooks")]
         {
             bridge.hook_work_scope = crate::agent::runner::current_hook_work_scope();
+            let mut bindings = crate::agent::runner::HookBindings::capture();
+            // The receiver's exact checker is authoritative, including when
+            // invocation setup runs outside an agent task-local binding.
+            bindings.permission = Some(bridge.deny_source.clone());
+            bridge.hook_bindings = Some(bindings);
         }
         bridge
     }
@@ -209,6 +220,8 @@ impl PermissionBridge {
                 invocation_cancellation: self.invocation_cancellation.clone(),
                 #[cfg(feature = "hooks")]
                 hook_work_scope: self.hook_work_scope.clone(),
+                #[cfg(feature = "hooks")]
+                hook_bindings: self.hook_bindings.clone(),
                 reply: PermissionReply::Sync(reply_tx),
             })
             .map_err(|_| self.closed_request_error())?;
@@ -306,6 +319,8 @@ impl PermissionBridge {
                 invocation_cancellation: self.invocation_cancellation.clone(),
                 #[cfg(feature = "hooks")]
                 hook_work_scope: self.hook_work_scope.clone(),
+                #[cfg(feature = "hooks")]
+                hook_bindings: self.hook_bindings.clone(),
                 reply: PermissionReply::Async(reply_tx),
             })
             .map_err(|_| self.closed_request_error())?;
@@ -568,6 +583,8 @@ async fn process_permission_request(
         invocation_cancellation,
         #[cfg(feature = "hooks")]
         hook_work_scope,
+        #[cfg(feature = "hooks")]
+        hook_bindings,
         reply,
     } = envelope;
     let request_id = request.id();
@@ -593,6 +610,8 @@ async fn process_permission_request(
                 ask_tx,
                 invocation_cancellation.as_ref(),
             ));
+            #[cfg(feature = "hooks")]
+            let resolve = hook_bindings.unwrap_or_else(crate::agent::runner::HookBindings::capture).run(resolve);
             #[cfg(feature = "hooks")]
             if let Some(scope) = hook_work_scope {
                 return scope.run(resolve).await;
@@ -2285,6 +2304,87 @@ mod js_permission_bridge {
     fn reply(envelope: PermissionEnvelope, outcome: PermOutcome) {
         let request_id = envelope.request.id();
         envelope.reply.send(PermResponse::new(request_id, outcome));
+    }
+
+    #[cfg(all(feature = "hooks", unix))]
+    #[tokio::test]
+    async fn js_permission_bridge_restores_invocation_hook_identity_outside_agent_task() {
+        use crate::extras::hooks::dispatcher::HookDispatcher;
+        use crate::extras::hooks::settings::{HookGroup, HookHandler, HookTrust, HooksConfig};
+        let _guard = crate::tests::fake_model::dispatcher_guard::acquire();
+        let dir = crate::tests::OwnedTestDirectory::new("js-hook-bindings");
+        let path = dir.path().join("permission-envelope.json");
+        let mut config = HooksConfig::new();
+        config.insert(
+            "PermissionRequest".into(),
+            vec![HookGroup {
+                matcher: None,
+                hooks: vec![HookHandler {
+                    kind: "command".into(),
+                    command: Some("/bin/sh".into()),
+                    args: Some(vec![
+                        "-c".into(),
+                        r#"cat > "$1"; printf '%s' '{}'"#.into(),
+                        "probe".into(),
+                        path.display().to_string(),
+                    ]),
+                    timeout: Some(10),
+                    is_async: false,
+                    condition: None,
+                    once: false,
+                    trust: HookTrust::Trusted,
+                    env: Default::default(),
+                }],
+            }],
+        );
+        crate::extras::hooks::init_dispatcher(HookDispatcher::from_config(&config).unwrap());
+        let (ask, mut requests) = tokio_mpsc::channel(1);
+        // Receiver starts before invocation binding and runs on its own task.
+        let owner = PermissionBridgeOwner::new(
+            Some(permission(Action::Ask)),
+            Some(ask),
+            Duration::from_secs(15),
+        );
+        let scope = crate::agent::runner::AgentWorkScope::new();
+        scope.set_hook_execution_root(dir.path());
+        scope.set_hook_session_context(crate::extras::hooks::HookCtx {
+            session_id: "parent".into(),
+            session_path: "/parent.json".into(),
+            cwd: dir.path().display().to_string(),
+            permission_mode: "restrictive".into(),
+        });
+        let bindings = crate::agent::runner::HookBindings {
+            context: Some(crate::extras::hooks::HookCtx {
+                session_id: "js-invocation".into(),
+                session_path: String::new(),
+                cwd: dir.path().display().to_string(),
+                permission_mode: "restrictive".into(),
+            }),
+            permission: None,
+            #[cfg(feature = "mcp")]
+            peers: Some(Arc::default()),
+        };
+        let bridge = scope
+            .run(bindings.run(async { owner.bridge().for_invocation(PermCancellation::new()) }))
+            .await;
+        let check = bridge.check_async("read", "held.txt");
+        tokio::pin!(check);
+        let request = tokio::select! {
+            request = requests.recv() => request.unwrap().into_permission(),
+            result = &mut check => panic!("observational hook completed permission early: {result:?}"),
+        };
+        request.reply.send(UserDecision::Deny).unwrap();
+        let result = check.await;
+        assert!(matches!(result, Err(PermissionBridgeError::Denied(_))));
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(envelope["session_id"], "js-invocation");
+        assert_eq!(envelope["session_path"], "");
+        scope
+            .run(async {
+                assert_eq!(crate::extras::hooks::session_context().0, "parent");
+            })
+            .await;
     }
 
     #[tokio::test]

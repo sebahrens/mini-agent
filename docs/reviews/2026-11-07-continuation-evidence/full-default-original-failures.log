@@ -1,0 +1,151 @@
+Full default suite: 6270 tests; 6244 passed, 10 failed, 16 ignored. Failure details before follow-up corrections:
+
+failures:
+
+---- extras::acp::protocol_tests::actual_acp_prompt_hook_envelope_uses_protocol_id_and_empty_session_path stdout ----
+PRIVATE_OPEN_FAILED=initial_metadata
+
+thread 'extras::acp::protocol_tests::actual_acp_prompt_hook_envelope_uses_protocol_id_and_empty_session_path' (66837070) panicked at src/extras/acp/mod.rs:13269:17:
+assertion `left != right` failed: fixture has distinct protocol and canonical IDs
+  left: "9b1db390-b700-4218-9e6d-be652d89fcca"
+ right: "9b1db390-b700-4218-9e6d-be652d89fcca"
+
+---- extras::hooks::backend::tests::agent_backend_uses_current_read_deny_instead_of_startup_allow stdout ----
+
+thread 'extras::hooks::backend::tests::agent_backend_uses_current_read_deny_instead_of_startup_allow' (66838475) panicked at src/extras/hooks/backend.rs:898:9:
+assertion `left == right` failed: agent hook: model call failed: Compression failed: ProviderError: Invalid content type was returned: "application/json"
+  left: Some(1)
+ right: Some(0)
+
+---- extras::js::host::tests::brokered_grep_accepts_a_single_file_path_under_read_rules stdout ----
+
+thread 'extras::js::host::tests::brokered_grep_accepts_a_single_file_path_under_read_rules' (66838554) panicked at src/extras/js/host.rs:6682:17:
+config/app.txt: single-file grep must succeed
+
+---- extras::js::supervisor::worker_exit_tests::buffered_terminal_survives_clean_exit_and_keeps_validation stdout ----
+
+thread 'extras::js::supervisor::worker_exit_tests::buffered_terminal_survives_clean_exit_and_keeps_validation' (66839099) panicked at src/extras/js/tests/worker_exit.rs:63:10:
+worker must exit before the parent reads its terminal frame: Elapsed(())
+
+---- extras::js::tool::js_permission_bridge::grep_accepts_a_single_file_path_and_truncates_deterministically stdout ----
+
+thread 'extras::js::tool::js_permission_bridge::grep_accepts_a_single_file_path_and_truncates_deterministically' (66845896) panicked at src/extras/js/tool.rs:4321:9:
+assertion `left == right` failed
+  left: "JS exception at 1:10 (stage: evaluation; script: model)"
+ right: "[[\"small.txt:2\"],false]"
+
+---- extras::subagents::task_tool::tests::report_contract_actual_task_requests_once_for_code_and_twice_for_repair stdout ----
+
+thread 'extras::subagents::task_tool::tests::report_contract_actual_task_requests_once_for_code_and_twice_for_repair' (66848250) panicked at src/extras/subagents/task_tool.rs:5438:83:
+called `Result::unwrap()` on an `Err` value: Os { code: 2, kind: NotFound, message: "No such file or directory" }
+
+---- tests::subprocess_inventory_tests::production_subprocess_sites_have_a_trust_classification stdout ----
+
+thread 'tests::subprocess_inventory_tests::production_subprocess_sites_have_a_trust_classification' (66881571) panicked at src/tests/subprocess_inventory_tests.rs:7218:5:
+subprocess inventory drifted; classify every new production Command::new/tokio::process/.spawn/.output/.status result in docs/specs/subprocess-trust.md and update the checked inventory.
+Unclassified or changed: [
+    (
+        "src/extras/mcp/server.rs",
+        "let mut child = match owned_command.spawn() {",
+        1,
+    ),
+]
+Stale: [
+    (
+        "src/extras/mcp/server.rs",
+        "async fn kill_tree(child: &mut tokio::process::Child, pid: Option<u32>) {",
+        1,
+    ),
+    (
+        "src/extras/mcp/server.rs",
+        "let mut child = match child.spawn() {",
+        1,
+    ),
+    (
+        "src/extras/mcp/server.rs",
+        "write_message(&mut output, &error(&Value::Null, -32700, \"parse error\")).await?;",
+        1,
+    ),
+    (
+        "src/extras/mcp/server.rs",
+        "write_message(&mut output, &error(&id, -32000, &format!(\"too many concurrent `run` calls (limit {}, --mcp-server-max-runs); retry when one finishes\", command.max_runs.max(1)))).await?;",
+        1,
+    ),
+    (
+        "src/extras/mcp/server.rs",
+        "write_message(&mut output, &error(&id, -32602, \"unknown tool; only `run` is offered\")).await?;",
+        1,
+    ),
+    (
+        "src/extras/mcp/server.rs",
+        "write_message(&mut output, &error(&id, -32602, &message)).await?;",
+        1,
+    ),
+    (
+        "src/extras/mcp/server.rs",
+        "write_message(&mut output, &handle_simple(&command, &id, method, &params)).await?;",
+        1,
+    ),
+    (
+        "src/extras/mcp/server.rs",
+        "write_message(&mut output, &reply).await?;",
+        1,
+    ),
+    (
+        "src/extras/mcp/server.rs",
+        "write_message(&mut output, &reply).await?;",
+        2,
+    ),
+]
+
+---- tests::subprocess_inventory_tests::windows_capable_production_process_terminals_use_creation_boundary stdout ----
+
+thread 'tests::subprocess_inventory_tests::windows_capable_production_process_terminals_use_creation_boundary' (66882177) panicked at src/tests/subprocess_inventory_tests.rs:7289:5:
+Windows-capable production process terminals bypass the crate creation boundary: [
+    "src/extras/mcp/headers_helper.rs:146 unrecognized macro context 4c8b85e6eb6ef8da3e0680afc3ba5a877bbfe732b9150a963865f94a5e0dc7de#1 for status terminal",
+    "src/extras/mcp/headers_helper.rs:149 unrecognized macro context 4c8b85e6eb6ef8da3e0680afc3ba5a877bbfe732b9150a963865f94a5e0dc7de#1 for output terminal",
+    "src/extras/mcp/headers_helper.rs:149 unrecognized macro context 4c8b85e6eb6ef8da3e0680afc3ba5a877bbfe732b9150a963865f94a5e0dc7de#1 for output terminal",
+    "src/extras/mcp/headers_helper.rs:149 unrecognized macro context 4c8b85e6eb6ef8da3e0680afc3ba5a877bbfe732b9150a963865f94a5e0dc7de#1 for status terminal",
+    "src/extras/mcp/headers_helper.rs:150 unrecognized macro context 4c8b85e6eb6ef8da3e0680afc3ba5a877bbfe732b9150a963865f94a5e0dc7de#1 for status terminal",
+    "src/extras/mcp/headers_helper.rs:153 unrecognized macro context 4c8b85e6eb6ef8da3e0680afc3ba5a877bbfe732b9150a963865f94a5e0dc7de#1 for output terminal",
+    "src/extras/mcp/headers_helper.rs:155 unrecognized macro context 4c8b85e6eb6ef8da3e0680afc3ba5a877bbfe732b9150a963865f94a5e0dc7de#1 for status terminal",
+    "src/extras/mcp/headers_helper.rs:155 unrecognized macro context 4c8b85e6eb6ef8da3e0680afc3ba5a877bbfe732b9150a963865f94a5e0dc7de#1 for output terminal",
+    "src/extras/mcp/headers_helper.rs:156 unrecognized macro context 4c8b85e6eb6ef8da3e0680afc3ba5a877bbfe732b9150a963865f94a5e0dc7de#1 for output terminal",
+    "src/extras/mcp/headers_helper.rs:156 unrecognized macro context 4c8b85e6eb6ef8da3e0680afc3ba5a877bbfe732b9150a963865f94a5e0dc7de#1 for status terminal",
+    "src/extras/mcp/server.rs:870 unrecognized macro context 5060a4fa982c2dc00234a99b857bcea723113ca93491f3804c117a2b99113a98#1 for status terminal",
+    "src/extras/mcp/server.rs:875 unrecognized macro context 5060a4fa982c2dc00234a99b857bcea723113ca93491f3804c117a2b99113a98#1 for status terminal",
+    "src/extras/mcp/server.rs:880 unrecognized macro context 5060a4fa982c2dc00234a99b857bcea723113ca93491f3804c117a2b99113a98#1 for status terminal",
+    "src/extras/mcp/server.rs:882 unrecognized macro context 5060a4fa982c2dc00234a99b857bcea723113ca93491f3804c117a2b99113a98#1 for status terminal",
+    "src/extras/mcp/server.rs:1178 unrecognized macro context d6d38b65394d86e02f59accaf62ebf13b460f5cddfc3914e71a90e7713f6d042#1 for spawn terminal",
+    "src/git/tool.rs:767 unrecognized macro context 1735ccb352820a631e226dc84e5f3519ce50986a4f53c07de077ce1528e49969#1 for output terminal",
+]
+
+---- ui::app::plan_approval_tests::context_length_rejection_compacts_once_and_resumes_the_tui_turn stdout ----
+PRIVATE_OPEN_FAILED=initial_metadata
+PRIVATE_OPEN_FAILED=initial_metadata
+PRIVATE_OPEN_FAILED=initial_metadata
+
+thread 'ui::app::plan_approval_tests::context_length_rejection_compacts_once_and_resumes_the_tui_turn' (66918177) panicked at src/ui/app.rs:19387:10:
+called `Result::unwrap()` on an `Err` value: Elapsed(())
+
+---- ui::app::plan_approval_tests::steering_compaction_presentation_failure_restores_pending_text stdout ----
+
+thread 'ui::app::plan_approval_tests::steering_compaction_presentation_failure_restores_pending_text' (66918641) panicked at src/ui/app.rs:15426:14:
+called `Result::unwrap_err()` on an `Ok` value: ()
+
+
+failures:
+    extras::acp::protocol_tests::actual_acp_prompt_hook_envelope_uses_protocol_id_and_empty_session_path
+    extras::hooks::backend::tests::agent_backend_uses_current_read_deny_instead_of_startup_allow
+    extras::js::host::tests::brokered_grep_accepts_a_single_file_path_under_read_rules
+    extras::js::supervisor::worker_exit_tests::buffered_terminal_survives_clean_exit_and_keeps_validation
+    extras::js::tool::js_permission_bridge::grep_accepts_a_single_file_path_and_truncates_deterministically
+    extras::subagents::task_tool::tests::report_contract_actual_task_requests_once_for_code_and_twice_for_repair
+    tests::subprocess_inventory_tests::production_subprocess_sites_have_a_trust_classification
+    tests::subprocess_inventory_tests::windows_capable_production_process_terminals_use_creation_boundary
+    ui::app::plan_approval_tests::context_length_rejection_compacts_once_and_resumes_the_tui_turn
+    ui::app::plan_approval_tests::steering_compaction_presentation_failure_restores_pending_text
+
+test result: FAILED. 6244 passed; 10 failed; 16 ignored; 0 measured; 0 filtered out; finished in 747.55s
+
+error: test failed, to rerun pass `--bin mini-agent`

@@ -1,0 +1,83 @@
+{
+  "reviewer": "integrations bounded P4 pass",
+  "source_baseline": "production282e1e1b; read-only current working tree at eef3001c, excluding root-owned temporary probes",
+  "new_p0_p3_findings": [
+    {
+      "priority": 3,
+      "title": "Consume the actual one-record Git rename shape in native commit validation",
+      "file": "src/ui/slash/git.rs",
+      "line_start": 213,
+      "line_end": 221,
+      "confidence": 0.99,
+      "scenario": "A native /commit selection includes both old.txt and new.txt for a staged rename. Actual GitTool status emits a single string ending new.txt plus tab-orig-old.txt, but check_staged_paths treats that whole suffix as the destination and expects a second array element for the origin. It rejects the selected rename as an unrelated staged path, preventing the commit.",
+      "evidence": [
+        "git/tool.rs parse_status_records appends the origin to the rename record with record.push_str(\"\\torig: \") and consumes the NUL origin field (2474-2485). Status output therefore has one JSON string per rename, explicitly documented by the producer.",
+        "check_staged_paths still splits type2 record into10 space-delimited parts, compares parts.last() directly to selected (slash/git.rs203-215), then advances the records iterator to obtain the origin (217-221). The destination is actually new.txt\\torig: old.txt, so even selecting both real paths cannot satisfy this check.",
+        "Native commit executes this guard before staging and again immediately before commit (slash/git.rs639 and667). The model-facing Git commit operation itself does not have this mismatch.",
+        "Existing native guard tests fabricate [rename_record, old_filename] arrays, while producer tests explicitly assert one record ends with renamed.txt\\torig: old. No existing test composes the real GitTool::Status result with its native consumer."
+      ],
+      "fix": "Align native validation with the actual bounded status result shape, preferably use structured destination/origin metadata shared with the producer. Preserve checking both source and destination and never consume the next unrelated record. Handle literal tabs/newlines or explicitly reject ambiguous spellings with a clear reason.",
+      "acceptance_tests": [
+        "Run the supplied compositional fixture: actual GitTool status after git mv old.txt new.txt, both selected, must pass native staged-path validation. Reject when either rename path is outside selection. Include an unrelated staged record immediately after the rename and literal space/tab filename cases."
+      ],
+      "probe": "/private/tmp/mini-agent-continuation-native-rename-probe.rs (insert into git/tool.rs tests, cfg git-worktree)",
+      "related_beads": [
+        "mini-agent-1tv59",
+        "mini-agent-k4fem"
+      ],
+      "validation": "Source and indexed implementation confirmed; supplied compositional regression awaits root-coordinated Cargo."
+    }
+  ],
+  "p4_findings": [
+    {
+      "priority": 4,
+      "title": "Bound aggregate hook payloads after placeholder expansion",
+      "file": "src/extras/hooks/backend.rs",
+      "line_start": 355,
+      "line_end": 363,
+      "confidence": 0.95,
+      "scenario": "An otherwise accepted prompt hook repeats $ARGUMENTS throughout a source prompt below the32KiB setting cap. Each replacement copies a separately bounded64KiB event;2500 placeholders produce roughly156MiB before any provider request. MCP input templates below64KiB likewise repeat ${tool_response} and can multiply a normal bounded tool result into a very large JSON request.",
+      "evidence": [
+        "settings.rs caps the authored model prompt at32KiB and authored MCP input JSON at64KiB; these checks run before expansion.",
+        "build_model_prompt sanitizes the event once to64KiB, then instructions.replace(\"$ARGUMENTS\", &block) copies the block for every occurrence without an aggregate ceiling (backend.rs355-363). A25KiB source containing2500 markers remains admissible but allocates roughly164million output bytes.",
+        "substitute_event_values appends every resolved event string with push_str for every occurrence and recursively builds arrays/objects with no output budget (backend.rs158-200). run_mcp_tool sends that expanded object directly.",
+        "The outer asynchronous timeout cannot prevent the synchronous expansion allocation that occurs before the request future yields."
+      ],
+      "fix": "Introduce an explicit aggregate post-expansion byte budget for model and MCP hook requests. Check capacity before appending/copying and return a static bounded hook failure when expansion would exceed it; do not silently truncate trusted instructions or alter the operand values. Keep existing small multi-placeholder behavior.",
+      "acceptance_tests": [
+        "A permitted source template with many repeated placeholders and a large event must fail before allocating an oversized final payload or contacting a backend. Verify exact-limit success, over-limit refusal, UTF8 accounting and nested array/object expansion. Keep small repeated/missing-placeholder substitutions unchanged."
+      ],
+      "classification": "Low-priority robustness of an optional operator-authored configuration; no claim of a normal-use production outage or live backend test."
+    }
+  ],
+  "held_candidate_dispositions": [
+    {
+      "candidate": "Backend once hooks consume their slot when no peer/provider effect starts",
+      "decision": "Not filed",
+      "reason": "The backend handler itself was invoked and may intentionally count as the one attempt, consistent with HTTP failures consuming once. OS-child-specific started wording does not establish a clear incompatible user contract for in-process handlers. A change needs a product decision, so avoid manufacturing a defect."
+    },
+    {
+      "candidate": "Bound synchronous ignore-file parsing",
+      "decision": "Not filed",
+      "reason": "No concrete consequential failure or project-specific limit contract established beyond general resource-hardening. The separate proven ignored-ancestor bug is already reported as P2; no duplicate issue."
+    }
+  ],
+  "post_p3_stabilization": {
+    "result": "After identifying the rename producer/consumer mismatch, one additional parser-to-consumer sweep found zero further distinct P0-P3 causes in the assigned scope.",
+    "checked": [
+      "Git porcelain v2 producer and native staged guard including ordinary/unmerged/rename records",
+      "Git name-status output is deliberately rendered as text, not reparsed; no production numstat parser exists in the searched source",
+      "Headless baseline porcelain v1 uses -z and --no-renames, and paths are normalized/stripped with the captured repository prefix",
+      "Statusline porcelain v2 reads only headers and XY/count fields, not filenames; quoted control names cannot create false records",
+      "Worktree registration porcelain uses -z and exact path-byte comparison; merge status checks use only emptiness; conflict name-only output is presentation data",
+      "Native diff/commit/PR actor captured operands, permission route, actual result observations and complete stdout URL validation",
+      "Export renderer/import projections and hook backend once/async/MCP/model request behavior"
+    ],
+    "limits": "Scoped risk-directed review, not a proof of total absence of defects."
+  },
+  "coverage_and_execution": {
+    "cargo": "None; root coordinates tests.",
+    "repository_mutation": "None by this subagent. Scratch probe/report files only.",
+    "indexer": "Direct MCP index get_impl confirmed current check_staged_paths implementation and source ranges. Earlier continuation index confirmed hook backend and caller paths."
+  }
+}

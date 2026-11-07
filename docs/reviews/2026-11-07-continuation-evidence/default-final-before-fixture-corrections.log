@@ -1,0 +1,416 @@
+   Compiling mini-agent v1.12.0 (/Users/seb/projects/mini-agent)
+    Finished `test` profile [unoptimized] target(s) in 49.02s
+     Running unittests src/main.rs (target/debug/deps/mini_agent-eb54318180c9c0b0)
+
+running 360 tests
+test agent::tools::find_files::tests::ancestor_ignore_accepts_execute_only_parent_and_symlinked_dotfile ... ok
+test agent::tools::find_files::tests::ancestor_ignore_fifo_never_waits_for_a_writer ... ok
+test agent::tools::find_files::tests::bound_search_depth_limit_skips_deep_descendants_and_preserves_siblings ... ok
+test agent::tools::find_files::tests::bound_search_entry_budget_counts_ignored_entries_and_releases_the_walk ... ok
+test agent::tools::find_files::tests::bound_walker_never_observes_an_aba_root_replacement ... ok
+test agent::tools::find_files::tests::bound_walker_stops_once_its_owner_is_cancelled ... ok
+test agent::tools::find_files::tests::capped_results_are_lexicographically_first_independent_of_walk_order ... ok
+test agent::tools::find_files::tests::common_globs_and_explicit_regex_find_the_expected_paths ... ok
+test agent::tools::find_files::tests::does_not_report_truncation_when_walker_is_exhausted_at_result_limit ... ok
+test agent::tools::find_files::tests::file_filter_runs_before_open_and_links_stay_refused ... ok
+test agent::tools::find_files::tests::file_path_reports_a_clear_not_a_directory_error ... ok
+test agent::tools::find_files::tests::find_files_external_path_permission_binds_walker_to_authorized_symlink_target ... ok
+test agent::tools::find_files::tests::find_files_external_path_permission_expands_tilde_before_asking ... ok
+test agent::tools::find_files::tests::find_files_external_path_permission_fails_closed_on_permission_channel_failure ... ok
+test agent::tools::find_files::tests::find_files_external_path_permission_keeps_local_relative_searches ... ok
+test agent::tools::find_files::tests::find_files_external_path_permission_omitted_root_searches_cwd ... ok
+test agent::tools::find_files::tests::find_files_external_path_permission_pattern_cannot_widen_root ... ok
+test agent::tools::find_files::tests::find_files_external_path_permission_rejects_empty_root_before_asking ... ok
+test agent::tools::find_files::tests::find_files_external_path_permission_resolves_symlink_escape_before_asking ... ok
+test agent::tools::find_files::tests::find_files_external_path_permission_resolves_traversal_before_asking ... ok
+test agent::tools::find_files::tests::find_files_external_path_permission_retains_authorized_root_on_replacement ... ok
+test agent::tools::find_files::tests::find_files_external_path_permission_uses_canonical_absolute_root ... ok
+test agent::tools::find_files::tests::find_files_omits_denied_paths ... ok
+test agent::tools::find_files::tests::global_ignore_matchers_are_cached_until_a_config_or_the_environment_changes ... ok
+test agent::tools::find_files::tests::invalid_linked_git_metadata_refuses_discovery_before_exposing_entries ... ok
+test agent::tools::find_files::tests::invalid_patterns_and_no_matches_report_the_interpretation ... ok
+test agent::tools::find_files::tests::js_discovery_listing_honours_git_info_exclude ... ok
+test agent::tools::find_files::tests::linked_git_metadata_rejects_symlink_sources ... ok
+test agent::tools::find_files::tests::linked_worktree_common_exclude_applies_to_native_discovery ... FAILED
+test agent::tools::find_files::tests::mtime_sort_retains_newest_paths_with_stable_ties_and_name_default ... ok
+test agent::tools::find_files::tests::mtime_sort_unavailable_timestamps_sort_last_and_name_ignores_them ... ok
+test agent::tools::find_files::tests::nested_ignore_whitelist_overrides_parent_matcher_without_cloning_chain ... ok
+test agent::tools::find_files::tests::pages_across_three_pages_in_stable_order ... ok
+test agent::tools::find_files::tests::parent_ignore_matchers_are_cached_and_invalidated_by_source_changes ... ok
+test agent::tools::find_files::tests::path_glob_matches_nested_and_root_files ... ok
+test agent::tools::find_files::tests::prompts_before_searching_external_path ... ok
+test agent::tools::find_files::tests::reports_exact_remaining_count_when_result_limit_is_hit ... ok
+test agent::tools::find_files::tests::walker_allocations_scale_with_matches_not_entries ... ok
+test agent::tools::find_files::tests::zero_result_cap_does_not_panic_or_return_an_empty_page ... ok
+test agent::tools::grep::discovery_root_deny_tests::explicit_directory_must_not_bypass_pruned_read_deny ... ok
+test agent::tools::grep::discovery_root_deny_tests::find_and_list_explicit_directory_obey_pruned_read_deny ... ok
+test agent::tools::grep::tests::bound_file_reads_never_observe_an_aba_root_replacement ... ok
+test agent::tools::grep::tests::cancelled_turn_keeps_real_grep_read_owned_until_it_finishes ... ok
+test agent::tools::grep::tests::context_output_uses_path_colon_line_and_separators_do_not_consume_limit ... ok
+test agent::tools::grep::tests::description_discloses_result_and_file_size_limits ... ok
+test agent::tools::grep::tests::does_not_report_truncation_when_walker_is_exhausted_at_limit ... ok
+test agent::tools::grep::tests::exact_cap_followed_by_non_matching_file_is_not_truncated ... ok
+test agent::tools::grep::tests::files_only_and_count_modes_return_compact_file_results ... ok
+test agent::tools::grep::tests::glob_to_regex_escapes_literal_regex_metacharacters ... ok
+test agent::tools::grep::tests::grep_allow_always_scope_handles_whitespace_in_root ... ok
+test agent::tools::grep::tests::grep_allow_always_scope_is_literal_tree_not_prefix ... ok
+test agent::tools::grep::tests::grep_external_path_permission_binds_walker_to_authorized_symlink_target ... ok
+test agent::tools::grep::tests::grep_external_path_permission_expands_tilde_before_asking ... ok
+test agent::tools::grep::tests::grep_external_path_permission_fails_closed_on_permission_channel_failure ... ok
+test agent::tools::grep::tests::grep_external_path_permission_keeps_local_relative_searches ... ok
+test agent::tools::grep::tests::grep_external_path_permission_omitted_root_searches_cwd ... ok
+test agent::tools::grep::tests::grep_external_path_permission_pattern_cannot_widen_root ... ok
+test agent::tools::grep::tests::grep_external_path_permission_policy_deny_prevents_traversal ... ok
+test agent::tools::grep::tests::grep_external_path_permission_prompts_before_traversal ... ok
+test agent::tools::grep::tests::grep_external_path_permission_rejects_empty_root_before_asking ... ok
+test agent::tools::grep::tests::grep_external_path_permission_resolves_symlink_escape_before_asking ... ok
+test agent::tools::grep::tests::grep_external_path_permission_resolves_traversal_before_asking ... ok
+test agent::tools::grep::tests::grep_external_path_permission_retains_authorized_root_on_replacement ... ok
+test agent::tools::grep::tests::grep_external_path_permission_uses_canonical_absolute_root ... ok
+test agent::tools::grep::tests::grep_reports_files_and_directories_it_could_not_open ... ok
+test agent::tools::grep::tests::grep_searches_a_single_external_file_by_absolute_path ... ok
+test agent::tools::grep::tests::grep_searches_a_single_workspace_file_named_as_path ... ok
+test agent::tools::grep::tests::grep_single_file_honors_read_and_grep_deny_rules ... ok
+test agent::tools::grep::tests::grep_single_file_searches_ignored_file_but_keeps_size_and_binary_rules ... ok
+test agent::tools::grep::tests::grep_skips_directories_matching_grep_deny_rules ... ok
+test agent::tools::grep::tests::grep_skips_files_matching_read_deny_rules ... ok
+test agent::tools::grep::tests::invalid_include_glob_is_an_explicit_error ... ok
+test agent::tools::grep::tests::path_aware_include_globs_match_root_and_nested_files ... ok
+test agent::tools::grep::tests::prefilter_is_disabled_for_anchored_patterns ... ok
+test agent::tools::grep::tests::prefilter_keeps_line_anchored_and_crlf_matches ... ok
+test agent::tools::grep::tests::reports_unknown_additional_matches_when_limit_is_hit ... ok
+test agent::tools::grep::tests::truncates_long_context_lines_as_well_as_matches ... ok
+test agent::tools::grep::tests::truncates_long_match_lines_around_the_match_on_character_boundaries ... ok
+test agent::tools::list_dir::tests::descriptor_bound_listing_ignores_an_aba_swap_during_permission_wait ... ok
+test agent::tools::list_dir::tests::descriptor_bound_listing_reports_symlinks_without_following_them ... ok
+test agent::tools::list_dir::tests::file_path_reports_a_clear_not_a_directory_error ... ok
+test agent::tools::list_dir::tests::flat_listing_pages_past_ten_thousand_entries ... ok
+test agent::tools::list_dir::tests::gitignore_negation_outranks_info_exclude ... ok
+test agent::tools::list_dir::tests::links_sort_with_files_after_directories ... ok
+test agent::tools::list_dir::tests::past_end_offset_header_has_no_inverted_range ... ok
+test agent::tools::list_dir::tests::unreadable_subdirectories_report_incomplete_coverage_without_hidden_names ... ok
+test extras::hooks::backend::tests::a_verdict_is_never_mistaken_for_a_read_request ... ok
+test extras::hooks::backend::tests::agent_backend_uses_current_read_deny_instead_of_startup_allow ... ok
+test extras::hooks::backend::tests::agent_file_reads_are_contained_link_free_and_refuse_secrets ... ok
+test extras::hooks::backend::tests::agent_file_reads_honour_user_read_deny_rules_and_refuse_on_ask ... ok
+test extras::hooks::backend::tests::agent_file_reads_refuse_gitignored_and_unlisted_credential_files ... ok
+test extras::hooks::backend::tests::aggregate_expansion_budget_covers_repetition_nested_values_and_utf8 ... ok
+test extras::hooks::backend::tests::an_unconnected_server_and_a_missing_model_fail_without_blocking ... ok
+test extras::hooks::backend::tests::event_values_substitute_only_strings_and_never_evaluate_anything ... ok
+test extras::hooks::backend::tests::ignored_parent_cannot_be_reincluded_and_root_rule_beats_info_exclude ... ok
+test extras::hooks::backend::tests::immutable_agent_bindings_share_cancellation_owner_without_cross_contamination ... ok
+test extras::hooks::backend::tests::linked_worktree_hook_reads_honor_common_exclude_and_root_negation ... ok
+test extras::hooks::backend::tests::mcp_tools_need_an_explicit_read_only_annotation_unless_unprompted ... ok
+test extras::hooks::backend::tests::scoped_session_context_is_independent_and_inherited ... ok
+test extras::hooks::backend::tests::the_event_is_fenced_bounded_and_cannot_close_its_fence ... ok
+test extras::hooks::backend::tests::timeouts_default_by_type_and_are_capped ... ok
+test extras::hooks::backend::tests::verdicts_map_onto_the_block_and_failure_exit_codes ... ok
+test extras::hooks::backend::tests::verdicts_parse_from_fenced_or_bare_json_and_reject_everything_else ... ok
+test extras::hooks::dispatcher::tests::doctor_hook_metadata_uses_captured_counts_and_does_not_wait_for_once_lock ... ok
+test extras::hooks::dispatcher::tests::hooks60_context_bounds_order_event_scope_and_block_precedence ... ok
+test extras::hooks::dispatcher::tests::i24tio_permission_request_answers_merge_deny_first ... ok
+test extras::hooks::dispatcher::tests::i24tio_post_tool_use_feeds_back_block_reasons_and_context_without_replacing_result ... ok
+test extras::hooks::dispatcher::tests::i6t6i0_gating_events_default_to_60s_and_others_to_600s ... ok
+test extras::hooks::dispatcher::tests::missing_redactions_leave_the_response_unchanged ... ok
+test extras::hooks::dispatcher::tests::plain_json_output_is_fully_redacted_not_treated_as_envelope ... ok
+test extras::hooks::dispatcher::tests::post_tool_feedback_keeps_image_envelopes_parseable ... ok
+test extras::hooks::dispatcher::tests::redactions_replace_only_requested_non_empty_literals ... ok
+test extras::hooks::event60_tests::hooks60_actual_permission_transport_observes_without_answering_and_compact_has_source ... ok
+test extras::hooks::persona_hook_scope_tests::persona_hooks_are_limited_to_sandboxed_tool_command_hooks ... ok
+test extras::hooks::settings::command60_tests::hooks60_command_strings_tokenize_quotes_without_shell_expansion ... ok
+test extras::hooks::subprocess::launch_prep_tests::condition_and_handler_share_one_launch_prep_per_policy ... ok
+test extras::hooks::subprocess::launch_prep_tests::launch_preparation_runs_off_the_calling_task_thread ... ok
+test extras::hooks::trust::confirmation_tests::confirmation_displays_event_and_matcher_that_are_bound_by_the_hash ... ok
+test extras::js::host::tests::brokered_grep_accepts_a_single_file_path_under_read_rules ... ok
+test extras::js::supervisor::worker_exit_tests::buffered_terminal_survives_clean_exit_and_keeps_validation ... ok
+test extras::js::tool::js_permission_bridge::a_script_may_name_its_variable_lines_without_a_collision ... ok
+test extras::js::tool::js_permission_bridge::audit_failures_map_to_distinct_source_free_classes ... ok
+test extras::js::tool::js_permission_bridge::collection_hint_only_applies_to_matching_type_errors ... ok
+test extras::js::tool::js_permission_bridge::csv_parse_handles_quotes_crlf_and_headers ... ok
+test extras::js::tool::js_permission_bridge::date_helpers_are_utc_only_exact_and_bounded ... ok
+test extras::js::tool::js_permission_bridge::date_parse_is_bounded_on_adversarial_input ... ok
+test extras::js::tool::js_permission_bridge::date_parse_matches_date_utc_arithmetic_for_every_day_of_a_leap_cycle ... ok
+test extras::js::tool::js_permission_bridge::description_mentions_every_helper_global_and_each_is_installed ... ok
+test extras::js::tool::js_permission_bridge::effects_after_an_accepted_result_are_denied_locally_and_keep_the_result ... ok
+test extras::js::tool::js_permission_bridge::glob_match_agrees_with_a_reference_regex_on_small_exhaustive_inputs ... ok
+test extras::js::tool::js_permission_bridge::glob_match_and_filter_follow_star_globstar_class_and_brace_rules ... ok
+test extras::js::tool::js_permission_bridge::glob_match_is_bounded_on_pathological_patterns_and_paths ... ok
+test extras::js::tool::js_permission_bridge::grep_accepts_a_single_file_path_and_truncates_deterministically ... ok
+test extras::js::tool::js_permission_bridge::js_audit_unavailable_returns_exact_error_without_launching_a_worker ... ok
+test extras::js::tool::js_permission_bridge::js_call_uses_single_absolute_deadline_for_all_phases ... ok
+test extras::js::tool::js_permission_bridge::js_permission_bridge_cancellation_unblocks_sync_wait ... ok
+test extras::js::tool::js_permission_bridge::js_permission_bridge_dropped_request_receiver_is_deterministic ... ok
+test extras::js::tool::js_permission_bridge::js_permission_bridge_dropped_response_sender_is_deterministic ... ok
+test extras::js::tool::js_permission_bridge::js_permission_bridge_late_reply_cannot_satisfy_repeated_call ... ok
+test extras::js::tool::js_permission_bridge::js_permission_bridge_out_of_order_replies_remain_correlated ... ok
+test extras::js::tool::js_permission_bridge::js_permission_bridge_propagates_allow_deny_and_ask_approval ... ok
+test extras::js::tool::js_permission_bridge::js_permission_bridge_rejects_crossed_response_identities ... ok
+test extras::js::tool::js_permission_bridge::js_permission_bridge_reports_backend_channel_failures ... ok
+test extras::js::tool::js_permission_bridge::js_permission_bridge_restores_invocation_hook_identity_outside_agent_task ... ok
+test extras::js::tool::js_permission_bridge::js_permission_bridge_timeout_is_bounded ... ok
+test extras::js::tool::js_permission_bridge::js_permission_bridge_tracks_only_an_unanswered_user_prompt ... ok
+test extras::js::tool::js_permission_bridge::js_supervisor_agent_rebuild_reuses_worker_and_stops_old_permission_receiver ... ok
+test extras::js::tool::js_permission_bridge::js_tool_constructor_defers_shared_audit_open ... ok
+test extras::js::tool::js_permission_bridge::json_exact_keeps_integers_beyond_2_pow_53 ... ok
+test extras::js::tool::js_permission_bridge::oversized_results_are_truncated_with_size_and_console_cap_is_visible ... ok
+test extras::js::tool::js_permission_bridge::pack_data_tests::data_pack_helpers_are_listed_by_help_and_installed_in_both_profiles ... ok
+test extras::js::tool::js_permission_bridge::pack_data_tests::first_access_cost_of_each_data_segment ... ignored
+test extras::js::tool::js_permission_bridge::pack_data_tests::path_matches_the_node_posix_table_and_handles_dotfiles ... ok
+test extras::js::tool::js_permission_bridge::pack_data_tests::path_rejects_bad_input_and_stays_linear_on_hostile_paths ... ok
+test extras::js::tool::js_permission_bridge::pack_data_tests::semver_cmp_orders_the_spec_chain_and_rejects_malformed_versions ... ok
+test extras::js::tool::js_permission_bridge::pack_data_tests::semver_helpers_are_bounded_on_hostile_input ... ok
+test extras::js::tool::js_permission_bridge::pack_data_tests::semver_helpers_are_listed_by_help_and_installed_in_both_profiles ... ok
+test extras::js::tool::js_permission_bridge::pack_data_tests::semver_sat_agrees_with_the_npm_semver_package_on_a_generated_table ... ok
+test extras::js::tool::js_permission_bridge::pack_data_tests::semver_sat_follows_caret_tilde_hyphen_prerelease_and_style_rules ... ok
+test extras::js::tool::js_permission_bridge::pack_data_tests::stats_uses_linear_interpolation_and_rejects_bad_numbers ... ok
+test extras::js::tool::js_permission_bridge::pack_data_tests::tally_and_stats_are_bounded_on_large_inputs ... ok
+test extras::js::tool::js_permission_bridge::pack_data_tests::tally_sorts_by_count_descending_then_key_ascending ... ok
+test extras::js::tool::js_permission_bridge::pack_data_tests::yaml_helpers_are_bounded_on_alias_bombs_deep_nesting_and_large_inputs ... ok
+test extras::js::tool::js_permission_bridge::pack_data_tests::yaml_helpers_are_listed_by_help_and_installed_in_both_profiles ... ok
+test extras::js::tool::js_permission_bridge::pack_data_tests::yaml_helpers_handle_large_inputs_within_their_caps ... ok
+test extras::js::tool::js_permission_bridge::pack_data_tests::yaml_parse_matches_a_yaml_12_core_schema_oracle ... ok
+test extras::js::tool::js_permission_bridge::pack_data_tests::yaml_parse_options_documents_and_exact_integers ... ok
+test extras::js::tool::js_permission_bridge::pack_data_tests::yaml_parse_throws_with_line_numbers_on_unsupported_or_invalid_syntax ... ok
+test extras::js::tool::js_permission_bridge::pack_data_tests::yaml_stringify_round_trips_and_quotes_what_would_change_type ... ok
+test extras::js::tool::js_permission_bridge::permission126_js_broker_benign_heredoc_yolo_zero_ask_standard_one ... ok
+test extras::js::tool::js_permission_bridge::read_limit_errors_state_the_limit_and_the_remedy ... ok
+test extras::js::tool::js_permission_bridge::read_lines_counts_against_the_effect_budget ... ok
+test extras::js::tool::js_permission_bridge::read_lines_reads_ranges_and_tails_files_larger_than_one_mib ... ok
+test extras::js::tool::js_permission_bridge::read_only_constructor_narrows_parent_authority_even_with_process_tree_ownership ... ok
+test extras::js::tool::js_permission_bridge::read_only_tool_profile_reaches_the_worker_and_omits_all_other_globals ... ok
+test extras::js::tool::js_permission_bridge::split_lines_has_no_phantom_trailing_element_and_handles_crlf ... ok
+test extras::js::tool::js_permission_bridge::structured_result_and_scratch_survive_a_fresh_runtime_and_agent_rebuild ... ok
+test extras::js::tool::js_permission_bridge::structured_result_expands_the_legacy_limit_but_keeps_its_own_cap ... ok
+test extras::js::tool::js_permission_bridge::structured_result_keeps_the_warm_worker ... ok
+test extras::js::tool::js_permission_bridge::structured_result_rejects_accessors_before_dispatch ... ok
+test extras::js::tool::js_permission_bridge::terminal_audit_flush_failure_is_the_closed_audit_error ... ok
+test extras::js::tool::js_permission_bridge::toml_parse_counts_dependencies_inline_tables_and_arrays_of_tables ... ok
+test extras::js::tool::js_permission_bridge::wrong_collection_type_errors_get_a_property_hint ... ok
+test extras::mcp::bounded_http::tests::actual_http_json_and_sse_validate_raw_forms_before_typed_schema_loss ... ok
+test extras::mcp::bounded_http::tests::error_excerpt_is_bounded_and_utf8_safe ... ok
+test extras::mcp::bounded_http::tests::event_counter_resets_at_blank_lines_for_every_terminator ... ok
+test extras::mcp::bounded_http::tests::non_success_body_is_truncated_before_entering_the_error ... ok
+test extras::mcp::bounded_http::tests::oversized_json_response_fails_tools_list_with_bounded_error ... ok
+test extras::mcp::bounded_http::tests::oversized_sse_event_fails_tools_call_with_bounded_error ... ok
+test extras::mcp::bounded_http::tests::responses_within_the_cap_pass_through_json_and_sse ... ok
+test extras::mcp::bounded_http::tests::same_origin_307_redirect_is_followed_and_cross_origin_is_named ... ok
+test extras::mcp::bounded_http::tests::scope_is_read_from_quoted_and_bare_parameters ... ok
+test extras::mcp::catalogue::tests::auxiliary_identity_preserves_native_policy_denies_without_cross_grants ... ok
+test extras::mcp::catalogue::tests::oversized_resource_text_is_capped_at_the_fetch_bound_on_a_char_boundary ... ok
+test extras::mcp::catalogue::tests::picker_operands_roundtrip_unicode_colons_and_spaces_without_path_interpretation ... ok
+test extras::mcp::catalogue::tests::prompt_roles_are_literal_bounded_data_and_cannot_close_json_or_mint_system_directives ... ok
+test extras::mcp::catalogue::tests::resource_text_of_exactly_the_fetch_bound_is_not_truncated ... ok
+test extras::mcp::catalogue::tests::resources_return_text_with_specific_reasons_for_what_is_not_text ... ok
+test extras::mcp::client::local_policy_tests::allowed_cidrs_unlock_only_listed_private_ranges_and_never_metadata ... ok
+test extras::mcp::client::local_policy_tests::explicit_local_policy_accepts_only_pinned_loopback_and_does_not_widen_private_networks ... ok
+test extras::mcp::client::tests::accepts_public_https_url_with_public_resolution ... ok
+test extras::mcp::client::tests::eager_servers_keep_the_small_tool_cap_and_deferrable_servers_a_larger_one ... ok
+test extras::mcp::client::tests::explicit_environment_overrides_inherited_value ... ok
+test extras::mcp::client::tests::http_transport_does_not_follow_redirects ... ok
+test extras::mcp::client::tests::lossy_stderr_rendering_remains_within_the_byte_cap ... ok
+test extras::mcp::client::tests::rejects_local_and_private_mcp_server_urls ... ok
+test extras::mcp::client::tests::rejects_non_http_scheme_and_embedded_credentials ... ok
+test extras::mcp::client::tests::stderr_capture_holds_no_buffer_once_the_connect_path_drops_it ... ok
+test extras::mcp::client::tests::stdio_command_ignores_relative_and_empty_path_entries ... ok
+test extras::mcp::client::tests::stdio_command_resolves_path_lookup_before_spawn ... ok
+test extras::mcp::client::tests::stdout_lines_are_capped_but_long_streams_of_short_lines_are_not ... ok
+test extras::mcp::config::options_tests::mcp_server_options_deserialize_flattened_and_clamp ... ok
+test extras::mcp::config::options_tests::mcp_server_tool_selection_and_enable_toggle ... ok
+test extras::mcp::config::options_tests::parallel_read_only_is_default_closed_and_opt_in ... ok
+test extras::mcp::deferred::native_reference_bounds_tests::native_reference_name_bounds_refuse_before_schema_publication ... ok
+test extras::mcp::deferred::tests::actual_search_bounds_queries_result_bytes_and_exact_name_ranking_without_candidate_calls ... ok
+test extras::mcp::deferred::tests::actual_search_matches_each_word_so_one_query_can_name_several_tools ... ok
+test extras::mcp::deferred::tests::actual_search_reserves_full_result_envelope_before_atomic_publication ... ok
+test extras::mcp::deferred::tests::actual_structured_discovery_can_publish_without_registry_deadlock_or_handle_cycle ... ok
+test extras::mcp::deferred::tests::cancelled_lock_wait_and_revoked_admission_publish_no_schema_or_activation ... ok
+test extras::mcp::deferred::tests::discovery_names_are_runtime_only_and_rekeyed_by_session_workspace_and_catalogue ... ok
+test extras::mcp::deferred::tests::sealed_builtin_fingerprint_stays_private_stable_and_distinct_from_authored_url ... ok
+test extras::mcp::deferred::tests::search_names_a_disconnected_server_instead_of_a_generic_change ... ok
+test extras::mcp::deferred::tests::search_recovers_through_the_sessions_newest_view_after_retirement ... ok
+test extras::mcp::deferred::tests::server_deferral_accepts_only_boolean_or_auto_and_preserves_exact_threshold ... ok
+test extras::mcp::egress::source_revision_tests::oauth_source_changed_during_metadata_refuses_registration_and_keeps_wire_positive ... ok
+test extras::mcp::egress::source_revision_tests::oauth_source_revalidation_after_owned_dns_answer_rejects_the_addresses ... ok
+test extras::mcp::egress::tests::a_name_rebound_to_loopback_after_validation_is_refused ... ok
+test extras::mcp::egress::tests::a_pinned_host_is_never_resolved_again ... ok
+test extras::mcp::egress::tests::oauth_client_follows_redirects_by_hand_with_one_client_and_a_hop_limit ... ok
+test extras::mcp::egress::tests::oauth_client_refuses_literal_internal_targets_and_redirects ... ok
+test extras::mcp::elicitation::capability_tests::remote_handlers_get_no_roots_and_no_handler_offers_sampling ... ok
+test extras::mcp::elicitation::capability_tests::url_elicitation_shows_only_safe_links_and_never_opens_them ... ok
+test extras::mcp::forms::tests::integer_constraints_preserve_exact_large_values_and_empty_string_is_explicit ... ok
+test extras::mcp::forms::tests::large_escaped_bodies_skip_the_serde_lex_and_small_forms_still_record ... ok
+test extras::mcp::forms::tests::method_prefilter_still_sees_escaped_method_names ... ok
+test extras::mcp::forms::tests::oversized_stdout_lines_keep_id_reuse_accounting_without_retaining_bytes ... ok
+test extras::mcp::forms::tests::raw_constraints_and_all_flat_primitive_enum_shapes_are_enforced ... ok
+test extras::mcp::forms::tests::raw_request_identity_rejects_forgery_reuse_oversize_and_exhaustion ... ok
+test extras::mcp::forms::tests::streamed_header_scan_agrees_with_serde_at_every_split ... ok
+test extras::mcp::headers_helper::tests::a_url_server_with_a_helper_does_not_run_it_without_the_opt_in ... ok
+test extras::mcp::headers_helper::tests::adversarial_output_exit_and_environment_are_contained ... ok
+test extras::mcp::headers_helper::tests::default_closed_runs_nothing ... ok
+test extras::mcp::headers_helper::tests::definitions_accept_string_argv_and_table_forms_with_bounds ... ok
+test extras::mcp::headers_helper::tests::dropping_the_helper_future_kills_its_descendants ... ok
+test extras::mcp::headers_helper::tests::enabled_helper_headers_override_static_ones_case_insensitively ... ok
+test extras::mcp::headers_helper::tests::successful_helper_leader_exit_retires_descendants_holding_stdout ... ok
+test extras::mcp::headers_helper::tests::work_scope_cancellation_kills_the_helper_descendants ... ok
+test extras::mcp::health::tests::bounded_metadata_omission_never_claims_a_connection_or_loses_cancellation ... ok
+test extras::mcp::health::tests::old_connection_and_catalogue_completion_cannot_relabel_a_new_attempt ... ok
+test extras::mcp::oauth::cli_login_tests::cli_login_refuses_unknown_non_url_and_non_oauth_servers_before_any_io ... ok
+test extras::mcp::oauth::owned_callback_tests::owned_callback_cancellation_releases_listener_and_partial_browser_socket ... ok
+test extras::mcp::oauth::owned_callback_tests::owned_callback_rejects_unrelated_state_then_accepts_fragmented_exact_response ... ok
+test extras::mcp::oauth::product_identity_tests::callback_filter_rejects_stray_state_and_accepts_active_login ... ok
+test extras::mcp::oauth::product_identity_tests::callback_listener_ignores_stray_connection_before_valid_redirect ... ok
+test extras::mcp::oauth::product_identity_tests::callback_listener_returns_immediately_when_the_active_login_is_denied ... ok
+test extras::mcp::oauth::product_identity_tests::callback_listener_waits_for_a_slow_client_to_send_its_redirect ... ok
+test extras::mcp::oauth::product_identity_tests::client_secret_comes_only_from_a_server_derived_environment_name ... ok
+test extras::mcp::oauth::product_identity_tests::client_secret_env_name_is_injective ... ok
+test extras::mcp::oauth::product_identity_tests::oauth_completion_uses_public_product_name ... ok
+test extras::mcp::oauth::product_identity_tests::pre_registered_client_logs_in_without_a_registration_endpoint ... ok
+test extras::mcp::oauth::product_identity_tests::read_request_line_rejects_an_unterminated_oversized_request ... ok
+test extras::mcp::oauth::product_identity_tests::without_a_client_id_or_registration_endpoint_login_fails_with_guidance ... ok
+test extras::mcp::progress::tests::long_messages_and_non_finite_numbers_stay_bounded ... ok
+test extras::mcp::progress::tests::registered_calls_receive_sanitized_previews_and_others_none ... ok
+test extras::mcp::progress::tests::tracked_calls_are_capped ... ok
+test extras::mcp::project::publication_tests::captured_server_source_preserves_manual_config_but_rejects_forged_builtin_and_changed_global ... ok
+test extras::mcp::project::publication_tests::project_snapshot_rejects_symlink_hardlink_and_fifo_without_changing_victim ... ok
+test extras::mcp::project::publication_tests::structural_json_edit_preserves_unknown_fields_and_private_publication_refuses_stale_snapshots ... ok
+test extras::mcp::project::tests::default_values_apply_to_unset_or_empty_variables_and_are_literal_and_bounded ... ok
+test extras::mcp::project::tests::environment_header_fields_fold_into_headers_without_running_anything ... ok
+test extras::mcp::project::tests::raw_definitions_are_bounded_and_never_manufacture_builtin_trust ... ok
+test extras::mcp::project::tests::substitution_is_one_pass_bounded_and_missing_secret_errors_do_not_reveal_values ... ok
+test extras::mcp::project::tests::whole_file_review_shows_launch_scope_and_disabled_oauth_without_secret_values ... ok
+test extras::mcp::project::trust_tests::disabled_definition_never_expands_secrets_and_malformed_neighbor_remains_visible ... ok
+test extras::mcp::project::trust_tests::project_mcp_authority_is_exact_file_content_and_never_crosses_to_project_toml_or_changed_json ... ok
+test extras::mcp::project::trust_tests::source_revalidation_is_metadata_first_and_rereads_only_after_a_change ... ok
+test extras::mcp::project::trust_tests::trusted_missing_environment_stays_inactive_and_total_substitution_is_bounded ... ok
+test extras::mcp::reconnect::tests::backoff_doubles_from_the_base_delay ... ok
+test extras::mcp::reconnect::tests::cached_tools_lists_from_the_replacement_after_a_reconnect ... ok
+test extras::mcp::reconnect::tests::dropped_transport_reconnects_and_the_next_call_uses_the_new_peer ... ok
+test extras::mcp::reconnect::tests::first_connect_retries_429_and_408_and_honours_retry_after ... ok
+test extras::mcp::reconnect::tests::first_connect_retries_transient_5xx_but_not_4xx ... ok
+test extras::mcp::reconnect::tests::first_connect_total_time_is_bounded_by_the_startup_budget ... ok
+test extras::mcp::reconnect::tests::five_failed_attempts_mark_the_server_failed_and_stop_retrying ... ok
+test extras::mcp::reconnect::tests::hook_registry_stays_bound_to_live_parent_when_same_named_child_retires ... ok
+test extras::mcp::reconnect::tests::mcp_tool_hook_reaches_the_server_after_a_transport_drop ... ok
+test extras::mcp::reconnect::tests::reconnect_relists_tools_and_follows_the_replacements_list_changed ... ok
+test extras::mcp::reconnect::tests::resource_catalogue_reaches_the_replacement_connection_after_a_drop ... ok
+test extras::mcp::resource_tools::tests::a_page_shorter_than_the_next_character_still_advances ... ok
+test extras::mcp::resource_tools::tests::listing_past_the_end_reports_an_empty_range_and_a_reset_hint ... ok
+test extras::mcp::resource_tools::tests::listing_shows_resource_templates_with_filter_and_incomplete_flag ... ok
+test extras::mcp::resource_tools::tests::pages_cover_the_text_exactly_without_splitting_characters ... ok
+test extras::mcp::resource_tools::tests::paging_by_the_printed_hints_visits_every_resource_of_every_server ... ok
+test extras::mcp::server::tests::a_permission_ask_is_forwarded_as_elicitation_and_only_an_explicit_accept_allows ... ok
+test extras::mcp::server::tests::a_returned_session_id_is_remembered_for_the_next_call ... ok
+test extras::mcp::server::tests::a_timed_out_run_reports_stderr_and_the_session_it_saved ... ok
+test extras::mcp::server::tests::approvals_are_not_forwarded_by_default_or_without_client_support ... ok
+test extras::mcp::server::tests::bang_prompts_are_refused_and_never_reach_the_child ... ok
+test extras::mcp::server::tests::client_loss_kills_the_whole_process_group_of_a_running_call ... ok
+test extras::mcp::server::tests::completed_run_keeps_its_slot_until_reply_enters_bounded_queue ... ok
+test extras::mcp::server::tests::concurrent_runs_beyond_the_limit_are_refused_not_queued ... ok
+test extras::mcp::server::tests::crafted_session_and_model_arguments_are_rejected_and_model_override_is_default_closed ... ok
+test extras::mcp::server::tests::cwd_override_is_default_closed_and_confined_to_the_workspace ... ok
+test extras::mcp::server::tests::envelope_parsing_falls_back_to_plain_text_and_truncates_on_char_boundaries ... ok
+test extras::mcp::server::tests::eof_retires_runs_while_stdout_is_backpressured ... ok
+test extras::mcp::server::tests::forwarded_args_drop_output_and_override_flags_but_keep_the_rest ... ok
+test extras::mcp::server::tests::initialize_answers_a_supported_version_or_the_newest ... ok
+test extras::mcp::server::tests::issued_session_ids_survive_a_restart_and_eviction_keeps_recent_ones ... ok
+test extras::mcp::server::tests::max_runs_and_timeout_are_configurable_and_advertised ... ok
+test extras::mcp::server::tests::mcp_server_forwards_every_flag_except_its_own_mode_flag ... ok
+test extras::mcp::server::tests::mcp_server_initializes_lists_run_and_executes_a_headless_child ... ok
+test extras::mcp::server::tests::mcp_server_mode_is_off_by_default_and_excludes_print_prompts ... ok
+test extras::mcp::server::tests::mcp_server_reports_failed_and_timed_out_runs_as_tool_errors ... ok
+test extras::mcp::server::tests::only_session_ids_this_server_issued_can_be_resumed ... ok
+test extras::mcp::server::tests::ping_is_answered_and_cancel_kills_the_whole_process_group_without_a_reply ... ok
+test extras::mcp::server::tests::protocol_version_is_negotiated_not_echoed ... ok
+test extras::mcp::server::tests::run_emits_progress_for_a_token_and_returns_the_continuation_session_id ... ok
+test extras::mcp::server::tests::stdin_eof_retires_a_silent_running_call_and_its_process_group ... ok
+test extras::mcp::server::tests::successful_leader_exit_retires_descendants_that_inherit_capture_pipes ... ok
+test extras::mcp::server::tests::unpersisted_sessions_are_not_offered_and_session_id_is_passed_to_the_child ... ok
+test extras::mcp::tests::a_generated_name_never_collides_with_an_unchanged_one ... ok
+test extras::mcp::tests::a_repeated_definition_from_one_server_still_gets_a_distinct_name ... ok
+test extras::mcp::tests::collect_tools_empty_handles_returns_empty_vec ... ok
+test extras::mcp::tests::config69_selected_cli_origin_survives_bounded_diagnostic_history ... ok
+test extras::mcp::tests::connect_all_in_empty_configs_returns_empty_manager ... ok
+test extras::mcp::tests::connect_all_in_failing_servers_produce_notices_not_panics ... ok
+test extras::mcp::tests::connect_all_in_stable_notice_order_independent_of_map_iteration ... ok
+test extras::mcp::tests::diagnostic_origins_are_bounded_captured_and_never_imply_connection ... ok
+test extras::mcp::tests::informational_tool_notices_are_queued_only_once ... ok
+test extras::mcp::tests::normalization_reserves_valid_names_and_disambiguates_aliases ... ok
+test extras::mcp::tests::registered_names_stay_within_provider_limits ... ok
+test extras::mcp::tests::separator_collisions_between_generated_names_are_disambiguated ... ok
+test extras::mcp::tests::server_instructions_are_capped_per_server_and_in_total_with_notices ... ok
+test extras::mcp::tests::take_notices_drains_tool_notices_once ... ok
+test extras::mcp::tests::tool_timeouts_apply_config_and_clamp_zero ... ok
+test extras::mcp::tests::unique_bare_names_are_registered_unchanged ... ok
+test extras::mcp::tool::tests::base64_decoded_len_handles_padding ... ok
+test extras::mcp::tool::tests::image_envelope_bypasses_bounds_while_response_spills_or_truncates ... ok
+test extras::mcp::tool::tests::malformed_arguments_are_rejected_instead_of_becoming_no_arguments ... ok
+test extras::mcp::tool::tests::mcp_body_cannot_forge_host_markers ... ok
+test extras::mcp::tool::tests::model_metadata_truncates_descriptions_on_utf8_boundaries ... ok
+test extras::mcp::tool::tests::no_image_results_are_unchanged_byte_for_byte ... ok
+test extras::mcp::tool::tests::oversized_result_is_spilled_and_rendered_as_bounded_head_and_tail ... ok
+test extras::mcp::tool::tests::oversized_schemas_are_reduced_not_dropped ... ok
+test extras::mcp::tool::tests::resource_links_and_audio_render_their_identifying_fields ... ok
+test extras::mcp::tool::tests::schemas_too_large_even_after_stripping_become_a_permissive_object_with_a_notice ... ok
+test extras::mcp::tool::tests::small_result_is_returned_without_spilling ... ok
+test extras::mcp::tool::tests::spill_failure_still_returns_a_bounded_recoverable_result ... ok
+test extras::mcp::tool::tests::success_all_supported_image_formats_preserve_source_order_and_replay ... ok
+test extras::mcp::tool::tests::success_image_envelope_preserves_text_and_reaches_tool_image_conversion ... ok
+test extras::mcp::tool::tests::success_images_at_byte_limit_survive_and_excess_resource_is_omitted ... ok
+test extras::mcp::tool::tests::success_images_over_count_limit_keep_excess_placeholders ... ok
+test extras::mcp::tool::tests::success_invalid_images_never_discard_valid_neighbors_or_consume_budget ... ok
+test extras::mcp::tool::tests::success_mixed_blocks_keep_text_and_image_resource_order ... ok
+test extras::mcp::tool::tests::success_oversized_image_does_not_consume_budget_for_later_images ... ok
+test extras::mcp::tool::tests::suspension_tracking_distinguishes_ready_from_pending_waits ... ok
+test extras::mcp::tool::tests::unsupported_image_mime_and_non_image_blobs_stay_plain_placeholders ... ok
+test tests::subprocess_inventory_tests::production_subprocess_sites_have_a_trust_classification ... FAILED
+test tests::subprocess_inventory_tests::windows_capable_production_process_terminals_use_creation_boundary ... FAILED
+
+failures:
+
+---- agent::tools::find_files::tests::linked_worktree_common_exclude_applies_to_native_discovery stdout ----
+
+thread 'agent::tools::find_files::tests::linked_worktree_common_exclude_applies_to_native_discovery' (66981815) panicked at src/agent/tools/find_files.rs:3698:9:
+explicit no_ignore failed: 6 files found:
+/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-linked-worktree-ignore-074fba5c-0835-4b5f-8f31-98e46e563f4c/linked/./kept.txt
+/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-linked-worktree-ignore-074fba5c-0835-4b5f-8f31-98e46e563f4c/linked/./nested/kept.txt
+/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-linked-worktree-ignore-074fba5c-0835-4b5f-8f31-98e46e563f4c/linked/./nested/notes.txt
+/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-linked-worktree-ignore-074fba5c-0835-4b5f-8f31-98e46e563f4c/linked/./nested/plain.txt
+/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-linked-worktree-ignore-074fba5c-0835-4b5f-8f31-98e46e563f4c/linked/./notes.txt
+/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-linked-worktree-ignore-074fba5c-0835-4b5f-8f31-98e46e563f4c/linked/./plain.txt
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- tests::subprocess_inventory_tests::production_subprocess_sites_have_a_trust_classification stdout ----
+
+thread 'tests::subprocess_inventory_tests::production_subprocess_sites_have_a_trust_classification' (66983794) panicked at src/tests/subprocess_inventory_tests.rs:7261:5:
+subprocess inventory drifted; classify every new production Command::new/tokio::process/.spawn/.output/.status result in docs/specs/subprocess-trust.md and update the checked inventory.
+Unclassified or changed: [
+    (
+        "src/agent/tools/find_files.rs",
+        ".output()",
+        1,
+    ),
+    (
+        "src/agent/tools/find_files.rs",
+        "let output = std::process::Command::new(\"git\")",
+        1,
+    ),
+]
+Stale: []
+
+---- tests::subprocess_inventory_tests::windows_capable_production_process_terminals_use_creation_boundary stdout ----
+
+thread 'tests::subprocess_inventory_tests::windows_capable_production_process_terminals_use_creation_boundary' (66984891) panicked at src/tests/subprocess_inventory_tests.rs:7332:5:
+Windows-capable production process terminals bypass the crate creation boundary: [
+    "src/agent/tools/find_files.rs:2634 unrecognized unguarded output terminal",
+    "src/agent/tools/find_files.rs:2637 unrecognized macro context dcaee4a4ace827bd2765f5446079a44f9a71a01129ed84080d2e60a5b1f5c854#1 for output terminal",
+    "src/agent/tools/find_files.rs:2639 unrecognized macro context dcaee4a4ace827bd2765f5446079a44f9a71a01129ed84080d2e60a5b1f5c854#1 for output terminal",
+]
+
+
+failures:
+    agent::tools::find_files::tests::linked_worktree_common_exclude_applies_to_native_discovery
+    tests::subprocess_inventory_tests::production_subprocess_sites_have_a_trust_classification
+    tests::subprocess_inventory_tests::windows_capable_production_process_terminals_use_creation_boundary
+
+test result: FAILED. 356 passed; 3 failed; 1 ignored; 0 measured; 5916 filtered out; finished in 83.65s
+
+error: test failed, to rerun pass `--bin mini-agent`

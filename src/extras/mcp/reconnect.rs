@@ -568,6 +568,49 @@ mod tests {
         original
     }
 
+    #[cfg(feature = "hooks")]
+    #[tokio::test]
+    async fn hook_registry_stays_bound_to_live_parent_when_same_named_child_retires() {
+        let Some((url, initializes)) = serve_catalogue().await else {
+            return;
+        };
+        let mut parent = linked(&url).await;
+        parent.server_name = "scoped-hook-server".into();
+        let parent_scope = crate::agent::runner::AgentWorkScope::new();
+        let parent_peers =
+            crate::extras::hooks::backend::capture_mcp_peers(std::slice::from_ref(&parent));
+        parent_scope.set_hook_mcp_peers(parent_peers.clone());
+        let mut child = linked(&url).await;
+        child.server_name = parent.server_name.clone();
+        let child_scope = crate::agent::runner::AgentWorkScope::new();
+        child_scope.set_hook_mcp_peers(crate::extras::hooks::backend::capture_mcp_peers(
+            std::slice::from_ref(&child),
+        ));
+        drop(child);
+        let invoke = || {
+            crate::extras::hooks::backend::call_mcp(
+                "scoped-hook-server",
+                "tool_v2",
+                serde_json::Map::new(),
+                Duration::from_secs(5),
+            )
+        };
+        let child_result = child_scope.run(invoke()).await;
+        assert!(String::from_utf8_lossy(&child_result.stderr).contains("not connected"));
+        let result = parent_scope.run(invoke()).await;
+        assert!(String::from_utf8_lossy(&result.stderr).contains("not annotated readOnlyHint"));
+        assert!(parent_peers["scoped-hook-server"].is_current());
+        let generations = initializes.load(Ordering::SeqCst);
+        drop(parent);
+        let result = parent_scope.run(invoke()).await;
+        assert!(String::from_utf8_lossy(&result.stderr).contains("not connected"));
+        assert_eq!(
+            initializes.load(Ordering::SeqCst),
+            generations,
+            "retired capabilities must not reconnect"
+        );
+    }
+
     // mini-agent-bu3wp: resource/prompt discovery and reads reconnect like tools/call.
     #[tokio::test]
     async fn resource_catalogue_reaches_the_replacement_connection_after_a_drop() {
@@ -687,15 +730,19 @@ mod tests {
         };
         let mut original = linked(&url).await;
         original.server_name = "bu3wp-hook-server".into();
-        crate::extras::hooks::backend::register_mcp_peers(std::slice::from_ref(&original));
+        let scope = crate::agent::runner::AgentWorkScope::new();
+        scope.set_hook_mcp_peers(crate::extras::hooks::backend::capture_mcp_peers(
+            std::slice::from_ref(&original),
+        ));
         dropped(&original).await;
-        let result = crate::extras::hooks::backend::call_mcp(
-            "bu3wp-hook-server",
-            "tool_v2",
-            serde_json::Map::new(),
-            Duration::from_secs(5),
-        )
-        .await;
+        let result = scope
+            .run(crate::extras::hooks::backend::call_mcp(
+                "bu3wp-hook-server",
+                "tool_v2",
+                serde_json::Map::new(),
+                Duration::from_secs(5),
+            ))
+            .await;
         let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
         // It reached the replacement: the read-only gate (not the connectivity
         // gate) is what refuses an unannotated tool.

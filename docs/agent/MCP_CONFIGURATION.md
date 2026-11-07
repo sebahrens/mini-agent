@@ -330,7 +330,7 @@ permission asks cannot be answered over MCP and fail closed unless those flags
 allow the action. A non-zero exit returns `isError: true` with stdout and a
 bounded stderr tail; a run is stopped after 30 minutes (`--mcp-server-timeout <seconds>`, 1-86400; the effective value is printed in the `run` tool description). On timeout the child gets SIGTERM and up to 12 s to save: the error then carries its stderr tail and, if it saved the session, the session id (also in `structuredContent`) so the work can be continued; a child that ignores SIGTERM is killed and reports no id. A `prompt` whose trimmed text starts with `!` is refused with `-32602`: in a headless child that prefix is the user-typed shell-command shortcut, which skips permission rules, so a remote prompt is never allowed to use it. Requests are read while
 a run executes: `ping` is answered, `notifications/cancelled` for the call's
-request id kills the child's whole process group and sends no reply (per the MCP
+request id kills the child's owned process tree and sends no reply (per the MCP
 cancellation utility), and a `_meta.progressToken` on the call yields
 `notifications/progress` heartbeats every 15 s. Up to 4 runs may overlap
 (`--mcp-server-max-runs <N>`, 1-64); the next is refused with error `-32000`. A persisted run reports its session id
@@ -346,7 +346,7 @@ sandbox and permission flags unchanged (the sandbox is not narrowed to the
 subdirectory; relative paths in forwarded flags then resolve from it). The server owns the child's
 `--output`, so a forwarded `--output` is dropped. The server process itself runs no tools and opens no connections.
 `--mcp-server-elicit-approvals` (default off) forwards a run's permission asks to the MCP client as `elicitation/create` requests, but only when the client advertised the `elicitation` capability at `initialize`. The child then runs with `--input-format stream-json --output stream-json --stream-json-control` (the server owns those flags) and each `can_use_tool` ask is shown to the client with the complete reviewed input and a boolean `allow` field. Only `action: accept` with `allow: true` approves that single action; decline, cancel, any other answer, an error, a closed connection, an input over 64 KiB or no answer within 300 s deny it. Without the flag, or with a client that does not advertise elicitation, asks fail closed as before and the ordinary one-shot JSON child is used. The flag adds no permission by itself: only actions that would otherwise ask reach the client, and `--mcp-server-elicit-approvals` is not forwarded to the child.
-Closing the server's stdin means the client is gone: every run still in flight is cancelled (its process group killed) and gets no reply; replies already produced are flushed first. A one-shot client must keep stdin open until it has read the answer to its `tools/call` (`printf req | mini-agent --mcp-server` gets no result).
+Closing the server's stdin means the client is gone: every run still in flight is cancelled (its owned process tree killed) and gets no reply. Active work retires before a bounded best-effort drain of already completed replies. Reply writes run independently behind a bounded queue; a client that stops reading cannot block cancellation or EOF retirement. A one-shot client must keep stdin open until it has read the answer to its `tools/call` (`printf req | mini-agent --mcp-server` gets no result).
 `--mcp-server` cannot be combined with `-p`, a prompt, `--acp` or `--loop`.
 
 ```json
@@ -483,3 +483,9 @@ The stdlib-only `tools/ghagent-mcp` companion runs outside the sandbox and expos
 allowlisted branch pushes, CI polling, and opt-in draft release creation. It is not
 registered automatically. See [installation, permissions, and trust boundaries](../../tools/ghagent-mcp/README.md)
 before configuring its token and repository allowlist.
+
+MCP run children and header helpers retain an owned process-tree boundary for their full
+lifetime: a fresh process group/session on Unix and a kill-on-close Job Object on Windows.
+Success, timeout, cancellation, and dropping the owning future retire descendants as well
+as the direct child. Native Windows MCP lifecycle tests retain live descendant process
+handles and require their exit signals after each retirement path.

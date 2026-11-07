@@ -2572,7 +2572,31 @@ fn apply_captured_override(
     let content = read_project_config_text_in_workspace(workspace, relative)
         .map_err(|_| "project config is unreadable (values omitted)".to_string())?;
     set_layer_status(cfg, layer, path, "sensitive keys inactive");
-    let (benign, sensitive, sensitive_keys) = split_project_override(&content)?;
+    let (mut benign, mut sensitive, mut sensitive_keys) = split_project_override(&content)?;
+    let inherited_provider = crate::cli::configured_provider(cfg);
+    // A model alias can select an endpoint when `provider` was implicit.
+    // Keep that selection under the same trust gate as an explicit provider.
+    let cross_provider_alias = cfg.provider.is_none()
+        && benign
+            .get("model")
+            .and_then(toml::Value::as_str)
+            .is_some_and(|name| {
+                super::quick_models_map(cfg)
+                    .get(name)
+                    .is_some_and(|model| model.provider != inherited_provider)
+            });
+    if cross_provider_alias {
+        let model = benign
+            .as_table_mut()
+            .expect("project table")
+            .remove("model")
+            .expect("model alias");
+        sensitive
+            .as_table_mut()
+            .expect("project table")
+            .insert("model".into(), model);
+        sensitive_keys.insert("model".into());
+    }
     let local = parse_project_toml(&content)?;
     let unknown = keys::unknown_key_warnings(
         "project config",
@@ -2589,8 +2613,14 @@ fn apply_captured_override(
             unknown.len(),
         ));
     }
+    let pins_model_provider = cfg.provider.is_none() && benign.get("model").is_some();
     #[allow(unused_mut)]
     let mut benign_cfg = merge_config_value_layer(cfg, benign, layer)?;
+    if pins_model_provider && crate::cli::configured_provider(&benign_cfg) != inherited_provider {
+        // A benign raw model id must not discard the provider inherited from
+        // the operator's previous alias and fall back to another default.
+        benign_cfg.provider = Some(inherited_provider);
+    }
     #[cfg(feature = "mcp")]
     record_project_mcp_origins(
         &mut benign_cfg,
@@ -6154,5 +6184,89 @@ mod task_cost_persistence_tests {
             assert!(before.preserved.keys().any(|preserved| preserved == key));
         }
         assert_eq!(saved["model"].as_str(), Some("after"));
+    }
+}
+
+#[cfg(test)]
+mod model_alias_trust_tests {
+    use super::*;
+
+    fn operator_config() -> Config {
+        toml::from_str(
+            r#"
+model = "local"
+[quick_models.local]
+provider = "ollama"
+model = "local-test"
+[quick_models.remote]
+provider = "openrouter"
+model = "remote-test"
+[quick_models.local2]
+provider = "ollama"
+model = "local-two"
+"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn project_model_alias_cannot_change_provider_without_trust() {
+        let root = crate::tests::OwnedTestDirectory::new("project-model-alias-trust");
+        let path = root.path().join("project/.mini-agent/config.toml");
+        let trust = root
+            .path()
+            .join("state/config/trusted-project-configs.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "model='remote'\n").unwrap();
+        let cli = crate::cli::Cli::default();
+        let mut cfg = operator_config();
+        assert_eq!(cli.resolve_provider(&cfg), "ollama");
+        let outcome =
+            apply_local_override_with_confirmation(&mut cfg, &path, &trust, false, &|_| {
+                panic!("headless prompt")
+            })
+            .unwrap();
+        assert_eq!(outcome, ProjectConfigTrustOutcome::SkippedHeadless);
+        assert_eq!(cli.resolve_provider(&cfg), "ollama");
+        assert_eq!(cfg.model.as_deref(), Some("local"));
+        apply_local_override_with_confirmation(&mut cfg, &path, &trust, true, &|description| {
+            assert!(description.contains("model"));
+            true
+        })
+        .unwrap();
+        assert_eq!(cli.resolve_provider(&cfg), "openrouter");
+        assert_eq!(cfg.model.as_deref(), Some("remote"));
+    }
+
+    #[test]
+    fn benign_project_models_preserve_inherited_provider() {
+        let root = crate::tests::OwnedTestDirectory::new("project-model-provider-pin");
+        let path = root.path().join("project/.mini-agent/config.toml");
+        let trust = root
+            .path()
+            .join("state/config/trusted-project-configs.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let cli = crate::cli::Cli::default();
+        for model in ["local2", "raw-model-id"] {
+            std::fs::write(&path, format!("model='{model}'\n")).unwrap();
+            let mut cfg = operator_config();
+            let outcome =
+                apply_local_override_with_confirmation(&mut cfg, &path, &trust, false, &|_| {
+                    panic!("benign prompt")
+                })
+                .unwrap();
+            assert_eq!(outcome, ProjectConfigTrustOutcome::NoSensitiveKeys);
+            assert_eq!(cli.resolve_provider(&cfg), "ollama");
+            assert_eq!(cfg.model.as_deref(), Some(model));
+        }
+        // An explicit operator provider also makes an alias an ordinary model selection.
+        std::fs::write(&path, "model='remote'\n").unwrap();
+        let mut cfg = operator_config();
+        cfg.provider = Some("ollama".into());
+        apply_local_override_with_confirmation(&mut cfg, &path, &trust, false, &|_| {
+            panic!("explicit provider prompt")
+        })
+        .unwrap();
+        assert_eq!(cli.resolve_provider(&cfg), "ollama");
     }
 }

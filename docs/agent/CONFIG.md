@@ -55,6 +55,9 @@ Tables merge by key; scalars and arrays replace. Each project file has its own
 canonical path/SHA-256 approval; approval for `config.toml` does not activate
 sensitive local values. `.mini-agent/config.local.toml` is ignored by this repository.
 Existing global-only financial/cache and permission-cycle policy stays global-only.
+A project `model` alias that changes an implicitly selected provider needs project trust.
+Benign raw model IDs and same-provider aliases preserve the inherited provider; an
+explicit operator provider remains authoritative.
 
 `--config` accepts literal TOML, including dotted paths and quoted dynamic names:
 
@@ -741,7 +744,7 @@ Accepted top-level keys:
 | `goal_checks`             | array   | Commands that must exit zero before a goal may be reported complete. Sensitive: an untrusted project config cannot supply one, exactly as for `verify_command`. Additive with `--goal-check` and `/goal check`. |
 | `goal_judge_model`        | string  | A `quick_models` entry name used to judge goal completion claims. Sensitive: the judge receives a bounded transcript tail, so naming its endpoint decides where that text is sent. |
 | `session_title_model` | string | Defaults to the session provider/model. Set `"off"` (or an empty string) to keep first-message titles without a title request; a `quick_models` alias selects a trusted override. After the first completed exchange, a no-tools request receives at most 2,000 bytes of the first user message and 1,000 bytes of the first reply, with a 64-token output cap and a 20-second deadline. Interactive generation runs as owned background work; headless saves title afterward. Names always win. Observed title usage is charged once at captured title-model prices, including on failure or cancellation; it does not change conversation context calibration. `--no-session` skips titles. Model/provider overrides remain sensitive project configuration. |
-| `goal`                    | object  | Goal defaults: `judge` (`"auto"`, `"off"`, `"session"`, or a `quick_models` name), `continuation` (`"continue"` or `"restart"`), `max_rounds` (50), `max_tokens`, `max_active_secs`, `no_progress_rounds` (3), `blocked_rounds` (3), `wrap_up_max_agent_turns` (4), `reinject_every` (6), `judge_every` (5), `check_every_round` (false: run checks only on a completion claim; true also runs them every round as feedback). Benign: every field bounds how long the harness keeps working or who reviews a claim, and none of them widens what may run. |
+| `goal`                    | object  | Goal defaults: `judge` (`"auto"`, `"off"`, `"session"`, or a `quick_models` name), `continuation` (`"continue"` or `"restart"`), `max_rounds` (50), `max_tokens`, `max_active_secs`, `no_progress_rounds` (3), `blocked_rounds` (3), `wrap_up_max_agent_turns` (4), `reinject_every` (6), `judge_every` (5), `check_every_round` (false: run checks only on a completion claim; true also runs them every round as feedback). The duration and progress limits are benign project settings. Selecting `judge` requires project trust because an alias can route a review to a different provider. |
 | `headless_agent_mentions` | boolean | Opt-in `@agent:<name>` routing for headless `-p` and ACP `session/prompt` prompts. Default: `false` (prompts pass through literally). When `true`, resolved mentions are normalised and routed through a non-persisted note; an unknown name fails `-p` with a nonzero exit before any provider request and fails an ACP prompt with JSON-RPC `-32602`. Accepted but inert without the `subagents` feature. Read at startup; a saved change applies after a restart. See [SUBAGENTS.md](SUBAGENTS.md#referencing-a-specialist-with-agent). |
 | `cron_max_fires`          | integer | Fires each `/cron` schedule may start before it is removed. Default: `24`; values below `1` count as `1`. Applies to TUI and ACP schedules. Read at startup; a saved change applies after a restart. See [COMMANDS.md](COMMANDS.md#cron). |
 | `verify_timeout_secs`     | integer | Wall-clock timeout for each `verify_command` attempt. Default: `300`; clamped to `1..=3600`. |
@@ -1382,24 +1385,39 @@ prompt and model are shown in the project-hook approval prompt; `command`, `args
   event JSON (nothing else is evaluated). The call is made by operator-authored, trust-approved
   configuration and does not prompt per call, so by default (`hooks_mcp_tool_unprompted` unset) the
   tool must be listed by the server with `readOnlyHint: true`; any other tool, an unlisted tool or a
-  failed lookup is refused. Set `hooks_mcp_tool_unprompted = true` to allow any tool. The server is resolved by name among the servers
-  connected in this process, so give servers distinct names when several ACP sessions run.
+  failed lookup is refused. Set `hooks_mcp_tool_unprompted = true` to allow any tool. The server is resolved within the current agent or session's captured MCP manager.
+  Concurrent ACP sessions and subagents may reuse server names without changing another
+  manager's hook target. Retiring that manager or changing its trusted project source revokes
+  the captured hook capability; a stale capability cannot reconnect a retired server.
 - `prompt` and `agent` need `hooks_model_enabled = true`, which sends the event JSON to a model
   provider. The handler's text is the instruction; `$ARGUMENTS` is replaced by the event (bounded
   to 64 KiB, fenced as untrusted data), otherwise the event is appended. The model must answer
   `{"ok": true|false, "reason": "..."}`: `false` blocks through the event's normal block path, an
   unparseable reply is a failure. The model is the startup model (or `model`, a quick-model name or a
   model of that provider); usage is attributed to the current run. Default timeouts: 30 s (`prompt`),
-  60 s (`agent`). By default the `agent` type is a tool-free verdict. With
+  60 s (`agent`). Expanded model prompts have a cumulative 1 MiB UTF-8 budget. MCP inputs have
+  a 1 MiB serialized JSON budget, including escaping. Both count every placeholder occurrence. Expansion
+  over the budget fails before contacting the backend; authored instructions and operands are
+  never silently shortened to fit. By default the `agent` type is a tool-free verdict. With
   `hooks_agent_read_files = true` it becomes a read-only investigator: it may answer
   `{"read": "relative/path"}` up to 5 times (32 KiB per file, UTF-8 text) before giving its verdict.
   Reads go through the workspace capability (no `..`, absolute paths or symlinks, regular files only)
   and refuse `.git`, `.env*`, `.ssh`, `.aws`, key/pem files, names containing `secret` or
   `credential`, common infrastructure secrets (`*.tfvars`, `*.tfstate`, kubeconfig, `.docker`,
   `.kube`, `.pgpass`, `.htpasswd`, `*.p12`/`*.pfx`/`*.keystore`, `service-account*`), anything hidden
-  by `.gitignore`/`.ignore`, and every path your `read` permission rules deny (a rule that would
+  by `.gitignore`/`.ignore`/`.git/info/exclude`, and every path your `read` permission rules deny (a rule that would
   ask also refuses, since a hook cannot prompt). File text is sent to the model as untrusted data. It has no write, shell or network
   tools. The model is still the startup model, not live `/model` switches.
+
+Hook envelopes use the current logical session ID and transcript path, including after
+`/new` or `/resume`. ACP uses its own session ID and an empty transcript path. Child work
+inherits its owning session identity and its explicitly selected workspace. Ignore matching
+checks each parent before descending: an ignore file inside an excluded directory cannot
+re-include a child; `.ignore` overrides `.gitignore`, which overrides `.git/info/exclude`.
+
+Native discovery and agent-hook reads resolve a linked worktree's `.git` gitfile and optional `commondir` to the repository's common `info/exclude`. This grants read-only access to that exact Git metadata source outside the worktree, consistent with the existing common Git metadata contract; it grants no file-content capability outside the workspace. A nested discovery root also applies common excludes inherited from its repository ancestor. Per-directory `.gitignore` and `.ignore` retain their existing higher precedence.
+
+Gitfile and `commondir` pointers are limited to 4 KiB, and repository `info/exclude` sources to 1 MiB. Hook-local ignore files also use the 1 MiB budget. Missing optional ignore files are allowed. Malformed or oversized pointers, unreadable or oversized Git metadata sources, and non-regular metadata files fail the ignore check. The final path component of each Git metadata file is opened without following symlinks or reparse points. Native ancestor `.gitignore`/`.ignore` retain their established optional-file and symlink behavior, and known-path ancestor metadata reads do not require permission to list those ancestors. Native `no_ignore=true` skips ignore metadata entirely while retaining permission-deny filters; hook reads always enforce ignore rules.
 
 ### Events
 
@@ -1743,7 +1761,12 @@ cannot be summarized in place (its signed thinking blocks and tool pairing repla
 verbatim), so on one the relief closes the native epoch at the tool-batch boundary (every
 completed tool result is saved), compacts the saved transcript, restarts the thinking chain from
 it as a new epoch (earlier thinking blocks are dropped, with a one-line notice) and resumes the
-task with the continuation prompt, in headless `-p`/`--loop`, goal rounds and ACP prompts (an ACP relief stops, with an error naming the reason, when the segment since the last one ran no tools or its compaction found nothing to compact). The interactive UI
+task with the continuation prompt in ordinary headless `-p` and ACP prompts
+(an ACP relief stops, with an error naming the reason, when the segment since the
+last one ran no tools or its compaction found nothing to compact). Automatic
+headless goal rounds and `--loop` currently require a compatible non-native
+history route: native Anthropic replay refuses those paths until their
+round-publication ownership is implemented. See [Goals](GOALS.md). The interactive UI
 closes the epoch and compacts there too, then restores your prompt so Enter continues on the
 compacted context. When nothing can be compacted, headless stops with an explicit "context is N%
 full ... follow-up prompt ... or start a fresh context" error and the completed tool results
@@ -2557,7 +2580,9 @@ rather than UTF-8 byte counts (terminal display width for wide/combining glyphs 
 Open items are retained in compaction context so an agent rebuild or compressed
 conversation does not lose the active plan.
 
-The structured Git tool accepts only those seven fixed local operations. Read operations use a
+The structured Git tool accepts sixteen fixed local operations: `status`, `diff`, `log`, `show`,
+`blame`, `stage`, `unstage`, `commit`, `branches`, `branch_create`, `switch`, `stash_push`,
+`stash_pop`, `stash_list`, `tag`, and `restore`. Read operations use a
 canonical structured revision, path, and count identity for permission matching. `stage` and
 `unstage` authorize each literal repository-relative path with their exact verb, while `commit`
 uses the bounded commit message as its permission identity. The tool exposes no raw arguments,
@@ -2745,7 +2770,8 @@ every case variant, so `read .ENV` or `read Secrets/key` cannot bypass a
 against deny rules: a deny that matches any line denies the entire script.
 
 Path `deny` rules also cover the walking tools. `grep`, `find_files`, and
-`list_dir` check their search root as usual, and then check every file and
+`list_dir` check explicit directory roots and their ancestors against the same deny
+filters used by a walk, and then check every file and
 directory they encounter against the `deny` rules for that tool and for
 `read` (plus `external_directory` denies outside the workspace): a denied
 file is skipped, so its contents and name never appear in results, and a
@@ -2768,6 +2794,11 @@ error. The `js` tool's discovery globals
 `list_dir`, `glob`, and `grep` apply the same filter, using the `deny` rules
 for `js/list_dir`, `js/glob`, or `js/grep` together with those for `read` and
 `js/read_file`.
+
+`list_dir` reports incomplete coverage when filesystem errors omit entries or subtrees.
+An unreadable child count is shown as `dir(?)`, rather than an exact zero. These notices
+do not name omitted entries or reveal paths hidden by permission rules. Workspace-bound
+file tools reject special nodes such as named pipes before attempting blocking I/O.
 
 Outside the working directory, a tool `allow` rule only counts when it names
 an absolute location (`/opt/data/**`, `~/notes/**`, or a regex starting with

@@ -1,0 +1,252 @@
+{
+  "reviewer": "boundaries",
+  "reviewed_head": "befd7c7c",
+  "production_head": "282e1e1b",
+  "scope": "Continuation review of read/grep/find/list discovery paths, permission/config trust and file-mutation preconditions; original eight p0h9g findings excluded.",
+  "findings": [
+    {
+      "id": "BOUNDARIES-A-1",
+      "priority": 1,
+      "confidence": 0.98,
+      "title": "Explicit discovery directory roots bypass the read-deny pruning applied to ordinary walks",
+      "file": "src/agent/tools/grep.rs",
+      "start_line": 897,
+      "end_line": 931,
+      "related_locations": [
+        {
+          "file": "src/agent/tools/find_files.rs",
+          "start_line": 2095,
+          "end_line": 2120
+        },
+        {
+          "file": "src/agent/tools/list_dir.rs",
+          "start_line": 230,
+          "end_line": 252
+        },
+        {
+          "file": "src/agent/tools/grep.rs",
+          "start_line": 747,
+          "end_line": 763
+        },
+        {
+          "file": "src/agent/tools/mod.rs",
+          "start_line": 1585,
+          "end_line": 1611
+        }
+      ],
+      "scenario": "A read deny names a private directory exactly. Ordinary discovery from its parent prunes that directory. A request naming the denied directory itself or a descendant directory as its search root bypasses that pruning and can return file contents through grep, or file names through find_files/list_dir.",
+      "evidence": [
+        "walk_deny_filter snapshots read denies for discovery tools, but BoundWalker/BoundDirectory only evaluate the filter on entries below the requested root.",
+        "Directory root admission checks the discovery tool key; it does not apply the read-deny probe to the root or its ancestors. Exact directory deny patterns therefore never see that directory when it is supplied as root.",
+        "Grep already checks the same root/ancestor policy for an explicitly named regular file with file_hidden_by_deny_filter, but omits equivalent directory-root validation.",
+        "Root independently confirmed the missing ancestor filter by source; an owned-fixture actual-tool regression probe is supplied, awaiting root Cargo execution."
+      ],
+      "mitigation": "Apply the discovery read-deny probe to the requested directory and the relevant ancestor chain before creating/using its walker, consistently for workspace-relative and canonical absolute roots; share the existing explicit-file ancestor logic or a common helper.",
+      "acceptance_tests": [
+        "With an exact read-denied directory containing a fixture match, ordinary parent-root grep prunes it and explicitly naming the directory or a descendant also refuses/hides it.",
+        "Cover grep/find_files/list_dir, absolute and relative targets, tool-specific and read denies, and a permitted sibling to prove filtering does not overreach.",
+        "Keep no_ignore=true subordinate to the same denies."
+      ],
+      "regression_artifact": "/private/tmp/mini-agent-continuation-discovery-root-probe.rs",
+      "regression_artifact_destination": "src/agent/tools/grep.rs",
+      "validation": "Source/indexed call-path proof only from this reviewer; root runtime validation pending before final P1 filing.",
+      "related_beads": [
+        "mini-agent-06im2",
+        "mini-agent-c1o7m"
+      ],
+      "dedup": "Not in eight p0h9g.* post-fix findings."
+    },
+    {
+      "id": "BOUNDARIES-A-2",
+      "priority": 2,
+      "confidence": 0.99,
+      "title": "Untrusted benign model aliases can silently select a different provider endpoint",
+      "file": "src/config/load.rs",
+      "start_line": 30,
+      "end_line": 70,
+      "related_locations": [
+        {
+          "file": "src/cli.rs",
+          "start_line": 1509,
+          "end_line": 1523
+        },
+        {
+          "file": "src/config/load.rs",
+          "start_line": 2586,
+          "end_line": 2611
+        },
+        {
+          "file": "src/startup.rs",
+          "start_line": 1471,
+          "end_line": 1475
+        }
+      ],
+      "scenario": "The operator selects a local quick-model alias with no explicit provider field, and also has another configured alias for a remote/custom provider. An untrusted project sets only model to the remote alias. Because model is benign, the override applies without trust and Cli resolves the different alias provider, sending the session prompt/context to that endpoint.",
+      "evidence": [
+        "BENIGN_PROJECT_CONFIG_KEYS includes model. apply_captured_override merges benign settings and can return NoSensitiveKeys before content-bound trust.",
+        "Cli::resolve_provider uses cfg.model quick-model alias provider when CLI/config provider is absent; this is documented supported alias selection.",
+        "No provenance/trust check distinguishes the benign project alias from an operator-selected alias at that resolver. Startup uses resolve_provider_and_model for the session.",
+        "The nearby goal.judge carve-out explicitly cites changing the endpoint receiving conversation data as security-sensitive, but model has no equivalent protection.",
+        "Root independently confirmed this pure split/merge-to-provider-resolution call path."
+      ],
+      "mitigation": "Keep benign project model changes on the operator-selected provider, or classify alias changes that can select a provider as sensitive. Preserve ordinary same-provider raw model selection and explicit CLI precedence.",
+      "acceptance_tests": [
+        "Pure operator config with local/default alias plus existing remote alias: merging an untrusted project/local model override cannot change resolved provider.",
+        "Trust approval may permit an explicitly sensitive provider selection; explicit CLI provider/quick-model selection retains precedence.",
+        "Exercise headless load as well as pure split/merge and verify provenance remains accurate."
+      ],
+      "regression_artifact": "/private/tmp/mini-agent-continuation-model-trust-probe.rs",
+      "regression_artifact_destination": "src/config/load.rs",
+      "validation": "Pure source/indexed proof; root runtime probe supplied and pending. No network or real credentials used.",
+      "related_beads": [],
+      "dedup": "Not in eight p0h9g.* post-fix findings."
+    },
+    {
+      "id": "BOUNDARIES-A-3",
+      "priority": 2,
+      "confidence": 0.99,
+      "title": "Workspace-bound file tools block indefinitely opening a named pipe",
+      "file": "src/paths.rs",
+      "start_line": 1339,
+      "end_line": 1355,
+      "related_locations": [
+        {
+          "file": "src/agent/tools/read.rs",
+          "start_line": 384,
+          "end_line": 395
+        },
+        {
+          "file": "src/agent/tools/edit.rs",
+          "start_line": 1423,
+          "end_line": 1427
+        },
+        {
+          "file": "src/agent/tools/write.rs",
+          "start_line": 331,
+          "end_line": 336
+        },
+        {
+          "file": "src/extras/js/host.rs",
+          "start_line": 4348,
+          "end_line": 4358
+        },
+        {
+          "file": "src/extras/lsp/query.rs",
+          "start_line": 114,
+          "end_line": 125
+        }
+      ],
+      "scenario": "A workspace path is a FIFO with no writer. read/edit, or write to the existing path, use WorkspaceBinding::open_relative; it performs a blocking read-only open before a regular-file check. The call never reaches its normal denial/type handling, and cancellation cannot interrupt that blocking OS open.",
+      "evidence": [
+        "open_relative selects open_file_no_follow_impl(...,false); O_NONBLOCK is enabled only for regular_only=true.",
+        "read uses that synchronous open before permission; edit uses it on a tracked blocking worker before permission. write uses it in the existing-target probe after permission, including overwrite=false.",
+        "Production JS bound-write validation also opens with open_relative, and LSP callers can block before their subsequent is_file checks. These are affected callers of one shared root cause.",
+        "Ambient fs::open_stable_file already uses O_NONBLOCK and regular-file validation; notebook uses open_regular_relative and has a controlled FIFO rejection regression, showing the intended safe alternative.",
+        "Tracked blocking jobs retain AgentWorkScope registrations until completion; a dropped/cancelled edit/write cannot make wait_idle retire the still-blocked opener."
+      ],
+      "mitigation": "Use nonblocking regular-file opens for file-tool/JS/LSP data paths, or make generic capability opens nonblocking and require the consumers to reject non-regular nodes before reads. Preserve no-follow identity checks and recapture behavior.",
+      "acceptance_tests": [
+        "A FIFO with no writer is rejected promptly for bound read/edit/write, including denied permission and overwrite=false cases; interruption/turn retirement completes without a writer arriving.",
+        "Retain positive regular-file tests, final/parent symlink refusal and path-replacement races.",
+        "Audit all open_relative consumers, including JS bound reads/writes and LSP sync, for consistent regular-file preconditions."
+      ],
+      "regression_artifact": "/private/tmp/mini-agent-continuation-fifo-probe.rs",
+      "regression_artifact_destination": "src/paths.rs",
+      "validation": "Indexed/shared-helper source proof. Root has a bounded fixture probe which releases the FIFO opener before asserting, leaving no blocked thread. This reviewer ran no FIFO operation or Cargo.",
+      "related_beads": [
+        "mini-agent-vvzsy (different worker Seatbelt FIFO scope; do not merge)"
+      ],
+      "dedup": "Not in eight p0h9g.* post-fix findings."
+    }
+  ],
+  "sweeps": [
+    {
+      "number": 1,
+      "focus": "Config project trust classification to startup endpoint selection; capability file opening/mutation preconditions.",
+      "new_distinct_p0_p3": 2,
+      "findings": [
+        "BOUNDARIES-A-2",
+        "BOUNDARIES-A-3"
+      ]
+    },
+    {
+      "number": 2,
+      "focus": "Discovery requested-root/ancestor permission consistency and explicit-file vs recursive directory behavior.",
+      "new_distinct_p0_p3": 1,
+      "findings": [
+        "BOUNDARIES-A-1"
+      ]
+    },
+    {
+      "number": 3,
+      "focus": "Distinct stabilization sweep: mutation-preimage disclosure branches; raw/character/notebook read overwrite proofs; notebook parse/source/layout/output and publication bounds; search paging/work-budget branches; managed profile/network/root pins; persisted approval scope.",
+      "new_distinct_p0_p3": 0,
+      "findings": [],
+      "qualification": "Zero new distinct issues in this enumerated sweep, not a claim that the entire repository is proven defect-free."
+    }
+  ],
+  "coverage": {
+    "deep": [
+      "src/agent/tools/read.rs read_inner and tracker contracts",
+      "src/agent/tools/grep.rs permission admission, matched-source/output/pagination and search budgets",
+      "src/agent/tools/find_files.rs directory/entry capability opens, walker/filter/ignore and root admission",
+      "src/agent/tools/list_dir.rs traversal, root authorization and paging",
+      "src/agent/tools/notebook.rs parser/edit/view/publication preconditions",
+      "src/config/load.rs benign/sensitive split and layer merge/trust flow",
+      "src/permission/checker.rs path rules/probe/session allowance and managed application interactions",
+      "src/paths.rs capability open regular-file semantics"
+    ],
+    "targeted": [
+      "src/agent/tools/edit.rs disclosure/error branches and bound preconditions",
+      "src/agent/tools/write.rs bound overwrite authorization and fingerprint contract",
+      "src/agent/tools/mod.rs ReadTracker and permission helper contracts",
+      "src/config/managed.rs profile/network/root clamps and deny application",
+      "src/cli.rs startup alias/provider selection",
+      "src/permission/project_approvals.rs persistence and scope",
+      "src/extras/js/host.rs bound-write capability-open call path",
+      "src/extras/lsp/query.rs and mod.rs shared opener consumers"
+    ],
+    "apply_patch": "No apply_patch/PatchTool implementation found under src by symbol/text search.",
+    "unreviewed_in_depth": [
+      "Full PDF renderer/filter/crypt/image internals; full Git structured operations; all platform-specific filesystem publication machinery; provider/network runtime beyond the model-alias call path."
+    ]
+  },
+  "suppressed_hypotheses": [
+    {
+      "candidate": "Read-only explicit user-config allow permits writes.",
+      "reason": "Existing readonly_respects_explicit_config_allow test documents this intentional permission_modes behavior; no new finding."
+    },
+    {
+      "candidate": "Grep drops a final complete file at an exactly exhausted aggregate byte budget.",
+      "reason": "Conservative partial-coverage behavior is visibly reported and existing tests select it; no new P0-P3 safety/correctness contract established."
+    },
+    {
+      "candidate": "ReadTracker could authorize a whole overwrite after a character/result-budget truncation.",
+      "reason": "Served-content fingerprint differs from full-file fingerprint, character windows have a separate kind, and clipped raw reads are explicitly barred; the straightforward bypass is blocked."
+    },
+    {
+      "candidate": "Notebook edit exposes source while read is denied.",
+      "reason": "Preimage/diff disclosure and mutation errors are source-gated in inspected branches; no complete content-disclosure scenario established."
+    },
+    {
+      "candidate": "List_dir silently hides unreadable children or subtrees.",
+      "reason": "Concrete behavior exists but severity/coverage promise is weaker and broader I/O completeness needs validation; retained as a separate P4-quality candidate rather than asserted P0-P3."
+    }
+  ],
+  "p4_candidates_separate": [
+    "List_dir unreadable child/subtree handling can omit entries or show a zero child count without an incomplete notice; evaluate during explicitly requested P4 phase.",
+    "Documentation still describes the structured Git tool as only seven operations despite current larger operation surface; adjacent docs drift, not analyzed as a functional defect here."
+  ],
+  "verification": {
+    "cargo_runs": 0,
+    "source_mutations": 0,
+    "bead_mutations": 0,
+    "probe_files": "Only /private/tmp review artifacts written. Root owns runtime test execution.",
+    "code_indexer": "Current MCP indexed resolve_provider, project split, capability opener, walk_deny_filter and explicit-file ancestor helper implementations/callers used; exact current source inspected too.",
+    "concurrent_edits": "Other root/agents appended temporary probes and unrelated external edits appeared; this reviewer did not modify or repair them."
+  },
+  "residual_risks": [
+    "Current report identifies three new root causes and one zero-new distinct stabilization sweep. Runtime verification remains with root before final filing.",
+    "Priority1 discovery bypass is proposed on content-access consequence, pending the requested actual-tool fixture regression."
+  ]
+}

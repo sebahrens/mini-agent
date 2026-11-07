@@ -2187,6 +2187,13 @@ fn bound_write_key(
         .map_err(file_path_error)
 }
 
+// A task-local seam exercises the production caller's digest forwarding
+// without timing races or hooks in the filesystem implementation.
+#[cfg(test)]
+tokio::task_local! {
+    static GUARDED_WRITE_PREPUBLICATION: std::cell::RefCell<Option<Box<dyn FnOnce() + Send>>>;
+}
+
 /// Guarded ambient-path write: same read-before-overwrite rule and diff as the
 /// native `write` tool. Targets outside the bound workspace cannot be
 /// checkpointed, which `/rewind` reports as an uncaptured change.
@@ -2215,6 +2222,12 @@ async fn write_guarded_path(
     crate::session::file_checkpoints::skipped();
     let after = crate::fs::ContentDigest::of(content.as_bytes());
     let recorded = content.clone();
+    #[cfg(test)]
+    let _ = GUARDED_WRITE_PREPUBLICATION.try_with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
     write_approved_file_cancellable(target, content, base, cancellation).await?;
     crate::session::file_checkpoints::published();
     guard.tracker.untrack_read_path(&key);
@@ -3391,16 +3404,9 @@ fn compile_discovery_grep(
 
 /// Hide everything except the regular file `name` directly under the walk root
 /// (directories are all hidden, so nothing below the root is visited).
-fn only_file_filter(
-    inner: Option<crate::agent::tools::find_files::PathFilter>,
-    name: std::ffi::OsString,
-) -> crate::agent::tools::find_files::PathFilter {
+fn only_file_filter(name: std::ffi::OsString) -> crate::agent::tools::find_files::PathFilter {
     std::sync::Arc::new(move |path: &Path, is_directory: bool| {
-        is_directory
-            || path.file_name() != Some(name.as_os_str())
-            || inner
-                .as_ref()
-                .is_some_and(|hidden| hidden(path, is_directory))
+        is_directory || path.file_name() != Some(name.as_os_str())
     })
 }
 
@@ -3425,37 +3431,41 @@ async fn prepare_discovery_root(
             let hidden = file
                 .permission_bridge
                 .walk_deny_filter(tool, Some(workspace.root()));
-            let (root, walk_root, hidden) = match workspace.open_relative_directory_file(&relative)
-            {
-                Ok(root) => (root, logical.clone(), hidden),
-                Err(error) => {
-                    // mini-agent-6v01f: a grep `path` naming one regular file searches
-                    // just that file. The same capability open `read_file` uses proves
-                    // it is a regular file inside the workspace; the walk then runs over
-                    // its capability-bound parent with every other entry hidden.
-                    let name = match (&action, relative.file_name()) {
-                        (DiscoveryAction::Grep { .. }, Some(name))
-                            if workspace.open_regular_relative(&relative).is_ok() =>
-                        {
-                            name.to_owned()
-                        }
-                        _ => return Err(HostEffectError::from(file_path_error(error))),
-                    };
-                    let parent = relative.parent().unwrap_or(Path::new(""));
-                    let root = workspace
-                        .open_relative_directory_file(parent)
-                        .map_err(file_path_error)?;
-                    let parent_logical = workspace
-                        .logical_relative_path(parent)
-                        .map_err(file_path_error)?;
-                    (root, parent_logical, Some(only_file_filter(hidden, name)))
-                }
-            };
+            let (root, walk_root, single_file) =
+                match workspace.open_relative_directory_file(&relative) {
+                    Ok(root) => (root, logical.clone(), None),
+                    Err(error) => {
+                        // mini-agent-6v01f: a grep `path` naming one regular file searches
+                        // just that file. The same capability open `read_file` uses proves
+                        // it is a regular file inside the workspace; the walk then runs over
+                        // its capability-bound parent with every other entry hidden.
+                        let name = match (&action, relative.file_name()) {
+                            (DiscoveryAction::Grep { .. }, Some(name))
+                                if workspace.open_regular_relative(&relative).is_ok() =>
+                            {
+                                name.to_owned()
+                            }
+                            _ => return Err(HostEffectError::from(file_path_error(error))),
+                        };
+                        let parent = relative.parent().unwrap_or(Path::new(""));
+                        let root = workspace
+                            .open_relative_directory_file(parent)
+                            .map_err(file_path_error)?;
+                        let parent_logical = workspace
+                            .logical_relative_path(parent)
+                            .map_err(file_path_error)?;
+                        (root, parent_logical, Some(name))
+                    }
+                };
             // mini-agent-c1o7m: entries the tool's (and `read`'s) path deny
             // rules hide are skipped, and denied directories are pruned.
             let directory = BoundDirectory::from_file(&walk_root, root)
                 .map_err(file_path_error)?
                 .with_hidden_filter(hidden);
+            let directory = match single_file {
+                Some(name) => directory.with_entry_filter(only_file_filter(name)),
+                None => directory,
+            };
             return Ok((
                 PreparedDiscoveryEffect {
                     directory,
@@ -3488,10 +3498,10 @@ async fn prepare_discovery_root(
         _ = cancellation.cancelled() => return Err(HostEffectError::InvocationCancelled),
     };
     let hidden = file.permission_bridge.walk_deny_filter(tool, None);
-    let (directory, hidden) = if identity.is_dir() {
+    let (directory, single_file) = if identity.is_dir() {
         (
             BoundDirectory::open(&canonical, &identity).map_err(file_path_error)?,
-            hidden,
+            None,
         )
     } else if matches!(action, DiscoveryAction::Grep { .. }) && identity.is_file() {
         // mini-agent-6v01f: a single-file grep path; see the workspace-bound branch.
@@ -3504,12 +3514,16 @@ async fn prepare_discovery_root(
         };
         (
             BoundDirectory::open(parent, &parent_identity).map_err(file_path_error)?,
-            Some(only_file_filter(hidden, name.to_owned())),
+            Some(name.to_owned()),
         )
     } else {
         return Err(HostEffectError::InvalidTarget);
     };
     let directory = directory.with_hidden_filter(hidden);
+    let directory = match single_file {
+        Some(name) => directory.with_entry_filter(only_file_filter(name)),
+        None => directory,
+    };
     let workspace_relative = workspace_relative_path(&output_base, &canonical)?;
     Ok((
         PreparedDiscoveryEffect {
@@ -6607,6 +6621,12 @@ mod tests {
         let base = directory.path().canonicalize().unwrap();
         let workspace_root = base.join("workspace");
         std::fs::create_dir_all(workspace_root.join("config")).unwrap();
+        std::fs::create_dir_all(workspace_root.join("private/sub")).unwrap();
+        std::fs::write(
+            workspace_root.join("private/sub/data.txt"),
+            "needle private\n",
+        )
+        .unwrap();
         std::fs::write(workspace_root.join("config/app.txt"), "x\nneedle app\n").unwrap();
         std::fs::write(
             workspace_root.join("config/sibling.txt"),
@@ -6622,7 +6642,11 @@ mod tests {
         .unwrap();
         let config = PermissionConfig {
             read: Some(ToolPerm::Granular(
-                [("config/token.txt".to_string(), Action::Deny)].into(),
+                [
+                    ("config/token.txt".to_string(), Action::Deny),
+                    ("private".to_string(), Action::Deny),
+                ]
+                .into(),
             )),
             doom_loop: Some(Action::Allow),
             ..PermissionConfig::default()
@@ -6679,6 +6703,22 @@ mod tests {
                 Err(_) => {}
                 Ok(EffectResult::Grep { matches, .. }) => assert!(matches.is_empty(), "{path}"),
                 Ok(other) => panic!("{path}: {other:?}"),
+            }
+        }
+        // Exact denied directories stay pruned when requested directly or
+        // through a descendant directory/file, including absolute spellings.
+        for path in ["private", "private/sub", "private/sub/data.txt"] {
+            for target in [
+                path.to_owned(),
+                workspace_root.join(path).to_string_lossy().into_owned(),
+            ] {
+                match grep(target.clone()).await {
+                    Err(_) => {}
+                    Ok(EffectResult::Grep { matches, .. }) => {
+                        assert!(matches.is_empty(), "{target}: {matches:?}")
+                    }
+                    Ok(other) => panic!("{target}: {other:?}"),
+                }
             }
         }
         assert!(grep("config/missing.txt".into()).await.is_err(), "missing");
@@ -10258,6 +10298,68 @@ mod tests {
             !external_target.exists(),
             "parent swap redirected the approved write"
         );
+    }
+
+    #[tokio::test]
+    async fn guarded_absolute_write_preserves_the_authorized_preimage_at_publication() {
+        use rig::tool::Tool;
+        let temp = TempDir::new_canonical("js-guarded-write-caller");
+        let file = temp.path().join("doc.txt");
+        for changed in [false, true] {
+            std::fs::write(&file, "aaaa").unwrap();
+            let tracker = crate::agent::tools::ReadTracker::new(true);
+            crate::agent::tools::ReadTool::new_with_tracker(None, None, None, 100, tracker.clone())
+                .call(crate::agent::tools::ReadArgs {
+                    path: file.to_string_lossy().into_owned(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let diffs = Arc::new(Mutex::new(Vec::new()));
+            let guard = JsWriteGuard {
+                tracker,
+                diff_options: Default::default(),
+                permission: None,
+                max_text_file_size: 1024,
+                diffs: diffs.clone(),
+            };
+            let target = resolve_write_target(temp.path(), file.to_str().unwrap())
+                .await
+                .unwrap();
+            let changed_file = file.clone();
+            let hook: Box<dyn FnOnce() + Send> = Box::new(move || {
+                if changed {
+                    // Same-length, same-inode mutation after authorization.
+                    std::fs::write(changed_file, "bbbb").unwrap();
+                }
+            });
+            let result = GUARDED_WRITE_PREPUBLICATION
+                .scope(
+                    std::cell::RefCell::new(Some(hook)),
+                    write_guarded_path(
+                        &guard,
+                        target,
+                        "model".into(),
+                        crate::fs::AtomicWriteCancellation::default(),
+                    ),
+                )
+                .await;
+            if changed {
+                assert!(
+                    matches!(result, Err(EffectServiceError::TargetChanged)),
+                    "{result:?}"
+                );
+                assert_eq!(std::fs::read_to_string(&file).unwrap(), "bbbb");
+                assert!(
+                    diffs.lock().unwrap().is_empty(),
+                    "rejected write published a diff"
+                );
+            } else {
+                result.unwrap();
+                assert_eq!(std::fs::read_to_string(&file).unwrap(), "model");
+                assert_eq!(diffs.lock().unwrap().len(), 1);
+            }
+        }
     }
 
     /// A guarded overwrite publishes only against the preimage it authorized:

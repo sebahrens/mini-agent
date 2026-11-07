@@ -69,7 +69,9 @@ fn collect_level(
         }
         let name = format!("{prefix}{}", entry.file_name.to_string_lossy());
         let kind = if entry.is_directory {
-            format!("dir({})", entry.child_count)
+            entry
+                .child_count
+                .map_or_else(|| "dir(?)".to_owned(), |count| format!("dir({count})"))
         } else if entry.is_link {
             "link".to_string()
         } else {
@@ -91,19 +93,24 @@ fn collect_level(
             size,
             link_target,
         });
-        if entry.is_directory
-            && level < max_depth
-            && let Ok(child) = directory.child_directory(&entry.file_name)
-        {
-            // An unreadable subdirectory keeps its own row and is skipped.
-            let _ = collect_level(
-                &child,
-                &format!("{name}/"),
-                level + 1,
-                max_depth,
-                rows,
-                incomplete,
-            );
+        if entry.is_directory && level < max_depth {
+            match directory.child_directory(&entry.file_name) {
+                Ok(child) => {
+                    if collect_level(
+                        &child,
+                        &format!("{name}/"),
+                        level + 1,
+                        max_depth,
+                        rows,
+                        incomplete,
+                    )
+                    .is_err()
+                    {
+                        directory.note_listing_incomplete();
+                    }
+                }
+                Err(_) => directory.note_listing_incomplete(),
+            }
         }
     }
     Ok(())
@@ -279,6 +286,7 @@ impl Tool for ListDirTool {
             (bound, coaching)
         };
 
+        let coverage = bound_directory.listing_coverage();
         let ignore_mode = bound_directory.ignore_mode();
         let notice_root = bound_directory.approved_root().to_path_buf();
         let (rows, incomplete) = crate::agent::runner::spawn_blocking_scoped(move || {
@@ -291,8 +299,22 @@ impl Tool for ListDirTool {
         .map_err(|error| ToolError::Msg(format!("list_dir directory reader failed: {error}")))??;
 
         let ignore_notice = ignore_mode.notice(&notice_root);
+        let unreadable = coverage.load(std::sync::atomic::Ordering::Relaxed);
+        let coverage_notice = if unreadable {
+            "\n[listing incomplete: some entries or subdirectories could not be read (permission denied or changed during listing); dir(?) means the child count is unknown]"
+        } else {
+            ""
+        };
         if rows.is_empty() {
-            let msg = format!("Listing {}:\n(empty directory){ignore_notice}", path);
+            let empty = if unreadable {
+                "no readable entries"
+            } else {
+                "empty directory"
+            };
+            let msg = format!(
+                "Listing {}:\n({empty}){ignore_notice}{coverage_notice}",
+                path
+            );
             return Ok(match coaching {
                 Some(c) => format!("{}\n\n{}", c, msg),
                 None => msg,
@@ -382,6 +404,7 @@ impl Tool for ListDirTool {
             ));
         }
         result.push_str(&ignore_notice);
+        result.push_str(coverage_notice);
         tracing::debug!(
             "tool list_dir done: path={}, entries={}",
             path,
@@ -407,6 +430,82 @@ mod tests {
     use crate::permission::ask::UserDecision;
     use crate::permission::checker::PermissionChecker;
     use crate::permission::{PermissionConfigs, SecurityMode};
+
+    #[tokio::test]
+    async fn unreadable_subdirectories_report_incomplete_coverage_without_hidden_names() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::tests::OwnedTestDirectory::new("list-dir-unreadable");
+        let blocked = root.path().join("blocked");
+        let hidden = root.path().join("hidden");
+        for directory in [&blocked, &hidden] {
+            std::fs::create_dir(directory).unwrap();
+            std::fs::write(directory.join("inside.txt"), "fixture").unwrap();
+        }
+        struct Restore(Vec<PathBuf>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for path in &self.0 {
+                    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+                }
+            }
+        }
+        let _restore = Restore(vec![blocked.clone(), hidden.clone()]);
+        for directory in [&blocked, &hidden] {
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o0)).unwrap();
+        }
+        // Privileged test runners may bypass DAC; only assert the omission
+        // branch on hosts where this owned fixture is actually unreadable.
+        if std::fs::read_dir(&blocked).is_ok() {
+            return;
+        }
+        let policy =
+            crate::permission::PermissionConfigs::from(crate::permission::PermissionConfig {
+                read: Some(crate::permission::ToolPerm::Granular(
+                    [("hidden".to_owned(), crate::permission::Action::Deny)].into(),
+                )),
+                ..Default::default()
+            });
+        let permission = Arc::new(Mutex::new(
+            PermissionChecker::new(
+                &policy,
+                SecurityMode::Standard,
+                Some(root.path().to_owned()),
+                None,
+            )
+            .unwrap(),
+        ));
+        let tool = ListDirTool::new(Some(permission), None, None).with_workspace(root.path());
+        for depth in [1, 3] {
+            let listing = tool
+                .call(ListDirArgs {
+                    depth: Some(depth),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert!(listing.contains("listing incomplete"), "{listing}");
+            assert!(!listing.contains("empty directory"), "{listing}");
+            assert!(!listing.contains("hidden"), "{listing}");
+            assert!(!listing.contains("inside.txt"), "{listing}");
+        }
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let listing = tool
+            .call(ListDirArgs {
+                depth: Some(3),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            !listing.contains("listing incomplete"),
+            "policy-hidden directory affected coverage: {listing}"
+        );
+        assert!(!listing.contains("hidden"), "{listing}");
+        assert!(
+            listing.contains("inside.txt"),
+            "readable sibling disappeared: {listing}"
+        );
+    }
 
     #[tokio::test]
     async fn descriptor_bound_listing_reports_symlinks_without_following_them() {

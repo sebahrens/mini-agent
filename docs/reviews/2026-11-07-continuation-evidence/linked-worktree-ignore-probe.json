@@ -1,0 +1,9 @@
+{
+  "fixture_only": true,
+  "linked_dot_git_is_file": true,
+  "literal_exclude_exists": false,
+  "git_common_dir": "/private/tmp/mini-agent-hook-linked-ignore-8xvbgz_e/repo/.git",
+  "git_check_ignore": "/private/tmp/mini-agent-hook-linked-ignore-8xvbgz_e/repo/.git/info/exclude:1:notes.txt\tnotes.txt",
+  "current_hook_source": "is_vcs_ignored loads only root/.git/info/exclude, which does not exist in this linked worktree.",
+  "negation_control": ".gitignore:1:!notes.txt\tnotes.txt"
+}

@@ -1,0 +1,36 @@
+   Compiling mini-agent v1.12.0 (/Users/seb/projects/mini-agent)
+    Finished `test` profile [unoptimized] target(s) in 48.58s
+     Running unittests src/main.rs (target/debug/deps/mini_agent-06a0b2bfe5cce132)
+
+running 28 tests
+test extras::hooks::backend::tests::a_verdict_is_never_mistaken_for_a_read_request ... ok
+test extras::hooks::backend::tests::agent_file_reads_are_contained_link_free_and_refuse_secrets ... ok
+test extras::hooks::backend::tests::agent_file_reads_honour_user_read_deny_rules_and_refuse_on_ask ... ok
+test extras::hooks::backend::tests::agent_file_reads_refuse_gitignored_and_unlisted_credential_files ... ok
+test extras::hooks::backend::tests::aggregate_expansion_budget_covers_repetition_nested_values_and_utf8 ... ok
+test extras::hooks::backend::tests::an_unconnected_server_and_a_missing_model_fail_without_blocking ... ok
+test extras::hooks::backend::tests::event_values_substitute_only_strings_and_never_evaluate_anything ... ok
+test extras::hooks::backend::tests::ignored_parent_cannot_be_reincluded_and_root_rule_beats_info_exclude ... ok
+test extras::hooks::backend::tests::immutable_agent_bindings_share_cancellation_owner_without_cross_contamination ... ok
+test extras::hooks::backend::tests::scoped_session_context_is_independent_and_inherited ... ok
+test extras::hooks::backend::tests::the_event_is_fenced_bounded_and_cannot_close_its_fence ... ok
+test extras::hooks::backend::tests::timeouts_default_by_type_and_are_capped ... ok
+test extras::hooks::backend::tests::verdicts_map_onto_the_block_and_failure_exit_codes ... ok
+test extras::hooks::backend::tests::verdicts_parse_from_fenced_or_bare_json_and_reject_everything_else ... ok
+test extras::hooks::dispatcher::tests::doctor_hook_metadata_uses_captured_counts_and_does_not_wait_for_once_lock ... ok
+test extras::hooks::dispatcher::tests::hooks60_context_bounds_order_event_scope_and_block_precedence ... ok
+test extras::hooks::dispatcher::tests::i24tio_permission_request_answers_merge_deny_first ... ok
+test extras::hooks::dispatcher::tests::i24tio_post_tool_use_feeds_back_block_reasons_and_context_without_replacing_result ... ok
+test extras::hooks::dispatcher::tests::i6t6i0_gating_events_default_to_60s_and_others_to_600s ... ok
+test extras::hooks::dispatcher::tests::missing_redactions_leave_the_response_unchanged ... ok
+test extras::hooks::dispatcher::tests::plain_json_output_is_fully_redacted_not_treated_as_envelope ... ok
+test extras::hooks::dispatcher::tests::post_tool_feedback_keeps_image_envelopes_parseable ... ok
+test extras::hooks::dispatcher::tests::redactions_replace_only_requested_non_empty_literals ... ok
+test extras::hooks::event60_tests::hooks60_actual_permission_transport_observes_without_answering_and_compact_has_source ... ok
+test extras::hooks::settings::command60_tests::hooks60_command_strings_tokenize_quotes_without_shell_expansion ... ok
+test extras::hooks::subprocess::launch_prep_tests::condition_and_handler_share_one_launch_prep_per_policy ... ok
+test extras::hooks::subprocess::launch_prep_tests::launch_preparation_runs_off_the_calling_task_thread ... ok
+test extras::hooks::trust::confirmation_tests::confirmation_displays_event_and_matcher_that_are_bound_by_the_hash ... ok
+
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 3966 filtered out; finished in 0.11s
+

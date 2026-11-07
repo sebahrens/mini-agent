@@ -211,6 +211,10 @@ impl std::fmt::Debug for Registration {
         f.write_str("ChatGPTRegistration([REDACTED])")
     }
 }
+#[derive(Debug, thiserror::Error)]
+#[error("Provider credentials are busy; retry after the other sign-in or refresh finishes")]
+struct CredentialBusy;
+
 struct CredentialLock(std::fs::File);
 impl Drop for CredentialLock {
     fn drop(&mut self) {
@@ -246,11 +250,13 @@ impl LockedStore {
         let lock =
             crate::fs::open_private_file_checked(&path, crate::fs::PrivateFileAccess::Append)
                 .context("Provider credential lock unavailable")?;
-        lock.try_lock().map_err(|_| {
-            anyhow::anyhow!(
-                "Provider credentials are busy; retry after the other sign-in or refresh finishes"
-            )
-        })?;
+        match lock.try_lock() {
+            Ok(()) => (),
+            Err(std::fs::TryLockError::WouldBlock) => return Err(CredentialBusy.into()),
+            Err(std::fs::TryLockError::Error(_)) => {
+                anyhow::bail!("Provider credential locking failed")
+            }
+        }
         let lock = CredentialLock(lock);
         let path = root.join("openai.json");
         let data =
@@ -605,10 +611,40 @@ pub(crate) fn store_opens(root: &std::path::Path) -> usize {
 }
 impl Registration {
     pub(crate) async fn access_token(&self) -> anyhow::Result<String> {
-        let registration = self.clone();
-        crate::agent::runner::spawn_blocking_scoped(move || registration.access_token_blocking())
+        // A refresh holds the same cross-process lock as login/logout through
+        // two bounded HTTP requests (15 seconds each). Sibling callers wait
+        // asynchronously and then read that refresh's result from disk/cache.
+        self.access_token_with_wait(Duration::from_secs(35)).await
+    }
+    async fn access_token_with_wait(&self, wait: Duration) -> anyhow::Result<String> {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            ensure!(
+                !crate::agent::runner::current_work_scope_is_cancelled(),
+                "Provider credential wait cancelled"
+            );
+            let registration = self.clone();
+            let result = crate::agent::runner::spawn_blocking_scoped(move || {
+                registration.access_token_blocking()
+            })
             .await
-            .context("Provider refresh worker failed")?
+            .context("Provider refresh worker failed")?;
+            match result {
+                Err(error) if error.is::<CredentialBusy>() => {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    ensure!(
+                        !remaining.is_zero(),
+                        "Provider credential refresh lock wait timed out"
+                    );
+                    tokio::select! {
+                        _ = crate::agent::runner::current_work_scope_cancelled() =>
+                            anyhow::bail!("Provider credential wait cancelled"),
+                        _ = tokio::time::sleep(Duration::from_millis(20).min(remaining)) => {}
+                    }
+                }
+                result => return result,
+            }
+        }
     }
     /// The cached token when it is still valid and the record is unchanged
     /// on disk (one private-file open and fstat, no lock, no parse). A logout,

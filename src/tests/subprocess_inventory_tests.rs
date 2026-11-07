@@ -1673,7 +1673,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/extras/mcp/server.rs",
-        "let mut child = match child.spawn() {",
+        "let mut child = match owned_command.spawn() {",
         1,
         "TC-SUPPORT-UTILITY",
     ),
@@ -2052,12 +2052,6 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/extras/mcp/server.rs",
-        "async fn kill_tree(child: &mut tokio::process::Child, pid: Option<u32>) {",
-        1,
-        "TC-SUPPORT-UTILITY",
-    ),
-    (
-        "src/extras/mcp/server.rs",
         "mut stdin: Option<tokio::process::ChildStdin>,",
         1,
         "TC-SUPPORT-UTILITY",
@@ -2105,6 +2099,73 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
 /// a process method. Any unlisted `spawn`, `output`, or `status` identifier in
 /// macro-controlled tokens remains process authority and fails closed.
 const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
+    // Exact capture/JSON data tokens within the reviewed full macro digests.
+    (
+        "src/extras/mcp/headers_helper.rs",
+        "status = child.inner_mut().wait() => {",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/mcp/headers_helper.rs",
+        "Ok((read, output)) => (read, output, Some(status)),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/mcp/headers_helper.rs",
+        "Err(_) => (Err(std::io::Error::other(\"MCP helper output did not retire\")), Vec::new(), Some(status)),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/mcp/headers_helper.rs",
+        "(read, output) = &mut read => {",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/mcp/headers_helper.rs",
+        "let status = if output.len() > MAX_OUTPUT_BYTES || read.is_err() { None } else { Some(child.inner_mut().wait().await) };",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/mcp/headers_helper.rs",
+        "(read, output, status)",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/mcp/server.rs",
+        "status = child.inner_mut().wait() => {",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/mcp/server.rs",
+        "Ok((stdout, stderr)) => (stdout, stderr, status),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/mcp/server.rs",
+        "let status = child.inner_mut().wait().await;",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/mcp/server.rs",
+        "(stdout, stderr, status)",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/git/tool.rs",
+        "\"path_records\": parse_status_paths(&output.stdout, truncated),",
+        1,
+        "NON-PROCESS",
+    ),
     // Wakeup tool and App /cron assertions inspect returned or rendered strings.
     (
         "src/agent/tools/schedule_wakeup.rs",
@@ -3833,42 +3894,6 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     (
-        "src/extras/mcp/server.rs",
-        "write_message(&mut output, &error(&Value::Null, -32700, \"parse error\")).await?;",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/mcp/server.rs",
-        "write_message(&mut output, &handle_simple(&command, &id, method, &params)).await?;",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/mcp/server.rs",
-        "write_message(&mut output, &error(&id, -32602, \"unknown tool; only `run` is offered\")).await?;",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/mcp/server.rs",
-        "write_message(&mut output, &error(&id, -32602, &message)).await?;",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/mcp/server.rs",
-        "write_message(&mut output, &error(&id, -32000, &format!(\"too many concurrent `run` calls (limit {}, --mcp-server-max-runs); retry when one finishes\", command.max_runs.max(1)))).await?;",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/mcp/server.rs",
-        "write_message(&mut output, &reply).await?;",
-        2,
-        "NON-PROCESS",
-    ),
-    (
         "src/git/tool.rs",
         "if matches!(output.status, CommandStatus::OutputLimitExceeded(_))",
         1,
@@ -5494,7 +5519,7 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     (
         "src/extras/mcp/server.rs",
         &[(
-            "53a4f97814def03d94a095312857f27d4297cb2fdac03c1004660cf68861a654",
+            "d6d38b65394d86e02f59accaf62ebf13b460f5cddfc3914e71a90e7713f6d042",
             1,
         )],
     ),
@@ -5552,6 +5577,30 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         &[(
             "bb8b0f921bc2afe7c1a0fdd7d97dc264237bdbe93e6c7aff99554fb104933299",
             4,
+        )],
+    ),
+    // Exact select bodies inspect captured I/O/status and JoinSet tasks;
+    // actual child creation remains outside these macros and guarded.
+    (
+        "src/extras/mcp/headers_helper.rs",
+        &[(
+            "4c8b85e6eb6ef8da3e0680afc3ba5a877bbfe732b9150a963865f94a5e0dc7de",
+            1,
+        )],
+    ),
+    (
+        "src/extras/mcp/server.rs",
+        &[(
+            "5060a4fa982c2dc00234a99b857bcea723113ca93491f3804c117a2b99113a98",
+            1,
+        )],
+    ),
+    // This status JSON reads captured CommandOutput.stdout; no launch occurs.
+    (
+        "src/git/tool.rs",
+        &[(
+            "1735ccb352820a631e226dc84e5f3519ce50986a4f53c07de077ce1528e49969",
+            1,
         )],
     ),
 ];
@@ -6700,12 +6749,6 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         "let mut child = command.spawn().map_err(|error| {",
         1,
         "TC-MCP-STDIO",
-    ),
-    (
-        "src/extras/mcp/server.rs",
-        "async fn kill_tree(child: &mut tokio::process::Child, pid: Option<u32>) {",
-        1,
-        "TC-SUPPORT-UTILITY",
     ),
     (
         "src/extras/mcp/server.rs",

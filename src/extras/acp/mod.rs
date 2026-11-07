@@ -4074,7 +4074,13 @@ async fn run_prompt(
                 let line = if argument.is_empty() {
                     selection_summary(state, &session_id, config_id).await
                 } else {
-                    match set_model_override(state, &session_id, config_id, argument, native).await
+                    let command_value = if config_id == model_options::MODEL_CONFIG_ID {
+                        model_options::command_model_value(argument)
+                    } else {
+                        argument.to_owned()
+                    };
+                    match set_model_override(state, &session_id, config_id, &command_value, native)
+                        .await
                     {
                         Ok(line) => {
                             let options = persona_config_options(state, &session_id).await;
@@ -5234,6 +5240,30 @@ async fn execute_prompt(
     let work_scope = crate::agent::runner::AgentWorkScope::new();
     #[cfg(feature = "hooks")]
     work_scope.set_hook_execution_root(workspace.root());
+    #[cfg(feature = "hooks")]
+    work_scope.set_hook_permission(permission.clone());
+    #[cfg(feature = "hooks")]
+    let hook_context = {
+        let mode = permission
+            .as_ref()
+            .map(|permission| {
+                permission
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .mode()
+                    .to_string()
+            })
+            .unwrap_or_else(|| "standard".into());
+        let mut ctx = crate::extras::hooks::context_for_session(
+            &session_id.to_string(),
+            workspace.root(),
+            &mode,
+        );
+        // ACP transcripts are not the process session store.
+        ctx.session_path.clear();
+        work_scope.set_hook_session_context(ctx.clone());
+        ctx
+    };
     if native {
         let ticket = if crate::session::native_publication::startup_requires_publication(
             &history.session,
@@ -5496,6 +5526,13 @@ async fn execute_prompt(
             }
         }
     }
+    #[cfg(all(feature = "hooks", feature = "mcp"))]
+    work_scope.set_hook_mcp_peers(
+        mcp_manager
+            .as_ref()
+            .map(|mcp| mcp.manager.hook_peers())
+            .unwrap_or_default(),
+    );
     let native_js_context = history.session.native_js_context();
     let tool_output_session_id = session_id.to_string();
     let build = crate::provider::build_agent_in_workspace(
@@ -5541,6 +5578,8 @@ async fn execute_prompt(
         state.cli.no_session,
     );
     let agent = agent.with_main_session(&state.cfg, &history.session);
+    #[cfg(feature = "hooks")]
+    let agent = agent.with_hook_context(hook_context);
     // The session's effort selection overrides the saved controls in memory
     // only; an effort this route's model cannot honour fails the prompt
     // rather than being silently dropped.
@@ -13182,6 +13221,130 @@ brainstorm = "no-such-quick-model"
             routes[1],
             route("acme", "acme-review", Some(("review", "review-fast")))
         );
+    }
+
+    #[cfg(all(feature = "hooks", unix))]
+    #[tokio::test]
+    async fn actual_acp_prompt_hook_envelope_uses_protocol_id_and_empty_session_path() {
+        use crate::extras::hooks::dispatcher::HookDispatcher;
+        use crate::extras::hooks::settings::{HookGroup, HookHandler, HookTrust, HooksConfig};
+        let _guard = crate::tests::fake_model::dispatcher_guard::acquire();
+        let workspace = ProtocolTempDir::new();
+        let envelope_path = workspace.path().join("prompt-envelope.json");
+        let mut config = HooksConfig::new();
+        config.insert("UserPromptSubmit".into(), vec![HookGroup { matcher:None, hooks:vec![HookHandler {
+            kind:"command".into(), command:Some("/bin/sh".into()),
+            args:Some(vec!["-c".into(), r#"cat > "$1"; printf '%s' '{"decision":"block","reason":"identity probe"}'"#.into(), "hook-probe".into(), envelope_path.display().to_string()]),
+            timeout:Some(10), is_async:false, condition:None, once:false, trust:HookTrust::Trusted, env:Default::default(),
+        }] }]);
+        crate::extras::hooks::init_dispatcher(HookDispatcher::from_config(&config).unwrap());
+        let mut state = persona_state(
+            PERSONA_CONFIG,
+            counting_fixture(Arc::new(AtomicUsize::new(0))),
+        );
+        let owned = Arc::get_mut(&mut state).unwrap();
+        owned.prompt_fixture = None; // Exercise the production agent builder and hook dispatch.
+        owned.cli.no_sandbox = true;
+        owned.cli.tools = vec!["read".into()];
+        let inspect = state.clone();
+        let cwd = workspace.path().to_path_buf();
+        Client
+            .builder()
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session = cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?
+                    .session_id;
+                let canonical_id = inspect.sessions.lock().await[&session]
+                    .history
+                    .lock()
+                    .await
+                    .session
+                    .id
+                    .to_string();
+                assert_eq!(canonical_id, session.to_string());
+                assert!(
+                    cx.send_request(prompt(session.clone(), "probe hooks"))
+                        .block_task()
+                        .await
+                        .is_err(),
+                    "the probe hook intentionally blocks before any model request"
+                );
+                let value: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&envelope_path).unwrap()).unwrap();
+                assert_eq!(value["session_id"], session.to_string());
+                assert_eq!(value["session_path"], "");
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn model_slash_uses_raw_aliases_while_picker_uses_encoded_ids() {
+        let turns = Arc::new(AtomicUsize::new(0));
+        let cfg = format!(
+            "{PERSONA_CONFIG}\n[quick_models.\"default\"]\nprovider = \"acme\"\nmodel = \"base\"\n[quick_models.\"alias:default\"]\nprovider = \"acme\"\nmodel = \"prefixed\"\n[quick_models.\"alias:fast\"]\nprovider = \"acme\"\nmodel = \"fast\"\n"
+        );
+        let state = persona_state(&cfg, counting_fixture(turns.clone()));
+        let inspect = state.clone();
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+        Client
+            .builder()
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session = cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?
+                    .session_id;
+                for alias in ["alias:default", "alias:fast"] {
+                    cx.send_request(prompt(session.clone(), &format!("/model {alias}")))
+                        .block_task()
+                        .await?;
+                    assert_eq!(
+                        inspect.sessions.lock().await[&session]
+                            .model_overrides
+                            .model
+                            .as_deref(),
+                        Some(alias)
+                    );
+                }
+                cx.send_request(SetSessionConfigOptionRequest::new(
+                    session.clone(),
+                    "model",
+                    "alias:default",
+                ))
+                .block_task()
+                .await?;
+                assert_eq!(
+                    inspect.sessions.lock().await[&session]
+                        .model_overrides
+                        .model
+                        .as_deref(),
+                    Some("default")
+                );
+                cx.send_request(prompt(session.clone(), "/model default"))
+                    .block_task()
+                    .await?;
+                assert!(
+                    inspect.sessions.lock().await[&session]
+                        .model_overrides
+                        .model
+                        .is_none()
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(turns.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]

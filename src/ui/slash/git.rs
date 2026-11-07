@@ -178,49 +178,48 @@ fn bounded_text(value: &str, limit: usize, name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// A commit uses the existing index. Refuse unrelated staged changes before
-/// staging and again immediately before commit; never unstage someone else's
-/// work. Porcelain-v2 rename records carry a second NUL-delimited old path.
+/// Refuse unrelated staged operands using GitTool's lossless path records.
+/// Rename destinations and origins are separate fields even for tabs/newlines.
 pub(crate) fn check_staged_paths(
     status: &serde_json::Value,
     selected: &[String],
 ) -> Result<(), String> {
+    if status.get("truncated").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Err("Git status was truncated".into());
+    }
     let records = status
-        .get("records")
+        .get("path_records")
         .and_then(serde_json::Value::as_array)
-        .ok_or("Git status did not return complete structured records")?;
+        .ok_or("Git status did not return complete structured paths")?;
     let selected: BTreeSet<&str> = selected.iter().map(String::as_str).collect();
-    let mut records = records.iter();
-    while let Some(record) = records.next() {
-        let record = record.as_str().ok_or("invalid Git status record")?;
-        if record.contains('\u{fffd}') {
-            return Err("Git status contains a path that is not unambiguous UTF-8".into());
+    for record in records {
+        let kind = record["kind"].as_str().ok_or("invalid Git status kind")?;
+        if kind == "u" {
+            return Err("resolve Git conflicts before committing".into());
         }
-        if record.starts_with("# ") || record.starts_with("? ") || record.starts_with("! ") {
-            continue;
+        if !matches!(kind, "1" | "2") {
+            return Err("invalid Git status kind".into());
         }
-        let (parts, renamed) = match record.as_bytes().first() {
-            Some(b'1') => (record.splitn(9, ' ').collect::<Vec<_>>(), false),
-            Some(b'2') => (record.splitn(10, ' ').collect::<Vec<_>>(), true),
-            Some(b'u') => return Err("resolve Git conflicts before committing".into()),
-            _ => return Err("unrecognized Git status record".into()),
+        let xy = record["xy"]
+            .as_str()
+            .filter(|xy| xy.len() == 2)
+            .ok_or("invalid Git status XY")?;
+        let path = record["path"]
+            .as_str()
+            .ok_or("Git status path is not UTF-8")?;
+        let origin = if kind == "2" {
+            Some(
+                record["origin"]
+                    .as_str()
+                    .ok_or("incomplete Git rename origin")?,
+            )
+        } else {
+            None
         };
-        if parts.len() != (if renamed { 10 } else { 9 }) || parts[1].len() != 2 {
-            return Err("incomplete Git status record".into());
-        }
-        let staged = parts[1].as_bytes()[0] != b'.';
-        let path = parts.last().copied().unwrap_or_default();
-        if staged && !selected.contains(path) {
+        if xy.as_bytes()[0] != b'.'
+            && (!selected.contains(path) || origin.is_some_and(|path| !selected.contains(path)))
+        {
             return Err("index contains staged paths outside this commit selection".into());
-        }
-        if renamed {
-            let old = records
-                .next()
-                .and_then(serde_json::Value::as_str)
-                .ok_or("incomplete Git rename record")?;
-            if old.contains('\u{fffd}') || (staged && !selected.contains(old)) {
-                return Err("index contains a renamed path outside this commit selection".into());
-            }
         }
     }
     Ok(())
@@ -1209,42 +1208,29 @@ mod tests {
 
     #[test]
     fn unrelated_staged_paths_and_rename_sources_are_refused() {
+        let entry = |kind, xy, path, origin: Option<&str>| serde_json::json!({"kind":kind,"xy":xy,"path":path,"origin":origin});
+        let check = |entries: Vec<serde_json::Value>, paths: &[String]| {
+            check_staged_paths(&serde_json::json!({"path_records":entries}), paths)
+        };
         let selected = vec!["a file".into()];
-        let ordinary = |xy, path| format!("1 {xy} N... 100644 100644 100644 aaa bbb {path}");
         assert!(
-            check_staged_paths(
-                &serde_json::json!({"records":[ordinary(".M","other"),ordinary("M.","a file")]}),
+            check(
+                vec![
+                    entry("1", ".M", "other", None),
+                    entry("1", "M.", "a file", None)
+                ],
                 &selected
             )
             .is_ok()
         );
-        assert!(
-            check_staged_paths(
-                &serde_json::json!({"records":[ordinary("M.","other")]}),
-                &selected
-            )
-            .is_err()
-        );
-        let rename = "2 R. N... 100644 100644 100644 aaa bbb R100 a file";
-        assert!(
-            check_staged_paths(
-                &serde_json::json!({"records":[rename,"old file"]}),
-                &selected
-            )
-            .is_err()
-        );
-        assert!(check_staged_paths(&serde_json::json!({"records":[rename]}), &selected).is_err());
-        assert!(
-            check_staged_paths(
-                &serde_json::json!({"records":[rename,"old file"]}),
-                &["a file".into(), "old file".into()]
-            )
-            .is_ok()
-        );
-        assert!(
-            check_staged_paths(&serde_json::json!({"records":["u UU conflict"]}), &selected)
-                .is_err()
-        );
+        assert!(check(vec![entry("1", "M.", "other", None)], &selected).is_err());
+        let rename = entry("2", "R.", "a file", Some("old file"));
+        assert!(check(vec![rename.clone()], &selected).is_err());
+        assert!(check(vec![rename.clone()], &["old file".into()]).is_err());
+        assert!(check(vec![rename], &["a file".into(), "old file".into()]).is_ok());
+        assert!(check(vec![entry("2", "R.", "a file", None)], &selected).is_err());
+        assert!(check(vec![entry("u", "UU", "a file", None)], &selected).is_err());
+        assert!(check_staged_paths(&serde_json::json!({"records": []}), &selected).is_err());
     }
 
     #[test]

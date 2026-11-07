@@ -248,6 +248,11 @@ pub(crate) fn subagent_provider_params(
 }
 
 impl SubagentAuthorization {
+    #[cfg(feature = "hooks")]
+    pub(crate) fn hook_permission(&self) -> Option<PermCheck> {
+        self.permission.clone()
+    }
+
     pub(crate) fn new(
         permission: Option<PermCheck>,
         ask_tx: Option<AskSender>,
@@ -1576,6 +1581,12 @@ pub(crate) async fn build_explore_agent_with_suffix(
         inner,
         #[cfg(feature = "skills")]
         skill_services,
+    );
+    #[cfg(feature = "hooks")]
+    let agent = agent.with_hook_routing(
+        authorization.hook_permission(),
+        #[cfg(feature = "mcp")]
+        Default::default(),
     );
     #[cfg(feature = "agent-skills")]
     let agent = match instructions {

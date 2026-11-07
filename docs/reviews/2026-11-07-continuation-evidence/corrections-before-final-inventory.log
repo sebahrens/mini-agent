@@ -1,0 +1,90 @@
+   Compiling mini-agent v1.12.0 (/Users/seb/projects/mini-agent)
+    Finished `test` profile [unoptimized] target(s) in 53.60s
+     Running unittests src/main.rs (target/debug/deps/mini_agent-eb54318180c9c0b0)
+
+running 43 tests
+test extras::acp::protocol_tests::acp_context_length_rejection_compacts_once_and_resumes ... ok
+test extras::acp::protocol_tests::actual_acp_prompt_hook_envelope_uses_protocol_id_and_empty_session_path ... ok
+test extras::hooks::backend::tests::agent_backend_uses_current_read_deny_instead_of_startup_allow ... ok
+test extras::js::supervisor::worker_exit_tests::buffered_terminal_survives_clean_exit_and_keeps_validation ... FAILED
+test extras::r#loop::headless::persistence_tests::final_loop_iteration_honours_background_exit_grace_and_zero_wait ... goal: budget limited — the goal reached its configured budget (round 1 of 1)
+goal: budget limited — the goal reached its configured budget (round 1 of 1)
+ok
+test extras::subagents::task_tool::child_continuation_tests::stop_hook_continuation_keeps_history_and_only_remaining_exploration_turns ... ok
+test extras::subagents::task_tool::tests::report_contract_actual_task_requests_once_for_code_and_twice_for_repair ... ok
+test startup::tests::headless_context_length_rejection_compacts_once_and_retries_once ... context limit reached; compacting the headless session and retrying once...
+ok
+test startup::tests::headless_gemini_context_length_rejection_compacts_once_and_retries_once ... context limit reached; compacting the headless session and retrying once...
+ok
+test tests::subprocess_inventory_tests::boundary_validation_fails_closed_for_unclassified_multiline_and_ufcs_terminals ... ok
+test tests::subprocess_inventory_tests::current_subprocess_inventory_accepts_exact_broker_and_rejects_cross_family_classes ... ok
+test tests::subprocess_inventory_tests::macro_non_process_identity_binds_full_nesting_chain ... ok
+test tests::subprocess_inventory_tests::macro_non_process_identity_binds_name_receiver_and_shape ... ok
+test tests::subprocess_inventory_tests::macro_non_process_identity_structurally_binds_exact_tokens ... ok
+test tests::subprocess_inventory_tests::path_provenance_fails_closed_for_self_prefix_namespace_collisions ... ok
+test tests::subprocess_inventory_tests::process_creation_raw_inventory_rejects_a_guard_dropped_before_spawn ... ok
+test tests::subprocess_inventory_tests::process_creation_raw_inventory_rejects_guards_across_suspension_and_deferral ... ok
+test tests::subprocess_inventory_tests::process_creation_raw_inventory_rejects_locally_defined_deferred_macros ... ok
+test tests::subprocess_inventory_tests::process_creation_raw_inventory_rejects_macro_deferred_terminals ... ok
+test tests::subprocess_inventory_tests::process_creation_raw_inventory_rejects_new_unguarded_helpers ... ok
+test tests::subprocess_inventory_tests::process_creation_raw_terminals_are_exact_and_guard_dominated ... ok
+test tests::subprocess_inventory_tests::production_source_excludes_test_only_modules ... ok
+test tests::subprocess_inventory_tests::production_subprocess_sites_have_a_trust_classification ... ok
+test tests::subprocess_inventory_tests::subprocess_inventory_rejects_site_specific_relabels_in_mixed_files ... ok
+test tests::subprocess_inventory_tests::token_terminal_discovery_distinguishes_guarded_calls_and_ignores_text ... ok
+test tests::subprocess_inventory_tests::token_terminal_discovery_does_not_trust_process_alias_spelling ... ok
+test tests::subprocess_inventory_tests::token_terminal_discovery_fails_closed_after_opaque_module_imports ... ok
+test tests::subprocess_inventory_tests::token_terminal_discovery_normalizes_raw_terminal_identifiers ... ok
+test tests::subprocess_inventory_tests::token_terminal_discovery_rejects_aliased_macro_method_ident_indirection ... ok
+test tests::subprocess_inventory_tests::token_terminal_discovery_rejects_inferred_macro_method_ident_indirection ... ok
+test tests::subprocess_inventory_tests::token_terminal_discovery_rejects_macro_method_ident_indirection ... ok
+test tests::subprocess_inventory_tests::token_terminal_discovery_rejects_multiline_creation_lock_bypasses ... ok
+test tests::subprocess_inventory_tests::token_terminal_discovery_rejects_nested_macro_method_ident_indirection ... ok
+test tests::subprocess_inventory_tests::token_terminal_discovery_rejects_process_function_item_indirection ... ok
+test tests::subprocess_inventory_tests::token_terminal_discovery_rejects_std_and_tokio_ufcs_bypasses ... ok
+test tests::subprocess_inventory_tests::token_terminal_discovery_resolves_process_type_aliases_and_module_reexports ... ok
+test tests::subprocess_inventory_tests::windows_capable_production_process_terminals_use_creation_boundary ... FAILED
+test ui::app::plan_approval_tests::ask_user_actual_pressure_restart_preserves_the_preclaimed_main_slot_and_budget_profile ... ok
+test ui::app::plan_approval_tests::context_length_rejection_compacts_once_and_resumes_the_tui_turn ... ok
+test ui::app::plan_approval_tests::real_token_boundary_below_local_budget_compacts_and_continues ... ok
+test ui::app::plan_approval_tests::steering_compaction_presentation_failure_restores_pending_text ... ok
+test ui::app::plan_approval_tests::token_boundary_with_no_old_prefix_disables_repeated_noop_relief ... ok
+test ui::app::plan_approval_tests::usd_budget_actual_midturn_compaction_reuses_account_and_prices_before_http_and_write ... ok
+
+failures:
+
+---- extras::js::supervisor::worker_exit_tests::buffered_terminal_survives_clean_exit_and_keeps_validation stdout ----
+
+thread 'extras::js::supervisor::worker_exit_tests::buffered_terminal_survives_clean_exit_and_keeps_validation' (66942646) panicked at src/extras/js/tests/worker_exit.rs:67:13:
+__verification_internal__: did not exit before read; read=Ok(WireFrame { protocol_version: 12, build_id: BuildIdentity("1.12.0+9c218964954070bf580e7f28773519a6df8bbc5f31065a07e1307aac91660bda"), invocation_id: Some(InvocationId("exit-ordering")), sequence: 3, message: VerificationResult(VerificationResult { passed: false, cases: [VerificationCaseResult { case_id: "embedded-0", passed: false, diagnostic: Some(Diagnostic { class: Internal, stage: Verification, script_role: EmbeddedTest, exception_class: None, line: None, column: None, hint: None }) }, VerificationCaseResult { case_id: "held-out-fault", passed: false, diagnostic: Some(Diagnostic { class: Internal, stage: Verification, script_role: HeldOutTest, exception_class: None, line: None, column: None, hint: None }) }], loader_version: 1 }) }), exit=Ok(Some(ExitStatus(unix_wait_status(0))))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- tests::subprocess_inventory_tests::windows_capable_production_process_terminals_use_creation_boundary stdout ----
+
+thread 'tests::subprocess_inventory_tests::windows_capable_production_process_terminals_use_creation_boundary' (66944147) panicked at src/tests/subprocess_inventory_tests.rs:7248:5:
+Windows-capable production process terminals bypass the crate creation boundary: [
+    "src/extras/mcp/headers_helper.rs:146 unrecognized macro context 4c8b85e6eb6ef8da3e0680afc3ba5a877bbfe732b9150a963865f94a5e0dc7de#1 for status terminal",
+    "src/extras/mcp/headers_helper.rs:149 unrecognized macro context 4c8b85e6eb6ef8da3e0680afc3ba5a877bbfe732b9150a963865f94a5e0dc7de#1 for output terminal",
+    "src/extras/mcp/headers_helper.rs:149 unrecognized macro context 4c8b85e6eb6ef8da3e0680afc3ba5a877bbfe732b9150a963865f94a5e0dc7de#1 for output terminal",
+    "src/extras/mcp/headers_helper.rs:149 unrecognized macro context 4c8b85e6eb6ef8da3e0680afc3ba5a877bbfe732b9150a963865f94a5e0dc7de#1 for status terminal",
+    "src/extras/mcp/headers_helper.rs:150 unrecognized macro context 4c8b85e6eb6ef8da3e0680afc3ba5a877bbfe732b9150a963865f94a5e0dc7de#1 for status terminal",
+    "src/extras/mcp/headers_helper.rs:153 unrecognized macro context 4c8b85e6eb6ef8da3e0680afc3ba5a877bbfe732b9150a963865f94a5e0dc7de#1 for output terminal",
+    "src/extras/mcp/headers_helper.rs:155 unrecognized macro context 4c8b85e6eb6ef8da3e0680afc3ba5a877bbfe732b9150a963865f94a5e0dc7de#1 for status terminal",
+    "src/extras/mcp/headers_helper.rs:155 unrecognized macro context 4c8b85e6eb6ef8da3e0680afc3ba5a877bbfe732b9150a963865f94a5e0dc7de#1 for output terminal",
+    "src/extras/mcp/headers_helper.rs:156 unrecognized macro context 4c8b85e6eb6ef8da3e0680afc3ba5a877bbfe732b9150a963865f94a5e0dc7de#1 for output terminal",
+    "src/extras/mcp/headers_helper.rs:156 unrecognized macro context 4c8b85e6eb6ef8da3e0680afc3ba5a877bbfe732b9150a963865f94a5e0dc7de#1 for status terminal",
+    "src/extras/mcp/server.rs:870 unrecognized macro context 5060a4fa982c2dc00234a99b857bcea723113ca93491f3804c117a2b99113a98#1 for status terminal",
+    "src/extras/mcp/server.rs:875 unrecognized macro context 5060a4fa982c2dc00234a99b857bcea723113ca93491f3804c117a2b99113a98#1 for status terminal",
+    "src/extras/mcp/server.rs:880 unrecognized macro context 5060a4fa982c2dc00234a99b857bcea723113ca93491f3804c117a2b99113a98#1 for status terminal",
+    "src/extras/mcp/server.rs:882 unrecognized macro context 5060a4fa982c2dc00234a99b857bcea723113ca93491f3804c117a2b99113a98#1 for status terminal",
+    "src/git/tool.rs:767 unrecognized macro context 1735ccb352820a631e226dc84e5f3519ce50986a4f53c07de077ce1528e49969#1 for output terminal",
+]
+
+
+failures:
+    extras::js::supervisor::worker_exit_tests::buffered_terminal_survives_clean_exit_and_keeps_validation
+    tests::subprocess_inventory_tests::windows_capable_production_process_terminals_use_creation_boundary
+
+test result: FAILED. 41 passed; 2 failed; 0 ignored; 0 measured; 6227 filtered out; finished in 54.12s
+
+error: test failed, to rerun pass `--bin mini-agent`

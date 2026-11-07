@@ -1,0 +1,746 @@
+{
+  "baseline": "eef3001c",
+  "scope": "Implemented 19 continuation findings plus eight prior post-fix findings (27 total). Final root source review and local validation complete; pushed-SHA hosted CI pending.",
+  "findings": [
+    {
+      "id": "BOUNDARIES-A-1",
+      "priority": 1,
+      "confidence": 0.98,
+      "title": "Explicit discovery directory roots bypass the read-deny pruning applied to ordinary walks",
+      "file": "src/agent/tools/grep.rs",
+      "start_line": 897,
+      "end_line": 931,
+      "related_locations": [
+        {
+          "file": "src/agent/tools/find_files.rs",
+          "start_line": 2095,
+          "end_line": 2120
+        },
+        {
+          "file": "src/agent/tools/list_dir.rs",
+          "start_line": 230,
+          "end_line": 252
+        },
+        {
+          "file": "src/agent/tools/grep.rs",
+          "start_line": 747,
+          "end_line": 763
+        },
+        {
+          "file": "src/agent/tools/mod.rs",
+          "start_line": 1585,
+          "end_line": 1611
+        }
+      ],
+      "scenario": "A read deny names a private directory exactly. Ordinary discovery from its parent prunes that directory. A request naming the denied directory itself or a descendant directory as its search root bypasses that pruning and can return file contents through grep, or file names through find_files/list_dir.",
+      "evidence": [
+        "walk_deny_filter snapshots read denies for discovery tools, but BoundWalker/BoundDirectory only evaluate the filter on entries below the requested root.",
+        "Directory root admission checks the discovery tool key; it does not apply the read-deny probe to the root or its ancestors. Exact directory deny patterns therefore never see that directory when it is supplied as root.",
+        "Grep already checks the same root/ancestor policy for an explicitly named regular file with file_hidden_by_deny_filter, but omits equivalent directory-root validation.",
+        "Root independently confirmed the missing ancestor filter by source; an owned-fixture actual-tool regression probe is supplied, awaiting root Cargo execution."
+      ],
+      "mitigation": "Apply the discovery read-deny probe to the requested directory and the relevant ancestor chain before creating/using its walker, consistently for workspace-relative and canonical absolute roots; share the existing explicit-file ancestor logic or a common helper.",
+      "acceptance_tests": [
+        "With an exact read-denied directory containing a fixture match, ordinary parent-root grep prunes it and explicitly naming the directory or a descendant also refuses/hides it.",
+        "Cover grep/find_files/list_dir, absolute and relative targets, tool-specific and read denies, and a permitted sibling to prove filtering does not overreach.",
+        "Keep no_ignore=true subordinate to the same denies."
+      ],
+      "regression_artifact": "/private/tmp/mini-agent-continuation-discovery-root-probe.rs",
+      "regression_artifact_destination": "src/agent/tools/grep.rs",
+      "validation": "Source/indexed call-path proof only from this reviewer; root runtime validation pending before final P1 filing.",
+      "related_beads": [
+        "mini-agent-06im2",
+        "mini-agent-c1o7m"
+      ],
+      "dedup": "Not in eight p0h9g.* post-fix findings.",
+      "review_report": "boundaries-a",
+      "bead": "mini-agent-gkqd4.1",
+      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+    },
+    {
+      "id": "runtime-cont-a-1",
+      "priority": 2,
+      "confidence": 1.0,
+      "title": "Ephemeral headless sessions discard completed turns needed by later stream inputs and retained goal rounds",
+      "locations": [
+        {
+          "file": "src/startup.rs",
+          "line_start": 3250,
+          "line_end": 3269
+        },
+        {
+          "file": "src/extras/goal/driver.rs",
+          "line_start": 1244,
+          "line_end": 1254
+        },
+        {
+          "file": "src/startup.rs",
+          "line_start": 4915,
+          "line_end": 4922
+        }
+      ],
+      "failure_scenario": "Use an OpenRouter/OpenAI compatible non-native provider with --no-session and --input-format stream-json. After a successful first prompt, finish_print_model skips both in-memory persist_headless_turn and charge_usage_delta because no_session=true. The next input line reuses self.session and converts its unchanged history, so the model cannot see the preceding prompt, answer or tool results. The same guard in goal::driver::persist_round causes a default Continue-mode ephemeral goal to relaunch with no completed-round conversation. Earlier context-relief segments happen to persist in memory, making retained context depend on whether a relief occurred.",
+      "evidence": [
+        "CLI describes --no-session as Ephemeral mode, do not save (cli.rs849), not stateless prompts. dispatch_print_stream_input says one turn per line in one session (startup.rs2554-2560), mutates self.cli.message and calls self.dispatch_print repeatedly (2626).",
+        "The next print builds history from self.session at startup.rs3005 onward. finish_print_model3250 wraps transcript mutation and charge3260-3269 in !no_session alongside disk persistence.",
+        "goal::driver::persist_round1244 returns Ok immediately under no_session; startup4871 sets persisted=true and next_round(Continue) produces HistoryMode::Retained, so next_history converts that same unchanged session.",
+        "Native headless binding commits canonical in-memory records in run_bound_headless_segment independently, so this is specifically the non-native path and cannot be dismissed as universal intended ephemeral behavior."
+      ],
+      "fix_acceptance_tests": [
+        "Two actual stream-json inputs under --no-session and a non-native scripted provider: second HTTP request must contain first prompt, final reply and completed tool results; assert no session/chat-history files are created.",
+        "Two Continue-mode goal rounds under --no-session: second provider request retains first round conversation and in-memory Session totals reflect all rounds exactly once.",
+        "Include user images and a turn that crossed context relief so in-memory history is identical in contract regardless of compaction."
+      ],
+      "probe_artifact": "/private/tmp/mini-agent-continuation-runtime-probes.rs",
+      "probe_tests": [
+        "continuation_runtime_a_probe_ephemeral_finalizer_keeps_in_memory_history",
+        "continuation_runtime_a_probe_ephemeral_goal_round_keeps_retained_history"
+      ],
+      "validation": "Complete source call-path proof; probes call actual finalizer/direct round recorder. Root owns Cargo execution; not run by this agent.",
+      "related_beads": [
+        "mini-agent-wr9nw",
+        "mini-agent-sgzh0"
+      ],
+      "new_vs_open_p0h9g": "Distinct from all eight previously open findings.",
+      "review_report": "runtime-a",
+      "bead": "mini-agent-gkqd4.2",
+      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+    },
+    {
+      "id": "runtime-cont-a-2",
+      "priority": 2,
+      "confidence": 0.99,
+      "title": "A failed final goal-round save makes print finalization append and charge the same round again",
+      "locations": [
+        {
+          "file": "src/extras/goal/driver.rs",
+          "line_start": 1247,
+          "line_end": 1254
+        },
+        {
+          "file": "src/startup.rs",
+          "line_start": 4850,
+          "line_end": 4871
+        },
+        {
+          "file": "src/startup.rs",
+          "line_start": 3259,
+          "line_end": 3269
+        }
+      ],
+      "failure_scenario": "The goal final round finishes and the gate stops it. persist_round appends the round transcript and charges Session usage, but saving fails (temporary storage failure, unavailable sessions directory, or oversized persisted data). run_headless_goal_rounds_inner logs a warning and leaves persisted=false. It returns the same final HeadlessTurn. finish_print_model sees !already_persisted and appends every prompt/tool/result/reply again and charges the same usage again before retrying storage. If the transient failure clears, the resulting saved session contains duplicates and doubled Session token/cost counters; permanent failure still leaves live session state corrupt for later stream-json turns.",
+      "evidence": [
+        "persist_round mutates Session before calling save_session_recovering and returns Err without rollback (driver.rs1247-1267).",
+        "The headless goal caller sets persisted=true only in the success else branch (startup.rs4850-4871), even though mutation already happened on Err. It does not stop the normal finalizer handoff after save error.",
+        "finish_print_model explicitly interprets persisted=false as not yet recorded/charged and repeats persist_headless_turn plus charge_usage_delta (3259-3269).",
+        "Existing loop_persistence_failures_are_reported_without_hiding_the_turn_failure checks only returned error text, while successful_loop_iterations_accumulate_once_in_the_saved_session covers only successful saves. Neither covers a failed first save followed by finalization."
+      ],
+      "fix_acceptance_tests": [
+        "Force one actual goal-round save failure after live transcript mutation, clear the failure, then run actual print finalization. Each prompt, tool call/result and reply must occur once and Session usage must be charged once.",
+        "Keep disk persistence failure distinct from in-memory round commit, so retrying save cannot repeat recording/accounting. Preserve visible failure reporting when the final retry also fails.",
+        "Exercise a retained stream-json session after the failure to ensure subsequent prompts see a single completed-effect transcript."
+      ],
+      "probe_artifact": "/private/tmp/mini-agent-continuation-runtime-probes.rs",
+      "probe_tests": [
+        "continuation_runtime_a_probe_failed_goal_save_does_not_duplicate_final_round"
+      ],
+      "validation": "Static complete mutation/error/finalizer path proof; supplied probe triggers real persist_round error then actual finish_print_model. Root owns Cargo; no execution by this agent.",
+      "related_beads": [
+        "mini-agent-ylcw5"
+      ],
+      "new_vs_open_p0h9g": "Distinct from financial ledger receipt dedup bugs: this duplicates Session transcript and legacy Session counters at the frontend round handoff.",
+      "review_report": "runtime-a",
+      "bead": "mini-agent-gkqd4.3",
+      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+    },
+    {
+      "id": "runtime-cont-a-3",
+      "priority": 2,
+      "confidence": 1.0,
+      "title": "Headless background-task cleanup uses prompt boundaries instead of the actual session lifetime",
+      "locations": [
+        {
+          "file": "src/startup.rs",
+          "line_start": 3325,
+          "line_end": 3327
+        },
+        {
+          "file": "src/session/mod.rs",
+          "line_start": 1239,
+          "line_end": 1243
+        },
+        {
+          "file": "src/extras/subagents/background.rs",
+          "line_start": 1180,
+          "line_end": 1205
+        },
+        {
+          "file": "src/extras/subagents/task_tool.rs",
+          "line_start": 2846,
+          "line_end": 2858
+        }
+      ],
+      "failure_scenario": "In multi-turn stream-json, finish_print_model runs exit wait and close_background_tasks after the first prompt, while the outer input loop intends to keep one Session until EOF. Pool::close permanently sets closing=true and stops observation admission, and close_background_tasks retains that pool in Session. Next prompt Run::for_session calls Pool::for_session, which returns the same closed pool; foreground task admission then fails background session is closing, as does any new background task. This can happen after an ordinary first prompt without a task because Run::for_session always initializes the pool. A related opposite seam exists for --loop: the loop-specific path never performs the configured headless exit wait; dropping its saved_session pool cancels last-round detached work immediately instead of giving it headless_exit_wait_secs grace.",
+      "evidence": [
+        "dispatch_print_stream_input reuses self.session until EOF (startup2554-2640). finish_print_model3325-3327 runs wait_background_tasks_before_exit and closes its pool on every successful input turn; outer dispatch already has real exit cleanup at2505-2507.",
+        "Session::close_background_tasks borrows &self and calls pool.close without removing/resetting it (session/mod.rs1239-1243). Only reset_background_tasks clears pool identity, and it is not called by the stream driver.",
+        "Pool::close sets state.closing=true and observations.stop_admission (background.rs1183-1185). Pool::for_session immediately returns existing matching session pool without reopening it (635-644). TaskTool foreground lane checks ensure_open at2852 and returns subagent admission refused when closing.",
+        "Run::for_session always calls Pool::for_session (spend/run.rs154), so no first-turn task is necessary for this poisoning.",
+        "Loop variant: dispatch_loop invokes run_headless_loop and returns (startup3454-3527); run_headless_loop stores a mutable saved_session clone, awaits rounds, and drops it (loop/headless.rs109-132). Neither path invokes the headless wait. Pool::Drop1382 cancels scopes and transfers cleanup fallback rather than waiting the documented grace period."
+      ],
+      "fix_acceptance_tests": [
+        "Two stream-json prompts in the same session: run a foreground task and a new background task on second prompt; both must be admitted. First-turn task may be absent. Test persisted and ephemeral rows.",
+        "A background task started by first input can remain alive for later task_send/task_result until its normal completion or explicit cancellation. EOF still performs bounded grace wait and exact cancellation/join.",
+        "--loop on a non-native provider with a short delayed task in the final iteration waits per headless_exit_wait_secs and captures its result before final save; a zero configured wait cancels promptly with accurate terminal history."
+      ],
+      "probe_artifact": "/private/tmp/mini-agent-continuation-runtime-probes.rs",
+      "probe_tests": [
+        "continuation_runtime_a_probe_stream_turn_does_not_permanently_close_task_pool"
+      ],
+      "validation": "Stream variant complete call-path proof plus actual finalizer/pool-reuse probe supplied for root execution. Loop variant source-proven omission of configured grace path, not independently run. No Cargo by this agent.",
+      "related_beads": [
+        "mini-agent-5ezmf"
+      ],
+      "new_vs_open_p0h9g": "Distinct from MCP server stdout cancellation/EOF issue; this is internal headless Session pool lifecycle across normal prompt boundaries.",
+      "review_report": "runtime-a",
+      "bead": "mini-agent-gkqd4.4",
+      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+    },
+    {
+      "id": "BOUNDARIES-A-2",
+      "priority": 2,
+      "confidence": 0.99,
+      "title": "Untrusted benign model aliases can silently select a different provider endpoint",
+      "file": "src/config/load.rs",
+      "start_line": 30,
+      "end_line": 70,
+      "related_locations": [
+        {
+          "file": "src/cli.rs",
+          "start_line": 1509,
+          "end_line": 1523
+        },
+        {
+          "file": "src/config/load.rs",
+          "start_line": 2586,
+          "end_line": 2611
+        },
+        {
+          "file": "src/startup.rs",
+          "start_line": 1471,
+          "end_line": 1475
+        }
+      ],
+      "scenario": "The operator selects a local quick-model alias with no explicit provider field, and also has another configured alias for a remote/custom provider. An untrusted project sets only model to the remote alias. Because model is benign, the override applies without trust and Cli resolves the different alias provider, sending the session prompt/context to that endpoint.",
+      "evidence": [
+        "BENIGN_PROJECT_CONFIG_KEYS includes model. apply_captured_override merges benign settings and can return NoSensitiveKeys before content-bound trust.",
+        "Cli::resolve_provider uses cfg.model quick-model alias provider when CLI/config provider is absent; this is documented supported alias selection.",
+        "No provenance/trust check distinguishes the benign project alias from an operator-selected alias at that resolver. Startup uses resolve_provider_and_model for the session.",
+        "The nearby goal.judge carve-out explicitly cites changing the endpoint receiving conversation data as security-sensitive, but model has no equivalent protection.",
+        "Root independently confirmed this pure split/merge-to-provider-resolution call path."
+      ],
+      "mitigation": "Keep benign project model changes on the operator-selected provider, or classify alias changes that can select a provider as sensitive. Preserve ordinary same-provider raw model selection and explicit CLI precedence.",
+      "acceptance_tests": [
+        "Pure operator config with local/default alias plus existing remote alias: merging an untrusted project/local model override cannot change resolved provider.",
+        "Trust approval may permit an explicitly sensitive provider selection; explicit CLI provider/quick-model selection retains precedence.",
+        "Exercise headless load as well as pure split/merge and verify provenance remains accurate."
+      ],
+      "regression_artifact": "/private/tmp/mini-agent-continuation-model-trust-probe.rs",
+      "regression_artifact_destination": "src/config/load.rs",
+      "validation": "Pure source/indexed proof; root runtime probe supplied and pending. No network or real credentials used.",
+      "related_beads": [],
+      "dedup": "Not in eight p0h9g.* post-fix findings.",
+      "review_report": "boundaries-a",
+      "bead": "mini-agent-gkqd4.5",
+      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+    },
+    {
+      "id": "BOUNDARIES-A-3",
+      "priority": 2,
+      "confidence": 0.99,
+      "title": "Workspace-bound file tools block indefinitely opening a named pipe",
+      "file": "src/paths.rs",
+      "start_line": 1339,
+      "end_line": 1355,
+      "related_locations": [
+        {
+          "file": "src/agent/tools/read.rs",
+          "start_line": 384,
+          "end_line": 395
+        },
+        {
+          "file": "src/agent/tools/edit.rs",
+          "start_line": 1423,
+          "end_line": 1427
+        },
+        {
+          "file": "src/agent/tools/write.rs",
+          "start_line": 331,
+          "end_line": 336
+        },
+        {
+          "file": "src/extras/js/host.rs",
+          "start_line": 4348,
+          "end_line": 4358
+        },
+        {
+          "file": "src/extras/lsp/query.rs",
+          "start_line": 114,
+          "end_line": 125
+        }
+      ],
+      "scenario": "A workspace path is a FIFO with no writer. read/edit, or write to the existing path, use WorkspaceBinding::open_relative; it performs a blocking read-only open before a regular-file check. The call never reaches its normal denial/type handling, and cancellation cannot interrupt that blocking OS open.",
+      "evidence": [
+        "open_relative selects open_file_no_follow_impl(...,false); O_NONBLOCK is enabled only for regular_only=true.",
+        "read uses that synchronous open before permission; edit uses it on a tracked blocking worker before permission. write uses it in the existing-target probe after permission, including overwrite=false.",
+        "Production JS bound-write validation also opens with open_relative, and LSP callers can block before their subsequent is_file checks. These are affected callers of one shared root cause.",
+        "Ambient fs::open_stable_file already uses O_NONBLOCK and regular-file validation; notebook uses open_regular_relative and has a controlled FIFO rejection regression, showing the intended safe alternative.",
+        "Tracked blocking jobs retain AgentWorkScope registrations until completion; a dropped/cancelled edit/write cannot make wait_idle retire the still-blocked opener."
+      ],
+      "mitigation": "Use nonblocking regular-file opens for file-tool/JS/LSP data paths, or make generic capability opens nonblocking and require the consumers to reject non-regular nodes before reads. Preserve no-follow identity checks and recapture behavior.",
+      "acceptance_tests": [
+        "A FIFO with no writer is rejected promptly for bound read/edit/write, including denied permission and overwrite=false cases; interruption/turn retirement completes without a writer arriving.",
+        "Retain positive regular-file tests, final/parent symlink refusal and path-replacement races.",
+        "Audit all open_relative consumers, including JS bound reads/writes and LSP sync, for consistent regular-file preconditions."
+      ],
+      "regression_artifact": "/private/tmp/mini-agent-continuation-fifo-probe.rs",
+      "regression_artifact_destination": "src/paths.rs",
+      "validation": "Indexed/shared-helper source proof. Root has a bounded fixture probe which releases the FIFO opener before asserting, leaving no blocked thread. This reviewer ran no FIFO operation or Cargo.",
+      "related_beads": [
+        "mini-agent-vvzsy (different worker Seatbelt FIFO scope; do not merge)"
+      ],
+      "dedup": "Not in eight p0h9g.* post-fix findings.",
+      "review_report": "boundaries-a",
+      "bead": "mini-agent-gkqd4.6",
+      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+    },
+    {
+      "priority": 2,
+      "title": "Bind MCP hook routes to the owning manager instead of a global server-name slot",
+      "file": "src/extras/hooks/backend.rs",
+      "line_start": 141,
+      "line_end": 150,
+      "confidence": 0.99,
+      "scenario": "A parent owns an MCP server named guard. A persona child or second ACP session connects another guard instance; from_handles overwrites the global registry entry. Parent hooks now reach the child/other workspace server. When that manager is dropped, parent hooks report not connected permanently even though the parent manager remains live.",
+      "evidence": [
+        "MCP_PEERS is a process-global HashMap<String,McpPeer> keyed only by server name (backend.rs125-136); register_mcp_peers unconditionally inserts/replaces by that name (141-151).",
+        "Every McpClientManager::from_handles calls this registration (mcp/mod.rs169), including independently connected persona managers (subagents/builder.rs693). ACP session managers likewise each connect with their captured workspace.",
+        "call_mcp resolves only that global name (backend.rs224-228), with no current work-scope/workspace/manager key. Dropping the newer handle retires its ServerLink; no unregister/restoration exists. ensure_connected then returns retired and call_mcp reports not connected (239-245), ignoring the live parent.",
+        "The registry also stores only peer/link and drops the retained source/liveness witnesses ordinary McpTool and RpcClient use. A scoped capture should retain those checks rather than introducing another raw-peer route.",
+        "Existing mini-agent-bu3wp reconnect fixture exercises one registered server only; it cannot expose multiple manager ownership."
+      ],
+      "fix": "Capture a manager/session-scoped hook capability registry in the work scope/dispatcher and resolve hooks through that owner, retaining the same source and liveness witnesses as ordinary MCP operations. Retiring a child must not alter parent routes.",
+      "acceptance_tests": [
+        "Use two local fixture MCP connections with identical names and distinct labels/workspaces. Parent and child hooks must reach their own connection concurrently. Drop the child, then prove parent hooks still reach its live manager. Cover replacing/removing/revoking one manager without affecting the other."
+      ],
+      "probe": "/private/tmp/mini-agent-continuation-mcp-hook-probe.rs (insert into existing reconnect tests; local fixture only)",
+      "related_beads": [
+        "mini-agent-bu3wp",
+        "mini-agent-omfna",
+        "mini-agent-pm3rh",
+        "mini-agent-su92b"
+      ],
+      "review_report": "integrations-a",
+      "bead": "mini-agent-gkqd4.7",
+      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+    },
+    {
+      "priority": 2,
+      "title": "Carry the current logical session identity into generic hook envelopes",
+      "file": "src/extras/hooks/mod.rs",
+      "line_start": 188,
+      "line_end": 199,
+      "confidence": 0.99,
+      "scenario": "Resume/import another TUI session, or run ordinary tools in two ACP sessions. Generic PreToolUse/PostToolUse/PermissionRequest/Stop hooks continue receiving the startup session id and transcript path, or a shared process UUID and empty path in ACP. A hook reading session_path evaluates the wrong conversation; per-session state and audit correlation mix sessions.",
+      "evidence": [
+        "session_context reads process-global ACTIVE_SESSION_CONTEXT, otherwise a OnceLock PROCESS_SESSION_ID and empty path (188-199). HookedTool::build_ctx calls it at decorator.rs45; best_effort_ctx calls it at mod.rs500 and feeds Stop/PermissionRequest/etc.",
+        "The only production set_active_session caller is startup.rs2204, confirmed by rg and code-indexer callers. There is no per-turn session identity in the current work-scope binding.",
+        "SlashCtx::replace_session replaces self.session at ui/slash/mod.rs195 and updates current goal/advisor, but never updates hook session identity. ACP creates per-session histories and sets only work_scope.set_hook_execution_root (acp/mod.rs5236).",
+        "ACP native SessionStart builds an explicit correct HookCtx at5418; generic later tool hooks read the global fallback, so those envelopes disagree for the same turn.",
+        "Closed pm3rh/su92b fix task-local cwd only (dispatcher::policy_context changes ctx.cwd); azbn wired the initial startup session_path, not session replacement/ACP correlation. c75u1.21 covers goal metadata rather than the session identity fields."
+      ],
+      "fix": "Bind session id, session path and relevant permission mode to each turn/work scope, with exact captured session identity for deferred lifecycle work. Update the process fallback on successful TUI replacement without letting concurrent ACP/child turns overwrite one another.",
+      "acceptance_tests": [
+        "Capture actual hook envelopes before and after SlashCtx session replacement and assert the new id/path. Run two ACP fixture sessions concurrently and assert each generic PreToolUse and Stop envelope matches its own ACP SessionId and saved transcript path. Include deferred async hooks so old work cannot adopt a successor identity."
+      ],
+      "related_beads": [
+        "mini-agent-azbn",
+        "mini-agent-pm3rh",
+        "mini-agent-su92b",
+        "mini-agent-c75u1.21"
+      ],
+      "review_report": "integrations-a",
+      "bead": "mini-agent-gkqd4.8",
+      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+    },
+    {
+      "priority": 2,
+      "title": "Preserve Git ignore ancestor and precedence rules in hook-agent reads",
+      "file": "src/extras/hooks/backend.rs",
+      "line_start": 585,
+      "line_end": 590,
+      "confidence": 0.99,
+      "scenario": "The workspace root excludes build/ in .gitignore. build/.gitignore contains !config.json. Git still ignores build/config.json because an excluded parent directory cannot be reopened by an ignore file inside it, but is_vcs_ignored resets ignored=false and read_hook_file sends that otherwise ignored file to the hook model.",
+      "evidence": [
+        "is_vcs_ignored independently loads every ancestor directory ignore file, including files inside an already excluded directory, and lets any deeper whitelist reset ignored=false (556-593).",
+        "read_hook_file relies on this boolean as its only VCS-ignore refusal at617, before opening and returning the file text. A normally named config.json with private generated values avoids the separate filename heuristic.",
+        "Scratch Git fixture at /private/tmp/mini-agent-hook-ignore-probe-bwhti9ci confirms git check-ignore -v build/config.json exits0 and attributes exclusion to root .gitignore:1:build/. Evidence at /private/tmp/mini-agent-hook-ignore-fixture.txt.",
+        "The existing test covers *.log followed by sub/!keep.log under a visible parent, which is legal, but does not cover a wholly excluded parent directory.",
+        "The same implementation adds .git/info/exclude after .gitignore and .ignore (571-574), letting its lower-priority patterns override root whitelist rules. Preserve this precedence too when replacing the hand-rolled aggregation."
+      ],
+      "fix": "Use an ignore-policy evaluation that preserves excluded ancestors and the intended .ignore/.gitignore/info-exclude precedence. A nested file whitelist must not reopen an excluded directory; permitted re-inclusion must explicitly reopen the directory from a visible ancestor.",
+      "acceptance_tests": [
+        "Run the supplied actual read_hook_file probe: root build/ plus nested !config.json must refuse. Keep the existing visible-parent *.log/!keep.log success. Add an explicit legal parent reopening case and root .gitignore whitelist overriding .git/info/exclude."
+      ],
+      "probe": "/private/tmp/mini-agent-continuation-hook-ignore-probe.rs (insert into backend tests)",
+      "related_beads": [
+        "mini-agent-m9txi"
+      ],
+      "review_report": "integrations-a",
+      "bead": "mini-agent-gkqd4.9",
+      "post_implementation_followon": {
+        "finding": "Linked worktree .git is a gitfile, so literal .git/info/exclude misses common repository rules in hooks and native root/ancestor discovery.",
+        "evidence": "2026-11-07-continuation-evidence/linked-worktree-ignore-probe.json",
+        "correction": "Use shared bounded Git metadata resolution for repository roots and ancestors, preserve precedence and explicit no_ignore, fail closed for malformed metadata.",
+        "validation": "Native root/nested discovery, malformed metadata/no_ignore, hook read and precedence tests passed; Windows exact discovery and execution added to CI."
+      },
+      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+    },
+    {
+      "priority": 2,
+      "title": "Coalesce concurrent OAuth refreshes instead of failing sibling provider turns",
+      "file": "src/auth/oauth.rs",
+      "scenario": "When an expiring registration refresh holds the credential store lock through token and JWKS calls, concurrent access_token callers immediately fail with Provider credentials are busy. Provider preparation propagates this as a non-retryable instance error, terminating sibling turns although the refresh succeeds.",
+      "evidence": [
+        "Actual lock-contention probe failed: sibling access_token returned busy instead of the newly saved token. Error is not classified retryable.",
+        "Registration::access_token -> load_or_refresh -> LockedStore::open uses immediate try_lock; provider_http::prepare propagates failure before HTTP send."
+      ],
+      "fix": "Bound and coalesce concurrent refresh admission, preserving logout/account/revision fences and bounded cancellation. Avoid indefinite blocking or duplicating rotated refresh-token requests.",
+      "acceptance_tests": [
+        "Two simultaneous callers at expiry both receive the fresh credential after one refresh; no busy error.",
+        "Cancellation, cross-process contention, refresh failure and logout/replacement preserve existing credential fencing."
+      ],
+      "probe": "mini-agent-continuation-oauth-probe.rs",
+      "review_report": "root",
+      "bead": "mini-agent-gkqd4.10",
+      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+    },
+    {
+      "priority": 3,
+      "title": "Consume the actual one-record Git rename shape in native commit validation",
+      "file": "src/ui/slash/git.rs",
+      "line_start": 213,
+      "line_end": 221,
+      "confidence": 0.99,
+      "scenario": "A native /commit selection includes both old.txt and new.txt for a staged rename. Actual GitTool status emits a single string ending new.txt plus tab-orig-old.txt, but check_staged_paths treats that whole suffix as the destination and expects a second array element for the origin. It rejects the selected rename as an unrelated staged path, preventing the commit.",
+      "evidence": [
+        "git/tool.rs parse_status_records appends the origin to the rename record with record.push_str(\"\\torig: \") and consumes the NUL origin field (2474-2485). Status output therefore has one JSON string per rename, explicitly documented by the producer.",
+        "check_staged_paths still splits type2 record into10 space-delimited parts, compares parts.last() directly to selected (slash/git.rs203-215), then advances the records iterator to obtain the origin (217-221). The destination is actually new.txt\\torig: old.txt, so even selecting both real paths cannot satisfy this check.",
+        "Native commit executes this guard before staging and again immediately before commit (slash/git.rs639 and667). The model-facing Git commit operation itself does not have this mismatch.",
+        "Existing native guard tests fabricate [rename_record, old_filename] arrays, while producer tests explicitly assert one record ends with renamed.txt\\torig: old. No existing test composes the real GitTool::Status result with its native consumer."
+      ],
+      "fix": "Align native validation with the actual bounded status result shape, preferably use structured destination/origin metadata shared with the producer. Preserve checking both source and destination and never consume the next unrelated record. Handle literal tabs/newlines or explicitly reject ambiguous spellings with a clear reason.",
+      "acceptance_tests": [
+        "Run the supplied compositional fixture: actual GitTool status after git mv old.txt new.txt, both selected, must pass native staged-path validation. Reject when either rename path is outside selection. Include an unrelated staged record immediately after the rename and literal space/tab filename cases."
+      ],
+      "probe": "/private/tmp/mini-agent-continuation-native-rename-probe.rs (insert into git/tool.rs tests, cfg git-worktree)",
+      "related_beads": [
+        "mini-agent-1tv59",
+        "mini-agent-k4fem"
+      ],
+      "validation": "Source and indexed implementation confirmed; supplied compositional regression awaits root-coordinated Cargo.",
+      "review_report": "integrations-p4",
+      "bead": "mini-agent-gkqd4.11",
+      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+    },
+    {
+      "priority": 4,
+      "title": "Bound aggregate hook payloads after placeholder expansion",
+      "file": "src/extras/hooks/backend.rs",
+      "line_start": 355,
+      "line_end": 363,
+      "confidence": 0.95,
+      "scenario": "An otherwise accepted prompt hook repeats $ARGUMENTS throughout a source prompt below the32KiB setting cap. Each replacement copies a separately bounded64KiB event;2500 placeholders produce roughly156MiB before any provider request. MCP input templates below64KiB likewise repeat ${tool_response} and can multiply a normal bounded tool result into a very large JSON request.",
+      "evidence": [
+        "settings.rs caps the authored model prompt at32KiB and authored MCP input JSON at64KiB; these checks run before expansion.",
+        "build_model_prompt sanitizes the event once to64KiB, then instructions.replace(\"$ARGUMENTS\", &block) copies the block for every occurrence without an aggregate ceiling (backend.rs355-363). A25KiB source containing2500 markers remains admissible but allocates roughly164million output bytes.",
+        "substitute_event_values appends every resolved event string with push_str for every occurrence and recursively builds arrays/objects with no output budget (backend.rs158-200). run_mcp_tool sends that expanded object directly.",
+        "The outer asynchronous timeout cannot prevent the synchronous expansion allocation that occurs before the request future yields."
+      ],
+      "fix": "Introduce an explicit aggregate post-expansion byte budget for model and MCP hook requests. Check capacity before appending/copying and return a static bounded hook failure when expansion would exceed it; do not silently truncate trusted instructions or alter the operand values. Keep existing small multi-placeholder behavior.",
+      "acceptance_tests": [
+        "A permitted source template with many repeated placeholders and a large event must fail before allocating an oversized final payload or contacting a backend. Verify exact-limit success, over-limit refusal, UTF8 accounting and nested array/object expansion. Keep small repeated/missing-placeholder substitutions unchanged."
+      ],
+      "classification": "Low-priority robustness of an optional operator-authored configuration; no claim of a normal-use production outage or live backend test.",
+      "review_report": "integrations-p4",
+      "bead": "mini-agent-gkqd4.12",
+      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+    },
+    {
+      "id": "runtime-p4-1",
+      "priority": 4,
+      "confidence": 1.0,
+      "title": "Goal and compaction docs advertise native automatic headless goal/loop support that the runtime explicitly refuses",
+      "locations": [
+        {
+          "file": "docs/agent/CONFIG.md",
+          "line_start": 1741,
+          "line_end": 1746
+        },
+        {
+          "file": "docs/agent/GOALS.md",
+          "line_start": 7,
+          "line_end": 20
+        },
+        {
+          "file": "src/startup.rs",
+          "line_start": 3883,
+          "line_end": 3884
+        },
+        {
+          "file": "src/startup.rs",
+          "line_start": 3916,
+          "line_end": 3920
+        }
+      ],
+      "evidence": [
+        "CONFIG.md1746 explicitly says native replay relief resumes headless --loop and goal rounds. GOALS.md gives unqualified --goal headless examples.",
+        "run_bound_headless_segment refuses live native goals before provider dispatch (startup3916-3920); native loop path passes no publication ticket and fails startup-owner guard (3883-3884). Historical native-headless review identifies automatic native goal/loop ownership as unimplemented, which was deliberately excluded as a new functional defect in PassA."
+      ],
+      "impact": "Operators following the guide on a native Anthropic session select a currently unavailable execution path and receive an ownership error. This finding asks only to describe the existing boundary accurately, not implement the deferred feature.",
+      "acceptance": [
+        "Correct the provider/surface statement in CONFIG compaction section; add a concise supported-provider/history limitation and compatible-provider example beside headless GOALS examples.",
+        "Keep ordinary native print and supported TUI/ACP behavior described accurately without broad unsupported claims. No new runtime behavior required."
+      ],
+      "related_beads": [],
+      "validation": "Documentation/source contradiction directly checked; no runtime execution needed.",
+      "review_report": "runtime-p4",
+      "bead": "mini-agent-gkqd4.13",
+      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+    },
+    {
+      "id": "runtime-p4-2",
+      "priority": 4,
+      "confidence": 1.0,
+      "title": "Rewinding away the newest uncaptured edit leaves its skip reason attached to earlier unavailable checkpoints",
+      "locations": [
+        {
+          "file": "src/session/file_checkpoints.rs",
+          "line_start": 438,
+          "line_end": 453
+        },
+        {
+          "file": "src/session/file_checkpoints.rs",
+          "line_start": 462,
+          "line_end": 472
+        },
+        {
+          "file": "src/session/file_checkpoints.rs",
+          "line_start": 1084,
+          "line_end": 1086
+        }
+      ],
+      "scenario": "Turn1 has a READ-disallowed mutation and turn2 has an oversized mutation. skip() stores only the most recent global skip_reason, the turn2 size error. Rewind truncates turn2 and retire_from removes its skipped count, leaving turn1 alone. summary_from still appends the retired size error to the one surviving unavailable edit, even though READ authority was its actual reason.",
+      "evidence": [
+        "skip overwrites Data.skip_reason globally on every uncaptured mutation (1084-1086).",
+        "retire_from prunes skipped counts by turn but never updates/clears skip_reason (462-472). Session::truncate_to invokes this on rewind/undo.",
+        "summary_from counts only skipped.range(index..) but displays the unscoped global skip_reason (438-453). File restoration remains correctly fail-closed; only the diagnostic is wrong."
+      ],
+      "acceptance": [
+        "After removing the turn that supplied the latest skip reason, do not report that retired reason for surviving unavailable edits. Report their accurate reason if retained, otherwise omit the optional reason.",
+        "Add a small regression with two distinct skip reasons, retire the latest turn, and assert count remains1 while the removed size reason is absent."
+      ],
+      "probe_artifact": "/private/tmp/mini-agent-continuation-runtime-p4-probes.rs",
+      "validation": "Complete in-memory data-flow proof; review-only probe supplied, not executed by this agent. Indexed retire_from implementation matched disk.",
+      "review_report": "runtime-p4",
+      "bead": "mini-agent-gkqd4.14",
+      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+    },
+    {
+      "id": "BOUNDARIES-P4-1",
+      "priority": 4,
+      "confidence": 1.0,
+      "title": "Exercise guarded absolute JS publication through its production caller in the regression test",
+      "file": "src/extras/js/host.rs",
+      "start_line": 10265,
+      "end_line": 10285,
+      "related_locations": [
+        {
+          "file": "src/extras/js/host.rs",
+          "start_line": 2218,
+          "end_line": 2218
+        },
+        {
+          "file": "src/extras/js/tests/write_file_guard.rs",
+          "start_line": 121,
+          "end_line": 138
+        }
+      ],
+      "problem": "The xorxl.11 regression directly supplies Some(base) to write_approved_file_cancellable. It would still pass if production write_guarded_path again forgot to forward the checked digest, which was the original defect.",
+      "evidence": [
+        "The new test computes base itself and calls the lower-level helper with Some(base) at10279-10283.",
+        "Production forwarding is a separate call at2218. No inspected test invokes that call while mutating the target between guard authorization and publication.",
+        "Existing a_file_changed_after_the_read_is_refused mutates a relative-path file before invoking the JS tool; it protects stale read authorization, not the later absolute-path publication boundary."
+      ],
+      "fix": "Add one deterministic behavioral test through write_guarded_path or the parent effect service, using an absolute path and a controlled mutation after overwrite authorization but before atomic publication. Reuse the existing helper test as lower-level coverage.",
+      "acceptance_tests": [
+        "After a complete read, the guarded production absolute-path call encounters a same-length intervening change, returns TargetChanged and preserves those newer bytes.",
+        "The corresponding unchanged absolute-path overwrite succeeds.",
+        "Negative control: temporarily dropping only the production forwarded digest makes the new regression fail while the lower-level helper test still passes.",
+        "Use a bounded test-only seam; no sleep-dependent race or production behavior change."
+      ],
+      "related_beads": [
+        "mini-agent-xorxl.11",
+        "mini-agent-ad4rl"
+      ],
+      "category": "regression coverage",
+      "current_production_status": "Source fix is correct; this is missing protection against recurrence.",
+      "review_report": "boundaries-p4",
+      "bead": "mini-agent-gkqd4.15",
+      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+    },
+    {
+      "id": "BOUNDARIES-P4-2",
+      "priority": 4,
+      "confidence": 0.98,
+      "title": "Report unreadable listing entries and subtrees instead of presenting complete or empty results",
+      "file": "src/agent/tools/find_files.rs",
+      "start_line": 927,
+      "end_line": 942,
+      "related_locations": [
+        {
+          "file": "src/agent/tools/list_dir.rs",
+          "start_line": 94,
+          "end_line": 107
+        },
+        {
+          "file": "src/agent/tools/list_dir.rs",
+          "start_line": 293,
+          "end_line": 299
+        }
+      ],
+      "problem": "list_dir silently drops a directory when its child descriptor cannot be opened, converts child-count read failure to0, and ignores recursive collect_level errors without setting incomplete. A readable parent containing unreadable children can therefore be shown as empty or complete with no omission notice.",
+      "evidence": [
+        "BoundDirectory::list_entries continues on open_child failure at928-929 and uses unwrap_or(0) for a child read_directory failure at940-942.",
+        "collect_level discards recursive errors at99-106 without changing its incomplete flag.",
+        "The result path emits (empty directory) for an empty rows vector at294-295, while its incomplete notices are currently reserved for row caps."
+      ],
+      "fix": "Keep a bounded record of unreadable entry/subtree omissions and unknown child counts, and disclose incomplete coverage in list_dir results; do not disclose paths hidden by permission-deny filters or ignored-directory policy.",
+      "acceptance_tests": [
+        "Under a non-root Unix test account, a readable parent with one chmod000 child does not produce an unqualified empty/complete listing; restore permissions with guaranteed cleanup.",
+        "A subtree that becomes unreadable during depth2/3 collection is reported as incomplete; a failed count is shown as unknown rather than exact zero.",
+        "Permission-denied policy paths remain hidden and ordinary count/offset paging stays unchanged."
+      ],
+      "related_beads": [
+        "mini-agent-vs169 (grep reporting; this is list_dir)"
+      ],
+      "category": "low-priority result accuracy",
+      "review_report": "boundaries-p4",
+      "bead": "mini-agent-gkqd4.16",
+      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+    },
+    {
+      "id": "BOUNDARIES-P4-3",
+      "priority": 4,
+      "confidence": 1.0,
+      "title": "Update the obsolete seven-operation Git description",
+      "file": "docs/agent/CONFIG.md",
+      "start_line": 2560,
+      "end_line": 2564,
+      "related_locations": [
+        {
+          "file": "src/git/tool.rs",
+          "start_line": 60,
+          "end_line": 94
+        }
+      ],
+      "problem": "The permission documentation says the structured Git tool accepts only seven fixed local operations. Its current enum has16 local operations, including blame, branch creation/switching, stash, tag and restore. Operators following the paragraph get an incomplete account of available mutations and permission keys.",
+      "evidence": [
+        "CONFIG.md2560 states the obsolete seven-operation contract.",
+        "GitOperation currently defines16 operations, including BranchCreate, Switch, StashPush, StashPop, Tag and Restore. The no-network/remotes statement in the following sentence remains accurate and should be retained."
+      ],
+      "fix": "Replace the stale operation count/list with the current operation and authorization model or link to its maintained owning section. Preserve accurate local-only, literal pathspec, filter-driver and commit behavior statements.",
+      "acceptance_tests": [
+        "Review the paragraph against GitOperation and the actual parameters/permission keys, including the newer local mutations.",
+        "Search operator docs for the same obsolete seven-operation claim and reconcile exact duplicates; preserve the accurate no-network boundary. No feature change or runtime test is required."
+      ],
+      "related_beads": [
+        "mini-agent-k4fem"
+      ],
+      "category": "operator documentation correctness",
+      "review_report": "boundaries-p4",
+      "bead": "mini-agent-gkqd4.17",
+      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+    },
+    {
+      "priority": 2,
+      "title": "Use the invoking agent read policy for model hook file reads",
+      "file": "src/extras/hooks/backend.rs",
+      "scenario": "Agent-type hooks resolve the current workspace but use the process-startup MODEL_RUNNER permission checker. A later ACP workspace or child with a stricter read policy can have a hook read a file that the actual invoking agent cannot read.",
+      "evidence": [
+        "MODEL_RUNNER is installed only at startup with startup permission. run_model passes runner.permission directly to read_hook_file; that function consults only its supplied checker.",
+        "The new immutable HookBindings already retains the invoking checker, but the model-hook read path does not use it."
+      ],
+      "fix": "Use the current invocation permission policy for hook reads, with the documented startup fallback when no invocation policy exists; preserve ask-as-refusal, secret/ignore filters and workspace binding.",
+      "acceptance_tests": [
+        "Actual agent-hook model request asks to read a file: startup-allow plus invocation-deny must refuse and must not send file contents in the next model request.",
+        "Invocation-allow control succeeds; permission changes through the same captured checker take effect; unscoped startup fallback remains covered."
+      ],
+      "review_report": "post-implementation-boundaries-audit",
+      "bead": "mini-agent-gkqd4.18",
+      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+    },
+    {
+      "priority": 4,
+      "title": "Keep buffered worker-exit fixture within minimum native pipe capacity",
+      "file": "src/extras/js/tests/worker_exit.rs",
+      "scenario": "The independent full default suite reproduced a deterministic timeout in buffered_terminal_survives_clean_exit_and_keeps_validation. The scripted verification worker writes two diagnostic cases before exit while the parent deliberately waits for exit before reading. A controlled read after timeout returned the complete valid terminal and immediately allowed clean exit, proving fixture backpressure rather than production supervisor failure. Keep one internal verification diagnostic so the buffered terminal fits the minimum pipe capacity while preserving exit-before-read protocol validation.",
+      "acceptance_tests": [
+        "Original two-case fixture fails on this native macOS host; one-case verification preserves closed diagnostics and non-reusability assertions and passes default and skills variants. Other clean/fault/effect/protocol/abnormal/CPU exit cases remain."
+      ],
+      "review_report": "root-final-validation",
+      "bead": "mini-agent-gkqd4.19",
+      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+    }
+  ],
+  "validation": {
+    "negative_probes": "13 distinct failing regressions plus one operator trust control pass; first failed-save fixture repaired and rerun; native rename and checkpoint probes confirmed separately.",
+    "source_restore": "All 9 temporary probe targets restored byteexact before implementation.",
+    "limits": "Scoped review is not proof that no defects remain. Unchanged passing test results were reused; every full-suite failure and subsequent source correction has a passing affected test. Full hosted feature/platform matrix remains pending.",
+    "guarded_write_negative_control": {
+      "result": "expected failure of production-caller regression while helper test passed; byteexact restored caller then both passed",
+      "restored_sha256": "06d02fad182e1680f37ac068c1c9ec14e7e463b5eafc98d6cbd4112c56d7005a",
+      "logs": [
+        "2026-11-07-continuation-evidence/guarded-write-negative.log",
+        "2026-11-07-continuation-evidence/js-positive-before-exit-fixture-fix.log"
+      ]
+    },
+    "rich_worker_exit": "Buffered terminal regression passed both default and default+skills rows, preserving all seven exit cases.",
+    "full_default_and_corrections": {
+      "initial_full": "6244 passed, 10 failed, 16 ignored; every failure subsequently investigated and corrected",
+      "corrections_batch": "41 passed; worker pipe fixture and exact inventory followups remained",
+      "final_affected": "356 passed, 3 fixture/inventory failures, 1 ignored performance test; all three corrected and final four-test gate passed",
+      "final_gate": "4 passed: linked-worktree actual discovery, TaskTool actual routing, both subprocess inventories",
+      "small_stacks": "18 passed with original stack sizes",
+      "remaining": "Hosted CI for the pushed source, including native Windows process lifecycle and linked-worktree tests."
+    },
+    "reduced_features": "72 hooks-only/discovery/path/trust tests passed. Strict all-targets Clippy passed in default, minimal and hooks-only configurations.",
+    "workflow_policy": "139 Python CI scope/fingerprint/docs/Phase6/Git-runtime policy tests passed. Added three explicitly discovered Windows linked-worktree native tests to platform-paths/default.",
+    "install": {
+      "command": "cargo install --path . --debug --locked",
+      "result": "passed; installed /Users/seb/.cargo/bin/mini-agent",
+      "build_id": "c6c84d4e3aa68ac6e4e37d052288e563b8a28cd9a4cfebd7ea739f7995b05fab",
+      "target": "aarch64-apple-darwin",
+      "note": "Initial unlocked install was interrupted before installation when it began resolving newer dependency versions."
+    },
+    "production_smoke": {
+      "version": "mini-agent 1.12.0",
+      "js_runtime": "JS runtime check: PASS (2)",
+      "connectivity": "Installed binary --no-session --no-tools --no-context-files -p request completed with final response Hello; exit 0."
+    },
+    "format": "cargo fmt and cargo fmt --check passed; git diff --check passed.",
+    "reused_results_rationale": "Final changes after the full run affected hook/MCP/discovery/JS caller paths; these received the 360-test affected batch and passing four-test correction gate. Runtime/ACP/TUI/TaskTool/loop fixes passed the 43-test correction batch, except its unrelated worker fixture and inventory failures, which subsequently passed. Root ledger/OAuth/checkpoint/trust passing results and original-size stack passes remain valid. Default+skills compilation and reduced hooks/minimal rows cover conditional boundaries; CI supplies remaining supported feature/platform rows."
+  },
+  "status": "local_validation_complete_ci_pending",
+  "final_root_review": "2026-11-07-continuation-evidence/root-final-review.json"
+}

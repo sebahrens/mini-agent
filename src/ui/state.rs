@@ -557,6 +557,9 @@ pub(crate) struct AgentRunState {
     pub was_reasoning: bool,
     pub turn_trace: Vec<compact_str::CompactString>,
     pub awaiting_compaction_relief: bool,
+    /// Nothing old enough to summarize at the last boundary. A fresh logical
+    /// turn re-arms the trigger; the current one continues without a no-op loop.
+    pub mid_turn_compaction_disabled: bool,
     /// The one provider-rejection (context-length) compact-and-retry of the
     /// current logical main turn has been spent (mini-agent-cj9oh). Reset when
     /// a new main turn starts; a second rejection surfaces unchanged.
@@ -608,6 +611,8 @@ impl AgentRunState {
         &mut self,
     ) -> std::sync::Arc<crate::agent::runner::HeadlessBudgetCarry> {
         self.budget_carry = Default::default();
+        self.mid_turn_compaction_disabled = false;
+        self.awaiting_compaction_relief = false;
         std::sync::Arc::clone(&self.budget_carry)
     }
 

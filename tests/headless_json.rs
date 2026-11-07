@@ -1920,6 +1920,135 @@ fn headless_session_end_hook_runs_after_a_failed_turn() {
     assert!(marker.exists(), "SessionEnd did not run: {stderr}");
 }
 
+#[cfg(all(
+    unix,
+    feature = "hooks",
+    feature = "mcp",
+    any(feature = "goal", feature = "subagents")
+))]
+#[test]
+fn headless_mcp_session_end_keeps_the_connection_through_plain_exit_and_stream_eof() {
+    let fixture = TempRoot::new();
+    let source = fixture.0.join("session-end-mcp.rs");
+    let executable = fixture.0.join("session-end-mcp");
+    std::fs::write(&source, r##"
+use std::io::{BufRead, Write};
+fn main() {
+    let log = std::env::args_os().nth(1).unwrap();
+    for line in std::io::stdin().lock().lines() {
+        let line = line.unwrap();
+        writeln!(std::fs::OpenOptions::new().create(true).append(true).open(&log).unwrap(), "{line}").unwrap();
+        let compact = line.replace(' ', "");
+        let Some(rest) = compact.split_once("\"id\":").map(|(_, rest)| rest) else { continue; };
+        let id = if rest.starts_with('"') {
+            &rest[..rest[1..].find('"').unwrap() + 2]
+        } else { rest.split([',', '}']).next().unwrap() };
+        let result = if compact.contains("\"method\":\"initialize\"") {
+            r#"{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"session-end","version":"1"}}"#
+        } else if compact.contains("\"method\":\"tools/list\"") {
+            r#"{"tools":[{"name":"probe","description":"Read-only hook probe","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}}]}"#
+        } else if compact.contains("\"method\":\"tools/call\"") {
+            r#"{"content":[{"type":"text","text":"{}"}]}"#
+        } else { "{}" };
+        println!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{result}}}");
+        std::io::stdout().flush().unwrap();
+    }
+}
+"##).unwrap();
+    let compiled = Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+        .args(["--edition=2024", "--crate-name", "session_end_mcp_fixture"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    for stream in [false, true] {
+        let root = TempRoot::new();
+        let log = root.0.join("mcp-session-rpc.jsonl");
+        let replies = if stream {
+            vec!["first", "second"]
+        } else {
+            vec!["finished"]
+        };
+        let server = scripted_provider(
+            &root,
+            "",
+            replies
+                .into_iter()
+                .map(|text| {
+                    ScriptedReply::Stream(
+                        serde_json::json!({"role":"assistant","content":text}),
+                        "stop",
+                    )
+                })
+                .collect(),
+        );
+        let original = std::fs::read_to_string(root.0.join("config.toml")).unwrap();
+        std::fs::write(root.0.join("config.toml"), format!(
+            "hooks_mcp_tool_enabled=true\n{original}\n[mcp_servers.audit]\ncommand={}\nargs=[{}]\n",
+            toml::Value::String(executable.to_string_lossy().into_owned()),
+            toml::Value::String(log.to_string_lossy().into_owned()),
+        )).unwrap();
+        std::fs::write(root.0.join("settings.json"), serde_json::json!({"hooks":{"SessionEnd":[{"hooks":[{
+            "type":"mcp_tool", "server":"audit", "tool":"probe",
+            "input":{"session":"${session_id}","event":"${hook_event_name}"}, "timeout":5, "trust":"trusted"
+        }]}]}}).to_string()).unwrap();
+        let mut command = root.provider_command("mcp__audit__probe");
+        command.args(["-p", "--output", "stream-json"]);
+        let output = if stream {
+            command
+                .args(["--input-format", "stream-json"])
+                .stdin(std::process::Stdio::piped());
+            bounded_output_with_stdin(command, Some(b"{\"type\":\"user\",\"message\":{\"content\":\"first prompt\"}}\n{\"type\":\"user\",\"message\":{\"content\":\"second prompt\"}}\n".to_vec()))
+        } else {
+            command.arg("one prompt");
+            bounded_output(command)
+        };
+        let requests = server.join().unwrap().unwrap();
+        assert!(
+            output.status.success(),
+            "stream={stream}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(requests.len(), if stream { 2 } else { 1 });
+        let rows: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let session_id =
+            rows.iter().find(|row| row["type"] == "result").unwrap()["session_id"].clone();
+        let rpc: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            rpc.iter()
+                .filter(|row| row["method"] == "initialize")
+                .count(),
+            1,
+            "one connection belongs to the whole input session"
+        );
+        let calls: Vec<_> = rpc
+            .iter()
+            .filter(|row| row["method"] == "tools/call")
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "SessionEnd must reach its live exact manager after the final turn: {rpc:?}"
+        );
+        assert_eq!(calls[0]["params"]["arguments"]["session"], session_id);
+        assert_eq!(calls[0]["params"]["arguments"]["event"], "SessionEnd");
+    }
+}
+
 /// A headless run never stops on the ARCHITECTURE.md offer (mini-agent-e3rp2).
 ///
 /// The prompt reads a line from stdin. With context files enabled, a `-p` run
@@ -5919,6 +6048,80 @@ fn stream_json_input_runs_each_user_line_as_a_turn_in_one_session() {
         .filter_map(|message| message["content"].as_str())
         .collect();
     assert_eq!(users, vec!["hello one", "hello two"]);
+}
+
+/// mini-agent-gkqd4.2: ephemeral means no disk snapshots, not a stateless
+/// series of prompts. Inspect the actual second-turn provider request.
+#[cfg(all(unix, any(feature = "goal", feature = "subagents")))]
+#[test]
+fn ephemeral_stream_json_retains_prior_prompt_reply_and_tool_result() {
+    let root = TempRoot::new();
+    std::fs::write(root.0.join("evidence.txt"), "EPHEMERAL_TOOL_RESULT_MARKER").unwrap();
+    let server = scripted_provider(
+        &root,
+        "",
+        vec![
+            ScriptedReply::Stream(
+                serde_json::json!({"role":"assistant","tool_calls":[{
+                    "index":0,"id":"ephemeral-read","type":"function",
+                    "function":{"name":"read","arguments":"{\"path\":\"evidence.txt\"}"}
+                }]}),
+                "tool_calls",
+            ),
+            ScriptedReply::Stream(
+                serde_json::json!({"role":"assistant","content":"FIRST_EPHEMERAL_REPLY"}),
+                "stop",
+            ),
+            ScriptedReply::Stream(
+                serde_json::json!({"role":"assistant","content":"SECOND_EPHEMERAL_REPLY"}),
+                "stop",
+            ),
+        ],
+    );
+    let mut command = root.provider_command("read");
+    command
+        .args([
+            "-p",
+            "--no-session",
+            "--input-format",
+            "stream-json",
+            "--output",
+            "stream-json",
+        ])
+        .stdin(std::process::Stdio::piped());
+    let input = concat!(
+        "{\"type\":\"user\",\"message\":{\"content\":\"FIRST_EPHEMERAL_PROMPT\"}}\n",
+        "{\"type\":\"user\",\"message\":{\"content\":\"SECOND_EPHEMERAL_PROMPT\"}}\n"
+    );
+    let output = bounded_output_with_stdin(command, Some(input.as_bytes().to_vec()));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let requests = server.join().unwrap().unwrap();
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(requests.len(), 3, "{stderr}");
+    let next = requests[2].to_string();
+    for text in [
+        "FIRST_EPHEMERAL_PROMPT",
+        "FIRST_EPHEMERAL_REPLY",
+        "EPHEMERAL_TOOL_RESULT_MARKER",
+        "SECOND_EPHEMERAL_PROMPT",
+    ] {
+        assert!(next.contains(text), "second turn lost {text}: {next}");
+    }
+    let rows: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let results: Vec<_> = rows.iter().filter(|row| row["type"] == "result").collect();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["session_id"], results[1]["session_id"]);
+    assert!(results.iter().all(|row| row["session_persisted"] == false));
+    assert!(!root.0.join("chat_history.json").exists());
+    assert!(
+        !std::fs::read_dir(root.0.join("sessions")).is_ok_and(|entries| entries
+            .filter_map(Result::ok)
+            .any(|entry| entry.path().extension().is_some_and(|ext| ext == "json")))
+    );
 }
 
 #[test]

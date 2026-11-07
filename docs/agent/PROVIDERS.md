@@ -62,7 +62,7 @@ signature against OpenAI's published keys, issuer, audience, expiry, nonce,
 account identity and plan scopes before replacing credentials. No other
 application's client ID or credential file is used. Records live below
 `credentials_dir/provider-oauth`, with owner-only files, atomic replacement,
-bounded reads and a cross-process lock covering rotating refresh tokens.
+bounded reads and a cross-process lock covering rotating refresh tokens. Concurrent provider calls wait asynchronously for that refresh, then recheck the active registration and stored token. Lock admission is cancellable and bounded to 35 seconds; login and logout keep their immediate busy diagnostics.
 Revoked/expired authorization requires sign-in; it does not silently switch
 to a billed API key. Signing out retains the public host/account registration
 for later reauthorization.

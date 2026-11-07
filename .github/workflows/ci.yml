@@ -2855,6 +2855,25 @@ jobs:
           cargo test --locked $test -- --exact --nocapture --test-threads=1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Test Windows linked-worktree discovery and hook exclusions
+        if: matrix.os == 'windows-latest' && matrix.feature.name == 'default'
+        shell: pwsh
+        run: |
+          $tests = @(
+            'agent::tools::find_files::tests::linked_worktree_common_exclude_applies_to_native_discovery',
+            'agent::tools::find_files::tests::invalid_linked_git_metadata_refuses_discovery_before_exposing_entries',
+            'extras::hooks::backend::tests::linked_worktree_hook_reads_honor_common_exclude_and_root_negation'
+          )
+          $discovered = @(cargo test --locked --bin mini-agent -- --list 2>&1)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($test in $tests) {
+            if (-not ($discovered -contains "${test}: test")) {
+              throw "Linked-worktree regression test was not discovered: $test"
+            }
+          }
+          cargo test --locked --bin mini-agent -- $tests --exact --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Test Windows Unicode clipboard
         if: matrix.os == 'windows-latest' && matrix.feature.name == 'default'
         shell: pwsh

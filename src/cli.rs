@@ -1302,6 +1302,22 @@ fn default_provider(
         .unwrap_or_else(|| CompactString::new("openrouter"))
 }
 
+/// The operator's configured route before command-line overrides. Project
+/// model overrides use this too, so an implicit quick-model provider is kept
+/// just as firmly as an explicit `provider` setting.
+pub(crate) fn configured_provider(cfg: &config::Config) -> CompactString {
+    let models = config::quick_models_map(cfg);
+    cfg.provider
+        .clone()
+        .or_else(|| {
+            cfg.model
+                .as_deref()
+                .and_then(|name| models.get(name))
+                .map(|model| model.provider.clone())
+        })
+        .unwrap_or_else(|| default_provider(models))
+}
+
 /// Stack for work that must not depend on the platform's main-thread default
 /// (1 MiB on Windows, and the budget the startup tests enforce).
 const ROOMY_STACK_SIZE: usize = 8 * 1024 * 1024;
@@ -1507,19 +1523,10 @@ impl Cli {
     }
 
     pub fn resolve_provider(&self, cfg: &config::Config) -> CompactString {
-        let qm = config::quick_models_map(cfg);
         self.provider
             .as_deref()
-            .or(cfg.provider.as_deref())
             .map(CompactString::new)
-            // A configured quick-model name carries its own provider.
-            .or_else(|| {
-                cfg.model
-                    .as_deref()
-                    .and_then(|m| qm.get(m))
-                    .map(|q| q.provider.clone())
-            })
-            .unwrap_or_else(|| default_provider(qm))
+            .unwrap_or_else(|| configured_provider(cfg))
     }
 
     /// The startup provider/model pair: `--provider`/`--model`/config

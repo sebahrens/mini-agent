@@ -113,10 +113,30 @@ pub(crate) async fn run_headless_loop(
         &prompt,
     )
     .await;
+    // The final iteration can leave session-owned work running. Retire it
+    // before dropping the loop's Session, just like ordinary headless EOF.
+    #[cfg(feature = "subagents")]
+    {
+        crate::startup::wait_headless_background_tasks(&saved_session, cfg).await;
+        saved_session.close_background_tasks().await;
+    }
+    let saved = if cli.no_session {
+        Ok(())
+    } else {
+        crate::session::storage::save_session_recovering(&mut saved_session, |notice| {
+            eprintln!("warning: {notice}")
+        })
+    };
     if let Some(ss) = status_signals.as_ref() {
         ss.send_stop();
     }
-    outcome
+    match (outcome, saved) {
+        (Err(error), Err(save)) => {
+            Err(error.context(format!("loop session cleanup could not be saved: {save:#}")))
+        }
+        (Err(error), _) => Err(error),
+        (Ok(()), result) => result,
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -389,6 +409,140 @@ mod persistence_tests {
                 result.content
             );
             assert!(result.content.contains("effect.txt"), "{}", result.content);
+        }
+    }
+
+    /// mini-agent-gkqd4.4: the last model iteration does not end a detached
+    /// task's session. Exercise the real loop wrapper and its final saved row.
+    #[cfg(all(unix, feature = "subagents"))]
+    #[tokio::test]
+    async fn final_loop_iteration_honours_background_exit_grace_and_zero_wait() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        use crate::extras::subagents::background::{Pool, Status};
+        use std::sync::Arc;
+        for (grace, expected) in [(1, Status::Completed), (0, Status::Cancelled)] {
+            let root = StateRoot::new();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (release, released) = tokio::sync::oneshot::channel();
+            let gate = Arc::new(crate::startup::HeadlessExitWaitTestGate {
+                entered: Default::default(),
+                release: std::sync::Mutex::new(Some(release)),
+            });
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(socket.read_u8().await.unwrap());
+                    assert!(request.len() < 64 * 1024);
+                }
+                let length = String::from_utf8(request)
+                    .unwrap()
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':')
+                            .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap();
+                socket.read_exact(&mut vec![0; length]).await.unwrap();
+                let chunk = serde_json::json!({"id":"last-loop","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"iteration done"},"finish_reason":null}]});
+                let end = serde_json::json!({"id":"last-loop","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}});
+                let body = format!("data: {chunk}\n\ndata: {end}\n\ndata: [DONE]\n\n");
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            });
+            let client = rig::providers::openrouter::Client::builder()
+                .api_key("inert")
+                .base_url(format!("http://{address}"))
+                .http_client(crate::provider_http::ProviderHttpClient::new(
+                    reqwest::Client::builder().no_proxy().build().unwrap(),
+                ))
+                .build()
+                .unwrap();
+            let agent = AnyAgent::without_skills(crate::provider::AnyAgentInner::OpenRouter(
+                client.agent("test").default_max_turns(1).build(),
+            ));
+            let cfg: Config = serde_json::from_value(serde_json::json!({
+                "session_title_model":"off", "subagents":{"headless_exit_wait_secs":grace}
+            }))
+            .unwrap();
+            let mut cli = Cli::parse_from(["mini-agent"]);
+            cli.loop_prompt = Some("one iteration".into());
+            cli.loop_plan = Some(root.path.join("plan.md"));
+            cli.loop_max = Some(1);
+            let mut session = Session::new("openrouter", "test", 128_000, "");
+            session.working_dir = root.path.to_str().unwrap().into();
+            session.initialize_spend_account(None).unwrap();
+            assert!(install_loop_goal(&cli, &cfg, &session).await.unwrap());
+            let pool = Pool::for_session(&mut session, 1).unwrap();
+            let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(&root.path).unwrap());
+            let run = crate::spend::run::Run::fixture(
+                session.spend_account.clone(),
+                Arc::new(crate::spend::Ledger::new(&root.path.join("state"))),
+                &session.id,
+                crate::spend::PriceSnapshot::capture(Some((0.0, 0.0)), Default::default(), false),
+            );
+            let recorder = session.file_checkpoints.recorder(&session.id, 0, false);
+            let id = pool
+                .reserve(&workspace, &run, &recorder)
+                .unwrap()
+                .start(
+                    async move {
+                        released
+                            .await
+                            .map_err(|_| "session exit never admitted grace".to_owned())?;
+                        Ok("FINAL_LOOP_BACKGROUND_REPORT".into())
+                    },
+                    run,
+                )
+                .unwrap();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                crate::startup::with_headless_exit_wait_gate(
+                    gate.clone(),
+                    run_headless_loop(
+                        agent,
+                        &cli,
+                        &cfg,
+                        &crate::context::load(true),
+                        &session,
+                        None,
+                        &Sandbox::new(false, "bwrap"),
+                        &crate::provider::AnyClient::OpenRouter(client),
+                    ),
+                ),
+            )
+            .await
+            .expect("loop and exact task cleanup are bounded")
+            .unwrap();
+            server.await.unwrap();
+            assert!(
+                gate.entered.load(std::sync::atomic::Ordering::SeqCst),
+                "the actual loop exit entered the shared retirement helper"
+            );
+            assert_eq!(
+                gate.release.lock().unwrap().is_some(),
+                grace == 0,
+                "zero grace cancels the still-gated job; positive grace releases it at wait admission"
+            );
+            assert_eq!(pool.result(&id).unwrap().status, expected);
+            assert_eq!(pool.active_count(), 0);
+            let saved = storage::load_session_exact(&session.id).unwrap().unwrap();
+            let row = saved
+                .background_history
+                .rows()
+                .into_iter()
+                .find(|row| row.id == id)
+                .unwrap();
+            assert_eq!(
+                row.status, expected,
+                "terminal task state is saved after loop cleanup"
+            );
+            if grace > 0 {
+                assert_eq!(row.result.as_deref(), Some("FINAL_LOOP_BACKGROUND_REPORT"));
+            }
+            crate::session::lock::release_session(&session.id);
         }
     }
 

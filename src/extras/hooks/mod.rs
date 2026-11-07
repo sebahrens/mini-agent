@@ -173,6 +173,21 @@ pub(crate) fn active_workspace_binding() -> Option<crate::paths::WorkspaceBindin
     crate::paths::WorkspaceBinding::capture(&active_workspace()).ok()
 }
 
+pub(crate) fn context_for_session(
+    session_id: &str,
+    root: &std::path::Path,
+    permission_mode: &str,
+) -> HookCtx {
+    HookCtx {
+        session_id: session_id.to_string(),
+        session_path: crate::session::storage::session_path(session_id)
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+        cwd: root.display().to_string(),
+        permission_mode: permission_mode.to_string(),
+    }
+}
+
 pub(crate) fn set_active_session(session_id: &str) {
     let session_path = crate::session::storage::session_path(session_id)
         .map(|path| path.display().to_string())
@@ -186,6 +201,9 @@ pub(crate) fn set_active_session(session_id: &str) {
 /// Best-effort session identity for `HookCtx` until the session-lifecycle
 /// seam supplies mini-agent's real session id/path.
 pub(crate) fn session_context() -> (String, String) {
+    if let Some(ctx) = crate::agent::runner::current_hook_session_context() {
+        return (ctx.session_id, ctx.session_path);
+    }
     if let Some(context) = ACTIVE_SESSION_CONTEXT
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -497,6 +515,17 @@ pub(crate) async fn gate_user_prompt_from(
 /// not directly own the `PermissionChecker`. The checker updates the shared
 /// mode whenever startup, `/mode`, or a prompt directive changes it.
 pub(crate) fn best_effort_ctx() -> HookCtx {
+    if let Some(mut ctx) = crate::agent::runner::current_hook_session_context() {
+        ctx.cwd = active_workspace().display().to_string();
+        if let Some(permission) = crate::agent::runner::current_hook_permission() {
+            ctx.permission_mode = permission
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .mode()
+                .to_string();
+        }
+        return ctx;
+    }
     let (session_id, session_path) = session_context();
     let cwd = active_workspace().display().to_string();
     HookCtx {

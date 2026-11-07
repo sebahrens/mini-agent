@@ -1,0 +1,9 @@
+   Compiling mini-agent v1.12.0 (/Users/seb/projects/mini-agent)
+    Finished `test` profile [unoptimized] target(s) in 8.44s
+     Running tests/headless_json.rs (target/debug/deps/headless_json-f62e74dcf7072634)
+
+running 1 test
+test headless_mcp_session_end_keeps_the_connection_through_plain_exit_and_stream_eof ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 63 filtered out; finished in 3.18s
+

@@ -666,6 +666,8 @@ pub(crate) struct BoundDirectory {
     approved_root: PathBuf,
     root: File,
     hidden: Option<PathFilter>,
+    root_hidden: bool,
+    listing_incomplete: Arc<std::sync::atomic::AtomicBool>,
     ignore: Arc<IgnoreMode>,
 }
 
@@ -818,6 +820,8 @@ impl BoundDirectory {
             approved_root: approved_root.to_path_buf(),
             root,
             hidden: None,
+            root_hidden: false,
+            listing_incomplete: Arc::default(),
             ignore: Arc::default(),
         })
     }
@@ -839,8 +843,40 @@ impl BoundDirectory {
     /// Hide every entry for which `filter` returns true from `walker` and
     /// `list_entries`; hidden directories are not descended into.
     pub(crate) fn with_hidden_filter(mut self, filter: Option<PathFilter>) -> Self {
+        // A directory pruned when walking its parent must not become readable
+        // by naming it (or one of its descendants) as the explicit walk root.
+        self.root_hidden = filter.as_ref().is_some_and(|hidden| {
+            self.approved_root
+                .ancestors()
+                .any(|ancestor| hidden(ancestor, true))
+        });
         self.hidden = filter;
         self
+    }
+
+    /// Narrow the entries selected for a walk without changing the policy
+    /// admission of its root. A single-file search, for example, hides every
+    /// directory entry but must not hide the capability-bound parent itself.
+    #[cfg(feature = "js")]
+    pub(crate) fn with_entry_filter(mut self, select: PathFilter) -> Self {
+        let hidden = self.hidden.take();
+        self.hidden = Some(Arc::new(move |path, is_directory| {
+            select(path, is_directory)
+                || hidden
+                    .as_ref()
+                    .is_some_and(|hidden| hidden(path, is_directory))
+        }));
+        self
+    }
+
+    fn check_visible_root(&self) -> std::io::Result<()> {
+        if self.root_hidden {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "directory is excluded from discovery by a deny rule",
+            ));
+        }
+        Ok(())
     }
 
     fn is_hidden(&self, path: &Path, is_directory: bool) -> bool {
@@ -850,6 +886,7 @@ impl BoundDirectory {
     }
 
     pub(crate) fn walker(&self) -> std::io::Result<BoundWalker> {
+        self.check_visible_root()?;
         BoundWalker::new(
             self.root.try_clone()?,
             self.approved_root.clone(),
@@ -858,27 +895,42 @@ impl BoundDirectory {
         )
     }
 
+    pub(super) fn listing_coverage(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.listing_incomplete)
+    }
+
+    pub(super) fn note_listing_incomplete(&self) {
+        self.listing_incomplete
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub(super) fn list_entries(&self) -> std::io::Result<Vec<BoundListEntry>> {
+        self.check_visible_root()?;
         let mut chain = IgnoreChain {
             node: None,
             mode: Arc::clone(&self.ignore),
         };
-        chain = chain.append(global_ignore_matchers(&self.approved_root));
-        chain = chain.append(parent_ignore_matchers(&self.approved_root));
-        // Same order as BoundWalker::new: .git/info/exclude is lower priority
-        // than the local .gitignore/.ignore, as in git itself.
-        if let Some(matcher) = root_exclude_matcher(&self.root, &self.approved_root) {
-            chain = chain.append(vec![matcher]);
-        }
-        let mut local_matchers = Vec::new();
-        for ignore_name in [".gitignore", ".ignore"] {
-            if let Some(matcher) =
-                local_ignore_matcher(&self.root, Path::new(""), &self.approved_root, ignore_name)
-            {
-                local_matchers.push(matcher);
+        if !chain.mode.include_ignored {
+            chain = chain.append(global_ignore_matchers(&self.approved_root));
+            chain = chain.append(parent_ignore_matchers(&self.approved_root)?);
+            // Same order as BoundWalker::new: .git/info/exclude is lower priority
+            // than the local .gitignore/.ignore, as in git itself.
+            if let Some(matcher) = root_exclude_matcher(&self.root, &self.approved_root)? {
+                chain = chain.append(vec![matcher]);
             }
+            let mut local_matchers = Vec::new();
+            for ignore_name in [".gitignore", ".ignore"] {
+                if let Some(matcher) = local_ignore_matcher(
+                    &self.root,
+                    Path::new(""),
+                    &self.approved_root,
+                    ignore_name,
+                ) {
+                    local_matchers.push(matcher);
+                }
+            }
+            chain = chain.append(local_matchers);
         }
-        chain = chain.append(local_matchers);
 
         let mut entries = Vec::new();
         for DirectoryName { name, kind } in bound_platform::read_directory(&self.root)? {
@@ -905,7 +957,7 @@ impl BoundDirectory {
                             is_directory: false,
                             is_link: true,
                             size: 0,
-                            child_count: 0,
+                            child_count: None,
                         });
                     }
                     continue;
@@ -926,6 +978,7 @@ impl BoundDirectory {
                     }
                     if is_directory {
                         let Ok(child) = bound_platform::open_child(&self.root, &name) else {
+                            self.note_listing_incomplete();
                             continue;
                         };
                         let metadata = match child.metadata() {
@@ -935,11 +988,12 @@ impl BoundDirectory {
                             {
                                 metadata
                             }
-                            _ => continue,
+                            _ => {
+                                self.note_listing_incomplete();
+                                continue;
+                            }
                         };
-                        let child_count = bound_platform::read_directory(&child)
-                            .map(|reader| reader.count() as u64)
-                            .unwrap_or(0);
+                        let child_count = self.listed_child_count(&child);
                         entries.push(BoundListEntry {
                             link_target: None,
                             file_name: name,
@@ -955,7 +1009,10 @@ impl BoundDirectory {
                             {
                                 size
                             }
-                            _ => continue,
+                            _ => {
+                                self.note_listing_incomplete();
+                                continue;
+                            }
                         };
                         entries.push(BoundListEntry {
                             link_target: None,
@@ -963,7 +1020,7 @@ impl BoundDirectory {
                             is_directory: false,
                             is_link: false,
                             size,
-                            child_count: 0,
+                            child_count: None,
                         });
                     }
                     continue;
@@ -986,12 +1043,15 @@ impl BoundDirectory {
                             is_directory: false,
                             is_link: true,
                             size: 0,
-                            child_count: 0,
+                            child_count: None,
                         });
                     }
                     continue;
                 }
-                Err(_) => continue,
+                Err(_) => {
+                    self.note_unreadable_visible(&chain, &self.approved_root.join(&name));
+                    continue;
+                }
             };
             let metadata = match child.metadata() {
                 Ok(metadata) if bound_platform::is_link_metadata(&metadata) => {
@@ -1008,13 +1068,16 @@ impl BoundDirectory {
                             is_directory: false,
                             is_link: true,
                             size: 0,
-                            child_count: 0,
+                            child_count: None,
                         });
                     }
                     continue;
                 }
                 Ok(metadata) if bound_platform::is_safe_entry(&metadata) => metadata,
-                _ => continue,
+                _ => {
+                    self.note_unreadable_visible(&chain, &self.approved_root.join(&name));
+                    continue;
+                }
             };
             let path = self.approved_root.join(&name);
             let is_directory = metadata.is_dir();
@@ -1025,11 +1088,9 @@ impl BoundDirectory {
                 continue;
             }
             let child_count = if is_directory {
-                bound_platform::read_directory(&child)
-                    .map(|reader| reader.count() as u64)
-                    .unwrap_or(0)
+                self.listed_child_count(&child)
             } else {
-                0
+                None
             };
             entries.push(BoundListEntry {
                 link_target: None,
@@ -1043,12 +1104,35 @@ impl BoundDirectory {
         Ok(entries)
     }
 
+    fn note_unreadable_visible(&self, chain: &IgnoreChain, path: &Path) {
+        // Unknown entry types must not turn policy-hidden or ignored names
+        // into an observable incomplete-listing signal.
+        if !self.is_hidden(path, false)
+            && !self.is_hidden(path, true)
+            && !prune_ignored(chain, path, false)
+            && !prune_ignored(chain, path, true)
+        {
+            self.note_listing_incomplete();
+        }
+    }
+
+    fn listed_child_count(&self, child: &File) -> Option<u64> {
+        match bound_platform::read_directory(child) {
+            Ok(reader) => Some(reader.count() as u64),
+            Err(_) => {
+                self.note_listing_incomplete();
+                None
+            }
+        }
+    }
+
     /// Open the named child directory no-follow, relative to this
     /// descriptor, keeping the hidden filter (used by `list_dir` depth).
     pub(super) fn child_directory(&self, name: &std::ffi::OsStr) -> std::io::Result<Self> {
         let child = bound_platform::open_child(&self.root, name)?;
         let mut bound = Self::from_file(&self.approved_root.join(name), child)?;
         bound.hidden = self.hidden.clone();
+        bound.listing_incomplete = Arc::clone(&self.listing_incomplete);
         bound.ignore = Arc::clone(&self.ignore);
         Ok(bound)
     }
@@ -1058,25 +1142,31 @@ impl BoundDirectory {
         &self,
         max_entries: usize,
     ) -> std::io::Result<(Vec<BoundDiscoveryEntry>, bool)> {
+        self.check_visible_root()?;
         let mut chain = IgnoreChain {
             node: None,
             mode: Arc::clone(&self.ignore),
         };
-        chain = chain.append(global_ignore_matchers(&self.approved_root));
-        chain = chain.append(parent_ignore_matchers(&self.approved_root));
-        // Same order as BoundWalker::new and list_entries.
-        if let Some(matcher) = root_exclude_matcher(&self.root, &self.approved_root) {
-            chain = chain.append(vec![matcher]);
-        }
-        let mut local_matchers = Vec::new();
-        for ignore_name in [".gitignore", ".ignore"] {
-            if let Some(matcher) =
-                local_ignore_matcher(&self.root, Path::new(""), &self.approved_root, ignore_name)
-            {
-                local_matchers.push(matcher);
+        if !chain.mode.include_ignored {
+            chain = chain.append(global_ignore_matchers(&self.approved_root));
+            chain = chain.append(parent_ignore_matchers(&self.approved_root)?);
+            // Same order as BoundWalker::new and list_entries.
+            if let Some(matcher) = root_exclude_matcher(&self.root, &self.approved_root)? {
+                chain = chain.append(vec![matcher]);
             }
+            let mut local_matchers = Vec::new();
+            for ignore_name in [".gitignore", ".ignore"] {
+                if let Some(matcher) = local_ignore_matcher(
+                    &self.root,
+                    Path::new(""),
+                    &self.approved_root,
+                    ignore_name,
+                ) {
+                    local_matchers.push(matcher);
+                }
+            }
+            chain = chain.append(local_matchers);
         }
-        chain = chain.append(local_matchers);
 
         let mut entries = Vec::with_capacity(max_entries.min(64));
         for DirectoryName { name, kind } in bound_platform::read_directory(&self.root)? {
@@ -1156,7 +1246,7 @@ pub(super) struct BoundListEntry {
     pub(super) is_directory: bool,
     pub(super) is_link: bool,
     pub(super) size: u64,
-    pub(super) child_count: u64,
+    pub(super) child_count: Option<u64>,
 }
 
 struct DirectoryFrame {
@@ -1173,15 +1263,17 @@ impl DirectoryFrame {
         mut matchers: IgnoreChain,
         approved_root: &Path,
     ) -> std::io::Result<Self> {
-        let mut local_matchers = Vec::new();
-        for ignore_name in [".gitignore", ".ignore"] {
-            if let Some(matcher) =
-                local_ignore_matcher(&directory, &relative_path, approved_root, ignore_name)
-            {
-                local_matchers.push(matcher);
+        if !matchers.mode.include_ignored {
+            let mut local_matchers = Vec::new();
+            for ignore_name in [".gitignore", ".ignore"] {
+                if let Some(matcher) =
+                    local_ignore_matcher(&directory, &relative_path, approved_root, ignore_name)
+                {
+                    local_matchers.push(matcher);
+                }
             }
+            matchers = matchers.append(local_matchers);
         }
-        matchers = matchers.append(local_matchers);
         let names = bound_platform::read_directory(&directory)?;
         Ok(Self {
             directory,
@@ -1332,10 +1424,12 @@ impl BoundWalker {
             node: None,
             mode: ignore,
         };
-        matchers = matchers.append(global_ignore_matchers(&approved_root));
-        matchers = matchers.append(parent_ignore_matchers(&approved_root));
-        if let Some(matcher) = root_exclude_matcher(&root, &approved_root) {
-            matchers = matchers.append(vec![matcher]);
+        if !matchers.mode.include_ignored {
+            matchers = matchers.append(global_ignore_matchers(&approved_root));
+            matchers = matchers.append(parent_ignore_matchers(&approved_root)?);
+            if let Some(matcher) = root_exclude_matcher(&root, &approved_root)? {
+                matchers = matchers.append(vec![matcher]);
+            }
         }
         let frame = DirectoryFrame::new(root, PathBuf::new(), matchers, &approved_root)?;
         Ok(Self {
@@ -1584,17 +1678,21 @@ fn local_ignore_matcher(
     )
 }
 
-fn parent_ignore_sources(approved_root: &Path) -> Vec<(PathBuf, PathBuf)> {
+fn parent_ignore_sources(approved_root: &Path) -> std::io::Result<Vec<(PathBuf, PathBuf, bool)>> {
     let mut directories: Vec<&Path> = approved_root.ancestors().skip(1).collect();
     directories.reverse();
     let mut sources = Vec::with_capacity(directories.len().saturating_mul(3));
     for directory in directories {
-        sources.push((directory.to_path_buf(), directory.join(".git/info/exclude")));
+        // Known-path metadata reads need search permission on ancestors, not
+        // permission to list every directory above the approved workspace.
+        if let Some(source) = ancestor_exclude_source(directory)? {
+            sources.push((directory.to_path_buf(), source, true));
+        }
         for ignore_name in [".gitignore", ".ignore"] {
-            sources.push((directory.to_path_buf(), directory.join(ignore_name)));
+            sources.push((directory.to_path_buf(), directory.join(ignore_name), false));
         }
     }
-    sources
+    Ok(sources)
 }
 
 fn ignore_source_stamp(source: &Path) -> IgnoreSourceStamp {
@@ -1614,10 +1712,10 @@ fn ignore_source_stamp(source: &Path) -> IgnoreSourceStamp {
     }
 }
 
-fn parent_ignore_stamps(sources: &[(PathBuf, PathBuf)]) -> Vec<IgnoreSourceStamp> {
+fn parent_ignore_stamps(sources: &[(PathBuf, PathBuf, bool)]) -> Vec<IgnoreSourceStamp> {
     sources
         .iter()
-        .map(|(_, source)| ignore_source_stamp(source))
+        .map(|(_, source, _)| ignore_source_stamp(source))
         .collect()
 }
 
@@ -1763,13 +1861,194 @@ fn global_ignore_cached(
     matchers
 }
 
-/// `.git/info/exclude` of the bound root. The file is still opened relative to
-/// the root descriptor; only the read and parse are skipped while the opened
-/// file's (length, mtime) stamp matches the cached one.
-fn root_exclude_matcher(root: &File, approved_root: &Path) -> Option<Gitignore> {
-    let exclude = open_relative(root, Path::new(".git/info/exclude")).ok()?;
-    let source = approved_root.join(".git/info/exclude");
-    let metadata = exclude.metadata().ok()?;
+const GIT_POINTER_MAX_BYTES: u64 = 4096;
+const METADATA_IGNORE_MAX_BYTES: u64 = 1024 * 1024;
+
+fn invalid_git_metadata() -> std::io::Error {
+    std::io::Error::other("Git ignore metadata is invalid or exceeds limits")
+}
+
+/// Read-only Git metadata can live outside a linked worktree. Open only the
+/// named metadata file, never a pipe/device or final symlink/reparse point.
+fn open_ignore_metadata(path: &Path) -> std::io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        };
+        options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !bound_platform::is_safe_entry(&metadata) || !metadata.is_file() {
+        return Err(invalid_git_metadata());
+    }
+    Ok(file)
+}
+
+fn git_pointer(file: File, prefix: Option<&str>) -> std::io::Result<PathBuf> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || !bound_platform::is_safe_entry(&metadata) {
+        return Err(invalid_git_metadata());
+    }
+    let mut text = String::new();
+    file.take(GIT_POINTER_MAX_BYTES + 1)
+        .read_to_string(&mut text)?;
+    if text.len() as u64 > GIT_POINTER_MAX_BYTES {
+        return Err(invalid_git_metadata());
+    }
+    let line = text.trim();
+    let target = prefix
+        .map_or(Some(line), |prefix| line.strip_prefix(prefix))
+        .ok_or_else(invalid_git_metadata)?
+        .trim();
+    if target.is_empty() || target.contains(['\n', '\r', '\0']) {
+        return Err(invalid_git_metadata());
+    }
+    Ok(PathBuf::from(target))
+}
+
+fn bounded_metadata_matcher(
+    file: File,
+    root: &Path,
+    source: PathBuf,
+) -> std::io::Result<Gitignore> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || !bound_platform::is_safe_entry(&metadata) {
+        return Err(invalid_git_metadata());
+    }
+    let mut contents = String::new();
+    file.take(METADATA_IGNORE_MAX_BYTES + 1)
+        .read_to_string(&mut contents)?;
+    if contents.len() as u64 > METADATA_IGNORE_MAX_BYTES {
+        return Err(invalid_git_metadata());
+    }
+    let mut builder = GitignoreBuilder::new(root);
+    for line in contents.lines() {
+        let _ = builder.add_line(Some(source.clone()), line);
+    }
+    builder.build().map_err(|_| invalid_git_metadata())
+}
+
+/// Matcher for an exact ignore metadata source. A missing source is optional;
+/// unreadable, special, linked or over-budget metadata refuses the ignore
+/// check instead of treating unknown exclusions as permission to disclose.
+#[cfg(feature = "hooks")]
+pub(crate) fn metadata_ignore_matcher(
+    root: &File,
+    approved_root: &Path,
+    relative: &Path,
+) -> std::io::Result<Option<Gitignore>> {
+    let source = approved_root.join(relative);
+    let base = source.parent().ok_or_else(invalid_git_metadata)?;
+    match open_relative(root, relative) {
+        Ok(file) => bounded_metadata_matcher(file, base, source.clone()).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn common_git_directory(
+    git_dir: &Path,
+    pointer: std::io::Result<File>,
+) -> std::io::Result<PathBuf> {
+    let common = match pointer {
+        Ok(pointer) => git_dir.join(git_pointer(pointer, None)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => git_dir.to_path_buf(),
+        Err(error) => return Err(error),
+    };
+    let metadata = std::fs::symlink_metadata(&common).map_err(|_| invalid_git_metadata())?;
+    if !metadata.is_dir() || !bound_platform::is_safe_entry(&metadata) {
+        return Err(invalid_git_metadata());
+    }
+    Ok(common)
+}
+
+/// Git metadata read through known paths for an ancestor. This deliberately
+/// does not open the ancestor directory itself: execute-only parents suffice.
+fn ancestor_exclude_source(directory: &Path) -> std::io::Result<Option<PathBuf>> {
+    let dot_git = directory.join(".git");
+    let metadata = match std::fs::symlink_metadata(&dot_git) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !bound_platform::is_safe_entry(&metadata) {
+        return Err(invalid_git_metadata());
+    }
+    let git_dir = if metadata.is_dir() {
+        dot_git
+    } else if metadata.is_file() {
+        directory.join(git_pointer(
+            open_ignore_metadata(&dot_git)?,
+            Some("gitdir:"),
+        )?)
+    } else {
+        return Err(invalid_git_metadata());
+    };
+    let metadata = std::fs::symlink_metadata(&git_dir).map_err(|_| invalid_git_metadata())?;
+    if !metadata.is_dir() || !bound_platform::is_safe_entry(&metadata) {
+        return Err(invalid_git_metadata());
+    }
+    let common = common_git_directory(&git_dir, open_ignore_metadata(&git_dir.join("commondir")))?;
+    Ok(Some(common.join("info/exclude")))
+}
+
+fn open_root_exclude(root: &File, approved_root: &Path) -> std::io::Result<(File, PathBuf)> {
+    let dot_git = open_relative(root, Path::new(".git"))?;
+    let metadata = dot_git.metadata()?;
+    if !bound_platform::is_safe_entry(&metadata) {
+        return Err(invalid_git_metadata());
+    }
+    // Same Git grammar as sandbox::git_metadata: gitdir is relative to the
+    // worktree; optional commondir is relative to that Git directory. Only
+    // the exact common info/exclude file is read outside the workspace.
+    let (git_dir, retained_directory, pointer) = if metadata.is_dir() {
+        let pointer = open_relative(&dot_git, Path::new("commondir"));
+        (approved_root.join(".git"), Some(dot_git), pointer)
+    } else {
+        let git_dir = approved_root.join(git_pointer(dot_git, Some("gitdir:"))?);
+        let metadata = std::fs::symlink_metadata(&git_dir).map_err(|_| invalid_git_metadata())?;
+        if !metadata.is_dir() || !bound_platform::is_safe_entry(&metadata) {
+            return Err(invalid_git_metadata());
+        }
+        let pointer = open_ignore_metadata(&git_dir.join("commondir"));
+        (git_dir, None, pointer)
+    };
+    let common = common_git_directory(&git_dir, pointer)?;
+    let source = common.join("info/exclude");
+    let exclude = if common == git_dir
+        && let Some(directory) = retained_directory
+    {
+        open_relative(&directory, Path::new("info/exclude"))?
+    } else {
+        open_ignore_metadata(&source)?
+    };
+    Ok((exclude, source))
+}
+
+/// Repository info/exclude, including the common Git directory of a linked
+/// worktree. The initial gitfile is opened through the retained root. Pointer
+/// and exclude reads are bounded; invalid metadata fails closed. The matcher
+/// remains anchored at the workspace, never the external metadata directory.
+pub(crate) fn root_exclude_matcher(
+    root: &File,
+    approved_root: &Path,
+) -> std::io::Result<Option<Gitignore>> {
+    let (exclude, source) = match open_root_exclude(root, approved_root) {
+        Ok(found) => found,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let metadata = exclude.metadata()?;
     let stamp = IgnoreSourceStamp {
         source: source.clone(),
         length: Some(metadata.len()),
@@ -1782,9 +2061,9 @@ fn root_exclude_matcher(root: &File, approved_root: &Path) -> Option<Gitignore> 
         .get(approved_root)
         && *cached_stamp == stamp
     {
-        return matcher.clone();
+        return Ok(matcher.clone());
     }
-    let matcher = ignore_matcher(exclude, approved_root, source);
+    let matcher = Some(bounded_metadata_matcher(exclude, approved_root, source)?);
     let mut cache = ROOT_EXCLUDE_CACHE
         .lock()
         .unwrap_or_else(|error| error.into_inner());
@@ -1792,22 +2071,52 @@ fn root_exclude_matcher(root: &File, approved_root: &Path) -> Option<Gitignore> 
         cache.clear();
     }
     cache.insert(approved_root.to_path_buf(), (stamp, matcher.clone()));
-    matcher
+    Ok(matcher)
 }
 
-fn parse_parent_ignore_matchers(sources: &[(PathBuf, PathBuf)]) -> Arc<[Gitignore]> {
-    sources
-        .iter()
-        .filter_map(|(directory, source)| {
-            let file = File::open(source).ok()?;
-            ignore_matcher(file, directory, source.clone())
-        })
-        .collect::<Vec<_>>()
-        .into()
+fn open_parent_ignore_file(source: &Path) -> std::io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    // Ordinary ancestor ignore files retain supported symlink aliases, but
+    // a pipe must never block before ignore_matcher can inspect its type.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(source)?;
+    if !file.metadata()?.is_file() {
+        return Err(invalid_git_metadata());
+    }
+    Ok(file)
 }
 
-fn parent_ignore_matchers(approved_root: &Path) -> Arc<[Gitignore]> {
-    let sources = parent_ignore_sources(approved_root);
+fn parse_parent_ignore_matchers(
+    sources: &[(PathBuf, PathBuf, bool)],
+) -> std::io::Result<Arc<[Gitignore]>> {
+    let mut matchers = Vec::new();
+    for (directory, source, git_metadata) in sources {
+        if *git_metadata {
+            match open_ignore_metadata(source) {
+                Ok(file) => {
+                    matchers.push(bounded_metadata_matcher(file, directory, source.clone())?)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        } else if let Ok(file) = open_parent_ignore_file(source)
+            && let Some(matcher) = ignore_matcher(file, directory, source.clone())
+        {
+            // Preserve established ancestor .gitignore/.ignore aliases and
+            // optional-source behavior (e.g. symlinked user dotfiles).
+            matchers.push(matcher);
+        }
+    }
+    Ok(matchers.into())
+}
+
+fn parent_ignore_matchers(approved_root: &Path) -> std::io::Result<Arc<[Gitignore]>> {
+    let sources = parent_ignore_sources(approved_root)?;
     let mut stamps = parent_ignore_stamps(&sources);
     if let Some(matchers) = PARENT_IGNORE_CACHE
         .lock()
@@ -1816,14 +2125,14 @@ fn parent_ignore_matchers(approved_root: &Path) -> Arc<[Gitignore]> {
         .filter(|entry| entry.stamps == stamps)
         .map(|entry| Arc::clone(&entry.matchers))
     {
-        return matchers;
+        return Ok(matchers);
     }
 
-    let mut matchers = parse_parent_ignore_matchers(&sources);
+    let mut matchers = parse_parent_ignore_matchers(&sources)?;
     let after_parse = parent_ignore_stamps(&sources);
     if after_parse != stamps {
         stamps = after_parse;
-        matchers = parse_parent_ignore_matchers(&sources);
+        matchers = parse_parent_ignore_matchers(&sources)?;
     }
 
     let mut cache = PARENT_IGNORE_CACHE
@@ -1839,7 +2148,7 @@ fn parent_ignore_matchers(approved_root: &Path) -> Arc<[Gitignore]> {
             matchers: Arc::clone(&matchers),
         },
     );
-    matchers
+    Ok(matchers)
 }
 
 fn ignore_matcher(mut file: File, root: &Path, source: PathBuf) -> Option<Gitignore> {
@@ -2284,6 +2593,78 @@ impl Tool for FindFilesTool {
             Some(c) => format!("{}\n\n{}", c, result),
             None => result,
         })
+    }
+}
+
+/// An owned real linked-worktree fixture shared by discovery and hook tests.
+#[cfg(test)]
+pub(crate) use linked_ignore_fixture::linked_worktree_ignore_fixture;
+
+#[cfg(test)]
+mod linked_ignore_fixture {
+    use super::*;
+    pub(crate) fn linked_worktree_ignore_fixture()
+    -> (crate::tests::OwnedTestDirectory, PathBuf, PathBuf) {
+        let owner = crate::tests::OwnedTestDirectory::new("linked-worktree-ignore");
+        let base = owner.path().canonicalize().unwrap();
+        let repo = base.join("repo");
+        let workspace = base.join("linked");
+        let empty = base.join("empty");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::create_dir(&empty).unwrap();
+        let global = base.join("empty-gitconfig");
+        std::fs::write(&global, "").unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args([
+                    "-c",
+                    "user.name=fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "commit.gpgSign=false",
+                    "-c",
+                ])
+                .arg(format!("core.hooksPath={}", empty.display()))
+                .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", &global)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_COMMON_DIR")
+                .env_remove("GIT_CONFIG_COUNT")
+                .env_remove("GIT_CONFIG_PARAMETERS")
+                .output()
+                .expect("fixture Git");
+            assert!(
+                output.status.success(),
+                "fixture Git failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&[
+            "init",
+            "--quiet",
+            &format!("--template={}", empty.display()),
+        ]);
+        git(&["commit", "--allow-empty", "--quiet", "-m", "fixture"]);
+        git(&[
+            "worktree",
+            "add",
+            "--detach",
+            "--quiet",
+            workspace.to_str().unwrap(),
+        ]);
+        std::fs::create_dir_all(repo.join(".git/info")).unwrap();
+        std::fs::write(repo.join(".git/info/exclude"), "notes.txt\nkept.txt\n").unwrap();
+        std::fs::write(workspace.join(".gitignore"), "!kept.txt\n").unwrap();
+        for name in ["notes.txt", "kept.txt", "plain.txt"] {
+            std::fs::write(workspace.join(name), "fixture-needle\n").unwrap();
+        }
+        assert!(workspace.join(".git").is_file());
+        (owner, repo, workspace)
     }
 }
 
@@ -3192,6 +3573,224 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn linked_worktree_common_exclude_applies_to_native_discovery() {
+        let (_owner, _repo, workspace) = linked_worktree_ignore_fixture();
+        let find = FindFilesTool::new(None, None, 100).with_workspace(&workspace);
+        let listed = find
+            .call(serde_json::from_value(serde_json::json!({"pattern":"*.txt"})).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            !listed
+                .lines()
+                .any(|line| !line.starts_with('[') && line.contains("notes.txt")),
+            "{listed}"
+        );
+        assert!(
+            listed.contains("kept.txt") && listed.contains("plain.txt"),
+            "{listed}"
+        );
+        let list =
+            crate::agent::tools::ListDirTool::new(None, None, None).with_workspace(&workspace);
+        let listed = list
+            .call(crate::agent::tools::ListDirArgs::default())
+            .await
+            .unwrap();
+        assert!(
+            !listed
+                .lines()
+                .any(|line| !line.starts_with('[') && line.contains("notes.txt")),
+            "{listed}"
+        );
+        assert!(
+            listed.contains("kept.txt") && listed.contains("plain.txt"),
+            "{listed}"
+        );
+        let grep = crate::agent::tools::GrepTool::new(None, None, 100).with_workspace(&workspace);
+        let found = grep
+            .call(serde_json::from_value(serde_json::json!({"pattern":"fixture-needle"})).unwrap())
+            .await
+            .unwrap();
+        assert!(!found.contains("notes.txt:"), "{found}");
+        assert!(
+            found.contains("kept.txt:") && found.contains("plain.txt:"),
+            "{found}"
+        );
+        #[cfg(feature = "js")]
+        {
+            let metadata = crate::fs::checked_path_metadata(&workspace).unwrap();
+            let bound = BoundDirectory::open(&workspace, &metadata).unwrap();
+            let (entries, _) = bound.list_entries_bounded(100).unwrap();
+            assert!(!entries.iter().any(|entry| entry.file_name == "notes.txt"));
+            assert!(entries.iter().any(|entry| entry.file_name == "kept.txt"));
+        }
+        let nested = workspace.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        for name in ["notes.txt", "kept.txt", "plain.txt"] {
+            std::fs::write(nested.join(name), "fixture-needle\n").unwrap();
+        }
+        let nested_find = FindFilesTool::new(None, None, 100).with_workspace(&workspace);
+        let found = nested_find
+            .call(
+                serde_json::from_value(serde_json::json!({"pattern":"*.txt", "path":"nested"}))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !found
+                .lines()
+                .any(|line| !line.starts_with('[') && line.contains("notes.txt")),
+            "{found}"
+        );
+        assert!(
+            found.contains("kept.txt") && found.contains("plain.txt"),
+            "{found}"
+        );
+        let listed = list
+            .call(crate::agent::tools::ListDirArgs {
+                path: Some("nested".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            !listed
+                .lines()
+                .any(|line| !line.starts_with('[') && line.contains("notes.txt")),
+            "{listed}"
+        );
+        let found = grep
+            .call(
+                serde_json::from_value(
+                    serde_json::json!({"pattern":"fixture-needle", "path":"nested"}),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(!found.contains("notes.txt:"), "{found}");
+        assert!(
+            found.contains("kept.txt:") && found.contains("plain.txt:"),
+            "{found}"
+        );
+        std::fs::write(workspace.join(".git"), "invalid gitfile\n").unwrap();
+        assert!(
+            find.call(
+                serde_json::from_value(serde_json::json!({"pattern":"*.txt", "path":"nested"}))
+                    .unwrap()
+            )
+            .await
+            .is_err()
+        );
+        let found = find
+            .call(
+                serde_json::from_value(
+                    serde_json::json!({"pattern":"*.txt", "path":"nested", "no_ignore":true}),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(found.contains("notes.txt"), "{found}");
+        let found = find
+            .call(
+                serde_json::from_value(serde_json::json!({"pattern":"*.txt", "no_ignore":true}))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            found
+                .lines()
+                .any(|line| Path::new(line).file_name() == Some(std::ffi::OsStr::new("notes.txt"))),
+            "explicit no_ignore failed: {found}"
+        );
+    }
+
+    #[test]
+    fn invalid_linked_git_metadata_refuses_discovery_before_exposing_entries() {
+        for case in [
+            "malformed-gitfile",
+            "oversized-gitfile",
+            "malformed-commondir",
+            "oversized-commondir",
+            "missing-gitdir",
+            "oversized-exclude",
+        ] {
+            let owner = crate::tests::OwnedTestDirectory::new("invalid-git-ignore-metadata");
+            let workspace = owner.path().join("workspace");
+            let git_dir = owner.path().join("git-dir");
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::create_dir_all(git_dir.join("info")).unwrap();
+            std::fs::write(workspace.join("notes.txt"), "fixture").unwrap();
+            std::fs::write(workspace.join(".gitignore"), "!notes.txt\n").unwrap();
+            std::fs::write(
+                workspace.join(".git"),
+                format!("gitdir: {}\n", git_dir.display()),
+            )
+            .unwrap();
+            match case {
+                "malformed-gitfile" => std::fs::write(workspace.join(".git"), "invalid\n").unwrap(),
+                "oversized-gitfile" => std::fs::write(
+                    workspace.join(".git"),
+                    format!("gitdir: {}", "a".repeat(GIT_POINTER_MAX_BYTES as usize)),
+                )
+                .unwrap(),
+                "malformed-commondir" => std::fs::write(git_dir.join("commondir"), "\0").unwrap(),
+                "oversized-commondir" => std::fs::write(
+                    git_dir.join("commondir"),
+                    "a".repeat(GIT_POINTER_MAX_BYTES as usize + 1),
+                )
+                .unwrap(),
+                "missing-gitdir" => {
+                    std::fs::write(workspace.join(".git"), "gitdir: missing-directory\n").unwrap()
+                }
+                "oversized-exclude" => std::fs::File::create(git_dir.join("info/exclude"))
+                    .unwrap()
+                    .set_len(METADATA_IGNORE_MAX_BYTES + 1)
+                    .unwrap(),
+                _ => unreachable!(),
+            }
+            let workspace = workspace.canonicalize().unwrap();
+            let metadata = crate::fs::checked_path_metadata(&workspace).unwrap();
+            let bound = BoundDirectory::open(&workspace, &metadata).unwrap();
+            assert!(bound.walker().is_err(), "{case} allowed a walk");
+            assert!(bound.list_entries().is_err(), "{case} allowed a listing");
+            let bound = bound.with_include_ignored(true);
+            assert!(
+                bound.walker().unwrap().any(|entry| entry
+                    .path
+                    .file_name()
+                    .is_some_and(|name| name == "notes.txt")),
+                "{case}: no_ignore still parsed metadata"
+            );
+            let hidden = bound.with_hidden_filter(Some(Arc::new(|path, _| {
+                path.file_name().is_some_and(|name| name == "notes.txt")
+            })));
+            assert!(
+                !hidden.walker().unwrap().any(|entry| entry
+                    .path
+                    .file_name()
+                    .is_some_and(|name| name == "notes.txt")),
+                "{case}: no_ignore bypassed a read deny"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_git_metadata_rejects_symlink_sources() {
+        let (_owner, repo, workspace) = linked_worktree_ignore_fixture();
+        let exclude = repo.join(".git/info/exclude");
+        std::fs::remove_file(&exclude).unwrap();
+        std::os::unix::fs::symlink(workspace.join("plain.txt"), &exclude).unwrap();
+        let metadata = crate::fs::checked_path_metadata(&workspace).unwrap();
+        let bound = BoundDirectory::open(&workspace, &metadata).unwrap();
+        assert!(bound.walker().is_err());
+    }
+
     /// mini-agent-iddn9: the JS directory listing honours `.git/info/exclude`
     /// like list_dir, and `.gitignore` still outranks it.
     #[cfg(feature = "js")]
@@ -3247,7 +3846,7 @@ mod tests {
         );
         let bound = BoundDirectory::open(directory.path(), &metadata)
             .unwrap()
-            .with_hidden_filter(Some(Arc::new(|_, _| true)));
+            .with_hidden_filter(Some(Arc::new(|path, _| path.extension().is_some())));
         let mut walker = bound
             .walker()
             .unwrap()
@@ -3399,6 +3998,81 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    #[test]
+    fn ancestor_ignore_fifo_never_waits_for_a_writer() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let owner = crate::tests::OwnedTestDirectory::new("parent-ignore-fifo");
+        let workspace = owner.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(workspace.join("plain.txt"), "fixture").unwrap();
+        let fifo = owner.path().join(".gitignore");
+        let cpath = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: cpath is an owned valid NUL-terminated fixture pathname.
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        let workspace = workspace.canonicalize().unwrap();
+        let metadata = crate::fs::checked_path_metadata(&workspace).unwrap();
+        let bound = BoundDirectory::open(&workspace, &metadata).unwrap();
+        let (started, start) = std::sync::mpsc::channel();
+        let (finished, finish) = std::sync::mpsc::channel();
+        let job = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            finished.send(bound.walker().is_ok()).unwrap();
+        });
+        start.recv_timeout(Duration::from_secs(5)).unwrap();
+        let observed = finish.recv_timeout(Duration::from_secs(2));
+        if observed.is_err() {
+            // Always release the controlled reader before any failure assertion.
+            let release = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo)
+                .unwrap();
+            finish.recv_timeout(Duration::from_secs(5)).unwrap();
+            drop(release);
+        }
+        job.join().unwrap();
+        assert!(observed.is_ok(), "ancestor ignore FIFO waited for a writer");
+        assert!(
+            observed.unwrap(),
+            "invalid optional parent source should be skipped"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ancestor_ignore_accepts_execute_only_parent_and_symlinked_dotfile() {
+        use std::os::unix::fs::PermissionsExt;
+        let owner = crate::tests::OwnedTestDirectory::new("ignore-search-only-parent");
+        let parent = owner.path().join("parent");
+        let workspace = parent.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(parent.join("patterns"), "notes.txt\n").unwrap();
+        std::os::unix::fs::symlink("patterns", parent.join(".gitignore")).unwrap();
+        std::fs::write(workspace.join("notes.txt"), "hidden").unwrap();
+        std::fs::write(workspace.join("plain.txt"), "public").unwrap();
+        struct Restore(PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        let _restore = Restore(parent.clone());
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o111)).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let metadata = crate::fs::checked_path_metadata(&workspace).unwrap();
+        let bound = BoundDirectory::open(&workspace, &metadata).unwrap();
+        let names: Vec<_> = bound
+            .walker()
+            .unwrap()
+            .map(|entry| entry.file_name)
+            .collect();
+        assert!(!names.iter().any(|name| name == "notes.txt"), "{names:?}");
+        assert!(names.iter().any(|name| name == "plain.txt"), "{names:?}");
+    }
+
     #[test]
     fn parent_ignore_matchers_are_cached_and_invalidated_by_source_changes() {
         let container = TempDir::new("parent_ignore_cache");
@@ -3407,12 +4081,12 @@ mod tests {
         let ignore = container.path().join(".gitignore");
         std::fs::write(&ignore, "first.txt\n").unwrap();
 
-        let first = parent_ignore_matchers(&workspace);
-        let cached = parent_ignore_matchers(&workspace);
+        let first = parent_ignore_matchers(&workspace).unwrap();
+        let cached = parent_ignore_matchers(&workspace).unwrap();
         assert!(Arc::ptr_eq(&first, &cached));
 
         std::fs::write(&ignore, "different-length-name.txt\n").unwrap();
-        let refreshed = parent_ignore_matchers(&workspace);
+        let refreshed = parent_ignore_matchers(&workspace).unwrap();
         assert!(!Arc::ptr_eq(&cached, &refreshed));
     }
 

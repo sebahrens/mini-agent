@@ -531,7 +531,7 @@ impl RunOutcome {
 
 /// Kill the child and its whole process group (sandboxed grandchildren
 /// included on Unix).
-async fn kill_tree(child: &mut tokio::process::Child, pid: Option<u32>) {
+async fn kill_tree(child: &mut Box<dyn process_wrap::tokio::ChildWrapper>, pid: Option<u32>) {
     #[cfg(unix)]
     if let Some(pid) = pid {
         crate::sandbox::kill_process_group(pid);
@@ -615,7 +615,7 @@ impl ElicitBridge {
 #[derive(Clone)]
 struct Elicit {
     bridge: Arc<ElicitBridge>,
-    out: tokio::sync::mpsc::UnboundedSender<Value>,
+    out: tokio::sync::mpsc::Sender<Value>,
 }
 
 /// Withdraws an unanswered request when its run stops waiting.
@@ -635,7 +635,7 @@ impl Drop for PendingAsk<'_> {
             .remove(&self.id)
             .is_some();
         if removed {
-            let _ = self.elicit.out.send(json!({
+            let _ = self.elicit.out.try_send(json!({
                 "jsonrpc": "2.0",
                 "method": "notifications/cancelled",
                 "params": {"requestId": self.id, "reason": "mini-agent run stopped waiting"}
@@ -668,7 +668,7 @@ impl Elicit {
             elicit: self,
             id: id.clone(),
         };
-        let sent = self.out.send(json!({
+        let sent = self.out.try_send(json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": "elicitation/create",
@@ -795,7 +795,7 @@ async fn read_control_stream(
 
 struct Progress {
     token: Value,
-    out: tokio::sync::mpsc::UnboundedSender<Value>,
+    out: tokio::sync::mpsc::Sender<Value>,
 }
 
 async fn run_prompt(
@@ -805,7 +805,7 @@ async fn run_prompt(
     progress: Option<Progress>,
     elicit: Option<Elicit>,
 ) -> RunOutcome {
-    use crate::process_creation::TokioCommandCreationExt as _;
+    use crate::process_creation::CommandWrapCreationExt as _;
     let mut child = tokio::process::Command::new(&command.program);
     child
         .args(command.argv(run, elicit.is_some()))
@@ -820,9 +820,8 @@ async fn run_prompt(
     if let Some(cwd) = &run.cwd {
         child.current_dir(cwd);
     }
-    #[cfg(unix)]
-    child.process_group(0);
-    let mut child = match child.spawn_guarded() {
+    let mut owned_command = crate::sandbox::owned_workspace_service_tree(child);
+    let mut child = match owned_command.spawn_guarded() {
         Ok(child) => child,
         Err(error) => {
             return RunOutcome::failed(format!("mini-agent run could not start: {error}"));
@@ -831,12 +830,12 @@ async fn run_prompt(
     let pid = child.id();
     let _group_guard = GroupKillOnDrop(pid);
     let control_stdin = if elicit.is_some() {
-        child.stdin.take()
+        child.stdin().take()
     } else {
         None
     };
-    let stdout = child.stdout.take().expect("piped stdout");
-    let stderr = child.stderr.take().expect("piped stderr");
+    let stdout = child.stdout().take().expect("piped stdout");
+    let stderr = child.stderr().take().expect("piped stderr");
     type Captured = (
         (Vec<u8>, bool),
         (Vec<u8>, bool),
@@ -853,16 +852,36 @@ async fn run_prompt(
     let started = tokio::time::Instant::now();
     let stop = {
         let work = async {
-            tokio::join!(
-                async {
-                    match elicit.clone() {
-                        Some(elicit) => read_control_stream(stdout, control_stdin, elicit).await,
-                        None => read_capped(stdout, MAX_CAPTURE_BYTES).await,
+            let reads = async {
+                tokio::join!(
+                    async {
+                        match elicit.clone() {
+                            Some(elicit) => {
+                                read_control_stream(stdout, control_stdin, elicit).await
+                            }
+                            None => read_capped(stdout, MAX_CAPTURE_BYTES).await,
+                        }
+                    },
+                    read_capped(stderr, MAX_STDERR_BYTES),
+                )
+            };
+            tokio::pin!(reads);
+            tokio::select! {
+                status = child.inner_mut().wait() => {
+                    // A descendant may still own the pipes after its leader
+                    // exits. Retire the tree before waiting for pipe EOF.
+                    let _ = child.start_kill();
+                    match tokio::time::timeout(Duration::from_secs(1), &mut reads).await {
+                        Ok((stdout, stderr)) => (stdout, stderr, status),
+                        Err(_) => ((Vec::new(), true), (Vec::new(), true), Err(std::io::Error::other("MCP child output did not retire"))),
                     }
-                },
-                read_capped(stderr, MAX_STDERR_BYTES),
-                child.wait()
-            )
+                }
+                (stdout, stderr) = &mut reads => {
+                    let status = child.inner_mut().wait().await;
+                    let _ = child.start_kill();
+                    (stdout, stderr, status)
+                }
+            }
         };
         tokio::pin!(work);
         let deadline = tokio::time::sleep(command.timeout);
@@ -900,7 +919,7 @@ async fn run_prompt(
                 _ = tick.tick(), if progress.is_some() => {
                     beat += 1;
                     if let Some(progress) = &progress {
-                        let _ = progress.out.send(json!({
+                        let _ = progress.out.try_send(json!({
                             "jsonrpc": "2.0",
                             "method": "notifications/progress",
                             "params": {
@@ -933,11 +952,8 @@ async fn run_prompt(
             return RunOutcome::Cancelled;
         }
     };
-    // A finished child may still have left descendants in its group.
-    #[cfg(unix)]
-    if let Some(pid) = pid {
-        crate::sandbox::kill_process_group_if_live(pid);
-    }
+    // Tree retirement is independent of who still owns the capture pipes.
+    kill_tree(&mut child, pid).await;
     let raw = String::from_utf8_lossy(&stdout).trim_end().to_owned();
     let (mut text, session_id) = if captured_truncated {
         (raw, None)
@@ -1036,11 +1052,11 @@ fn id_key(id: &Value) -> String {
 /// Serve until the client closes its end of the stream. End of input is
 /// transport retirement: runs still executing are cancelled (and their process
 /// groups killed) at once, since no client remains to read their answers.
-/// Replies already queued by completed work are flushed first.
+/// Completed replies drain with a short deadline after active work retires.
 pub(crate) async fn serve(
     command: RunCommand,
     input: impl AsyncRead + Send + Unpin + 'static,
-    mut output: impl AsyncWrite + Unpin,
+    mut output: impl AsyncWrite + Unpin + Send + 'static,
 ) -> anyhow::Result<()> {
     use tokio::sync::mpsc;
     let (line_tx, mut line_rx) = mpsc::channel::<anyhow::Result<Option<Vec<u8>>>>(8);
@@ -1067,33 +1083,36 @@ pub(crate) async fn serve(
             }
         }
     });
-    let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<Value>();
+    // A bounded, independently owned writer cannot block the request/cancel loop.
+    let (reply_tx, mut reply_rx) = mpsc::channel::<Value>(32);
+    let mut writer = tokio::spawn(async move {
+        while let Some(reply) = reply_rx.recv().await {
+            tokio::time::timeout(Duration::from_secs(5), write_message(&mut output, &reply))
+                .await
+                .map_err(|_| anyhow::anyhow!("MCP client stopped reading responses"))??;
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+    let _reader_owner = AbortTaskOnDrop(reader.abort_handle());
+    let _writer_owner = AbortTaskOnDrop(writer.abort_handle());
     let cancels = Arc::new(std::sync::Mutex::new(Cancels::new()));
     let bridge = Arc::new(ElicitBridge::default());
     let slots = Arc::new(tokio::sync::Semaphore::new(command.max_runs.max(1)));
     let mut tasks = tokio::task::JoinSet::new();
-    let mut input_open = true;
+    let mut writer_finished = false;
     let outcome: anyhow::Result<()> = async {
         loop {
-            if !input_open {
-                // Calls answer through `reply_rx`; flush what is queued. Runs
-                // still active are cancelled by the teardown after this loop.
-                while let Ok(reply) = reply_rx.try_recv() {
-                    write_message(&mut output, &reply).await?;
-                }
-                return Ok(());
-            }
             tokio::select! {
-                item = line_rx.recv(), if input_open => {
-                    let Some(item) = item else { input_open = false; continue };
-                    let Some(line) = item? else { input_open = false; continue };
+                item = line_rx.recv() => {
+                    let Some(item) = item else { return Ok(()) };
+                    let Some(line) = item? else { return Ok(()) };
                     if line.iter().all(u8::is_ascii_whitespace) {
                         continue;
                     }
                     let message = match serde_json::from_slice::<Value>(&line) {
                         Ok(message) => message,
                         Err(_) => {
-                            write_message(&mut output, &error(&Value::Null, -32700, "parse error")).await?;
+                            queue_reply(&reply_tx, error(&Value::Null, -32700, "parse error"))?;
                             continue;
                         }
                     };
@@ -1124,22 +1143,22 @@ pub(crate) async fn serve(
                         );
                     }
                     if method != "tools/call" {
-                        write_message(&mut output, &handle_simple(&command, &id, method, &params)).await?;
+                        queue_reply(&reply_tx, handle_simple(&command, &id, method, &params))?;
                         continue;
                     }
                     if params.get("name").and_then(Value::as_str) != Some("run") {
-                        write_message(&mut output, &error(&id, -32602, "unknown tool; only `run` is offered")).await?;
+                        queue_reply(&reply_tx, error(&id, -32602, "unknown tool; only `run` is offered"))?;
                         continue;
                     }
                     let request = match parse_run_request(&command, params.get("arguments")) {
                         Ok(request) => request,
                         Err(message) => {
-                            write_message(&mut output, &error(&id, -32602, &message)).await?;
+                            queue_reply(&reply_tx, error(&id, -32602, &message))?;
                             continue;
                         }
                     };
                     let Ok(permit) = slots.clone().try_acquire_owned() else {
-                        write_message(&mut output, &error(&id, -32000, &format!("too many concurrent `run` calls (limit {}, --mcp-server-max-runs); retry when one finishes", command.max_runs.max(1)))).await?;
+                        queue_reply(&reply_tx, error(&id, -32000, &format!("too many concurrent `run` calls (limit {}, --mcp-server-max-runs); retry when one finishes", command.max_runs.max(1))))?;
                         continue;
                     };
                     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
@@ -1159,14 +1178,12 @@ pub(crate) async fn serve(
                     tasks.spawn(async move {
                         let outcome = run_prompt(&command, &request, cancel_rx, progress, elicit).await;
                         cancels.lock().expect("cancel map").remove(&key);
-                        drop(permit);
-                        if let RunOutcome::Finished { text, is_error, session_id } = outcome {
-                            let _ = reply_tx.send(result(&id, tool_result(text, is_error, session_id.as_deref())));
-                        }
+                        enqueue_run_reply(&reply_tx, &id, outcome, permit).await;
                     });
                 }
-                Some(reply) = reply_rx.recv() => {
-                    write_message(&mut output, &reply).await?;
+                result = &mut writer => {
+                    writer_finished = true;
+                    return result.map_err(anyhow::Error::from)?;
                 }
                 Some(joined) = tasks.join_next(), if !tasks.is_empty() => {
                     let _ = joined;
@@ -1179,9 +1196,67 @@ pub(crate) async fn serve(
     for (_, cancel) in cancels.lock().expect("cancel map").drain() {
         let _ = cancel.send(());
     }
-    tasks.shutdown().await;
+    // Give cooperative cancellation its bounded tree wait before falling
+    // back to drop ownership. Completed tasks blocked on replies cannot hold
+    // EOF indefinitely, and the writer continues independently throughout.
+    let retired = tokio::time::timeout(Duration::from_secs(5), async {
+        while tasks.join_next().await.is_some() {}
+    })
+    .await;
+    if retired.is_err() {
+        tasks.shutdown().await;
+    }
     reader.abort();
+    drop(reply_tx);
+    // Retirement of active work precedes any best-effort response drain.
+    if !writer_finished {
+        match tokio::time::timeout(Duration::from_millis(250), &mut writer).await {
+            Ok(result) => {
+                result??;
+            }
+            Err(_) => {
+                writer.abort();
+                let _ = writer.await;
+            }
+        }
+    }
     outcome
+}
+
+/// Retain the run slot until its bounded reply queue owns the payload. A
+/// blocked writer cannot turn completed replies into unlimited detached tasks.
+async fn enqueue_run_reply(
+    out: &tokio::sync::mpsc::Sender<Value>,
+    id: &Value,
+    outcome: RunOutcome,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) {
+    if let RunOutcome::Finished {
+        text,
+        is_error,
+        session_id,
+    } = outcome
+    {
+        let _ = out
+            .send(result(
+                id,
+                tool_result(text, is_error, session_id.as_deref()),
+            ))
+            .await;
+    }
+    drop(permit);
+}
+
+struct AbortTaskOnDrop(tokio::task::AbortHandle);
+impl Drop for AbortTaskOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn queue_reply(out: &tokio::sync::mpsc::Sender<Value>, message: Value) -> anyhow::Result<()> {
+    out.try_send(message)
+        .map_err(|_| anyhow::anyhow!("MCP response queue is full or closed"))
 }
 
 async fn write_message(
@@ -1266,6 +1341,102 @@ mod tests {
             command.issued_sessions.record(id);
         }
         command
+    }
+
+    #[tokio::test]
+    async fn completed_run_keeps_its_slot_until_reply_enters_bounded_queue() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = slots.clone().acquire_owned().await.unwrap();
+        let (out, mut replies) = tokio::sync::mpsc::channel(1);
+        out.send(json!({"already":"queued"})).await.unwrap();
+        let id = json!(1);
+        let pending = enqueue_run_reply(
+            &out,
+            &id,
+            RunOutcome::Finished {
+                text: "completed payload".into(),
+                is_error: false,
+                session_id: None,
+            },
+            permit,
+        );
+        tokio::pin!(pending);
+        assert!(matches!(
+            futures::poll!(&mut pending),
+            std::task::Poll::Pending
+        ));
+        assert!(
+            slots.clone().try_acquire_owned().is_err(),
+            "completed payload must still occupy its run slot"
+        );
+        replies.recv().await.unwrap();
+        pending.await;
+        assert!(slots.try_acquire_owned().is_ok());
+        assert_eq!(replies.recv().await.unwrap()["id"], 1);
+    }
+
+    #[tokio::test]
+    async fn successful_leader_exit_retires_descendants_that_inherit_capture_pipes() {
+        let dir = crate::tests::OwnedTestDirectory::new("mcp-inherited-pipes");
+        let marker = dir.path().join("descendant.pid");
+        let script = format!(
+            "sleep 300 & echo $! > '{}'; printf '%s' '{{\"result\":\"done\"}}'",
+            marker.display()
+        );
+        let replies = exchange(shell(&script), &[call(1, json!({"prompt":"x"}))]).await;
+        assert_eq!(replies[0]["result"]["isError"], false, "{replies:?}");
+        assert_eq!(replies[0]["result"]["content"][0]["text"], "done");
+    }
+
+    #[tokio::test]
+    async fn eof_retires_runs_while_stdout_is_backpressured() {
+        let marker =
+            std::env::temp_dir().join(format!("mcp-eof-backpressure-{}.pid", uuid::Uuid::new_v4()));
+        let script = format!("sleep 300 & echo $! > '{}'; wait", marker.display());
+        let (mut client_in, server_in) = tokio::io::duplex(1 << 16);
+        let (server_out, mut client_out) = tokio::io::duplex(1);
+        let mut server = tokio::spawn(serve(shell(&script), server_in, server_out));
+        let mut bytes = serde_json::to_vec(&call(7, json!({"prompt":"x"}))).unwrap();
+        bytes.push(b'\n');
+        client_in.write_all(&bytes).await.unwrap();
+        let grandchild = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&marker)
+                    && let Ok(pid) = text.trim().parse::<i32>()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fixture child startup");
+        client_in
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"ping\"}\n")
+            .await
+            .unwrap();
+        // Prove dispatch is writing its reply, then leave stdout open but unread.
+        let mut first = [0u8; 1];
+        tokio::time::timeout(Duration::from_secs(2), client_out.read_exact(&mut first))
+            .await
+            .unwrap()
+            .unwrap();
+        drop(client_in);
+        let retired = tokio::time::timeout(Duration::from_secs(2), &mut server)
+            .await
+            .is_ok();
+        let child_live =
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(grandchild), None).is_ok();
+        // Always retire the probe before asserting so the negative case leaks nothing.
+        if !retired {
+            server.abort();
+            let _ = server.await;
+        }
+        let _ = std::fs::remove_file(&marker);
+        assert!(
+            retired && !child_live,
+            "stdin EOF did not retire a backpressured server: retired={retired}, child_live={child_live}"
+        );
     }
 
     #[tokio::test]
@@ -2100,5 +2271,227 @@ printf '{"type":"result","result":"%s","session_id":"s-elicit","session_persiste
             text.starts_with("plain:") && !text.contains("control"),
             "{text}"
         );
+    }
+}
+
+/// Native Windows proof: retain the exact descendant handle and observe its
+/// signal after each real MCP owner retires. No PID lookup after retirement.
+#[cfg(all(test, windows))]
+#[allow(unsafe_code)]
+pub(crate) mod windows_tree_tests {
+    use super::*;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, TerminateProcess,
+        WaitForSingleObject,
+    };
+
+    pub(crate) struct Fixture {
+        dir: crate::tests::OwnedTestDirectory,
+        program: PathBuf,
+        parent: PathBuf,
+    }
+    pub(crate) struct Descendant(OwnedHandle);
+    impl Drop for Descendant {
+        fn drop(&mut self) {
+            // Failure cleanup uses only the retained process capability.
+            unsafe {
+                TerminateProcess(self.0.as_raw_handle(), 125);
+                WaitForSingleObject(self.0.as_raw_handle(), 2_000);
+            }
+        }
+    }
+    impl Descendant {
+        pub(crate) async fn assert_retired(&self) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    // SAFETY: this exact live process handle stays owned here.
+                    match unsafe { WaitForSingleObject(self.0.as_raw_handle(), 0) } {
+                        WAIT_OBJECT_0 => break,
+                        WAIT_TIMEOUT => tokio::time::sleep(Duration::from_millis(10)).await,
+                        other => panic!("descendant observation failed: {other}"),
+                    }
+                }
+            })
+            .await
+            .expect("MCP descendant survived retirement");
+        }
+    }
+    impl Fixture {
+        pub(crate) fn new() -> Self {
+            Self::with_inherited_pipes(false)
+        }
+        pub(crate) fn inheriting_pipes() -> Self {
+            Self::with_inherited_pipes(true)
+        }
+        fn with_inherited_pipes(inherited: bool) -> Self {
+            let dir = crate::tests::OwnedTestDirectory::new("mcp-windows-tree");
+            let program = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"))
+                .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+            let quote = |path: &std::path::Path| path.display().to_string().replace('\'', "''");
+            let child = dir.path().join("child.ps1");
+            std::fs::write(
+                &child,
+                format!(
+                    "[IO.File]::WriteAllText('{}', $PID.ToString()); Start-Sleep -Seconds 300",
+                    quote(&dir.path().join("child.pid"))
+                ),
+            )
+            .unwrap();
+            let parent = dir.path().join("parent.ps1");
+            // UseShellExecute=false creates an ordinary descendant, without a
+            // broker or shell escaping the Job. Output is separate owned files.
+            let script = format!(
+                r#"
+$i=[System.Diagnostics.ProcessStartInfo]::new();
+$i.FileName='{}';
+$i.Arguments='-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{}"';
+$i.UseShellExecute=$false;
+$i.RedirectStandardOutput=$true; $i.RedirectStandardError=$true;
+$p=[System.Diagnostics.Process]::new(); $p.StartInfo=$i;
+if(-not $p.Start()) {{ exit 9 }}
+while(-not [IO.File]::Exists('{}')) {{ Start-Sleep -Milliseconds 10 }}
+while(-not [IO.File]::Exists('{}')) {{ Start-Sleep -Milliseconds 10 }}
+[Console]::WriteLine('{{}}');
+"#,
+                quote(&program),
+                quote(&child),
+                quote(&dir.path().join("child.pid")),
+                quote(&dir.path().join("release"))
+            );
+            let script = if inherited {
+                script.replace(
+                    "$i.RedirectStandardOutput=$true; $i.RedirectStandardError=$true;",
+                    "$i.RedirectStandardOutput=$false; $i.RedirectStandardError=$false;",
+                )
+            } else {
+                script
+            };
+            std::fs::write(&parent, script).unwrap();
+            Self {
+                dir,
+                program,
+                parent,
+            }
+        }
+        pub(crate) fn argv(&self) -> Vec<String> {
+            vec![
+                self.program.display().to_string(),
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-ExecutionPolicy".into(),
+                "Bypass".into(),
+                "-File".into(),
+                self.parent.display().to_string(),
+            ]
+        }
+        pub(crate) fn root(&self) -> &std::path::Path {
+            self.dir.path()
+        }
+        pub(crate) fn release(&self) {
+            std::fs::write(self.dir.path().join("release"), "go").unwrap();
+        }
+        pub(crate) async fn ready(&self) -> Descendant {
+            let marker = self.dir.path().join("child.pid");
+            let pid = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Ok(text) = std::fs::read_to_string(&marker)
+                        && let Ok(pid) = text.parse::<u32>()
+                    {
+                        break pid;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("MCP descendant startup");
+            // SAFETY: marker belongs to this held fixture and its child is
+            // blocked until release. Retain the handle before any retirement.
+            let handle = unsafe {
+                OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION
+                        | PROCESS_TERMINATE
+                        | windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE,
+                    0,
+                    pid,
+                )
+            };
+            assert!(!handle.is_null(), "retain live fixture descendant");
+            let child = Descendant(unsafe { OwnedHandle::from_raw_handle(handle) });
+            assert_eq!(
+                unsafe { WaitForSingleObject(child.0.as_raw_handle(), 0) },
+                WAIT_TIMEOUT
+            );
+            child
+        }
+        fn command(&self) -> RunCommand {
+            let args = self.argv();
+            RunCommand {
+                program: args[0].clone().into(),
+                args: args[1..].iter().map(Into::into).collect(),
+                timeout: Duration::from_secs(15),
+                progress_interval: Duration::from_secs(60),
+                allow_model_override: false,
+                allow_cwd_override: false,
+                elicit_approvals: false,
+                workspace_root: self.root().to_path_buf(),
+                max_runs: 1,
+                stop_grace: Duration::ZERO,
+                issued_sessions: IssuedSessions::default(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_stdio_server_owns_windows_descendants_on_success_timeout_cancel_and_drop() {
+        for action in ["success", "success-inherited", "timeout", "cancel", "drop"] {
+            let fixture = if action == "success-inherited" {
+                Fixture::inheriting_pipes()
+            } else {
+                Fixture::new()
+            };
+            let command = fixture.command();
+            let request = RunRequest {
+                prompt: "x".into(),
+                session_id: None,
+                model: None,
+                cwd: None,
+            };
+            let (cancel, cancelled) = tokio::sync::oneshot::channel();
+            let task =
+                tokio::spawn(
+                    async move { run_prompt(&command, &request, cancelled, None, None).await },
+                );
+            let _task_owner = AbortTaskOnDrop(task.abort_handle());
+            let descendant = fixture.ready().await;
+            match action {
+                "success" | "success-inherited" => fixture.release(),
+                "cancel" => {
+                    cancel.send(()).unwrap();
+                }
+                "drop" => task.abort(),
+                _ => {}
+            }
+            let result = tokio::time::timeout(Duration::from_secs(20), task)
+                .await
+                .expect("MCP run retirement");
+            match action {
+                "drop" => assert!(matches!(result, Err(error) if error.is_cancelled())),
+                "cancel" => assert!(matches!(result.unwrap(), RunOutcome::Cancelled)),
+                "timeout" => assert!(matches!(
+                    result.unwrap(),
+                    RunOutcome::Finished { is_error: true, .. }
+                )),
+                _ => assert!(matches!(
+                    result.unwrap(),
+                    RunOutcome::Finished {
+                        is_error: false,
+                        ..
+                    }
+                )),
+            }
+            descendant.assert_retired().await;
+        }
     }
 }

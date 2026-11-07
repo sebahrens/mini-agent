@@ -1,0 +1,12 @@
+   Compiling mini-agent v1.12.0 (/Users/seb/projects/mini-agent)
+    Finished `test` profile [unoptimized] target(s) in 41.88s
+     Running unittests src/main.rs (target/debug/deps/mini_agent-eb54318180c9c0b0)
+
+running 4 tests
+test agent::tools::find_files::tests::linked_worktree_common_exclude_applies_to_native_discovery ... ok
+test extras::subagents::task_tool::tests::report_contract_actual_task_requests_once_for_code_and_twice_for_repair ... ok
+test tests::subprocess_inventory_tests::production_subprocess_sites_have_a_trust_classification ... ok
+test tests::subprocess_inventory_tests::windows_capable_production_process_terminals_use_creation_boundary ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 6272 filtered out; finished in 54.64s
+

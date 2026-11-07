@@ -1,0 +1,221 @@
+{
+  "reviewer": "runtime-continuation-pass-a",
+  "head": "befd7c7c",
+  "production_head": "282e1e1b",
+  "findings": [
+    {
+      "id": "runtime-cont-a-1",
+      "priority": 2,
+      "confidence": 1.0,
+      "title": "Ephemeral headless sessions discard completed turns needed by later stream inputs and retained goal rounds",
+      "locations": [
+        {
+          "file": "src/startup.rs",
+          "line_start": 3250,
+          "line_end": 3269
+        },
+        {
+          "file": "src/extras/goal/driver.rs",
+          "line_start": 1244,
+          "line_end": 1254
+        },
+        {
+          "file": "src/startup.rs",
+          "line_start": 4915,
+          "line_end": 4922
+        }
+      ],
+      "failure_scenario": "Use an OpenRouter/OpenAI compatible non-native provider with --no-session and --input-format stream-json. After a successful first prompt, finish_print_model skips both in-memory persist_headless_turn and charge_usage_delta because no_session=true. The next input line reuses self.session and converts its unchanged history, so the model cannot see the preceding prompt, answer or tool results. The same guard in goal::driver::persist_round causes a default Continue-mode ephemeral goal to relaunch with no completed-round conversation. Earlier context-relief segments happen to persist in memory, making retained context depend on whether a relief occurred.",
+      "evidence": [
+        "CLI describes --no-session as Ephemeral mode, do not save (cli.rs849), not stateless prompts. dispatch_print_stream_input says one turn per line in one session (startup.rs2554-2560), mutates self.cli.message and calls self.dispatch_print repeatedly (2626).",
+        "The next print builds history from self.session at startup.rs3005 onward. finish_print_model3250 wraps transcript mutation and charge3260-3269 in !no_session alongside disk persistence.",
+        "goal::driver::persist_round1244 returns Ok immediately under no_session; startup4871 sets persisted=true and next_round(Continue) produces HistoryMode::Retained, so next_history converts that same unchanged session.",
+        "Native headless binding commits canonical in-memory records in run_bound_headless_segment independently, so this is specifically the non-native path and cannot be dismissed as universal intended ephemeral behavior."
+      ],
+      "fix_acceptance_tests": [
+        "Two actual stream-json inputs under --no-session and a non-native scripted provider: second HTTP request must contain first prompt, final reply and completed tool results; assert no session/chat-history files are created.",
+        "Two Continue-mode goal rounds under --no-session: second provider request retains first round conversation and in-memory Session totals reflect all rounds exactly once.",
+        "Include user images and a turn that crossed context relief so in-memory history is identical in contract regardless of compaction."
+      ],
+      "probe_artifact": "/private/tmp/mini-agent-continuation-runtime-probes.rs",
+      "probe_tests": [
+        "continuation_runtime_a_probe_ephemeral_finalizer_keeps_in_memory_history",
+        "continuation_runtime_a_probe_ephemeral_goal_round_keeps_retained_history"
+      ],
+      "validation": "Complete source call-path proof; probes call actual finalizer/direct round recorder. Root owns Cargo execution; not run by this agent.",
+      "related_beads": [
+        "mini-agent-wr9nw",
+        "mini-agent-sgzh0"
+      ],
+      "new_vs_open_p0h9g": "Distinct from all eight previously open findings."
+    },
+    {
+      "id": "runtime-cont-a-2",
+      "priority": 2,
+      "confidence": 0.99,
+      "title": "A failed final goal-round save makes print finalization append and charge the same round again",
+      "locations": [
+        {
+          "file": "src/extras/goal/driver.rs",
+          "line_start": 1247,
+          "line_end": 1254
+        },
+        {
+          "file": "src/startup.rs",
+          "line_start": 4850,
+          "line_end": 4871
+        },
+        {
+          "file": "src/startup.rs",
+          "line_start": 3259,
+          "line_end": 3269
+        }
+      ],
+      "failure_scenario": "The goal final round finishes and the gate stops it. persist_round appends the round transcript and charges Session usage, but saving fails (temporary storage failure, unavailable sessions directory, or oversized persisted data). run_headless_goal_rounds_inner logs a warning and leaves persisted=false. It returns the same final HeadlessTurn. finish_print_model sees !already_persisted and appends every prompt/tool/result/reply again and charges the same usage again before retrying storage. If the transient failure clears, the resulting saved session contains duplicates and doubled Session token/cost counters; permanent failure still leaves live session state corrupt for later stream-json turns.",
+      "evidence": [
+        "persist_round mutates Session before calling save_session_recovering and returns Err without rollback (driver.rs1247-1267).",
+        "The headless goal caller sets persisted=true only in the success else branch (startup.rs4850-4871), even though mutation already happened on Err. It does not stop the normal finalizer handoff after save error.",
+        "finish_print_model explicitly interprets persisted=false as not yet recorded/charged and repeats persist_headless_turn plus charge_usage_delta (3259-3269).",
+        "Existing loop_persistence_failures_are_reported_without_hiding_the_turn_failure checks only returned error text, while successful_loop_iterations_accumulate_once_in_the_saved_session covers only successful saves. Neither covers a failed first save followed by finalization."
+      ],
+      "fix_acceptance_tests": [
+        "Force one actual goal-round save failure after live transcript mutation, clear the failure, then run actual print finalization. Each prompt, tool call/result and reply must occur once and Session usage must be charged once.",
+        "Keep disk persistence failure distinct from in-memory round commit, so retrying save cannot repeat recording/accounting. Preserve visible failure reporting when the final retry also fails.",
+        "Exercise a retained stream-json session after the failure to ensure subsequent prompts see a single completed-effect transcript."
+      ],
+      "probe_artifact": "/private/tmp/mini-agent-continuation-runtime-probes.rs",
+      "probe_tests": [
+        "continuation_runtime_a_probe_failed_goal_save_does_not_duplicate_final_round"
+      ],
+      "validation": "Static complete mutation/error/finalizer path proof; supplied probe triggers real persist_round error then actual finish_print_model. Root owns Cargo; no execution by this agent.",
+      "related_beads": [
+        "mini-agent-ylcw5"
+      ],
+      "new_vs_open_p0h9g": "Distinct from financial ledger receipt dedup bugs: this duplicates Session transcript and legacy Session counters at the frontend round handoff."
+    },
+    {
+      "id": "runtime-cont-a-3",
+      "priority": 2,
+      "confidence": 1.0,
+      "title": "Headless background-task cleanup uses prompt boundaries instead of the actual session lifetime",
+      "locations": [
+        {
+          "file": "src/startup.rs",
+          "line_start": 3325,
+          "line_end": 3327
+        },
+        {
+          "file": "src/session/mod.rs",
+          "line_start": 1239,
+          "line_end": 1243
+        },
+        {
+          "file": "src/extras/subagents/background.rs",
+          "line_start": 1180,
+          "line_end": 1205
+        },
+        {
+          "file": "src/extras/subagents/task_tool.rs",
+          "line_start": 2846,
+          "line_end": 2858
+        }
+      ],
+      "failure_scenario": "In multi-turn stream-json, finish_print_model runs exit wait and close_background_tasks after the first prompt, while the outer input loop intends to keep one Session until EOF. Pool::close permanently sets closing=true and stops observation admission, and close_background_tasks retains that pool in Session. Next prompt Run::for_session calls Pool::for_session, which returns the same closed pool; foreground task admission then fails background session is closing, as does any new background task. This can happen after an ordinary first prompt without a task because Run::for_session always initializes the pool. A related opposite seam exists for --loop: the loop-specific path never performs the configured headless exit wait; dropping its saved_session pool cancels last-round detached work immediately instead of giving it headless_exit_wait_secs grace.",
+      "evidence": [
+        "dispatch_print_stream_input reuses self.session until EOF (startup2554-2640). finish_print_model3325-3327 runs wait_background_tasks_before_exit and closes its pool on every successful input turn; outer dispatch already has real exit cleanup at2505-2507.",
+        "Session::close_background_tasks borrows &self and calls pool.close without removing/resetting it (session/mod.rs1239-1243). Only reset_background_tasks clears pool identity, and it is not called by the stream driver.",
+        "Pool::close sets state.closing=true and observations.stop_admission (background.rs1183-1185). Pool::for_session immediately returns existing matching session pool without reopening it (635-644). TaskTool foreground lane checks ensure_open at2852 and returns subagent admission refused when closing.",
+        "Run::for_session always calls Pool::for_session (spend/run.rs154), so no first-turn task is necessary for this poisoning.",
+        "Loop variant: dispatch_loop invokes run_headless_loop and returns (startup3454-3527); run_headless_loop stores a mutable saved_session clone, awaits rounds, and drops it (loop/headless.rs109-132). Neither path invokes the headless wait. Pool::Drop1382 cancels scopes and transfers cleanup fallback rather than waiting the documented grace period."
+      ],
+      "fix_acceptance_tests": [
+        "Two stream-json prompts in the same session: run a foreground task and a new background task on second prompt; both must be admitted. First-turn task may be absent. Test persisted and ephemeral rows.",
+        "A background task started by first input can remain alive for later task_send/task_result until its normal completion or explicit cancellation. EOF still performs bounded grace wait and exact cancellation/join.",
+        "--loop on a non-native provider with a short delayed task in the final iteration waits per headless_exit_wait_secs and captures its result before final save; a zero configured wait cancels promptly with accurate terminal history."
+      ],
+      "probe_artifact": "/private/tmp/mini-agent-continuation-runtime-probes.rs",
+      "probe_tests": [
+        "continuation_runtime_a_probe_stream_turn_does_not_permanently_close_task_pool"
+      ],
+      "validation": "Stream variant complete call-path proof plus actual finalizer/pool-reuse probe supplied for root execution. Loop variant source-proven omission of configured grace path, not independently run. No Cargo by this agent.",
+      "related_beads": [
+        "mini-agent-5ezmf"
+      ],
+      "new_vs_open_p0h9g": "Distinct from MCP server stdout cancellation/EOF issue; this is internal headless Session pool lifecycle across normal prompt boundaries."
+    }
+  ],
+  "passes": [
+    {
+      "pass": "A1 persistence/restore/goal handoff",
+      "new_P0_P3": 2,
+      "finding_ids": [
+        "runtime-cont-a-1",
+        "runtime-cont-a-2"
+      ],
+      "coverage": [
+        "Session truncate_to/rewind_to/redo and metadata pruning",
+        "file checkpoint preflight restore, chain hashes and retire semantics",
+        "bounded Session encoding, undo-drop ladder and save recovery",
+        "headless goal initial/retained/restart rounds, round persistence and finalizer handoff",
+        "native headless guard, segment commit and acknowledged historical goal/loop restrictions"
+      ]
+    },
+    {
+      "pass": "A2 independent cancellation/session-lifetime sweep after A1 findings",
+      "new_P0_P3": 1,
+      "finding_ids": [
+        "runtime-cont-a-3"
+      ],
+      "coverage": [
+        "stream-json same-session driver vs per-turn finalization",
+        "background pool close/reset/drop and next-turn foreground admission",
+        "loop-specific Startup dispatch and saved-session drop",
+        "configured exit grace vs actual close placement"
+      ]
+    },
+    {
+      "pass": "A3 follow-on adversarial sweep after lifecycle finding",
+      "new_P0_P3": 0,
+      "coverage": [
+        "Run::for_session pool initialization and reuse confirming A2, not a new issue",
+        "goal relief ownership/usage carry, judge/check interrupt settlement and disk-failure branches",
+        "native startup replay restart and final owner progress",
+        "Session optional undo drop and private atomic publication",
+        "file checkpoint restore/redo documented separation and cleanup metadata"
+      ],
+      "qualification": "Zero distinct additional P0-P3 findings in these enumerated paths during this follow-on sweep. This is a scoped zero-new pass, not exhaustive absence across repository or all behaviors."
+    }
+  ],
+  "excluded_hypotheses": [
+    {
+      "hypothesis": "Native Anthropic --goal/--loop cannot automatically run.",
+      "disposition": "Observed explicit ownership guards and historical review docs marking automatic native goal/loop ownership deferred. Not filed as a newly discovered defect against current accepted scope."
+    },
+    {
+      "hypothesis": "Redo fails to rearm file checkpoints after restoring conversation.",
+      "disposition": "Intentional: docs/agent/file-checkpoints.md7 explicitly says redo restores conversation only and does not replay filesystem effects or rearm abandoned-branch checkpoints."
+    },
+    {
+      "hypothesis": "Checkpoint restore can overwrite unrelated intervening file changes.",
+      "disposition": "No proven bypass: chain before/after hashes, workspace fingerprint, descriptor metadata/content preflight, and per-publication expected-content checks reject intervening changes; partial restoration reports the completed count and retires restored records."
+    },
+    {
+      "hypothesis": "Child relief summaries lose cumulative usage after assignment.",
+      "disposition": "Previously suppressed correctly: shared relief_usage ledger outputs cumulative totals across summary and continuation requests; not a new finding."
+    },
+    {
+      "hypothesis": "Previously filed real token-pressure gate, stop-hook cap, ledger rotation or MCP EOF findings are new in continuation.",
+      "disposition": "Explicitly excluded all eight existing p0h9g findings using docs/reviews/2026-11-07-post-fix-review.json."
+    }
+  ],
+  "P4_candidates": [],
+  "verification": {
+    "cargo": "No Cargo run by this reviewer; root owns probes and source insertion/cleanup.",
+    "mutations": "Only /private/tmp report/probe artifacts written. No source, bead, git or build mutations.",
+    "indexer": "MCP code indexer now working. Queried relieve_headless_turn/run_headless_goal_rounds symbols, save_session_recovering, persist_round exact implementation and its callers, close_background_tasks symbols. Indexed positions/implementation matched current disk for the reviewed paths; server does not return commit SHA.",
+    "tests_missing": "Existing successful persistence and error-message tests do not cover in-memory commit vs disk-save status, ephemeral multi-turn history, or task pool admission after first stream-json prompt."
+  },
+  "artifacts": [
+    "/private/tmp/mini-agent-continuation-runtime-probes.rs"
+  ]
+}

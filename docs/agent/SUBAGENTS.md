@@ -1257,6 +1257,11 @@ normal TOML/YAML/JSON mini-agent configuration described in
 | `subagent_model`            | `string` | `none (uses main model)` | Model name or quick-model alias |
 | `subagent_provider`         | `string` | (same as main)           | Provider for the subagent (optional) |
 
+Stream-json input keeps its task pool between input turns; exit means EOF or a
+terminal driver error. The final `--loop` iteration uses the same grace period.
+At exit, remaining tasks are cancelled and joined, and their terminal history is
+saved when session persistence is enabled.
+
 All integer task limits must be greater than zero.
 `task_max_output_bytes` must be at least 256, leaving room for an explicit
 partial-status header, and `task_timeout_secs` cannot exceed 86400 (24 hours).
@@ -1545,6 +1550,11 @@ retained, but it cannot cause queued work to start at or after the deadline.
 Exhausting `task_max_turns` is not a child failure. The child returns all text
 accumulated so far followed by `[partial: turn budget exhausted]`; its queued
 and in-flight siblings continue normally (mini-agent-ddno).
+
+`SubagentStop` hooks still observe completion at this cap. A hook that asks the
+child to continue receives only its remaining exploration turns and keeps the
+child's existing conversation; it cannot restart the turn budget. Tool-free
+summary, write-up and report-repair requests have separate finite bounds.
 
 Output accounting charges each response in its returned (quoted and fenced)
 form: a response is cut so that form fits the remaining budget, and the cut is

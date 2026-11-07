@@ -408,3 +408,14 @@ the replacement with the messages after the prior history the hook saw (the prev
 injected input, in order), so nothing is dropped or reordered. A patch without both fields behaves
 exactly as before. The application regression combines a steering injection with an image-budget
 replacement. No dependency version, checksum, license or source-input policy changes.
+
+
+## Gemini initial query credential encoding (mini-agent-p0h9g.5)
+
+The GenerateContent client percent-encodes its API key as one query component
+before constructing both ordinary and SSE request URIs. Reserved punctuation,
+spaces and UTF-8 bytes can no longer alter the first request's query or fragment;
+command credential middleware can recognize the initial issued key and renew it
+on a 401. The application regression in `src/key_command.rs` sends actual SDK
+requests through a loopback server, verifies decoded initial and renewed keys,
+and covers streaming reuse. No dependency or public API changes.

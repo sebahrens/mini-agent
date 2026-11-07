@@ -1,0 +1,101 @@
+   Compiling mini-agent v1.12.0 (/Users/seb/projects/mini-agent)
+    Finished `test` profile [unoptimized] target(s) in 35.03s
+     Running unittests src/main.rs (target/debug/deps/mini_agent-eb54318180c9c0b0)
+
+running 12 tests
+test agent::tools::grep::continuation_discovery_root_probe::continuation_explicit_directory_must_not_bypass_pruned_read_deny ... FAILED
+test agent::tools::grep::continuation_discovery_root_probe::continuation_find_and_list_explicit_directory_obey_pruned_read_deny ... FAILED
+test auth::oauth::tests::continuation_oauth_refresh_waiter_uses_the_completed_refresh ... FAILED
+test config::load::continuation_model_trust_probe::continuation_model_trust_control_operator_alias_is_local ... ok
+test config::load::continuation_model_trust_probe::continuation_model_trust_untrusted_model_must_not_change_provider ... FAILED
+test extras::hooks::backend::tests::continuation_agent_reads_do_not_unignore_children_of_an_excluded_directory ... FAILED
+test extras::mcp::reconnect::tests::continuation_child_manager_does_not_poison_parent_hook_peer ... FAILED
+test paths::continuation_bound_fifo_probe::continuation_bound_file_open_must_refuse_fifo_before_a_writer_arrives ... FAILED
+test startup::continuation_runtime_a_probes::continuation_runtime_a_probe_ephemeral_finalizer_keeps_in_memory_history ... {"session_id":"3a8ee9e1-cea1-4839-b06d-4c3f42d4115a","session_name":"","session_persisted":false,"result":"FIRST_REPLY_AUDIT_MARKER","files_changed":[],"tool_calls":{"total":0,"by_name":{}},"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5,"cached_input_tokens":0,"cache_creation_input_tokens":0,"tool_use_prompt_tokens":0,"hosted_search_requests":0,"reasoning_tokens":0},"cost":0.0,"total_cost_usd":0.0,"num_turns":0,"is_error":false,"cost_unpriced":true,"stop_reason":"completed","duration_ms":21,"type":"result"}
+FAILED
+test startup::continuation_runtime_a_probes::continuation_runtime_a_probe_ephemeral_goal_round_keeps_retained_history ... FAILED
+test startup::continuation_runtime_a_probes::continuation_runtime_a_probe_failed_goal_save_does_not_duplicate_final_round ... Reading piped stdin (limit 1048576 bytes)
+FAILED
+test startup::continuation_runtime_a_probes::continuation_runtime_a_probe_stream_turn_does_not_permanently_close_task_pool ... {"session_id":"e0045add-ebc3-4264-a2d0-8c13b6b42057","session_name":"","session_persisted":false,"result":"FIRST_REPLY_AUDIT_MARKER","files_changed":[],"tool_calls":{"total":0,"by_name":{}},"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5,"cached_input_tokens":0,"cache_creation_input_tokens":0,"tool_use_prompt_tokens":0,"hosted_search_requests":0,"reasoning_tokens":0},"cost":0.0,"total_cost_usd":0.0,"num_turns":0,"is_error":false,"cost_unpriced":true,"stop_reason":"completed","duration_ms":49,"type":"result"}
+FAILED
+
+failures:
+
+---- agent::tools::grep::continuation_discovery_root_probe::continuation_explicit_directory_must_not_bypass_pruned_read_deny stdout ----
+
+thread 'agent::tools::grep::continuation_discovery_root_probe::continuation_explicit_directory_must_not_bypass_pruned_read_deny' (66693207) panicked at src/agent/tools/grep.rs:2581:31:
+explicit directory bypassed the same read deny: 1 results (searched 1 files):
+/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-continuation-denied-root-5797d24c-afee-4eaf-b3f6-72a3bc1e180b/private/sub/data.txt:1:fixture-needle
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- agent::tools::grep::continuation_discovery_root_probe::continuation_find_and_list_explicit_directory_obey_pruned_read_deny stdout ----
+
+thread 'agent::tools::grep::continuation_discovery_root_probe::continuation_find_and_list_explicit_directory_obey_pruned_read_deny' (66693212) panicked at src/agent/tools/grep.rs:2602:17:
+find_files explicit-root bypass: 1 files found:
+/private/var/folders/06/wh3xd5fj2jb6bbhsb8624fx80000gn/T/mini-agent-continuation-denied-metadata-root-d1d6e73c-43b5-475e-8b88-24318002641c/private/sub/data.txt
+
+---- auth::oauth::tests::continuation_oauth_refresh_waiter_uses_the_completed_refresh stdout ----
+
+thread 'auth::oauth::tests::continuation_oauth_refresh_waiter_uses_the_completed_refresh' (66693216) panicked at src/auth/oauth_tests.rs:1109:23:
+called `Result::unwrap()` on an `Err` value: Provider credentials are busy; retry after the other sign-in or refresh finishes
+
+---- config::load::continuation_model_trust_probe::continuation_model_trust_untrusted_model_must_not_change_provider stdout ----
+
+thread 'config::load::continuation_model_trust_probe::continuation_model_trust_untrusted_model_must_not_change_provider' (66693222) panicked at src/config/load.rs:6191:9:
+assertion `left == right` failed: an untrusted benign layer must not choose another provider through an existing quick-model alias
+  left: "openrouter"
+ right: "ollama"
+
+---- extras::hooks::backend::tests::continuation_agent_reads_do_not_unignore_children_of_an_excluded_directory stdout ----
+
+thread 'extras::hooks::backend::tests::continuation_agent_reads_do_not_unignore_children_of_an_excluded_directory' (66693223) panicked at src/extras/hooks/backend.rs:949:9:
+root-excluded directory was re-opened by its own .gitignore: ignored=false, result=Ok("fixture-private-data")
+
+---- extras::mcp::reconnect::tests::continuation_child_manager_does_not_poison_parent_hook_peer stdout ----
+
+thread 'extras::mcp::reconnect::tests::continuation_child_manager_does_not_poison_parent_hook_peer' (66693224) panicked at src/extras/mcp/reconnect.rs:827:9:
+child retirement poisoned a parent hook despite its live peer: mcp_tool hook: MCP server 'continuation-parent-hook-ce07398f-a759-43f8-a041-bc34adbee420' is not connected
+
+---- paths::continuation_bound_fifo_probe::continuation_bound_file_open_must_refuse_fifo_before_a_writer_arrives stdout ----
+
+thread 'paths::continuation_bound_fifo_probe::continuation_bound_file_open_must_refuse_fifo_before_a_writer_arrives' (66693227) panicked at src/paths.rs:4887:9:
+workspace-bound file open waited for the controlled FIFO writer
+
+---- startup::continuation_runtime_a_probes::continuation_runtime_a_probe_ephemeral_finalizer_keeps_in_memory_history stdout ----
+
+thread 'startup::continuation_runtime_a_probes::continuation_runtime_a_probe_ephemeral_finalizer_keeps_in_memory_history' (66693438) panicked at src/startup.rs:8411:9:
+stream-json's next input receives no preceding ephemeral turn: []
+
+---- startup::continuation_runtime_a_probes::continuation_runtime_a_probe_ephemeral_goal_round_keeps_retained_history stdout ----
+
+thread 'startup::continuation_runtime_a_probes::continuation_runtime_a_probe_ephemeral_goal_round_keeps_retained_history' (66693440) panicked at src/startup.rs:8423:9:
+next_round(Continue) converts this same session, but no completed round was recorded
+
+---- startup::continuation_runtime_a_probes::continuation_runtime_a_probe_failed_goal_save_does_not_duplicate_final_round stdout ----
+
+thread 'startup::continuation_runtime_a_probes::continuation_runtime_a_probe_failed_goal_save_does_not_duplicate_final_round' (66693441) panicked at src/startup.rs:8453:60:
+called `Result::unwrap()` on an `Err` value: Os { code: 2, kind: NotFound, message: "No such file or directory" }
+
+---- startup::continuation_runtime_a_probes::continuation_runtime_a_probe_stream_turn_does_not_permanently_close_task_pool stdout ----
+PRIVATE_OPEN_FAILED=initial_metadata
+
+thread 'startup::continuation_runtime_a_probes::continuation_runtime_a_probe_stream_turn_does_not_permanently_close_task_pool' (66693443) panicked at src/startup.rs:8503:9:
+a stream-json turn is not session exit; the next prompt must retain task admission
+
+
+failures:
+    agent::tools::grep::continuation_discovery_root_probe::continuation_explicit_directory_must_not_bypass_pruned_read_deny
+    agent::tools::grep::continuation_discovery_root_probe::continuation_find_and_list_explicit_directory_obey_pruned_read_deny
+    auth::oauth::tests::continuation_oauth_refresh_waiter_uses_the_completed_refresh
+    config::load::continuation_model_trust_probe::continuation_model_trust_untrusted_model_must_not_change_provider
+    extras::hooks::backend::tests::continuation_agent_reads_do_not_unignore_children_of_an_excluded_directory
+    extras::mcp::reconnect::tests::continuation_child_manager_does_not_poison_parent_hook_peer
+    paths::continuation_bound_fifo_probe::continuation_bound_file_open_must_refuse_fifo_before_a_writer_arrives
+    startup::continuation_runtime_a_probes::continuation_runtime_a_probe_ephemeral_finalizer_keeps_in_memory_history
+    startup::continuation_runtime_a_probes::continuation_runtime_a_probe_ephemeral_goal_round_keeps_retained_history
+    startup::continuation_runtime_a_probes::continuation_runtime_a_probe_failed_goal_save_does_not_duplicate_final_round
+    startup::continuation_runtime_a_probes::continuation_runtime_a_probe_stream_turn_does_not_permanently_close_task_pool
+
+test result: FAILED. 1 passed; 11 failed; 0 ignored; 0 measured; 6231 filtered out; finished in 2.43s
+
+error: test failed, to rerun pass `--bin mini-agent`

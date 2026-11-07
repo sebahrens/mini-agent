@@ -1,0 +1,23 @@
+   Compiling mini-agent v1.12.0 (/Users/seb/projects/mini-agent)
+    Finished `test` profile [unoptimized] target(s) in 39.92s
+     Running tests/headless_json.rs (target/debug/deps/headless_json-f62e74dcf7072634)
+
+running 2 tests
+test ephemeral_stream_json_retains_prior_prompt_reply_and_tool_result ... ok
+test headless_mcp_session_end_keeps_the_connection_through_plain_exit_and_stream_eof ... FAILED
+
+failures:
+
+---- headless_mcp_session_end_keeps_the_connection_through_plain_exit_and_stream_eof stdout ----
+
+thread 'headless_mcp_session_end_keeps_the_connection_through_plain_exit_and_stream_eof' (66948414) panicked at tests/headless_json.rs:838:43:
+piped stdin
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    headless_mcp_session_end_keeps_the_connection_through_plain_exit_and_stream_eof
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 62 filtered out; finished in 1.87s
+
+error: test failed, to rerun pass `--test headless_json`

@@ -74,13 +74,21 @@ impl Provider for GeminiExt {
     fn build_uri(&self, base_url: &str, path: &str, transport: Transport) -> String {
         let trimmed = path.trim_start_matches('/');
         let separator = if trimmed.contains('?') { "&" } else { "?" };
+        // Encode before the first send too: refresh middleware can only
+        // identify an owned credential if it survives URI construction.
+        let mut api_key = String::with_capacity(self.api_key.len());
+        for byte in self.api_key.bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+                api_key.push(char::from(byte));
+            } else {
+                use std::fmt::Write as _;
+                write!(&mut api_key, "%{byte:02X}").expect("formatting into a String");
+            }
+        }
 
         match transport {
-            Transport::Sse => format!(
-                "{base_url}/{trimmed}{separator}alt=sse&key={}",
-                self.api_key
-            ),
-            _ => format!("{base_url}/{trimmed}{separator}key={}", self.api_key),
+            Transport::Sse => format!("{base_url}/{trimmed}{separator}alt=sse&key={}", api_key),
+            _ => format!("{base_url}/{trimmed}{separator}key={api_key}"),
         }
     }
 }

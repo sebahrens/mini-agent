@@ -1,0 +1,21 @@
+    Finished `test` profile [unoptimized] target(s) in 0.21s
+     Running unittests src/main.rs (target/debug/deps/mini_agent-eb54318180c9c0b0)
+
+running 1 test
+test git::tool::tests::continuation_native_staged_guard_accepts_actual_git_tool_rename_records ... FAILED
+
+failures:
+
+---- git::tool::tests::continuation_native_staged_guard_accepts_actual_git_tool_rename_records stdout ----
+
+thread 'git::tool::tests::continuation_native_staged_guard_accepts_actual_git_tool_rename_records' (66708043) panicked at src/git/tool.rs:4545:9:
+actual GitTool rename record was rejected despite selecting both paths: Err("index contains staged paths outside this commit selection"); {"records":["# branch.oid 4da0b3af6f0365be00f7c830cf19bff3cb3cda68","# branch.head main","2 R. N... 100644 100644 100644 5fb78360e3deef98e05c03db25f9901b2efe3929 5fb78360e3deef98e05c03db25f9901b2efe3929 R100 new.txt\torig: old.txt"],"truncated":false,"counts":{"changed":1,"untracked":0},"operation":"status","coaching":null}
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    git::tool::tests::continuation_native_staged_guard_accepts_actual_git_tool_rename_records
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 6244 filtered out; finished in 0.33s
+
+error: test failed, to rerun pass `--bin mini-agent`

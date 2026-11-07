@@ -764,6 +764,7 @@ impl GitTool {
             parse_status_records(&output.stdout, truncated);
         let mut value = serde_json::json!({
             "records": records,
+            "path_records": parse_status_paths(&output.stdout, truncated),
             "truncated": truncated,
             "counts": { "changed": changed_count, "untracked": untracked_count },
         });
@@ -2484,6 +2485,47 @@ fn parse_status_records(stdout: &[u8], truncated: bool) -> (Vec<String>, usize, 
     (records, changed, untracked)
 }
 
+/// Lossless path operands for consumers that authorize effects. Display records
+/// deliberately join rename fields and therefore cannot serve as path operands.
+fn parse_status_paths(stdout: &[u8], truncated: bool) -> Vec<serde_json::Value> {
+    let mut fields: Vec<&[u8]> = stdout.split(|byte| *byte == 0).collect();
+    let tail = fields.pop().unwrap_or_default();
+    if !truncated && !tail.is_empty() {
+        fields.push(tail);
+    }
+    let mut entries = Vec::new();
+    let mut fields = fields.into_iter();
+    while let Some(field) = fields.next() {
+        let Some(kind @ (b'1' | b'2' | b'u')) = field.first().copied() else {
+            continue;
+        };
+        let count = if kind == b'2' {
+            10
+        } else if kind == b'u' {
+            11
+        } else {
+            9
+        };
+        let parts: Vec<&[u8]> = field.splitn(count, |byte| *byte == b' ').collect();
+        let origin = if kind == b'2' { fields.next() } else { None };
+        if truncated && kind == b'2' && origin.is_none() {
+            break;
+        }
+        let valid = parts.len() == count && parts[1].len() == 2;
+        let path = valid
+            .then(|| std::str::from_utf8(parts[count - 1]).ok())
+            .flatten();
+        let origin = origin.and_then(|path| std::str::from_utf8(path).ok());
+        entries.push(serde_json::json!({
+            "kind": (kind as char).to_string(),
+            "xy": valid.then(|| std::str::from_utf8(parts[1]).ok()).flatten(),
+            "path": path,
+            "origin": origin,
+        }));
+    }
+    entries
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -2761,6 +2803,41 @@ mod tests {
         );
         assert!(committed["before"]["records"].is_array());
         assert!(committed["after"]["records"].is_array());
+    }
+
+    #[cfg(feature = "git-worktree")]
+    #[tokio::test]
+    async fn native_commit_guard_accepts_real_rename_operands_losslessly() {
+        let repo = TestRepo::new();
+        let old = if cfg!(windows) {
+            "old 雪.txt"
+        } else {
+            "old\torig: name\n雪.txt"
+        };
+        let new = if cfg!(windows) {
+            "new 雪.txt"
+        } else {
+            "new\torig: name\n雪.txt"
+        };
+        repo.write(old, "tracked\n");
+        repo.git(["add", "--", old]);
+        repo.git(["commit", "--quiet", "-m", "initial"]);
+        repo.git(["mv", "--", old, new]);
+        repo.write("other.txt", "other\n");
+        repo.git(["add", "--", "other.txt"]);
+        let tool = repo.tool();
+        let status = tool
+            .call(args(GitOperation::Status, &[], None))
+            .await
+            .unwrap();
+        let guard = crate::ui::slash::git::check_staged_paths;
+        assert!(
+            guard(&status, &[old.into(), new.into(), "other.txt".into()]).is_ok(),
+            "{status}"
+        );
+        assert!(guard(&status, &[old.into(), new.into()]).is_err());
+        assert!(guard(&status, &[new.into(), "other.txt".into()]).is_err());
+        assert!(guard(&status, &[old.into(), "other.txt".into()]).is_err());
     }
 
     #[test]

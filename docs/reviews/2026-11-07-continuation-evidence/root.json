@@ -1,0 +1,23 @@
+{
+  "reviewer": "root independent review",
+  "baseline": "eef3001c",
+  "findings": [
+    {
+      "priority": 2,
+      "title": "Coalesce concurrent OAuth refreshes instead of failing sibling provider turns",
+      "file": "src/auth/oauth.rs",
+      "scenario": "When an expiring registration refresh holds the credential store lock through token and JWKS calls, concurrent access_token callers immediately fail with Provider credentials are busy. Provider preparation propagates this as a non-retryable instance error, terminating sibling turns although the refresh succeeds.",
+      "evidence": [
+        "Actual lock-contention probe failed: sibling access_token returned busy instead of the newly saved token. Error is not classified retryable.",
+        "Registration::access_token -> load_or_refresh -> LockedStore::open uses immediate try_lock; provider_http::prepare propagates failure before HTTP send."
+      ],
+      "fix": "Bound and coalesce concurrent refresh admission, preserving logout/account/revision fences and bounded cancellation. Avoid indefinite blocking or duplicating rotated refresh-token requests.",
+      "acceptance_tests": [
+        "Two simultaneous callers at expiry both receive the fresh credential after one refresh; no busy error.",
+        "Cancellation, cross-process contention, refresh failure and logout/replacement preserve existing credential fencing."
+      ],
+      "probe": "mini-agent-continuation-oauth-probe.rs"
+    }
+  ],
+  "stabilization": "Follow-on review of OAuth JWT/store/logout, retry, web fetch/proxy cache and PDF resource limits found no further established P0-P3. Cache policy-revocation hypothesis suppressed because no supported complete failure schedule was demonstrated."
+}

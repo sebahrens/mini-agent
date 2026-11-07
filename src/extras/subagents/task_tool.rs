@@ -2092,6 +2092,18 @@ editing in a known location, grepping for a literal you will act on immediately.
                 let evidence_base_dir = authorization
                     .workspace()
                     .map(|workspace| workspace.root().to_path_buf());
+                #[cfg(feature = "hooks")]
+                let child_hook_bindings = crate::agent::runner::HookBindings {
+                    context: crate::agent::runner::current_hook_session_context(),
+                    permission: Some(authorization.hook_permission()),
+                    #[cfg(feature = "mcp")]
+                    peers: Some(
+                        mcp_manager
+                            .as_ref()
+                            .map(|manager| manager.hook_peers())
+                            .unwrap_or_default(),
+                    ),
+                };
                 #[cfg(not(feature = "mcp"))]
                 let evidence_mcp: Vec<(String, String)> = Vec::new();
                 #[cfg(feature = "mcp")]
@@ -2118,6 +2130,12 @@ editing in a known location, grepping for a literal you will act on immediately.
                 )
                 .await
                 .with_spend(spend_profile);
+                #[cfg(feature = "hooks")]
+                let agent = agent.with_hook_routing(
+                    child_hook_bindings.permission.clone().flatten(),
+                    #[cfg(feature = "mcp")]
+                    child_hook_bindings.peers.clone().unwrap_or_default(),
+                );
                 #[cfg(feature = "agent-skills")]
                 let agent = if let Some(services) = agent.instruction_services() {
                     agent.clone().with_instruction_turn(Some(
@@ -2222,29 +2240,35 @@ editing in a known location, grepping for a literal you will act on immediately.
                 if !task_budget.exhausted()
                     && let Ok(response) = run.response.as_ref()
                     && let crate::extras::hooks::SubagentStopGate::Continue { reason } =
-                        crate::extras::hooks::dispatch_subagent_stop(
-                            &hook_agent_type,
-                            &hook_agent_source,
-                            false,
-                        )
-                        .await
+                        child_hook_bindings
+                            .clone()
+                            .run(crate::extras::hooks::dispatch_subagent_stop(
+                                &hook_agent_type,
+                                &hook_agent_source,
+                                false,
+                            ))
+                            .await
+                    && remaining_child_turns(max_turns, run.turns) > 0
                 {
                     tracing::info!("hooks: SubagentStop forced continuation: {reason}");
                     let continuation = format!("{response}\n\n{reason}");
                     let retried = agent
-                        .run_subagent(
+                        .run_subagent_with_history(
                             &continuation,
-                            max_turns,
+                            run.history.clone(),
+                            remaining_child_turns(max_turns, run.turns),
                             event_tx.as_ref(),
                             &config.retry,
                             retry_usage.clone(),
                             None,
                         )
                         .await;
+                    let new_history =
+                        &retried.history[run.history.len().min(retried.history.len())..];
                     if evidence_enabled {
-                        evidence.record_history(&retried.history);
+                        evidence.record_history(new_history);
                     }
-                    omitted_images += super::image_cost::omitted_images(&retried.history);
+                    omitted_images += super::image_cost::omitted_images(new_history);
                     run = merge_forced_continuation_run(run, retried);
                 }
 
@@ -2742,6 +2766,12 @@ where
         known_violations,
         details,
     }
+}
+
+/// Exploration continuations, including stop hooks, share the child's cap.
+#[cfg(any(feature = "hooks", test))]
+fn remaining_child_turns(limit: usize, spent: u32) -> usize {
+    limit.saturating_sub(spent as usize)
 }
 
 #[cfg(feature = "hooks")]
@@ -5124,6 +5154,8 @@ mod tests {
     #[tokio::test]
     async fn report_contract_actual_task_requests_once_for_code_and_twice_for_repair() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
 
         // This fixture uses the same bounded Content-Length/SSE contract as
         // builder::provider_param_tests and the provider's real stream tests.
@@ -5148,17 +5180,106 @@ mod tests {
             ),
         ]);
         let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(fixture.path()).unwrap());
+        std::fs::write(
+            fixture.path().join("fixture.rs"),
+            "pub fn route_witness() {}\n",
+        )
+        .unwrap();
+        #[cfg(feature = "hooks")]
+        let stop_hook_executable = {
+            let source = fixture.path().join("stop_hook.rs");
+            let executable = fixture.path().join(if cfg!(windows) {
+                "stop_hook.exe"
+            } else {
+                "stop_hook"
+            });
+            std::fs::write(
+                &source,
+                r##"
+fn main() {
+    std::fs::write(std::env::var_os("HOOK_MARKER").unwrap(), "seen").unwrap();
+    println!("{}", r#"{"decision":"block","reason":"keep digging"}"#);
+}
+"##,
+            )
+            .unwrap();
+            let output = std::process::Command::new(
+                std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()),
+            )
+            .args(["--edition=2024", "--crate-name", "task_stop_hook_fixture"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            executable
+        };
+        #[cfg(all(feature = "hooks", feature = "mcp"))]
+        let mcp_fixture = crate::tests::mcp_stdio_tests::FixtureBuild::compile();
+        #[cfg(all(feature = "hooks", feature = "mcp"))]
+        struct RestoreMcpHooks;
+        #[cfg(all(feature = "hooks", feature = "mcp"))]
+        impl Drop for RestoreMcpHooks {
+            fn drop(&mut self) {
+                crate::extras::hooks::backend::set_mcp_tool_hooks_enabled(false);
+                crate::extras::hooks::backend::set_mcp_tool_hooks_unprompted(false);
+            }
+        }
+        #[cfg(all(feature = "hooks", feature = "mcp"))]
+        let _restore_mcp_hooks = RestoreMcpHooks;
         let valid = "## Findings\n- [confidence: high] Source contains this literal Markdown:\n\
             ````text\n## Findings\n- a code bullet, not an unlabelled finding\n```\n````\n\
             ## Unverified\n- None.\n## Coverage\n- Covered: fixture.rs:1.\n- Skipped: None.";
-        for (answers, expected_count, budget, partial) in [
-            (vec![valid], 1, 4_000_000, false),
+        #[allow(unused_mut)]
+        let mut cases = vec![
+            (vec![valid], 1, 4_000_000, false, 2, false),
             // Each observed call costs 7 input + 5*5 output = 32 units.
             // Both the initial call and its repair fit only if charged once.
-            (vec!["unstructured finding", valid], 2, 65, false),
+            (vec!["unstructured finding", valid], 2, 65, false, 2, false),
             // The old 1x output accounting would incorrectly fit this limit.
-            (vec![valid], 1, 31, true),
-        ] {
+            (vec![valid], 1, 31, true, 2, false),
+        ];
+        #[cfg(all(feature = "hooks", not(feature = "mcp")))]
+        cases.push((vec![valid], 1, 4_000_000, false, 1, true));
+        #[cfg(all(feature = "hooks", feature = "mcp"))]
+        cases.push((
+            vec!["ROUTE_CHILD_TOOL", valid],
+            2,
+            4_000_000,
+            false,
+            2,
+            true,
+        ));
+        for (answers, expected_count, budget, partial, max_turns, _stop_hook) in cases {
+            #[cfg(feature = "hooks")]
+            if _stop_hook {
+                #[allow(unused_mut)]
+                let mut hooks = serde_json::json!({
+                    "SubagentStop": [{"hooks": [{"type": "command", "command": stop_hook_executable.to_string_lossy(), "args": [],
+                        "env": {"HOOK_MARKER": fixture.path().join("stop-hook-ran").to_string_lossy()},
+                        "trust": "trusted", "timeout": 5}]}]
+                });
+                #[cfg(feature = "mcp")]
+                {
+                    crate::extras::hooks::backend::set_mcp_tool_hooks_enabled(true);
+                    crate::extras::hooks::backend::set_mcp_tool_hooks_unprompted(true);
+                    hooks["SubagentStop"][0]["hooks"].as_array_mut().unwrap().push(serde_json::json!({
+                        "type":"mcp_tool", "command":"shared", "args":["probe", "{}"], "timeout":5
+                    }));
+                    hooks["PreToolUse"] = serde_json::json!([{"hooks":[{
+                        "type":"mcp_tool", "command":"shared", "args":["probe", "{}"], "timeout":5
+                    }]}]);
+                }
+                let hooks = serde_json::from_value(hooks).unwrap();
+                crate::extras::hooks::init_dispatcher(
+                    crate::extras::hooks::dispatcher::HookDispatcher::from_config(&hooks).unwrap(),
+                );
+            }
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let requests = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
@@ -5198,14 +5319,20 @@ mod tests {
                     // Keep serving unexpected extra calls so they are counted
                     // and cannot masquerade as a correct no-repair result.
                     let answer = answers.get(index).copied().unwrap_or(valid);
-                    let first = serde_json::json!({"id":"report125","object":"chat.completion.chunk","created":0,"model":"fixture","choices":[{"index":0,"delta":{"role":"assistant","content":answer},"finish_reason":null}]});
-                    let last = serde_json::json!({"id":"report125","object":"chat.completion.chunk","created":0,"model":"fixture","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":5,"total_tokens":12}});
+                    let delta = if answer == "ROUTE_CHILD_TOOL" {
+                        serde_json::json!({"role":"assistant","tool_calls":[{"index":0,"id":"route-read","type":"function","function":{"name":"read","arguments":"{\"path\":\"fixture.rs\"}"}}]})
+                    } else {
+                        serde_json::json!({"role":"assistant","content":answer})
+                    };
+                    let first = serde_json::json!({"id":"report125","object":"chat.completion.chunk","created":0,"model":"fixture","choices":[{"index":0,"delta":delta,"finish_reason":null}]});
+                    let last = serde_json::json!({"id":"report125","object":"chat.completion.chunk","created":0,"model":"fixture","choices":[{"index":0,"delta":{},"finish_reason":if answer == "ROUTE_CHILD_TOOL" { "tool_calls" } else { "stop" }}],"usage":{"prompt_tokens":7,"completion_tokens":5,"total_tokens":12}});
                     let response = format!("data: {first}\n\ndata: {last}\n\ndata: [DONE]\n\n");
                     socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).await.unwrap();
                     socket.shutdown().await.unwrap();
                 }
             })));
-            let config: crate::config::Config = serde_json::from_value(serde_json::json!({
+            #[allow(unused_mut)]
+            let mut config: crate::config::Config = serde_json::from_value(serde_json::json!({
                 "no_context_files": true, "session_title_model": "off",
                 "max_tokens": 1024, "subagent_max_tokens": 1024,
                 "task_report_repair_max_tokens": 37,
@@ -5215,6 +5342,36 @@ mod tests {
                     "base_url": format!("http://{address}/v1"), "api_style": "completions"}}
             }))
             .unwrap();
+            #[cfg(all(feature = "hooks", feature = "mcp"))]
+            let parent_mcp = if _stop_hook {
+                let child = mcp_fixture.config(
+                    mcp_fixture.executable.display().to_string(),
+                    Vec::new(),
+                    "aux",
+                    &mcp_fixture.lease("task-child-route"),
+                );
+                config.mcp_servers =
+                    Some(std::collections::HashMap::from([("shared".into(), child)]));
+                let paths = crate::paths::process_paths_ref().unwrap();
+                crate::paths::ensure_private_directory(&paths.agents_dir()).unwrap();
+                crate::fs::private_atomic_write_sync(&paths.agents_dir().join("route-child.md"),
+                    b"---\nmcp_servers:\n  shared: [probe]\n---\nTrace actual code and return the requested report.").unwrap();
+                let parent = mcp_fixture.config(
+                    mcp_fixture.executable.display().to_string(),
+                    Vec::new(),
+                    "aux",
+                    &mcp_fixture.lease("task-parent-route"),
+                );
+                Some(
+                    crate::extras::mcp::McpClientManager::connect_all_in_binding(
+                        &std::collections::HashMap::from([("shared".into(), parent)]),
+                        &workspace,
+                    )
+                    .await,
+                )
+            } else {
+                None
+            };
             let client = crate::provider::create_client(
                 "report-wire",
                 Some("inert-loopback-key"),
@@ -5229,15 +5386,36 @@ mod tests {
                 model_name: "fixture".into(),
                 fallback_notice: None,
                 api_key: None,
-                max_turns: 2,
+                max_turns,
                 config: config.into(),
             };
             let task = TaskTool::new(None, None, true).with_workspace_binding(workspace.clone());
-            let args = serde_json::from_value(
-                serde_json::json!({"prompts":["Trace fixture.rs and return actual code extracts"]}),
-            )
-            .unwrap();
+            #[allow(unused_mut)]
+            let mut args =
+                serde_json::json!({"prompts":["Trace fixture.rs and return actual code extracts"]});
+            #[cfg(all(feature = "hooks", feature = "mcp"))]
+            if _stop_hook {
+                args["agent_type"] = "route-child".into();
+            }
+            let args = serde_json::from_value(args).unwrap();
             let scope = crate::agent::runner::AgentWorkScope::new();
+            #[cfg(all(feature = "hooks", feature = "mcp"))]
+            if let Some(manager) = &parent_mcp {
+                scope.set_hook_mcp_peers(manager.hook_peers());
+                let control = scope
+                    .run(crate::extras::hooks::backend::call_mcp(
+                        "shared",
+                        "probe",
+                        Default::default(),
+                        Duration::from_secs(5),
+                    ))
+                    .await;
+                assert_eq!(
+                    control.exit_code,
+                    Some(0),
+                    "the parent route is live before child execution"
+                );
+            }
             let cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(scope.clone());
             let result = tokio::time::timeout(
                 Duration::from_secs(5),
@@ -5252,8 +5430,40 @@ mod tests {
             worker.abort();
             let _ = worker.await;
             let report = result.expect("loopback task must settle").unwrap();
-            let requests = requests.lock().unwrap();
+            let requests = requests.lock().unwrap().clone();
             assert_eq!(requests.len(), expected_count, "{report}");
+            #[cfg(feature = "hooks")]
+            if _stop_hook {
+                assert_eq!(
+                    std::fs::read_to_string(fixture.path().join("stop-hook-ran")).unwrap(),
+                    "seen",
+                    "SubagentStop remains observable even when no exploration turns remain"
+                );
+            }
+            #[cfg(all(feature = "hooks", feature = "mcp"))]
+            if let Some(manager) = parent_mcp {
+                let count_calls = |name| {
+                    std::fs::read_to_string(mcp_fixture.lease(name).with_extension("rpc"))
+                        .unwrap()
+                        .lines()
+                        .filter(|line| {
+                            serde_json::from_str::<serde_json::Value>(line).unwrap()["method"]
+                                == "tools/call"
+                        })
+                        .count()
+                };
+                assert_eq!(
+                    count_calls("task-parent-route"),
+                    1,
+                    "child hooks must never inherit the same-name parent connection"
+                );
+                assert_eq!(
+                    count_calls("task-child-route"),
+                    2,
+                    "actual child agent tool hooks and TaskTool Stop must both use their owned persona manager"
+                );
+                manager.shutdown().await;
+            }
             assert!(
                 report.contains("> ## Coverage\n> - Covered: fixture.rs:1."),
                 "{report}"
@@ -5267,7 +5477,7 @@ mod tests {
                 assert!(report.contains("cost_units=32/31"), "{report}");
             }
             assert_eq!(requests[0]["max_tokens"], 1024);
-            if expected_count == 2 {
+            if expected_count == 2 && !_stop_hook {
                 assert_eq!(
                     requests[1]["max_tokens"], 37,
                     "repair honors its captured response cap"
@@ -5282,6 +5492,8 @@ mod tests {
                 );
             }
         }
+        #[cfg(all(feature = "hooks", feature = "mcp"))]
+        mcp_fixture.cleanup();
     }
 
     #[test]
@@ -8300,6 +8512,58 @@ mod child_continuation_tests {
         .await;
         assert!(!called, "no summary or continuation past the turn cap");
         assert!(run.response.is_err());
+    }
+
+    #[cfg(feature = "hooks")]
+    #[tokio::test]
+    async fn stop_hook_continuation_keeps_history_and_only_remaining_exploration_turns() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call("before", EvidenceTool::NAME, serde_json::json!({})),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            text_usage("initial report", 10),
+            vec![
+                MockStreamEvent::tool_call("after", EvidenceTool::NAME, serde_json::json!({})),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            text_usage("must not get another exploration request", 10),
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .tool(EvidenceTool(calls.clone()))
+            .build();
+        let original = run_subagent_with_history(
+            &agent,
+            "inspect",
+            Vec::new(),
+            3,
+            None,
+            &crate::retry::RetryConfig::default(),
+            SharedUsageLedger::default(),
+            None,
+        )
+        .await;
+        assert_eq!(original.turns, 2);
+        let prior_len = original.history.len();
+        let retried = run_subagent_with_history(
+            &agent,
+            "keep digging",
+            original.history.clone(),
+            remaining_child_turns(3, original.turns),
+            None,
+            &crate::retry::RetryConfig::default(),
+            SharedUsageLedger::default(),
+            None,
+        )
+        .await;
+        assert!(retried.turn_budget_exhausted);
+        assert_eq!(model.requests().len(), 3);
+        assert!(retried.history.len() > prior_len);
+        assert_eq!(&retried.history[..prior_len], original.history.as_slice());
+        let merged = merge_forced_continuation_run(original, retried);
+        assert_eq!(merged.turns, 3);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]

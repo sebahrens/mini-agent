@@ -97,7 +97,7 @@ async fn run(
     workspace: &Path,
     timeout: Duration,
 ) -> anyhow::Result<HashMap<String, String>> {
-    use crate::process_creation::TokioCommandCreationExt as _;
+    use crate::process_creation::CommandWrapCreationExt as _;
     helper
         .validate()
         .map_err(|error| anyhow::anyhow!("MCP server '{server_name}': {error}"))?;
@@ -125,28 +125,37 @@ async fn run(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
-    #[cfg(unix)]
-    command.process_group(0);
+    let mut command = crate::sandbox::owned_workspace_service_tree(command);
     let mut child = command.spawn_guarded().map_err(|error| {
         anyhow::anyhow!("MCP server '{server_name}' headersHelper cannot start: {error}")
     })?;
     let pid = child.id();
     let _group_guard = GroupKillOnDrop(pid);
-    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stdout = child.stdout().take().expect("piped stdout");
     let work = async {
-        let mut output = Vec::new();
-        let read = (&mut stdout)
-            .take(MAX_OUTPUT_BYTES as u64 + 1)
-            .read_to_end(&mut output)
-            .await;
-        // Closing the pipe early (output over the cap) must not wait on a
-        // child that is still writing.
-        let status = if output.len() > MAX_OUTPUT_BYTES {
-            None
-        } else {
-            Some(child.wait().await)
+        let read = async {
+            let mut output = Vec::new();
+            let read = (&mut stdout)
+                .take(MAX_OUTPUT_BYTES as u64 + 1)
+                .read_to_end(&mut output)
+                .await;
+            (read, output)
         };
-        (read, output, status)
+        tokio::pin!(read);
+        tokio::select! {
+            status = child.inner_mut().wait() => {
+                let _ = child.start_kill();
+                match tokio::time::timeout(Duration::from_secs(1), &mut read).await {
+                    Ok((read, output)) => (read, output, Some(status)),
+                    Err(_) => (Err(std::io::Error::other("MCP helper output did not retire")), Vec::new(), Some(status)),
+                }
+            }
+            (read, output) = &mut read => {
+                // Over-limit writers are stopped without waiting for exit.
+                let status = if output.len() > MAX_OUTPUT_BYTES || read.is_err() { None } else { Some(child.inner_mut().wait().await) };
+                (read, output, status)
+            }
+        }
     };
     let finished = tokio::time::timeout(timeout, work).await;
     #[cfg(unix)]
@@ -156,6 +165,7 @@ async fn run(
     #[cfg(not(unix))]
     let _ = pid;
     let _ = child.start_kill();
+    let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
     let Ok((read, output, status)) = finished else {
         anyhow::bail!(
             "MCP server '{server_name}' headersHelper timed out after {} s",
@@ -248,6 +258,18 @@ mod tests {
         let result = merged_headers("srv", helper, &statics, &work, enabled, timeout).await;
         let _ = std::fs::remove_dir_all(&work);
         result
+    }
+
+    #[tokio::test]
+    async fn successful_helper_leader_exit_retires_descendants_holding_stdout() {
+        let result = merged(
+            &helper("sleep 300 & printf '%s' '{\"x-owned\":\"done\"}'"),
+            true,
+            HELPER_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.get("x-owned").map(String::as_str), Some("done"));
     }
 
     #[tokio::test]
@@ -469,5 +491,54 @@ mod tests {
             parse_definition(serde_json::json!({"command":"c","headersHelper":"x"})).is_err(),
             "command servers cannot use a headers helper"
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tree_tests {
+    use super::*;
+    use crate::extras::mcp::server::windows_tree_tests::Fixture;
+
+    struct AbortOnDrop(tokio::task::AbortHandle);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_stdio_headers_helper_owns_windows_descendants_on_success_timeout_and_drop() {
+        for action in ["success", "success-inherited", "timeout", "drop"] {
+            let fixture = if action == "success-inherited" {
+                Fixture::inheriting_pipes()
+            } else {
+                Fixture::new()
+            };
+            let helper = McpHeadersHelper {
+                command: fixture.argv(),
+                inherit_env: vec!["SystemRoot".into()],
+                sandbox: None,
+            };
+            let root = fixture.root().to_path_buf();
+            let task = tokio::spawn(async move {
+                run("tree-test", &helper, &root, Duration::from_secs(15)).await
+            });
+            let _task_owner = AbortOnDrop(task.abort_handle());
+            let descendant = fixture.ready().await;
+            match action {
+                "success" | "success-inherited" => fixture.release(),
+                "drop" => task.abort(),
+                _ => {}
+            }
+            let result = tokio::time::timeout(Duration::from_secs(20), task)
+                .await
+                .expect("MCP helper retirement");
+            match action {
+                "success" | "success-inherited" => assert!(result.unwrap().is_ok()),
+                "timeout" => assert!(result.unwrap().is_err()),
+                _ => assert!(result.unwrap_err().is_cancelled()),
+            }
+            descendant.assert_retired().await;
+        }
     }
 }

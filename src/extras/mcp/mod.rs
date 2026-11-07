@@ -162,11 +162,14 @@ pub(crate) struct McpServerStatus {
 }
 
 impl McpClientManager {
+    #[cfg(feature = "hooks")]
+    pub(crate) fn hook_peers(&self) -> std::sync::Arc<crate::extras::hooks::backend::McpPeers> {
+        crate::extras::hooks::backend::capture_mcp_peers(&self.handles)
+    }
+
     /// Wrap already-connected handles. Handles should be sorted by server name
     /// so tool ordering and collision handling stay deterministic.
     pub fn from_handles(handles: Vec<client::McpClientHandle>) -> Self {
-        #[cfg(feature = "hooks")]
-        crate::extras::hooks::backend::register_mcp_peers(&handles);
         let health = health::Health::default();
         for handle in &handles {
             health

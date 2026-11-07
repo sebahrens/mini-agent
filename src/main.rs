@@ -118,7 +118,18 @@ fn run_on_runtime(cli: cli::Cli, runtime_headless: bool) -> anyhow::Result<ExitC
     let runtime = normal_runtime().context("failed to initialize the async runtime")?;
     // Runtime adapters otherwise copy the entire startup future into their
     // own stack frames before polling it.
+    #[cfg(feature = "mcp")]
+    let mcp_server = cli.mcp_server;
     let result = runtime.block_on(Box::pin(run(cli)));
+    #[cfg(feature = "mcp")]
+    if mcp_server {
+        // serve() has retired its owned runs. Tokio's standard-I/O adapters
+        // can still have uncancellable blocking reads/writes in the pool;
+        // waiting for that pool on Runtime::drop would keep the server alive
+        // after client EOF or a backpressured writer deadline.
+        runtime.shutdown_timeout(std::time::Duration::from_millis(250));
+        return result.map(|()| ExitCode::SUCCESS);
+    }
     // A headless run that stopped waiting for stalled cleanup (a second
     // interrupt, or the grace deadline) has already persisted what it had.
     // Exit now: dropping the runtime would wait for that work forever.

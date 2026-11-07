@@ -1,0 +1,80 @@
+   Compiling mini-agent v1.12.0 (/Users/seb/projects/mini-agent)
+    Finished `test` profile [unoptimized] target(s) in 44.86s
+     Running unittests src/main.rs (target/debug/deps/mini_agent-06a0b2bfe5cce132)
+
+running 72 tests
+test agent::tools::find_files::tests::ancestor_ignore_accepts_execute_only_parent_and_symlinked_dotfile ... ok
+test agent::tools::find_files::tests::ancestor_ignore_fifo_never_waits_for_a_writer ... ok
+test agent::tools::find_files::tests::bound_search_depth_limit_skips_deep_descendants_and_preserves_siblings ... ok
+test agent::tools::find_files::tests::bound_search_entry_budget_counts_ignored_entries_and_releases_the_walk ... ok
+test agent::tools::find_files::tests::bound_walker_never_observes_an_aba_root_replacement ... ok
+test agent::tools::find_files::tests::bound_walker_stops_once_its_owner_is_cancelled ... ok
+test agent::tools::find_files::tests::capped_results_are_lexicographically_first_independent_of_walk_order ... ok
+test agent::tools::find_files::tests::common_globs_and_explicit_regex_find_the_expected_paths ... ok
+test agent::tools::find_files::tests::does_not_report_truncation_when_walker_is_exhausted_at_result_limit ... ok
+test agent::tools::find_files::tests::file_filter_runs_before_open_and_links_stay_refused ... ok
+test agent::tools::find_files::tests::file_path_reports_a_clear_not_a_directory_error ... ok
+test agent::tools::find_files::tests::find_files_external_path_permission_binds_walker_to_authorized_symlink_target ... ok
+test agent::tools::find_files::tests::find_files_external_path_permission_expands_tilde_before_asking ... ok
+test agent::tools::find_files::tests::find_files_external_path_permission_fails_closed_on_permission_channel_failure ... ok
+test agent::tools::find_files::tests::find_files_external_path_permission_keeps_local_relative_searches ... ok
+test agent::tools::find_files::tests::find_files_external_path_permission_omitted_root_searches_cwd ... ok
+test agent::tools::find_files::tests::find_files_external_path_permission_pattern_cannot_widen_root ... ok
+test agent::tools::find_files::tests::find_files_external_path_permission_rejects_empty_root_before_asking ... ok
+test agent::tools::find_files::tests::find_files_external_path_permission_resolves_symlink_escape_before_asking ... ok
+test agent::tools::find_files::tests::find_files_external_path_permission_resolves_traversal_before_asking ... ok
+test agent::tools::find_files::tests::find_files_external_path_permission_retains_authorized_root_on_replacement ... ok
+test agent::tools::find_files::tests::find_files_external_path_permission_uses_canonical_absolute_root ... ok
+test agent::tools::find_files::tests::find_files_omits_denied_paths ... ok
+test agent::tools::find_files::tests::global_ignore_matchers_are_cached_until_a_config_or_the_environment_changes ... ok
+test agent::tools::find_files::tests::invalid_linked_git_metadata_refuses_discovery_before_exposing_entries ... ok
+test agent::tools::find_files::tests::invalid_patterns_and_no_matches_report_the_interpretation ... ok
+test agent::tools::find_files::tests::linked_git_metadata_rejects_symlink_sources ... ok
+test agent::tools::find_files::tests::linked_worktree_common_exclude_applies_to_native_discovery ... ok
+test agent::tools::find_files::tests::mtime_sort_retains_newest_paths_with_stable_ties_and_name_default ... ok
+test agent::tools::find_files::tests::mtime_sort_unavailable_timestamps_sort_last_and_name_ignores_them ... ok
+test agent::tools::find_files::tests::nested_ignore_whitelist_overrides_parent_matcher_without_cloning_chain ... ok
+test agent::tools::find_files::tests::pages_across_three_pages_in_stable_order ... ok
+test agent::tools::find_files::tests::parent_ignore_matchers_are_cached_and_invalidated_by_source_changes ... ok
+test agent::tools::find_files::tests::path_glob_matches_nested_and_root_files ... ok
+test agent::tools::find_files::tests::prompts_before_searching_external_path ... ok
+test agent::tools::find_files::tests::reports_exact_remaining_count_when_result_limit_is_hit ... ok
+test agent::tools::find_files::tests::walker_allocations_scale_with_matches_not_entries ... ok
+test agent::tools::find_files::tests::zero_result_cap_does_not_panic_or_return_an_empty_page ... ok
+test config::load::model_alias_trust_tests::benign_project_models_preserve_inherited_provider ... ok
+test config::load::model_alias_trust_tests::project_model_alias_cannot_change_provider_without_trust ... ok
+test extras::hooks::backend::tests::a_verdict_is_never_mistaken_for_a_read_request ... ok
+test extras::hooks::backend::tests::agent_backend_uses_current_read_deny_instead_of_startup_allow ... ok
+test extras::hooks::backend::tests::agent_file_reads_are_contained_link_free_and_refuse_secrets ... ok
+test extras::hooks::backend::tests::agent_file_reads_honour_user_read_deny_rules_and_refuse_on_ask ... ok
+test extras::hooks::backend::tests::agent_file_reads_refuse_gitignored_and_unlisted_credential_files ... ok
+test extras::hooks::backend::tests::aggregate_expansion_budget_covers_repetition_nested_values_and_utf8 ... ok
+test extras::hooks::backend::tests::an_unconnected_server_and_a_missing_model_fail_without_blocking ... ok
+test extras::hooks::backend::tests::event_values_substitute_only_strings_and_never_evaluate_anything ... ok
+test extras::hooks::backend::tests::ignored_parent_cannot_be_reincluded_and_root_rule_beats_info_exclude ... ok
+test extras::hooks::backend::tests::immutable_agent_bindings_share_cancellation_owner_without_cross_contamination ... ok
+test extras::hooks::backend::tests::linked_worktree_hook_reads_honor_common_exclude_and_root_negation ... ok
+test extras::hooks::backend::tests::scoped_session_context_is_independent_and_inherited ... ok
+test extras::hooks::backend::tests::the_event_is_fenced_bounded_and_cannot_close_its_fence ... ok
+test extras::hooks::backend::tests::timeouts_default_by_type_and_are_capped ... ok
+test extras::hooks::backend::tests::verdicts_map_onto_the_block_and_failure_exit_codes ... ok
+test extras::hooks::backend::tests::verdicts_parse_from_fenced_or_bare_json_and_reject_everything_else ... ok
+test extras::hooks::dispatcher::tests::doctor_hook_metadata_uses_captured_counts_and_does_not_wait_for_once_lock ... ok
+test extras::hooks::dispatcher::tests::hooks60_context_bounds_order_event_scope_and_block_precedence ... ok
+test extras::hooks::dispatcher::tests::i24tio_permission_request_answers_merge_deny_first ... ok
+test extras::hooks::dispatcher::tests::i24tio_post_tool_use_feeds_back_block_reasons_and_context_without_replacing_result ... ok
+test extras::hooks::dispatcher::tests::i6t6i0_gating_events_default_to_60s_and_others_to_600s ... ok
+test extras::hooks::dispatcher::tests::missing_redactions_leave_the_response_unchanged ... ok
+test extras::hooks::dispatcher::tests::plain_json_output_is_fully_redacted_not_treated_as_envelope ... ok
+test extras::hooks::dispatcher::tests::post_tool_feedback_keeps_image_envelopes_parseable ... ok
+test extras::hooks::dispatcher::tests::redactions_replace_only_requested_non_empty_literals ... ok
+test extras::hooks::event60_tests::hooks60_actual_permission_transport_observes_without_answering_and_compact_has_source ... ok
+test extras::hooks::settings::command60_tests::hooks60_command_strings_tokenize_quotes_without_shell_expansion ... ok
+test extras::hooks::subprocess::launch_prep_tests::condition_and_handler_share_one_launch_prep_per_policy ... ok
+test extras::hooks::subprocess::launch_prep_tests::launch_preparation_runs_off_the_calling_task_thread ... ok
+test extras::hooks::trust::confirmation_tests::confirmation_displays_event_and_matcher_that_are_bound_by_the_hash ... ok
+test paths::bound_special_file_tests::bound_file_open_refuses_fifo_before_a_writer_arrives ... ok
+test paths::generic_workspace_open_tests::generic_workspace_open_preserves_directory_type_information ... ok
+
+test result: ok. 72 passed; 0 failed; 0 ignored; 0 measured; 3929 filtered out; finished in 0.60s
+

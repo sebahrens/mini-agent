@@ -1,0 +1,125 @@
+{
+  "owner": "boundaries_review",
+  "cargo_run": false,
+  "status": "implemented; awaiting coordinated root validation",
+  "beads": [
+    {
+      "id": "p0h9g.5",
+      "files": [
+        "patched-deps/rig-core/src/providers/gemini/client.rs",
+        "patched-deps/rig-core/PATCH.md",
+        "src/key_command.rs"
+      ],
+      "behavior": "Encode API keys before initial GenerateContent/SSE URI construction.",
+      "tests": [
+        "gemini_initial_reserved_keys_survive_sdk_uri_construction_and_401"
+      ],
+      "acceptance": "Loopback actual SDK completion/SSE initial requests, query punctuation/space/UTF-8, one key parameter, 401 ownership/rotation and opposite-transport reuse."
+    },
+    {
+      "id": "gkqd4.1",
+      "files": [
+        "src/agent/tools/find_files.rs",
+        "src/agent/tools/grep.rs"
+      ],
+      "behavior": "Descriptor-bound discovery refuses policy-hidden explicit roots and descendants by checking ancestors.",
+      "tests": [
+        "discovery_root_deny_tests"
+      ],
+      "acceptance": "Actual grep/find/list controls and explicit denied roots, relative and absolute; allowed sibling remains visible."
+    },
+    {
+      "id": "gkqd4.5",
+      "files": [
+        "src/cli.rs",
+        "src/config/load.rs"
+      ],
+      "behavior": "Project aliases selecting a different implicit provider need trust; benign raw model selection preserves inherited provider.",
+      "tests": [
+        "model_alias_trust_tests"
+      ],
+      "acceptance": "Headless untrusted alias cannot route ollama prompts to openrouter; approved alias can; raw/same-provider models remain benign; explicit provider remains authoritative."
+    },
+    {
+      "id": "gkqd4.6",
+      "files": [
+        "src/paths.rs"
+      ],
+      "behavior": "Unix generic bound acquisition uses O_NONBLOCK and rejects special nodes while preserving directory handles for typed caller errors.",
+      "tests": [
+        "bound_special_file_tests",
+        "generic_workspace_open_tests"
+      ],
+      "acceptance": "Owned FIFO refuses before writer; bounded controlled cleanup prevents leaked blocked worker on regression; generic directory compatibility, regular-only directory refusal."
+    },
+    {
+      "id": "gkqd4.15",
+      "files": [
+        "src/extras/js/host.rs"
+      ],
+      "behavior": "Test-only task-local prepublication seam directly checks production write_guarded_path digest forwarding.",
+      "tests": [
+        "guarded_absolute_write_preserves_the_authorized_preimage_at_publication"
+      ],
+      "acceptance": "Changed same-length same-inode target survives, TargetChanged returned, no diff published; unchanged target replaces and publishes one diff. Canonical Phase6 checklist read; no production worker/protocol/grant change."
+    },
+    {
+      "id": "gkqd4.16",
+      "files": [
+        "src/agent/tools/find_files.rs",
+        "src/agent/tools/list_dir.rs"
+      ],
+      "behavior": "Unreadable listing entries/subtrees share a bounded incomplete flag; failed child count is unknown; fixed notices disclose no omitted names.",
+      "tests": [
+        "unreadable_subdirectories_report_incomplete_coverage_without_hidden_names"
+      ],
+      "acceptance": "Mode-000 child yields incomplete notice instead of empty/complete output at depth1 and3; permission-hidden child never appears or marks incompleteness; readable sibling remains listed."
+    },
+    {
+      "id": "gkqd4.17",
+      "files": [],
+      "proposed_patch": "/private/tmp/mini-agent-boundaries-config-docs.patch",
+      "behavior": "Root-owned docs patch updates seven to sixteen actual local Git operations, retaining no-network contract."
+    }
+  ],
+  "documentation_contracts": "/private/tmp/mini-agent-boundaries-doc-contracts.txt",
+  "local_validation": [
+    "Selected owned files parsed/formatted with rustfmt --edition2024 --config skip_children=true",
+    "git diff --check clean"
+  ],
+  "independent_root_patch_review": {
+    "files": [
+      "src/spend.rs",
+      "src/spend/ledger.rs",
+      "src/auth/oauth.rs",
+      "src/auth/oauth_tests.rs"
+    ],
+    "new_p0_p3": [],
+    "coverage": [
+      "retry IDs survive errors and replacement Ledger",
+      "same/external rotation prevalidation and dedup",
+      "account/ledger/coordination/file lock order",
+      "fresh receipts avoid archive scan",
+      "dropped session fallback merges totals without all-time duplication",
+      "OAuth typed WouldBlock retries, timeout, cancellation and logout active-account fence"
+    ]
+  },
+  "risks": [
+    "Cargo results pending root batch; no commits or bead mutations made.",
+    "Unreadable-directory DAC regression skips the omission branch on privileged hosts that bypass mode000.",
+    "A benign raw model that otherwise changes an implicit provider pins the inherited runtime provider; a later project layer must request an explicit trusted provider to change that pinned route.",
+    "Existing OAuth blocking refresh cancellation remains owned/settled by its scoped blocking task; no introduced cancellation finding."
+  ],
+  "integration_repair": {
+    "cause": "JS single-file grep traversal-only filter hides directory entries; policy root admission incorrectly treated it as a denied parent.",
+    "files": [
+      "src/agent/tools/find_files.rs",
+      "src/extras/js/host.rs"
+    ],
+    "change": "Keep permission ancestor admission in with_hidden_filter; apply single-file selection afterward through with_entry_filter, composing existing entry denies without changing root_hidden. Bound and ambient branches updated.",
+    "regression": "brokered_grep_accepts_a_single_file_path_under_read_rules now also checks exact-denied directory, descendant directory and descendant file through relative/absolute spellings; existing allowed regular file and sibling/symlink controls retained.",
+    "validation": "Selected rustfmt and git diff --check pass. Cargo pending root rerun after existing full-suite binary finishes.",
+    "guarded_write_seam": "Production base forwarding and its deterministic mutation negative control unchanged."
+  },
+  "coordinator_status": "Local validation complete. Later coordinator corrections and test results are authoritative in ../2026-11-07-continuation-review.json; hosted CI pending."
+}

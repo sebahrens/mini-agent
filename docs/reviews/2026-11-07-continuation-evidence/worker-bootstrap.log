@@ -1,0 +1,15 @@
+   Compiling mini-agent v1.12.0 (/Users/seb/projects/mini-agent)
+    Finished `test` profile [unoptimized] target(s) in 8.17s
+     Running tests/worker_bootstrap.rs (target/debug/deps/worker_bootstrap-00731f4256439222)
+
+running 7 tests
+test worker_bootstrap_production_main_emits_ready_from_byte_zero_before_clap_or_tokio ... ok
+test worker_bootstrap_production_main_rejects_invalid_marker_value ... ok
+test worker_bootstrap_production_main_rejects_malformed_hello_without_fallthrough ... ok
+test worker_bootstrap_production_main_rejects_null_stdout ... ok
+test worker_bootstrap_production_main_rejects_regular_file_stderr ... ok
+test worker_bootstrap_production_main_rejects_regular_file_stdio ... ok
+test worker_bootstrap_production_main_rejects_socket_stdio ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+

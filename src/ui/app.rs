@@ -1939,6 +1939,8 @@ impl<'a> App<'a> {
             tokio::task::JoinHandle<crate::extras::hooks::OwnedSessionStartContext>,
         >,
     ) -> anyhow::Result<Self> {
+        #[cfg(all(feature = "hooks", feature = "mcp"))]
+        super::bind_current_mcp_hook_peers(ui.mcp_manager.as_ref());
         let keybindings =
             KeyBindings::from_overrides(ui.cfg.keys.as_ref()).map_err(anyhow::Error::msg)?;
         let terminal_guard = TerminalGuard::new(crate::ui::terminal::TerminalOptions {
@@ -2957,6 +2959,7 @@ impl<'a> App<'a> {
     #[cfg(test)]
     pub(crate) async fn teardown(mut self) {
         self.teardown_owners().await;
+        self.shutdown_services().await;
     }
 
     pub(super) async fn teardown_owners(&mut self) {
@@ -3026,18 +3029,21 @@ impl<'a> App<'a> {
             .session
             .close_background_tasks_within(TEARDOWN_TIMEOUT)
             .await;
-        #[cfg(feature = "lsp")]
-        crate::extras::lsp::shutdown_live_managers().await;
-        #[cfg(feature = "mcp")]
-        if let Some(mgr) = self.ui.mcp_manager.take() {
-            mgr.shutdown().await;
-        }
         // Turn-end snapshots are written off the UI task; every one must be
         // complete before exit returns.
         match tokio::task::spawn_blocking(crate::session::storage::flush_deferred_sessions).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => tracing::warn!("deferred session save failed: {error:#}"),
             Err(error) => tracing::warn!(%error, "deferred session save join failed"),
+        }
+    }
+
+    pub(super) async fn shutdown_services(&mut self) {
+        #[cfg(feature = "lsp")]
+        crate::extras::lsp::shutdown_live_managers().await;
+        #[cfg(feature = "mcp")]
+        if let Some(mgr) = self.ui.mcp_manager.take() {
+            mgr.shutdown().await;
         }
     }
 
@@ -4645,8 +4651,7 @@ impl<'a> App<'a> {
             )
             .await
             {
-                self.fail_pending_main_turn().await;
-                return Err(error);
+                return self.fail_context_relief(error).await;
             }
             self.refresh()?;
             return Ok(());
@@ -4774,6 +4779,8 @@ impl<'a> App<'a> {
             // `--no-session` compacts the in-memory session, so neither
             // excludes in-turn protection (mini-agent-wr9nw).
             && self.run.is_running
+            && (!self.run.mid_turn_compaction_disabled
+                || self.ui.session.mid_turn_size_pressure(self.ui.cfg.resolve_compact_size_fraction()))
             && self.ui.cfg.resolve_compact_enabled()
             && self.ui.session.context_window > 0
             && let Some(threshold) = self.ui.cfg.resolve_mid_turn_trigger_threshold(
@@ -4912,10 +4919,9 @@ impl<'a> App<'a> {
                 anyhow::anyhow!("runner reached an unrequested compaction boundary")
             })?;
             if let Err(error) = self.mid_turn_compact(pressure, &interactions).await {
-                self.fail_pending_main_turn().await;
-                return Err(error);
+                return self.fail_context_relief(error).await;
             }
-            self.run.awaiting_compaction_relief = true;
+            self.run.awaiting_compaction_relief = !self.run.mid_turn_compaction_disabled;
             self.refresh()?;
             return Ok(());
         }
@@ -5148,6 +5154,20 @@ impl<'a> App<'a> {
                 });
             }
         }
+    }
+
+    /// Summarizer and admission failures end this turn, while the operator can
+    /// still inspect the saved progress and submit another prompt.
+    async fn fail_context_relief(&mut self, error: anyhow::Error) -> anyhow::Result<()> {
+        let recoverable = error.is::<super::ContextReliefFailure>();
+        self.fail_pending_main_turn().await;
+        if !recoverable {
+            return Err(error);
+        }
+        self.renderer
+            .write_line(&format!("context relief failed: {error:#}"), C_ERROR)?;
+        self.refresh()?;
+        Ok(())
     }
 
     /// Exception-safe failure transition with no required presentation. Used
@@ -17955,10 +17975,15 @@ mod plan_approval_tests {
     async fn midturn_compaction_budget_matrix() {
         #[cfg(feature = "hooks")]
         let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
-        for capped in [true, false] {
+        for (capped, exhaust_at_boundary) in [(true, false), (false, false), (true, true)] {
             let roots = Roots::new();
-            let provider =
-                Provider::new(vec!["pressure-read", "cap-write", "WRITE_COMPLETED"]).await;
+            let provider = Provider::new(vec![
+                "pressure-read",
+                "PAID_CONTEXT_SUMMARY",
+                "cap-write",
+                "WRITE_COMPLETED",
+            ])
+            .await;
             let mut cfg = provider.config();
             cfg.compact_enabled = Some(true);
             cfg.mid_turn_compact_threshold = Some(0.75);
@@ -18046,11 +18071,18 @@ mod plan_approval_tests {
                         assert_eq!(provider.calls().len(), 1);
                         assert!(!app.ui.session.spend_account.has_pending());
                         assert!(!app.ui.session.spend_account.snapshot().tracking_error);
+                        if exhaust_at_boundary {
+                            // A sibling paid request can settle after this
+                            // runner parks but before compaction admission.
+                            let usage = crate::event::UsageDelta { input_tokens: 9, output_tokens: 4, ..Default::default() };
+                            crate::spend::run::Run::for_session(app.ui.session, &cfg, crate::spend::RequestKind::Turn).observe(usage);
+                            app.ui.session.charge_usage_delta(usage, false);
+                        }
                     }
                     crate::startup::heap_future(|| app.handle_agent_event(event))
                         .await
                         .unwrap();
-                    if terminal {
+                    if terminal || !app.run.is_running {
                         break success;
                     }
                 }
@@ -18074,8 +18106,14 @@ mod plan_approval_tests {
             assert_eq!(succeeded, !capped);
             assert_eq!(
                 provider.calls().len(),
-                if capped { 2 } else { 3 },
-                "the admitted restarted response crosses the cap before a write or a third HTTP request"
+                if exhaust_at_boundary {
+                    1
+                } else if capped {
+                    2
+                } else {
+                    4
+                },
+                "the admitted summary crosses the cap before a write or a third HTTP request"
             );
             assert_eq!(
                 effect.exists(),
@@ -18094,12 +18132,12 @@ mod plan_approval_tests {
             assert_eq!(app.ui.session.id, id);
             assert!(app.ui.session.permission_allowlist.is_empty());
             let totals = ledger.summary_for_session(&id).unwrap().session;
-            assert_eq!(totals.records, if capped { 2 } else { 3 });
+            assert_eq!(totals.records, if capped { 2 } else { 4 });
             assert_eq!(
                 (totals.input_tokens, totals.output_tokens),
-                if capped { (100009, 8) } else { (100018, 12) }
+                if capped { (100009, 8) } else { (100027, 16) }
             );
-            assert!((totals.known_cost - if capped { 0.200050 } else { 0.200084 }).abs() < 1e-12);
+            assert!((totals.known_cost - if capped { 0.200050 } else { 0.200118 }).abs() < 1e-12);
             assert!(
                 (app.ui.session.spend_account.snapshot().recorded_spend() - totals.known_cost)
                     .abs()
@@ -18108,6 +18146,7 @@ mod plan_approval_tests {
             assert_eq!(app.ui.session.total_input_tokens, totals.input_tokens);
             assert!(!app.ui.session.spend_account.has_pending());
             assert!(!app.ui.session.spend_account.snapshot().tracking_error);
+            let mut compaction_receipts = 0;
             for line in std::fs::read_to_string(
                 roots
                     .directory
@@ -18123,7 +18162,29 @@ mod plan_approval_tests {
                 assert_eq!(row["model"], "owned-model");
                 assert_eq!(row["prices"]["input"], 2.0);
                 assert_eq!(row["prices"]["output"], 4.0);
-                assert_eq!(row["kind"], "turn");
+                if row["kind"] == "compaction" {
+                    compaction_receipts += 1;
+                } else {
+                    assert_eq!(row["kind"], "turn");
+                }
+            }
+            assert_eq!(
+                compaction_receipts,
+                usize::from(!exhaust_at_boundary),
+                "only admitted summaries produce compaction receipts"
+            );
+            if exhaust_at_boundary {
+                assert!(
+                    app.renderer
+                        .captured_output()
+                        .contains("context relief failed")
+                );
+                assert!(app.run.main_abort.is_none() && app.run.agent_rx.is_none());
+                assert!(app.run.pending_turn.is_none());
+                assert!(!app.run.awaiting_compaction_relief);
+                assert!(app.ui.session.compactions.is_empty());
+                user(&mut app, UserEvent::Paste("operator can still type".into())).await;
+                assert!(app.input.buffer.contains("operator can still type"));
             }
             drop(app);
             if capped {
@@ -19316,7 +19377,7 @@ mod plan_approval_tests {
                 crate::startup::heap_future(|| app.handle_agent_event(event))
                     .await
                     .unwrap();
-                if terminal_error && (spent || !compact) {
+                if terminal_error && (spent || !compact || !app.run.is_running) {
                     surfaced_errors += 1;
                     break;
                 }
@@ -19414,11 +19475,115 @@ mod plan_approval_tests {
         provider.finish().await;
     }
 
+    /// mini-agent-p0h9g.3: a measured boundary must reach the summarizer
+    /// even below the independent between-turn window-minus-reserve budget.
+    #[tokio::test]
+    async fn real_token_boundary_below_local_budget_compacts_and_continues() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let roots = Roots::new();
+        let provider = Provider::new(vec![
+            "TOKEN_BOUNDARY_SUMMARY",
+            "CONTINUED_AFTER_TOKEN_RELIEF",
+        ])
+        .await;
+        let mut cfg = provider.config();
+        cfg.compact_enabled = Some(true);
+        cfg.compact_size_fraction = Some(0.0);
+        cfg.keep_recent_tokens = Some(1_000);
+        cfg.mid_turn_compact_threshold = Some(0.80);
+        let cli = crate::cli::Cli {
+            no_tools: true,
+            no_session: true,
+            ..Default::default()
+        };
+        let workspace = roots.workspace();
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new(
+            "plan80",
+            "owned-model",
+            100_000,
+            workspace.root().to_str().unwrap(),
+        );
+        session.add_message(MessageRole::User, &"x".repeat(160_000));
+        session.add_message(MessageRole::Assistant, "old work complete");
+        session.add_message(MessageRole::User, &"continue ".repeat(1_000));
+        let mut app = owned_app(ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+            SecurityMode::Standard,
+        ));
+        let before = app.ui.session.messages.len();
+        app.mid_turn_compact(0.81, &[]).await.unwrap();
+        assert!(app.ui.session.messages.len() < before + 1);
+        assert!(!app.run.mid_turn_compaction_disabled);
+        assert!(
+            app.ui
+                .session
+                .messages
+                .iter()
+                .any(|message| message.content.contains("TOKEN_BOUNDARY_SUMMARY"))
+        );
+        let (_, done) = drive_context_relief_turn(&mut app).await;
+        assert!(done);
+        assert_eq!(
+            provider.calls().len(),
+            2,
+            "one summary and one continuing request"
+        );
+        provider.finish().await;
+    }
+
+    #[tokio::test]
+    async fn token_boundary_with_no_old_prefix_disables_repeated_noop_relief() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let roots = Roots::new();
+        let provider = Provider::new(vec!["CONTINUED_WITHOUT_SUMMARY"]).await;
+        let cfg = provider.config();
+        let cli = crate::cli::Cli {
+            no_tools: true,
+            no_session: true,
+            ..Default::default()
+        };
+        let workspace = roots.workspace();
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new(
+            "plan80",
+            "owned-model",
+            100_000,
+            workspace.root().to_str().unwrap(),
+        );
+        session.add_message(MessageRole::User, "only a current prompt");
+        let mut app = owned_app(ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+            SecurityMode::Standard,
+        ));
+        app.mid_turn_compact(0.95, &[]).await.unwrap();
+        assert!(app.run.mid_turn_compaction_disabled);
+        assert!(app.ui.session.compactions.is_empty());
+        let (_, done) = drive_context_relief_turn(&mut app).await;
+        assert!(done);
+        assert_eq!(
+            provider.calls().len(),
+            1,
+            "no summarizer request for an empty old prefix"
+        );
+        provider.finish().await;
+    }
+
     /// mini-agent-cj9oh: a provider context-length 400 compacts once and resumes
     /// the TUI turn; a second rejection (or `compact_enabled = false`) surfaces.
     #[tokio::test]
     async fn context_length_rejection_compacts_once_and_resumes_the_tui_turn() {
-        for (script, compact, expect_done, expect_calls) in [
+        for (script, compact, expect_done, expect_calls, summary_failed) in [
             (
                 vec![
                     "context-error",
@@ -19428,14 +19593,25 @@ mod plan_approval_tests {
                 true,
                 true,
                 3,
+                false,
             ),
             (
                 vec!["context-error", "COMPACTION_SUMMARY", "context-error"],
                 true,
                 false,
                 3,
+                false,
             ),
-            (vec!["context-error"], false, false, 1),
+            // A failed summarizer ends this turn and leaves the TUI live.
+            // The cache fork and its independent text fallback both fail.
+            (
+                vec!["context-error", "context-error", "context-error"],
+                true,
+                false,
+                3,
+                true,
+            ),
+            (vec!["context-error"], false, false, 1, false),
         ] {
             #[cfg(feature = "hooks")]
             let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
@@ -19478,6 +19654,18 @@ mod plan_approval_tests {
             assert_eq!(surfaced, usize::from(!expect_done), "surfaced errors");
             assert_eq!(provider.calls().len(), expect_calls);
             assert_eq!(app.run.reactive_relief_used, compact);
+            if summary_failed {
+                assert!(
+                    app.renderer
+                        .captured_output()
+                        .contains("context relief failed")
+                );
+                assert!(!app.run.awaiting_compaction_relief);
+                assert!(app.run.pending_turn.is_none());
+                assert!(app.ui.session.compactions.is_empty());
+                user(&mut app, UserEvent::Paste("operator can still type".into())).await;
+                assert!(app.input.buffer.contains("operator can still type"));
+            }
             if expect_done {
                 let last = serde_json::to_string(&provider.calls()[2]).unwrap();
                 assert!(
@@ -19508,6 +19696,7 @@ mod plan_approval_tests {
         let roots = Roots::new();
         let provider = Provider::new(vec![
             "pressure-read",
+            "PAID_CONTEXT_SUMMARY",
             "question-again",
             "FINISHED_AFTER_RESTART",
         ])
@@ -19606,18 +19795,18 @@ mod plan_approval_tests {
         .unwrap();
         assert_eq!(boundaries, 1);
         assert!(rejected_again);
-        assert_eq!(provider.calls().len(), 3);
+        assert_eq!(provider.calls().len(), 4);
         let persisted =
             crate::spend::Ledger::new(&roots.directory.path().join("MINI_AGENT_STATE_DIR"))
                 .summary_for_session(&id)
                 .unwrap()
                 .session;
-        assert_eq!(persisted.records, 3);
+        assert_eq!(persisted.records, 4);
         assert_eq!(
             (persisted.input_tokens, persisted.output_tokens),
-            (100018, 12)
+            (100027, 16)
         );
-        assert!((persisted.known_cost - 0.200084).abs() < 1e-12);
+        assert!((persisted.known_cost - 0.200118).abs() < 1e-12);
         assert!(
             !app.ui.session.spend_account.has_pending()
                 && !app.ui.session.spend_account.snapshot().tracking_error

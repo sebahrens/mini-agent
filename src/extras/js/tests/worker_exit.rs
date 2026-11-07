@@ -22,9 +22,16 @@ async fn requested_connection(code: &str) -> WorkerConnection {
         InvocationId::new("exit-ordering").unwrap(),
         connection.sequence,
         if code == "__verification_internal__" {
-            ParentFrame::VerifyArtifact(
-                crate::extras::js::tests::worker_runtime::verification_with_source(code),
-            )
+            let mut verification =
+                crate::extras::js::tests::worker_runtime::verification_with_source(code);
+            // This test waits for exit before draining stdout. Keep the
+            // terminal below the minimum native pipe capacity: a second
+            // diagnostic can block the fixture writer before it exits.
+            // The held-out case still proves closed internal diagnostics.
+            #[cfg(not(feature = "skills"))]
+            verification.artifact.tests.clear();
+            verification.cases[0].case_id = "v".into();
+            ParentFrame::VerifyArtifact(verification)
         } else {
             ParentFrame::RunStep(RunStep::new(code.into()))
         },
@@ -60,7 +67,9 @@ async fn buffered_terminal_survives_clean_exit_and_keeps_validation() {
             }
         })
         .await
-        .expect("worker must exit before the parent reads its terminal frame");
+        .unwrap_or_else(|error| {
+            panic!("{code}: worker must exit before the parent reads its terminal frame: {error}")
+        });
         let result = read_worker(
             &mut connection,
             false,
@@ -85,6 +94,9 @@ async fn buffered_terminal_survives_clean_exit_and_keeps_validation() {
                     panic!("expected a verification terminal");
                 };
                 assert!(!result.passed);
+                assert_eq!(result.cases.len(), 1);
+                assert_eq!(result.cases[0].case_id, "v");
+                assert!(result.cases[0].diagnostic.is_some());
                 assert!(verification_diagnostics_are_closed(&result));
                 assert!(!verification_result_is_reusable(&result));
             }

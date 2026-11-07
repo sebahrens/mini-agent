@@ -14,8 +14,14 @@ done when:
 - cargo test passes
 ```
 
+Automatic headless goals and `--loop` currently require a compatible non-native
+history route (for example an OpenRouter profile). Native Anthropic replay does
+not yet have an automatic-round publication owner, so those paths refuse before
+running the goal. Ordinary native `-p` prompts remain available. Select an
+appropriate configured provider/profile explicitly for headless goal work:
+
 ```bash
-mini-agent -p --goal "make the migration idempotent" \
+mini-agent --provider openrouter -p --goal "make the migration idempotent" \
   --goal-done "running it twice is a no-op" \
   --goal-check "cargo test"
 ```
@@ -33,6 +39,10 @@ cargo test failed: test migrate::twice ... FAILED
 The objective lives outside the conversation, so compaction cannot lose it, and it is restated into
 every compaction summary. Each round starts with a fresh turn and token budget, so one runaway round
 is still bounded the way any single turn is, while the goal's own bounds cover the objective.
+
+`--no-session` keeps the same live round history and usage accounting while the
+process runs; it skips disk persistence. A failed session save does not append or
+charge an already recorded round again when saving is retried.
 
 You are not locked out while a goal runs. Typing a message is a normal turn; the gate simply
 evaluates at its end.

@@ -610,6 +610,10 @@ pub(crate) struct Startup {
     native_startup: Option<crate::session::native_publication::NativeStartupPublication>,
     native_ticket: Option<crate::session::native_publication::NativePublicationTicket>,
     native_headless: Option<provider::NativeRunOwner>,
+    // The hook registry holds weak peers. Keep the actual connection owner
+    // alive through the session's final hooks, including stream-json EOF.
+    #[cfg(feature = "mcp")]
+    headless_mcp: Option<std::sync::Arc<crate::extras::mcp::McpClientManager>>,
     /// Routing note for an `-p` prompt's `@agent:<name>` mentions, resolved
     /// at startup when `headless_agent_mentions` is on; sent with the first
     /// model request only and never persisted.
@@ -1332,6 +1336,60 @@ fn needs_openrouter_context_refresh(cfg: &Config, model: &str) -> bool {
         && Config::catalog_context_window("openrouter", model).is_none()
 }
 
+/// Headless detached work belongs to the session, including the final loop
+/// iteration. A forced stop skips grace but still joins cancellation below.
+#[cfg(all(test, feature = "subagents"))]
+pub(crate) struct HeadlessExitWaitTestGate {
+    pub entered: std::sync::atomic::AtomicBool,
+    pub release: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+}
+#[cfg(all(test, feature = "subagents"))]
+tokio::task_local! { static HEADLESS_EXIT_WAIT_TEST_GATE: std::sync::Arc<HeadlessExitWaitTestGate>; }
+#[cfg(all(test, feature = "subagents"))]
+pub(crate) async fn with_headless_exit_wait_gate<F: std::future::Future>(
+    gate: std::sync::Arc<HeadlessExitWaitTestGate>,
+    future: F,
+) -> F::Output {
+    HEADLESS_EXIT_WAIT_TEST_GATE.scope(gate, future).await
+}
+
+#[cfg(feature = "subagents")]
+pub(crate) async fn wait_headless_background_tasks(session: &Session, cfg: &Config) {
+    #[cfg(test)]
+    let _ = HEADLESS_EXIT_WAIT_TEST_GATE.try_with(|gate| {
+        gate.entered
+            .store(true, std::sync::atomic::Ordering::SeqCst)
+    });
+    let secs = cfg
+        .subagents
+        .as_ref()
+        .and_then(|policy| policy.headless_exit_wait_secs)
+        .unwrap_or(DEFAULT_HEADLESS_EXIT_WAIT_SECS)
+        .min(3600);
+    let (active, _) = session.background_task_counts();
+    if active == 0 || secs == 0 || crate::print::headless_force_stopped() {
+        return;
+    }
+    #[cfg(test)]
+    let _ = HEADLESS_EXIT_WAIT_TEST_GATE.try_with(|gate| {
+        if let Some(release) = gate.release.lock().unwrap().take() {
+            let _ = release.send(());
+        }
+    });
+    eprintln!(
+        "waiting up to {secs} s for {active} background task(s) to finish ([subagents] headless_exit_wait_secs)"
+    );
+    let left = tokio::select! {
+        left = session.wait_background_tasks_within(std::time::Duration::from_secs(secs)) => left,
+        _ = crate::print::headless_interrupt() => session.background_task_counts().0,
+    };
+    if left > 0 {
+        eprintln!(
+            "warning: {left} background task(s) still running at session exit will be cancelled"
+        );
+    }
+}
+
 impl Startup {
     /// Phase 1: context load, provider/model resolution, session
     /// creation/resolution, client creation.
@@ -1845,6 +1903,8 @@ impl Startup {
             native_startup,
             native_ticket: None,
             native_headless: None,
+            #[cfg(feature = "mcp")]
+            headless_mcp: None,
             #[cfg(feature = "subagents")]
             headless_agent_directive,
             #[cfg(feature = "hooks")]
@@ -2208,8 +2268,34 @@ impl Startup {
                 "startup"
             }
             .to_string();
+            let mode = self
+                .permission
+                .as_ref()
+                .map(|permission| {
+                    permission
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .mode()
+                        .to_string()
+                })
+                .unwrap_or_else(|| "standard".into());
+            let context = crate::extras::hooks::context_for_session(
+                &self.session.id,
+                self.workspace.root(),
+                &mode,
+            );
             let hook = heap_future(|| async move {
-                crate::extras::hooks::dispatch_session_start(&source).await
+                match crate::extras::hooks::get_dispatcher() {
+                    Some(dispatcher) => {
+                        crate::extras::hooks::dispatch_session_start_with(
+                            &dispatcher,
+                            &context,
+                            &source,
+                        )
+                        .await
+                    }
+                    None => crate::extras::hooks::dispatch_session_start(&source).await,
+                }
             });
             self.session_start_task = Some(match &self.native_startup {
                 Some(owner) => owner.spawn_hook(hook).await,
@@ -2383,7 +2469,40 @@ impl Startup {
         };
         #[cfg(not(feature = "js"))]
         let startup = self;
-        let result = heap_future(|| startup.dispatch_inner()).await;
+        #[cfg(feature = "hooks")]
+        let hook_scope = {
+            let scope = crate::agent::runner::AgentWorkScope::new();
+            let mode = startup
+                .permission
+                .as_ref()
+                .map(|permission| {
+                    permission
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .mode()
+                        .to_string()
+                })
+                .unwrap_or_else(|| "standard".into());
+            scope.set_hook_session_context(crate::extras::hooks::context_for_session(
+                &startup.session.id,
+                startup.workspace.root(),
+                &mode,
+            ));
+            scope.set_hook_permission(startup.permission.clone());
+            #[cfg(feature = "mcp")]
+            scope.set_hook_mcp_peers(Default::default());
+            scope
+        };
+        #[cfg(feature = "hooks")]
+        let hook_cleanup =
+            crate::agent::runner::AgentRunCleanupGuard::auxiliary(hook_scope.clone());
+        let work = heap_future(|| startup.dispatch_inner());
+        #[cfg(feature = "hooks")]
+        let result = hook_scope.run(work).await;
+        #[cfg(not(feature = "hooks"))]
+        let result = work.await;
+        #[cfg(feature = "hooks")]
+        hook_cleanup.settle().await;
         #[cfg(feature = "js")]
         if let Some(probe) = probe {
             probe.retire_after_owner_exit().await?;
@@ -2413,37 +2532,65 @@ impl Startup {
         self.session.note_stale_child_ids(self.session_resumed);
     }
 
-    /// Headless runs have no later turn: give still-running background `task`
-    /// jobs a bounded time to finish (`[subagents] headless_exit_wait_secs`,
-    /// default 300, `0` cancels at once) and say so on stderr, including the
-    /// jobs that are then cancelled.
+    /// Give detached work its configured grace period at the actual session
+    /// boundary, never between stream-json input turns.
     #[cfg(feature = "subagents")]
     async fn wait_background_tasks_before_exit(&self) {
-        let secs = self
-            .cfg
-            .subagents
-            .as_ref()
-            .and_then(|policy| policy.headless_exit_wait_secs)
-            .unwrap_or(DEFAULT_HEADLESS_EXIT_WAIT_SECS)
-            .min(3600);
-        let (active, _) = self.session.background_task_counts();
-        if active == 0 || secs == 0 {
-            return;
+        wait_headless_background_tasks(&self.session, &self.cfg).await;
+    }
+
+    /// EOF/error cleanup for a headless session. Native model actors still
+    /// settle after every input turn; their retained SessionEnd permit seals
+    /// the final background observations and hooks at the real session end.
+    async fn finish_headless_session(&mut self) -> anyhow::Result<()> {
+        #[cfg(feature = "subagents")]
+        {
+            self.wait_background_tasks_before_exit().await;
+            self.session.close_background_tasks().await;
         }
-        eprintln!(
-            "waiting up to {secs} s for {active} background task(s) to finish \
-             ([subagents] headless_exit_wait_secs)"
-        );
-        let left = self
-            .session
-            .wait_background_tasks_within(std::time::Duration::from_secs(secs))
-            .await;
-        if left > 0 {
-            eprintln!(
-                "warning: {left} background task(s) still running after {secs} s were cancelled; \
-                 their results are not in the session"
-            );
+        #[allow(unused_mut)]
+        let mut failure = None;
+        #[cfg(any(feature = "hooks", feature = "subagents"))]
+        if self.cli.input_format() == crate::cli::InputFormat::StreamJson
+            && let Some(end) = self
+                .native_headless
+                .as_mut()
+                .and_then(|owner| owner.take_retired_session_end())
+        {
+            #[cfg(feature = "hooks")]
+            {
+                self.native_session_end_done = true;
+            }
+            let finalization = end.run(&mut self.session);
+            #[cfg(feature = "hooks")]
+            let finalization = crate::agent::runner::HookBindings::capture().run(finalization);
+            failure = finalization.await.err();
         }
+        #[cfg(feature = "subagents")]
+        if self.native_headless.is_none()
+            && !self.cli.no_session
+            && !self.session.background_history.is_empty()
+        {
+            let saved = session::storage::save_session_recovering(&mut self.session, |notice| {
+                eprintln!("warning: {notice}")
+            });
+            if failure.is_none() {
+                failure = saved.err();
+            }
+        }
+        // A failed save must not skip the session's lifecycle notification.
+        #[cfg(feature = "hooks")]
+        if !self.native_session_end_done {
+            heap_future(|| crate::extras::hooks::dispatch_session_end("exit")).await;
+            self.native_session_end_done = true;
+        }
+        #[cfg(feature = "mcp")]
+        if let Some(manager) = self.headless_mcp.take()
+            && let Ok(manager) = std::sync::Arc::try_unwrap(manager)
+        {
+            manager.shutdown().await;
+        }
+        failure.map_or(Ok(()), Err)
     }
 
     async fn dispatch_inner(mut self: Box<Self>) -> anyhow::Result<()> {
@@ -2501,18 +2648,16 @@ impl Startup {
                 heap_future(|| self.dispatch_print()).await
             };
             settle_housekeeping(housekeeping).await;
-            #[cfg(feature = "subagents")]
-            self.wait_background_tasks_before_exit().await;
-            #[cfg(feature = "subagents")]
-            self.session.close_background_tasks().await;
-            // Every headless exit ends the session: a failed turn, a
-            // persistence failure and a goal's own exit code alike
-            // (mini-agent-rnpjm).
-            #[cfg(feature = "hooks")]
-            if !self.native_session_end_done {
-                heap_future(|| crate::extras::hooks::dispatch_session_end("exit")).await;
+            // Errors and EOF share exact session retirement. The original
+            // turn error wins, while a cleanup failure remains visible.
+            let cleanup = heap_future(|| self.finish_headless_session()).await;
+            match (result, cleanup) {
+                (Err(error), Err(cleanup)) => {
+                    Err(error.context(format!("headless session cleanup failed: {cleanup:#}")))
+                }
+                (Err(error), _) => Err(error),
+                (Ok(()), result) => result,
             }
-            result
         } else {
             #[cfg(feature = "loop")]
             if self.cli.loop_mode {
@@ -2776,9 +2921,9 @@ impl Startup {
                     None
                 };
                 let mut persistence_failure = None;
+                self.session.add_shell_interaction(&msg, &result);
                 if !self.cli.no_session {
                     let session = &mut self.session;
-                    session.add_shell_interaction(&msg, &result);
                     if let Err(error) =
                         session::storage::save_session_recovering(session, |notice| {
                             eprintln!("warning: {notice}")
@@ -2919,10 +3064,14 @@ impl Startup {
             let skill_service_owner_for_goal =
                 std::sync::Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new());
             #[cfg(feature = "mcp")]
-            let mut mcp_manager = if !self.cli.mcp_is_eligible(&self.cfg) {
+            let mut mcp_manager = if let Some(manager) = self.headless_mcp.take() {
+                Some(manager)
+            } else if !self.cli.mcp_is_eligible(&self.cfg) {
                 None
             } else {
-                connect_headless_mcp(&self.cfg, &self.workspace).await
+                connect_headless_mcp(&self.cfg, &self.workspace)
+                    .await
+                    .map(std::sync::Arc::new)
             };
             // Boxed: building an agent pulls in every provider's setup, and this
             // future is inlined into the startup frame otherwise.
@@ -2954,17 +3103,32 @@ impl Startup {
                     #[cfg(feature = "skills")]
                     skill_service_owner_for_goal.clone(),
                     #[cfg(feature = "mcp")]
-                    mcp_manager.as_ref(),
+                    mcp_manager.as_deref(),
                 )
             })
             .await;
+            #[cfg(feature = "mcp")]
+            {
+                report_headless_mcp_notices(
+                    mcp_manager.as_mut().and_then(std::sync::Arc::get_mut),
+                    |notice| eprintln!("{notice}"),
+                );
+                self.headless_mcp = mcp_manager.clone();
+            }
             // No tool can have run yet, so the baseline observes exactly the
             // state it did when it was taken before MCP connect.
             let change_baseline = join_change_baseline(baseline_task).await;
             #[cfg(feature = "subagents")]
             let agent = agent.with_headless_turn_directive(self.headless_agent_directive.take());
-            #[cfg(feature = "mcp")]
-            report_headless_mcp_notices(mcp_manager.as_mut(), |notice| eprintln!("{notice}"));
+            #[cfg(all(feature = "hooks", feature = "mcp"))]
+            if let Some(scope) = crate::agent::runner::current_hook_work_scope() {
+                scope.set_hook_mcp_peers(
+                    mcp_manager
+                        .as_ref()
+                        .map(|manager| manager.hook_peers())
+                        .unwrap_or_default(),
+                );
+            }
             // What the model can actually use, and which configured MCP
             // servers did not connect, before the first request
             // (mini-agent-f71r6).
@@ -3026,9 +3190,7 @@ impl Startup {
                 let user = crate::headless_media::images_user_message(&media)?;
                 let mut with_images = history.to_vec();
                 with_images.push(user.to_message());
-                if !self.cli.no_session {
-                    self.session.add_user_message(user);
-                }
+                self.session.add_user_message(user);
                 with_images.into()
             };
             // Goal verdicts are skill evidence. The recorder lives behind the
@@ -3247,25 +3409,21 @@ impl Startup {
         }
         let mut persistence_failure = None;
         let mut title_accounting = None;
+        // An ephemeral stream still owns one live conversation. Disk policy
+        // must not discard the turn needed by its next input line.
+        if !already_persisted {
+            crate::print::persist_headless_turn(
+                &mut self.session,
+                &recorded_prompt,
+                &response,
+                &interactions,
+            );
+            let anthropic_native = self.cfg.is_anthropic_native(&self.session.provider);
+            self.session
+                .charge_usage_delta(usage.into(), anthropic_native);
+        }
         if !self.cli.no_session {
             let session = &mut self.session;
-            // Prompt, then tool calls/results in provider order, then the
-            // assistant message: the same record order the interactive UI
-            // writes, so `--continue` replays the turn in sequence.
-            //
-            // A goal run has already written this round, under the prompt
-            // that round actually ran with. Writing it again would double
-            // every record in it and charge its tokens twice.
-            if !already_persisted {
-                crate::print::persist_headless_turn(
-                    session,
-                    &recorded_prompt,
-                    &response,
-                    &interactions,
-                );
-                let anthropic_native = self.cfg.is_anthropic_native(&session.provider);
-                session.charge_usage_delta(usage.into(), anthropic_native);
-            }
             let saved = if let Some(owner) = &mut self.native_headless {
                 let result = owner.progress(session).await;
                 session::storage::report_pending_save_notices(session, |notice| {
@@ -3321,16 +3479,25 @@ impl Startup {
                     });
             }
         }
+        #[cfg_attr(
+            not(any(feature = "hooks", feature = "subagents")),
+            allow(unused_variables)
+        )]
+        let session_exit = self.cli.input_format() != crate::cli::InputFormat::StreamJson;
         #[cfg(feature = "subagents")]
-        self.wait_background_tasks_before_exit().await;
-        #[cfg(feature = "subagents")]
-        self.session.close_background_tasks().await;
+        if session_exit {
+            self.wait_background_tasks_before_exit().await;
+            self.session.close_background_tasks().await;
+        }
         if let Some(owner) = &mut self.native_headless {
             #[cfg(feature = "hooks")]
-            {
-                owner
-                    .scope
-                    .run(crate::extras::hooks::dispatch_session_end("exit"))
+            if session_exit {
+                crate::agent::runner::HookBindings::capture()
+                    .run(
+                        owner
+                            .scope
+                            .run(crate::extras::hooks::dispatch_session_end("exit")),
+                    )
                     .await;
                 self.native_session_end_done = true;
             }
@@ -3505,6 +3672,15 @@ impl Startup {
             mcp_manager.as_ref(),
         )
         .await;
+        #[cfg(all(feature = "hooks", feature = "mcp"))]
+        if let Some(scope) = crate::agent::runner::current_hook_work_scope() {
+            scope.set_hook_mcp_peers(
+                mcp_manager
+                    .as_ref()
+                    .map(|manager| manager.hook_peers())
+                    .unwrap_or_default(),
+            );
+        }
         #[cfg(feature = "mcp")]
         report_headless_mcp_notices(mcp_manager.as_mut(), |notice| eprintln!("{notice}"));
         // Boxed: dispatch_loop's future is built on the stack before it is
@@ -3706,6 +3882,26 @@ fn apply_goal_flags(cli: &Cli, cfg: &config::Config, session: &Session) -> anyho
         .goal_store
         .set(goal, cli.goal_args.goal_replace)
         .map_err(|error| anyhow::anyhow!("{error} (or pass --goal-replace)"))
+}
+
+/// The goal handoff tracks live recording independently of the save result.
+/// `persist_round` always records before attempting disk IO, so a finalizer
+/// must retry only that IO after an error (mini-agent-gkqd4.3).
+#[cfg(feature = "goal")]
+fn record_headless_goal_round(
+    session: &mut Session,
+    prompt: &str,
+    turn: crate::agent::runner::HeadlessTurn,
+    cfg: &Config,
+    no_session: bool,
+    recorded: &mut bool,
+) -> anyhow::Result<()> {
+    if *recorded {
+        return Ok(());
+    }
+    let result = crate::extras::goal::driver::persist_round(session, prompt, turn, cfg, no_session);
+    *recorded = true;
+    result.map(|_| ())
 }
 
 /// Drive `--loop` rounds through the goal engine.
@@ -4847,28 +5043,25 @@ async fn run_headless_goal_rounds_inner(
             // The round that just ran is history for whatever comes next, and its
             // work has to survive an interrupt, so it is persisted before the
             // gate's decision is acted on rather than only on a relaunch.
-            if !persisted
-                && let Err(error) = crate::extras::goal::driver::persist_round(
-                    session,
-                    &round_prompt,
-                    crate::agent::runner::HeadlessTurn {
-                        response: turn.response.clone(),
-                        usage: turn.usage,
-                        interactions: turn.interactions.clone(),
-                        failure: None,
-                    },
-                    cfg,
-                    cli.no_session,
-                )
-            {
+            if let Err(error) = record_headless_goal_round(
+                session,
+                &round_prompt,
+                crate::agent::runner::HeadlessTurn {
+                    response: turn.response.clone(),
+                    usage: turn.usage,
+                    interactions: turn.interactions.clone(),
+                    failure: None,
+                },
+                cfg,
+                cli.no_session,
+                &mut persisted,
+            ) {
                 notices
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .push(format!(
                         "warning: failed to save session between goal rounds: {error}\n"
                     ));
-            } else {
-                persisted = true;
             }
             let notices = std::mem::take(
                 &mut *notices
@@ -5412,6 +5605,8 @@ fn reported_headless_interactions(
 pub(crate) struct HeadlessRounds {
     pub turn: crate::agent::runner::HeadlessTurn,
     pub prompt: String,
+    /// The final segment's messages and usage are already recorded in the
+    /// live Session. A disk save may still need to be retried.
     pub persisted: bool,
     /// Usage of context-relief segments and compactions inside these rounds,
     /// already charged to the session; reported, never charged again.
@@ -8357,5 +8552,330 @@ mod native_publication_startup_tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+}
+
+#[cfg(all(test, feature = "goal"))]
+mod headless_session_lifetime_tests {
+    use super::*;
+
+    fn round() -> HeadlessRounds {
+        HeadlessRounds {
+            turn: crate::agent::runner::HeadlessTurn {
+                response: "FIRST_REPLY_AUDIT_MARKER".into(),
+                usage: rig::completion::Usage {
+                    input_tokens: 3,
+                    output_tokens: 2,
+                    total_tokens: 5,
+                    ..Default::default()
+                },
+                interactions: Vec::new(),
+                failure: None,
+            },
+            prompt: "FIRST_PROMPT_AUDIT_MARKER".into(),
+            persisted: false,
+            relief_usage: Default::default(),
+            relief_interactions: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn ephemeral_finalizer_keeps_in_memory_history() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let root = crate::tests::OwnedTestDirectory::new("audit-ephemeral-history");
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            (
+                "MINI_AGENT_CONFIG_DIR",
+                Some(root.path().join("config").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_DATA_DIR",
+                Some(root.path().join("data").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_STATE_DIR",
+                Some(root.path().join("state").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_CACHE_DIR",
+                Some(root.path().join("cache").into_os_string()),
+            ),
+        ]);
+        let workspace =
+            std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let cli = Cli {
+            provider: Some("openrouter".into()),
+            model: Some("openai/gpt-4o-mini".into()),
+            api_key: Some("unused-audit-key".into()),
+            no_context_files: true,
+            message: vec!["FIRST_PROMPT_AUDIT_MARKER".into()],
+            no_tools: true,
+            no_sandbox: true,
+            no_session: true,
+            print: true,
+            input_format: Some(crate::cli::InputFormat::StreamJson),
+            output: Some(crate::cli::OutputFormat::StreamJson),
+            ..Default::default()
+        };
+        let cfg = Config {
+            session_title_model: Some("off".into()),
+            ..Default::default()
+        };
+        let mut startup = Startup::init(
+            cli,
+            cfg,
+            crate::paths::process_paths_ref().unwrap().clone(),
+            workspace,
+            false,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        let identity = (
+            startup.session.id.to_string(),
+            startup.session.name.to_string(),
+        );
+        let output = crate::print::HeadlessOutputPolicy::from_cli(&startup.cli);
+        startup
+            .finish_print_model(
+                "FIRST_PROMPT_AUDIT_MARKER".into(),
+                None,
+                output,
+                identity,
+                None,
+                Default::default(),
+                round(),
+                crate::output_schema::SchemaOutcome::default(),
+            )
+            .await
+            .unwrap();
+        let next_history = crate::agent::runner::convert_history(&startup.session);
+        assert!(
+            format!("{next_history:?}").contains("FIRST_REPLY_AUDIT_MARKER"),
+            "stream-json's next input receives no preceding ephemeral turn: {next_history:?}"
+        );
+        assert_eq!(startup.session.total_input_tokens, 3);
+    }
+
+    #[test]
+    fn ephemeral_goal_round_keeps_retained_history() {
+        let mut session = Session::new("openrouter", "test", 128_000, "");
+        let rounds = round();
+        crate::extras::goal::driver::persist_round(
+            &mut session,
+            &rounds.prompt,
+            rounds.turn,
+            &Config::default(),
+            true,
+        )
+        .unwrap();
+        assert!(
+            !session.messages.is_empty(),
+            "next_round(Continue) converts this same session, but no completed round was recorded"
+        );
+        assert_eq!(session.total_input_tokens, 3);
+    }
+    #[tokio::test]
+    async fn failed_goal_save_does_not_duplicate_final_round() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let root = crate::tests::OwnedTestDirectory::new("audit-goal-save-retry");
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            (
+                "MINI_AGENT_CONFIG_DIR",
+                Some(root.path().join("config").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_DATA_DIR",
+                Some(root.path().join("data").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_STATE_DIR",
+                Some(root.path().join("state").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_CACHE_DIR",
+                Some(root.path().join("cache").into_os_string()),
+            ),
+        ]);
+        let workspace =
+            std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let cli = Cli {
+            provider: Some("openrouter".into()),
+            model: Some("openai/gpt-4o-mini".into()),
+            api_key: Some("unused-audit-key".into()),
+            no_context_files: true,
+            message: vec!["FIRST_PROMPT_AUDIT_MARKER".into()],
+            no_tools: true,
+            no_sandbox: true,
+            print: true,
+            ..Default::default()
+        };
+        let cfg = Config {
+            session_title_model: Some("off".into()),
+            ..Default::default()
+        };
+        let paths = crate::paths::process_paths_ref().unwrap();
+        let mut startup = Startup::init(cli, cfg, paths.clone(), workspace, false, false, false)
+            .await
+            .unwrap();
+        let sessions = paths.sessions_dir();
+        // Only the isolated owned test tree is changed. Simulate one failed
+        // round write, then repair it before the actual print finalizer retries.
+        if sessions.exists() {
+            std::fs::remove_dir_all(&sessions).unwrap();
+        }
+        std::fs::create_dir_all(sessions.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(sessions.parent().unwrap()).unwrap();
+        std::fs::write(&sessions, "blocks the first save").unwrap();
+        let rounds = round();
+        let mut recorded = false;
+        assert!(
+            record_headless_goal_round(
+                &mut startup.session,
+                &rounds.prompt,
+                rounds.turn,
+                &startup.cfg,
+                false,
+                &mut recorded,
+            )
+            .is_err()
+        );
+        assert!(recorded, "live commit survives a failed disk save");
+        assert_eq!(
+            startup.session.messages.len(),
+            2,
+            "the failed save already committed live history"
+        );
+        std::fs::remove_file(&sessions).unwrap();
+        // Retry persistence through the real finalizer using the production
+        // handoff's live-recording state.
+        let identity = (
+            startup.session.id.to_string(),
+            startup.session.name.to_string(),
+        );
+        let output = crate::print::HeadlessOutputPolicy::from_cli(&startup.cli);
+        let mut final_round = round();
+        final_round.persisted = recorded;
+        startup
+            .finish_print_model(
+                "FIRST_PROMPT_AUDIT_MARKER".into(),
+                None,
+                output,
+                identity,
+                None,
+                Default::default(),
+                final_round,
+                crate::output_schema::SchemaOutcome::default(),
+            )
+            .await
+            .unwrap();
+        let prompts = startup
+            .session
+            .messages
+            .iter()
+            .filter(|m| m.content == "FIRST_PROMPT_AUDIT_MARKER")
+            .count();
+        assert_eq!(
+            prompts, 1,
+            "retrying persistence must not append the final round again"
+        );
+        assert_eq!(
+            startup.session.total_input_tokens, 3,
+            "one observed round must be charged once"
+        );
+        crate::session::lock::release_session(&startup.session.id);
+    }
+
+    #[cfg(feature = "subagents")]
+    #[tokio::test]
+    async fn stream_turn_does_not_permanently_close_task_pool() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let root = crate::tests::OwnedTestDirectory::new("audit-ephemeral-history");
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            (
+                "MINI_AGENT_CONFIG_DIR",
+                Some(root.path().join("config").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_DATA_DIR",
+                Some(root.path().join("data").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_STATE_DIR",
+                Some(root.path().join("state").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_CACHE_DIR",
+                Some(root.path().join("cache").into_os_string()),
+            ),
+        ]);
+        let workspace =
+            std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let cli = Cli {
+            provider: Some("openrouter".into()),
+            model: Some("openai/gpt-4o-mini".into()),
+            api_key: Some("unused-audit-key".into()),
+            no_context_files: true,
+            message: vec!["FIRST_PROMPT_AUDIT_MARKER".into()],
+            no_tools: true,
+            no_sandbox: true,
+            no_session: true,
+            print: true,
+            input_format: Some(crate::cli::InputFormat::StreamJson),
+            output: Some(crate::cli::OutputFormat::StreamJson),
+            ..Default::default()
+        };
+        let cfg = Config {
+            session_title_model: Some("off".into()),
+            ..Default::default()
+        };
+        let mut startup = Startup::init(
+            cli,
+            cfg,
+            crate::paths::process_paths_ref().unwrap().clone(),
+            workspace,
+            false,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        let pool = crate::extras::subagents::background::Pool::for_session(&mut startup.session, 1)
+            .unwrap();
+        assert!(pool.ensure_open().is_ok());
+        let identity = (
+            startup.session.id.to_string(),
+            startup.session.name.to_string(),
+        );
+        let output = crate::print::HeadlessOutputPolicy::from_cli(&startup.cli);
+        startup
+            .finish_print_model(
+                "FIRST_PROMPT_AUDIT_MARKER".into(),
+                None,
+                output,
+                identity,
+                None,
+                Default::default(),
+                round(),
+                crate::output_schema::SchemaOutcome::default(),
+            )
+            .await
+            .unwrap();
+        let next_pool =
+            crate::extras::subagents::background::Pool::for_session(&mut startup.session, 1)
+                .unwrap();
+        assert!(
+            next_pool.ensure_open().is_ok(),
+            "a stream-json turn is not session exit; the next prompt must retain task admission"
+        );
+        startup.finish_headless_session().await.unwrap();
+        assert!(
+            next_pool.ensure_open().is_err(),
+            "EOF closes admission for the same retained pool"
+        );
     }
 }

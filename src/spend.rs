@@ -542,6 +542,10 @@ struct State {
     unpriced_tokens: u64,
     tracking_error: bool,
     pending: BTreeMap<Uuid, Arc<Row>>,
+    // Only pending receipts survive here; retries can have reached an archive
+    // after a failed append/sync or a concurrent writer rotation.
+    attempted: std::collections::HashSet<Uuid>,
+    flush_serialization: Arc<Mutex<()>>,
     #[cfg(feature = "subagents")]
     pending_observations: BTreeMap<Uuid, crate::session::background_observation::JobObservation>,
     #[cfg(feature = "subagents")]
@@ -1039,6 +1043,7 @@ impl Account {
         state.pending.insert(row.id, row.clone());
         Ok(true)
     }
+    #[cfg(test)]
     fn pending(&self) -> Vec<Arc<Row>> {
         self.0
             .lock()
@@ -1047,6 +1052,20 @@ impl Account {
             .values()
             .cloned()
             .collect()
+    }
+    fn flush_serialization(&self) -> Arc<Mutex<()>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .flush_serialization
+            .clone()
+    }
+    fn begin_flush(&self) -> (Vec<Arc<Row>>, std::collections::HashSet<Uuid>) {
+        let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        let rows: Vec<_> = state.pending.values().cloned().collect();
+        let retries = state.attempted.clone();
+        state.attempted.extend(rows.iter().map(|row| row.id));
+        (rows, retries)
     }
     fn acknowledge(&self, id: Uuid) {
         #[cfg(feature = "subagents")]
@@ -1062,6 +1081,7 @@ impl Account {
         #[cfg(not(feature = "subagents"))]
         let mut state = self.edit();
         state.pending.remove(&id);
+        state.attempted.remove(&id);
         #[cfg(feature = "subagents")]
         state.pending_observations.remove(&id);
     }

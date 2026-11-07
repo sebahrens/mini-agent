@@ -3429,6 +3429,12 @@ pub struct AnyAgent {
     /// `max_tokens` is the per-response output cap sent to the provider — a
     /// different unit entirely.
     turn_token_budget: Option<u64>,
+    #[cfg(feature = "hooks")]
+    hook_context: Option<crate::extras::hooks::HookCtx>,
+    #[cfg(feature = "hooks")]
+    hook_permission: Option<Option<crate::permission::checker::PermCheck>>,
+    #[cfg(all(feature = "hooks", feature = "mcp"))]
+    hook_mcp_peers: Option<std::sync::Arc<crate::extras::hooks::backend::McpPeers>>,
     spend: Option<crate::spend::run::Run>,
     file_checkpoints: Option<crate::session::file_checkpoints::Recorder>,
     /// Per-prompt budget spent by earlier context-relief segments of an
@@ -4256,6 +4262,12 @@ impl AnyAgent {
         Self {
             inner,
             turn_token_budget: None,
+            #[cfg(feature = "hooks")]
+            hook_context: runner::current_hook_session_context(),
+            #[cfg(feature = "hooks")]
+            hook_permission: None,
+            #[cfg(all(feature = "hooks", feature = "mcp"))]
+            hook_mcp_peers: runner::current_hook_mcp_peers(),
             spend: None,
             file_checkpoints: None,
             budget_carry: None,
@@ -4306,6 +4318,52 @@ impl AnyAgent {
         Some(agent)
     }
 
+    #[cfg(all(feature = "hooks", feature = "acp"))]
+    pub(crate) fn with_hook_context(mut self, context: crate::extras::hooks::HookCtx) -> Self {
+        self.hook_context = Some(context);
+        self
+    }
+
+    /// Auxiliary agents carry their own read policy and exact MCP manager,
+    /// including an explicitly absent policy or an empty manager catalogue.
+    #[cfg(all(feature = "hooks", feature = "subagents"))]
+    pub(crate) fn with_hook_routing(
+        mut self,
+        permission: Option<PermCheck>,
+        #[cfg(feature = "mcp")] peers: std::sync::Arc<crate::extras::hooks::backend::McpPeers>,
+    ) -> Self {
+        self.hook_permission = Some(permission);
+        #[cfg(feature = "mcp")]
+        {
+            self.hook_mcp_peers = Some(peers);
+        }
+        self
+    }
+
+    #[cfg(feature = "hooks")]
+    fn hook_bindings(&self) -> runner::HookBindings {
+        runner::HookBindings {
+            context: self
+                .hook_context
+                .clone()
+                .or_else(runner::current_hook_session_context),
+            permission: self
+                .hook_permission
+                .clone()
+                .or_else(|| {
+                    self.native_host
+                        .as_ref()
+                        .map(|host| host.permission.clone())
+                })
+                .or_else(runner::current_hook_permission_binding),
+            #[cfg(feature = "mcp")]
+            peers: self
+                .hook_mcp_peers
+                .clone()
+                .or_else(runner::current_hook_mcp_peers),
+        }
+    }
+
     /// Capture main-session data before restoring a binding or starting work.
     /// Independently built auxiliary agents retain their own context policy.
     pub(crate) fn with_main_session(self, cfg: &Config, session: &crate::session::Session) -> Self {
@@ -4313,6 +4371,31 @@ impl AnyAgent {
             .with_reasoning_controls(cfg, session.reasoning_controls)
             .with_ollama_context_window(session.context_window);
         agent.fallback = resolve_fallback_route(cfg, session);
+        #[cfg(feature = "hooks")]
+        {
+            let root = agent
+                .native_host
+                .as_ref()
+                .map(|host| host.workspace.root().to_path_buf())
+                .unwrap_or_else(crate::extras::hooks::active_workspace);
+            let mode = agent
+                .native_host
+                .as_ref()
+                .and_then(|host| host.permission.as_ref())
+                .map(|permission| {
+                    permission
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .mode()
+                        .to_string()
+                })
+                .unwrap_or_else(|| "standard".into());
+            agent.hook_context = Some(crate::extras::hooks::context_for_session(
+                &session.id,
+                &root,
+                &mode,
+            ));
+        }
         #[cfg(feature = "memory")]
         {
             agent.with_memory_placement(session.memory_placement)
@@ -4944,6 +5027,12 @@ impl AnyAgent {
         Self {
             inner,
             turn_token_budget: None,
+            #[cfg(feature = "hooks")]
+            hook_context: runner::current_hook_session_context(),
+            #[cfg(feature = "hooks")]
+            hook_permission: None,
+            #[cfg(all(feature = "hooks", feature = "mcp"))]
+            hook_mcp_peers: runner::current_hook_mcp_peers(),
             spend: None,
             file_checkpoints: None,
             budget_carry: None,
@@ -5382,6 +5471,8 @@ impl AnyAgent {
             }
         });
         let future = crate::session::file_checkpoints::scope(self.file_checkpoints.clone(), future);
+        #[cfg(feature = "hooks")]
+        let future = self.hook_bindings().run(future);
         let mut turn = crate::question::scope(self.question_turn.clone(), future).await;
         // SDK hook errors carry a string. Recover the typed budget outcome
         // only when this exact parent-owned run actually refused admission.
@@ -5559,6 +5650,8 @@ impl AnyAgent {
             self.spend.clone().or_else(crate::spend::run::Run::current),
             future,
         );
+        #[cfg(feature = "hooks")]
+        let future = self.hook_bindings().run(future);
         crate::question::scope(None, future).await
     }
 
@@ -5670,6 +5763,8 @@ impl AnyAgent {
     where
         H: Into<std::sync::Arc<[Message]>>,
     {
+        #[cfg(feature = "hooks")]
+        let hook_bindings = self.hook_bindings();
         #[cfg(feature = "hooks")]
         let mut prompt = prompt;
         // The typed dispatch child is large in debug builds. Construct it in
@@ -5919,6 +6014,8 @@ impl AnyAgent {
                 paused
             }),
         );
+        #[cfg(feature = "hooks")]
+        let future = hook_bindings.run(future);
         crate::question::scope(
             question_turn,
             crate::session::file_checkpoints::scope(
@@ -5941,33 +6038,45 @@ impl AnyAgent {
         let self_ = self.deferred_instruction_hook(&prompt);
         #[cfg(not(feature = "agent-skills"))]
         let self_ = self;
-        crate::question::scope_sync(None, || {
-            crate::spend::run::scope_sync(self_.spend.clone(), || match self_.inner {
-                AnyAgentInner::OpenRouter(a) => {
-                    runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
-                }
-                AnyAgentInner::OpenAI(a) => match a {
-                    OpenAiAgent::Responses(a) => {
+        #[cfg(feature = "hooks")]
+        let hook_bindings = self_.hook_bindings();
+        let spawn = || {
+            crate::question::scope_sync(None, || {
+                crate::spend::run::scope_sync(self_.spend.clone(), || match self_.inner {
+                    AnyAgentInner::OpenRouter(a) => {
                         runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
                     }
-                    OpenAiAgent::Completions(a) => {
+                    AnyAgentInner::OpenAI(a) => match a {
+                        OpenAiAgent::Responses(a) => {
+                            runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
+                        }
+                        OpenAiAgent::Completions(a) => {
+                            runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
+                        }
+                    },
+                    AnyAgentInner::Anthropic(a) => {
                         runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
                     }
-                },
-                AnyAgentInner::Anthropic(a) => {
-                    runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
-                }
-                AnyAgentInner::Gemini(a) => {
-                    runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
-                }
-                AnyAgentInner::Ollama(a) => {
-                    runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
-                }
-                AnyAgentInner::Copilot(a) => {
-                    runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
-                }
+                    AnyAgentInner::Gemini(a) => {
+                        runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
+                    }
+                    AnyAgentInner::Ollama(a) => {
+                        runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
+                    }
+                    AnyAgentInner::Copilot(a) => {
+                        runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
+                    }
+                })
             })
-        })
+        };
+        #[cfg(feature = "hooks")]
+        {
+            hook_bindings.run_sync(spawn)
+        }
+        #[cfg(not(feature = "hooks"))]
+        {
+            spawn()
+        }
     }
 }
 
@@ -7195,6 +7304,14 @@ async fn build_agent_with_probe_snapshot(
     let startup_js_omitted = native_js_context.omitted;
     #[cfg(feature = "js")]
     let startup_js_omitted = startup_js_omitted || js_probe_pending;
+    #[cfg(all(feature = "hooks", feature = "mcp"))]
+    {
+        agent.hook_mcp_peers = Some(
+            mcp_manager
+                .map(McpClientManager::hook_peers)
+                .unwrap_or_default(),
+        );
+    }
     agent.native_host = Some(std::sync::Arc::new(NativeHostOwner {
         startup_js_omitted,
         workspace: native_host.0,

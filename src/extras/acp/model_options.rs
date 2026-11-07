@@ -123,6 +123,15 @@ pub(super) fn config_options(cfg: &Config, current: &Overrides) -> Vec<SessionCo
     out
 }
 
+/// Slash commands use the configured alias spelling; only picker IDs are escaped.
+pub(super) fn command_model_value(value: &str) -> String {
+    if value == DEFAULT_VALUE {
+        value.to_owned()
+    } else {
+        wire_value(value)
+    }
+}
+
 /// `default` clears the override; otherwise `value` must be a configured
 /// quick-model alias.
 pub(super) fn parse_model(cfg: &Config, value: &str) -> Result<Option<String>, String> {
@@ -289,6 +298,12 @@ mod tests {
         ] {
             let selected = parse_model(&cfg, &wire_value(alias)).unwrap().unwrap();
             assert_eq!(selected, alias);
+            if alias != DEFAULT_VALUE {
+                assert_eq!(
+                    parse_model(&cfg, &command_model_value(alias)),
+                    Ok(Some(alias.to_owned()))
+                );
+            }
             assert_eq!(&*route_for(&cfg, &selected).unwrap().provider, provider);
             let current = Overrides {
                 model: Some(alias.into()),

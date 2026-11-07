@@ -1292,6 +1292,128 @@ mod tests {
         }
     }
 
+    // Exercise actual SDK URI construction, not just the renewal rewriter:
+    // the first request must identify the credential even with query syntax.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gemini_initial_reserved_keys_survive_sdk_uri_construction_and_401() {
+        use crate::tests::support::loopback_http::asynchronous as http;
+        use futures::StreamExt as _;
+        use rig::completion::CompletionModel as _;
+        let _turn = REGISTRY_TESTS.lock().await;
+        let dir = crate::tests::OwnedTestDirectory::new("gemini-initial-query-encoding");
+        for (index, secret) in ["a+b", "a&b=c", "a#b", "a%b", "a b", "a?b/ü"]
+            .into_iter()
+            .enumerate()
+        {
+            let (listener, base) = http::bind().await;
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let recorded = seen.clone();
+            let server = tokio::spawn(async move {
+                for request_index in 0..3 {
+                    let (mut socket, request) = http::accept_request(&listener).await;
+                    let line = request.head.lines().next().unwrap().to_owned();
+                    recorded.lock().unwrap().push(line);
+                    if request_index == 0 {
+                        http::respond(&mut socket, "401 Unauthorized", "application/json", r#"{"error":{"code":401,"message":"expired","status":"UNAUTHENTICATED"}}"#).await;
+                    } else if request
+                        .head
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .contains("streamGenerateContent")
+                    {
+                        http::respond_sse(&mut socket, "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}\n\n").await;
+                    } else {
+                        http::respond_json(&mut socket, r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}"#).await;
+                    }
+                }
+            });
+            let marker = dir.path().join(format!("issued-{index}"));
+            let spec = ApiKeyCommandSpec {
+                command: vec!["sh".into(), "-c".into(),
+                    "if [ -f \"$1\" ]; then printf '%s\n' 'renewed+&=#%'; else : > \"$1\"; printf '%s\n' \"$2\"; fi".into(),
+                    "credential-fixture".into(), marker.to_string_lossy().into_owned(), secret.into()],
+                ttl_secs: Some(0), timeout_secs: Some(5),
+            };
+            configure(Some(&[("encoded-gemini".to_owned(), spec)].into())).unwrap();
+            let config: crate::config::Config = serde_json::from_value(serde_json::json!({
+                "custom_providers":{"encoded-gemini":{"provider_type":"gemini","base_url":base}}
+            }))
+            .unwrap();
+            let crate::provider::AnyClient::Gemini(client) = crate::provider::create_client(
+                "encoded-gemini",
+                None,
+                config.custom_providers_map(),
+                None,
+            )
+            .unwrap() else {
+                panic!("gemini route");
+            };
+            let model =
+                rig::providers::gemini::completion::CompletionModel::new(client, "gemini-test");
+            let request = || model.completion_request("hello").build();
+            if index % 2 == 0 {
+                model
+                    .completion(request())
+                    .await
+                    .expect("initial key is owned and renewed");
+            } else {
+                let mut stream = model
+                    .stream(request())
+                    .await
+                    .expect("initial streaming key is owned and renewed");
+                while let Some(part) = stream.next().await {
+                    part.unwrap();
+                }
+            }
+            if index % 2 == 0 {
+                let mut stream = model
+                    .stream(request())
+                    .await
+                    .expect("stream with refreshed key");
+                while let Some(part) = stream.next().await {
+                    part.unwrap();
+                }
+            } else {
+                model
+                    .completion(request())
+                    .await
+                    .expect("completion with refreshed key");
+            }
+            server.await.unwrap();
+            let seen = seen.lock().unwrap();
+            for (line, expected) in seen.iter().zip([secret, "renewed+&=#%", "renewed+&=#%"]) {
+                let uri: ::http::Uri = line.split_whitespace().nth(1).unwrap().parse().unwrap();
+                let parameters: Vec<_> = uri.query().unwrap().split('&').collect();
+                assert_eq!(
+                    parameters
+                        .iter()
+                        .filter(|item| item.starts_with("key="))
+                        .count(),
+                    1,
+                    "{line}"
+                );
+                assert_eq!(
+                    percent_decode(query_key(&uri).unwrap()).unwrap(),
+                    expected,
+                    "{line}"
+                );
+                assert_eq!(
+                    parameters.len(),
+                    if line.contains("streamGenerateContent") {
+                        2
+                    } else {
+                        1
+                    },
+                    "injected query: {line}"
+                );
+            }
+            assert_eq!(seen[2].contains("alt=sse"), index % 2 == 0, "{}", seen[2]);
+            configure(None).unwrap();
+        }
+    }
+
     // mini-agent-dxbuy: Gemini carries its key in the URL; a stale key there is
     // swapped for the current one and a 401 renews it and resends once.
     #[cfg(unix)]

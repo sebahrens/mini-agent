@@ -1241,14 +1241,17 @@ pub fn persist_round(
         interactions,
         failure,
     } = turn;
+    // Recording the live round is independent of disk persistence. Ephemeral
+    // Continue-mode goals need the same history and accounting for the next
+    // round (mini-agent-gkqd4.2).
+    crate::print::persist_headless_turn(session, prompt, &response, &interactions);
+    session.charge_usage_delta(
+        cfg.normalize_usage(&session.provider, usage.into()),
+        cfg.is_anthropic_native(&session.provider),
+    );
     let persistence = if no_session {
         Ok(())
     } else {
-        crate::print::persist_headless_turn(session, prompt, &response, &interactions);
-        session.charge_usage_delta(
-            cfg.normalize_usage(&session.provider, usage.into()),
-            cfg.is_anthropic_native(&session.provider),
-        );
         crate::session::storage::save_session_recovering(session, |notice| {
             eprintln!("warning: {notice}")
         })

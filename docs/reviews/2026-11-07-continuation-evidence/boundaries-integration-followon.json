@@ -1,0 +1,63 @@
+{
+  "reviewer": "boundaries_review",
+  "mode": "read-only; no Cargo or bead/source mutation",
+  "scope": [
+    "AnyAgent print/interactive/subagent/btw entry points",
+    "HookBindings immutable overlay capture, scoped async tasks and MCP callback restoration",
+    "JS PermissionBridge invocation/envelope/receiver transfer",
+    "manager-local RpcClient liveness and reconnect checks",
+    "aggregate JSON/prompt substitution preallocation limits",
+    "MCP serve bounded writer, reply task permits, EOF/error cancellation and process-tree/pipe completion"
+  ],
+  "accepted_findings": [
+    {
+      "id": "gkqd4.18",
+      "priority": "P2",
+      "location": "src/extras/hooks/backend.rs:479",
+      "evidence": "run_model directly supplies process-global startup ModelRunner permission to read_hook_file; invocation HookBindings carries a separate checker but was unused. Root confirmed and assigned integration fix.",
+      "acceptance": "Actual backend loopback model read with startup-allow and invocation-deny/ask must refuse bytes; allowed control remains.",
+      "related_coverage_gap": "Auxiliary AnyAgent run_subagent_with_history and spawn_btw entry points do not yet apply the stored overlay. Persona task builder returns AnyAgent without NativeHostOwner and task manager peers are not explicitly attached; integration was informed to thread explicit authorization and manager peers, including empty peers."
+    }
+  ],
+  "existing_bead_followups": [
+    {
+      "ids": [
+        "p0h9g.6",
+        "p0h9g.7"
+      ],
+      "location": "src/extras/mcp/server.rs:1163",
+      "evidence": "max_runs permit drops before bounded response enqueue; blocked result holders can accumulate outside slot bound. Root forwarded retention through enqueue to integration."
+    },
+    {
+      "ids": [
+        "p0h9g.6",
+        "p0h9g.7"
+      ],
+      "location": "src/extras/mcp/server.rs:849",
+      "evidence": "joined pipe readers and direct-child wait prevent success cleanup until descendants close inherited pipes or full run timeout. Root forwarded ordinary inherited-pipe fixture/parent-exit cleanup to integration."
+    }
+  ],
+  "second_bounded_sweep": {
+    "additional_distinct_confirmed_p0_p3": [],
+    "status": "No additional distinct confirmed issue after grouping accepted checker/auxiliary overlay and MCP lifecycle cases under their existing roots. Fixes were still in progress; this does not certify post-fix source."
+  },
+  "suppressed_or_unverified": [
+    {
+      "candidate": "Backend execution-root lease bypass before active_workspace_binding recapture",
+      "callpath": [
+        "dispatcher dispatch->policy_context captures directory identity I in HookExecutionRootLease",
+        "run_handlers backend branch queues run_backend_hook without passing or revalidating lease",
+        "run_model captures active_workspace_binding fresh from root pathname, potentially replacement identity J",
+        "read_hook_file reads through fresh J capability"
+      ],
+      "trigger": "Directory replacement between lease capture and queued backend first poll.",
+      "reason_not_filed": "No executed production-seam probe and explicit lease comments currently name child creation. Parent requested clearer backend identity contract/trigger verification before filing; source proof sent.",
+      "suggested_acceptance": "Pause backend after policy_context; replace owned root fixture directory; resume actual agent-hook backend and require refusal or original retained directory bytes."
+    }
+  ],
+  "residual_risks": [
+    "No Windows/macOS runtime execution in this pass.",
+    "Did not rerun any tests; parent coordinates current feature rows.",
+    "Post-fix overlay and EOF lifetime work must be rechecked after integration lands."
+  ]
+}

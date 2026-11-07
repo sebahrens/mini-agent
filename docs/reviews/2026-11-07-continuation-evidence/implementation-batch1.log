@@ -1,0 +1,157 @@
+   Compiling mini-agent v1.12.0 (/Users/seb/projects/mini-agent)
+   Compiling rig-core v0.40.0 (/Users/seb/projects/mini-agent/patched-deps/rig-core)
+    Finished `test` profile [unoptimized] target(s) in 1m 31s
+     Running unittests src/main.rs (target/debug/deps/mini_agent-eb54318180c9c0b0)
+
+running 142 tests
+test agent::runner::tests::interactive_relief_segment_charges_prior_tokens_to_the_budget ... ok
+test agent::runner::tests::interactive_relief_segment_gets_only_the_remaining_turn_budget ... ok
+test agent::tools::find_files::tests::bound_search_depth_limit_skips_deep_descendants_and_preserves_siblings ... ok
+test agent::tools::find_files::tests::bound_search_entry_budget_counts_ignored_entries_and_releases_the_walk ... ok
+test agent::tools::find_files::tests::bound_walker_never_observes_an_aba_root_replacement ... ok
+test agent::tools::find_files::tests::bound_walker_stops_once_its_owner_is_cancelled ... ok
+test agent::tools::find_files::tests::capped_results_are_lexicographically_first_independent_of_walk_order ... ok
+test agent::tools::find_files::tests::common_globs_and_explicit_regex_find_the_expected_paths ... ok
+test agent::tools::find_files::tests::does_not_report_truncation_when_walker_is_exhausted_at_result_limit ... ok
+test agent::tools::find_files::tests::file_filter_runs_before_open_and_links_stay_refused ... ok
+test agent::tools::find_files::tests::file_path_reports_a_clear_not_a_directory_error ... ok
+test agent::tools::find_files::tests::find_files_external_path_permission_binds_walker_to_authorized_symlink_target ... ok
+test agent::tools::find_files::tests::find_files_external_path_permission_expands_tilde_before_asking ... ok
+test agent::tools::find_files::tests::find_files_external_path_permission_fails_closed_on_permission_channel_failure ... ok
+test agent::tools::find_files::tests::find_files_external_path_permission_keeps_local_relative_searches ... ok
+test agent::tools::find_files::tests::find_files_external_path_permission_omitted_root_searches_cwd ... ok
+test agent::tools::find_files::tests::find_files_external_path_permission_pattern_cannot_widen_root ... ok
+test agent::tools::find_files::tests::find_files_external_path_permission_rejects_empty_root_before_asking ... ok
+test agent::tools::find_files::tests::find_files_external_path_permission_resolves_symlink_escape_before_asking ... ok
+test agent::tools::find_files::tests::find_files_external_path_permission_resolves_traversal_before_asking ... ok
+test agent::tools::find_files::tests::find_files_external_path_permission_retains_authorized_root_on_replacement ... ok
+test agent::tools::find_files::tests::find_files_external_path_permission_uses_canonical_absolute_root ... ok
+test agent::tools::find_files::tests::find_files_omits_denied_paths ... ok
+test agent::tools::find_files::tests::global_ignore_matchers_are_cached_until_a_config_or_the_environment_changes ... ok
+test agent::tools::find_files::tests::invalid_patterns_and_no_matches_report_the_interpretation ... ok
+test agent::tools::find_files::tests::js_discovery_listing_honours_git_info_exclude ... ok
+test agent::tools::find_files::tests::mtime_sort_retains_newest_paths_with_stable_ties_and_name_default ... ok
+test agent::tools::find_files::tests::mtime_sort_unavailable_timestamps_sort_last_and_name_ignores_them ... ok
+test agent::tools::find_files::tests::nested_ignore_whitelist_overrides_parent_matcher_without_cloning_chain ... ok
+test agent::tools::find_files::tests::pages_across_three_pages_in_stable_order ... ok
+test agent::tools::find_files::tests::parent_ignore_matchers_are_cached_and_invalidated_by_source_changes ... ok
+test agent::tools::find_files::tests::path_glob_matches_nested_and_root_files ... ok
+test agent::tools::find_files::tests::prompts_before_searching_external_path ... ok
+test agent::tools::find_files::tests::reports_exact_remaining_count_when_result_limit_is_hit ... ok
+test agent::tools::find_files::tests::walker_allocations_scale_with_matches_not_entries ... ok
+test agent::tools::find_files::tests::zero_result_cap_does_not_panic_or_return_an_empty_page ... ok
+test agent::tools::grep::discovery_root_deny_tests::explicit_directory_must_not_bypass_pruned_read_deny ... ok
+test agent::tools::grep::discovery_root_deny_tests::find_and_list_explicit_directory_obey_pruned_read_deny ... ok
+test agent::tools::list_dir::tests::descriptor_bound_listing_ignores_an_aba_swap_during_permission_wait ... ok
+test agent::tools::list_dir::tests::descriptor_bound_listing_reports_symlinks_without_following_them ... ok
+test agent::tools::list_dir::tests::file_path_reports_a_clear_not_a_directory_error ... ok
+test agent::tools::list_dir::tests::flat_listing_pages_past_ten_thousand_entries ... ok
+test agent::tools::list_dir::tests::gitignore_negation_outranks_info_exclude ... ok
+test agent::tools::list_dir::tests::links_sort_with_files_after_directories ... ok
+test agent::tools::list_dir::tests::past_end_offset_header_has_no_inverted_range ... ok
+test agent::tools::list_dir::tests::unreadable_subdirectories_report_incomplete_coverage_without_hidden_names ... ok
+test auth::oauth::tests::a_valid_access_token_is_served_without_reopening_the_locked_store ... ok
+test auth::oauth::tests::login_labels47_doctor_and_setup_use_explicit_saved_account_state_and_actual_route_precedence ... ok
+test auth::oauth::tests::login_labels47_openai_reader_is_bounded_nonrepairing_and_preserves_the_revocation_fence ... ok
+test auth::oauth::tests::login_labels47_private_inspection_rejects_links_and_preserves_permissive_modes ... ok
+test auth::oauth::tests::oauth47_actual_client_login_precedes_keys_but_never_crosses_custom_routes ... ok
+test auth::oauth::tests::oauth47_actual_loopback_exchange_refresh_and_logout_keep_registration_private ... ok
+test auth::oauth::tests::oauth47_actual_sdk_plan_tool_followup_and_auxiliary_use_one_selected_registration ... ok
+test auth::oauth::tests::oauth47_auxiliary_completion_requires_actual_completed_envelope ... ok
+test auth::oauth::tests::oauth47_callback_is_exact_state_and_registration_bound ... ok
+test auth::oauth::tests::oauth47_cli_and_slash_commands_expose_login_without_an_api_key ... ok
+test auth::oauth::tests::oauth47_identity_signature_nonce_client_expiry_and_plan_scopes_are_enforced ... ok
+test auth::oauth::tests::oauth47_plan_body_is_stateless_and_preserves_tools_schema_data ... ok
+test auth::oauth::tests::oauth47_private_store_rejects_malformed_and_retains_host_on_signout ... ok
+test auth::oauth::tests::oauth47_revoked_refresh_preserves_a_reauthorization_fence_without_key_fallback ... ok
+test auth::oauth::tests::oauth47_stale_signin_cannot_replace_a_newer_or_different_host_registration ... ok
+test auth::oauth::tests::oauth_refresh_wait_is_bounded_cancellable_and_rechecks_logout ... ok
+test auth::oauth::tests::oauth_refresh_waiter_uses_the_completed_refresh ... ok
+test config::load::model_alias_trust_tests::benign_project_models_preserve_inherited_provider ... ok
+test config::load::model_alias_trust_tests::project_model_alias_cannot_change_provider_without_trust ... ok
+test config::load::project_config_trust_tests::project_config_cannot_set_api_key_commands_without_trust ... ok
+test extras::acp::history_tests::mv5wx_token_pressure_drives_compaction_under_compact_enabled ... ok
+test extras::acp::protocol_tests::acp53_checkpoint_drop_keeps_lease_and_blocking_job_until_actual_retirement ... ok
+test extras::acp::protocol_tests::acp53_checkpoint_settlement_waits_for_the_exact_admitted_blocking_job ... ok
+test extras::acp::protocol_tests::acp53_local_checkpoint_failure_replies_without_closing_the_connection ... ok
+test extras::js::host::tests::guarded_absolute_write_preserves_the_authorized_preimage_at_publication ... ok
+test extras::subagents::task_tool::child_continuation_tests::child_context_relief_continues_with_only_the_remaining_turns ... ok
+test extras::subagents::task_tool::child_continuation_tests::child_context_relief_stops_when_no_turns_remain ... ok
+test key_command::tests::a_401_queued_behind_a_refresh_is_resent_without_rerunning_the_command ... ok
+test key_command::tests::a_hung_command_is_killed_at_the_timeout ... ok
+test key_command::tests::an_expired_token_is_refreshed_once_on_401_and_the_request_succeeds ... ok
+test key_command::tests::an_expired_ttl_refreshes_before_the_request ... ok
+test key_command::tests::an_unchanged_token_after_refresh_surfaces_the_401_without_a_resend ... ok
+test key_command::tests::async_timeout_kills_grandchildren_and_success_ignores_daemons ... ok
+test key_command::tests::blocking_success_does_not_wait_for_a_backgrounded_daemon ... ok
+test key_command::tests::blocking_timeout_returns_promptly_and_kills_grandchildren ... ok
+test key_command::tests::command_failures_name_the_command_and_never_echo_its_output ... ok
+test key_command::tests::configure_rejects_invalid_entries_and_looks_providers_up_case_insensitively ... ok
+test key_command::tests::credential_commands_are_closed_by_default_and_rank_below_the_cli_key ... ok
+test key_command::tests::gemini_initial_reserved_keys_survive_sdk_uri_construction_and_401 ... ok
+test key_command::tests::gemini_query_string_key_is_refreshed_and_renewed_on_401 ... ok
+test key_command::tests::long_lived_client_token_survives_more_rotations_than_the_rolling_window ... ok
+test key_command::tests::output_must_be_one_clean_line_within_the_bound ... ok
+test key_command::tests::query_key_is_found_and_rewritten_without_touching_other_parameters ... ok
+test key_command::tests::query_key_rewrite_percent_encodes_reserved_characters ... ok
+test key_command::tests::results_are_cached_for_the_ttl ... ok
+test key_command::tests::spec_validation_is_structural_and_never_echoes_values ... ok
+test paths::bound_special_file_tests::bound_file_open_refuses_fifo_before_a_writer_arrives ... ok
+test paths::generic_workspace_open_tests::generic_workspace_open_preserves_directory_type_information ... ok
+test provider::effort_tests::replay_probe::cache71_memory_actual_paused_write_checkpoint_tracks_the_literal_user_after_context ... ok
+test provider::effort_tests::replay_probe::effort46_actual_headless_fresh_no_session_runs_configured_start_hook_without_checkpoint ... first completed answer
+ok
+test provider::effort_tests::replay_probe::effort46_native_refused_checkpoint_preserves_observed_canonical_usage ... observed completed answer
+ok
+test provider::effort_tests::replay_probe::effort46_native_refused_checkpoint_preserves_observed_interactive_usage ... ok
+test session::file_checkpoints::retired_checkpoint_reason_tests::rewind_drops_the_retired_skip_reason ... ok
+test session::file_checkpoints::tests::limits_resolve_defaults_follow_edit_limit_and_clamp ... ok
+test session::file_checkpoints::tests::perf_prepare_scans_blob_directory_once_and_syncs_off_the_caller ... ok
+test session::file_checkpoints::tests::rewind35_actual_compaction_remaps_kept_turn_without_restoring_pruned_edits ... ok
+test session::file_checkpoints::tests::rewind35_actual_sdk_dispatch_keeps_private_checkpoint_without_display_diff ... ok
+test session::file_checkpoints::tests::rewind35_actual_steering_ack_anchors_later_write_and_refuses_stale_or_cancelled_turn ... ok
+test session::file_checkpoints::tests::rewind35_actual_write_edit_chain_and_creation_restore_exact_files_after_failure ... ok
+test session::file_checkpoints::tests::rewind35_checks_all_postimages_before_any_restore_and_preserves_editor_changes ... ok
+test session::file_checkpoints::tests::rewind35_orphaned_preimages_keep_physical_budget_and_private_links_fail_closed ... ok
+test session::file_checkpoints::tests::rewind35_private_saved_reload_restores_but_import_fork_and_corrupt_blob_do_not ... ok
+test session::file_checkpoints::tests::rewind35_read_policy_limits_and_replaced_workspace_fail_closed ... ok
+test session::file_checkpoints::tests::rewind_restores_exact_notebook_preimage_after_notebook_edit ... ok
+test session::file_checkpoints::tests::rewind_restores_exact_utf16_preimage_after_edit ... ok
+test session::file_checkpoints::tests::uncaptured_mutations_warn_once_and_rewind_summary_names_the_reason ... ok
+test session::native_publication::tests::native_publication_deferred_snapshot_never_overwrites_a_newer_checkpoint ... ok
+test spend::ledger::tests::concurrent_rotating_writers_do_not_lose_a_rollup_generation ... ok
+test spend::ledger::tests::corrupt_rollup_fails_closed_instead_of_dropping_history ... ok
+test spend::ledger::tests::first_flush_seeds_from_the_checkpoint_and_still_detects_prefix_conflicts ... ok
+test spend::ledger::tests::full_ledger_rotates_and_keeps_all_time_session_and_model_totals ... ok
+test spend::ledger::tests::repeated_flushes_do_not_reread_the_ledger_prefix ... ok
+test spend::ledger::tests::rotation_that_crashed_before_the_rollup_write_is_recovered_without_double_counting ... ok
+test spend::ledger::tests::spend_ledger_concurrent_lock_is_bounded_and_directory_replacement_is_refused ... ok
+test spend::ledger::tests::spend_ledger_corrupt_tail_preserves_bytes_pending_and_incurred_charge ... ok
+test spend::ledger::tests::spend_ledger_dropped_rollup_details_recover_whole_session_not_partial_cache ... ok
+test spend::ledger::tests::spend_ledger_malformed_or_duplicate_rows_are_not_silently_repaired ... ok
+test spend::ledger::tests::spend_ledger_records_only_new_usage_and_repeated_saves_are_idempotent ... ok
+test spend::ledger::tests::spend_ledger_recovers_post_checkpoint_charges_without_importing_or_doubling_rows ... ok
+test spend::ledger::tests::spend_ledger_refuses_public_hardlinked_symlink_and_nonregular_files_without_mutation ... ok
+test spend::ledger::tests::spend_ledger_retry_across_rotation_counts_receipt_once ... ok
+test spend::ledger::tests::spend_ledger_retry_after_another_writer_rotates_is_exact_and_conflicts_fail_closed ... ok
+test spend::ledger::tests::spend_ledger_rollup_keeps_untracked_session_charge ... ok
+test spend::ledger::tests::spend_ledger_shared_account_serializes_across_ledger_instances ... ok
+test spend::ledger::tests::startup_checkpoint_scans_only_the_tail_and_equals_a_full_scan ... ok
+test spend::ledger::tests::startup_session_summary_equals_full_scan_session_totals ... ok
+test spend::ledger::tests::summary_after_rotation_crash_keeps_archived_usage_read_only ... ok
+test spend::ledger::tests::summary_racing_a_real_rotation_counts_each_receipt_exactly_once ... ok
+test spend::ledger::tests::summary_tolerates_read_only_coordination_lock ... ok
+test spend::ledger::tests::usd_budget_concurrent_profile_receipts_share_io_and_never_double_or_drop_charges ... ok
+test spend::model_call_count_tests::model_call_count_old_checkpoints_missing_reports_and_saturation_are_honest ... ok
+test startup::headless_session_lifetime_tests::ephemeral_finalizer_keeps_in_memory_history ... {"session_id":"89f7f00d-d550-4b7e-b2a3-b1a246629b2e","session_name":"","session_persisted":false,"result":"FIRST_REPLY_AUDIT_MARKER","files_changed":[],"tool_calls":{"total":0,"by_name":{}},"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5,"cached_input_tokens":0,"cache_creation_input_tokens":0,"tool_use_prompt_tokens":0,"hosted_search_requests":0,"reasoning_tokens":0},"cost":0.0,"total_cost_usd":0.0,"num_turns":0,"is_error":false,"cost_unpriced":true,"stop_reason":"completed","duration_ms":13711,"type":"result"}
+ok
+test startup::headless_session_lifetime_tests::ephemeral_goal_round_keeps_retained_history ... ok
+test startup::headless_session_lifetime_tests::failed_goal_save_does_not_duplicate_final_round ... Reading piped stdin (limit 1048576 bytes)
+FIRST_REPLY_AUDIT_MARKER
+ok
+test startup::headless_session_lifetime_tests::stream_turn_does_not_permanently_close_task_pool ... {"session_id":"3cd7ea60-91e8-49d7-a36b-4c58efacd942","session_name":"","session_persisted":false,"result":"FIRST_REPLY_AUDIT_MARKER","files_changed":[],"tool_calls":{"total":0,"by_name":{}},"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5,"cached_input_tokens":0,"cache_creation_input_tokens":0,"tool_use_prompt_tokens":0,"hosted_search_requests":0,"reasoning_tokens":0},"cost":0.0,"total_cost_usd":0.0,"num_turns":0,"is_error":false,"cost_unpriced":true,"stop_reason":"completed","duration_ms":33,"type":"result"}
+ok
+test ui::app::plan_approval_tests::tui_byte_pressure_below_token_pressure_compacts_once ... ok
+
+test result: ok. 142 passed; 0 failed; 0 ignored; 0 measured; 6119 filtered out; finished in 21.02s
+
