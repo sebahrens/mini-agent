@@ -278,18 +278,27 @@ fn command_is_read_only(
     // one operand `sed_is_read_only` selects as the script is exempt, so a
     // file operand like `/etc/p` is still confined and screened.
     let sed_script = (command == "sed").then(|| sed_script_index(args)).flatten();
-    if !args
-        .iter()
-        .enumerate()
-        .all(|(index, arg)| sed_script == Some(index) || arg_ok(arg, working_dir))
-    {
+    // After a bare `--` every word is an operand, even one that starts with
+    // `-` (a legal file name), so it is confined and screened like any path.
+    let end_of_options = args.iter().position(|a| a == "--");
+    let is_operand = |index: usize| end_of_options.is_some_and(|at| index > at);
+    if !args.iter().enumerate().all(|(index, arg)| {
+        sed_script == Some(index)
+            || if is_operand(index) {
+                path_ok(arg, working_dir)
+            } else {
+                arg_ok(arg, working_dir)
+            }
+    }) {
         return false;
     }
     for (index, arg) in args.iter().enumerate() {
         if sed_script == Some(index) {
             continue;
         }
-        if let Some(long) = arg.strip_prefix("--") {
+        if is_operand(index) {
+            report.paths.push(arg.clone());
+        } else if let Some(long) = arg.strip_prefix("--") {
             if let Some((_, value)) = long.split_once('=') {
                 report.paths.push(value.to_string());
             }
@@ -635,6 +644,30 @@ mod tests {
                 .paths
                 .contains(&".env".to_string())
         );
+    }
+
+    #[test]
+    fn dash_leading_operands_after_double_dash_are_confined_and_screened() {
+        // `-k` may be a symlink to a secret: it must reach the path checker.
+        for script in ["cat -- -k", "head -- -k", "wc -c -- -k"] {
+            let report = super::classify(script, WD, true).unwrap();
+            assert!(
+                report.paths.contains(&"-k".to_string()),
+                "operand screened: {script}"
+            );
+        }
+        // Confinement applies to dash-leading operands too.
+        for script in [
+            "cat -- -d/../../../etc/passwd",
+            "cat -- --x/../../y",
+            "cat -n -- ok -d/../x",
+        ] {
+            no(script);
+        }
+        yes("cat -n -- -k");
+        // Before `--`, flags stay flags.
+        let report = super::classify("cat -n a -- b", WD, true).unwrap();
+        assert_eq!(report.paths, vec!["a".to_string(), "b".to_string()]);
     }
 
     #[test]

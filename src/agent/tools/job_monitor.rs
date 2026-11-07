@@ -80,10 +80,13 @@ fn scan_step(
         let mut text = String::from_utf8_lossy(bytes).into_owned();
         // Hold back an unfinished last line so a match split across reads is
         // seen whole; a very long line is consumed rather than held forever.
-        if is_last && !finished && !text.ends_with('\n') {
-            if let Some(at) = text.rfind('\n') {
+        if is_last && !finished && bytes.last() != Some(&b'\n') {
+            // Offsets are byte offsets: search the raw slice, never the lossy
+            // string, whose invalid bytes expand to 3-byte U+FFFD.
+            if let Some(at) = bytes.iter().rposition(|byte| *byte == b'\n') {
                 result.next = end - (bytes.len() - at - 1) as u64;
-                text.truncate(at + 1);
+                let keep = String::from_utf8_lossy(&bytes[..=at]).into_owned();
+                text = keep;
             } else if bytes.len() < 8192 {
                 result.next = end - bytes.len() as u64;
                 text.clear();
@@ -225,6 +228,32 @@ mod tests {
         let done = scan_step(&regex, &window(0, "x\nERROR"), false, true);
         assert_eq!(done.matches, 1, "a finished job's last line counts");
         assert_eq!(done.next, 7);
+    }
+
+    #[test]
+    fn scan_holds_back_by_bytes_when_invalid_utf8_precedes_the_last_newline() {
+        let regex = regex::Regex::new("ERR").unwrap();
+        let bytes = b"caf\xe9\n\xe9\xe9\xe9\xe9ERR".to_vec();
+        let win = OutputWindow {
+            start: 0,
+            next: bytes.len() as u64,
+            head: bytes,
+            skipped: 0,
+            tail: Vec::new(),
+        };
+        let step = scan_step(&regex, &win, false, false);
+        assert_eq!(step.next, 5, "resumes at the start of the partial line");
+        // More invalid bytes before the newline than bytes after it used to
+        // underflow the cursor arithmetic.
+        let bytes = b"\xe9\xe9\xe9\na".to_vec();
+        let win = OutputWindow {
+            start: 0,
+            next: bytes.len() as u64,
+            head: bytes,
+            skipped: 0,
+            tail: Vec::new(),
+        };
+        assert_eq!(scan_step(&regex, &win, false, false).next, 4);
     }
 
     #[test]

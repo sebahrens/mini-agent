@@ -1461,9 +1461,14 @@ impl JobStatusTool {
             return Ok(summaries
                 .into_iter()
                 .map(|job| {
-                    let exit = job
-                        .exit_code
-                        .map_or_else(String::new, |code| format!("; exit {code}"));
+                    let exit = job.exit_code.map_or_else(
+                        || {
+                            job.signal.map_or_else(String::new, |signal| {
+                                format!("; {}", describe_signal(signal))
+                            })
+                        },
+                        |code| format!("; exit {code}"),
+                    );
                     let log = job
                         .log_path
                         .map(|path| format!("\n  log: {}", path.display()))
@@ -4131,6 +4136,25 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn signal_killed_background_job_is_described_in_the_job_list() {
+        let shell = test_tool();
+        let status = JobStatusTool::new(shell.sandbox.clone(), None);
+        let id = start_job(&shell, "kill -9 $$").await;
+        wait_for_terminal_job(&status, &id).await;
+        let list = status
+            .call(JobStatusArgs {
+                action: JobAction::List,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(list.contains("Terminated by signal: SIGKILL (9)"), "{list}");
+        let summaries = shell.sandbox.background_job_summaries();
+        assert_eq!(summaries[0].signal, Some(9));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn signal_killed_job_notice_and_auto_background_result_name_the_signal() {
         let shell = test_tool();
         start_job(&shell, "kill -9 $$").await;
@@ -4195,6 +4219,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sub/deep")).unwrap();
         dir
+    }
+
+    /// When bwrap remaps the workspace to `/workspace`, `cd` must use that
+    /// path and the advertised alias spelling must be accepted.
+    #[cfg(unix)]
+    #[test]
+    fn workdir_uses_the_sandbox_workspace_alias() {
+        let fixture = workdir_fixture("alias").canonicalize().unwrap();
+        let sandbox = Sandbox::new(false, "bwrap").with_working_dir(&fixture);
+        let alias = std::path::Path::new("/workspace");
+        let relative = sandbox
+            .command_in_workdir_aliased("sub", "ls", Some(alias))
+            .unwrap();
+        assert_eq!(relative, "cd -- '/workspace/sub' || exit 1; ls");
+        let spelled = sandbox
+            .command_in_workdir_aliased("/workspace/sub/deep", "ls", Some(alias))
+            .unwrap();
+        assert_eq!(spelled, "cd -- '/workspace/sub/deep' || exit 1; ls");
+        let root = sandbox
+            .command_in_workdir_aliased("/workspace", "ls", Some(alias))
+            .unwrap();
+        assert_eq!(root, "cd -- '/workspace' || exit 1; ls");
+        // The alias spelling cannot be used to leave the workspace.
+        let escape = sandbox
+            .command_in_workdir_aliased("/workspace/../..", "ls", Some(alias))
+            .unwrap_err();
+        assert!(escape.contains("outside the workspace"), "{escape}");
+        // Without an alias the host path is still emitted.
+        let host = sandbox
+            .command_in_workdir_aliased("sub", "ls", None)
+            .unwrap();
+        assert!(host.contains(&fixture.join("sub").to_string_lossy().into_owned()));
+        std::fs::remove_dir_all(&fixture).ok();
     }
 
     #[cfg(unix)]
