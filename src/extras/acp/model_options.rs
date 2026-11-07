@@ -42,6 +42,19 @@ pub(super) struct Overrides {
     pub(super) effort: Option<ReasoningEffort>,
 }
 
+/// Prefix that advertises a quick model whose alias is literally `default`,
+/// so it stays distinct from the synthetic "clear override" choice.
+const RESERVED_ALIAS_PREFIX: &str = "alias:";
+
+/// The value a client sends to select the quick-model `alias`.
+fn wire_value(alias: &str) -> String {
+    if alias == DEFAULT_VALUE {
+        format!("{RESERVED_ALIAS_PREFIX}{alias}")
+    } else {
+        alias.to_owned()
+    }
+}
+
 fn sorted_aliases(cfg: &Config) -> Vec<&String> {
     let mut aliases: Vec<&String> = crate::config::quick_models_map(cfg).keys().collect();
     aliases.sort();
@@ -62,7 +75,7 @@ pub(super) fn config_options(cfg: &Config, current: &Overrides) -> Vec<SessionCo
         for alias in sorted_aliases(cfg).into_iter().take(MAX_ADVERTISED_MODELS) {
             let entry = &quick[alias];
             choices.push(
-                SessionConfigSelectOption::new(alias.to_string(), alias.to_string()).description(
+                SessionConfigSelectOption::new(wire_value(alias), alias.to_string()).description(
                     bounded_message(&format!("{}/{}", entry.provider, entry.model)),
                 ),
             );
@@ -74,8 +87,7 @@ pub(super) fn config_options(cfg: &Config, current: &Overrides) -> Vec<SessionCo
                 current
                     .model
                     .as_deref()
-                    .unwrap_or(DEFAULT_VALUE)
-                    .to_string(),
+                    .map_or_else(|| DEFAULT_VALUE.to_owned(), wire_value),
                 choices,
             )
             .description("Model for this session's next prompts, from [quick_models]".to_string())
@@ -114,8 +126,15 @@ pub(super) fn parse_model(cfg: &Config, value: &str) -> Result<Option<String>, S
     if value == DEFAULT_VALUE {
         return Ok(None);
     }
-    if crate::config::quick_models_map(cfg).contains_key(value) {
+    let quick = crate::config::quick_models_map(cfg);
+    if quick.contains_key(value) {
         return Ok(Some(value.to_owned()));
+    }
+    if let Some(alias) = value.strip_prefix(RESERVED_ALIAS_PREFIX)
+        && alias == DEFAULT_VALUE
+        && quick.contains_key(alias)
+    {
+        return Ok(Some(alias.to_owned()));
     }
     Err(bounded_message(&format!(
         "unknown ACP model '{value}'; choose default or a configured quick model"
@@ -212,6 +231,32 @@ mod tests {
             .collect();
         assert_eq!(values, ["default", "alpha", "zeta"]);
         assert_eq!(json["options"][1]["description"], "anthropic/claude-a");
+    }
+
+    #[test]
+    fn quick_model_named_default_is_selectable_under_a_distinct_value() {
+        let cfg = cfg_with(&[("default", "openai", "gpt-d"), ("fast", "openai", "gpt-f")]);
+        let json = serde_json::to_value(&config_options(&cfg, &Overrides::default())[0]).unwrap();
+        let values: Vec<_> = json["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["value"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(values, ["default", "alias:default", "fast"]);
+        assert_eq!(parse_model(&cfg, "default"), Ok(None));
+        assert_eq!(
+            parse_model(&cfg, "alias:default"),
+            Ok(Some("default".into()))
+        );
+        let current = Overrides {
+            model: Some("default".into()),
+            effort: None,
+        };
+        let json = serde_json::to_value(&config_options(&cfg, &current)[0]).unwrap();
+        assert_eq!(json["currentValue"], "alias:default");
+        let plain = cfg_with(&[("fast", "openai", "gpt-f")]);
+        assert!(parse_model(&plain, "alias:default").is_err());
     }
 
     #[test]
