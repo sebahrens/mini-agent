@@ -110,6 +110,10 @@ fn lex(script: &str) -> Option<Vec<Vec<String>>> {
                 end_segment!();
             }
             '>' | '<' | '`' | '$' | '\\' | '(' | ')' | '{' | '}' | '#' | '@' => return None,
+            // An unquoted glob is expanded by the shell to paths the checker
+            // never sees (`cat .e*` -> `.env`, `cat lin*/x` through a
+            // symlink); quoted globs stay literal and are handled above.
+            '*' | '?' | '[' => return None,
             other => {
                 in_word = true;
                 word.push(other);
@@ -515,5 +519,24 @@ mod tests {
             disabled.check("bash", "grep -n a src/a.txt"),
             CheckResult::Allowed
         );
+    }
+
+    #[test]
+    fn unquoted_globs_ask_but_quoted_stay_literal() {
+        for script in [
+            "cat .e*",
+            "cat .en?",
+            "head .e[n]v",
+            "cat lin*/x",
+            "ls src/*",
+            "grep a* f",
+            "cat \"ok\" .e*",
+            "ls \"a\"*",
+        ] {
+            no(script);
+        }
+        yes("find . -name '*.rs'");
+        yes("grep 'a*' f");
+        yes("grep \"a?[b]\" f");
     }
 }
