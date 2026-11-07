@@ -197,11 +197,43 @@ pub(crate) struct FileEdits {
     pub omitted_edits: usize,
 }
 
+/// A workspace-edit resource operation with its (workspace-contained) paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FileOp {
+    Create(PathBuf),
+    Delete(PathBuf),
+    Rename { from: PathBuf, to: PathBuf },
+}
+
+impl FileOp {
+    /// Every path the operation names, for permission checks.
+    pub(crate) fn paths(&self) -> Vec<&Path> {
+        match self {
+            Self::Create(path) | Self::Delete(path) => vec![path.as_path()],
+            Self::Rename { from, to } => vec![from.as_path(), to.as_path()],
+        }
+    }
+
+    /// One-line description; `display` renders each path.
+    pub(crate) fn describe(&self, display: &dyn Fn(&Path) -> String) -> String {
+        match self {
+            Self::Create(path) => format!("create {}", clean_name(&display(path))),
+            Self::Delete(path) => format!("delete {}", clean_name(&display(path))),
+            Self::Rename { from, to } => format!(
+                "rename {} -> {}",
+                clean_name(&display(from)),
+                clean_name(&display(to))
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct EditPreview {
     pub files: Vec<FileEdits>,
     /// `create`/`rename`/`delete` resource operations inside the workspace.
-    pub file_ops: Vec<String>,
+    /// Structured so read-deny rules can check every path before presentation.
+    pub file_ops: Vec<FileOp>,
     /// Files or operations outside the workspace (omitted, never named).
     pub outside: usize,
     /// Files dropped by [`MAX_EDIT_FILES`].
@@ -255,6 +287,7 @@ impl LspManager {
             .ok_or_else(|| "file is outside the language-server workspace".to_string())?;
         let position = json!({ "line": query.line, "character": query.character });
         let map = |uri: &str| client.parent_path(uri);
+        let edit_map = |uri: &str| client.parent_edit_path(uri);
         // One request; an empty answer from a server that is still indexing
         // waits (bounded) for it to finish and asks once more.
         let ask = |method: &'static str, params: Value| {
@@ -317,7 +350,7 @@ impl LspManager {
                     }),
                 )
                 .await?;
-                (NavAnswer::Edit(edit_preview(&result, &map)), indexing)
+                (NavAnswer::Edit(edit_preview(&result, &edit_map)), indexing)
             }
             NavOp::CodeActions => {
                 let (end_line, end_character) = query.end.unwrap_or((query.line, query.character));
@@ -349,7 +382,7 @@ impl LspManager {
                                 )
                             })?;
                         match entry.get("edit") {
-                            Some(edit) => NavAnswer::Edit(edit_preview(edit, &map)),
+                            Some(edit) => NavAnswer::Edit(edit_preview(edit, &edit_map)),
                             None => {
                                 return Err(
                                     "that code action carries no edit (server commands are never executed)"
@@ -547,9 +580,13 @@ pub(crate) fn edit_preview(edit: &Value, map: &dyn Fn(&str) -> Option<PathBuf>) 
         match change.get("kind").and_then(Value::as_str) {
             Some(kind @ ("create" | "delete")) => {
                 match change.get("uri").and_then(Value::as_str).and_then(map) {
-                    Some(path) if preview.file_ops.len() < MAX_EDIT_FILES => preview.file_ops.push(
-                        format!("{kind} {}", clean_name(&path.display().to_string())),
-                    ),
+                    Some(path) if preview.file_ops.len() < MAX_EDIT_FILES => {
+                        preview.file_ops.push(if kind == "create" {
+                            FileOp::Create(path)
+                        } else {
+                            FileOp::Delete(path)
+                        })
+                    }
                     Some(_) => preview.omitted_files += 1,
                     None => preview.outside += 1,
                 }
@@ -559,11 +596,7 @@ pub(crate) fn edit_preview(edit: &Value, map: &dyn Fn(&str) -> Option<PathBuf>) 
                 let new = change.get("newUri").and_then(Value::as_str).and_then(map);
                 match (old, new) {
                     (Some(old), Some(new)) if preview.file_ops.len() < MAX_EDIT_FILES => {
-                        preview.file_ops.push(format!(
-                            "rename {} -> {}",
-                            clean_name(&old.display().to_string()),
-                            clean_name(&new.display().to_string())
-                        ));
+                        preview.file_ops.push(FileOp::Rename { from: old, to: new });
                     }
                     (Some(_), Some(_)) => preview.omitted_files += 1,
                     _ => preview.outside += 1,

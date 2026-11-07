@@ -873,6 +873,17 @@ pub(crate) fn render_edit_preview_with(
     }
     // Stable order across calls (path, then position) so pages do not overlap.
     visible.sort_by(|a, b| a.path.cmp(&b.path));
+    // Resource operations name paths too: every source and destination must be
+    // readable, otherwise the whole operation is hidden and only counted.
+    let mut visible_ops: Vec<String> = Vec::new();
+    let op_display = |path: &Path| workspace_relative_display(path, root);
+    for operation in &preview.file_ops {
+        if deny.is_some_and(|deny| operation.paths().into_iter().any(|path| deny(path, false))) {
+            hidden += 1;
+        } else {
+            visible_ops.push(operation.describe(&op_display));
+        }
+    }
     let files = visible.len();
     // Every previewable edit in listing order: (file, edit, omitted-after).
     let mut flat: Vec<(String, &EditView, Option<usize>)> = Vec::new();
@@ -961,11 +972,11 @@ pub(crate) fn render_edit_preview_with(
         }
     }
     if offset == 0 {
-        for operation in &preview.file_ops {
+        for operation in &visible_ops {
             body.push_str(&format!("file operation: {operation}\n"));
         }
     }
-    let mut out = if files == 0 && preview.file_ops.is_empty() {
+    let mut out = if files == 0 && visible_ops.is_empty() {
         format!("{heading}\n(the server returned no edits)")
     } else if offset >= shown_edits && shown_edits > 0 {
         format!("{heading}\nNo edits at offset {offset} ({shown_edits} previewable in total).")
