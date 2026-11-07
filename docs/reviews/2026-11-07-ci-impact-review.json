@@ -16,7 +16,8 @@
     "historical_negative_control": "Exact6617aaeb..b399f697 diff: original classifier=code, repaired=docs. Original production and production+tests fingerprints change; repaired fingerprints remain equal.",
     "real_git_controls": "Add/edit/delete review evidence with newline and quote in filename skips matrix; moving identical source into and back out of evidence requires code checks.",
     "failure_controls": "Missing Python, unavailable history, unknown paths, tags and full manual/scheduled events remain conservative.",
-    "format": "cargo fmt and git diff --check passed."
+    "format": "cargo fmt and git diff --check passed.",
+    "affected_rust_test": "cargo test --locked test_workflow_only_headless_relevance_check_executes_embedded_policy:1 passed,0 failed; default-feature compilation passed."
   },
   "root_review": {
     "reviewers": [
@@ -27,11 +28,22 @@
     "assessment": "No additional confirmed issue after tracing workflow outputs, skip acceptance, input exclusions, rename handling and cache invalidation. Metadata policy checks remain unconditional; no JSON-wide exemption."
   },
   "hosted_validation": {
-    "status": "pending",
-    "acceptance": "CI for the classifier/workflow change must pass, followed by a records-only closure push proving the expensive matrix is skipped."
+    "status": "owning_policy_checks_passed_records_push_pending",
+    "rule_change_run": "https://github.com/sebahrens/mini-agent/actions/runs/42416033909",
+    "acceptance": "Hosted changes/fmt must pass, then a records-only push must finish green with the expensive matrix skipped. The unrelated matrix from the rule-change run is superseded after the owning policy checks pass.",
+    "changes": {
+      "job": 128534220451,
+      "conclusion": "success"
+    },
+    "fmt": {
+      "job": 128534220672,
+      "conclusion": "success"
+    },
+    "runtime_matrix": "Cancelled after owning policy acceptance; unchanged runtime source reuses the green6617aaeb matrix."
   },
   "limits": [
     "This is path-based impact classification. Unknown inputs remain conservative; adding consumers of exempt artifacts requires updating the rules and tests.",
     "Tag, schedule and explicit manual proof policies are unchanged."
-  ]
+  ],
+  "validation_scope": "Reuse source CI42408094543 (78 successful jobs): git diff6617aaeb..5c02a1f4 is empty for src/,tests/,Cargo.toml,Cargo.lock,build.rs,build_inputs.rs,rust-toolchain.toml. Validate changed CI selection with335 Python policy tests, the affected Rust workflow consumer, hosted changes/fmt jobs, and an actual records-only push. An additional unchanged runtime matrix is unnecessary."
 }
