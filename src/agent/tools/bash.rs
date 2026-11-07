@@ -1272,6 +1272,11 @@ impl JobStatusTool {
                 if line.trim().is_empty() {
                     continue;
                 }
+                if let Some(trigger) = history_expansion_trigger(&line) {
+                    return Err(format!(
+                        "job_status keys: Enter would submit a line containing {trigger}, which an interactive shell rewrites before running it, so the command could differ from what was permission-checked. Avoid ! and a leading ^, or quote them out of the typed text."
+                    ));
+                }
                 let (checked, _released) = super::concurrency::prompt_unlocked(check_perm(
                     &self.permission,
                     &self.ask_tx,
@@ -1638,6 +1643,14 @@ impl JobStatusTool {
                     .cloned()
                     .unwrap_or_default();
                 let combined = format!("{pending}{input}");
+                // The line spans calls: a designator split across them
+                // (`!` then `!\n`) is only visible in the cumulative text,
+                // and the baseline may have changed while a prompt was open.
+                if let Some(trigger) = history_expansion_trigger(&combined) {
+                    return Err(ToolError::Msg(format!(
+                        "job_status input completes {trigger} together with the line already typed, which an interactive shell rewrites before running it, so the command could differ from what was permission-checked. Avoid ! and a leading ^, or quote them out of the typed text."
+                    )));
+                }
                 let edited = self
                     .edited_lines
                     .lock()
@@ -4820,6 +4833,56 @@ mod tests {
         job_input(&status, &id, "echo alive\n").await.unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(!tab.exists() && !hist.exists(), "rewritten input ran");
+        shell.sandbox.stop_background_job(&id).await.unwrap();
+    }
+
+    /// A history designator split across calls passes each chunk's own guard;
+    /// the cumulative line must be refused before the terminal sees the rest.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn split_history_designator_is_refused_against_the_cumulative_line() {
+        use crate::permission::{Action, PermissionConfig, ToolPerm};
+        if !std::path::Path::new("/bin/bash").exists() {
+            return;
+        }
+        let dir = std::env::current_dir().unwrap();
+        let marker = dir.join(format!("job-input-split-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let shell = test_tool();
+        let id = start_pty_job(&shell, "/bin/bash --norc --noprofile -i").await;
+        let permission = shell_permission(
+            PermissionConfig {
+                bash: Some(ToolPerm::Granular(
+                    [
+                        ("touch *".to_string(), Action::Deny),
+                        ("*".to_string(), Action::Allow),
+                    ]
+                    .into(),
+                )),
+                ..Default::default()
+            },
+            crate::permission::SecurityMode::Yolo,
+        );
+        let status =
+            JobStatusTool::new(shell.sandbox.clone(), None).with_permission(Some(permission), None);
+        let name = marker.file_name().unwrap().to_string_lossy().to_string();
+        // Seed history with a command the deny rule would have refused.
+        job_input(&status, &id, &format!("history -s 'touch {name}'\n"))
+            .await
+            .unwrap();
+        // Each chunk alone has no designator; the joined line does.
+        for (first, second) in [("!", "!\n"), ("!", "touch\n"), ("!", "-1\n")] {
+            job_input(&status, &id, first).await.unwrap();
+            let error = job_input(&status, &id, second).await.unwrap_err();
+            assert!(error.to_string().contains("history"), "{error}");
+            job_keys(&status, &id, &[JobKey::CtrlC]).await.unwrap();
+        }
+        job_input(&status, &id, "echo alive\n").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !marker.exists(),
+            "split history expansion ran a denied command"
+        );
         shell.sandbox.stop_background_job(&id).await.unwrap();
     }
 
