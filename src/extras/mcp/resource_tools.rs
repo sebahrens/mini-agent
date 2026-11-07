@@ -396,6 +396,14 @@ fn page(text: &str, offset: usize, length: usize) -> (&str, usize, usize) {
     while !text.is_char_boundary(end) {
         end -= 1;
     }
+    if end == start && start < text.len() {
+        // `length` is smaller than the character at `start`: return that one
+        // character so the continuation offset always advances.
+        end = start + 1;
+        while !text.is_char_boundary(end) {
+            end += 1;
+        }
+    }
     (&text[start..end], start, end)
 }
 
@@ -672,6 +680,15 @@ mod tests {
             scoped.contains("call again with offset=128 to continue"),
             "{scoped}"
         );
+    }
+
+    // mini-agent-ho2cr: a length below the next character still advances.
+    #[test]
+    fn a_page_shorter_than_the_next_character_still_advances() {
+        let text = "日本語";
+        assert_eq!(page(text, 0, 1), ("日", 0, 3));
+        assert_eq!(page(text, 3, 2), ("本", 3, 6));
+        assert_eq!(page(text, 9, 1), ("", 9, 9));
     }
 
     // mini-agent-xhvu5: an offset past the matches does not print an inverted range.
