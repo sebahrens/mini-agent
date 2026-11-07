@@ -200,6 +200,9 @@ pub(crate) struct OverCap {
     pub(crate) names: Vec<String>,
     /// Pagination finished, so `count` is the whole overflow.
     pub(crate) exact: bool,
+    /// Pagination stopped at `MCP_LIST_TOOLS_MAX_PAGES` while the server still
+    /// offered another page, so more tools than were counted may exist.
+    pub(crate) page_limited: bool,
 }
 const MCP_STDERR_LIMIT: usize = 8 * 1024;
 const MCP_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -248,8 +251,9 @@ pub(crate) async fn list_bounded_tools(
     // A catalogue of exactly the cap that was listed to the end lost nothing;
     // report a cut only when tools were counted past the cap or the listing
     // stopped before the server's last page.
-    listed.reached_tool_cap =
-        listed.over_cap.count > 0 || (listed.entries.len() >= cap && !listed.over_cap.exact);
+    listed.reached_tool_cap = listed.over_cap.count > 0
+        || listed.over_cap.page_limited
+        || (listed.entries.len() >= cap && !listed.over_cap.exact);
     Ok(Arc::new(listed))
 }
 
@@ -1331,6 +1335,7 @@ pub(crate) async fn list_all_tools_selected(
                 tracing::debug!(
                     "MCP tools/list stopped after {pages} pages; ignoring further cursors"
                 );
+                over_cap.page_limited = true;
                 break;
             }
             next => cursor = next,

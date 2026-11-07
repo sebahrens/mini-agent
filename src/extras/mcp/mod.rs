@@ -825,6 +825,12 @@ impl McpClientManager {
                                 },
                             ));
                         }
+                        if over.page_limited {
+                            notice.push_str(&format!(
+                                "; the server listed more than {} pages of tools and the rest were not read",
+                                client::MCP_LIST_TOOLS_MAX_PAGES,
+                            ));
+                        }
                         notice.push_str(
                             "; use enabled_tools/disabled_tools to select which tools to keep",
                         );

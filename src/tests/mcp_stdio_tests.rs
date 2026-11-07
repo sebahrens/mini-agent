@@ -296,6 +296,20 @@ fn main() {
                     continue;
                 }
             }
+            if mode == "endless-pages" {
+                // One tool per page and a cursor on every page, forever.
+                let page: usize = compact
+                    .split("\"cursor\":\"")
+                    .nth(1)
+                    .and_then(|rest| rest.split('"').next())
+                    .and_then(|cursor| cursor.parse().ok())
+                    .unwrap_or(0);
+                write_response(
+                    &mut stdout,
+                    &format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"tools\":[{{\"name\":\"p{page}\",\"inputSchema\":{{\"type\":\"object\"}}}}],\"nextCursor\":\"{}\"}}}}", page + 1),
+                );
+                continue;
+            }
             if mode == "many-tools" {
                 let tools = (0..200)
                     .map(|index| format!("{{\"name\":\"t{index}\",\"inputSchema\":{{\"type\":\"object\"}}}}"))
@@ -1857,6 +1871,31 @@ async fn mcp_per_server_startup_and_tool_timeouts_override_the_defaults() {
     shutdown(manager).await;
     assert_process_reaped(pid).await;
     fixture.cleanup();
+}
+
+#[tokio::test]
+async fn mcp_tool_listing_cut_by_the_page_limit_is_reported_below_the_tool_cap() {
+    let fixture = FixtureBuild::compile();
+    let lease = fixture.lease("endless-pages");
+    let config = fixture.config(
+        fixture.executable.display().to_string(),
+        Vec::new(),
+        "endless-pages",
+        &lease,
+    );
+    let handle = McpClientHandle::connect(CompactString::new("fixture"), &config)
+        .await
+        .unwrap();
+    let listed = handle.cached_tools().await.unwrap();
+    assert_eq!(
+        listed.entries.len(),
+        crate::extras::mcp::client::MCP_LIST_TOOLS_MAX_PAGES
+    );
+    assert!(listed.over_cap.page_limited && !listed.over_cap.exact);
+    assert!(listed.reached_tool_cap, "a page-limit cut must be reported");
+    let pid = wait_for_pid(&lease).await;
+    shutdown(McpClientManager::from_handles(vec![handle])).await;
+    assert_process_reaped(pid).await;
 }
 
 #[tokio::test]
