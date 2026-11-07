@@ -623,7 +623,7 @@ held-out skill tests) keep the strict 64 KiB contract and fail with
 | Effect calls | 256 per step | Closed `effect_limit` error |
 | `read_file` / `write_file` | 1 MiB per call | `too_large` |
 | `read_files` | 256 paths, 6 MiB encoded results | `too_large` |
-| `spawn` output | 1 MiB stdout, 1 MiB stderr, 1.5 MiB combined; 4,096 arguments, 1 MiB argument bytes | Output truncated flags / `too_large` |
+| `spawn` output | 1 MiB stdout, 1 MiB stderr, 1.5 MiB combined; 4,096 arguments, 1 MiB argument bytes | Output truncated flags / `too_large` (program binary over 64 MiB or over 4,096 arguments also yields `too_large`, with a hint to use the shell tool) |
 | `fetch` | 256 KiB request body (POST only), 1 MiB response body | `too_large` |
 | `scratch_put` | 128-byte keys, 1 MiB values, 4 MiB and 128 entries per session | `too_large` |
 | Final expression value | 64 KiB UTF-8 (`MAX_RESULT_BYTES`) | Model steps: truncated with a size marker; verification roles: `invalid_result` |
@@ -868,7 +868,7 @@ validated with `rev-parse --verify`, so options and malformed operands are rejec
 accepts `revision_to` (two-commit diff) and `staged` (index vs HEAD, or vs `revision`); ranges
 cannot be combined with those. `log` accepts `skip` and returns `skip`/`next_skip` (non-null when a
 full `max_count` page was returned) so history beyond 100 commits is reachable, plus fixed-string
-`author` and `grep` filters. `blame` (one `path`, optional `start_line`/`end_line`/`revision`) is
+`author` and `grep` filters (`grep` matches the whole message). Each log commit carries `subject` plus `body` (the rest of the message including trailers, at most 2 KiB, `body_truncated` when cut; read the full message with `show`). If the output cap cuts a page short, `truncated` is set and `next_skip` continues from the last complete commit. `blame` (one `path`, optional `start_line`/`end_line`/`revision`) is
 paged like `diff` and uses the `git/show` permission key. `reset`, `revert`, `cherry-pick`,
 `merge`, `rebase`, `fetch`, `pull` and `push` are intentionally not offered: they rewrite history
 or touch remotes/network, outside the fixed local-only surface (mini-agent-kg67c).

@@ -1736,11 +1736,14 @@ impl GitTool {
                     "grep": args.grep,
                 }))?;
                 let coaching = self.permission("git/log", &identity).await?;
+                // Unpredictable record terminator: a commit message cannot forge or split
+                // records because it cannot know this value.
+                let log_terminator = new_log_terminator();
                 let mut command = vec![
                     "log".into(),
                     format!("--max-count={count}"),
                     "--date=iso-strict".into(),
-                    LOG_FORMAT.into(),
+                    log_format(&log_terminator),
                 ];
                 if skip > 0 {
                     command.push(format!("--skip={skip}"));
@@ -1762,7 +1765,7 @@ impl GitTool {
                 let output = self
                     .run_query("log", command, with_timeout(TEXT_LIMITS, timeout))
                     .await?;
-                render_log_result(&output, skip, count, timeout, coaching)
+                render_log_result(&output, skip, count, timeout, coaching, &log_terminator)
             }
             GitOperation::Show => {
                 reject_irrelevant_fields(&args, false, true, false)?;
@@ -1865,15 +1868,63 @@ impl GitTool {
     }
 }
 
-/// `git log` pretty format: NUL-separated fields, each record ended by an ASCII
-/// record separator. Git's tformat also appends a newline after every record,
-/// so parsing splits records first and then fields, keeping empty fields (a
-/// root commit has an empty `%P`).
-const LOG_FORMAT: &str = "--format=%H%x00%P%x00%an%x00%ae%x00%aI%x00%s%x1e";
-const LOG_FIELD_COUNT: usize = 6;
+/// `git log` pretty format: NUL-separated fields (git forbids NUL in messages),
+/// each record ended by a per-call unpredictable terminator. Git's tformat also
+/// appends a newline after every record, so parsing splits records first and
+/// then fields, keeping empty fields (a root commit has an empty `%P`).
+fn log_format(terminator: &[u8]) -> String {
+    format!(
+        "--format=%H%x00%P%x00%an%x00%ae%x00%aI%x00%s%x00%b%x1e{}",
+        String::from_utf8_lossy(&terminator[1..])
+    )
+}
 
-fn parse_log_records(stdout: &[u8]) -> Result<Vec<serde_json::Value>, ToolError> {
-    let mut records = stdout.split(|byte| *byte == 0x1e).collect::<Vec<_>>();
+fn new_log_terminator() -> Vec<u8> {
+    let mut terminator = b"\x1e".to_vec();
+    terminator.extend_from_slice(uuid::Uuid::new_v4().simple().to_string().as_bytes());
+    terminator
+}
+
+const LOG_FIELD_COUNT: usize = 7;
+/// Bytes of commit-message body kept per commit; `body_truncated` flags the rest
+/// (read the whole message with `show`).
+const LOG_BODY_MAX_BYTES: usize = 2048;
+
+fn split_on<'a>(haystack: &'a [u8], needle: &[u8]) -> Vec<&'a [u8]> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut index = 0;
+    while index + needle.len() <= haystack.len() {
+        if &haystack[index..index + needle.len()] == needle {
+            parts.push(&haystack[start..index]);
+            index += needle.len();
+            start = index;
+        } else {
+            index += 1;
+        }
+    }
+    parts.push(&haystack[start..]);
+    parts
+}
+
+/// Bounded body text: trailing whitespace trimmed, cut at a char boundary.
+fn bounded_log_body(body: &str) -> (String, bool) {
+    let body = body.trim_end();
+    if body.len() <= LOG_BODY_MAX_BYTES {
+        return (body.to_string(), false);
+    }
+    let mut end = LOG_BODY_MAX_BYTES;
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    (body[..end].to_string(), true)
+}
+
+fn parse_log_records(
+    stdout: &[u8],
+    terminator: &[u8],
+) -> Result<Vec<serde_json::Value>, ToolError> {
+    let mut records = split_on(stdout, terminator);
     // What follows the final terminator is only the trailing newline for
     // complete output, or a partial record when the output limit cut it off
     // (reported separately as `truncated`). Only terminated records count.
@@ -1891,9 +1942,11 @@ fn parse_log_records(stdout: &[u8]) -> Result<Vec<serde_json::Value>, ToolError>
                     "git log output had unexpected field count".to_string(),
                 ));
             }
+            let (body, body_truncated) = bounded_log_body(&fields[6]);
             Ok(serde_json::json!({
                 "id": fields[0], "parents": fields[1], "author": fields[2],
                 "email": fields[3], "authored_at": fields[4], "subject": fields[5],
+                "body": body, "body_truncated": body_truncated,
             }))
         })
         .collect()
@@ -1907,9 +1960,9 @@ impl Tool for GitTool {
 
     fn description(&self) -> String {
         if self.read_only {
-            return "Inspect the bound Git repository through fixed read-only operations: status (collapsed untracked dirs; optional paths narrow it; truncated is flagged), diff (revision may be a range a..b or a...b; revision_to for a two-commit diff; staged for the index), show (format patch|stat|name_status; at most 192 KiB per call, page with offset/next_offset or narrow with paths), log (revision may be a range; skip/next_skip pages past 100 commits; author/grep are fixed strings), blame (one path, optional start_line/end_line/revision, paged like diff), branches (scope local|remote|all|tags; page with skip/max_count and next_skip) and stash_list. Nothing can be changed and nothing is fetched. No shell, raw argv, remotes, or network access is available.".to_string();
+            return "Inspect the bound Git repository through fixed read-only operations: status (collapsed untracked dirs; optional paths narrow it; truncated is flagged), diff (revision may be a range a..b or a...b; revision_to for a two-commit diff; staged for the index), show (format patch|stat|name_status; at most 192 KiB per call, page with offset/next_offset or narrow with paths), log (revision may be a range; skip/next_skip pages past 100 commits; each commit carries subject plus a body of at most 2 KiB with body_truncated, use show for the full message; author/grep are fixed strings matched against the whole message), blame (one path, optional start_line/end_line/revision, paged like diff), branches (scope local|remote|all|tags; page with skip/max_count and next_skip) and stash_list. Nothing can be changed and nothing is fetched. No shell, raw argv, remotes, or network access is available.".to_string();
         }
-        "Inspect and update the bound Git repository through fixed structured operations: status (collapsed untracked dirs; optional paths narrow it; truncated is flagged), diff (revision may be a range a..b or a...b; revision_to for a two-commit diff; staged for the index) and show (format patch|stat|name_status; at most 192 KiB per call, page with offset/next_offset or narrow with paths), log (revision may be a range; skip/next_skip pages past 100 commits; author/grep are fixed strings; a query that exceeds its 30 s budget returns the commits found so far, and log, blame, branches and stash_list accept timeout_secs up to 120), blame (one path, optional start_line/end_line/revision, paged like diff), stage, unstage, commit (optional signoff, allow_empty and a guarded amend of an unpushed HEAD; hooks and signing are never run and the result says so), branches (scope local|remote|all|tags lists remote-tracking branches or tags without network access; page with skip/max_count and next_skip), branch_create (name, optional start revision), switch (name of an existing branch), stash_push (optional message/paths), stash_pop, stash_list, tag (name, optional revision; message makes it annotated) and restore (discard working-tree changes of paths, from the index or revision). Every mutation has its own git/<operation> permission key. No shell, raw argv, remotes, or network access is available; reset, revert, cherry-pick, merge, rebase, fetch, pull and push are intentionally not offered.".to_string()
+        "Inspect and update the bound Git repository through fixed structured operations: status (collapsed untracked dirs; optional paths narrow it; truncated is flagged), diff (revision may be a range a..b or a...b; revision_to for a two-commit diff; staged for the index) and show (format patch|stat|name_status; at most 192 KiB per call, page with offset/next_offset or narrow with paths), log (revision may be a range; skip/next_skip pages past 100 commits; each commit carries subject plus a body of at most 2 KiB with body_truncated, use show for the full message; author/grep are fixed strings matched against the whole message; a query that exceeds its 30 s budget returns the commits found so far, and log, blame, branches and stash_list accept timeout_secs up to 120), blame (one path, optional start_line/end_line/revision, paged like diff), stage, unstage, commit (optional signoff, allow_empty and a guarded amend of an unpushed HEAD; hooks and signing are never run and the result says so), branches (scope local|remote|all|tags lists remote-tracking branches or tags without network access; page with skip/max_count and next_skip), branch_create (name, optional start revision), switch (name of an existing branch), stash_push (optional message/paths), stash_pop, stash_list, tag (name, optional revision; message makes it annotated) and restore (discard working-tree changes of paths, from the index or revision). Every mutation has its own git/<operation> permission key. No shell, raw argv, remotes, or network access is available; reset, revert, cherry-pick, merge, rebase, fetch, pull and push are intentionally not offered.".to_string()
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -2256,19 +2309,22 @@ fn render_log_result(
     count: u16,
     timeout: std::time::Duration,
     coaching: Option<String>,
+    terminator: &[u8],
 ) -> Result<serde_json::Value, ToolError> {
     let timed_out = output.status == CommandStatus::TimedOut;
-    let commits = parse_log_records(&output.stdout)?;
+    let output_limited = matches!(output.status, CommandStatus::OutputLimitExceeded(_));
+    let commits = parse_log_records(&output.stdout, terminator)?;
     // A full page may have more behind it: say how to continue. A timed-out
     // query always offers a continuation.
-    let next_skip = (commits.len() == usize::from(count) || (timed_out && !commits.is_empty()))
-        .then(|| u64::from(skip) + commits.len() as u64);
+    let next_skip = (commits.len() == usize::from(count)
+        || ((timed_out || output_limited) && !commits.is_empty()))
+    .then(|| u64::from(skip) + commits.len() as u64);
     let mut value = serde_json::json!({
         "operation": "log",
         "skip": skip,
         "next_skip": next_skip,
         "commits": commits,
-        "truncated": timed_out || matches!(output.status, CommandStatus::OutputLimitExceeded(_)),
+        "truncated": timed_out || output_limited,
         "coaching": coaching,
     });
     if timed_out {
@@ -2740,19 +2796,70 @@ mod tests {
         assert_eq!(commits[1]["subject"], "first");
     }
 
+    #[tokio::test]
+    async fn log_returns_bounded_multi_paragraph_body_and_trailers() {
+        let repo = TestRepo::new();
+        repo.write("a.txt", "a\n");
+        repo.git(["add", "a.txt"]);
+        repo.git([
+            "commit",
+            "--quiet",
+            "-m",
+            "subject line",
+            "-m",
+            "first paragraph\n\nsecond \x1e paragraph",
+            "-m",
+            "Fixes: #123\nCo-authored-by: A <a@example.invalid>",
+        ]);
+        repo.write("b.txt", "b\n");
+        repo.git(["add", "b.txt"]);
+        let long = "x".repeat(5000);
+        repo.git(["commit", "--quiet", "-m", "long body", "-m", long.as_str()]);
+        repo.write("c.txt", "c\n");
+        repo.git(["add", "c.txt"]);
+        repo.git(["commit", "--quiet", "-m", "no body"]);
+
+        let log = repo.tool().call(log_args(None)).await.expect("log");
+        let commits = log["commits"].as_array().unwrap();
+        assert_eq!(commits.len(), 3);
+        assert_eq!(commits[0]["body"], "");
+        assert_eq!(commits[0]["body_truncated"], false);
+        assert_eq!(commits[1]["subject"], "long body");
+        assert_eq!(commits[1]["body"].as_str().unwrap().len(), 2048);
+        assert_eq!(commits[1]["body_truncated"], true);
+        assert_eq!(commits[2]["subject"], "subject line");
+        let body = commits[2]["body"].as_str().unwrap();
+        assert!(
+            body.contains("first paragraph\n\nsecond \u{1e} paragraph"),
+            "{body}"
+        );
+        assert!(body.contains("Fixes: #123"), "{body}");
+        assert!(body.contains("Co-authored-by: A"), "{body}");
+        assert_eq!(commits[2]["body_truncated"], false);
+    }
+
+    #[test]
+    fn log_body_cut_respects_char_boundaries() {
+        let text = "é".repeat(2000);
+        let (body, truncated) = super::bounded_log_body(&text);
+        assert!(truncated);
+        assert!(body.len() <= 2048 && body.chars().all(|c| c == 'é'));
+    }
+
     #[test]
     fn log_parser_returns_only_terminated_records() {
-        let complete = b"a\0\0n\0e\0t\0s1\x1e\nb\0a\0n\0e\0t\0s2\x1e\n";
-        let partial = b"a\0\0n\0e\0t\0s1\x1e\nb\0a\0n";
-        let parsed = super::parse_log_records(complete).expect("complete output");
+        const T: &[u8] = b"\x1eNONCE";
+        let complete = b"a\0\0n\0e\0t\0s1\0\x1eNONCE\nb\0a\0n\0e\0t\0s2\0\x1eNONCE\n";
+        let partial = b"a\0\0n\0e\0t\0s1\0\x1eNONCE\nb\0a\0n";
+        let parsed = super::parse_log_records(complete, T).expect("complete output");
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[1]["id"], "b");
         assert_eq!(parsed[1]["parents"], "a");
-        let parsed = super::parse_log_records(partial).expect("truncated output");
+        let parsed = super::parse_log_records(partial, T).expect("truncated output");
         assert_eq!(parsed.len(), 1);
-        assert!(super::parse_log_records(b"a\0b\x1e\n").is_err());
+        assert!(super::parse_log_records(b"a\0b\x1eNONCE\n", T).is_err());
         assert!(
-            super::parse_log_records(b"")
+            super::parse_log_records(b"", T)
                 .expect("empty history")
                 .is_empty()
         );
@@ -3830,7 +3937,7 @@ mod tests {
     fn timed_out_log_returns_partial_commits_with_a_continuation() {
         let record = |n: u32| {
             format!(
-                "{n:040x}\0\0A\0a@example.invalid\02026-01-01T00:00:00+00:00\0subject {n}\x1e\n"
+                "{n:040x}\0\0A\0a@example.invalid\02026-01-01T00:00:00+00:00\0subject {n}\0\x1eNONCE\n"
             )
         };
         let mut stdout = record(1).into_bytes();
@@ -3843,9 +3950,15 @@ mod tests {
             status: crate::sandbox::CommandStatus::TimedOut,
             descendants_escaped: false,
         };
-        let value =
-            super::render_log_result(&output, 10, 20, std::time::Duration::from_secs(30), None)
-                .unwrap();
+        let value = super::render_log_result(
+            &output,
+            10,
+            20,
+            std::time::Duration::from_secs(30),
+            None,
+            b"\x1eNONCE",
+        )
+        .unwrap();
         assert_eq!(value["commits"].as_array().unwrap().len(), 2, "{value}");
         assert_eq!(value["timed_out"], true);
         assert_eq!(value["truncated"], true);

@@ -14,6 +14,8 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- JS `spawn` `too_large` now carries a hint (program binary over 64 MiB or more than 4096 arguments; use the shell tool) and the spawn description states the executable limit (mini-agent-sebpw).
+- `git` `log` commits now include a bounded `body` (2 KiB, `body_truncated`) with trailers, records use a per-call unforgeable terminator, and an output-capped page offers `next_skip` (mini-agent-umewt).
 - Background `task` jobs: `task_result` takes `wait_secs` (1-600) to block until the job settles, and headless runs wait up to `[subagents] headless_exit_wait_secs` (default 300; `0` restores immediate cancel) for running background tasks before exit, reporting any cancelled on stderr (mini-agent-5ezmf).
 - `skills_search` no longer fails when the selected skills' JSON exceeds 8192 bytes: lowest-ranked entries are omitted with an `omitted` count and a note to narrow the query (mini-agent-zwa2o).
 - The `task` tool's `resume` schema text and unknown-id error now say a session's resumable ids are restored on `--continue`/`--resume` within the count/byte limits instead of claiming they do not survive a restart (mini-agent-sw1ug).
