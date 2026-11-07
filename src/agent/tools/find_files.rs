@@ -725,6 +725,9 @@ impl IgnoreMode {
                     .collect()
             })
             .unwrap_or_default();
+        // The walk visits entries in filesystem order; sort so the notice is
+        // deterministic across platforms.
+        names.sort();
         if count > names.len() {
             names.push(format!("+{} more", count - names.len()));
         }

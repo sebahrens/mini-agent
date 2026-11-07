@@ -583,10 +583,11 @@ fn run_gh(
     program: &std::ffi::OsStr,
     args: &[&std::ffi::OsStr],
 ) -> Result<std::process::Output, std::io::Error> {
+    use crate::process_creation::StdCommandCreationExt as _;
     std::process::Command::new(program)
         .args(args)
         .stdin(std::process::Stdio::null())
-        .output()
+        .output_guarded()
 }
 
 /// The workflow that signs release attestations: only artifacts built by this
@@ -824,9 +825,10 @@ async fn install_verified(exe: &Path, binary: &[u8], version: &str) -> Result<()
                 probe_clone.parent().map_or_else(String::new, |p| p.display().to_string())
             )
         })?;
+        use crate::process_creation::StdCommandCreationExt as _;
         let output = std::process::Command::new(&probe_clone)
             .arg("--version")
-            .output()
+            .output_guarded()
             .map_err(|error| format!("the downloaded executable does not run: {error}"))?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         if !output.status.success() || !stdout.trim_start().starts_with(&expected) {

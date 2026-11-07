@@ -2373,7 +2373,7 @@ mod tests {
         // A directory search reports what it skipped in a footer.
         assert!(
             walked.contains(
-                "[skipped 2 files not searched: 1 larger than the 10 MiB per-file search limit, 1 binary (NUL byte in the first 8 KiB);"
+                "[skipped 2 files not searched: 1 larger than the 10 MiB per-file search limit, 1 binary (NUL byte in the first 8 KiB, not BOM-marked UTF-16);"
             ),
             "{walked}"
         );
