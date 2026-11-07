@@ -1064,6 +1064,10 @@ impl BoundDirectory {
         };
         chain = chain.append(global_ignore_matchers(&self.approved_root));
         chain = chain.append(parent_ignore_matchers(&self.approved_root));
+        // Same order as BoundWalker::new and list_entries.
+        if let Some(matcher) = root_exclude_matcher(&self.root, &self.approved_root) {
+            chain = chain.append(vec![matcher]);
+        }
         let mut local_matchers = Vec::new();
         for ignore_name in [".gitignore", ".ignore"] {
             if let Some(matcher) =
@@ -3189,6 +3193,34 @@ mod tests {
         let seen = seen.lock().unwrap();
         assert!(seen.iter().all(|path| !path.starts_with("linked_dir")));
         assert!(!seen.iter().any(|path| path == Path::new("link.rs")));
+    }
+
+    /// mini-agent-iddn9: the JS directory listing honours `.git/info/exclude`
+    /// like list_dir, and `.gitignore` still outranks it.
+    #[cfg(feature = "js")]
+    #[test]
+    fn js_discovery_listing_honours_git_info_exclude() {
+        let directory = crate::tests::OwnedTestDirectory::new("find-files-js-exclude");
+        std::fs::create_dir_all(directory.path().join(".git/info")).unwrap();
+        std::fs::write(
+            directory.path().join(".git/info/exclude"),
+            "secret.txt\nkept.txt\n",
+        )
+        .unwrap();
+        std::fs::write(directory.path().join(".gitignore"), "!kept.txt\n").unwrap();
+        for name in ["secret.txt", "kept.txt", "plain.txt"] {
+            std::fs::write(directory.path().join(name), "x").unwrap();
+        }
+        let metadata = crate::fs::checked_path_metadata(directory.path()).unwrap();
+        let bound = BoundDirectory::open(directory.path(), &metadata).unwrap();
+        let (entries, _) = bound.list_entries_bounded(100).unwrap();
+        let names: Vec<String> = entries
+            .iter()
+            .map(|entry| entry.file_name.to_string_lossy().into_owned())
+            .collect();
+        assert!(!names.contains(&"secret.txt".to_string()), "{names:?}");
+        assert!(names.contains(&"kept.txt".to_string()), "{names:?}");
+        assert!(names.contains(&"plain.txt".to_string()), "{names:?}");
     }
 
     #[test]
