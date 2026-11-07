@@ -33,6 +33,8 @@ const MAX_RETAINED_BYTES: usize = 128 * 1024;
 const MAX_RECEIPTS: usize = 128;
 /// One notice result, including its JSON framing.
 const MAX_NOTICE_BYTES: usize = 32 * 1024;
+const READ_AUTHORITY_REQUIRED: &str =
+    "Workspace instructions require existing read Allow authority";
 const BUDGET_EXHAUSTED: &str = "Workspace instruction retained-source limit reached";
 const MAX_HISTORY_BLOCKS: usize = 16_384;
 const MAX_PATH_BYTES: usize = 4096;
@@ -727,7 +729,7 @@ impl WorkspaceInstructions {
                     .unwrap_or_else(|e| e.into_inner())
                     .allows_mutation_preimage(&identity.to_string_lossy(), true)
             }) {
-                return Err("Workspace instructions require existing read Allow authority".into());
+                return Err(READ_AUTHORITY_REQUIRED.into());
             }
         }
         self.workspace
@@ -817,6 +819,10 @@ impl WorkspaceInstructions {
                 .nlink()
                 != 1
             {
+                // A prose `@word` naming a hard-linked file is not guidance.
+                if depth > 0 {
+                    return Ok(());
+                }
                 return Err("Linked workspace instruction source rejected".into());
             }
         }
@@ -825,6 +831,9 @@ impl WorkspaceInstructions {
             .map_err(|_| "Instruction metadata unavailable")?
             != 1
         {
+            if depth > 0 {
+                return Ok(());
+            }
             return Err("Linked workspace instruction source rejected".into());
         }
         let mut source = Source {
@@ -837,7 +846,13 @@ impl WorkspaceInstructions {
             identity: crate::fs::checked_file_metadata(&file)
                 .map_err(|_| "Instruction identity unavailable")?,
         };
-        self.authorize_sources(std::slice::from_ref(&source))?;
+        match self.authorize_sources(std::slice::from_ref(&source)) {
+            Ok(()) => {}
+            // A prose `@word` naming a file the model may not read is not
+            // guidance; skipping it is the safe outcome.
+            Err(error) if depth > 0 && error == READ_AUTHORITY_REQUIRED => return Ok(()),
+            Err(error) => return Err(error),
+        }
         if self
             .state
             .lock()
@@ -880,9 +895,13 @@ impl WorkspaceInstructions {
             .saturating_sub(source.path.as_os_str().len().saturating_mul(2))
             .saturating_sub(scope.as_os_str().len().saturating_mul(2))
             .min(remaining.saturating_sub(DELIVERY_OVERHEAD_BYTES));
-        let (text, truncated) = crate::paths::read_utf8_prefix(file, remaining)
-            .map_err(|_| "Could not read workspace instructions")?
-            .ok_or("Workspace instructions are not valid UTF-8")?;
+        let (text, truncated) = match crate::paths::read_utf8_prefix(file, remaining) {
+            Ok(Some(read)) => read,
+            // A prose `@word` naming a binary file is not guidance.
+            Ok(None) if depth > 0 => return Ok(()),
+            Ok(None) => return Err("Workspace instructions are not valid UTF-8".into()),
+            Err(_) => return Err("Could not read workspace instructions".into()),
+        };
         if truncated && budget_short {
             return Err(BUDGET_EXHAUSTED.into());
         }
@@ -2247,6 +2266,39 @@ mod tests {
             )
             .unwrap();
         let state = service.state.lock().unwrap();
+        assert!(
+            state
+                .initial
+                .sources
+                .iter()
+                .any(|s| s.text.contains("REAL"))
+        );
+    }
+    #[test]
+    fn prose_mentions_of_binary_and_hard_linked_files_do_not_fail_capture() {
+        let (_root, service) = fixture();
+        let root = service.workspace.root();
+        std::fs::write(root.join("diagram.png"), [0x89, b'P', 0xff, 0xfe, 0x00]).unwrap();
+        std::fs::write(root.join("shared.md"), "SHARED\n").unwrap();
+        #[cfg(unix)]
+        std::fs::hard_link(root.join("shared.md"), root.join("alias.md")).unwrap();
+        std::fs::write(root.join("real.md"), "REAL\n").unwrap();
+        let text = "see @diagram.png and @shared.md for layout\n@real.md";
+        service
+            .capture_initial(
+                vec![
+                    InstructionRoot::workspace(
+                        &service.workspace,
+                        PathBuf::from("AGENTS.md"),
+                        text,
+                    )
+                    .unwrap(),
+                ],
+                0,
+            )
+            .unwrap();
+        let state = service.state.lock().unwrap();
+        assert!(state.initial.error.is_none());
         assert!(
             state
                 .initial
