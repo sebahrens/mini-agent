@@ -198,6 +198,11 @@ enum MatchResult {
 /// 64-character SEARCH blocks) the fuzzy fallback may spend on one SEARCH
 /// block after histogram pruning; documented in TOOL_RUNTIME.md.
 const MAX_FUZZY_DISTANCE_WORK: u128 = 64_000_000;
+/// Bytes the per-character match masks of one SEARCH block may occupy
+/// (distinct characters x 64-character blocks x 8 bytes). A SEARCH over the
+/// limit reports `FuzzyBudgetExceeded`, which the tool surfaces as a visible
+/// notice, instead of allocating a quadratic table.
+const MAX_FUZZY_MASK_BYTES: usize = 64 * 1024 * 1024;
 /// A unique fuzzy match at or above this similarity may be applied with
 /// `fuzzy: true` (and is previewed otherwise).
 const FUZZY_APPLY_SIMILARITY: f64 = 0.85;
@@ -421,7 +426,8 @@ fn find_best_match(
     // Windows at or above the apply threshold, as (start, similarity).
     let mut applicable: Vec<(usize, f64)> = Vec::new();
     let mut work = 0u128;
-    let mut pattern = BitParallelPattern::new(&search_norm_chars);
+    // Built lazily: a SEARCH no candidate can match never pays for masks.
+    let mut pattern: Option<BitParallelPattern> = None;
     // Scratch buffer reused for every window.
     let mut window: Vec<char> = Vec::new();
 
@@ -443,7 +449,16 @@ fn find_best_match(
             }
             window.extend_from_slice(norm_lines.line(index));
         }
-        let Some(distance) = pattern.distance_within(&window, allowed, &mut work) else {
+        if pattern.is_none() {
+            match BitParallelPattern::new(&search_norm_chars) {
+                Some(built) => pattern = Some(built),
+                None => return MatchResult::FuzzyBudgetExceeded,
+            }
+        }
+        let Some(distance) = pattern
+            .as_mut()
+            .and_then(|pattern| pattern.distance_within(&window, allowed, &mut work))
+        else {
             if work > MAX_FUZZY_DISTANCE_WORK {
                 return MatchResult::FuzzyBudgetExceeded;
             }
@@ -514,8 +529,19 @@ struct BitParallelPattern {
 }
 
 impl BitParallelPattern {
-    fn new(pattern: &[char]) -> Self {
+    /// `None` when the dense mask table would exceed [`MAX_FUZZY_MASK_BYTES`].
+    fn new(pattern: &[char]) -> Option<Self> {
         let blocks = pattern.len().div_ceil(64).max(1);
+        let distinct = pattern
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        let table_bytes = distinct
+            .checked_mul(blocks)
+            .and_then(|cells| cells.checked_mul(std::mem::size_of::<u64>()))?;
+        if table_bytes > MAX_FUZZY_MASK_BYTES {
+            return None;
+        }
         let mut index = HashMap::new();
         let mut masks = Vec::new();
         for (position, &ch) in pattern.iter().enumerate() {
@@ -525,14 +551,14 @@ impl BitParallelPattern {
             });
             masks[offset + position / 64] |= 1u64 << (position % 64);
         }
-        Self {
+        Some(Self {
             len: pattern.len(),
             blocks,
             index,
             masks,
             positive: Vec::with_capacity(blocks),
             negative: Vec::with_capacity(blocks),
-        }
+        })
     }
 
     /// Global Levenshtein distance to `text` if it is at most `limit`. Each
@@ -2198,6 +2224,7 @@ mod tests {
                 for limit in [0, 1, 2, 3, 5, 8, 140] {
                     let mut work = 0;
                     let bounded = super::BitParallelPattern::new(&a_chars)
+                        .unwrap()
                         .distance_within(&b_chars, limit, &mut work);
                     assert_eq!(
                         bounded,
@@ -2308,6 +2335,35 @@ mod tests {
             find_best_match(&within, &search, &cache),
             MatchResult::FuzzyBudgetExceeded
         ));
+    }
+
+    #[test]
+    fn many_distinct_unicode_scalars_fail_closed_without_a_dense_mask_table() {
+        // 100,000 distinct scalars would need ~1.25 GB of dense masks.
+        let search: String = (0..100_000u32)
+            .map(|i| char::from_u32(0x10000 + i).unwrap())
+            .collect();
+        // One-character file: no candidate is viable, nothing is allocated.
+        let cache = std::sync::OnceLock::new();
+        assert!(matches!(
+            find_best_match("x", &search, &cache),
+            MatchResult::NotFound
+        ));
+        // A viable candidate would need the table: fail closed with the notice.
+        let cache = std::sync::OnceLock::new();
+        assert!(matches!(
+            find_best_match(
+                &search,
+                &format!("{}!", &search[..search.len() - 4]),
+                &cache
+            ),
+            MatchResult::FuzzyBudgetExceeded
+        ));
+        let chars: Vec<char> = search.chars().collect();
+        assert!(super::BitParallelPattern::new(&chars).is_none());
+        // Normal multilingual patterns still build.
+        let normal: Vec<char> = "日本語 fn main() { println!() }".chars().collect();
+        assert!(super::BitParallelPattern::new(&normal).is_some());
     }
 
     #[test]
