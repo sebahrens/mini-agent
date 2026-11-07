@@ -12,7 +12,7 @@
       "title": "Do not charge target-only changes to a documentation pull request",
       "reproduction": "A real divergent Git history with a README-only PR and an unrelated target-side source addition selected the full matrix.",
       "correction": "PR-owned changed paths use the unique merge base. Changed Rust tests retain common-ancestor, target and head platform markers. Pushes retain exact before/after semantics. Missing, ambiguous or malformed ancestry runs the full matrix.",
-      "status": "implemented; local validation passed; hosted owning checks pending"
+      "status": "implemented and validated; closed"
     }
   ],
   "validation": {
@@ -40,7 +40,18 @@
     "assessment": "After the correction, no further confirmed P0-P4 issue in the reviewed paths. This is a scoped review, not proof that the repository has no defects."
   },
   "hosted_validation": {
-    "status": "pending"
+    "status": "owning_checks_passed",
+    "commit": "85d7a4f914a95c4683cfd7034e5d83038dbf21ed",
+    "run": "https://github.com/sebahrens/mini-agent/actions/runs/42422103943",
+    "changes": {
+      "job": 128552527402,
+      "conclusion": "success"
+    },
+    "fmt": {
+      "job": 128552527181,
+      "conclusion": "success"
+    },
+    "runtime_matrix": "Cancelled after owning checks passed to avoid redundant runtime suites; unchanged Rust logic reuses full CI42408094543. The cancelled overall run is not claimed as a full green run."
   },
-  "status": "awaiting hosted owning checks and publication"
+  "status": "complete"
 }
