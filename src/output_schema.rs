@@ -950,6 +950,7 @@ mod tests {
             prompt: "answer".into(),
             persisted: false,
             relief_usage: Default::default(),
+            relief_interactions: Vec::new(),
         };
         let outcome = repair_rounds(
             &mut rounds,

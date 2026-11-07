@@ -3191,6 +3191,7 @@ impl Startup {
             prompt: recorded_prompt,
             persisted: already_persisted,
             relief_usage,
+            relief_interactions,
         } = response_result;
         // Priced and charged in one shape whatever the provider.
         let usage: rig::completion::Usage = self
@@ -3205,11 +3206,20 @@ impl Startup {
             .saturating_add(compaction_usage)
             .saturating_add(relief_usage)
             .into();
+        // The JSON reports tool traffic over the earlier context-relief
+        // segments plus the final one, as `json_usage` does for tokens
+        // (mini-agent-bz8k0). Only `interactions` is persisted below: the
+        // earlier segments are already in the session.
+        let reported_interactions = if json_output {
+            reported_headless_interactions(&relief_interactions, &interactions)
+        } else {
+            Vec::new()
+        };
         let json_context = if json_output {
             let files_changed = crate::print::files_changed_since(
                 self.workspace.root(),
                 change_baseline.as_ref(),
-                &interactions,
+                &reported_interactions,
             )
             .await;
             Some((
@@ -3368,7 +3378,7 @@ impl Startup {
             let rendered = crate::print::render_headless_json(
                 self.workspace.root(),
                 &response,
-                &interactions,
+                &reported_interactions,
                 json_usage,
                 files_changed,
                 pricing,
@@ -4416,6 +4426,7 @@ async fn run_headless_goal_rounds(
                 prompt: relieved.prompt,
                 persisted: relieved.persisted,
                 relief_usage: relieved.relief_usage,
+                relief_interactions: relieved.relief_interactions,
             };
         };
         return HeadlessRounds {
@@ -4423,6 +4434,7 @@ async fn run_headless_goal_rounds(
             prompt: message.to_owned(),
             persisted,
             relief_usage: native_relief_usage,
+            relief_interactions: native_relief_interactions,
         };
     }
     heap_future(|| {
@@ -4496,7 +4508,6 @@ async fn run_headless_goal_rounds_inner(
     let mut relief_usage = crate::event::UsageDelta::default();
     // This round's earlier segments: their usage (also in `relief_usage`) and
     // tool traffic, which the final segment's own turn does not carry.
-    #[cfg_attr(not(feature = "goal"), allow(unused_mut, unused_variables))]
     let mut relief_interactions: Vec<rig::completion::Message> = Vec::new();
 
     // A goal's time bound measures how long the agent worked. Headless runs
@@ -4556,10 +4567,7 @@ async fn run_headless_goal_rounds_inner(
         .await;
         round_prompt = relieved.prompt;
         relief_usage = relieved.relief_usage;
-        #[cfg(feature = "goal")]
-        {
-            relief_interactions = relieved.relief_interactions;
-        }
+        relief_interactions = relieved.relief_interactions;
         (relieved.turn, relieved.persisted)
     };
     #[cfg(feature = "goal")]
@@ -4980,6 +4988,7 @@ async fn run_headless_goal_rounds_inner(
         prompt: round_prompt,
         persisted,
         relief_usage,
+        relief_interactions,
     }
 }
 
@@ -4993,8 +5002,8 @@ pub(crate) struct RelievedHeadlessTurn {
     pub prompt: String,
     pub persisted: bool,
     /// Tool traffic of earlier segments, already persisted; kept so a goal
-    /// round counts all of its tool calls (mini-agent-yt0mb).
-    #[cfg_attr(not(feature = "goal"), allow(dead_code))]
+    /// round counts all of its tool calls (mini-agent-yt0mb) and the
+    /// headless JSON reports them (mini-agent-bz8k0).
     pub relief_interactions: Vec<rig::completion::Message>,
     /// Usage of earlier segments and relief compactions, already charged to
     /// the session; reported with the turn but never charged again.
@@ -5350,6 +5359,15 @@ pub(crate) fn loop_round_info(
     }
 }
 
+/// Tool traffic the headless JSON reports: the earlier context-relief
+/// segments followed by the final one (mini-agent-bz8k0).
+fn reported_headless_interactions(
+    relief: &[rig::completion::Message],
+    last: &[rig::completion::Message],
+) -> Vec<rig::completion::Message> {
+    relief.iter().chain(last).cloned().collect()
+}
+
 /// What a headless run leaves for its caller to finish.
 ///
 /// A goal run persists each round as it completes, so the caller must not
@@ -5362,6 +5380,9 @@ pub(crate) struct HeadlessRounds {
     /// Usage of context-relief segments and compactions inside these rounds,
     /// already charged to the session; reported, never charged again.
     pub relief_usage: crate::event::UsageDelta,
+    /// Tool traffic of the earlier context-relief segments of the final
+    /// round, already persisted; reported in the JSON, never persisted again.
+    pub relief_interactions: Vec<rig::completion::Message>,
 }
 
 /// Comparable label for the tool set recorded in the session environment:
@@ -6208,6 +6229,73 @@ mod tests {
             10 * boundary_turn(true).interactions.len()
         );
         assert!(!relieved.relief_interactions.is_empty());
+    }
+
+    // mini-agent-bz8k0: the JSON counts turns and edited files over the
+    // relief segments too, not only the final one.
+    #[tokio::test]
+    async fn headless_json_reports_relief_segment_tool_traffic() {
+        use rig::completion::message::{AssistantContent, ToolCall, ToolFunction};
+        let call = rig::completion::Message::Assistant {
+            id: None,
+            content: rig::OneOrMany::one(AssistantContent::ToolCall(ToolCall {
+                id: "c1".into(),
+                call_id: None,
+                function: ToolFunction {
+                    name: "write".into(),
+                    arguments: serde_json::json!({"path": "before_relief.txt", "content": "x"}),
+                },
+                signature: None,
+                additional_params: None,
+            })),
+        };
+        let mut session = relief_session();
+        let cfg = crate::config::Config::default();
+        let mut segments = 0;
+        let relieved = relieve_headless_turn(
+            &mut session,
+            &cfg,
+            true,
+            "do the thing",
+            std::sync::Arc::from(Vec::new()),
+            async |_session: &mut crate::session::Session, _prompt: &str, _history, _mid_turn| {
+                segments += 1;
+                if segments == 1 {
+                    let mut turn = boundary_turn(true);
+                    turn.interactions = vec![call.clone()];
+                    turn
+                } else {
+                    ok_turn("done")
+                }
+            },
+            async |_session: &mut crate::session::Session, _pending| {
+                Ok((crate::event::UsageDelta::default(), true))
+            },
+        )
+        .await;
+        let reported = super::reported_headless_interactions(
+            &relieved.relief_interactions,
+            &relieved.turn.interactions,
+        );
+        let dir = crate::tests::OwnedTestDirectory::new("relief-json-traffic");
+        let json: serde_json::Value = serde_json::from_str(
+            &crate::print::render_headless_json(
+                dir.path(),
+                "done",
+                &reported,
+                Default::default(),
+                Vec::new(),
+                crate::print::HeadlessPricing::from_session(&session, &cfg),
+                crate::print::HeadlessStopReason::Completed,
+                #[cfg(feature = "goal")]
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(json["num_turns"], 1, "{json}");
+        assert_eq!(json["tool_calls"]["total"], 1, "{json}");
+        assert_eq!(json["files_changed"][0], "before_relief.txt", "{json}");
     }
 
     // Two consecutive reliefs with no tool progress in between stop the turn
