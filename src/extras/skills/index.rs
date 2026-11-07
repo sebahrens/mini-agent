@@ -39,6 +39,10 @@ pub struct AgentSkillRecord {
     pub context_fork: bool,
     /// `agent` of a forked skill (the `task` agent type).
     pub agent: Option<String>,
+    /// `model` of a forked skill (a `[quick_models]` alias, vetted by `task`).
+    pub model: Option<String>,
+    /// `paths` globs scoping automatic selection (empty = unscoped).
+    pub paths: Vec<String>,
     /// Unsupported Claude Code key diagnostics, surfaced by `/skills`.
     pub diagnostics: Vec<String>,
     pub(crate) embedding: Vec<f32>,
@@ -356,6 +360,8 @@ mod tests {
             argument_hint: None,
             context_fork: false,
             agent: None,
+            model: None,
+            paths: Vec::new(),
             diagnostics: Vec::new(),
             embedding,
         }

@@ -10,6 +10,7 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 - Persona frontmatter `background: true` (delegations detach as background tasks), `memory: user|project|local` (private notes directory injected at start and writable through an `agent_memory` tool) and `hooks:` (scoped to the child's tool calls) are now implemented; memory and hooks are opt-in via `[subagents] agent_memory` / `agent_hooks` (mini-agent-scu2y).
 - Skills run with `/<name> args` now substitute `$ARGUMENTS`, `$ARGUMENTS[N]`, `$N` and `${CLAUDE_SKILL_DIR}`, rewrite ``!`cmd` `` spans into shell-tool instructions (`skills_shell_placeholders`), and honour `context: fork` with `agent:` by delegating the body to one `task` child (mini-agent-h7wxv).
+- Skill frontmatter `model` (forked skills; the `task` tool takes a per-call `model` limited to configured `[quick_models]` aliases and never overrides a persona-pinned model) and `paths` (automatic selection only when the request names a matching file); `effort` and `hooks` now report a reason (mini-agent-h7wxv).
 
 ### Fixed
 

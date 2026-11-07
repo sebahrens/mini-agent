@@ -92,8 +92,20 @@ tool, so the normal shell permission check and sandbox apply; the harness itself
 (optionally `agent: <agent type>`) is not followed inline: its rendered body is wrapped as the single
 prompt of one `task` call (the first request of the turn forces the `task` tool where the provider
 allows it), so the child runs with the agent type's tools, permissions and its own task budget and
-only its report returns to the main conversation. `model`, `effort`, `paths` and `hooks` are still
-reported as not applied (a forked skill's model comes from its agent persona). Builtins and custom command templates take precedence;
+only its report returns to the main conversation. Frontmatter keys beyond that:
+
+- `model` (with `context: fork` only): the forked `task` call carries `model`, which the task tool
+  accepts only when it names a configured `[quick_models]` alias. Raw model ids, unknown aliases and
+  any override of an agent type that pins its own `model:` are refused, so a skill cannot reach an
+  unconfigured model; the main conversation keeps the session model. Without `context: fork` the
+  key is reported as not applied.
+- `paths` (list or comma string of globs, at most 32): scoped activation. Such a skill joins
+  automatic selection only when the request names a file matching one of the globs; `/<name>`
+  pinning and `skills_search` are unaffected. Invalid globs are dropped and an unusable value is
+  reported.
+- `effort` and `hooks` are reported with a reason and not applied: a task child has no per-call
+  reasoning effort and an inline skill must not change the session effort; skill-scoped hooks would
+  run commands named by the skill package, so use the user-configured `[hooks]` instead. Builtins and custom command templates take precedence;
 a later explicit user prompt clears the pin. Source changes, lost trust/read authority or an oversized
 pin fail visibly before user history or HTTP. `--no-context-files` suppresses automatic directory scans;
 explicit list/pin actions still apply the same source policy. All roots share the bounded discovery caps

@@ -399,6 +399,8 @@ fn scan_record(
         argument_hint: manifest.argument_hint,
         context_fork: manifest.context_fork,
         agent: manifest.agent,
+        model: manifest.model,
+        paths: manifest.paths,
         diagnostics: manifest.diagnostics,
         embedding: Vec::new(),
     }))

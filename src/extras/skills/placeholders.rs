@@ -31,6 +31,42 @@ pub(crate) struct PinRender<'a> {
     pub(crate) skill_dir: &'a str,
     pub(crate) fork: bool,
     pub(crate) agent: Option<&'a str>,
+    /// `model:` of a forked skill, passed to `task` as its `model` argument.
+    pub(crate) model: Option<&'a str>,
+}
+
+/// Whether a `paths:`-scoped skill applies to `query`: unscoped skills always
+/// do; scoped ones only when some whitespace-separated word of the request,
+/// stripped of quotes and trailing punctuation, matches one of the globs.
+pub(crate) fn paths_match_query(patterns: &[String], query: &str) -> bool {
+    if patterns.is_empty() {
+        return true;
+    }
+    let mut builder = globset::GlobSetBuilder::new();
+    for pattern in patterns {
+        match globset::Glob::new(pattern) {
+            Ok(glob) => {
+                builder.add(glob);
+            }
+            // A pattern that cannot compile scopes nothing in.
+            Err(_) => return false,
+        }
+    }
+    let Ok(set) = builder.build() else {
+        return false;
+    };
+    query.split_whitespace().any(|word| {
+        let word = word
+            .trim_start_matches(['"', '\'', '`', '(', '[', '<'])
+            .trim_end_matches(|c: char| {
+                matches!(
+                    c,
+                    '"' | '\'' | '`' | ')' | ']' | '>' | ',' | ';' | ':' | '.' | '!' | '?'
+                )
+            });
+        let word = word.strip_prefix("./").unwrap_or(word);
+        !word.is_empty() && !word.contains("..") && set.is_match(word)
+    })
 }
 
 /// Splits `arguments` the way a shell word list reads: whitespace separated,
@@ -225,9 +261,16 @@ fn render_section(section: &mut AgentSection, render: &PinRender<'_>) {
         Some(agent) => format!("agent_type \"{agent}\""),
         None => "no agent_type (the default explorer)".to_owned(),
     };
+    let model = match render.model {
+        Some(model) => format!(
+            " and model \"{model}\" (the task tool only accepts a configured quick-model alias; \
+             if it rejects the model, tell the user instead of retrying without it)"
+        ),
+        None => String::new(),
+    };
     section.markdown = format!(
         "This skill is configured with context: fork. Do not follow its instructions yourself. \
-         Call the task tool exactly once with {agent} and a single prompt that is exactly the \
+         Call the task tool exactly once with {agent}{model} and a single prompt that is exactly the \
          text between the skill_task_prompt markers below, then relay the child's report to \
          the user.\n<skill_task_prompt>\n{}\n</skill_task_prompt>\n",
         body.trim_end()
@@ -322,9 +365,11 @@ mod tests {
                 skill_dir: "/d",
                 fork: true,
                 agent: Some("reviewer"),
+                model: Some("fast"),
             },
         );
         assert!(section.markdown.contains("agent_type \"reviewer\""));
+        assert!(section.markdown.contains("model \"fast\""));
         assert!(
             section
                 .markdown
@@ -335,5 +380,17 @@ mod tests {
             "frontmatter is not part of the prompt"
         );
         assert!(section.resources.is_empty());
+    }
+
+    #[test]
+    fn paths_scope_selection_to_requests_naming_a_matching_file() {
+        let scoped = vec!["src/**/*.rs".to_owned(), "docs/*.md".to_owned()];
+        assert!(paths_match_query(&[], "anything"));
+        assert!(paths_match_query(&scoped, "please fix `src/a/b.rs`."));
+        assert!(paths_match_query(&scoped, "edit ./docs/x.md now"));
+        assert!(!paths_match_query(&scoped, "fix the bug in lib.rs"));
+        assert!(!paths_match_query(&scoped, "tests/a.rs"));
+        // A traversal-looking word never matches a scope.
+        assert!(!paths_match_query(&scoped, "src/../../etc/passwd.rs"));
     }
 }

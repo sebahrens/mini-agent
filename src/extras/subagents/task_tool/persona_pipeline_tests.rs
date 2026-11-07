@@ -505,3 +505,80 @@ fn persona_memory_and_hooks_are_closed_unless_the_subagent_opt_ins_are_set() {
     let hooks_only = resolve(&config);
     assert!(hooks_only.memory.is_none() && hooks_only.hooks.is_some());
 }
+
+#[test]
+fn per_call_model_override_is_closed_to_raw_ids_unknown_aliases_and_pinned_personas() {
+    let config = fixture_config();
+    let plain = super::validate_model_override("glm", None, &config);
+    assert!(plain.is_ok(), "a configured alias is accepted");
+
+    // Adversarial: a raw id, an unknown alias and a traversal-looking name.
+    for hostile in ["example-opus-model", "nope", "../glm", "glm; rm -rf /"] {
+        let error = super::validate_model_override(hostile, None, &config)
+            .expect_err(hostile)
+            .to_string();
+        assert!(error.contains("configured [quick_models] alias"), "{error}");
+    }
+
+    // Default closed: with no quick models nothing is accepted.
+    let empty = crate::config::Config::default();
+    assert!(super::validate_model_override("glm", None, &empty).is_err());
+
+    // A persona that pins its own model cannot be overridden.
+    let pinned = alias_persona("review");
+    let error = super::validate_model_override("glm", Some(&pinned), &config)
+        .expect_err("pinned persona")
+        .to_string();
+    assert!(error.contains("pins model"), "{error}");
+}
+
+#[test]
+fn per_call_model_override_switches_provider_with_the_scoped_key() {
+    let config = fixture_config();
+    let factory = RecordingFactory::new();
+    let mut runtime = super::resolve_persona_runtime_with(
+        cli_key_parent(&config),
+        "anthropic",
+        "anthropic",
+        "example-opus-model".into(),
+        20,
+        Some(CLI_KEY),
+        &config,
+        None,
+        &factory.build(None),
+    )
+    .unwrap();
+    super::apply_model_override(
+        &mut runtime,
+        "glm",
+        "anthropic",
+        Some(CLI_KEY),
+        &config,
+        &factory.build(Some(GLM_KEY)),
+    )
+    .unwrap();
+    assert_eq!(runtime.provider_name, "glm");
+    assert_eq!(
+        *factory.keys.borrow(),
+        vec![("glm".to_owned(), None)],
+        "the CLI key never reaches another provider"
+    );
+    assert!(
+        super::apply_model_override(
+            &mut runtime,
+            "raw-id",
+            "anthropic",
+            None,
+            &config,
+            &|_, _, _| { unreachable!("no client for an unknown alias") }
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn task_args_accept_a_model_alias_field() {
+    let args: super::TaskArgs =
+        serde_json::from_str(r#"{"prompts":["x"],"model":"fast"}"#).unwrap();
+    assert_eq!(args.options.model.as_deref(), Some("fast"));
+}

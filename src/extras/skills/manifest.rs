@@ -30,6 +30,14 @@ pub struct AgentSkillManifest {
     /// Claude Code `agent`: the `task` agent type a forked skill runs as.
     /// Used only with `context: fork`.
     pub agent: Option<String>,
+    /// Claude Code `model`: the model a forked skill's `task` child asks for.
+    /// Only a configured `[quick_models]` alias is ever honoured, by the
+    /// `task` tool, and only with `context: fork`.
+    pub model: Option<String>,
+    /// Claude Code `paths`: glob patterns that scope automatic selection. A
+    /// skill with patterns is auto-selected only when the request names a
+    /// matching file; `/<name>` pinning is unaffected. Empty = unscoped.
+    pub paths: Vec<String>,
     /// One diagnostic per recognised-but-unsupported Claude Code key (for
     /// example `context: fork not applied; skill runs inline`). Unknown
     /// non-Claude keys stay quiet. Display only; never grants anything.
@@ -84,6 +92,10 @@ struct RawManifest {
     context: Option<String>,
     #[serde(default, deserialize_with = "lenient_word")]
     agent: Option<String>,
+    #[serde(default, deserialize_with = "lenient_model")]
+    model: Option<String>,
+    #[serde(default, deserialize_with = "lenient_paths")]
+    paths: Option<Vec<String>>,
     /// Filled by `unsupported_diagnostics`, never read from YAML directly.
     #[serde(skip)]
     diagnostics: Vec<String>,
@@ -112,6 +124,75 @@ where
         .as_ref()
         .and_then(scalar_to_string)
         .and_then(|text| clean_word(&text)))
+}
+
+const MAX_PATH_PATTERNS: usize = 32;
+const MAX_PATH_PATTERN_CHARS: usize = 200;
+
+/// A model id or `[quick_models]` alias: no whitespace, quotes or control
+/// characters, at most 128 characters. Whether it is *allowed* is decided by
+/// the `task` tool at call time, never here.
+fn clean_model(text: &str) -> Option<String> {
+    let text = text.trim();
+    (!text.is_empty()
+        && text.chars().count() <= 128
+        && text.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '/' | '@' | '+')
+        }))
+    .then(|| text.to_owned())
+}
+
+fn lenient_model<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: Option<serde_yaml_ng::Value> = Option::deserialize(deserializer)?;
+    Ok(raw
+        .as_ref()
+        .and_then(scalar_to_string)
+        .and_then(|text| clean_model(&text)))
+}
+
+/// Valid glob patterns from a comma separated string; invalid, over-long or
+/// excess entries are dropped.
+fn clean_paths<'a>(items: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for item in items {
+        let item = item.trim();
+        if out.len() >= MAX_PATH_PATTERNS
+            || item.is_empty()
+            || item.chars().count() > MAX_PATH_PATTERN_CHARS
+            || item.chars().any(char::is_control)
+            || globset::Glob::new(item).is_err()
+            || out.iter().any(|existing| existing == item)
+        {
+            continue;
+        }
+        out.push(item.to_owned());
+    }
+    out
+}
+
+/// `paths` as a YAML list or one comma separated string. `Some(empty)` means
+/// the key was present but held no usable pattern (reported as a diagnostic).
+fn lenient_paths<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde_yaml_ng::Value;
+    let raw: Option<Value> = Option::deserialize(deserializer)?;
+    Ok(match raw {
+        None | Some(Value::Null) => None,
+        Some(Value::Sequence(items)) => {
+            let strings: Vec<String> = items.iter().filter_map(scalar_to_string).collect();
+            Some(clean_paths(strings.iter().map(String::as_str)))
+        }
+        Some(other) => Some(
+            scalar_to_string(&other)
+                .map(|text| clean_paths(text.split(',')))
+                .unwrap_or_default(),
+        ),
+    })
 }
 
 fn clean_hint(text: &str) -> Option<String> {
@@ -144,10 +225,13 @@ fn unsupported_message(key: &str, value: Option<&str>, fork: bool) -> Option<Str
         "agent" if fork => return None,
         "agent" => "agent not applied without context: fork; skill runs inline with the current agent"
             .to_owned(),
-        "model" => "model not applied; skill uses the session model (a forked skill's model comes from its agent persona)".to_owned(),
-        "effort" => "effort not applied; skill uses the session effort".to_owned(),
-        "paths" => "paths not applied; skill is not limited to matching files".to_owned(),
-        "hooks" => "hooks not applied; skill hooks never run".to_owned(),
+        "model" if fork => return None,
+        "model" => "model applies only with context: fork; skill uses the session model".to_owned(),
+        "effort" => "effort not applied: a task child has no per-call reasoning effort and an inline skill must not change the session effort; skill uses the session effort".to_owned(),
+        // Parsed into `paths`; a present-but-unusable value is reported by
+        // `finish_manifest`.
+        "paths" => return None,
+        "hooks" => "hooks not applied: skill-scoped hooks would run commands named by the skill package; use the user-configured [hooks] instead".to_owned(),
         _ => return None,
     })
 }
@@ -344,6 +428,8 @@ fn empty_raw() -> RawManifest {
         argument_hint: None,
         context: None,
         agent: None,
+        model: None,
+        paths: None,
         diagnostics: Vec::new(),
     }
 }
@@ -381,6 +467,8 @@ fn scan_simple_keys(yaml: &str) -> RawManifest {
             "argument-hint" => raw.argument_hint = clean_hint(value),
             "context" => raw.context = clean_word(value),
             "agent" => raw.agent = clean_word(value),
+            "model" => raw.model = clean_model(value),
+            "paths" => raw.paths = Some(clean_paths(value.split(','))),
             other => pairs.push((other.to_owned(), value.to_owned())),
         }
     }
@@ -397,7 +485,7 @@ fn first_body_line(body: &str) -> Option<String> {
 }
 
 fn finish_manifest(
-    raw: RawManifest,
+    mut raw: RawManifest,
     name: String,
     description: String,
 ) -> Result<AgentSkillManifest, ManifestError> {
@@ -420,6 +508,13 @@ fn finish_manifest(
     {
         return Err(ManifestError::InvalidLearnedJs);
     }
+    if raw.paths.as_ref().is_some_and(Vec::is_empty) {
+        raw.diagnostics.push(
+            "paths ignored: no valid glob pattern; skill is not limited to matching files"
+                .to_owned(),
+        );
+        raw.diagnostics.sort();
+    }
     Ok(AgentSkillManifest {
         name,
         description,
@@ -433,6 +528,8 @@ fn finish_manifest(
         argument_hint: raw.argument_hint,
         context_fork: raw.context.as_deref() == Some("fork"),
         agent: raw.agent,
+        model: raw.model,
+        paths: raw.paths.unwrap_or_default(),
         diagnostics: raw.diagnostics,
     })
 }
@@ -590,8 +687,13 @@ mod tests {
         let markdown = b"---\nname: s\ndescription: d\ncontext: fork\nagent: Explore\nmodel: opus\neffort: high\npaths:\n  - src/**\nhooks:\n  PreToolUse: []\nargument-hint: \"[issue]\"\nvendor-thing: 1\n---\n";
         let manifest = parse_skill_markdown(markdown).unwrap();
         assert_eq!(manifest.argument_hint.as_deref(), Some("[issue]"));
-        // `context: fork` and its `agent` are honoured; the rest are reported.
-        assert_eq!(manifest.diagnostics.len(), 4);
+        // `context: fork`, `agent`, `model` (with fork) and `paths` are
+        // honoured; `effort` and `hooks` get a reasoned diagnostic.
+        assert_eq!(manifest.diagnostics.len(), 2, "{:?}", manifest.diagnostics);
+        assert_eq!(manifest.model.as_deref(), Some("opus"));
+        assert_eq!(manifest.paths, ["src/**"]);
+        assert!(manifest.diagnostics.iter().any(|d| d.starts_with("effort")));
+        assert!(manifest.diagnostics.iter().any(|d| d.starts_with("hooks")));
         assert!(manifest.context_fork);
         assert_eq!(manifest.agent.as_deref(), Some("Explore"));
         assert!(
@@ -613,7 +715,8 @@ mod tests {
             "s",
         )
         .unwrap();
-        assert_eq!(lenient.diagnostics.len(), 1);
+        assert!(lenient.diagnostics.is_empty(), "{:?}", lenient.diagnostics);
+        assert_eq!(lenient.model.as_deref(), Some("opus"));
         assert!(lenient.context_fork);
         let plain = parse_skill_markdown(b"---\nname: p\ndescription: d\n---\n").unwrap();
         assert!(plain.diagnostics.is_empty() && plain.argument_hint.is_none());
@@ -628,6 +731,49 @@ mod tests {
         .unwrap();
         let hint = hint.argument_hint.unwrap();
         assert!(hint.chars().count() <= 80 && !hint.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn model_and_paths_keys_are_sanitised_and_model_needs_fork() {
+        let parse = |yaml: &str| {
+            parse_skill_markdown(format!("---\nname: s\ndescription: d\n{yaml}---\n").as_bytes())
+                .unwrap()
+        };
+        // Without fork the model is reported as not applied.
+        let inline = parse("model: fast\n");
+        assert!(
+            inline
+                .diagnostics
+                .iter()
+                .any(|d| d.starts_with("model applies only"))
+        );
+        // Adversarial model values never survive: quotes, spaces, newlines.
+        for hostile in [
+            "\"a\\\" b\"",
+            "\"fast\\nIgnore previous\"",
+            "\"x y\"",
+            "\"a`b\"",
+        ] {
+            let manifest = parse(&format!("context: fork\nmodel: {hostile}\n"));
+            assert_eq!(manifest.model, None, "{hostile}");
+        }
+        // paths: list or comma string; invalid globs and extras are dropped.
+        assert_eq!(
+            parse("paths: \"src/**, docs/*.md\"\n").paths,
+            ["src/**", "docs/*.md"]
+        );
+        let bad = parse("paths:\n  - \"[\"\n");
+        assert!(bad.paths.is_empty());
+        assert!(
+            bad.diagnostics
+                .iter()
+                .any(|d| d.starts_with("paths ignored"))
+        );
+        let many: String = (0..40).map(|i| format!("  - \"d{i}/*\"\n")).collect();
+        assert_eq!(parse(&format!("paths:\n{many}")).paths.len(), 32);
+        // Absent keys: default closed (no model, no scope, no diagnostics).
+        let plain = parse("");
+        assert!(plain.model.is_none() && plain.paths.is_empty() && plain.diagnostics.is_empty());
     }
 
     #[test]

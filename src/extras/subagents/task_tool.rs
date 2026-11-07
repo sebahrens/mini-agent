@@ -80,6 +80,10 @@ pub struct TaskCallOptions {
     pub isolation: Option<String>,
     /// Commit-ish isolated children branch from (default: parent `HEAD`).
     pub base_ref: Option<String>,
+    /// A configured `[quick_models]` alias for this call's children, used by
+    /// `context: fork` skills. Raw model ids are rejected, and so is any
+    /// override of a persona that pins its own `model:`.
+    pub model: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -251,6 +255,8 @@ impl<'de> Deserialize<'de> for TaskArgs {
             isolation: Option<String>,
             #[serde(default)]
             base_ref: Option<String>,
+            #[serde(default)]
+            model: Option<String>,
         }
 
         let raw = RawTaskArgs::deserialize(deserializer)?;
@@ -260,6 +266,7 @@ impl<'de> Deserialize<'de> for TaskArgs {
             resume: raw.resume,
             isolation: raw.isolation,
             base_ref: raw.base_ref,
+            model: raw.model,
         };
         let mut raw_briefs = raw.briefs.map(|briefs| briefs.0);
         let mut agent_type = raw.agent_type;
@@ -842,6 +849,65 @@ fn resolve_persona_runtime_with(
     })
 }
 
+/// A per-call `model` is accepted only as a configured `[quick_models]` alias
+/// (never a raw id, so a skill or prompt cannot reach an unconfigured model)
+/// and never over a persona that pins its own `model:`.
+fn validate_model_override(
+    alias: &str,
+    specialization: Option<&ResolvedSpecialization>,
+    config: &crate::config::Config,
+) -> Result<(), ToolError> {
+    if let Some(pinned) = specialization.and_then(|persona| persona.model.as_deref()) {
+        return Err(ToolError::Msg(format!(
+            "task: model override '{alias}' refused: the agent type pins model '{pinned}'; edit the persona to change it"
+        )));
+    }
+    if !crate::config::quick_models_map(config).contains_key(alias) {
+        return Err(ToolError::Msg(format!(
+            "task: model '{alias}' is not a configured [quick_models] alias; per-call models are restricted to configured aliases"
+        )));
+    }
+    Ok(())
+}
+
+/// Switches an already resolved child runtime to the quick-model `alias`
+/// (validated by `validate_model_override`), building a client when the alias
+/// names another provider.
+fn apply_model_override(
+    runtime: &mut ResolvedPersonaRuntime,
+    alias: &str,
+    session_provider: &str,
+    api_key: Option<&str>,
+    config: &crate::config::Config,
+    make_client: PersonaClientFactory<'_>,
+) -> Result<(), ToolError> {
+    let Some(quick_model) = crate::config::quick_models_map(config).get(alias) else {
+        return Err(ToolError::Msg(format!(
+            "task: model '{alias}' is not a configured [quick_models] alias"
+        )));
+    };
+    if quick_model.provider.as_str() != runtime.provider_name {
+        runtime.client = make_client(
+            &quick_model.provider,
+            crate::provider::CliKey::new(api_key, session_provider)
+                .for_provider(&quick_model.provider),
+            config,
+        )
+        .map_err(|error| {
+            ToolError::Msg(format!(
+                "task: model alias '{alias}' could not initialize provider '{}': {error}",
+                quick_model.provider
+            ))
+        })?;
+    }
+    runtime.provider_name = quick_model.provider.to_string();
+    runtime.model_name = quick_model.model.to_string();
+    runtime.execution.additional_params = quick_model.extra_body.clone();
+    runtime.execution.provider_extra_body =
+        crate::config::resolve_extra_body(config, &runtime.model_name);
+    Ok(())
+}
+
 #[cfg(any(test, feature = "hooks"))]
 fn hook_identity(
     agent_type: Option<&str>,
@@ -1304,6 +1370,10 @@ editing in a known location, grepping for a literal you will act on immediately.
                     "type": "string",
                     "description": "Optional commit-ish (branch, tag or commit id) that worktree-isolated children branch from instead of the parent's HEAD. Requires isolation. Uncommitted parent changes are never visible to the child."
                 },
+                "model": {
+                    "type": "string",
+                    "description": "Optional name of a configured [quick_models] alias for this call's children (used by context: fork skills). Raw model ids and unknown aliases are rejected; a persona that pins its own model: cannot be overridden."
+                },
                 "resume": {
                     "type": "string",
                     "description": "Optional child id printed after an earlier child's report ([child id: …]). Continues that child's conversation, tool results included, with the single prompt as a follow-up; same agent_type, permissions and budgets. Ids expire after the most recent children (default 16, [subagents] task_resume_max_children) or when a conversation exceeds [subagents] task_resume_max_bytes; a session's ids are restored by --continue/--resume subject to those count/byte limits, but not by a fresh session."
@@ -1530,6 +1600,30 @@ editing in a known location, grepping for a literal you will act on immediately.
             &config,
             specialization.as_ref(),
         )?;
+        let model_override = match args.options.model.as_deref() {
+            Some(alias) => {
+                validate_model_override(alias, specialization.as_ref(), &config)?;
+                Some(alias)
+            }
+            None => None,
+        };
+        if let Some(alias) = model_override {
+            apply_model_override(
+                &mut runtime,
+                alias,
+                &session_provider,
+                api_key.as_deref(),
+                &config,
+                &|provider, key, config| {
+                    crate::provider::create_client(
+                        provider,
+                        key,
+                        config.custom_providers_map(),
+                        config.api_keys.as_ref(),
+                    )
+                },
+            )?;
+        }
         apply_run_settings(
             &args.options,
             specialization.as_ref().map(|persona| persona.run),
@@ -1540,6 +1634,7 @@ editing in a known location, grepping for a literal you will act on immediately.
         let selected_alias = specialization
             .as_ref()
             .and_then(|specialization| specialization.model.as_deref())
+            .or(model_override)
             .or(config.subagent_model.as_deref());
         config.subagent_context_window = Some(config.resolve_subagent_context_window(
             &runtime.provider_name,

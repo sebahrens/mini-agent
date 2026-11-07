@@ -732,6 +732,12 @@ impl InstructionServices {
                     record
                 })
                 .collect();
+            // `paths:` scoping: a scoped skill joins automatic selection only
+            // when the request names a matching file. A pin always keeps it.
+            records.retain(|record| {
+                pin.as_ref().is_some_and(|pin| pin.digest == record.digest)
+                    || super::placeholders::paths_match_query(&record.paths, &query)
+            });
             #[cfg(feature = "skills")]
             let semantic_model = if vector.is_some() {
                 let embedder = embedder.as_ref().expect("query vector has an embedder");
@@ -772,6 +778,7 @@ impl InstructionServices {
                         skill_dir: &skill_dir,
                         fork: package.record.context_fork,
                         agent: package.record.agent.as_deref(),
+                        model: package.record.model.as_deref(),
                     },
                 )?;
             }
@@ -2246,6 +2253,70 @@ mod discovery_tests {
             .await
             .unwrap_err();
         assert!(error.contains("arguments exceed"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn paths_scope_automatic_selection_and_fork_carries_the_model_alias() {
+        let fixture = Fixture::new(false);
+        let scoped = fixture.skill(
+            ".claude/skills",
+            "rust-style",
+            "style rules for modules",
+            "x",
+        );
+        std::fs::write(
+            &scoped,
+            "---\nname: rust-style\ndescription: style rules for modules\npaths:\n  - \"src/**/*.rs\"\n---\nUse style.\n",
+        )
+        .unwrap();
+        let forked = fixture.skill(".claude/skills", "deep-review", "review deeply", "x");
+        std::fs::write(
+            &forked,
+            "---\nname: deep-review\ndescription: review deeply\ncontext: fork\nmodel: fast\n---\nReview.\n",
+        )
+        .unwrap();
+
+        let names = |selection: &super::super::selection::InstructionSelection| {
+            selection
+                .sections
+                .iter()
+                .any(|s| s.markdown.contains("Use style."))
+        };
+        let off = fixture
+            .services
+            .select("style rules for modules", None)
+            .await
+            .unwrap();
+        assert!(
+            !names(&off),
+            "scoped skill must stay out without a matching file"
+        );
+        let on = fixture
+            .services
+            .select("style rules for modules in src/a/b.rs", None)
+            .await
+            .unwrap();
+        assert!(names(&on), "a named matching file activates the skill");
+        // A pin keeps working regardless of paths.
+        let pin = fixture.services.pin("rust-style").await.unwrap();
+        let pinned = fixture
+            .services
+            .select("anything", Some(&pin))
+            .await
+            .unwrap();
+        assert!(names(&pinned));
+
+        let pin = fixture.services.pin("deep-review").await.unwrap();
+        let selection = fixture
+            .services
+            .select("anything", Some(&pin))
+            .await
+            .unwrap();
+        assert!(
+            selection.sections[0].markdown.contains("model \"fast\""),
+            "{}",
+            selection.sections[0].markdown
+        );
     }
 
     #[tokio::test]
