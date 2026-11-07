@@ -165,9 +165,14 @@ pub(crate) fn provider_retry_hint(
     error: &(dyn std::error::Error + 'static),
     now: SystemTime,
 ) -> Option<Duration> {
-    let response = error_sources(error).find_map(|candidate| {
+    let Some(response) = error_sources(error).find_map(|candidate| {
         candidate.downcast_ref::<crate::provider_http::ProviderRetryAfterError>()
-    })?;
+    }) else {
+        // Rig preserved only a status: still honour a wait stated in the body.
+        return provider_response_status(error)
+            .filter(|status| matches!(status.as_u16(), 429 | 503))
+            .and_then(|_| body_retry_hint(error));
+    };
     let header = |name: &str| {
         response
             .headers
@@ -178,6 +183,13 @@ pub(crate) fn provider_retry_hint(
         .and_then(parse_retry_after_ms)
         .or_else(|| header("retry-after").and_then(|value| parse_retry_after(value, now)))
         .or_else(|| {
+            // Gemini and some OpenAI-compatible gateways carry the wait in
+            // the error body instead of a header.
+            matches!(response.status.as_u16(), 429 | 503)
+                .then(|| body_retry_hint(error))
+                .flatten()
+        })
+        .or_else(|| {
             // Without an explicit hint, a rate-limited response's reset
             // headers say when capacity returns. Which limit was hit is not
             // reported, so wait for the latest reset.
@@ -185,6 +197,72 @@ pub(crate) fn provider_retry_hint(
                 .then(|| rate_limit_reset(&response.headers, now))
                 .flatten()
         })
+}
+
+/// A wait stated in an error body: Gemini's `google.rpc.RetryInfo`
+/// (`"retryDelay": "38s"`) or prose such as "Please retry in 38.2s" /
+/// "Please try again in 1.5s" / "try again in 20ms". The longest hint found in
+/// the source chain wins; callers clamp it to the hint ceiling.
+pub(crate) fn body_retry_hint(error: &(dyn std::error::Error + 'static)) -> Option<Duration> {
+    error_sources(error)
+        .filter_map(|candidate| parse_body_retry_hint(&candidate.to_string()))
+        .max()
+}
+
+pub(crate) fn parse_body_retry_hint(message: &str) -> Option<Duration> {
+    let lower = message.to_ascii_lowercase();
+    let mut best: Option<Duration> = None;
+    let mut keep = |value: Option<Duration>| {
+        if let Some(value) = value {
+            best = Some(best.map_or(value, |current| current.max(value)));
+        }
+    };
+    // RetryInfo: "retryDelay": "38s" (JSON, possibly escaped quotes).
+    let mut from = 0;
+    while let Some(found) = lower[from..].find("retrydelay") {
+        let rest = &lower[from + found + "retrydelay".len()..];
+        let rest = rest
+            .trim_start_matches(|c: char| c == '"' || c == '\\' || c == ':' || c.is_whitespace());
+        let end = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == 's' || c == 'm'))
+            .unwrap_or(rest.len());
+        keep(parse_go_duration(&rest[..end]));
+        from += found + "retrydelay".len();
+    }
+    for needle in ["retry in ", "try again in ", "retry after "] {
+        let mut from = 0;
+        while let Some(found) = lower[from..].find(needle) {
+            let rest = &lower[from + found + needle.len()..];
+            let number_end = rest
+                .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+                .unwrap_or(rest.len());
+            if number_end > 0
+                && let Ok(number) = rest[..number_end].parse::<f64>()
+            {
+                let unit = &rest[number_end..];
+                let scale = if unit.starts_with("ms") || unit.starts_with("millisecond") {
+                    Some(0.001)
+                } else if unit.starts_with("min")
+                    || unit.starts_with('m') && !unit.starts_with("ms")
+                {
+                    Some(60.0)
+                } else if unit.starts_with('s') {
+                    Some(1.0)
+                } else {
+                    None
+                };
+                if let Some(scale) = scale
+                    && number.is_finite()
+                {
+                    keep(Some(Duration::from_secs_f64(
+                        (number * scale).clamp(0.0, 1e9),
+                    )));
+                }
+            }
+            from += found + needle.len();
+        }
+    }
+    best
 }
 
 /// The latest reset among `anthropic-ratelimit-*-reset` (RFC 3339 instants)
@@ -253,9 +331,21 @@ pub fn is_quota_exhausted_error(error: &(dyn std::error::Error + 'static)) -> bo
 
 fn is_quota_exhausted_message(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
+    // Gemini opens every 429 RESOURCE_EXHAUSTED, including ordinary
+    // per-minute limits, with "You exceeded your current quota". It is
+    // terminal only for a daily/billing limit or when the body gives no
+    // recovery hint; a RetryInfo delay or a per-minute metric is recoverable.
+    if lower.contains("exceeded your current quota") || lower.contains("quota exceeded for metric")
+    {
+        let daily = lower.contains("perday") || lower.contains("per day");
+        let per_minute = lower.contains("perminute") || lower.contains("per minute");
+        let hinted = parse_body_retry_hint(message).is_some();
+        if daily || !(hinted || per_minute) {
+            return true;
+        }
+    }
     lower.contains("insufficient_quota")
         || lower.contains("billing_hard_limit")
-        || lower.contains("exceeded your current quota")
         || lower.contains("credit balance is too low")
         || lower.contains("usage_limit_reached")
         || lower.contains("billing_not_active")
@@ -345,6 +435,7 @@ pub fn is_retryable(error: &(dyn std::error::Error + 'static)) -> bool {
                     | std::io::ErrorKind::NotConnected
                     | std::io::ErrorKind::TimedOut
                     | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
             )
         {
             return true;
@@ -367,6 +458,8 @@ pub fn is_retryable(error: &(dyn std::error::Error + 'static)) -> bool {
             || lower.contains("bad gateway")
             || lower.contains("gateway timeout")
             || lower.contains("error sending request")
+            || lower.contains("closed before message completed")
+            || lower.contains("error reading a body from connection")
         {
             return true;
         }
@@ -387,7 +480,9 @@ fn provider_should_retry(error: &(dyn std::error::Error + 'static)) -> Option<bo
 }
 
 fn is_retryable_status(code: u16) -> bool {
-    matches!(code, 408 | 409 | 425 | 429 | 500 | 502 | 503 | 504 | 529)
+    // Like the official SDKs: every 5xx except 501 Not Implemented
+    // (Cloudflare 520-524/530, 507, 598/599 proxies included).
+    matches!(code, 408 | 409 | 425 | 429) || (500..=599).contains(&code) && code != 501
 }
 
 fn message_has_retryable_status(message: &str) -> bool {
@@ -886,6 +981,103 @@ mod tests {
         ] {
             assert_eq!(parse_go_duration(value), expected, "{value}");
         }
+    }
+
+    use crate::provider_http::ProviderRetryAfterError;
+
+    const GEMINI_429_MINUTE: &str = r#"{"error":{"code":429,"message":"You exceeded your current quota, please check your plan and billing details. * Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 15\nPlease retry in 38.2s.","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaMetric":"generativelanguage.googleapis.com/generate_content_free_tier_requests","quotaId":"GenerateRequestsPerMinutePerProjectPerModel-FreeTier"}]},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"38s"}]}}"#;
+
+    #[test]
+    fn gemini_per_minute_429_is_retried_with_the_body_delay() {
+        let error = ProviderRetryAfterError::for_test(429, &[], GEMINI_429_MINUTE);
+        assert!(!is_quota_exhausted_error(&error));
+        assert!(is_retryable(&error));
+        let delay = retry_delay_for_error_with_hint_ceiling(
+            Duration::from_millis(500),
+            Duration::from_secs(10),
+            Duration::from_secs(300),
+            &error,
+        );
+        assert_eq!(delay, Duration::from_millis(38_200));
+        // The hint ceiling still clamps it.
+        let clamped = retry_delay_for_error_with_hint_ceiling(
+            Duration::from_millis(500),
+            Duration::from_secs(10),
+            Duration::from_secs(20),
+            &error,
+        );
+        assert_eq!(clamped, Duration::from_secs(20));
+    }
+
+    #[test]
+    fn gemini_daily_or_unhinted_exhaustion_stays_terminal() {
+        let daily = ProviderRetryAfterError::for_test(
+            429,
+            &[],
+            r#"You exceeded your current quota. Quota exceeded for metric: generate_content_free_tier_requests, quotaId: GenerateRequestsPerDayPerProjectPerModel-FreeTier. Please retry in 38s"#,
+        );
+        assert!(is_quota_exhausted_error(&daily));
+        assert!(!is_retryable(&daily));
+        let bare = ProviderRetryAfterError::for_test(
+            429,
+            &[],
+            "You exceeded your current quota, please check your plan and billing details.",
+        );
+        assert!(!is_retryable(&bare));
+    }
+
+    #[test]
+    fn body_retry_hints_parse_prose_and_retry_info() {
+        for (text, expected) in [
+            (r#""retryDelay": "38s""#, Some(Duration::from_secs(38))),
+            (
+                r#"\"retryDelay\":\"1.5s\""#,
+                Some(Duration::from_millis(1500)),
+            ),
+            (
+                "Please try again in 1.5s.",
+                Some(Duration::from_millis(1500)),
+            ),
+            ("Please try again in 20ms.", Some(Duration::from_millis(20))),
+            ("Please retry in 2m", Some(Duration::from_secs(120))),
+            ("nothing here", None),
+            ("retry in soon", None),
+        ] {
+            assert_eq!(parse_body_retry_hint(text), expected, "{text}");
+        }
+        // Only 429/503 bodies are consulted.
+        let teapot = ProviderRetryAfterError::for_test(418, &[], "Please retry in 5s");
+        assert_eq!(provider_retry_hint(&teapot, SystemTime::now()), None);
+        let openai = ProviderRetryAfterError::for_test(
+            429,
+            &[],
+            "Rate limit reached. Please try again in 1.5s.",
+        );
+        assert_eq!(
+            provider_retry_hint(&openai, SystemTime::now()),
+            Some(Duration::from_millis(1500))
+        );
+    }
+
+    #[test]
+    fn broad_5xx_statuses_are_retryable_except_not_implemented() {
+        for code in [500, 502, 507, 520, 521, 522, 523, 524, 530, 598, 599] {
+            assert!(is_retryable(&hinted(code, &[])), "{code}");
+        }
+        assert!(!is_retryable(&hinted(501, &[])));
+        assert!(!is_retryable(&hinted(400, &[])));
+        assert!(is_retryable(&hinted(522, &[("x-should-retry", "true")])));
+        assert!(!is_retryable(&hinted(522, &[("x-should-retry", "false")])));
+    }
+
+    #[test]
+    fn truncated_body_transport_errors_are_retryable() {
+        let eof = std::io::Error::from(std::io::ErrorKind::UnexpectedEof);
+        assert!(is_retryable(&eof));
+        let hyper = std::io::Error::other("connection closed before message completed");
+        assert!(is_retryable(&hyper));
+        let body = std::io::Error::other("error reading a body from connection");
+        assert!(is_retryable(&body));
     }
 
     #[test]
