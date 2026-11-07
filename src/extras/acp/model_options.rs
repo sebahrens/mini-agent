@@ -42,13 +42,16 @@ pub(super) struct Overrides {
     pub(super) effort: Option<ReasoningEffort>,
 }
 
-/// Prefix that advertises a quick model whose alias is literally `default`,
-/// so it stays distinct from the synthetic "clear override" choice.
+/// Escape prefix of the wire encoding. Aliases that would collide with the
+/// synthetic "clear override" value (`default`) or with the prefix itself are
+/// sent as `alias:<alias>`, so the mapping alias -> wire value is injective:
+/// a value without the prefix is a plain alias (never `default`, never
+/// prefixed), and a value with it decodes by stripping exactly one prefix.
 const RESERVED_ALIAS_PREFIX: &str = "alias:";
 
 /// The value a client sends to select the quick-model `alias`.
 fn wire_value(alias: &str) -> String {
-    if alias == DEFAULT_VALUE {
+    if alias == DEFAULT_VALUE || alias.starts_with(RESERVED_ALIAS_PREFIX) {
         format!("{RESERVED_ALIAS_PREFIX}{alias}")
     } else {
         alias.to_owned()
@@ -126,14 +129,10 @@ pub(super) fn parse_model(cfg: &Config, value: &str) -> Result<Option<String>, S
     if value == DEFAULT_VALUE {
         return Ok(None);
     }
-    let quick = crate::config::quick_models_map(cfg);
-    if quick.contains_key(value) {
-        return Ok(Some(value.to_owned()));
-    }
-    if let Some(alias) = value.strip_prefix(RESERVED_ALIAS_PREFIX)
-        && alias == DEFAULT_VALUE
-        && quick.contains_key(alias)
-    {
+    // Decode before any lookup, so a configured alias that looks like an
+    // escaped value can never shadow the alias the value actually names.
+    let alias = value.strip_prefix(RESERVED_ALIAS_PREFIX).unwrap_or(value);
+    if wire_value(alias) == value && crate::config::quick_models_map(cfg).contains_key(alias) {
         return Ok(Some(alias.to_owned()));
     }
     Err(bounded_message(&format!(
@@ -257,6 +256,50 @@ mod tests {
         assert_eq!(json["currentValue"], "alias:default");
         let plain = cfg_with(&[("fast", "openai", "gpt-f")]);
         assert!(parse_model(&plain, "alias:default").is_err());
+    }
+
+    // mini-agent-xorxl.16
+    #[test]
+    fn reserved_prefix_aliases_get_unique_wire_values_that_round_trip() {
+        let cfg = cfg_with(&[
+            ("default", "p-default", "m-default"),
+            ("alias:default", "p-prefixed", "m-prefixed"),
+            ("alias:alias:default", "p-double", "m-double"),
+            ("fast", "p-fast", "m-fast"),
+        ]);
+        let json = serde_json::to_value(&config_options(&cfg, &Overrides::default())[0]).unwrap();
+        let values: Vec<String> = json["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["value"].as_str().unwrap().to_owned())
+            .collect();
+        let unique: std::collections::HashSet<_> = values.iter().collect();
+        assert_eq!(
+            unique.len(),
+            values.len(),
+            "duplicate wire values: {values:?}"
+        );
+        assert_eq!(values.len(), 5);
+        for (alias, provider) in [
+            ("default", "p-default"),
+            ("alias:default", "p-prefixed"),
+            ("alias:alias:default", "p-double"),
+            ("fast", "p-fast"),
+        ] {
+            let selected = parse_model(&cfg, &wire_value(alias)).unwrap().unwrap();
+            assert_eq!(selected, alias);
+            assert_eq!(&*route_for(&cfg, &selected).unwrap().provider, provider);
+            let current = Overrides {
+                model: Some(alias.into()),
+                effort: None,
+            };
+            let json = serde_json::to_value(&config_options(&cfg, &current)[0]).unwrap();
+            assert_eq!(json["currentValue"], wire_value(alias));
+        }
+        assert_eq!(parse_model(&cfg, "default"), Ok(None));
+        // Unescaped spellings of escaped aliases name nothing.
+        assert!(parse_model(&cfg, "alias:alias:alias:alias:default").is_err());
     }
 
     #[test]
