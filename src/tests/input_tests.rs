@@ -746,3 +746,30 @@ fn pasting_a_trailing_at_opens_the_file_picker() {
     editor.handle_paste("user@".to_string());
     assert!(!file_picker_open(&editor));
 }
+
+#[test]
+fn lone_ctrl_j_inserts_newline_and_does_not_submit() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "ab");
+    let submitted = editor.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+    assert!(submitted.is_none());
+    type_str(&mut editor, "cd");
+    assert_eq!(editor.buffer.as_str(), "ab\ncd");
+}
+
+#[test]
+fn backslash_enter_inserts_newline_and_consumes_the_backslash() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "line one\\");
+    assert!(editor.handle_key(press(KeyCode::Enter)).is_none());
+    type_str(&mut editor, "two");
+    assert_eq!(editor.buffer.as_str(), "line one\ntwo");
+}
+
+#[test]
+fn doubled_backslash_enter_still_submits() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "path\\\\");
+    let submitted = editor.handle_key(press(KeyCode::Enter));
+    assert_eq!(submitted.as_deref(), Some("path\\\\"));
+}

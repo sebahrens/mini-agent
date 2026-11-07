@@ -1547,6 +1547,17 @@ impl InputEditor {
         // Option-as-Meta on macOS, Option+L (`@` on a German layout) arrives
         // as Alt+l. Ctrl+Alt together is AltGr on Windows and carries the
         // composed character, so it still inserts. Ctrl+H stays backspace.
+        // Ctrl+J is the classic LF newline every terminal can send. A pasted
+        // '\n' is coalesced into a paste upstream (see `PasteBurst`), so a
+        // lone Ctrl+J that reaches here is a deliberate newline gesture.
+        if key.code == KeyCode::Char('j') && key.modifiers == KeyModifiers::CONTROL {
+            if self.picker.as_ref().is_some_and(|p| p.active()) {
+                return None;
+            }
+            self.buffer.insert(self.cursor, '\n');
+            self.cursor += 1;
+            return None;
+        }
         if is_modifier_chord(key) {
             return None;
         }
@@ -1559,6 +1570,21 @@ impl InputEditor {
                 if self.picker.as_ref().is_some_and(|p| p.active()) {
                     return None;
                 }
+                self.buffer.insert(self.cursor, '\n');
+                self.cursor += 1;
+                None
+            }
+            // Backslash-Enter: a trailing `\` before the cursor turns Enter into
+            // a newline (the backslash is consumed), for terminals that cannot
+            // report Shift+Enter. A doubled `\\` is left alone and submits.
+            KeyCode::Enter
+                if key.modifiers.is_empty()
+                    && self.buffer[..self.cursor].ends_with('\\')
+                    && !self.buffer[..self.cursor].ends_with("\\\\")
+                    && !self.picker.as_ref().is_some_and(|p| p.active()) =>
+            {
+                self.cursor -= 1;
+                self.buffer.remove(self.cursor);
                 self.buffer.insert(self.cursor, '\n');
                 self.cursor += 1;
                 None

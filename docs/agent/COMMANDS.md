@@ -810,7 +810,8 @@ one JSON object, which carries the extra `note` and `next_command` fields.
 | Shortcut | Action |
 | -------- | ------ |
 | `Enter` | Send message. |
-| `Shift+Enter` or `Alt+Enter` | Insert newline. |
+| `Shift+Enter` or `Alt+Enter` | Insert newline. Shift+Enter is only distinguishable from Enter in terminals that speak the kitty keyboard protocol (kitty, WezTerm, Ghostty, iTerm2 with CSI u enabled, recent Windows Terminal); in macOS Terminal.app, the default VS Code integrated terminal and tmux without `extended-keys` it arrives as a plain Enter and sends the draft. Alt+Enter needs the terminal to send ESC-CR (Terminal.app: enable "Use Option as Meta key"). |
+| `Ctrl+J` or `\` then `Enter` | Insert newline in any terminal. A lone Ctrl+J inserts a newline; a trailing backslash before the cursor is replaced by a newline when you press Enter (a doubled `\\` still submits). A Ctrl+J that arrives inside a paste burst is treated as pasted text. To bind another key, add a `newline` entry to your keybindings config (defaults: `shift+enter`, `alt+enter`); in tmux set `extended-keys on` to pass Shift+Enter through. |
 | `Ctrl+C` | Cancel the current agent response, validation, or shell command. Typed follow-up drafts remain in the editor unless the failed prompt is restored; in that case Ctrl+Y can recover the displaced draft. Queued inputs are dropped with a count. When idle it clears a non-empty draft (Ctrl+Y brings it back). The first press immediately acknowledges the interrupt and arms exit before cleanup begins; only a second consecutive `Ctrl+C` exits, with a shutdown acknowledgment. Any intervening key or paste disarms exit. |
 | `Ctrl+D` | Same interrupt behavior as `Ctrl+C` while something runs. When idle it deletes the character under the cursor in a non-empty draft and quits on an empty input. |
 | `Ctrl+Shift+C` | Copy selected text through the Unicode clipboard on Windows. |

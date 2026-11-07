@@ -4870,6 +4870,12 @@ impl Sandbox {
 
     /// Announce only the exceptional Linux general-process cwd remapping.
     /// Pure: never probes a backend, creates storage or changes authority.
+    /// True when shell commands run under bubblewrap, which mounts a fresh
+    /// private tmpfs at `/tmp` for every command (macOS keeps a persistent one).
+    pub(crate) fn shell_private_tmp(&self) -> bool {
+        cfg!(target_os = "linux") && self.enabled && self.backend == "bwrap"
+    }
+
     pub(crate) fn shell_cwd_alias(&self) -> Option<PathBuf> {
         if cfg!(target_os = "linux") && self.enabled && self.backend == "bwrap" {
             self.workspace_binding.as_ref().and_then(|workspace| {

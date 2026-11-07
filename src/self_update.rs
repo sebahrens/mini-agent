@@ -15,7 +15,7 @@
 //! install needs `--allow-unattested` or an interactive confirmation.
 //! `MINI_AGENT_SKIP_ATTESTATION=1` skips the check as in `install.sh`, and an
 //! older `--release` than the running version needs `--allow-downgrade` or a
-//! confirmation. `install.sh` also refreshes the bundled notice documents.
+//! confirmation. A successful update also refreshes the notice documents under `share/doc/mini-agent`.
 
 use std::ffi::OsString;
 use std::io::Read;
@@ -27,6 +27,10 @@ use sha2::{Digest, Sha256};
 const BINARY_NAME: &str = "mini-agent";
 const MAX_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
+/// Largest notice document taken from a release archive.
+const MAX_DOCUMENT_BYTES: u64 = 8 * 1024 * 1024;
+/// The notice documents `install.sh` installs next to the binary.
+const NOTICE_DOCUMENTS: [&str; 4] = ["LICENSE", "NOTICE", "SOURCE.md", "THIRD_PARTY_LICENSES"];
 const MAX_MANIFEST_BYTES: u64 = 128 * 1024;
 const API_TIMEOUT: Duration = Duration::from_secs(15);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
@@ -206,6 +210,13 @@ pub(crate) fn verified_binary(
 /// read through bounded readers. Entries are matched by exact name, never
 /// written to the paths they claim, so a hostile archive cannot traverse.
 fn extract_binary(archive: &[u8], name: &str) -> Result<Vec<u8>, String> {
+    extract_member(archive, name, MAX_BINARY_BYTES)?
+        .ok_or_else(|| format!("archive does not contain the {name} executable"))
+}
+
+/// Like [`extract_binary`] for any one member: `None` when absent, with the
+/// size of the member bounded by `max_bytes`.
+fn extract_member(archive: &[u8], name: &str, max_bytes: u64) -> Result<Option<Vec<u8>>, String> {
     let decoder = flate2::read::GzDecoder::new(archive);
     // Bound the decompressed stream so a decompression bomb cannot grow memory.
     let mut tar = decoder.take(MAX_ARCHIVE_BYTES.saturating_mul(2));
@@ -242,7 +253,7 @@ fn extract_binary(archive: &[u8], name: &str) -> Result<Vec<u8>, String> {
             if found.is_some() {
                 return Err(format!("archive contains {name} more than once"));
             }
-            if size == 0 || size > MAX_BINARY_BYTES {
+            if size == 0 || size > max_bytes {
                 return Err(format!("{name} in the archive has an unreasonable size"));
             }
             let mut data = Vec::new();
@@ -271,7 +282,79 @@ fn extract_binary(archive: &[u8], name: &str) -> Result<Vec<u8>, String> {
             skip(&mut tar, padded)?;
         }
     }
-    found.ok_or_else(|| format!("archive does not contain the {name} executable"))
+    Ok(found)
+}
+
+/// The notice documents present in an archive whose digest was already
+/// verified. Older releases lack some of them; those are simply absent.
+fn archive_documents(archive: &[u8]) -> Result<Vec<(&'static str, Vec<u8>)>, String> {
+    let mut documents = Vec::new();
+    for name in NOTICE_DOCUMENTS {
+        if let Some(data) = extract_member(archive, name, MAX_DOCUMENT_BYTES)? {
+            documents.push((name, data));
+        }
+    }
+    Ok(documents)
+}
+
+/// Where `install.sh` puts the notice documents for an executable at `exe`.
+fn notice_directory(exe: &Path) -> Option<PathBuf> {
+    let bin_dir = exe.parent()?;
+    let base = if bin_dir.file_name().is_some_and(|name| name == "bin") {
+        bin_dir.parent()?.to_path_buf()
+    } else {
+        bin_dir.to_path_buf()
+    };
+    Some(base.join("share").join("doc").join(BINARY_NAME))
+}
+
+/// How refreshing the installed notice documents went.
+#[derive(Debug, PartialEq, Eq)]
+enum NoticeRefresh {
+    Refreshed(usize),
+    /// The notice directory does not exist: nothing was installed there.
+    Missing(PathBuf),
+    Failed(PathBuf, String),
+}
+
+/// Replaces the documents in `directory` (which must already exist) one by one
+/// through a staged file and a rename, so a failure never leaves a half-written
+/// notice. Documents the directory does not hold yet are added.
+fn refresh_notice_documents(directory: &Path, documents: &[(&str, Vec<u8>)]) -> NoticeRefresh {
+    if !directory.is_dir() {
+        return NoticeRefresh::Missing(directory.to_path_buf());
+    }
+    let mut written = 0;
+    for (name, data) in documents {
+        let staged = directory.join(format!(".{name}.update.{}", std::process::id()));
+        let result = std::fs::write(&staged, data)
+            .and_then(|()| std::fs::rename(&staged, directory.join(name)));
+        if let Err(error) = result {
+            let _ = std::fs::remove_file(&staged);
+            return NoticeRefresh::Failed(directory.to_path_buf(), error.to_string());
+        }
+        written += 1;
+    }
+    NoticeRefresh::Refreshed(written)
+}
+
+fn report_notice_refresh(outcome: &NoticeRefresh) {
+    match outcome {
+        NoticeRefresh::Refreshed(count) if *count > 0 => {
+            println!("Refreshed {count} license and source notice document(s).");
+        }
+        NoticeRefresh::Refreshed(_) => {}
+        NoticeRefresh::Missing(directory) => eprintln!(
+            "Warning: {} does not exist, so the license and source notices were not refreshed; \
+             rerun install.sh to install the notices for this release.",
+            directory.display()
+        ),
+        NoticeRefresh::Failed(directory, error) => eprintln!(
+            "Warning: could not refresh the license and source notices in {}: {error}; \
+             rerun install.sh to update them.",
+            directory.display()
+        ),
+    }
 }
 
 fn skip(reader: &mut impl Read, bytes: u64) -> Result<(), String> {
@@ -472,11 +555,15 @@ async fn run_inner(args: UpdateArgs) -> Result<(), String> {
         exe.display()
     );
     if attestation != Attestation::Verified {
-        eprintln!(
-            "Note: this install was not provenance-verified; install.sh also refreshes the \
-             bundled notice documents."
-        );
+        eprintln!("Note: this install was not provenance-verified.");
     }
+    // The archive digest was verified above; its notices now replace the old ones.
+    let outcome = match (archive_documents(&archive), notice_directory(&exe)) {
+        (Ok(documents), Some(directory)) => refresh_notice_documents(&directory, &documents),
+        (Err(error), _) => NoticeRefresh::Failed(PathBuf::from("the release archive"), error),
+        (_, None) => NoticeRefresh::Failed(exe.clone(), "no install directory".into()),
+    };
+    report_notice_refresh(&outcome);
     Ok(())
 }
 
@@ -916,6 +1003,53 @@ mod tests {
             verified_binary(&manifest, "a.tar.gz", &archive).unwrap(),
             b"#!binary"
         );
+    }
+
+    #[test]
+    fn notices_from_the_archive_replace_installed_ones_when_the_directory_exists() {
+        let archive = gz_tar(&[
+            tar_entry("mini-agent", b'0', b"bin"),
+            tar_entry("LICENSE", b'0', b"new gpl"),
+            tar_entry("./THIRD_PARTY_LICENSES", b'0', b"new inventory"),
+            tar_entry("evil/../NOTICE", b'0', b"must not match"),
+        ]);
+        let documents = archive_documents(&archive).unwrap();
+        let names: Vec<&str> = documents.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, ["LICENSE", "THIRD_PARTY_LICENSES"]);
+
+        let root = std::env::temp_dir().join(format!("ma-notice-{}", std::process::id()));
+        let exe = root.join("bin").join("mini-agent");
+        let directory = notice_directory(&exe).unwrap();
+        assert_eq!(directory, root.join("share/doc/mini-agent"));
+        // Missing directory: nothing is created, the outcome names it.
+        assert_eq!(
+            refresh_notice_documents(&directory, &documents),
+            NoticeRefresh::Missing(directory.clone())
+        );
+        assert!(!directory.exists());
+        // Existing directory: documents are replaced in place.
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("LICENSE"), "old gpl").unwrap();
+        assert_eq!(
+            refresh_notice_documents(&directory, &documents),
+            NoticeRefresh::Refreshed(2)
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.join("LICENSE")).unwrap(),
+            "new gpl"
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.join("THIRD_PARTY_LICENSES")).unwrap(),
+            "new inventory"
+        );
+        // A directory that cannot take the write reports a failure, not a panic.
+        let blocked = root.join("blocked");
+        std::fs::create_dir_all(blocked.join("LICENSE")).unwrap();
+        assert!(matches!(
+            refresh_notice_documents(&blocked, &documents),
+            NoticeRefresh::Failed(..)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

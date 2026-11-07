@@ -256,7 +256,7 @@ default `bwrap` backend, the following matrix is normative:
 | Capability | Enforced policy |
 |------------|-----------------|
 | Filesystem reads | The canonical current workspace, mini-agent's canonical application cache, explicit read-only runtime roots (`/usr`, `/bin`, `/sbin`, `/lib`, `/lib32`, `/lib64`, `/nix` when present), the validated read-only `sandbox-toolchain-roots` (see below), any explicit profile `sandbox-read-roots`, `/etc/localtime`, `/etc/ld.so.cache`, and kernel/system metadata exposed by the new `/proc` |
-| Filesystem writes | The workspace and application cache bind mounts plus a private ephemeral `/tmp`, except the workspace Git metadata below, which stays read-only; the remaining sandbox root and runtime mounts are read-only |
+| Filesystem writes | The workspace and application cache bind mounts plus a private ephemeral `/tmp` (a fresh RAM-backed tmpfs per command, so files there do not survive to the next shell call; the shell tool description tells the model to keep cross-call files in the workspace), except the workspace Git metadata below, which stays read-only; the remaining sandbox root and runtime mounts are read-only |
 | Process namespace | Separate user, PID, IPC, UTS, and cgroup namespaces |
 | Devices | A synthetic minimal `/dev`; host device trees are not mounted |
 | Environment | `--clearenv`, followed only by `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `LANG`, `LC_ALL`, `COLORTERM`, and `NO_COLOR`; `TMPDIR` is fixed to `/tmp` |
