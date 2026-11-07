@@ -208,7 +208,7 @@ include `\n` for Enter) types into a running pty job and returns the output
 once it goes quiet (200 ms of silence, at most 3 s). The typed text is judged
 like a `shell` script: deny rules apply, manual mode asks, and an unapproved
 input is never written. The write gives up after 5 s with `the program is not
-reading its terminal input` and the bytes accepted. `pty` output shown to the
+reading its terminal input` and the bytes accepted; after that error no further byte of the input is delivered (on Windows the blocked write is cancelled with `CancelSynchronousIo` and joined before the error returns, and `written` is a lower bound), and the next input does not wait behind it. `pty` output shown to the
 model has CSI/OSC escape sequences and control bytes removed and carriage-return
 redraws collapsed to each line's final state; the log file keeps the raw bytes.
 Jobs without `pty` keep a null stdin and reject input.
