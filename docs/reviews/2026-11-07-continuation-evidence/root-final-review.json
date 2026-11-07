@@ -6,6 +6,11 @@
       "bead": "mini-agent-p0h9g.7",
       "priority": 2,
       "status": "Native Windows failure corrected in source; fresh native acceptance pending"
+    },
+    {
+      "bead": "mini-agent-gkqd4.26",
+      "priority": 2,
+      "status": "External Windows cwd boundary corrected; native comparison and helper acceptance pending; historical timeout attribution unconfirmed"
     }
   ],
   "scope": [
@@ -35,7 +40,7 @@
     "Stalled-output fixtures handle512-byte pipes and stale startup notices while preserving original negative-control failures",
     "Windows workspace-service drop explicitly terminates the exact retained Job despite process-wrap registry behavior"
   ],
-  "assessment": "Final source follow-up found and corrected the feature-boundary, native error-kind, output ownership and fixture issues. All actual stdout/stderr positive cases passed; the pre-repair binary still fails both original cancellation contracts. No further confirmed source finding in the reviewed paths, but final clearance is withheld pending fresh hosted CI, especially the previously failing Windows helper/descendant acceptance.",
+  "assessment": "Root reviewed the focused Windows external-path correction, required canonical identity preservation for ambiguous names, and corrected an unguarded process launch in its native regression. No further confirmed source finding in the reviewed paths; final clearance remains withheld pending native Windows helper, discovery and full hosted acceptance.",
   "residual_risks": [
     "Native Windows process lifecycle requires the new CI tests; local execution is macOS.",
     "A speculative model-hook workspace identity replacement race lacked a reproduced contract violation and was retained as unverified in the follow-on report.",

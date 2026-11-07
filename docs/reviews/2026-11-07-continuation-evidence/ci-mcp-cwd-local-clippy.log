@@ -1,0 +1,18 @@
+    Checking tower v0.5.3
+    Checking tokio-native-tls v0.3.1
+    Checking hyper-util v0.1.20
+    Checking serde_with v3.22.0
+    Checking jsonschema-value v0.49.9
+   Compiling mini-agent v1.12.0 (/Users/seb/projects/mini-agent)
+    Checking process-wrap v9.1.0
+    Checking sse-stream v0.2.5
+    Checking oauth2 v5.0.0
+    Checking jsonschema v0.49.9
+    Checking tower-http v0.6.11
+    Checking hyper-tls v0.6.0
+    Checking reqwest v0.13.4
+    Checking agent-client-protocol-schema v1.5.0
+    Checking rmcp v2.2.0
+    Checking rig-core v0.40.0 (/Users/seb/projects/mini-agent/patched-deps/rig-core)
+    Checking agent-client-protocol v2.0.0
+    Finished `dev` profile [unoptimized] target(s) in 50.63s

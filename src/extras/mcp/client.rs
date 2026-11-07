@@ -1607,6 +1607,28 @@ pub(super) fn stdio_command(
         anyhow::bail!("MCP stdio network denial requires an available workspace-service sandbox");
     }
 
+    // Keep canonical identities for resolution and sandbox authorization, but
+    // use the ordinary Windows spelling at the external-process boundary.
+    // Legacy runtimes can interpret a verbatim current directory as UNC.
+    #[cfg(windows)]
+    let (program, cwd) = {
+        let external_path = |path: std::path::PathBuf| {
+            let ordinary = crate::sandbox::windows::child_process_path(&path);
+            // Removing the verbatim prefix changes trailing-dot/space name
+            // semantics. Preserve the original spelling unless both names
+            // resolve to the same canonical identity.
+            if path.components().any(|component| {
+                matches!(component, std::path::Component::Normal(name) if name.to_string_lossy().ends_with(['.', ' ']))
+            }) {
+                return path;
+            }
+            match (path.canonicalize(), ordinary.canonicalize()) {
+                (Ok(identity), Ok(projected)) if identity == projected => ordinary,
+                _ => path,
+            }
+        };
+        (external_path(program), external_path(cwd))
+    };
     let mut child = Command::new(program);
     child
         .args(args)
@@ -2093,6 +2115,148 @@ mod tests {
         .unwrap();
 
         assert!(std::path::Path::new(command.as_std().get_program()).is_absolute());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mcp_stdio_external_cwd_retains_names_that_cannot_round_trip() {
+        let root = crate::tests::OwnedTestDirectory::new("mcp-external-distinct-cwd");
+        let root_path = root.path().canonicalize().unwrap();
+        let program = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        for name in ["distinct.", "distinct "] {
+            let cwd = root_path.join(name);
+            std::fs::create_dir(&cwd).unwrap();
+            let command = stdio_command(
+                program.to_str().unwrap(),
+                &[],
+                &cwd,
+                None,
+                &HashMap::new(),
+                &[],
+                None,
+                super::McpStdioNetwork::Inherit,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                command.as_std().get_current_dir().unwrap(),
+                cwd.canonicalize().unwrap()
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn mcp_stdio_external_cwd_uses_ordinary_windows_spelling() {
+        use crate::process_creation::TokioCommandCreationExt;
+
+        let root = crate::tests::OwnedTestDirectory::new("mcp-external-cwd");
+        let canonical = root.path().canonicalize().unwrap();
+        let ordinary = crate::sandbox::windows::child_process_path(&canonical);
+        std::fs::write(root.path().join("present.txt"), "present").unwrap();
+        let program = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let absolute_marker = ordinary
+            .join("present.txt")
+            .display()
+            .to_string()
+            .replace('\'', "''");
+        let script = format!(
+            "$values=@([Environment]::CurrentDirectory,[IO.File]::Exists('present.txt').ToString(),[IO.File]::Exists('{absolute_marker}').ToString()); $bytes=[Text.Encoding]::UTF8.GetBytes([String]::Join(\"`n\",$values)); $stdout=[Console]::OpenStandardOutput(); $stdout.Write($bytes,0,$bytes.Length); $stdout.Flush();"
+        );
+        let args = vec![
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-Command".into(),
+            script,
+        ];
+        let inherit = ["SystemRoot", "PATH", "TEMP", "TMP"].map(str::to_owned);
+        let mut observations = Vec::new();
+        for legacy_cwd in [false, true] {
+            // The comparison control recreates the former final launch boundary
+            // after all identical resolution and environment policy decisions.
+            let mut command = stdio_command(
+                program.to_str().unwrap(),
+                &args,
+                root.path(),
+                None,
+                &HashMap::new(),
+                &inherit,
+                None,
+                super::McpStdioNetwork::Inherit,
+                None,
+            )
+            .unwrap();
+            if legacy_cwd {
+                command.current_dir(&canonical);
+            }
+            let launched_cwd = command.as_std().get_current_dir().unwrap().to_path_buf();
+            let launched_program = std::path::PathBuf::from(command.as_std().get_program());
+            command
+                .kill_on_drop(true)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            let child = command.spawn_guarded().unwrap();
+            let outcome =
+                tokio::time::timeout(Duration::from_secs(15), child.wait_with_output()).await;
+            let stdout = match outcome {
+                Ok(Ok(output)) => {
+                    let stdout = String::from_utf8(output.stdout).unwrap();
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    eprintln!(
+                        "MCP external cwd legacy={legacy_cwd}, launch={launched_cwd:?}, output={stdout:?}, status={}, stderr={stderr}",
+                        output.status
+                    );
+                    if !legacy_cwd {
+                        assert!(output.status.success(), "cwd probe failed: {stderr}");
+                    }
+                    Some(stdout)
+                }
+                other => {
+                    eprintln!(
+                        "MCP external cwd legacy={legacy_cwd}, launch={launched_cwd:?}, outcome={other:?}"
+                    );
+                    assert!(
+                        legacy_cwd,
+                        "normal external cwd probe must finish successfully"
+                    );
+                    None
+                }
+            };
+            observations.push((launched_cwd, launched_program, stdout));
+        }
+        let (launched_cwd, launched_program, stdout) = &observations[0];
+        assert_eq!(launched_cwd, &ordinary);
+        assert_eq!(
+            launched_program,
+            &crate::sandbox::windows::child_process_path(&program.canonicalize().unwrap())
+        );
+        let stdout = stdout.as_ref().unwrap();
+        let lines = stdout.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3, "native cwd metadata: {stdout:?}");
+        assert!(
+            !lines[0].starts_with(r"\\?\"),
+            "external runtime received verbatim cwd: {stdout:?}"
+        );
+        assert_eq!(
+            std::path::Path::new(lines[0]).canonicalize().unwrap(),
+            canonical
+        );
+        assert_eq!(
+            &lines[1..],
+            &["True", "True"],
+            "native file lookup: {stdout:?}"
+        );
+        assert_eq!(
+            observations[1].0, canonical,
+            "comparison control must retain the former launch spelling"
+        );
+        assert_ne!(
+            observations[0].0, observations[1].0,
+            "control must exercise distinct Windows cwd spellings"
+        );
     }
 
     #[cfg(unix)]

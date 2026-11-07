@@ -90,6 +90,13 @@ headers override static `headers` of the same name. Failure notices carry the
 exit status only, never its output. It runs on every (re)connect, not on each
 request; command servers cannot use it.
 
+Windows stdio servers and header helpers keep canonical working-directory
+identities for validation. At the unsandboxed launch boundary, executable and
+cwd paths use ordinary Windows spelling when it resolves to the same canonical
+identity. Paths with trailing-dot/space components or a failed identity round
+trip retain their original spelling. This compatibility conversion does not
+change the explicitly delegated environment or executable search policy.
+
 URL servers require public addresses by default. Explicit `allow_local=true`
 also permits loopback-only endpoints: IPv4 `127/8`, IPv6 `::1`, normalized mapped
 loopback and DNS names resolving exclusively to loopback. DNS results remain
@@ -485,7 +492,8 @@ registered automatically. See [installation, permissions, and trust boundaries](
 before configuring its token and repository allowlist.
 
 MCP run children and header helpers retain an owned process-tree boundary for their full
-lifetime: a fresh process group/session on Unix and a kill-on-close Job Object on Windows.
+lifetime: a fresh process group/session on Unix and a Job Object with explicit
+termination before owner drop on Windows.
 Success, timeout, cancellation, and dropping the owning future retire descendants as well
 as the direct child. Native Windows MCP lifecycle tests retain live descendant process
 handles and require their exit signals after each retirement path.

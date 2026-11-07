@@ -2343,7 +2343,7 @@ pub(crate) mod windows_tree_tests {
             std::fs::write(
                 &child,
                 format!(
-                    "[IO.File]::WriteAllText('{}', $PID.ToString()); Start-Sleep -Seconds 300",
+                    "[IO.File]::WriteAllText('{}', $PID.ToString()); [Threading.Thread]::Sleep(300000)",
                     quote(&dir.path().join("child.pid"))
                 ),
             )
@@ -2364,9 +2364,9 @@ $i.RedirectStandardOutput=$true; $i.RedirectStandardError=$true;
 $p=[System.Diagnostics.Process]::new(); $p.StartInfo=$i;
 if(-not $p.Start()) {{ exit 9 }}
 Set-FixtureStage 'child-started';
-while(-not [IO.File]::Exists('{}')) {{ Start-Sleep -Milliseconds 10 }}
+while(-not [IO.File]::Exists('{}')) {{ [Threading.Thread]::Sleep(10) }}
 Set-FixtureStage 'child-ready';
-while(-not [IO.File]::Exists('{}')) {{ Start-Sleep -Milliseconds 10 }}
+while(-not [IO.File]::Exists('{}')) {{ [Threading.Thread]::Sleep(10) }}
 Set-FixtureStage 'released';
 $bytes=[System.Text.Encoding]::UTF8.GetBytes('{{}}');
 $stdout=[Console]::OpenStandardOutput();

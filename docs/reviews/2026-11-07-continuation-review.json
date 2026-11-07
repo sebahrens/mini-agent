@@ -1,6 +1,6 @@
 {
   "baseline": "eef3001c",
-  "scope": "25 continuation findings plus eight prior post-fix findings (33 total). All follow-up source corrections and affected local validation complete; fresh hosted feature/platform acceptance pending.",
+  "scope": "26 continuation review items plus eight prior post-fix findings (34 total). Native Windows helper follow-up remains under investigation; closure requires fresh hosted acceptance.",
   "findings": [
     {
       "id": "BOUNDARIES-A-1",
@@ -755,6 +755,23 @@
       "bead": "mini-agent-gkqd4.25",
       "review_report": "Native Windows platform CI",
       "implementation_status": "implemented;11 local linked-worktree regressions passed; native Windows acceptance pending"
+    },
+    {
+      "id": "windows-mcp-external-cwd",
+      "bead": "mini-agent-gkqd4.26",
+      "priority": 2,
+      "title": "Normalize external Windows MCP program and working-directory spelling while preserving canonical identity",
+      "evidence": [
+        "Native helper normal-success timeout persists after explicit PowerShell environment prerequisites. Stage is child-started while Rust has read child.pid and retained the live child.",
+        "Unsandboxed stdio_command passes canonical Windows cwd directly to external runtimes; native sandbox launcher and established foreground fixtures project external path spellings."
+      ],
+      "implementation_status": "Implemented and root-reviewed;71 affected reduced-feature tests, strict reduced all-targets Clippy and228 workflow/metadata policy tests passed. Native Windows comparison/acceptance pending.",
+      "correction": "Project final executable/cwd spellings only when canonical roundtrip preserves identity; retain trailing-dot/space components and non-roundtripping paths. Production environment clearing and executable resolution policy unchanged.",
+      "native_tests": [
+        "mcp_stdio_external_cwd_uses_ordinary_windows_spelling",
+        "mcp_stdio_external_cwd_retains_names_that_cannot_round_trip"
+      ],
+      "comparison_limit": "Former canonical-cwd launch is observational; its failure is not asserted. Fixture wait now uses Thread.Sleep to remove PowerShell module-autoload uncertainty. Existing helper/server descendant assertions and deadlines remain unchanged."
     }
   ],
   "validation": {
@@ -833,7 +850,26 @@
       "status": "Windows helper normal-success timeout remains; other matrix jobs still progressing",
       "windows_mcp": "Native server success/inherited-pipe/timeout/cancel/drop descendant cases and Job lifecycle-dispatch regression passed. Helper normal-success case timed out15s;42passed1failed in owning job.",
       "investigation": "Root and reviewer traced direct-leader wait through spawn_guarded and both Job wrappers; no further production wait defect established. Test-only follow-up delegates established PowerShell runtime prerequisites SystemRoot/PATH/TEMP/TMP and records parent stages/capture completion. Production environment clearing and15s/20s/5s bounds unchanged.",
-      "local_acceptance": "78 affected helper/stdio/subprocess-inventory Rust tests and117 package-metadata policy tests passed. cargo fmt and diff check passed. Production debug-install/smoke reused because follow-up is cfg(test) only."
+      "local_acceptance": "78 affected helper/stdio/subprocess-inventory Rust tests and117 package-metadata policy tests passed. cargo fmt and diff check passed. Production debug-install/smoke reused because follow-up is cfg(test) only.",
+      "second_run": "https://github.com/sebahrens/mini-agent/actions/runs/42401413200",
+      "second_run_result": "b87400e5 helper still times out15s at parent_stage=child-started; release_present=true; read_finished=false. No confirmed production wait-dispatch defect. Native server descendant cases continue passing. gkqd4.26 adds an identity-preserving external path boundary correction and comparison control; fixture waits remove cmdlet loading."
+    },
+    "windows_cwd_followup": {
+      "local": "71 MCP launch/stdio/inventory tests, strict mcp,acp all-targets Clippy,228 policy tests passed; format/diff checks passed.",
+      "native_pending": [
+        "mcp_stdio_external_cwd_uses_ordinary_windows_spelling",
+        "mcp_stdio_external_cwd_retains_names_that_cannot_round_trip",
+        "mcp_stdio_headers_helper_owns_windows_descendants_on_success_timeout_and_drop"
+      ],
+      "root_review": "Required guarded native test process creation, explicit pipes and kill-on-drop ownership, comparison rather than unasserted negative-control terminology, and preservation of ambiguous path names.",
+      "previous_cancelled_job": "Windows default compile128490222980 passed all native test steps and uploaded verified sources, but job ended cancelled after~30minutes. No test failure in its log; fresh run must complete successfully.",
+      "install": {
+        "command": "cargo install --path . --debug --locked",
+        "result": "passed",
+        "build_id": "73f63c6d4fa02b7d967dc0979427294f002f8a010cc27f7cf4324247ef612101",
+        "native_js": "PASS (2)",
+        "connectivity": "Prior live-provider pass reused; production change is Windows-only."
+      }
     }
   },
   "status": "local_ci_corrections_validated_native_ci_pending",

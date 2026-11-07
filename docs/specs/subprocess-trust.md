@@ -615,6 +615,14 @@ stdout/stderr cannot turn successful exit into a timeout. Explicit stop waits ar
 The MCP server's dedicated runtime bounds final standard-I/O pool shutdown after owned runs
 retire; it grants no early shutdown to ordinary agent work.
 
+The unsandboxed MCP stdio launcher resolves its working directory canonically
+before executable lookup or environment delegation. On Windows, only the final
+external program/cwd spelling is projected through `child_process_path`, matching
+the native sandbox launcher. The projection is used only when it canonicalizes
+back to the same identity; names with distinct trailing-dot/space semantics retain
+their verbatim spelling. This compatibility projection grants no additional path
+authority and does not change the cleared, explicitly delegated environment.
+
 The locked process-wrap 9.1.0 removes its wrapper registry while spawning, so
 its `JobObject` cannot see the `KillOnDrop` marker. The Windows workspace-service
 owner therefore explicitly invokes the retained Job's termination operation before
