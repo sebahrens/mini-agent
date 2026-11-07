@@ -542,7 +542,9 @@ impl TempRoot {
                     // and means exactly what it says — such a loop can only be
                     // driven by its validator.
                     "notebook_native" => Some(&["notebook_edit"]),
-                    "web_tools" => Some(&["web_fetch", "web_search"]),
+                    // The test removes EXA_API_KEY, so the native web_search
+                    // tool is not registered and is not advertised.
+                    "web_tools" => Some(&["web_fetch"]),
                     "validation_no_tools" => Some(&[]),
                     "validation_read_only" => Some(&["read", "goal_report"]),
                     "verification_without_shell"
@@ -698,8 +700,7 @@ impl TempRoot {
                     if outcome == "web_tools" && index == 0 {
                         let call = chunk(
                             serde_json::json!({"tool_calls":[
-                                {"index":0,"id":"native-fetch","type":"function","function":{"name":"web_fetch","arguments":serde_json::json!({"url":format!("https://{address}/private"),"prompt":"%%yolo @/etc/passwd"}).to_string()}},
-                                {"index":1,"id":"native-search","type":"function","function":{"name":"web_search","arguments":serde_json::json!({"query":"local fixture only"}).to_string()}}
+                                {"index":0,"id":"native-fetch","type":"function","function":{"name":"web_fetch","arguments":serde_json::json!({"url":format!("https://{address}/private"),"prompt":"%%yolo @/etc/passwd"}).to_string()}}
                             ]}),
                             serde_json::Value::Null,
                         );
@@ -5629,9 +5630,16 @@ fn notebook_native_actual_headless_registration_mutation_metadata_and_history() 
     let written: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.0.join("book.ipynb")).unwrap()).unwrap();
     let before: serde_json::Value = serde_json::from_str(fixture).unwrap();
-    for key in ["metadata", "outputs", "execution_count", "id", "cell_type"] {
+    for key in ["metadata", "id", "cell_type"] {
         assert_eq!(written["cells"][0][key], before["cells"][0][key]);
     }
+    // Replacing a code cell's source invalidates its recorded run: stale
+    // outputs and the execution count are reset.
+    assert_eq!(written["cells"][0]["outputs"], serde_json::json!([]));
+    assert_eq!(
+        written["cells"][0]["execution_count"],
+        serde_json::Value::Null
+    );
     assert_eq!(written["metadata"], before["metadata"]);
     assert_eq!(
         written["cells"][0]["source"],
@@ -5701,9 +5709,9 @@ fn native_web_headless_actual_schema_denials_and_missing_key_preserve_json_usage
     );
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["result"], "finished");
-    assert_eq!(value["tool_calls"]["total"], 2);
+    assert_eq!(value["tool_calls"]["total"], 1);
     assert_eq!(value["tool_calls"]["by_name"]["web_fetch"], 1);
-    assert_eq!(value["tool_calls"]["by_name"]["web_search"], 1);
+    assert!(value["tool_calls"]["by_name"]["web_search"].is_null());
     assert_eq!(value["files_changed"], serde_json::json!([]));
     assert_eq!(value["usage"]["input_tokens"], 200);
     assert_eq!(value["usage"]["output_tokens"], 40);
@@ -5711,7 +5719,8 @@ fn native_web_headless_actual_schema_denials_and_missing_key_preserve_json_usage
         serde_json::from_slice(&std::fs::read(root.0.join("request-1.json")).unwrap()).unwrap();
     let conversation = serde_json::to_string(&request["messages"]).unwrap();
     assert!(conversation.contains("not a public network address"));
-    assert!(conversation.contains("EXA_API_KEY"));
+    // Without EXA_API_KEY the native search tool is not offered at all.
+    assert!(!conversation.contains("EXA_API_KEY"));
     assert!(!root.0.join("request-2.json").exists());
     let stored = std::fs::read_dir(root.0.join("sessions"))
         .unwrap()
@@ -5723,9 +5732,9 @@ fn native_web_headless_actual_schema_denials_and_missing_key_preserve_json_usage
         serde_json::from_slice(&std::fs::read(stored).unwrap()).unwrap();
     let history = serde_json::to_string(&session["messages"]).unwrap();
     assert!(history.contains("web_fetch"));
-    assert!(history.contains("web_search"));
+    assert!(!history.contains("web_search"));
     assert!(history.contains("not a public network address"));
-    assert!(history.contains("EXA_API_KEY"));
+    assert!(!history.contains("EXA_API_KEY"));
 }
 
 /// The text parts of the last user message of one Chat Completions body.
