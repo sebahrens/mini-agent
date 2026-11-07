@@ -781,6 +781,8 @@ pub(crate) enum HostEffectError {
     AuditFailure,
     #[error("effect outcome is unknown after dispatch")]
     OutcomeUnknown,
+    #[error("existing file was not fully read in this session")]
+    OverwriteNotAuthorized,
 }
 
 impl HostEffectError {
@@ -809,6 +811,7 @@ impl HostEffectError {
             | Self::InvocationTerminal
             | Self::InvocationRecycled
             | Self::SessionDenied
+            | Self::OverwriteNotAuthorized
             | Self::PermissionDenied => EffectErrorCode::Denied,
         }
     }
@@ -818,6 +821,7 @@ impl HostEffectError {
             Self::NoConfiguredRoots => Some(DenialReason::NoConfiguredRoots),
             Self::OutsideRoots => Some(DenialReason::OutsideRoots),
             Self::PermissionDenied => Some(DenialReason::PermissionDenied),
+            Self::OverwriteNotAuthorized => Some(DenialReason::UnreadOverwrite),
             _ => None,
         }
     }
@@ -861,6 +865,7 @@ impl From<EffectServiceError> for HostEffectError {
             EffectServiceError::BodyLimit => Self::OutputLimit,
             EffectServiceError::BackendFailure => Self::BackendFailure,
             EffectServiceError::OutcomeUnknown => Self::OutcomeUnknown,
+            EffectServiceError::OverwriteNotAuthorized => Self::OverwriteNotAuthorized,
         }
     }
 }

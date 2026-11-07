@@ -24,7 +24,7 @@ use crate::extras::js::broker::{
     PreparedSkillManifest, SkillCallAuthority, SkillExportAuthoritySpec,
 };
 use crate::extras::js::host::{
-    AllowConfig, FileEffectService, ParentHostEffectService, SPAWN_STDERR_MAX_BYTES,
+    AllowConfig, FileEffectService, JsWriteGuard, ParentHostEffectService, SPAWN_STDERR_MAX_BYTES,
     SPAWN_STDOUT_MAX_BYTES, SpawnEffectService,
 };
 #[cfg(feature = "sandbox")]
@@ -681,6 +681,17 @@ async fn resolve_permission(
     }
 }
 
+/// Per-session inputs of [`super::host::JsWriteGuard`].
+#[derive(Clone)]
+pub(crate) struct JsWriteGuardConfig {
+    pub(crate) tracker: crate::agent::tools::ReadTracker,
+    pub(crate) diff_options: crate::agent::tools::mutation_diff::DiffOptions,
+    pub(crate) permission: Option<PermCheck>,
+    pub(crate) max_text_file_size: u64,
+}
+
+type DiffSink = Arc<std::sync::Mutex<Vec<crate::agent::tools::mutation_diff::MutationDiff>>>;
+
 pub struct JsTool {
     sandbox: Sandbox,
     allow_config: AllowConfig,
@@ -705,6 +716,8 @@ pub struct JsTool {
     #[cfg(feature = "skills")]
     skill_tool_call_ordinal: AtomicU64,
     profile: ModelEffectProfile,
+    /// Session overwrite guard for `write_file`; see [`JsWriteGuardConfig`].
+    write_guard: Option<JsWriteGuardConfig>,
     /// Whole-invocation deadline (`js-step-timeout-secs`, default 30 s).
     step_timeout: Duration,
 }
@@ -797,8 +810,17 @@ impl JsTool {
             #[cfg(feature = "skills")]
             skill_tool_call_ordinal: AtomicU64::new(0),
             profile: ModelEffectProfile::Full,
+            write_guard: None,
             step_timeout: STEP_TIMEOUT,
         }
+    }
+
+    /// Put `write_file` under the native `write` tool's rules: an existing
+    /// file is replaced only after a complete current `read`, the preimage is
+    /// checkpointed for `/rewind`, and the mutation diff is published.
+    pub(crate) fn with_write_guard(mut self, guard: JsWriteGuardConfig) -> Self {
+        self.write_guard = Some(guard);
+        self
     }
 
     /// Configure the whole-step deadline, clamped to
@@ -1177,7 +1199,7 @@ impl Tool for JsTool {
             "`glob(pattern: string, options?: {path?: string}): {paths: string[], truncated: boolean}` (synchronous, recursive, respects ignore files). Example: `const files = glob('**/*.rs').paths;`".to_string(),
             "`grep(pattern: string, options?: {path?: string, include?: string, case_sensitive?: boolean}): {matches: {path: string, line: number, text: string}[], truncated: boolean, skipped: {large: number, binary: number, non_utf8: number, unreadable: number}}` (synchronous Rust regex search; case-sensitive by default; matched lines only; invalid UTF-8 decoded lossily; `skipped` counts files NOT searched (large >10 MiB, binary, unreadable) and non_utf8 files searched lossily: no matches with skipped>0 is not proof of absence).".to_string(),
             format!(
-                "`write_file(path: string, content: string): void` (synchronous; max {} MiB). Example: `write_file('out.txt', 'done\\n');`",
+                "`write_file(path: string, content: string): void` (synchronous; max {} MiB; replacing an existing file requires reading its complete current contents with the `read` tool first, like `write`; replaced files are checkpointed for /rewind). Example: `write_file('out.txt', 'done\\n');`",
                 WRITE_FILE_MAX_BYTES / (1024 * 1024)
             ),
             format!(
@@ -1286,7 +1308,38 @@ impl Tool for JsTool {
     }
 
     async fn call(&self, args: JsArgs) -> Result<String, ToolError> {
-        let rendered = self.call_with_deadline(args).await?;
+        self.call_collecting(args, &DiffSink::default()).await
+    }
+
+    async fn call_structured(
+        &self,
+        args: JsArgs,
+        _extensions: &rig::tool::ToolCallExtensions,
+    ) -> Result<rig::tool::ToolReturn<String>, ToolError> {
+        let diffs = DiffSink::default();
+        let output = self.call_collecting(args, &diffs).await?;
+        let mut recorded = std::mem::take(&mut *diffs.lock().unwrap_or_else(|e| e.into_inner()));
+        if recorded.is_empty() {
+            return Ok(rig::tool::ToolReturn::success(output));
+        }
+        // One result carries one diff preview; say so when a script wrote more.
+        let extra = recorded.len() - 1;
+        let first = recorded.swap_remove(0);
+        let output = if extra > 0 {
+            format!(
+                "{output}\n\n[diff preview shown for {} only; {extra} more file write(s) in this call have no preview]",
+                first.path
+            )
+        } else {
+            output
+        };
+        Ok(rig::tool::ToolReturn::success(output).with_extension(first))
+    }
+}
+
+impl JsTool {
+    async fn call_collecting(&self, args: JsArgs, diffs: &DiffSink) -> Result<String, ToolError> {
+        let rendered = self.call_with_deadline(args, diffs).await?;
         if self.step_timeout == STEP_TIMEOUT {
             return Ok(rendered);
         }
@@ -1303,7 +1356,11 @@ impl Tool for JsTool {
 }
 
 impl JsTool {
-    async fn call_with_deadline(&self, args: JsArgs) -> Result<String, ToolError> {
+    async fn call_with_deadline(
+        &self,
+        args: JsArgs,
+        diffs: &DiffSink,
+    ) -> Result<String, ToolError> {
         self.permission_bridge
             .bridge()
             .check_async("js", &args.code)
@@ -1403,7 +1460,14 @@ impl JsTool {
                 bridge.clone(),
                 self.allow_config.clone(),
                 remaining_deadline,
-            ),
+            )
+            .with_write_guard(self.write_guard.as_ref().map(|guard| JsWriteGuard {
+                tracker: guard.tracker.clone(),
+                diff_options: guard.diff_options,
+                permission: guard.permission.clone(),
+                max_text_file_size: guard.max_text_file_size,
+                diffs: Arc::clone(diffs),
+            })),
             SpawnEffectService::new(self.sandbox.clone(), bridge.clone(), remaining_deadline),
         )
         .with_scratch_store(self.scratch.clone());
@@ -1515,7 +1579,10 @@ impl JsTool {
             );
         }
 
-        let output = render_step_result(&response);
+        let mut output = render_step_result(&response);
+        if let Some(notice) = crate::session::file_checkpoints::take_uncaptured_notice() {
+            output.push_str(&notice);
+        }
         #[cfg(feature = "skills")]
         let output = match self.proposal_service.as_ref() {
             Some(service) => with_settled_proposal_outcomes(output, service),

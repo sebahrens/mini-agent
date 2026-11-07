@@ -1979,7 +1979,7 @@ impl<M: rig::completion::CompletionModel> rig::agent::AgentHook<M> for MutationD
             extensions,
             ..
         } = &event
-            && matches!(*tool_name, "edit" | "write" | "notebook_edit")
+            && matches!(*tool_name, "edit" | "write" | "notebook_edit" | "js")
             && let Some(diff) = extensions.get::<MutationDiff>()
         {
             let (path, tool) = (diff.path.clone(), tool_name.to_string());
@@ -1995,7 +1995,7 @@ impl<M: rig::completion::CompletionModel> rig::agent::AgentHook<M> for MutationD
             extensions,
             ..
         } = event
-            && matches!(tool_name, "edit" | "write" | "notebook_edit")
+            && matches!(tool_name, "edit" | "write" | "notebook_edit" | "js")
             && matches!(outcome, rig::tool::ToolOutcome::Success)
             && let Some(diff) = extensions.get::<MutationDiff>()
             && diff.bounded()

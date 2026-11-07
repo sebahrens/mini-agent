@@ -79,6 +79,8 @@ pub(crate) enum EffectServiceError {
     BackendFailure,
     #[error("effect outcome is unknown after dispatch")]
     OutcomeUnknown,
+    #[error("existing file was not fully read in this session")]
+    OverwriteNotAuthorized,
 }
 
 /// Reversibly canonical permission identity for one structured spawn request.

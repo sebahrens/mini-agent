@@ -8,6 +8,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- `lsp_diagnostics` `directory` accepts `.`, `./src`, `src/` and `src//sub`: `.` components are dropped and an empty result means no filter, instead of silently listing nothing and answering "No diagnostics." (mini-agent-6ti22).
+- The ACP edit permission preview marks the last emitted diff `mini-agent-truncated` with `mini-agent-omitted-blocks` when blocks beyond 16 or beyond the 64 KiB budget were skipped, and the VS Code approval view states "N more edit blocks not shown" (mini-agent-937li).
+- The `js` tool's `write_file` now follows the native `write` overwrite rules: replacing an existing file requires a complete current `read` (otherwise refused with a message naming the rule), the exact preimage is checkpointed for `/rewind`, and the mutation diff is published (mini-agent-ad4rl).
 - `--no-session` keeps resumable subagent conversations in memory only: no `subagent-resume-store-*.json` is created under the tool-output directory (mini-agent-6myt0).
 - `.claude/rules` discovery is deterministic (sorted traversal) and reports every skipped or truncated rule, directory, link and glob with the limit hit in a `Rule discovery notices` block and a warning; a rule whose `paths:` scope is oversized or unparseable is skipped instead of becoming an always-on rule (mini-agent-z8719).
 - With `user_instruction_files = true`, `~/.claude/rules/**/*.md` is loaded (path-scoped delivery included) and rule symlinks whose canonical target is inside the workspace or `~/.claude/rules` are followed; other links are skipped with a notice (mini-agent-zyifs).

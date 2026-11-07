@@ -795,6 +795,7 @@ fn register_js_tool(
     containment_status: crate::sandbox::worker::WorkerContainmentStatus,
     workspace: Arc<crate::paths::WorkspaceBinding>,
     scratch: crate::extras::js::session::ScratchStore,
+    read_tracker: Option<tools::ReadTracker>,
     #[cfg(feature = "skills")] skill_services: Option<
         Arc<crate::extras::js::skills::session::SkillSessionServices>,
     >,
@@ -808,6 +809,7 @@ fn register_js_tool(
         containment_status,
         workspace,
         scratch,
+        read_tracker,
         #[cfg(feature = "skills")]
         skill_services,
     );
@@ -824,6 +826,7 @@ fn register_js_tool_with_status(
     containment_status: crate::sandbox::worker::WorkerContainmentStatus,
     workspace: Arc<crate::paths::WorkspaceBinding>,
     scratch: crate::extras::js::session::ScratchStore,
+    read_tracker: Option<tools::ReadTracker>,
     #[cfg(feature = "skills")] skill_services: Option<
         Arc<crate::extras::js::skills::session::SkillSessionServices>,
     >,
@@ -880,15 +883,24 @@ fn register_js_tool_with_status(
     let step_timeout_secs = cfg
         .js_step_timeout_secs
         .unwrap_or(crate::extras::js::types::STEP_TIMEOUT.as_secs());
+    let write_guard = read_tracker.map(|tracker| crate::extras::js::tool::JsWriteGuardConfig {
+        tracker,
+        diff_options: cfg.mutation_diff_options(),
+        permission: permission.clone(),
+        max_text_file_size: cfg.resolve_max_edit_file_size(),
+    });
     #[cfg(feature = "skills")]
     let mut js_tool = JsTool::new(sandbox, permission, ask_tx, allow_config)
         .with_scratch_store(scratch)
         .with_step_timeout_secs(step_timeout_secs);
 
     #[cfg(not(feature = "skills"))]
-    let js_tool = JsTool::new(sandbox, permission, ask_tx, allow_config)
+    let mut js_tool = JsTool::new(sandbox, permission, ask_tx, allow_config)
         .with_scratch_store(scratch)
         .with_step_timeout_secs(step_timeout_secs);
+    if let Some(guard) = write_guard {
+        js_tool = js_tool.with_write_guard(guard);
+    }
 
     #[cfg(feature = "skills")]
     if let Some(services) = skill_services {
@@ -1610,6 +1622,7 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
                 js_worker_containment_status,
                 workspace.clone(),
                 js_scratch,
+                Some(read_tracker.clone()),
                 #[cfg(feature = "skills")]
                 skill_services.clone(),
             );
@@ -3319,6 +3332,7 @@ mod js_tests {
             },
             workspace,
             crate::extras::js::session::ScratchStore::default(),
+            None,
             #[cfg(feature = "skills")]
             None,
         );
@@ -3350,6 +3364,7 @@ mod js_tests {
             },
             workspace_binding(),
             crate::extras::js::session::ScratchStore::default(),
+            None,
             #[cfg(feature = "skills")]
             None,
         );
@@ -3372,6 +3387,7 @@ mod js_tests {
             },
             workspace_binding(),
             crate::extras::js::session::ScratchStore::default(),
+            None,
             #[cfg(feature = "skills")]
             None,
         );

@@ -937,6 +937,9 @@ pub(super) fn effect_error_text(
             Some("outside configured roots; path is outside the allowed read roots")
         }
         Some(DenialReason::PermissionDenied) => Some("permission denied"),
+        Some(DenialReason::UnreadOverwrite) => Some(
+            "existing file was not fully read in this session; read the whole current file with the read tool first, or write a new path",
+        ),
         None => None,
     };
     effect_error_message(tool, error.code, detail)

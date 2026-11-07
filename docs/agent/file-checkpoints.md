@@ -20,7 +20,13 @@ external `edit` targets). Checkpoints are independent of displayed diff limits a
 post-tool output rewriting. The committed postimage is recorded before optional
 formatter work yields; a known formatter result updates that postimage. The
 ordinary request owns the capture, including native writes made by its child
-agents. Shell commands and arbitrary external processes are not checkpointed.
+agents. The `js` tool's `write_file` is captured the same way (it also appends
+the one-time uncaptured notice) and replaces an existing file only after the `read`
+tool returned its complete current contents, exactly like `write`; a refused
+overwrite names the rule and leaves the file untouched. `read_file` inside a
+script does not count as a read. One `js` result carries one mutation diff
+(the first file written); further writes in the same call are counted in the
+result, not previewed. Shell commands and arbitrary external processes are not checkpointed.
 
 Preimages are SHA-256 addressed private `.bin` files in the session's existing
 `tool-outputs/<opaque-session-directory>/checkpoints` directory. The private
