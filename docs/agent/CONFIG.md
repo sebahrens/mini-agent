@@ -3141,9 +3141,12 @@ never removes a user-defined entry.
 
 In `readonly` and `planwrite` modes, approval-free MCP access is limited to
 immutable built-in registrations and these exact read-only tool names:
-Exa `websearch` and `webfetch`; Context7 `get_context` and `search_docs`; and
-Grep.app `search_code` and `search_repos`. They are exempt because they only
-retrieve public web, documentation, or source-search results. The exemption is
+Context7 `get_context` and `search_docs`; and Grep.app `search_code` and
+`search_repos`. They are exempt because they only retrieve public
+documentation or source-search results. Exa `websearch` and `webfetch` are
+deliberately not exempt: they send arbitrary query text to, and fetch arbitrary
+URLs through, a third party, so they follow the normal MCP permission rules
+like any other network tool. The exemption is
 bound to mini-agent's built-in registration identity, not the configured server
 name or URL. Custom servers—including servers using the same name or
 endpoint—follow normal MCP permission rules, and any unlisted tool on a

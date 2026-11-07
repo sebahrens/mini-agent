@@ -93,7 +93,11 @@ impl TrustedMcpServer {
     /// rules until they are deliberately reviewed and added here.
     pub(crate) fn exempts_read_only_tool(self, tool_name: &str) -> bool {
         match self.0 {
-            TrustedMcpServerKind::Exa => matches!(tool_name, "websearch" | "webfetch"),
+            // Exa `websearch`/`webfetch` send arbitrary query text and fetch
+            // arbitrary URLs server-side, an unprompted exfiltration channel
+            // that bypasses per-host web_fetch approval, so they follow the
+            // normal MCP permission rules.
+            TrustedMcpServerKind::Exa => false,
             TrustedMcpServerKind::Context7 => {
                 matches!(tool_name, "get_context" | "search_docs")
             }

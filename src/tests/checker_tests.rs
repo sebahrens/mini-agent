@@ -2165,11 +2165,6 @@ fn mcp_read_only_exemption_allows_only_exact_trusted_pairs() {
     let mut checker = make_checker(SecurityMode::ReadOnly);
     for (registration, server_name, tool_names) in [
         (
-            McpServerConfig::built_in(TrustedMcpServer::EXA, HashMap::new()),
-            "Exa Web Search",
-            &["websearch", "webfetch"][..],
-        ),
-        (
             McpServerConfig::built_in(TrustedMcpServer::CONTEXT7, HashMap::new()),
             "Context7",
             &["get_context", "search_docs"][..],
@@ -2186,6 +2181,29 @@ fn mcp_read_only_exemption_allows_only_exact_trusted_pairs() {
                 checker.check_mcp(&input, registration.trusted_identity(), tool_name),
                 CheckResult::Allowed,
             ));
+        }
+    }
+}
+
+#[cfg(feature = "mcp")]
+#[test]
+fn mcp_exa_web_tools_are_not_exempt_in_readonly_or_planwrite() {
+    use std::collections::HashMap;
+
+    use crate::extras::mcp::config::{McpServerConfig, TrustedMcpServer};
+
+    let registration = McpServerConfig::built_in(TrustedMcpServer::EXA, HashMap::new());
+    for mode in [SecurityMode::ReadOnly, SecurityMode::PlanWrite] {
+        let mut checker = make_checker(mode);
+        for tool_name in ["websearch", "webfetch"] {
+            let input = format!("mcp_tool:Exa Web Search:{tool_name}");
+            assert!(
+                !matches!(
+                    checker.check_mcp(&input, registration.trusted_identity(), tool_name),
+                    CheckResult::Allowed,
+                ),
+                "{tool_name} must not bypass approval in {mode:?}",
+            );
         }
     }
 }
