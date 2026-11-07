@@ -277,7 +277,7 @@ pub(crate) async fn generate_for_session(
     cfg: &crate::config::Config,
     client: &crate::provider::AnyClient,
 ) -> (crate::event::UsageDelta, bool) {
-    generate_for_session_in(session, cfg, client, true).await
+    crate::startup::heap_future(|| generate_for_session_in(session, cfg, client, true)).await
 }
 
 /// [`generate_for_session`] for a caller that owns its own signal handling:
@@ -327,7 +327,7 @@ pub(crate) async fn generate_for_session_in(
         match title_client {
             Ok(client) => crate::spend::run::scope(
                 Some(spend),
-                generate(&request, &client, cfg, ledger.clone()),
+                crate::startup::heap_future(|| generate(&request, &client, cfg, ledger.clone())),
             )
             .await
             .map_err(std::io::Error::other),

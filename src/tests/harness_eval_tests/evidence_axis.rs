@@ -771,13 +771,18 @@ async fn run_arm(case: &EvidenceCase, values: &BTreeMap<String, u64>, arm: Arm) 
     let cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(scope.clone());
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        crate::spend::run::scope(
+        // Heap each wrapper layer: nested by value, the task-local scopes and
+        // the task call compound into megabyte-sized unoptimized poll frames
+        // that overflow the 2 MiB test thread.
+        Box::pin(crate::spend::run::scope(
             Some(run.clone()),
-            scope.run(crate::extras::subagents::scope_test_config(
-                configured,
-                task.call(args),
-            )),
-        ),
+            Box::pin(
+                scope.run(Box::pin(crate::extras::subagents::scope_test_config(
+                    configured,
+                    Box::pin(task.call(args)),
+                ))),
+            ),
+        )),
     )
     .await;
     cleanup.settle().await;

@@ -1645,7 +1645,6 @@ fn context63_actual_readonly_btw_factory_delivers_source_and_explicit_optout_dis
 }
 
 async fn prove_readonly_btw_factory_delivers_source_and_explicit_optout_disables_it() {
-    use clap::Parser;
     for enabled in [true, false] {
         let fixture = Fixture::new();
         fixture.instructions.prepare_initial(Vec::new(), 0).await;
@@ -1664,7 +1663,12 @@ async fn prove_readonly_btw_factory_delivers_source_and_explicit_optout_disables
         let cli = if enabled {
             crate::cli::Cli::default()
         } else {
-            crate::cli::Cli::parse_from(["mini-agent", "--no-context-files"])
+            // Built directly: clap's unoptimized `Cli::command()` frame alone
+            // overflows the physical 1 MiB thread this test proves against.
+            crate::cli::Cli {
+                no_context_files: true,
+                ..crate::cli::Cli::default()
+            }
         };
         let cfg = Config::default();
         let context = captured_context(&fixture);
