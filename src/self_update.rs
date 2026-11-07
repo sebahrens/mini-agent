@@ -579,15 +579,143 @@ pub(crate) enum Attestation {
     Skipped,
 }
 
+/// Limits for the helper and probe subprocesses `update` runs. The deadline is
+/// configurable with `MINI_AGENT_UPDATE_HELPER_TIMEOUT_SECS` (default 60).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HelperLimits {
+    pub deadline: Duration,
+    pub max_output: usize,
+}
+
+const DEFAULT_HELPER_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_HELPER_OUTPUT_BYTES: usize = 1024 * 1024;
+
+impl HelperLimits {
+    pub(crate) fn from_env() -> Self {
+        let deadline = std::env::var("MINI_AGENT_UPDATE_HELPER_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|secs| *secs > 0)
+            .map_or(DEFAULT_HELPER_TIMEOUT, Duration::from_secs);
+        Self {
+            deadline,
+            max_output: MAX_HELPER_OUTPUT_BYTES,
+        }
+    }
+}
+
+/// Runs `command` with a wall-clock deadline and a per-stream output cap. The
+/// child leads its own process group (Unix) so a timeout or overflow tears
+/// down every descendant; the failure is an error, never a partial success.
+pub(crate) fn run_bounded(
+    command: &mut std::process::Command,
+    limits: HelperLimits,
+) -> std::io::Result<std::process::Output> {
+    use crate::process_creation::StdCommandCreationExt as _;
+    use std::io::{Error, ErrorKind};
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let mut child = command.spawn_guarded()?;
+    let pid = child.id();
+    let (sender, receiver) = mpsc::channel::<(bool, Vec<u8>, bool)>();
+    for (is_stdout, stream) in [
+        (
+            true,
+            child
+                .stdout
+                .take()
+                .map(|s| Box::new(s) as Box<dyn Read + Send>),
+        ),
+        (
+            false,
+            child
+                .stderr
+                .take()
+                .map(|s| Box::new(s) as Box<dyn Read + Send>),
+        ),
+    ] {
+        let Some(stream) = stream else { continue };
+        let sender = sender.clone();
+        let cap = limits.max_output;
+        std::thread::spawn(move || {
+            let mut data = Vec::new();
+            let mut limited = stream.take(cap as u64 + 1);
+            let _ = limited.read_to_end(&mut data);
+            let overflow = data.len() > cap;
+            data.truncate(cap);
+            let _ = sender.send((is_stdout, data, overflow));
+        });
+    }
+    drop(sender);
+    let teardown = |child: &mut std::process::Child| {
+        #[cfg(unix)]
+        crate::sandbox::kill_process_group(pid);
+        #[cfg(windows)]
+        crate::sandbox::windows::terminate_owned_child(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+    };
+    let started = Instant::now();
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    let mut finished_streams = 0;
+    let mut status = None;
+    loop {
+        // Drain finished readers; an overflowing stream ends the run.
+        while let Ok((is_stdout, data, overflow)) = receiver.try_recv() {
+            finished_streams += 1;
+            if overflow {
+                teardown(&mut child);
+                return Err(Error::new(
+                    ErrorKind::Other,
+                    format!("output exceeded {} bytes", limits.max_output),
+                ));
+            }
+            if is_stdout {
+                stdout = data
+            } else {
+                stderr = data
+            }
+        }
+        if status.is_none() {
+            status = child.try_wait()?;
+        }
+        if status.is_some() && finished_streams >= 2 {
+            break;
+        }
+        if started.elapsed() >= limits.deadline {
+            teardown(&mut child);
+            return Err(Error::new(
+                ErrorKind::TimedOut,
+                format!("timed out after {}s", limits.deadline.as_secs_f64()),
+            ));
+        }
+        // A descendant holding a pipe after the leader exits is bounded by
+        // the same deadline above.
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Ok(std::process::Output {
+        status: status.expect("leader status recorded"),
+        stdout,
+        stderr,
+    })
+}
+
 fn run_gh(
     program: &std::ffi::OsStr,
     args: &[&std::ffi::OsStr],
+    limits: HelperLimits,
 ) -> Result<std::process::Output, std::io::Error> {
-    use crate::process_creation::StdCommandCreationExt as _;
-    std::process::Command::new(program)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .output_guarded()
+    run_bounded(std::process::Command::new(program).args(args), limits)
 }
 
 /// The workflow that signs release attestations: only artifacts built by this
@@ -607,6 +735,29 @@ pub(crate) fn check_attestation(
     skip: bool,
     no_gh: bool,
 ) -> Attestation {
+    check_attestation_with(
+        program,
+        archive,
+        repo,
+        tag,
+        skip,
+        no_gh,
+        HelperLimits::from_env(),
+    )
+}
+
+/// [`check_attestation`] with explicit helper limits. A `gh` that stalls or
+/// floods output is "unavailable" during the sign-in and capability probes
+/// (still needing confirmation) and a rejection during verification itself.
+pub(crate) fn check_attestation_with(
+    program: &std::ffi::OsStr,
+    archive: &Path,
+    repo: &str,
+    tag: &str,
+    skip: bool,
+    no_gh: bool,
+    limits: HelperLimits,
+) -> Attestation {
     use std::ffi::OsStr;
     if skip {
         return Attestation::Skipped;
@@ -616,7 +767,7 @@ pub(crate) fn check_attestation(
             "MINI_AGENT_INSTALL_NO_GH=1 disables the GitHub CLI".into(),
         );
     }
-    match run_gh(program, &[OsStr::new("auth"), OsStr::new("status")]) {
+    match run_gh(program, &[OsStr::new("auth"), OsStr::new("status")], limits) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Attestation::Unavailable("the GitHub CLI ('gh') is not installed".into());
         }
@@ -638,6 +789,7 @@ pub(crate) fn check_attestation(
             OsStr::new("verify"),
             OsStr::new("--help"),
         ],
+        limits,
     );
     let Some(help) = help.ok().filter(|output| output.status.success()) else {
         return Attestation::Unavailable(
@@ -670,6 +822,7 @@ pub(crate) fn check_attestation(
             OsStr::new("--source-ref"),
             OsStr::new(&format!("refs/tags/{tag}")),
         ],
+        limits,
     ) {
         Ok(output) if output.status.success() => Attestation::Verified,
         Ok(output) => {
@@ -833,11 +986,11 @@ async fn install_verified(exe: &Path, binary: &[u8], version: &str) -> Result<()
                 probe_clone.parent().map_or_else(String::new, |p| p.display().to_string())
             )
         })?;
-        use crate::process_creation::StdCommandCreationExt as _;
-        let output = std::process::Command::new(&probe_clone)
-            .arg("--version")
-            .output_guarded()
-            .map_err(|error| format!("the downloaded executable does not run: {error}"))?;
+        let output = run_bounded(
+            std::process::Command::new(&probe_clone).arg("--version"),
+            HelperLimits::from_env(),
+        )
+        .map_err(|error| format!("the downloaded executable does not run: {error}"))?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         if !output.status.success() || !version_probe_matches(&stdout, &requested_version) {
             return Err(format!(
@@ -1178,6 +1331,97 @@ mod tests {
         std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
+    }
+
+    #[cfg(unix)]
+    fn short_limits() -> HelperLimits {
+        HelperLimits {
+            deadline: Duration::from_millis(400),
+            max_output: 4096,
+        }
+    }
+
+    // mini-agent-xorxl.3: a stalled gh or probe is bounded and its tree reaped.
+    #[cfg(unix)]
+    #[test]
+    fn stalled_gh_times_out_without_surviving_descendants() {
+        let dir = std::env::temp_dir().join(format!("stall-gh-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let archive = dir.join("a.tar.gz");
+        let marker = dir.join("leaked");
+        let run = |gh: &Path| {
+            let started = std::time::Instant::now();
+            let outcome = check_attestation_with(
+                gh.as_os_str(),
+                &archive,
+                "owner/repo",
+                "v1.2.3",
+                false,
+                false,
+                short_limits(),
+            );
+            assert!(started.elapsed() < Duration::from_secs(5));
+            outcome
+        };
+        // Stalled sign-in probe: unavailable (still needs confirmation), never verified.
+        let stall_auth = stub_gh(
+            &dir,
+            &format!(
+                "if [ \"$1\" = auth ]; then trap '' TERM; (sleep 2; echo x > {}) & wait; fi\nexit 0",
+                marker.display()
+            ),
+        );
+        let outcome = run(&stall_auth);
+        assert!(
+            matches!(&outcome, Attestation::Unavailable(m) if m.contains("timed out")),
+            "{outcome:?}"
+        );
+        // Stalled verification: a failure, which aborts even with --allow-unattested.
+        let stall_verify = stub_gh(
+            &dir,
+            "if [ \"$3\" = --help ]; then echo '--signer-workflow --source-ref'; exit 0; fi\nif [ \"$1\" = attestation ]; then sleep 30; fi\nexit 0",
+        );
+        let outcome = run(&stall_verify);
+        assert!(
+            matches!(&outcome, Attestation::Failed(m) if m.contains("timed out")),
+            "{outcome:?}"
+        );
+        assert!(matches!(
+            attestation_action(&outcome, true),
+            AttestationAction::Abort(_)
+        ));
+        std::thread::sleep(Duration::from_millis(2300));
+        assert!(!marker.exists(), "descendant survived the timeout");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_that_never_exits_or_floods_is_bounded() {
+        let dir = std::env::temp_dir().join(format!("stall-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let hang = stub_gh(&dir, "sleep 30");
+        let error = run_bounded(
+            std::process::Command::new(&hang).arg("--version"),
+            short_limits(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        let flood = stub_gh(&dir, "yes | head -c 100000000");
+        let error = run_bounded(
+            std::process::Command::new(&flood).arg("--version"),
+            short_limits(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("exceeded"), "{error}");
+        // Normal output within bounds still passes through exactly.
+        let ok = stub_gh(&dir, "echo mini-agent 1.2.3");
+        let output = run_bounded(&mut std::process::Command::new(&ok), short_limits()).unwrap();
+        assert!(version_probe_matches(
+            &String::from_utf8_lossy(&output.stdout),
+            "1.2.3"
+        ));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[cfg(unix)]
