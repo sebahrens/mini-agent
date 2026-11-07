@@ -2402,16 +2402,22 @@ where
     let mut attempt = 0usize;
     loop {
         attempt += 1;
-        match run_summarizer_attempt(&make_request, max_output_tokens, retry_config, &observed, |error| {
-            (attempt < config.max_attempts && retry::is_retryable(error)).then(|| {
-                retry::retry_delay_for_error_with_hint_ceiling(
-                    backoff,
-                    max_backoff,
-                    config.hint_ceiling(),
-                    error,
-                )
-            })
-        })
+        match run_summarizer_attempt(
+            &make_request,
+            max_output_tokens,
+            retry_config,
+            &observed,
+            |error| {
+                (attempt < config.max_attempts && retry::is_retryable(error)).then(|| {
+                    retry::retry_delay_for_error_with_hint_ceiling(
+                        backoff,
+                        max_backoff,
+                        config.hint_ceiling(),
+                        error,
+                    )
+                })
+            },
+        )
         .await
         {
             Ok(done) => return Ok(done),
@@ -2549,7 +2555,9 @@ where
     while let Some(item) = stream.next().await {
         match item {
             Ok(StreamedAssistantContent::Text(text)) => {
-                if response.len().saturating_add(text.text.len()) > summarizer_stream_byte_limit(max_output_tokens) {
+                if response.len().saturating_add(text.text.len())
+                    > summarizer_stream_byte_limit(max_output_tokens)
+                {
                     return Err(anyhow::anyhow!("Compression output exceeds byte budget").into());
                 }
                 response.push_str(&text.text);
