@@ -2666,7 +2666,12 @@ fn rename_preview_is_bounded_and_never_names_outside_files() {
         &map,
     );
     assert_eq!(ops.outside, 2);
-    assert_eq!(ops.file_ops, vec!["create /ws/new.rs".to_string()]);
+    assert_eq!(
+        ops.file_ops,
+        vec![crate::extras::lsp::navigate::FileOp::Create(
+            std::path::PathBuf::from("/ws/new.rs")
+        )]
+    );
 }
 
 async fn inject_error_files(root: &TempDir, manager: &LspManager, files: usize, per_file: u32) {
@@ -3153,6 +3158,65 @@ async fn query_wait_ms_is_validated_and_per_file_only() {
             .to_string();
         assert!(error.contains("wait_ms"), "{error}");
     }
+}
+
+// mini-agent-xorxl.4: file operations obey the read policy on every path.
+#[test]
+fn edit_preview_file_operations_never_name_read_denied_paths() {
+    use crate::agent::tools::lsp::{TextView, render_edit_preview_with};
+    use crate::extras::lsp::navigate::edit_preview;
+    let root = std::path::PathBuf::from("/ws");
+    let map = |uri: &str| uri.strip_prefix("file:///ws/").map(|rest| root.join(rest));
+    let edit = serde_json::json!({"documentChanges": [
+        {"kind": "delete", "uri": "file:///ws/hidden-name.rs"},
+        {"kind": "rename", "oldUri": "file:///ws/hidden-src.rs", "newUri": "file:///ws/ok-dst.rs"},
+        {"kind": "rename", "oldUri": "file:///ws/ok-src.rs", "newUri": "file:///ws/hidden-dst.rs"},
+        {"kind": "create", "uri": "file:///ws/visible-new.rs"},
+        {"textDocument": {"uri": "file:///ws/hidden-edit.rs"}, "edits": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}, "newText": "t"}]},
+        {"textDocument": {"uri": "file:///ws/shown.rs"}, "edits": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}, "newText": "t"}]},
+    ]});
+    let preview = edit_preview(&edit, &map);
+    let deny: crate::agent::tools::find_files::PathFilter =
+        std::sync::Arc::new(|path, _| path.to_string_lossy().contains("hidden"));
+    let views = [
+        TextView::default(),
+        TextView {
+            full: true,
+            ..TextView::default()
+        },
+        TextView {
+            edit: Some(1),
+            ..TextView::default()
+        },
+    ];
+    for view in views {
+        for rename in [false, true] {
+            let text =
+                render_edit_preview_with(&preview, &root, Some(&deny), rename, "n", (0, 100), view);
+            for name in ["hidden-name", "hidden-src", "hidden-dst", "hidden-edit"] {
+                assert!(!text.contains(name), "{text}");
+            }
+        }
+    }
+    let text = render_edit_preview_with(
+        &preview,
+        &root,
+        Some(&deny),
+        false,
+        "",
+        (0, 100),
+        TextView::default(),
+    );
+    assert!(
+        text.contains("create visible-new.rs") || text.contains("visible-new.rs"),
+        "{text}"
+    );
+    assert!(
+        text.contains("[4 files hidden by permission rules]"),
+        "{text}"
+    );
 }
 
 // mini-agent-5pb74: the compact listing cuts long replacements visibly, and the

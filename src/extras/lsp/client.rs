@@ -1150,6 +1150,16 @@ impl LspClient {
         )?)
     }
 
+    /// Like [`Self::parent_path`] for workspace-edit previews, where create and
+    /// rename destinations do not exist yet. An absent tail is accepted only
+    /// when it is plain names below an existing canonical in-workspace ancestor.
+    pub(crate) fn parent_edit_path(&self, wire_uri: &str) -> Option<PathBuf> {
+        if let Some(path) = self.parent_path(wire_uri) {
+            return Some(path);
+        }
+        absent_edit_path(&self.workspace, &self.server_root, wire_uri)
+    }
+
     #[cfg(test)]
     pub(crate) async fn request_for_test(&self, timeout: Duration) -> Option<Value> {
         self.request("mini-agent/test", json!({}), timeout).await
@@ -1884,6 +1894,54 @@ fn parent_diagnostic_uri(
     file_uri(&parent)
 }
 
+/// Containment mapping for a URI whose file may not exist yet (edit previews).
+fn absent_edit_path(
+    workspace: &crate::paths::WorkspaceBinding,
+    server_root: &Path,
+    raw_uri: &str,
+) -> Option<PathBuf> {
+    workspace.validate().ok()?;
+    let path = file_path(raw_uri)?;
+    if file_uri(&path).as_deref() != Some(raw_uri) {
+        return None;
+    }
+    let wire_root = file_path(&file_uri(server_root)?)?;
+    let parent_root = file_path(&file_uri(workspace.root())?)?;
+    let relative = path
+        .strip_prefix(&wire_root)
+        .or_else(|_| path.strip_prefix(&parent_root))
+        .ok()?;
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    let target = workspace.root().join(relative);
+    // Walk up to the nearest existing ancestor; it must be canonical (no
+    // symlink aliases) and strictly inside the workspace root.
+    let mut ancestor = target.as_path();
+    loop {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(_) => break,
+            Err(_) => ancestor = ancestor.parent()?,
+        }
+    }
+    if ancestor == target {
+        // Exists: the strict mapping already refused it.
+        return None;
+    }
+    if !ancestor.starts_with(workspace.root())
+        || std::fs::canonicalize(ancestor).ok()? != ancestor
+        || !std::fs::metadata(ancestor).ok()?.is_dir()
+    {
+        return None;
+    }
+    workspace.validate().ok()?;
+    Some(target)
+}
+
 fn validate_diagnostic_envelope(workspace_uri: &str, params: &Value) -> DiagnosticStoreOutcome {
     let Some(uri) = params.get("uri").and_then(Value::as_str) else {
         return DiagnosticStoreOutcome::LimitExceeded;
@@ -2392,6 +2450,60 @@ mod boundary_tests {
             read_document_text(unicode.as_bytes()).await.unwrap(),
             unicode
         );
+    }
+
+    // mini-agent-xorxl.15: create/rename destinations do not exist yet.
+    #[test]
+    fn edit_preview_mapping_accepts_absent_in_workspace_destinations_only() {
+        let temp = std::env::temp_dir().join(format!("lsp-edit-map-{}", uuid::Uuid::new_v4()));
+        let root = temp.join("workspace");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join("existing.rs"), "x").unwrap();
+        let outside = temp.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(&root).unwrap());
+        let server_root = workspace_service_root(&root);
+        let uri = |rel: &str| file_uri(&server_root.join(rel)).unwrap();
+        assert_eq!(
+            absent_edit_path(&workspace, &server_root, &uri("new.rs")),
+            Some(root.join("new.rs"))
+        );
+        assert_eq!(
+            absent_edit_path(&workspace, &server_root, &uri("sub/deeper/new.rs")),
+            Some(root.join("sub/deeper/new.rs"))
+        );
+        // Existing files are left to the strict mapper.
+        assert_eq!(
+            absent_edit_path(&workspace, &server_root, &uri("existing.rs")),
+            None
+        );
+        let wire_root_uri = file_uri(&server_root).unwrap();
+        for bad in [
+            file_uri(&outside.join("new.rs")).unwrap(),
+            format!("{wire_root_uri}/%2e%2e/new.rs"),
+            format!("{wire_root_uri}/sub/%2e%2e/%2e%2e/new.rs"),
+            wire_root_uri.clone(),
+        ] {
+            assert_eq!(
+                absent_edit_path(&workspace, &server_root, &bad),
+                None,
+                "{bad}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+            assert_eq!(
+                absent_edit_path(&workspace, &server_root, &uri("link/new.rs")),
+                None
+            );
+            std::os::unix::fs::symlink(outside.join("gone"), root.join("dangling")).unwrap();
+            assert_eq!(
+                absent_edit_path(&workspace, &server_root, &uri("dangling")),
+                None
+            );
+        }
     }
 
     #[tokio::test]
