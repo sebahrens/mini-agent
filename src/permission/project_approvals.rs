@@ -42,7 +42,9 @@ fn valid(rule: &ProjectApproval) -> bool {
         && !rule.pattern.is_empty()
         && rule.pattern.len() <= MAX_FIELD_BYTES
         && !rule.tool.chars().any(char::is_control)
-        && !rule.pattern.contains(['\0', '\n', '\r'])
+        // Newlines are legal: a shell AllowAlways key is the exact complete
+        // script, and the store is JSON.
+        && !rule.pattern.contains('\0')
 }
 
 fn read(state_dir: &Path, workspace: &Path) -> anyhow::Result<Store> {
@@ -74,7 +76,15 @@ pub(crate) fn load(state_dir: &Path, workspace: &Path) -> anyhow::Result<Vec<Pro
 
 /// Persist `rule` for `workspace`; an identical rule is not duplicated.
 pub(crate) fn add(state_dir: &Path, workspace: &Path, rule: ProjectApproval) -> anyhow::Result<()> {
-    anyhow::ensure!(valid(&rule), "approval rule is empty or oversized");
+    anyhow::ensure!(
+        !rule.tool.is_empty() && !rule.pattern.is_empty(),
+        "approval rule is empty"
+    );
+    anyhow::ensure!(
+        rule.tool.len() <= 128 && rule.pattern.len() <= MAX_FIELD_BYTES,
+        "approval rule is larger than the {MAX_FIELD_BYTES}-byte per-rule limit"
+    );
+    anyhow::ensure!(valid(&rule), "approval rule contains control characters");
     let mut store = read(state_dir, workspace)?;
     if store.rules.contains(&rule) {
         return Ok(());
@@ -136,7 +146,13 @@ mod tests {
             load(&state, &two).unwrap().is_empty(),
             "scoped to its workspace"
         );
-        assert!(add(&state, &one, rule("shell", "a\nb")).is_err());
+        assert!(add(&state, &one, rule("shell", "a\0b")).is_err());
+        add(&state, &one, rule("shell", "cd build\nmake")).unwrap();
+        assert_eq!(
+            load(&state, &one).unwrap().last().unwrap(),
+            &rule("shell", "cd build\nmake")
+        );
+        remove(&state, &one, Some(3)).unwrap();
         assert_eq!(
             remove(&state, &one, Some(1)).unwrap(),
             vec![rule("shell", "cargo test")]

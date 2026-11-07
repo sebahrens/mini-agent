@@ -3040,9 +3040,10 @@ fn is_path_tool_name(tool: &str) -> bool {
 /// The other file-modifying rule keys that share `tool`'s capability.
 fn write_family_siblings(tool: &str) -> &'static [&'static str] {
     match tool {
-        "write" => &["edit", "notebook_edit"],
-        "edit" => &["write", "notebook_edit"],
-        "notebook_edit" => &["write", "edit"],
+        "write" => &["edit", "notebook_edit", "js/write_file"],
+        "edit" => &["write", "notebook_edit", "js/write_file"],
+        "notebook_edit" => &["write", "edit", "js/write_file"],
+        "js/write_file" => &["write", "edit", "notebook_edit"],
         _ => &[],
     }
 }
@@ -3809,6 +3810,72 @@ mod tests {
         )
         .unwrap();
         assert_eq!(checker.check_path("edit", &target), CheckResult::Ask);
+    }
+
+    // mini-agent-6syvp: a configured bash rule replaces only the convenience
+    // allows; the built-in destructive denies stay (documented in CONFIG.md).
+    #[test]
+    fn configured_bash_rule_keeps_builtin_destructive_denies() {
+        let configs = PermissionConfigs::from(PermissionConfig {
+            allow_entries: Some([("bash".to_owned(), vec!["cargo test".to_owned()])].into()),
+            ..PermissionConfig::default()
+        });
+        let mut checker =
+            PermissionChecker::new(&configs, SecurityMode::Standard, None, None).unwrap();
+        assert!(matches!(
+            checker.check("shell", "dd if=/dev/zero of=x"),
+            CheckResult::Denied(_)
+        ));
+        assert!(matches!(
+            checker.check("shell", "rm -rf /tmp/x/*"),
+            CheckResult::Denied(_)
+        ));
+    }
+
+    // mini-agent-st28w: edit/notebook_edit rules also govern js/write_file.
+    #[test]
+    fn write_family_deny_and_ask_cover_js_write_file() {
+        let root = crate::tests::OwnedTestDirectory::new("st28w-js-write");
+        let env_file = root.path().canonicalize().unwrap().join("prod.env");
+        std::fs::write(&env_file, "x").unwrap();
+        let target = env_file.to_string_lossy().to_string();
+        for key in ["write", "edit", "notebook_edit"] {
+            let configs = PermissionConfigs::from(PermissionConfig {
+                deny_entries: Some([(key.to_owned(), vec!["**/*.env".to_owned()])].into()),
+                ..PermissionConfig::default()
+            });
+            let mut checker = PermissionChecker::new(
+                &configs,
+                SecurityMode::Standard,
+                Some(root.path().to_path_buf()),
+                None,
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    checker.check_path("js/write_file", &target),
+                    CheckResult::Denied(_)
+                ),
+                "deny `{key}` must deny js/write_file"
+            );
+            let configs = PermissionConfigs::from(PermissionConfig {
+                ask_entries: Some([(key.to_owned(), vec!["**/*.env".to_owned()])].into()),
+                default: Some(Action::Allow),
+                ..PermissionConfig::default()
+            });
+            let mut checker = PermissionChecker::new(
+                &configs,
+                SecurityMode::Standard,
+                Some(root.path().to_path_buf()),
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                checker.check_path("js/write_file", &target),
+                CheckResult::Ask,
+                "ask `{key}` must ask for js/write_file"
+            );
+        }
     }
 
     #[test]

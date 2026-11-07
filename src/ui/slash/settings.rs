@@ -495,7 +495,12 @@ pub(crate) fn project_approval_lines(
                     rules
                         .iter()
                         .enumerate()
-                        .map(|(index, rule)| format!("  {}. {}: {}", index + 1, rule.tool, rule.pattern)),
+                        .map(|(index, rule)| format!(
+                            "  {}. {}: {}",
+                            index + 1,
+                            rule.tool,
+                            rule.pattern.replace('\r', "\\r").replace('\n', "\\n")
+                        )),
                 );
                 lines.push("  remove with /permissions forget <n|all>".into());
                 lines

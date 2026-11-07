@@ -1726,6 +1726,69 @@ impl Config {
         Ok(())
     }
 
+    /// Revert any tool limit that `self` set to zero but `base` did not, and
+    /// return a warning per reverted key. Used for project/local layers, whose
+    /// benign limit keys apply without a trust prompt: a zero there must not
+    /// abort startup (`validate_tool_limits`) for the whole repository.
+    pub(crate) fn revert_zero_tool_limits(&mut self, base: &Config, source: &str) -> Vec<String> {
+        let mut slots: Vec<(&str, &mut Option<u64>, Option<u64>)> = vec![
+            (
+                "max_read_lines",
+                &mut self.max_read_lines,
+                base.max_read_lines,
+            ),
+            (
+                "max_grep_results",
+                &mut self.max_grep_results,
+                base.max_grep_results,
+            ),
+            (
+                "max_find_results",
+                &mut self.max_find_results,
+                base.max_find_results,
+            ),
+            (
+                "max_list_dir_entries",
+                &mut self.max_list_dir_entries,
+                base.max_list_dir_entries,
+            ),
+            #[cfg(feature = "subagents")]
+            (
+                "subagent_max_read_lines",
+                &mut self.subagent_max_read_lines,
+                base.subagent_max_read_lines,
+            ),
+            #[cfg(feature = "subagents")]
+            (
+                "subagent_max_grep_results",
+                &mut self.subagent_max_grep_results,
+                base.subagent_max_grep_results,
+            ),
+            #[cfg(feature = "subagents")]
+            (
+                "subagent_max_find_results",
+                &mut self.subagent_max_find_results,
+                base.subagent_max_find_results,
+            ),
+            #[cfg(feature = "subagents")]
+            (
+                "subagent_max_list_dir_entries",
+                &mut self.subagent_max_list_dir_entries,
+                base.subagent_max_list_dir_entries,
+            ),
+        ];
+        let mut warnings = Vec::new();
+        for (name, slot, inherited) in slots.iter_mut() {
+            if **slot == Some(0) && *inherited != Some(0) {
+                **slot = *inherited;
+                warnings.push(format!(
+                    "{source}: {name} = 0 is invalid (must be at least 1); ignored"
+                ));
+            }
+        }
+        warnings
+    }
+
     pub fn resolve_max_grep_results(&self) -> u64 {
         self.max_grep_results.unwrap_or(150).max(1)
     }
