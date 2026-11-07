@@ -3210,22 +3210,18 @@ impl Startup {
         // segments plus the final one, as `json_usage` does for tokens
         // (mini-agent-bz8k0). Only `interactions` is persisted below: the
         // earlier segments are already in the session.
-        let reported_interactions = if json_output {
-            reported_headless_interactions(&relief_interactions, &interactions)
-        } else {
-            Vec::new()
-        };
         let json_context = if json_output {
-            let files_changed = crate::print::files_changed_since(
-                self.workspace.root(),
-                change_baseline.as_ref(),
-                &reported_interactions,
+            Some(
+                headless_json_context(
+                    self.workspace.root(),
+                    change_baseline.as_ref(),
+                    &relief_interactions,
+                    &interactions,
+                    &self.session,
+                    &self.cfg,
+                )
+                .await,
             )
-            .await;
-            Some((
-                files_changed,
-                crate::print::HeadlessPricing::from_session(&self.session, &self.cfg),
-            ))
         } else {
             None
         };
@@ -3346,7 +3342,7 @@ impl Startup {
         session::storage::report_pending_save_notices(&mut self.session, |notice| {
             eprintln!("warning: {notice}")
         });
-        if let Some((files_changed, pricing)) = json_context {
+        if let Some((files_changed, pricing, reported_interactions)) = json_context {
             let stop_reason = if pending_question.is_some() {
                 crate::print::HeadlessStopReason::AwaitingUser
             } else if failure.as_ref().is_some_and(|error| {
@@ -4421,13 +4417,7 @@ async fn run_headless_goal_rounds(
                 )
             })
             .await;
-            return HeadlessRounds {
-                turn: relieved.turn,
-                prompt: relieved.prompt,
-                persisted: relieved.persisted,
-                relief_usage: relieved.relief_usage,
-                relief_interactions: relieved.relief_interactions,
-            };
+            return relieved.into();
         };
         return HeadlessRounds {
             turn,
@@ -5359,6 +5349,42 @@ pub(crate) fn loop_round_info(
     }
 }
 
+/// Edited files and pricing for the headless JSON, computed over the tool
+/// traffic of the earlier relief segments and the final one
+/// (mini-agent-bz8k0).
+async fn headless_json_context(
+    workspace: &std::path::Path,
+    baseline: Option<&crate::print::WorkspaceChangeBaseline>,
+    relief: &[rig::completion::Message],
+    last: &[rig::completion::Message],
+    session: &Session,
+    cfg: &crate::config::Config,
+) -> (
+    Vec<String>,
+    crate::print::HeadlessPricing,
+    Vec<rig::completion::Message>,
+) {
+    let reported = reported_headless_interactions(relief, last);
+    let files_changed = crate::print::files_changed_since(workspace, baseline, &reported).await;
+    (
+        files_changed,
+        crate::print::HeadlessPricing::from_session(session, cfg),
+        reported,
+    )
+}
+
+impl From<RelievedHeadlessTurn> for HeadlessRounds {
+    fn from(relieved: RelievedHeadlessTurn) -> Self {
+        Self {
+            turn: relieved.turn,
+            prompt: relieved.prompt,
+            persisted: relieved.persisted,
+            relief_usage: relieved.relief_usage,
+            relief_interactions: relieved.relief_interactions,
+        }
+    }
+}
+
 /// Tool traffic the headless JSON reports: the earlier context-relief
 /// segments followed by the final one (mini-agent-bz8k0).
 fn reported_headless_interactions(
@@ -6273,19 +6299,27 @@ mod tests {
             },
         )
         .await;
-        let reported = super::reported_headless_interactions(
-            &relieved.relief_interactions,
-            &relieved.turn.interactions,
-        );
+        // The same conversion and JSON computation `finish_print_model`
+        // runs, so reverting either leg fails here.
+        let rounds: super::HeadlessRounds = relieved.into();
         let dir = crate::tests::OwnedTestDirectory::new("relief-json-traffic");
+        let (files_changed, pricing, reported) = super::headless_json_context(
+            dir.path(),
+            None,
+            &rounds.relief_interactions,
+            &rounds.turn.interactions,
+            &session,
+            &cfg,
+        )
+        .await;
         let json: serde_json::Value = serde_json::from_str(
             &crate::print::render_headless_json(
                 dir.path(),
                 "done",
                 &reported,
                 Default::default(),
-                Vec::new(),
-                crate::print::HeadlessPricing::from_session(&session, &cfg),
+                files_changed,
+                pricing,
                 crate::print::HeadlessStopReason::Completed,
                 #[cfg(feature = "goal")]
                 None,
