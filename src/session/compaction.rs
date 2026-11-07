@@ -25,27 +25,51 @@ pub(crate) fn restored_read_windows(
     if budget_tokens == 0 {
         return None;
     }
-    let mut calls = std::collections::HashMap::new();
-    for message in messages {
-        if message.role == MessageRole::ToolCall
-            && let Some(PersistedToolMessage::Call { name, arguments }) = &message.tool
-            && name == "read"
-            && let Some(id) = &message.tool_call_id
-        {
-            calls.insert(id.clone(), arguments);
+    // Provider call ids need not be unique across responses, so pair each
+    // result with the call that immediately precedes it in transcript order
+    // instead of a global id map (mini-agent-xorxl.7). A result whose paired
+    // call is not a `read` (or has no pending call at all) is never a window.
+    let mut pending: std::collections::HashMap<
+        &str,
+        std::collections::VecDeque<Option<&serde_json::Value>>,
+    > = std::collections::HashMap::new();
+    let mut paired: Vec<Option<&serde_json::Value>> = vec![None; messages.len()];
+    for (index, message) in messages.iter().enumerate() {
+        let Some(id) = message.tool_call_id.as_deref() else {
+            continue;
+        };
+        match (&message.role, &message.tool) {
+            (MessageRole::ToolCall, Some(PersistedToolMessage::Call { name, arguments })) => {
+                pending
+                    .entry(id)
+                    .or_default()
+                    .push_back((name == "read").then_some(arguments));
+            }
+            (MessageRole::ToolResult, _) => {
+                // More than one unanswered call sharing the id makes the
+                // pairing ambiguous: restore nothing rather than guess.
+                if let Some(queue) = pending.get_mut(id) {
+                    if queue.len() == 1 {
+                        paired[index] = queue.pop_front().flatten();
+                    } else {
+                        queue.clear();
+                    }
+                }
+            }
+            _ => {}
         }
     }
     let mut used = super::Session::estimate_tokens(HEADING);
     let mut seen_paths = std::collections::HashSet::new();
     let mut windows = Vec::new();
-    for message in messages.iter().rev() {
+    for (index, message) in messages.iter().enumerate().rev() {
         if windows.len() >= MAX_RESTORED_READ_WINDOWS {
             break;
         }
         if message.role != MessageRole::ToolResult {
             continue;
         }
-        let Some(arguments) = message.tool_call_id.as_ref().and_then(|id| calls.get(id)) else {
+        let Some(arguments) = paired[index] else {
             continue;
         };
         let Some(PersistedToolMessage::Result { output, .. }) = &message.tool else {
@@ -401,6 +425,84 @@ mod tests {
         assert!(Session::estimate_tokens(&restored) <= 400);
         assert!(restored.contains("> 2: [file window ends]"), "{restored}");
         assert!(restored.find("src/b.rs").unwrap() < restored.find("fn a_newer").unwrap());
+    }
+
+    fn reused_id_session(first_ok: bool, second_ok: bool) -> Session {
+        let mut session = Session::new("test", "test", 128_000, "");
+        session.add_message(MessageRole::User, "inspect");
+        session.add_tool_call_with_id("call-1", "read", &serde_json::json!({"path": "a.txt"}));
+        let a = if first_ok { "1: AAA" } else { "Error: nope" };
+        session.add_tool_result_with_id("call-1", "read", a);
+        session.add_tool_call_with_id("call-1", "read", &serde_json::json!({"path": "b.txt"}));
+        let b = if second_ok {
+            "1: BBB"
+        } else {
+            "Error: missing"
+        };
+        session.add_tool_result_with_id("call-1", "read", b);
+        session
+    }
+
+    // mini-agent-xorxl.7: a provider call id reused across responses must not
+    // restore one file's body under another file's path.
+    #[test]
+    fn reused_call_id_never_restores_a_body_under_the_wrong_path() {
+        let failed_second = restored_read_windows(&reused_id_session(true, false).messages, 4_000)
+            .expect("a.txt window");
+        assert!(failed_second.contains("a.txt") && failed_second.contains("AAA"));
+        assert!(!failed_second.contains("b.txt"), "{failed_second}");
+
+        let both = restored_read_windows(&reused_id_session(true, true).messages, 4_000).unwrap();
+        assert!(both.contains("a.txt") && both.contains("AAA"), "{both}");
+        assert!(both.contains("b.txt") && both.contains("BBB"), "{both}");
+    }
+
+    #[test]
+    fn a_non_read_call_sharing_the_id_never_masquerades_as_a_file_window() {
+        let mut session = Session::new("test", "test", 128_000, "");
+        session.add_message(MessageRole::User, "go");
+        session.add_tool_call_with_id("call-1", "read", &serde_json::json!({"path": "a.txt"}));
+        session.add_tool_result_with_id("call-1", "read", "1: AAA");
+        session.add_tool_call_with_id("call-1", "bash", &serde_json::json!({"command": "ls"}));
+        session.add_tool_result_with_id("call-1", "bash", "SECRET-LISTING");
+        let restored = restored_read_windows(&session.messages, 4_000).unwrap();
+        assert!(restored.contains("AAA"));
+        assert!(!restored.contains("SECRET-LISTING"), "{restored}");
+    }
+
+    #[test]
+    fn headless_persistence_with_reused_call_ids_compacts_without_misattribution() {
+        use rig::OneOrMany;
+        use rig::message::{AssistantContent, Message, ToolResultContent, UserContent};
+        let call = |path: &str| Message::Assistant {
+            id: None,
+            content: OneOrMany::one(AssistantContent::tool_call(
+                "call-1",
+                "read",
+                serde_json::json!({"path": path}),
+            )),
+        };
+        let result = |text: &str| Message::User {
+            content: OneOrMany::one(UserContent::tool_result(
+                "call-1",
+                OneOrMany::one(ToolResultContent::text(text)),
+            )),
+        };
+        let interactions = vec![
+            call("a.txt"),
+            result("1: AAA"),
+            call("b.txt"),
+            result("Error: missing"),
+        ];
+        let mut session = Session::new("test", "test", 128_000, "");
+        crate::print::persist_headless_turn(&mut session, "read both", "done", &interactions);
+        session.add_message(MessageRole::User, "next");
+        let restored = restored_read_windows(&session.messages, 4_000).unwrap();
+        assert!(
+            restored.contains("a.txt") && restored.contains("AAA"),
+            "{restored}"
+        );
+        assert!(!restored.contains("b.txt"), "{restored}");
     }
 
     #[test]
