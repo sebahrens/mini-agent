@@ -185,8 +185,9 @@ pub(super) fn lzw(data: &[u8], early_change: bool, limit: usize) -> Result<Vec<u
             table.push((previous as u16, first));
         }
         previous = Some(code);
-        // The decoder adds each entry one code after the encoder, hence `+ 1`.
-        let used = 258 + table.len() + early + 1;
+        // The next code to be assigned; the width grows once it (plus the
+        // early-change bias) reaches a power of two, as in libtiff and pdf.js.
+        let used = 258 + table.len() + early;
         width = if used >= 2048 {
             12
         } else if used >= 1024 {
@@ -343,7 +344,8 @@ pub(crate) fn lzw_encode(data: &[u8], early_change: bool) -> Vec<u8> {
     let mut dict: HashMap<Vec<u8>, u32> = HashMap::new();
     let mut next = 258u32;
     let width_for = |next: u32| {
-        let used = next as usize + early;
+        // The decoder lags the encoder by one table entry.
+        let used = next as usize - 1 + early;
         if used >= 2048 {
             12
         } else if used >= 1024 {
@@ -478,6 +480,21 @@ mod tests {
                 "early={early}"
             );
         }
+    }
+
+    #[test]
+    fn lzw_decodes_a_real_libtiff_strip() {
+        // 64x64 gray strip written by PIL/libtiff (tiff_lzw, EarlyChange 1
+        // semantics), passing through the 9->10->11->12 bit width changes.
+        let strip = include_bytes!("fixtures/pil_tiff_lzw_strip.bin");
+        let mut state = 987_654_321u32;
+        let expected: Vec<u8> = (0..4096)
+            .map(|_| {
+                state = state.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                (state >> 16) as u8
+            })
+            .collect();
+        assert_eq!(lzw(strip, true, 1 << 20).unwrap(), expected);
     }
 
     #[test]
