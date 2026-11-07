@@ -19,6 +19,21 @@ describe('LineRingBuffer', () => {
     expect(ring.flush()).toEqual([]);
   });
 
+  // mini-agent-qgtrj
+  it('decodes a multibyte character split across chunks', () => {
+    const ring = new LineRingBuffer(10);
+    const bytes = Buffer.from('héllo 雪\n', 'utf8');
+    for (let split = 1; split < bytes.length; split += 1) {
+      const fresh = new LineRingBuffer(10);
+      fresh.push(bytes.subarray(0, split));
+      expect(fresh.push(bytes.subarray(split)), `split ${split}`).toEqual(['héllo 雪']);
+    }
+    ring.push(Buffer.from('tail ', 'utf8'));
+    ring.push(Buffer.from([0xe9, 0x9b]));
+    ring.push(Buffer.from([0xaa]));
+    expect(ring.flush()).toEqual(['tail 雪']);
+  });
+
   it('accepts binary chunks and drops blank lines', () => {
     const ring = new LineRingBuffer(10);
     expect(ring.push(Buffer.from('a\n\n  \nb\n', 'utf8'))).toEqual(['a', 'b']);
