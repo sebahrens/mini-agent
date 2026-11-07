@@ -45,10 +45,24 @@ export interface RendererOptions {
 /** Converts typed ACP updates into the stable VS Code 1.90 chat stream surface. */
 export class ChatUpdateRenderer {
   private readonly toolTitles = new Map<string, string>();
+  /** True while a quoted thought block is open and its last line has not been ended by a newline. */
+  private thoughtOpen = false;
+  private thoughtMidLine = false;
 
   constructor(private readonly options: RendererOptions = {}) {}
 
   render(update: acp.SessionUpdate): RenderEvent[] {
+    const events = this.renderOne(update);
+    if (this.thoughtOpen && update.sessionUpdate !== 'agent_thought_chunk' && events.length > 0) {
+      // Close the quote so following text is not a lazy continuation of it.
+      this.thoughtOpen = false;
+      this.thoughtMidLine = false;
+      return [{ kind: 'markdown', value: '\n\n' }, ...events];
+    }
+    return events;
+  }
+
+  private renderOne(update: acp.SessionUpdate): RenderEvent[] {
     switch (update.sessionUpdate) {
       case 'agent_message_chunk': {
         const text = contentText(update.content);
@@ -58,8 +72,20 @@ export class ChatUpdateRenderer {
         const text = contentText(update.content);
         if (!text) { return []; }
         if (this.options.keepThoughts) {
-          const quoted = bounded(text).split('\n').map(line => `> ${line}`).join('\n');
-          return [{ kind: 'markdown', value: `\n${quoted}\n\n` }];
+          // Chunks arrive at arbitrary token boundaries: keep one quoted block open
+          // across them and only start a new quoted line where the thought has a newline.
+          return chunked(text).map(part => {
+            const lines = part.split('\n');
+            let out = this.thoughtOpen ? '' : '\n';
+            lines.forEach((line, i) => {
+              if (i > 0) { out += '\n'; this.thoughtMidLine = false; }
+              if (!this.thoughtMidLine) { out += '> '; }
+              out += line;
+              this.thoughtMidLine = true;
+            });
+            this.thoughtOpen = true;
+            return { kind: 'markdown' as const, value: out };
+          });
         }
         return [{ kind: 'progress', value: bounded(text) }];
       }

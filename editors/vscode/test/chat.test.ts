@@ -55,6 +55,16 @@ describe('ChatUpdateRenderer', () => {
     expect(events.map(event => event.value).join('')).toBe(text);
     expect(events[0]?.value.endsWith('x')).toBe(true);
   });
+
+  it('joins coalesced thought chunks into one quoted block', () => {
+    const renderer = new ChatUpdateRenderer({ keepThoughts: true });
+    const chunk = (text: string) => renderer.render({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text } });
+    const out = [...chunk('The user wants to rea'), ...chunk('d a file.\nSecond line'), ...chunk(' goes on.')]
+      .map(event => event.value).join('');
+    expect(out).toBe('\n> The user wants to read a file.\n> Second line goes on.');
+    const after = renderer.render({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Answer' } });
+    expect(after.map(event => event.value).join('')).toBe('\n\nAnswer');
+  });
 });
 
 describe('stopResult', () => {
@@ -108,6 +118,6 @@ describe('ChatUpdateRenderer tool output', () => {
   it('keeps thoughts as quoted markdown only when asked', () => {
     const chunk: acp.SessionUpdate = { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'hmm\nok' } };
     expect(new ChatUpdateRenderer().render(chunk)[0]?.kind).toBe('progress');
-    expect(new ChatUpdateRenderer({ keepThoughts: true }).render(chunk)).toEqual([{ kind: 'markdown', value: '\n> hmm\n> ok\n\n' }]);
+    expect(new ChatUpdateRenderer({ keepThoughts: true }).render(chunk)).toEqual([{ kind: 'markdown', value: '\n> hmm\n> ok' }]);
   });
 });
