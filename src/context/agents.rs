@@ -729,7 +729,15 @@ fn parse_agent_extras(mapping: &serde_yaml_ng::Mapping, notices: &mut Vec<String
             Ok(json) if json.is_object() => {
                 #[cfg(feature = "hooks")]
                 match crate::extras::hooks::settings::parse_hooks_config(&json) {
-                    Ok(_) => extras.hooks = Some(json.to_string()),
+                    Ok(config) => {
+                        #[cfg(feature = "subagents")]
+                        notices.extend(crate::extras::hooks::persona_dropped_hook_notices(
+                            &config,
+                        ));
+                        #[cfg(not(feature = "subagents"))]
+                        let _ = config;
+                        extras.hooks = Some(json.to_string());
+                    }
                     Err(error) => notices.push(format!(
                         "[specialist metadata: hooks not applied: {}]",
                         error.chars().take(200).collect::<String>()
@@ -3217,6 +3225,22 @@ pub(crate) mod tests {
                 "hooks:\n  PreToolUse:\n    - matcher: Bash\n      hooks:\n        - type: command\n          command: echo hi",
             );
             assert!(hooked.extras.hooks.is_some(), "{:?}", hooked.compat_notices);
+            #[cfg(feature = "subagents")]
+            {
+                assert!(
+                    !hooked.compat_notices.iter().any(|n| n.contains("hooks")),
+                    "{:?}",
+                    hooked.compat_notices
+                );
+                let dropped = parse(
+                    "hooks:\n  PostToolUse:\n    - matcher: Edit\n      hooks:\n        - type: command\n          command: lint\n  Stop:\n    - hooks:\n        - type: command\n          command: done\n  PreToolUse:\n    - matcher: Bash\n      hooks:\n        - type: prompt\n          prompt: is this safe?\n        - type: command\n          command: guard",
+                );
+                let notices = dropped.compat_notices.join("\n");
+                assert!(notices.contains("PostToolUse is not supported"), "{notices}");
+                assert!(notices.contains("Stop is not supported"), "{notices}");
+                assert!(notices.contains("PreToolUse prompt handler"), "{notices}");
+                assert!(!notices.contains("PreToolUse is not supported"), "{notices}");
+            }
         }
     }
 
