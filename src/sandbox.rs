@@ -5252,6 +5252,65 @@ impl Sandbox {
         separate_streams: bool,
         progress: Option<CommandProgress>,
     ) -> std::io::Result<String> {
+        self.start_background_command_with_capture(
+            command,
+            timeout,
+            log_dir,
+            pty,
+            separate_streams,
+            progress,
+            false,
+        )
+        .await
+    }
+
+    /// A foreground command that may be promoted at its deadline: captured
+    /// like a foreground command until [`Self::promote_background_job`].
+    pub(crate) async fn start_auto_background_command(
+        &self,
+        command: String,
+        timeout: std::time::Duration,
+        log_dir: Option<&Path>,
+        pty: bool,
+        separate_streams: bool,
+        progress: Option<CommandProgress>,
+    ) -> std::io::Result<String> {
+        self.start_background_command_with_capture(
+            command,
+            timeout,
+            log_dir,
+            pty,
+            separate_streams,
+            progress,
+            true,
+        )
+        .await
+    }
+
+    /// The job outlived its foreground deadline: switch its capture to
+    /// background retention limits (no output ceiling, complete log).
+    pub(crate) fn promote_background_job(&self, id: &str) {
+        let jobs = self
+            .background_jobs
+            .jobs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(job) = jobs.get(id) {
+            job.capture.promote_to_background();
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_background_command_with_capture(
+        &self,
+        command: String,
+        timeout: std::time::Duration,
+        log_dir: Option<&Path>,
+        pty: bool,
+        separate_streams: bool,
+        progress: Option<CommandProgress>,
+        foreground_capture: bool,
+    ) -> std::io::Result<String> {
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
             std::io::Error::other("background commands require an active Tokio runtime")
         })?;
@@ -5264,7 +5323,11 @@ impl Sandbox {
         let id = format!("job-{}", uuid::Uuid::new_v4());
         let cancellation = CommandCancellation::new();
         let log_path = log_dir.map(|dir| dir.join(format!("shell-{id}.log")));
-        let capture = SharedCommandCapture::spooled(SpoolPolicy::background(log_path.clone()));
+        let capture = SharedCommandCapture::spooled(if foreground_capture {
+            SpoolPolicy::auto_background(log_path.clone())
+        } else {
+            SpoolPolicy::background(log_path.clone())
+        });
         let changed = Arc::new(Notify::new());
         {
             let mut jobs = self
@@ -7126,6 +7189,13 @@ impl SharedCommandCapture {
             CommandCapture::Spooled(capture) => capture
                 .push(stream.channel(), bytes)
                 .map_err(|_| CommandOutputLimit::Combined),
+        }
+    }
+
+    fn promote_to_background(&self) {
+        let mut capture = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        if let CommandCapture::Spooled(capture) = &mut *capture {
+            capture.promote_to_background();
         }
     }
 

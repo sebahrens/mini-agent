@@ -875,7 +875,7 @@ impl ShellTool {
         let progress = CommandProgress::new();
         let id = match self
             .sandbox
-            .start_background_command_logged(
+            .start_auto_background_command(
                 args.command.clone(),
                 DEFAULT_BACKGROUND_COMMAND_TIMEOUT,
                 self.output_log_dir.as_deref(),
@@ -922,6 +922,7 @@ impl ShellTool {
         };
         pending.armed = false;
         if !snapshot.status.is_terminal() {
+            self.sandbox.promote_background_job(&id);
             let so_far = self
                 .sandbox
                 .read_background_job_output(&id, None, JOB_OUTPUT_READ_BYTES)
@@ -3462,6 +3463,45 @@ mod tests {
             .unwrap();
         assert!(promoted.contains("promoted_to_background"), "{promoted}");
         configured.sandbox.cancel_background_jobs();
+    }
+
+    // A command that finishes inside the auto-background deadline keeps the
+    // foreground retention window, not the 64 KiB background one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auto_background_result_keeps_foreground_retention() {
+        let shell = test_tool();
+        let output = shell
+            .call(BashArgs {
+                command: "seq 1 20000".to_string(),
+                auto_background: Some(true),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // ~109 KB of output: all of it fits the 768 KiB head.
+        assert!(output.contains("\n10000\n"), "middle line dropped");
+        assert!(output.contains("\n20000"), "tail missing");
+        assert!(shell.sandbox.background_job_summaries().is_empty());
+    }
+
+    // The 64 MiB foreground ceiling applies until promotion.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auto_background_stops_a_runaway_writer_at_the_foreground_ceiling() {
+        let shell = test_tool();
+        let started = std::time::Instant::now();
+        let error = shell
+            .call(BashArgs {
+                command: "yes".to_string(),
+                timeout: Some(60_000),
+                auto_background: Some(true),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("output"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
     }
 
     #[cfg(unix)]
