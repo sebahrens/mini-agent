@@ -241,6 +241,10 @@ impl DoctorReport {
             None => report.row("managed policy", "none"),
         }
         report.row("load warnings", cfg.load_warnings.len().to_string());
+        #[cfg(feature = "lsp")]
+        for warning in cfg.lsp_config_warnings() {
+            report.row("lsp config", warning);
+        }
         report.section("Config key sources (values omitted; merged tables can use both layers)");
         for key in cfg
             .provenance

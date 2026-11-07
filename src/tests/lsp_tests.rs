@@ -2535,6 +2535,60 @@ fn lsp_settings_must_be_a_small_object() {
     assert!(cfg.workspace_settings().is_some());
 }
 
+// mini-agent-rqy76: ignored settings and clamped timeouts are reported, naming
+// the server and the limit, without echoing the settings content.
+#[test]
+fn lsp_config_validation_reports_ignored_settings_and_clamped_timeouts() {
+    let mut cfg = LspConfig::default();
+    cfg.servers.insert(
+        "py".into(),
+        LspServerConfig {
+            settings: Some(serde_json::json!("SECRET-not-an-object")),
+            startup_timeout_ms: Some(500),
+            request_timeout_ms: Some(600_000),
+            wait_ms: Some(LspServerConfig::MAX_WAIT_MS + 1),
+            ..Default::default()
+        },
+    );
+    cfg.servers.insert(
+        "big".into(),
+        LspServerConfig {
+            settings: Some(
+                serde_json::json!({"blob": "x".repeat(LspServerConfig::MAX_SETTINGS_BYTES)}),
+            ),
+            ..Default::default()
+        },
+    );
+    cfg.trust_builtins = vec!["rust".into(), "clangd".into()];
+    let warnings = cfg.validation_warnings();
+    let joined = warnings.join("\n");
+    assert!(
+        joined.contains("lsp.servers.py.settings must be a table"),
+        "{joined}"
+    );
+    assert!(
+        joined.contains("lsp.servers.big.settings exceeds 65536"),
+        "{joined}"
+    );
+    assert!(joined.contains("startup_timeout_ms = 500") && joined.contains("1000 ms is used"));
+    assert!(joined.contains("request_timeout_ms = 600000") && joined.contains("300000 ms is used"));
+    assert!(joined.contains("wait_ms"));
+    assert!(joined.contains("trust_builtins names 'clangd'"));
+    assert!(!joined.contains("SECRET"));
+    assert_eq!(warnings.len(), 6, "{joined}");
+    let mut config = crate::config::Config::default();
+    assert!(config.lsp_config_warnings().is_empty());
+    config.lsp = Some(cfg);
+    assert_eq!(config.lsp_config_warnings().len(), 6);
+    // Valid values warn about nothing.
+    let ok = LspServerConfig {
+        settings: Some(serde_json::json!({"a": 1})),
+        startup_timeout_ms: Some(2000),
+        ..Default::default()
+    };
+    assert!(ok.validation_warnings("ok").is_empty());
+}
+
 #[test]
 fn idle_timeout_defaults_to_fifteen_minutes_and_zero_disables_retirement() {
     let mut cfg = LspConfig::default();

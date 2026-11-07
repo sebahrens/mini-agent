@@ -2521,6 +2521,7 @@ async fn lsp_process_idle_server_is_retired_and_respawned_without_cooldown() {
             enabled: true.into(),
             servers: HashMap::from([("fixture".to_string(), server)]),
             idle_timeout_secs: Some(1),
+            ..Default::default()
         },
         workspace.clone(),
     );

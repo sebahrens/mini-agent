@@ -461,6 +461,11 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
     for warning in &cfg.load_warnings[loaded_warning_count..] {
         eprintln!("warning: {warning}");
     }
+    #[cfg(feature = "lsp")]
+    for warning in cfg.lsp_config_warnings() {
+        eprintln!("warning: {warning}");
+        cfg.load_warnings.push(warning);
+    }
 
     #[cfg(feature = "git-worktree")]
     if cli.git_runtime_check {

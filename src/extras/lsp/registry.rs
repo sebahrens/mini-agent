@@ -145,7 +145,7 @@ impl WithheldBuiltin {
     /// One-line reason and remedy, shown by `/doctor` and the `lsp` tool.
     pub(crate) fn explanation(&self) -> String {
         format!(
-            "built-in '{0}' language server is withheld: it runs repository build/config code and this project's .mini-agent/config.toml is missing or not trusted. Trust the project config, or define [lsp.servers.{0}] in your own config to enable it",
+            "built-in '{0}' language server is withheld: it runs repository build/config code and this project's .mini-agent/config.toml is missing or not trusted. To enable it for every workspace, add to your user config (not a project file):\n[lsp]\ntrust_builtins = [\"{0}\"]\nOr trust this project's config (only possible when .mini-agent/config.toml exists), or define [lsp.servers.{0}] yourself",
             self.name
         )
     }
@@ -157,9 +157,14 @@ impl WithheldBuiltin {
 pub(crate) fn split_untrusted_builtins(
     servers: Vec<(String, LspServerConfig)>,
     user: &HashMap<String, LspServerConfig>,
+    opted_in: &[String],
     trusted: impl FnOnce() -> bool,
 ) -> (Vec<(String, LspServerConfig)>, Vec<WithheldBuiltin>) {
-    let gated = |name: &str| BUILD_EVALUATING_BUILTINS.contains(&name) && !user.contains_key(name);
+    let gated = |name: &str| {
+        BUILD_EVALUATING_BUILTINS.contains(&name)
+            && !user.contains_key(name)
+            && !opted_in.iter().any(|entry| entry == name)
+    };
     if !servers.iter().any(|(name, _)| gated(name)) || trusted() {
         return (servers, Vec::new());
     }
@@ -168,7 +173,7 @@ pub(crate) fn split_untrusted_builtins(
         .into_iter()
         .map(|(name, cfg)| {
             tracing::warn!(
-                "lsp[{name}]: built-in server not started because it evaluates project build files and this project's config is not trusted; trust the project config or define [lsp.servers.{name}] yourself"
+                "lsp[{name}]: built-in server not started because it evaluates project build files and this project's config is not trusted; set lsp.trust_builtins = [\"{name}\"] in your user config, trust the project config, or define [lsp.servers.{name}] yourself"
             );
             WithheldBuiltin {
                 name,
@@ -186,7 +191,7 @@ pub(crate) fn withhold_untrusted_builtins(
     user: &HashMap<String, LspServerConfig>,
     trusted: impl FnOnce() -> bool,
 ) -> Vec<(String, LspServerConfig)> {
-    split_untrusted_builtins(servers, user, trusted).0
+    split_untrusted_builtins(servers, user, &[], trusted).0
 }
 
 /// Merges user config over the built-ins: a same-named entry replaces the
@@ -328,6 +333,33 @@ mod language_coverage_tests {
             panic!("trust must not be consulted")
         });
         assert_eq!(out.len(), 1);
+    }
+
+    // mini-agent-n529g: a user-config opt-in starts a named build-evaluating
+    // built-in without a trusted project config; others stay withheld, and the
+    // withheld message carries the exact snippet.
+    #[test]
+    fn trust_builtins_opts_named_builtins_in_and_the_message_has_the_snippet() {
+        let all = resolve_servers(&HashMap::new());
+        let (kept, withheld) = split_untrusted_builtins(
+            all,
+            &HashMap::new(),
+            &["rust".to_string(), "not-a-server".to_string()],
+            || false,
+        );
+        assert!(kept.iter().any(|(name, _)| name == "rust"));
+        assert!(!kept.iter().any(|(name, _)| name == "python"));
+        assert!(withheld.iter().all(|entry| entry.name != "rust"));
+        let python = withheld
+            .iter()
+            .find(|entry| entry.name == "python")
+            .unwrap();
+        let message = python.explanation();
+        assert!(
+            message.contains("[lsp]\ntrust_builtins = [\"python\"]"),
+            "{message}"
+        );
+        assert!(message.contains("user config"), "{message}");
     }
 
     #[cfg(unix)]

@@ -1626,6 +1626,15 @@ impl Config {
         }
     }
 
+    /// LSP settings that would otherwise be silently ignored or clamped.
+    #[cfg(feature = "lsp")]
+    pub fn lsp_config_warnings(&self) -> Vec<String> {
+        self.lsp
+            .as_ref()
+            .map(types::LspConfig::validation_warnings)
+            .unwrap_or_default()
+    }
+
     pub fn resolve_max_grep_results(&self) -> u64 {
         self.max_grep_results.unwrap_or(150)
     }

@@ -8,6 +8,8 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- `api_key_commands` now refreshes Gemini keys, which travel in the URL `key=` parameter, on TTL expiry and after a `401` (mini-agent-dxbuy); the credential command runs in its own process group that is killed on timeout and after exit, and its output is never joined past the deadline, so `sh -c` wrappers cannot stall client construction or leak grandchildren (mini-agent-8g37o).
+- `[lsp] trust_builtins = [...]` in user config opts named build-evaluating built-in servers in for every workspace (default closed), and the withheld message prints the exact snippet (mini-agent-n529g); ignored LSP `settings` and clamped timeouts are now reported as startup warnings and in `/doctor` (mini-agent-rqy76).
 - Managed policy: `/sandbox <profile>` (the only run-time profile switch) now refuses a profile above `max_profile`
   naming the managed file (mini-agent-el299); `max_profile` also clears explicit sandbox read/write/toolchain/Windows
   roots outside a new `sandbox.allowed_roots` allowance, and `allowed_hosts` caps `sandbox-network` at `allowlist`

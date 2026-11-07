@@ -4217,6 +4217,7 @@ archive recipe.
 [lsp]
 enabled = "auto"          # omitted also means auto; false disables, true is explicit lazy mode
 # idle_timeout_secs = 900  # stop a server unused this long (default 900); 0 never retires
+# trust_builtins = ["rust", "python"]  # start these build-evaluating built-ins in every workspace (default: none)
 
 [lsp.servers.rust]          # override a built-in default
 command = "rust-analyzer"
@@ -4279,6 +4280,22 @@ a repository cannot make them run just by being opened and edited. To use one an
 trusting the project, define it yourself in your user config (for example `[lsp.servers.rust]` with
 `command = "rust-analyzer"` and `extensions = [".rs"]`): a same-named user entry is your explicit
 choice and is never withheld. `clangd`, `bash`, `lua` and `php` keep their existing behaviour.
+
+**Opting in without a project config.** `[lsp] trust_builtins = ["rust", "python"]` in your user
+config starts exactly the named built-ins (from `java`, `csharp`, `ruby`, `kotlin`, `swift`,
+`zig`, `rust`, `python`, `typescript`, `go`) in every workspace, trusted or not, without
+redefining them. It is default closed (empty), part of the `lsp` table (a project
+`.mini-agent/config.toml` can set it only once that project is trusted, so a repository cannot
+opt itself in), and unknown names are reported as a startup warning and by `--doctor`/`/doctor`.
+The withheld message in `/doctor` and the `lsp` tool prints this exact snippet. Opting in means
+that server runs the repository's build code (`build.rs`, the selected interpreter, plugins)
+outside the shell sandbox for every repository you open, so name only the languages you accept
+that for.
+
+**Ignored and clamped settings are reported.** A non-object `settings`, `settings` over 64 KiB
+serialized, `startup_timeout_ms`/`request_timeout_ms` outside 1000..=300000 and `wait_ms` over
+60000 are applied as the limit (or ignored) but now raise a startup warning (also in `load_warnings`
+and `--doctor`/`/doctor` as `lsp config`) naming the server and the limit.
 
 Behavior notes:
 
