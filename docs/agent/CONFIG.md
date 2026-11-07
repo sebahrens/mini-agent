@@ -3079,7 +3079,14 @@ login and when a stored token is restored, sent to the token endpoint
 file. There is deliberately no config key for it, so a project config cannot
 point at another variable. It is ignored without `client_id`.
 
-The first time you connect, run `/mcp login <server>` inside the TUI. mini-agent
+The first time you connect, run `/mcp login <server>` inside the TUI, or, for
+`-p`, CI, ACP-only and SSH use, run `mini-agent --mcp-login <server>` once: it
+runs the same PKCE loopback flow without a TUI (prints the authorization URL,
+opens a browser only when stdout is a terminal, waits 180 s for the redirect on
+the loopback port, so a remote shell must forward `redirect_port`, and exits
+non-zero on failure or Ctrl-C). It uses the effective configuration of the
+current directory (a project server needs project trust like any other launch)
+and stores the token exactly where `/mcp login` does. In the TUI, mini-agent
 prints an authorization URL, attempts to open it in the desktop browser, and
 also attempts to copy it to your clipboard. Under WSL, Windows' URL protocol
 handler is invoked through `rundll32.exe`, opening the configured default Windows

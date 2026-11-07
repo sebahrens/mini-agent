@@ -461,6 +461,12 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
     for warning in &cfg.load_warnings[loaded_warning_count..] {
         eprintln!("warning: {warning}");
     }
+    #[cfg(feature = "mcp")]
+    if let Some(server) = cli.mcp_login.as_deref() {
+        let message = startup::heap_future(|| extras::mcp::oauth::cli_login(server, &cfg)).await?;
+        println!("{message}");
+        return Ok(());
+    }
     #[cfg(feature = "lsp")]
     for warning in cfg.lsp_config_warnings() {
         eprintln!("warning: {warning}");

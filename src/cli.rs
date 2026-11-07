@@ -114,6 +114,15 @@ pub struct Cli {
         help = "Sign out of a provider account and exit (openai, copilot)"
     )]
     pub logout: Option<String>,
+    /// Run the MCP OAuth browser login for a configured URL server, then exit.
+    #[cfg(feature = "mcp")]
+    #[arg(
+        long,
+        value_name = "SERVER",
+        conflicts_with_all = ["login", "logout"],
+        help = "Sign in to an OAuth MCP server (PKCE loopback flow) and exit"
+    )]
+    pub mcp_login: Option<String>,
     #[arg(
         long,
         value_enum,
@@ -1812,6 +1821,17 @@ mod tests {
         assert_eq!(cli.image, vec![base.join("a.png")]);
         assert_eq!(cli.output_schema, Some(base.join("s.json")));
         assert_eq!(cli.sandbox_toolchain_roots, vec![base.join("tools")]);
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn mcp_login_flag_takes_a_server_and_excludes_provider_login() {
+        let cli = Cli::try_parse_from(["mini-agent", "--mcp-login", "notion"]).unwrap();
+        assert_eq!(cli.mcp_login.as_deref(), Some("notion"));
+        assert!(Cli::try_parse_from(["mini-agent", "--mcp-login"]).is_err());
+        assert!(
+            Cli::try_parse_from(["mini-agent", "--mcp-login", "x", "--login", "openai"]).is_err()
+        );
     }
 
     #[cfg(feature = "agent-skills")]

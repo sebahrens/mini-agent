@@ -1359,7 +1359,9 @@ pub(crate) async fn build_auth_client(
         .await
         .map_err(|e| anyhow::anyhow!("OAuth restore failed: {e}"))?;
     if !restored {
-        anyhow::bail!("no OAuth token stored; run `/mcp login {server_name}`");
+        anyhow::bail!(
+            "no OAuth token stored; run `/mcp login {server_name}` or `mini-agent --mcp-login {server_name}`"
+        );
     }
     // Restoring knows only the stored client id; a confidential pre-registered
     // client also needs its secret to refresh the token.
@@ -1570,6 +1572,86 @@ pub(crate) async fn begin_login_bound(
     })
 }
 
+/// Non-interactive MCP OAuth login (`mini-agent --mcp-login SERVER`): the same
+/// PKCE loopback flow as `/mcp login`, for `-p`, CI and ACP-only users. The
+/// authorization URL is printed (and opened in a browser when attached to a
+/// terminal); the token is stored where the running agent reads it. Failures
+/// never include credential values.
+pub(crate) async fn cli_login(
+    server_name: &str,
+    cfg: &crate::config::Config,
+) -> anyhow::Result<String> {
+    use std::io::IsTerminal as _;
+    let servers = cfg.mcp_servers.as_ref();
+    let Some(server) = servers.and_then(|servers| servers.get(server_name)) else {
+        let mut names: Vec<&str> = servers
+            .map(|servers| servers.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        names.sort_unstable();
+        anyhow::bail!(
+            "no MCP server named '{}' is configured (configured: {})",
+            server_name
+                .chars()
+                .filter(|c| !c.is_control())
+                .collect::<String>(),
+            if names.is_empty() {
+                "none".to_owned()
+            } else {
+                names.join(", ")
+            }
+        );
+    };
+    let super::config::McpServerConfig::Url {
+        url,
+        allow_local,
+        oauth: Some(oauth),
+        options,
+        ..
+    } = server
+    else {
+        anyhow::bail!("MCP server '{server_name}' is not an OAuth URL server (set `oauth = true`)");
+    };
+    let settings = oauth
+        .settings()
+        .ok_or_else(|| anyhow::anyhow!("MCP OAuth is disabled for server '{server_name}'"))?;
+    let login = tokio::time::timeout(
+        super::client::MCP_INITIALIZE_TIMEOUT,
+        begin_login_bound(
+            server_name,
+            url,
+            &settings,
+            *allow_local,
+            &options.allowed_cidrs,
+            std::sync::Arc::new(|| true),
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("MCP OAuth setup timed out"))?
+    .map_err(|_| anyhow::anyhow!("MCP OAuth setup failed (credential values omitted)"))?;
+    let auth_url: String = login.auth_url.chars().filter(|c| !c.is_control()).collect();
+    let opened =
+        std::io::stdout().is_terminal() && crate::ui::renderer::open_url(&auth_url).await.is_ok();
+    eprintln!(
+        "{} for MCP server '{server_name}':\n{auth_url}\nWaiting up to 180 s for the redirect on http://127.0.0.1:{} (a remote shell needs that port forwarded to this machine; Ctrl-C cancels).",
+        if opened {
+            "Opened the authorization URL in your browser"
+        } else {
+            "Open this URL to authorize"
+        },
+        settings.redirect_port(),
+    );
+    tokio::select! {
+        biased;
+        _ = tokio::signal::ctrl_c() => anyhow::bail!("MCP login cancelled"),
+        result = login.wait_for_callback_owned(Duration::from_secs(180), || Ok(())) => {
+            result.map_err(|_| anyhow::anyhow!("MCP login failed (credential values omitted)"))?;
+        }
+    }
+    Ok(format!(
+        "MCP OAuth token for '{server_name}' saved. Start mini-agent to use the server."
+    ))
+}
+
 impl LoginSession {
     /// The App owns this listener/future directly. Cancellation drops both the
     /// accepted socket and listener; there is no detached blocking accept task.
@@ -1667,6 +1749,45 @@ async fn capture_callback_owned(
         biased;
         _ = crate::agent::runner::current_work_scope_cancelled() => anyhow::bail!("MCP login cancelled"),
         result = tokio::time::timeout(timeout, wait) => result.map_err(|_| anyhow::anyhow!("OAuth callback wait timed out"))?,
+    }
+}
+
+#[cfg(test)]
+mod cli_login_tests {
+    use super::cli_login;
+    use crate::config::Config;
+    use crate::extras::mcp::config::McpServerConfig;
+
+    // mini-agent-t452g: the CLI path refuses early, before any network I/O,
+    // with messages that name the problem and never a credential.
+    #[tokio::test]
+    async fn cli_login_refuses_unknown_non_url_and_non_oauth_servers_before_any_io() {
+        let mut cfg = Config::default();
+        let servers: std::collections::HashMap<String, McpServerConfig> =
+            serde_json::from_value(serde_json::json!({
+                "stdio": {"command": "true"},
+                "plain": {"url": "https://mcp.example/mcp"},
+                "off": {"url": "https://mcp.example/mcp", "oauth": false}
+            }))
+            .unwrap();
+        cfg.mcp_servers = Some(servers);
+        let error = cli_login("missing", &cfg).await.unwrap_err().to_string();
+        assert!(error.contains("no MCP server named 'missing'"), "{error}");
+        assert!(error.contains("off, plain, stdio"), "{error}");
+        for name in ["stdio", "plain", "off"] {
+            let error = cli_login(name, &cfg).await.unwrap_err().to_string();
+            assert!(
+                error.contains("not an OAuth URL server") || error.contains("disabled"),
+                "{name}: {error}"
+            );
+        }
+        assert!(
+            cli_login("x", &Config::default())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("none")
+        );
     }
 }
 
