@@ -221,7 +221,9 @@ impl CommandCredential {
                 })
             };
             let owns_query = |uri: &http::Uri, state: &State| {
-                query_key(uri).is_some_and(|value| state.known.iter().any(|known| known == value))
+                query_key_candidates(uri)
+                    .iter()
+                    .any(|value| state.known.iter().any(|known| known == value))
             };
             if !owns(headers, &self.lock()) && !owns_query(uri, &self.lock()) {
                 return None;
@@ -234,9 +236,16 @@ impl CommandCredential {
                 let state = self.lock();
                 (state.current.clone()?, state.generation)
             };
-            if let Some(value) = query_key(uri)
-                && value != current
-                && self.lock().known.iter().any(|known| known == value)
+            let stale_query = {
+                let state = self.lock();
+                let candidates = query_key_candidates(uri);
+                !candidates.is_empty()
+                    && !candidates.iter().any(|value| *value == current)
+                    && candidates
+                        .iter()
+                        .any(|value| state.known.iter().any(|known| known == value))
+            };
+            if stale_query
                 && let Some(rewritten) = with_query_key(uri, &current)
             {
                 *uri = rewritten;
@@ -287,14 +296,64 @@ fn query_key(uri: &http::Uri) -> Option<&str> {
         .find_map(|pair| pair.strip_prefix("key="))
 }
 
-/// `uri` with its `key=` query parameter replaced by `secret`. `None` when the
-/// result is not a valid URI (a credential with URL-unsafe characters).
+/// The `key=` value as written and, when it differs, percent-decoded. A key
+/// the provider SDK inserted raw matches a known secret as written; one this
+/// module inserted percent-encoded matches after decoding.
+fn query_key_candidates(uri: &http::Uri) -> Vec<String> {
+    let Some(raw) = query_key(uri) else {
+        return Vec::new();
+    };
+    let mut out = vec![raw.to_owned()];
+    if let Some(decoded) = percent_decode(raw)
+        && decoded != raw
+    {
+        out.push(decoded);
+    }
+    out
+}
+
+/// Percent-decodes `text` (`+` is left alone). `None` for malformed escapes or
+/// a non-UTF-8 result.
+fn percent_decode(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = text.get(i + 1..i + 3)?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Percent-encodes everything but RFC 3986 unreserved characters, so a secret
+/// containing `+`, `&`, `#`, `%`, `=` or a space stays one query value.
+fn percent_encode_component(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// `uri` with its `key=` query parameter replaced by `secret`, percent-encoded
+/// so reserved characters cannot split or truncate the query. `None` when the
+/// result is not a valid URI.
 fn with_query_key(uri: &http::Uri, secret: &str) -> Option<http::Uri> {
     let query = uri.query()?;
     let rebuilt: Vec<String> = query
         .split('&')
         .map(|pair| match pair.strip_prefix("key=") {
-            Some(_) => format!("key={secret}"),
+            Some(_) => format!("key={}", percent_encode_component(secret)),
             None => pair.to_owned(),
         })
         .collect();
@@ -1083,8 +1142,33 @@ mod tests {
         );
         let plain: http::Uri = "http://h/p?monkey=1".parse().unwrap();
         assert_eq!(query_key(&plain), None);
-        // A credential that cannot form a URI is refused, not smuggled in.
-        assert!(with_query_key(&uri, "a b\r\nHost: evil").is_none());
+        // Control characters are encoded, never smuggled into the request line.
+        let hostile = with_query_key(&uri, "a b\r\nHost: evil").unwrap();
+        assert!(!hostile.to_string().contains(['\r', '\n', ' ']));
+    }
+
+    // mini-agent-07f21: reserved characters in a command-issued key are
+    // percent-encoded and cannot inject parameters or truncate the query.
+    #[test]
+    fn query_key_rewrite_percent_encodes_reserved_characters() {
+        let uri: http::Uri = "http://h/p?alt=sse&key=old&x=y".parse().unwrap();
+        for (secret, encoded) in [
+            ("a+b", "a%2Bb"),
+            ("a&b=c", "a%26b%3Dc"),
+            ("a#b", "a%23b"),
+            ("a%b", "a%25b"),
+            ("a b", "a%20b"),
+        ] {
+            let rewritten = with_query_key(&uri, secret).unwrap();
+            assert_eq!(
+                rewritten.to_string(),
+                format!("http://h/p?alt=sse&key={encoded}&x=y"),
+            );
+            // Exactly the original parameters survive; nothing was injected.
+            assert_eq!(rewritten.query().unwrap().split('&').count(), 3);
+            assert_eq!(percent_decode(query_key(&rewritten).unwrap()).unwrap(), secret);
+            assert!(query_key_candidates(&rewritten).iter().any(|c| c == secret));
+        }
     }
 
     // mini-agent-dxbuy: Gemini carries its key in the URL; a stale key there is
