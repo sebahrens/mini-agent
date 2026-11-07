@@ -14,6 +14,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- Remote MCP servers: a mid-session transport drop is now repaired automatically before the next tool call (5 attempts, 1 s doubling backoff, shown as pending then failed in `/mcp`; in-flight calls are never replayed; stdio stays manual), and the first HTTP connection is retried up to 3 times on timeouts, refused connections and 5xx (auth and 4xx are final) (mini-agent-tj7na, mini-agent-kxtgo).
+- Persona `memory:`/`hooks:` declared while `[subagents] agent_memory`/`agent_hooks` are off now say so in the `task` result, and persona hooks name every dropped event (e.g. `PostToolUse`, `Stop`) or non-command handler at load; SUBAGENTS.md states handlers are forced into the hook sandbox (mini-agent-uree1, mini-agent-j4qhn).
+- Skills: positional `$N` is substituted only when arguments were given and never inside fenced code (`$$1` is a literal `$1`); `context: fork` renders inline with a notice when the `task` tool is not advertised (mini-agent-jvods, mini-agent-ey4o7).
+- ACP approval dialogs append a visible text block when an edit/write preview is truncated, omitted or unparseable, instead of flagging it only in ignored `_meta` (mini-agent-xa52k).
 - Background `task` jobs: `task_result` takes `wait_secs` (1-600) to block until the job settles, and headless runs wait up to `[subagents] headless_exit_wait_secs` (default 300; `0` restores immediate cancel) for running background tasks before exit, reporting any cancelled on stderr (mini-agent-5ezmf).
 - `skills_search` no longer fails when the selected skills' JSON exceeds 8192 bytes: lowest-ranked entries are omitted with an `omitted` count and a note to narrow the query (mini-agent-zwa2o).
 - The `task` tool's `resume` schema text and unknown-id error now say a session's resumable ids are restored on `--continue`/`--resume` within the count/byte limits instead of claiming they do not survive a restart (mini-agent-sw1ug).

@@ -499,6 +499,24 @@ impl ServerSourceProof {
         }
     }
 
+    /// The retained workspace, name and definition of a remote (URL) server,
+    /// for automatic reconnection of its dropped transport. `None` for stdio
+    /// servers and proofs without a definition.
+    pub(crate) fn reconnect_target(
+        &self,
+    ) -> Option<(
+        std::sync::Arc<crate::paths::WorkspaceBinding>,
+        String,
+        McpServerConfig,
+    )> {
+        let server = self.server.as_ref()?;
+        matches!(
+            server,
+            McpServerConfig::Url { .. } | McpServerConfig::BuiltIn { .. }
+        )
+        .then(|| (self.workspace.clone(), self.name.clone(), server.clone()))
+    }
+
     pub(crate) fn is_current(&self) -> bool {
         (!self.declared_source || self.origin.is_some())
             && server_source_is_current(

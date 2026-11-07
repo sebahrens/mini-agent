@@ -731,9 +731,7 @@ fn parse_agent_extras(mapping: &serde_yaml_ng::Mapping, notices: &mut Vec<String
                 match crate::extras::hooks::settings::parse_hooks_config(&json) {
                     Ok(config) => {
                         #[cfg(feature = "subagents")]
-                        notices.extend(crate::extras::hooks::persona_dropped_hook_notices(
-                            &config,
-                        ));
+                        notices.extend(crate::extras::hooks::persona_dropped_hook_notices(&config));
                         #[cfg(not(feature = "subagents"))]
                         let _ = config;
                         extras.hooks = Some(json.to_string());
@@ -3236,10 +3234,16 @@ pub(crate) mod tests {
                     "hooks:\n  PostToolUse:\n    - matcher: Edit\n      hooks:\n        - type: command\n          command: lint\n  Stop:\n    - hooks:\n        - type: command\n          command: done\n  PreToolUse:\n    - matcher: Bash\n      hooks:\n        - type: prompt\n          prompt: is this safe?\n        - type: command\n          command: guard",
                 );
                 let notices = dropped.compat_notices.join("\n");
-                assert!(notices.contains("PostToolUse is not supported"), "{notices}");
+                assert!(
+                    notices.contains("PostToolUse is not supported"),
+                    "{notices}"
+                );
                 assert!(notices.contains("Stop is not supported"), "{notices}");
                 assert!(notices.contains("PreToolUse prompt handler"), "{notices}");
-                assert!(!notices.contains("PreToolUse is not supported"), "{notices}");
+                assert!(
+                    !notices.contains("PreToolUse is not supported"),
+                    "{notices}"
+                );
             }
         }
     }

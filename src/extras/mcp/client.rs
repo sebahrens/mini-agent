@@ -49,6 +49,104 @@ pub(crate) const MCP_LIST_TOOLS_MAX_DEFERRED_TOOLS: usize = 1024;
 /// Names of cap-omitted tools quoted in the notice.
 pub(crate) const MCP_OMITTED_TOOL_NAMES: usize = 16;
 
+/// Retries of a first HTTP connection after a transient failure (5xx,
+/// connection refused or reset, timeout), so up to four attempts in all.
+pub(crate) const MCP_CONNECT_RETRIES: usize = 3;
+/// Delay before the first retry; each later retry doubles it.
+const MCP_CONNECT_RETRY_BASE: Duration = Duration::from_millis(500);
+
+/// Whether a failed first connection is worth retrying: a timeout, a refused
+/// or reset connection, or an HTTP 5xx. Authentication problems, other 4xx
+/// responses, refused redirects and cancellation are final.
+pub(crate) fn is_transient_connect_error(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}");
+    let lower = text.to_ascii_lowercase();
+    const FINAL: [&str; 7] = [
+        "cancelled",
+        "auth required",
+        "auth error",
+        "insufficient scope",
+        "unauthorized",
+        "forbidden",
+        "disabled",
+    ];
+    if FINAL.iter().any(|marker| lower.contains(marker)) {
+        return false;
+    }
+    if let Some(code) = text.match_indices("HTTP ").find_map(|(at, _)| {
+        text.get(at + 5..at + 8)
+            .and_then(|digits| digits.parse::<u16>().ok())
+    }) {
+        return (500..600).contains(&code);
+    }
+    const TRANSIENT: [&str; 6] = [
+        "timed out",
+        "connection refused",
+        "connection reset",
+        "error sending request",
+        "tcp connect",
+        "unexpected end of stream",
+    ];
+    TRANSIENT.iter().any(|marker| lower.contains(marker))
+}
+
+/// Runs `attempt`, retrying a transient failure up to `retries` times with a
+/// doubling backoff from `base`. Cancellation of the work scope ends it.
+pub(crate) async fn retry_transient_connect<T, F, Fut>(
+    mut attempt: F,
+    retries: usize,
+    base: Duration,
+) -> anyhow::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<T>>,
+{
+    let mut tried = 0usize;
+    loop {
+        match attempt().await {
+            Ok(value) => return Ok(value),
+            Err(error) if tried < retries && is_transient_connect_error(&error) => {
+                let delay = base.saturating_mul(1u32 << tried.min(16));
+                tracing::debug!(
+                    "MCP first connection failed transiently; retry {} of {retries}",
+                    tried + 1
+                );
+                tokio::select! {
+                    biased;
+                    _ = crate::agent::runner::current_work_scope_cancelled() => return Err(error),
+                    _ = tokio::time::sleep(delay) => {}
+                }
+                tried += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Test hook: the retrying HTTP first connect with a short backoff.
+#[cfg(test)]
+pub(crate) async fn connect_http_retrying_for_test(
+    url: &str,
+    base: Duration,
+) -> anyhow::Result<McpClientHandle> {
+    let headers = HashMap::new();
+    retry_transient_connect(
+        || {
+            McpClientHandle::connect_http_with_timeout(
+                CompactString::new("t"),
+                url,
+                &headers,
+                None,
+                None,
+                Duration::from_secs(5),
+            )
+        },
+        MCP_CONNECT_RETRIES,
+        base,
+    )
+    .await
+}
+
 /// Tool-count ceiling for a server's `defer` setting.
 pub(crate) const fn tool_cap_for(defer: super::config::McpDefer) -> usize {
     match defer {
@@ -245,6 +343,9 @@ pub struct McpClientHandle {
     /// Schema-loading mode of the connecting configuration; it sets the
     /// tool-count ceiling of this server's listing.
     pub(crate) defer: super::config::McpDefer,
+    /// Auto-reconnect of a dropped remote server (URL servers only); shared
+    /// with that server's tools. Stdio servers stay manual.
+    pub(crate) link: Option<Arc<super::reconnect::ServerLink>>,
 }
 
 /// Longest stdout line (one JSON-RPC message) accepted from a stdio MCP
@@ -487,6 +588,9 @@ impl Drop for McpClientHandle {
         // immediately. The service task's OwnedStdioTransport then closes and
         // reaps its Unix process group or Windows Job Object.
         self.running_service.cancellation_token().cancel();
+        if let Some(link) = &self.link {
+            link.retire();
+        }
     }
 }
 
@@ -532,6 +636,7 @@ impl McpClientHandle {
             workspace,
             None,
             None,
+            true,
         )
         .await
     }
@@ -549,6 +654,7 @@ impl McpClientHandle {
             workspace.root(),
             Some(workspace),
             None,
+            true,
         )
         .await
     }
@@ -567,6 +673,7 @@ impl McpClientHandle {
             workspace.root(),
             Some(workspace),
             Some(admission),
+            true,
         )
         .await
     }
@@ -578,6 +685,7 @@ impl McpClientHandle {
         workspace: &std::path::Path,
         binding: Option<&Arc<crate::paths::WorkspaceBinding>>,
         admission: Option<&(dyn Fn() -> bool + Send + Sync)>,
+        retry_http: bool,
     ) -> anyhow::Result<Self> {
         let validate = || -> anyhow::Result<()> {
             if let Some(binding) = binding {
@@ -714,6 +822,7 @@ impl McpClientHandle {
                     tools: Arc::new(ToolListCache::with_flag(tools_changed)),
                     options: Default::default(),
                     defer: Default::default(),
+                    link: None,
                 })
             }
             McpServerConfig::Url {
@@ -751,13 +860,22 @@ impl McpClientHandle {
                 } else {
                     headers
                 };
-                let mut handle = Self::connect_http_with_timeout(
-                    server_name,
-                    url,
-                    headers,
-                    oauth.as_ref(),
-                    Some(&endpoint),
-                    initialize_timeout,
+                let retries = if retry_http { MCP_CONNECT_RETRIES } else { 0 };
+                let mut handle = retry_transient_connect(
+                    || async {
+                        validate()?;
+                        Self::connect_http_with_timeout(
+                            server_name.clone(),
+                            url,
+                            headers,
+                            oauth.as_ref(),
+                            Some(&endpoint),
+                            initialize_timeout,
+                        )
+                        .await
+                    },
+                    retries,
+                    MCP_CONNECT_RETRY_BASE,
                 )
                 .await?;
                 handle.trusted_identity = config.trusted_identity();
@@ -765,13 +883,22 @@ impl McpClientHandle {
             }
             McpServerConfig::BuiltIn { identity, headers } => {
                 validate()?;
-                let mut handle = Self::connect_http_with_timeout(
-                    server_name,
-                    identity.endpoint(),
-                    headers,
-                    None,
-                    None,
-                    initialize_timeout,
+                let retries = if retry_http { MCP_CONNECT_RETRIES } else { 0 };
+                let mut handle = retry_transient_connect(
+                    || async {
+                        validate()?;
+                        Self::connect_http_with_timeout(
+                            server_name.clone(),
+                            identity.endpoint(),
+                            headers,
+                            None,
+                            None,
+                            initialize_timeout,
+                        )
+                        .await
+                    },
+                    retries,
+                    MCP_CONNECT_RETRY_BASE,
                 )
                 .await?;
                 handle.trusted_identity = config.trusted_identity();
@@ -885,6 +1012,7 @@ impl McpClientHandle {
             tools: Arc::new(ToolListCache::with_flag(tools_changed)),
             options: Default::default(),
             defer: Default::default(),
+            link: None,
         })
     }
 
@@ -893,8 +1021,51 @@ impl McpClientHandle {
     }
 
     pub(crate) fn with_source_proof(mut self, proof: super::project::ServerSourceProof) -> Self {
-        self.source_proof = Some(std::sync::Arc::new(proof));
+        let proof = std::sync::Arc::new(proof);
+        self.link = self.reconnect_link(&proof);
+        self.source_proof = Some(proof);
         self
+    }
+
+    /// The auto-reconnect link of a URL server captured with its exact
+    /// definition and workspace; `None` for stdio servers (manual reconnect).
+    fn reconnect_link(
+        &self,
+        proof: &Arc<super::project::ServerSourceProof>,
+    ) -> Option<Arc<super::reconnect::ServerLink>> {
+        let (workspace, name, config) = proof.reconnect_target()?;
+        let proof = Arc::clone(proof);
+        let connector: super::reconnect::Connector = Arc::new(move || {
+            let (workspace, name, config, proof) = (
+                workspace.clone(),
+                name.clone(),
+                config.clone(),
+                proof.clone(),
+            );
+            Box::pin(async move {
+                anyhow::ensure!(proof.is_current(), "MCP source changed");
+                // The link owns the attempt budget, so no inner retries.
+                Self::connect_bound_with_timeout_in(
+                    CompactString::new(&name),
+                    &config,
+                    config.options().startup_timeout(MCP_INITIALIZE_TIMEOUT),
+                    workspace.root(),
+                    Some(&workspace),
+                    Some(&|| proof.is_current()),
+                    false,
+                )
+                .await
+            })
+        });
+        Some(super::reconnect::ServerLink::new(
+            self.server_name.clone(),
+            super::reconnect::Conn {
+                peer: self.peer(),
+                elicitation: self.elicitation.clone(),
+            },
+            connector,
+            super::reconnect::RECONNECT_BASE_DELAY,
+        ))
     }
 
     /// Called by the owned connection actor after its immutable source proof
