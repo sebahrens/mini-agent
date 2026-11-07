@@ -145,4 +145,11 @@ describe('buildPromptBlocks images and unsupported references', () => {
     expect(built.blocks).toHaveLength(1);
     expect(built.notes).toHaveLength(3);
   });
+
+  // mini-agent-yjxk5
+  it('reports deferred references that the cap did not reach', async () => {
+    const built = await buildPromptBlocks(options([
+      { kind: 'unsupported', name: 'a', reason: 'no' }, { kind: 'deferred' }, { kind: 'deferred' }]));
+    expect(built.notes.join()).toMatch(/2 more references were not read/);
+  });
 });
