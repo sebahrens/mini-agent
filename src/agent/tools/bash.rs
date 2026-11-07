@@ -1463,9 +1463,14 @@ impl JobStatusTool {
             return Ok(summaries
                 .into_iter()
                 .map(|job| {
-                    let exit = job
-                        .exit_code
-                        .map_or_else(String::new, |code| format!("; exit {code}"));
+                    let exit = job.exit_code.map_or_else(
+                        || {
+                            job.signal.map_or_else(String::new, |signal| {
+                                format!("; {}", describe_signal(signal))
+                            })
+                        },
+                        |code| format!("; exit {code}"),
+                    );
                     let log = job
                         .log_path
                         .map(|path| format!("\n  log: {}", path.display()))
@@ -4109,6 +4114,25 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn signal_killed_background_job_is_described_in_the_job_list() {
+        let shell = test_tool();
+        let status = JobStatusTool::new(shell.sandbox.clone(), None);
+        let id = start_job(&shell, "kill -9 $$").await;
+        wait_for_terminal_job(&status, &id).await;
+        let list = status
+            .call(JobStatusArgs {
+                action: JobAction::List,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(list.contains("Terminated by signal: SIGKILL (9)"), "{list}");
+        let summaries = shell.sandbox.background_job_summaries();
+        assert_eq!(summaries[0].signal, Some(9));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn signal_killed_job_notice_and_auto_background_result_name_the_signal() {
         let shell = test_tool();
         start_job(&shell, "kill -9 $$").await;
@@ -4175,30 +4199,6 @@ mod tests {
         dir
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn workdir_runs_foreground_and_background_commands_in_the_directory() {
-        let fixture = workdir_fixture("run");
-        let rel = format!("{}/sub", fixture.file_name().unwrap().to_string_lossy());
-        let shell = test_tool();
-        let out = shell
-            .call(BashArgs {
-                command: "pwd".into(),
-                workdir: Some(rel.clone()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let real = fixture.join("sub").canonicalize().unwrap();
-        assert!(out.contains(real.to_str().unwrap()), "{out}");
-        // Absolute inside the workspace works too.
-        let out = shell
-            .call(BashArgs {
-                command: "pwd".into(),
-                workdir: Some(fixture.join("sub/deep").to_string_lossy().into_owned()),
-                ..Default::default()
-            })
-            .await
     /// When bwrap remaps the workspace to `/workspace`, `cd` must use that
     /// path and the advertised alias spelling must be accepted.
     #[cfg(unix)]
@@ -4232,6 +4232,30 @@ mod tests {
         std::fs::remove_dir_all(&fixture).ok();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workdir_runs_foreground_and_background_commands_in_the_directory() {
+        let fixture = workdir_fixture("run");
+        let rel = format!("{}/sub", fixture.file_name().unwrap().to_string_lossy());
+        let shell = test_tool();
+        let out = shell
+            .call(BashArgs {
+                command: "pwd".into(),
+                workdir: Some(rel.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let real = fixture.join("sub").canonicalize().unwrap();
+        assert!(out.contains(real.to_str().unwrap()), "{out}");
+        // Absolute inside the workspace works too.
+        let out = shell
+            .call(BashArgs {
+                command: "pwd".into(),
+                workdir: Some(fixture.join("sub/deep").to_string_lossy().into_owned()),
+                ..Default::default()
+            })
+            .await
             .unwrap();
         assert!(out.contains("deep"), "{out}");
         // cd does not persist; the next call starts at the workspace root.

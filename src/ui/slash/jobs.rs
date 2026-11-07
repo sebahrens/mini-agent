@@ -8,10 +8,11 @@ fn summary(job: &crate::sandbox::BackgroundJobSummary) -> String {
         .take(512)
         .collect();
     let command = command.split_whitespace().collect::<Vec<_>>().join(" ");
-    let exit = job
-        .exit_code
-        .map(|code| format!(" exit={code}"))
-        .unwrap_or_default();
+    let exit = match (job.exit_code, job.signal) {
+        (Some(code), _) => format!(" exit={code}"),
+        (None, Some(signal)) => format!(" {}", crate::agent::tools::bash::describe_signal(signal)),
+        (None, None) => String::new(),
+    };
     format!("{}  {}{exit}  {command}", job.id, job.status.as_str())
 }
 
@@ -60,6 +61,7 @@ mod tests {
             command: format!("雪\x1b[2J\n{}", "x".repeat(2000)),
             status: crate::sandbox::BackgroundJobStatus::Stopping,
             exit_code: None,
+            signal: None,
             log_path: None,
         };
         let text = super::summary(&job);
@@ -67,5 +69,18 @@ mod tests {
         assert!(!text.contains('\x1b'));
         assert!(!text.contains('\n'));
         assert!(text.chars().count() < 560);
+    }
+
+    #[test]
+    fn signal_killed_job_summary_names_the_signal() {
+        let job = crate::sandbox::BackgroundJobSummary {
+            id: "job-sig".into(),
+            command: "kill -9 $$".into(),
+            status: crate::sandbox::BackgroundJobStatus::Completed,
+            exit_code: None,
+            signal: Some(9),
+            log_path: None,
+        };
+        assert!(super::summary(&job).contains("Terminated by signal: SIGKILL (9)"));
     }
 }

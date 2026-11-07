@@ -1091,6 +1091,8 @@ pub(crate) struct BackgroundJobSummary {
     pub command: String,
     pub status: BackgroundJobStatus,
     pub exit_code: Option<i32>,
+    /// Signal number that terminated the job, when it had no exit code.
+    pub signal: Option<i32>,
     pub log_path: Option<PathBuf>,
 }
 
@@ -3566,8 +3568,6 @@ impl Sandbox {
         workdir: &str,
         command: &str,
     ) -> Result<String, String> {
-        let workdir = workdir.trim();
-    ) -> Result<String, String> {
         self.command_in_workdir_aliased(workdir, command, self.shell_cwd_alias().as_deref())
     }
 
@@ -3580,6 +3580,8 @@ impl Sandbox {
         workdir: &str,
         command: &str,
         alias: Option<&Path>,
+    ) -> Result<String, String> {
+        let workdir = workdir.trim();
         if workdir.is_empty() || workdir.contains('\0') {
             return Err("workdir must be a non-empty path".into());
         }
@@ -5621,6 +5623,7 @@ impl Sandbox {
                         command: job.command.clone(),
                         status,
                         exit_code: terminal.and_then(|terminal| terminal.exit_code),
+                        signal: terminal.and_then(|terminal| terminal.signal),
                         log_path: job.log_path.clone(),
                     },
                 )
@@ -13230,29 +13233,6 @@ echo PRIVATE_TEMP_PASS"#,
 
         #[tokio::test]
         #[allow(unsafe_code)]
-        async fn forking_past_the_process_limit_gets_eagain() {
-            // SAFETY: geteuid has no preconditions. Root bypasses RLIMIT_NPROC.
-            if unsafe { libc::geteuid() } == 0 {
-                return;
-            }
-            let limits = ShellResourceLimits {
-                max_processes: Some(1),
-                max_file_bytes: None,
-            };
-            let (ok, text) = run("/bin/echo forked; /bin/echo done", limits).await;
-            assert!(!ok && !text.contains("forked"), "{text}");
-            // Normal limits still run ordinary workloads.
-            let (ok, text) = run(
-                "/bin/echo forked; /bin/echo done",
-                ShellResourceLimits::default(),
-            )
-            .await;
-            assert!(ok && text.contains("forked"), "{text}");
-        }
-    }
-}
-        #[tokio::test]
-        #[allow(unsafe_code)]
         async fn an_operator_soft_limit_below_the_cap_is_not_raised() {
             use std::os::unix::process::CommandExt;
             let dir = crate::tests::OwnedTestDirectory::new("shell-fsize-soft");
@@ -13289,3 +13269,26 @@ echo PRIVATE_TEMP_PASS"#,
             );
         }
 
+        #[tokio::test]
+        #[allow(unsafe_code)]
+        async fn forking_past_the_process_limit_gets_eagain() {
+            // SAFETY: geteuid has no preconditions. Root bypasses RLIMIT_NPROC.
+            if unsafe { libc::geteuid() } == 0 {
+                return;
+            }
+            let limits = ShellResourceLimits {
+                max_processes: Some(1),
+                max_file_bytes: None,
+            };
+            let (ok, text) = run("/bin/echo forked; /bin/echo done", limits).await;
+            assert!(!ok && !text.contains("forked"), "{text}");
+            // Normal limits still run ordinary workloads.
+            let (ok, text) = run(
+                "/bin/echo forked; /bin/echo done",
+                ShellResourceLimits::default(),
+            )
+            .await;
+            assert!(ok && text.contains("forked"), "{text}");
+        }
+    }
+}
