@@ -149,7 +149,7 @@ impl Tool for LspTool {
                         "directory must be a workspace-relative path without `..`".to_string(),
                     ));
                 }
-                Some(dir.to_path_buf())
+                normalize_directory_filter(dir)
             }
         };
         match args.path {
@@ -1128,4 +1128,46 @@ fn render_actions(
     }
     out.push_str("Pass `action`=N to preview an action's edit.");
     out
+}
+
+/// Drops `.` components so `./src`, `src/` and `src//sub` compare against
+/// workspace-relative paths by component; an empty result (`.`, `./`, ``)
+/// means "no filter" rather than matching nothing.
+fn normalize_directory_filter(dir: &Path) -> Option<std::path::PathBuf> {
+    let normalized: std::path::PathBuf = dir
+        .components()
+        .filter(|c| matches!(c, std::path::Component::Normal(_)))
+        .collect();
+    (!normalized.as_os_str().is_empty()).then_some(normalized)
+}
+
+#[cfg(test)]
+mod directory_filter_tests {
+    use super::*;
+
+    fn keeps(dir: &str, file: &str) -> bool {
+        match normalize_directory_filter(Path::new(dir)) {
+            None => true,
+            Some(dir) => Path::new(file).starts_with(dir),
+        }
+    }
+
+    #[test]
+    fn curdir_forms_do_not_hide_cached_diagnostics() {
+        assert!(keeps(".", "src/a.rs"));
+        assert!(keeps("./", "src/a.rs"));
+        assert!(keeps("", "src/a.rs"));
+        assert!(keeps("./src", "src/a.rs"));
+        assert!(keeps("src/", "src/a.rs"));
+        assert!(keeps("src//sub", "src/sub/a.rs"));
+        assert!(keeps("./src/./sub", "src/sub/a.rs"));
+    }
+
+    #[test]
+    fn directory_filter_still_excludes_other_trees() {
+        assert!(!keeps("./src", "tests/a.rs"));
+        assert!(!keeps("src//sub", "src/other/a.rs"));
+        assert!(!keeps("src", "srcx/a.rs"));
+        assert_eq!(normalize_directory_filter(Path::new(".")), None);
+    }
 }
