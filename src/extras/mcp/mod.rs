@@ -138,6 +138,10 @@ pub struct McpClientManager {
     /// Exact count from the last captured effective catalogue, independent of
     /// retained live handles and bounded diagnostic origin rows.
     configured_count: Option<usize>,
+    /// How many of the configured servers are meant to connect (entries with
+    /// `enabled = false` are retained but never launched), so a manager is
+    /// complete when it holds this many handles.
+    connectable_count: Option<usize>,
     deferred_view: Mutex<std::sync::Weak<deferred::DiscoveryView>>,
     /// Bounded, credential-free reason each configured server failed to
     /// connect, kept after [`Self::take_notices`] drains the notices so
@@ -179,6 +183,7 @@ impl McpClientManager {
             origins: Default::default(),
             origins_omitted: false,
             configured_count: None,
+            connectable_count: None,
             deferred_view: Mutex::new(std::sync::Weak::new()),
             connect_errors: Default::default(),
         }
@@ -297,8 +302,18 @@ impl McpClientManager {
     pub(crate) fn configured_count(&self) -> Option<usize> {
         self.configured_count
     }
+    pub(crate) fn connectable_count(&self) -> Option<usize> {
+        self.connectable_count
+    }
     pub(crate) fn capture_config(&mut self, cfg: &crate::config::Config) {
         self.configured_count = Some(cfg.mcp_servers.as_ref().map_or(0, HashMap::len));
+        self.connectable_count = Some(
+            cfg.mcp_servers
+                .iter()
+                .flatten()
+                .filter(|(_, server)| server.options().is_enabled())
+                .count(),
+        );
         // MCP connections outlive model switches, so their bound scales with
         // the configured window (or the 128k default) rather than a model's.
         self.spill_limits =

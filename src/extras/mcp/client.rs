@@ -239,22 +239,21 @@ pub(crate) async fn list_bounded_tools(
     options: &super::config::McpServerOptions,
     defer: super::config::McpDefer,
 ) -> Result<Arc<ListedTools>, ServiceError> {
-    let found = list_all_tools_selected(
-        peer,
-        timeout,
-        &|name| options.admits_tool(name),
-        tool_cap_for(defer),
-    )
-    .await?;
-    let mut listed = bound_listed_tools_capped(found.tools, tool_cap_for(defer));
+    let cap = tool_cap_for(defer);
+    let found =
+        list_all_tools_selected(peer, timeout, &|name| options.admits_tool(name), cap).await?;
+    let mut listed = bound_listed_tools(found.tools);
     listed.filtered_by_config = found.filtered;
     listed.over_cap = found.over_cap;
-    listed.reached_tool_cap |= listed.over_cap.count > 0;
+    // A catalogue of exactly the cap that was listed to the end lost nothing;
+    // report a cut only when tools were counted past the cap or the listing
+    // stopped before the server's last page.
+    listed.reached_tool_cap =
+        listed.over_cap.count > 0 || (listed.entries.len() >= cap && !listed.over_cap.exact);
     Ok(Arc::new(listed))
 }
 
-pub(crate) fn bound_listed_tools_capped(tools: Vec<Tool>, cap: usize) -> ListedTools {
-    let reached_tool_cap = tools.len() == cap;
+pub(crate) fn bound_listed_tools(tools: Vec<Tool>) -> ListedTools {
     let entries = tools
         .into_iter()
         .map(|definition| {
@@ -274,7 +273,7 @@ pub(crate) fn bound_listed_tools_capped(tools: Vec<Tool>, cap: usize) -> ListedT
         .collect();
     ListedTools {
         entries,
-        reached_tool_cap,
+        reached_tool_cap: false,
         over_cap: OverCap::default(),
         filtered_by_config: 0,
     }
@@ -1195,11 +1194,14 @@ impl McpClientHandle {
     /// The cached listing of this connection generation, listing (and
     /// bounding) once on first use. Same cell the agent build fills.
     pub async fn cached_tools(&self) -> Result<Arc<ListedTools>, ServiceError> {
-        let peer = self.running_service.peer();
+        // The live generation's peer (like the agent build path): after a
+        // reconnect the original peer is closed and listing on it would fail
+        // and consume the reconnect staleness flag.
+        let peer = self.live_peer();
         self.tools
             .get_or_list(|| {
                 list_bounded_tools(
-                    peer,
+                    &peer,
                     self.options.list_timeout(MCP_LIST_TOOLS_TIMEOUT),
                     &self.options,
                     self.defer,

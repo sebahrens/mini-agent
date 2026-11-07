@@ -47,7 +47,7 @@ export interface PromptBuild {
 
 function contained(root: string, target: string): boolean {
   const relative = path.relative(root, target);
-  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+  return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
 /** Resolved path when it exists inside the workspace root (symlinks followed), else undefined. */

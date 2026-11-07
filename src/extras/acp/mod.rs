@@ -267,8 +267,8 @@ impl PromptMcp {
         self.key.as_ref() == Some(key)
             && self
                 .manager
-                .configured_count()
-                .is_none_or(|configured| self.manager.handles.len() >= configured)
+                .connectable_count()
+                .is_none_or(|connectable| self.manager.handles.len() >= connectable)
             && self.manager.all_connections_open()
     }
 
@@ -11693,6 +11693,34 @@ mod protocol_tests {
                 .unwrap();
         }
         server.cleanup();
+    }
+
+    // mini-agent-zjuqw: a disabled server is configured but never connects, so
+    // it must not make the prompt-spanning manager look incomplete.
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn session_mcp_manager_is_reusable_with_a_disabled_server() {
+        use crate::extras::mcp::McpClientManager;
+
+        let workspace = ProtocolTempDir::new();
+        let binding = Arc::new(crate::paths::WorkspaceBinding::capture(workspace.path()).unwrap());
+        let off: crate::extras::mcp::config::McpServerConfig = serde_json::from_value(
+            serde_json::json!({"command": "never-launched", "enabled": false}),
+        )
+        .unwrap();
+        let cfg = Config {
+            mcp_servers: Some(HashMap::from([("off".to_owned(), off)])),
+            ..Config::default()
+        };
+        let key = McpKey::new(&cfg, &binding);
+        let mut manager = McpClientManager::from_handles(Vec::new());
+        manager.capture_config(&cfg);
+        let mcp = PromptMcp {
+            manager,
+            scope: crate::agent::runner::AgentWorkScope::new(),
+            key: Some(McpKey::new(&cfg, &binding)),
+        };
+        assert!(mcp.is_reusable(&key), "disabled entries never connect");
     }
 
     #[cfg(all(feature = "mcp", unix))]

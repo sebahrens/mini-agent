@@ -650,6 +650,34 @@ mod tests {
         assert!(original.auxiliary.is_stale());
     }
 
+    // mini-agent-yqb9w: /mcp <server> lists through the live peer after a reconnect.
+    #[tokio::test]
+    async fn cached_tools_lists_from_the_replacement_after_a_reconnect() {
+        let Some((url, _)) = serve_catalogue().await else {
+            return;
+        };
+        let original = linked(&url).await;
+        let names = |listed: Arc<crate::extras::mcp::client::ListedTools>| {
+            listed
+                .entries
+                .iter()
+                .map(|e| e.definition.name.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(original.cached_tools().await.unwrap()), ["tool_v1"]);
+        dropped(&original).await;
+        original
+            .link
+            .clone()
+            .unwrap()
+            .ensure_connected()
+            .await
+            .unwrap();
+        assert!(original.tools.is_stale());
+        assert_eq!(names(original.cached_tools().await.unwrap()), ["tool_v2"]);
+        assert!(!original.tools.is_stale());
+    }
+
     // mini-agent-bu3wp: mcp_tool hooks reconnect instead of "not connected".
     #[cfg(feature = "hooks")]
     #[tokio::test]

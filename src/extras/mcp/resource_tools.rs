@@ -204,10 +204,20 @@ fn render_server_listing(
         } else {
             ""
         },
-        if matching.is_empty() { 0 } else { offset + 1 },
-        end,
+        if offset >= matching.len() {
+            0
+        } else {
+            offset + 1
+        },
+        if offset >= matching.len() { 0 } else { end },
         matching.len()
     ));
+    if offset >= matching.len() && !matching.is_empty() {
+        listing.push_str(&format!(
+            "  offset is past the last of {} matching resource(s); call again with offset=0 to start over\n",
+            matching.len()
+        ));
+    }
     let omitted = catalogue.resources_omitted;
     if omitted.total() > 0 {
         listing.push_str(&format!(
@@ -385,6 +395,14 @@ fn page(text: &str, offset: usize, length: usize) -> (&str, usize, usize) {
     let mut end = start.saturating_add(length).min(text.len());
     while !text.is_char_boundary(end) {
         end -= 1;
+    }
+    if end == start && start < text.len() {
+        // `length` is smaller than the character at `start`: return that one
+        // character so the continuation offset always advances.
+        end = start + 1;
+        while !text.is_char_boundary(end) {
+            end += 1;
+        }
     }
     (&text[start..end], start, end)
 }
@@ -662,6 +680,36 @@ mod tests {
             scoped.contains("call again with offset=128 to continue"),
             "{scoped}"
         );
+    }
+
+    // mini-agent-ho2cr: a length below the next character still advances.
+    #[test]
+    fn a_page_shorter_than_the_next_character_still_advances() {
+        let text = "日本語";
+        assert_eq!(page(text, 0, 1), ("日", 0, 3));
+        assert_eq!(page(text, 3, 2), ("本", 3, 6));
+        assert_eq!(page(text, 9, 1), ("", 9, 9));
+    }
+
+    // mini-agent-xhvu5: an offset past the matches does not print an inverted range.
+    #[test]
+    fn listing_past_the_end_reports_an_empty_range_and_a_reset_hint() {
+        let resource = |n: usize| {
+            serde_json::from_value::<rmcp::model::Resource>(serde_json::json!({
+                "uri": format!("mem://r{n}"), "name": format!("r{n}")
+            }))
+            .unwrap()
+        };
+        let catalogue = Catalogue {
+            resources: (0..5).map(resource).collect(),
+            ..Catalogue::default()
+        };
+        let past = render_server_listing("gh", &catalogue, None, 50, 128, true, None);
+        assert!(past.contains("showing 0-0 of 5 matching"), "{past}");
+        assert!(past.contains("offset=0"), "{past}");
+        assert!(!past.contains("mem://r"), "{past}");
+        let inside = render_server_listing("gh", &catalogue, None, 2, 128, true, None);
+        assert!(inside.contains("showing 3-5 of 5 matching"), "{inside}");
     }
 
     #[test]

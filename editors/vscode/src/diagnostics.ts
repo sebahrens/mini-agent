@@ -1,3 +1,5 @@
+import { StringDecoder } from 'node:string_decoder';
+
 /** Default number of child-process stderr lines retained for error reports. */
 export const STDERR_RING_CAPACITY = 50;
 /** Lines shown inline in a toast; the full ring goes to the output channel. */
@@ -7,6 +9,8 @@ export const STDERR_TOAST_LINES = 3;
 export class LineRingBuffer {
   private readonly buffer: string[] = [];
   private partial = '';
+  /** Stateful so a multibyte character split across chunks decodes intact. */
+  private readonly decoder = new StringDecoder('utf8');
 
   constructor(private readonly capacity: number = STDERR_RING_CAPACITY) {
     if (!Number.isInteger(capacity) || capacity < 1) {
@@ -16,7 +20,7 @@ export class LineRingBuffer {
 
   /** Feed a chunk; returns the complete lines it finished so callers can log them. */
   push(chunk: string | Uint8Array): string[] {
-    const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8');
+    const text = typeof chunk === 'string' ? chunk : this.decoder.write(Buffer.from(chunk));
     const parts = (this.partial + text).split(/\r?\n/);
     this.partial = parts.pop() ?? '';
     const completed = parts.map(line => line.trimEnd()).filter(line => line.length > 0);
@@ -26,7 +30,7 @@ export class LineRingBuffer {
 
   /** Flush a trailing partial line (e.g. after the stream ends). */
   flush(): string[] {
-    const line = this.partial.trimEnd();
+    const line = (this.partial + this.decoder.end()).trimEnd();
     this.partial = '';
     if (line.length === 0) { return []; }
     this.append(line);

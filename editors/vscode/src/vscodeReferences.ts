@@ -45,11 +45,16 @@ export async function collectReferences(
     const display = typeof name === 'string' && name ? name : 'reference';
     if (isLocation(value)) {
       if (value.uri.scheme !== 'file') { out.push(unsupported(display, `only local files can be sent, not ${value.uri.scheme}: references`)); continue; }
-      const document = await vscode.workspace.openTextDocument(value.uri as vscode.Uri);
-      out.push({
-        kind: 'snippet', fsPath: value.uri.fsPath, text: document.getText(value.range as vscode.Range),
-        startLine: value.range.start.line, endLine: value.range.end.line, ...named,
-      });
+      try {
+        const document = await vscode.workspace.openTextDocument(value.uri as vscode.Uri);
+        out.push({
+          kind: 'snippet', fsPath: value.uri.fsPath, text: document.getText(value.range as vscode.Range),
+          startLine: value.range.start.line, endLine: value.range.end.line, ...named,
+        });
+      } catch {
+        // A deleted, binary or oversized document must not fail the whole request.
+        out.push(unsupported(display, 'the document could not be opened as text'));
+      }
     } else if (isUri(value)) {
       if (value.scheme === 'file') { out.push({ kind: 'file', fsPath: value.fsPath, ...named }); }
       else { out.push(unsupported(display, `only local files can be sent, not ${value.scheme}: references`)); }

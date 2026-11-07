@@ -34,6 +34,13 @@ describe('buildPromptBlocks', () => {
     expect(inline.blocks[1]).toEqual({ type: 'text', text: 'Reference a.ts:5-7:\nlet x' });
   });
 
+  // mini-agent-uxsfz
+  it('links a workspace file whose name begins with two dots', async () => {
+    const built = await buildPromptBlocks(options([{ kind: 'file', fsPath: '/work/space/..notes.txt' }]));
+    expect(built.notes).toEqual([]);
+    expect(built.blocks).toHaveLength(2);
+  });
+
   it('refuses out-of-workspace paths, traversal, symlink escapes, relative paths and missing files', async () => {
     const built = await buildPromptBlocks(options([
       { kind: 'file', fsPath: '/etc/passwd' },

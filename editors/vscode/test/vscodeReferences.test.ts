@@ -23,6 +23,20 @@ describe('collectReferences', () => {
     expect(out.at(-1)).toMatchObject({ kind: 'file', fsPath: '/w/ok.ts' });
   });
 
+  // mini-agent-pcpu7
+  it('skips a location whose document cannot be opened and keeps the rest', async () => {
+    const vscode = await import('vscode');
+    vi.mocked(vscode.workspace.openTextDocument).mockRejectedValueOnce(new Error('file not found'));
+    const out = await collectReferences({
+      references: [
+        { id: 'a', name: 'gone.ts', value: { uri: uri('file', '/w/gone.ts'), range: { start: { line: 0 }, end: { line: 1 } } } },
+        { id: 'b', name: 'ok.ts', value: uri('file', '/w/ok.ts') },
+      ] as never,
+    }, false);
+    expect(out[0]).toMatchObject({ kind: 'unsupported', name: 'gone.ts' });
+    expect(out[1]).toMatchObject({ kind: 'file', fsPath: '/w/ok.ts' });
+  });
+
   it('reads image binary references and flags non-image binaries', async () => {
     const out = await collectReferences({
       references: [
