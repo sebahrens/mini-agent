@@ -95,7 +95,14 @@ per directory, while a deny rule on the bare command still applies.
 `pty = true` and `job_status action=input`/`keys` exist on Unix only. There is
 no ConPTY path, so on Windows the tool schemas omit them and the model is never
 offered a pseudo-terminal; a call that still sends `pty = true` is refused with
-a message saying so.
+a message saying so. The Windows `shell` description states the limitation
+(REPLs, prompting installers, `python -i`, ssh/gh login cannot be driven; use
+non-interactive flags) instead of leaving the model to discover it. A ConPTY
+path is not implemented: the AppContainer helper is started through
+`std::process::Command` with a private launch request on its stdin and an
+attested inherited-handle list, and attaching a pseudo console
+(`PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`) needs a separate, Windows-tested launch
+path that reimplements that attestation.
 
 `pty = true` and `job_status action=input`/`keys` exist on Unix only. There is
 no ConPTY path, so on Windows the tool schemas omit them and the model is never
@@ -108,9 +115,12 @@ text, a line starting with `^`), because an interactive bash or zsh rewrites
 the line (completion, history) before running it. It judges each chunk together
 with the unterminated line typed so far, so permission rules see the command
 the terminal will run. Named keys go through the separate `keys` list
-(`ctrl_c`, `ctrl_d`, `esc`, `up`, `down`, `left`, `right`, `tab`, `enter`,
-`backspace`), whose bytes the tool renders: `ctrl_c`/`ctrl_d` carry no text and
-need no permission; `enter` judges the line typed so far; cursor, history and
+(`ctrl_c`, `ctrl_d`, `ctrl_l`, `ctrl_z`, `esc`, `up`, `down`, `left`, `right`,
+`tab`, `shift_tab`, `enter`, `backspace`, `page_up`, `page_down`, `home`, `end`,
+`delete`, `f1`..`f12`; at most 64 per call), whose bytes the tool renders:
+`ctrl_c`/`ctrl_d` carry no text and need no permission (`ctrl_l` only redraws and
+`ctrl_z` suspends the foreground program); `enter` judges the line typed so far;
+cursor, history, paging, Home/End/Delete, Shift-Tab, function and
 `esc` keys make the next Enter judged as an opaque "edited line" command (so an
 ask or deny rule can stop it; `ctrl_c` clears the line); `tab` on a partly typed
 line is refused.
@@ -184,8 +194,9 @@ combined; byte_cap: 67108864; ...]` with the partial transcript. The
 `max_bash_output_lines` head/tail line cap still bounds the rendered text; the
 log footer is appended after it so it is never cut. Hook, validation and other
 sandbox command classes keep their existing bounded 1 MiB/1.5 MiB capture.
-`pty = true` (Unix only) runs the command under a fresh 120x40
-pseudo-terminal instead of pipes: its stdin, stdout and stderr are one TTY, so
+`pty = true` (Unix only) runs the command under a fresh pseudo-terminal
+(120x40 unless the mini-agent process environment sets `LINES` (5-500) and/or
+`COLUMNS` (20-1000); anything else keeps the default for that axis) instead of pipes: its stdin, stdout and stderr are one TTY, so
 `isatty()` is true and colour/progress/prompt behaviour matches an interactive
 terminal. The output is one merged, unlabelled stream. The terminal belongs to
 the command; it is never the user's terminal, the command still gets a new

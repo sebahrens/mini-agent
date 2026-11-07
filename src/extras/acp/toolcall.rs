@@ -123,6 +123,7 @@ pub(super) fn pending_diffs(tool: &str, args: &Value) -> Vec<ToolCallContent> {
             let Ok(blocks) = crate::agent::tools::edit::parse_blocks(raw) else {
                 return Vec::new();
             };
+            let total = blocks.len();
             let mut budget = MAX_DIFF_BYTES;
             let mut out = Vec::new();
             for block in blocks.into_iter().take(MAX_PREVIEW_BLOCKS) {
@@ -137,6 +138,19 @@ pub(super) fn pending_diffs(tool: &str, args: &Value) -> Vec<ToolCallContent> {
                     diff.meta = Some(truncated_meta());
                 }
                 out.push(ToolCallContent::Diff(diff));
+            }
+            // Blocks skipped by count or byte budget would otherwise vanish
+            // silently: mark the last emitted diff and say how many.
+            let skipped = total.saturating_sub(out.len());
+            if skipped > 0
+                && let Some(ToolCallContent::Diff(last)) = out.last_mut()
+            {
+                let meta = last.meta.get_or_insert_with(truncated_meta);
+                meta.insert("mini-agent-truncated".to_owned(), Value::Bool(true));
+                meta.insert(
+                    "mini-agent-omitted-blocks".to_owned(),
+                    Value::from(skipped as u64),
+                );
             }
             out
         }
@@ -262,6 +276,46 @@ mod tests {
                 .unwrap()
                 .contains_key("mini-agent-truncated")
         );
+    }
+
+    fn blocks(n: usize, body: &str) -> String {
+        (0..n)
+            .map(|i| format!("<<<<<<< SEARCH\nold{i}{body}\n=======\nnew{i}\n>>>>>>> REPLACE"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn omitted(out: &[ToolCallContent]) -> Option<u64> {
+        out.iter().rev().find_map(|c| match c {
+            ToolCallContent::Diff(d) => d.meta.as_ref()?.get("mini-agent-omitted-blocks")?.as_u64(),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn skipped_blocks_by_count_are_marked_with_count() {
+        let out = pending_diffs("edit", &json!({"path": "a.rs", "block": blocks(20, "")}));
+        assert_eq!(out.len(), MAX_PREVIEW_BLOCKS);
+        assert_eq!(omitted(&out), Some(4));
+        let ToolCallContent::Diff(last) = out.last().unwrap() else {
+            panic!()
+        };
+        assert!(
+            last.meta
+                .as_ref()
+                .unwrap()
+                .contains_key("mini-agent-truncated")
+        );
+        let full = pending_diffs("edit", &json!({"path": "a.rs", "block": blocks(16, "")}));
+        assert_eq!(omitted(&full), None);
+    }
+
+    #[test]
+    fn skipped_blocks_by_byte_budget_are_marked_with_count() {
+        let body = "z".repeat(MAX_DIFF_BYTES / 2);
+        let out = pending_diffs("edit", &json!({"path": "a.rs", "block": blocks(6, &body)}));
+        assert!(out.len() < 6);
+        assert_eq!(omitted(&out), Some((6 - out.len()) as u64));
     }
 
     #[test]

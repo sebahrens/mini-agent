@@ -834,6 +834,8 @@ pub(crate) enum DenialReason {
     NoConfiguredRoots,
     OutsideRoots,
     PermissionDenied,
+    /// `write_file` onto an existing file the model has not fully read.
+    UnreadOverwrite,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

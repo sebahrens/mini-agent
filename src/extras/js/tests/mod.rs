@@ -92,6 +92,7 @@ mod worker_file_targets;
 mod worker_protocol;
 mod worker_resource_benchmark;
 pub(super) mod worker_runtime;
+mod write_file_guard;
 
 use crate::extras::js::audit::EffectAudit;
 use crate::extras::js::host::AllowConfig;

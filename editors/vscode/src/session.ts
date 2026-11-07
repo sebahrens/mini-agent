@@ -118,8 +118,20 @@ export class AgentSession {
   async availableCommands(): Promise<readonly acp.AvailableCommand[]> {
     await this.start();
     const active = await this.conversation.current();
-    return active.commands?.() ?? [];
+    const commands = active.commands?.() ?? [];
+    this.commandsDropped = active.droppedCommands?.() ?? 0;
+    if (this.commandsDropped > 0 && this.commandsDropped !== this.commandsDroppedLogged) {
+      this.commandsDroppedLogged = this.commandsDropped;
+      log.warn(`The Mini Agent server advertised ${commands.length + this.commandsDropped} slash commands; only the first ${commands.length} are kept, so ${this.commandsDropped} cannot be listed or run from this extension.`);
+    }
+    return commands;
   }
+
+  private commandsDropped = 0;
+  private commandsDroppedLogged = 0;
+
+  /** Advertised commands the session could not keep, as of the last `availableCommands()` call. */
+  droppedCommands(): number { return this.commandsDropped; }
 
   /** Pick the permission mode (the agent's ACP session modes) for the workspace conversation. */
   async selectMode(): Promise<void> {

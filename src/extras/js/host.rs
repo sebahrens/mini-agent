@@ -1415,6 +1415,57 @@ async fn read_approved_file(target: ResolvedReadTarget) -> Result<String, Effect
     String::from_utf8(bytes).map_err(|_| EffectServiceError::InvalidBody)
 }
 
+/// Positions `file` at the start of its last `keep` lines by scanning backwards from EOF in
+/// chunks. At most `READ_LINES_MAX_SCAN_BYTES` are examined, measured from the end; a tail whose
+/// last `keep` lines are longer than that is `OutputLimit`, like a forward scan of that size.
+/// A final newline terminates the last line and is not a separator, matching `read_lines_range`.
+async fn seek_to_tail<F>(file: &mut F, keep: usize) -> Result<(), EffectServiceError>
+where
+    F: tokio::io::AsyncRead + tokio::io::AsyncSeek + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    const CHUNK: u64 = 64 * 1024;
+    let len = file
+        .seek(std::io::SeekFrom::End(0))
+        .await
+        .map_err(file_path_error)?;
+    let mut start = 0u64;
+    if keep > 0 {
+        let mut position = len;
+        let mut scanned = 0u64;
+        let mut seen = 0usize;
+        let mut buffer = vec![0u8; CHUNK as usize];
+        'scan: while position > 0 {
+            let size = position.min(CHUNK);
+            position -= size;
+            scanned += size;
+            if scanned > READ_LINES_MAX_SCAN_BYTES {
+                return Err(EffectServiceError::OutputLimit);
+            }
+            file.seek(std::io::SeekFrom::Start(position))
+                .await
+                .map_err(file_path_error)?;
+            let chunk = &mut buffer[..size as usize];
+            file.read_exact(chunk).await.map_err(file_path_error)?;
+            for index in (0..chunk.len()).rev() {
+                let absolute = position + index as u64;
+                if chunk[index] == b'\n' && absolute + 1 != len {
+                    seen += 1;
+                    if seen == keep {
+                        start = absolute + 1;
+                        break 'scan;
+                    }
+                }
+            }
+        }
+    }
+    file.seek(std::io::SeekFrom::Start(start))
+        .await
+        .map_err(file_path_error)?;
+    Ok(())
+}
+
 /// Streams `count` lines starting at 1-based `from` (or the last `-from` lines when negative).
 ///
 /// Bounded three ways: at most `READ_LINES_MAX_SCAN_BYTES` are scanned, each line is truncated
@@ -1613,6 +1664,95 @@ pub(crate) struct FileEffectService {
     permission_bridge: PermissionBridge,
     allow_config: AllowConfig,
     timeout: Duration,
+    write_guard: Option<JsWriteGuard>,
+}
+
+/// Session state that puts `write_file` under the same overwrite rules as the
+/// native `write` tool: replacing an existing file needs a complete current
+/// read, the exact preimage is checkpointed for `/rewind`, and the mutation
+/// diff is published. Absent (tests, evals), `write_file` keeps the bare
+/// permission-and-atomic-replace behaviour.
+#[derive(Clone)]
+pub(crate) struct JsWriteGuard {
+    pub(crate) tracker: crate::agent::tools::ReadTracker,
+    pub(crate) diff_options: crate::agent::tools::mutation_diff::DiffOptions,
+    pub(crate) permission: Option<crate::permission::checker::PermCheck>,
+    pub(crate) max_text_file_size: u64,
+    /// Diffs recorded by this invocation's writes, drained by the tool.
+    pub(crate) diffs:
+        std::sync::Arc<std::sync::Mutex<Vec<crate::agent::tools::mutation_diff::MutationDiff>>>,
+}
+
+impl JsWriteGuard {
+    fn authorize_overwrite(
+        &self,
+        key: &str,
+        metadata: &std::fs::Metadata,
+        current: &[u8],
+    ) -> Result<(), EffectServiceError> {
+        let (crc, lines) = crate::agent::tools::write::full_text_fingerprint(current)
+            .map_err(|_| EffectServiceError::OverwriteNotAuthorized)?;
+        if self
+            .tracker
+            .permits_full_overwrite(key, metadata, crc, lines)
+        {
+            Ok(())
+        } else {
+            Err(EffectServiceError::OverwriteNotAuthorized)
+        }
+    }
+
+    fn read_preimage(
+        &self,
+        file: &mut std::fs::File,
+    ) -> Result<(std::fs::Metadata, Vec<u8>), EffectServiceError> {
+        use std::io::Read;
+        let metadata = file.metadata().map_err(file_path_error)?;
+        if metadata.len() > self.max_text_file_size {
+            return Err(EffectServiceError::OverwriteNotAuthorized);
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.take(self.max_text_file_size.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(file_path_error)?;
+        if bytes.len() as u64 > self.max_text_file_size {
+            return Err(EffectServiceError::OverwriteNotAuthorized);
+        }
+        Ok((metadata, bytes))
+    }
+
+    fn record_diff(
+        &self,
+        key: &str,
+        before: Option<&str>,
+        content: &str,
+        before_digest: Option<&crate::fs::ContentDigest>,
+        after_digest: &crate::fs::ContentDigest,
+    ) {
+        let diff = crate::agent::tools::mutation_diff::MutationDiff::replacement_with_digests(
+            key,
+            before,
+            content,
+            self.diff_options,
+            before_digest.map(|digest| digest.hex()),
+            after_digest.hex(),
+        );
+        if let Some(diff) = diff {
+            self.diffs
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(diff);
+        }
+    }
+
+    fn preimage_visible(&self, key: &str, contained: bool) -> bool {
+        self.diff_options.max_lines > 0
+            && crate::agent::tools::mutation_diff::preimage_allowed(
+                &self.permission,
+                key,
+                contained,
+            )
+    }
 }
 
 enum PreparedReadEffect {
@@ -1646,7 +1786,13 @@ impl FileEffectService {
             permission_bridge,
             allow_config,
             timeout,
+            write_guard: None,
         }
+    }
+
+    pub(crate) fn with_write_guard(mut self, guard: Option<JsWriteGuard>) -> Self {
+        self.write_guard = guard;
+        self
     }
 
     #[cfg(test)]
@@ -1781,6 +1927,14 @@ impl FileEffectService {
                     tokio::fs::File::from_std(file)
                 }
             };
+            let mut file = file;
+            if from < 0 {
+                // Tail read: find where the last lines begin by scanning backwards from EOF, so a
+                // multi-GB log costs only the bytes of its final lines.
+                let keep =
+                    (from.unsigned_abs() as usize).min(count.min(READ_LINES_MAX_COUNT) as usize);
+                seek_to_tail(&mut file, keep).await?;
+            }
             read_lines_range(tokio::io::BufReader::new(file), from, count).await
         };
         tokio::select! {
@@ -1888,12 +2042,21 @@ impl FileEffectService {
         content: String,
         bridge: PermissionBridge,
     ) -> Result<(), EffectServiceError> {
+        let guard = self.write_guard.clone();
         match prepared {
             PreparedWriteEffect::Path(target) => {
                 let write_cancellation = crate::fs::AtomicWriteCancellation::default();
                 let signal = write_cancellation.clone();
                 let call = async {
-                    write_approved_file_cancellable(target, content, write_cancellation).await
+                    match &guard {
+                        Some(guard) => {
+                            write_guarded_path(guard, target, content, write_cancellation).await
+                        }
+                        None => {
+                            write_approved_file_cancellable(target, content, write_cancellation)
+                                .await
+                        }
+                    }
                 };
                 await_mutating_effect_with_interrupt(&bridge, self.timeout, call, move || {
                     signal.cancel()
@@ -1905,9 +2068,27 @@ impl FileEffectService {
                 relative,
             } => {
                 let call = async move {
+                    let Some(guard) = guard else {
+                        return workspace
+                            .create_relative_atomic(&relative, content.as_bytes())
+                            .map_err(file_path_error);
+                    };
+                    let key = bound_write_key(&workspace, &relative)?;
+                    let mut checkpoint = crate::session::file_checkpoints::prepare(
+                        &workspace, &relative, None, true,
+                    )
+                    .await;
                     workspace
                         .create_relative_atomic(&relative, content.as_bytes())
-                        .map_err(file_path_error)
+                        .map_err(file_path_error)?;
+                    crate::session::file_checkpoints::published();
+                    let after = crate::fs::ContentDigest::of(content.as_bytes());
+                    if let Some(checkpoint) = &mut checkpoint {
+                        checkpoint.committed(&after, content.len());
+                    }
+                    guard.tracker.untrack_read_path(&key);
+                    guard.record_diff(&key, None, &content, None, &after);
+                    Ok(())
                 };
                 await_mutating_effect(&bridge, self.timeout, call).await
             }
@@ -1917,14 +2098,112 @@ impl FileEffectService {
                 expected,
             } => {
                 let call = async move {
+                    let Some(guard) = guard else {
+                        return workspace
+                            .replace_relative_atomic(&relative, content.as_bytes(), &expected)
+                            .map_err(file_path_error);
+                    };
+                    let key = bound_write_key(&workspace, &relative)?;
+                    let mut existing = workspace
+                        .open_relative(&relative)
+                        .map_err(file_path_error)?;
+                    let (metadata, current) = guard.read_preimage(&mut existing)?;
+                    drop(existing);
+                    guard.authorize_overwrite(&key, &metadata, &current)?;
+                    let base = crate::fs::ContentDigest::of(&current);
+                    let before = String::from_utf8(current)
+                        .map_err(|_| EffectServiceError::OverwriteNotAuthorized)?;
+                    let preimage_ok = crate::agent::tools::mutation_diff::preimage_allowed(
+                        &guard.permission,
+                        &key,
+                        true,
+                    );
+                    let mut checkpoint = crate::session::file_checkpoints::prepare(
+                        &workspace,
+                        &relative,
+                        Some(crate::session::file_checkpoints::Preimage::new(
+                            std::sync::Arc::<[u8]>::from(before.as_bytes()),
+                            &base,
+                        )),
+                        preimage_ok,
+                    )
+                    .await;
                     workspace
-                        .replace_relative_atomic(&relative, content.as_bytes(), &expected)
-                        .map_err(file_path_error)
+                        .replace_relative_atomic_expecting(
+                            &relative,
+                            content.as_bytes(),
+                            &expected,
+                            &base,
+                        )
+                        .map_err(file_path_error)?;
+                    crate::session::file_checkpoints::published();
+                    let after = crate::fs::ContentDigest::of(content.as_bytes());
+                    if let Some(checkpoint) = &mut checkpoint {
+                        checkpoint.committed(&after, content.len());
+                    }
+                    guard.tracker.untrack_read_path(&key);
+                    if guard.preimage_visible(&key, true)
+                        && before.len() <= crate::agent::tools::mutation_diff::MAX_INPUT_BYTES
+                    {
+                        guard.record_diff(&key, Some(&before), &content, Some(&base), &after);
+                    }
+                    Ok(())
                 };
                 await_mutating_effect(&bridge, self.timeout, call).await
             }
         }
     }
+}
+
+fn bound_write_key(
+    workspace: &crate::paths::WorkspaceBinding,
+    relative: &Path,
+) -> Result<String, EffectServiceError> {
+    workspace
+        .logical_relative_path(relative)
+        .map(|logical| logical.to_string_lossy().into_owned())
+        .map_err(file_path_error)
+}
+
+/// Guarded ambient-path write: same read-before-overwrite rule and diff as the
+/// native `write` tool. Targets outside the bound workspace cannot be
+/// checkpointed, which `/rewind` reports as an uncaptured change.
+async fn write_guarded_path(
+    guard: &JsWriteGuard,
+    target: ResolvedWriteTarget,
+    content: String,
+    cancellation: crate::fs::AtomicWriteCancellation,
+) -> Result<(), EffectServiceError> {
+    let key = target.path.to_string_lossy().into_owned();
+    let mut before = None;
+    let mut base = None;
+    if matches!(target.mode, WriteMode::Replace) {
+        let mut existing = crate::fs::open_stable_file(&target.path)
+            .await
+            .map_err(file_path_error)?
+            .into_std()
+            .await;
+        let (metadata, current) = guard.read_preimage(&mut existing)?;
+        guard.authorize_overwrite(&key, &metadata, &current)?;
+        base = Some(crate::fs::ContentDigest::of(&current));
+        before = Some(
+            String::from_utf8(current).map_err(|_| EffectServiceError::OverwriteNotAuthorized)?,
+        );
+    }
+    crate::session::file_checkpoints::skipped();
+    let after = crate::fs::ContentDigest::of(content.as_bytes());
+    let recorded = content.clone();
+    write_approved_file_cancellable(target, content, cancellation).await?;
+    crate::session::file_checkpoints::published();
+    guard.tracker.untrack_read_path(&key);
+    let show_before = before.as_deref().filter(|text| {
+        text.len() <= crate::agent::tools::mutation_diff::MAX_INPUT_BYTES
+            && guard.preimage_visible(&key, false)
+    });
+    if before.is_none() || show_before.is_some() {
+        guard.record_diff(&key, show_before, &recorded, base.as_ref(), &after);
+    }
+    Ok(())
 }
 
 async fn read_capability_file(file: std::fs::File) -> Result<String, EffectServiceError> {
@@ -9989,6 +10268,81 @@ mod tests {
             "timed_out must be true when deadline expires"
         );
         assert_eq!(result.code, -1, "timed-out process has no exit code");
+    }
+
+    #[tokio::test]
+    async fn read_lines_tail_seeks_from_the_end_of_a_file_over_the_scan_limit() {
+        use std::io::{Seek, Write};
+        let directory = TempDir::new("js-read-lines-tail");
+        let path = directory.path().join("big.log");
+        {
+            let mut file = std::fs::File::create(&path).unwrap();
+            // A sparse file larger than the forward-scan limit, then a few real lines.
+            file.seek(std::io::SeekFrom::Start(
+                READ_LINES_MAX_SCAN_BYTES + 4 * 1024 * 1024,
+            ))
+            .unwrap();
+            file.write_all(b"\nalpha\r\nbeta\ngamma\ndelta\n").unwrap();
+        }
+        let tail = |from: i64, count: u32| {
+            let path = path.clone();
+            async move {
+                let mut file = tokio::fs::File::open(path).await.unwrap();
+                let keep = (from.unsigned_abs() as usize).min(count as usize);
+                super::seek_to_tail(&mut file, keep).await.unwrap();
+                super::read_lines_range(tokio::io::BufReader::new(file), from, count)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(
+            tail(-3, 100).await,
+            (vec!["beta".into(), "gamma".into(), "delta".into()], true)
+        );
+        assert_eq!(tail(-1, 100).await, (vec!["delta".into()], true));
+        assert_eq!(
+            tail(-2, 100).await.0,
+            vec!["gamma".to_string(), "delta".to_string()]
+        );
+        // Forward reads of the same file still hit the scan limit.
+        let file = tokio::fs::File::open(&path).await.unwrap();
+        assert_eq!(
+            super::read_lines_range(tokio::io::BufReader::new(file), 1, 5)
+                .await
+                .unwrap_err(),
+            EffectServiceError::OutputLimit
+        );
+    }
+
+    #[tokio::test]
+    async fn read_lines_tail_seek_matches_the_streaming_tail_on_small_inputs() {
+        let cases: [&[u8]; 6] = [
+            b"",
+            b"a",
+            b"a\n",
+            b"a\nb\nc",
+            b"a\r\nb\r\nc\r\n",
+            b"\n\n\nx\n\n",
+        ];
+        for data in cases {
+            for keep in 1..6i64 {
+                let mut cursor = std::io::Cursor::new(data.to_vec());
+                super::seek_to_tail(&mut cursor, keep as usize)
+                    .await
+                    .unwrap();
+                let seeked = super::read_lines_range(
+                    tokio::io::BufReader::new(&data[cursor.position() as usize..]),
+                    -keep,
+                    100,
+                )
+                .await
+                .unwrap();
+                let streamed = super::read_lines_range(tokio::io::BufReader::new(data), -keep, 100)
+                    .await
+                    .unwrap();
+                assert_eq!(seeked, streamed, "{data:?} keep={keep}");
+            }
+        }
     }
 
     #[tokio::test]

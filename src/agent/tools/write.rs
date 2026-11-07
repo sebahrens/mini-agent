@@ -14,7 +14,7 @@ use crate::extras::lsp::LspManager;
 
 const DEFAULT_MAX_TEXT_SIZE: u64 = crate::config::DEFAULT_MAX_EDIT_FILE_SIZE;
 
-fn full_text_fingerprint(bytes: &[u8]) -> Result<(u32, usize), ToolError> {
+pub(crate) fn full_text_fingerprint(bytes: &[u8]) -> Result<(u32, usize), ToolError> {
     std::str::from_utf8(bytes).map_err(|_| {
         ToolError::Msg(
             "overwrite=true requires a complete prior read of the current UTF-8 text file"

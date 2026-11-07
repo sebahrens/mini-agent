@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type * as acp from '@agentclientprotocol/sdk';
-import { SessionUpdateRouter } from '../src/protocolSession';
+import { MAX_COMMANDS, SessionUpdateRouter } from '../src/protocolSession';
+import { COMMANDS_PAGE_SIZE, describeServerCommands } from '../src/commandList';
 
 function held<T>() {
   let release!: (value: T) => void;
@@ -139,5 +140,39 @@ describe('permission modes, commands and content-block prompts', () => {
     await session.setMode('plan');
     expect(request).toHaveBeenCalledWith('session/set_mode', { sessionId: 's1', modeId: 'plan' }, expect.anything());
     expect(session.modes()?.currentModeId).toBe('plan');
+  });
+});
+
+describe('long command lists', () => {
+  const advertised = (count: number): acp.AvailableCommand[] =>
+    Array.from({ length: count }, (_, index) => ({ name: `cmd${index}`, description: `Command ${index}` }));
+
+  it('lists 150 advertised commands in pages and says how many are not shown', () => {
+    const first = describeServerCommands(advertised(150));
+    expect(first.match(/^- `\//gmu)).toHaveLength(COMMANDS_PAGE_SIZE);
+    expect(first).toContain('Showing commands 1-100 of 150; 50 more commands not shown on this page.');
+    expect(first).toContain('`/commands 2`');
+    expect(first).not.toContain('cmd100`');
+    const second = describeServerCommands(advertised(150), 0, '2');
+    expect(second.match(/^- `\//gmu)).toHaveLength(50);
+    expect(second).toContain('/cmd149');
+    expect(second).toContain('Showing commands 101-150 of 150');
+    expect(describeServerCommands(advertised(150), 0, '99')).toContain('Showing commands 101-150');
+    expect(describeServerCommands(advertised(150), 0, 'junk')).toContain('Showing commands 1-100');
+  });
+
+  it('stays silent for a list that fits and reports commands the session could not keep', () => {
+    expect(describeServerCommands(advertised(5))).not.toContain('not shown');
+    expect(describeServerCommands(advertised(5))).not.toContain('could not be kept');
+    expect(describeServerCommands(advertised(256), 44)).toContain('44 more commands advertised by the server could not be kept');
+  });
+
+  it('counts commands beyond the storage limit instead of dropping them silently', () => {
+    const router = new SessionUpdateRouter();
+    router.begin();
+    const session = router.finish({ request: vi.fn(), notify: vi.fn() } as unknown as acp.ClientContext, 's1', []);
+    router.receive({ sessionId: 's1', update: { sessionUpdate: 'available_commands_update', availableCommands: advertised(MAX_COMMANDS + 44) } });
+    expect(session.commands()).toHaveLength(MAX_COMMANDS);
+    expect(session.droppedCommands()).toBe(44);
   });
 });

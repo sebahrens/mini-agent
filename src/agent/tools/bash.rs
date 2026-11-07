@@ -402,6 +402,7 @@ impl Tool for ShellTool {
         if self.sandbox.shell_private_tmp() {
             description.push_str(SHELL_PRIVATE_TMP_NOTE);
         }
+        description = with_pty_limitation_note(description, PTY_SUPPORTED);
         if self.allow_escalation {
             description.push_str(
                 " If the sandbox blocks a command that must run (network, a write outside the workspace), retry that one command with escalate=true and a justification: the user is asked to approve it every time, and only that command runs without the sandbox.",
@@ -449,7 +450,7 @@ impl Tool for ShellTool {
                 },
                 "pty": {
                     "type": "boolean",
-                    "description": "Run under a pseudo-terminal so isatty() is true and stdin/stdout/stderr are one 120x40 TTY (Unix only; default false). With background=true, job_status action=input types into it, e.g. for REPLs or prompts."
+                    "description": "Run under a pseudo-terminal so isatty() is true and stdin/stdout/stderr are one TTY, 120x40 unless the mini-agent process sets COLUMNS/LINES (Unix only; default false). With background=true, job_status action=input types into it, e.g. for REPLs or prompts."
                 }
             },
             "required": ["command"]
@@ -1062,6 +1063,18 @@ async fn forward_progress<T>(
 /// `pty`, terminal input or named keys (mini-agent-jguj1).
 const PTY_SUPPORTED: bool = cfg!(unix);
 
+/// Added to the shell description where `pty` is not offered, so the model
+/// knows why and what to do instead of guessing (mini-agent-msr4t).
+const NO_PTY_NOTE: &str = " This platform has no pseudo-terminal (Windows has no ConPTY path): commands that need a TTY, such as REPLs, installers that prompt, `python -i`, or ssh/gh login flows, cannot be driven and may hang or refuse to run. Use their non-interactive flags, pass answers on the command line or through files, or ask the user to run them.";
+
+/// The shell description, plus the no-terminal limitation where `pty` is not offered.
+fn with_pty_limitation_note(mut description: String, pty_supported: bool) -> String {
+    if !pty_supported {
+        description.push_str(NO_PTY_NOTE);
+    }
+    description
+}
+
 /// Remove the pseudo-terminal parameters from a `shell` or `job_status` tool
 /// schema when the platform cannot honour them.
 fn without_unsupported_pty(
@@ -1243,12 +1256,13 @@ impl JobStatusTool {
                         text.pop();
                     }
                 }
-                JobKey::Left | JobKey::Right => {
+                JobKey::Left | JobKey::Right | JobKey::CtrlZ => {
                     if !text.is_empty() || edited {
                         edited = true;
                     }
                 }
-                JobKey::Up | JobKey::Down | JobKey::Esc => edited = true,
+                // Redraw only: the line editor's buffer is unchanged.
+                JobKey::CtrlL => {}
                 JobKey::Tab => {
                     if !text.is_empty() || edited {
                         return Err("job_status keys: tab on a partly typed line lets the shell complete it into a different command than was permission-checked. Send the full text instead, or press ctrl_c first.".into());
@@ -1262,6 +1276,12 @@ impl JobStatusTool {
                     });
                     text.clear();
                     edited = false;
+                }
+                // Arrows, history, paging, Home/End/Delete, Shift-Tab, F-keys, Esc.
+                other => {
+                    if other.edits_line() {
+                        edited = true;
+                    }
                 }
             }
         }
@@ -1364,8 +1384,8 @@ impl Tool for JobStatusTool {
                     "type": "array",
                     "minItems": 1,
                     "maxItems": MAX_JOB_KEYS,
-                    "items": {"type": "string", "enum": ["ctrl_c", "ctrl_d", "esc", "up", "down", "left", "right", "tab", "enter", "backspace"]},
-                    "description": "Only with action=input, instead of input: named keys pressed in order (ctrl_c interrupts the foreground program, ctrl_d sends EOF, plus esc, arrows, tab, enter, backspace for pagers, TUIs and REPLs). The tool renders the bytes. ctrl_c and ctrl_d are always allowed; enter judges the typed line like input; cursor, history and esc keys make the line unknowable so the next enter is judged as an opaque edited line (use ctrl_c to clear it); tab on a partly typed line is refused."
+                    "items": {"type": "string", "enum": JobKey::NAMES},
+                    "description": "Only with action=input, instead of input: named keys pressed in order (ctrl_c interrupts the foreground program, ctrl_d sends EOF, ctrl_z suspends it, ctrl_l redraws the screen, plus esc, arrows, page_up, page_down, home, end, delete, shift_tab, f1..f12, tab, enter, backspace for pagers, TUIs and REPLs). The tool renders the bytes. ctrl_c and ctrl_d are always allowed; enter judges the typed line like input; cursor, history, function and esc keys make the line unknowable so the next enter is judged as an opaque edited line (use ctrl_c to clear it); tab on a partly typed line is refused."
                 },
                 "timeout_ms": {
                     "type": "integer",
@@ -4097,6 +4117,90 @@ mod tests {
             "{actions:?}"
         );
         assert!(status["properties"].get("timeout_ms").is_some());
+    }
+
+    #[test]
+    fn platforms_without_a_pty_tell_the_model_why_and_what_to_do() {
+        let base = "Execute a command.".to_string();
+        assert_eq!(with_pty_limitation_note(base.clone(), true), base);
+        let note = with_pty_limitation_note(base.clone(), false);
+        assert!(note.starts_with(&base));
+        assert!(note.contains("no pseudo-terminal") && note.contains("non-interactive flags"));
+        // The unsupported schema also drops the parameters the note replaces.
+        let schema = without_unsupported_pty(
+            serde_json::json!({"properties": {"pty": {}, "command": {}}}),
+            false,
+        );
+        assert!(schema["properties"].get("pty").is_none());
+    }
+
+    #[test]
+    fn extended_job_keys_have_fixed_bytes_and_a_matching_schema_enum() {
+        for (name, bytes) in [
+            ("page_up", &b"\x1b[5~"[..]),
+            ("page_down", b"\x1b[6~"),
+            ("home", b"\x1b[H"),
+            ("end", b"\x1b[F"),
+            ("delete", b"\x1b[3~"),
+            ("shift_tab", b"\x1b[Z"),
+            ("ctrl_l", b"\x0c"),
+            ("ctrl_z", b"\x1a"),
+            ("f1", b"\x1bOP"),
+            ("f4", b"\x1bOS"),
+            ("f5", b"\x1b[15~"),
+            ("f10", b"\x1b[21~"),
+            ("f12", b"\x1b[24~"),
+        ] {
+            let key: JobKey = serde_json::from_value(serde_json::json!(name)).unwrap();
+            assert_eq!(key.bytes(), bytes, "{name}");
+        }
+        // Every advertised name parses, renders printable-free bytes, and none repeats.
+        let mut seen = std::collections::HashSet::new();
+        for name in JobKey::NAMES {
+            let key: JobKey = serde_json::from_value(serde_json::json!(name)).unwrap();
+            assert!(
+                !key.bytes().is_empty() && seen.insert(key.bytes()),
+                "{name}"
+            );
+        }
+        assert_eq!(JobKey::NAMES.len(), 30);
+        assert!(
+            JobKey::Home.edits_line() && JobKey::F5.edits_line() && JobKey::ShiftTab.edits_line()
+        );
+        assert!(!JobKey::CtrlL.edits_line() && !JobKey::Enter.edits_line());
+        assert!(serde_json::from_value::<JobKey>(serde_json::json!("f13")).is_err());
+    }
+
+    /// The new keys reach a real pty as the exact escape sequences, and keys
+    /// that rewrite the line make the next Enter an opaque, judged line.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn extended_job_keys_reach_a_pty_and_mark_the_line_edited() {
+        let shell = test_tool();
+        let status = JobStatusTool::new(shell.sandbox.clone(), None);
+        let id = start_pty_job(&shell, "cat -v").await;
+        let mut seen = String::new();
+        for key in [
+            JobKey::PageUp,
+            JobKey::PageDown,
+            JobKey::Home,
+            JobKey::End,
+            JobKey::Delete,
+            JobKey::ShiftTab,
+            JobKey::F1,
+            JobKey::F12,
+            JobKey::CtrlL,
+        ] {
+            seen.push_str(&job_keys(&status, &id, &[key]).await.unwrap());
+        }
+        seen.push_str(&job_keys(&status, &id, &[JobKey::Enter]).await.unwrap());
+        for echoed in [
+            "^[[5~", "^[[6~", "^[[H", "^[[F", "^[[3~", "^[[Z", "^[OP", "^[[24~", "^L",
+        ] {
+            assert!(seen.contains(echoed), "{echoed} missing from {seen:?}");
+        }
+        job_keys(&status, &id, &[JobKey::CtrlC]).await.unwrap();
+        shell.sandbox.stop_background_job(&id).await.unwrap();
     }
 
     #[test]

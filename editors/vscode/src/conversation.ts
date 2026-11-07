@@ -19,6 +19,8 @@ export interface ConversationSession {
   setMode?(modeId: string): Promise<void>;
   /** Slash commands the agent advertised for this session. */
   commands?(): readonly acp.AvailableCommand[];
+  /** Commands the agent advertised beyond what the session keeps. */
+  droppedCommands?(): number;
   configOptions?(): readonly acp.SessionConfigOption[];
   setConfigOption?(configId: string, value: string): Promise<void>;
 }
