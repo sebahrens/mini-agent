@@ -12,28 +12,28 @@
       "priority": 4,
       "title": "Restore CI impact diagnostics",
       "correction": "The workflow reports the selected route, conservative fallback reason, and at most20 JSON-escaped changed paths; missing Python emits an explicit warning.",
-      "status": "implemented; local acceptance passed; hosted owning checks pending"
+      "status": "implemented and validated; closed"
     },
     {
       "bead": "mini-agent-fb6g7.2",
       "priority": 4,
       "title": "Correct release and CI scope guidance",
       "correction": "Reconciled records-only, test-only, packaging, harness and Linux-gate behavior in the release guide, workflow comments and aggregate documentation.",
-      "status": "implemented; local acceptance passed; hosted owning checks pending"
+      "status": "implemented and validated; closed"
     },
     {
       "bead": "mini-agent-fb6g7.3",
       "priority": 3,
       "title": "Invalidate CI pass caches for file-mode changes",
       "correction": "Tracked identities now include mode plus object ID. Real Git index tests distinguish production/test helper modes while preserving evidence exclusions.",
-      "status": "implemented; local acceptance passed; hosted owning checks pending"
+      "status": "implemented and validated; closed"
     },
     {
       "bead": "mini-agent-fb6g7.4",
       "priority": 3,
       "title": "Retain platform proofs from before/after Rust test attributes",
       "correction": "Scans complete multiline, item-level and cfg_attr markers from both Git revisions, including deleted tests and removed gates. Literal path lookup handles bracketed names; unreadable or nonregular test inputs fail open. Negated platform conditions retain both native OS rows conservatively.",
-      "status": "implemented; local acceptance passed; hosted owning checks pending"
+      "status": "implemented and validated; closed"
     }
   ],
   "validation": {
@@ -72,6 +72,18 @@
     "assessment": "No further confirmed issue in the reviewed paths after the four corrections. Platform attribute collection is conservative rather than a full Rust cfg evaluator."
   },
   "hosted_validation": {
-    "status": "pending"
-  }
+    "status": "owning_checks_passed",
+    "commit": "7ae5b8fadedb7bc28c9f030cd6c8f3cf03fe0a82",
+    "run": "https://github.com/sebahrens/mini-agent/actions/runs/42418700239",
+    "changes": {
+      "job": 128542264234,
+      "conclusion": "success"
+    },
+    "fmt": {
+      "job": 128542264013,
+      "conclusion": "success"
+    },
+    "runtime_matrix": "Cancelled after owning acceptance to avoid redundant runtime suites. Unchanged Rust logic reuses full CI42408094543; changed embedded guidance passed targeted Rust tests and final debug install/smoke."
+  },
+  "status": "complete"
 }
