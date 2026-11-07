@@ -755,6 +755,32 @@ impl ContentDigest {
         }
     }
 
+    /// Digest of everything `file` yields, streamed so the contents are never
+    /// held in memory.
+    #[cfg(feature = "subagents")]
+    pub(crate) fn of_reader(file: &mut impl std::io::Read) -> std::io::Result<Self> {
+        use sha2::Digest;
+
+        let mut hasher = sha2::Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        let mut len: u64 = 0;
+        loop {
+            match file.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    len += read as u64;
+                    hasher.update(&buffer[..read]);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(Self {
+            len,
+            hash: hasher.finalize().into(),
+        })
+    }
+
     /// Whether `file` still holds exactly the snapshotted bytes.
     ///
     /// Reading is bounded by the snapshot length plus one byte, so a file that
