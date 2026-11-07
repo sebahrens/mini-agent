@@ -330,6 +330,18 @@ mod tests {
         assert_eq!(session.bytes_after_last_compaction, None);
     }
     #[test]
+    fn between_turn_pressure_honours_the_futility_floor() {
+        // mini-agent-stgyu
+        let mut session = image_session(7);
+        assert!(session.actionable_size_pressure(Some(0.75)));
+        session.compress("recap".to_owned(), 1, 0);
+        assert!(session.size_pressure(Some(0.75)));
+        assert!(
+            !session.actionable_size_pressure(Some(0.75)),
+            "a futile compaction must not re-arm the paid summarizer every turn"
+        );
+    }
+    #[test]
     fn history_prefix_conversion_leaves_the_session_cache_and_messages_alone() {
         let mut session = crate::session::Session::new("logical", "model", 32_000, "");
         session.add_user_message(

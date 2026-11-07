@@ -2771,6 +2771,14 @@ impl Session {
     /// at every tool batch would only re-run a futile compaction each segment
     /// (mini-agent-cbjft).
     pub(crate) fn mid_turn_size_pressure(&self, fraction: Option<f64>) -> bool {
+        self.actionable_size_pressure(fraction)
+    }
+
+    /// Byte pressure that a further compaction can still relieve. Every
+    /// auto-compaction decision (mid-turn, between turns, headless) uses it so
+    /// a session pinned over the threshold by retained pixels does not pay for
+    /// a futile summarizer request each turn (mini-agent-stgyu).
+    pub(crate) fn actionable_size_pressure(&self, fraction: Option<f64>) -> bool {
         self.size_pressure(fraction)
             && fraction.is_some_and(|fraction| {
                 self.bytes_after_last_compaction.is_none_or(|floor| {
