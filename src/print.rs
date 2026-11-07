@@ -2667,6 +2667,7 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
         cfg.shell_max_background_jobs
             .unwrap_or(crate::sandbox::DEFAULT_MAX_BACKGROUND_JOBS),
     )
+    .with_shell_resource_limits(cfg.shell_max_processes, cfg.shell_max_file_size_mb)
     .with_shell(&shell)
     .with_windows_appcontainer_roots(
         cli.resolve_windows_appcontainer_read_roots(cfg),

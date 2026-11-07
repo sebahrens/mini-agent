@@ -66,6 +66,13 @@ call is interrupted before either happens, the job is stopped. At most
 table is full an explicit `background = true` call fails naming the key, while
 an `auto_background` call simply runs as an ordinary foreground command.
 
+On Unix every model shell, background and pty command also runs with
+`RLIMIT_CORE=0` (no core files), `RLIMIT_NPROC` from `shell-max-processes`
+(default 32768) and `RLIMIT_FSIZE` from `shell-max-file-size-mb` (default
+16384). Limits are only ever lowered from the inherited hard limit, `0` turns a
+limit off, and a command exceeding one sees `EAGAIN` (fork) or `EFBIG` (write)
+while the agent stays responsive.
+
 `job_status action=wait` returns when the job ends or `timeout_ms` expires. Pass
 `until=<regex>` (Rust regex syntax, at most 512 bytes, linear-time engine) to also
 return as soon as output not yet read (or after `since`) matches, for a server

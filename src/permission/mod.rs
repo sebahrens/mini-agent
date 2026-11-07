@@ -366,6 +366,8 @@ pub(crate) struct ConfiguredSandboxKey {
     network_hosts: Vec<String>,
     shell_env: crate::sandbox::ShellEnvPolicy,
     max_background_jobs: usize,
+    max_processes: Option<u64>,
+    max_file_size_mb: Option<u64>,
 }
 
 #[cfg(test)]
@@ -397,6 +399,8 @@ impl ConfiguredSandboxKey {
             max_background_jobs: cfg
                 .shell_max_background_jobs
                 .unwrap_or(crate::sandbox::DEFAULT_MAX_BACKGROUND_JOBS),
+            max_processes: cfg.shell_max_processes,
+            max_file_size_mb: cfg.shell_max_file_size_mb,
         }
     }
 
@@ -423,6 +427,7 @@ impl ConfiguredSandboxKey {
             .with_network_hosts(self.network_hosts.clone())
             .with_shell_env(self.shell_env.clone())
             .with_max_background_jobs(self.max_background_jobs)
+            .with_shell_resource_limits(self.max_processes, self.max_file_size_mb)
     }
 }
 

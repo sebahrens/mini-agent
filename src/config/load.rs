@@ -3921,7 +3921,7 @@ mod project_config_trust_tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
             &path,
-            "shell-inherit-env = ['JAVA_HOME']\nshell-env = { FOO = 'bar' }\nshell-env-allow-secrets = true\nshell-allow-escalation = true\nshell-max-background-jobs = 3\nsandbox-network = 'allowlist'\nsandbox-network-hosts = ['a.example.com']\nchat_left_margin = 3\n",
+            "shell-inherit-env = ['JAVA_HOME']\nshell-env = { FOO = 'bar' }\nshell-env-allow-secrets = true\nshell-allow-escalation = true\nshell-max-background-jobs = 3\nshell-max-processes = 0\nshell-max-file-size-mb = 0\nsandbox-network = 'allowlist'\nsandbox-network-hosts = ['a.example.com']\nchat_left_margin = 3\n",
         )
         .unwrap();
         let mut cfg = Config::default();
@@ -3936,12 +3936,19 @@ mod project_config_trust_tests {
             "untrusted project cannot offer escalation"
         );
         assert_eq!(cfg.shell_max_background_jobs, None);
+        assert_eq!(
+            (cfg.shell_max_processes, cfg.shell_max_file_size_mb),
+            (None, None),
+            "untrusted project cannot lift resource limits"
+        );
         assert!(cfg.sandbox_network.is_none() && cfg.sandbox_network_hosts.is_empty());
         assert_eq!(cfg.chat_left_margin, Some(3));
         apply_local_override_with_confirmation(&mut cfg, &path, &trust, true, &|_| true).unwrap();
         assert_eq!(cfg.shell_inherit_env, vec!["JAVA_HOME".to_string()]);
         assert_eq!(cfg.shell_allow_escalation, Some(true));
         assert_eq!(cfg.shell_max_background_jobs, Some(3));
+        assert_eq!(cfg.shell_max_processes, Some(0));
+        assert_eq!(cfg.shell_max_file_size_mb, Some(0));
         assert_eq!(
             cfg.sandbox_network,
             Some(crate::sandbox::SandboxNetwork::Allowlist)

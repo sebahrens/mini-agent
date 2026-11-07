@@ -573,6 +573,25 @@ pub struct Config {
         alias = "shell_max_background_jobs"
     )]
     pub shell_max_background_jobs: Option<usize>,
+    /// `shell-max-processes`: `RLIMIT_NPROC` for model shell, background and
+    /// pty commands on Unix (default 32768; `0` = no limit). The kernel counts
+    /// every process and thread of the user, so keep it above normal load.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "shell-max-processes",
+        alias = "shell_max_processes"
+    )]
+    pub shell_max_processes: Option<u64>,
+    /// `shell-max-file-size-mb`: `RLIMIT_FSIZE` for model shell, background
+    /// and pty commands on Unix, in MiB (default 16384; `0` = no limit).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "shell-max-file-size-mb",
+        alias = "shell_max_file_size_mb"
+    )]
+    pub shell_max_file_size_mb: Option<u64>,
     /// `shell-job-notifications`: tell the model (and wake an idle TUI
     /// session) when a background shell job ends on its own. Default true.
     #[serde(

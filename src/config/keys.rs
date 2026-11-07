@@ -269,6 +269,12 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     aliased("shell-max-background-jobs", &["shell_max_background_jobs"])
         .described("Running background shell jobs allowed at once (1..=64, default 8). A full table makes auto_background calls run in the foreground.")
         .shaped(ConfigShape::Integer),
+    aliased("shell-max-processes", &["shell_max_processes"])
+        .described("Per-user process/thread limit (RLIMIT_NPROC) for model shell commands on Unix, default 32768; 0 disables. Project layers need trust.")
+        .shaped(ConfigShape::Integer),
+    aliased("shell-max-file-size-mb", &["shell_max_file_size_mb"])
+        .described("Largest file (RLIMIT_FSIZE, MiB) a model shell command may write on Unix, default 16384; 0 disables. Project layers need trust.")
+        .shaped(ConfigShape::Integer),
     aliased("shell-job-notifications", &["shell_job_notifications"])
         .described("Notify the model when a background shell job ends on its own (bounded notice with status, exit code, output tail and log path, delivered once) and wake an idle TUI session. Default true; false disables.")
         .shaped(ConfigShape::Bool),

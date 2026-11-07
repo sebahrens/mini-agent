@@ -474,6 +474,8 @@ pub struct SandboxConfig {
     network_hosts: Vec<String>,
     /// `shell-max-background-jobs`: running background jobs allowed at once.
     max_background_jobs: usize,
+    /// `shell-max-processes` / `shell-max-file-size-mb` (Unix rlimits).
+    resource_limits: ShellResourceLimits,
     read_roots: Vec<PathBuf>,
     write_roots: Vec<PathBuf>,
     /// Raw HOME-relative `sandbox-home-mounts` entries, validated at capture.
@@ -939,6 +941,82 @@ pub(crate) struct CommandOutput {
     /// descendant escaped the owned process group. The direct result remains
     /// authoritative; callers can surface this containment warning separately.
     pub descendants_escaped: bool,
+}
+
+/// Default `shell-max-processes` (`RLIMIT_NPROC`). The kernel counts every
+/// process and thread of the user, so the default stays well above a busy
+/// desktop while still bounding a fork bomb.
+pub const DEFAULT_SHELL_MAX_PROCESSES: u64 = 32_768;
+/// Default `shell-max-file-size-mb` (`RLIMIT_FSIZE`).
+pub const DEFAULT_SHELL_MAX_FILE_SIZE_MB: u64 = 16_384;
+
+/// Resource limits applied to model shell commands on Unix; `None` = no limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ShellResourceLimits {
+    pub(crate) max_processes: Option<u64>,
+    pub(crate) max_file_bytes: Option<u64>,
+}
+
+impl Default for ShellResourceLimits {
+    fn default() -> Self {
+        Self::from_config(None, None)
+    }
+}
+
+impl ShellResourceLimits {
+    pub(crate) fn from_config(max_processes: Option<u64>, max_file_size_mb: Option<u64>) -> Self {
+        let processes = max_processes.unwrap_or(DEFAULT_SHELL_MAX_PROCESSES);
+        let mib = max_file_size_mb.unwrap_or(DEFAULT_SHELL_MAX_FILE_SIZE_MB);
+        Self {
+            max_processes: (processes != 0).then_some(processes),
+            max_file_bytes: (mib != 0).then(|| mib.saturating_mul(1024 * 1024)),
+        }
+    }
+}
+
+/// Core dumps are always disabled; process count and file size are capped
+/// (never above the inherited hard limit). `SIGXFSZ` is ignored so an
+/// oversized write fails with `EFBIG` instead of killing the command. Runs
+/// between fork and exec, so it only calls async-signal-safe functions.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub(crate) fn apply_shell_resource_limits(cmd: &mut Command, limits: ShellResourceLimits) {
+    use std::os::unix::process::CommandExt;
+    unsafe fn cap(resource: libc::c_int, wanted: u64) {
+        // SAFETY: plain getrlimit/setrlimit on a stack value.
+        unsafe {
+            let mut current: libc::rlimit = std::mem::zeroed();
+            if libc::getrlimit(resource as _, &mut current) != 0 {
+                return;
+            }
+            let value = (wanted as libc::rlim_t).min(current.rlim_max);
+            let lowered = libc::rlimit {
+                rlim_cur: value,
+                rlim_max: current.rlim_max,
+            };
+            let _ = libc::setrlimit(resource as _, &lowered);
+        }
+    }
+    // SAFETY: the closure only calls async-signal-safe libc functions and does
+    // not allocate. Failures are ignored: a limit that cannot be set must not
+    // stop the command (limits only ever lower, so this is fail-open by design).
+    unsafe {
+        cmd.as_std_mut().pre_exec(move || {
+            let zero = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            let _ = libc::setrlimit(libc::RLIMIT_CORE as _, &zero);
+            if let Some(bytes) = limits.max_file_bytes {
+                libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+                cap(libc::RLIMIT_FSIZE as _, bytes);
+            }
+            if let Some(processes) = limits.max_processes {
+                cap(libc::RLIMIT_NPROC as _, processes);
+            }
+            Ok(())
+        });
+    }
 }
 
 /// Default and ceiling of `shell-max-background-jobs`.
@@ -2636,6 +2714,17 @@ impl Sandbox {
         self
     }
 
+    /// `shell-max-processes` and `shell-max-file-size-mb` (`None` = default,
+    /// `Some(0)` = unlimited).
+    pub fn with_shell_resource_limits(
+        mut self,
+        max_processes: Option<u64>,
+        max_file_size_mb: Option<u64>,
+    ) -> Self {
+        self.resource_limits = ShellResourceLimits::from_config(max_processes, max_file_size_mb);
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn max_background_jobs(&self) -> usize {
         self.max_background_jobs
@@ -2849,6 +2938,7 @@ impl Sandbox {
                 shell_env: ShellEnvPolicy::default(),
                 network_hosts: Vec::new(),
                 max_background_jobs: DEFAULT_MAX_BACKGROUND_JOBS,
+                resource_limits: ShellResourceLimits::default(),
                 read_roots: Vec::new(),
                 write_roots: Vec::new(),
                 home_mounts: Vec::new(),
@@ -3773,8 +3863,12 @@ impl Sandbox {
     }
 
     pub fn wrap_command(&self, command: &str) -> Result<ExecutionCommand, String> {
-        self.wrap_command_inner(command)
-            .map(|command| command.retaining_roots(&self.git_write_roots))
+        self.wrap_command_inner(command).map(|mut command| {
+            // Every model shell, background and pty launch goes through here.
+            #[cfg(unix)]
+            apply_shell_resource_limits(&mut command, self.resource_limits);
+            command.retaining_roots(&self.git_write_roots)
+        })
     }
 
     #[cfg(feature = "js")]
@@ -12879,5 +12973,75 @@ echo PRIVATE_TEMP_PASS"#,
                 .any(|arg| arg.contains("secret") || arg.contains("evil")),
             "{argv:?}"
         );
+    }
+
+    #[cfg(unix)]
+    mod shell_rlimit_tests {
+        use super::super::{ShellResourceLimits, apply_shell_resource_limits};
+        use tokio::process::Command;
+
+        async fn run(script: &str, limits: ShellResourceLimits) -> (bool, String) {
+            let mut cmd = Command::new("/bin/sh");
+            cmd.arg("-c").arg(script);
+            apply_shell_resource_limits(&mut cmd, limits);
+            let output = cmd.output().await.unwrap();
+            let text = String::from_utf8_lossy(&output.stderr).into_owned()
+                + &String::from_utf8_lossy(&output.stdout);
+            (output.status.success(), text)
+        }
+
+        #[test]
+        fn config_defaults_are_bounded_and_zero_disables() {
+            let default = ShellResourceLimits::from_config(None, None);
+            assert_eq!(default.max_processes, Some(32_768));
+            assert_eq!(default.max_file_bytes, Some(16_384 * 1024 * 1024));
+            let open = ShellResourceLimits::from_config(Some(0), Some(0));
+            assert_eq!((open.max_processes, open.max_file_bytes), (None, None));
+        }
+
+        #[tokio::test]
+        async fn writes_past_the_file_size_limit_fail_with_efbig_and_core_is_zero() {
+            let dir = crate::tests::OwnedTestDirectory::new("shell-fsize");
+            let file = dir.path().join("big");
+            let limits = ShellResourceLimits {
+                max_processes: None,
+                max_file_bytes: Some(1024 * 1024),
+            };
+            let script = format!(
+                "dd if=/dev/zero of='{}' bs=1024 count=4096 2>&1; echo core=$(ulimit -c)",
+                file.display()
+            );
+            let (_, text) = run(&script, limits).await;
+            assert!(
+                text.contains("too large") || text.contains("EFBIG"),
+                "{text}"
+            );
+            assert!(text.contains("core=0"), "{text}");
+            assert_eq!(std::fs::metadata(&file).unwrap().len(), 1024 * 1024);
+            // The agent process itself keeps its limits.
+            std::fs::write(dir.path().join("agent"), vec![0u8; 2 * 1024 * 1024]).unwrap();
+        }
+
+        #[tokio::test]
+        #[allow(unsafe_code)]
+        async fn forking_past_the_process_limit_gets_eagain() {
+            // SAFETY: geteuid has no preconditions. Root bypasses RLIMIT_NPROC.
+            if unsafe { libc::geteuid() } == 0 {
+                return;
+            }
+            let limits = ShellResourceLimits {
+                max_processes: Some(1),
+                max_file_bytes: None,
+            };
+            let (ok, text) = run("/bin/echo forked; /bin/echo done", limits).await;
+            assert!(!ok && !text.contains("forked"), "{text}");
+            // Normal limits still run ordinary workloads.
+            let (ok, text) = run(
+                "/bin/echo forked; /bin/echo done",
+                ShellResourceLimits::default(),
+            )
+            .await;
+            assert!(ok && text.contains("forked"), "{text}");
+        }
     }
 }

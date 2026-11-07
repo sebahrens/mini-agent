@@ -16,6 +16,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- Read-only shell auto-allow no longer lets `git log -p`, `git show`, `git diff` or `git blame` (including `REV:path` arguments) read denied files from history: with any read deny rule they ask (mini-agent-qc4cf).
+- Azure WireServer `168.63.129.16` (and its IPv4-mapped form) is blocked by web fetch, JS fetch, MCP URL screening and the sandbox proxy (mini-agent-u903e).
+- MCP first-connect retries are bounded in total by `startup_timeout_sec`, a timed-out handshake is not retried, and 408/429 (with numeric `Retry-After`) are retried (mini-agent-0yrql).
+- Model shell, background and pty commands on Unix run with `RLIMIT_CORE=0` and bounded `RLIMIT_NPROC`/`RLIMIT_FSIZE`; new `shell-max-processes` and `shell-max-file-size-mb` keys (0 disables, project layers need trust) (mini-agent-cmje9).
 - Remote MCP servers: a mid-session transport drop is now repaired automatically before the next tool call (5 attempts, 1 s doubling backoff, shown as pending then failed in `/mcp`; in-flight calls are never replayed; stdio stays manual), and the first HTTP connection is retried up to 3 times on timeouts, refused connections and 5xx (auth and 4xx are final) (mini-agent-tj7na, mini-agent-kxtgo).
 - Persona `memory:`/`hooks:` declared while `[subagents] agent_memory`/`agent_hooks` are off now say so in the `task` result, and persona hooks name every dropped event (e.g. `PostToolUse`, `Stop`) or non-command handler at load; SUBAGENTS.md states handlers are forced into the hook sandbox (mini-agent-uree1, mini-agent-j4qhn).
 - Skills: positional `$N` is substituted only when arguments were given and never inside fenced code (`$$1` is a literal `$1`); `context: fork` renders inline with a notice when the `task` tool is not advertised (mini-agent-jvods, mini-agent-ey4o7).
