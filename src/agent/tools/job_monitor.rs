@@ -158,6 +158,7 @@ pub(crate) async fn run_monitor(
                 command: snapshot.command.clone(),
                 status: snapshot.status,
                 exit_code: snapshot.exit_code,
+                signal: snapshot.signal,
                 pty: snapshot.pty,
                 log_path: snapshot.transcript.log.as_ref().map(|log| log.path.clone()),
                 tail: Vec::new(),

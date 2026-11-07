@@ -1064,6 +1064,8 @@ pub(crate) struct BackgroundJobSnapshot {
     pub command: String,
     pub status: BackgroundJobStatus,
     pub exit_code: Option<i32>,
+    /// Signal that killed the job (Unix), which leaves no exit code.
+    pub signal: Option<i32>,
     pub descendants_escaped: bool,
     /// Whether the job runs on a pseudo-terminal (`pty = true`), whose output
     /// carries terminal escape sequences and redraws.
@@ -1092,6 +1094,7 @@ pub(crate) struct BackgroundJobSummary {
 struct BackgroundJobTerminal {
     status: BackgroundJobStatus,
     exit_code: Option<i32>,
+    signal: Option<i32>,
     descendants_escaped: bool,
 }
 
@@ -5272,6 +5275,7 @@ impl Sandbox {
                     BackgroundJobTerminal {
                         status: BackgroundJobStatus::Failed,
                         exit_code: None,
+                        signal: None,
                         descendants_escaped: false,
                     }
                 }
@@ -6832,7 +6836,22 @@ fn background_terminal(output: CommandOutput) -> BackgroundJobTerminal {
     BackgroundJobTerminal {
         status,
         exit_code: output.exit_status.and_then(|status| status.code()),
+        signal: output.exit_status.and_then(exit_signal),
         descendants_escaped: output.descendants_escaped,
+    }
+}
+
+/// The signal that terminated a process, if it died from one.
+pub(crate) fn exit_signal(status: std::process::ExitStatus) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
     }
 }
 
@@ -6868,6 +6887,7 @@ fn finish_background_job(
                 command: snapshot.command,
                 status: snapshot.status,
                 exit_code: snapshot.exit_code,
+                signal: snapshot.signal,
                 pty: snapshot.pty,
                 log_path: job.log_path.clone(),
                 tail,
@@ -6882,20 +6902,22 @@ fn finish_background_job(
 
 fn snapshot_background_job(id: &str, job: &BackgroundJobRecord) -> BackgroundJobSnapshot {
     let transcript = job.capture.transcript();
-    let (status, exit_code, descendants_escaped) = match &job.terminal {
+    let (status, exit_code, signal, descendants_escaped) = match &job.terminal {
         Some(terminal) => (
             terminal.status,
             terminal.exit_code,
+            terminal.signal,
             terminal.descendants_escaped,
         ),
-        None if job.stop_requested => (BackgroundJobStatus::Stopping, None, false),
-        None => (BackgroundJobStatus::Running, None, false),
+        None if job.stop_requested => (BackgroundJobStatus::Stopping, None, None, false),
+        None => (BackgroundJobStatus::Running, None, None, false),
     };
     BackgroundJobSnapshot {
         id: id.to_string(),
         command: job.command.clone(),
         status,
         exit_code,
+        signal,
         descendants_escaped,
         pty: job.input.is_some(),
         transcript,
@@ -8300,6 +8322,7 @@ mod sandbox_tests {
             terminal: terminal.then_some(BackgroundJobTerminal {
                 status: BackgroundJobStatus::Completed,
                 exit_code: Some(0),
+                signal: None,
                 descendants_escaped: false,
             }),
             stop_requested: false,

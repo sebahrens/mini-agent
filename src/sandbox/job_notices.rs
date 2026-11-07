@@ -25,6 +25,8 @@ pub(crate) struct JobNotice {
     pub command: String,
     pub status: super::BackgroundJobStatus,
     pub exit_code: Option<i32>,
+    /// Signal that killed the job (Unix), which leaves no exit code.
+    pub signal: Option<i32>,
     pub pty: bool,
     pub log_path: Option<PathBuf>,
     /// Raw trailing output bytes, at most [`NOTICE_TAIL_BYTES`].
@@ -186,9 +188,14 @@ pub(crate) fn render(notice: &JobNotice) -> String {
     if let Some(hit) = &notice.output_match {
         return render_match(notice, hit);
     }
-    let exit = notice
-        .exit_code
-        .map_or_else(String::new, |code| format!("; exit code {code}"));
+    let exit = notice.exit_code.map_or_else(
+        || {
+            notice.signal.map_or_else(String::new, |signal| {
+                format!("; {}", crate::agent::tools::bash::describe_signal(signal))
+            })
+        },
+        |code| format!("; exit code {code}"),
+    );
     let log = notice
         .log_path
         .as_ref()
@@ -261,9 +268,14 @@ pub(crate) fn wake_prompt(notices: &[JobNotice]) -> String {
         "[System notice: background shell job(s) reported while the session was idle.]",
     );
     for notice in notices {
-        let exit = notice
-            .exit_code
-            .map_or_else(String::new, |code| format!(", exit code {code}"));
+        let exit = notice.exit_code.map_or_else(
+            || {
+                notice.signal.map_or_else(String::new, |signal| {
+                    format!(", {}", crate::agent::tools::bash::describe_signal(signal))
+                })
+            },
+            |code| format!(", exit code {code}"),
+        );
         let log = notice
             .log_path
             .as_ref()
@@ -302,6 +314,7 @@ mod tests {
             command: "make test".into(),
             status: BackgroundJobStatus::Completed,
             exit_code: Some(2),
+            signal: None,
             pty: false,
             log_path: Some(PathBuf::from("/tmp/x.log")),
             tail: tail.as_bytes().to_vec(),

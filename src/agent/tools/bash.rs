@@ -965,11 +965,16 @@ impl ShellTool {
                 "[status: descendants_escaped; direct command result preserved; containment cleanup incomplete]",
             );
         }
-        if let Some(code) = snapshot.exit_code.filter(|code| *code != 0) {
+        let ended = snapshot
+            .exit_code
+            .filter(|code| *code != 0)
+            .map(|code| format!("Exit code: {code}"))
+            .or_else(|| snapshot.signal.map(describe_signal));
+        if let Some(ended) = ended {
             if !result.is_empty() && !result.ends_with('\n') {
                 result.push('\n');
             }
-            result.push_str(&format!("Exit code: {code}"));
+            result.push_str(&ended);
         }
         let transcript = self.spill_line_capped_output(transcript, &result);
         let mut result = bound_output_lines(result, self.max_output_lines);
@@ -1891,22 +1896,26 @@ fn scan_for_pattern_chunked(
 #[cfg(test)]
 pub type BashTool = ShellTool;
 
+/// `Terminated by signal: SIGKILL (9)`; shared by foreground results, job
+/// status, auto-background results and completion notices.
+pub(crate) fn describe_signal(number: i32) -> String {
+    #[cfg(unix)]
+    let name = nix::sys::signal::Signal::try_from(number)
+        .map(|signal| format!("{signal:?}"))
+        .unwrap_or_else(|_| "UNKNOWN".to_string());
+    #[cfg(not(unix))]
+    let name = "UNKNOWN".to_string();
+    format!("Terminated by signal: {name} ({number})")
+}
+
 fn render_termination(status: Option<std::process::ExitStatus>) -> Option<String> {
     let status = status?;
     if let Some(code) = status.code() {
         return (code != 0).then(|| format!("Exit code: {code}"));
     }
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-
-        if let Some(number) = status.signal() {
-            let name = nix::sys::signal::Signal::try_from(number)
-                .map(|signal| format!("{signal:?}"))
-                .unwrap_or_else(|_| "UNKNOWN".to_string());
-            return Some(format!("Terminated by signal: {name} ({number})"));
-        }
+    if let Some(number) = crate::sandbox::exit_signal(status) {
+        return Some(describe_signal(number));
     }
 
     Some("Process terminated without an exit code".to_string())
@@ -1989,6 +1998,8 @@ fn render_background_job(output: BackgroundJobOutput, max_output_lines: Option<u
     );
     if let Some(exit_code) = snapshot.exit_code {
         result.push_str(&format!("\nExit code: {exit_code}"));
+    } else if let Some(signal) = snapshot.signal {
+        result.push_str(&format!("\n{}", describe_signal(signal)));
     }
     if snapshot.descendants_escaped {
         result.push_str(
@@ -4078,6 +4089,53 @@ mod tests {
         assert!(
             parent_result.contains(&format!("Background shell job {id} completed")),
             "{parent_result}"
+        );
+    }
+
+    /// A job killed by a signal has no exit code; every surface must still
+    /// say how it ended.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signal_killed_background_job_reports_the_signal() {
+        let shell = test_tool();
+        let status = JobStatusTool::new(shell.sandbox.clone(), None);
+        let id = start_job(&shell, "kill -9 $$").await;
+        let terminal = wait_for_terminal_job(&status, &id).await;
+        assert!(
+            terminal.contains("Terminated by signal: SIGKILL (9)"),
+            "{terminal}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signal_killed_job_notice_and_auto_background_result_name_the_signal() {
+        let shell = test_tool();
+        start_job(&shell, "kill -9 $$").await;
+        wait_for_notice(&shell).await;
+        let notice = shell
+            .call(BashArgs {
+                command: "echo next".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            notice.contains("Terminated by signal: SIGKILL (9)"),
+            "{notice}"
+        );
+        let shell = test_tool().with_auto_background(true);
+        let result = shell
+            .call(BashArgs {
+                command: "kill -9 $$".into(),
+                auto_background: Some(true),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            result.contains("Terminated by signal: SIGKILL (9)"),
+            "{result}"
         );
     }
 
