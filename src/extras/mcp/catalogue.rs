@@ -900,7 +900,9 @@ fn resource_text(result: ReadResourceResult) -> Result<ResourceText, ServiceErro
                 if out.fetch_truncated {
                     continue;
                 }
-                let room = MAX_FETCH_BYTES.saturating_sub(out.text.len() + 1);
+                // Reserve the separator byte only when one will actually be pushed.
+                let separator = usize::from(!out.text.is_empty());
+                let room = MAX_FETCH_BYTES.saturating_sub(out.text.len() + separator);
                 if !out.text.is_empty() {
                     out.text.push('\n');
                 }
@@ -1131,6 +1133,17 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("non-text MIME type image/png"), "{err}");
+    }
+
+    #[test]
+    fn resource_text_of_exactly_the_fetch_bound_is_not_truncated() {
+        let exact = "x".repeat(MAX_FETCH_BYTES);
+        let read = resource_text(ReadResourceResult::new(vec![ResourceContents::text(
+            exact, "urn:exact",
+        )]))
+        .unwrap();
+        assert!(!read.fetch_truncated);
+        assert_eq!(read.text.len(), MAX_FETCH_BYTES);
     }
 
     #[test]
