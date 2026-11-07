@@ -6,6 +6,9 @@ use uuid::Uuid;
 use crate::session::Session;
 
 pub(crate) const MAX_SESSION_BYTES: usize = 32 * 1024 * 1024;
+/// Growth past the bytes a futile compaction left that re-arms mid-turn byte
+/// pressure (2 MiB, 1/16 of the ceiling).
+pub(crate) const MID_TURN_REARM_GROWTH_BYTES: usize = MAX_SESSION_BYTES / 16;
 pub(crate) const MAX_SESSION_MESSAGES: usize = 100_000;
 
 /// The persisted-storage error remains static and never includes session data.

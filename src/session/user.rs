@@ -270,6 +270,11 @@ mod tests {
         session.compress("recap".to_owned(), 1, 0);
         assert!(session.size_pressure(Some(0.75)));
         assert!(!session.mid_turn_size_pressure(Some(0.75)));
+        // Material growth after the futile compaction re-arms the relief
+        // (a long tool-heavy turn adding images toward the hard ceiling).
+        session
+            .add_user_message(PersistedUserMessage::new(vec![image(&raw), image(&raw)]).unwrap());
+        assert!(session.mid_turn_size_pressure(Some(0.75)));
         // A compaction that does bring the session under the threshold keeps
         // the trigger meaningful for later growth.
         session.compress("recap".to_owned(), 5, 0);

@@ -2745,7 +2745,12 @@ impl Session {
         self.size_pressure(fraction)
             && fraction.is_some_and(|fraction| {
                 self.bytes_after_last_compaction.is_none_or(|floor| {
+                    // The suppression ends once the session has grown
+                    // materially past what the futile compaction left, so a
+                    // later tool-heavy turn still gets mid-turn relief.
                     floor as f64 <= storage::MAX_SESSION_BYTES as f64 * fraction
+                        || self.approx_persisted_bytes()
+                            > floor.saturating_add(storage::MID_TURN_REARM_GROWTH_BYTES)
                 })
             })
     }

@@ -136,6 +136,25 @@ describe('server-started turns between prompts', () => {
     expect(JSON.stringify(seen[100_000])).toContain('2 updates');
   });
 
+  it('reports idle output as it arrives and keeps it buffered across a refused prompt', async () => {
+    const router = new SessionUpdateRouter();
+    const reported: acp.SessionUpdate[] = [];
+    router.reportIdle = (_id, u) => reported.push(u);
+    router.begin();
+    let refuse = true;
+    const client = { request: vi.fn(async () => { if (refuse) { throw new Error('ACP session already has an active prompt'); } return { stopReason: 'end_turn' }; }), notify: vi.fn() } as unknown as acp.ClientContext;
+    const session = router.finish(client, 's1');
+    router.receive({ sessionId: 's1', update: chunk('cron output') });
+    expect(reported).toEqual([chunk('cron output')]);
+    const failed: acp.SessionUpdate[] = [];
+    await expect(session.prompt('hi', u => failed.push(u), new AbortController().signal)).rejects.toThrow(/\/cron fire/);
+    expect(failed).toEqual([]);
+    refuse = false;
+    const seen: acp.SessionUpdate[] = [];
+    await session.prompt('again', u => seen.push(u), new AbortController().signal);
+    expect(seen).toEqual([chunk('cron output')]);
+  });
+
   it('explains a refused prompt while the server runs its own turn', async () => {
     const router = new SessionUpdateRouter();
     router.begin();
