@@ -1,0 +1,12 @@
+2026-11-07T19:57:31.2172727Z test extras::mcp::client::tests::mcp_stdio_external_cwd_retains_names_that_cannot_round_trip ... ok
+2026-11-07T19:57:31.4423730Z MCP external cwd legacy=false, launch="C:\\Users\\runneradmin\\AppData\\Local\\Temp\\mini-agent-mcp-external-cwd-9bac6fa3-bd22-4e6b-89c3-9885ab6e0a97", output="C:\\Users\\runneradmin\\AppData\\Local\\Temp\\mini-agent-mcp-external-cwd-9bac6fa3-bd22-4e6b-89c3-9885ab6e0a97\nTrue\nTrue", status=exit code: 0, stderr=
+2026-11-07T19:57:31.7042684Z MCP external cwd legacy=true, launch="\\\\?\\C:\\Users\\runneradmin\\AppData\\Local\\Temp\\mini-agent-mcp-external-cwd-9bac6fa3-bd22-4e6b-89c3-9885ab6e0a97", output="C:\\Users\\runneradmin\\AppData\\Local\\Temp\\mini-agent-mcp-external-cwd-9bac6fa3-bd22-4e6b-89c3-9885ab6e0a97\nTrue\nTrue", status=exit code: 0, stderr=
+2026-11-07T19:57:31.7044135Z test extras::mcp::client::tests::mcp_stdio_external_cwd_uses_ordinary_windows_spelling ... ok
+2026-11-07T19:57:31.7051349Z test sandbox::workspace_job_drop_tests::mcp_stdio_workspace_job_drop_and_unwrap_keep_job_lifecycle_dispatch ... ok
+2026-11-07T19:57:47.5562112Z test extras::mcp::headers_helper::windows_tree_tests::mcp_stdio_headers_helper_owns_windows_descendants_on_success_timeout_and_drop ... ok
+2026-11-07T19:57:47.9153481Z test extras::mcp::server::windows_tree_tests::mcp_stdio_server_owns_windows_descendants_on_success_timeout_cancel_and_drop ... ok
+2026-11-07T19:57:49.3650285Z test result: ok. 45 passed; 0 failed; 0 ignored; 0 measured; 3789 filtered out; finished in 18.15s
+2026-11-07T19:57:49.9841601Z test mcp_stdio_actual_binary_exits_on_eof_with_physically_backpressured_stdout ... ok
+2026-11-07T19:57:54.8634647Z test mcp_stdio_actual_binary_exits_on_writer_deadline_while_stdin_stays_open ... ok
+2026-11-07T19:57:54.8635022Z test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 5.45s
+2026-11-07T19:57:59.6858937Z test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3833 filtered out; finished in 4.08s

@@ -1,13 +1,7 @@
 {
   "reviewer": "root-final",
   "baseline": "eef3001c6d0bba40fad24ecd595fa60fd5db0289",
-  "findings": [
-    {
-      "bead": "mini-agent-gkqd4.27",
-      "priority": 4,
-      "status": "Actual-binary Windows fixture setup corrected; native acceptance pending."
-    }
-  ],
+  "findings": [],
   "scope": [
     "ledger retry/rotation/session rollup exactness and OAuth lock wait/cancellation",
     "invocation-local hook manager/read policy/logical session identity across ACP, main agents, child agents, and JS permission callbacks",
@@ -33,13 +27,18 @@
     "Windows native error kinds preserved for optional Git metadata",
     "Git-created hidden metadata fixtures truncate existing files without recreation",
     "Stalled-output fixtures handle512-byte pipes and stale startup notices while preserving original negative-control failures",
-    "Windows workspace-service drop explicitly terminates the exact retained Job despite process-wrap registry behavior"
+    "Windows workspace-service drop explicitly terminates the exact retained Job despite process-wrap registry behavior",
+    "External Windows MCP paths project to ordinary spelling only when canonical identity roundtrips; ambiguous names remain unchanged.",
+    "Native comparison reclassified the external cwd item to P4 and did not attribute the historical helper timeout to cwd spelling.",
+    "Actual-binary MCP fixtures allow application-created private roots and retain stderr/exit diagnostics; both native Windows shutdown cases passed."
   ],
-  "assessment": "Final focused source review found no additional confirmed P0-P3 issue. Native Windows helper/server descendant and path-control unit regressions now pass. Root reclassified the cwd item to P4 after native comparison disproved attribution to that spelling. Both actual-binary fixture cases pass locally after private-root isolation and diagnostic capture; final clearance remains withheld pending native integration/discovery and full hosted acceptance.",
+  "assessment": "Final independent root source and evidence review found no additional confirmed P0-P3 or P4 issue in the reviewed scope after the documented corrections. All 35 review findings have implementation and acceptance evidence. Native Windows MCP lifecycle, actual-binary shutdown, path controls and discovery passed; final source CI completed successfully with 78 passing jobs and 4 existing policy skips.",
   "residual_risks": [
-    "Native Windows actual-binary shutdown fixture still requires acceptance after setup correction; local execution is macOS.",
     "A speculative model-hook workspace identity replacement race lacked a reproduced contract violation and was retained as unverified in the follow-on report.",
-    "Unrelated historical deferred features and beads are outside this review wave."
+    "Unrelated historical deferred features and beads are outside this review wave.",
+    "Review and passing tests do not establish universal absence of defects; four release/scheduled/manual jobs remain governed by the existing branch CI policy."
   ],
-  "local_validation_manifest": "../2026-11-07-continuation-review.json"
+  "local_validation_manifest": "../2026-11-07-continuation-review.json",
+  "reviewed_source": "6617aaeb14b20a9d4fc0855e2a4d5497c929f001",
+  "final_source_ci": "final-source-ci.json"
 }

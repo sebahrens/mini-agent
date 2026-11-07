@@ -1,0 +1,8 @@
+2026-11-07T19:45:54.8607240Z running 5 tests
+2026-11-07T19:45:54.8609910Z test agent::tools::find_files::bound_platform::native_error_tests::windows_native_errors_preserve_missing_and_access_denied_classes ... ok
+2026-11-07T19:45:54.8797022Z test agent::tools::find_files::tests::invalid_linked_git_metadata_refuses_discovery_before_exposing_entries ... ok
+2026-11-07T19:45:55.0981937Z test agent::tools::find_files::tests::linked_worktree_common_exclude_applies_to_native_discovery ... ok
+2026-11-07T19:45:55.1011236Z test agent::tools::find_files::tests::windows_optional_git_metadata_accepts_missing_paths_and_rejects_corruption ... ok
+2026-11-07T19:45:55.2607506Z test extras::hooks::backend::tests::linked_worktree_hook_reads_honor_common_exclude_and_root_negation ... ok
+2026-11-07T19:45:55.2608046Z
+2026-11-07T19:45:55.2608214Z test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 5626 filtered out; finished in 0.40s

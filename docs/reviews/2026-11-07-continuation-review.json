@@ -1,6 +1,6 @@
 {
   "baseline": "eef3001c",
-  "scope": "27 continuation review items plus eight prior post-fix findings (35 total). Native Windows MCP unit regressions now pass; actual-binary fixture follow-up and final hosted acceptance remain pending.",
+  "scope": "27 continuation review items plus eight prior post-fix findings (35 total): 22 P1-P3 and 13 P4. All implemented and validated, including native Windows acceptance and the complete branch CI matrix.",
   "findings": [
     {
       "id": "BOUNDARIES-A-1",
@@ -55,7 +55,7 @@
       "dedup": "Not in eight p0h9g.* post-fix findings.",
       "review_report": "boundaries-a",
       "bead": "mini-agent-gkqd4.1",
-      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+      "implementation_status": "Implemented and validated; final source CI passed at 6617aaeb (run 42408094543)."
     },
     {
       "id": "runtime-cont-a-1",
@@ -104,7 +104,7 @@
       "new_vs_open_p0h9g": "Distinct from all eight previously open findings.",
       "review_report": "runtime-a",
       "bead": "mini-agent-gkqd4.2",
-      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+      "implementation_status": "Implemented and validated; final source CI passed at 6617aaeb (run 42408094543)."
     },
     {
       "id": "runtime-cont-a-2",
@@ -151,7 +151,7 @@
       "new_vs_open_p0h9g": "Distinct from financial ledger receipt dedup bugs: this duplicates Session transcript and legacy Session counters at the frontend round handoff.",
       "review_report": "runtime-a",
       "bead": "mini-agent-gkqd4.3",
-      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+      "implementation_status": "Implemented and validated; final source CI passed at 6617aaeb (run 42408094543)."
     },
     {
       "id": "runtime-cont-a-3",
@@ -204,7 +204,7 @@
       "new_vs_open_p0h9g": "Distinct from MCP server stdout cancellation/EOF issue; this is internal headless Session pool lifecycle across normal prompt boundaries.",
       "review_report": "runtime-a",
       "bead": "mini-agent-gkqd4.4",
-      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+      "implementation_status": "Implemented and validated; final source CI passed at 6617aaeb (run 42408094543)."
     },
     {
       "id": "BOUNDARIES-A-2",
@@ -252,7 +252,7 @@
       "dedup": "Not in eight p0h9g.* post-fix findings.",
       "review_report": "boundaries-a",
       "bead": "mini-agent-gkqd4.5",
-      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+      "implementation_status": "Implemented and validated; final source CI passed at 6617aaeb (run 42408094543)."
     },
     {
       "id": "BOUNDARIES-A-3",
@@ -312,7 +312,7 @@
       "dedup": "Not in eight p0h9g.* post-fix findings.",
       "review_report": "boundaries-a",
       "bead": "mini-agent-gkqd4.6",
-      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+      "implementation_status": "Implemented and validated; final source CI passed at 6617aaeb (run 42408094543)."
     },
     {
       "priority": 2,
@@ -342,7 +342,7 @@
       ],
       "review_report": "integrations-a",
       "bead": "mini-agent-gkqd4.7",
-      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+      "implementation_status": "Implemented and validated; final source CI passed at 6617aaeb (run 42408094543)."
     },
     {
       "priority": 2,
@@ -371,7 +371,7 @@
       ],
       "review_report": "integrations-a",
       "bead": "mini-agent-gkqd4.8",
-      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+      "implementation_status": "Implemented and validated; final source CI passed at 6617aaeb (run 42408094543)."
     },
     {
       "priority": 2,
@@ -404,7 +404,7 @@
         "correction": "Use shared bounded Git metadata resolution for repository roots and ancestors, preserve precedence and explicit no_ignore, fail closed for malformed metadata.",
         "validation": "Native root/nested discovery, malformed metadata/no_ignore, hook read and precedence tests passed; Windows exact discovery and execution added to CI."
       },
-      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+      "implementation_status": "Implemented and validated; final source CI passed at 6617aaeb (run 42408094543)."
     },
     {
       "priority": 2,
@@ -423,7 +423,7 @@
       "probe": "mini-agent-continuation-oauth-probe.rs",
       "review_report": "root",
       "bead": "mini-agent-gkqd4.10",
-      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+      "implementation_status": "Implemented and validated; final source CI passed at 6617aaeb (run 42408094543)."
     },
     {
       "priority": 3,
@@ -451,7 +451,7 @@
       "validation": "Source and indexed implementation confirmed; supplied compositional regression awaits root-coordinated Cargo.",
       "review_report": "integrations-p4",
       "bead": "mini-agent-gkqd4.11",
-      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+      "implementation_status": "Implemented and validated; final source CI passed at 6617aaeb (run 42408094543)."
     },
     {
       "priority": 4,
@@ -474,7 +474,7 @@
       "classification": "Low-priority robustness of an optional operator-authored configuration; no claim of a normal-use production outage or live backend test.",
       "review_report": "integrations-p4",
       "bead": "mini-agent-gkqd4.12",
-      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+      "implementation_status": "Implemented and validated; final source CI passed at 6617aaeb (run 42408094543)."
     },
     {
       "id": "runtime-p4-1",
@@ -516,7 +516,7 @@
       "validation": "Documentation/source contradiction directly checked; no runtime execution needed.",
       "review_report": "runtime-p4",
       "bead": "mini-agent-gkqd4.13",
-      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+      "implementation_status": "Implemented and validated; final source CI passed at 6617aaeb (run 42408094543)."
     },
     {
       "id": "runtime-p4-2",
@@ -554,7 +554,7 @@
       "validation": "Complete in-memory data-flow proof; review-only probe supplied, not executed by this agent. Indexed retire_from implementation matched disk.",
       "review_report": "runtime-p4",
       "bead": "mini-agent-gkqd4.14",
-      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+      "implementation_status": "Implemented and validated; final source CI passed at 6617aaeb (run 42408094543)."
     },
     {
       "id": "BOUNDARIES-P4-1",
@@ -597,7 +597,7 @@
       "current_production_status": "Source fix is correct; this is missing protection against recurrence.",
       "review_report": "boundaries-p4",
       "bead": "mini-agent-gkqd4.15",
-      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+      "implementation_status": "Implemented and validated; final source CI passed at 6617aaeb (run 42408094543)."
     },
     {
       "id": "BOUNDARIES-P4-2",
@@ -637,7 +637,7 @@
       "category": "low-priority result accuracy",
       "review_report": "boundaries-p4",
       "bead": "mini-agent-gkqd4.16",
-      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+      "implementation_status": "Implemented and validated; final source CI passed at 6617aaeb (run 42408094543)."
     },
     {
       "id": "BOUNDARIES-P4-3",
@@ -670,7 +670,7 @@
       "category": "operator documentation correctness",
       "review_report": "boundaries-p4",
       "bead": "mini-agent-gkqd4.17",
-      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+      "implementation_status": "Implemented and validated; final source CI passed at 6617aaeb (run 42408094543)."
     },
     {
       "priority": 2,
@@ -688,7 +688,7 @@
       ],
       "review_report": "post-implementation-boundaries-audit",
       "bead": "mini-agent-gkqd4.18",
-      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+      "implementation_status": "Implemented and validated; final source CI passed at 6617aaeb (run 42408094543)."
     },
     {
       "priority": 4,
@@ -700,7 +700,7 @@
       ],
       "review_report": "root-final-validation",
       "bead": "mini-agent-gkqd4.19",
-      "implementation_status": "implemented; local affected validation passed; hosted CI pending"
+      "implementation_status": "Implemented and validated; final source CI passed at 6617aaeb (run 42408094543)."
     },
     {
       "priority": 4,
@@ -709,7 +709,7 @@
       "scenario": "A module-level goal gate silently excluded the stream pool lifetime regression from reduced subagents configurations. Restrict the goal gate to the two goal-specific tests.",
       "bead": "mini-agent-gkqd4.20",
       "review_report": "CI follow-up review",
-      "implementation_status": "local regression passed; hosted CI pending"
+      "implementation_status": "Implemented and validated; final source CI passed at 6617aaeb (run 42408094543)."
     },
     {
       "priority": 2,
@@ -718,7 +718,7 @@
       "scenario": "Linux CI reproduced stalled final stdout and goal stderr that never acknowledged SIGINT or completed forced exit. A new generic startup AgentWorkScope caused output to bypass the actual headless interrupt driver.",
       "bead": "mini-agent-gkqd4.21",
       "review_report": "CI follow-up review",
-      "implementation_status": "implemented; actual binary positive and negative-control validation passed; hosted CI pending"
+      "implementation_status": "Implemented and validated; final source CI passed at 6617aaeb (run 42408094543)."
     },
     {
       "priority": 1,
@@ -727,7 +727,7 @@
       "scenario": "NtCreateFile errors were wrapped as ErrorKind::Other. Optional .git, commondir and info/exclude readers use NotFound to distinguish absence from invalid metadata, so ordinary Windows discovery could fail closed unnecessarily.",
       "bead": "mini-agent-gkqd4.22",
       "review_report": "Final Windows portability review",
-      "implementation_status": "implemented; static/local affected validation passed; native Windows acceptance pending"
+      "implementation_status": "Implemented and validated; final source CI passed at 6617aaeb (run 42408094543)."
     },
     {
       "priority": 4,
@@ -736,7 +736,7 @@
       "scenario": "Git-created .git files are hidden on Windows, so std::fs::write uses a creation mode that can fail before corrupting fixture metadata. Open existing gitfiles with write+truncate and no create, preserving attributes and the original refusal assertions.",
       "bead": "mini-agent-gkqd4.23",
       "review_report": "Final Windows portability review",
-      "implementation_status": "implemented; static/local affected validation passed; native Windows acceptance pending"
+      "implementation_status": "Implemented and validated; final source CI passed at 6617aaeb (run 42408094543)."
     },
     {
       "priority": 4,
@@ -745,7 +745,7 @@
       "scenario": "Both baseline and repaired binaries fail local readiness before interruption. Native pipe probes accept512 bytes then return EAGAIN while POLLOUT still reports writable. Gate post-tool provider output and establish physical backpressure without relying on minimum capacity or poll-only readiness.",
       "bead": "mini-agent-gkqd4.24",
       "review_report": "Root native fixture diagnosis",
-      "implementation_status": "implemented; actual binary positive and negative-control validation passed; hosted CI pending"
+      "implementation_status": "Implemented and validated; final source CI passed at 6617aaeb (run 42408094543)."
     },
     {
       "priority": 4,
@@ -754,7 +754,7 @@
       "scenario": "Native Windows CI reached linked-worktree tests but fixture Git failed reading configuration because canonical verbatim paths crossed C Git argv/environment boundaries. Normalize -C, hooks/template paths, global config and worktree destination while preserving canonical filesystem ownership.",
       "bead": "mini-agent-gkqd4.25",
       "review_report": "Native Windows platform CI",
-      "implementation_status": "implemented;11 local linked-worktree regressions passed; native Windows acceptance pending"
+      "implementation_status": "Implemented and validated; final source CI passed at 6617aaeb (run 42408094543)."
     },
     {
       "id": "windows-mcp-external-cwd",
@@ -765,13 +765,14 @@
         "Native helper normal-success timeout persists after explicit PowerShell environment prerequisites. Stage is child-started while Rust has read child.pid and retained the live child.",
         "Unsandboxed stdio_command passes canonical Windows cwd directly to external runtimes; native sandbox launcher and established foreground fixtures project external path spellings."
       ],
-      "implementation_status": "Native ordinary-cwd and ambiguous-name controls passed. Reclassified P4: both ordinary and legacy cwd comparisons had the same successful runtime lookup, so this is not evidence of a P2 cwd cause for the old helper timeout.",
+      "implementation_status": "Implemented and validated; final source CI passed at 6617aaeb (run 42408094543).",
       "correction": "Project final executable/cwd spellings only when canonical roundtrip preserves identity; retain trailing-dot/space components and non-roundtripping paths. Production environment clearing and executable resolution policy unchanged.",
       "native_tests": [
         "mcp_stdio_external_cwd_uses_ordinary_windows_spelling",
         "mcp_stdio_external_cwd_retains_names_that_cannot_round_trip"
       ],
-      "comparison_limit": "Former canonical-cwd launch is observational; its failure is not asserted. Fixture wait now uses Thread.Sleep to remove PowerShell module-autoload uncertainty. Existing helper/server descendant assertions and deadlines remain unchanged."
+      "comparison_limit": "Former canonical-cwd launch is observational; its failure is not asserted. Fixture wait now uses Thread.Sleep to remove PowerShell module-autoload uncertainty. Existing helper/server descendant assertions and deadlines remain unchanged.",
+      "classification": "P4: both ordinary and legacy cwd comparisons produced successful runtime lookups. Native evidence does not establish cwd spelling as the cause of the historical helper timeout."
     },
     {
       "id": "windows-mcp-private-fixture",
@@ -783,14 +784,14 @@
         "The fixture reused a plain pre-created TempDir as all six private app roots. Windows private-directory repair requires current-user ownership; elevated default directory owners can be Administrators."
       ],
       "correction": "Use nonexistent per-purpose roots, allowing startup to create its explicit private ownership, and retain stderr/exit status on failures. Physical unread stdout and15s/10s bounds unchanged.",
-      "implementation_status": "Both actual-binary cases and shared temp helper passed locally (3 tests); strict owning Clippy passed. Native acceptance pending.",
+      "implementation_status": "Implemented and validated; final source CI passed at 6617aaeb (run 42408094543).",
       "confidence_limit": "Exact prior startup error was hidden. The fixture correction addresses ownership setup without weakening production private-path validation."
     }
   ],
   "validation": {
     "negative_probes": "13 distinct failing regressions plus one operator trust control pass; first failed-save fixture repaired and rerun; native rename and checkpoint probes confirmed separately.",
     "source_restore": "All 9 temporary probe targets restored byteexact before implementation.",
-    "limits": "Scoped review is not proof that no defects remain. Unchanged passing test results were reused; every full-suite failure and subsequent source correction has a passing affected test. Full hosted feature/platform matrix remains pending.",
+    "limits": "Scoped review is not proof that no defects remain. Unchanged passing tests were reused; subsequent corrections received affected checks and the final source passed the complete branch CI matrix. Four existing policy-gated jobs were skipped.",
     "guarded_write_negative_control": {
       "result": "expected failure of production-caller regression while helper test passed; byteexact restored caller then both passed",
       "restored_sha256": "06d02fad182e1680f37ac068c1c9ec14e7e463b5eafc98d6cbd4112c56d7005a",
@@ -806,7 +807,7 @@
       "final_affected": "356 passed, 3 fixture/inventory failures, 1 ignored performance test; all three corrected and final four-test gate passed",
       "final_gate": "4 passed: linked-worktree actual discovery, TaskTool actual routing, both subprocess inventories",
       "small_stacks": "18 passed with original stack sizes",
-      "remaining": "Hosted CI for the pushed source, including native Windows process lifecycle and linked-worktree tests."
+      "remaining": "None in this review wave; final source CI passed, including native Windows process lifecycle and linked-worktree tests."
     },
     "reduced_features": "72 hooks-only/discovery/path/trust tests passed. Strict all-targets Clippy passed in default, minimal and hooks-only configurations.",
     "workflow_policy": "139 Python CI scope/fingerprint/docs/Phase6/Git-runtime policy tests passed. Added three explicitly discovered Windows linked-worktree native tests to platform-paths/default.",
@@ -827,7 +828,7 @@
     "evidence_format": "Stored logs normalize trailing whitespace and terminal empty lines; original command logs remain under /private/tmp during the session.",
     "ci_followup": {
       "run": "https://github.com/sebahrens/mini-agent/actions/runs/42394587015",
-      "status": "not green; corrections in progress",
+      "status": "Historical failed run; all corrections accepted by final source CI.",
       "feature_gate": "Shared interrupt helper now compiled with goal OR subagents. Unix loop-only test gate matches actual caller. Reduced hooks,js,subagents,skills,sandbox regression: 3 passed; strict all-targets Clippy passed.",
       "test_environment": "TaskTool fixture marker now passed explicitly as argv; package metadata policy 117 passed.",
       "new_findings": [
@@ -860,7 +861,7 @@
     "ci_native_followup": {
       "run": "https://github.com/sebahrens/mini-agent/actions/runs/42399538709",
       "commit": "86aa9b3fb55e7104fb62bf65b8797956b45c443d",
-      "status": "Windows helper normal-success timeout remains; other matrix jobs still progressing",
+      "status": "Historical native failure; subsequent corrections and acceptance are recorded below.",
       "windows_mcp": "Native server success/inherited-pipe/timeout/cancel/drop descendant cases and Job lifecycle-dispatch regression passed. Helper normal-success case timed out15s;42passed1failed in owning job.",
       "investigation": "Root and reviewer traced direct-leader wait through spawn_guarded and both Job wrappers; no further production wait defect established. Test-only follow-up delegates established PowerShell runtime prerequisites SystemRoot/PATH/TEMP/TMP and records parent stages/capture completion. Production environment clearing and15s/20s/5s bounds unchanged.",
       "local_acceptance": "78 affected helper/stdio/subprocess-inventory Rust tests and117 package-metadata policy tests passed. cargo fmt and diff check passed. Production debug-install/smoke reused because follow-up is cfg(test) only.",
@@ -869,11 +870,7 @@
     },
     "windows_cwd_followup": {
       "local": "71 MCP launch/stdio/inventory tests, strict mcp,acp all-targets Clippy,228 policy tests passed; format/diff checks passed.",
-      "native_pending": [
-        "mcp_stdio_external_cwd_uses_ordinary_windows_spelling",
-        "mcp_stdio_external_cwd_retains_names_that_cannot_round_trip",
-        "mcp_stdio_headers_helper_owns_windows_descendants_on_success_timeout_and_drop"
-      ],
+      "native_pending": [],
       "root_review": "Required guarded native test process creation, explicit pipes and kill-on-drop ownership, comparison rather than unasserted negative-control terminology, and preservation of ambiguous path names.",
       "previous_cancelled_job": "Windows default compile128490222980 passed all native test steps and uploaded verified sources, but job ended cancelled after~30minutes. No test failure in its log; fresh run must complete successfully.",
       "install": {
@@ -887,17 +884,81 @@
     },
     "windows_private_fixture_followup": {
       "local": "cargo test --locked --test mcp_server_stdio_shutdown:3 passed5.40s (both actual-binary cases plus temp helper); strict owning Clippy passed.",
-      "native_pending": true,
-      "build_reuse": "Installed production build73f63c6d and its PASS2 smoke reused: change is integration-test setup/diagnostics only."
+      "native_pending": false,
+      "build_reuse": "Installed production build73f63c6d and its PASS2 smoke reused: change is integration-test setup/diagnostics only.",
+      "native": {
+        "run": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543",
+        "commit": "6617aaeb14b20a9d4fc0855e2a4d5497c929f001",
+        "job": 128510479461,
+        "result": "success",
+        "stdio_units": 45,
+        "actual_binary_shutdown_cases": 2,
+        "http_oauth_initialization_cases": 1,
+        "evidence": "2026-11-07-continuation-evidence/native-windows-mcp-acceptance.log"
+      }
     },
     "windows_discovery_acceptance": {
       "run": "https://github.com/sebahrens/mini-agent/actions/runs/42404621394",
       "commit": "664e823a8c04473668590e715481d3005112ba08",
       "step": "Test Windows linked-worktree discovery and hook exclusions",
-      "result": "completed success; owning job still running subsequent storage checks at observation",
-      "tests": 5
+      "result": "All five explicitly discovered native regressions executed and passed; log excerpt retained. Subsequent integration-only fixture change does not affect this source.",
+      "tests": 5,
+      "evidence": "2026-11-07-continuation-evidence/native-windows-discovery-acceptance.log"
+    },
+    "final_source_ci": {
+      "headSha": "6617aaeb14b20a9d4fc0855e2a4d5497c929f001",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543",
+      "status": "completed",
+      "conclusion": "success",
+      "counts": {
+        "success": 78,
+        "skipped": 4
+      },
+      "policy_limit": "Four jobs were skipped by existing branch workflow policy; release/scheduled/manual gates were not newly enabled for this review.",
+      "evidence": "2026-11-07-continuation-evidence/final-source-ci.json"
+    },
+    "final_macos_skill_runtime_confirmation": {
+      "command": "RUST_MIN_STACK=8388608 cargo test --locked --no-default-features --features hooks,js,subagents,skills,sandbox extras::js::tests::skill_runtime_binding -- --test-threads=1",
+      "result": "23 passed, 0 failed in 2.64s after 47.34s compilation; same hosted isolated check passed. No reproducible failure from the longer hosted duration."
     }
   },
-  "status": "local_ci_corrections_validated_native_ci_pending",
-  "final_root_review": "2026-11-07-continuation-evidence/root-final-review.json"
+  "status": "implemented_validated_review_complete",
+  "final_root_review": "2026-11-07-continuation-evidence/root-final-review.json",
+  "review_beads": [
+    "mini-agent-p0h9g.1",
+    "mini-agent-p0h9g.2",
+    "mini-agent-p0h9g.3",
+    "mini-agent-p0h9g.4",
+    "mini-agent-p0h9g.5",
+    "mini-agent-p0h9g.6",
+    "mini-agent-p0h9g.7",
+    "mini-agent-p0h9g.8",
+    "mini-agent-gkqd4.1",
+    "mini-agent-gkqd4.2",
+    "mini-agent-gkqd4.3",
+    "mini-agent-gkqd4.4",
+    "mini-agent-gkqd4.5",
+    "mini-agent-gkqd4.6",
+    "mini-agent-gkqd4.7",
+    "mini-agent-gkqd4.8",
+    "mini-agent-gkqd4.9",
+    "mini-agent-gkqd4.10",
+    "mini-agent-gkqd4.11",
+    "mini-agent-gkqd4.12",
+    "mini-agent-gkqd4.13",
+    "mini-agent-gkqd4.14",
+    "mini-agent-gkqd4.15",
+    "mini-agent-gkqd4.16",
+    "mini-agent-gkqd4.17",
+    "mini-agent-gkqd4.18",
+    "mini-agent-gkqd4.19",
+    "mini-agent-gkqd4.20",
+    "mini-agent-gkqd4.21",
+    "mini-agent-gkqd4.22",
+    "mini-agent-gkqd4.23",
+    "mini-agent-gkqd4.24",
+    "mini-agent-gkqd4.25",
+    "mini-agent-gkqd4.26",
+    "mini-agent-gkqd4.27"
+  ]
 }

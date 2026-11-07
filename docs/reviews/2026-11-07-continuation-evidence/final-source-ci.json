@@ -1,0 +1,505 @@
+{
+  "headSha": "6617aaeb14b20a9d4fc0855e2a4d5497c929f001",
+  "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543",
+  "status": "completed",
+  "conclusion": "success",
+  "counts": {
+    "success": 78,
+    "skipped": 4
+  },
+  "jobs": [
+    {
+      "name": "fmt",
+      "databaseId": 128510432475,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510432475"
+    },
+    {
+      "name": "changes",
+      "databaseId": 128510432692,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510432692"
+    },
+    {
+      "name": "package-compliance-smoke (ubuntu-latest, --channel aur --channel conda-bin --channel conda-source)",
+      "databaseId": 128510479053,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479053"
+    },
+    {
+      "name": "harness-regression",
+      "databaseId": 128510479099,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479099"
+    },
+    {
+      "name": "vscode",
+      "databaseId": 128510479122,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479122"
+    },
+    {
+      "name": "all-features",
+      "databaseId": 128510479125,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479125"
+    },
+    {
+      "name": "corresponding-source",
+      "databaseId": 128510479132,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479132"
+    },
+    {
+      "name": "package-compliance-smoke (macos-latest, --channel homebrew)",
+      "databaseId": 128510479161,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479161"
+    },
+    {
+      "name": "windows-hooks-compile (--no-default-features --features hooks,advisor,lsp,multimodal,pdf)",
+      "databaseId": 128510479241,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479241"
+    },
+    {
+      "name": "windows-hooks-compile (--no-default-features --features hooks,js,subagents,skills,sandbox)",
+      "databaseId": 128510479242,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479242"
+    },
+    {
+      "name": "parallel-test-smoke (ubuntu-latest)",
+      "databaseId": 128510479245,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479245"
+    },
+    {
+      "name": "parallel-test-smoke (macos-latest)",
+      "databaseId": 128510479276,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479276"
+    },
+    {
+      "name": "linux-sandbox-policy",
+      "databaseId": 128510479290,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479290"
+    },
+    {
+      "name": "macos-gym-ownership",
+      "databaseId": 128510479300,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479300"
+    },
+    {
+      "name": "install (ubuntu-latest)",
+      "databaseId": 128510479311,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479311"
+    },
+    {
+      "name": "windows-default-compile",
+      "databaseId": 128510479315,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479315"
+    },
+    {
+      "name": "windows-msi",
+      "databaseId": 128510479316,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479316"
+    },
+    {
+      "name": "platform-path-install-smoke (macos-latest)",
+      "databaseId": 128510479324,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479324"
+    },
+    {
+      "name": "dependency-policy",
+      "databaseId": 128510479337,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479337"
+    },
+    {
+      "name": "platform-path-negative-controls",
+      "databaseId": 128510479341,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479341"
+    },
+    {
+      "name": "mcp-stdio (ubuntu-latest)",
+      "databaseId": 128510479342,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479342"
+    },
+    {
+      "name": "windows-worker-launcher-unit",
+      "databaseId": 128510479348,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479348"
+    },
+    {
+      "name": "package",
+      "databaseId": 128510479396,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479396"
+    },
+    {
+      "name": "install (macos-latest)",
+      "databaseId": 128510479401,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479401"
+    },
+    {
+      "name": "clippy (--no-default-features --features js)",
+      "databaseId": 128510479430,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479430"
+    },
+    {
+      "name": "mcp-stdio (windows-latest)",
+      "databaseId": 128510479461,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479461"
+    },
+    {
+      "name": "platform-path-install-smoke (ubuntu-latest)",
+      "databaseId": 128510479479,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479479"
+    },
+    {
+      "name": "clippy (--no-default-features)",
+      "databaseId": 128510479506,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479506"
+    },
+    {
+      "name": "mcp-stdio (macos-latest)",
+      "databaseId": 128510479508,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479508"
+    },
+    {
+      "name": "clippy",
+      "databaseId": 128510479510,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479510"
+    },
+    {
+      "name": "test (ubuntu-latest)",
+      "databaseId": 128510479524,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479524"
+    },
+    {
+      "name": "platform-path-install-smoke (windows-latest)",
+      "databaseId": 128510479525,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479525"
+    },
+    {
+      "name": "clippy (--no-default-features --features js,skills)",
+      "databaseId": 128510479540,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479540"
+    },
+    {
+      "name": "clippy (--no-default-features --features sandbox)",
+      "databaseId": 128510479544,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479544"
+    },
+    {
+      "name": "clippy (--no-default-features --features memory)",
+      "databaseId": 128510479549,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479549"
+    },
+    {
+      "name": "lsp-lifecycle (windows-latest)",
+      "databaseId": 128510479566,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479566"
+    },
+    {
+      "name": "clippy (--no-default-features --features hooks,js,subagents,skills,sandbox)",
+      "databaseId": 128510479579,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479579"
+    },
+    {
+      "name": "clippy (--no-default-features --features acp)",
+      "databaseId": 128510479590,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479590"
+    },
+    {
+      "name": "lsp-lifecycle (macos-latest)",
+      "databaseId": 128510479596,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479596"
+    },
+    {
+      "name": "lsp-lifecycle (ubuntu-latest)",
+      "databaseId": 128510479605,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479605"
+    },
+    {
+      "name": "clippy (--no-default-features --features hooks,advisor,lsp,multimodal,pdf)",
+      "databaseId": 128510479611,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479611"
+    },
+    {
+      "name": "test (ubuntu-latest, --no-default-features --features mcp,js,sandbox,skills,memory)",
+      "databaseId": 128510479613,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479613"
+    },
+    {
+      "name": "clippy (--no-default-features --features mcp,js,sandbox,skills,memory)",
+      "databaseId": 128510479617,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479617"
+    },
+    {
+      "name": "test (macos-latest)",
+      "databaseId": 128510479625,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479625"
+    },
+    {
+      "name": "test (macos-latest, --no-default-features --features hooks,advisor,lsp,multimodal,pdf)",
+      "databaseId": 128510479630,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479630"
+    },
+    {
+      "name": "test (ubuntu-latest, --no-default-features --features js)",
+      "databaseId": 128510479633,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479633"
+    },
+    {
+      "name": "clippy (--no-default-features --features mcp)",
+      "databaseId": 128510479640,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479640"
+    },
+    {
+      "name": "clippy (--no-default-features --features goal)",
+      "databaseId": 128510479646,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479646"
+    },
+    {
+      "name": "clippy (--no-default-features --features js,sandbox)",
+      "databaseId": 128510479669,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479669"
+    },
+    {
+      "name": "platform-paths (ubuntu-latest, mcp, --no-default-features --features mcp, true)",
+      "databaseId": 128510479687,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479687"
+    },
+    {
+      "name": "test (ubuntu-latest, --no-default-features --features mcp)",
+      "databaseId": 128510479691,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479691"
+    },
+    {
+      "name": "test (ubuntu-latest, --no-default-features --features memory)",
+      "databaseId": 128510479702,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479702"
+    },
+    {
+      "name": "platform-paths (ubuntu-latest, default, true)",
+      "databaseId": 128510479709,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479709"
+    },
+    {
+      "name": "test (macos-latest, --no-default-features --features sandbox)",
+      "databaseId": 128510479710,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479710"
+    },
+    {
+      "name": "clippy (--no-default-features --features skills)",
+      "databaseId": 128510479712,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479712"
+    },
+    {
+      "name": "platform-paths (macos-latest, default, true)",
+      "databaseId": 128510479720,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479720"
+    },
+    {
+      "name": "test (ubuntu-latest, --no-default-features --features js,sandbox)",
+      "databaseId": 128510479756,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479756"
+    },
+    {
+      "name": "test (ubuntu-latest, --no-default-features --features skills)",
+      "databaseId": 128510479766,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479766"
+    },
+    {
+      "name": "test (ubuntu-latest, --no-default-features --features hooks,js,subagents,skills,sandbox)",
+      "databaseId": 128510479781,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479781"
+    },
+    {
+      "name": "test (ubuntu-latest, --no-default-features --features goal)",
+      "databaseId": 128510479784,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479784"
+    },
+    {
+      "name": "test (macos-latest, --no-default-features --features js)",
+      "databaseId": 128510479785,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479785"
+    },
+    {
+      "name": "platform-paths (macos-latest, mcp, --no-default-features --features mcp, true)",
+      "databaseId": 128510479787,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479787"
+    },
+    {
+      "name": "platform-paths (ubuntu-latest, js, --no-default-features --features js, false)",
+      "databaseId": 128510479804,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479804"
+    },
+    {
+      "name": "platform-paths (macos-latest, mcp-js, --no-default-features --features mcp,js, true)",
+      "databaseId": 128510479805,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479805"
+    },
+    {
+      "name": "test (ubuntu-latest, --no-default-features --features acp)",
+      "databaseId": 128510479808,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479808"
+    },
+    {
+      "name": "test (ubuntu-latest, --no-default-features --features hooks,advisor,lsp,multimodal,pdf)",
+      "databaseId": 128510479815,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479815"
+    },
+    {
+      "name": "platform-paths (macos-latest, js, --no-default-features --features js, false)",
+      "databaseId": 128510479819,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479819"
+    },
+    {
+      "name": "platform-paths (windows-latest, js, --no-default-features --features js, false)",
+      "databaseId": 128510479827,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479827"
+    },
+    {
+      "name": "test (macos-latest, --no-default-features --features js,sandbox)",
+      "databaseId": 128510479835,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479835"
+    },
+    {
+      "name": "test (ubuntu-latest, --no-default-features --features js,skills)",
+      "databaseId": 128510479852,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479852"
+    },
+    {
+      "name": "platform-paths (windows-latest, mcp-js, --no-default-features --features mcp,js, true)",
+      "databaseId": 128510479853,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479853"
+    },
+    {
+      "name": "test (ubuntu-latest, --no-default-features --features sandbox)",
+      "databaseId": 128510479862,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479862"
+    },
+    {
+      "name": "platform-paths (ubuntu-latest, mcp-js, --no-default-features --features mcp,js, true)",
+      "databaseId": 128510479892,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479892"
+    },
+    {
+      "name": "test (macos-latest, --no-default-features --features hooks,js,subagents,skills,sandbox)",
+      "databaseId": 128510479896,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479896"
+    },
+    {
+      "name": "platform-paths (windows-latest, default, true)",
+      "databaseId": 128510479905,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479905"
+    },
+    {
+      "name": "platform-paths (windows-latest, mcp, --no-default-features --features mcp, true)",
+      "databaseId": 128510479908,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510479908"
+    },
+    {
+      "name": "test (ubuntu-latest, --no-default-features)",
+      "databaseId": 128510480048,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510480048"
+    },
+    {
+      "name": "macos-worker-containment-gate",
+      "databaseId": 128510480226,
+      "conclusion": "skipped",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510480226"
+    },
+    {
+      "name": "windows-worker-containment-gate",
+      "databaseId": 128510480534,
+      "conclusion": "skipped",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510480534"
+    },
+    {
+      "name": "windows-general-sandbox-policy",
+      "databaseId": 128510480916,
+      "conclusion": "skipped",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128510480916"
+    },
+    {
+      "name": "phase6-cross-platform-gate",
+      "databaseId": 128521182083,
+      "conclusion": "skipped",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128521182083"
+    },
+    {
+      "name": "ci-success",
+      "databaseId": 128529689779,
+      "conclusion": "success",
+      "url": "https://github.com/sebahrens/mini-agent/actions/runs/42408094543/job/128529689779"
+    }
+  ],
+  "policy_limit": "Four jobs were skipped by existing branch workflow policy; release/scheduled/manual gates were not newly enabled for this review."
+}
