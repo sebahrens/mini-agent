@@ -873,7 +873,19 @@ impl WorkspaceInstructions {
         }
         *nodes = nodes.saturating_add(1);
         if *nodes > MAX_INCLUDE_NODES {
-            return Err("Workspace instruction include node limit reached".into());
+            // Authored prose can name any number of existing files; the cap
+            // bounds the work, so it degrades with a visible notice on the
+            // last delivered source instead of ending the turn.
+            if *nodes == MAX_INCLUDE_NODES + 1
+                && let Some(last) = loaded.last_mut()
+            {
+                last.text = Arc::from(format!(
+                    "{}\n[instruction include limit of {MAX_INCLUDE_NODES} sources reached; \
+                     further @-included files were not loaded]",
+                    last.text
+                ));
+            }
+            return Ok(());
         }
         seen.insert(key);
         let remaining = {
@@ -2305,6 +2317,41 @@ mod tests {
                 .sources
                 .iter()
                 .any(|s| s.text.contains("REAL"))
+        );
+    }
+    #[test]
+    fn prose_naming_more_files_than_the_include_limit_degrades_with_notice() {
+        let (_root, service) = fixture();
+        let root = service.workspace.root();
+        let mut text = String::new();
+        for i in 0..MAX_INCLUDE_NODES + 8 {
+            std::fs::write(root.join(format!("f{i}.md")), format!("F{i}\n")).unwrap();
+            text.push_str(&format!("@f{i}.md "));
+        }
+        service
+            .capture_initial(
+                vec![
+                    InstructionRoot::workspace(
+                        &service.workspace,
+                        PathBuf::from("AGENTS.md"),
+                        &text,
+                    )
+                    .unwrap(),
+                ],
+                0,
+            )
+            .unwrap();
+        let state = service.state.lock().unwrap();
+        assert!(state.initial.error.is_none());
+        assert_eq!(state.initial.sources.len(), MAX_INCLUDE_NODES);
+        assert!(
+            state
+                .initial
+                .sources
+                .last()
+                .unwrap()
+                .text
+                .contains("include limit")
         );
     }
     #[test]
