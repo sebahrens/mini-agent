@@ -688,8 +688,9 @@ fn search_target(
             Ok(search.finish(
                 walker.work_limit_hit(),
                 format!(
-                    "{}{}",
+                    "{}{}{}",
                     walker.skipped_directories().notice(),
+                    walker.unopened().notice(),
                     ignore_mode.notice(&include_root)
                 ),
                 walker.stop_path().map(Path::to_path_buf),
@@ -1645,6 +1646,46 @@ mod tests {
         .await;
 
         assert!(result.is_err());
+    }
+
+    /// mini-agent-vs169: entries the walker cannot open are reported, not
+    /// treated as match-free.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grep_reports_files_and_directories_it_could_not_open() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = TempDir::new("unopenable");
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("secret.txt"), "needle\n").unwrap();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/x.txt"), "needle\n").unwrap();
+        std::fs::set_permissions(root.join("secret.txt"), std::fs::Permissions::from_mode(0))
+            .unwrap();
+        std::fs::set_permissions(root.join("sub"), std::fs::Permissions::from_mode(0)).unwrap();
+        let can_open = std::fs::File::open(root.join("secret.txt")).is_ok();
+        let output = GrepTool::new(None, None, 50)
+            .with_workspace(&root)
+            .call(grep_args("needle", None, None))
+            .await
+            .unwrap();
+        // Restore so the temp dir can be removed.
+        std::fs::set_permissions(root.join("sub"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(
+            root.join("secret.txt"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        if can_open {
+            return; // running as root: permissions are not enforced
+        }
+        assert!(
+            output.contains("could not open 2 files or directories"),
+            "{output}"
+        );
+        assert!(
+            output.contains("secret.txt") && output.contains("sub"),
+            "{output}"
+        );
     }
 
     #[cfg(unix)]
