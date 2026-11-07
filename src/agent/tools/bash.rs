@@ -1255,7 +1255,7 @@ impl JobStatusTool {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .contains(id);
-        let lines = apply_job_keys(keys, &mut text, &mut edited)?;
+        let (lines, start_text, start_edited) = apply_job_keys_from(keys, &mut text, &mut edited)?;
         for line in lines {
             if line.trim().is_empty() {
                 continue;
@@ -1269,8 +1269,6 @@ impl JobStatusTool {
             .await;
             checked.map_err(|error| error.to_string())?;
         }
-        let start_text = text.clone();
-        let start_edited = edited;
         if let Err(error) = self.sandbox.write_background_job_input(id, &bytes).await {
             if error.written > 0 {
                 // Only the keys the program already received count; a key cut
@@ -1758,6 +1756,18 @@ fn apply_job_keys(
         }
     }
     Ok(lines)
+}
+
+/// Applies `keys` to the tracked line and also returns the line state from
+/// BEFORE any key, which is the baseline a partial write must replay from.
+fn apply_job_keys_from(
+    keys: &[JobKey],
+    text: &mut String,
+    edited: &mut bool,
+) -> Result<(Vec<String>, String, bool), String> {
+    let start = (text.clone(), *edited);
+    let lines = apply_job_keys(keys, text, edited)?;
+    Ok((lines, start.0, start.1))
 }
 
 /// The typed line after only the first `written` bytes of `keys` reached the
@@ -3832,6 +3842,18 @@ mod tests {
             .await
             .unwrap();
         background_id(&started)
+    }
+
+    #[test]
+    fn partial_write_replays_from_the_pre_key_line() {
+        let keys = [JobKey::Backspace, JobKey::Backspace, JobKey::Backspace];
+        let mut text = "rm -rf x".to_string();
+        let mut edited = false;
+        let (_, start_text, start_edited) =
+            apply_job_keys_from(&keys, &mut text, &mut edited).unwrap();
+        let written = JobKey::Backspace.bytes().len();
+        let (got, _) = line_after_partial_keys(&keys, written, start_text, start_edited);
+        assert_eq!(got, "rm -rf ");
     }
 
     #[test]
