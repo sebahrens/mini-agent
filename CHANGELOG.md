@@ -8,6 +8,7 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- The `js` tool's `read_lines(path, -N)` tail read seeks backwards from the end of the file instead of scanning from byte 0, so the last lines of logs over 64 MiB (or any size) are returned with `eof: true`; only a tail longer than the 64 MiB scan limit measured from the end is refused (mini-agent-s17nk).
 - `lsp_diagnostics` `directory` accepts `.`, `./src`, `src/` and `src//sub`: `.` components are dropped and an empty result means no filter, instead of silently listing nothing and answering "No diagnostics." (mini-agent-6ti22).
 - The ACP edit permission preview marks the last emitted diff `mini-agent-truncated` with `mini-agent-omitted-blocks` when blocks beyond 16 or beyond the 64 KiB budget were skipped, and the VS Code approval view states "N more edit blocks not shown" (mini-agent-937li).
 - The `js` tool's `write_file` now follows the native `write` overwrite rules: replacing an existing file requires a complete current `read` (otherwise refused with a message naming the rule), the exact preimage is checkpointed for `/rewind`, and the mutation diff is published (mini-agent-ad4rl).

@@ -1141,7 +1141,7 @@ fn helper_globals_doc() -> [String; 4] {
         "`toml_parse(text: string): object` and `csv_parse(text: string, {header?: boolean}): string[][] | object[]` (pure; 4 MiB max; TOML inline tables/arrays of tables/quoted keys, CSV quotes/CRLF; integers beyond 2^53 are BigInt)."
             .to_string(),
         format!(
-            "`read_lines(path: string, from: number, count?: number): {{lines: string[], eof: boolean}}` (synchronous; one read effect; 1-based `from`, negative = last N lines; files over {} MiB ok, scans max {} MiB, count max {}, about {} MiB returned else eof=false, lines cut at {} KiB). Example: `read_lines('app.log', -50).lines`.",
+            "`read_lines(path: string, from: number, count?: number): {{lines: string[], eof: boolean}}` (synchronous; one read effect; 1-based `from`, negative = last N lines, found by seeking back from the end of the file so a log of any size can be tailed (eof=true); files over {} MiB ok, a forward scan or the tail itself covers max {} MiB, count max {}, about {} MiB returned else eof=false, lines cut at {} KiB). Example: `read_lines('app.log', -50).lines`.",
             READ_FILE_MAX_BYTES / (1024 * 1024),
             READ_LINES_MAX_SCAN_BYTES / (1024 * 1024),
             READ_LINES_MAX_COUNT,

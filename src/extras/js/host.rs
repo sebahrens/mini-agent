@@ -1400,6 +1400,57 @@ async fn read_approved_file(target: ResolvedReadTarget) -> Result<String, Effect
     String::from_utf8(bytes).map_err(|_| EffectServiceError::InvalidBody)
 }
 
+/// Positions `file` at the start of its last `keep` lines by scanning backwards from EOF in
+/// chunks. At most `READ_LINES_MAX_SCAN_BYTES` are examined, measured from the end; a tail whose
+/// last `keep` lines are longer than that is `OutputLimit`, like a forward scan of that size.
+/// A final newline terminates the last line and is not a separator, matching `read_lines_range`.
+async fn seek_to_tail<F>(file: &mut F, keep: usize) -> Result<(), EffectServiceError>
+where
+    F: tokio::io::AsyncRead + tokio::io::AsyncSeek + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    const CHUNK: u64 = 64 * 1024;
+    let len = file
+        .seek(std::io::SeekFrom::End(0))
+        .await
+        .map_err(file_path_error)?;
+    let mut start = 0u64;
+    if keep > 0 {
+        let mut position = len;
+        let mut scanned = 0u64;
+        let mut seen = 0usize;
+        let mut buffer = vec![0u8; CHUNK as usize];
+        'scan: while position > 0 {
+            let size = position.min(CHUNK);
+            position -= size;
+            scanned += size;
+            if scanned > READ_LINES_MAX_SCAN_BYTES {
+                return Err(EffectServiceError::OutputLimit);
+            }
+            file.seek(std::io::SeekFrom::Start(position))
+                .await
+                .map_err(file_path_error)?;
+            let chunk = &mut buffer[..size as usize];
+            file.read_exact(chunk).await.map_err(file_path_error)?;
+            for index in (0..chunk.len()).rev() {
+                let absolute = position + index as u64;
+                if chunk[index] == b'\n' && absolute + 1 != len {
+                    seen += 1;
+                    if seen == keep {
+                        start = absolute + 1;
+                        break 'scan;
+                    }
+                }
+            }
+        }
+    }
+    file.seek(std::io::SeekFrom::Start(start))
+        .await
+        .map_err(file_path_error)?;
+    Ok(())
+}
+
 /// Streams `count` lines starting at 1-based `from` (or the last `-from` lines when negative).
 ///
 /// Bounded three ways: at most `READ_LINES_MAX_SCAN_BYTES` are scanned, each line is truncated
@@ -1861,6 +1912,14 @@ impl FileEffectService {
                     tokio::fs::File::from_std(file)
                 }
             };
+            let mut file = file;
+            if from < 0 {
+                // Tail read: find where the last lines begin by scanning backwards from EOF, so a
+                // multi-GB log costs only the bytes of its final lines.
+                let keep =
+                    (from.unsigned_abs() as usize).min(count.min(READ_LINES_MAX_COUNT) as usize);
+                seek_to_tail(&mut file, keep).await?;
+            }
             read_lines_range(tokio::io::BufReader::new(file), from, count).await
         };
         tokio::select! {
@@ -10194,6 +10253,81 @@ mod tests {
             "timed_out must be true when deadline expires"
         );
         assert_eq!(result.code, -1, "timed-out process has no exit code");
+    }
+
+    #[tokio::test]
+    async fn read_lines_tail_seeks_from_the_end_of_a_file_over_the_scan_limit() {
+        use std::io::{Seek, Write};
+        let directory = TempDir::new("js-read-lines-tail");
+        let path = directory.path().join("big.log");
+        {
+            let mut file = std::fs::File::create(&path).unwrap();
+            // A sparse file larger than the forward-scan limit, then a few real lines.
+            file.seek(std::io::SeekFrom::Start(
+                READ_LINES_MAX_SCAN_BYTES + 4 * 1024 * 1024,
+            ))
+            .unwrap();
+            file.write_all(b"\nalpha\r\nbeta\ngamma\ndelta\n").unwrap();
+        }
+        let tail = |from: i64, count: u32| {
+            let path = path.clone();
+            async move {
+                let mut file = tokio::fs::File::open(path).await.unwrap();
+                let keep = (from.unsigned_abs() as usize).min(count as usize);
+                super::seek_to_tail(&mut file, keep).await.unwrap();
+                super::read_lines_range(tokio::io::BufReader::new(file), from, count)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(
+            tail(-3, 100).await,
+            (vec!["beta".into(), "gamma".into(), "delta".into()], true)
+        );
+        assert_eq!(tail(-1, 100).await, (vec!["delta".into()], true));
+        assert_eq!(
+            tail(-2, 100).await.0,
+            vec!["gamma".to_string(), "delta".to_string()]
+        );
+        // Forward reads of the same file still hit the scan limit.
+        let file = tokio::fs::File::open(&path).await.unwrap();
+        assert_eq!(
+            super::read_lines_range(tokio::io::BufReader::new(file), 1, 5)
+                .await
+                .unwrap_err(),
+            EffectServiceError::OutputLimit
+        );
+    }
+
+    #[tokio::test]
+    async fn read_lines_tail_seek_matches_the_streaming_tail_on_small_inputs() {
+        let cases: [&[u8]; 6] = [
+            b"",
+            b"a",
+            b"a\n",
+            b"a\nb\nc",
+            b"a\r\nb\r\nc\r\n",
+            b"\n\n\nx\n\n",
+        ];
+        for data in cases {
+            for keep in 1..6i64 {
+                let mut cursor = std::io::Cursor::new(data.to_vec());
+                super::seek_to_tail(&mut cursor, keep as usize)
+                    .await
+                    .unwrap();
+                let seeked = super::read_lines_range(
+                    tokio::io::BufReader::new(&data[cursor.position() as usize..]),
+                    -keep,
+                    100,
+                )
+                .await
+                .unwrap();
+                let streamed = super::read_lines_range(tokio::io::BufReader::new(data), -keep, 100)
+                    .await
+                    .unwrap();
+                assert_eq!(seeked, streamed, "{data:?} keep={keep}");
+            }
+        }
     }
 
     #[tokio::test]
