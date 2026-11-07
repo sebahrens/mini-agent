@@ -30,7 +30,7 @@
     "correction": "Final consumer audit found src/extras/hooks/trust.rs reads workspace .claude/settings.json. Removed that proposed metadata exemption; workflow and fingerprint regressions require it to remain an input."
   },
   "hosted_validation": {
-    "status": "records_only_acceptance_passed_final_configuration_control_pending",
+    "status": "accepted",
     "rule_change_run": "https://github.com/sebahrens/mini-agent/actions/runs/42416033909",
     "acceptance": "Hosted changes/fmt must pass, then a records-only push must finish green with the expensive matrix skipped. The unrelated matrix from the rule-change run is superseded after the owning policy checks pass.",
     "changes": {
@@ -80,11 +80,25 @@
         "install",
         "phase6-cross-platform-gate"
       ]
+    },
+    "final_configuration_control": {
+      "commit": "32c6f3aa76e341aea235533ec4d29617c52f3f78",
+      "run": "https://github.com/sebahrens/mini-agent/actions/runs/42416675901",
+      "changes": {
+        "job": 128536160231,
+        "conclusion": "success"
+      },
+      "fmt": {
+        "job": 128536160423,
+        "conclusion": "success"
+      },
+      "runtime_matrix": "Cancelled after both owning checks passed; unchanged production source reuses CI42408094543."
     }
   },
   "limits": [
     "This is path-based impact classification. Unknown inputs remain conservative; adding consumers of exempt artifacts requires updating the rules and tests.",
     "Tag, schedule and explicit manual proof policies are unchanged."
   ],
-  "validation_scope": "Reuse source CI42408094543 (78 successful jobs): git diff6617aaeb..5c02a1f4 is empty for src/,tests/,Cargo.toml,Cargo.lock,build.rs,build_inputs.rs,rust-toolchain.toml. Validate changed CI selection with335 Python policy tests, the affected Rust workflow consumer, hosted changes/fmt jobs, and an actual records-only push. An additional unchanged runtime matrix is unnecessary."
+  "validation_scope": "Reuse source CI42408094543 (78 successful jobs): git diff6617aaeb..32c6f3aa is empty for src/,tests/,Cargo.toml,Cargo.lock,build.rs,build_inputs.rs,rust-toolchain.toml. Validate changed CI selection with335 Python policy tests, the affected Rust workflow consumer, hosted changes/fmt jobs, and an actual records-only push. An additional unchanged runtime matrix is unnecessary.",
+  "status": "complete"
 }
