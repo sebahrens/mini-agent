@@ -265,6 +265,9 @@ fn bind_workspace_handle(
     let Some(workspace) = workspace else {
         return Ok(fallback.to_path_buf());
     };
+    // The sandbox wrapper's pre_exec closures dup2 onto fixed descriptors; a
+    // source sitting on one of them would be clobbered before our dup2 runs.
+    let workspace = crate::sandbox::move_fd_above_reserved(workspace)?;
     let source = workspace.as_raw_fd();
     unsafe {
         command.as_std_mut().pre_exec(move || {
@@ -2506,5 +2509,54 @@ mod boundary_tests {
         assert!(!document_content_current(&settled).await);
         assert_eq!(rehashes(), start + 1);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod workspace_handle_fd_tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    /// A workspace clone allocated on a descriptor that a sandbox pre_exec
+    /// closure dup2s over (196/197) must not be the source of the LSP dup2.
+    #[test]
+    #[allow(unsafe_code)]
+    fn workspace_clone_on_reserved_descriptor_survives_sandbox_clobber() {
+        let mut held = Vec::new();
+        let dir = loop {
+            let file = std::fs::File::open(std::env::temp_dir()).unwrap();
+            if file.as_raw_fd() >= 196 {
+                break file;
+            }
+            held.push(file);
+        };
+        let raw = dir.as_raw_fd();
+        let mut command = tokio::process::Command::new("/usr/bin/true");
+        // Simulates bwrap_set_env / workspace authority clobbering 196 and 197.
+        // SAFETY: only async-signal-safe libc calls.
+        unsafe {
+            command.as_std_mut().pre_exec(|| {
+                let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
+                if null == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                libc::dup2(null, 196);
+                libc::dup2(null, 197);
+                libc::close(null);
+                Ok(())
+            });
+        }
+        bind_workspace_handle(&mut command, Some(dir), Path::new("/")).unwrap();
+        let status = command
+            .as_std_mut()
+            .spawn()
+            .and_then(|mut child| child.wait())
+            .map(|status| status.success());
+        drop(held);
+        assert!(
+            matches!(status, Ok(true)),
+            "spawn failed (source fd {raw}): {status:?}"
+        );
     }
 }

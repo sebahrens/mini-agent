@@ -69,14 +69,15 @@ const WORKSPACE_AUTHORITY_FD: i32 = 197;
 /// Lowest descriptor number a pre_exec dup2 source may hold. The fixed
 /// child-side targets (bwrap `--args` 196, workspace authority 197) must never
 /// be reachable by the allocator, or one closure's dup2 could clobber another
-/// closure's source descriptor.
+/// closure's source descriptor. The LSP workspace target (198) is reserved too,
+/// so every source stays strictly disjoint from every fixed target.
 #[cfg(unix)]
-const FIRST_UNRESERVED_FD: i32 = 198;
+const FIRST_UNRESERVED_FD: i32 = 199;
 
 /// Move `file` to a descriptor number above every fixed pre_exec target.
 #[cfg(unix)]
 #[allow(unsafe_code)]
-fn move_fd_above_reserved(file: std::fs::File) -> std::io::Result<std::fs::File> {
+pub(crate) fn move_fd_above_reserved(file: std::fs::File) -> std::io::Result<std::fs::File> {
     use std::os::fd::{AsRawFd, FromRawFd};
     if file.as_raw_fd() >= FIRST_UNRESERVED_FD {
         return Ok(file);
@@ -13261,11 +13262,7 @@ echo PRIVATE_TEMP_PASS"#,
             held.push(file);
         };
         let moved = move_fd_above_reserved(victim).unwrap();
-        assert!(
-            moved.as_raw_fd() > WORKSPACE_AUTHORITY_FD,
-            "{}",
-            moved.as_raw_fd()
-        );
+        assert!(moved.as_raw_fd() > 198, "{}", moved.as_raw_fd());
         drop(held);
     }
 }
