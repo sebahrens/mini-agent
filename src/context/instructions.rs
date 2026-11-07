@@ -871,8 +871,13 @@ impl WorkspaceInstructions {
             seen.insert(key);
             return Ok(());
         }
-        *nodes = nodes.saturating_add(1);
-        if *nodes > MAX_INCLUDE_NODES {
+        // Authored root files (depth 0: AGENTS.md, CLAUDE.md, CLAUDE.local.md)
+        // are exempt from the cap and never counted: only @-included files
+        // can exhaust it, so prose mentions cannot starve a later root.
+        if depth > 0 {
+            *nodes = nodes.saturating_add(1);
+        }
+        if depth > 0 && *nodes > MAX_INCLUDE_NODES {
             // Authored prose can name any number of existing files; the cap
             // bounds the work, so it degrades with a visible notice on the
             // last delivered source instead of ending the turn.
@@ -2352,6 +2357,50 @@ mod tests {
                 .unwrap()
                 .text
                 .contains("include limit")
+        );
+    }
+    #[test]
+    fn include_limit_never_drops_later_root_instruction_files() {
+        let (_root, service) = fixture();
+        let root = service.workspace.root();
+        let mut text = String::new();
+        for i in 0..MAX_INCLUDE_NODES + 1 {
+            std::fs::write(root.join(format!("f{i}.md")), format!("F{i}\n")).unwrap();
+            text.push_str(&format!("@../f{i}.md "));
+        }
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/AGENTS.md"), &text).unwrap();
+        std::fs::write(root.join("sub/CLAUDE.md"), "CLAUDE-ROOT\n").unwrap();
+        std::fs::write(root.join("sub/CLAUDE.local.md"), "PRIVATE-LOCAL\n").unwrap();
+        let loaded = service.load_directory(Path::new("sub")).unwrap();
+        assert!(loaded.iter().any(|s| s.text.contains("CLAUDE-ROOT")));
+        assert!(loaded.iter().any(|s| s.text.contains("PRIVATE-LOCAL")));
+        assert!(
+            loaded.iter().any(|s| s.text.contains("include limit")),
+            "the include notice stays visible"
+        );
+
+        std::fs::write(root.join("CLAUDE.local.md"), "ROOT-PRIVATE\n").unwrap();
+        service
+            .capture_initial(
+                vec![
+                    InstructionRoot::workspace(
+                        &service.workspace,
+                        PathBuf::from("AGENTS.md"),
+                        &text.replace("@../", "@"),
+                    )
+                    .unwrap(),
+                ],
+                0,
+            )
+            .unwrap();
+        let state = service.state.lock().unwrap();
+        assert!(
+            state
+                .initial
+                .sources
+                .iter()
+                .any(|s| s.text.contains("ROOT-PRIVATE"))
         );
     }
     #[test]
