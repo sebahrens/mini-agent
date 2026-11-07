@@ -125,33 +125,51 @@ pub(crate) fn spawn_control_reader(
 ) -> tokio::sync::mpsc::Receiver<Result<String, String>> {
     crate::headless_control::enable(output, permission, ask_timeout);
     let (tx, rx) = tokio::sync::mpsc::channel(CONTROL_QUEUE_LINES);
-    tokio::spawn(async move {
-        loop {
-            let line = match read_stream_input_line().await {
-                Ok(Some(line)) => line,
-                Ok(None) | Err(_) => break,
-            };
-            if let Ok(text) = &line
-                && let Some(control) = crate::headless_control::classify_line(text.trim())
+    tokio::spawn(control_reader_loop(
+        crate::headless_control::state(),
+        output,
+        tx,
+        read_stream_input_line,
+    ));
+    rx
+}
+
+/// The reader task body: routes control lines to `state`, queues the rest,
+/// and on EOF, a read error or a dead output closes the control channel so
+/// pending and future asks deny instead of waiting for a driver that is gone.
+async fn control_reader_loop<F, Fut>(
+    state: Option<&crate::headless_control::ControlState>,
+    output: HeadlessOutputPolicy,
+    tx: tokio::sync::mpsc::Sender<Result<String, String>>,
+    mut next_line: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Option<Result<String, String>>>>,
+{
+    loop {
+        let line = match next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) | Err(_) => break,
+        };
+        if let Ok(text) = &line
+            && let Some(control) = crate::headless_control::classify_line(text.trim())
+        {
+            let ack = state.and_then(|s| s.handle(control));
+            if let Some(event) = ack
+                && output.emit_event(event).await.is_err()
             {
-                let ack = crate::headless_control::state().and_then(|s| s.handle(control));
-                if let Some(event) = ack
-                    && output.emit_event(event).await.is_err()
-                {
-                    break;
-                }
-                continue;
-            }
-            if tx.send(line).await.is_err() {
                 break;
             }
+            continue;
         }
-        // No driver can answer from here on: deny pending and future asks.
-        if let Some(state) = crate::headless_control::state() {
-            state.close();
+        if tx.send(line).await.is_err() {
+            break;
         }
-    });
-    rx
+    }
+    // No driver can answer from here on: deny pending and future asks.
+    if let Some(state) = state {
+        state.close();
+    }
 }
 
 pub(crate) fn headless_result_emitted() -> bool {
@@ -3397,6 +3415,82 @@ fn system_instruction_entries(cli: &cli::Cli) -> Vec<(&'static str, String)> {
 
 #[cfg(test)]
 mod tests {
+
+    use crate::print::{HeadlessOutputPolicy, control_reader_loop};
+
+    fn control_state() -> std::sync::Arc<crate::headless_control::ControlState> {
+        std::sync::Arc::new(crate::headless_control::ControlState::new(
+            HeadlessOutputPolicy::legacy(false, false),
+            None,
+            std::time::Duration::ZERO,
+        ))
+    }
+
+    async fn run_reader_over(
+        state: &crate::headless_control::ControlState,
+        script: Vec<anyhow::Result<Option<Result<String, String>>>>,
+    ) -> Vec<Result<String, String>> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut script = script.into_iter();
+        control_reader_loop(
+            Some(state),
+            HeadlessOutputPolicy::legacy(false, false),
+            tx,
+            move || {
+                let next = script.next().unwrap_or(Ok(None));
+                async move { next }
+            },
+        )
+        .await;
+        let mut queued = Vec::new();
+        while let Some(line) = rx.recv().await {
+            queued.push(line);
+        }
+        queued
+    }
+
+    #[tokio::test]
+    async fn stdin_eof_mid_ask_denies_the_pending_and_later_asks() {
+        let state = control_state();
+        let waiting = std::sync::Arc::clone(&state);
+        let ask = tokio::spawn(async move { waiting.ask("write", "x").await });
+        while state.pending_ids().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        let queued = run_reader_over(&state, vec![Ok(None)]).await;
+        assert!(queued.is_empty());
+        assert!(matches!(
+            ask.await.unwrap(),
+            crate::headless_control::Reply::Deny(_)
+        ));
+        assert!(matches!(
+            state.ask("bash", "touch x").await,
+            crate::headless_control::Reply::Deny(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn stdin_read_error_mid_ask_denies_and_keeps_queued_lines() {
+        let state = control_state();
+        let waiting = std::sync::Arc::clone(&state);
+        let ask = tokio::spawn(async move { waiting.ask("write", "x").await });
+        while state.pending_ids().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        let queued = run_reader_over(
+            &state,
+            vec![
+                Ok(Some(Ok(r#"{"type":"user","content":"hi"}"#.into()))),
+                Err(anyhow::anyhow!("broken pipe")),
+            ],
+        )
+        .await;
+        assert_eq!(queued.len(), 1);
+        assert!(matches!(
+            ask.await.unwrap(),
+            crate::headless_control::Reply::Deny(_)
+        ));
+    }
     #[cfg(unix)]
     #[test]
     #[allow(unsafe_code)]
