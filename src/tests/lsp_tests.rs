@@ -2696,6 +2696,48 @@ async fn inject_error_files(root: &TempDir, manager: &LspManager, files: usize, 
     }
 }
 
+/// mini-agent-ug66f: a warning in an earlier file does not precede an error
+/// in a later file in the project-wide listing.
+#[tokio::test]
+async fn project_diagnostics_list_errors_before_warnings_across_files() {
+    let root = TempDir::new("diagnostics-errors-first");
+    let manager = LspManager::new(&LspConfig::default(), root.path().to_path_buf());
+    for (name, severity) in [
+        ("a.rs", lsp_types::DiagnosticSeverity::WARNING),
+        ("b.rs", lsp_types::DiagnosticSeverity::ERROR),
+    ] {
+        let path = root.path().join(name);
+        std::fs::write(&path, "contents").unwrap();
+        let path = path.canonicalize().unwrap();
+        let diagnostics = (0..3)
+            .map(|n| diag(severity, n, 0, &format!("{name}-{n}")))
+            .collect();
+        assert!(manager.try_inject_diagnostics(
+            &crate::extras::lsp::client::file_uri(&path).unwrap(),
+            "rust",
+            diagnostics,
+        ));
+    }
+    let tool = LspTool::new(
+        manager.clone(),
+        Some(permission(root.path(), PermissionConfig::default())),
+        None,
+    );
+    let page = tool
+        .call(LspArgs {
+            limit: Some(3),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.matches(" error: b.rs-").count(), 3, "{page}");
+    assert!(!page.contains("warning"), "{page}");
+    assert!(
+        page.contains("3 more diagnostics in 1 file(s) not shown"),
+        "{page}"
+    );
+}
+
 #[tokio::test]
 async fn explicit_project_diagnostics_page_with_exact_hidden_counts() {
     let root = TempDir::new("diagnostics-paging");
@@ -2716,8 +2758,10 @@ async fn explicit_project_diagnostics_page_with_exact_hidden_counts() {
             .count(),
         200
     );
+    // Errors first across files: 216 errors fill the page before any warning.
+    assert!(!first.contains(" warning: f"), "{first}");
     assert!(
-        first.contains("70 more diagnostics in 2 file(s) not shown (showing 1-200 of 270 in 6 files); pass offset=200"),
+        first.contains("70 more diagnostics in 6 file(s) not shown (showing 1-200 of 270 in 6 files); pass offset=200"),
         "{first}"
     );
     let second = tool
