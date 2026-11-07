@@ -1323,7 +1323,7 @@ fn absolute_lexical(base: &Path, path: &Path) -> PathBuf {
 }
 
 fn file_path_error(error: std::io::Error) -> EffectServiceError {
-    if crate::fs::is_path_changed_error(&error) {
+    if crate::fs::is_path_changed_error(&error) || crate::fs::is_stale_content_error(&error) {
         return EffectServiceError::TargetChanged;
     }
     match error.kind() {
@@ -1624,14 +1624,19 @@ async fn write_approved_file(
     write_approved_file_cancellable(
         target,
         content,
+        None,
         crate::fs::AtomicWriteCancellation::default(),
     )
     .await
 }
 
+/// `base` is the digest of the preimage a guarded overwrite was authorized
+/// against: a replacement publishes only while the target still holds exactly
+/// those bytes. `None` keeps the unguarded identity-only check.
 async fn write_approved_file_cancellable(
     target: ResolvedWriteTarget,
     content: String,
+    base: Option<crate::fs::ContentDigest>,
     cancellation: crate::fs::AtomicWriteCancellation,
 ) -> Result<(), EffectServiceError> {
     match target.mode {
@@ -1644,15 +1649,27 @@ async fn write_approved_file_cancellable(
             )
             .await
         }
-        WriteMode::Replace => {
-            crate::fs::atomic_write_resolved_checked_cancellable(
-                target.path,
-                content.as_bytes(),
-                target.parent_identity,
-                cancellation,
-            )
-            .await
-        }
+        WriteMode::Replace => match base {
+            Some(base) => {
+                crate::fs::atomic_write_resolved_expecting_cancellable(
+                    &target.path,
+                    content.as_bytes(),
+                    target.parent_identity,
+                    base,
+                    cancellation,
+                )
+                .await
+            }
+            None => {
+                crate::fs::atomic_write_resolved_checked_cancellable(
+                    target.path,
+                    content.as_bytes(),
+                    target.parent_identity,
+                    cancellation,
+                )
+                .await
+            }
+        },
     }
     .map_err(file_path_error)
 }
@@ -2053,8 +2070,13 @@ impl FileEffectService {
                             write_guarded_path(guard, target, content, write_cancellation).await
                         }
                         None => {
-                            write_approved_file_cancellable(target, content, write_cancellation)
-                                .await
+                            write_approved_file_cancellable(
+                                target,
+                                content,
+                                None,
+                                write_cancellation,
+                            )
+                            .await
                         }
                     }
                 };
@@ -2193,7 +2215,7 @@ async fn write_guarded_path(
     crate::session::file_checkpoints::skipped();
     let after = crate::fs::ContentDigest::of(content.as_bytes());
     let recorded = content.clone();
-    write_approved_file_cancellable(target, content, cancellation).await?;
+    write_approved_file_cancellable(target, content, base, cancellation).await?;
     crate::session::file_checkpoints::published();
     guard.tracker.untrack_read_path(&key);
     let show_before = before.as_deref().filter(|text| {
@@ -10236,6 +10258,50 @@ mod tests {
             !external_target.exists(),
             "parent swap redirected the approved write"
         );
+    }
+
+    /// A guarded overwrite publishes only against the preimage it authorized:
+    /// a same-length in-place change after the guard must not be replaced.
+    #[tokio::test]
+    async fn approved_replace_with_base_rejects_a_changed_target() {
+        let temp = TempDir::new("js-write-base");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let file = workspace.join("doc.txt");
+        std::fs::write(&file, "aaaa").unwrap();
+        let base = crate::fs::ContentDigest::of(b"aaaa");
+        let target = resolve_write_target(&workspace, file.to_str().unwrap())
+            .await
+            .expect("resolve write target");
+        assert!(matches!(target.mode, WriteMode::Replace));
+        // Another process edits the file after the overwrite guard ran.
+        std::fs::write(&file, "bbbb").unwrap();
+        let error = write_approved_file_cancellable(
+            target,
+            "model".to_string(),
+            Some(base),
+            crate::fs::AtomicWriteCancellation::default(),
+        )
+        .await
+        .expect_err("changed preimage must not be overwritten");
+        assert!(
+            matches!(error, EffectServiceError::TargetChanged),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "bbbb");
+        // An unchanged preimage still replaces.
+        let target = resolve_write_target(&workspace, file.to_str().unwrap())
+            .await
+            .unwrap();
+        write_approved_file_cancellable(
+            target,
+            "model".to_string(),
+            Some(crate::fs::ContentDigest::of(b"bbbb")),
+            crate::fs::AtomicWriteCancellation::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "model");
     }
 
     #[cfg(unix)]
