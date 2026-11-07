@@ -450,7 +450,7 @@ impl Tool for ShellTool {
                 },
                 "pty": {
                     "type": "boolean",
-                    "description": "Run under a pseudo-terminal so isatty() is true and stdin/stdout/stderr are one TTY, 120x40 unless the mini-agent process sets COLUMNS/LINES (Unix only; default false). With background=true, job_status action=input types into it, e.g. for REPLs or prompts."
+                    "description": "Run under a pseudo-terminal so isatty() is true and stdin/stdout/stderr are one TTY, 120x40 unless the mini-agent process sets COLUMNS/LINES (Unix, or Windows with the AppContainer sandbox backend; default false). With background=true, job_status action=input types into it, e.g. for REPLs or prompts."
                 }
             },
             "required": ["command"]
@@ -1058,14 +1058,15 @@ async fn forward_progress<T>(
     }
 }
 
-/// Whether this platform can run a command under a pseudo-terminal. Unix
-/// only: there is no ConPTY path, so on Windows the model is never offered
-/// `pty`, terminal input or named keys (mini-agent-jguj1).
-const PTY_SUPPORTED: bool = cfg!(unix);
+/// Whether this platform can run a command under a pseudo-terminal: a Unix
+/// pty, or a Windows ConPTY hosted by the AppContainer sandbox helper
+/// (mini-agent-jguj1, mini-agent-msr4t). Elsewhere the model is never offered
+/// `pty`, terminal input or named keys.
+const PTY_SUPPORTED: bool = cfg!(any(unix, windows));
 
 /// Added to the shell description where `pty` is not offered, so the model
 /// knows why and what to do instead of guessing (mini-agent-msr4t).
-const NO_PTY_NOTE: &str = " This platform has no pseudo-terminal (Windows has no ConPTY path): commands that need a TTY, such as REPLs, installers that prompt, `python -i`, or ssh/gh login flows, cannot be driven and may hang or refuse to run. Use their non-interactive flags, pass answers on the command line or through files, or ask the user to run them.";
+const NO_PTY_NOTE: &str = " This platform has no pseudo-terminal: commands that need a TTY, such as REPLs, installers that prompt, `python -i`, or ssh/gh login flows, cannot be driven and may hang or refuse to run. Use their non-interactive flags, pass answers on the command line or through files, or ask the user to run them.";
 
 /// The shell description, plus the no-terminal limitation where `pty` is not offered.
 fn with_pty_limitation_note(mut description: String, pty_supported: bool) -> String {

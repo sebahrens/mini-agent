@@ -26,15 +26,22 @@ pub(crate) mod net_forwarder;
 pub(crate) mod net_proxy;
 pub(crate) mod shell_env;
 pub use shell_env::ShellEnvPolicy;
+#[cfg(windows)]
+pub(crate) mod conpty;
 #[cfg(test)]
 mod network_tests;
 mod output_capture;
 #[cfg(unix)]
 pub(crate) mod pty;
+mod pty_common;
+#[cfg(windows)]
+mod pty_windows;
 pub(crate) use output_capture::{
     OutputChannel, OutputLog, OutputTranscript, OutputWindow, SHELL_HARD_OUTPUT_BYTES, SpoolPolicy,
     TranscriptPart, write_private_log,
 };
+#[cfg(windows)]
+pub(crate) use pty_windows as pty;
 mod git_metadata;
 mod read_roots;
 pub(crate) use read_roots::default_sandbox_read_roots;
@@ -503,6 +510,10 @@ pub struct Sandbox {
     active_groups: Arc<Mutex<HashSet<u32>>>,
     #[cfg(windows)]
     general_owners: GeneralOwnerMap,
+    /// Windows only: the terminal the next wrapped shell command must run
+    /// under. Set on a per-command clone, never on the shared configuration.
+    #[cfg(windows)]
+    pty_launch: Option<pty::PtyLaunch>,
     cancelled_groups: Arc<Mutex<HashSet<u32>>>,
     background_jobs: Arc<BackgroundJobsInner>,
     /// Lazily captured environment snapshot shared by all clones.
@@ -1069,8 +1080,10 @@ enum CommandStdio {
     /// Separate stdout/stderr pipes (stdin null or caller input).
     #[default]
     Pipes,
-    /// One pseudo-terminal for stdin, stdout and stderr.
-    #[cfg(unix)]
+    /// One pseudo-terminal for stdin, stdout and stderr. On Windows the
+    /// AppContainer helper hosts the ConPTY and relays it over the helper's
+    /// stdout and private request pipe.
+    #[cfg(any(unix, windows))]
     Pty(pty::PtyPair),
     /// One pipe for both stdout and stderr (`2>&1`), so the capture sees
     /// output in exact write order.
@@ -2858,6 +2871,8 @@ impl Sandbox {
             active_groups: Arc::new(Mutex::new(HashSet::new())),
             #[cfg(windows)]
             general_owners: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(windows)]
+            pty_launch: None,
             cancelled_groups: Arc::new(Mutex::new(HashSet::new())),
             background_jobs: Arc::new(BackgroundJobsInner::default()),
             cached_essential_env: Arc::new(OnceLock::new()),
@@ -3887,6 +3902,7 @@ impl Sandbox {
                 &cache_dir,
                 &self.windows_appcontainer_read_roots,
                 &self.windows_appcontainer_write_roots,
+                self.pty_launch.as_ref(),
             )
             .map(ExecutionCommand::appcontainer_helper);
         }
@@ -5356,7 +5372,7 @@ impl Sandbox {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) async fn write_pty_input(
         &self,
         input: &pty::PtyInput,
@@ -5385,14 +5401,14 @@ impl Sandbox {
         len: usize,
     ) -> Result<BackgroundJobInput, String> {
         validate_background_job_id(id)?;
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if len > pty::MAX_PTY_INPUT_BYTES {
             return Err(format!(
                 "job_status input is limited to {} bytes per call",
                 pty::MAX_PTY_INPUT_BYTES
             ));
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         let _ = len;
         let jobs = self
             .background_jobs
@@ -5417,12 +5433,12 @@ impl Sandbox {
         bytes: &[u8],
     ) -> Result<(), String> {
         let input = self.background_job_input_handle(id, bytes.len())?;
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             self.write_pty_input(&input, bytes, pty::PTY_INPUT_WRITE_TIMEOUT)
                 .await
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = (input, bytes);
             Err("pseudo-terminal input is not supported on this platform".into())
@@ -5919,10 +5935,22 @@ impl Sandbox {
             settle_early(cancelled_output(), response_tx);
             return;
         }
+        #[cfg(windows)]
+        let windows_pty_shell = matches!(
+            (&stdio, &pending),
+            (CommandStdio::Pty(_), PendingCommand::Shell { .. })
+        );
+        #[cfg(windows)]
+        let windows_pty_requested = matches!(stdio, CommandStdio::Pty(_));
         let mut cmd = match pending {
             PendingCommand::Built(cmd) => cmd,
             PendingCommand::Shell { command, cwd } => {
-                let sandbox = self.clone();
+                #[cfg_attr(not(windows), allow(unused_mut))]
+                let mut sandbox = self.clone();
+                #[cfg(windows)]
+                if let CommandStdio::Pty(pair) = &stdio {
+                    sandbox.pty_launch = Some(pair.launch());
+                }
                 let wrapped = crate::agent::runner::spawn_blocking_scoped(move || {
                     sandbox.wrap_command(&command)
                 })
@@ -5953,6 +5981,25 @@ impl Sandbox {
                 }
             }
         };
+        // Windows ConPTY is hosted by the AppContainer helper, which is the only
+        // process that both owns the terminal and attests the target's handles.
+        // A shell that did not become that helper (sandbox disabled, another
+        // backend) or any caller-built command cannot honour pty=true.
+        #[cfg(windows)]
+        if windows_pty_requested && !(windows_pty_shell && cmd.helper_owns_tree()) {
+            settle_early(
+                CommandOutput {
+                    exit_status: None,
+                    stdout: Vec::new(),
+                    stderr: b"pty=true on Windows requires the AppContainer sandbox backend (sandbox enabled and available); this command cannot run under a pseudo-terminal here. Run it without pty."
+                        .to_vec(),
+                    status: CommandStatus::Failed,
+                    descendants_escaped: false,
+                },
+                response_tx,
+            );
+            return;
+        }
         // Preparation may have taken a while; a cancellation observed now
         // still prevents the spawn.
         if is_cancelled(&cancellation) {
@@ -6090,6 +6137,16 @@ impl Sandbox {
                     progress.clone(),
                 )
             }
+            #[cfg(windows)]
+            CommandStdio::Pty(_pair) => spawn_bounded_pipe_reader(
+                // The helper merges the terminal output onto its stdout.
+                child.stdout.take(),
+                CommandOutputStream::Merged,
+                captured.clone(),
+                limits,
+                reader_error_tx.clone(),
+                progress.clone(),
+            ),
             #[cfg(unix)]
             CommandStdio::MergedPipe(MergedPipe { reader, writer }) => {
                 // Only the child (and its descendants) may hold the write
@@ -6586,9 +6643,9 @@ fn validate_background_job_id(id: &str) -> Result<(), String> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 type BackgroundJobInput = pty::PtyInput;
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 type BackgroundJobInput = std::convert::Infallible;
 
 /// Stdio for a model-authored shell command: a pty, separate pipes, or (the
@@ -6611,15 +6668,15 @@ fn command_stdio(pty: bool) -> std::io::Result<CommandStdio> {
     if !pty {
         return Ok(CommandStdio::Pipes);
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         pty::PtyPair::open().map(CommandStdio::Pty)
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            "pty=true is not supported on this platform (no pseudo-terminal; Windows has no ConPTY path). Run the command without pty; programs that need a TTY cannot be driven here.",
+            "pty=true is not supported on this platform (no pseudo-terminal). Run the command without pty; programs that need a TTY cannot be driven here.",
         ))
     }
 }
@@ -6629,7 +6686,7 @@ fn background_input(stdio: &CommandStdio) -> Option<BackgroundJobInput> {
         CommandStdio::Pipes => None,
         #[cfg(unix)]
         CommandStdio::MergedPipe(_) => None,
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         CommandStdio::Pty(pair) => Some(pair.input()),
     }
 }

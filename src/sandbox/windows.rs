@@ -297,6 +297,15 @@ struct LaunchRequest {
     ready_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     preflight_witness: Option<preflight_witness::Attachment>,
+    /// Run the target under a ConPTY of this size hosted by the helper.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pty: Option<PtyRequest>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Eq, PartialEq)]
+struct PtyRequest {
+    rows: u16,
+    cols: u16,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, Eq, PartialEq)]
@@ -1919,6 +1928,7 @@ pub(crate) fn build_shell_helper(
     cache: &Path,
     configured_read_roots: &[PathBuf],
     configured_write_roots: &[PathBuf],
+    pty: Option<&crate::sandbox::pty::PtyLaunch>,
 ) -> Result<tokio::process::Command, String> {
     let program = resolve_program(shell, cwd)?;
     let arguments = prefix_args
@@ -1933,6 +1943,7 @@ pub(crate) fn build_shell_helper(
         cache,
         configured_read_roots,
         configured_write_roots,
+        pty,
     )
 }
 
@@ -1952,6 +1963,7 @@ pub(crate) fn build_direct_helper(
         cache,
         configured_read_roots,
         configured_write_roots,
+        None,
     )
 }
 
@@ -2013,6 +2025,7 @@ pub(crate) fn build_git_direct_helper(
         configured_read_roots,
         configured_write_roots,
         Some(workspace),
+        None,
     )
 }
 
@@ -2060,7 +2073,7 @@ fn build_helper(
     cwd: &Path,
     cache: &Path,
 ) -> Result<tokio::process::Command, String> {
-    build_helper_configured(program, arguments, cwd, cache, &[], &[])
+    build_helper_configured(program, arguments, cwd, cache, &[], &[], None)
 }
 
 fn build_helper_configured(
@@ -2070,6 +2083,7 @@ fn build_helper_configured(
     cache: &Path,
     configured_read_roots: &[PathBuf],
     configured_write_roots: &[PathBuf],
+    pty: Option<&crate::sandbox::pty::PtyLaunch>,
 ) -> Result<tokio::process::Command, String> {
     build_helper_with_ready_and_roots(
         program,
@@ -2080,6 +2094,7 @@ fn build_helper_configured(
         configured_read_roots,
         configured_write_roots,
         None,
+        pty,
     )
 }
 
@@ -2090,7 +2105,17 @@ fn build_helper_with_ready(
     cache: &Path,
     ready_path: Option<PathBuf>,
 ) -> Result<tokio::process::Command, String> {
-    build_helper_with_ready_and_roots(program, arguments, cwd, cache, ready_path, &[], &[], None)
+    build_helper_with_ready_and_roots(
+        program,
+        arguments,
+        cwd,
+        cache,
+        ready_path,
+        &[],
+        &[],
+        None,
+        None,
+    )
 }
 
 fn prepare_launch_request(
@@ -2156,6 +2181,7 @@ fn prepare_launch_request(
         parent_created: process_creation_time(unsafe { GetCurrentProcess() })?,
         ready_path,
         preflight_witness: None,
+        pty: None,
     })
 }
 
@@ -2168,8 +2194,9 @@ fn build_helper_with_ready_and_roots(
     configured_read_roots: &[PathBuf],
     configured_write_roots: &[PathBuf],
     workspace: Option<&Path>,
+    pty: Option<&crate::sandbox::pty::PtyLaunch>,
 ) -> Result<tokio::process::Command, String> {
-    let request = prepare_launch_request(
+    let mut request = prepare_launch_request(
         program,
         arguments,
         cwd,
@@ -2179,6 +2206,11 @@ fn build_helper_with_ready_and_roots(
         configured_write_roots,
         workspace,
     )?;
+    request.pty = pty.map(|launch| PtyRequest {
+        rows: launch.rows,
+        cols: launch.cols,
+    });
+    let pty_input = pty.map(|launch| launch.input.clone());
     let payload = serde_json::to_vec(&request)
         .map_err(|error| format!("sandbox: encode Windows launch request: {error}"))?;
     if payload.len() > REQUEST_MAX_BYTES {
@@ -2211,9 +2243,15 @@ fn build_helper_with_ready_and_roots(
                 }
             }
             let _permit = FeederPermit;
-            let _ = writer
+            let delivered = writer
                 .write_all(&(payload.len() as u32).to_le_bytes())
-                .and_then(|_| writer.write_all(&payload));
+                .and_then(|_| writer.write_all(&payload))
+                .is_ok();
+            // A terminal job keeps the request pipe open: bytes written after
+            // the launch request are the helper's terminal input.
+            if delivered && let Some(input) = pty_input {
+                input.attach(writer);
+            }
         })
         .map_err(|error| {
             ACTIVE_REQUEST_FEEDERS.fetch_sub(1, Ordering::AcqRel);
@@ -3241,6 +3279,19 @@ fn run_helper() -> Result<i32, String> {
     }
     grants.disarm_for_launch();
     mark_helper_stage(HELPER_STAGE_LAUNCH);
+    let pty = match request
+        .pty
+        .map(|size| crate::sandbox::conpty::ConPty::open(size.rows, size.cols))
+        .transpose()
+    {
+        Ok(pty) => pty,
+        Err(error) => {
+            terminate_and_drain_job(&job, 126)?;
+            grants.mark_job_quiescent();
+            grants.cleanup()?;
+            return Err(error);
+        }
+    };
     let child = match launch_appcontainer(
         &token,
         &job,
@@ -3251,6 +3302,7 @@ fn run_helper() -> Result<i32, String> {
         &cwd,
         &cache,
         &grants.profile.storage,
+        pty.as_ref(),
     ) {
         Ok(child) => child,
         Err(error) => {
@@ -3260,6 +3312,9 @@ fn run_helper() -> Result<i32, String> {
             return Err(error);
         }
     };
+    // Relay the terminal until the helper returns. Dropping it closes the
+    // pseudoconsole and drains the last output after the Job has been retired.
+    let _terminal_relay = pty.map(crate::sandbox::conpty::ConPty::relay);
     mark_helper_stage(HELPER_STAGE_VERIFY_JOB);
     let omitted_canary_inherited = if authority_probe_requested {
         match target_inherited_omitted_canary(&child, &omitted_handle) {
@@ -5349,6 +5404,7 @@ fn launch_appcontainer(
     cwd: &Path,
     cache: &Path,
     private_storage: &Path,
+    pty: Option<&crate::sandbox::conpty::ConPty>,
 ) -> Result<Handle, String> {
     // Preserve verbatim canonical paths for policy/identity checks, but use
     // ordinary Win32 drive paths at the final process boundary. In particular,
@@ -5360,15 +5416,22 @@ fn launch_appcontainer(
     let stdout = inheritable_duplicate(std::io::stdout().as_raw_handle())?;
     let stderr = inheritable_duplicate(std::io::stderr().as_raw_handle())?;
     let stdin = inheritable_null_input()?;
-    let handles = [stdin.raw(), stdout.raw(), stderr.raw()];
+    // Under a ConPTY the target's standard handles are the pseudoconsole, so only the unused null
+    // input stays in the exact inheritance list; the pipe-backed stdout/stderr are never inherited.
+    let handles = if pty.is_some() {
+        vec![stdin.raw()]
+    } else {
+        vec![stdin.raw(), stdout.raw(), stderr.raw()]
+    };
+    let attribute_count: u32 = if pty.is_some() { 3 } else { 2 };
     let mut bytes = 0usize;
-    unsafe { InitializeProcThreadAttributeList(null_mut(), 2, 0, &mut bytes) };
+    unsafe { InitializeProcThreadAttributeList(null_mut(), attribute_count, 0, &mut bytes) };
     if bytes == 0 {
         return Err(last_error("size restricted process attribute list"));
     }
     let mut storage = vec![0usize; bytes.div_ceil(size_of::<usize>())];
     let list = storage.as_mut_ptr().cast();
-    if unsafe { InitializeProcThreadAttributeList(list, 2, 0, &mut bytes) } == 0 {
+    if unsafe { InitializeProcThreadAttributeList(list, attribute_count, 0, &mut bytes) } == 0 {
         return Err(last_error("initialize restricted process attribute list"));
     }
     struct DeleteList(windows_sys::Win32::System::Threading::LPPROC_THREAD_ATTRIBUTE_LIST);
@@ -5384,7 +5447,7 @@ fn launch_appcontainer(
             0,
             PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
             handles.as_ptr().cast_mut().cast(),
-            size_of_val(&handles),
+            handles.len() * size_of::<HANDLE>(),
             null_mut(),
             null_mut(),
         )
@@ -5414,12 +5477,17 @@ fn launch_appcontainer(
     {
         return Err(last_error("set AppContainer security capabilities"));
     }
+    if let Some(pty) = pty {
+        pty.set_attribute(list)?;
+    }
     let mut startup = STARTUPINFOEXW::default();
     startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
-    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-    startup.StartupInfo.hStdInput = stdin.raw();
-    startup.StartupInfo.hStdOutput = stdout.raw();
-    startup.StartupInfo.hStdError = stderr.raw();
+    if pty.is_none() {
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        startup.StartupInfo.hStdInput = stdin.raw();
+        startup.StartupInfo.hStdOutput = stdout.raw();
+        startup.StartupInfo.hStdError = stderr.raw();
+    }
     startup.StartupInfo.lpDesktop = desktop.startup_name.as_ptr().cast_mut();
     startup.lpAttributeList = list;
     let application = wide_null(child_program.as_os_str())?;
@@ -6068,6 +6136,7 @@ fn run_runtime_probe() -> Result<i32, String> {
         std::slice::from_ref(&configured_read),
         std::slice::from_ref(&configured_write),
         None,
+        None,
     )?;
     let configured_result = configured_launch
         .as_std_mut()
@@ -6263,6 +6332,7 @@ fn run_runtime_probe() -> Result<i32, String> {
         None,
         std::slice::from_ref(&authority_read),
         &[],
+        None,
         None,
     )?;
     let authority_result = authority_probe
@@ -6537,6 +6607,7 @@ fn run_parent_probe(marker: Option<&Path>) -> Result<i32, String> {
         Some(ready_path.clone()),
         std::slice::from_ref(&descendant_read),
         &[],
+        None,
         None,
     )?;
     let mut child = helper

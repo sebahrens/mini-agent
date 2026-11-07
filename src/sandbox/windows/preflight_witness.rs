@@ -616,6 +616,7 @@ mod tests {
             parent_created: 1,
             ready_path: None,
             preflight_witness: None,
+            pty: None,
         };
         let mut original = serde_json::to_value(&request).unwrap();
         assert!(original.get("preflight_witness").is_none());
