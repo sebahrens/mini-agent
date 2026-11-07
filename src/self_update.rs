@@ -810,7 +810,7 @@ async fn verify_provenance(
 /// Whether `--version` output names exactly `version` as its version token:
 /// `mini-agent 1.1.10` must not satisfy a request for `1.1.1`.
 fn version_probe_matches(stdout: &str, version: &str) -> bool {
-    let mut tokens = stdout.trim_start().split_whitespace();
+    let mut tokens = stdout.split_whitespace();
     tokens.next() == Some(BINARY_NAME) && tokens.next() == Some(version)
 }
 
