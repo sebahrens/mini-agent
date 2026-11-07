@@ -96,9 +96,10 @@ export async function buildPromptBlocks(options: PromptBuildOptions): Promise<Pr
   let accepted = 0;
   let imageCount = 0;
   let imageBytes = 0;
-  for (const reference of options.references) {
+  for (const [index, reference] of options.references.entries()) {
     if (accepted >= MAX_REFERENCES) {
-      notes.push(`Only the first ${MAX_REFERENCES} references were sent; ${options.references.length - accepted} more were dropped.`);
+      // Count only references the cap actually cut off; earlier skips were reported individually.
+      notes.push(`Only the first ${MAX_REFERENCES} references were sent; ${options.references.length - index} more were dropped.`);
       break;
     }
     const name = label(reference);
