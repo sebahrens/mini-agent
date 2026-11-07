@@ -140,7 +140,7 @@ mod encode_tests {
         assert!(output.len() <= METADATA_BUDGET);
         let value: serde_json::Value = serde_json::from_str(&output).unwrap();
         let kept = value["agent_skills"].as_array().unwrap().len();
-        assert!(kept >= 1 && kept < 16, "{kept}");
+        assert!((1..16).contains(&kept), "{kept}");
         assert_eq!(value["omitted"], 16 - kept);
         assert!(value["note"].as_str().unwrap().contains("narrower query"));
         // The highest-ranked entries are the ones kept, in order.

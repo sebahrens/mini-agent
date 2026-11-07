@@ -232,6 +232,7 @@ pub(crate) enum AgentMemoryScope {
 }
 
 impl AgentMemoryScope {
+    #[cfg_attr(not(feature = "subagents"), allow(dead_code))]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::User => "user",
@@ -559,7 +560,7 @@ fn normalize_agent_definition(
                 .into(),
         );
     }
-    let extras = parse_agent_extras(&mapping, &mut compat_notices);
+    let extras = parse_agent_extras(mapping, &mut compat_notices);
     // Claude Code keys with no mini-agent equivalent: say what is not applied
     // rather than only listing them as unknown.
     for (key, behaviour) in UNSUPPORTED_CLAUDE_KEYS {

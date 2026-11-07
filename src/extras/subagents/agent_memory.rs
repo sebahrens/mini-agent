@@ -117,6 +117,7 @@ impl AgentMemory {
     }
 
     /// The directory, for display.
+    #[cfg(test)]
     pub(crate) fn directory(&self) -> &Path {
         &self.directory
     }

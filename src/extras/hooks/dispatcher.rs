@@ -297,14 +297,14 @@ impl HookDispatcher {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "subagents"))]
     pub(crate) fn from_config(config: &HooksConfig) -> Result<Self, String> {
         let backend = if cfg!(target_os = "macos") {
             "seatbelt"
         } else {
             "bwrap"
         };
-        Self::from_config_with_backend(config, backend)
+        Self::from_config_with_backend_and_optional_root(config, backend, None, HashMap::new())
     }
 
     #[cfg(test)]
