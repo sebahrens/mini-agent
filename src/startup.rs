@@ -1349,6 +1349,10 @@ impl Startup {
         ));
         context::set_user_instruction_files(cfg.user_instruction_files == Some(true));
         context::set_rule_external_symlinks(cfg.rule_external_symlinks == Some(true));
+        #[cfg(feature = "agent-skills")]
+        crate::extras::skills::placeholders::set_shell_placeholders(
+            cfg.skills_shell_placeholders != Some(false),
+        );
         if let Err(error) = crate::key_command::configure(cfg.api_key_commands.as_ref()) {
             anyhow::bail!(error);
         }

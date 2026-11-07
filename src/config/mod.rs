@@ -1005,6 +1005,11 @@ pub struct Config {
     /// project config can only set it after project trust (mini-agent-fddr2).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rule_external_symlinks: Option<bool>,
+    /// Rewrite ``!`command` `` spans of a pinned skill into an instruction to
+    /// run the command with the shell tool (default true). The harness never
+    /// runs them; `false` leaves the spans literal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skills_shell_placeholders: Option<bool>,
     /// Tool calls of one model turn that run at once (default 4, clamped to 1..=16).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_concurrency: Option<usize>,

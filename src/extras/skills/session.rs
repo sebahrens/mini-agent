@@ -16,6 +16,9 @@ pub(crate) struct Pin {
     pub(crate) name: String,
     pub(crate) digest: String,
     pub(crate) origin: &'static str,
+    /// The text typed after `/<name>`, for `$ARGUMENTS`, `$N` and
+    /// `$ARGUMENTS[N]` in the skill body. Empty for an argument-less pin.
+    pub(crate) arguments: String,
     scope: uuid::Uuid,
 }
 
@@ -658,6 +661,7 @@ impl InstructionServices {
             name: name.to_string(),
             digest: package.record.digest.clone(),
             origin: package.origin,
+            arguments: String::new(),
             scope: self.scope,
         })
     }
@@ -746,7 +750,7 @@ impl InstructionServices {
             let model = semantic_model.unwrap_or(model);
             let index = AgentSkillIndex::build(generation, model, records)
                 .map_err(|error| error.to_string())?;
-            super::selection::select_with_vector(
+            let mut selection = super::selection::select_with_vector(
                 &index,
                 &query,
                 pin.as_ref().map(|pin| pin.digest.as_str()),
@@ -754,7 +758,24 @@ impl InstructionServices {
                 vector.as_deref(),
                 #[cfg(not(feature = "skills"))]
                 None,
-            )
+            )?;
+            if let Some(pin) = &pin
+                && let Some(package) = snapshot.packages.get(&pin.name)
+                && package.record.digest == pin.digest
+            {
+                let skill_dir = package.source_directory.display().to_string();
+                super::placeholders::apply_pin(
+                    &mut selection,
+                    &pin.digest,
+                    &super::placeholders::PinRender {
+                        arguments: &pin.arguments,
+                        skill_dir: &skill_dir,
+                        fork: package.record.context_fork,
+                        agent: package.record.agent.as_deref(),
+                    },
+                )?;
+            }
+            Ok(selection)
         })
         .await
         .map_err(|_| "instruction selection worker unavailable")?
@@ -2157,6 +2178,74 @@ mod discovery_tests {
             .await
             .unwrap();
         assert!(auto.selected.iter().any(|s| s.name == "internal-only"));
+    }
+
+    #[tokio::test]
+    async fn pinned_skill_substitutes_arguments_and_forks_but_automatic_selection_stays_literal() {
+        let fixture = Fixture::new(false);
+        let plain = fixture.skill(".claude/skills", "fix-issue", "fix one issue", "x");
+        std::fs::write(
+            &plain,
+            "---\nname: fix-issue\ndescription: fix one issue\n---\nFix $ARGUMENTS[0] ($1) from ${CLAUDE_SKILL_DIR}. Diff: !`gh pr diff`\n",
+        )
+        .unwrap();
+        let forked = fixture.skill(".claude/skills", "deep-review", "review deeply", "x");
+        std::fs::write(
+            &forked,
+            "---\nname: deep-review\ndescription: review deeply\ncontext: fork\nagent: reviewer\n---\nReview $ARGUMENTS thoroughly\n",
+        )
+        .unwrap();
+
+        let mut pin = fixture.services.pin("fix-issue").await.unwrap();
+        pin.arguments = "42 \"two words\"".into();
+        let selection = fixture
+            .services
+            .select("anything", Some(&pin))
+            .await
+            .unwrap();
+        let markdown = &selection.sections[0].markdown;
+        assert!(markdown.contains("Fix 42 (two words) from "), "{markdown}");
+        assert!(!markdown.contains("$ARGUMENTS"), "{markdown}");
+        assert!(
+            markdown.contains("shell tool, then use its output here: `gh pr diff`"),
+            "{markdown}"
+        );
+
+        // Not pinned: the body is exactly what was authored.
+        let auto = fixture
+            .services
+            .select("fix one issue", None)
+            .await
+            .unwrap();
+        let literal = auto
+            .sections
+            .iter()
+            .find(|section| section.markdown.contains("Fix $ARGUMENTS[0]"))
+            .expect("literal body");
+        assert!(literal.markdown.contains("!`gh pr diff`"));
+
+        let mut pin = fixture.services.pin("deep-review").await.unwrap();
+        pin.arguments = "src/lib.rs".into();
+        let selection = fixture
+            .services
+            .select("anything", Some(&pin))
+            .await
+            .unwrap();
+        let markdown = &selection.sections[0].markdown;
+        assert!(markdown.contains("agent_type \"reviewer\""), "{markdown}");
+        assert!(
+            markdown.contains("Review src/lib.rs thoroughly"),
+            "{markdown}"
+        );
+
+        // Oversized arguments fail visibly instead of being cut.
+        pin.arguments = "a".repeat(super::super::placeholders::MAX_ARGUMENT_BYTES + 1);
+        let error = fixture
+            .services
+            .select("anything", Some(&pin))
+            .await
+            .unwrap_err();
+        assert!(error.contains("arguments exceed"), "{error}");
     }
 
     #[tokio::test]

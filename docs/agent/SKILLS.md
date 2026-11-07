@@ -79,7 +79,21 @@ may be YAML booleans or the strings `true`/`false`; anything else is ignored.
 
 `/skills` lists names, origins and bounded one-line descriptions and opens the command picker.
 `/<skill-name> [arguments]` pins the exact captured skill for the next ordinary turn and its automatic
-continuations. Arguments remain literal user text. Builtins and custom command templates take precedence;
+continuations. The pinned body is rendered with the arguments before it reaches the model, in one
+left-to-right pass (substituted text is never expanded again): `$ARGUMENTS` is the whole argument
+text, `$ARGUMENTS[N]` and `$N` are the zero-based shell-style words (`"two words"` and `'two words'`
+are one word; a missing word is empty; at most 127), and `${CLAUDE_SKILL_DIR}` is the skill's
+directory. When the body mentions none of the argument forms the arguments are appended as
+`ARGUMENTS: ...`. Arguments over 32 KiB are refused. Automatically selected skills and
+`skills_search` results are not rendered: their placeholders stay literal. A ``!`command` `` span in
+a pinned body is rewritten into an instruction for the model to run the command with its shell
+tool, so the normal shell permission check and sandbox apply; the harness itself never runs it, and
+`skills_shell_placeholders = false` leaves the spans literal. A skill with `context: fork`
+(optionally `agent: <agent type>`) is not followed inline: its rendered body is wrapped as the single
+prompt of one `task` call (the first request of the turn forces the `task` tool where the provider
+allows it), so the child runs with the agent type's tools, permissions and its own task budget and
+only its report returns to the main conversation. `model`, `effort`, `paths` and `hooks` are still
+reported as not applied (a forked skill's model comes from its agent persona). Builtins and custom command templates take precedence;
 a later explicit user prompt clears the pin. Source changes, lost trust/read authority or an oversized
 pin fail visibly before user history or HTTP. `--no-context-files` suppresses automatic directory scans;
 explicit list/pin actions still apply the same source policy. All roots share the bounded discovery caps

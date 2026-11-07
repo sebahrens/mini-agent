@@ -6,6 +6,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Skills run with `/<name> args` now substitute `$ARGUMENTS`, `$ARGUMENTS[N]`, `$N` and `${CLAUDE_SKILL_DIR}`, rewrite ``!`cmd` `` spans into shell-tool instructions (`skills_shell_placeholders`), and honour `context: fork` with `agent:` by delegating the body to one `task` child (mini-agent-h7wxv).
+
 ### Fixed
 
 - Background `task` jobs: `task_result` takes `wait_secs` (1-600) to block until the job settles, and headless runs wait up to `[subagents] headless_exit_wait_secs` (default 300; `0` restores immediate cancel) for running background tasks before exit, reporting any cancelled on stderr (mini-agent-5ezmf).

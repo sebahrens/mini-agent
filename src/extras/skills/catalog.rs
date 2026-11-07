@@ -397,6 +397,8 @@ fn scan_record(
         disable_model_invocation: manifest.disable_model_invocation,
         user_invocable: manifest.user_invocable,
         argument_hint: manifest.argument_hint,
+        context_fork: manifest.context_fork,
+        agent: manifest.agent,
         diagnostics: manifest.diagnostics,
         embedding: Vec::new(),
     }))
