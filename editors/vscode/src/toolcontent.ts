@@ -42,6 +42,10 @@ export function diffText(diff: acp.Diff): string {
   const notes: string[] = [];
   if (meta['mini-agent-partial']) { notes.push('changed region only'); }
   if (meta['mini-agent-truncated']) { notes.push('preview was truncated by the agent'); }
+  const omittedBlocks = Number(meta['mini-agent-omitted-blocks']);
+  if (Number.isFinite(omittedBlocks) && omittedBlocks > 0) {
+    notes.push(`${Math.floor(omittedBlocks)} more edit block${omittedBlocks === 1 ? '' : 's'} not shown`);
+  }
   // Bound lines, line length and total size so a fenced block always closes.
   let budget = MAX_DIFF_CHARS;
   let kept = 0;

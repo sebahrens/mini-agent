@@ -147,6 +147,14 @@ describe('buildPermissionDetail', () => {
     expect(permissionOmittedChars(small)).toBe(0);
   });
 
+  it('reports edit blocks the agent skipped from the preview', () => {
+    const request = serverRequest('', {
+      content: [{ type: 'diff', path: '/repo/a.txt', oldText: 'a', newText: 'b', _meta: { 'mini-agent-truncated': true, 'mini-agent-omitted-blocks': 4 } }],
+    });
+    expect(permissionOmittedChars(request)).toBeGreaterThan(0);
+    expect(permissionFullText(request)).toContain('4 more edit blocks not shown');
+  });
+
   it('names the session rule when the server provides one', () => {
     const request = serverRequest('npm test');
     request.options = options.map(option => option.kind === 'allow_always'
