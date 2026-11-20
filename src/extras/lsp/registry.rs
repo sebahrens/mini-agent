@@ -57,6 +57,7 @@ fn server(command: &str, args: &[&str], extensions: &[&str]) -> LspServerConfig 
         settings: None,
         startup_timeout_ms: None,
         request_timeout_ms: None,
+        language_id: None,
     }
 }
 
