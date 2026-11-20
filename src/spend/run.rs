@@ -354,6 +354,27 @@ impl Run {
         run.reject_model_override(cfg);
         run
     }
+    /// This session's run re-profiled for the model a turn was routed to
+    /// (`model` selection or `[prompt_to_model]` persona), so admission, the
+    /// ledger and the captured prices name that model. Unlike [`Self::for_model`]
+    /// it keeps the turn's invocation state (accepted usage, refusal, SDK
+    /// correlation): the turn is still one sequential invocation of the session.
+    #[cfg(feature = "acp")]
+    pub(crate) fn for_routed_turn(
+        &self,
+        provider: &str,
+        model: &str,
+        cfg: &Config,
+        selected: Option<&str>,
+    ) -> Self {
+        Self {
+            refused: self.refused.clone(),
+            tracking_detail: self.tracking_detail.clone(),
+            sdk_request: self.sdk_request.clone(),
+            accepted_usage: self.accepted_usage.clone(),
+            ..self.for_model(provider, model, cfg, selected, None, self.kind)
+        }
+    }
     fn reject_model_override(&mut self, cfg: &Config) {
         if !matches!(
             self.kind,
