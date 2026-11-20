@@ -10,6 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
+use std::sync::Arc;
 
 use super::pdf_crypt;
 use super::pdf_filters;
@@ -396,7 +397,8 @@ fn find_near(haystack: &[u8], needle: &[u8], from: usize, slack: usize) -> Optio
 /// The parsed object table plus the bounded decoder budget.
 pub(crate) struct Document {
     objects: HashMap<u32, Obj>,
-    pages: Vec<(Dict, Option<Dict>)>,
+    /// Page dict plus its (possibly inherited) resources, shared between pages.
+    pages: Vec<(Dict, Option<Arc<Dict>>)>,
     decoded_budget: std::cell::Cell<u64>,
     /// The file declared encryption (its objects were decrypted in memory).
     #[cfg_attr(not(feature = "multimodal"), allow(dead_code))]
@@ -876,7 +878,8 @@ impl Document {
             .and_then(|catalog| catalog.get(b"Pages"))
         {
             let mut visited = HashSet::new();
-            self.walk_pages(root, None, 0, &mut visited, &mut pages)?;
+            let mut shared = HashMap::new();
+            self.walk_pages(root, None, 0, &mut visited, &mut shared, &mut pages)?;
         }
         if pages.is_empty() {
             // Fall back to every page object in object-number order.
@@ -909,10 +912,11 @@ impl Document {
     fn walk_pages(
         &self,
         node: &Obj,
-        inherited: Option<&Dict>,
+        inherited: Option<&Arc<Dict>>,
         depth: usize,
         visited: &mut HashSet<u32>,
-        pages: &mut Vec<(Dict, Option<Dict>)>,
+        shared: &mut HashMap<u32, Arc<Dict>>,
+        pages: &mut Vec<(Dict, Option<Arc<Dict>>)>,
     ) -> Result<(), PdfError> {
         if depth > MAX_DEPTH {
             return Ok(());
@@ -925,10 +929,19 @@ impl Document {
         let Some(dict) = self.resolve(node).as_dict() else {
             return Ok(());
         };
-        let resources = dict
-            .get(b"Resources")
-            .and_then(|resources| self.resolve(resources).as_dict())
-            .or(inherited);
+        // Resources are shared by reference: pages (and kids) that point at the
+        // same object must not each deep-copy it.
+        let own = dict.get(b"Resources").and_then(|node| {
+            let resolved = self.resolve(node).as_dict()?;
+            Some(match node {
+                Obj::Ref(number) => shared
+                    .entry(*number)
+                    .or_insert_with(|| Arc::new(resolved.clone()))
+                    .clone(),
+                _ => Arc::new(resolved.clone()),
+            })
+        });
+        let resources = own.as_ref().or(inherited);
         match dict.get(b"Type").and_then(Obj::as_name) {
             Some(b"Page") => {
                 if pages.len() >= MAX_PAGES {
@@ -939,7 +952,7 @@ impl Document {
             _ => {
                 if let Some(Obj::Array(kids)) = dict.get(b"Kids").map(|kids| self.resolve(kids)) {
                     for kid in kids {
-                        self.walk_pages(kid, resources, depth + 1, visited, pages)?;
+                        self.walk_pages(kid, resources, depth + 1, visited, shared, pages)?;
                     }
                 }
             }
@@ -1108,8 +1121,8 @@ impl Document {
                 }
             }
         }
-        let fonts = self.fonts(resources.as_ref())?;
-        let images = self.image_names(resources.as_ref());
+        let fonts = self.fonts(resources.as_deref())?;
+        let images = self.image_names(resources.as_deref());
         let mut flags = ContentFlags::default();
         let text = normalize_text(&extract_text(&content, &fonts, &images, &mut flags));
         Ok(PageContent {
@@ -1616,7 +1629,10 @@ fn extract_text(
             b"BI" => {
                 flags.images += 1;
                 // Inline image: skip binary data up to a delimited `EI`.
+                // Without one the rest is image data: treat it as consumed so
+                // later `BI`s do not rescan it (quadratic).
                 let mut index = lexer.pos;
+                let mut closed = false;
                 while let Some(found) = find(content, b"EI", index) {
                     let before = found == 0 || is_whitespace(content[found - 1]);
                     let after = content
@@ -1624,10 +1640,15 @@ fn extract_text(
                         .is_none_or(|byte| is_whitespace(*byte));
                     index = found + 2;
                     if before && after {
+                        closed = true;
                         break;
                     }
                 }
-                lexer.pos = index.min(content.len());
+                lexer.pos = if closed {
+                    index.min(content.len())
+                } else {
+                    content.len()
+                };
             }
             _ => {}
         }
@@ -2392,6 +2413,16 @@ mod tests {
         let text = document.page_text(0).unwrap();
         assert!(text.contains("Hello Encrypted World"), "{text}");
         assert!(text.contains("Second line of text"), "{text}");
+    }
+
+    #[test]
+    fn inline_image_without_end_marker_consumes_the_rest_without_rescanning() {
+        let content = b"BI ".repeat(400_000);
+        let mut flags = ContentFlags::default();
+        let started = std::time::Instant::now();
+        extract_text(&content, &HashMap::new(), &HashSet::new(), &mut flags);
+        assert_eq!(flags.images, 1);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]

@@ -2175,12 +2175,21 @@ fn parent_ignore_matchers(approved_root: &Path) -> std::io::Result<Arc<[Gitignor
     Ok(matchers)
 }
 
-fn ignore_matcher(mut file: File, root: &Path, source: PathBuf) -> Option<Gitignore> {
+fn ignore_matcher(file: File, root: &Path, source: PathBuf) -> Option<Gitignore> {
     if !file.metadata().ok()?.is_file() {
         return None;
     }
-    let mut contents = String::new();
-    file.read_to_string(&mut contents).ok()?;
+    // Git treats ignore files as bytes: a stray non-UTF-8 byte only damages its
+    // own line. An over-limit file is treated as unreadable, like other
+    // unreadable ignore files, instead of being slurped whole.
+    let mut bytes = Vec::new();
+    file.take(METADATA_IGNORE_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > METADATA_IGNORE_MAX_BYTES {
+        return None;
+    }
+    let contents = String::from_utf8_lossy(&bytes);
     let mut builder = GitignoreBuilder::new(root);
     for line in contents.lines() {
         let _ = builder.add_line(Some(source.clone()), line);
@@ -4180,6 +4189,24 @@ mod tests {
             .collect();
         assert!(!names.iter().any(|name| name == "notes.txt"), "{names:?}");
         assert!(names.iter().any(|name| name == "plain.txt"), "{names:?}");
+    }
+
+    #[test]
+    fn ignore_matcher_survives_non_utf8_bytes_and_rejects_oversized_files() {
+        let container = TempDir::new("ignore_matcher_bytes");
+        let root = container.path();
+        let latin1 = root.join("latin1.ignore");
+        std::fs::write(&latin1, b"# caf\xe9\nbuild.out\n").unwrap();
+        let matcher =
+            ignore_matcher(File::open(&latin1).unwrap(), root, latin1.clone()).expect("matcher");
+        assert!(matcher.matched(root.join("build.out"), false).is_ignore());
+
+        let huge = root.join("huge.ignore");
+        std::fs::File::create(&huge)
+            .unwrap()
+            .set_len(METADATA_IGNORE_MAX_BYTES + 1)
+            .unwrap();
+        assert!(ignore_matcher(File::open(&huge).unwrap(), root, huge.clone()).is_none());
     }
 
     #[test]

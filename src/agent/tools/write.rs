@@ -69,6 +69,7 @@ fn create_error(path: &str, error: std::io::Error) -> ToolError {
     }
 }
 
+#[cfg(test)]
 fn read_bounded_overwrite(
     reader: &mut impl Read,
     recorded: u64,
@@ -331,10 +332,16 @@ impl WriteTool {
                 let limit = self.max_text_file_size;
                 crate::agent::runner::spawn_blocking_scoped(move || {
                     let mut existing = workspace.open_relative(&relative)?;
+                    let metadata = existing.metadata()?;
+                    if metadata.is_dir() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::IsADirectory,
+                            "path is a directory, not a file",
+                        ));
+                    }
                     if !overwrite {
                         return Ok(Probe::Exists);
                     }
-                    let metadata = existing.metadata()?;
                     if metadata.len() > limit {
                         return Ok(Probe::TooLarge);
                     }
@@ -342,16 +349,15 @@ impl WriteTool {
                     // Bind the read itself, not only the earlier metadata
                     // length: the file may grow while its descriptor remains
                     // open. A regrown file is reported the same way a file
-                    // already too large at the metadata check is.
-                    let current = match read_bounded_overwrite(
-                        &mut existing,
-                        metadata.len(),
-                        limit,
-                        &relative.to_string_lossy(),
-                    ) {
-                        Ok(bytes) => bytes,
-                        Err(_) => return Ok(Probe::TooLarge),
-                    };
+                    // already too large at the metadata check is; a real read
+                    // error propagates as an I/O error instead.
+                    let mut current = Vec::with_capacity(metadata.len().min(limit) as usize);
+                    (&mut existing)
+                        .take(limit.saturating_add(1))
+                        .read_to_end(&mut current)?;
+                    if current.len() as u64 > limit {
+                        return Ok(Probe::TooLarge);
+                    }
                     Ok::<_, std::io::Error>(Probe::Read(Box::new((metadata, expected, current))))
                 })
                 .await

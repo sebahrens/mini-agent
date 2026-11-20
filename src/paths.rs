@@ -725,8 +725,15 @@ impl WorkspaceBinding {
             // name so it is never open for writing while another thread can
             // exec it (ETXTBSY).
             drop(file);
-            parent.hard_link(&temp, &parent, &name)?;
-            Ok(())
+            match parent.hard_link(&temp, &parent, &name) {
+                Ok(()) => Ok(()),
+                // Filesystems without link(2) (exFAT/FAT, some SMB/FUSE): a
+                // no-replace rename gives the same create-only publication.
+                Err(error) if hard_link_unsupported(&error) => {
+                    rename_no_replace_relative(&parent, &temp, &name).map_err(|_| error)
+                }
+                Err(error) => Err(error),
+            }
         })();
         let _ = parent.remove_file(&temp);
         result
@@ -1143,12 +1150,30 @@ thread_local! {
     pub(crate) static VALIDATE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-fn sibling_temp_name(name: &OsStr) -> OsString {
-    OsString::from(format!(
-        ".{}.mini-agent-{}",
-        name.to_string_lossy(),
-        uuid::Uuid::new_v4()
-    ))
+/// Fixed-length sibling name, independent of the target's own name so a valid
+/// name near NAME_MAX still has a valid staging name.
+fn sibling_temp_name(_name: &OsStr) -> OsString {
+    OsString::from(format!(".mini-agent-{}", uuid::Uuid::new_v4()))
+}
+
+/// Whether `link(2)` failed because the filesystem cannot hard-link (as
+/// opposed to the target existing or another real error).
+fn hard_link_unsupported(error: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(
+            error.raw_os_error(),
+            Some(code) if code == libc::EPERM
+                || code == libc::ENOTSUP
+                || code == libc::EOPNOTSUPP
+                || code == libc::ENOSYS
+                || code == libc::EMLINK
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        error.kind() == io::ErrorKind::Unsupported
+    }
 }
 
 /// Atomically exchange two names in one retained directory. The old target is
@@ -1466,6 +1491,33 @@ mod workspace_binding_tests {
         ));
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn create_relative_accepts_a_name_at_the_filesystem_limit() {
+        let root = temp_root("long-name").canonicalize().unwrap();
+        let binding = WorkspaceBinding::capture(&root).unwrap();
+        let name = "n".repeat(250);
+        binding
+            .create_relative_atomic_policy(Path::new(&name), b"data", false)
+            .unwrap();
+        assert_eq!(std::fs::read(root.join(&name)).unwrap(), b"data");
+        let second = binding.create_relative_atomic_policy(Path::new(&name), b"x", false);
+        assert_eq!(
+            second.unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hard_link_fallback_only_for_unsupported_errors() {
+        assert!(super::hard_link_unsupported(
+            &std::io::Error::from_raw_os_error(libc::EPERM)
+        ));
+        assert!(!super::hard_link_unsupported(
+            &std::io::Error::from_raw_os_error(libc::EEXIST)
+        ));
     }
 
     #[test]
@@ -1845,7 +1897,7 @@ mod windows_workspace_binding_tests {
                 .unwrap()
                 .file_name()
                 .to_string_lossy()
-                .starts_with(".target.txt.mini-agent-")
+                .starts_with(".mini-agent-")
         }));
 
         drop(published_identity);
