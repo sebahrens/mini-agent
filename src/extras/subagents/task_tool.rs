@@ -2343,7 +2343,12 @@ editing in a known location, grepping for a literal you will act on immediately.
                 });
                 // The report the parent sees was replaced by the host: its raw
                 // text stays withheld, but the host-recorded index is offered.
-                let withheld = violations.as_ref().is_some_and(|v| !v.is_empty());
+                // A formatting-only violation is normalized into the real
+                // report, which is not withheld.
+                let withheld = match (&finished.response, &violations) {
+                    (Ok(response), Some(v)) => report_withheld_by_host(response, v),
+                    _ => false,
+                };
                 let output = finished.response.map(|response| {
                     enforce_validated_report_contract(
                         response,
@@ -3348,6 +3353,21 @@ fn cancelled_partial(
 /// Rows of the evidence index offered when the child's report was withheld.
 const WITHHELD_EVIDENCE_ROWS: usize = 16;
 
+/// `suffix` when it fits `limit` bytes; otherwise only its resume line plus a
+/// note that the evidence index was omitted, or nothing if even that is too big.
+fn fit_host_suffix(suffix: String, limit: usize) -> Option<String> {
+    if suffix.len() <= limit {
+        return Some(suffix);
+    }
+    let resume = suffix
+        .lines()
+        .find(|line| line.starts_with("[child id: "))?;
+    let kept = format!(
+        "{resume}\n[host: evidence index omitted; it did not fit the aggregate output limit]\n"
+    );
+    (kept.len() <= limit).then_some(kept)
+}
+
 /// The host-authored `## Evidence` section placed after a child's closing
 /// quote fence: metadata of the cited records (or, for a withheld report, of
 /// the first recorded ones) and the handle that `task_evidence` dereferences.
@@ -3595,10 +3615,13 @@ async fn execute_tasks_with_budget(
             .saturating_sub(output_bytes)
             .saturating_sub(section_overhead);
         // The host evidence index is kept only when it leaves at least half
-        // of the remaining budget to the child's own report.
+        // of the remaining budget to the child's own report; when dropped,
+        // the resume line stays (the conversation is already stored) with a
+        // note that the rest was omitted.
         let suffix = child
             .host_suffix
-            .filter(|suffix| child.output.is_ok() && suffix.len() <= remaining_output / 2);
+            .filter(|_| child.output.is_ok())
+            .and_then(|suffix| fit_host_suffix(suffix, remaining_output / 2));
         let suffix_len = suffix.as_ref().map_or(0, String::len);
         let (outcome, child_failed, output_exhausted) = match child.output {
             Ok(response) => {
@@ -4413,6 +4436,25 @@ fn enforce_report_contract(response: &str) -> String {
     host_repaired_report(response, &violations)
 }
 
+/// The child's own text normalized into the contract, when its `violations`
+/// are formatting-only. Normalization fixes Markdown only; it cannot make an
+/// unverifiable evidence citation valid, so such a report is withheld instead.
+fn normalized_repair(response: &str, violations: &[&'static str]) -> Option<String> {
+    let bad_evidence = violations
+        .iter()
+        .any(|violation| matches!(*violation, UNKNOWN_EVIDENCE | MALFORMED_EVIDENCE));
+    if bad_evidence {
+        return None;
+    }
+    normalize_report_contract(response)
+}
+
+/// Whether the host replaced a violating `response` with the fixed repair
+/// that withholds the child's text (as opposed to normalizing it in place).
+fn report_withheld_by_host(response: &str, violations: &[&'static str]) -> bool {
+    !violations.is_empty() && normalized_repair(response, violations).is_none()
+}
+
 /// The host-repaired contract for a response with known `violations`.
 /// Harmless Markdown variations are normalized into the contract; the
 /// normalized text is never "raw" or unstructured, since this only returns
@@ -4422,12 +4464,7 @@ fn enforce_report_contract(response: &str) -> String {
 /// unverifiable response; the user can still read the withheld text, marked
 /// unverified, with `/tasks result <id>`.
 fn host_repaired_report(response: &str, violations: &[&'static str]) -> String {
-    // Normalization fixes Markdown only; it cannot make an unverifiable
-    // evidence citation valid, so such a report is withheld instead.
-    let bad_evidence = violations
-        .iter()
-        .any(|violation| matches!(*violation, UNKNOWN_EVIDENCE | MALFORMED_EVIDENCE));
-    if !bad_evidence && let Some(normalized) = normalize_report_contract(response) {
+    if let Some(normalized) = normalized_repair(response, violations) {
         return normalized;
     }
     format!(
@@ -4893,6 +4930,41 @@ mod tests {
         assert!(!normalized.contains("Here is the requested report"));
         assert!(!normalized.contains("Raw child response"));
         assert!(normalized.len() < response.len());
+    }
+
+    #[test]
+    fn host_normalized_report_is_not_reported_as_withheld() {
+        let formatting_only = "## Findings\n\
+                        - **Confidence: High**: Verified issue.\n\n\
+                        ## Unverified\n\
+                        - None.\n\n\
+                        ## Coverage\n\
+                        - **Covered:** src/lib.rs.\n\
+                        - **Skipped:** None.";
+        let violations = report_contract_violations(formatting_only);
+        assert!(!violations.is_empty());
+        assert!(!report_withheld_by_host(formatting_only, &violations));
+
+        let unstructured = "no sections at all";
+        let violations = report_contract_violations(unstructured);
+        assert!(report_withheld_by_host(unstructured, &violations));
+        assert!(!report_withheld_by_host(formatting_only, &[]));
+    }
+
+    #[test]
+    fn oversized_host_suffix_keeps_the_resume_line() {
+        let resume = super::super::resume::resume_line("abc");
+        let suffix = format!("{resume}## Evidence\n{}", "row\n".repeat(200));
+        assert_eq!(
+            fit_host_suffix(suffix.clone(), suffix.len()),
+            Some(suffix.clone())
+        );
+        let kept = fit_host_suffix(suffix.clone(), 400).unwrap();
+        assert!(kept.starts_with(&resume));
+        assert!(kept.contains("evidence index omitted"));
+        assert!(!kept.contains("## Evidence"));
+        assert_eq!(fit_host_suffix(suffix, 10), None);
+        assert_eq!(fit_host_suffix("## Evidence\n".repeat(50), 10), None);
     }
 
     #[test]

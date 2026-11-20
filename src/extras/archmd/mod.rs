@@ -58,7 +58,8 @@ pub fn should_ask(dir: &Path) -> bool {
 
 pub(crate) fn should_ask_with_path(dir: &Path, asked_path: &Path) -> bool {
     let arch_path = dir.join("ARCHITECTURE.md");
-    !arch_path.exists() && !has_been_asked_with_path(dir, asked_path)
+    // `symlink_metadata` also sees a dangling symlink, which `exists()` does not.
+    arch_path.symlink_metadata().is_err() && !has_been_asked_with_path(dir, asked_path)
 }
 
 pub fn ask_and_create(dir: &Path) -> anyhow::Result<bool> {
@@ -132,9 +133,18 @@ pub(crate) fn record_asked_dir_with_path(dir: &Path, asked_path: &Path) -> anyho
 
 pub(crate) fn create_architecture_template(dir: &Path) -> anyhow::Result<()> {
     let path = dir.join("ARCHITECTURE.md");
-    if path.exists() {
-        return Ok(());
+    // Any existing entry (including a dangling symlink) is left alone, and
+    // `create_new` (O_EXCL) never follows a symlink at the final component.
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            file.write_all(ARCHITECTURE_TEMPLATE.as_bytes())?;
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e.into()),
     }
-    std::fs::write(&path, ARCHITECTURE_TEMPLATE)?;
-    Ok(())
 }

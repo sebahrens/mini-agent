@@ -4,6 +4,20 @@ import { StringDecoder } from 'node:string_decoder';
 export const STDERR_RING_CAPACITY = 50;
 /** Lines shown inline in a toast; the full ring goes to the output channel. */
 export const STDERR_TOAST_LINES = 3;
+/** Longest stderr line (or unfinished partial line) kept; the excess is dropped and marked. */
+export const STDERR_MAX_LINE_CHARS = 8192;
+const TRUNCATION_MARK = '... [truncated]';
+
+function capLine(line: string): string {
+  return line.length > STDERR_MAX_LINE_CHARS ? line.slice(0, STDERR_MAX_LINE_CHARS) + TRUNCATION_MARK : line;
+}
+
+/** Bounds an unfinished line; a mark is already present once it was cut, so it is not re-appended. */
+function capPartial(partial: string): string {
+  return partial.length > STDERR_MAX_LINE_CHARS + TRUNCATION_MARK.length
+    ? partial.slice(0, STDERR_MAX_LINE_CHARS) + TRUNCATION_MARK
+    : partial;
+}
 
 /** Retains the last N complete lines from a chunked text stream. */
 export class LineRingBuffer {
@@ -22,15 +36,15 @@ export class LineRingBuffer {
   push(chunk: string | Uint8Array): string[] {
     const text = typeof chunk === 'string' ? chunk : this.decoder.write(Buffer.from(chunk));
     const parts = (this.partial + text).split(/\r?\n/);
-    this.partial = parts.pop() ?? '';
-    const completed = parts.map(line => line.trimEnd()).filter(line => line.length > 0);
+    this.partial = capPartial(parts.pop() ?? '');
+    const completed = parts.map(line => capLine(line.trimEnd())).filter(line => line.length > 0);
     for (const line of completed) { this.append(line); }
     return completed;
   }
 
   /** Flush a trailing partial line (e.g. after the stream ends). */
   flush(): string[] {
-    const line = (this.partial + this.decoder.end()).trimEnd();
+    const line = capLine((this.partial + this.decoder.end()).trimEnd());
     this.partial = '';
     if (line.length === 0) { return []; }
     this.append(line);

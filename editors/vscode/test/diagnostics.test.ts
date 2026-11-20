@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   LineRingBuffer,
+  STDERR_MAX_LINE_CHARS,
   STDERR_RING_CAPACITY,
   formatStderrBlock,
   probeFailureMessage,
@@ -54,6 +55,16 @@ describe('LineRingBuffer', () => {
     expect(ring.size).toBe(STDERR_RING_CAPACITY);
     expect(ring.lines()[0]).toBe('line 25');
     expect(() => new LineRingBuffer(0)).toThrow(/positive/);
+  });
+
+  it('truncates overlong lines and bounds an unfinished partial line', () => {
+    const ring = new LineRingBuffer(3);
+    const huge = 'x'.repeat(STDERR_MAX_LINE_CHARS * 3);
+    expect(ring.push(`${huge}\nok\n`)).toEqual([`${'x'.repeat(STDERR_MAX_LINE_CHARS)}... [truncated]`, 'ok']);
+    for (let i = 0; i < 20; i += 1) { ring.push(huge); }
+    const flushed = ring.flush();
+    expect(flushed).toHaveLength(1);
+    expect(flushed[0]).toBe(`${'x'.repeat(STDERR_MAX_LINE_CHARS)}... [truncated]`);
   });
 
   it('returns a copy so callers cannot mutate the buffer', () => {
