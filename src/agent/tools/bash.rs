@@ -538,14 +538,15 @@ impl ShellTool {
             )));
         }
         // Deny rules still win; allow rules and modes cannot waive the prompt.
-        if let Some(permission) = &self.permission {
-            let (result, _) = permission
+        if let Some(permission) = &self.permission
+            && permission
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .check_diagnosed(|guard| guard.check("shell", &args.command));
-            if let crate::permission::checker::CheckResult::Denied(reason) = result {
-                return Err(ToolError::Msg(format!("Permission denied: {reason}")));
-            }
+                .call_is_denied("shell", &args.command)
+        {
+            return Err(ToolError::Msg(
+                "Permission denied: Blocked by deny rule".to_string(),
+            ));
         }
         let (approval, _released) = super::concurrency::prompt_unlocked(
             super::request_sandbox_escalation_approval(&self.ask_tx, &args.command, justification),
@@ -624,14 +625,17 @@ impl ShellTool {
             // The permission key is the script with the directory change, so
             // approvals are per directory, but a deny rule on the command
             // itself still applies.
-            if let Some(permission) = &self.permission {
-                let (result, _) = permission
+            // The probe is side-effect free so it cannot spend a hook
+            // decision or split doom-loop tracking from the real check below.
+            if let Some(permission) = &self.permission
+                && permission
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
-                    .check_diagnosed(|guard| guard.check("shell", &plain));
-                if let crate::permission::checker::CheckResult::Denied(reason) = result {
-                    return Err(ToolError::Msg(format!("Permission denied: {reason}")));
-                }
+                    .call_is_denied("shell", &plain)
+            {
+                return Err(ToolError::Msg(
+                    "Permission denied: Blocked by deny rule".to_string(),
+                ));
             }
         }
         let maximum = if args.background {

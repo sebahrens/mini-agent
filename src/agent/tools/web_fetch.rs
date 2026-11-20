@@ -541,6 +541,10 @@ impl MarkdownWriter {
         match bare {
             "p" | "div" | "section" | "article" | "header" | "footer" | "main" | "nav"
             | "aside" | "blockquote" | "figure" | "figcaption" | "dl" | "form" | "table" => {
+                if bare == "table" && !closing {
+                    // Each table gets its own header separator row.
+                    self.header_rule_done = false;
+                }
                 self.blank_line()
             }
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
@@ -868,6 +872,14 @@ mod web_fetch_tests {
         assert!(page_markdown("<p>1 < 2 and x<y</p>", None).contains("1 < 2"));
         assert!(!page_markdown("<script>a</scripts>b</script>c", None).contains('b'));
     }
+    #[test]
+    fn web_fetch_html_second_table_gets_its_own_header_rule() {
+        let html = "<table><tr><th>A</th></tr><tr><td>1</td></tr></table>\
+                    <table><tr><th>B</th></tr><tr><td>2</td></tr></table>";
+        let page = page_markdown(html, None);
+        assert_eq!(page.matches("| --- |").count(), 2, "{page}");
+    }
+
     #[test]
     fn web_fetch_html_renders_markdown_links_headings_lists_code_and_tables() {
         let base = reqwest::Url::parse("https://docs.example/guide/intro.html").unwrap();

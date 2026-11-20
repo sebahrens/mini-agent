@@ -1532,17 +1532,7 @@ impl PermissionChecker {
         // A Bash script is additionally checked line by line: a deny that
         // matches any single line denies the whole script, so a benign first
         // line can never smuggle a denied command past an anchored pattern.
-        let mut deny_inputs: SmallVec<[&str; 4]> = SmallVec::new();
-        deny_inputs.push(policy_input);
-        deny_inputs.push(identity);
-        if tool == "shell" {
-            for line in policy_input.lines() {
-                let line = line.trim();
-                if !line.is_empty() && line != policy_input {
-                    deny_inputs.push(line);
-                }
-            }
-        }
+        let deny_inputs = deny_probe_inputs(tool, policy_input, identity);
         if self.matches_deny_rule(tool, &deny_inputs) {
             return CheckResult::Denied("Blocked by deny rule".to_string());
         }
@@ -1551,7 +1541,12 @@ impl PermissionChecker {
         if tool == "todo_write" && !self.rules.contains_key(tool) {
             return CheckResult::Allowed;
         }
-        if self.allow_all_mcp_calls && tool == "mcp_tool" {
+        // The flag skips MCP prompts, not the mode: read-only and plan-write
+        // keep their contract and fall through to the read-only exemption.
+        if self.allow_all_mcp_calls
+            && tool == "mcp_tool"
+            && !matches!(self.mode, SecurityMode::ReadOnly | SecurityMode::PlanWrite)
+        {
             return CheckResult::Allowed;
         }
         if self.is_session_allowed(tool, identity) {
@@ -1781,9 +1776,12 @@ impl PermissionChecker {
 
         let initial_action =
             self.resolve_path_action(tool, &matched, abs_path, external, external_action, false);
+        // An allowed external tree has no workspace-relative spelling; judge
+        // its absolute path so `.git/hooks` there is guarded as well.
+        let git_metadata_path = relative.as_deref().or(external.then_some(abs_path));
         let action = self.ask_before_git_execution_metadata_write(
             tool,
-            relative.as_deref(),
+            git_metadata_path,
             !matched.is_empty(),
             initial_action,
         );
@@ -1968,6 +1966,15 @@ impl PermissionChecker {
         result
     }
 
+    /// Side-effect-free deny-only probe for a whole call. Unlike [`Self::check`]
+    /// it never consumes a pending hook decision, never feeds doom-loop
+    /// tracking and never touches the ask attribution, so a caller may use it
+    /// as a pre-check before the real `check` of a rewritten command.
+    pub(crate) fn call_is_denied(&self, tool: &str, input: &str) -> bool {
+        let tool = canonical_permission_tool(tool);
+        self.matches_deny_rule(tool, &deny_probe_inputs(tool, input, input))
+    }
+
     /// Evaluate only explicit deny rules against a lexical path identity.
     /// This is side-effect free and intentionally performs no filesystem I/O,
     /// session approval, prompting, or doom-loop accounting. File tools use it
@@ -2045,7 +2052,10 @@ impl PermissionChecker {
             };
             for (pattern, action) in rules {
                 let matches = |input: &&str| {
-                    if is_path_tool_name(tool) {
+                    // Shell commands fold case too on macOS/Windows: `GIT push`
+                    // runs the same binary there, so it must not dodge a deny.
+                    // Folding the whole line over-denies, which is safe here.
+                    if is_path_tool_name(tool) || tool == "shell" {
                         pattern.matches_path_for_deny(input)
                     } else {
                         pattern.matches(input)
@@ -2993,6 +3003,35 @@ pub(crate) fn exact_allow_scope_for_input(tool: &str, input: &str) -> Option<Str
     Some(crate::permission::pattern::exact_path_pattern(
         &normalize_path(Path::new(&expanded)),
     ))
+}
+
+/// The strings a deny rule is matched against for one call: the policy input,
+/// its identity, a fetch identity's bare URL, and each line of a shell script.
+fn deny_probe_inputs<'a>(
+    tool: &str,
+    policy_input: &'a str,
+    identity: &'a str,
+) -> SmallVec<[&'a str; 4]> {
+    let mut deny_inputs: SmallVec<[&str; 4]> = SmallVec::new();
+    deny_inputs.push(policy_input);
+    deny_inputs.push(identity);
+    // A live fetch identity carries a ` destinations=[...]` suffix; an
+    // exact-URL deny must still match the bare URL (as it does on a cache
+    // hit), not only a trailing-wildcard pattern.
+    if is_url_identity_tool(tool)
+        && let Some((bare_url, _)) = identity.split_once(" destinations=[")
+    {
+        deny_inputs.push(bare_url);
+    }
+    if tool == "shell" {
+        for line in policy_input.lines() {
+            let line = line.trim();
+            if !line.is_empty() && line != policy_input {
+                deny_inputs.push(line);
+            }
+        }
+    }
+    deny_inputs
 }
 
 /// Tools whose permission identity is a URL (or URL-shaped destination list),
