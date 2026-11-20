@@ -2381,6 +2381,7 @@ pub(crate) fn persist_headless_turn(
     response: &str,
     interactions: &[Message],
 ) {
+    let start = session.messages.len();
     if let Err(error) = persist_headless_turn_input(
         session,
         &crate::agent::input::PromptInput::text(prompt.to_owned()),
@@ -2388,6 +2389,14 @@ pub(crate) fn persist_headless_turn(
         interactions,
     ) {
         tracing::warn!(%error, "canonical user-content projection was incomplete");
+        // Never keep a half-written turn (tool calls without results or the
+        // final answer): roll it back, then record the prompt and answer as
+        // plain text so a resumed session still sees a coherent turn.
+        session.truncate_to(start);
+        session.add_message(MessageRole::User, prompt);
+        if !response.is_empty() {
+            session.add_message(MessageRole::Assistant, response);
+        }
     }
 }
 

@@ -701,3 +701,31 @@ async fn done_paints_the_final_tokens_before_the_agent_task_settles() {
     );
     assert!(run.agent_rx.is_none());
 }
+
+#[test]
+fn headless_turn_rolls_back_to_plain_prompt_and_answer_on_projection_failure() {
+    let mut session = session();
+    let args = serde_json::json!({"path": "src/main.rs"});
+    let bad_user = Message::User {
+        content: OneOrMany::one(UserContent::Image(rig::message::Image {
+            data: rig::message::DocumentSourceKind::Url("https://example.test/a.png".into()),
+            media_type: Some(rig::message::ImageMediaType::PNG),
+            detail: None,
+            additional_params: None,
+        })),
+    };
+    let interactions = vec![
+        tool_call_message("provider-1", "read", args),
+        bad_user,
+        Message::assistant("done"),
+    ];
+
+    persist_headless_turn(&mut session, "read it", "done", &interactions);
+
+    assert_eq!(
+        roles(&session),
+        [MessageRole::User, MessageRole::Assistant],
+        "a failed projection must not leave dangling tool calls"
+    );
+    assert_eq!(session.messages[1].content, "done");
+}
