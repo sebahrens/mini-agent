@@ -587,7 +587,7 @@ pub fn fork_session(source: &Session) -> anyhow::Result<Session> {
     if !fork.name.is_empty() {
         fork.name = CompactString::new(format!("{} (fork)", fork.name));
     }
-    fork.updated_at = CompactString::new(chrono::Utc::now().to_rfc3339());
+    fork.updated_at = CompactString::new(crate::session::rfc3339_utc(jiff::Timestamp::now()));
     Ok(fork)
 }
 

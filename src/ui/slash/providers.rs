@@ -854,7 +854,7 @@ async fn handle_models(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
                 );
                 write_result(
                     ctx.renderer,
-                    crate::models_catalog::catalog_age_line(chrono::Utc::now()),
+                    crate::models_catalog::catalog_age_line(jiff::Timestamp::now()),
                 );
             } else {
                 // Full listing: quick models, then the provider's available models.
@@ -932,7 +932,7 @@ async fn handle_models(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
                 }
                 write_result(
                     ctx.renderer,
-                    crate::models_catalog::catalog_age_line(chrono::Utc::now()),
+                    crate::models_catalog::catalog_age_line(jiff::Timestamp::now()),
                 );
             }
         }

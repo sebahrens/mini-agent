@@ -347,7 +347,7 @@ impl App<'_> {
     /// persists it. Quit and teardown stop the store without syncing, so the
     /// saved schedule survives them disarmed.
     pub(super) fn sync_cron_schedule(&mut self) {
-        self.ui.session.cron_schedule = self.cron.export(Instant::now(), chrono::Utc::now());
+        self.ui.session.cron_schedule = self.cron.export(Instant::now(), jiff::Timestamp::now());
     }
 
     /// The active session changed (`/resume`, `/new`, `/clear`, `/fork`,

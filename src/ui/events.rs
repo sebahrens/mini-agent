@@ -1,4 +1,3 @@
-use chrono::Datelike;
 use compact_str::CompactString;
 
 use crate::cli::Cli;
@@ -9,19 +8,19 @@ use crate::ui::feed::BlockStyle;
 use crate::ui::renderer::Renderer;
 
 pub fn format_time(rfc3339: &str) -> CompactString {
-    let dt = chrono::DateTime::parse_from_rfc3339(rfc3339).ok();
+    let dt = rfc3339.parse::<jiff::Timestamp>().ok();
     let dt = match dt {
         Some(dt) => dt,
         None => return CompactString::new(rfc3339),
     };
-    let local = dt.with_timezone(&chrono::Local);
-    let now = chrono::Local::now();
-    if local.date_naive() == now.date_naive() {
-        CompactString::new(local.format("%H:%M").to_string())
+    let local = dt.to_zoned_datetime(jiff::tz::TimeZone::system());
+    let now = jiff::ZonedDateTime::now();
+    if local.date() == now.date() {
+        CompactString::new(local.strftime("%H:%M").to_string())
     } else if local.year() == now.year() {
-        CompactString::new(local.format("%b %d %H:%M").to_string())
+        CompactString::new(local.strftime("%b %d %H:%M").to_string())
     } else {
-        CompactString::new(local.format("%Y-%m-%d %H:%M").to_string())
+        CompactString::new(local.strftime("%Y-%m-%d %H:%M").to_string())
     }
 }
 
