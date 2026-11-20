@@ -2715,6 +2715,9 @@ pub(crate) struct SpawnEffectService {
 }
 
 struct PreparedSpawnEffect {
+    /// Program as requested; its basename names the sealed snapshot inside the sandbox.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    program: String,
     executable: SpawnExecutableIdentity,
     arguments: Vec<String>,
     target: PreparedSpawnTarget,
@@ -2831,6 +2834,7 @@ impl PreparedSpawnEffect {
                 let (snapshot, content) = create_sealed_executable_snapshot(&mut source, control)?;
                 let executable = executable.with_content(content);
                 return Ok(Self {
+                    program: program.to_string(),
                     executable,
                     arguments,
                     target: PreparedSpawnTarget::SealedSnapshot(SealedExecutableSnapshot::new(
@@ -2866,6 +2870,7 @@ impl PreparedSpawnEffect {
         #[cfg(not(unix))]
         let target = PreparedSpawnTarget::Path;
         Ok(Self {
+            program: program.to_string(),
             executable,
             arguments,
             target,
@@ -3175,7 +3180,7 @@ impl SpawnEffectService {
             PreparedSpawnTarget::SealedSnapshot(snapshot) => {
                 let mut command = self
                     .sandbox
-                    .wrap_command_with_executable_snapshot(&prepared.arguments)
+                    .wrap_command_with_executable_snapshot(&prepared.program, &prepared.arguments)
                     .map_err(|_| EffectServiceError::BackendFailure)?;
                 provide_snapshot_fd(&mut command, snapshot)?;
                 command
@@ -7247,7 +7252,7 @@ mod tests {
         verify_executable_snapshot_seals(snapshot).unwrap();
         let sandbox = Sandbox::new(true, "bwrap").with_shell("/definitely/not-a-shell");
         let mut command = sandbox
-            .wrap_command_with_executable_snapshot(&prepared.arguments)
+            .wrap_command_with_executable_snapshot(&prepared.program, &prepared.arguments)
             .unwrap();
         provide_snapshot_fd(&mut command, snapshot).unwrap();
 
@@ -7286,7 +7291,7 @@ mod tests {
         };
         let sandbox = Sandbox::new(true, "bwrap").with_shell("/definitely/not-a-shell");
         let mut command = sandbox
-            .wrap_command_with_executable_snapshot(&prepared.arguments)
+            .wrap_command_with_executable_snapshot(&prepared.program, &prepared.arguments)
             .unwrap();
         provide_snapshot_fd(&mut command, snapshot).unwrap();
         let output = sandbox
@@ -7303,6 +7308,47 @@ mod tests {
             .unwrap();
         assert_eq!(output.status, CommandStatus::Completed);
         assert_eq!(output.stdout, b"elf-snapshot");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires a real Linux bubblewrap backend"]
+    async fn linux_spawn_multicall_utility_runs_from_sealed_snapshot() {
+        let version = std::process::Command::new("printf")
+            .arg("--version")
+            .output();
+        let is_uutils = version
+            .map(|output| String::from_utf8_lossy(&output.stdout).contains("uutils"))
+            .unwrap_or(false);
+        if !is_uutils {
+            eprintln!("skipping: PATH printf is not uutils coreutils");
+            return;
+        }
+        let prepared =
+            PreparedSpawnEffect::capture("printf", vec!["multicall-%s".into(), "ok".into()], true)
+                .unwrap();
+        let PreparedSpawnTarget::SealedSnapshot(snapshot) = &prepared.target else {
+            panic!("Linux immutable capture must produce a sealed snapshot");
+        };
+        let sandbox = Sandbox::new(true, "bwrap").with_shell("/definitely/not-a-shell");
+        let mut command = sandbox
+            .wrap_command_with_executable_snapshot(&prepared.program, &prepared.arguments)
+            .unwrap();
+        provide_snapshot_fd(&mut command, snapshot).unwrap();
+        let output = sandbox
+            .output_built_command_with_limits(
+                command,
+                CommandLimits {
+                    timeout: Duration::from_secs(5),
+                    stdout_bytes: 1024,
+                    stderr_bytes: 1024,
+                    combined_bytes: 2048,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.status, CommandStatus::Completed);
+        assert_eq!(output.stdout, b"multicall-ok");
     }
 
     #[cfg(target_os = "linux")]
@@ -7345,7 +7391,7 @@ mod tests {
         verify_executable_snapshot_seals(&snapshot).unwrap();
         let sandbox = bound(&workspace, &cache).with_shell("/definitely/not-a-shell");
         let mut command = sandbox
-            .wrap_command_with_executable_snapshot(&prepared.arguments)
+            .wrap_command_with_executable_snapshot(&prepared.program, &prepared.arguments)
             .unwrap();
         provide_snapshot_fd(&mut command, &snapshot).unwrap();
         let output = sandbox

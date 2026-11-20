@@ -2144,7 +2144,46 @@ const BWRAP_REQUESTED_NETWORK_POLICY: &str =
 const SEATBELT_REQUESTED_NETWORK_POLICY: &str =
     "deny (Seatbelt network*; backend absence/setup failure denies launch)";
 #[cfg(feature = "js")]
-const SNAPSHOT_EXECUTABLE_PATH: &str = "/run/mini-agent/spawn-executable";
+const SNAPSHOT_EXECUTABLE_DIR: &str = "/run/mini-agent/spawn";
+#[cfg(feature = "js")]
+const SNAPSHOT_HOST_EXECUTABLE_DIR: &str = "/dev/mini-agent-spawn";
+#[cfg(feature = "js")]
+const SNAPSHOT_FALLBACK_NAME: &str = "spawn-executable";
+
+/// Name under which the sealed snapshot is exposed inside the sandbox.
+///
+/// Multi-call binaries (uutils coreutils, busybox) select the utility from argv[0] and, on
+/// some builds, require the basename of `/proc/self/exe` to equal it, so the snapshot keeps
+/// the basename of the requested program. Anything that is not a plain file name falls back
+/// to a fixed name.
+#[cfg(feature = "js")]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn snapshot_executable_name(program: &str) -> String {
+    let name = Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.len() > 255
+        || name.contains(['/', '\0'])
+    {
+        SNAPSHOT_FALLBACK_NAME.to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+#[cfg(feature = "js")]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn snapshot_executable_dir(workspace_profile: bool) -> &'static str {
+    if workspace_profile {
+        SNAPSHOT_EXECUTABLE_DIR
+    } else {
+        SNAPSHOT_HOST_EXECUTABLE_DIR
+    }
+}
 
 #[cfg(feature = "hooks")]
 pub(crate) const HOOK_SANDBOX_READY_MARKER: &[u8] = b"MINI_AGENT_HOOK_SANDBOX_READY/1\n";
@@ -4116,6 +4155,7 @@ impl Sandbox {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn wrap_command_with_executable_snapshot(
         &self,
+        program: &str,
         arguments: &[String],
     ) -> Result<ExecutionCommand, String> {
         if let Some(workspace) = &self.workspace_binding {
@@ -4147,6 +4187,7 @@ impl Sandbox {
             bwrap,
             &cwd,
             &cache_dir,
+            program,
             arguments,
             git_metadata,
             &read_roots,
@@ -5063,27 +5104,34 @@ impl Sandbox {
 
     #[cfg(feature = "js")]
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[allow(clippy::too_many_arguments)]
     fn build_bwrap_snapshot_command(
         &self,
         bwrap: &Path,
         cwd: &Path,
         cache_dir: &Path,
+        program: &str,
         arguments: &[String],
         git_metadata: git_metadata::BwrapGitMetadataBinds,
         read_roots: &read_roots::BwrapReadRoots,
     ) -> Result<Command, String> {
         let mut cmd =
             self.build_bwrap_base_command(bwrap, cwd, cache_dir, git_metadata, read_roots, &[])?;
-        let executable = if self.profile == SandboxProfile::Workspace {
+        let workspace_profile = self.profile == SandboxProfile::Workspace;
+        if workspace_profile {
             cmd.args(["--dir", "/run", "--dir", "/run/mini-agent"]);
-            SNAPSHOT_EXECUTABLE_PATH
-        } else {
-            "/dev/mini-agent-spawn-executable"
-        };
-        // fd 3 is consumed by bubblewrap while constructing this read-only executable file.
-        // It is deliberately not listed under `--preserve-fds`, so neither the target nor any
-        // descendant can inherit the snapshot descriptor.
-        cmd.args(["--perms", "0500", "--ro-bind-data", "3", executable]);
+        }
+        let directory = snapshot_executable_dir(workspace_profile);
+        let executable = format!("{directory}/{}", snapshot_executable_name(program));
+        // fd 3 is consumed by bubblewrap while constructing this executable file. It is
+        // deliberately not listed under `--preserve-fds`, so neither the target nor any
+        // descendant can inherit the snapshot descriptor. `--file` copies the sealed bytes onto
+        // a dedicated tmpfs (a linked dentry, unlike `--ro-bind-data`, whose unlinked source
+        // makes /proc/self/exe read "... (deleted)") and the tmpfs is then remounted read-only,
+        // so the executed bytes stay the sealed snapshot.
+        cmd.args(["--tmpfs", directory]);
+        cmd.args(["--perms", "0500", "--file", "3", executable.as_str()]);
+        cmd.args(["--remount-ro", directory]);
         let sandbox_cwd = self.sandbox_cwd(cwd);
         // Brokered JS spawn never inherits the shell network opt-in.
         append_bwrap_isolation(
@@ -5092,7 +5140,12 @@ impl Sandbox {
             self.profile != SandboxProfile::HostFull,
             true,
         );
-        cmd.args(["--new-session", "--die-with-parent", "--", executable]);
+        cmd.args([
+            "--new-session",
+            "--die-with-parent",
+            "--",
+            executable.as_str(),
+        ]);
         cmd.args(arguments);
         configure_new_session_child_lifetime(&mut cmd);
         Ok(cmd)
@@ -8490,6 +8543,47 @@ fn validate_macos_runtime_cache(
 
 #[cfg(test)]
 mod sandbox_tests {
+    #[cfg(feature = "js")]
+    #[test]
+    fn snapshot_executable_name_keeps_plain_basenames_and_rejects_the_rest() {
+        for (program, expected) in [
+            ("printf", "printf"),
+            ("/usr/bin/ls", "ls"),
+            ("./tools/my-tool.sh", "my-tool.sh"),
+            ("dir/cat", "cat"),
+            ("", "spawn-executable"),
+            (".", "spawn-executable"),
+            ("..", "spawn-executable"),
+            ("/", "spawn-executable"),
+            ("a/..", "spawn-executable"),
+            ("bad\0name", "spawn-executable"),
+        ] {
+            assert_eq!(
+                super::snapshot_executable_name(program),
+                expected,
+                "{program:?}"
+            );
+        }
+        assert_eq!(
+            super::snapshot_executable_name(&"x".repeat(256)),
+            "spawn-executable"
+        );
+        assert_eq!(super::snapshot_executable_name(&"x".repeat(255)).len(), 255);
+    }
+
+    #[cfg(feature = "js")]
+    #[test]
+    fn snapshot_executable_dir_is_a_dedicated_mount_per_profile() {
+        assert_eq!(
+            super::snapshot_executable_dir(true),
+            "/run/mini-agent/spawn"
+        );
+        assert_eq!(
+            super::snapshot_executable_dir(false),
+            "/dev/mini-agent-spawn"
+        );
+    }
+
     #[test]
     fn git_write_root_rebind_retains_old_owner_then_releases_directory() {
         // Hold the process-environment lock: test builds derive
