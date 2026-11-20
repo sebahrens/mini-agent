@@ -612,6 +612,22 @@ impl Run {
             .upgrade()
             .map(|request| request.guard.clone())
     }
+    fn settle_unbilled_first_item(&self) {
+        let request = self
+            .sdk_request
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .upgrade();
+        if let Some(request) = request
+            && request
+                .receipt
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none()
+        {
+            request.guard.finished();
+        }
+    }
     fn observe_projection(&self, usage: UsageDelta) {
         let request = self
             .sdk_request
@@ -809,6 +825,16 @@ impl UsageObserver {
     }
 }
 
+/// The first item of the current SDK stream was a provider refusal that bills
+/// nothing (see `retry::is_unbilled_stream_error`): settle that request as
+/// zero-usage so the retry is not refused for incomplete tracking. Only an
+/// opened request with no accepted receipt is settled.
+pub(crate) fn settle_unbilled_first_item() {
+    if let Some(run) = Run::current() {
+        run.settle_unbilled_first_item();
+    }
+}
+
 /// An admitted successful HTTP stream that is dropped or fails before its
 /// canonical Final has incomplete billing state. It contributes no invented
 /// usage, but future capped admissions must not assume that request was free.
@@ -842,5 +868,93 @@ impl Drop for StreamGuard {
         {
             run.account.tracking_failed();
         }
+    }
+}
+
+#[cfg(test)]
+mod first_item_tests {
+    use super::*;
+    use crate::spend::{Ledger, PriceSnapshot};
+
+    /// Drives the retry layer with a first attempt whose stream opens (HTTP 200)
+    /// and then yields `first_error`, followed by a healthy second attempt.
+    /// Returns (tracking_error before the held requests drop, after, second
+    /// attempt admitted).
+    async fn run_case(name: &str, first_error: &'static str) -> (bool, bool, bool) {
+        let root = crate::tests::OwnedTestDirectory::new(name);
+        let account = Account::new("first-item", Some(1.0), 0.0).unwrap();
+        let run = Run::fixture(
+            account,
+            Arc::new(Ledger::new(root.path())),
+            "first-item",
+            PriceSnapshot::capture(Some((1.0, 2.0)), Default::default(), false),
+        );
+        let held = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let second_admitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let config = crate::retry::RetryConfig {
+            max_attempts: 2,
+            initial_backoff_ms: 0,
+            max_backoff_ms: 0,
+            max_retry_after_ms: 0,
+        };
+        let (factory_run, factory_held, admitted) =
+            (run.clone(), held.clone(), second_admitted.clone());
+        let mut calls = 0;
+        let stream = scope(Some(run.clone()), async {
+            crate::retry::retry_stream_chat(&config, || {
+                calls += 1;
+                let attempt = calls;
+                let request = factory_run.begin_sdk_request();
+                let item: Result<u8, std::io::Error> = match request {
+                    Ok(request) if attempt == 1 => {
+                        request.guard.opened();
+                        factory_held.lock().unwrap().push(request);
+                        Err(std::io::Error::other(first_error))
+                    }
+                    Ok(request) => {
+                        admitted.store(true, std::sync::atomic::Ordering::Release);
+                        request.guard.finished();
+                        Ok(1)
+                    }
+                    Err(_) => Err(std::io::Error::other("second attempt refused")),
+                };
+                std::future::ready(futures::stream::iter([item]))
+            })
+            .await
+        })
+        .await;
+        drop(stream);
+        let before = run.account.snapshot().tracking_error;
+        held.lock().unwrap().clear();
+        let after = run.account.snapshot().tracking_error;
+        (
+            before,
+            after,
+            second_admitted.load(std::sync::atomic::Ordering::Acquire),
+        )
+    }
+
+    #[tokio::test]
+    async fn overloaded_first_item_retries_without_tripping_cost_tracking() {
+        let (before, after, admitted) = run_case(
+            "first-item-overloaded",
+            r#"Invalid status code 529: {"type":"overloaded_error"}"#,
+        )
+        .await;
+        assert!(admitted, "the retried request must be admitted");
+        assert!(
+            !before && !after,
+            "unbilled overload keeps tracking healthy"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_first_item_error_still_fails_closed() {
+        let (_, after, admitted) = run_case("first-item-unknown", "connection reset by peer").await;
+        assert!(
+            !admitted,
+            "the unfinished request must still refuse a retry"
+        );
+        assert!(after, "an unknown outcome keeps tracking failed");
     }
 }
