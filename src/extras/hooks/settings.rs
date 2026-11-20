@@ -214,8 +214,34 @@ fn http_binding(
     Ok((url.to_owned(), headers))
 }
 
+/// One hook dropped while parsing an otherwise valid hooks config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SkippedHook {
+    pub(crate) event: String,
+    pub(crate) reason: String,
+}
+
+/// Logs and records one skipped hook so the caller can also tell the user.
+fn skip_hook(skipped: &mut Vec<SkippedHook>, event: &str, reason: String) {
+    tracing::warn!("hooks: {reason}");
+    skipped.push(SkippedHook {
+        event: event.to_owned(),
+        reason,
+    });
+}
+
 /// Parses the JSON value found at the top-level `hooks` key of settings.json.
 pub(crate) fn parse_hooks_config(value: &serde_json::Value) -> Result<HooksConfig, String> {
+    parse_hooks_config_with_skips(value).map(|(config, _)| config)
+}
+
+/// [`parse_hooks_config`] that also returns the hooks it dropped one by one
+/// (unsupported type, invalid binding), so a guard that is not enforced is
+/// not only a log line.
+pub(crate) fn parse_hooks_config_with_skips(
+    value: &serde_json::Value,
+) -> Result<(HooksConfig, Vec<SkippedHook>), String> {
+    let mut skipped = Vec::new();
     let mut config: HooksConfig =
         serde_json::from_value(value.clone()).map_err(|e| format!("invalid hooks config: {e}"))?;
 
@@ -280,8 +306,10 @@ pub(crate) fn parse_hooks_config(value: &serde_json::Value) -> Result<HooksConfi
                             handler.env = headers;
                             kept.push(handler);
                         }
-                        Err(error) => tracing::warn!(
-                            "hooks: skipping one http hook for event {event:?}: {error}"
+                        Err(error) => skip_hook(
+                            &mut skipped,
+                            event,
+                            format!("skipping one http hook for event {event:?}: {error}"),
                         ),
                     },
                     "mcp_tool" => {
@@ -293,8 +321,10 @@ pub(crate) fn parse_hooks_config(value: &serde_json::Value) -> Result<HooksConfi
                                 handler.env.clear();
                                 kept.push(handler);
                             }
-                            Err(error) => tracing::warn!(
-                                "hooks: skipping one mcp_tool hook for event {event:?}: {error}"
+                            Err(error) => skip_hook(
+                                &mut skipped,
+                                event,
+                                format!("skipping one mcp_tool hook for event {event:?}: {error}"),
                             ),
                         }
                     }
@@ -307,14 +337,20 @@ pub(crate) fn parse_hooks_config(value: &serde_json::Value) -> Result<HooksConfi
                                 handler.env.clear();
                                 kept.push(handler);
                             }
-                            Err(error) => tracing::warn!(
-                                "hooks: skipping one {kind} hook for event {event:?}: {error}"
+                            Err(error) => skip_hook(
+                                &mut skipped,
+                                event,
+                                format!("skipping one {kind} hook for event {event:?}: {error}"),
                             ),
                         }
                     }
-                    other => tracing::warn!(
-                        "hooks: skipping one hook of unsupported type {other:?} for event {event:?}; this build runs {} (other hooks in the file stay loaded)",
-                        SUPPORTED_HOOK_TYPES.join(", ")
+                    other => skip_hook(
+                        &mut skipped,
+                        event,
+                        format!(
+                            "skipping one hook of unsupported type {other:?} for event {event:?}; this build runs {} (other hooks in the file stay loaded)",
+                            SUPPORTED_HOOK_TYPES.join(", ")
+                        ),
                     ),
                 }
             }
@@ -322,7 +358,7 @@ pub(crate) fn parse_hooks_config(value: &serde_json::Value) -> Result<HooksConfi
         }
     }
 
-    Ok(config)
+    Ok((config, skipped))
 }
 
 /// Command-string compatibility is quoting/tokenization only. The existing

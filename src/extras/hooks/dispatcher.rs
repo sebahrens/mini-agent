@@ -276,6 +276,12 @@ pub(crate) struct HookDispatcher {
     /// `super::normalize_pinned_spelling`, built once with the pins so a
     /// write check normalizes only its own input.
     pinned_normalized: Arc<[String]>,
+    /// Set when a managed or global hooks file could not be loaded, so its
+    /// guards are unknown: every `PreToolUse` is denied with this reason
+    /// instead of running unguarded.
+    fail_closed: Option<String>,
+    /// Hooks-file problems found at startup, for the caller to show the user.
+    startup_notices: Vec<String>,
 }
 
 pub(crate) type HookDiagnosticMetadata = (usize, usize, Option<usize>);
@@ -414,7 +420,25 @@ impl HookDispatcher {
             once_ran: Arc::new(Mutex::new(HashSet::new())),
             content_pins,
             pinned_normalized,
+            fail_closed: None,
+            startup_notices: Vec::new(),
         })
+    }
+
+    /// Record hooks-file load problems: `fail_closed` denies every
+    /// `PreToolUse`; `notices` are for the user to see at startup.
+    pub(crate) fn with_load_problems(
+        mut self,
+        fail_closed: Option<String>,
+        notices: Vec<String>,
+    ) -> Self {
+        self.fail_closed = fail_closed;
+        self.startup_notices = notices;
+        self
+    }
+
+    pub(crate) fn startup_notices(&self) -> &[String] {
+        &self.startup_notices
     }
 
     /// The content binding for `handler`; a bound dispatcher never launches
@@ -520,9 +544,11 @@ impl HookDispatcher {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.events
-            .values()
-            .all(|entries| entries.iter().all(|entry| entry.handlers.is_empty()))
+        self.fail_closed.is_none()
+            && self
+                .events
+                .values()
+                .all(|entries| entries.iter().all(|entry| entry.handlers.is_empty()))
     }
 
     /// True when any `PreToolUse`/`PostToolUse`/`PostToolUseFailure` handler is
@@ -530,13 +556,14 @@ impl HookDispatcher {
     /// `current_dir` syscall + permission lock) when only lifecycle hooks are
     /// configured, restoring the zero-cost invariant for that case.
     pub(crate) fn has_tool_hooks(&self) -> bool {
-        ["PreToolUse", "PostToolUse", "PostToolUseFailure"]
-            .iter()
-            .any(|event| {
-                self.events
-                    .get(*event)
-                    .is_some_and(|entries| entries.iter().any(|entry| !entry.handlers.is_empty()))
-            })
+        self.fail_closed.is_some()
+            || ["PreToolUse", "PostToolUse", "PostToolUseFailure"]
+                .iter()
+                .any(|event| {
+                    self.events.get(*event).is_some_and(|entries| {
+                        entries.iter().any(|entry| !entry.handlers.is_empty())
+                    })
+                })
     }
 
     /// Configured events with their total handler count (across all matcher
@@ -634,6 +661,13 @@ impl HookDispatcher {
             || canonical_tool_name(tool_name),
             McpToolIdentity::matcher_name,
         );
+        if let Some(reason) = &self.fail_closed {
+            return PreDecision {
+                verdict: Verdict::Deny,
+                reason: Some(reason.clone()),
+                updated_input: None,
+            };
+        }
         let handlers = self.handlers_for("PreToolUse", &canonical);
         if handlers.is_empty() {
             return PreDecision {

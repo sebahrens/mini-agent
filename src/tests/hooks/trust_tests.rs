@@ -517,3 +517,167 @@ fn hooks60_claude_project_settings_require_exact_trust_and_cannot_disable_global
         "changed argv requires fresh approval"
     );
 }
+
+fn build(
+    global: &std::path::Path,
+    project: &std::path::Path,
+    managed: &std::path::Path,
+    trust_path: &std::path::Path,
+) -> crate::extras::hooks::dispatcher::HookDispatcher {
+    trust::build_dispatcher_from_paths(
+        global,
+        project,
+        managed,
+        &project_root(),
+        false,
+        true,
+        trust_path,
+        &|_| false,
+    )
+}
+
+fn hook_ctx() -> crate::extras::hooks::HookCtx {
+    crate::extras::hooks::HookCtx {
+        session_id: "s".into(),
+        session_path: String::new(),
+        cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+        permission_mode: "default".into(),
+    }
+}
+
+#[tokio::test]
+async fn unparsable_managed_hooks_file_denies_pre_tool_use_and_is_reported() {
+    use crate::extras::hooks::Verdict;
+    for broken in [
+        "{ not json",
+        r#"{"hooks":{"PreToolUSe":[{"hooks":[{"type":"command","command":"true"}]}]}}"#,
+        r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"echo \"unbalanced"}]}]}}"#,
+    ] {
+        let managed = unique_path("broken-managed");
+        write_settings(&managed, broken);
+        let dispatcher = build(
+            &missing_path("g"),
+            &missing_path("p"),
+            &managed,
+            &unique_path("trust"),
+        );
+        assert!(!dispatcher.is_empty(), "{broken}");
+        assert!(
+            dispatcher
+                .startup_notices()
+                .iter()
+                .any(|n| n.contains("managed") || n.contains(&managed.display().to_string())),
+            "{broken}: {:?}",
+            dispatcher.startup_notices()
+        );
+        let decision = dispatcher
+            .dispatch_pre_tool_use(&hook_ctx(), "bash", serde_json::json!({}))
+            .await;
+        assert_eq!(decision.verdict, Verdict::Deny, "{broken}");
+        assert!(decision.reason.unwrap().contains("managed hooks file"));
+    }
+}
+
+#[tokio::test]
+async fn unparsable_global_hooks_file_denies_unless_hooks_are_disabled() {
+    use crate::extras::hooks::Verdict;
+    let global = unique_path("broken-global");
+    write_settings(&global, "{ not json");
+    let dispatcher = build(
+        &global,
+        &missing_path("p"),
+        &missing_path("m"),
+        &unique_path("trust"),
+    );
+    let decision = dispatcher
+        .dispatch_pre_tool_use(&hook_ctx(), "bash", serde_json::json!({}))
+        .await;
+    assert_eq!(decision.verdict, Verdict::Deny);
+
+    // The user turned hooks off explicitly: no guard is expected, so nothing denies.
+    let disabled = trust::build_dispatcher_from_paths(
+        &global,
+        &missing_path("p"),
+        &missing_path("m"),
+        &project_root(),
+        true,
+        true,
+        &unique_path("trust"),
+        &|_| false,
+    );
+    assert!(disabled.is_empty());
+}
+
+#[test]
+fn unparsable_project_hooks_file_is_reported_but_does_not_deny() {
+    let project = unique_path("broken-project");
+    write_settings(&project, "{ not json");
+    let dispatcher = build(
+        &missing_path("g"),
+        &project,
+        &missing_path("m"),
+        &unique_path("trust"),
+    );
+    assert!(dispatcher.is_empty());
+    assert!(
+        !dispatcher.startup_notices().is_empty(),
+        "a broken project hooks file must be visible"
+    );
+}
+
+#[test]
+fn skipped_global_guard_hook_is_fail_closed_and_reported() {
+    let global = unique_path("skipped-global");
+    write_settings(
+        &global,
+        r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"future-type"},{"type":"command","command":"true"}]}]}}"#,
+    );
+    let dispatcher = build(
+        &global,
+        &missing_path("p"),
+        &missing_path("m"),
+        &unique_path("trust"),
+    );
+    assert!(
+        dispatcher
+            .startup_notices()
+            .iter()
+            .any(|n| n.contains("unsupported type")),
+        "{:?}",
+        dispatcher.startup_notices()
+    );
+    assert!(!dispatcher.is_empty(), "a dropped guard must fail closed");
+}
+
+#[test]
+fn concurrent_trust_store_saves_keep_each_others_entries() {
+    let path = unique_path("merge");
+    let initial: std::collections::HashSet<String> =
+        ["keep".to_string(), "drop".to_string()].into();
+    trust::save_trust_store(&path, &initial).unwrap();
+
+    // Two sessions loaded the same store, then each changed it.
+    let mut first = initial.clone();
+    first.insert("first".into());
+    let mut second = initial.clone();
+    second.remove("drop");
+    second.insert("second".into());
+    trust::save_trust_store_merged(&path, &initial, &first).unwrap();
+    trust::save_trust_store_merged(&path, &initial, &second).unwrap();
+
+    let merged = trust::load_trust_store(&path);
+    let expected: std::collections::HashSet<String> =
+        ["keep", "first", "second"].map(String::from).into();
+    assert_eq!(merged, expected);
+}
+
+#[test]
+fn unreadable_trust_store_is_not_overwritten() {
+    let path = unique_path("corrupt");
+    write_settings(&path, "{ not a set");
+    let loaded = std::collections::HashSet::new();
+    let current: std::collections::HashSet<String> = ["new".to_string()].into();
+    let error = trust::save_trust_store_merged(&path, &loaded, &current).unwrap_err();
+    assert!(error.contains("not overwriting"), "{error}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not a set");
+}

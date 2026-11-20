@@ -2,8 +2,9 @@
 //!
 //! The slave end becomes the child's stdin, stdout and stderr; the parent
 //! keeps the master to read the merged terminal output and, for background
-//! jobs, to write bounded input. Both ends are close-on-exec in the parent so
-//! no other child inherits them. The child stays inside the same sandbox
+//! jobs, to write bounded input. Both ends are created close-on-exec (atomically
+//! on Linux and macOS) so no other child, however concurrently spawned,
+//! inherits them. The child stays inside the same sandbox
 //! wrapper: the pty only replaces its pipes.
 
 use std::io;
@@ -53,6 +54,64 @@ fn register(fd: OwnedFd) -> io::Result<AsyncFd<OwnedFd>> {
     unsafe { AsyncFd::register(fd) }.map_err(io::Error::from)
 }
 
+/// Open a terminal pair whose descriptors are close-on-exec from creation.
+///
+/// `openpty` returns inheritable descriptors, and setting `FD_CLOEXEC`
+/// afterwards leaves a window in which a concurrent fork+exec on another
+/// thread inherits the slave and keeps the master from ever seeing EOF. The
+/// `O_CLOEXEC` flag on `posix_openpt` and on the slave `open` closes it.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+#[allow(unsafe_code)]
+fn open_cloexec_pair(size: &nix::pty::Winsize) -> io::Result<(OwnedFd, OwnedFd)> {
+    use std::os::fd::FromRawFd;
+
+    let flags = libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC;
+    // SAFETY: plain libc calls; every descriptor returned is wrapped in an
+    // `OwnedFd` immediately, so each error path closes it, and the name
+    // buffer outlives the calls that fill and read it.
+    unsafe {
+        let raw = libc::posix_openpt(flags);
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let master = OwnedFd::from_raw_fd(raw);
+        if libc::grantpt(raw) != 0 || libc::unlockpt(raw) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut name = [0 as libc::c_char; 256];
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let code = libc::ptsname_r(raw, name.as_mut_ptr(), name.len());
+            if code != 0 {
+                return Err(io::Error::from_raw_os_error(code));
+            }
+        }
+        #[cfg(target_os = "macos")]
+        if libc::ioctl(raw, libc::TIOCPTYGNAME as _, name.as_mut_ptr()) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let slave = libc::open(name.as_ptr(), flags);
+        if slave < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let slave = OwnedFd::from_raw_fd(slave);
+        if libc::ioctl(raw, libc::TIOCSWINSZ as _, size as *const nix::pty::Winsize) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((master, slave))
+    }
+}
+
+/// Fallback for other Unix targets: `openpty` then `FD_CLOEXEC` (not atomic).
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+fn open_cloexec_pair(size: &nix::pty::Winsize) -> io::Result<(OwnedFd, OwnedFd)> {
+    let pair = nix::pty::openpty(size, None).map_err(io::Error::from)?;
+    for fd in [&pair.master, &pair.slave] {
+        set_flag(fd, libc::F_GETFD, libc::F_SETFD, libc::FD_CLOEXEC)?;
+    }
+    Ok((pair.master, pair.slave))
+}
+
 impl PtyPair {
     /// Open a terminal pair sized 40x120 unless `LINES`/`COLUMNS` in the
     /// mini-agent process environment say otherwise (see [`pty_size`]). Must
@@ -68,14 +127,11 @@ impl PtyPair {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        let pair = nix::pty::openpty(&size, None).map_err(io::Error::from)?;
-        for fd in [&pair.master, &pair.slave] {
-            set_flag(fd, libc::F_GETFD, libc::F_SETFD, libc::FD_CLOEXEC)?;
-        }
-        set_flag(&pair.master, libc::F_GETFL, libc::F_SETFL, libc::O_NONBLOCK)?;
+        let (master, slave) = open_cloexec_pair(&size)?;
+        set_flag(&master, libc::F_GETFL, libc::F_SETFL, libc::O_NONBLOCK)?;
         Ok(Self {
-            master: Arc::new(register(pair.master)?),
-            slave: pair.slave,
+            master: Arc::new(register(master)?),
+            slave,
         })
     }
 
@@ -195,6 +251,17 @@ mod tests {
             std::env::var("COLUMNS").ok().as_deref(),
         );
         assert_eq!((size.ws_row, size.ws_col), (rows, cols));
+    }
+
+    #[tokio::test]
+    async fn both_terminal_ends_are_close_on_exec() {
+        let pair = PtyPair::open().unwrap();
+        for fd in [pair.master.get_ref().as_raw_fd(), pair.slave.as_raw_fd()] {
+            // SAFETY: both descriptors are live and owned by `pair`.
+            #[allow(unsafe_code)]
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
+        }
     }
 
     /// A tty line discipline may drop or buffer instead of blocking, so the

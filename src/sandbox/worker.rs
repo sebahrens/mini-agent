@@ -312,6 +312,10 @@ pub(crate) struct WorkerProcess {
     pub(crate) input: File,
     pub(crate) output: File,
     pub(crate) stderr: File,
+    /// A group-wide kill already succeeded. Once the root is reaped, its
+    /// process-group id may be reused, so no further group kill is sent.
+    #[cfg(unix)]
+    tree_terminated: bool,
     #[cfg(test)]
     reap_observer: Option<Arc<AtomicUsize>>,
     #[cfg(test)]
@@ -377,12 +381,22 @@ impl WorkerProcess {
         if self.force_tree_termination_error {
             return Err(io::Error::other("forced tree-termination failure"));
         }
+        #[cfg(unix)]
+        if result.is_ok() {
+            self.tree_terminated = true;
+        }
         result
     }
 
     pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         let status = self.process.try_wait()?;
         if status.is_some() {
+            // Kill leftover descendants now, while the reaped root's group id
+            // cannot have been reused yet; a later teardown skips the group.
+            #[cfg(unix)]
+            if !self.tree_terminated {
+                let _ = self.terminate_tree();
+            }
             self.process.retire_after_reap()?;
             self.notify_reaped();
         }
@@ -395,7 +409,15 @@ impl WorkerProcess {
         let root_status = self.try_wait()?;
         // Teardown must target the containment tree even if the root has already exited: an old
         // descendant may still own a protocol-pipe clone and otherwise outlive its generation.
-        let mut termination_error = self.terminate_tree().err();
+        #[cfg(unix)]
+        let already_terminated = root_status.is_some() && self.tree_terminated;
+        #[cfg(not(unix))]
+        let already_terminated = false;
+        let mut termination_error = if already_terminated {
+            None
+        } else {
+            self.terminate_tree().err()
+        };
         if let Some(status) = root_status {
             return match termination_error.take() {
                 Some(error) => Err(error),
@@ -721,6 +743,8 @@ impl WorkerLauncher for TestWorkerLauncher {
             input: child_stdin_file(input),
             output: child_stdout_file(output),
             stderr: child_stderr_file(stderr),
+            #[cfg(unix)]
+            tree_terminated: false,
             reap_observer: None,
             force_tree_termination_error: false,
             authenticated_ready_observer: None,
@@ -1069,15 +1093,37 @@ mod tests {
         let mut process = TestWorkerLauncher::current_test_process()
             .launch()
             .expect("test launcher should start the current test executable");
+        process.force_tree_termination_error_for_test();
+        // The root is reaped here, but the group kill failed, so it stays owed.
         process
             .terminate_and_reap(Duration::from_secs(5))
-            .expect("test worker group should terminate and its root reap");
-        process.force_tree_termination_error_for_test();
+            .expect_err("tree-termination failure must surface");
 
         let error = process
             .terminate_and_reap(Duration::from_millis(50))
             .expect_err("a cached root status must not hide tree-termination failure");
         assert_eq!(error.to_string(), "forced tree-termination failure");
+    }
+
+    /// After the root is reaped and the group was killed once, its group id
+    /// may be recycled, so teardown (and `Drop`) must not signal it again.
+    #[cfg(unix)]
+    #[test]
+    fn reaped_worker_group_is_not_signalled_again() {
+        let mut process = TestWorkerLauncher::current_test_process()
+            .launch()
+            .expect("test launcher should start the current test executable");
+        assert!(!process.tree_terminated);
+        process
+            .terminate_and_reap(Duration::from_secs(5))
+            .expect("test worker group should terminate and its root reap");
+        assert!(process.tree_terminated);
+
+        // A forced failure would surface if the group kill were issued again.
+        process.force_tree_termination_error_for_test();
+        process
+            .terminate_and_reap(Duration::from_millis(50))
+            .expect("a reaped, already-terminated worker needs no second group kill");
     }
 
     #[test]
