@@ -407,7 +407,11 @@ async fn worker_effect_cancellation_kills_spawn_tree_and_marks_dispatched_outcom
         )
         .await
         .expect("next spawn must succeed without a leaked cancellation task");
-    assert_eq!(next.stdout, "recovered");
+    assert_eq!(
+        next.stdout, "recovered",
+        "code={} timed_out={} stderr={:?}",
+        next.code, next.timed_out, next.stderr
+    );
     let _ = std::fs::remove_file(heartbeat_path);
     permission_owner.shutdown();
 }

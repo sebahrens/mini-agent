@@ -1663,7 +1663,19 @@ mod tests {
             stdout.contains("cargo ") && stdout.contains("test result: ok. 1 passed;"),
             "{stdout}"
         );
-        assert!(fixture.cwd.join("target/debug/deps").is_dir());
+        assert!(
+            fixture.cwd.join("target/debug/deps").is_dir(),
+            "no target/debug/deps in the workspace; workspace entries: {:?}; target entries: {:?}\nstdout:\n{stdout}\nstderr:\n{}",
+            std::fs::read_dir(&fixture.cwd).map(|entries| entries
+                .flatten()
+                .map(|entry| entry.file_name())
+                .collect::<Vec<_>>()),
+            std::fs::read_dir(fixture.cwd.join("target")).map(|entries| entries
+                .flatten()
+                .map(|entry| entry.file_name())
+                .collect::<Vec<_>>()),
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert!(
             !fixture.home.join(".cargo/registry").exists(),
             "Cargo writes are directed to the owned workspace, not the readonly home"
