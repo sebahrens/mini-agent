@@ -153,6 +153,8 @@ fn launch_executable(
         input: super::child_stdin_file(input),
         output: super::child_stdout_file(output),
         stderr: super::child_stderr_file(stderr),
+        observed_exit: None,
+        root_reaped: false,
         #[cfg(test)]
         reap_observer: None,
         #[cfg(test)]
@@ -1872,8 +1874,14 @@ impl WorkerChild {
         super::terminate_worker_process_group(self.child.id())
     }
 
+    /// Observes the root's exit without reaping it; see `reap_exited`.
     pub(super) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        self.child.try_wait()
+        super::observe_exit_without_reaping(&self.child)
+    }
+
+    /// Reaps the root after `try_wait` observed its exit and the group was signalled.
+    pub(super) fn reap_exited(&mut self) -> io::Result<ExitStatus> {
+        self.child.wait()
     }
 }
 
