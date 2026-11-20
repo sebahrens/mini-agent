@@ -399,10 +399,13 @@ async fn worker_effect_cancellation_kills_spawn_tree_and_marks_dispatched_outcom
         "cancelled spawn left a descendant writing after service completion"
     );
 
+    // The shell's builtin printf: a multi-call coreutils binary (uutils, now on
+    // the CI image) refuses to run from the sealed snapshot path, which is a
+    // separate concern from cancellation recovery.
     let next = service
         .execute(
-            "printf",
-            &["%s".to_string(), "recovered".to_string()],
+            "sh",
+            &["-c".to_string(), "printf %s recovered".to_string()],
             PermCancellation::new(),
         )
         .await
