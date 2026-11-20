@@ -81,6 +81,9 @@ fn append_entry_to_path(
     let mut states = history_file_states()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Held until return: another process must not append between this
+    // process's read and its compaction/rewrite.
+    let _cross_process = lock_history_file(path);
     let state = states.entry(path.to_path_buf()).or_default();
     let current = file_stamp(path)?;
     if state.observed != current {
@@ -128,6 +131,34 @@ fn append_entry_to_path(
     Ok(())
 }
 
+/// Advisory cross-process lock on `<history>.lock`, serializing appends and
+/// whole-file rewrites between mini-agent processes sharing one history file.
+/// The OS releases it when the returned file drops or the process exits. A
+/// lock that cannot be taken (for example on a filesystem without advisory
+/// locks) is logged and history proceeds unguarded rather than failing.
+fn lock_history_file(path: &Path) -> Option<std::fs::File> {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".lock");
+    let lock_path = PathBuf::from(name);
+    let acquire = || -> anyhow::Result<std::fs::File> {
+        match crate::fs::private_atomic_create_sync(&lock_path, b"") {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        let file = crate::fs::open_private_file(&lock_path)?;
+        file.lock()?;
+        Ok(file)
+    };
+    match acquire() {
+        Ok(file) => Some(file),
+        Err(error) => {
+            tracing::warn!("chat history lock unavailable, continuing unguarded: {error:#}");
+            None
+        }
+    }
+}
+
 fn file_stamp(path: &Path) -> anyhow::Result<Option<FileStamp>> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => Ok(Some(FileStamp {
@@ -153,7 +184,7 @@ fn append_line_to_file(path: &Path, line: &str) -> anyhow::Result<()> {
     drop(crate::fs::open_private_file(path)?);
 
     let mut options = OpenOptions::new();
-    options.write(true).append(true);
+    options.read(true).write(true).append(true);
 
     #[cfg(unix)]
     {
@@ -169,7 +200,20 @@ fn append_line_to_file(path: &Path, line: &str) -> anyhow::Result<()> {
     }
 
     let mut file = options.open(path)?;
-    file.write_all(line.as_bytes())?;
+    // A crash mid-append can leave a final line without its newline; start on
+    // a fresh line so this record is not glued onto the torn one.
+    let mut record = String::with_capacity(line.len() + 1);
+    if file.metadata()?.len() > 0 {
+        use std::io::{Seek, SeekFrom};
+        let mut last = [0u8; 1];
+        file.seek(SeekFrom::End(-1))?;
+        file.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            record.push('\n');
+        }
+    }
+    record.push_str(line);
+    file.write_all(record.as_bytes())?;
     file.flush()?;
     Ok(())
 }
@@ -256,6 +300,7 @@ fn load_history_from_path(
     let mut states = history_file_states()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _cross_process = lock_history_file(path);
     let state = states.entry(path.to_path_buf()).or_default();
     let parsed = read_history_document(path)?;
     #[cfg(test)]
@@ -531,5 +576,30 @@ mod tests {
         let entries = load_history_from_path(&path, 100).unwrap();
         assert_eq!(entries.len(), 21);
         assert_eq!(entries.first().unwrap().content, "external-entry");
+    }
+
+    #[test]
+    fn append_after_a_torn_line_starts_on_a_fresh_line() {
+        let temp = private_temp_dir();
+        let path = temp.path().join("chat_history.json");
+        let entry = |content: &str| ChatHistoryEntry {
+            content: content.into(),
+            timestamp: "2026-07-29T00:00:00Z".into(),
+        };
+        append_entry_to_path(&path, &entry("first"), 100).unwrap();
+        // Simulate a crash that left a half-written record without a newline.
+        let mut torn = std::fs::read_to_string(&path).unwrap();
+        torn.push_str("{\"content\":\"tor");
+        std::fs::write(&path, torn).unwrap();
+        append_entry_to_path(&path, &entry("second"), 100).unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            contents.lines().any(|line| {
+                serde_json::from_str::<ChatHistoryEntry>(line)
+                    .is_ok_and(|parsed| parsed.content == "second")
+            }),
+            "the new record must parse on its own line: {contents:?}"
+        );
     }
 }

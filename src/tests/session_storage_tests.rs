@@ -337,6 +337,31 @@ fn delete_session_removes_file() {
 }
 
 #[test]
+fn delete_session_refuses_a_session_another_process_owns() {
+    let env = setup_test_env();
+    let s = Session::new("openai", "gpt-4", 128000, "");
+    save_session(&s).unwrap();
+    crate::session::lock::release_session(&s.id);
+    // Stand in for another process: a separate open file description holding
+    // the session's advisory lock.
+    let other = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(crate::session::lock::lock_path(&s.id).unwrap())
+        .unwrap();
+    other.try_lock().unwrap();
+
+    let error = delete_session(&s.id).expect_err("a held session must not be deleted");
+    assert!(error.to_string().contains("another mini-agent process"));
+    assert!(load_session_exact(&s.id).unwrap().is_some());
+
+    other.unlock().unwrap();
+    delete_session(&s.id).unwrap();
+    assert!(load_session_exact(&s.id).unwrap().is_none());
+    drop(env);
+}
+
+#[test]
 fn save_session_preserves_messages() {
     let env = setup_test_env();
     let mut s = Session::new("anthropic", "claude", 200000, "");

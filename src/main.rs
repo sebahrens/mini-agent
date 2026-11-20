@@ -712,7 +712,12 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
     if cli.resolve_sandbox(&cfg) && cli.general_sandbox_is_eligible(&cfg) {
         sandbox::begin_backend_probe(&cli.resolve_sandbox_backend(&cfg));
     }
-    let version_changed = docs::ensure_global()?;
+    // The docs copy is non-essential: an unwritable data dir or a racing start
+    // must not abort startup (including headless runs).
+    let version_changed = docs::ensure_global().unwrap_or_else(|error| {
+        eprintln!("warning: could not install bundled docs: {error:#}");
+        false
+    });
     #[cfg(feature = "agent-skills")]
     {
         extras::skills::index::AgentSkillSearchPolicy::configure(&cfg);
