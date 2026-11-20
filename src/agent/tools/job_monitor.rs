@@ -133,7 +133,14 @@ pub(crate) async fn run_monitor(
             return;
         };
         let finished = snapshot.status.is_terminal();
-        for _ in 0..MAX_STEPS_PER_TICK {
+        // A finished job gets no later tick: drain the whole backlog instead of
+        // capping the windows scanned, so late matches are still counted.
+        let steps = if finished {
+            usize::MAX
+        } else {
+            MAX_STEPS_PER_TICK
+        };
+        for _ in 0..steps {
             let Ok(window) = sandbox.peek_background_job_window(&id, cursor, SCAN_BYTES) else {
                 return;
             };

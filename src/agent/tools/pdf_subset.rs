@@ -177,7 +177,7 @@ impl Document {
             if !entries.iter().any(|(existing, _)| existing == b"Resources")
                 && let Some(resources) = resources
             {
-                entries.push((b"Resources".to_vec(), Obj::Dict(resources.clone())));
+                entries.push((b"Resources".to_vec(), Obj::Dict(Dict::clone(resources))));
             }
             let mut remapped = copier.remap_dict(&Dict(entries), 0)?;
             remapped

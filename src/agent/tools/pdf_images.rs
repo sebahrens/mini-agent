@@ -55,7 +55,7 @@ impl Document {
             return Ok(Vec::new());
         };
         let xobjects = resources
-            .as_ref()
+            .as_deref()
             .and_then(|resources| resources.get(b"XObject"))
             .and_then(|xobjects| self.resolve(xobjects).as_dict());
         let mut candidates: Vec<(u64, &Dict, &[u8])> = Vec::new();
@@ -69,7 +69,9 @@ impl Document {
                 .and_then(|xobjects| xobjects.get(name))
                 .map(|object| self.resolve(object))
             {
-                let area = self.number(dict, b"Width") * self.number(dict, b"Height");
+                let area = self
+                    .number(dict, b"Width")
+                    .saturating_mul(self.number(dict, b"Height"));
                 candidates.push((area, dict, raw));
             }
         }
