@@ -72,3 +72,37 @@ fn single_tool_allowlist() {
     let filtered = filter_tools_by_allowlist(tools, &allowlist);
     assert_eq!(tool_names(&filtered), vec!["bash", "job_status"]);
 }
+
+#[test]
+fn task_allowlist_keeps_background_task_companions() {
+    let tools = make_tools(&[
+        "task",
+        "task_result",
+        "task_list",
+        "task_cancel",
+        "task_send",
+        "read",
+        "write",
+    ]);
+    let allowlist = vec!["read".to_string(), "task".to_string()];
+    let filtered = filter_tools_by_allowlist(tools, &allowlist);
+    assert_eq!(
+        tool_names(&filtered),
+        vec![
+            "task",
+            "task_result",
+            "task_list",
+            "task_cancel",
+            "task_send",
+            "read"
+        ]
+    );
+}
+
+#[test]
+fn task_companions_are_dropped_without_task_allowed() {
+    let tools = make_tools(&["task", "task_result", "read"]);
+    let allowlist = vec!["read".to_string()];
+    let filtered = filter_tools_by_allowlist(tools, &allowlist);
+    assert_eq!(tool_names(&filtered), vec!["read"]);
+}

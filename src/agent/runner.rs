@@ -3994,10 +3994,14 @@ fn normalized_continuation_bridge(
 ) -> Vec<Message> {
     let mut bridge = completed_interactions;
     bridge.extend_from_slice(uncommitted_interactions);
-    if matches!(bridge.last(), Some(Message::User { .. })) {
-        bridge.push(Message::assistant(String::new()));
+    // After tool results the bridge already ends with a user turn. Fold the
+    // instruction into it: an empty assistant filler is rejected by
+    // Anthropic-style APIs ("text content blocks must be non-empty").
+    if let Some(Message::User { content }) = bridge.last_mut() {
+        content.push(UserContent::text(continuation_instruction));
+    } else {
+        bridge.push(Message::user(continuation_instruction.to_string()));
     }
-    bridge.push(Message::user(continuation_instruction.to_string()));
     bridge
 }
 
@@ -4852,6 +4856,12 @@ where
                             &response_text,
                             &mut interactions,
                         );
+                        // Rig's grouped delta (already in `completed_interactions`)
+                        // is authoritative for this stream; keeping the streamed
+                        // copies would make terminal errors report them twice.
+                        // Only the synthetic unresolved-tool results appended
+                        // below remain in `interactions`.
+                        interactions.clear();
                         tracing::info!(
                             "agent done: input_tokens={}, output_tokens={}, cached_input_tokens={}, cache_creation_input_tokens={}",
                             usage.input_tokens,
@@ -9498,7 +9508,7 @@ mod tests {
         .0;
 
         let mut attempts = Vec::new();
-        let error = loop {
+        let (error, error_interactions) = loop {
             match runner.event_rx.recv().await.expect("runner terminal event") {
                 crate::event::AgentEvent::Verification {
                     attempt, passed, ..
@@ -9506,7 +9516,11 @@ mod tests {
                     assert!(!passed);
                     attempts.push(attempt);
                 }
-                crate::event::AgentEvent::Error { message: error, .. } => break error.to_string(),
+                crate::event::AgentEvent::Error {
+                    message: error,
+                    interactions,
+                    ..
+                } => break (error.to_string(), interactions),
                 crate::event::AgentEvent::Done { response, .. } => {
                     panic!("failed verification must not emit done: {response}")
                 }
@@ -9517,6 +9531,22 @@ mod tests {
         assert_eq!(attempts, [1, 2]);
         assert!(error.contains("Verification failed after 2 attempts"));
         assert!(error.contains("still broken"));
+        // mini-agent-cebhz: the final stream's messages must appear once.
+        for text in ["candidate one", "candidate two"] {
+            let occurrences = error_interactions
+                .iter()
+                .filter(|message| *message == &Message::assistant(text))
+                .count();
+            assert_eq!(
+                occurrences, 1,
+                "{text} duplicated in {error_interactions:?}"
+            );
+        }
+        assert_eq!(
+            tool_call_ids_of(&error_interactions),
+            ["mutating-call"],
+            "tool calls must not be duplicated in the Error history"
+        );
         assert_eq!(model.requests().len(), 3);
     }
 
@@ -12065,7 +12095,7 @@ mod tests {
         let requests = model.requests();
         assert_eq!(requests.len(), 3);
         let history = &requests[2].chat_history;
-        assert_eq!(history.len(), 5);
+        assert_eq!(history.len(), 4);
         assert_eq!(history.first_ref(), &Message::user("start"));
         assert!(matches!(
             history.iter().nth(1),
@@ -12079,8 +12109,20 @@ mod tests {
             Some(Message::User { content })
                 if matches!(content.first_ref(), rig::message::UserContent::ToolResult(result) if result.id == "causal-tool")
         ));
-        assert_eq!(history.iter().nth(3), Some(&Message::assistant("")));
-        assert_eq!(history.last_ref(), &Message::user("Please continue."));
+        // The continuation instruction rides in the trailing tool-result user
+        // turn; no empty assistant message is inserted.
+        assert!(matches!(
+            history.last_ref(),
+            Message::User { content }
+                if content.len() == 2
+                    && matches!(content.first_ref(), rig::message::UserContent::ToolResult(result) if result.id == "causal-tool")
+                    && matches!(content.iter().nth(1), Some(rig::message::UserContent::Text(text)) if text.text == "Please continue.")
+        ));
+        assert!(
+            !history
+                .iter()
+                .any(|message| *message == Message::assistant(""))
+        );
         let mut expected_interactions = history.iter().skip(1).cloned().collect::<Vec<_>>();
         expected_interactions.push(Message::assistant("answer"));
         assert_eq!(

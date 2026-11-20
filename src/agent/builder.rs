@@ -777,6 +777,9 @@ pub(crate) fn filter_tools_by_allowlist(
             allowed.contains(name)
                 || (name == "job_status" && allowed.contains("shell"))
                 || (name == "todo_read" && allowed.contains("todo_write"))
+                // A background `task` hands the model an id it can only
+                // collect, list, cancel or message through these companions.
+                || (name.starts_with("task_") && allowed.contains("task"))
                 // A goal's report channel is not a capability the user is
                 // narrowing; without it the gate never hears from the agent.
                 || name == "goal_report"
@@ -2062,7 +2065,18 @@ pub async fn build_btw_agent_inner<M: CompletionModel + 'static>(
                 .with_workspace_binding(workspace.clone()),
         ),
     ];
+    // Honor `--tools` like the main agent. Gate by eligibility rather than
+    // `filter_tools_by_allowlist`, which warns about every unknown name.
+    let read_tools: Vec<Box<dyn rig::tool::ToolDyn>> = read_tools
+        .into_iter()
+        .filter(|tool| cli.tool_is_eligible(cfg, tool.name().as_ref()))
+        .collect();
     let read_tools = tools::memoize::definitions(read_tools);
+    // Run the user's PreToolUse/PostToolUse hooks, as the main agent and
+    // subagents do; otherwise /btw reads bypass hook policy.
+    #[cfg(feature = "hooks")]
+    let read_tools =
+        crate::extras::hooks::wrap_from_global(read_tools, permission.clone(), ask_tx.clone());
     let read_tools = tools::concurrency::bind(read_tools);
 
     let mut builder = AgentBuilder::new(model)
