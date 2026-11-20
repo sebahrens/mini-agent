@@ -493,6 +493,23 @@ fn provider_should_retry(error: &(dyn std::error::Error + 'static)) -> Option<bo
     }
 }
 
+/// A first-stream-item error that providers reject before generating (and so
+/// bill nothing for): Anthropic `overloaded_error` / `rate_limit_error` events
+/// or a 429/529 status. Unknown errors are NOT included: they may follow
+/// billable output, so they stay fail-closed in `StreamGuard`.
+fn is_unbilled_stream_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    if !is_retryable(error) {
+        return false;
+    }
+    if provider_response_status(error).is_some_and(|status| matches!(status.as_u16(), 429 | 529)) {
+        return true;
+    }
+    error_sources(error).any(|source| {
+        let message = source.to_string().to_ascii_lowercase();
+        message.contains("overloaded_error") || message.contains("rate_limit_error")
+    })
+}
+
 fn is_retryable_status(code: u16) -> bool {
     // Like the official SDKs: every 5xx except 501 Not Implemented
     // (Cloudflare 520-524/530, 507, 598/599 proxies included).
@@ -681,6 +698,12 @@ where
                         "provider rejected the image count; retrying with fewer images: {e}"
                     );
                     continue;
+                }
+                // The provider refused before generating anything: settle the
+                // dropped request as unbilled so cost-cap tracking stays healthy.
+                // Any other first-item failure keeps the fail-closed guard.
+                if is_unbilled_stream_error(&e) {
+                    crate::spend::run::settle_unbilled_first_item();
                 }
                 if attempt >= config.max_attempts || !is_retryable(&e) {
                     return Err(e);
