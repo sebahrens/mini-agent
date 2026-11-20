@@ -208,6 +208,18 @@ fn create_template_idempotent_does_not_overwrite() {
     assert_eq!(content, "# custom architecture");
 }
 
+#[cfg(unix)]
+#[test]
+fn dangling_symlink_is_neither_asked_about_nor_written_through() {
+    let dir = temp_dir("dangling_link");
+    let outside = temp_dir("dangling_link_outside").join("target.md");
+    std::os::unix::fs::symlink(&outside, dir.join("ARCHITECTURE.md")).unwrap();
+    let asked = dir.join("asked.txt");
+    assert!(!archmd::should_ask_with_path(&dir, &asked));
+    archmd::create_architecture_template(&dir).unwrap();
+    assert!(!outside.exists());
+}
+
 // ---------------------------------------------------------------------------
 // ask_and_create (pure logic: non-interactive paths)
 // ---------------------------------------------------------------------------

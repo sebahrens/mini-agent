@@ -34,8 +34,8 @@ describe('persona selector', () => {
     expect(personaSelector([])).toBeUndefined();
     expect(personaSelector([{ id: PERSONA_CONFIG_ID, name: 'Persona', type: 'boolean', currentValue: true }])).toBeUndefined();
     expect(personaSelector([{ ...personaOption('x', ['x']), id: 'other' }])).toBeUndefined();
-    const many = Array.from({ length: 100 }, (_, index) => `p${index}`);
-    expect(personaSelector([personaOption('p0', many)])?.choices).toHaveLength(64);
+    const many = Array.from({ length: 200 }, (_, index) => `p${index}`);
+    expect(personaSelector([personaOption('p0', many)])?.choices).toHaveLength(128);
   });
 
   it('tracks advertised options and selects a persona over the public RPC', async () => {

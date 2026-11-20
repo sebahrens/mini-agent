@@ -7,7 +7,8 @@ export const PERSONA_CONFIG_ID = 'mode';
 export const MODEL_CONFIG_ID = 'model';
 export const EFFORT_CONFIG_ID = 'effort';
 
-const MAX_PERSONA_CHOICES = 64;
+/** Matches the server's advertised maximum (128 prompts / 128 quick models). */
+const MAX_PERSONA_CHOICES = 128;
 
 export interface PersonaChoice {
   readonly value: string;
