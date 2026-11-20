@@ -19,8 +19,7 @@ const WRITE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StateLock {
     Read,
-    Append,
-    Rotate,
+    Write,
 }
 
 const LOCK_FILE: &str = "usage.lock";
@@ -439,12 +438,13 @@ impl Ledger {
     /// The stable cross-process coordination lock (`usage.lock`). Unlike the
     /// active segment, whose inode is replaced by rotation, this file is never
     /// renamed, so one lock spans active-file generation, archive and rollup
-    /// publication, recovery and every summary snapshot. Writers hold it
-    /// shared for a flush that only appends; summaries hold it shared until the
-    /// rollup is merged. Appending writers hold it shared (the active-file
-    /// lock still serializes them against each other and against readers'
-    /// scans); only a rotation takes it exclusively, so it also excludes every
-    /// in-flight summary snapshot. Returns `None` for a read-only caller when no ledger
+    /// publication, recovery and every summary snapshot. Summaries hold it
+    /// shared until the rollup is merged; every flush holds it exclusively, so
+    /// a rotation also excludes every in-flight summary snapshot. Lock order,
+    /// everywhere: this lock first, then the active-file lock, never the
+    /// reverse (a writer that needs the exclusive lock while holding a shared
+    /// one, with a peer waiting on the active file, would otherwise ping-pong
+    /// on the bounded waits). Returns `None` for a read-only caller when no ledger
     /// storage exists yet, or when the directory cannot hold the lock file
     /// (then no writer can exist either).
     fn lock_state(
@@ -490,7 +490,7 @@ impl Ledger {
         if write {
             let started = std::time::Instant::now();
             loop {
-                let attempt = if mode == StateLock::Rotate {
+                let attempt = if write {
                     file.try_lock()
                 } else {
                     file.try_lock_shared()
@@ -815,22 +815,20 @@ impl Ledger {
     ) -> anyhow::Result<()> {
         // A full active segment is rotated away once, under the exclusive
         // coordination lock; the batch is then appended to the fresh segment.
-        match self.flush_rows_once(account, pending, retries, StateLock::Append)? {
-            FlushOutcome::Flushed => return Ok(()),
-            FlushOutcome::NeedsRotation => {}
-            FlushOutcome::Rotated => unreachable!("append pass never rotates"),
-        }
-        // A competing writer can rotate between lock acquisitions too.
-        let retries = pending.iter().map(|row| row.id).collect();
-        match self.flush_rows_once(account, pending, &retries, StateLock::Rotate)? {
-            // Another process rotated first, so this pass appended directly.
+        // The coordination lock is exclusive for the whole pass and taken
+        // before the active-file lock, the only order any path uses. A pass
+        // that finds the segment full therefore rotates in place, so two
+        // writers can never wait on each other's lock across a retry.
+        match self.flush_rows_once(account, pending, retries, true)? {
             FlushOutcome::Flushed => return Ok(()),
             FlushOutcome::Rotated => {}
-            FlushOutcome::NeedsRotation => unreachable!("rotate pass rotates"),
+            FlushOutcome::NeedsRotation => unreachable!("rotating pass rotates"),
         }
         // This batch may already contain receipts in the segment just archived.
-        // Recheck all of it, including a formerly complete but unacknowledged row.
-        match self.flush_rows_once(account, pending, &retries, StateLock::Append)? {
+        // Recheck all of it, including a formerly complete but unacknowledged
+        // row; a competing writer may also have filled the fresh segment.
+        let retries = pending.iter().map(|row| row.id).collect();
+        match self.flush_rows_once(account, pending, &retries, false)? {
             FlushOutcome::Flushed => Ok(()),
             _ => anyhow::bail!("usage ledger capacity reached"),
         }
@@ -840,14 +838,14 @@ impl Ledger {
         account: &Account,
         pending: &[Arc<Row>],
         retries: &std::collections::HashSet<Uuid>,
-        mode: StateLock,
+        may_rotate: bool,
     ) -> anyhow::Result<FlushOutcome> {
         let write_binding = self
             .binding(true)?
             .ok_or_else(|| anyhow::anyhow!("usage ledger unavailable"))?;
         // Taken before the active segment is opened, so a rotation by another
         // process can never leave this writer locking an already-renamed file.
-        let _state_lock = self.lock_state(&write_binding, mode)?;
+        let _state_lock = self.lock_state(&write_binding, StateLock::Write)?;
         let (file, binding) = self
             .open(true)?
             .ok_or_else(|| anyhow::anyhow!("usage ledger unavailable"))?;
@@ -893,7 +891,7 @@ impl Ledger {
             scanned.records += 1;
             scanned.bytes += bytes.len() + 1;
             if scanned.records > MAX_LEDGER_RECORDS || scanned.bytes > MAX_LEDGER_BYTES {
-                if mode != StateLock::Rotate {
+                if !may_rotate {
                     return Ok(FlushOutcome::NeedsRotation);
                 }
                 let records = scanned.records - 1;
@@ -3011,9 +3009,15 @@ mod tests {
                     let receipt = one_receipt("a", 3 + index);
                     let account = Account::new("a", None, 0.0).unwrap();
                     account.observe(&receipt).unwrap();
+                    // Bounded: a lock-order regression must fail, not hang CI.
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
                     loop {
                         match ledger.flush(&account) {
                             Err(error) if error.to_string().contains("lock wait expired") => {
+                                assert!(
+                                    std::time::Instant::now() < deadline,
+                                    "writer {index} still failing with lock wait expired after 30s"
+                                );
                                 std::thread::sleep(std::time::Duration::from_millis(
                                     150 * (index + 1),
                                 ));
