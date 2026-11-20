@@ -357,12 +357,17 @@ impl SelectionPoint {
 }
 
 /// Byte index of the character covering display column `col` in `text`, or
-/// `text.len()` when the column lies past the end of the text.
+/// `text.len()` when the column lies past the end of the text. Zero-width
+/// characters (combining marks, ZWJ, variation selectors) occupy no cell of
+/// their own; they belong to the preceding character.
 fn byte_at_display_col(text: &str, col: usize) -> usize {
     let mut width = 0usize;
     for (index, ch) in text.char_indices() {
         let char_width = char_display_width(ch);
-        if col < width + char_width.max(1) {
+        if char_width == 0 {
+            continue;
+        }
+        if col < width + char_width {
             return index;
         }
         width += char_width;
@@ -391,10 +396,16 @@ pub(crate) fn selection_byte_range(
     };
     let end = if line == hi.line {
         let at = byte_at_display_col(text, hi.col);
-        text[at..]
-            .chars()
-            .next()
-            .map_or(at, |ch| at + ch.len_utf8())
+        let mut chars = text[at..].chars();
+        // Include the character under the pointer and any zero-width
+        // characters attached to it.
+        chars.next().map_or(at, |first| {
+            at + first.len_utf8()
+                + chars
+                    .take_while(|&ch| char_display_width(ch) == 0)
+                    .map(char::len_utf8)
+                    .sum::<usize>()
+        })
     } else {
         text.len()
     };
@@ -444,18 +455,27 @@ pub(crate) fn word_cols_at(text: &str, col: usize) -> Option<(usize, usize)> {
         cells.push((width, ch));
         width += char_display_width(ch);
     }
-    let hit = cells.iter().rposition(|&(start, _)| start <= col)?;
+    let mut hit = cells.iter().rposition(|&(start, _)| start <= col)?;
+    // A zero-width character belongs to the cell before it.
+    while hit > 0 && char_display_width(cells[hit].1) == 0 {
+        hit -= 1;
+    }
     let (hit_start, hit_char) = cells[hit];
     if !is_word_char(hit_char) || col >= hit_start + char_display_width(hit_char).max(1) {
         return None;
     }
     let mut first = hit;
-    while first > 0 && is_word_char(cells[first - 1].1) {
+    let joins = |ch: char| is_word_char(ch) || char_display_width(ch) == 0;
+    while first > 0 && joins(cells[first - 1].1) {
         first -= 1;
     }
     let mut last = hit;
-    while last + 1 < cells.len() && is_word_char(cells[last + 1].1) {
+    while last + 1 < cells.len() && joins(cells[last + 1].1) {
         last += 1;
+    }
+    // The end column is that of the last cell, not a trailing zero-width mark.
+    while last > hit && char_display_width(cells[last].1) == 0 {
+        last -= 1;
     }
     while last > hit && matches!(cells[last].1, '.' | ':') {
         last -= 1;

@@ -224,6 +224,7 @@ pub(crate) fn parse_color(s: &str) -> Option<Color> {
         _ => {
             if let Some(hex) = s.strip_prefix('#')
                 && hex.len() == 6
+                && hex.is_ascii()
                 && let (Ok(r), Ok(g), Ok(b)) = (
                     u8::from_str_radix(&hex[0..2], 16),
                     u8::from_str_radix(&hex[2..4], 16),
@@ -375,6 +376,21 @@ fn descendant_pattern(path: &std::path::Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parse_color_rejects_multibyte_hex_without_panicking() {
+        // mini-agent-f4hxq: 6 bytes, but not on char boundaries.
+        assert_eq!(super::parse_color("#a€bc"), None);
+        assert_eq!(super::parse_color("#ab€1"), None);
+        assert_eq!(
+            super::parse_color("#00ff80"),
+            Some(crossterm::style::Color::Rgb {
+                r: 0,
+                g: 255,
+                b: 128
+            })
+        );
+    }
+
     use super::{
         compact_multiline, display_prefix, display_suffix, display_width, format_tool_call_display,
         format_tool_call_summary, middle_elide, suggest_pattern, wrap_to_width,

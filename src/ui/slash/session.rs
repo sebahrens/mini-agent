@@ -735,8 +735,6 @@ async fn handle_undo(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
             return Ok(());
         }
     };
-    #[cfg(feature = "subagents")]
-    ctx.session.reset_background_tasks().await;
     let removed = match mutate_and_persist_session(
         ctx.session,
         undo_session_mutation,
@@ -764,6 +762,10 @@ async fn handle_undo(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
             return Ok(());
         }
     };
+    // Only a persisted undo invalidates background tasks; a no-op or failed
+    // undo must leave them running.
+    #[cfg(feature = "subagents")]
+    ctx.session.reset_background_tasks().await;
     render_session(ctx.renderer, ctx.session, ctx.cli, ctx.cfg, ctx.context)?;
     write_ok(ctx.renderer, format!("removed {} message(s)", removed));
 

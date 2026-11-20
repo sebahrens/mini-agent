@@ -21,6 +21,8 @@ pub(crate) struct QuestionState {
     draft: String,
     text_mode: bool,
     was_at_bottom: bool,
+    /// When the overlay opened; answer keys are ignored briefly after this.
+    opened: std::time::Instant,
 }
 impl Drop for QuestionState {
     fn drop(&mut self) {
@@ -45,6 +47,7 @@ impl QuestionState {
             draft: String::new(),
             text_mode,
             was_at_bottom: !renderer.is_scrolling(),
+            opened: std::time::Instant::now(),
         };
         state.show(renderer)?;
         renderer.set_activity(super::terminal::AgentActivity::WaitingForUserAnswer)?;
@@ -133,6 +136,13 @@ impl QuestionState {
             renderer.resize();
             renderer.invalidate();
             self.show(renderer)?;
+            return Ok(QuestionEvent::Waiting);
+        }
+        if super::permission_handler::premature_prompt_key(
+            event,
+            self.opened.elapsed(),
+            super::permission_handler::prompt_arming_delay(),
+        ) {
             return Ok(QuestionEvent::Waiting);
         }
         let question = &self

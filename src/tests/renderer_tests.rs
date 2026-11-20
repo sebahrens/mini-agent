@@ -1195,6 +1195,30 @@ mod word_selection_tests {
     }
 
     #[test]
+    fn zero_width_characters_stay_with_the_preceding_cell() {
+        // mini-agent-jb0tk: "e" + combining acute occupies one column.
+        let text = "e\u{301}x";
+        assert_eq!(word(text, 0), Some("e\u{301}x"));
+        assert_eq!(word(text, 1), Some("e\u{301}x"));
+        let whole = selection_byte_range(
+            text,
+            0,
+            SelectionPoint::new(0, 0),
+            SelectionPoint::new(0, 1),
+        )
+        .unwrap();
+        assert_eq!(&text[whole.0..whole.1], text, "drag over the word copies x");
+        let tail = selection_byte_range(
+            text,
+            0,
+            SelectionPoint::new(0, 1),
+            SelectionPoint::new(0, 1),
+        )
+        .unwrap();
+        assert_eq!(&text[tail.0..tail.1], "x", "no orphan combining mark");
+    }
+
+    #[test]
     fn wide_characters_map_by_display_column() {
         let text = "中文 word";
         assert_eq!(word(text, 0), Some("中文"));
