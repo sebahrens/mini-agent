@@ -418,7 +418,7 @@ impl TitleJob {
 impl TitleOutcome {
     /// A finished request for `job` with a canned result, for tests of the
     /// callers' locking.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "acp"))]
     pub(crate) fn canned(
         job: TitleJob,
         title: Option<&str>,
