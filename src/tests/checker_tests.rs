@@ -1432,6 +1432,34 @@ fn add_dir_access_is_default_closed_scoped_and_still_permission_checked() {
 }
 
 #[test]
+fn external_allowed_directory_git_hooks_write_still_asks() {
+    let external = std::env::temp_dir()
+        .canonicalize()
+        .unwrap()
+        .join(format!("zs_ext_git_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(external.join(".git/hooks")).unwrap();
+    let mut checker = PermissionChecker::new(
+        &configs_from(PermissionConfig::default()),
+        SecurityMode::Standard,
+        Some(test_workspace()),
+        None,
+    )
+    .unwrap();
+    checker.allow_external_directory(&external);
+    let hook = external.join(".git/hooks/pre-commit");
+    assert_eq!(
+        checker.check_path("write", hook.to_str().unwrap()),
+        CheckResult::Ask
+    );
+    let plain = external.join("src.txt");
+    assert_eq!(
+        checker.check_path("write", plain.to_str().unwrap()),
+        CheckResult::Allowed
+    );
+    let _ = std::fs::remove_dir_all(&external);
+}
+
+#[test]
 fn check_path_normalizes_parent_components_before_policy_matching() {
     let config = PermissionConfig {
         write: Some(ToolPerm::Granular(
@@ -1641,6 +1669,67 @@ fn allow_all_mcp_does_not_affect_non_mcp_tools() {
         "expected Denied for bash even with allow_all_mcp_calls, got {:?}",
         result,
     );
+}
+
+#[cfg(feature = "mcp")]
+#[test]
+fn allow_all_mcp_honours_read_only_and_plan_write_modes() {
+    for mode in [SecurityMode::ReadOnly, SecurityMode::PlanWrite] {
+        let mut checker = PermissionChecker::new(
+            &configs_from(PermissionConfig::default()),
+            mode,
+            None,
+            default_modes(),
+        )
+        .expect("valid permission test configuration");
+        checker.set_allow_all_mcp_calls(true);
+        let result = checker.check("mcp_tool", "mcp_tool:filesystem:delete_file");
+        assert!(
+            !matches!(result, CheckResult::Allowed),
+            "allow_all_mcp_calls must not allow a mutating MCP call in {mode:?}, got {result:?}",
+        );
+    }
+}
+
+#[test]
+fn fetch_exact_url_deny_matches_live_identity_with_destinations_suffix() {
+    let config = PermissionConfig {
+        web_fetch: Some(ToolPerm::Granular(
+            [("https://evil.example/secret".to_string(), Action::Deny)].into(),
+        )),
+        ..PermissionConfig::default()
+    };
+    let mut checker = PermissionChecker::new(
+        &configs_from(config),
+        SecurityMode::Standard,
+        None,
+        default_modes(),
+    )
+    .expect("valid permission test configuration");
+    let live = "https://evil.example/secret destinations=[93.184.216.34:443]";
+    assert!(matches!(
+        checker.check("web_fetch", live),
+        CheckResult::Denied(_)
+    ));
+}
+
+#[test]
+fn call_is_denied_probe_is_side_effect_free_and_checks_script_lines() {
+    let config = PermissionConfig {
+        bash: Some(ToolPerm::Granular(
+            [("git push*".to_string(), Action::Deny)].into(),
+        )),
+        ..PermissionConfig::default()
+    };
+    let checker = PermissionChecker::new(
+        &configs_from(config),
+        SecurityMode::Standard,
+        None,
+        default_modes(),
+    )
+    .expect("valid permission test configuration");
+    assert!(checker.call_is_denied("shell", "echo hi\ngit push origin"));
+    assert!(!checker.call_is_denied("shell", "echo hi"));
 }
 
 // --- todo_write convenience allowance ---
