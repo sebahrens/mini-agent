@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use rmcp::transport::auth::{
     AuthClient, AuthError, AuthorizationManager, AuthorizationRequest, AuthorizationSession,
-    CredentialStore, OAuthClientConfig, StoredCredentials,
+    CredentialRefreshGuard, CredentialStore, OAuthClientConfig, StoredCredentials,
 };
 
 use super::config::OAuthSettings;
@@ -23,6 +23,10 @@ use super::config::OAuthSettings;
 const CLIENT_NAME: &str = crate::product::PUBLIC_NAME;
 const MAX_CREDENTIAL_BYTES: u64 = 1024 * 1024;
 const MIGRATION_MARKER_VERSION: u8 = 1;
+/// Longest a process waits for another process's in-flight token refresh. The
+/// holder is bounded by rmcp's 30 s token-request timeout plus the save.
+const REFRESH_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
+const REFRESH_LOCK_POLL: Duration = Duration::from_millis(25);
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct MigrationMarker {
@@ -98,6 +102,7 @@ pub(crate) struct FileCredentialStore {
     legacy_dir: PathBuf,
     legacy_server_name: String,
     explicit_client_id: Option<String>,
+    refresh_lock_timeout: Duration,
 }
 
 impl FileCredentialStore {
@@ -118,6 +123,35 @@ impl FileCredentialStore {
             legacy_dir: paths.data_dir.join("mcp-oauth"),
             legacy_server_name: server_name.to_string(),
             explicit_client_id: settings.client_id.clone(),
+            refresh_lock_timeout: REFRESH_LOCK_TIMEOUT,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_refresh_lock_timeout(mut self, timeout: Duration) -> Self {
+        self.refresh_lock_timeout = timeout;
+        self
+    }
+
+    /// Hold the cross-process refresh lock until the returned guard drops.
+    ///
+    /// rmcp takes it before loading credentials and keeps it through the token
+    /// request and the save, so a second process waits, then loads the already
+    /// rotated refresh token instead of replaying the old one. It is a separate
+    /// file from the short load/save lock (which `load`/`save` take while this
+    /// is held) and is never held across interactive browser login. The wait is
+    /// bounded and a timeout is returned as an error.
+    pub(crate) fn acquire_refresh_lock_blocking(&self) -> Result<CredentialLock, AuthError> {
+        self.prepare_directories()?;
+        let lock_path = self.path.with_extension("json.refresh.lock");
+        CredentialLock::acquire_bounded(&lock_path, self.refresh_lock_timeout).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                AuthError::CredentialStoreError(
+                    "timed out waiting for another process to finish refreshing the MCP OAuth token; retry shortly".into(),
+                )
+            } else {
+                storage_error("lock", error.kind())
+            }
         })
     }
 
@@ -155,10 +189,7 @@ impl FileCredentialStore {
         })
     }
 
-    fn with_lock<T>(
-        &self,
-        operation: impl FnOnce() -> Result<T, AuthError>,
-    ) -> Result<T, AuthError> {
+    fn prepare_directories(&self) -> Result<(), AuthError> {
         let directory = self
             .path
             .parent()
@@ -168,8 +199,14 @@ impl FileCredentialStore {
             .ok_or_else(|| storage_error("resolve", std::io::ErrorKind::InvalidInput))?;
         ensure_private_directory(credential_root)
             .map_err(|error| storage_error("prepare", error.kind()))?;
-        ensure_private_directory(directory)
-            .map_err(|error| storage_error("prepare", error.kind()))?;
+        ensure_private_directory(directory).map_err(|error| storage_error("prepare", error.kind()))
+    }
+
+    fn with_lock<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, AuthError>,
+    ) -> Result<T, AuthError> {
+        self.prepare_directories()?;
         let lock_path = self.path.with_extension("json.lock");
         let _lock = CredentialLock::acquire(&lock_path)
             .map_err(|error| storage_error("lock", error.kind()))?;
@@ -400,11 +437,29 @@ fn secure_remove_file(path: &Path) -> std::io::Result<bool> {
     Ok(true)
 }
 
-struct CredentialLock {
+pub(crate) struct CredentialLock {
     file: std::fs::File,
 }
 
 impl CredentialLock {
+    /// Like [`Self::acquire`] but gives up with `TimedOut` after `timeout`.
+    fn acquire_bounded(path: &Path, timeout: Duration) -> std::io::Result<Self> {
+        let file = open_private_lock(path)?;
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if try_lock_exclusive(&file)? {
+                return Ok(Self { file });
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "credential refresh lock wait timed out",
+                ));
+            }
+            std::thread::sleep(REFRESH_LOCK_POLL);
+        }
+    }
+
     fn acquire(path: &Path) -> std::io::Result<Self> {
         let file = open_private_lock(path)?;
         lock_exclusive(&file)?;
@@ -545,6 +600,31 @@ fn lock_exclusive(file: &std::fs::File) -> std::io::Result<()> {
 
 #[cfg(unix)]
 #[allow(unsafe_code)]
+fn try_lock_exclusive(file: &std::fs::File) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    unsafe extern "C" {
+        fn flock(
+            file_descriptor: std::os::raw::c_int,
+            operation: std::os::raw::c_int,
+        ) -> std::os::raw::c_int;
+    }
+    loop {
+        // SAFETY: the descriptor remains owned by `file` for the duration of the call.
+        // 6 = LOCK_EX | LOCK_NB
+        if unsafe { flock(file.as_raw_fd(), 6) } == 0 {
+            return Ok(true);
+        }
+        let error = std::io::Error::last_os_error();
+        match error.kind() {
+            std::io::ErrorKind::Interrupted => {}
+            std::io::ErrorKind::WouldBlock => return Ok(false),
+            _ => return Err(error),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
 fn unlock_file(file: &std::fs::File) {
     use std::os::fd::AsRawFd;
     unsafe extern "C" {
@@ -580,6 +660,11 @@ fn secure_atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(windows)]
 fn lock_exclusive(file: &std::fs::File) -> std::io::Result<()> {
     windows_private::lock(file)
+}
+
+#[cfg(windows)]
+fn try_lock_exclusive(file: &std::fs::File) -> std::io::Result<bool> {
+    windows_private::try_lock(file)
 }
 
 #[cfg(windows)]
@@ -633,6 +718,14 @@ fn lock_exclusive(_file: &std::fs::File) -> std::io::Result<()> {
 }
 
 #[cfg(not(any(unix, windows)))]
+fn try_lock_exclusive(_file: &std::fs::File) -> std::io::Result<bool> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "MCP OAuth credential storage is unsupported on this platform",
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn unlock_file(_file: &std::fs::File) {}
 
 #[cfg(windows)]
@@ -672,6 +765,8 @@ mod windows_private {
     const DACL_SECURITY_INFORMATION: Dword = 0x0000_0004;
     const PROTECTED_DACL_SECURITY_INFORMATION: Dword = 0x8000_0000;
     const LOCKFILE_EXCLUSIVE_LOCK: Dword = 0x0000_0002;
+    const LOCKFILE_FAIL_IMMEDIATELY: Dword = 0x0000_0001;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
     const TOKEN_QUERY: Dword = 0x0000_0008;
     const TOKEN_USER_CLASS: Dword = 1;
     const ERROR_ALREADY_EXISTS: Dword = 183;
@@ -1204,6 +1299,29 @@ mod windows_private {
         }
     }
 
+    pub(super) fn try_lock(file: &std::fs::File) -> std::io::Result<bool> {
+        let mut overlapped = Overlapped::default();
+        if unsafe {
+            LockFileEx(
+                file.as_raw_handle(),
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                0,
+                u32::MAX,
+                u32::MAX,
+                &mut overlapped,
+            )
+        } != 0
+        {
+            return Ok(true);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_LOCK_VIOLATION) {
+            Ok(false)
+        } else {
+            Err(error)
+        }
+    }
+
     pub(super) fn unlock(file: &std::fs::File) {
         let mut overlapped = Overlapped::default();
         let _ =
@@ -1322,6 +1440,24 @@ impl CredentialStore for FileCredentialStore {
             crate::agent::runner::spawn_blocking_scoped(move || store.clear_blocking().map(|_| ()))
                 .await
                 .map_err(|_| storage_error("worker", std::io::ErrorKind::Other))?
+        })
+    }
+
+    fn acquire_refresh_guard<'life0, 'async_trait>(
+        &'life0 self,
+    ) -> StoreFuture<'async_trait, Option<CredentialRefreshGuard>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        let store = self.clone();
+        Box::pin(async move {
+            let lock = crate::agent::runner::spawn_blocking_scoped(move || {
+                store.acquire_refresh_lock_blocking()
+            })
+            .await
+            .map_err(|_| storage_error("worker", std::io::ErrorKind::Other))??;
+            Ok(Some(CredentialRefreshGuard::new(lock)))
         })
     }
 }

@@ -773,3 +773,174 @@ fn oauth_config_round_trips_through_serde() {
     };
     assert!(oauth.unwrap().settings().is_some());
 }
+
+/// Fake rotating token endpoint: each refresh request consumes its refresh
+/// token and issues `rt-<n+1>`. A replayed (already consumed) token is recorded
+/// and answered with `invalid_grant`. Responses are delayed so concurrent
+/// refreshers overlap unless something serializes them.
+fn spawn_rotating_token_endpoint() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let recorded = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let recorded = recorded.clone();
+            std::thread::spawn(move || {
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                loop {
+                    let n = stream.read(&mut chunk).unwrap_or(0);
+                    request.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&request).to_string();
+                    if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                        let length = head
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if body.len() >= length {
+                            break;
+                        }
+                    }
+                    if n == 0 {
+                        break;
+                    }
+                }
+                let text = String::from_utf8_lossy(&request).to_string();
+                let body = text.split_once("\r\n\r\n").map_or("", |(_, b)| b);
+                let presented = body
+                    .split('&')
+                    .find_map(|pair| pair.strip_prefix("refresh_token="))
+                    .unwrap_or("")
+                    .to_string();
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                let (status, payload) = {
+                    let mut seen = recorded.lock().unwrap();
+                    let current = format!("rt-{}", seen.iter().filter(|t| *t != "stale").count());
+                    let valid = presented == current;
+                    seen.push(if valid {
+                        presented.clone()
+                    } else {
+                        "stale".into()
+                    });
+                    if valid {
+                        let next = format!("rt-{}", seen.iter().filter(|t| *t != "stale").count());
+                        (
+                            "200 OK",
+                            format!(
+                                r#"{{"access_token":"at-{next}","token_type":"Bearer","expires_in":3600,"refresh_token":"{next}"}}"#
+                            ),
+                        )
+                    } else {
+                        (
+                            "400 Bad Request",
+                            r#"{"error":"invalid_grant"}"#.to_string(),
+                        )
+                    }
+                };
+                let _ = stream.write_all(
+                    format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}", payload.len()).as_bytes(),
+                );
+            });
+        }
+    });
+    (port, seen)
+}
+
+async fn refresh_manager(
+    store: oauth::FileCredentialStore,
+    token_port: u16,
+) -> rmcp::transport::auth::AuthorizationManager {
+    use rmcp::transport::auth::{AuthorizationManager, AuthorizationMetadata, OAuthClientConfig};
+    let mut manager = AuthorizationManager::new("http://127.0.0.1:9/mcp")
+        .await
+        .unwrap();
+    let metadata: AuthorizationMetadata = serde_json::from_value(serde_json::json!({
+        "authorization_endpoint": "http://127.0.0.1:1/authorize",
+        "token_endpoint": format!("http://127.0.0.1:{token_port}/token"),
+        "code_challenge_methods_supported": ["S256"]
+    }))
+    .unwrap();
+    manager.set_metadata(metadata);
+    manager.set_credential_store(store);
+    manager
+        .configure_client(OAuthClientConfig::new(
+            "client",
+            "http://127.0.0.1:1/callback",
+        ))
+        .unwrap();
+    manager
+}
+
+#[tokio::test]
+async fn concurrent_refreshers_sharing_stored_credentials_replay_no_refresh_token() {
+    let root = TempDir::new("refresh-serialized");
+    let paths = test_paths(root.path());
+    let settings = OAuthSettings::default();
+    let (port, seen) = spawn_rotating_token_endpoint();
+    let make_store = || {
+        oauth::FileCredentialStore::for_paths(&paths, "server", "https://example.com", &settings)
+            .unwrap()
+    };
+    let initial: rmcp::transport::auth::OAuthTokenResponse =
+        serde_json::from_value(serde_json::json!({
+            "access_token": "at-0",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "refresh_token": "rt-0"
+        }))
+        .unwrap();
+    make_store()
+        .write_blocking(&StoredCredentials::new(
+            "client".into(),
+            Some(initial),
+            Vec::new(),
+            Some(0),
+        ))
+        .unwrap();
+
+    // Two managers with separate store handles stand in for two processes.
+    let first = refresh_manager(make_store(), port).await;
+    let second = refresh_manager(make_store(), port).await;
+    let (a, b) = tokio::join!(first.refresh_token(), second.refresh_token());
+    a.expect("first refresh");
+    b.expect("second refresh uses the rotated token");
+
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen, ["rt-0", "rt-1"], "no refresh token may be replayed");
+    let saved = make_store().read_blocking().unwrap().unwrap();
+    let saved = serde_json::to_value(&saved).unwrap();
+    assert_eq!(saved["token_response"]["refresh_token"], "rt-2");
+}
+
+#[tokio::test]
+async fn refresh_waiting_on_another_process_times_out_visibly() {
+    use rmcp::transport::auth::CredentialStore;
+    let root = TempDir::new("refresh-timeout");
+    let paths = test_paths(root.path());
+    let settings = OAuthSettings::default();
+    let holder =
+        oauth::FileCredentialStore::for_paths(&paths, "server", "https://example.com", &settings)
+            .unwrap();
+    let waiter =
+        oauth::FileCredentialStore::for_paths(&paths, "server", "https://example.com", &settings)
+            .unwrap()
+            .with_refresh_lock_timeout(std::time::Duration::from_millis(150));
+    let guard = holder.acquire_refresh_guard().await.unwrap();
+    assert!(guard.is_some());
+    // The short load/save lock stays usable while a refresh is in flight.
+    holder.read_blocking().unwrap();
+    let error = match waiter.acquire_refresh_guard().await {
+        Ok(_) => panic!("must not acquire while another holder refreshes"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("timed out"), "{error}");
+    drop(guard);
+    assert!(waiter.acquire_refresh_guard().await.unwrap().is_some());
+}
