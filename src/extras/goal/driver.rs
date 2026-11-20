@@ -96,6 +96,7 @@ impl RoundCollector {
             }
             AgentEvent::ToolResult {
                 id,
+                name,
                 output,
                 is_error: true,
                 ..
@@ -104,7 +105,12 @@ impl RoundCollector {
                     self.failed_mutating += 1;
                     self.failure_hash = Some(fold_failure(self.failure_hash, &name, output));
                 }
-                if let Some(setting) = crate::agent::tools::user_gated_setting(output) {
+                // Only a refusal returned by the `task` tool itself counts, as in
+                // `summary_from_headless_turn`: a failing command whose output
+                // merely quotes the marker must not park a goal.
+                if name.as_str() == "task"
+                    && let Some(setting) = crate::agent::tools::user_gated_setting(output)
+                {
                     self.user_gate = Some(setting.to_string());
                 }
             }
@@ -446,24 +452,32 @@ pub(crate) const CONTEXT_FILE_BYTES: usize = 32 * 1024;
 
 /// Read at most [`CONTEXT_FILE_BYTES`] of the plan, clipped on a character
 /// boundary. A file that is not text is absent, like a missing one.
+///
+/// The plan lives in a workspace the agent can write, so it is read through the
+/// workspace binding: the final component is never followed as a symlink and
+/// only a regular file is opened (a FIFO or device is absent, never a hang).
+/// A relative path or one under the current directory binds that directory; any
+/// other absolute path was chosen by the user outside the workspace and binds
+/// its own parent. (mini-agent-xbkwf)
 fn read_context_file(path: &std::path::Path) -> Option<String> {
-    use std::io::Read;
-
-    let file = std::fs::File::open(path).ok()?;
-    let mut bytes = Vec::new();
+    let cwd = std::env::current_dir().ok();
+    let (root, relative) = match (path.is_absolute(), cwd) {
+        (false, Some(cwd)) => (cwd, path.to_path_buf()),
+        (true, Some(cwd)) if path.strip_prefix(&cwd).is_ok() => {
+            let relative = path.strip_prefix(&cwd).ok()?.to_path_buf();
+            (cwd, relative)
+        }
+        (true, _) => (
+            path.parent()?.to_path_buf(),
+            std::path::PathBuf::from(path.file_name()?),
+        ),
+        (false, None) => return None,
+    };
+    let binding = crate::paths::WorkspaceBinding::capture(&root).ok()?;
     // A few bytes past the cap tell a clipped file from one that fits, and
     // keep a character split by the cap decodable up to the boundary.
-    file.take(CONTEXT_FILE_BYTES as u64 + 4)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    let text = match std::str::from_utf8(&bytes) {
-        Ok(text) => text,
-        // Only a sequence cut short by the read limit is tolerated.
-        Err(error) if error.error_len().is_none() => {
-            std::str::from_utf8(&bytes[..error.valid_up_to()]).ok()?
-        }
-        Err(_) => return None,
-    };
+    let (text, _, _) = binding.read_relative_context_file(&relative, CONTEXT_FILE_BYTES + 4)?;
+    let text = text.as_str();
     Some(crate::extras::truncate::truncate_cjk(
         text,
         CONTEXT_FILE_BYTES,
@@ -752,6 +766,19 @@ mod tests {
         collector.observe(&event(refusal.to_string(), false));
         collector.observe(&event("task: unknown agent_type".into(), true));
         let g = goal();
+        assert_eq!(
+            collector.clone().finish(&g, RoundEnd::Done, 0).user_gate,
+            None
+        );
+        // The same marker quoted by another tool's failing output is not a
+        // refusal (mini-agent-7xb4a).
+        collector.observe(&AgentEvent::ToolResult {
+            id: CompactString::new("2"),
+            name: CompactString::new("bash"),
+            output: CompactString::new(refusal.to_string()),
+            images: Vec::new(),
+            is_error: true,
+        });
         assert_eq!(
             collector.clone().finish(&g, RoundEnd::Done, 0).user_gate,
             None
@@ -1149,6 +1176,28 @@ mod tests {
         let third = next_round(&g, &decision).expect("relaunch");
         assert!(!third.prompt.contains("second task"));
         assert!(third.prompt.contains("carry on"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A plan that is a symlink or a FIFO is absent, not read with the
+    /// harness's authority and not a hang (mini-agent-xbkwf).
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_or_special_context_file_is_absent() {
+        let dir = std::env::temp_dir().join(format!("goal-plan-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let secret = dir.join("secret.txt");
+        std::fs::write(&secret, "TOP SECRET").unwrap();
+        let link = dir.join("PLAN.md");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        assert_eq!(read_context_file(&link), None);
+        assert!(read_context_file(&secret).is_some(), "a regular file reads");
+
+        std::fs::remove_file(&link).unwrap();
+        let made = std::process::Command::new("mkfifo").arg(&link).status();
+        if made.is_ok_and(|status| status.success()) {
+            assert_eq!(read_context_file(&link), None);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

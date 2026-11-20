@@ -65,7 +65,6 @@ pub async fn run_with_interrupt<F>(
 where
     F: std::future::Future<Output = std::io::Result<()>>,
 {
-    let mut interrupted = false;
     let mut commands: Vec<(&str, VerificationKind)> = Vec::new();
     if request.run_verify_command
         && let Some(command) = cfg.verify_command.as_deref()
@@ -87,6 +86,7 @@ where
     let limits = limits(cfg);
     let mut verified = Vec::new();
     tokio::pin!(interrupt);
+    let mut interrupt_pending = true;
     for (command, kind) in commands {
         if let Err(error) = crate::spend::run::admit_current_effect().await {
             return (
@@ -102,22 +102,32 @@ where
         let cancellation = operation.cancellation();
         let wait = operation.wait();
         tokio::pin!(wait);
-        let result = tokio::select! {
-            // Poll the signal first so a handler is installed before the
-            // command can launch.
-            biased;
-            signal = &mut interrupt => {
-                interrupted = true;
-                cancellation.cancel();
-                // The scoped worker reports only once the group is terminated
-                // and its direct child reaped.
-                let result = wait.await;
-                if signal.is_err() {
-                    tracing::warn!("goal check interrupt handler failed");
+        let result = loop {
+            tokio::select! {
+                // Poll the signal first so a handler is installed before the
+                // command can launch. The guard fuses the interrupt future:
+                // once it has resolved it is never polled again.
+                biased;
+                signal = &mut interrupt, if interrupt_pending => {
+                    interrupt_pending = false;
+                    if signal.is_err() {
+                        // A handler that could not be installed is not an
+                        // interrupt (as in `unless_interrupted`): let the
+                        // check run to completion.
+                        tracing::warn!("goal check interrupt handler failed");
+                        continue;
+                    }
+                    cancellation.cancel();
+                    // The scoped worker reports only once the group is
+                    // terminated and its direct child reaped.
+                    let result = wait.await;
+                    return (
+                        Some(interrupted_outcome(command, &result, verified)),
+                        true,
+                    );
                 }
-                result
+                result = &mut wait => break result,
             }
-            result = &mut wait => result,
         };
         if !result.succeeded() {
             // Timeout, cancellation, an output-limit breach, a launch failure,
@@ -138,7 +148,7 @@ where
                     )),
                     verified: Vec::new(),
                 }),
-                interrupted,
+                false,
             );
         }
         if !verified.contains(&kind) {
@@ -152,8 +162,26 @@ where
             failure_tail: None,
             verified,
         }),
-        interrupted,
+        false,
     )
+}
+
+/// A check cut short by an interrupt: never evidence the objective was met,
+/// even when the cancelled command still exited zero.
+fn interrupted_outcome(
+    command: &str,
+    result: &crate::extras::validation::ValidationResult,
+    verified: Vec<VerificationKind>,
+) -> CheckOutcome {
+    CheckOutcome {
+        all_passed: false,
+        failure_tail: Some(format!(
+            "{} interrupted:\n{}",
+            crate::extras::validation::display_command(command),
+            result.render_tail(FAILURE_TAIL_CHARS)
+        )),
+        verified,
+    }
 }
 
 /// Whether the operator interrupted the tier while it was running.
@@ -369,5 +397,40 @@ mod tests {
             .is_none(),
             "a verify command that is not configured must not be reported as verified"
         );
+    }
+
+    /// A failing interrupt handler is not an interrupt: the check runs to
+    /// completion (mini-agent-eonky).
+    #[tokio::test]
+    async fn a_failed_interrupt_handler_does_not_cancel_the_check() {
+        let goal = goal_with(&["true", "true"]);
+        let (outcome, interrupted) = run_with_interrupt(
+            &goal,
+            &request(false, true),
+            &sandbox(),
+            &Default::default(),
+            async { Err(std::io::Error::other("no signal handler")) },
+        )
+        .await;
+        assert!(!interrupted);
+        assert!(outcome.expect("checks ran").all_passed);
+    }
+
+    /// An interrupt ends the tier at once, even when the cancelled command
+    /// still exited zero, and the resolved interrupt is never polled again
+    /// (mini-agent-kmmni).
+    #[tokio::test]
+    async fn an_interrupt_stops_the_tier_and_is_polled_once() {
+        let goal = goal_with(&["true", "true"]);
+        let (outcome, interrupted) = run_with_interrupt(
+            &goal,
+            &request(false, true),
+            &sandbox(),
+            &Default::default(),
+            async { Ok(()) },
+        )
+        .await;
+        assert!(interrupted);
+        assert!(!outcome.expect("outcome").all_passed);
     }
 }
