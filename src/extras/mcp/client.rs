@@ -139,7 +139,11 @@ where
                 if let Some(hint) = retry_after_hint(&error) {
                     delay = delay.max(hint);
                 }
-                if tokio::time::Instant::now() + delay >= deadline {
+                // checked_add: a hostile Retry-After near u64::MAX would panic on `+`.
+                if tokio::time::Instant::now()
+                    .checked_add(delay)
+                    .is_none_or(|due| due >= deadline)
+                {
                     return Err(error);
                 }
                 tracing::debug!(

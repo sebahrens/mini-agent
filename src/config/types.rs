@@ -968,6 +968,10 @@ pub struct LspServerConfig {
     /// selects [`LspServerConfig::DEFAULT_REQUEST_TIMEOUT_MS`]; clamped to
     /// 1000..=[`LspServerConfig::MAX_TIMEOUT_MS`].
     pub request_timeout_ms: Option<u64>,
+    /// `languageId` sent in `textDocument/didOpen` for every file this server
+    /// handles. Absent uses the built-in extension mapping, and for an
+    /// unmapped extension the extension text itself.
+    pub language_id: Option<CompactString>,
 }
 
 #[cfg(feature = "lsp")]

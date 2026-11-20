@@ -829,6 +829,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn first_connect_huge_retry_after_stops_retries_without_panicking() {
+        use super::super::client::retry_transient_connect;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&attempts);
+        let result: anyhow::Result<()> = retry_transient_connect(
+            || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Err(anyhow::anyhow!(
+                        "HTTP 503 Service Unavailable [retry-after: 18446744073709551615]: down"
+                    ))
+                }
+            },
+            3,
+            Duration::from_millis(5),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn first_connect_retries_429_and_408_and_honours_retry_after() {
         use super::super::client::retry_transient_connect;
         for status in ["HTTP 429 Too Many Requests", "HTTP 408 Request Timeout"] {

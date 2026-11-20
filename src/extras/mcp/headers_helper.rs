@@ -225,6 +225,12 @@ fn parse_output(output: &[u8]) -> Result<HashMap<String, String>, &'static str> 
         if value.len() > MAX_VALUE_BYTES || http::HeaderValue::from_str(value).is_err() {
             return Err("printed an invalid or oversized header value");
         }
+        if headers
+            .keys()
+            .any(|seen: &String| seen.eq_ignore_ascii_case(name))
+        {
+            return Err("printed the same header name twice (case-insensitively)");
+        }
         headers.insert(name.clone(), value.to_owned());
     }
     Ok(headers)
@@ -309,6 +315,14 @@ mod tests {
         assert!(!headers.contains_key("Authorization"));
         assert_eq!(headers.get("x-static").map(String::as_str), Some("keep"));
         assert_eq!(headers.get("X-Extra").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn duplicate_header_names_differing_only_in_case_are_rejected() {
+        let error = parse_output(br#"{"Authorization":"Bearer a","authorization":"Bearer b"}"#)
+            .unwrap_err();
+        assert!(error.contains("twice"));
+        assert!(parse_output(br#"{"Authorization":"Bearer a","X-Other":"b"}"#).is_ok());
     }
 
     #[tokio::test]

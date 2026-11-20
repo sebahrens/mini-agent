@@ -546,6 +546,8 @@ pub struct LspClient {
     progress: Arc<ProgressState>,
     /// Deadline of one navigation request (`request_timeout_ms`).
     request_timeout: Duration,
+    /// Configured `language_id`, sent in didOpen instead of the extension map.
+    language_id: Option<String>,
     #[cfg(test)]
     sync_probes: Mutex<std::collections::VecDeque<SyncProbe>>,
     #[cfg(test)]
@@ -880,6 +882,7 @@ impl LspClient {
             capabilities: std::sync::OnceLock::new(),
             progress,
             request_timeout: cfg.request_timeout(),
+            language_id: cfg.language_id.as_ref().map(|id| id.to_string()),
             #[cfg(test)]
             sync_probes: Mutex::new(std::collections::VecDeque::new()),
             #[cfg(test)]
@@ -1033,10 +1036,32 @@ impl LspClient {
         self.touch();
         match response {
             Ok(Ok(resp)) => Some(resp),
-            _ => {
+            other => {
                 tracing::debug!("lsp[{}]: '{}' timed out", self.name, method);
+                if other.is_err() && !matches!(method, "initialize" | "shutdown") {
+                    self.cancel_request(id).await;
+                }
                 None
             }
+        }
+    }
+
+    /// Best-effort `$/cancelRequest` so a server does not keep computing an
+    /// answer nobody awaits (a repeated slow query would queue duplicate work
+    /// on a single-threaded server). Skipped when the writer is busy, so a
+    /// stuck pipe is never waited on here; the short deadline bounds the rest.
+    /// A frame abandoned midway still closes the transport, as for any write.
+    async fn cancel_request(&self, id: i64) {
+        if self.stdin.try_lock().is_err() {
+            return;
+        }
+        let msg = json!({"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": id}});
+        if let Ok(body) = serde_json::to_vec(&msg) {
+            let deadline = self
+                .transport
+                .write_timeout()
+                .min(Duration::from_millis(250));
+            write_owned_frame_with_deadline(&self.stdin, &self.transport, &body, deadline).await;
         }
     }
 
@@ -1389,7 +1414,7 @@ impl LspClient {
                     "textDocument/didOpen",
                     json!({
                         "textDocument": {
-                            "uri": wire_uri, "languageId": language_id(path),
+                            "uri": wire_uri, "languageId": language_id(path, self.language_id.as_deref()),
                             "version": 1, "text": text
                         }
                     }),
@@ -2285,7 +2310,23 @@ pub(crate) fn store_diagnostics_for_test(
 
 /// LSP `languageId` for didOpen. Servers mostly infer from the extension,
 /// but a correct id avoids ambiguity on shared extensions (`.h`, `.m`).
-fn language_id(path: &Path) -> &'static str {
+/// A configured id wins; an unmapped extension is sent as its own text (so a
+/// custom `.hs` server is not told the file is plain text).
+fn language_id(path: &Path, configured: Option<&str>) -> String {
+    if let Some(id) = configured.filter(|id| !id.is_empty()) {
+        return id.to_owned();
+    }
+    let known = builtin_language_id(path);
+    if known != "plaintext" {
+        return known.to_owned();
+    }
+    path.extension()
+        .and_then(|e| e.to_str())
+        .filter(|e| !e.is_empty())
+        .map_or_else(|| known.to_owned(), str::to_ascii_lowercase)
+}
+
+fn builtin_language_id(path: &Path) -> &'static str {
     match path
         .extension()
         .and_then(|e| e.to_str())
@@ -2326,6 +2367,15 @@ fn language_id(path: &Path) -> &'static str {
 #[cfg(test)]
 mod boundary_tests {
     use super::*;
+
+    #[test]
+    fn language_id_prefers_config_then_builtin_then_extension() {
+        let p = |s: &str| PathBuf::from(s);
+        assert_eq!(language_id(&p("a.hs"), Some("haskell")), "haskell");
+        assert_eq!(language_id(&p("a.rs"), None), "rust");
+        assert_eq!(language_id(&p("a.HS"), None), "hs");
+        assert_eq!(language_id(&p("Makefile"), None), "plaintext");
+    }
 
     #[cfg(unix)]
     #[test]

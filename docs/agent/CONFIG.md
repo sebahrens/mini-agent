@@ -4332,6 +4332,7 @@ extensions = [".my"]
 # wait_ms = 1000             # post-edit diagnostics wait (default 1000, max 60000)
 # startup_timeout_ms = 15000 # initialize handshake deadline (default 15000, clamped 1000-300000)
 # request_timeout_ms = 10000 # per navigation request deadline for the lsp tool (default 10000, clamped 1000-300000)
+# language_id = "haskell"    # languageId sent in didOpen (default: built-in extension map, else the extension text)
 # [lsp.servers.myserver.settings.python.analysis]  # answered for workspace/configuration and pushed
 # typeCheckingMode = "strict"                      # via workspace/didChangeConfiguration
 ```

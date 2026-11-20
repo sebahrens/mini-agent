@@ -722,6 +722,20 @@ fn external_location(uri: &str) -> Option<PathBuf> {
     if !path.is_absolute() {
         return None;
     }
+    // A `file://host/share/..` URI becomes a UNC path on Windows, and
+    // canonicalizing it would open an SMB connection (NTLM leak, blocking
+    // network call) before any permission check. Refuse before touching it.
+    #[cfg(windows)]
+    if matches!(
+        path.components().next(),
+        Some(std::path::Component::Prefix(prefix))
+            if matches!(
+                prefix.kind(),
+                std::path::Prefix::UNC(..) | std::path::Prefix::VerbatimUNC(..)
+            )
+    ) {
+        return None;
+    }
     let canonical = std::fs::canonicalize(path).ok()?;
     let text = canonical.to_str()?;
     if text.len() > MAX_EXTERNAL_PATH_BYTES || text.chars().any(char::is_control) {

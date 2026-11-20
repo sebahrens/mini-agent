@@ -709,6 +709,8 @@ impl FetchResolver for RuntimeFetchResolver {
         if permission_bridge.is_cancelled() {
             return Err(FetchError::Cancelled);
         }
+        // `Url::host_str` brackets IPv6 literals; strip them as the native web tools do.
+        let host = host.trim_matches(['[', ']']);
         if let Ok(address) = host.parse::<IpAddr>() {
             return Ok(vec![SocketAddr::new(address, port)]);
         }
@@ -5565,6 +5567,23 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(lookup.active(), expected);
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[tokio::test]
+    async fn js_fetch_resolver_accepts_bracketed_ipv6_literals() {
+        let resolver = RuntimeFetchResolver::new(tokio::runtime::Handle::current());
+        let owner = PermissionBridgeOwner::new(None, None, STEP_TIMEOUT);
+        let addresses = resolver
+            .resolve("[2606:4700:4700::1111]", 443, &owner.bridge())
+            .expect("bracketed IPv6 literal resolves without DNS");
+        assert_eq!(
+            addresses,
+            vec![SocketAddr::new(
+                "2606:4700:4700::1111".parse().unwrap(),
+                443
+            )]
+        );
     }
 
     #[cfg(feature = "sandbox")]
