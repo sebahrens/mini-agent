@@ -978,7 +978,7 @@ pub fn apply(
         reason: decision.reason().to_string(),
         source,
         evidence,
-        at: compact_str::CompactString::new(chrono::Utc::now().to_rfc3339()),
+        at: super::now_rfc3339(),
     });
     goal.touch();
 }

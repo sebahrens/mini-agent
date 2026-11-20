@@ -570,7 +570,28 @@ impl std::fmt::Display for GoalError {
 impl std::error::Error for GoalError {}
 
 fn now_rfc3339() -> CompactString {
-    CompactString::new(chrono::Utc::now().to_rfc3339())
+    CompactString::new(now_rfc3339_string())
+}
+
+/// Current UTC time as RFC 3339 with a `+00:00` offset and the shortest of
+/// 0/3/6/9 fractional digits (byte-identical to the previous output).
+fn now_rfc3339_string() -> String {
+    format_rfc3339_utc(jiff::Timestamp::now())
+}
+
+fn format_rfc3339_utc(ts: jiff::Timestamp) -> String {
+    let base = ts.strftime("%Y-%m-%dT%H:%M:%S").to_string();
+    let nanos = ts.subsec_nanosecond();
+    let frac = if nanos == 0 {
+        String::new()
+    } else if nanos % 1_000_000 == 0 {
+        format!(".{:03}", nanos / 1_000_000)
+    } else if nanos % 1_000 == 0 {
+        format!(".{:06}", nanos / 1_000)
+    } else {
+        format!(".{nanos:09}")
+    };
+    format!("{base}{frac}+00:00")
 }
 
 /// A persistent objective and everything the harness needs to pursue it.
@@ -1174,6 +1195,23 @@ impl StoredGoal {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rfc3339_utc_matches_previous_output() {
+        let f = |s: i64, n: i32| super::format_rfc3339_utc(jiff::Timestamp::new(s, n).unwrap());
+        assert_eq!(f(1_795_170_467, 0), "2026-11-20T10:27:47+00:00");
+        assert_eq!(
+            f(1_795_170_467, 123_000_000),
+            "2026-11-20T10:27:47.123+00:00"
+        );
+        assert_eq!(
+            f(1_795_170_467, 123_456_000),
+            "2026-11-20T10:27:47.123456+00:00"
+        );
+        assert_eq!(f(1_795_170_467, 5), "2026-11-20T10:27:47.000000005+00:00");
+        let parsed: jiff::Timestamp = "2026-11-20T10:27:47.123+00:00".parse().unwrap();
+        assert_eq!(parsed.as_second(), 1_795_170_467);
+    }
+
     use super::*;
 
     fn goal() -> Goal {
