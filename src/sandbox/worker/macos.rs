@@ -778,6 +778,8 @@ impl PendingGuardian {
             input: super::child_stdin_file(input),
             output: super::child_stdout_file(output),
             stderr: super::child_stderr_file(stderr),
+            observed_exit: None,
+            root_reaped: false,
             #[cfg(test)]
             reap_observer: None,
             #[cfg(test)]
@@ -2723,7 +2725,12 @@ impl WorkerChild {
 
     pub(super) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         release_reaped_guardian(&mut self.heartbeat)?;
-        self.child.try_wait()
+        super::observe_exit_without_reaping(&self.child)
+    }
+
+    /// Reaps the root after `try_wait` observed its exit and the group was signalled.
+    pub(super) fn reap_exited(&mut self) -> io::Result<ExitStatus> {
+        self.child.wait()
     }
 }
 

@@ -312,6 +312,15 @@ pub(crate) struct WorkerProcess {
     pub(crate) input: File,
     pub(crate) output: File,
     pub(crate) stderr: File,
+    /// The root's exit as observed without reaping it (see [`observe_exit_without_reaping`]).
+    /// The unreaped zombie keeps the worker's process-group id reserved, so the group stays
+    /// owned until teardown has signalled it.
+    #[cfg(unix)]
+    observed_exit: Option<ExitStatus>,
+    /// The root was reaped, which releases its pid and process-group id for reuse. Teardown
+    /// reaps only after the group kill, and never signals the group once this is set.
+    #[cfg(unix)]
+    root_reaped: bool,
     #[cfg(test)]
     reap_observer: Option<Arc<AtomicUsize>>,
     #[cfg(test)]
@@ -372,7 +381,25 @@ impl WorkerProcess {
     }
 
     pub(crate) fn terminate_tree(&mut self) -> io::Result<()> {
+        // A reaped root released its process-group id, which may already name an unrelated
+        // group; the group was signalled before the reap, so nothing is owed.
+        #[cfg(unix)]
+        if self.root_reaped {
+            return Ok(());
+        }
         let result = self.process.terminate_tree();
+        // Darwin reports EPERM, not ESRCH, when a group holds only zombies, which is the state
+        // here once the observed root has exited and no signalable descendant remains. A live
+        // same-user member would have been signalled successfully instead.
+        #[cfg(target_os = "macos")]
+        let result = match result {
+            Err(error)
+                if self.observed_exit.is_some() && error.raw_os_error() == Some(libc::EPERM) =>
+            {
+                Ok(())
+            }
+            other => other,
+        };
         #[cfg(test)]
         if self.force_tree_termination_error {
             return Err(io::Error::other("forced tree-termination failure"));
@@ -380,13 +407,42 @@ impl WorkerProcess {
         result
     }
 
+    /// Reports the root's exit status. On Unix the root is only observed (`waitid` with
+    /// `WNOWAIT`), never reaped here: it stays a zombie holding its process-group id until
+    /// `terminate_and_reap` (or `Drop`) has signalled the group.
     pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        let status = self.process.try_wait()?;
-        if status.is_some() {
-            self.process.retire_after_reap()?;
-            self.notify_reaped();
+        #[cfg(unix)]
+        {
+            if self.observed_exit.is_none() {
+                self.observed_exit = self.process.try_wait()?;
+                if self.observed_exit.is_some() {
+                    // The worker has stopped running; only its pid and group id are still held.
+                    self.notify_reaped();
+                }
+            }
+            Ok(self.observed_exit)
         }
-        Ok(status)
+        #[cfg(not(unix))]
+        {
+            let status = self.process.try_wait()?;
+            if status.is_some() {
+                self.process.retire_after_reap()?;
+                self.notify_reaped();
+            }
+            Ok(status)
+        }
+    }
+
+    /// Reaps the already observed, exited root and completes its platform retirement.
+    #[cfg(unix)]
+    fn reap_observed_root(&mut self) -> io::Result<()> {
+        if self.root_reaped {
+            return Ok(());
+        }
+        self.process.reap_exited()?;
+        self.root_reaped = true;
+        self.process.retire_after_reap()?;
+        Ok(())
     }
 
     /// Terminates the complete containment tree and waits a bounded time for its root to reap.
@@ -395,20 +451,16 @@ impl WorkerProcess {
         let root_status = self.try_wait()?;
         // Teardown must target the containment tree even if the root has already exited: an old
         // descendant may still own a protocol-pipe clone and otherwise outlive its generation.
+        // The root is still unreaped here (a zombie keeps its group id reserved), so the group
+        // is signalled while it is still owned and the root is reaped only afterwards.
         let mut termination_error = self.terminate_tree().err();
         if let Some(status) = root_status {
-            return match termination_error.take() {
-                Some(error) => Err(error),
-                None => Ok(status),
-            };
+            return self.finish_exited(status, termination_error.take());
         }
 
         loop {
             if let Some(status) = self.try_wait()? {
-                return match termination_error.take() {
-                    Some(error) => Err(error),
-                    None => Ok(status),
-                };
+                return self.finish_exited(status, termination_error.take());
             }
             if Instant::now() >= deadline {
                 return Err(termination_error.unwrap_or_else(|| {
@@ -420,6 +472,21 @@ impl WorkerProcess {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// Reaps the exited root once the group kill succeeded. After a failed kill the zombie is
+    /// kept so a later teardown can retry against a group id that is still reserved.
+    fn finish_exited(
+        &mut self,
+        status: ExitStatus,
+        termination_error: Option<io::Error>,
+    ) -> io::Result<ExitStatus> {
+        if let Some(error) = termination_error {
+            return Err(error);
+        }
+        #[cfg(unix)]
+        self.reap_observed_root()?;
+        Ok(status)
     }
 
     #[cfg(test)]
@@ -483,6 +550,12 @@ impl Drop for WorkerProcess {
         // This is the last-resort path for cancellation by caller-future drop. It is bounded so
         // synchronous destruction cannot hang an async executor indefinitely.
         let _ = self.terminate_and_reap(Duration::from_millis(500));
+        // Last resort: if the group kill kept failing, still do not leave a zombie behind. No
+        // further group signal is sent after this reap.
+        #[cfg(unix)]
+        if self.observed_exit.is_some() {
+            let _ = self.reap_observed_root();
+        }
     }
 }
 
@@ -491,6 +564,50 @@ impl Drop for WorkerProcess {
 #[cfg(target_os = "linux")]
 pub(crate) fn linux_cpu_limit_seconds() -> u64 {
     platform::cpu_limit_seconds()
+}
+
+/// Reports whether `child` has exited without reaping it: the zombie keeps its pid and
+/// process-group id reserved. The status is rebuilt from the `waitid` record into the raw
+/// wait-status encoding `ExitStatus` expects.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn observe_exit_without_reaping(child: &std::process::Child) -> io::Result<Option<ExitStatus>> {
+    use std::os::unix::process::ExitStatusExt;
+
+    let pid = libc::id_t::from(child.id());
+    loop {
+        // SAFETY: an all-zero siginfo_t is a valid initial value.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: P_PID names this worker's own unreaped child; WNOHANG|WNOWAIT neither blocks
+        // nor reaps. waitid writes only through the exclusive `info` pointer during the call.
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        // SAFETY: waitid succeeded, so the siginfo_t members read here are initialised.
+        let (waited, code, value) = unsafe { (info.si_pid(), info.si_code, info.si_status()) };
+        if waited == 0 {
+            return Ok(None);
+        }
+        let raw = match code {
+            libc::CLD_EXITED => (value & 0xff) << 8,
+            libc::CLD_KILLED => value & 0x7f,
+            libc::CLD_DUMPED => (value & 0x7f) | 0x80,
+            _ => return Ok(None),
+        };
+        return Ok(Some(ExitStatus::from_raw(raw)));
+    }
 }
 
 #[cfg(unix)]
@@ -721,6 +838,10 @@ impl WorkerLauncher for TestWorkerLauncher {
             input: child_stdin_file(input),
             output: child_stdout_file(output),
             stderr: child_stderr_file(stderr),
+            #[cfg(unix)]
+            observed_exit: None,
+            #[cfg(unix)]
+            root_reaped: false,
             reap_observer: None,
             force_tree_termination_error: false,
             authenticated_ready_observer: None,
@@ -1064,6 +1185,7 @@ mod tests {
         assert_eq!(reaps.load(Ordering::Acquire), 0);
     }
 
+    #[cfg(not(unix))]
     #[test]
     fn worker_root_exit_does_not_mask_tree_termination_failure() {
         let mut process = TestWorkerLauncher::current_test_process()
@@ -1078,6 +1200,71 @@ mod tests {
             .terminate_and_reap(Duration::from_millis(50))
             .expect_err("a cached root status must not hide tree-termination failure");
         assert_eq!(error.to_string(), "forced tree-termination failure");
+    }
+
+    /// A failed group kill must not be hidden by the root's exit, and must leave the root
+    /// unreaped (its zombie keeps the group id reserved) so the kill can be retried.
+    #[cfg(unix)]
+    #[test]
+    fn worker_root_exit_does_not_mask_tree_termination_failure() {
+        let mut process = TestWorkerLauncher::current_test_process()
+            .launch()
+            .expect("test launcher should start the current test executable");
+        process.force_tree_termination_error_for_test();
+        let error = process
+            .terminate_and_reap(Duration::from_secs(5))
+            .expect_err("tree-termination failure must surface");
+        assert_eq!(error.to_string(), "forced tree-termination failure");
+        assert!(
+            !process.root_reaped,
+            "a failed group kill must not reap the root"
+        );
+
+        let error = process
+            .terminate_and_reap(Duration::from_millis(50))
+            .expect_err("a cached root status must not hide tree-termination failure");
+        assert_eq!(error.to_string(), "forced tree-termination failure");
+    }
+
+    /// The root stays an unreaped zombie (so its pid and group id cannot be reused) while its
+    /// exit is observed; it is reaped only by teardown, after which the group is never
+    /// signalled again.
+    #[cfg(unix)]
+    #[test]
+    fn exited_root_is_not_reaped_before_the_group_kill_and_group_is_not_signalled_after() {
+        let mut process = TestWorkerLauncher::current_test_process()
+            .launch()
+            .expect("test launcher should start the current test executable");
+        let pid = process.id();
+        // Kill only the root so it exits on its own while we merely observe it.
+        let root = nix::unistd::Pid::from_raw(pid as i32);
+        nix::sys::signal::kill(root, nix::sys::signal::Signal::SIGKILL)
+            .expect("kill the test root");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let observed = loop {
+            if let Some(status) = process.try_wait().expect("observe root exit") {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "root did not exit");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(observed.signal(), Some(libc::SIGKILL));
+        assert!(!process.root_reaped);
+        // Still owned: the zombie keeps the group id, so the group can be signalled.
+        nix::sys::signal::kill(root, None).expect("the unreaped zombie root must still exist");
+
+        let status = process
+            .terminate_and_reap(Duration::from_secs(5))
+            .expect("teardown should signal the group, then reap the root");
+        assert_eq!(status, observed);
+        assert!(process.root_reaped);
+
+        // A forced failure would surface if the group kill were issued again.
+        process.force_tree_termination_error_for_test();
+        process
+            .terminate_and_reap(Duration::from_millis(50))
+            .expect("a reaped worker needs no second group kill");
     }
 
     #[test]
