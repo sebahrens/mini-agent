@@ -1663,9 +1663,28 @@ mod tests {
             stdout.contains("cargo ") && stdout.contains("test result: ok. 1 passed;"),
             "{stdout}"
         );
+        // Cargo 1.100 moved intermediate artifacts (`deps/`) out of
+        // `target/` into a separate build directory under CARGO_HOME, so only
+        // require that the compiled test binary landed inside the owned
+        // workspace, wherever this Cargo version puts it.
+        fn holds_test_binary(dir: &std::path::Path) -> bool {
+            std::fs::read_dir(dir).is_ok_and(|entries| {
+                entries.flatten().any(|entry| {
+                    let path = entry.path();
+                    if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                        holds_test_binary(&path)
+                    } else {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with("profile100_home_rustup-")
+                    }
+                })
+            })
+        }
         assert!(
-            fixture.cwd.join("target/debug/deps").is_dir(),
-            "no target/debug/deps in the workspace; workspace entries: {:?}; target entries: {:?}\nstdout:\n{stdout}\nstderr:\n{}",
+            fixture.cwd.join("target/debug").is_dir() && holds_test_binary(&fixture.cwd),
+            "no compiled test binary in the workspace; workspace entries: {:?}; target entries: {:?}\nstdout:\n{stdout}\nstderr:\n{}",
             std::fs::read_dir(&fixture.cwd).map(|entries| entries
                 .flatten()
                 .map(|entry| entry.file_name())
