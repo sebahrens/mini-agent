@@ -331,7 +331,9 @@ fn render_main_menu(ctx: &Ctx) -> io::Result<()> {
         for name in &providers {
             let type_str = provider_type_display(name, &ctx.cfg);
             write_line(row, 4, name, Color::White)?;
-            write_line(row, 4 + name.len() as u16 + 2, &type_str, Color::DarkGrey)?;
+            let type_col =
+                (4 + crate::ui::utils::display_width(name) + 2).min(u16::MAX as usize) as u16;
+            write_line(row, type_col, &type_str, Color::DarkGrey)?;
             row += 1;
         }
     }

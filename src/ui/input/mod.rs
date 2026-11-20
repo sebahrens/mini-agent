@@ -519,7 +519,9 @@ impl InputEditor {
     /// rewind flow to drop the chosen user turn back into the box for editing.
     pub fn load_text(&mut self, text: &str) {
         self.clear_undo();
-        self.buffer = CompactString::new(text);
+        // History text (imported or foreign sessions) is untrusted: strip
+        // escape sequences and tabs exactly as for a paste.
+        self.buffer = CompactString::new(sanitize_paste(text));
         // `cursor` is a byte offset into `buffer` (sliced as `buffer[..cursor]`
         // and advanced by `len_utf8()` elsewhere), so end-of-buffer is the byte
         // length, not the char count — they differ for multi-byte (e.g. CJK) text.
@@ -2357,6 +2359,17 @@ mod settings_history_tests {
         assert!(input.handle_picker_key(KeyCode::Enter.into()));
         assert_eq!(input.buffer, "/config --project sandbox true");
         assert!(!input.picker.as_ref().unwrap().active());
+    }
+
+    #[test]
+    fn load_text_strips_escape_sequences_and_tabs() {
+        // mini-agent-x894j: history text must not reach the terminal raw.
+        let mut input = InputEditor::new();
+        input.load_text("a\x1b]52;c;ZXZpbA==\x07b\tc\nnext");
+        assert!(!input.buffer.contains('\x1b'));
+        assert!(!input.buffer.contains('\t'));
+        assert!(input.buffer.starts_with('a') && input.buffer.ends_with("c\nnext"));
+        assert_eq!(input.cursor, input.buffer.len());
     }
 
     #[test]

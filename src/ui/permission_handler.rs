@@ -13,6 +13,31 @@ use crate::ui::utils::suggest_pattern;
 
 use super::{C_ERROR, C_PERM};
 
+/// Keystrokes already queued (or in flight) when an overlay opens were typed
+/// for the draft, not for the prompt. Answer keys are ignored for this long
+/// after the overlay appears; Esc and Ctrl+C/D always work immediately.
+#[cfg(not(test))]
+const PROMPT_ARMING_DELAY: std::time::Duration = std::time::Duration::from_millis(350);
+#[cfg(test)]
+const PROMPT_ARMING_DELAY: std::time::Duration = std::time::Duration::ZERO;
+
+/// True when `event` is a key that must be discarded because the prompt that
+/// opened `elapsed` ago is not armed yet. Abort keys are never premature.
+pub(super) fn premature_prompt_key(
+    event: &UserEvent,
+    elapsed: std::time::Duration,
+    delay: std::time::Duration,
+) -> bool {
+    match event {
+        UserEvent::Key(key) => elapsed < delay && classify_prompt_key(*key) != PromptInput::Abort,
+        _ => false,
+    }
+}
+
+pub(super) fn prompt_arming_delay() -> std::time::Duration {
+    PROMPT_ARMING_DELAY
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PromptInput {
     AllowOnce,
@@ -168,6 +193,8 @@ pub(crate) struct PermissionState {
     instruction: Option<String>,
     /// Draft of a deny note while the user is typing one for this request.
     note: Option<String>,
+    /// When the overlay opened; answer keys are ignored briefly after this.
+    opened: std::time::Instant,
 }
 
 pub(crate) enum PermissionEvent {
@@ -230,6 +257,7 @@ impl PermissionState {
             was_at_bottom: !renderer.is_scrolling(),
             instruction: None,
             note: None,
+            opened: std::time::Instant::now(),
         };
         state.show(renderer)?;
         renderer.set_activity(crate::ui::terminal::AgentActivity::WaitingForApproval)?;
@@ -250,6 +278,7 @@ impl PermissionState {
             was_at_bottom: !renderer.is_scrolling(),
             instruction: Some(String::new()),
             note: None,
+            opened: std::time::Instant::now(),
         };
         state.show_instruction(renderer)?;
         Ok(state)
@@ -401,6 +430,9 @@ impl PermissionState {
             renderer.resize();
             renderer.invalidate();
             draw_prompt(renderer)?;
+            return Ok(PermissionEvent::Waiting);
+        }
+        if premature_prompt_key(event, self.opened.elapsed(), PROMPT_ARMING_DELAY) {
             return Ok(PermissionEvent::Waiting);
         }
         if let Some(note) = self.note.as_mut() {
@@ -784,6 +816,36 @@ fn record_session_grants(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn type_ahead_keys_are_discarded_until_the_prompt_is_armed() {
+        use std::time::Duration;
+        let delay = Duration::from_millis(350);
+        let key = |code, mods| UserEvent::Key(KeyEvent::new(code, mods));
+        let early = Duration::from_millis(10);
+        for code in ['a', 'p', 'f', 'w', 'y', 't'] {
+            assert!(premature_prompt_key(
+                &key(KeyCode::Char(code), KeyModifiers::NONE),
+                early,
+                delay
+            ));
+        }
+        assert!(!premature_prompt_key(
+            &key(KeyCode::Char('a'), KeyModifiers::NONE),
+            delay,
+            delay
+        ));
+        assert!(!premature_prompt_key(
+            &key(KeyCode::Esc, KeyModifiers::NONE),
+            early,
+            delay
+        ));
+        assert!(!premature_prompt_key(
+            &key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            early,
+            delay
+        ));
+    }
 
     #[test]
     fn control_c_and_d_abort_permission_prompt() {
