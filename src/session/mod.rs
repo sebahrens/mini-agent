@@ -22,6 +22,31 @@ use compact_str::CompactString;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// RFC 3339 text for a UTC instant in the exact shape older builds wrote:
+/// `+00:00` offset and a fraction trimmed to 0, 3, 6 or
+/// 9 digits. Persisted session files carry these strings, so the format must
+/// not drift.
+pub(crate) fn rfc3339_utc(ts: jiff::Timestamp) -> String {
+    let base = ts.strftime("%Y-%m-%dT%H:%M:%S").to_string();
+    let nanos = ts.subsec_nanosecond();
+    if nanos == 0 {
+        format!("{base}+00:00")
+    } else if nanos % 1_000_000 == 0 {
+        format!("{base}.{:03}+00:00", nanos / 1_000_000)
+    } else if nanos % 1_000 == 0 {
+        format!("{base}.{:06}+00:00", nanos / 1_000)
+    } else {
+        format!("{base}.{nanos:09}+00:00")
+    }
+}
+
+/// Seconds elapsed since an RFC 3339 timestamp (negative when it is in the
+/// future), or `None` when the text does not parse.
+pub(crate) fn seconds_since_rfc3339(text: &str) -> Option<i64> {
+    let then: jiff::Timestamp = text.parse().ok()?;
+    Some(jiff::Timestamp::now().duration_since(then).as_secs())
+}
+
 pub const TOOL_RESULT_SAVE_THRESHOLD: usize = 12_000;
 pub const TOOL_RESULT_HEAD_CHARS: usize = 2_000;
 pub const TOOL_RESULT_TAIL_CHARS: usize = 8_000;
@@ -1513,7 +1538,7 @@ impl Session {
     }
 
     pub fn new(provider: &str, model: &str, context_window: u64, name: &str) -> Self {
-        let now = CompactString::new(chrono::Utc::now().to_rfc3339());
+        let now = CompactString::new(rfc3339_utc(jiff::Timestamp::now()));
         Session {
             id: CompactString::new(Uuid::new_v4().to_string()),
             name: CompactString::new(name),
@@ -1604,7 +1629,7 @@ impl Session {
             from_model: self.model.clone(),
             to_provider: CompactString::new(to_provider),
             to_model: CompactString::new(to_model),
-            changed_at: CompactString::new(chrono::Utc::now().to_rfc3339()),
+            changed_at: CompactString::new(rfc3339_utc(jiff::Timestamp::now())),
             context_disclosure_acknowledged,
         };
         self.provider = audit.to_provider.clone();
@@ -1940,7 +1965,7 @@ impl Session {
         });
         self.mark_history_changed();
         self.total_estimated_tokens = self.total_estimated_tokens.saturating_add(tokens);
-        self.updated_at = CompactString::new(chrono::Utc::now().to_rfc3339());
+        self.updated_at = CompactString::new(rfc3339_utc(jiff::Timestamp::now()));
         // The conversation has moved forward, so the last rewind's restore point
         // no longer lines up — drop it so /redo can't splice in a stale tail.
         self.rewind_undo = None;
@@ -3110,7 +3135,7 @@ impl Session {
             first_kept_index: 1, // The summary is at index 0
             summarized_count,
             token_savings,
-            created_at: CompactString::new(chrono::Utc::now().to_rfc3339()),
+            created_at: CompactString::new(rfc3339_utc(jiff::Timestamp::now())),
             memory_ref: Some(memory_ref),
             pruned: None,
         });
@@ -3124,7 +3149,7 @@ impl Session {
         self.mark_history_changed();
         self.read_tracker.clear();
         self.bytes_after_last_compaction = Some(self.approx_persisted_bytes());
-        self.updated_at = CompactString::new(chrono::Utc::now().to_rfc3339());
+        self.updated_at = CompactString::new(rfc3339_utc(jiff::Timestamp::now()));
     }
 
     /// Number of leading messages to drain after a compaction whose summarizer
@@ -4548,5 +4573,57 @@ mod storage_encoding_tests {
                 "{json}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod rfc3339_format_tests {
+    use super::*;
+
+    fn ts(secs: i64, nanos: i32) -> jiff::Timestamp {
+        jiff::Timestamp::new(secs, nanos).unwrap()
+    }
+
+    #[test]
+    fn digits_trim_to_zero_three_six_or_nine() {
+        // 2026-11-20T13:27:47Z
+        let secs = 1_795_181_267;
+        assert_eq!(rfc3339_utc(ts(secs, 0)), "2026-11-20T13:27:47+00:00");
+        assert_eq!(
+            rfc3339_utc(ts(secs, 123_000_000)),
+            "2026-11-20T13:27:47.123+00:00"
+        );
+        assert_eq!(
+            rfc3339_utc(ts(secs, 123_456_000)),
+            "2026-11-20T13:27:47.123456+00:00"
+        );
+        assert_eq!(
+            rfc3339_utc(ts(secs, 123_456_789)),
+            "2026-11-20T13:27:47.123456789+00:00"
+        );
+        assert_eq!(
+            rfc3339_utc(ts(secs, 5_000_000)),
+            "2026-11-20T13:27:47.005+00:00"
+        );
+        assert_eq!(
+            rfc3339_utc(ts(secs, 1)),
+            "2026-11-20T13:27:47.000000001+00:00"
+        );
+    }
+
+    #[test]
+    fn previously_written_strings_parse_back() {
+        for old in [
+            "2026-11-20T13:27:47.123456789+00:00",
+            "2026-11-20T13:27:47+00:00",
+            "2026-11-20T13:27:47.5Z",
+            "2026-11-20T13:27:47Z",
+        ] {
+            assert!(old.parse::<jiff::Timestamp>().is_ok(), "{old}");
+            assert!(seconds_since_rfc3339(old).is_some(), "{old}");
+        }
+        assert_eq!(seconds_since_rfc3339("not a time"), None);
+        let text = rfc3339_utc(jiff::Timestamp::now());
+        assert_eq!(rfc3339_utc(text.parse().unwrap()), text);
     }
 }

@@ -596,11 +596,7 @@ impl CronStore {
     /// The schedule to save with the session: armed entries (with their next
     /// fire projected onto the wall clock for display) and disarmed ones as
     /// they were restored.
-    pub(crate) fn export(
-        &self,
-        now: Instant,
-        wall_now: chrono::DateTime<chrono::Utc>,
-    ) -> SavedCronSchedule {
+    pub(crate) fn export(&self, now: Instant, wall_now: jiff::Timestamp) -> SavedCronSchedule {
         let armed = self.entries.iter().map(|entry| {
             // An in-flight self-paced entry saves as not in flight: its next
             // fire is unknown, so it is shown as due now.
@@ -609,18 +605,16 @@ impl CronStore {
             } else {
                 entry.next_at.saturating_duration_since(now)
             };
-            let next = chrono::Duration::from_std(left)
+            let next = jiff::SignedDuration::try_from(left)
                 .ok()
-                .and_then(|left| wall_now.checked_add_signed(left))
+                .and_then(|left| wall_now.checked_add(left).ok())
                 .unwrap_or(wall_now);
             SavedCronEntry {
                 id: entry.id.clone(),
                 interval_secs: entry.interval.as_secs(),
                 payload: entry.payload.clone(),
                 fires: entry.fires,
-                next_fire_at: next
-                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-                    .into(),
+                next_fire_at: rfc3339_secs_z(next).into(),
                 dynamic: entry.dynamic,
             }
         });
@@ -629,6 +623,11 @@ impl CronStore {
             entries: armed.chain(self.disarmed.iter().cloned()).collect(),
         }
     }
+}
+
+/// `YYYY-MM-DDTHH:MM:SSZ`, the whole-second UTC form saved in the schedule.
+fn rfc3339_secs_z(ts: jiff::Timestamp) -> String {
+    ts.strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 #[cfg(test)]
@@ -847,14 +846,11 @@ mod tests {
         store.arm_dynamic("watch".into(), now).unwrap();
         store.begin_fire("c1", now, 24).unwrap();
         assert_eq!(store.summary(now).running, 1);
-        let wall = chrono::Utc::now();
+        let wall = jiff::Timestamp::now();
         let saved = store.export(now + secs(30), wall);
         let entry = &saved.entries[0];
         assert!(entry.dynamic && entry.fires == 1);
-        assert_eq!(
-            entry.next_fire_at,
-            wall.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-        );
+        assert_eq!(entry.next_fire_at, rfc3339_secs_z(wall));
         let mut restored = CronStore::from_saved(&saved);
         restored.rearm_saved(now);
         let entry = restored.get("c1").unwrap();
@@ -944,9 +940,7 @@ mod tests {
     #[test]
     fn export_keeps_ids_fires_and_disarmed_entries_and_stop_removes_disarmed() {
         let now = Instant::now();
-        let wall = chrono::DateTime::parse_from_rfc3339("2026-10-18T12:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
+        let wall = "2026-10-18T12:00:00Z".parse::<jiff::Timestamp>().unwrap();
         let mut store = CronStore::from_saved(&SavedCronSchedule {
             last_id: 1,
             entries: vec![saved("c1", 120, 3, "old")],

@@ -769,7 +769,7 @@ mod tests {
         assert!(entry.dynamic && entry.due && !entry.in_flight && entry.fires == 3);
         assert_eq!(store.next_due_id(), Some("c2"));
         // It exports as self-paced again, never as a zero-second interval.
-        let saved = store.export(now, chrono::Utc::now());
+        let saved = store.export(now, jiff::Timestamp::now());
         assert!(saved.entries[0].dynamic && saved.entries[0].interval_secs == 0);
     }
 

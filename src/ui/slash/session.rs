@@ -835,7 +835,7 @@ fn clear_session_mutation(session: &mut crate::session::Session) -> Option<()> {
     session.rewind_undo = None;
     session.mark_history_changed();
     session.read_tracker.clear();
-    session.updated_at = CompactString::new(chrono::Utc::now().to_rfc3339());
+    session.updated_at = CompactString::new(crate::session::rfc3339_utc(jiff::Timestamp::now()));
     Some(())
 }
 
@@ -844,14 +844,16 @@ fn undo_session_mutation(session: &mut crate::session::Session) -> Option<usize>
     if removed == 0 {
         None
     } else {
-        session.updated_at = CompactString::new(chrono::Utc::now().to_rfc3339());
+        session.updated_at =
+            CompactString::new(crate::session::rfc3339_utc(jiff::Timestamp::now()));
         Some(removed)
     }
 }
 
 fn redo_session_mutation(session: &mut crate::session::Session) -> Option<()> {
     if session.redo() {
-        session.updated_at = CompactString::new(chrono::Utc::now().to_rfc3339());
+        session.updated_at =
+            CompactString::new(crate::session::rfc3339_utc(jiff::Timestamp::now()));
         Some(())
     } else {
         None

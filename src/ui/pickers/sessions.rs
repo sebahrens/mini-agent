@@ -343,12 +343,10 @@ impl SessionsPicker {
 }
 
 pub(crate) fn relative_time(timestamp: &str) -> String {
-    let Ok(time) = chrono::DateTime::parse_from_rfc3339(timestamp) else {
+    let Some(seconds) = crate::session::seconds_since_rfc3339(timestamp) else {
         return "time unknown".into();
     };
-    let seconds = (chrono::Utc::now() - time.with_timezone(&chrono::Utc))
-        .num_seconds()
-        .max(0);
+    let seconds = seconds.max(0);
     if seconds < 60 {
         "just now".into()
     } else if seconds < 3600 {
@@ -431,7 +429,7 @@ mod tests {
         let row = |title: &str| crate::session::catalogue::SessionRow {
             id: uuid::Uuid::new_v4().to_string().into(),
             title: title.into(),
-            updated_at: chrono::Utc::now().to_rfc3339().into(),
+            updated_at: crate::session::rfc3339_utc(jiff::Timestamp::now()).into(),
             working_dir: workspace.root().to_string_lossy().into(),
             message_count: 1,
             provider: "anthropic".into(),
@@ -487,7 +485,7 @@ mod tests {
         let row = crate::session::catalogue::SessionRow {
             id: uuid::Uuid::new_v4().to_string().into(),
             title: "Parser 雪".into(),
-            updated_at: chrono::Utc::now().to_rfc3339().into(),
+            updated_at: crate::session::rfc3339_utc(jiff::Timestamp::now()).into(),
             working_dir: workspace.root().to_string_lossy().into(),
             message_count: 7,
             provider: "anthropic".into(),

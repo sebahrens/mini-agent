@@ -300,8 +300,8 @@ pub fn cache_key(session: &Session, ctx: &StatusContext) -> u64 {
     if uses.clock {
         // The clock shows minutes; offsets are whole minutes, so the UTC
         // minute changes exactly when the local display can.
-        chrono::Utc::now()
-            .timestamp()
+        jiff::Timestamp::now()
+            .as_second()
             .div_euclid(60)
             .hash(&mut state);
     }
@@ -749,7 +749,7 @@ fn resolve_item(
         "message_count" => Some(session.messages.len().to_string()),
         "session_age" => fmt_elapsed(&session.created_at),
         "session_updated" => fmt_elapsed(&session.updated_at),
-        "clock" => Some(chrono::Local::now().format("%H:%M").to_string()),
+        "clock" => Some(jiff::ZonedDateTime::now().strftime("%H:%M").to_string()),
         "host" => hostname(),
         "user" => std::env::var("USER")
             .or_else(|_| std::env::var("USERNAME"))
@@ -945,12 +945,7 @@ fn read_git_worktree(dir: &str) -> Option<String> {
 }
 
 fn elapsed_secs(rfc3339: &str) -> Option<i64> {
-    let then = chrono::DateTime::parse_from_rfc3339(rfc3339).ok()?;
-    Some(
-        (chrono::Utc::now() - then.with_timezone(&chrono::Utc))
-            .num_seconds()
-            .max(0),
-    )
+    Some(crate::session::seconds_since_rfc3339(rfc3339)?.max(0))
 }
 
 /// A value that changes whenever [`fmt_elapsed`]'s text can: every second

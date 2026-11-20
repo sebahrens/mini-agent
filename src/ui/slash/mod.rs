@@ -1245,7 +1245,7 @@ pub(crate) async fn handle_slash(
             );
             // The generic settlement (or the running turn's end) saves it.
             ctx.session.cron_schedule =
-                cron_store.export(tokio::time::Instant::now(), chrono::Utc::now());
+                cron_store.export(tokio::time::Instant::now(), jiff::Timestamp::now());
             Ok(())
         }
         "/loop" => {
