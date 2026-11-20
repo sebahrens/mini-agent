@@ -128,7 +128,7 @@ fn build_record<'a>(
 ) -> RoundRecord<'a> {
     RoundRecord {
         round: goal.progress.rounds,
-        timestamp: chrono::Utc::now().to_rfc3339(),
+        timestamp: super::now_rfc3339_string(),
         goal_id: goal.id.as_str(),
         instruction_sha256: crate::hex::encode_lower(Sha256::digest(instruction.as_bytes())),
         status_after: goal.status.label(),

@@ -2,7 +2,6 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use chrono::Local;
 use regex::RegexBuilder;
 use rig::tool::Tool;
 use serde::Deserialize;
@@ -442,7 +441,7 @@ impl Mem {
             .and_then(Path::parent)
             .expect("startup workspace must have a project path");
         let project = project_slug(project_root);
-        let today = Local::now().format("%Y-%m-%d").to_string();
+        let today = jiff::ZonedDateTime::now().strftime("%Y-%m-%d").to_string();
         tracing::debug!("memory open: root={}, project={}", root.display(), project);
         Mem {
             root,
@@ -997,7 +996,7 @@ it is only allowed for target=note, not long_term/scratchpad/daily",
     /// pre-compaction flush so the rolling summary survives compaction
     /// deterministically, rather than at the model's discretion.
     pub fn append_daily(&self, heading: &str, body: &str) -> std::io::Result<()> {
-        let stamp = Local::now().format("%H:%M").to_string();
+        let stamp = jiff::ZonedDateTime::now().strftime("%H:%M").to_string();
         let entry = format!("\n### {stamp} — {heading}\n{}\n", body.trim());
         self.write(WriteTarget::Daily, &entry, WriteMode::Append, None)?;
         Ok(())

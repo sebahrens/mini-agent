@@ -10,7 +10,6 @@
 //!
 //! Owning specification: `docs/specs/goals.md` (Record).
 
-use compact_str::CompactString;
 use rig::tool::Tool;
 use serde::Deserialize;
 
@@ -120,7 +119,7 @@ fn build_report(args: GoalReportArgs, round: u32) -> Result<Report, ToolError> {
         reason,
         question,
         round,
-        at: CompactString::new(chrono::Utc::now().to_rfc3339()),
+        at: super::now_rfc3339(),
     })
 }
 

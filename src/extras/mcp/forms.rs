@@ -774,6 +774,25 @@ impl Form {
         Ok(Value::Object(values))
     }
 }
+/// RFC 3339 `date-time` check: full date, `T`/`t`/space, seconds required, and
+/// an explicit `Z` or `+HH:MM` offset (the same strictness as before the jiff migration).
+fn is_rfc3339_date_time(text: &str) -> bool {
+    let b = text.as_bytes();
+    if !text.is_ascii() || b.len() < 20 {
+        return false;
+    }
+    let shape = b[4] == b'-'
+        && b[7] == b'-'
+        && matches!(b[10], b'T' | b't' | b' ')
+        && b[13] == b':'
+        && b[16] == b':';
+    let offset_ok = match b[b.len() - 1] {
+        b'Z' | b'z' => true,
+        _ => b.len() >= 25 && matches!(b[b.len() - 6], b'+' | b'-') && b[b.len() - 3] == b':',
+    };
+    shape && offset_ok && text.parse::<jiff::Timestamp>().is_ok()
+}
+
 fn integer(value: &Value) -> Option<i128> {
     value
         .as_i64()
@@ -813,9 +832,9 @@ impl Field {
                         text.len() == 10
                             && text.as_bytes()[4] == b'-'
                             && text.as_bytes()[7] == b'-'
-                            && chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").is_ok()
+                            && jiff::civil::Date::strptime("%Y-%m-%d", text).is_ok()
                     }
-                    Some("date-time") => chrono::DateTime::parse_from_rfc3339(text).is_ok(),
+                    Some("date-time") => is_rfc3339_date_time(text),
                     Some("email") => text.split_once('@').is_some_and(|(local, domain)| {
                         !local.is_empty()
                             && !local.chars().any(|c| c.is_whitespace() || c == '@')
@@ -922,6 +941,29 @@ impl Field {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rfc3339_date_time_matches_previous_semantics() {
+        for ok in [
+            "2026-11-20T13:27:47Z",
+            "2026-11-20T13:27:47.123456789+00:00",
+            "2026-11-20t13:27:47-05:30",
+        ] {
+            assert!(super::is_rfc3339_date_time(ok), "{ok}");
+        }
+        for bad in [
+            "2026-11-20",
+            "2026-11-20T13:27:47",
+            "2026-11-20T13:27Z",
+            "2026-13-20T13:27:47Z",
+            "2026-11-20T13:27:47+0000",
+            "not a date time",
+        ] {
+            assert!(!super::is_rfc3339_date_time(bad), "{bad}");
+        }
+        assert!(jiff::civil::Date::strptime("%Y-%m-%d", "2024-02-29").is_ok());
+        assert!(jiff::civil::Date::strptime("%Y-%m-%d", "2023-02-29").is_err());
+    }
+
     use super::*;
     #[test]
     fn raw_request_identity_rejects_forgery_reuse_oversize_and_exhaustion() {

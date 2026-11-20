@@ -123,8 +123,8 @@ impl SearchOptions {
             }
         };
         let published_after = days.map(|days| {
-            (chrono::Utc::now() - chrono::Duration::days(days))
-                .format("%Y-%m-%dT%H:%M:%S.000Z")
+            (jiff::Timestamp::now() - jiff::SignedDuration::from_hours(days * 24))
+                .strftime("%Y-%m-%dT%H:%M:%S.000Z")
                 .to_string()
         });
         Ok(Self {
