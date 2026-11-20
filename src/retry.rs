@@ -289,9 +289,9 @@ fn rate_limit_reset(headers: &http::HeaderMap, now: SystemTime) -> Option<Durati
             let name = name.as_str();
             let value = value.to_str().ok()?.trim();
             if name.starts_with("anthropic-ratelimit-") && name.ends_with("-reset") {
-                let instant = chrono::DateTime::parse_from_rfc3339(value).ok()?;
+                let instant = value.parse::<jiff::Timestamp>().ok()?;
                 let instant = SystemTime::UNIX_EPOCH
-                    + Duration::from_millis(u64::try_from(instant.timestamp_millis()).ok()?);
+                    + Duration::from_millis(u64::try_from(instant.as_millisecond()).ok()?);
                 Some(instant.duration_since(now).unwrap_or_default())
             } else if name.starts_with("x-ratelimit-reset") {
                 parse_go_duration(value)
@@ -947,8 +947,10 @@ mod tests {
     #[test]
     fn rate_limit_reset_headers_are_used_when_retry_after_is_missing() {
         let now = SystemTime::now();
-        let reset = chrono::DateTime::<chrono::Utc>::from(now + Duration::from_secs(30))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let reset = jiff::Timestamp::try_from(now + Duration::from_secs(30))
+            .unwrap()
+            .strftime("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
         let anthropic = hinted(
             429,
             &[

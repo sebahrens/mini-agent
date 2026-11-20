@@ -13,6 +13,38 @@ use uuid::Uuid;
 
 mod ledger;
 mod report;
+/// Serde form of a receipt instant. Byte-identical to the previous wire
+/// format (`YYYY-MM-DDTHH:MM:SS[.mmm|.uuuuuu|.nnnnnnnnn]Z`, fraction in
+/// groups of three digits); parsing accepts any RFC 3339 instant.
+mod ts_serde {
+    pub(super) fn format(ts: &jiff::Timestamp) -> String {
+        let nanos = ts.subsec_nanosecond();
+        let base = ts.strftime("%Y-%m-%dT%H:%M:%S");
+        if nanos == 0 {
+            format!("{base}Z")
+        } else if nanos % 1_000_000 == 0 {
+            format!("{base}.{:03}Z", nanos / 1_000_000)
+        } else if nanos % 1_000 == 0 {
+            format!("{base}.{:06}Z", nanos / 1_000)
+        } else {
+            format!("{base}.{nanos:09}Z")
+        }
+    }
+
+    pub(super) fn serialize<S: serde::Serializer>(
+        ts: &jiff::Timestamp,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&format(ts))
+    }
+
+    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<jiff::Timestamp, D::Error> {
+        let text = <std::borrow::Cow<'de, str> as serde::Deserialize>::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}
 #[cfg(test)]
 mod request_tests;
 #[cfg(test)]
@@ -265,7 +297,8 @@ impl RequestKind {
 struct Row {
     version: u8,
     id: Uuid,
-    ts: chrono::DateTime<chrono::Utc>,
+    #[serde(with = "ts_serde")]
+    ts: jiff::Timestamp,
     session_id: String,
     provider: String,
     model: String,
@@ -303,7 +336,8 @@ impl<'de, const V: u8> Deserialize<'de> for ExactVersion<V> {
 struct RowFields<P, U, const V: u8> {
     version: ExactVersion<V>,
     id: Uuid,
-    ts: chrono::DateTime<chrono::Utc>,
+    #[serde(deserialize_with = "ts_serde::deserialize")]
+    ts: jiff::Timestamp,
     session_id: String,
     provider: String,
     model: String,
@@ -497,7 +531,7 @@ impl Receipt {
             row: Arc::new(Row {
                 version: 2,
                 id: Uuid::new_v4(),
-                ts: chrono::Utc::now(),
+                ts: jiff::Timestamp::now(),
                 session_id: session_id.into(),
                 provider: provider.into(),
                 model: model.into(),
@@ -1095,6 +1129,44 @@ impl Account {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Serialize, Deserialize)]
+    struct TsHolder {
+        #[serde(with = "ts_serde")]
+        ts: jiff::Timestamp,
+    }
+
+    /// Previously written instants parse; new output is byte-identical to the previous format
+    /// (fraction in 0/3/6/9-digit groups, `Z` suffix).
+    #[test]
+    fn receipt_timestamp_wire_format_matches_chrono_era_rows() {
+        for (old, canonical) in [
+            ("2026-11-20T13:27:47Z", "2026-11-20T13:27:47Z"),
+            ("2026-11-20T13:27:47+00:00", "2026-11-20T13:27:47Z"),
+            ("2026-11-20T13:27:47.120Z", "2026-11-20T13:27:47.120Z"),
+            ("2026-11-20T13:27:47.12Z", "2026-11-20T13:27:47.120Z"),
+            ("2026-11-20T13:27:47.123456Z", "2026-11-20T13:27:47.123456Z"),
+            (
+                "2026-11-20T13:27:47.123456789Z",
+                "2026-11-20T13:27:47.123456789Z",
+            ),
+            (
+                "2026-11-20T13:27:47.000000001Z",
+                "2026-11-20T13:27:47.000000001Z",
+            ),
+            ("2026-11-20T14:27:47.5+01:00", "2026-11-20T13:27:47.500Z"),
+        ] {
+            let json = format!(r#"{{"ts":"{old}"}}"#);
+            let holder: TsHolder = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                serde_json::to_string(&holder).unwrap(),
+                format!(r#"{{"ts":"{canonical}"}}"#),
+                "{old}"
+            );
+        }
+        assert!(serde_json::from_str::<TsHolder>(r#"{"ts":"nope"}"#).is_err());
+    }
+
     fn prices(input: Option<f64>) -> PriceSnapshot {
         PriceSnapshot::capture(
             input.map(|input| (input, input)),

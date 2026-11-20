@@ -17,9 +17,26 @@ pub fn crash_log_dir() -> PathBuf {
         .crash_logs_dir()
 }
 
+/// Local time as RFC 3339 with a numeric offset, matching the previous
+/// `to_rfc3339()` (fraction trimmed to 0, 3, 6 or 9 digits).
+fn local_rfc3339(now: &jiff::ZonedDateTime) -> String {
+    let nanos = now.subsec_nanosecond();
+    let base = now.strftime("%Y-%m-%dT%H:%M:%S");
+    let offset = now.strftime("%:z");
+    if nanos == 0 {
+        format!("{base}{offset}")
+    } else if nanos % 1_000_000 == 0 {
+        format!("{base}.{:03}{offset}", nanos / 1_000_000)
+    } else if nanos % 1_000 == 0 {
+        format!("{base}.{:06}{offset}", nanos / 1_000)
+    } else {
+        format!("{base}.{nanos:09}{offset}")
+    }
+}
+
 pub fn resolve_crash_log_path() -> PathBuf {
     let dir = crash_log_dir();
-    let ts = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
+    let ts = jiff::ZonedDateTime::now().strftime("%Y-%m-%d_%H-%M-%S");
     let pid = std::process::id();
     dir.join(format!("mini-agent-crash-{ts}_{pid}.log"))
 }
@@ -47,7 +64,10 @@ fn write_crash_report(info: &std::panic::PanicHookInfo) -> Option<PathBuf> {
     }
 
     let mut content = String::from("mini-agent crash report\n");
-    content.push_str(&format!("time: {}\n", chrono::Local::now().to_rfc3339()));
+    content.push_str(&format!(
+        "time: {}\n",
+        local_rfc3339(&jiff::ZonedDateTime::now())
+    ));
     if let Some(version) = option_env!("CARGO_PKG_VERSION") {
         content.push_str(&format!("version: {version}\n"));
     }
@@ -90,7 +110,7 @@ pub fn resolve_log_path(cli: &Cli) -> Option<PathBuf> {
             .expect("startup must initialize application paths")
             .logs_dir();
         ensure_private_log_directory(&logs_dir).ok();
-        let ts = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
+        let ts = jiff::ZonedDateTime::now().strftime("%Y-%m-%d_%H-%M-%S");
         let pid = std::process::id();
         return Some(logs_dir.join(format!("mini-agent-{ts}_{pid}.log")));
     }
@@ -527,5 +547,40 @@ mod headless_diagnostic_tests {
                 assert!(queue.0.lock().unwrap().messages.is_empty());
             })
             .await;
+    }
+}
+
+#[cfg(test)]
+mod rfc3339_tests {
+    use super::local_rfc3339;
+
+    #[test]
+    fn local_rfc3339_matches_previous_digit_and_offset_rules() {
+        let utc = jiff::tz::TimeZone::UTC;
+        let at = |sec: i64, nanos: i32| {
+            jiff::Timestamp::new(sec, nanos)
+                .unwrap()
+                .to_zoned_datetime(utc.clone())
+        };
+        assert_eq!(
+            local_rfc3339(&at(1_797_000_000, 0)),
+            "2026-12-11T14:40:00+00:00"
+        );
+        assert_eq!(
+            local_rfc3339(&at(1_797_000_000, 120_000_000)),
+            "2026-12-11T14:40:00.120+00:00"
+        );
+        assert_eq!(
+            local_rfc3339(&at(1_797_000_000, 123_456_000)),
+            "2026-12-11T14:40:00.123456+00:00"
+        );
+        assert_eq!(
+            local_rfc3339(&at(1_797_000_000, 1)),
+            "2026-12-11T14:40:00.000000001+00:00"
+        );
+        let plus_one = jiff::Timestamp::new(1_797_000_000, 0)
+            .unwrap()
+            .to_zoned_datetime(jiff::tz::TimeZone::fixed(jiff::tz::Offset::constant(1)));
+        assert_eq!(local_rfc3339(&plus_one), "2026-12-11T15:40:00+01:00");
     }
 }

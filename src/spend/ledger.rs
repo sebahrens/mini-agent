@@ -144,7 +144,8 @@ pub(crate) struct CacheRequestSummary {
     pub kind: super::RequestKind,
     pub usage: crate::event::UsageDelta,
     pub anthropic_native: bool,
-    timestamp: chrono::DateTime<chrono::Utc>,
+    #[serde(with = "super::ts_serde")]
+    timestamp: jiff::Timestamp,
     id: Uuid,
 }
 
@@ -1174,7 +1175,7 @@ struct RollupState {
     /// More sessions than are tracked (or than fit the size limit): the
     /// totals of the untracked ones are only in `all_time`.
     sessions_dropped: bool,
-    last_day: Option<(chrono::NaiveDate, Totals)>,
+    last_day: Option<(jiff::civil::Date, Totals)>,
 }
 
 impl RollupState {
@@ -1196,7 +1197,7 @@ impl RollupState {
         } else {
             self.sessions_dropped = true;
         }
-        let day = row.ts.date_naive();
+        let day = row.ts.to_zoned_datetime(jiff::tz::TimeZone::UTC).date();
         match &mut self.last_day {
             Some((current, totals)) if *current == day => totals.add(row)?,
             Some((current, _)) if *current > day => {}
@@ -1212,7 +1213,10 @@ impl RollupState {
     fn apply(&self, summary: &mut LedgerSummary, session_id: Option<&str>) -> anyhow::Result<()> {
         summary.all_time.merge(&self.all_time)?;
         if let Some((day, totals)) = &self.last_day
-            && *day == chrono::Utc::now().date_naive()
+            && *day
+                == jiff::Timestamp::now()
+                    .to_zoned_datetime(jiff::tz::TimeZone::UTC)
+                    .date()
         {
             summary.today.merge(totals)?;
         }
@@ -1269,7 +1273,7 @@ struct RollupRecord {
     model_details_capped: bool,
     sessions: Vec<SessionRecord>,
     sessions_dropped: bool,
-    last_day: Option<(chrono::NaiveDate, TotalsRecord)>,
+    last_day: Option<(jiff::civil::Date, TotalsRecord)>,
 }
 
 fn totals_by_model(
@@ -1568,7 +1572,9 @@ fn scan_with(file: &mut File, session_id: Option<&str>, mode: ScanMode) -> anyho
         summary: LedgerSummary::default(),
     };
     let mut seen = std::collections::BTreeSet::new();
-    let today = chrono::Utc::now().date_naive();
+    let today = jiff::Timestamp::now()
+        .to_zoned_datetime(jiff::tz::TimeZone::UTC)
+        .date();
     for line in bytes.split_inclusive(|byte| *byte == b'\n') {
         scanned.records += 1;
         anyhow::ensure!(
@@ -1597,7 +1603,9 @@ fn scan_with(file: &mut File, session_id: Option<&str>, mode: ScanMode) -> anyho
         // bounds. Today/by-model totals are subsets and cannot fail when it
         // succeeds, so skipping them never changes the scan's outcome.
         scanned.summary.all_time.add(&row)?;
-        if mode != ScanMode::SessionOnly && row.ts.date_naive() == today {
+        if mode != ScanMode::SessionOnly
+            && row.ts.to_zoned_datetime(jiff::tz::TimeZone::UTC).date() == today
+        {
             scanned.summary.today.add(&row)?;
         }
         if session_id == Some(row.session_id.as_str()) {
@@ -2104,6 +2112,29 @@ fn store_checkpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_summary_timestamp_and_checkpoint_day_keep_the_old_wire_format() {
+        let summary = CacheRequestSummary {
+            provider: "p".into(),
+            model: "m".into(),
+            kind: crate::spend::RequestKind::Turn,
+            usage: Default::default(),
+            anthropic_native: false,
+            timestamp: jiff::Timestamp::constant(1_797_000_000, 123_456_789),
+            id: Uuid::nil(),
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(
+            json.contains(r#""timestamp":"2026-12-11T14:40:00.123456789Z""#),
+            "{json}"
+        );
+        let old = json.replace("789Z", "789+00:00");
+        let back: CacheRequestSummary = serde_json::from_str(&old).unwrap();
+        assert_eq!(back.timestamp, summary.timestamp);
+        let day: (jiff::civil::Date, u8) = serde_json::from_str(r#"["2026-11-20",1]"#).unwrap();
+        assert_eq!(serde_json::to_string(&day).unwrap(), r#"["2026-11-20",1]"#);
+    }
     use crate::event::UsageDelta;
     use crate::spend::{PriceSnapshot, Receipt, RequestKind};
     fn receipt(kind: RequestKind) -> Receipt {
