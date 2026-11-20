@@ -35,6 +35,12 @@ const COMMON_DIR_ENTRIES: [&str; 4] = ["config", "hooks", "info", "modules"];
 /// configuration and the pointer Git follows to the common directory (a
 /// planted `commondir` would redirect Git to a model-written `config`).
 const GIT_DIR_ENTRIES: [&str; 2] = ["config.worktree", "commondir"];
+/// Entries of every linked worktree's admin directory
+/// (`<common>/worktrees/<id>`) that select configuration or the common
+/// directory. They are protected for sibling worktrees too: a rewritten
+/// `commondir` there would make the host's next `git` run in that worktree
+/// execute a model-written config.
+const WORKTREE_ADMIN_ENTRIES: [&str; 3] = ["commondir", "config.worktree", "gitdir"];
 /// Upper bound on bytes read from a `.git` gitfile or a `commondir` pointer.
 const POINTER_FILE_LIMIT: u64 = 4096;
 
@@ -105,7 +111,24 @@ pub(super) fn discover(workspace: &Path) -> GitMetadataLayout {
     for entry in GIT_DIR_ENTRIES {
         push_unique(&mut layout.read_only, git_dir.join(entry));
     }
+    for admin_dir in linked_worktree_admin_dirs(&common_dir) {
+        for entry in WORKTREE_ADMIN_ENTRIES {
+            push_unique(&mut layout.read_only, admin_dir.join(entry));
+        }
+    }
     layout
+}
+
+/// The admin directory of every linked worktree registered in `common_dir`,
+/// sorted so the layout is deterministic. An unreadable or absent
+/// `worktrees` directory yields none.
+fn linked_worktree_admin_dirs(common_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(common_dir.join("worktrees")) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    dirs.sort();
+    dirs
 }
 
 fn push_unique(paths: &mut Vec<PathBuf>, path: PathBuf) {
@@ -882,8 +905,42 @@ mod tests {
                 common_dir.join("modules"),
                 worktree_git_dir.join("config.worktree"),
                 worktree_git_dir.join("commondir"),
+                // The same admin directory, spelled through the common dir.
+                common_dir.join("worktrees/wt/commondir"),
+                common_dir.join("worktrees/wt/config.worktree"),
+                common_dir.join("worktrees/wt/gitdir"),
             ]
         );
+    }
+
+    #[test]
+    fn sibling_worktree_admin_entries_are_protected_from_the_main_workspace() {
+        let scratch = Scratch::new();
+        let (main, _worktree) = fixtures::linked_worktree(&scratch.0, &scratch.0);
+        let sibling = main.join(".git/worktrees/wt");
+
+        let layout = discover(&main);
+
+        for entry in ["commondir", "config.worktree", "gitdir"] {
+            let path = sibling.join(entry);
+            assert!(layout.read_only.contains(&path), "{path:?}");
+            let rule = format!("(subpath \"{}\")", path.display());
+            assert!(
+                seatbelt_write_denies_for(&layout).contains(&rule),
+                "missing {rule}"
+            );
+        }
+        // bubblewrap binds the existing sibling entries read-only.
+        let planned = BwrapGitMetadataBinds::open(&main).unwrap().planned();
+        for entry in [
+            ".git/worktrees/wt/commondir",
+            ".git/worktrees/wt/config.worktree",
+        ] {
+            assert!(
+                planned.contains(&(true, PathBuf::from(entry))),
+                "{planned:?}"
+            );
+        }
     }
 
     #[test]

@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 
 use super::dispatcher::HookDispatcher;
 use super::pins::HookContentPins;
-use super::settings::{HookGroup, HookHandler, HooksConfig, parse_hooks_config};
+use super::settings::{HookGroup, HookHandler, HooksConfig, parse_hooks_config_with_skips};
 
 /// Deterministic hash of a project hook binding (project root + event +
 /// matcher + handler definition). Any change to the binding, or trusting the
@@ -120,11 +120,99 @@ fn default_trust_store_path(paths: &crate::paths::AppPaths) -> PathBuf {
     paths.hook_trust_file()
 }
 
+#[cfg(test)]
 pub(crate) fn load_trust_store(path: &Path) -> HashSet<String> {
     let Ok(content) = std::fs::read_to_string(path) else {
         return HashSet::new();
     };
     serde_json::from_str::<HashSet<String>>(&content).unwrap_or_default()
+}
+
+/// Like [`load_trust_store`], but an existing store that cannot be read or
+/// parsed is an error instead of an empty set, so its content records are
+/// never silently forgotten (and never overwritten).
+fn load_trust_store_checked(path: &Path) -> Result<HashSet<String>, String> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(error) => {
+            return Err(format!(
+                "hook trust store {} is unreadable: {error}",
+                path.display()
+            ));
+        }
+    };
+    serde_json::from_str::<HashSet<String>>(&content)
+        .map_err(|error| format!("hook trust store {} is not valid: {error}", path.display()))
+}
+
+/// Exclusive advisory lock on `<store>.lock`, held until dropped. The lock
+/// file is never deleted (unlinking one another process has open would let
+/// two owners lock different inodes).
+fn lock_trust_store(path: &Path) -> Result<std::fs::File, String> {
+    let mut name = path
+        .file_name()
+        .ok_or_else(|| "hook trust store path has no file name".to_string())?
+        .to_os_string();
+    name.push(".lock");
+    let lock_path = path.with_file_name(name);
+    match crate::fs::private_atomic_create_sync(&lock_path, b"") {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(format!("failed to create hook trust store lock: {error}")),
+    }
+    let file = crate::fs::open_private_file(&lock_path)
+        .map_err(|error| format!("failed to open hook trust store lock: {error}"))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(
+                        "timed out waiting for another session's hook trust store lock".to_string(),
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(format!("failed to lock hook trust store: {error}"));
+            }
+        }
+    }
+}
+
+/// Persist this session's trust changes without discarding another session's:
+/// under the store lock, re-read the file and apply only the delta from
+/// `loaded` to `current` (entries added, entries removed). An unreadable
+/// existing store is left untouched and reported.
+pub(crate) fn save_trust_store_merged(
+    path: &Path,
+    loaded: &HashSet<String>,
+    current: &HashSet<String>,
+) -> Result<(), String> {
+    if crate::paths::artifact_disabled("hook trust") {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        return Err(format!(
+            "failed to create hook trust store directory: {error}"
+        ));
+    }
+    let _lock = lock_trust_store(path)?;
+    let on_disk =
+        load_trust_store_checked(path).map_err(|error| format!("{error}; not overwriting it"))?;
+    let mut merged = on_disk.clone();
+    for removed in loaded.difference(current) {
+        merged.remove(removed);
+    }
+    merged.extend(current.difference(loaded).cloned());
+    if merged == on_disk {
+        return Ok(());
+    }
+    save_trust_store(path, &merged)
 }
 
 pub(crate) fn save_trust_store(path: &Path, trusted: &HashSet<String>) -> Result<(), String> {
@@ -251,16 +339,39 @@ fn hook_confirmation_description(
 struct SourceConfig {
     hooks: HooksConfig,
     disable_all_hooks: bool,
+    /// Why this file's hooks could not be loaded (the whole file is dropped),
+    /// or which hooks inside it were skipped. Never contains file content
+    /// beyond parser messages, with control characters removed.
+    problems: Vec<String>,
+    /// The file exists but none of its hooks could be loaded.
+    unloadable: bool,
+    /// A `PreToolUse` hook was dropped from an otherwise loaded file.
+    dropped_pre_tool_use: bool,
+}
+
+/// One printable line of a parser message: no control characters, bounded.
+fn printable(text: &str) -> String {
+    text.chars()
+        .filter(|ch| !ch.is_control())
+        .take(300)
+        .collect()
 }
 
 fn load_settings_file(path: &Path) -> SourceConfig {
-    let empty = SourceConfig {
+    let mut config = SourceConfig {
         hooks: HashMap::new(),
         disable_all_hooks: false,
+        problems: Vec::new(),
+        unloadable: false,
+        dropped_pre_tool_use: false,
     };
     use std::io::Read;
-    let Ok(file) = std::fs::File::open(path) else {
-        return empty;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return config,
+        Err(error) => {
+            return unloadable(config, path, format!("cannot be opened: {error}"));
+        }
     };
     let mut content = String::new();
     if file
@@ -269,30 +380,42 @@ fn load_settings_file(path: &Path) -> SourceConfig {
         .is_err()
         || content.len() > 1024 * 1024
     {
-        tracing::warn!("hooks: settings exceed bounds or are not UTF-8, ignoring");
-        return empty;
+        return unloadable(config, path, "exceeds bounds or is not UTF-8".to_string());
     }
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
-        tracing::warn!("hooks: {}: invalid JSON, ignoring", path.display());
-        return empty;
+        return unloadable(config, path, "is not valid JSON".to_string());
     };
-    let hooks = value
-        .get("hooks")
-        .map(|h| {
-            parse_hooks_config(h).unwrap_or_else(|e| {
-                tracing::warn!("hooks: {}: {e}", path.display());
-                HashMap::new()
-            })
-        })
-        .unwrap_or_default();
-    let disable_all_hooks = value
+    config.disable_all_hooks = value
         .get("disableAllHooks")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    SourceConfig {
-        hooks,
-        disable_all_hooks,
+    if let Some(h) = value.get("hooks") {
+        match parse_hooks_config_with_skips(h) {
+            Ok((hooks, skipped)) => {
+                config.hooks = hooks;
+                for skipped in skipped {
+                    config.dropped_pre_tool_use |= skipped.event == "PreToolUse";
+                    config.problems.push(format!(
+                        "hooks: {}: {}",
+                        path.display(),
+                        printable(&skipped.reason)
+                    ));
+                }
+            }
+            Err(error) => return unloadable(config, path, printable(&error)),
+        }
     }
+    config
+}
+
+fn unloadable(mut config: SourceConfig, path: &Path, why: String) -> SourceConfig {
+    tracing::warn!("hooks: {}: {why}, ignoring its hooks", path.display());
+    config.problems.push(format!(
+        "hooks: {} {why}; none of its hooks were loaded",
+        path.display()
+    ));
+    config.unloadable = true;
+    config
 }
 
 fn merge_into(target: &mut HooksConfig, source: HooksConfig) {
@@ -355,11 +478,13 @@ fn record_approved_pins(
 /// files differ asks interactively; a declined or headless change keeps the
 /// hook installed but denies every launch (fail-closed for `PreToolUse`), so
 /// the guard is never silently replaced nor silently dropped.
+#[allow(clippy::too_many_arguments)]
 fn pin_configured_hook_content(
     hooks: &HooksConfig,
     source: &str,
     project_root: &Path,
     store: &mut HashSet<String>,
+    store_readable: bool,
     headless: bool,
     confirm: &dyn Fn(&str) -> bool,
     approved: &mut HashMap<HookHandler, HookContentPins>,
@@ -377,7 +502,9 @@ fn pin_configured_hook_content(
                     .filter(|entry| entry.starts_with(&prefix))
                     .cloned()
                     .collect();
-                if recorded.is_empty() {
+                // An unreadable store holds records we cannot see, so "no
+                // record" is not first use: review it like a changed file.
+                if recorded.is_empty() && (store_readable || pins.is_empty()) {
                     if !pins.is_empty() {
                         store.insert(current);
                     }
@@ -533,7 +660,7 @@ fn build_dispatcher_from_paths_with_backend(
     confirm: &dyn Fn(&str) -> bool,
     sandbox_backend: &str,
 ) -> HookDispatcher {
-    let global = load_settings_file(global_path);
+    let mut global = load_settings_file(global_path);
     let compatibility_path = project_root.join(".claude/settings.json");
     let mut project = load_settings_file(&compatibility_path);
     if project_path != compatibility_path {
@@ -541,7 +668,7 @@ fn build_dispatcher_from_paths_with_backend(
         project.disable_all_hooks |= native_project.disable_all_hooks;
         merge_into(&mut project.hooks, native_project.hooks);
     }
-    let managed = load_settings_file(managed_path);
+    let mut managed = load_settings_file(managed_path);
 
     // A repository-controlled `disableAllHooks` value must not disable
     // user-global guard hooks. Project hooks are individually trust-gated
@@ -553,8 +680,34 @@ fn build_dispatcher_from_paths_with_backend(
         );
     }
 
+    // Hook files that fail to load must be visible, and for the sources that
+    // carry guards (managed, and global unless the user turned hooks off) the
+    // lost guards must not turn into "no guard": deny every PreToolUse.
+    let mut notices: Vec<String> = Vec::new();
+    let mut fail_closed: Vec<String> = Vec::new();
+    for (name, source, guards_active) in [
+        ("managed", &mut managed, true),
+        ("global", &mut global, !disable_non_managed),
+    ] {
+        if guards_active && (source.unloadable || source.dropped_pre_tool_use) {
+            fail_closed.push(format!(
+                "{name} hooks file could not be fully loaded, so its PreToolUse guards are unknown; denying tool calls until it is fixed ({})",
+                source.problems.join("; ")
+            ));
+        }
+        notices.append(&mut source.problems);
+    }
+    notices.append(&mut project.problems);
+    let fail_closed = (!fail_closed.is_empty()).then(|| fail_closed.join(" | "));
+
     let mut merged: HooksConfig = HashMap::new();
-    let mut store = load_trust_store(trust_store_path);
+    let (mut store, store_readable) = match load_trust_store_checked(trust_store_path) {
+        Ok(store) => (store, true),
+        Err(error) => {
+            notices.push(format!("hooks: {error}; workspace hook files will be re-reviewed and trust decisions will not persist"));
+            (HashSet::new(), false)
+        }
+    };
     let loaded_store = store.clone();
     let mut approved_pins = HashMap::new();
 
@@ -564,6 +717,7 @@ fn build_dispatcher_from_paths_with_backend(
             "global",
             project_root,
             &mut store,
+            store_readable,
             headless,
             confirm,
             &mut approved_pins,
@@ -585,6 +739,7 @@ fn build_dispatcher_from_paths_with_backend(
         "managed",
         project_root,
         &mut store,
+        store_readable,
         headless,
         confirm,
         &mut approved_pins,
@@ -592,9 +747,10 @@ fn build_dispatcher_from_paths_with_backend(
     merge_into(&mut merged, managed.hooks);
 
     if store != loaded_store
-        && let Err(error) = save_trust_store(trust_store_path, &store)
+        && let Err(error) = save_trust_store_merged(trust_store_path, &loaded_store, &store)
     {
         tracing::warn!("hooks: {error} (trust decisions won't persist)");
+        notices.push(format!("hooks: {error} (trust decisions won't persist)"));
     }
 
     HookDispatcher::from_config_with_backend_root_and_pins(
@@ -603,14 +759,22 @@ fn build_dispatcher_from_paths_with_backend(
         project_root,
         approved_pins,
     )
+    .map(|dispatcher| dispatcher.with_load_problems(fail_closed.clone(), notices.clone()))
     .unwrap_or_else(|e| {
         tracing::warn!("hooks: invalid merged config, disabling hooks: {e}");
+        notices.push(format!("hooks: invalid merged config, hooks disabled: {e}"));
+        let reason = fail_closed.clone().or_else(|| {
+            Some(format!(
+                "hooks could not be built from the merged config ({e}); denying tool calls"
+            ))
+        });
         HookDispatcher::from_config_with_backend_and_root(
             &HashMap::new(),
             sandbox_backend,
             project_root,
         )
         .expect("empty config is always valid")
+        .with_load_problems(reason, notices.clone())
     })
 }
 
@@ -635,7 +799,7 @@ pub(crate) fn load_dispatcher(
     sandbox_backend: &str,
 ) -> HookDispatcher {
     let trust_unavailable = crate::paths::artifact_disabled("hook trust");
-    build_dispatcher_from_paths_with_backend(
+    let dispatcher = build_dispatcher_from_paths_with_backend(
         &global_settings_path(paths),
         &project_settings_path(paths),
         &managed_settings_path(),
@@ -645,7 +809,11 @@ pub(crate) fn load_dispatcher(
         &default_trust_store_path(paths),
         &confirm_untrusted_hook,
         sandbox_backend,
-    )
+    );
+    for notice in dispatcher.startup_notices() {
+        eprintln!("warning: {notice}");
+    }
+    dispatcher
 }
 
 #[cfg(test)]
