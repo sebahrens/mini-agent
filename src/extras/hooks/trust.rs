@@ -664,8 +664,9 @@ fn build_dispatcher_from_paths_with_backend(
     let compatibility_path = project_root.join(".claude/settings.json");
     let mut project = load_settings_file(&compatibility_path);
     if project_path != compatibility_path {
-        let native_project = load_settings_file(project_path);
+        let mut native_project = load_settings_file(project_path);
         project.disable_all_hooks |= native_project.disable_all_hooks;
+        project.problems.append(&mut native_project.problems);
         merge_into(&mut project.hooks, native_project.hooks);
     }
     let mut managed = load_settings_file(managed_path);
