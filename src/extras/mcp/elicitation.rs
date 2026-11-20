@@ -3,7 +3,7 @@
 use super::forms::RawForms;
 use crate::permission::ask::{AskSender, QuestionRequest, UserRequest};
 use crate::question::{QuestionAnswer, QuestionTurn};
-use rmcp::model::{ClientInfo, ElicitRequestParams, ElicitResult, ElicitationAction};
+use rmcp::model::{ClientConfig, ElicitRequestParams, ElicitResult, ElicitationAction};
 use rmcp::service::{RequestContext, RoleClient};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -225,9 +225,8 @@ fn response(action: ElicitationAction, content: Option<serde_json::Value>) -> El
     response
 }
 impl rmcp::ClientHandler for Handler {
-    #[allow(deprecated)]
-    fn get_info(&self) -> ClientInfo {
-        let mut info = ClientInfo::default();
+    fn get_info(&self) -> ClientConfig {
+        let mut info = ClientConfig::default();
         info.capabilities.elicitation = Some(
             rmcp::model::ElicitationCapability::new()
                 .with_form(rmcp::model::FormElicitationCapability::default())
