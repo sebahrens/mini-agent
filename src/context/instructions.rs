@@ -35,6 +35,10 @@ const MAX_RECEIPTS: usize = 128;
 const MAX_NOTICE_BYTES: usize = 32 * 1024;
 const READ_AUTHORITY_REQUIRED: &str =
     "Workspace instructions require existing read Allow authority";
+/// I/O failures that may be transient (EMFILE, EINTR, a file mid-rewrite).
+/// They are reported but never cached, so the next call re-probes.
+const OPEN_FAILED: &str = "Could not safely open workspace instruction source";
+const READ_FAILED: &str = "Could not read workspace instructions";
 const BUDGET_EXHAUSTED: &str = "Workspace instruction retained-source limit reached";
 const MAX_HISTORY_BLOCKS: usize = 16_384;
 const MAX_PATH_BYTES: usize = 4096;
@@ -631,6 +635,9 @@ impl WorkspaceInstructions {
             omitted.push(key);
             return Ok(());
         }
+        if matches!(&loaded, Err(error) if error == OPEN_FAILED || error == READ_FAILED) {
+            return loaded.map(|sources| result.extend(sources));
+        }
         let populated = state
             .directories
             .values()
@@ -808,7 +815,7 @@ impl WorkspaceInstructions {
             Err(error) if optional && error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(());
             }
-            Err(_) => return Err("Could not safely open workspace instruction source".into()),
+            Err(_) => return Err(OPEN_FAILED.into()),
         };
         #[cfg(unix)]
         {
@@ -917,7 +924,7 @@ impl WorkspaceInstructions {
             // A prose `@word` naming a binary file is not guidance.
             Ok(None) if depth > 0 => return Ok(()),
             Ok(None) => return Err("Workspace instructions are not valid UTF-8".into()),
-            Err(_) => return Err("Could not read workspace instructions".into()),
+            Err(_) => return Err(READ_FAILED.into()),
         };
         if truncated && budget_short {
             return Err(BUDGET_EXHAUSTED.into());
@@ -1897,6 +1904,27 @@ mod tests {
             .with_test_paths(paths),
         );
         (root, service)
+    }
+    // mini-agent-k80i1: a transient I/O failure while loading nested guidance
+    // is reported once but not cached for the rest of the session.
+    #[test]
+    fn transient_nested_load_errors_are_not_cached() {
+        let (_owned, service) = fixture();
+        let key = PathBuf::from("nested");
+        let (mut result, mut omitted) = (Vec::new(), Vec::new());
+        let error = service
+            .collect_cached(
+                key.clone(),
+                |_, _| Err(READ_FAILED.to_string()),
+                &mut result,
+                &mut omitted,
+            )
+            .unwrap_err();
+        assert_eq!(error, READ_FAILED);
+        assert!(!service.state.lock().unwrap().directories.contains_key(&key));
+        service
+            .collect_cached(key, |_, _| Ok(Vec::new()), &mut result, &mut omitted)
+            .expect("the next call re-probes and succeeds");
     }
     // mini-agent-59sgr: a nested source just over the per-source cap loads
     // truncated with a notice instead of being rejected, and its delivered
