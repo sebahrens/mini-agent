@@ -1081,6 +1081,13 @@ impl<Counterpart: Role> ConnectTo<Counterpart> for BoundedStdioTransport {
     }
 }
 
+/// The TLS peer's reader under the same per-frame byte limit stdio and plain
+/// TCP enforce, so one newline-free line cannot grow memory without bound
+/// (mini-agent-t70we).
+fn tls_frame_reader<R>(read_half: tls::FuturesIo<R>) -> BoundedLineReader<tls::FuturesIo<R>> {
+    BoundedLineReader::new(read_half, MAX_ACP_FRAME_BYTES)
+}
+
 struct TcpTransport {
     host: String,
     port: u16,
@@ -1120,7 +1127,10 @@ impl<Counterpart: Role> ConnectTo<Counterpart> for TcpTransport {
             tracing::info!("Authenticated ACP TLS client connected from {}", peer_addr);
             let (read_half, write_half) = tokio::io::split(stream);
             return ConnectTo::<Counterpart>::connect_to(
-                ByteStreams::new(tls::FuturesIo(write_half), tls::FuturesIo(read_half)),
+                ByteStreams::new(
+                    tls::FuturesIo(write_half),
+                    tls_frame_reader(tls::FuturesIo(read_half)),
+                ),
                 client,
             )
             .await;
@@ -2994,7 +3004,17 @@ fn spawn_turn(
                     let _ = respond_terminal(&registration, reply, StopReason::Cancelled);
                     return Ok(());
                 }
-                let history = history.lock_owned().await;
+                // A prompt queued behind a turn that still holds the history
+                // (post-reply title generation) stays cancellable while it
+                // waits (mini-agent-nooj0).
+                let history = tokio::select! {
+                    biased;
+                    _ = control.cancelled() => {
+                        let _ = respond_terminal(&registration, reply, StopReason::Cancelled);
+                        return Ok(());
+                    }
+                    history = history.lock_owned() => history,
+                };
                 let result = crate::spend::run::scope(
                     Some(spend),
                     crate::startup::heap_future(|| {
@@ -4161,6 +4181,16 @@ async fn run_prompt(
                     "ACP command checkpoint failed; observed progress remains in memory".into(),
                 );
             }
+            // `/rename` and `/undo` change what the client shows (title,
+            // context meter): push both now rather than at the next prompt
+            // (mini-agent-8x75g).
+            if matches!(
+                command,
+                commands::Command::Undo | commands::Command::Rename(_)
+            ) {
+                send_usage_update(state, &history, &session_id, &cx);
+                send_session_info(&mut history, &session_id, &cx);
+            }
             cx.send_notification(SessionNotification::new(
                 session_id,
                 SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
@@ -4202,7 +4232,9 @@ async fn run_prompt(
     // end-of-prompt commit charges only what came after
     // (mini-agent-wkzav).
     let mut usage_committed = usage_before;
-    let pricing = crate::print::HeadlessPricing::from_session(&history.session, &state.cfg);
+    let mut pricing = crate::print::HeadlessPricing::from_session(&history.session, &state.cfg);
+    // Set once a turn is routed to a model other than the startup one.
+    let mut routed_run: Option<crate::spend::run::Run> = None;
     history.pending_question = None;
     let mut native_owner = None;
     // Mid-turn compaction (mini-agent-sgzh0): a segment that stops at a
@@ -4231,6 +4263,7 @@ async fn run_prompt(
                 session_id.clone(),
                 &mut history,
                 &mut native_owner,
+                &mut routed_run,
                 workspace.clone(),
                 context.clone(),
                 read_tracker.clone(),
@@ -4251,6 +4284,11 @@ async fn run_prompt(
             )
         })
         .await;
+        // The cost estimate follows the routed model's prices
+        // (mini-agent-1ly5i).
+        if let Some(routed) = &routed_run {
+            pricing = headless_pricing_for_run(routed);
+        }
         // A compaction that could not shrink the history must not leave the
         // forced-compaction flag armed for the next prompt.
         history.manual_compact = false;
@@ -4268,25 +4306,7 @@ async fn run_prompt(
             {
                 outcome
             }
-            other => {
-                #[cfg(feature = "goal")]
-                let other = other.map(|mut outcome| {
-                    outcome.usage.input_tokens = outcome
-                        .usage
-                        .input_tokens
-                        .saturating_add(carried_usage.input_tokens);
-                    outcome.usage.output_tokens = outcome
-                        .usage
-                        .output_tokens
-                        .saturating_add(carried_usage.output_tokens);
-                    outcome.usage.total_tokens = outcome
-                        .usage
-                        .total_tokens
-                        .saturating_add(carried_usage.total_tokens);
-                    outcome
-                });
-                break other;
-            }
+            other => break other,
         };
         let reactive = outcome.error.take().is_some();
         reactive_used |= reactive;
@@ -4399,6 +4419,33 @@ async fn run_prompt(
             crate::agent::runner::HEADLESS_CONTEXT_RELIEF_PROMPT.to_owned(),
         );
     };
+    // A later segment that fails to start (`Err`) must not drop what the
+    // earlier, already persisted relief segments spent or wrote: answer with
+    // the error, but through the commit tail below so that usage is charged and
+    // the transcript checkpointed (mini-agent-ccuu8).
+    let result = match result {
+        Err(error) if reliefs > 0 => Ok(PromptOutcome::failed(error.to_string())),
+        other => other,
+    };
+    // Every way out of the loop owes the round the tokens earlier relief
+    // segments spent: a cancelled or failed final segment included
+    // (mini-agent-51okt).
+    #[cfg(feature = "goal")]
+    let result = result.map(|mut outcome| {
+        outcome.usage.input_tokens = outcome
+            .usage
+            .input_tokens
+            .saturating_add(carried_usage.input_tokens);
+        outcome.usage.output_tokens = outcome
+            .usage
+            .output_tokens
+            .saturating_add(carried_usage.output_tokens);
+        outcome.usage.total_tokens = outcome
+            .usage
+            .total_tokens
+            .saturating_add(carried_usage.total_tokens);
+        outcome
+    });
     // Keep the history lock and generation registered until every server this
     // prompt does not hand back to the session is closed, including
     // cancellation during agent/runner preparation. Only a prompt that ended
@@ -4462,6 +4509,11 @@ async fn run_prompt(
                     _ => None,
                 }
             })
+    } else if matches!(command, Some(commands::Command::Compact)) {
+        // `/compact` is housekeeping, not a round of goal work: settling it
+        // would spend a round, grow the no-progress streak and run the gate's
+        // checks (mini-agent-argjb).
+        None
     } else {
         settle_acp_goal_round(
             &goal_store_for_gate,
@@ -4652,6 +4704,22 @@ async fn run_prompt(
         .await;
     }
     Ok(())
+}
+
+/// The per-token prices a turn's run captured, in the shape the session's
+/// cost estimate takes.
+fn headless_pricing_for_run(run: &crate::spend::run::Run) -> crate::print::HeadlessPricing {
+    crate::print::HeadlessPricing {
+        anthropic_native: run.prices.anthropic_native,
+        input_token_cost: run.prices.input.unwrap_or(0.0),
+        output_token_cost: run.prices.output.unwrap_or(0.0),
+        cache_prices: crate::pricing::CachePrices {
+            read: run.prices.cache_read,
+            write: run.prices.cache_write,
+            write_1h: run.prices.cache_write_1h,
+            split_required: run.prices.cache_split_required,
+        },
+    }
 }
 
 /// `/cost`: spend and context use for the session so far.
@@ -5011,6 +5079,8 @@ async fn execute_prompt(
     session_id: SessionId,
     history: &mut SessionHistory,
     native_owner: &mut Option<crate::provider::NativeRunOwner>,
+    // The run this turn's requests are accounted to once its route is known.
+    routed_run: &mut Option<crate::spend::run::Run>,
     workspace: Arc<crate::paths::WorkspaceBinding>,
     context: Arc<ContextFiles>,
     read_tracker: crate::agent::tools::ReadTracker,
@@ -5033,11 +5103,6 @@ async fn execute_prompt(
     }
     if let Err(error) = workspace.validate() {
         return Ok(PromptOutcome::failed(error.to_string()));
-    }
-    if let Some(run) = crate::spend::run::Run::current()
-        && run.admit().is_err()
-    {
-        return Ok(PromptOutcome::failed(crate::spend::run::BUDGET_STOP.into()));
     }
     // The session prompt's `[prompt_to_model]` route, or the startup
     // selection when it is unmapped. A route that cannot be initialized
@@ -5075,6 +5140,28 @@ async fn execute_prompt(
         &route.model,
         crate::config::quick_models_map(&state.cfg),
     );
+    // Admission, the ledger receipts, compaction and the cost estimate all use
+    // the model this turn is routed to, not the session's startup model
+    // (mini-agent-1ly5i). The startup route keeps the session's own profile.
+    let rerouted = overrides.model.is_some() || route.mapped.is_some();
+    let run = crate::spend::run::Run::current().map(|run| {
+        if !rerouted {
+            return run;
+        }
+        let selected = overrides
+            .model
+            .as_deref()
+            .or_else(|| route.mapped.as_ref().map(|(_, alias)| alias.as_str()));
+        run.for_routed_turn(&route.provider, &route.model, &state.cfg, selected)
+    });
+    if let Some(run) = &run
+        && run.admit().is_err()
+    {
+        return Ok(PromptOutcome::failed(crate::spend::run::BUDGET_STOP.into()));
+    }
+    if rerouted {
+        *routed_run = run.clone();
+    }
     #[cfg(test)]
     lock_unpoisoned(&state.turn_routes).push(route.clone());
     // The relay reads the same session-local store the actual tool mutates.
@@ -5328,7 +5415,7 @@ async fn execute_prompt(
             );
         let compaction_timeout = state.cfg.resolve_compaction_timeout();
         let compaction_retry = &state.cfg.retry;
-        let observed = crate::spend::run::Run::current().map_or_else(Default::default, |run| {
+        let observed = run.clone().map_or_else(Default::default, |run| {
             let compaction_run = match &configured_compaction {
                 Some((alias, model)) => run.for_model(
                     &provider_str,
@@ -5348,8 +5435,9 @@ async fn execute_prompt(
             };
             crate::spend::run::UsageObserver::with_run(compaction_run)
         });
-        let compacted = history
-            .compact_with_known(
+        let compacted = crate::spend::run::scope(
+            run.clone(),
+            history.compact_with_known(
                 needs_compaction,
                 &control,
                 #[cfg(feature = "goal")]
@@ -5375,8 +5463,9 @@ async fn execute_prompt(
                         Ok(output)
                     }
                 },
-            )
-            .await;
+            ),
+        )
+        .await;
         let Some(usage) = compacted else {
             return Ok(PromptOutcome::cancelled(None));
         };
@@ -5601,7 +5690,7 @@ async fn execute_prompt(
     };
     let agent = agent
         .with_file_checkpoints(file_checkpoints.clone())
-        .with_spend(crate::spend::run::Run::current())
+        .with_spend(run)
         .with_question_turn(cron::question_origin().capture(None));
     let (agent, prior_history) = if let Some(owner) = native_owner.as_mut() {
         use crate::session::native_replay::ReplayBoundary;
@@ -5695,12 +5784,9 @@ async fn execute_prompt(
     // the goal's total and `max_tokens` bound like the agent's own
     // (mini-agent-i6q98).
     #[cfg(feature = "goal")]
-    add_goal_usage(
-        &mut outcome.usage,
-        &state.cfg,
-        &usage_provider,
-        compaction_usage,
-    );
+    // `compaction_usage` was normalised once in the summarizer closure; it is
+    // not normalised again here (mini-agent-yhlut).
+    add_normalized_goal_usage(&mut outcome.usage, compaction_usage);
     Ok(outcome)
 }
 
@@ -5770,28 +5856,32 @@ async fn relay_paused_runner(
         paused_runner.start()
     };
     let mid_turn = mid_turn.zip(runner.compaction_decision_tx.take());
-    if !attached {
+    let outcome = if !attached {
         let mut last_plan = Vec::new();
-        return cancelled_after_runner_with_plan(
+        cancelled_after_runner_with_plan(
             &mut runner.event_rx,
             &session_id,
             &cx,
             &plan_store,
             &mut last_plan,
         )
-        .await;
-    }
-    let outcome = relay_prompt_events(
-        session_id,
-        cx,
-        control,
-        runner.event_rx,
-        plan_store,
-        mid_turn,
-        #[cfg(feature = "goal")]
-        usage_provider,
-    )
-    .await;
+        .await
+    } else {
+        relay_prompt_events(
+            session_id,
+            cx,
+            control,
+            runner.event_rx,
+            plan_store,
+            mid_turn,
+            #[cfg(feature = "goal")]
+            usage_provider,
+        )
+        .await
+    };
+    // `start()` acknowledged these notices, so they ride on the turn's progress
+    // whether it ran or was cancelled before the runner attached
+    // (mini-agent-uusv2).
     #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
     let outcome = {
         let mut outcome = outcome;
@@ -5815,7 +5905,13 @@ fn add_goal_usage(
     provider: &str,
     delta: crate::event::UsageDelta,
 ) {
-    let delta = cfg.normalize_usage(provider, delta);
+    add_normalized_goal_usage(total, cfg.normalize_usage(provider, delta));
+}
+
+/// Add a report that was already normalised (see [`add_goal_usage`]) to a
+/// goal round's token total without normalising it again.
+#[cfg(feature = "goal")]
+fn add_normalized_goal_usage(total: &mut rig::completion::Usage, delta: crate::event::UsageDelta) {
     total.input_tokens = total.input_tokens.saturating_add(delta.input_tokens);
     total.output_tokens = total.output_tokens.saturating_add(delta.output_tokens);
     total.total_tokens = total
@@ -5973,9 +6069,14 @@ async fn relay_prompt_events(
             biased;
             _ = control.cancelled() => {
                 pending_text.flush(&session_id, &cx);
-                return cancelled_after_runner_with_plan(
+                let outcome = cancelled_after_runner_with_plan(
                     &mut rx, &session_id, &cx, &plan_store, &mut last_plan,
                 ).await;
+                // What the cancelled segment already spent still counts toward
+                // a goal's token bound (mini-agent-51okt).
+                #[cfg(feature = "goal")]
+                let outcome = PromptOutcome { usage, ..outcome };
+                return outcome;
             }
             () = pending_text.deadline_elapsed(), if pending_text.is_pending() => {
                 pending_text.flush(&session_id, &cx);
@@ -7497,6 +7598,26 @@ mod protocol_tests {
         let mut bounded = BoundedLineReader::new(futures::io::Cursor::new(input.clone()), 32);
         let mut output = String::new();
         futures::executor::block_on(bounded.read_to_string(&mut output)).unwrap();
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn tls_frame_reader_bounds_each_newline_delimited_message() {
+        use futures::AsyncReadExt;
+
+        let mut oversized = tls_frame_reader(tls::FuturesIo(std::io::Cursor::new(vec![
+            b'x';
+            MAX_ACP_FRAME_BYTES
+                + 1
+        ])));
+        let mut output = Vec::new();
+        let error = futures::executor::block_on(oversized.read_to_end(&mut output)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+        let input = format!("{}\n{}\n", "a".repeat(64), "b".repeat(64));
+        let mut within = tls_frame_reader(tls::FuturesIo(std::io::Cursor::new(input.clone())));
+        let mut output = String::new();
+        futures::executor::block_on(within.read_to_string(&mut output)).unwrap();
         assert_eq!(output, input);
     }
 
@@ -15196,6 +15317,17 @@ mod goal_usage_tests {
     }
 
     #[test]
+    fn acp_goal_usage_adds_already_normalised_compaction_usage_once() {
+        let cfg = Config::default();
+        // The summarizer closure normalises once; the goal total adds it as is.
+        let normalised = cfg.normalize_usage("gemini", report(20, 30));
+        let mut total = rig::completion::Usage::default();
+        add_normalized_goal_usage(&mut total, normalised);
+        assert_eq!(total.output_tokens, 50);
+        assert_eq!(total.total_tokens, 150);
+    }
+
+    #[test]
     fn acp_goal_usage_does_not_double_count_inclusive_reasoning() {
         let cfg = Config::default();
         let mut total = rig::completion::Usage::default();
@@ -15278,5 +15410,54 @@ mod question_transport_tests {
                 .unwrap()
                 .unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod routed_spend_tests {
+    use super::*;
+    use crate::config::types::QuickModelConfig;
+    use crate::spend::{Account, Ledger, PriceSnapshot};
+
+    #[test]
+    fn routed_turn_run_is_priced_and_named_for_the_routed_model() {
+        let root = crate::tests::OwnedTestDirectory::new("acp-routed-spend");
+        let cfg = Config {
+            quick_models: Some(
+                [(
+                    "pricey".to_owned(),
+                    QuickModelConfig {
+                        provider: "openai".into(),
+                        model: "gpt-pricey".into(),
+                        input_token_cost: Some(30.0),
+                        output_token_cost: Some(60.0),
+                        cache_read_token_cost: None,
+                        cache_write_token_cost: None,
+                        cache_write_1h_token_cost: None,
+                        reserve_tokens: None,
+                        temperature: None,
+                        extra_body: None,
+                        context_window: None,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            ),
+            ..Default::default()
+        };
+        let startup = crate::spend::run::Run::fixture(
+            Account::new("routed-session", None, 0.0).unwrap(),
+            Arc::new(Ledger::new(root.path())),
+            "routed-session",
+            PriceSnapshot::capture(Some((1.0, 2.0)), Default::default(), false),
+        );
+        let routed = startup.for_routed_turn("openai", "gpt-pricey", &cfg, Some("pricey"));
+        assert_eq!(routed.prices.input, Some(30.0));
+        assert_eq!(routed.prices.output, Some(60.0));
+        let pricing = headless_pricing_for_run(&routed);
+        assert_eq!(pricing.input_token_cost, 30.0);
+        assert_eq!(pricing.output_token_cost, 60.0);
+        // The startup profile is untouched.
+        assert_eq!(startup.prices.input, Some(1.0));
     }
 }
