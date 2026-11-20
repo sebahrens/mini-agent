@@ -136,6 +136,9 @@ struct SessionHistory {
     /// The last title sent in a `session_info_update`, so a title is pushed
     /// only when it changes.
     last_title_sent: Option<String>,
+    /// A post-reply title request is running without the history lock; one at
+    /// a time, so a later turn does not start a duplicate (mini-agent-nooj0).
+    title_in_flight: bool,
 }
 
 /// When ACP live history is summarized. Token pressure mirrors the TUI's
@@ -294,6 +297,7 @@ impl Default for SessionHistory {
             limits: Default::default(),
             context_window: 0,
             last_title_sent: None,
+            title_in_flight: false,
         }
     }
 }
@@ -2086,6 +2090,7 @@ async fn install_session(
                 limits: Default::default(),
                 context_window: 0,
                 last_title_sent: None,
+                title_in_flight: false,
             })),
             workspace,
             base_context: Arc::new(base_context),
@@ -4698,10 +4703,8 @@ async fn run_prompt(
         let _ = respond_terminal(registration, responder, outcome.reason);
     }
     if title_eligible {
-        crate::startup::heap_future(|| {
-            generate_session_title(state, &mut history, &session_id, &cx)
-        })
-        .await;
+        crate::startup::heap_future(|| generate_session_title(state, history, &session_id, &cx))
+            .await;
     }
     Ok(())
 }
@@ -4821,9 +4824,14 @@ fn send_session_info(
 /// Opt-in model-written title (`session_title_model` must be set): runs once,
 /// after the first completed turn has been answered, never for native history,
 /// and is pushed as a `session_info_update`. A failure keeps the derived title.
+///
+/// The model call can take tens of seconds, so the history lock is released
+/// for it: what it needs is snapshotted under the lock, and the lock is taken
+/// again only to charge the spend and store the title, which a rename (or any
+/// other title) that landed meanwhile wins (mini-agent-nooj0).
 async fn generate_session_title(
     state: &AcpState,
-    history: &mut SessionHistory,
+    history: tokio::sync::OwnedMutexGuard<SessionHistory>,
     session_id: &SessionId,
     cx: &ConnectionTo<Client>,
 ) {
@@ -4833,6 +4841,7 @@ async fn generate_session_title(
     ) || state.cli.no_session
         || crate::session::native_publication::is_native_bearing(&history.session)
         || history.session.generated_title.is_some()
+        || history.title_in_flight
     {
         return;
     }
@@ -4845,21 +4854,44 @@ async fn generate_session_title(
     if matches!(client, crate::provider::AnyClient::Anthropic(_)) {
         return;
     }
-    let _ = crate::startup::heap_future(|| {
-        crate::session::title::generate_for_session_in(
-            &mut history.session,
-            &state.cfg,
-            &client,
-            false,
-        )
+    let (mut history, applied) = title_without_history_lock(history, &state.cfg, &client, |job| {
+        crate::startup::heap_future(|| job.run(&state.cfg, false))
     })
     .await;
-    if history.session.generated_title.is_none() {
+    if !applied {
         return;
     }
-    let _ = sessions::checkpoint(history, |_| {}).await;
-    send_session_info(history, session_id, cx);
-    send_usage_update(state, history, session_id, cx);
+    let _ = sessions::checkpoint(&mut history, |_| {}).await;
+    send_session_info(&mut history, session_id, cx);
+    send_usage_update(state, &history, session_id, cx);
+}
+
+/// Snapshot the title request under `history`, release the lock while `run`
+/// makes the model call, then re-take it to charge the spend (once) and store
+/// the title if nothing named the session meanwhile. Returns the re-taken
+/// guard and whether a title was stored. Nothing is stored when no title is due.
+async fn title_without_history_lock<F, Fut>(
+    mut history: tokio::sync::OwnedMutexGuard<SessionHistory>,
+    cfg: &Config,
+    client: &crate::provider::AnyClient,
+    run: F,
+) -> (tokio::sync::OwnedMutexGuard<SessionHistory>, bool)
+where
+    F: FnOnce(crate::session::title::TitleJob) -> Fut,
+    Fut: std::future::Future<Output = crate::session::title::TitleOutcome>,
+{
+    let Some(job) = crate::session::title::TitleJob::prepare(&mut history.session, cfg, client)
+    else {
+        return (history, false);
+    };
+    history.title_in_flight = true;
+    let mutex = tokio::sync::OwnedMutexGuard::mutex(&history).clone();
+    drop(history);
+    let outcome = run(job).await;
+    let mut history = mutex.lock_owned().await;
+    history.title_in_flight = false;
+    let (_, _, applied) = outcome.finish(&mut history.session);
+    (history, applied)
 }
 
 /// Judge the goal round this ACP prompt turn was.
@@ -7670,6 +7702,89 @@ mod protocol_tests {
             assert_eq!(calls.load(Ordering::SeqCst), 1, "local commands cannot launch a model runner");
             Ok(())
         }).await.unwrap();
+    }
+
+    fn title_due_history() -> Arc<Mutex<SessionHistory>> {
+        let mut history = SessionHistory::default();
+        history
+            .session
+            .add_message(crate::session::MessageRole::User, "name this session");
+        history
+            .session
+            .add_message(crate::session::MessageRole::Assistant, "an answer");
+        Arc::new(Mutex::new(history))
+    }
+
+    /// Runs title generation against `history` with a model call that parks
+    /// until released; returns once the call is in flight.
+    async fn start_parked_title(
+        history: &Arc<Mutex<SessionHistory>>,
+    ) -> (tokio::task::JoinHandle<bool>, Arc<tokio::sync::Notify>) {
+        let client = crate::provider::create_client("ollama", None, &HashMap::new(), None).unwrap();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let guard = history.clone().lock_owned().await;
+        let parked = release.clone();
+        let task = tokio::spawn(async move {
+            let (guard, applied) =
+                title_without_history_lock(guard, &Config::default(), &client, |job| async move {
+                    let _ = started_tx.send(());
+                    parked.notified().await;
+                    let usage = crate::event::UsageDelta {
+                        input_tokens: 7,
+                        ..Default::default()
+                    };
+                    crate::session::title::TitleOutcome::canned(job, Some("Model title"), usage)
+                })
+                .await;
+            drop(guard);
+            applied
+        });
+        started_rx.await.unwrap();
+        (task, release)
+    }
+
+    #[tokio::test]
+    async fn title_generation_leaves_the_history_lock_free_for_mode_changes() {
+        let history = title_due_history();
+        let (task, release) = start_parked_title(&history).await;
+        // set_session_mode and set_session_config_option only try_lock.
+        {
+            let idle = history
+                .try_lock()
+                .expect("history is not held across the title model call");
+            assert!(idle.title_in_flight);
+            assert!(idle.session.generated_title.is_none());
+        }
+        release.notify_one();
+        assert!(task.await.unwrap(), "the title is stored once it arrives");
+        let history = history.lock().await;
+        assert_eq!(
+            history.session.generated_title.as_deref(),
+            Some("Model title")
+        );
+        assert_eq!(
+            history.session.total_input_tokens, 7,
+            "charged exactly once"
+        );
+        assert!(!history.title_in_flight);
+    }
+
+    #[tokio::test]
+    async fn a_rename_during_title_generation_is_not_overwritten() {
+        let history = title_due_history();
+        let (task, release) = start_parked_title(&history).await;
+        history.lock().await.session.name = "Chosen by the user".into();
+        release.notify_one();
+        assert!(!task.await.unwrap(), "a concurrent rename wins");
+        let history = history.lock().await;
+        assert_eq!(history.session.name, "Chosen by the user");
+        assert!(history.session.generated_title.is_none());
+        assert_eq!(
+            history.session.total_input_tokens, 7,
+            "the spend of the discarded title is still charged once"
+        );
+        assert!(!history.title_in_flight);
     }
 
     #[tokio::test]

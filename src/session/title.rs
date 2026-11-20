@@ -295,6 +295,159 @@ pub(crate) async fn generate_for_session(
     crate::startup::heap_future(|| generate_for_session_in(session, cfg, client, true)).await
 }
 
+/// Everything a title request needs from its session, captured up front so the
+/// model call can run without borrowing (or locking) the session.
+pub(crate) struct TitleJob {
+    request: TitleRequest,
+    pricing: TitlePricing,
+    spend: crate::spend::run::Run,
+    client: anyhow::Result<crate::provider::AnyClient>,
+}
+
+/// What a finished [`TitleJob`] hands back to [`TitleOutcome::finish`].
+pub(crate) struct TitleOutcome {
+    request: TitleRequest,
+    pricing: TitlePricing,
+    usage: crate::event::UsageDelta,
+    interrupted: bool,
+    title: Option<CompactString>,
+}
+
+impl TitleJob {
+    /// Snapshot the request, prices and spend run for `session`, or `None`
+    /// when no title is due.
+    pub(crate) fn prepare(
+        session: &mut Session,
+        cfg: &crate::config::Config,
+        client: &crate::provider::AnyClient,
+    ) -> Option<Self> {
+        let request = title_request(cfg, session)?;
+        let pricing = TitlePricing::capture(cfg, session, &request);
+        let spend =
+            crate::spend::run::Run::for_session(session, cfg, crate::spend::RequestKind::Title)
+                .with_captured_profile(
+                    &request.provider,
+                    &request.model,
+                    crate::spend::PriceSnapshot::capture(
+                        pricing.known_prices(),
+                        pricing.cache,
+                        pricing.anthropic_native,
+                    ),
+                    cfg,
+                    crate::spend::RequestKind::Title,
+                );
+        let client = if request.provider == session.provider {
+            Ok(client.clone())
+        } else {
+            crate::provider::create_client(
+                &request.provider,
+                None,
+                cfg.custom_providers_map(),
+                cfg.api_keys.as_ref(),
+            )
+        };
+        Some(Self {
+            request,
+            pricing,
+            spend,
+            client,
+        })
+    }
+
+    /// Run the model call. Needs no session, so no session lock is held.
+    pub(crate) async fn run(self, cfg: &crate::config::Config, headless: bool) -> TitleOutcome {
+        let Self {
+            request,
+            pricing,
+            spend,
+            client,
+        } = self;
+        if spend.admit().is_err() {
+            crate::print::headless_stderr(format_args!(
+                "USD budget: optional session title skipped; the completed answer is retained\n"
+            ));
+            return TitleOutcome {
+                request,
+                pricing,
+                usage: Default::default(),
+                interrupted: false,
+                title: None,
+            };
+        }
+        let ledger = UsageLedger::with_spend(spend.clone());
+        let command = async {
+            match client {
+                Ok(client) => crate::spend::run::scope(
+                    Some(spend),
+                    crate::startup::heap_future(|| {
+                        generate(&request, &client, cfg, ledger.clone())
+                    }),
+                )
+                .await
+                .map_err(std::io::Error::other),
+                Err(error) => Err(std::io::Error::other(error)),
+            }
+        };
+        let result = if headless {
+            crate::print::run_headless_command(command).await
+        } else {
+            command.await
+        };
+        let interrupted = result.as_ref().err().is_some_and(|error| {
+            error.kind() == std::io::ErrorKind::Interrupted
+                || crate::print::headless_force_stopped()
+        });
+        let usage = cfg.normalize_usage(&request.provider, ledger.take());
+        let title = match result {
+            Ok(title) => Some(title),
+            Err(error) => {
+                tracing::debug!(%error,"session title unavailable");
+                None
+            }
+        };
+        TitleOutcome {
+            request,
+            pricing,
+            usage,
+            interrupted,
+            title,
+        }
+    }
+}
+
+impl TitleOutcome {
+    /// A finished request for `job` with a canned result, for tests of the
+    /// callers' locking.
+    #[cfg(test)]
+    pub(crate) fn canned(
+        job: TitleJob,
+        title: Option<&str>,
+        usage: crate::event::UsageDelta,
+    ) -> Self {
+        Self {
+            request: job.request,
+            pricing: job.pricing,
+            usage,
+            interrupted: false,
+            title: title.map(CompactString::new),
+        }
+    }
+
+    /// Charge the observed usage (exactly once) and store the title when it is
+    /// still wanted. Returns the usage, whether the call was interrupted, and
+    /// whether the title was stored. A different session is left untouched.
+    pub(crate) fn finish(self, session: &mut Session) -> (crate::event::UsageDelta, bool, bool) {
+        if session.id != self.request.session_id {
+            return (self.usage, self.interrupted, false);
+        }
+        self.pricing.charge(session, self.usage);
+        let applied = self
+            .title
+            .is_some_and(|title| apply(session, &self.request.session_id, title));
+        (self.usage, self.interrupted, applied)
+    }
+}
+
 /// [`generate_for_session`] for a caller that owns its own signal handling:
 /// with `headless` false the request runs directly instead of inside the
 /// headless command wrapper (ACP servers speak a protocol on stdio and must
@@ -305,66 +458,11 @@ pub(crate) async fn generate_for_session_in(
     client: &crate::provider::AnyClient,
     headless: bool,
 ) -> (crate::event::UsageDelta, bool) {
-    let Some(request) = title_request(cfg, session) else {
+    let Some(job) = TitleJob::prepare(session, cfg, client) else {
         return (Default::default(), false);
     };
-    let pricing = TitlePricing::capture(cfg, session, &request);
-    let spend = crate::spend::run::Run::for_session(session, cfg, crate::spend::RequestKind::Title)
-        .with_captured_profile(
-            &request.provider,
-            &request.model,
-            crate::spend::PriceSnapshot::capture(
-                pricing.known_prices(),
-                pricing.cache,
-                pricing.anthropic_native,
-            ),
-            cfg,
-            crate::spend::RequestKind::Title,
-        );
-    if spend.admit().is_err() {
-        crate::print::headless_stderr(format_args!(
-            "USD budget: optional session title skipped; the completed answer is retained\n"
-        ));
-        return (Default::default(), false);
-    }
-    let title_client = if request.provider == session.provider {
-        Ok(client.clone())
-    } else {
-        crate::provider::create_client(
-            &request.provider,
-            None,
-            cfg.custom_providers_map(),
-            cfg.api_keys.as_ref(),
-        )
-    };
-    let ledger = UsageLedger::with_spend(spend.clone());
-    let command = async {
-        match title_client {
-            Ok(client) => crate::spend::run::scope(
-                Some(spend),
-                crate::startup::heap_future(|| generate(&request, &client, cfg, ledger.clone())),
-            )
-            .await
-            .map_err(std::io::Error::other),
-            Err(error) => Err(std::io::Error::other(error)),
-        }
-    };
-    let result = if headless {
-        crate::print::run_headless_command(command).await
-    } else {
-        command.await
-    };
-    let interrupted = result.as_ref().err().is_some_and(|error| {
-        error.kind() == std::io::ErrorKind::Interrupted || crate::print::headless_force_stopped()
-    });
-    let usage = cfg.normalize_usage(&request.provider, ledger.take());
-    pricing.charge(session, usage);
-    match result {
-        Ok(title) => {
-            apply(session, &request.session_id, title);
-        }
-        Err(error) => tracing::debug!(%error,"session title unavailable"),
-    };
+    let outcome = job.run(cfg, headless).await;
+    let (usage, interrupted, _) = outcome.finish(session);
     (usage, interrupted)
 }
 
