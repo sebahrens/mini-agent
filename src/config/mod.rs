@@ -1172,6 +1172,21 @@ pub(crate) enum PromptRoute<'a> {
     },
 }
 
+/// Quick models whose model id is `model_id`, ordered by alias so that when
+/// several aliases share an id the winning window/temperature/extra_body is
+/// the same on every run (HashMap iteration order is per-process random).
+fn quick_models_for_model<'a>(
+    qm: &'a HashMap<String, types::QuickModelConfig>,
+    model_id: &str,
+) -> Vec<&'a types::QuickModelConfig> {
+    let mut hits: Vec<(&String, &types::QuickModelConfig)> = qm
+        .iter()
+        .filter(|(_, qmc)| qmc.model.as_str() == model_id)
+        .collect();
+    hits.sort_by(|a, b| a.0.cmp(b.0));
+    hits.into_iter().map(|(_, qmc)| qmc).collect()
+}
+
 impl Config {
     /// The shell environment policy these keys configure.
     pub fn shell_env_policy(&self) -> crate::sandbox::ShellEnvPolicy {
@@ -1304,7 +1319,7 @@ impl Config {
         if let Some(cw) = self.context_window {
             return Some(cw);
         }
-        for qmc in qm.values() {
+        for qmc in quick_models_for_model(qm, model_id) {
             if qmc.model.as_str() == model_id
                 && let Some(cw) = qmc.context_window
             {
@@ -1355,7 +1370,7 @@ impl Config {
         if let Some(rt) = self.reserve_tokens {
             return rt;
         }
-        for qmc in qm.values() {
+        for qmc in quick_models_for_model(qm, model_id) {
             if qmc.model.as_str() == model_id
                 && let Some(rt) = qmc.reserve_tokens
             {
@@ -1491,7 +1506,7 @@ impl Config {
         if let Some(temp) = cli.temperature {
             return Some(temp.clamp(0.0, 2.0));
         }
-        for qmc in qm.values() {
+        for qmc in quick_models_for_model(qm, model_id) {
             if qmc.model.as_str() == model_id
                 && let Some(temp) = qmc.temperature
             {
@@ -1510,7 +1525,7 @@ impl Config {
         model_id: &str,
         qm: &HashMap<String, types::QuickModelConfig>,
     ) -> Option<serde_json::Value> {
-        for qmc in qm.values() {
+        for qmc in quick_models_for_model(qm, model_id) {
             if qmc.model.as_str() == model_id
                 && let Some(eb) = &qmc.extra_body
             {
@@ -2448,6 +2463,29 @@ impl Config {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn shared_model_id_quick_models_resolve_by_sorted_alias() {
+        let mk = |ctx: u64| -> types::QuickModelConfig {
+            serde_json::from_value(serde_json::json!({
+                "provider": "openai",
+                "model": "gpt-x",
+                "context_window": ctx,
+                "extra_body": {"ctx": ctx},
+            }))
+            .expect("quick model")
+        };
+        let mut qm = HashMap::new();
+        for (alias, ctx) in [("zeta", 3u64), ("alpha", 1), ("mid", 2)] {
+            qm.insert(alias.to_string(), mk(ctx));
+        }
+        let cfg = Config::default();
+        assert_eq!(cfg.known_context_window("openai", "gpt-x", &qm), Some(1));
+        assert_eq!(
+            cfg.resolve_extra_body("gpt-x", &qm),
+            Some(serde_json::json!({"ctx": 1}))
+        );
+    }
 
     #[test]
     fn shell_deadline_configuration_has_a_finite_hard_ceiling() {

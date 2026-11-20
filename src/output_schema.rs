@@ -351,18 +351,19 @@ pub(crate) async fn repair_rounds(
     // These records are now managed here rather than written twice by dispatch.
     rounds.persisted = true;
     for attempt in 0..=MAX_REPAIRS {
-        if !cli.no_session {
-            crate::print::persist_headless_turn(session, &prompt, &response, &interactions);
-            let usage = cfg.normalize_usage(&session.provider, attempt_usage.into());
-            session.charge_usage_delta(usage, cfg.is_anthropic_native(&session.provider));
-            if let Err(error) =
+        // An ephemeral stream still owns one live conversation: record and
+        // charge every attempt in memory, and only skip the disk save.
+        crate::print::persist_headless_turn(session, &prompt, &response, &interactions);
+        let usage = cfg.normalize_usage(&session.provider, attempt_usage.into());
+        session.charge_usage_delta(usage, cfg.is_anthropic_native(&session.provider));
+        if !cli.no_session
+            && let Err(error) =
                 crate::session::storage::save_session_recovering(session, |notice| {
                     eprintln!("warning: {notice}")
                 })
-            {
-                rounds.turn.failure = Some(error);
-                return SchemaOutcome::default();
-            }
+        {
+            rounds.turn.failure = Some(error);
+            return SchemaOutcome::default();
         }
         if rounds.turn.failure.is_some() {
             return SchemaOutcome::default();
