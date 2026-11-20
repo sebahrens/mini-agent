@@ -83,7 +83,7 @@ struct Catalog {
     max_output: HashMap<String, HashMap<String, u32>>,
     long_context: HashMap<String, HashMap<String, crate::pricing::LongContextPrices>>,
     source: CatalogSource,
-    generated_at: Option<chrono::DateTime<chrono::Utc>>,
+    generated_at: Option<jiff::Timestamp>,
 }
 static CATALOG: LazyLock<Catalog> = LazyLock::new(|| {
     // Tests never read a developer's real cache directory.
@@ -95,7 +95,7 @@ static CATALOG: LazyLock<Catalog> = LazyLock::new(|| {
         CATALOG_JSON,
         EMBEDDED_GENERATED_AT,
         overlay.as_deref(),
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )
 });
 
@@ -105,14 +105,12 @@ static CATALOG: LazyLock<Catalog> = LazyLock::new(|| {
 /// snapshot, and suppress every refresh, until real time caught up.
 const MAX_FUTURE_SKEW_DAYS: i64 = 1;
 
-fn is_future_dated(at: chrono::DateTime<chrono::Utc>, now: chrono::DateTime<chrono::Utc>) -> bool {
-    at > now + chrono::Duration::days(MAX_FUTURE_SKEW_DAYS)
+fn is_future_dated(at: jiff::Timestamp, now: jiff::Timestamp) -> bool {
+    at > now + jiff::SignedDuration::from_hours(MAX_FUTURE_SKEW_DAYS * 24)
 }
 
-fn parse_instant(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    chrono::DateTime::parse_from_rfc3339(value.trim())
-        .ok()
-        .map(|instant| instant.with_timezone(&chrono::Utc))
+fn parse_instant(value: &str) -> Option<jiff::Timestamp> {
+    value.trim().parse::<jiff::Timestamp>().ok()
 }
 
 /// The cache-overlay path, when application paths are available.
@@ -155,7 +153,7 @@ fn load_catalog(
     embedded_json: &str,
     embedded_generated_at: &str,
     overlay_path: Option<&std::path::Path>,
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
 ) -> Catalog {
     let mut raw: RawCatalog = match serde_json::from_str(embedded_json) {
         Ok(raw) => raw,
@@ -308,14 +306,14 @@ pub(crate) fn model_image_input(provider: &str, model: &str) -> Option<bool> {
 }
 
 /// `/models` line naming the catalog in use and its age.
-pub(crate) fn catalog_age_line(now: chrono::DateTime<chrono::Utc>) -> String {
+pub(crate) fn catalog_age_line(now: jiff::Timestamp) -> String {
     describe_age(&CATALOG.source, CATALOG.generated_at, now)
 }
 
 fn describe_age(
     source: &CatalogSource,
-    generated_at: Option<chrono::DateTime<chrono::Utc>>,
-    now: chrono::DateTime<chrono::Utc>,
+    generated_at: Option<jiff::Timestamp>,
+    now: jiff::Timestamp,
 ) -> String {
     let origin = match source {
         CatalogSource::Embedded => "embedded snapshot".to_string(),
@@ -323,10 +321,10 @@ fn describe_age(
     };
     match generated_at {
         Some(at) => {
-            let days = (now - at).num_days().max(0);
+            let days = (now.duration_since(at).as_secs() / 86_400).max(0);
             format!(
                 "model catalog: {origin} from {} ({days} day{} old; /models catalog-refresh updates it)",
-                at.format("%Y-%m-%d"),
+                at.strftime("%Y-%m-%d"),
                 if days == 1 { "" } else { "s" }
             )
         }
@@ -584,7 +582,9 @@ pub(crate) async fn refresh_cache() -> anyhow::Result<(std::path::PathBuf, usize
     let count = providers.values().map(Vec::len).sum();
     anyhow::ensure!(count > 0, "models.dev returned no usable models");
     let overlay = CatalogOverlay {
-        generated_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        generated_at: jiff::Timestamp::now()
+            .strftime("%Y-%m-%dT%H:%M:%SZ")
+            .to_string(),
         source: Some(MODELS_DEV_URL.to_string()),
         providers,
     };
@@ -602,15 +602,16 @@ pub(crate) async fn refresh_cache() -> anyhow::Result<(std::path::PathBuf, usize
 
 /// Whether the cache at `path` needs a refresh at `now`: it is missing,
 /// unreadable, future-dated beyond the skew policy, or at least `days` old.
-fn refresh_due(path: &std::path::Path, days: u64, now: chrono::DateTime<chrono::Utc>) -> bool {
-    let ttl = chrono::Duration::days(
+fn refresh_due(path: &std::path::Path, days: u64, now: jiff::Timestamp) -> bool {
+    let ttl = jiff::SignedDuration::from_hours(
         i64::try_from(days)
             .unwrap_or(i64::MAX / 86_400_000)
-            .min(36_500),
+            .min(36_500)
+            * 24,
     );
     let fresh = read_overlay(path)
         .and_then(|overlay| parse_instant(&overlay.generated_at))
-        .is_some_and(|at| !is_future_dated(at, now) && (now - at) < ttl);
+        .is_some_and(|at| !is_future_dated(at, now) && now.duration_since(at) < ttl);
     !fresh
 }
 
@@ -624,7 +625,7 @@ pub(crate) fn spawn_refresh_if_stale(days: Option<u64>) {
     let Some(path) = cache_path() else {
         return;
     };
-    if !refresh_due(&path, days, chrono::Utc::now()) {
+    if !refresh_due(&path, days, jiff::Timestamp::now()) {
         return;
     }
     tokio::spawn(async {
@@ -655,8 +656,7 @@ mod tests {
     }
 
     /// The single explicit clock value every catalog decision in these tests uses.
-    const NOW: chrono::DateTime<chrono::Utc> =
-        chrono::DateTime::from_timestamp(1_797_292_800, 0).unwrap(); // 2026-12-15
+    const NOW: jiff::Timestamp = jiff::Timestamp::constant(1_797_292_800, 0); // 2026-12-15
 
     const EMBEDDED: &str = r#"{"anthropic":[{"id":"claude-old","name":"Old","context":1000}],"openai":[{"id":"gpt-x","name":"X","context":2000}]}"#;
 
@@ -688,6 +688,22 @@ mod tests {
             line.contains("models.dev cache") && line.contains("10 days old"),
             "{line}"
         );
+    }
+
+    #[test]
+    fn parse_instant_accepts_old_cache_stamps_and_age_uses_utc_date() {
+        let a = super::parse_instant("2026-12-01T00:00:00Z").unwrap();
+        assert_eq!(super::parse_instant(" 2026-12-01T00:00:00+00:00 "), Some(a));
+        assert_eq!(super::parse_instant("2026-12-01T01:00:00+01:00"), Some(a));
+        assert_eq!(
+            super::parse_instant("2026-12-01T00:00:00.5Z")
+                .unwrap()
+                .as_millisecond()
+                % 1000,
+            500
+        );
+        assert!(super::parse_instant("2026-12-01").is_none());
+        assert_eq!(a.strftime("%Y-%m-%d").to_string(), "2026-12-01");
     }
 
     #[test]
