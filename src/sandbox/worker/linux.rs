@@ -153,8 +153,6 @@ fn launch_executable(
         input: super::child_stdin_file(input),
         output: super::child_stdout_file(output),
         stderr: super::child_stderr_file(stderr),
-        #[cfg(unix)]
-        tree_terminated: false,
         #[cfg(test)]
         reap_observer: None,
         #[cfg(test)]
