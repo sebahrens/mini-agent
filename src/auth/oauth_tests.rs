@@ -845,6 +845,69 @@ async fn oauth47_revoked_refresh_preserves_a_reauthorization_fence_without_key_f
     );
 }
 
+#[tokio::test]
+async fn oauth_refresh_keeps_a_rotated_refresh_token_when_key_fetch_fails() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let roots = crate::tests::OwnedTestDirectory::new("oauth-rotated-refresh-kept");
+    let root = roots.path().join("credentials");
+    let mut store = LockedStore::open(root.clone(), true).unwrap().unwrap();
+    store.data.accounts.push(Account {
+        client_id: "oaiapp_own".into(),
+        subject: "subject".into(),
+        email: None,
+        tokens: Some(Tokens {
+            access: "expired".into(),
+            refresh: "old-refresh".into(),
+            id: "id".into(),
+            scopes: SCOPES.into(),
+            expires: 0,
+        }),
+    });
+    store.data.active = Some("oaiapp_own".into());
+    store.save().unwrap();
+    drop(store);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let registration = Registration {
+        root: root.clone(),
+        client_id: "oaiapp_own".into(),
+        endpoints: Some(AuthEndpoints {
+            token: endpoint.clone(),
+            jwks: endpoint,
+        }),
+    };
+    let server = async {
+        for status in ["200 OK", "500 Internal Server Error"] {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                headers.push(socket.read_u8().await.unwrap());
+                assert!(headers.len() < 8192);
+            }
+            let body = if status == "200 OK" {
+                serde_json::json!({"access_token":"new-access","refresh_token":"new-refresh","id_token":"unverified","token_type":"Bearer","expires_in":3600,"scope":SCOPES}).to_string()
+            } else {
+                "{}".to_string()
+            };
+            socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+        }
+    };
+    let operation = async {
+        assert!(registration.access_token().await.is_err());
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(server, operation)
+    })
+    .await
+    .unwrap();
+    let store = LockedStore::open(root, false).unwrap().unwrap();
+    let tokens = store.data.accounts[0].tokens.as_ref().unwrap();
+    assert_eq!(tokens.refresh, "new-refresh");
+    assert_eq!(tokens.expires, 0, "unverified tokens are never served");
+    assert_eq!(tokens.access, "expired");
+    store.data.validate().unwrap();
+}
+
 #[test]
 fn oauth47_cli_and_slash_commands_expose_login_without_an_api_key() {
     use clap::Parser;

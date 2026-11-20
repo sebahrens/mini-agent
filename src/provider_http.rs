@@ -356,6 +356,43 @@ fn retry_hint_headers(headers: &http::HeaderMap) -> http::HeaderMap {
         .collect()
 }
 
+/// Upper bound on the error body kept and read; the rest is discarded.
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+
+/// Reads at most `MAX_ERROR_BODY_BYTES` of a non-2xx body so a gateway that
+/// streams an endless or huge error cannot grow memory without limit.
+async fn read_error_body(mut response: reqwest::Response) -> String {
+    let mut body = Vec::new();
+    let mut truncated = false;
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let room = MAX_ERROR_BODY_BYTES - body.len();
+                if chunk.len() > room {
+                    body.extend_from_slice(&chunk[..room]);
+                    truncated = true;
+                    break;
+                }
+                body.extend_from_slice(&chunk);
+                if body.len() == MAX_ERROR_BODY_BYTES {
+                    // Exactly at the cap; anything further is dropped.
+                    truncated = true;
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(error) => {
+                return format!("failed to read error response body: {error}");
+            }
+        }
+    }
+    let mut text = String::from_utf8_lossy(&body).into_owned();
+    if truncated {
+        text.push_str("... [error body truncated]");
+    }
+    text
+}
+
 async fn response_error(
     response: reqwest::Response,
     private_auth: Option<&'static str>,
@@ -365,10 +402,7 @@ async fn response_error(
     let body = if let Some(message) = private_auth {
         message.to_owned()
     } else {
-        response
-            .text()
-            .await
-            .unwrap_or_else(|error| format!("failed to read error response body: {error}"))
+        read_error_body(response).await
     };
     let source = http_client::Error::InvalidStatusCodeWithMessage(status, body);
     if hint_headers.is_empty() {

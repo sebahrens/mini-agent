@@ -735,19 +735,39 @@ impl Registration {
                 return Err(error);
             }
         };
-        let keys: Jwks = json_response(
-            http.get(&endpoints.jwks)
-                .send()
-                .map_err(|_| anyhow::anyhow!("Provider signing keys unavailable"))?,
-        )?;
-        let (tokens, _) = accept_tokens(
-            response,
-            &keys,
-            &self.client_id,
-            None,
-            Some(&account.subject),
-            at,
-        )?;
+        // The server may already have rotated (consumed) the old refresh token.
+        // Keep the new one if the follow-up verification fails, but expired, so
+        // nothing unverified is ever served and the next call just refreshes.
+        let rotated = response.refresh_token.clone();
+        let verified = (|| {
+            let keys: Jwks = json_response(
+                http.get(&endpoints.jwks)
+                    .send()
+                    .map_err(|_| anyhow::anyhow!("Provider signing keys unavailable"))?,
+            )?;
+            accept_tokens(
+                response,
+                &keys,
+                &self.client_id,
+                None,
+                Some(&account.subject),
+                at,
+            )
+        })();
+        let (tokens, _) = match verified {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                if bounded(&rotated, MAX_TOKEN)
+                    && let Some(stored) = account.tokens.as_mut()
+                    && stored.refresh != rotated
+                {
+                    stored.refresh = rotated;
+                    stored.expires = 0;
+                    store.save()?;
+                }
+                return Err(error);
+            }
+        };
         let access = tokens.access.clone();
         let expires = tokens.expires;
         account.tokens = Some(tokens);

@@ -507,8 +507,7 @@ impl Ledger {
                 }
             }
         } else {
-            file.try_lock_shared()
-                .map_err(|_| anyhow::anyhow!("usage ledger is busy"))?;
+            Self::lock_shared_bounded(&file)?;
         }
         Ok(Some(LockedLedgerFile::new(file)))
     }
@@ -588,8 +587,7 @@ impl Ledger {
         let Some((file, binding)) = self.open(false)? else {
             return self.with_rollup(LedgerSummary::default(), Some(session_id));
         };
-        file.try_lock_shared()
-            .map_err(|_| anyhow::anyhow!("usage ledger is busy"))?;
+        Self::lock_shared_bounded(&file)?;
         let mut file = LockedLedgerFile::new(file);
         #[cfg(all(test, unix))]
         self.pause_lock_for_test(&file);
@@ -662,8 +660,7 @@ impl Ledger {
         let Some((file, binding)) = self.open(false)? else {
             return self.with_rollup(LedgerSummary::default(), session_id);
         };
-        file.try_lock_shared()
-            .map_err(|_| anyhow::anyhow!("usage ledger is busy"))?;
+        Self::lock_shared_bounded(&file)?;
         let mut file = LockedLedgerFile::new(file);
         #[cfg(all(test, unix))]
         self.pause_lock_for_test(&file);
@@ -705,6 +702,25 @@ impl Ledger {
             account.tracking_failed();
         }
         result
+    }
+    /// Shared lock for readers, waiting up to `WRITE_LOCK_WAIT` like writers
+    /// so a concurrent flush (exclusive lock held across scan, write and
+    /// fsync) does not fail a capped run's startup summary as "busy".
+    fn lock_shared_bounded(file: &File) -> anyhow::Result<()> {
+        let started = std::time::Instant::now();
+        loop {
+            match file.try_lock_shared() {
+                Ok(()) => return Ok(()),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    let remaining = WRITE_LOCK_WAIT.saturating_sub(started.elapsed());
+                    anyhow::ensure!(!remaining.is_zero(), "usage ledger is busy");
+                    std::thread::sleep(WRITE_LOCK_RETRY.min(remaining));
+                }
+                Err(std::fs::TryLockError::Error(_)) => {
+                    anyhow::bail!("usage ledger locking failed")
+                }
+            }
+        }
     }
     fn lock_writer(
         &self,
@@ -894,18 +910,37 @@ impl Ledger {
             additions.push((row.id, bytes));
         }
         Self::revalidate(&binding, &file)?;
+        // One buffer, one write: a failure leaves at most a torn tail that this
+        // live writer, still holding the exclusive lock, rolls back to the
+        // pre-append length so later scans do not fail closed on its own mess.
+        let previous_length = file
+            .metadata()
+            .map_err(|_| anyhow::anyhow!("usage ledger append failed"))?
+            .len();
+        let mut batch = Vec::new();
         for (_, bytes) in &additions {
-            file.write_all(bytes)
-                .map_err(|_| anyhow::anyhow!("usage ledger append failed"))?;
-            file.write_all(b"\n")
-                .map_err(|_| anyhow::anyhow!("usage ledger append failed"))?;
+            batch.extend_from_slice(bytes);
+            batch.push(b'\n');
         }
-        #[cfg(test)]
-        if let Some(gate) = &self.pre_sync_gate {
-            gate.wait(account);
+        let appended = file
+            .write_all(&batch)
+            .map_err(|_| anyhow::anyhow!("usage ledger append failed"))
+            .and_then(|()| {
+                #[cfg(test)]
+                if let Some(gate) = &self.pre_sync_gate {
+                    gate.wait(account);
+                }
+                file.sync_all()
+                    .map_err(|_| anyhow::anyhow!("usage ledger sync failed"))
+            });
+        if let Err(error) = appended {
+            // Best effort: if the rollback itself fails the tail stays torn
+            // and the ledger remains fail-closed, as for a crash tail.
+            if file.set_len(previous_length).is_ok() {
+                let _ = file.sync_all();
+            }
+            return Err(error);
         }
-        file.sync_all()
-            .map_err(|_| anyhow::anyhow!("usage ledger sync failed"))?;
         Self::revalidate(&binding, &file)?;
         if let Ok(metadata) = file.metadata()
             && metadata.len() == scanned.bytes as u64
@@ -2696,6 +2731,29 @@ mod tests {
         );
         loaded.reconcile(Some(6.0), &summary.session).unwrap();
         assert_eq!(loaded.snapshot().recorded_spend(), 7.0);
+    }
+
+    #[test]
+    fn spend_ledger_summary_waits_for_a_briefly_held_writer_lock() {
+        let root = crate::tests::OwnedTestDirectory::new("spend-ledger-reader-wait");
+        let parent = root.path().join("state");
+        crate::fs::ensure_private_directory(&parent).unwrap();
+        let ledger = Ledger::new(&parent);
+        let account = Account::new("s", None, 0.0).unwrap();
+        account.observe(&receipt(RequestKind::Turn)).unwrap();
+        ledger.flush(&account).unwrap();
+        let holder = crate::fs::open_private_file_checked(
+            &ledger.path,
+            crate::fs::PrivateFileAccess::Append,
+        )
+        .unwrap();
+        holder.try_lock().unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            drop(holder);
+        });
+        assert_eq!(ledger.summary().unwrap().all_time.records, 1);
+        release.join().unwrap();
     }
 
     #[test]
