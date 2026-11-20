@@ -979,8 +979,11 @@ mod tests {
         );
         assert_eq!(rounds.turn.usage.input_tokens, 100);
         assert_eq!(rounds.turn.response, "\"invalid\"");
-        assert_eq!(session.total_input_tokens, 0);
-        assert!(session.messages.is_empty());
+        // --no-session only skips the disk save: the rejected attempt is still
+        // recorded in the live history and charged exactly once
+        // (mini-agent-t6s5b).
+        assert_eq!(session.total_input_tokens, 100);
+        assert!(!session.messages.is_empty());
     }
 
     #[test]

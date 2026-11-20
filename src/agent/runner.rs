@@ -3994,14 +3994,14 @@ fn normalized_continuation_bridge(
 ) -> Vec<Message> {
     let mut bridge = completed_interactions;
     bridge.extend_from_slice(uncommitted_interactions);
-    // After tool results the bridge already ends with a user turn. Fold the
-    // instruction into it: an empty assistant filler is rejected by
-    // Anthropic-style APIs ("text content blocks must be non-empty").
-    if let Some(Message::User { content }) = bridge.last_mut() {
-        content.push(UserContent::text(continuation_instruction));
-    } else {
-        bridge.push(Message::user(continuation_instruction.to_string()));
-    }
+    // The continuation instruction stays its own trailing user message: the
+    // OpenAI-family converters (chat completions, Responses, OpenRouter) drop
+    // text parts that share a user message with tool results, so folding it into
+    // the tool-result turn would silently lose it. No empty assistant filler
+    // either: Anthropic-style APIs reject empty text blocks (mini-agent-em2cw),
+    // and they accept adjacent user turns (Anthropic merges them; OpenAI takes a
+    // tool message followed by a user message).
+    bridge.push(Message::user(continuation_instruction.to_string()));
     bridge
 }
 
@@ -11793,7 +11793,7 @@ mod tests {
     #[tokio::test]
     async fn runner_tool_call_text_eof_preserves_one_assistant_turn_on_both_surfaces() {
         fn assert_recovery_history(history: Vec<Message>) -> ToolResult {
-            assert_eq!(history.len(), 5);
+            assert_eq!(history.len(), 4);
             assert_eq!(history[0], Message::user("start"));
             let Message::Assistant { content, .. } = &history[1] else {
                 panic!("tool call and following text must share one assistant turn")
@@ -11817,12 +11817,7 @@ mod tests {
             assert!(result.content.iter().any(
                 |part| matches!(part, ToolResultContent::Text(text) if text.text == UNKNOWN_TOOL_OUTCOME)
             ));
-            assert!(matches!(
-                &history[3],
-                Message::Assistant { content, .. }
-                    if matches!(content.first(), AssistantContent::Text(text) if text.text.is_empty())
-            ));
-            assert_eq!(history[4], Message::user("Please continue."));
+            assert_eq!(history[3], Message::user("Please continue."));
             result.clone()
         }
 
@@ -12109,15 +12104,9 @@ mod tests {
             Some(Message::User { content })
                 if matches!(content.first_ref(), rig::message::UserContent::ToolResult(result) if result.id == "causal-tool")
         ));
-        // The continuation instruction rides in the trailing tool-result user
-        // turn; no empty assistant message is inserted.
-        assert!(matches!(
-            history.last_ref(),
-            Message::User { content }
-                if content.len() == 2
-                    && matches!(content.first_ref(), rig::message::UserContent::ToolResult(result) if result.id == "causal-tool")
-                    && matches!(content.iter().nth(1), Some(rig::message::UserContent::Text(text)) if text.text == "Please continue.")
-        ));
+        // The continuation instruction is its own trailing user message; no empty
+        // assistant message is inserted (mini-agent-em2cw).
+        assert_eq!(history.last_ref(), &Message::user("Please continue."));
         assert!(
             !history
                 .iter()
