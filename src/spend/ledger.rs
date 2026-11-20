@@ -19,10 +19,19 @@ const WRITE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StateLock {
     Read,
-    Write,
+    Append,
+    Rotate,
 }
 
 const LOCK_FILE: &str = "usage.lock";
+// A rotation needs the coordination lock exclusively, so it must outlast an
+// appender's in-flight full-segment scan (held shared, longer than
+// `WRITE_LOCK_WAIT` on a slow runner). With the one-second bound two writers
+// that both find the segment full keep expiring each other's wait and retrying
+// (a livelock); every holder of the shared lock finishes in finite time, so a
+// longer bound lets the rotator through. Appenders and readers keep the short
+// bound. Lock order stays: coordination lock first, then the active file.
+const ROTATE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 const WRITE_LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
 
 #[derive(Debug, Clone, Default)]
@@ -438,13 +447,12 @@ impl Ledger {
     /// The stable cross-process coordination lock (`usage.lock`). Unlike the
     /// active segment, whose inode is replaced by rotation, this file is never
     /// renamed, so one lock spans active-file generation, archive and rollup
-    /// publication, recovery and every summary snapshot. Summaries hold it
-    /// shared until the rollup is merged; every flush holds it exclusively, so
-    /// a rotation also excludes every in-flight summary snapshot. Lock order,
-    /// everywhere: this lock first, then the active-file lock, never the
-    /// reverse (a writer that needs the exclusive lock while holding a shared
-    /// one, with a peer waiting on the active file, would otherwise ping-pong
-    /// on the bounded waits). Returns `None` for a read-only caller when no ledger
+    /// publication, recovery and every summary snapshot. Writers hold it
+    /// shared for a flush that only appends; summaries hold it shared until the
+    /// rollup is merged. Appending writers hold it shared (the active-file
+    /// lock still serializes them against each other and against readers'
+    /// scans); only a rotation takes it exclusively, so it also excludes every
+    /// in-flight summary snapshot. Returns `None` for a read-only caller when no ledger
     /// storage exists yet, or when the directory cannot hold the lock file
     /// (then no writer can exist either).
     fn lock_state(
@@ -489,8 +497,13 @@ impl Ledger {
             .map_err(|_| anyhow::anyhow!("usage ledger private validation failed"))?;
         if write {
             let started = std::time::Instant::now();
+            let bound = if mode == StateLock::Rotate {
+                ROTATE_LOCK_WAIT
+            } else {
+                WRITE_LOCK_WAIT
+            };
             loop {
-                let attempt = if write {
+                let attempt = if mode == StateLock::Rotate {
                     file.try_lock()
                 } else {
                     file.try_lock_shared()
@@ -498,7 +511,7 @@ impl Ledger {
                 match attempt {
                     Ok(()) => break,
                     Err(std::fs::TryLockError::WouldBlock) => {
-                        let remaining = WRITE_LOCK_WAIT.saturating_sub(started.elapsed());
+                        let remaining = bound.saturating_sub(started.elapsed());
                         anyhow::ensure!(!remaining.is_zero(), "usage ledger lock wait expired");
                         std::thread::sleep(WRITE_LOCK_RETRY.min(remaining));
                     }
@@ -815,20 +828,22 @@ impl Ledger {
     ) -> anyhow::Result<()> {
         // A full active segment is rotated away once, under the exclusive
         // coordination lock; the batch is then appended to the fresh segment.
-        // The coordination lock is exclusive for the whole pass and taken
-        // before the active-file lock, the only order any path uses. A pass
-        // that finds the segment full therefore rotates in place, so two
-        // writers can never wait on each other's lock across a retry.
-        match self.flush_rows_once(account, pending, retries, true)? {
+        match self.flush_rows_once(account, pending, retries, StateLock::Append)? {
+            FlushOutcome::Flushed => return Ok(()),
+            FlushOutcome::NeedsRotation => {}
+            FlushOutcome::Rotated => unreachable!("append pass never rotates"),
+        }
+        // A competing writer can rotate between lock acquisitions too.
+        let retries = pending.iter().map(|row| row.id).collect();
+        match self.flush_rows_once(account, pending, &retries, StateLock::Rotate)? {
+            // Another process rotated first, so this pass appended directly.
             FlushOutcome::Flushed => return Ok(()),
             FlushOutcome::Rotated => {}
-            FlushOutcome::NeedsRotation => unreachable!("rotating pass rotates"),
+            FlushOutcome::NeedsRotation => unreachable!("rotate pass rotates"),
         }
         // This batch may already contain receipts in the segment just archived.
-        // Recheck all of it, including a formerly complete but unacknowledged
-        // row; a competing writer may also have filled the fresh segment.
-        let retries = pending.iter().map(|row| row.id).collect();
-        match self.flush_rows_once(account, pending, &retries, false)? {
+        // Recheck all of it, including a formerly complete but unacknowledged row.
+        match self.flush_rows_once(account, pending, &retries, StateLock::Append)? {
             FlushOutcome::Flushed => Ok(()),
             _ => anyhow::bail!("usage ledger capacity reached"),
         }
@@ -838,14 +853,14 @@ impl Ledger {
         account: &Account,
         pending: &[Arc<Row>],
         retries: &std::collections::HashSet<Uuid>,
-        may_rotate: bool,
+        mode: StateLock,
     ) -> anyhow::Result<FlushOutcome> {
         let write_binding = self
             .binding(true)?
             .ok_or_else(|| anyhow::anyhow!("usage ledger unavailable"))?;
         // Taken before the active segment is opened, so a rotation by another
         // process can never leave this writer locking an already-renamed file.
-        let _state_lock = self.lock_state(&write_binding, StateLock::Write)?;
+        let _state_lock = self.lock_state(&write_binding, mode)?;
         let (file, binding) = self
             .open(true)?
             .ok_or_else(|| anyhow::anyhow!("usage ledger unavailable"))?;
@@ -891,7 +906,7 @@ impl Ledger {
             scanned.records += 1;
             scanned.bytes += bytes.len() + 1;
             if scanned.records > MAX_LEDGER_RECORDS || scanned.bytes > MAX_LEDGER_BYTES {
-                if !may_rotate {
+                if mode != StateLock::Rotate {
                     return Ok(FlushOutcome::NeedsRotation);
                 }
                 let records = scanned.records - 1;
