@@ -804,6 +804,12 @@ fn selected_with_limit(
     );
     retained.validate().map_err(anyhow::Error::msg)?;
     anyhow::ensure!(session.id == row.id, "selected session identity changed");
+    session
+        .validate_native_persistence()
+        .map_err(anyhow::Error::from)?;
+    // The file stem is the row id, so these checkpoints are this process's own
+    // saved ones; without this `/rewind` cannot restore files after a resume.
+    session.file_checkpoints.trust_owned_load();
     anyhow::ensure!(
         session.working_dir == row.working_dir,
         "selected session workspace changed; refresh the picker"

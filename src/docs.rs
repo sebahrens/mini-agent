@@ -86,12 +86,37 @@ fn ensure_installed(dir: &Path) -> anyhow::Result<bool> {
     };
 
     if should_copy {
-        if dir.exists() {
-            std::fs::remove_dir_all(dir)?;
+        // Stage the full tree beside `dir`, then swap it in, so a racing start
+        // never observes or deletes a half-copied install.
+        let parent = dir.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let staging = parent.join(format!(".docs-install-{}", uuid::Uuid::new_v4()));
+        let staged = (|| -> anyhow::Result<()> {
+            std::fs::create_dir_all(&staging)?;
+            copy_embedded(&staging)?;
+            std::fs::write(staging.join("current_version"), current_version)?;
+            Ok(())
+        })();
+        if let Err(error) = staged {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(error);
         }
-        std::fs::create_dir_all(dir)?;
-        copy_embedded(dir)?;
-        std::fs::write(&version_file, current_version)?;
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(error.into());
+            }
+        }
+        if let Err(error) = std::fs::rename(&staging, dir) {
+            let _ = std::fs::remove_dir_all(&staging);
+            // A concurrent start installed the same docs first; that is fine.
+            if dir.join(INSTALL_SENTINEL).is_file() {
+                return Ok(true);
+            }
+            return Err(error.into());
+        }
         return Ok(true);
     }
 
@@ -160,6 +185,22 @@ mod tests {
         assert!(ensure_installed(&dest).unwrap());
         assert!(dest.join("agent/CONFIG.md").is_file());
         assert!(!ensure_installed(&dest).unwrap(), "second call is a no-op");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_stale_install_is_replaced_without_leaving_staging_dirs() {
+        let root = std::env::temp_dir().join(format!("zs_docs_test_{}", uuid::Uuid::new_v4()));
+        let dest = root.join("docs");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("stale.md"), "old").unwrap();
+        std::fs::write(dest.join("current_version"), "0.0.0-old").unwrap();
+
+        assert!(ensure_installed(&dest).unwrap());
+        assert!(!dest.join("stale.md").exists());
+        assert!(dest.join("agent/CONFIG.md").is_file());
+        let siblings: Vec<_> = std::fs::read_dir(&root).unwrap().flatten().collect();
+        assert_eq!(siblings.len(), 1, "staging dir left behind: {siblings:?}");
         let _ = std::fs::remove_dir_all(root);
     }
 

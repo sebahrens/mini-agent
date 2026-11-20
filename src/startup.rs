@@ -1608,6 +1608,7 @@ impl Startup {
         }
 
         let fork_source = cli.fork_session.then(|| session.id.clone());
+        let loaded_id = session.id.clone();
         if session_resumed {
             session = session::catalogue::for_workspace(session, &workspace)?;
         }
@@ -1629,6 +1630,20 @@ impl Startup {
             session = resumed.session;
             if let Some(notice) = resumed.notice {
                 eprintln!("notice: {notice}");
+            } else if session.id == loaded_id {
+                // The snapshot above was read before this claim, so the
+                // previous owner may have saved a final turn (and released
+                // the lock) in between. Re-read under the lock we now hold so
+                // our next save cannot replace that turn.
+                match session::storage::load_session_exact(&loaded_id) {
+                    Ok(Some(fresh)) => {
+                        session = session::catalogue::for_workspace(fresh, &workspace)?;
+                    }
+                    Ok(None) => {}
+                    Err(error) => tracing::warn!(
+                        "could not refresh session {loaded_id} after claiming it: {error:#}"
+                    ),
+                }
             }
         }
 

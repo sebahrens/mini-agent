@@ -956,6 +956,26 @@ pub fn delete_session(id: &str) -> anyhow::Result<()> {
         return Ok(());
     }
     crate::paths::validate_portable_component(id)?;
+    // A session another live process owns keeps its file, sidecar and spilled
+    // tool outputs: deleting them would pull the files out from under it and
+    // its next save would silently recreate the snapshot.
+    let already_owned = super::lock::held_by_this_process(id);
+    match super::lock::claim_session(id)? {
+        super::lock::SessionClaim::Owned => {}
+        super::lock::SessionClaim::HeldElsewhere => {
+            anyhow::bail!(
+                "session {id} is open in another mini-agent process; close it there before deleting"
+            );
+        }
+    }
+    let result = delete_session_files(id);
+    if !already_owned {
+        super::lock::release_session(id);
+    }
+    result
+}
+
+fn delete_session_files(id: &str) -> anyhow::Result<()> {
     let Some(dir) = existing_session_dir()? else {
         tracing::debug!("session delete skipped (not found): id={}", id);
         return Ok(());
@@ -1526,7 +1546,12 @@ pub fn find_recent_sessions_for_workspace(
             },
         };
         match decode_session_json(&json) {
-            Ok(session) => matches.push(session),
+            Ok(session) => {
+                if path.file_stem().and_then(|stem| stem.to_str()) == Some(session.id.as_str()) {
+                    session.file_checkpoints.trust_owned_load();
+                }
+                matches.push(session);
+            }
             Err(error) => {
                 skipped.note(&path, &error);
                 continue;
