@@ -258,6 +258,11 @@ impl GuardedOAuthHttpClient {
     }
 }
 
+/// Build the type-erased error rmcp 3 expects from a message or an error.
+fn oauth_error(error: impl Into<OAuthHttpClientError>) -> OAuthHttpClientError {
+    error.into()
+}
+
 impl GuardedOAuthHttpClient {
     async fn send(
         &self,
@@ -266,16 +271,14 @@ impl GuardedOAuthHttpClient {
         timeout: Option<Duration>,
     ) -> Result<http::Response<Vec<u8>>, OAuthHttpClientError> {
         if !source_is_current(&self.source) {
-            return Err(OAuthHttpClientError::new("MCP OAuth source changed"));
+            return Err(oauth_error("MCP OAuth source changed"));
         }
-        let mut request = reqwest::Request::try_from(request)
-            .map_err(|error| OAuthHttpClientError::new(error.to_string()))?;
+        let mut request =
+            reqwest::Request::try_from(request).map_err(|error| oauth_error(error.to_string()))?;
         if !self.endpoint.accepts_local_origin(request.url()) {
-            check_url_host(request.url()).map_err(OAuthHttpClientError::new)?;
+            check_url_host(request.url()).map_err(oauth_error)?;
         } else if !request.url().username().is_empty() || request.url().password().is_some() {
-            return Err(OAuthHttpClientError::new(
-                "MCP URL must not contain credentials",
-            ));
+            return Err(oauth_error("MCP URL must not contain credentials"));
         }
         // A local-origin endpoint never follows redirects.
         let follow_redirects = follow_redirects && self.endpoint.local_origin.is_none();
@@ -294,24 +297,24 @@ impl GuardedOAuthHttpClient {
                 .client
                 .execute(request)
                 .await
-                .map_err(|error| OAuthHttpClientError::new(error_chain(&error)))?;
+                .map_err(|error| oauth_error(error_chain(&error)))?;
             let Some(next) = next else { break response };
             let Some((code, target)) = redirect_target(&response) else {
                 break response;
             };
             if !source_is_current(&self.source) {
-                return Err(OAuthHttpClientError::new("MCP OAuth source changed"));
+                return Err(oauth_error("MCP OAuth source changed"));
             }
             // `previous().len()` of the equivalent redirect policy is hops + 1.
             if hops + 1 >= OAUTH_HTTP_MAX_REDIRECTS {
-                return Err(OAuthHttpClientError::new("too many redirects"));
+                return Err(oauth_error("too many redirects"));
             }
-            check_url_host(&target).map_err(OAuthHttpClientError::new)?;
+            check_url_host(&target).map_err(oauth_error)?;
             request = redirected_request(next, code, target);
             hops += 1;
         };
         if !source_is_current(&self.source) {
-            return Err(OAuthHttpClientError::new("MCP OAuth source changed"));
+            return Err(oauth_error("MCP OAuth source changed"));
         }
 
         let mut builder = http::Response::builder()
@@ -323,20 +326,20 @@ impl GuardedOAuthHttpClient {
         let mut body = Vec::new();
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|error| OAuthHttpClientError::new(error.to_string()))?;
+            let chunk = chunk.map_err(|error| oauth_error(error.to_string()))?;
             if chunk.len() > OAUTH_HTTP_MAX_BODY_BYTES - body.len() {
-                return Err(OAuthHttpClientError::new(format!(
+                return Err(oauth_error(format!(
                     "OAuth HTTP response body exceeds {OAUTH_HTTP_MAX_BODY_BYTES} bytes"
                 )));
             }
             body.extend_from_slice(&chunk);
         }
         if !source_is_current(&self.source) {
-            return Err(OAuthHttpClientError::new("MCP OAuth source changed"));
+            return Err(oauth_error("MCP OAuth source changed"));
         }
         builder
             .body(body)
-            .map_err(|error| OAuthHttpClientError::new(error.to_string()))
+            .map_err(|error| oauth_error(error.to_string()))
     }
 }
 

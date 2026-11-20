@@ -14,8 +14,8 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use rmcp::transport::auth::{
-    AuthClient, AuthError, AuthorizationManager, AuthorizationSession, CredentialStore,
-    OAuthClientConfig, StoredCredentials,
+    AuthClient, AuthError, AuthorizationManager, AuthorizationRequest, AuthorizationSession,
+    CredentialStore, OAuthClientConfig, StoredCredentials,
 };
 
 use super::config::OAuthSettings;
@@ -1496,9 +1496,12 @@ async fn authorization_session(
         has_registration,
         "the authorization server offers no dynamic client registration; register {CLIENT_NAME} with it and set `oauth.client_id` (for a confidential client also set the client secret in the environment variable named by the server, see MCP OAuth in CONFIG.md)"
     );
-    AuthorizationSession::new(manager, scopes, redirect_uri, Some(CLIENT_NAME), None)
+    let request = AuthorizationRequest::new(redirect_uri)
+        .with_scopes(scopes.iter().copied())
+        .with_client_name(CLIENT_NAME);
+    AuthorizationSession::new(manager, request)
         .await
-        .map_err(|e| anyhow::anyhow!("OAuth authorization setup failed: {e}"))
+        .map_err(|(_, e)| anyhow::anyhow!("OAuth authorization setup failed: {e}"))
 }
 
 /// Result of starting an interactive login: the URL to open and the live session.
@@ -1532,9 +1535,10 @@ pub(crate) async fn begin_login_bound(
     manager.set_credential_store(FileCredentialStore::new(server_name, url, settings)?);
 
     let metadata = manager
-        .discover_metadata()
+        .resolve_metadata()
         .await
-        .map_err(|e| anyhow::anyhow!("OAuth metadata discovery failed: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("OAuth metadata discovery failed: {e}"))?
+        .metadata;
     let has_registration = metadata.registration_endpoint.is_some();
     manager.set_metadata(metadata);
 
