@@ -1614,7 +1614,8 @@ pub(crate) struct App<'a> {
 struct PendingSkillCommands {
     /// Discovery ran for this binding; a worktree rebind discards it.
     workspace: Arc<crate::paths::WorkspaceBinding>,
-    rx: tokio::sync::oneshot::Receiver<Vec<(String, String)>>,
+    /// Picker entries and how many packages the scan rejected.
+    rx: tokio::sync::oneshot::Receiver<(Vec<(String, String)>, usize)>,
     /// Joined (bounded) at teardown so discovery never outlives the App.
     task: tokio::task::JoinHandle<()>,
     /// A later explicit listing already replaced the picker entries.
@@ -1990,7 +1991,12 @@ impl<'a> App<'a> {
             let (tx, rx) = tokio::sync::oneshot::channel();
             let task = tokio::spawn(async move {
                 if let Ok(snapshot) = services.refresh(false).await {
-                    let _ = tx.send(skill_command_entries(&snapshot));
+                    let rejected = snapshot
+                        .diagnostics
+                        .iter()
+                        .filter(|diagnostic| diagnostic.contains(" rejected: "))
+                        .count();
+                    let _ = tx.send((skill_command_entries(&snapshot), rejected));
                 }
             });
             PendingSkillCommands {
@@ -2767,7 +2773,7 @@ impl<'a> App<'a> {
                 }
                 Some(result) = async { Some((&mut self.skill_commands.as_mut()?.rx).await) } => {
                     let pending = self.skill_commands.take().expect("polled pending skills");
-                    if let Ok(entries) = result
+                    if let Ok((entries, rejected)) = result
                         && !pending.stale
                         && Arc::ptr_eq(&pending.workspace, &self.ui.workspace)
                     {
@@ -2775,6 +2781,13 @@ impl<'a> App<'a> {
                         self.input.set_skill_commands(entries);
                         #[cfg(not(feature = "agent-skills"))]
                         let _ = entries;
+                        if rejected > 0 {
+                            self.renderer.write_line(
+                                &format!("{rejected} skill(s) were not loaded; run /skills for details"),
+                                C_ERROR,
+                            )?;
+                            self.refresh()?;
+                        }
                     }
                 }
                 Some(result) = async { Some(self.session_start_task.as_mut()?.await) } => {
@@ -7088,6 +7101,13 @@ impl<'a> App<'a> {
             }
         };
         if !snapshot.packages.contains_key(name) {
+            // A package that was found but rejected is not an unknown command:
+            // say why it is not available.
+            if let Some(reason) = rejected_skill_reason(&snapshot.diagnostics, name) {
+                self.renderer
+                    .write_line(&sanitize_output(&reason), C_ERROR)?;
+                return Ok(true);
+            }
             return Ok(false);
         }
         if self.run.is_running
@@ -14986,7 +15006,16 @@ mod git_confirmation_stack_tests {
     }
 }
 
+/// The discovery diagnostic that rejected the skill package directory `name`.
 #[cfg(feature = "agent-skills")]
+fn rejected_skill_reason(diagnostics: &[String], name: &str) -> Option<String> {
+    let marker = format!(" skill '{name}' rejected: ");
+    diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.contains(&marker))
+        .cloned()
+}
+
 #[cfg(feature = "agent-skills")]
 fn skill_command_entries(
     snapshot: &crate::extras::skills::discovery::Discovery,
@@ -19976,5 +20005,23 @@ mod config_editor68_tests {
                 assert_eq!(before,serde_json::to_vec(app.ui.session).unwrap());assert!(app.run.agent.is_none());assert!(tokio::time::timeout(Duration::from_millis(20),listener.accept()).await.is_err());
             }));
         }).unwrap().join().unwrap();
+    }
+}
+
+#[cfg(all(test, feature = "agent-skills"))]
+mod rejected_skill_tests {
+    use super::rejected_skill_reason;
+
+    #[test]
+    fn an_unknown_slash_word_finds_the_rejection_of_its_package() {
+        let diagnostics = vec![
+            "project skill 'other' rejected: bad front matter".to_string(),
+            "project skill 'release' rejected: missing description".to_string(),
+        ];
+        assert_eq!(
+            rejected_skill_reason(&diagnostics, "release").as_deref(),
+            Some("project skill 'release' rejected: missing description")
+        );
+        assert_eq!(rejected_skill_reason(&diagnostics, "absent"), None);
     }
 }
