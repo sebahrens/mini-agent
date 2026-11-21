@@ -356,12 +356,6 @@ impl KeyBindings {
         (!self.removed_default(key, true)).then_some(key)
     }
 
-    pub(crate) fn has_override(&self, action: KeyAction) -> bool {
-        self.overrides
-            .iter()
-            .any(|(candidate, chords)| *candidate == action && !chords.is_empty())
-    }
-
     pub(crate) fn is_explicit_binding(&self, key: KeyEvent) -> bool {
         self.overrides
             .iter()

@@ -35,8 +35,10 @@ fn max_walk_files() -> usize {
 }
 
 /// Dot-directories directly under the walk root that stay selectable. Every
-/// other dot-entry (`.git`, `.env`, `.cache`, ...) is pruned from the walk;
-/// type its path (`.name/`) to list inside a pruned directory other than `.git`.
+/// other dot-directory (`.git`, `.cache`, ...) is pruned from the walk; type
+/// its path (`.name/`) to list inside a pruned directory other than `.git`.
+/// Dot-files directly under the root are listed unless the ignore rules or
+/// the credential-file policy of `is_hidden_by_policy` exclude them.
 const ALLOWED_ROOT_DOT_DIRS: [&str; 3] = [".github", ".devcontainer", ".vscode"];
 
 /// Shown while the cached walk stopped at a cap.
@@ -301,7 +303,7 @@ pub(crate) struct CacheEntry {
 
 /// Where a cache entry came from. Virtual entries are completion strings
 /// (they keep their own `@` marker) and never depend on the walk root.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum EntryKind {
     /// A walked filesystem path.
     Path,
@@ -407,6 +409,61 @@ pub struct FilePicker {
     /// Entries of a typed-prefix subtree walk, scanned after `file_cache`.
     subtree_cache: Vec<CacheEntry>,
     subtree: Option<SubtreeWalk>,
+    /// The best [`MAX_MATCHES`] scored entries seen for the current query;
+    /// `matches` and its parallel vectors are derived from it.
+    ranked: Vec<Ranked>,
+}
+
+/// A cache entry that matched the query, with its rank.
+struct Ranked {
+    score: i32,
+    /// Position in scan order (cache index; subtree entries come after), the
+    /// tie-break that keeps equal scores in walk order.
+    order: usize,
+    entry: CacheEntry,
+}
+
+/// `order` base of subtree-walk entries: after every cache entry.
+const SUBTREE_ORDER: usize = usize::MAX / 2;
+
+/// Sort best first: higher score, then earlier in scan order.
+fn rank_order(a: &Ranked, b: &Ranked) -> std::cmp::Ordering {
+    b.score.cmp(&a.score).then(a.order.cmp(&b.order))
+}
+
+/// Score of `path_lower` for `query_lower` (both lowercase), or `None`.
+/// Substring matches outrank subsequence matches (as in the model picker),
+/// and a match in the file name outranks one in a directory name.
+fn score_path(path_lower: &str, query_lower: &str) -> Option<i32> {
+    if query_lower.is_empty() {
+        // Dot-files and dot-directories rank below everything else, so an
+        // empty query lists the project's regular files first.
+        return Some(if path_lower.starts_with('.') { -1 } else { 0 });
+    }
+    // Cheap subsequence reject before the scorer allocates.
+    let mut wanted = query_lower.chars().peekable();
+    for c in path_lower.chars() {
+        if wanted.peek() == Some(&c) {
+            wanted.next();
+        }
+    }
+    if wanted.peek().is_some() {
+        return None;
+    }
+    let mut score = super::fuzzy_score_lower(path_lower, query_lower)?;
+    let trimmed = path_lower.trim_end_matches('/');
+    let base = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    if base == query_lower {
+        score += 3000;
+    } else if base.contains(query_lower) {
+        score += 1500;
+        if base.starts_with(query_lower) {
+            score += 300;
+        }
+    } else if let Some(base_score) = super::fuzzy_score_lower(base, query_lower) {
+        score += base_score.clamp(0, 400);
+    }
+    Some(score)
 }
 
 /// A running or finished walk of one typed directory prefix.
@@ -443,6 +500,7 @@ impl FilePicker {
             truncated: false,
             walk_truncated: Arc::new(AtomicBool::new(false)),
             subtree_cache: Vec::new(),
+            ranked: Vec::new(),
             subtree: None,
         }
     }
@@ -540,6 +598,7 @@ impl FilePicker {
         self.match_dirs.clear();
         self.match_kinds.clear();
         self.match_descriptions.clear();
+        self.ranked.clear();
         self.selected = 0;
         self.file_cache.clear();
         self.virtual_len = 0;
@@ -834,51 +893,93 @@ impl FilePicker {
         self.match_dirs.clear();
         self.match_kinds.clear();
         self.match_descriptions.clear();
+        self.ranked.clear();
         self.selected = 0;
         #[cfg(test)]
         count_filter(0, true);
+        self.ranked.clear();
         self.filter_from(0);
+        self.sync_matches(true);
         self.start_subtree_walk();
     }
 
-    /// Append matches for the query from `file_cache[start..]` until
-    /// [`MAX_MATCHES`] are kept. Matches stay in cache (walk) order, so
-    /// filtering a streamed batch gives the same result as a full rescan.
+    /// Merge the scored entries of `file_cache[start..]` into the best
+    /// [`MAX_MATCHES`]. Equal scores keep walk order, so filtering a streamed
+    /// batch gives the same result as a full rescan.
     fn filter_from(&mut self, start: usize) {
-        if self.matches.len() >= MAX_MATCHES {
-            return;
-        }
         let cache = std::mem::take(&mut self.file_cache);
-        self.scan(cache.iter().skip(start));
+        self.scan(cache.iter().skip(start), start);
         self.file_cache = cache;
-        if start == 0 && self.matches.len() < MAX_MATCHES {
+        if start == 0 {
             let subtree = std::mem::take(&mut self.subtree_cache);
-            self.scan(subtree.iter());
+            self.scan(subtree.iter(), SUBTREE_ORDER);
             self.subtree_cache = subtree;
         }
+        self.sync_matches(false);
     }
 
-    /// Keep entries matching the current query until [`MAX_MATCHES`].
-    fn scan<'a>(&mut self, entries: impl Iterator<Item = &'a CacheEntry>) {
+    /// Score `entries` (numbered from `order_base`) against the query and
+    /// keep the best in `ranked`.
+    fn scan<'a>(&mut self, entries: impl Iterator<Item = &'a CacheEntry>, order_base: usize) {
         let query = self.query_lower.clone();
-        for entry in entries {
-            if self.matches.len() >= MAX_MATCHES {
+        let empty = query.is_empty();
+        // With an empty query later entries lose every tie, so once the
+        // list holds MAX_MATCHES entries of the top score nothing can win.
+        let mut top = self.ranked.iter().filter(|kept| kept.score >= 0).count();
+        for (index, entry) in entries.enumerate() {
+            if empty && top >= MAX_MATCHES {
                 break;
             }
             #[cfg(test)]
             count_filter(1, false);
-            if entry
-                .lower
-                .as_deref()
-                .unwrap_or(&entry.text)
-                .contains(query.as_str())
-            {
-                self.matches.push(PathBuf::from(&*entry.text));
-                self.match_dirs.push(entry.is_dir);
-                self.match_kinds.push(entry.kind);
-                self.match_descriptions.push(entry.description.clone());
+            let lower = entry.lower.as_deref().unwrap_or(&entry.text);
+            let Some(score) = score_path(lower, &query) else {
+                continue;
+            };
+            top += usize::from(score >= 0);
+            self.ranked.push(Ranked {
+                score,
+                order: order_base + index,
+                entry: entry.clone(),
+            });
+            if self.ranked.len() >= MAX_MATCHES * 8 {
+                self.trim_ranked();
             }
         }
+        self.trim_ranked();
+    }
+
+    fn trim_ranked(&mut self) {
+        self.ranked.sort_unstable_by(rank_order);
+        self.ranked.truncate(MAX_MATCHES);
+    }
+
+    /// Rebuild `matches` from `ranked`, dropping repeated paths (a typed
+    /// directory's subtree walk lists entries the cache already holds). With
+    /// `reset` the selection returns to the first row; otherwise it stays on
+    /// the same path when that path is still listed.
+    fn sync_matches(&mut self, reset: bool) {
+        let selected = (!reset)
+            .then(|| self.matches.get(self.selected).cloned())
+            .flatten();
+        self.matches.clear();
+        self.match_dirs.clear();
+        self.match_kinds.clear();
+        self.match_descriptions.clear();
+        let mut seen = std::collections::HashSet::new();
+        for ranked in &self.ranked {
+            let entry = &ranked.entry;
+            if !seen.insert((entry.text.clone(), entry.kind)) {
+                continue;
+            }
+            self.matches.push(PathBuf::from(&*entry.text));
+            self.match_dirs.push(entry.is_dir);
+            self.match_kinds.push(entry.kind);
+            self.match_descriptions.push(entry.description.clone());
+        }
+        self.selected = selected
+            .and_then(|path| self.matches.iter().position(|candidate| *candidate == path))
+            .unwrap_or(0);
     }
 
     /// Stops and forgets a typed-prefix subtree walk.
@@ -974,8 +1075,9 @@ impl FilePicker {
                 cancel,
             });
             let cache = std::mem::take(&mut self.subtree_cache);
-            self.scan(cache.iter());
+            self.scan(cache.iter(), SUBTREE_ORDER);
             self.subtree_cache = cache;
+            self.sync_matches(false);
         }
     }
 
@@ -1001,9 +1103,13 @@ impl FilePicker {
         }
         let mut changed = false;
         for batch in batches {
-            self.scan(batch.iter());
+            let base = SUBTREE_ORDER + self.subtree_cache.len();
+            self.scan(batch.iter(), base);
             self.subtree_cache.extend(batch);
             changed = true;
+        }
+        if changed {
+            self.sync_matches(false);
         }
         changed
     }
@@ -1127,8 +1233,38 @@ fn is_dot_entry(entry: &ignore::DirEntry, root: &Path) -> bool {
     if !name.starts_with('.') {
         return false;
     }
-    let allowed = entry.path().parent() == Some(root) && ALLOWED_ROOT_DOT_DIRS.contains(&&*name);
-    !allowed
+    if entry.path().parent() != Some(root) {
+        return true;
+    }
+    if ALLOWED_ROOT_DOT_DIRS.contains(&&*name) {
+        return false;
+    }
+    // Regular dot-files at the root that the ignore rules did not exclude
+    // (`.gitignore`, `.env.example`, `.gitlab-ci.yml`) are project files.
+    let is_file = entry.file_type().is_some_and(|kind| kind.is_file());
+    !(is_file && !is_hidden_by_policy(&name))
+}
+
+/// Root dot-files the picker never lists: the repository marker, OS litter and
+/// files that conventionally hold credentials (`.env`, `.env.local`,
+/// `.netrc`, ...). The template forms `.env.example` and friends are listed.
+fn is_hidden_by_policy(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if let Some(suffix) = lower.strip_prefix(".env.") {
+        return !matches!(suffix, "example" | "sample" | "template" | "dist" | "defaults");
+    }
+    matches!(
+        lower.as_str(),
+        ".git"
+            | ".env"
+            | ".ds_store"
+            | ".netrc"
+            | ".npmrc"
+            | ".pypirc"
+            | ".pgpass"
+            | ".htpasswd"
+            | ".git-credentials"
+    )
 }
 
 /// Walk `root`, invoking `emit` with batches of paths as they are found so
@@ -1296,6 +1432,50 @@ mod truncation_tests {
     }
 
     #[test]
+    fn root_dot_files_are_listed_unless_ignored_or_credentials() {
+        let root = crate::tests::OwnedTestDirectory::new("file-picker-dot-files");
+        std::fs::create_dir_all(root.path().join(".git")).unwrap();
+        std::fs::write(root.path().join(".git/config"), "").unwrap();
+        std::fs::write(root.path().join(".ignore"), ".local-notes\n").unwrap();
+        for file in [
+            ".gitignore",
+            ".env",
+            ".env.local",
+            ".env.example",
+            ".gitlab-ci.yml",
+            ".local-notes",
+            ".DS_Store",
+            ".npmrc",
+        ] {
+            std::fs::write(root.path().join(file), "").unwrap();
+        }
+        std::fs::create_dir_all(root.path().join("sub")).unwrap();
+        std::fs::write(root.path().join("sub/.hidden"), "").unwrap();
+        let listed: Vec<String> = walk_files(&root.path().to_string_lossy())
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        for wanted in [".gitignore", ".env.example", ".gitlab-ci.yml", ".ignore"] {
+            assert!(listed.iter().any(|p| p == wanted), "{wanted} in {listed:?}");
+        }
+        for pruned in [
+            ".env",
+            ".env.local",
+            ".local-notes",
+            ".DS_Store",
+            ".npmrc",
+            ".git",
+            ".git/config",
+            "sub/.hidden",
+        ] {
+            assert!(
+                !listed.iter().any(|p| p == pruned),
+                "{pruned} in {listed:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_capped_walk_shows_a_notice_and_a_typed_prefix_reaches_past_the_cut() {
         TEST_FILE_CAP.with(|cap| cap.set(Some(3)));
         let root = crate::tests::OwnedTestDirectory::new("file-picker-truncated");
@@ -1362,14 +1542,14 @@ mod truncation_tests {
 mod cache_tests {
     use super::*;
 
-    fn naive_matches(paths: &[PathBuf], query: &str) -> Vec<PathBuf> {
-        let query = query.to_lowercase();
-        paths
-            .iter()
-            .filter(|path| path.to_string_lossy().to_lowercase().contains(&query))
-            .take(MAX_MATCHES)
-            .cloned()
-            .collect()
+    /// The matches of a full rescan of `paths` for `query`.
+    fn rescan_matches(paths: &[PathBuf], query: &str) -> Vec<PathBuf> {
+        let mut picker = FilePicker::new();
+        picker.test_set_cache(paths.to_vec());
+        for c in query.chars() {
+            picker.char_input(c);
+        }
+        picker.matches
     }
 
     #[test]
@@ -1383,17 +1563,25 @@ mod cache_tests {
         picker.char_input('e');
         picker.char_input('_');
         picker.char_input('1');
-        assert_eq!(picker.matches, naive_matches(&paths, "e_1"));
         assert_eq!(picker.matches.len(), MAX_MATCHES);
+        // Substring hits outrank subsequence hits.
+        assert!(
+            picker
+                .matches
+                .iter()
+                .all(|path| path.to_string_lossy().to_lowercase().contains("e_1")),
+            "{:?}",
+            picker.matches
+        );
         let (scanned, rescans) = take_filter_counts();
         assert_eq!(rescans, 3, "one rescan per query change");
-        // Each rescan stops at the 50th match instead of lowercasing the
-        // whole cache.
-        assert!(scanned < 3 * 2_000, "scanned {scanned} entries");
+        // Ranking looks at every entry once per rescan.
+        assert_eq!(scanned, 3 * MAX_WALK_FILES);
         picker.char_input('9');
         picker.char_input('9');
         picker.char_input('9');
-        assert_eq!(picker.matches, naive_matches(&paths, "e_1999"));
+        let first = picker.matches[0].to_string_lossy().to_lowercase();
+        assert!(first.contains("e_1999"), "{first}");
     }
 
     async fn finish_walk(picker: &mut FilePicker) {
@@ -1556,11 +1744,74 @@ mod cache_tests {
         drop(tx);
         assert!(picker.try_finish_loading());
         assert!(!picker.is_loading());
-        assert_eq!(picker.matches, naive_matches(&all, "b"));
         let (scanned, rescans) = take_filter_counts();
+        assert_eq!(picker.matches, rescan_matches(&all, "b"));
         assert_eq!(rescans, 0, "streaming never rescans the cache");
-        // Batches after the 50th match are not scanned at all.
-        assert_eq!(scanned, 4 * WALK_BATCH_SIZE + 4);
+        // Every streamed entry is scored once, never rescanned.
+        assert_eq!(scanned, 40 * WALK_BATCH_SIZE);
+    }
+
+    #[test]
+    fn matches_are_ranked_by_file_name_and_fuzzy_subsequence() {
+        // 'src/ui/renderer.rs' sorts after 60 other paths containing the query.
+        let mut paths: Vec<PathBuf> = (0..60)
+            .map(|index| PathBuf::from(format!("a/renderer/dir{index}/notes.txt")))
+            .collect();
+        paths.extend((0..5_000).map(|index| PathBuf::from(format!("b/file{index}.rs"))));
+        paths.push(PathBuf::from("src/ui/renderer.rs"));
+        let mut picker = FilePicker::new();
+        picker.test_set_cache(paths);
+        for c in "renderer".chars() {
+            picker.char_input(c);
+        }
+        assert_eq!(picker.matches[0], PathBuf::from("src/ui/renderer.rs"));
+        // A subsequence query reaches it too.
+        picker.query.clear();
+        picker.cursor = 0;
+        for c in "uirend".chars() {
+            picker.char_input(c);
+        }
+        assert_eq!(picker.matches[0], PathBuf::from("src/ui/renderer.rs"));
+        // Exact file name outranks a longer name that contains it.
+        let mut picker = FilePicker::new();
+        picker.test_set_cache(vec![
+            PathBuf::from("a/mod_tests.rs"),
+            PathBuf::from("b/mod.rs"),
+        ]);
+        for c in "mod".chars() {
+            picker.char_input(c);
+        }
+        assert_eq!(picker.matches[0], PathBuf::from("b/mod.rs"));
+    }
+
+    #[test]
+    fn dot_entries_rank_below_regular_files_for_an_empty_query() {
+        let mut picker = FilePicker::new();
+        picker.test_set_cache(vec![
+            PathBuf::from(".gitignore"),
+            PathBuf::from(".vscode"),
+            PathBuf::from("a.txt"),
+        ]);
+        picker.char_input('x');
+        picker.backspace();
+        assert_eq!(picker.matches[0], PathBuf::from("a.txt"));
+        assert_eq!(picker.matches.len(), 3);
+    }
+
+    #[test]
+    fn selection_stays_on_the_same_path_when_a_streamed_batch_reorders() {
+        let mut picker = FilePicker::new();
+        picker.test_set_cache(vec![PathBuf::from("x/a_b.rs"), PathBuf::from("y/ab_c.rs")]);
+        for c in "ab".chars() {
+            picker.char_input(c);
+        }
+        picker.select_next();
+        let chosen = picker.matches[picker.selected].clone();
+        picker.file_cache.push(CacheEntry::new(PathBuf::from("ab"), false));
+        let from = picker.file_cache.len() - 1;
+        picker.filter_from(from);
+        assert_eq!(picker.matches[0], PathBuf::from("ab"));
+        assert_eq!(picker.matches[picker.selected], chosen);
     }
 
     #[test]

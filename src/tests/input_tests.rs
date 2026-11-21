@@ -995,3 +995,115 @@ fn typing_coalesces_into_word_sized_undo_steps() {
     editor.handle_key(undo);
     assert_eq!(editor.buffer.as_str(), "");
 }
+
+// --- Vim operators, counts, registers and dot repeat (mini-agent-nvnkx.89) ---
+
+fn vim_editor(text: &str) -> InputEditor {
+    let mut editor = InputEditor::new();
+    editor.load_text(text);
+    editor.set_vim_enabled(true);
+    editor.set_cursor(0);
+    editor.handle_key(press(KeyCode::Esc));
+    editor
+}
+
+#[test]
+fn vim_cw_changes_the_word_and_esc_returns_to_normal() {
+    let mut editor = vim_editor("foo bar");
+    type_str(&mut editor, "cwx");
+    editor.handle_key(press(KeyCode::Esc));
+    assert_eq!(editor.buffer.as_str(), "x bar");
+    assert_eq!(editor.vim_label(), "vim:NORMAL");
+}
+
+#[test]
+fn vim_counts_operators_and_motions() {
+    let mut editor = vim_editor("a\nb\nc\nd");
+    type_str(&mut editor, "2dd");
+    assert_eq!(editor.buffer.as_str(), "c\nd");
+    let mut editor = vim_editor("one two three four");
+    type_str(&mut editor, "d2w");
+    assert_eq!(editor.buffer.as_str(), "three four");
+    type_str(&mut editor, "3x");
+    assert_eq!(editor.buffer.as_str(), "ee four");
+    type_str(&mut editor, "$");
+    type_str(&mut editor, "dw");
+    assert_eq!(editor.buffer.as_str(), "ee four");
+    type_str(&mut editor, "0dw");
+    assert_eq!(editor.buffer.as_str(), "four");
+    type_str(&mut editor, "d$");
+    assert_eq!(editor.buffer.as_str(), "");
+}
+
+#[test]
+fn vim_p_puts_the_last_deleted_line_and_dot_repeats() {
+    let mut editor = vim_editor("one\ntwo\nthree");
+    type_str(&mut editor, "dd");
+    assert_eq!(editor.buffer.as_str(), "two\nthree");
+    type_str(&mut editor, "p");
+    assert_eq!(editor.buffer.as_str(), "two\none\nthree");
+    type_str(&mut editor, "P");
+    assert_eq!(editor.buffer.as_str(), "two\none\none\nthree");
+    let mut editor = vim_editor("a b c d");
+    type_str(&mut editor, "dw");
+    assert_eq!(editor.buffer.as_str(), "b c d");
+    type_str(&mut editor, ".");
+    assert_eq!(editor.buffer.as_str(), "c d");
+    // Dot repeats a change with its typed text, once.
+    let mut editor = vim_editor("aa bb cc");
+    type_str(&mut editor, "cwX");
+    editor.handle_key(press(KeyCode::Esc));
+    type_str(&mut editor, "w.");
+    assert_eq!(editor.buffer.as_str(), "X X cc");
+    // One undo step reverts the repeat.
+    type_str(&mut editor, "u");
+    assert_eq!(editor.buffer.as_str(), "X bb cc");
+}
+
+#[test]
+fn vim_yank_put_open_replace_find_and_goto() {
+    let mut editor = vim_editor("foo bar");
+    type_str(&mut editor, "ywP");
+    assert_eq!(editor.buffer.as_str(), "foo foo bar");
+    let mut editor = vim_editor("l1\nl2");
+    type_str(&mut editor, "yyjp");
+    assert_eq!(editor.buffer.as_str(), "l1\nl2\nl1");
+    let mut editor = vim_editor("l1\nl2");
+    type_str(&mut editor, "oX");
+    editor.handle_key(press(KeyCode::Esc));
+    assert_eq!(editor.buffer.as_str(), "l1\nX\nl2");
+    type_str(&mut editor, "OY");
+    editor.handle_key(press(KeyCode::Esc));
+    assert_eq!(editor.buffer.as_str(), "l1\nY\nX\nl2");
+    let mut editor = vim_editor("abcd");
+    type_str(&mut editor, "rz");
+    assert_eq!(editor.buffer.as_str(), "zbcd");
+    type_str(&mut editor, "2rq");
+    assert_eq!(editor.buffer.as_str(), "qqcd");
+    type_str(&mut editor, "~");
+    assert_eq!(editor.buffer.as_str(), "qQcd");
+    let mut editor = vim_editor("hello, world");
+    type_str(&mut editor, "dt,");
+    assert_eq!(editor.buffer.as_str(), ", world");
+    type_str(&mut editor, "fwD");
+    assert_eq!(editor.buffer.as_str(), ", ");
+    let mut editor = vim_editor("a\nb\nc");
+    type_str(&mut editor, "Gx");
+    assert_eq!(editor.buffer.as_str(), "a\nb\n");
+    type_str(&mut editor, "ggdG");
+    assert_eq!(editor.buffer.as_str(), "");
+    let mut editor = vim_editor("foo bar baz");
+    type_str(&mut editor, "wdiw");
+    assert_eq!(editor.buffer.as_str(), "foo  baz");
+    type_str(&mut editor, "daw");
+    assert_eq!(editor.buffer.as_str(), "foo");
+    type_str(&mut editor, "0e");
+    assert_eq!(editor.cursor, 2);
+    type_str(&mut editor, "^");
+    assert_eq!(editor.cursor, 0);
+    let mut editor = vim_editor("Ab");
+    type_str(&mut editor, "2~");
+    assert_eq!(editor.buffer.as_str(), "aB");
+    type_str(&mut editor, "C!");
+    assert_eq!(editor.buffer.as_str(), "aB!");
+}

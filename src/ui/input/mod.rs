@@ -803,14 +803,14 @@ impl InputEditor {
     /// Open the Ctrl+R reverse history search. The current draft is kept and
     /// restored on Esc; the buffer holds the query meanwhile.
     pub fn start_history_search(&mut self) {
-        let (items, full) = crate::ui::pickers::history::history_items(&self.history);
+        let (items, full, haystacks) = crate::ui::pickers::history::history_items(&self.history);
         if items.is_empty() {
             return;
         }
         let mut picker = ListPicker::new();
         picker.set_monochrome(self.monochrome);
         picker.set_accent_color(self.accent);
-        picker.set_items(items);
+        picker.set_items_with_haystacks(items, haystacks);
         picker.activate();
         let draft = std::mem::take(&mut self.buffer);
         let search = crate::ui::pickers::history::HistorySearch {
@@ -1369,45 +1369,20 @@ impl InputEditor {
     fn apply_vim_action(&mut self, action: vim::VimAction) {
         use vim::VimAction;
         match action {
-            VimAction::Left => self.cursor = self.prev_boundary(self.cursor),
-            VimAction::Right | VimAction::InsertAfter => {
-                self.cursor = self.next_boundary(self.cursor);
-            }
-            VimAction::Up | VimAction::Down => {
-                let (line, col) = cursor_to_line_col(&self.buffer, self.cursor);
-                let line = if action == VimAction::Up {
-                    line.saturating_sub(1)
-                } else {
-                    (line + 1).min(count_lines(&self.buffer) - 1)
-                };
-                self.cursor = line_col_to_cursor(&self.buffer, line, col);
-            }
-            VimAction::WordNext => self.cursor = vim::next_word_start(&self.buffer, self.cursor),
-            VimAction::WordPrevious => {
-                self.cursor = vim::previous_word_start(&self.buffer, self.cursor);
-            }
-            VimAction::LineStart | VimAction::InsertLineStart => {
-                self.cursor = line_start(&self.buffer, self.cursor);
-            }
-            VimAction::LineEnd | VimAction::InsertLineEnd => {
-                self.cursor = line_end(&self.buffer, self.cursor);
-            }
-            VimAction::Delete => self.delete_next_grapheme(),
-            VimAction::DeleteLine => {
-                let start = line_start(&self.buffer, self.cursor);
-                let end = line_end(&self.buffer, self.cursor);
-                let (start, end) = if end < self.buffer.len() {
-                    (start, end + 1)
-                } else if start > 0 {
-                    (start - 1, end)
-                } else {
-                    (start, end)
-                };
-                let deleted: CompactString = self.buffer[start..end].into();
-                self.buffer.replace_range(start..end, "");
-                self.cursor = start.min(self.buffer.len());
-                self.push_kill(deleted);
-            }
+            VimAction::Move { motion, count } => self.vim_move(motion, count),
+            VimAction::Operate {
+                operator,
+                motion,
+                count,
+            } => self.vim_operate(operator, motion, count),
+            VimAction::Put { after, count } => self.vim_put(after, count),
+            VimAction::Open { above } => self.vim_open(above),
+            VimAction::Replace { ch, count } => self.vim_replace(ch, count),
+            VimAction::ToggleCase { count } => self.vim_toggle_case(count),
+            VimAction::Repeat => self.vim_repeat(),
+            VimAction::InsertAfter => self.cursor = self.next_boundary(self.cursor),
+            VimAction::InsertLineStart => self.cursor = line_start(&self.buffer, self.cursor),
+            VimAction::InsertLineEnd => self.cursor = line_end(&self.buffer, self.cursor),
             VimAction::Undo => {
                 self.undo_run_end = None;
                 if let Some((text, cursor)) = self.undo.pop_back() {
