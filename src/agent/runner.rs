@@ -567,6 +567,8 @@ impl<M: CompletionModel> AgentHook<M> for ToolLoopGuard {
                 }
                 record_settled_result(internal_call_id, result);
                 show_settled_call(internal_call_id, outcome, result);
+                let rewritten = take_effective_args(internal_call_id);
+                let args = rewritten.as_deref().unwrap_or(args);
                 let raw = raw_args_hash(args);
                 let cached = update_loop_state(ctx, |state: &mut ToolLoopState| {
                     state
@@ -1957,6 +1959,29 @@ pub(crate) fn record_settled_result(internal_call_id: &str, result: &str) {
     while settled.len() > SETTLED_RESULT_MAX_ENTRIES {
         settled.pop_front();
     }
+}
+
+/// Arguments a `PreToolUse` hook rewrote before the call ran, by internal call
+/// id, so the loop guard fingerprints the call that actually executed instead
+/// of the one the model proposed (mini-agent-sskdu.263).
+static EFFECTIVE_ARGS: std::sync::Mutex<VecDeque<(String, String)>> =
+    std::sync::Mutex::new(VecDeque::new());
+const EFFECTIVE_ARGS_MAX_ENTRIES: usize = 128;
+
+#[cfg(feature = "hooks")]
+pub(crate) fn record_effective_args(internal_call_id: &str, args: &str) {
+    let mut entries = EFFECTIVE_ARGS.lock().unwrap_or_else(|e| e.into_inner());
+    entries.retain(|(id, _)| id != internal_call_id);
+    entries.push_back((internal_call_id.to_owned(), args.to_owned()));
+    while entries.len() > EFFECTIVE_ARGS_MAX_ENTRIES {
+        entries.pop_front();
+    }
+}
+
+fn take_effective_args(internal_call_id: &str) -> Option<String> {
+    let mut entries = EFFECTIVE_ARGS.lock().unwrap_or_else(|e| e.into_inner());
+    let position = entries.iter().position(|(id, _)| id == internal_call_id)?;
+    entries.remove(position).map(|(_, args)| args)
 }
 
 /// The result a call produced before its batch settled, consuming it.
@@ -10008,6 +10033,18 @@ mod tests {
                 .iter()
                 .all(|text| !text.contains(super::super::read_loop::UNCHANGED_READ_NOTICE))
         );
+    }
+
+    #[cfg(feature = "hooks")]
+    #[test]
+    fn rewritten_args_are_taken_once_for_the_loop_guard_fingerprint() {
+        super::record_effective_args("rewrite-id-1", r#"{"path":"effective"}"#);
+        let effective = super::take_effective_args("rewrite-id-1").unwrap();
+        assert_ne!(
+            super::tool_call_fingerprint("read", &effective),
+            super::tool_call_fingerprint("read", r#"{"path":"proposed"}"#)
+        );
+        assert!(super::take_effective_args("rewrite-id-1").is_none());
     }
 
     #[test]

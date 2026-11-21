@@ -121,6 +121,17 @@ pub(crate) async fn scope_tool_call_id<F: std::future::Future>(
     TOOL_CALL_ID.scope(id, future).await
 }
 
+/// The internal call id of the shell or non-shell tool call running in this
+/// task, if known.
+#[cfg(feature = "hooks")]
+pub(crate) fn current_any_call_id() -> Option<CompactString> {
+    TOOL_CALL_ID
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        .or_else(|| SHELL_CALL_ID.try_with(Clone::clone).ok().flatten())
+}
+
 /// The internal call id of the tool call running in this task, if known.
 #[cfg(any(feature = "mcp", feature = "subagents"))]
 pub(crate) fn current_tool_call_id() -> Option<CompactString> {
