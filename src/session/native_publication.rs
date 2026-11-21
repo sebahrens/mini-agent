@@ -441,7 +441,7 @@ pub(crate) fn startup_requires_publication(
     let bearing = is_native_bearing(session);
     anyhow::ensure!(
         !no_session || !bearing,
-        "saved native context requires persistence before startup; start a fresh context to use --no-session"
+        "saved native context requires persistence before startup; drop --no-session to resume it, or add --fork-session to continue in a copy"
     );
     Ok(!no_session && (actual_native_protocol || bearing))
 }
@@ -470,7 +470,7 @@ fn checked_publication_encoded(session: &Session) -> anyhow::Result<(&NativePubl
     let digest: [u8; 32] = Sha256::digest(encoded.as_bytes()).into();
     anyhow::ensure!(
         digest == publication.digest,
-        "native context snapshot changed before publication"
+        "native context snapshot changed before publication; run `/fork` (or restart with `--continue --fork-session`) to continue from the visible transcript"
     );
     Ok((publication, encoded))
 }
@@ -497,7 +497,7 @@ fn checked_publication(session: &Session) -> anyhow::Result<&NativePublication> 
     let publication = checked_publication_owner(session)?;
     anyhow::ensure!(
         digest(session)? == publication.digest,
-        "native context snapshot changed before publication"
+        "native context snapshot changed before publication; run `/fork` (or restart with `--continue --fork-session`) to continue from the visible transcript"
     );
     Ok(publication)
 }
@@ -685,7 +685,7 @@ fn begin_blocking(
 ) -> anyhow::Result<(NativePublication, NativePublicationTicket)> {
     anyhow::ensure!(
         snapshot.native_frontier.ready(),
-        "native context is unfinished"
+        "native context is unfinished; run `/fork` (or restart with `--continue --fork-session`) to continue from the visible transcript"
     );
     let cell = snapshot.native_frontier.publication_cell();
     let owner = match &snapshot.native_publication {
@@ -806,6 +806,7 @@ pub(crate) async fn begin_owned(
 /// chain that cannot be replayed, or a failed publication, is dropped and a
 /// new epoch starts from the transcript, as the TUI and headless frontends
 /// do. Returns the restart cause for the user-facing notice.
+#[cfg(feature = "acp")]
 pub(crate) async fn begin_owned_reconciled(
     session: &mut Session,
     scope: &Arc<crate::agent::runner::AgentWorkScope>,
@@ -813,6 +814,9 @@ pub(crate) async fn begin_owned_reconciled(
     NativePublicationTicket,
     Option<super::native_replay::NativeRestartCause>,
 )> {
+    // Metadata the editor changed while idle (a rename, a title, usage) is
+    // published as its own revision first, as the TUI does.
+    let republished = recover_idle(session)?.1;
     let unfinished = session.native_unfinished_cause();
     let failed = session.native_publication.as_ref().is_some_and(|p| {
         p.owner
@@ -827,7 +831,8 @@ pub(crate) async fn begin_owned_reconciled(
     let cause = session
         .native_restart_cause()
         .or(unfinished)
-        .or_else(|| failed.then_some(super::native_replay::NativeRestartCause::WriteFailed));
+        .or_else(|| failed.then_some(super::native_replay::NativeRestartCause::WriteFailed))
+        .or(republished);
     if unfinished.is_some() {
         session.restart_unfinished_native_chain()?;
     } else if cause.is_some() {
@@ -842,13 +847,6 @@ async fn begin_owned_with(
     scope: &Arc<crate::agent::runner::AgentWorkScope>,
     restarted: bool,
 ) -> anyhow::Result<NativePublicationTicket> {
-    if !restarted && idle_republish_needed(session) {
-        // Idle metadata changed since the last publication; publish it as its
-        // own revision instead of refusing the turn.
-        if let Some(cause) = republish_idle_sync(session)? {
-            super::storage::queue_session_notice(session, cause.notice());
-        }
-    }
     let snapshot = session.clone();
     let (publication, ticket) = scope
         .run(async move {
@@ -956,6 +954,13 @@ impl RetiredSessionEndPermit {
 /// publication left no live actor. Anything else (an active turn, a stale clone
 /// or a session this process does not own) is left to the strict paths.
 pub(super) fn idle_republish_needed(session: &Session) -> bool {
+    idle_republish_needed_with(session, true)
+}
+
+/// `compare_digest` false skips the whole-session encode a changed-metadata
+/// check needs (the turn-end deferred save keeps its no-encode contract); a
+/// failed publication and a replaced observation owner are still detected.
+pub(super) fn idle_republish_needed_with(session: &Session, compare_digest: bool) -> bool {
     let Some(publication) = session.native_publication.as_ref() else {
         return false;
     };
@@ -979,8 +984,20 @@ pub(super) fn idle_republish_needed(session: &Session) -> bool {
             publication.revision == state.revision && publication.digest == state.digest,
         )
     };
+    // `/undo` and `/clear` replace the background task pool (runtime-only): the
+    // retired publication still names the old observation owner, so a turn
+    // could not begin. The same exact owner re-baselines it from the session.
+    #[cfg(feature = "subagents")]
+    let replaced = publication.observations.is_some() && session.background_observations.is_none();
+    #[cfg(not(feature = "subagents"))]
+    let replaced = false;
     match phase {
-        Phase::Retired => current && digest(session).is_ok_and(|now| now != publication.digest),
+        Phase::Retired => {
+            current
+                && (replaced
+                    || (compare_digest
+                        && digest(session).is_ok_and(|now| now != publication.digest)))
+        }
         Phase::Failed => publication.owner.lease.live_writers() == 0,
         _ => false,
     }
@@ -2007,7 +2024,7 @@ impl RetiredSessionEndPermit {
                 );
             }
             anyhow::bail!(
-                "session context changed during cleanup; start a fresh context to continue"
+                "session context changed during cleanup; run `/fork` (or restart with `--continue --fork-session`) to continue from the visible transcript"
             );
         }
         if let Some(ticket) = ticket.take() {
@@ -4081,9 +4098,12 @@ mod tests {
             // The retired owner survives idle republication.
             permit.restart_chain(&mut session).await.unwrap();
             assert_eq!(imported(&session).native_frontier.refusal(), None);
-            // A change that was never saved is published when the turn begins.
+            // A change that was never saved is refused by the strict turn
+            // begin; the TUI publishes it first (`rebind_native_session`).
             session.name = "renamed again".into();
             let scope = crate::agent::runner::AgentWorkScope::new();
+            assert!(begin_owned(&mut session, &scope).await.is_err());
+            assert!(recover_idle(&mut session).unwrap().0);
             let ticket = begin_owned(&mut session, &scope).await.unwrap();
             assert_eq!(
                 imported(&session).native_frontier.refusal(),
@@ -4230,6 +4250,149 @@ mod tests {
             fork.name = "fork renamed".into();
             super::super::storage::save_session_recovering(&mut fork, |_| {}).unwrap();
             assert_eq!(imported(&fork).name, "fork renamed");
+        });
+    }
+
+    #[cfg(feature = "acp")]
+    #[test]
+    fn cancelled_turn_restarts_for_the_next_prompt_in_every_frontend() {
+        // mini-agent-nvnkx.265: ACP calls begin_owned directly; a cancelled or
+        // failed turn leaves an IncompleteTurn refusal that only a restart
+        // clears.
+        let roots = crate::tests::OwnedTestDirectory::new("native-cancelled-restart");
+        let _environment = environment(&roots);
+        let mut session = Session::new("anthropic", "fixture", 32_000, "");
+        let _release = Release(session.id.to_string());
+        session.add_message(super::super::MessageRole::User, "cancelled prompt");
+        runtime().block_on(async {
+            let scope = crate::agent::runner::AgentWorkScope::new();
+            let ticket = begin_owned(&mut session, &scope).await.unwrap();
+            retire_owned(
+                &mut session,
+                ticket,
+                RetiredNativeOutcome::Incomplete,
+                &scope,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                session.native_frontier.refusal(),
+                Some(RestartReason::IncompleteTurn)
+            );
+            let scope = crate::agent::runner::AgentWorkScope::new();
+            // The plain begin refuses every later prompt.
+            assert!(begin_owned(&mut session, &scope).await.is_err());
+            let (ticket, cause) = begin_owned_reconciled(&mut session, &scope).await.unwrap();
+            assert_eq!(
+                cause,
+                Some(super::super::native_replay::NativeRestartCause::Refused(
+                    RestartReason::IncompleteTurn
+                ))
+            );
+            assert!(session.native_frontier.ready());
+            retire_owned(
+                &mut session,
+                ticket,
+                RetiredNativeOutcome::Completed,
+                &scope,
+            )
+            .await
+            .unwrap();
+            assert_eq!(imported(&session).native_frontier.refusal(), None);
+        });
+    }
+
+    #[test]
+    fn non_native_turn_on_a_native_bearing_session_saves_under_its_owner() {
+        // mini-agent-nvnkx.264: after a provider switch the turn runs without a
+        // ticket, but its save must still land.
+        let roots = crate::tests::OwnedTestDirectory::new("native-legacy-turn");
+        let _environment = environment(&roots);
+        let mut session = Session::new("anthropic", "fixture", 32_000, "");
+        let _release = Release(session.id.to_string());
+        runtime().block_on(async {
+            let _permit = idle_owned(&mut session).await;
+            session.provider = "openai".into();
+            session.add_message(super::super::MessageRole::User, "turn after the switch");
+            session.add_message(super::super::MessageRole::Assistant, "answer");
+            super::super::storage::save_session_recovering(&mut session, |_| {}).unwrap();
+            let saved = imported(&session);
+            assert_eq!(saved.messages.len(), 2);
+            assert_eq!(saved.provider, "openai");
+            session.add_message(super::super::MessageRole::User, "another turn");
+            super::super::storage::save_session_recovering(&mut session, |_| {}).unwrap();
+            assert_eq!(imported(&session).messages.len(), 3);
+        });
+    }
+
+    #[test]
+    fn every_refusal_text_names_a_way_out_and_a_fork_continues_from_the_transcript() {
+        // mini-agent-nvnkx.271
+        for reason in [
+            RestartReason::ChangedDomain,
+            RestartReason::ChangedPrefix,
+            RestartReason::IncompleteTurn,
+            RestartReason::UnavailableSource,
+            RestartReason::Limit,
+            RestartReason::InFlight,
+        ] {
+            let roots = crate::tests::OwnedTestDirectory::new("native-refusal-fork");
+            let _environment = environment(&roots);
+            let mut session = Session::new("anthropic", "fixture", 32_000, "");
+            session.add_message(super::super::MessageRole::User, "visible row");
+            session.add_message(super::super::MessageRole::Assistant, "visible answer");
+            session.native_frontier.refuse_expected(0, reason).unwrap();
+            if reason == RestartReason::InFlight {
+                assert!(reason.to_string().contains("/fork"), "{reason}");
+                assert!(reason.to_string().contains("--fork-session"), "{reason}");
+            }
+            let mut fork = super::super::lock::fork_at_turn(&session, None).unwrap();
+            let _release = Release(fork.id.to_string());
+            runtime().block_on(async {
+                publish_new_session(&mut fork)
+                    .await
+                    .unwrap_or_else(|error| panic!("{reason:?}: {error:#}"));
+            });
+            let saved = imported(&fork);
+            assert_eq!(saved.native_frontier.refusal(), None, "{reason:?}");
+            assert_eq!(saved.messages.len(), 2, "{reason:?}: rows intact");
+        }
+        // Raw overrides refuse a fresh chain too: the text says to remove them.
+        let text = RestartReason::UnsupportedOverride.to_string();
+        assert!(text.contains("remove the raw request overrides"), "{text}");
+    }
+
+    #[test]
+    fn legacy_file_of_an_unpublished_interactive_session_takes_its_first_native_turn() {
+        // mini-agent-nvnkx.210: a fresh interactive session publishes nothing
+        // before its first prompt; a /rename before it writes an ordinary file
+        // that the first native turn must be able to take over.
+        let roots = crate::tests::OwnedTestDirectory::new("native-legacy-first-turn");
+        let _environment = environment(&roots);
+        let mut session = Session::new("anthropic", "fixture", 32_000, "");
+        let _release = Release(session.id.to_string());
+        assert!(!is_native_bearing(&session));
+        session.name = "named before the first prompt".into();
+        super::super::storage::save_session_recovering(&mut session, |_| {}).unwrap();
+        assert_eq!(imported(&session).name, "named before the first prompt");
+        runtime().block_on(async {
+            let scope = crate::agent::runner::AgentWorkScope::new();
+            let ticket = begin_owned(&mut session, &scope).await.unwrap();
+            assert_eq!(
+                imported(&session).native_frontier.refusal(),
+                Some(RestartReason::InFlight)
+            );
+            retire_owned(
+                &mut session,
+                ticket,
+                RetiredNativeOutcome::Completed,
+                &scope,
+            )
+            .await
+            .unwrap();
+            let saved = imported(&session);
+            assert_eq!(saved.native_frontier.refusal(), None);
+            assert_eq!(saved.name, "named before the first prompt");
         });
     }
 }

@@ -7,7 +7,7 @@ pub(crate) use app::drive_native_stale_session_end_fixture;
 #[cfg(test)]
 pub(crate) use app::{
     drive_native_effort_fixture, drive_native_fixture_turn, drive_native_fixture_turns,
-    drive_native_script, drive_native_steer_fixture,
+    drive_native_script, drive_native_steer_fixture, drive_native_title_fixture,
 };
 mod app;
 #[cfg(feature = "multimodal")]
@@ -1756,7 +1756,7 @@ pub(crate) async fn reconcile_native_chain(
         result?;
     } else {
         anyhow::bail!(
-            "unfinished native context requires recovery before it can restart; start a fresh context to continue"
+            "unfinished native context requires recovery before it can restart; run `/fork` (or restart with `--continue --fork-session`) to continue from the visible transcript"
         );
     }
     run.native_blocked = None;

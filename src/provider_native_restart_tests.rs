@@ -41,6 +41,19 @@ async fn drive(
     observe: bool,
     extra_config: Value,
 ) -> Run {
+    drive_with(name, responses, steps, observe, extra_config, false).await
+}
+
+/// `titled` leaves session title generation at its default and applies the
+/// first turn's title while the session is idle.
+async fn drive_with(
+    name: &str,
+    responses: Vec<(bool, String)>,
+    steps: Vec<String>,
+    observe: bool,
+    extra_config: Value,
+    titled: bool,
+) -> Run {
     #[cfg(feature = "hooks")]
     let _dispatcher = crate::tests::fake_model::dispatcher_guard::acquire();
     let roots = crate::tests::OwnedTestDirectory::new(name);
@@ -74,6 +87,12 @@ async fn drive(
             "model-b":{"provider":"restart-tui","model":"claude-sonnet-5-0","context_window":200000,"input_token_cost":2.0,"output_token_cost":4.0}
         },
     });
+    if titled {
+        config
+            .as_object_mut()
+            .unwrap()
+            .remove("session_title_model");
+    }
     for (key, value) in extra_config.as_object().unwrap() {
         config[key] = value.clone();
     }
@@ -93,7 +112,12 @@ async fn drive(
         "restart-tui",
         "claude-opus-5-5",
         200_000,
-        workspace.root().to_str().unwrap(),
+        // A named session is never titled.
+        if titled {
+            ""
+        } else {
+            workspace.root().to_str().unwrap()
+        },
     );
     #[cfg(feature = "agent-skills")]
     {
@@ -124,8 +148,11 @@ async fn drive(
         crate::sandbox::Sandbox::new(false, "none").with_workspace_binding(workspace.clone()),
         None,
     );
-    let saved =
-        crate::startup::heap_future(|| crate::ui::drive_native_script(ui, &steps, observe)).await;
+    let saved = if titled {
+        crate::startup::heap_future(|| crate::ui::drive_native_title_fixture(ui, &steps)).await
+    } else {
+        crate::startup::heap_future(|| crate::ui::drive_native_script(ui, &steps, observe)).await
+    };
     let bodies = wire.finish();
     Run { saved, bodies }
 }
@@ -776,4 +803,192 @@ async fn headless_multi_turn_input_without_a_saved_session_keeps_the_chain_in_me
         signatures(&bodies[1]),
         vec!["memory-one-signature".to_string()]
     );
+}
+
+fn title_response(title: &str) -> (bool, String) {
+    (true, start() + &text(0, title) + &finish())
+}
+
+// mini-agent-nvnkx.262: the auto-generated title arrives while the session is
+// idle; it must be saved, and the next prompt must reach the provider.
+#[tokio::test]
+async fn idle_title_between_turns_saves_and_the_next_prompt_completes() {
+    let run = drive_with(
+        "native-idle-title",
+        vec![
+            response("title-signature-one", "first answer"),
+            title_response("Idle Title"),
+            response("title-signature-two", "second answer"),
+        ],
+        vec!["first prompt".into(), "second prompt".into()],
+        true,
+        json!({}),
+        true,
+    )
+    .await;
+    assert_eq!(run.bodies.len(), 3, "turn, title, turn");
+    let titled = &run.saved[0];
+    assert_eq!(titled.generated_title.as_deref(), Some("Idle Title"));
+    assert_eq!(titled.native_frontier.refusal(), None);
+    // The chain survives the metadata republication: the signed block of the
+    // first turn is replayed by the second request.
+    assert!(
+        signatures(&run.bodies[2]).contains(&"title-signature-one".to_string()),
+        "{}",
+        run.bodies[2]
+    );
+    let last = &run.saved[1];
+    assert_eq!(last.generated_title.as_deref(), Some("Idle Title"));
+    assert_eq!(last.native_frontier.refusal(), None);
+    assert_eq!(last.native_history_snapshot().unwrap().frames().len(), 2);
+}
+
+// mini-agent-nvnkx.262: /rename between two native turns.
+#[tokio::test]
+async fn rename_between_native_turns_saves_and_keeps_the_chain() {
+    let run = drive(
+        "native-rename",
+        vec![
+            response("rename-signature-one", "first answer"),
+            response("rename-signature-two", "second answer"),
+        ],
+        vec![
+            "first prompt".into(),
+            "/rename renamed idle".into(),
+            "second prompt".into(),
+        ],
+        true,
+        json!({}),
+    )
+    .await;
+    assert_eq!(run.bodies.len(), 2);
+    assert_eq!(run.saved[1].name, "renamed idle");
+    assert_eq!(run.saved[1].native_frontier.refusal(), None);
+    assert!(signatures(&run.bodies[1]).contains(&"rename-signature-one".to_string()));
+    assert_eq!(run.saved[2].name, "renamed idle");
+    assert_eq!(
+        run.saved[2]
+            .native_history_snapshot()
+            .unwrap()
+            .frames()
+            .len(),
+        2
+    );
+}
+
+// mini-agent-nvnkx.263: /undo and /clear on a native session are saved (not
+// rolled back) and the next prompt completes on a new chain.
+#[tokio::test]
+async fn undo_and_clear_on_a_native_session_are_saved_and_the_next_prompt_completes() {
+    let run = drive(
+        "native-undo-clear",
+        vec![
+            response("undo-signature-one", "first answer"),
+            response("undo-signature-two", "second answer"),
+            response("undo-signature-three", "third answer"),
+            response("undo-signature-four", "fourth answer"),
+        ],
+        vec![
+            "first prompt".into(),
+            "second prompt".into(),
+            "/undo".into(),
+            "third prompt".into(),
+            "/clear".into(),
+            "fourth prompt".into(),
+        ],
+        true,
+        json!({}),
+    )
+    .await;
+    assert_eq!(run.bodies.len(), 4);
+    let undone = &run.saved[2];
+    assert_eq!(
+        undone
+            .messages
+            .iter()
+            .filter(|row| row.role == crate::session::MessageRole::User)
+            .count(),
+        1,
+        "the undone exchange is gone from the reloaded file"
+    );
+    assert_eq!(undone.native_frontier.refusal(), None);
+    let replay = run.bodies[2]["messages"].to_string();
+    assert!(!replay.contains("second prompt"), "{replay}");
+    assert!(replay.contains("third prompt"));
+    let cleared = &run.saved[4];
+    assert!(
+        cleared.messages.is_empty(),
+        "/clear leaves an empty session"
+    );
+    assert_eq!(cleared.native_frontier.refusal(), None);
+    let fourth = run.bodies[3]["messages"].to_string();
+    assert!(
+        !fourth.contains("first prompt") && fourth.contains("fourth prompt"),
+        "{fourth}"
+    );
+}
+
+// mini-agent-nvnkx.267 / .268: /fork publishes the copy through its own owner,
+// the App then switches to it, and prompts, commands and exit keep working.
+#[tokio::test]
+async fn fork_of_a_native_session_is_saved_and_prompts_continue_in_the_fork() {
+    let run = drive(
+        "native-fork",
+        vec![
+            response("fork-signature-one", "first answer"),
+            response("fork-signature-two", "second answer"),
+            response("fork-signature-three", "third answer"),
+        ],
+        vec![
+            "first prompt".into(),
+            "second prompt".into(),
+            "/fork 1".into(),
+            "/rename forked".into(),
+            "third prompt".into(),
+        ],
+        true,
+        json!({}),
+    )
+    .await;
+    assert_eq!(run.bodies.len(), 3);
+    let original = &run.saved[1];
+    let fork = &run.saved[2];
+    assert_ne!(fork.id, original.id);
+    assert_eq!(
+        fork.messages
+            .iter()
+            .filter(|row| row.role == crate::session::MessageRole::User)
+            .count(),
+        1,
+        "/fork 1 keeps the first exchange only"
+    );
+    assert_eq!(fork.native_frontier.refusal(), None);
+    assert_eq!(run.saved[3].name, "forked");
+    let replay = run.bodies[2]["messages"].to_string();
+    assert!(
+        replay.contains("first prompt") && !replay.contains("second prompt"),
+        "{replay}"
+    );
+    let last = &run.saved[4];
+    assert_eq!(last.id, fork.id);
+    assert_eq!(last.native_frontier.refusal(), None);
+}
+
+// mini-agent-nvnkx.268: leaving a session through /fork and quitting at once
+// (no prompt in the new session) ends cleanly: the driver's SessionEnd runs
+// against the entered session's own owner, not the one that was left.
+#[tokio::test]
+async fn quit_right_after_a_session_switch_leaves_healthy_files() {
+    let run = drive(
+        "native-switch-quit",
+        vec![response("switch-signature-one", "first answer")],
+        vec!["first prompt".into(), "/fork".into()],
+        true,
+        json!({}),
+    )
+    .await;
+    let original = &run.saved[0];
+    let fork = &run.saved[1];
+    assert_ne!(original.id, fork.id);
+    assert_eq!(fork.native_frontier.refusal(), None);
 }

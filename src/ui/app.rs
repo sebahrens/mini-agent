@@ -9509,6 +9509,14 @@ pub(crate) async fn drive_native_script(
 }
 
 #[cfg(test)]
+pub(crate) async fn drive_native_title_fixture(
+    ui: UiContext<'_>,
+    prompts: &[String],
+) -> Vec<Session> {
+    plan_approval_tests::drive_native_title_fixture(ui, prompts).await
+}
+
+#[cfg(test)]
 pub(crate) async fn drive_native_effort_fixture(ui: UiContext<'_>) -> Vec<Session> {
     plan_approval_tests::drive_native_effort_fixture(ui).await
 }

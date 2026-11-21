@@ -216,3 +216,57 @@ third HTTP request; the first two accepted usage receipts remain unchanged.
 Native pressure currently parks its complete bound tool reply rather than
 starting an unbound compactor. Automatic round, explicit fresh-context/recovery,
 and all metadata mutation paths still require their own controller adoption.
+
+## Idle republication, resume and recovery (2026-11-21)
+
+An idle native session is always held by a **retired** publication. Anything
+that changes the session outside a model turn (the generated title, `/rename`,
+permission allowlist and cron-schedule saves, usage charges, `/undo`, `/redo`,
+`/clear`, `/new`, a replaced background task pool) makes the next save or turn
+start republish it as a new revision under the same writer lease:
+`native_publication::republish_idle_sync`, called from
+`save_session_recovering` and from `begin_owned` when
+`idle_republish_needed` is true. A chain the new transcript no longer matches is
+dropped first (new epoch, one-line notice); the previous value is denied on disk
+before the healthy payload replaces it. A stale clone or a session this process
+does not own is never republished: the strict digest/revision checks still
+refuse it.
+
+`PublicationState::authority` is the actor generation. It advances when an actor
+begins or retires and not for an idle republish, so the TUI's
+`RetiredSessionEndPermit` (SessionEnd, effort and chain restarts) survives
+metadata republication while any later actor invalidates it.
+
+The interactive TUI retires its idle startup ticket back to a healthy checkpoint
+once the SessionStart hook has joined (`retire_idle_startup`), so a quit before
+the first prompt leaves a healthy file. A brand-new interactive session opens no
+publication until its first prompt. `rebind_native_session` keeps the owner
+bound to the session that is open: after `/fork` or `/sessions` the owner,
+ticket and blocked state of the session that was left are dropped and the
+entered session is published healthy. `/fork` publishes the copy through
+`publish_new_session` (the `--fork-session` sequence).
+
+Recovery:
+
+- A freshly loaded file whose frontier is `in_flight` has no live writer once
+  `NativeStartupPublication::begin` claims its lock: the chain is dropped and a
+  new epoch starts from the transcript (`NativeRestartCause::Unfinished`). A
+  lock held elsewhere still refuses. ACP uses `begin_owned_reconciled`, which
+  applies the same rule to refused, near-bound, model-changed, edited and failed
+  publications.
+- A publication a failed write left in `Phase::Failed` is recovered by the exact
+  lease holder once no writer guard is live (`NativeWriterLease::live_writers`):
+  the chain restarts and the transcript is republished as a healthy revision.
+- A turn on a native-bearing session that no longer uses an Anthropic client
+  (`/model`, `--resume-provider`) runs the plain transcript path; its turn-end
+  save republishes under the same owner. Headless retires its idle startup
+  ticket first.
+- Terminal refusal texts name `/fork` (or `--continue --fork-session`), which
+  continues from the visible transcript in a new session. Raw request overrides
+  refuse a fresh chain too; their text says to remove them.
+
+Session files carry `session_format` (read up to `SESSION_FORMAT`; a newer file reports
+"saved by a newer mini-agent" instead of corruption) and `written_by`; unknown
+top-level fields are kept and re-emitted on save. Without advisory locks a legacy
+session is replaced atomically (reported once) and a native-bearing file is
+never replaced. Deleting a session also removes its lock file.

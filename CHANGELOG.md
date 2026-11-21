@@ -16,6 +16,8 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Persona frontmatter `background: true` (delegations detach as background tasks), `memory: user|project|local` (private notes directory injected at start and writable through an `agent_memory` tool) and `hooks:` (scoped to the child's tool calls) are now implemented; memory and hooks are opt-in via `[subagents] agent_memory` / `agent_hooks` (mini-agent-scu2y).
 - Skills run with `/<name> args` now substitute `$ARGUMENTS`, `$ARGUMENTS[N]`, `$N` and `${CLAUDE_SKILL_DIR}`, rewrite ``!`cmd` `` spans into shell-tool instructions (`skills_shell_placeholders`), and honour `context: fork` with `agent:` by delegating the body to one `task` child (mini-agent-h7wxv).
 - Skill frontmatter `model` (forked skills; the `task` tool takes a per-call `model` limited to configured `[quick_models]` aliases and never overrides a persona-pinned model) and `paths` (automatic selection only when the request names a matching file); `effort` and `hooks` now report a reason (mini-agent-h7wxv).
+- Saved sessions carry `session_format` and `written_by`; a build refuses a file written by a newer format with a "saved by a newer mini-agent" message (not as corruption), and top-level fields it does not know are written back unchanged (mini-agent-nvnkx.214).
+- Native refusal messages name a way out: `/fork` (or `--continue --fork-session`) continues from the visible transcript, and a fork of any recoverable refused or in-flight native session starts a fresh chain over its rows (mini-agent-nvnkx.271).
 
 ### Fixed
 
@@ -98,6 +100,11 @@ Notable changes to mini-agent are documented in this file. The format follows
   caps concurrent relays at 256 (mini-agent-y42nd). `update` and `install.sh` treat a `gh` whose
   `attestation verify --help` lacks the pin flags as unavailable (upgrade gh), not a failed
   verification (mini-agent-0cshc).
+- An Anthropic TUI session no longer stops saving after its first turn: the idle title, `/rename`, permission and schedule changes, usage charges and `/undo`, `/redo`, `/clear` and `/new` are republished as new revisions under the same retired owner (kept across them), so the next save and prompt succeed instead of failing with "native context snapshot changed before publication" or exiting with "unattributed or replaced shared observation state" (mini-agent-nvnkx.262, .263).
+- A native session left in flight by a dead writer (SIGKILL, crash, or a quit before the first prompt) resumes: the new process that claims its lock restarts the thinking chain from the transcript with a one-line notice instead of refusing startup, `--fork-session` and `/sessions`. The TUI now retires its idle startup ticket to a healthy checkpoint, and a brand-new interactive session writes no file before its first prompt; `--continue` skips sessions that never received a prompt (mini-agent-nvnkx.209, .210).
+- A failed native checkpoint write no longer ends the conversation for the process: the same writer restarts a new epoch from the transcript on the next save or prompt (mini-agent-nvnkx.266). A native session continued on a non-Anthropic model (`/model`, `--resume-provider`) keeps saving (mini-agent-nvnkx.264). ACP restarts a refused chain (cancelled or failed turn, bounds) before the next prompt as the TUI does (mini-agent-nvnkx.265).
+- TUI `/fork` of an Anthropic session publishes the copy through its own owner, and switching sessions rebinds the idle owner, startup ticket and blocked state to the entered session, so prompts, restarts and exit work after `/fork` and `/sessions` (mini-agent-nvnkx.267, .268).
+- Session saves keep working on filesystems without advisory locks (legacy sessions are replaced atomically, the degraded state is reported once, a native-bearing file is never replaced) (mini-agent-nvnkx.211). Deleting a session from `/sessions` also removes its lock file (mini-agent-nvnkx.54).
 
 ### Added
 

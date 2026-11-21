@@ -36,11 +36,11 @@ impl std::fmt::Display for RestartReason {
             Self::IncompleteTurn => "native thinking tool reply is incomplete",
             Self::UnavailableSource => "native thinking context cannot be reproduced",
             Self::UnsupportedOverride => {
-                "raw request overrides cannot reproduce native thinking context"
+                "raw request overrides cannot reproduce native thinking context; remove the raw request overrides (system, messages, tools or model) to continue"
             }
             Self::Limit => "native thinking context exceeds its finite bounds",
             Self::InFlight => {
-                "native thinking context is unfinished; start a fresh context to continue"
+                "native thinking context is unfinished; run `/fork` (or restart with `--continue --fork-session`) to continue from the visible transcript"
             }
         })
     }

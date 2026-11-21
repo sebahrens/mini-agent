@@ -104,7 +104,9 @@ impl HeldSessionLock {
         Ok(())
     }
 
-    fn revoke(&self, force_unlock: bool) {
+    /// Returns whether the lock is unlocked now (no native publisher still
+    /// holds it).
+    fn revoke(&self, force_unlock: bool) -> bool {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         state.revoked = true;
         // Forced exit must not unlock an in-flight native publisher while its
@@ -114,7 +116,9 @@ impl HeldSessionLock {
         // ownership. Legacy force-stop unlocking stays unchanged.
         if state.publishers == 0 || (force_unlock && state.native_frontier.is_none()) {
             let _ = self.file.unlock();
+            return true;
         }
+        false
     }
 
     fn prepare_legacy_target(&self, session_id: &str) -> anyhow::Result<()> {
@@ -165,23 +169,7 @@ impl HeldSessionLock {
             bytes.len() <= super::storage::MAX_SESSION_BYTES,
             "saved session exceeds its finite limit"
         );
-        #[derive(serde::Deserialize)]
-        struct SavedClassification {
-            #[serde(default)]
-            native_frontier: super::native_replay::NativeFrontier,
-            #[serde(default)]
-            native_history: Option<serde::de::IgnoredAny>,
-            #[serde(default)]
-            retired_native_history: Vec<serde::de::IgnoredAny>,
-        }
-        let classification: SavedClassification = serde_json::from_slice(&bytes)
-            .map_err(|_| anyhow::anyhow!("saved session compatibility cannot be classified"))?;
-        anyhow::ensure!(
-            classification.native_frontier.is_initial()
-                && classification.native_history.is_none()
-                && classification.retired_native_history.is_empty(),
-            "unfinished native context requires its saved-session owner"
-        );
+        ensure_legacy_bytes(&bytes)?;
         let current = self
             .root
             .open_regular_relative(std::path::Path::new(&name))?;
@@ -264,6 +252,29 @@ impl HeldSessionLock {
         self.root.validate_private_root()?;
         Ok(LegacyStamp::of(&published))
     }
+}
+
+/// Restrictive classification of saved bytes: only a session with no native
+/// chain, frontier marker or retired history may take the legacy write path.
+fn ensure_legacy_bytes(bytes: &[u8]) -> anyhow::Result<()> {
+    #[derive(serde::Deserialize)]
+    struct SavedClassification {
+        #[serde(default)]
+        native_frontier: super::native_replay::NativeFrontier,
+        #[serde(default)]
+        native_history: Option<serde::de::IgnoredAny>,
+        #[serde(default)]
+        retired_native_history: Vec<serde::de::IgnoredAny>,
+    }
+    let classification: SavedClassification = serde_json::from_slice(bytes)
+        .map_err(|_| anyhow::anyhow!("saved session compatibility cannot be classified"))?;
+    anyhow::ensure!(
+        classification.native_frontier.is_initial()
+            && classification.native_history.is_none()
+            && classification.retired_native_history.is_empty(),
+        "unfinished native context requires its saved-session owner"
+    );
+    Ok(())
 }
 
 /// Exact process-local writer lease; importing the same saved id does not
@@ -488,6 +499,10 @@ pub fn claim_session(session_id: &str) -> anyhow::Result<SessionClaim> {
     if crate::paths::artifact_disabled("sessions") {
         return Ok(SessionClaim::Owned);
     }
+    #[cfg(test)]
+    if tests_support::LOCKS_UNAVAILABLE.with(std::cell::Cell::get) {
+        anyhow::bail!("advisory locks are unavailable (test seam)");
+    }
     let path = lock_path(session_id)?;
     let cached = HELD
         .lock()
@@ -552,8 +567,17 @@ pub fn release_session(session_id: &str) {
         // concurrent spawn briefly shares this open file description until its
         // close-on-exec `exec`, and closing only our copy would leave the lock
         // held for that window.
-        lease.revoke(false);
+        let unlocked = lease.revoke(false);
         tracing::debug!("session lock released: id={}", session_id);
+        // A session that has no snapshot (deleted by `/sessions`, or never
+        // saved) has nothing to resume, so nobody can race this unlink onto a
+        // second owner: drop its zero-byte lock file instead of leaving one
+        // per session forever (mini-agent-nvnkx.54).
+        // Only once the lock is really free: an unlinked lock file that a
+        // native publisher still holds would let a second owner lock a new one.
+        if unlocked && super::storage::session_path(session_id).is_ok_and(|json| !json.exists()) {
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }
 
@@ -627,6 +651,9 @@ pub(crate) fn fork_at_turn(source: &Session, turn: Option<usize>) -> anyhow::Res
     Ok(fork)
 }
 
+/// Why saves and resumes refuse when session locks cannot be established.
+pub(crate) const LOCK_UNAVAILABLE_NOTICE: &str = "session locking is unavailable on this filesystem (set MINI_AGENT_STATE_DIR to a local directory)";
+
 /// A resumed session this process may write, plus the notice to show when it
 /// had to be forked.
 pub struct ResumedSession {
@@ -637,8 +664,8 @@ pub struct ResumedSession {
 /// Take ownership of a session selected for resumption. When another live
 /// process already owns it, continue in a fork instead of clobbering that
 /// process's turns. A lock that cannot be established at all (for example on
-/// a filesystem without advisory locks) is reported and the resume proceeds
-/// unguarded rather than failing.
+/// a filesystem without advisory locks) refuses the resume with the cause and
+/// the fix: its later saves could not replace the snapshot anyway.
 pub fn claim_or_fork(session: Session) -> anyhow::Result<ResumedSession> {
     match claim_session(&session.id) {
         Ok(SessionClaim::Owned) => Ok(ResumedSession {
@@ -662,15 +689,19 @@ pub fn claim_or_fork(session: Session) -> anyhow::Result<ResumedSession> {
             })
         }
         Err(error) => {
+            // Nothing could exclude another writer, and a save of an existing
+            // snapshot is refused without ownership, so resuming would only
+            // lose every later turn. Refuse up front with the cause and the fix
+            // (mini-agent-nvnkx.211).
             tracing::warn!(
-                "session lock for {} unavailable, resuming unguarded: {}",
+                "session lock for {} unavailable, refusing the resume: {}",
                 session.id,
                 error
             );
-            Ok(ResumedSession {
-                session,
-                notice: None,
-            })
+            Err(anyhow::anyhow!(
+                "{LOCK_UNAVAILABLE_NOTICE}: cannot resume session {}: {error}",
+                session.id
+            ))
         }
     }
 }
@@ -780,5 +811,76 @@ mod fork75_tests {
         ] {
             assert!(crate::cli::Cli::try_parse_from(args).is_err());
         }
+    }
+}
+
+/// Test seam: make [`claim_session`] fail on this thread, as on a filesystem
+/// without advisory locks.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    thread_local! {
+        pub(crate) static LOCKS_UNAVAILABLE: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+}
+
+#[cfg(test)]
+mod lock_unavailable_tests {
+    use super::*;
+
+    struct Unavailable;
+    impl Unavailable {
+        fn on() -> Self {
+            tests_support::LOCKS_UNAVAILABLE.with(|cell| cell.set(true));
+            Self
+        }
+    }
+    impl Drop for Unavailable {
+        fn drop(&mut self) {
+            tests_support::LOCKS_UNAVAILABLE.with(|cell| cell.set(false));
+        }
+    }
+
+    #[test]
+    fn missing_locks_refuse_the_resume_and_say_why_a_later_save_fails() {
+        // mini-agent-nvnkx.211
+        let roots = crate::tests::OwnedTestDirectory::new("lock-unavailable");
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            (
+                "MINI_AGENT_CONFIG_DIR",
+                Some(roots.path().join("config").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_DATA_DIR",
+                Some(roots.path().join("data").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_STATE_DIR",
+                Some(roots.path().join("state").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_CACHE_DIR",
+                Some(roots.path().join("cache").into_os_string()),
+            ),
+        ]);
+        let _unavailable = Unavailable::on();
+        let mut session = Session::new("openai", "fixture", 32_000, "");
+        // The first snapshot of a new session is still written create-only.
+        super::super::storage::save_session_recovering(&mut session, |_| {}).unwrap();
+        session.add_message(crate::session::MessageRole::User, "second save");
+        let error = super::super::storage::save_session_recovering(&mut session, |_| {})
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("MINI_AGENT_STATE_DIR") && error.contains("locking is unavailable"),
+            "{error}"
+        );
+        // Resuming it would only lose every later turn: refuse up front.
+        let error = claim_or_fork(session.clone()).err().unwrap().to_string();
+        assert!(error.contains("MINI_AGENT_STATE_DIR"), "{error}");
+        // The stored snapshot is untouched.
+        let path = super::super::storage::session_path(&session.id).unwrap();
+        let saved: Session = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(saved.messages.is_empty());
     }
 }
