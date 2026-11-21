@@ -732,9 +732,9 @@ fn acp53_stdio_native_turns_publish_restore_and_rename_republishes() {
     assert_eq!(after_rename["name"], "changed native");
     assert!(after_rename["native_history"].is_object(), "{after_rename}");
     assert_eq!(after_rename["messages"], saved["messages"]);
-    let before = std::fs::read(&path).unwrap();
     #[cfg(feature = "goal")]
     {
+        let before = std::fs::read(&path).unwrap();
         assert!(
             peer.exchange(
                 70,
