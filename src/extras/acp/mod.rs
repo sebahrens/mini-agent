@@ -8,6 +8,8 @@ mod model_options;
 mod persona;
 mod policy;
 mod sessions;
+#[cfg(feature = "subagents")]
+mod tasks;
 mod tls;
 mod toolcall;
 
@@ -2581,14 +2583,15 @@ async fn handle_set_session_mode(
         .validate()
         .map_err(|error| agent_client_protocol::Error::new(-32602, error.to_string()))?;
     #[cfg(feature = "subagents")]
-    if session
-        .spend
-        .background_pool()
-        .is_some_and(|pool| pool.active_count() > 0)
+    if let Some(pool) = session.spend.background_pool()
+        && pool.active_count() > 0
     {
+        let ids = tasks::running_ids(&pool.list()).join(", ");
         return Err(agent_client_protocol::Error::new(
             -32000,
-            "cancel or finish background tasks before changing permission mode",
+            format!(
+                "finish or cancel background tasks before changing permission mode (running: {ids}); send /tasks to list them or /tasks cancel <id> to stop one"
+            ),
         ));
     }
     let history = session
@@ -2820,6 +2823,12 @@ async fn handle_prompt(
         return cron::handle_command(&arguments, &session_id, responder, cx, &state).await;
     }
 
+    // `/tasks` reads or cancels background tasks and, like `/cron`, needs no turn.
+    #[cfg(feature = "subagents")]
+    if let Some(arguments) = commands::tasks_arguments(&req.prompt) {
+        return tasks::handle_command(&arguments, &session_id, responder, cx, &state).await;
+    }
+
     let command = commands::classify(&req.prompt)?;
     // A user-defined prompt command expands to one ordinary user text block;
     // everything downstream (and agent-mention routing) sees that block.
@@ -2844,6 +2853,8 @@ async fn handle_prompt(
             expanded_custom = true;
         }
     }
+    #[cfg(feature = "multimodal")]
+    let prompt_blocks = fit_prompt_images(prompt_blocks).await?;
     let prompt_input = parse_prompt_blocks(&prompt_blocks)?;
     let _ = expanded_custom; // read only by agent-mention routing (`subagents`)
 
@@ -3068,6 +3079,94 @@ fn spawn_turn(
     })
 }
 
+/// Images for a model the catalog lists as text-only are refused up front with
+/// the same sentence headless uses, instead of surfacing a raw provider error.
+#[cfg(feature = "multimodal")]
+fn image_route_refusal(
+    prompt_input: &crate::agent::input::PromptInput,
+    provider: &str,
+    model: &str,
+) -> Option<String> {
+    prompt_input
+        .persisted_user()
+        .is_some_and(|user| user.has_images())
+        .then(|| crate::headless_media::ensure_vision(provider, model).err())
+        .flatten()
+}
+
+#[cfg(not(feature = "multimodal"))]
+fn image_route_refusal(
+    _prompt_input: &crate::agent::input::PromptInput,
+    _provider: &str,
+    _model: &str,
+) -> Option<String> {
+    None
+}
+
+/// Re-encode an image block above the per-image limit so it fits, like the
+/// TUI `/add` and headless paths do. Images already within the limit pass
+/// through untouched. The decode and re-encode run on the blocking pool.
+#[cfg(feature = "multimodal")]
+async fn fit_prompt_images(
+    blocks: Vec<ContentBlock>,
+) -> Result<Vec<ContentBlock>, agent_client_protocol::Error> {
+    let encoded_limit = crate::session::user::MAX_USER_IMAGE_BYTES.div_ceil(3) * 4;
+    let mut out = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        let ContentBlock::Image(mut image) = block else {
+            out.push(block);
+            continue;
+        };
+        if image.data.len() > encoded_limit {
+            let declared = image.mime_type.clone();
+            let data = std::mem::take(&mut image.data);
+            let (data, mime) =
+                tokio::task::spawn_blocking(move || fit_oversized_image(&data, &declared))
+                    .await
+                    .map_err(|_| {
+                        agent_client_protocol::Error::new(-32603, "image resizing task failed")
+                    })?
+                    .map_err(|message| agent_client_protocol::Error::new(-32602, message))?;
+            image.data = data;
+            image.mime_type = mime;
+        }
+        out.push(ContentBlock::Image(image));
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "multimodal")]
+fn fit_oversized_image(encoded: &str, declared: &str) -> Result<(String, String), String> {
+    use base64::Engine;
+    const MIB: usize = 1024 * 1024;
+    let limit = crate::session::user::MAX_USER_IMAGE_BYTES;
+    let size = format!("{:.1} MiB", encoded.len() as f64 * 0.75 / MIB as f64);
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| format!("image data is not valid base64 (declared {declared})"))?;
+    let mut attachment = crate::extras::multimodal::image_from_bytes(
+        std::path::Path::new("acp-image"),
+        bytes,
+        Some(declared),
+    )
+    .map_err(|error| {
+        format!(
+            "image of {size} exceeds the {} MiB limit and could not be resized: {error}",
+            limit / MIB
+        )
+    })?;
+    crate::extras::multimodal::fit_image_attachment(&mut attachment).map_err(|error| {
+        format!(
+            "image of {size} exceeds the {} MiB limit and could not be resized: {error}",
+            limit / MIB
+        )
+    })?;
+    let crate::extras::multimodal::MediaAttachment::Image { data, mime, .. } = attachment else {
+        return Err("image resizing returned a non-image".to_owned());
+    };
+    Ok((base64::engine::general_purpose::STANDARD.encode(data), mime))
+}
+
 fn parse_prompt_blocks(
     blocks: &[ContentBlock],
 ) -> Result<crate::agent::input::PromptInput, agent_client_protocol::Error> {
@@ -3104,7 +3203,13 @@ fn parse_prompt_blocks(
             match block {
                 ContentBlock::Image(image) => {
                     let mime_type = ImageMime::parse(&image.mime_type).ok_or_else(|| {
-                        agent_client_protocol::Error::new(-32602, "unsupported ACP image MIME type")
+                        agent_client_protocol::Error::new(
+                            -32602,
+                            format!(
+                                "unsupported ACP image MIME type {:?}; accepted types are image/png, image/jpeg, image/gif and image/webp",
+                                toolcall::clip(&image.mime_type, 40)
+                            ),
+                        )
                     })?;
                     // The inline data is authoritative. URI/annotations/meta are
                     // display metadata, never a fetch or file-read request.
@@ -3316,6 +3421,58 @@ mod typed_prompt_tests {
     }
     #[cfg(feature = "multimodal")]
     #[test]
+    fn image_route_refusal_only_applies_to_image_prompts() {
+        let text = crate::agent::input::PromptInput::text("hello".into());
+        assert!(image_route_refusal(&text, "openai", "gpt-4o").is_none());
+        let image = parse_prompt_blocks(&[ContentBlock::Image(ImageContent::new(
+            "aW5lcnQ=",
+            "image/png",
+        ))])
+        .unwrap();
+        // An unknown model is allowed: the provider reports its own error.
+        assert!(image_route_refusal(&image, "no-such-provider", "no-such-model").is_none());
+    }
+
+    #[cfg(feature = "multimodal")]
+    #[test]
+    fn oversized_image_is_resized_under_the_limit_and_bad_types_list_the_accepted_ones() {
+        use base64::Engine;
+        // Incompressible noise: a PNG well above the 2 MiB per-image limit.
+        let mut state = 0x9e37_79b9_u32;
+        let pixels = image::RgbImage::from_fn(1100, 900, |_, _| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let [a, b, c, _] = state.to_be_bytes();
+            image::Rgb([a, b, c])
+        });
+        let mut png = Vec::new();
+        pixels
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        assert!(png.len() > crate::session::user::MAX_USER_IMAGE_BYTES);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
+        let (data, mime) = fit_oversized_image(&encoded, "image/png").unwrap();
+        let fitted = base64::engine::general_purpose::STANDARD
+            .decode(&data)
+            .unwrap();
+        assert!(fitted.len() <= crate::session::user::MAX_USER_IMAGE_BYTES);
+        assert!(mime.starts_with("image/"));
+        let blocks = vec![ContentBlock::Image(ImageContent::new(data, mime))];
+        assert!(parse_prompt_blocks(&blocks).is_ok());
+
+        let mismatch = fit_oversized_image(&encoded, "image/jpeg").unwrap_err();
+        assert!(mismatch.contains("MiB") && mismatch.contains("image/png"));
+
+        let tiff = [ContentBlock::Image(ImageContent::new(
+            "aW5lcnQ=",
+            "image/tiff",
+        ))];
+        let error = parse_prompt_blocks(&tiff).unwrap_err();
+        assert!(error.message.contains("image/tiff"));
+        assert!(error.message.contains("image/webp"));
+    }
+
+    #[cfg(feature = "multimodal")]
+    #[test]
     fn acp_image_prompt_with_blank_text_blocks_is_accepted() {
         let image = || ContentBlock::Image(ImageContent::new("aW5lcnQ=", "image/png"));
         // Image-only after an empty typed-text block.
@@ -3468,6 +3625,46 @@ fn allow_always_scope(
     (pattern, meta)
 }
 
+/// Most characters of the readable grant shown in the option label.
+const ALLOW_ALWAYS_LABEL_CHARS: usize = 80;
+
+/// Generic ACP clients render only the option name, so the rule a session
+/// grant installs belongs in the label (the full text stays in `_meta`).
+fn allow_always_label(readable: &str) -> String {
+    if readable.is_empty() {
+        return "Allow for this session".to_owned();
+    }
+    format!(
+        "Allow for this session: {}",
+        toolcall::clip(readable, ALLOW_ALWAYS_LABEL_CHARS)
+    )
+}
+
+/// Title of a permission request. A real call keeps the descriptive title it
+/// was announced with (clients apply the update to the existing call);
+/// a synthetic request has no call to rename and names the tool.
+fn permission_title(tool: &str, tool_call_id: Option<&str>) -> String {
+    match tool_call_id {
+        None => format!("Permission: {tool}"),
+        Some(id) => toolcall::recall_title(id).unwrap_or_else(|| tool.to_owned()),
+    }
+}
+
+#[cfg(feature = "mcp")]
+const MCP_ELICITATION_REFUSED: &str =
+    "An MCP server asked for input, which ACP clients cannot answer; the request was cancelled.";
+
+#[cfg(feature = "mcp")]
+fn send_thought(session_id: &SessionId, cx: &ConnectionTo<Client>, text: &str) {
+    let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text.to_owned())));
+    if let Err(error) = cx.send_notification(SessionNotification::new(
+        session_id.clone(),
+        SessionUpdate::AgentThoughtChunk(chunk),
+    )) {
+        tracing::warn!("ACP failed to send thought notification: {error}");
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum QuestionSelection {
     Choice(usize),
@@ -3537,6 +3734,329 @@ mod question_selection_tests {
             question_selection(&id, 0, &item, &format!("{id}:0:choice:0")),
             Some(QuestionSelection::Choice(0))
         );
+    }
+}
+
+#[cfg(test)]
+mod acp_surface_doc_tests {
+    use super::*;
+
+    const REGISTRY: &str = include_str!("../../../docs/acp-registry.json");
+    const SETUP_DOC: &str = include_str!("../../../docs/vscode-acp-setup.md");
+    const PACKAGE_JSON: &str = include_str!("../../../editors/vscode/package.json");
+
+    #[test]
+    fn registry_capabilities_match_the_advertised_ones() {
+        let registry: serde_json::Value = serde_json::from_str(REGISTRY).unwrap();
+        let caps = &registry["agent"]["capabilities"];
+        let advertised = acp_capabilities();
+        assert_eq!(
+            caps["sessions"]["load"].as_bool(),
+            Some(advertised.load_session)
+        );
+        assert_eq!(
+            caps["sessions"]["list"].as_bool(),
+            Some(advertised.session_capabilities.list.is_some())
+        );
+        assert_eq!(
+            caps["sessions"]["close"].as_bool(),
+            Some(advertised.session_capabilities.close.is_some())
+        );
+        assert_eq!(
+            caps["prompt"]["embedded_context"].as_bool(),
+            Some(advertised.prompt_capabilities.embedded_context)
+        );
+        #[cfg(feature = "multimodal")]
+        assert_eq!(
+            caps["prompt"]["image"].as_bool(),
+            Some(advertised.prompt_capabilities.image)
+        );
+    }
+
+    #[test]
+    fn setup_doc_counts_match_the_extension_manifest() {
+        let manifest: serde_json::Value = serde_json::from_str(PACKAGE_JSON).unwrap();
+        let commands = manifest["contributes"]["commands"]
+            .as_array()
+            .unwrap()
+            .len();
+        let settings = manifest["contributes"]["configuration"]["properties"]
+            .as_object()
+            .unwrap()
+            .len();
+        let word = |count: usize| match count {
+            2 => "two",
+            4 => "four",
+            6 => "six",
+            11 => "eleven",
+            other => panic!("add a number word for {other} to this test"),
+        };
+        assert!(
+            SETUP_DOC.contains(&format!("exposes {} commands", word(commands))),
+            "the command count in docs/vscode-acp-setup.md is stale"
+        );
+        assert!(
+            SETUP_DOC.contains(&format!("contributes {} settings", word(settings))),
+            "the setting count in docs/vscode-acp-setup.md is stale"
+        );
+        let rows = |prefix: &str| SETUP_DOC.lines().filter(|l| l.starts_with(prefix)).count();
+        assert_eq!(rows("| **Mini Agent:"), commands);
+        assert_eq!(rows("| `mini-agent."), settings);
+    }
+}
+
+#[cfg(all(test, feature = "mcp"))]
+mod mcp_bridge_tests {
+    use super::*;
+    use crate::permission::ask::{AskRequest, UserDecision, UserRequest};
+
+    fn ask(reply: tokio::sync::oneshot::Sender<UserDecision>) -> AskRequest {
+        AskRequest {
+            diagnostic: None,
+            #[cfg(feature = "subagents")]
+            background: None,
+            agent_name: None,
+            tool: "mcp__srv__tool".into(),
+            input: "{}".to_owned(),
+            tool_call_id: Some("mcp-call".to_owned()),
+            suggested_pattern: None,
+            additional_allow_patterns: Vec::new(),
+            reply,
+        }
+    }
+
+    fn origin() -> crate::extras::mcp::elicitation::AskOrigin {
+        crate::extras::mcp::elicitation::AskOrigin {
+            owner: crate::extras::mcp::elicitation::FrontendOwner::Main("main".into()),
+            valid: Arc::new(|| true),
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_permission_uses_the_permission_flow_and_elicitation_says_it_was_cancelled() {
+        let (ask_tx, ask_rx) = tokio::sync::mpsc::channel(4);
+        let agent = Agent
+            .builder()
+            .on_receive_request(
+                async |_: InitializeRequest, responder, _cx| {
+                    responder.respond(InitializeResponse::new(ProtocolVersion::V1))
+                },
+                on_receive_request!(),
+            )
+            .with_spawned(move |cx| async move {
+                drive_permission_bridge(
+                    cx,
+                    idle::Activity::default(),
+                    SessionId::new("mcp-bridge"),
+                    ask_rx,
+                    Arc::new(TurnControl::new()),
+                    None,
+                    #[cfg(feature = "goal")]
+                    Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                )
+                .await;
+                Ok(())
+            });
+        let (note_tx, mut note_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let connection = Client
+            .builder()
+            .on_receive_notification(
+                move |notification: SessionNotification, _cx| {
+                    let _ = note_tx.send(notification);
+                    async { Ok(()) }
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .on_receive_request(
+                move |request: RequestPermissionRequest, responder, _cx| {
+                    let _ = request_tx.send((request, responder));
+                    async { Ok(()) }
+                },
+                on_receive_request!(),
+            )
+            .connect_with(agent, async move |_cx| {
+                // Elicitation: cancelled, with a visible thought.
+                let (reply, cancelled) = tokio::sync::oneshot::channel();
+                let question = crate::permission::ask::QuestionRequest {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    questions: crate::question::QuestionBatch(Vec::new()),
+                    tool_call_id: None,
+                    reply,
+                };
+                ask_tx
+                    .send(UserRequest::McpElicitation(
+                        crate::extras::mcp::elicitation::Request {
+                            question,
+                            owner: crate::extras::mcp::elicitation::FrontendOwner::Main(
+                                "main".into(),
+                            ),
+                            valid: Arc::new(|| true),
+                        },
+                    ))
+                    .await
+                    .unwrap();
+                let answer = cancelled.await.unwrap();
+                assert!(matches!(answer, crate::question::QuestionAnswer::Cancelled));
+
+                // Permission: forwarded as a session/request_permission.
+                let (reply, receiver) = tokio::sync::oneshot::channel();
+                ask_tx
+                    .send(UserRequest::McpPermission(
+                        crate::extras::mcp::elicitation::PermissionRequest {
+                            request: ask(reply),
+                            origin: origin(),
+                        },
+                    ))
+                    .await
+                    .unwrap();
+                let (request, responder) = request_rx.recv().await.unwrap();
+                assert_eq!(request.tool_call.tool_call_id.0.as_ref(), "mcp-call");
+                responder.respond(RequestPermissionResponse::new(
+                    RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                        "allow_once",
+                    )),
+                ))?;
+                assert!(matches!(receiver.await.unwrap(), UserDecision::AllowOnce));
+
+                // A stale origin is denied without bothering the user.
+                let (reply, receiver) = tokio::sync::oneshot::channel();
+                let stale = crate::extras::mcp::elicitation::AskOrigin {
+                    owner: crate::extras::mcp::elicitation::FrontendOwner::Main("main".into()),
+                    valid: Arc::new(|| false),
+                };
+                ask_tx
+                    .send(UserRequest::McpPermission(
+                        crate::extras::mcp::elicitation::PermissionRequest {
+                            request: ask(reply),
+                            origin: stale,
+                        },
+                    ))
+                    .await
+                    .unwrap();
+                assert!(matches!(receiver.await.unwrap(), UserDecision::Deny));
+                Ok(())
+            });
+        tokio::time::timeout(std::time::Duration::from_secs(5), connection)
+            .await
+            .expect("the bridge must answer")
+            .unwrap();
+        let mut thoughts = Vec::new();
+        while let Ok(notification) = note_rx.try_recv() {
+            if let SessionUpdate::AgentThoughtChunk(chunk) = notification.update
+                && let ContentBlock::Text(text) = chunk.content
+            {
+                thoughts.push(text.text);
+            }
+        }
+        assert!(
+            thoughts.iter().any(|text| text == MCP_ELICITATION_REFUSED),
+            "the elicitation refusal must be visible: {thoughts:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tool_presentation_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn native_refusal_names_the_command_and_the_next_step() {
+        let undo = native_command_refusal(&commands::Command::Undo);
+        assert!(undo.starts_with("/undo is not available"));
+        assert!(undo.contains("Start a new session"));
+        assert!(native_command_refusal(&commands::Command::Compact).starts_with("/compact"));
+        assert!(!undo.contains("native session changes require"));
+    }
+
+    #[test]
+    fn announce_tool_call_titles_kinds_and_absolute_locations() {
+        let root = std::env::temp_dir().join("acp-announce");
+        let call = announce_tool_call("c1", "edit", &json!({"path": "src/main.rs"}), &root);
+        assert_eq!(call.title, "edit src/main.rs");
+        assert_eq!(call.kind, ToolKind::Edit);
+        assert_eq!(call.locations[0].path, root.join("src/main.rs"));
+    }
+
+    #[test]
+    fn permission_title_keeps_the_announced_title() {
+        toolcall::remember_args(
+            "perm-title",
+            "shell",
+            &json!({"command": "cargo test --all"}),
+            "shell cargo test --all",
+            None,
+        );
+        assert_eq!(
+            permission_title("shell", Some("perm-title")),
+            "shell cargo test --all"
+        );
+        assert_eq!(permission_title("shell", Some("unknown")), "shell");
+        assert_eq!(permission_title("shell", None), "Permission: shell");
+        toolcall::forget_args("perm-title");
+    }
+
+    #[test]
+    fn allow_always_label_states_the_rule_and_is_bounded() {
+        assert_eq!(
+            allow_always_label("anything under /repo/"),
+            "Allow for this session: anything under /repo/"
+        );
+        assert_eq!(allow_always_label(""), "Allow for this session");
+        let long = allow_always_label(&"x".repeat(500));
+        assert!(
+            long.chars().count() <= "Allow for this session: ".len() + ALLOW_ALWAYS_LABEL_CHARS
+        );
+
+        let (reply, _receiver) = tokio::sync::oneshot::channel();
+        let ask = crate::permission::ask::AskRequest {
+            diagnostic: None,
+            #[cfg(feature = "subagents")]
+            background: None,
+            agent_name: None,
+            tool: "shell".into(),
+            input: "cargo test".to_owned(),
+            tool_call_id: None,
+            suggested_pattern: None,
+            additional_allow_patterns: Vec::new(),
+            reply,
+        };
+        let (_, meta) = allow_always_scope(&ask);
+        let readable = meta["suggestedPattern"].as_str().unwrap();
+        assert_eq!(
+            allow_always_label(readable),
+            "Allow for this session: cargo test"
+        );
+    }
+
+    #[test]
+    fn progress_update_targets_the_same_call_with_content_only() {
+        let update = tool_progress_update("call-9", "compiling...\nlinking");
+        assert_eq!(update.tool_call_id.0.as_ref(), "call-9");
+        assert!(update.fields.status.is_none());
+        assert_eq!(update.fields.content.as_ref().map(Vec::len), Some(1));
+    }
+
+    #[cfg(feature = "subagents")]
+    #[test]
+    fn subagent_lines_attach_to_the_single_open_task_call() {
+        let mut activity = TaskActivity::default();
+        assert!(activity.note("grep foo").is_none(), "no open task call");
+        activity.call_started("task-1");
+        let first = activity.note("grep foo").unwrap();
+        assert_eq!(first.tool_call_id.0.as_ref(), "task-1");
+        activity.note("read a.rs").unwrap();
+        activity.call_started("task-2");
+        assert!(activity.note("grep bar").is_none(), "ambiguous with two");
+        activity.call_finished("task-2");
+        activity.call_finished("task-1");
+        assert!(activity.note("grep baz").is_none());
+        activity.call_started("task-3");
+        for _ in 0..TaskActivity::MAX_LINES {
+            let _ = activity.note("line");
+        }
+        assert!(activity.note("one too many").is_none());
     }
 }
 
@@ -3733,13 +4253,20 @@ async fn drive_permission_bridge(
         let mut ask = match ask {
             #[cfg(feature = "mcp")]
             crate::permission::ask::UserRequest::McpPermission(request) => {
-                let _ = request.request.reply.send(UserDecision::Deny);
-                continue;
+                // An allow/deny question like any other tool ask: the same
+                // session/request_permission flow, unless the request is stale.
+                if !(request.origin.valid)() || request.request.reply.is_closed() {
+                    let _ = request.request.reply.send(UserDecision::Deny);
+                    continue;
+                }
+                request.request
             }
             #[cfg(feature = "mcp")]
             crate::permission::ask::UserRequest::McpElicitation(request) => {
-                // ACP has no form-response contract. Refuse instead of routing
-                // a server question through the permission approval protocol.
+                // ACP has no form-response contract, so the request is
+                // cancelled rather than routed through the permission
+                // protocol; say so instead of failing silently.
+                send_thought(&session_id, &cx, MCP_ELICITATION_REFUSED);
                 let _ = request
                     .question
                     .reply
@@ -3762,11 +4289,7 @@ async fn drive_permission_bridge(
         };
         let (suggested, allow_always_meta) = allow_always_scope(&ask);
         let synthetic_tool_call_id = ask.tool_call_id.is_none();
-        let title = if synthetic_tool_call_id {
-            format!("Permission: {}", ask.tool)
-        } else {
-            ask.tool.to_string()
-        };
+        let title = permission_title(&ask.tool, ask.tool_call_id.as_deref());
         let title = match &ask.agent_name {
             Some(name) => format!("[subagent: {name}] {title}"),
             None => title,
@@ -3787,6 +4310,14 @@ async fn drive_permission_bridge(
             .unwrap_or_default();
         content.push(ToolCallContent::from(ContentBlock::Text(TextContent::new(
             ask.input.clone(),
+        ))));
+        let readable = allow_always_meta
+            .get("suggestedPattern")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        content.push(ToolCallContent::from(ContentBlock::Text(TextContent::new(
+            format!("\"Allow for this session\" would allow: {readable}"),
         ))));
         if synthetic_tool_call_id {
             let announced = ToolCall::new(tool_call_id.clone(), title.clone())
@@ -3816,7 +4347,7 @@ async fn drive_permission_bridge(
             ),
             PermissionOption::new(
                 OPT_ALLOW_ALWAYS,
-                "Allow for this session",
+                allow_always_label(&readable),
                 PermissionOptionKind::AllowAlways,
             )
             .meta(allow_always_meta),
@@ -4030,6 +4561,22 @@ fn last_assistant_text(progress: &[Message]) -> String {
     }
 }
 
+/// Refusal for a context-changing command on a session that carries
+/// provider-native state: say which command and what to do instead.
+fn native_command_refusal(command: &commands::Command) -> String {
+    let name = match command {
+        commands::Command::Undo => "/undo",
+        commands::Command::Compact => "/compact",
+        commands::Command::Rename(_) => "/rename",
+        #[cfg(feature = "goal")]
+        commands::Command::Goal(_) => "/goal",
+        _ => "this command",
+    };
+    format!(
+        "{name} is not available in this session: it holds provider-managed (native) conversation state that cannot be rewritten or re-saved in place. Start a new session to use {name}; automatic compaction still runs."
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_prompt(
     state: &AcpState,
@@ -4069,7 +4616,7 @@ async fn run_prompt(
             return respond_terminal_error(
                 registration,
                 responder,
-                "native session changes require a new ACP session".into(),
+                native_command_refusal(command),
             );
         }
         let line = match command {
@@ -5196,6 +5743,9 @@ async fn execute_prompt(
     }
     #[cfg(test)]
     lock_unpoisoned(&state.turn_routes).push(route.clone());
+    if let Some(refusal) = image_route_refusal(prompt_input, &route.provider, &route.model) {
+        return Ok(PromptOutcome::failed(refusal));
+    }
     // The relay reads the same session-local store the actual tool mutates.
     // Tool output and arguments are display data, never a second TODO source.
     let plan_store = todo_store.clone();
@@ -5233,6 +5783,7 @@ async fn execute_prompt(
             });
         return Ok(relay_paused_runner(
             session_id,
+            workspace.root().to_path_buf(),
             cx,
             control,
             paused_runner,
@@ -5270,6 +5821,7 @@ async fn execute_prompt(
         drop(event_tx);
         return Ok(relay_prompt_events(
             session_id,
+            workspace.root().to_path_buf(),
             cx,
             control,
             event_rx,
@@ -5656,6 +6208,7 @@ async fn execute_prompt(
     );
     let native_js_context = history.session.native_js_context();
     let tool_output_session_id = session_id.to_string();
+    let workspace_root = workspace.root().to_path_buf();
     let build = crate::provider::build_agent_in_workspace(
         model,
         &state.cli,
@@ -5803,6 +6356,7 @@ async fn execute_prompt(
     #[cfg_attr(not(feature = "goal"), allow(unused_mut))]
     let mut outcome = relay_paused_runner(
         session_id,
+        workspace_root,
         cx,
         control,
         paused_runner,
@@ -5868,8 +6422,10 @@ async fn run_owned_pre_run<T>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn relay_paused_runner(
     session_id: SessionId,
+    workspace_root: std::path::PathBuf,
     cx: ConnectionTo<Client>,
     control: Arc<TurnControl>,
     paused_runner: crate::agent::runner::PausedAgentRunner,
@@ -5901,6 +6457,7 @@ async fn relay_paused_runner(
     } else {
         relay_prompt_events(
             session_id,
+            workspace_root,
             cx,
             control,
             runner.event_rx,
@@ -6074,8 +6631,87 @@ impl PendingText {
     }
 }
 
+/// The `ToolCall` announcement for a model tool call: descriptive title, kind
+/// and absolute file locations. Shared by the live relay and session replay so
+/// a resumed transcript matches what the user watched.
+pub(super) fn announce_tool_call(
+    id: &str,
+    name: &str,
+    args: &serde_json::Value,
+    workspace_root: &std::path::Path,
+) -> ToolCall {
+    ToolCall::new(
+        ToolCallId::new(id.to_owned()),
+        toolcall::title_for(name, args),
+    )
+    .kind(toolcall::kind_for(name))
+    .locations(toolcall::locations_for(name, args, Some(workspace_root)))
+    .raw_input(Some(args.clone()))
+}
+
+/// A live output preview as content on the call's own id.
+fn tool_progress_update(id: &str, text: &str) -> ToolCallUpdate {
+    ToolCallUpdate::new(
+        ToolCallId::new(id.to_owned()),
+        ToolCallUpdateFields::new().content(vec![ToolCallContent::from(ContentBlock::Text(
+            TextContent::new(crate::ui::events::sanitize_output(text).to_string()),
+        ))]),
+    )
+}
+
+fn send_tool_update(session_id: &SessionId, cx: &ConnectionTo<Client>, update: ToolCallUpdate) {
+    if let Err(e) = cx.send_notification(SessionNotification::new(
+        session_id.clone(),
+        SessionUpdate::ToolCallUpdate(update),
+    )) {
+        tracing::warn!("ACP failed to send tool progress notification: {}", e);
+    }
+}
+
+/// Child activity of in-flight `task` calls, shown as lines on the outer call.
+/// Subagent events carry no outer call id, so lines are attributed only while
+/// exactly one `task` call is open; with several the attribution would be a
+/// guess and the lines are dropped.
+#[cfg(feature = "subagents")]
+#[derive(Default)]
+struct TaskActivity {
+    open: Vec<String>,
+    lines: Vec<String>,
+}
+
+#[cfg(feature = "subagents")]
+impl TaskActivity {
+    /// Most child lines kept per call (mirrors `MAX_TOOL_LOG_ENTRIES`).
+    const MAX_LINES: usize = 24;
+
+    fn call_started(&mut self, id: &str) {
+        if !self.open.iter().any(|open| open == id) {
+            self.open.push(id.to_owned());
+        }
+        self.lines.clear();
+    }
+
+    fn call_finished(&mut self, id: &str) {
+        self.open.retain(|open| open != id);
+        self.lines.clear();
+    }
+
+    fn note(&mut self, line: &str) -> Option<ToolCallUpdate> {
+        let [id] = self.open.as_slice() else {
+            return None;
+        };
+        if self.lines.len() >= Self::MAX_LINES {
+            return None;
+        }
+        self.lines.push(toolcall::clip(line, 160));
+        Some(tool_progress_update(id, &self.lines.join("\n")))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn relay_prompt_events(
     session_id: SessionId,
+    workspace_root: std::path::PathBuf,
     cx: ConnectionTo<Client>,
     control: Arc<TurnControl>,
     mut rx: tokio::sync::mpsc::Receiver<AgentEvent>,
@@ -6096,6 +6732,8 @@ async fn relay_prompt_events(
     let mut usage = rig::completion::Usage::default();
     let mut pending_text = PendingText::default();
     let mut mutation_diffs: HashMap<String, ToolCallContent> = HashMap::new();
+    #[cfg(feature = "subagents")]
+    let mut task_activity = TaskActivity::default();
     loop {
         let event = tokio::select! {
             biased;
@@ -6140,12 +6778,13 @@ async fn relay_prompt_events(
                 pending_text.push(TextKind::Thought, &text, &session_id, &cx);
             }
             AgentEvent::ToolCall { id, name, args } => {
-                toolcall::remember_args(&id, &name, &args);
+                let tool_call = announce_tool_call(&id, &name, &args, &workspace_root);
+                toolcall::remember_args(&id, &name, &args, &tool_call.title, Some(&workspace_root));
+                #[cfg(feature = "subagents")]
+                if name == "task" {
+                    task_activity.call_started(&id);
+                }
                 let id = ToolCallId::new(id.to_string());
-                let tool_call = ToolCall::new(id.clone(), toolcall::title_for(&name, &args))
-                    .kind(toolcall::kind_for(&name))
-                    .locations(toolcall::locations_for(&name, &args))
-                    .raw_input(Some(args));
                 let notif = SessionNotification::new(
                     session_id.clone(),
                     SessionUpdate::ToolCall(tool_call),
@@ -6166,20 +6805,25 @@ async fn relay_prompt_events(
                 }
             }
             #[cfg(feature = "subagents")]
-            AgentEvent::SubagentToolCall { .. } => {
-                // This is a display-only event from inside a task tool. The outer
-                // provider tool call/result is canonical and will arrive with a
-                // stable ID; advertising a nested call here would create an ACP
-                // call that can never receive a matching result.
+            AgentEvent::SubagentToolCall { name, args } => {
+                // Never a new ACP call (it could not receive a matching
+                // result): one line appended to the outer `task` call.
+                let line = toolcall::title_for(&name, &args);
+                if let Some(update) = task_activity.note(&line) {
+                    send_tool_update(&session_id, &cx, update);
+                }
             }
             #[cfg(feature = "subagents")]
-            AgentEvent::SubagentStarted { .. } => {
-                // Display-only provenance; the outer task call remains the
-                // canonical ACP tool lifecycle.
+            AgentEvent::SubagentStarted { agent_type, source } => {
+                let line = format!("specialist {agent_type} ({source})");
+                if let Some(update) = task_activity.note(&line) {
+                    send_tool_update(&session_id, &cx, update);
+                }
             }
-            AgentEvent::ToolProgress { .. } => {
-                // Display-only live output preview for the TUI. The tool
-                // result update below remains the canonical ACP content.
+            AgentEvent::ToolProgress { id, text } => {
+                // Throttled by the runner; one update on the same call, never
+                // a new tool call. The result update stays canonical.
+                send_tool_update(&session_id, &cx, tool_progress_update(&id, &text));
             }
             AgentEvent::FileMutation { id, diff, .. } => {
                 // Carried as ACP diff content on the tool result update; it
@@ -6199,6 +6843,8 @@ async fn relay_prompt_events(
             } => {
                 let id = id.to_string();
                 toolcall::forget_args(&id);
+                #[cfg(feature = "subagents")]
+                task_activity.call_finished(&id);
                 let mut content = Vec::new();
                 content.extend(mutation_diffs.remove(&id));
                 content.push(ToolCallContent::from(ContentBlock::Text(TextContent::new(
@@ -8871,7 +9517,20 @@ mod protocol_tests {
             .iter()
             .find(|option| option.kind == PermissionOptionKind::AllowAlways)
             .expect("an allow-always option is offered");
-        assert_eq!(option.name, "Allow for this session");
+        assert_eq!(
+            option.name,
+            format!(
+                "Allow for this session: exactly {}",
+                requested.replace('\\', "/")
+            )
+        );
+        assert!(
+            request.tool_call.fields.content.iter().flatten().any(|c| matches!(
+                c,
+                ToolCallContent::Content(c) if matches!(&c.content, ContentBlock::Text(t) if t.text.contains("would allow: exactly"))
+            )),
+            "the grant is also stated as request content"
+        );
         let meta = option.meta.as_ref().expect("the option carries _meta");
         assert_eq!(meta["allowPatterns"], serde_json::json!([installed]));
         assert_eq!(meta["scope"], "session");
@@ -9201,6 +9860,7 @@ mod protocol_tests {
                                 entered.notify_one();
                                 let outcome = relay_prompt_events(
                                     req.session_id,
+                                    std::env::temp_dir(),
                                     cx,
                                     control,
                                     rx,
@@ -10254,7 +10914,10 @@ mod protocol_tests {
             .unwrap();
         assert_eq!(first.title, "read a");
         assert_eq!(first.kind, ToolKind::Read);
-        assert_eq!(first.locations[0].path.to_str(), Some("a"));
+        // ACP locations are absolute: the model's relative path is joined onto
+        // the session workspace.
+        assert!(first.locations[0].path.is_absolute());
+        assert!(first.locations[0].path.ends_with("a"));
         let write_result = notifications
             .iter()
             .find_map(|n| match &n.update {

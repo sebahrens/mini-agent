@@ -970,7 +970,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/acp/commands.rs",
         "commands.push(AvailableCommand::new(",
-        1,
+        2,
         "NON-PROCESS",
     ),
     // ACP protocol statuses and the Bedrock HTTP response builder are data.
@@ -982,7 +982,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/extras/acp/sessions.rs",
-        ".status(ToolCallStatus::Pending),",
+        ".status(ToolCallStatus::Failed)",
         1,
         "NON-PROCESS",
     ),
