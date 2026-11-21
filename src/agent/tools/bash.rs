@@ -432,6 +432,17 @@ impl Tool for ShellTool {
             description.push_str(SHELL_PRIVATE_TMP_NOTE);
         }
         description = with_pty_limitation_note(description, PTY_SUPPORTED);
+        if self.sandbox.containment_requested() {
+            if self.sandbox.shell_network_proxied() {
+                description.push_str(
+                    " Network: shell commands reach only the hosts in sandbox-network-hosts plus hosts the user approves at a prompt; a refused host is named in the result.",
+                );
+            } else if !self.sandbox.shell_network_effective() {
+                description.push_str(
+                    " Network: shell commands have no network in this session (sandbox-network = deny), so installs and downloads that need it fail; the user can open it with /sandbox network allowlist|allow.",
+                );
+            }
+        }
         if self.allow_escalation {
             description.push_str(
                 " If the sandbox blocks a command that must run (network, a write outside the workspace), retry that one command with escalate=true and a justification: the user is asked to approve it every time, and only that command runs without the sandbox.",
@@ -773,6 +784,7 @@ impl ShellTool {
         }
         // Retention never stops the child; only this ceiling does.
         limits.combined_bytes = usize::try_from(SHELL_HARD_OUTPUT_BYTES).unwrap_or(usize::MAX);
+        let net_mark = self.sandbox.network_refusal_mark();
         let capture = ShellOutputCapture::new(SpoolPolicy::foreground_shell(
             self.output_log_dir
                 .as_deref()
@@ -822,11 +834,10 @@ impl ShellTool {
 
         if output.status != CommandStatus::Completed {
             tracing::debug!("tool shell stopped before completion: {:?}", output.status);
-            return Err(resource_limit_error(
+            return Err(self.with_limit_notes(
+                resource_limit_error(output.status, &transcript, limits, self.max_output_lines),
                 output.status,
-                &transcript,
-                limits,
-                self.max_output_lines,
+                net_mark,
             ));
         }
 
@@ -862,6 +873,7 @@ impl ShellTool {
                 clean_exit: output
                     .exit_status
                     .is_some_and(|status| status.code() == Some(0)),
+                net_mark,
             },
         );
 
@@ -905,6 +917,7 @@ impl ShellTool {
         deadline: std::time::Duration,
     ) -> Result<Option<String>, ToolError> {
         let progress = CommandProgress::new();
+        let net_mark = self.sandbox.network_refusal_mark();
         let id = match self
             .sandbox
             .start_auto_background_command(
@@ -979,11 +992,10 @@ impl ShellTool {
         if status != CommandStatus::Completed {
             let mut limits = DEFAULT_COMMAND_LIMITS;
             limits.timeout = deadline;
-            return Err(resource_limit_error(
+            return Err(self.with_limit_notes(
+                resource_limit_error(status, &transcript, limits, self.max_output_lines),
                 status,
-                &transcript,
-                limits,
-                self.max_output_lines,
+                net_mark,
             ));
         }
         let result = self.render_completed(
@@ -995,6 +1007,7 @@ impl ShellTool {
                 failed: snapshot.exit_code.is_some_and(|code| code != 0)
                     || snapshot.signal.is_some(),
                 clean_exit: snapshot.exit_code == Some(0),
+                net_mark,
             },
         );
         Ok(Some(result))
@@ -1012,9 +1025,39 @@ struct CompletedCommand {
     /// The command exited with code 0 (an empty result is then reported as a
     /// success rather than as nothing).
     clean_exit: bool,
+    /// Allowlist-proxy refusal-log position when the command started.
+    net_mark: u64,
 }
 
 impl ShellTool {
+    /// Appends the sandbox notes to the error of a command that was stopped
+    /// (deadline, cancel, output ceiling): a blocked-host line, and for a
+    /// deadline the reminder that a hung network call may be the sandbox.
+    fn with_limit_notes(
+        &self,
+        error: ToolError,
+        status: CommandStatus,
+        net_mark: u64,
+    ) -> ToolError {
+        let ToolError::Msg(mut message) = error else {
+            return error;
+        };
+        if status == CommandStatus::NotStarted {
+            return ToolError::Msg(message);
+        }
+        if status == CommandStatus::TimedOut
+            && let Some(note) = sandbox_timeout_note(&self.sandbox)
+        {
+            message.push('\n');
+            message.push_str(&note);
+        }
+        if let Some(note) = network_refusal_note(&self.sandbox, net_mark) {
+            message.push('\n');
+            message.push_str(&note);
+        }
+        ToolError::Msg(message)
+    }
+
     /// The model-visible text of a command that ran to completion. Shared by
     /// the foreground and auto-background paths so the two cannot drift: pty
     /// normalisation, the escaped-descendants status, the termination line,
@@ -1044,6 +1087,10 @@ impl ShellTool {
         if let Some(note) =
             sandbox_failure_note(&self.sandbox, self.allow_escalation, done.failed, &result)
         {
+            ensure_newline(&mut result);
+            result.push_str(&note);
+        }
+        if let Some(note) = network_refusal_note(&self.sandbox, done.net_mark) {
             ensure_newline(&mut result);
             result.push_str(&note);
         }
@@ -1818,7 +1865,32 @@ impl JobStatusTool {
             .sandbox
             .read_background_job_output(id, args.since, JOB_OUTPUT_READ_BYTES)
             .map_err(ToolError::Msg)?;
-        let rendered = render_background_job(output, self.max_output_lines);
+        let net_mark = output.snapshot.net_refusal_mark;
+        let failed = output.snapshot.status.is_terminal()
+            && (output.snapshot.exit_code.is_some_and(|code| code != 0)
+                || output.snapshot.signal.is_some()
+                || matches!(
+                    output.snapshot.status,
+                    crate::sandbox::BackgroundJobStatus::TimedOut
+                ));
+        let timed_out = matches!(
+            output.snapshot.status,
+            crate::sandbox::BackgroundJobStatus::TimedOut
+        );
+        let mut rendered = render_background_job(output, self.max_output_lines);
+        // The same attribution a foreground command gets (mini-agent-nvnkx.69).
+        if let Some(note) = sandbox_failure_note(&self.sandbox, false, failed, &rendered) {
+            rendered.push('\n');
+            rendered.push_str(&note);
+        }
+        if timed_out && let Some(note) = sandbox_timeout_note(&self.sandbox) {
+            rendered.push('\n');
+            rendered.push_str(&note);
+        }
+        if let Some(note) = network_refusal_note(&self.sandbox, net_mark) {
+            rendered.push('\n');
+            rendered.push_str(&note);
+        }
         Ok(match wait_note {
             Some(note) => format!("{note}\n{rendered}"),
             None => rendered,
@@ -2272,24 +2344,52 @@ fn bound_output_lines_with_hint(text: String, max_output_lines: Option<u64>, hin
 
 /// Output fragments that a sandbox denial produces and that an unrelated
 /// failure rarely does. Matched case-insensitively against the retained output.
-const SANDBOX_FAILURE_MARKERS: [&str; 7] = [
+const SANDBOX_FAILURE_MARKERS: [&str; 5] = [
     "operation not permitted",
     "read-only file system",
-    "could not resolve host",
-    "network is unreachable",
     "sandbox-exec",
     "bwrap:",
     "not enough quota is available",
+];
+
+/// Spellings of a denied network: resolver, curl, git, npm, cargo and pip
+/// failures when the shell has no network (or only a refusing proxy). These
+/// are attributed to the sandbox outright when the session's network is denied.
+const NETWORK_FAILURE_MARKERS: [&str; 11] = [
+    "could not resolve host",
+    "network is unreachable",
+    "temporary failure in name resolution",
+    "name or service not known",
+    "nodename nor servname provided",
+    "enotfound",
+    "eai_again",
+    "failed to lookup address information",
+    "connect tunnel failed",
+    "tunnel connection failed",
+    "no address associated with hostname",
 ];
 
 /// Windows ERROR_NOT_ENOUGH_QUOTA text: the AppContainer Job's active-process
 /// cap refused a further CreateProcess (mini-agent-nvnkx.361).
 const WINDOWS_PROCESS_CAP_MARKER: &str = "not enough quota is available";
 
+/// Output of a failed connection to the sandbox proxy itself.
+fn proxy_connection_refused(lowered: &str) -> bool {
+    lowered.contains("connection refused") && lowered.contains("proxy")
+}
+
+/// Whether the shell has no usable network in this session (denied, or a mode
+/// the backend cannot enforce).
+fn shell_network_denied(sandbox: &Sandbox) -> bool {
+    !sandbox.shell_network_effective() && !sandbox.shell_network_proxied()
+}
+
 /// One bracketed line telling the model (and user) that a failed command may
 /// have been stopped by the sandbox rather than by its own logic
 /// (mini-agent-sskdu.143). `None` unless containment was requested, the
-/// command failed and the output carries a known sandbox marker.
+/// command failed and the output carries a known sandbox marker. With the
+/// network denied for the session, a network-looking failure is stated as the
+/// sandbox's doing instead of a possibility (mini-agent-nvnkx.69).
 fn sandbox_failure_note(
     sandbox: &Sandbox,
     allow_escalation: bool,
@@ -2300,17 +2400,29 @@ fn sandbox_failure_note(
         return None;
     }
     let lowered = output.to_ascii_lowercase();
-    if !SANDBOX_FAILURE_MARKERS
+    let network_failure = NETWORK_FAILURE_MARKERS
         .iter()
         .any(|marker| lowered.contains(marker))
+        || proxy_connection_refused(&lowered);
+    if !network_failure
+        && !SANDBOX_FAILURE_MARKERS
+            .iter()
+            .any(|marker| lowered.contains(marker))
     {
         return None;
     }
     let mut note = format!(
-        "[sandbox: profile {}, network {}. This failure may be the sandbox, not the command.",
+        "[sandbox: profile {}, network {}.",
         sandbox.profile().name(),
         sandbox.network().name()
     );
+    if network_failure && shell_network_denied(sandbox) {
+        note.push_str(
+            " Shell commands have no network access in this session, so this network failure is caused by the sandbox, not the command.",
+        );
+    } else {
+        note.push_str(" This failure may be the sandbox, not the command.");
+    }
     if sandbox.profile() != crate::sandbox::SandboxProfile::HostFull {
         note.push_str(" Writes are limited to the workspace.");
     }
@@ -2319,12 +2431,57 @@ fn sandbox_failure_note(
             " \"Not enough quota\" means the sandbox's active-process cap was reached; lower build/test parallelism (for example make -j, msbuild -m, pytest -n).",
         );
     }
+    if network_failure && shell_network_denied(sandbox) {
+        note.push_str(
+            " The user can run /sandbox network allowlist (asks per host) or allow for this session.",
+        );
+    }
     note.push_str(" See /sandbox");
     if allow_escalation {
         note.push_str("; escalate=true runs one command unsandboxed after user approval");
     }
     note.push(']');
     Some(note)
+}
+
+/// Note for a command that hit its deadline under containment: with no
+/// network, a hung download or install is the usual cause.
+fn sandbox_timeout_note(sandbox: &Sandbox) -> Option<String> {
+    (sandbox.containment_requested() && shell_network_denied(sandbox)).then(|| {
+        format!(
+            "[sandbox: profile {}, network {}. The command timed out; shell commands have no network in this session, so a download or install waiting on one hangs until the deadline. The user can run /sandbox network allowlist or allow.]",
+            sandbox.profile().name(),
+            sandbox.network().name()
+        )
+    })
+}
+
+/// Hosts the allowlist proxy refused while a command ran, as one bracketed
+/// line, independent of the command's own output (curl, cargo, npm, pip and git
+/// show only "CONNECT tunnel failed, response 403"). `mark` is the proxy's
+/// refusal-log position when the command started (mini-agent-nvnkx.186).
+fn network_refusal_note(sandbox: &Sandbox, mark: u64) -> Option<String> {
+    const SHOWN: usize = 5;
+    let refusals = sandbox.network_refusals_since(mark);
+    if refusals.is_empty() {
+        return None;
+    }
+    let mut items: Vec<String> = refusals
+        .iter()
+        .rev()
+        .take(SHOWN)
+        .map(|refusal| {
+            format!(
+                "blocked {} ({})",
+                refusal.host_port,
+                refusal.reason.describe()
+            )
+        })
+        .collect();
+    if refusals.len() > SHOWN {
+        items.push(format!("{} more", refusals.len() - SHOWN));
+    }
+    Some(format!("[sandbox network: {}]", items.join("; ")))
 }
 
 fn resource_limit_error(
@@ -3417,8 +3574,6 @@ mod tests {
         for output in [
             "touch: /Users/x/.cache/foo: Operation not permitted",
             "rm: x: Read-only file system",
-            "curl: (6) Could not resolve host: example.com",
-            "connect: Network is unreachable",
             "sandbox-exec: sandbox_apply: denied",
             "bwrap: Can't mount proc",
             "CreateProcess: Not enough quota is available to process this command.",
@@ -3456,6 +3611,201 @@ mod tests {
             sandbox_failure_note(&on, true, true, "Operation not permitted")
                 .unwrap()
                 .contains("escalate=true")
+        );
+    }
+
+    #[test]
+    fn network_failure_spellings_are_attributed_to_a_denied_network_outright() {
+        let denied = Sandbox::new(true, "bwrap");
+        for output in [
+            "curl: (6) Could not resolve host: example.com",
+            "connect: Network is unreachable",
+            "pip: Temporary failure in name resolution",
+            "ping: unknown host: Name or service not known",
+            "npm ERR! code ENOTFOUND\nnpm ERR! errno ENOTFOUND registry.npmjs.org",
+            "npm ERR! code EAI_AGAIN",
+            "error: failed to lookup address information: nodename nor servname provided, or not known",
+            "curl: (56) CONNECT tunnel failed, response 403",
+            "Tunnel connection failed: 403 Forbidden",
+            "curl: (7) Failed to connect to proxy 127.0.0.1 port 3128: Connection refused",
+            "git: Could not resolve host: github.com",
+        ] {
+            let note = sandbox_failure_note(&denied, false, true, output)
+                .unwrap_or_else(|| panic!("no note for {output}"));
+            assert!(note.contains("caused by the sandbox"), "{output}: {note}");
+            assert!(note.contains("/sandbox network"), "{output}: {note}");
+            assert!(!note.contains("may be the sandbox"), "{note}");
+            // Without containment, or for a command that succeeded, nothing.
+            assert_eq!(
+                sandbox_failure_note(&Sandbox::new(false, "bwrap"), false, true, output),
+                None
+            );
+            assert_eq!(sandbox_failure_note(&denied, false, false, output), None);
+        }
+        // A plain refused connection (no proxy involved) is not a sandbox marker.
+        assert_eq!(
+            sandbox_failure_note(
+                &denied,
+                false,
+                true,
+                "connect ECONNREFUSED 127.0.0.1:5432: Connection refused"
+            ),
+            None
+        );
+        // With the network open the same text stays a possibility, not a verdict.
+        let open = Sandbox::new(true, "bwrap").with_network(crate::sandbox::SandboxNetwork::Allow);
+        let note = sandbox_failure_note(&open, false, true, "Temporary failure in name resolution")
+            .unwrap();
+        assert!(note.contains("may be the sandbox"), "{note}");
+        assert!(!note.contains("caused by the sandbox"), "{note}");
+        let allowlist =
+            Sandbox::new(true, "bwrap").with_network(crate::sandbox::SandboxNetwork::Allowlist);
+        let note = sandbox_failure_note(
+            &allowlist,
+            false,
+            true,
+            "CONNECT tunnel failed, response 403",
+        )
+        .unwrap();
+        assert!(note.contains("may be the sandbox"), "{note}");
+    }
+
+    #[test]
+    fn a_timed_out_command_under_a_denied_network_gets_the_sandbox_note() {
+        let denied = Sandbox::new(true, "bwrap");
+        let note = sandbox_timeout_note(&denied).unwrap();
+        assert!(
+            note.contains("timed out") && note.contains("no network"),
+            "{note}"
+        );
+        assert_eq!(sandbox_timeout_note(&Sandbox::new(false, "bwrap")), None);
+        let open = Sandbox::new(true, "bwrap").with_network(crate::sandbox::SandboxNetwork::Allow);
+        assert_eq!(sandbox_timeout_note(&open), None);
+        let tool = ShellTool::new(None, None, denied, None);
+        let error = tool.with_limit_notes(
+            ToolError::Msg("[status: timed_out; timeout_ms: 1000]".into()),
+            CommandStatus::TimedOut,
+            0,
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("[sandbox: profile workspace, network deny."),
+            "{error}"
+        );
+        // A refused launch is the program's own explanation: left alone.
+        let error = tool.with_limit_notes(
+            ToolError::Msg("[status: not_started; the command was not run] x".into()),
+            CommandStatus::NotStarted,
+            0,
+        );
+        assert!(!error.to_string().contains("[sandbox"), "{error}");
+    }
+
+    fn sandbox_with_refusal() -> Sandbox {
+        let proxy =
+            crate::sandbox::net_proxy::NetworkProxy::start(Vec::new(), Default::default()).unwrap();
+        proxy.record_refusal_for_test(
+            "index.crates.io",
+            443,
+            crate::sandbox::net_proxy::RefusalReason::NotAllowed,
+        );
+        Sandbox::new(true, "seatbelt")
+            .with_network(crate::sandbox::SandboxNetwork::Allowlist)
+            .with_network_proxy_for_test(proxy)
+    }
+
+    #[test]
+    fn blocked_hosts_are_named_after_a_command_even_without_a_failure_marker() {
+        let sandbox = sandbox_with_refusal();
+        assert_eq!(
+            network_refusal_note(&sandbox, sandbox.network_refusal_mark()),
+            None
+        );
+        let note = network_refusal_note(&sandbox, 0).unwrap();
+        assert_eq!(
+            note,
+            "[sandbox network: blocked index.crates.io:443 (not in sandbox-network-hosts; add it there or approve the prompt)]"
+        );
+        let tool = ShellTool::new(None, None, sandbox.clone(), None);
+        // The command's own output carries no marker, only curl's opaque 403.
+        let transcript = OutputTranscript {
+            parts: vec![TranscriptPart::Output(
+                OutputChannel::Merged,
+                b"curl: (56) received HTTP code 403 from proxy after CONNECT\n".to_vec(),
+            )],
+            total_bytes: 60,
+            ..Default::default()
+        };
+        let rendered = tool.render_completed(
+            transcript,
+            CompletedCommand {
+                pty: false,
+                descendants_escaped: false,
+                termination: Some("Exit code: 56".into()),
+                failed: true,
+                clean_exit: false,
+                net_mark: 0,
+            },
+        );
+        assert!(
+            rendered
+                .trim_end()
+                .ends_with("(not in sandbox-network-hosts; add it there or approve the prompt)]"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("blocked index.crates.io:443"),
+            "{rendered}"
+        );
+        // A deadline stop reports it too.
+        let error = tool.with_limit_notes(
+            ToolError::Msg("[status: timed_out]".into()),
+            CommandStatus::TimedOut,
+            0,
+        );
+        assert!(
+            error.to_string().contains("blocked index.crates.io:443"),
+            "{error}"
+        );
+        // Commands that began after the refusal do not see it.
+        let after = sandbox.network_refusal_mark();
+        assert!(
+            tool.with_limit_notes(ToolError::Msg("x".into()), CommandStatus::Cancelled, after)
+                .to_string()
+                == "x"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_failed_background_job_with_a_resolver_error_ends_with_the_sandbox_note() {
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
+        if !crate::sandbox::seatbelt_exists() {
+            crate::sandbox::skip_unusable_real_sandbox_test("Seatbelt is unavailable");
+            return;
+        }
+        let workspace = std::sync::Arc::new(
+            crate::paths::WorkspaceBinding::capture(&std::env::current_dir().unwrap()).unwrap(),
+        );
+        let sandbox = Sandbox::new(true, "seatbelt").with_workspace_binding(workspace);
+        let shell = BashTool::new(None, None, sandbox, None);
+        let status = JobStatusTool::new(shell.sandbox.clone(), None);
+        let started = shell
+            .call(BashArgs {
+                command: "printf 'pip: Temporary failure in name resolution\\n' >&2; exit 3"
+                    .to_string(),
+                background: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let terminal = wait_for_terminal_job(&status, &background_id(&started)).await;
+        assert!(terminal.contains("Exit code: 3"), "{terminal}");
+        assert!(
+            terminal.contains("[sandbox: profile workspace, network deny.")
+                && terminal.contains("caused by the sandbox"),
+            "{terminal}"
         );
     }
 

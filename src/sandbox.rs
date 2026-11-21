@@ -358,7 +358,16 @@ impl SandboxProfile {
 /// is the default; `Allow` is an explicit, project-trust-gated opt-in that
 /// only changes network policy, never filesystem reach.
 #[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    clap::ValueEnum,
 )]
 #[serde(rename_all = "kebab-case")]
 pub enum SandboxNetwork {
@@ -1433,6 +1442,9 @@ pub(crate) struct BackgroundJobSnapshot {
     pub pty: bool,
     /// Arrival-ordered retained output, total size and full-output log.
     pub transcript: OutputTranscript,
+    /// The allowlist proxy's refusal-log position when the job started, for
+    /// naming hosts it refused since (see [`Sandbox::network_refusals_since`]).
+    pub net_refusal_mark: u64,
 }
 
 /// A window of a background job's complete output stream.
@@ -1477,6 +1489,8 @@ struct BackgroundJobRecord {
     terminal: Option<BackgroundJobTerminal>,
     stop_requested: bool,
     changed: Arc<Notify>,
+    /// Allowlist-proxy refusal-log position at start.
+    net_refusal_mark: u64,
 }
 
 #[derive(Debug, Default)]
@@ -3106,6 +3120,37 @@ impl Sandbox {
         self.network
     }
 
+    /// Switches the shell network policy for this session (never saved to
+    /// configuration), bounded by the managed `max_network` ceiling.
+    pub(crate) fn set_network(&mut self, network: SandboxNetwork) -> Result<(), String> {
+        self.set_network_under(crate::config::managed::active(), network)
+    }
+
+    /// [`Self::set_network`] against an explicit managed policy. Refused while
+    /// commands or background jobs run, so no running command changes policy.
+    pub(crate) fn set_network_under(
+        &mut self,
+        policy: Option<&crate::config::managed::ManagedPolicy>,
+        network: SandboxNetwork,
+    ) -> Result<(), String> {
+        if let Some(message) = policy.and_then(|policy| policy.network_violation(network)) {
+            return Err(message);
+        }
+        if self.running_background_job_count() != 0
+            || !self
+                .active_groups
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        {
+            return Err(
+                "finish or stop active commands before changing the sandbox network".into(),
+            );
+        }
+        *self = self.clone().with_network(network);
+        Ok(())
+    }
+
     /// `sandbox-network-hosts` for `sandbox-network = "allowlist"`. Entries
     /// are validated by the config loader; an invalid list here fails closed
     /// when the proxy would start.
@@ -3171,6 +3216,46 @@ impl Sandbox {
             })
             .clone()
             .map(Some)
+    }
+
+    /// Position in the allowlist proxy's refusal log now (0 when the proxy has
+    /// not started, as nothing can have been refused yet).
+    pub(crate) fn network_refusal_mark(&self) -> u64 {
+        self.running_network_proxy()
+            .map_or(0, |proxy| proxy.refusal_mark())
+    }
+
+    /// Destinations the allowlist proxy refused after `mark`, oldest first.
+    pub(crate) fn network_refusals_since(&self, mark: u64) -> Vec<net_proxy::Refusal> {
+        self.running_network_proxy()
+            .map(|proxy| proxy.refusals_since(mark))
+            .unwrap_or_default()
+    }
+
+    /// The proxy's retained recent refusals, oldest first (`/sandbox`).
+    pub(crate) fn recent_network_refusals(&self) -> Vec<net_proxy::Refusal> {
+        self.running_network_proxy()
+            .map(|proxy| proxy.recent_refusals())
+            .unwrap_or_default()
+    }
+
+    fn running_network_proxy(&self) -> Option<Arc<net_proxy::NetworkProxy>> {
+        match self.network_proxy.get() {
+            Some(Ok(proxy)) => Some(proxy.clone()),
+            _ => None,
+        }
+    }
+
+    /// Installs an already-running proxy as this sandbox's allowlist proxy.
+    #[cfg(test)]
+    pub(crate) fn with_network_proxy_for_test(
+        mut self,
+        proxy: Arc<net_proxy::NetworkProxy>,
+    ) -> Self {
+        let cell = OnceLock::new();
+        let _ = cell.set(Ok(proxy));
+        self.network_proxy = Arc::new(cell);
+        self
     }
 
     /// `shell-inherit-env` / `shell-env` / `shell-env-allow-secrets` for
@@ -5890,6 +5975,7 @@ impl Sandbox {
                     terminal: None,
                     stop_requested: false,
                     changed,
+                    net_refusal_mark: self.network_refusal_mark(),
                 },
             );
             self.background_jobs.running.fetch_add(1, Ordering::Release);
@@ -7583,6 +7669,7 @@ fn snapshot_background_job(id: &str, job: &BackgroundJobRecord) -> BackgroundJob
         descendants_escaped,
         pty: job.input.is_some(),
         transcript,
+        net_refusal_mark: job.net_refusal_mark,
     }
 }
 
@@ -9190,6 +9277,7 @@ mod sandbox_tests {
             }),
             stop_requested: false,
             changed: Arc::new(Notify::new()),
+            net_refusal_mark: 0,
         }
     }
 

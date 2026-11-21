@@ -301,6 +301,7 @@ fn shared_with_prompt(
         });
     }
     let shared = Shared {
+        refusals: Mutex::default(),
         rules,
         session: Mutex::default(),
         prompt,
@@ -630,4 +631,59 @@ fn client_host_headers_are_replaced_by_the_vetted_uri_authority() {
         assert_eq!(hosts, [format!("Host: {expected}")], "{forwarded}");
         assert!(!forwarded.contains("other.example") && !forwarded.contains("third.example"));
     }
+}
+
+#[test]
+fn refusals_are_recorded_bounded_coalesced_and_readable_since_a_mark() {
+    let (shared, _) = shared_with_prompt(Vec::new(), None);
+    let mark = shared.refusal_mark();
+    assert!(shared.refusals_since(mark).is_empty());
+    shared.record_refusal("index.crates.io", 443, RefusalReason::NotAllowed);
+    shared.record_refusal("example.com", 443, RefusalReason::PrivateAddress);
+    shared.record_refusal("index.crates.io", 443, RefusalReason::NotAllowed);
+    let since = shared.refusals_since(mark);
+    assert_eq!(since.len(), 2);
+    // The repeated destination moved to the end with its count.
+    assert_eq!(since[1].host_port, "index.crates.io:443");
+    assert_eq!(since[1].count, 2);
+    assert_eq!(since[0].reason, RefusalReason::PrivateAddress);
+    let later = shared.refusal_mark();
+    assert!(shared.refusals_since(later).is_empty());
+    for index in 0..(MAX_REFUSALS + 10) {
+        shared.record_refusal(
+            &format!("h{index}.example"),
+            443,
+            RefusalReason::Unreachable,
+        );
+    }
+    assert_eq!(shared.refusals_since(0).len(), MAX_REFUSALS);
+}
+
+#[tokio::test]
+async fn a_denied_connect_records_one_refusal_naming_the_host() {
+    let proxy = NetworkProxy::start(Vec::new(), Arc::default()).unwrap();
+    let mark = proxy.refusal_mark();
+    let (user, token) = ("mini-agent", proxy.token.clone());
+    let auth = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{token}"));
+    let mut stream = TcpStream::connect(("127.0.0.1", proxy.port()))
+        .await
+        .unwrap();
+    stream
+        .write_all(
+            format!(
+                "CONNECT blocked.example:443 HTTP/1.1\r\nHost: blocked.example:443\r\nProxy-Authorization: Basic {auth}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut response = String::new();
+    let _ =
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_string(&mut response)).await;
+    assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+    let refusals = proxy.refusals_since(mark);
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert_eq!(refusals[0].host_port, "blocked.example:443");
+    assert_eq!(refusals[0].reason, RefusalReason::NotAllowed);
+    assert_eq!(proxy.recent_refusals().len(), 1);
 }

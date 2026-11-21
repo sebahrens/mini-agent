@@ -147,6 +147,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     key("no_tools").shaped(ConfigShape::Bool),
     aliased("web-fetch-origins", &["web_fetch_origins"]).described("Exact permitted origins for native web retrieval; independent of JS fetch grants").shaped(ConfigShape::Strings),
     aliased("web-fetch-allow-http", &["web_fetch_allow_http"]).described("Permit native HTTP to safe public destinations").shaped(ConfigShape::Bool),
+    aliased("web-fetch-local-origins", &["web_fetch_local_origins"]).described("User-config only: exact loopback/private origins web_fetch may reach after approval (e.g. http://localhost:3000, http://127.0.0.1:*); cloud metadata ranges stay denied").shaped(ConfigShape::Strings),
     aliased("web-search-provider", &["web_search_provider"]).described("Native search provider, exa or off").shaped(ConfigShape::Enum(&["exa", "off"])),
     aliased("hosted-web-search", &["hosted_web_search"]).described("Opt-in: use the Anthropic or OpenAI Responses provider-hosted web search instead of native Exa; bypasses per-call web_search permission").shaped(ConfigShape::Bool),
     aliased("hosted-web-search-allowed-domains", &["hosted_web_search_allowed_domains"]).described("Bare domains hosted web search may use (Anthropic and OpenAI Responses); at most 20; not with the block-list").shaped(ConfigShape::Strings),

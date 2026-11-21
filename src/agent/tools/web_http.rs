@@ -46,6 +46,62 @@ pub(crate) struct FetchPolicy {
     pub(crate) allow_http: bool,
     /// Drop `#fragment`s instead of refusing them (native tools only).
     pub(crate) strip_fragments: bool,
+    /// Exact loopback/private origins the user opted into for `web_fetch`
+    /// (`web-fetch-local-origins`, user config only). Empty by default.
+    pub(crate) local_origins: Vec<LocalOrigin>,
+}
+
+/// One `web-fetch-local-origins` entry: scheme, host and a port (`None` is the
+/// `:*` wildcard). Admits that origin to loopback/private destinations only;
+/// cloud metadata ranges stay denied (see [`validate_local_destinations`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LocalOrigin {
+    scheme: String,
+    host: String,
+    port: Option<u16>,
+}
+
+impl LocalOrigin {
+    /// Parses `http://localhost:3000`, `http://127.0.0.1:*` or
+    /// `https://intranet.corp`. Paths, queries, credentials and other schemes
+    /// are rejected.
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
+        let raw = raw.trim();
+        let (raw, wildcard) = match raw.strip_suffix(":*") {
+            Some(base) => (base, true),
+            None => (raw, false),
+        };
+        let url = Url::parse(raw).ok()?;
+        if !matches!(url.scheme(), "http" | "https")
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || url.path() != "/"
+            || (wildcard && url.port().is_some())
+        {
+            return None;
+        }
+        Some(Self {
+            scheme: url.scheme().to_owned(),
+            host: url.host_str()?.to_ascii_lowercase(),
+            port: if wildcard {
+                None
+            } else {
+                Some(url.port_or_known_default()?)
+            },
+        })
+    }
+
+    fn matches(&self, url: &Url) -> bool {
+        url.scheme() == self.scheme
+            && url
+                .host_str()
+                .is_some_and(|host| host.eq_ignore_ascii_case(&self.host))
+            && self
+                .port
+                .is_none_or(|port| url.port_or_known_default() == Some(port))
+    }
 }
 
 impl Default for FetchPolicy {
@@ -54,6 +110,7 @@ impl Default for FetchPolicy {
             origins: FetchOriginPolicy::Unrestricted,
             allow_http: false,
             strip_fragments: false,
+            local_origins: Vec::new(),
         }
     }
 }
@@ -70,7 +127,7 @@ impl FetchPolicy {
             return Self {
                 origins: FetchOriginPolicy::Deny,
                 allow_http,
-                strip_fragments: false,
+                ..Self::default()
             };
         }
         let parsed = origins
@@ -82,8 +139,32 @@ impl FetchPolicy {
                 .map(FetchOriginPolicy::Exact)
                 .unwrap_or(FetchOriginPolicy::Deny),
             allow_http,
-            strip_fragments: false,
+            ..Self::default()
         }
+    }
+
+    /// Adds the user's `web-fetch-local-origins`; unparsable entries are
+    /// dropped with a warning rather than widening anything.
+    pub(crate) fn with_local_origins(mut self, origins: Option<&[String]>) -> Self {
+        self.local_origins = origins
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|raw| {
+                let parsed = LocalOrigin::parse(raw);
+                if parsed.is_none() {
+                    tracing::warn!(
+                        "web-fetch-local-origins: ignoring {raw:?}; expected an origin such as http://localhost:3000 or http://127.0.0.1:*"
+                    );
+                }
+                parsed
+            })
+            .collect();
+        self
+    }
+
+    /// Whether `url` is one of the listed local origins.
+    pub(crate) fn local_origin_matches(&self, url: &Url) -> bool {
+        self.local_origins.iter().any(|origin| origin.matches(url))
     }
 
     pub(crate) fn authorize(&self, raw_url: &str) -> Result<Url, FetchError> {
@@ -92,7 +173,7 @@ impl FetchPolicy {
     }
 
     pub(crate) fn authorize_normalized(&self, url: Url) -> Result<Url, FetchError> {
-        if url.scheme() == "http" && !self.allow_http {
+        if url.scheme() == "http" && !self.allow_http && !self.local_origin_matches(&url) {
             return Err(FetchError::SchemeDenied);
         }
         let origin = fetch_origin(&url)?;
@@ -171,6 +252,46 @@ pub(crate) fn validate_public_destinations(addresses: &[SocketAddr]) -> Result<(
         Err(FetchError::DestinationDenied)
     } else {
         Ok(())
+    }
+}
+
+/// Destination check for an origin the user listed in
+/// `web-fetch-local-origins`: every address must be public, loopback or
+/// private (RFC1918, shared 100.64/10, IPv6 ULA). Link-local and cloud
+/// metadata ranges (169.254.0.0/16, Azure WireServer 168.63.129.16),
+/// unspecified, multicast and reserved addresses stay denied.
+pub(crate) fn validate_local_destinations(addresses: &[SocketAddr]) -> Result<(), FetchError> {
+    if addresses.len() > FETCH_MAX_DESTINATION_ADDRESSES {
+        Err(FetchError::TooManyDestinations)
+    } else if addresses.is_empty()
+        || addresses
+            .iter()
+            .any(|address| !(is_public_ip(address.ip()) || is_local_dev_ip(address.ip())))
+    {
+        Err(FetchError::DestinationDenied)
+    } else {
+        Ok(())
+    }
+}
+
+fn is_local_dev_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            let value = u32::from(address);
+            [
+                (0x7f00_0000, 8),  // loopback
+                (0x0a00_0000, 8),  // RFC1918
+                (0xac10_0000, 12), // RFC1918
+                (0xc0a8_0000, 16), // RFC1918
+                (0x6440_0000, 10), // shared address space (VPN meshes)
+            ]
+            .into_iter()
+            .any(|(network, prefix)| ipv4_in_prefix(value, network, prefix))
+        }
+        IpAddr::V6(address) => match address.to_ipv4_mapped() {
+            Some(mapped) => is_local_dev_ip(IpAddr::V4(mapped)),
+            None => address.is_loopback() || ipv6_in_prefix(u128::from(address), 0xfc00 << 112, 7),
+        },
     }
 }
 
@@ -259,6 +380,12 @@ pub(crate) struct FetchRequest {
     pub(crate) method: reqwest::Method,
     pub(crate) headers: reqwest::header::HeaderMap,
     pub(crate) body: Option<Vec<u8>>,
+    /// Host-chosen `Accept` value (native `web_fetch` only; not a caller
+    /// header, so it never blocks redirect following).
+    pub(crate) accept: Option<&'static str>,
+    /// Connect without an environment proxy (set per hop by the native client
+    /// for user-listed local origins).
+    pub(crate) direct: bool,
 }
 
 impl FetchRequest {
@@ -267,6 +394,8 @@ impl FetchRequest {
             method: reqwest::Method::GET,
             headers: reqwest::header::HeaderMap::new(),
             body: None,
+            accept: None,
+            direct: false,
         }
     }
 
@@ -319,6 +448,8 @@ impl FetchRequest {
             method,
             headers: parsed_headers,
             body,
+            accept: None,
+            direct: false,
         })
     }
 }
@@ -430,7 +561,7 @@ impl std::fmt::Display for FetchError {
             Self::ClientBuild(message) => write!(formatter, "fetch client setup failed: {message}"),
             Self::ProxyUnusable(variable) => write!(
                 formatter,
-                "{variable} is set but is not a usable http(s) proxy URL (socks5:// is not supported); refusing a direct connection. Unset it or use http://host:port"
+                "{variable} is set but is not a usable proxy URL (http, https, socks5 or socks5h; socks4 is not supported); refusing a direct connection. Unset it or use http://host:port or socks5h://host:port"
             ),
             Self::Cancelled => formatter.write_str("fetch cancelled"),
             Self::TimedOut => formatter.write_str("fetch timed out"),
@@ -892,7 +1023,14 @@ pub(crate) struct NativeFetchLimits {
     /// Retry a GET once after 429/502/503/504 (honoring `Retry-After`) or a
     /// connection failure, inside the same total deadline.
     pub(crate) retry_transient: bool,
+    /// Longest the permission prompt may stay open. The network deadline
+    /// (`total_timeout`) does not run while the user is deciding; this is the
+    /// separate, much longer bound on the human wait itself.
+    pub(crate) approval_timeout: Duration,
 }
+
+/// Default bound on one permission prompt.
+pub(crate) const FETCH_APPROVAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 impl Default for NativeFetchLimits {
     fn default() -> Self {
@@ -906,6 +1044,7 @@ impl Default for NativeFetchLimits {
             skip_binary_body: false,
             accept_pdf: false,
             retry_transient: false,
+            approval_timeout: FETCH_APPROVAL_TIMEOUT,
         }
     }
 }
@@ -1174,7 +1313,11 @@ pub(crate) async fn send_async(
         return Err(FetchError::RequestBodyTooLarge);
     }
     let host = url.host_str().ok_or(FetchError::MissingHost)?;
-    let proxy = super::web_proxy::proxy_for_url(&url)?;
+    let proxy = if request.direct {
+        None
+    } else {
+        super::web_proxy::proxy_for_url(&url)?
+    };
     if addresses.is_empty() && proxy.is_none() {
         return Err(FetchError::DestinationDenied);
     }
@@ -1235,6 +1378,9 @@ pub(crate) async fn send_async(
         .request(request.method.clone(), url.clone())
         .headers(request.headers.clone())
         .header(reqwest::header::ACCEPT_ENCODING, "gzip, deflate");
+    if let Some(accept) = request.accept {
+        builder = builder.header(reqwest::header::ACCEPT, accept);
+    }
     if let Some(body) = &request.body {
         builder = builder.body(body.clone());
     }
@@ -1338,6 +1484,10 @@ pub(crate) struct NativeWebClient {
     ask_tx: Option<super::AskSender>,
     #[cfg(test)]
     pub(crate) test_resolution: Option<(Vec<SocketAddr>, Vec<SocketAddr>)>,
+    /// Successive DNS answers (the last repeats), overriding `test_resolution`'s
+    /// approved answer.
+    #[cfg(test)]
+    pub(crate) test_resolution_queue: Option<Arc<std::sync::Mutex<Vec<Vec<SocketAddr>>>>>,
     #[cfg(test)]
     pub(crate) test_transport_http: bool,
 }
@@ -1358,6 +1508,8 @@ impl NativeWebClient {
             #[cfg(test)]
             test_resolution: None,
             #[cfg(test)]
+            test_resolution_queue: None,
+            #[cfg(test)]
             test_transport_http: false,
         }
     }
@@ -1366,6 +1518,18 @@ impl NativeWebClient {
     pub(crate) fn with_limits(mut self, limits: NativeFetchLimits) -> Self {
         self.limits = limits;
         self
+    }
+
+    /// Lists the user's `web-fetch-local-origins` (see [`LocalOrigin`]).
+    pub(crate) fn with_local_origins(mut self, origins: Option<&[String]>) -> Self {
+        self.policy = self.policy.with_local_origins(origins);
+        self
+    }
+
+    /// Whether `url` is a listed local origin (kept on `http://`, reachable
+    /// at loopback/private addresses after approval).
+    pub(crate) fn admits_local_origin(&self, url: &Url) -> bool {
+        self.policy.local_origin_matches(url)
     }
 
     /// Whether plaintext `http://` fetches are permitted by policy.
@@ -1401,6 +1565,17 @@ impl NativeWebClient {
     }
 
     #[cfg(test)]
+    pub(crate) fn with_permissions_for_test(
+        mut self,
+        permission: Option<super::PermCheck>,
+        ask_tx: Option<super::AskSender>,
+    ) -> Self {
+        self.permission = permission;
+        self.ask_tx = ask_tx;
+        self
+    }
+
+    #[cfg(test)]
     pub(crate) fn permission_for_test(&self) -> super::PermCheck {
         self.permission
             .clone()
@@ -1408,6 +1583,15 @@ impl NativeWebClient {
     }
 
     async fn resolve(&self, url: &Url) -> Result<Vec<SocketAddr>, FetchError> {
+        #[cfg(test)]
+        if let Some(queue) = &self.test_resolution_queue {
+            let mut queue = queue.lock().unwrap();
+            return Ok(if queue.len() > 1 {
+                queue.remove(0)
+            } else {
+                queue[0].clone()
+            });
+        }
         #[cfg(test)]
         if let Some((approved, _)) = &self.test_resolution {
             return Ok(approved.clone());
@@ -1444,62 +1628,114 @@ impl NativeWebClient {
         follow: bool,
     ) -> Result<(Url, NativeFetchResult), super::ToolError> {
         let started = std::time::Instant::now();
+        let budget = NetworkBudget::new(self.limits.total_timeout);
         let work = async {
             let mut retried = false;
             let mut url = self.policy.authorize(raw_url).map_err(native_error)?;
+            // Origin admitted to local destinations on the previous hop; only a
+            // same-origin redirect may keep that admission.
+            let mut local_admitted: Option<FetchOrigin> = None;
             for redirects in 0..=FETCH_MAX_REDIRECTS {
                 if url.as_str().len() > NATIVE_MAX_URL_BYTES {
                     return Err(super::ToolError::Msg(
                         "web URL exceeds the 8192-byte normalized URL limit".into(),
                     ));
                 }
-                // Behind an environment proxy the proxy resolves DNS names, so
-                // there is nothing to pin: screen the name instead and leave the
-                // destination set empty (see `web_proxy`).
-                let proxied_name =
-                    super::web_proxy::proxied_dns_name(&url).map_err(native_error)?;
-                let addresses = if proxied_name {
-                    super::web_proxy::validate_proxied_host_name(
-                        url.host_str()
-                            .ok_or(FetchError::MissingHost)
-                            .map_err(native_error)?,
-                    )
-                    .map_err(native_error)?;
-                    Vec::new()
+                let is_local = self.policy.local_origin_matches(&url)
+                    && (redirects == 0 || local_admitted == fetch_origin(&url).ok());
+                local_admitted = if is_local {
+                    fetch_origin(&url).ok()
                 } else {
-                    let mut addresses = self.resolve(&url).await.map_err(native_error)?;
-                    addresses.sort_unstable();
-                    addresses.dedup();
-                    validate_public_destinations(&addresses).map_err(native_error)?;
-                    addresses
+                    None
                 };
-                // The approval includes the normalized URL and complete public
-                // answer. A host-wide grant never skips DNS/redirect validation.
-                let key = if proxied_name {
-                    format!("{} destinations=[via-proxy]", url.as_str())
-                } else {
-                    format!(
-                        "{} destinations=[{}]",
-                        url.as_str(),
+                let mut reprompts = 0;
+                let addresses = loop {
+                    // Behind an environment proxy the proxy resolves DNS names,
+                    // so there is nothing to pin: screen the name instead and
+                    // leave the destination set empty (see `web_proxy`). A
+                    // listed local origin always connects directly.
+                    let proxied_name = !is_local
+                        && super::web_proxy::proxied_dns_name(&url).map_err(native_error)?;
+                    let addresses = if proxied_name {
+                        super::web_proxy::validate_proxied_host_name(
+                            url.host_str()
+                                .ok_or(FetchError::MissingHost)
+                                .map_err(native_error)?,
+                        )
+                        .map_err(native_error)?;
+                        Vec::new()
+                    } else {
+                        let mut addresses = self.resolve(&url).await.map_err(native_error)?;
+                        addresses.sort_unstable();
+                        addresses.dedup();
+                        if is_local {
+                            validate_local_destinations(&addresses).map_err(native_error)?;
+                        } else {
+                            validate_public_destinations(&addresses).map_err(native_error)?;
+                        }
                         addresses
-                            .iter()
-                            .map(SocketAddr::to_string)
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    )
+                    };
+                    // The approval includes the normalized URL and complete
+                    // answer. A host-wide grant never skips DNS/redirect
+                    // validation.
+                    let key = if proxied_name {
+                        format!("{} destinations=[via-proxy]", url.as_str())
+                    } else {
+                        format!(
+                            "{} destinations=[{}]",
+                            url.as_str(),
+                            addresses
+                                .iter()
+                                .map(SocketAddr::to_string)
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        )
+                    };
+                    let origin_scope = crate::permission::pattern::web_origin_pattern(&url);
+                    // The human wait does not count against the network
+                    // deadline; it has its own, longer bound.
+                    let prompt_started = tokio::time::Instant::now();
+                    {
+                        let _paused = budget.pause();
+                        tokio::time::timeout(
+                            self.limits.approval_timeout,
+                            super::check_perm_with_suggestion(
+                                &self.permission,
+                                &self.ask_tx,
+                                tool,
+                                &key,
+                                Some(origin_scope),
+                            ),
+                        )
+                        .await
+                        .map_err(|_| {
+                            super::ToolError::Msg(format!(
+                                "{tool}: the approval prompt expired after {} seconds without an answer; no request was sent. Ask again if you still want this fetch.",
+                                self.limits.approval_timeout.as_secs()
+                            ))
+                        })??;
+                    }
+                    if crate::agent::runner::current_work_scope_is_cancelled() {
+                        return Err(native_error(FetchError::Cancelled));
+                    }
+                    // A long wait can outlive the DNS answer that was approved:
+                    // resolve again and ask again only if the set changed.
+                    if !proxied_name && prompt_started.elapsed() > FETCH_REVALIDATE_AFTER {
+                        let mut again = self.resolve(&url).await.map_err(native_error)?;
+                        again.sort_unstable();
+                        again.dedup();
+                        if again != addresses {
+                            reprompts += 1;
+                            if reprompts > FETCH_MAX_REPROMPTS {
+                                return Err(super::ToolError::Msg(
+                                    "web destination addresses kept changing while waiting for approval; try again".into(),
+                                ));
+                            }
+                            continue;
+                        }
+                    }
+                    break addresses;
                 };
-                let origin_scope = crate::permission::pattern::web_origin_pattern(&url);
-                super::check_perm_with_suggestion(
-                    &self.permission,
-                    &self.ask_tx,
-                    tool,
-                    &key,
-                    Some(origin_scope),
-                )
-                .await?;
-                if crate::agent::runner::current_work_scope_is_cancelled() {
-                    return Err(native_error(FetchError::Cancelled));
-                }
                 #[cfg(test)]
                 let addresses = self
                     .test_resolution
@@ -1515,6 +1751,16 @@ impl NativeWebClient {
                     local
                 } else {
                     send_url
+                };
+                let hop_request;
+                let request = if is_local {
+                    hop_request = FetchRequest {
+                        direct: true,
+                        ..request.clone()
+                    };
+                    &hop_request
+                } else {
+                    request
                 };
                 let mut outcome =
                     send_async(send_url.clone(), request, &addresses, &self.limits).await;
@@ -1552,11 +1798,100 @@ impl NativeWebClient {
             }
             Err(native_error(FetchError::TooManyRedirects))
         };
-        let total_timeout = self.limits.total_timeout;
+        tokio::pin!(work);
+        // The deadline spans DNS, redirects and the body, but stops while a
+        // permission prompt is open (`NetworkBudget::pause`).
+        let bounded = async {
+            loop {
+                let deadline = budget.deadline();
+                tokio::select! { biased;
+                    result = &mut work => return result,
+                    () = budget.changed.notified() => {}
+                    () = async {
+                        match deadline {
+                            Some(deadline) => tokio::time::sleep_until(deadline).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        if budget.expired() {
+                            return Err(native_error(FetchError::TimedOut));
+                        }
+                    }
+                }
+            }
+        };
         tokio::select! { biased;
             _ = crate::agent::runner::current_work_scope_cancelled() => Err(native_error(FetchError::Cancelled)),
-            result = tokio::time::timeout(total_timeout, work) => result.unwrap_or_else(|_| Err(native_error(FetchError::TimedOut))),
+            result = bounded => result,
         }
+    }
+}
+
+/// A prompt that stayed open longer than this triggers a fresh DNS resolution
+/// before dispatch, so the connection still goes to the approved address set.
+const FETCH_REVALIDATE_AFTER: Duration = Duration::from_secs(3);
+/// Times the destination set may change while the user answers before the
+/// fetch gives up.
+const FETCH_MAX_REPROMPTS: usize = 2;
+
+/// Remaining network time for one exchange. It runs down like a deadline but
+/// freezes while an approval prompt is open, so a slow human cannot expire it.
+struct NetworkBudget {
+    state: std::sync::Mutex<BudgetState>,
+    changed: tokio::sync::Notify,
+}
+
+struct BudgetState {
+    deadline: tokio::time::Instant,
+    /// Time left when paused; `None` while running.
+    paused_remaining: Option<Duration>,
+}
+
+struct BudgetPause<'a>(&'a NetworkBudget);
+
+impl Drop for BudgetPause<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(remaining) = state.paused_remaining.take() {
+            state.deadline = tokio::time::Instant::now() + remaining;
+        }
+        drop(state);
+        self.0.changed.notify_one();
+    }
+}
+
+impl NetworkBudget {
+    fn new(total: Duration) -> Self {
+        Self {
+            state: std::sync::Mutex::new(BudgetState {
+                deadline: tokio::time::Instant::now() + total,
+                paused_remaining: None,
+            }),
+            changed: tokio::sync::Notify::new(),
+        }
+    }
+    /// Stops the clock until the returned guard drops.
+    fn pause(&self) -> BudgetPause<'_> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.paused_remaining.is_none() {
+            state.paused_remaining = Some(
+                state
+                    .deadline
+                    .saturating_duration_since(tokio::time::Instant::now()),
+            );
+        }
+        drop(state);
+        self.changed.notify_one();
+        BudgetPause(self)
+    }
+    /// The running deadline, or `None` while paused.
+    fn deadline(&self) -> Option<tokio::time::Instant> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.paused_remaining.is_none().then_some(state.deadline)
+    }
+    fn expired(&self) -> bool {
+        self.deadline()
+            .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
     }
 }
 
@@ -1587,6 +1922,7 @@ fn native_error(error: FetchError) -> super::ToolError {
     // Transport diagnostics may contain URLs or backend detail. Do not expose
     // backend strings, response error bodies or credentials to the model.
     let message = match error {
+        FetchError::DestinationDenied => "fetch destination is not a public network address (loopback, private and cloud-metadata ranges are blocked). To check a local dev server, ask the user to list its origin in web-fetch-local-origins in their user config, or use the shell tool (curl) when the sandbox allows it".to_string(),
         FetchError::ClientBuild(_) => "web HTTP client setup failed".to_string(),
         FetchError::RequestFailed(_) => "web HTTP request failed".to_string(),
         other => other.to_string(),
@@ -1950,7 +2286,7 @@ pub(crate) mod web_http_tests {
         use super::super::web_proxy::{ProxyEnv, set_test_proxy_env};
         let peer = Peer::new(vec![Peer::response("direct")]);
         let env = ProxyEnv::from_lookup(|name| {
-            (name == "ALL_PROXY").then(|| "socks5://127.0.0.1:1080".to_owned())
+            (name == "ALL_PROXY").then(|| "socks4://127.0.0.1:1080".to_owned())
         });
         let client = NativeWebClient::new(
             FetchPolicy::from_settings(None, true),
@@ -2533,11 +2869,9 @@ mod web_opaque_and_literal_tests {
 mod web_deadline_tests {
     use super::*;
     use web_http_tests::{Peer, fixture_client};
-    #[tokio::test]
-    async fn web_http_absolute_deadline_expires_pending_approval_without_late_grant_or_dispatch() {
-        let peer = Peer::new(vec![]);
-        let mut client = fixture_client(&peer);
-        let checker = std::sync::Arc::new(std::sync::Mutex::new(
+    /// Interactive-style checker: web calls ask.
+    pub(super) fn standard_checker() -> super::super::PermCheck {
+        std::sync::Arc::new(std::sync::Mutex::new(
             crate::permission::checker::PermissionChecker::new(
                 &crate::permission::PermissionConfigs::default(),
                 crate::permission::SecurityMode::Standard,
@@ -2545,21 +2879,28 @@ mod web_deadline_tests {
                 None,
             )
             .unwrap(),
-        ));
+        ))
+    }
+    #[tokio::test]
+    async fn web_http_approval_prompt_bound_expires_pending_approval_without_late_grant_or_dispatch()
+     {
+        let peer = Peer::new(vec![]);
+        let mut client = fixture_client(&peer);
+        let checker = standard_checker();
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         client.ask_tx = Some(tx);
         client.permission = Some(checker.clone());
-        client.limits.total_timeout = Duration::from_millis(750);
+        client.limits.total_timeout = Duration::from_secs(60);
+        client.limits.approval_timeout = Duration::from_millis(500);
         let request = FetchRequest::get();
         let fetch = client.execute("http://fixture.invalid/docs", &request, "web_fetch", true);
         let late = async {
             let mut ask = rx.recv().await.unwrap().into_permission();
-            // Wait for the deadline to drop the receiver instead of sleeping a
-            // fixed margin that a loaded runner can miss (mini-agent-h3o6r).
+            // Wait for the prompt bound to drop the receiver instead of sleeping
+            // a fixed margin that a loaded runner can miss (mini-agent-h3o6r).
             tokio::time::timeout(Duration::from_secs(30), ask.reply.closed())
                 .await
-                .expect("deadline must close the pending approval");
-            assert!(ask.reply.is_closed());
+                .expect("the prompt bound must close the pending approval");
             assert!(
                 ask.reply
                     .send(crate::permission::ask::UserDecision::AllowAlways(
@@ -2569,7 +2910,9 @@ mod web_deadline_tests {
             );
         };
         let (result, ()) = tokio::join!(fetch, late);
-        assert!(result.unwrap_err().to_string().contains("timed out"));
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("approval prompt expired"), "{message}");
+        assert!(!message.contains("timed out"), "{message}");
         assert_eq!(peer.count(), 0);
         assert_eq!(
             checker.lock().unwrap().check(
@@ -2578,6 +2921,33 @@ mod web_deadline_tests {
             ),
             crate::permission::checker::CheckResult::Ask
         );
+    }
+    #[tokio::test]
+    async fn web_http_slow_approval_past_the_network_deadline_still_dispatches_once() {
+        // Size the network deadline to the measured TLS setup so only the
+        // human wait, not client construction, can exceed it.
+        let setup = std::time::Instant::now();
+        drop(reqwest::Client::builder().no_proxy().build().unwrap());
+        let total = setup.elapsed() * 4 + Duration::from_millis(500);
+        let peer = Peer::new(vec![Peer::response("approved late")]);
+        let mut client = fixture_client(&peer);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        client.ask_tx = Some(tx);
+        client.permission = Some(standard_checker());
+        client.limits.total_timeout = total;
+        let request = FetchRequest::get();
+        let fetch = client.execute("http://fixture.invalid/docs", &request, "web_fetch", true);
+        let user = async {
+            let ask = rx.recv().await.unwrap().into_permission();
+            tokio::time::sleep(total + Duration::from_millis(400)).await;
+            ask.reply
+                .send(crate::permission::ask::UserDecision::AllowOnce)
+                .unwrap();
+        };
+        let (result, ()) = tokio::join!(fetch, user);
+        let (_, page) = result.expect("a reply after the network deadline must still dispatch");
+        assert_eq!(page.text, "approved late");
+        assert_eq!(peer.count(), 1);
     }
     #[tokio::test]
     async fn web_http_absolute_deadline_bounds_a_live_stalled_exchange() {
@@ -2751,5 +3121,451 @@ mod web_absent_checker_tests {
             .to_string();
         assert!(error.contains("not a public network address"));
         assert_eq!(peer.count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod web_local_and_reprompt_tests {
+    use super::*;
+    use web_http_tests::{Peer, fixture_client};
+
+    fn get_request() -> &'static FetchRequest {
+        static REQUEST: OnceLock<FetchRequest> = OnceLock::new();
+        REQUEST.get_or_init(FetchRequest::get)
+    }
+
+    fn local_client(peer: &Peer, origins: &[&str]) -> NativeWebClient {
+        let mut client = fixture_client(peer);
+        let origins: Vec<String> = origins.iter().map(|o| (*o).to_owned()).collect();
+        client.policy = FetchPolicy::from_settings(None, false).with_local_origins(Some(&origins));
+        // The approved answer is the real loopback address of the fixture.
+        client.test_resolution = Some((vec![peer.address], vec![peer.address]));
+        client
+    }
+
+    #[test]
+    fn local_origins_parse_exactly_and_reject_widening_forms() {
+        let ok = |raw: &str| LocalOrigin::parse(raw).is_some();
+        assert!(ok("http://localhost:3000"));
+        assert!(ok("http://127.0.0.1:*"));
+        assert!(ok("https://intranet.corp"));
+        assert!(ok("http://[::1]:8080"));
+        for bad in [
+            "localhost:3000",
+            "ftp://localhost:21",
+            "http://localhost:3000/app",
+            "http://user@localhost:3000",
+            "http://localhost:3000?x=1",
+            "http://localhost:3000:*",
+            "*",
+            "",
+        ] {
+            assert!(!ok(bad), "{bad}");
+        }
+        let origin = LocalOrigin::parse("http://localhost:3000").unwrap();
+        assert!(origin.matches(&Url::parse("http://localhost:3000/x").unwrap()));
+        assert!(!origin.matches(&Url::parse("http://localhost:3001/").unwrap()));
+        assert!(!origin.matches(&Url::parse("https://localhost:3000/").unwrap()));
+        assert!(!origin.matches(&Url::parse("http://localhost.evil:3000/").unwrap()));
+        let any_port = LocalOrigin::parse("http://127.0.0.1:*").unwrap();
+        assert!(any_port.matches(&Url::parse("http://127.0.0.1:9/").unwrap()));
+        assert!(!any_port.matches(&Url::parse("http://127.0.0.2:9/").unwrap()));
+    }
+
+    #[test]
+    fn local_destinations_admit_loopback_and_private_but_never_metadata() {
+        let ok =
+            |ip: &str| validate_local_destinations(&[SocketAddr::new(ip.parse().unwrap(), 80)]);
+        for allowed in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.9",
+            "192.168.1.1",
+            "::1",
+            "fd00::1",
+            "93.184.216.34",
+        ] {
+            assert!(ok(allowed).is_ok(), "{allowed}");
+        }
+        for denied in [
+            "169.254.169.254",
+            "169.254.0.1",
+            "168.63.129.16",
+            "::ffff:169.254.169.254",
+            "::ffff:168.63.129.16",
+            "0.0.0.0",
+            "224.0.0.1",
+            "fe80::1",
+        ] {
+            assert_eq!(ok(denied), Err(FetchError::DestinationDenied), "{denied}");
+        }
+        // A mixed answer with one metadata address is refused as a whole.
+        assert!(
+            validate_local_destinations(&[
+                SocketAddr::new("127.0.0.1".parse().unwrap(), 80),
+                SocketAddr::new("169.254.169.254".parse().unwrap(), 80),
+            ])
+            .is_err()
+        );
+        // The public check is unchanged.
+        assert!(
+            validate_public_destinations(&[SocketAddr::new("127.0.0.1".parse().unwrap(), 80)])
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn local_origin_is_fetched_after_one_approval_and_http_is_kept() {
+        let peer = Peer::new(vec![Peer::response("dev server")]);
+        let origin = format!("http://fixture.invalid:{}", peer.address.port());
+        let mut client = local_client(&peer, &[&origin]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        client.ask_tx = Some(tx);
+        client.permission = Some(web_deadline_tests::standard_checker());
+        let url = format!("{origin}/status");
+        let fetch = client.execute(&url, get_request(), "web_fetch", true);
+        let user = async {
+            let ask = rx.recv().await.unwrap().into_permission();
+            assert!(
+                ask.reply
+                    .send(crate::permission::ask::UserDecision::AllowOnce)
+                    .is_ok()
+            );
+        };
+        let (result, ()) = tokio::join!(fetch, user);
+        let (_, page) = result.unwrap();
+        assert_eq!(page.text, "dev server");
+        assert_eq!(peer.count(), 1);
+        assert!(rx.try_recv().is_err(), "exactly one prompt");
+    }
+
+    #[tokio::test]
+    async fn unlisted_loopback_stays_denied_with_the_setting_hint() {
+        let peer = Peer::new(vec![]);
+        let client = local_client(&peer, &["http://other.invalid:1"]);
+        let url = format!("http://fixture.invalid:{}/", peer.address.port());
+        // Not even http is allowed for an unlisted origin.
+        let error = client
+            .execute(&url, get_request(), "web_fetch", true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("scheme is not allowed"), "{error}");
+        let mut client = local_client(&peer, &[]);
+        client.policy.allow_http = true;
+        let error = client
+            .execute(&url, get_request(), "web_fetch", true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not a public network address"), "{error}");
+        assert!(error.contains("web-fetch-local-origins"), "{error}");
+        assert_eq!(peer.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn metadata_addresses_stay_denied_even_for_a_listed_origin() {
+        let peer = Peer::new(vec![]);
+        for ip in ["169.254.169.254", "168.63.129.16"] {
+            let mut client = local_client(&peer, &[&format!("http://{ip}:*")]);
+            client.test_resolution = Some((
+                vec![SocketAddr::new(ip.parse().unwrap(), 80)],
+                vec![peer.address],
+            ));
+            let error = client
+                .execute(
+                    &format!("http://{ip}/latest/meta-data"),
+                    get_request(),
+                    "web_fetch",
+                    true,
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("not a public network address"),
+                "{ip}: {error}"
+            );
+        }
+        assert_eq!(peer.count(), 0);
+    }
+
+    fn redirect(location: &str) -> String {
+        format!(
+            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn public_origin_redirecting_into_a_local_origin_is_refused() {
+        let peer = Peer::new(vec![]);
+        let port = peer.address.port();
+        let peer = Peer::new(vec![redirect(&format!(
+            "http://local.invalid:{port}/inner"
+        ))]);
+        let port = peer.address.port();
+        let mut client = local_client(&peer, &[&format!("http://local.invalid:{port}")]);
+        client.policy.allow_http = true;
+        let public: SocketAddr = SocketAddr::new("93.184.216.34".parse().unwrap(), port);
+        let local = peer.address;
+        client.test_resolution = Some((vec![], vec![peer.address]));
+        client.test_resolution_queue = Some(Arc::new(std::sync::Mutex::new(vec![
+            vec![public],
+            vec![local],
+        ])));
+        let error = client
+            .execute(
+                &format!("http://public.invalid:{port}/start"),
+                get_request(),
+                "web_fetch",
+                true,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not a public network address"), "{error}");
+        assert_eq!(peer.count(), 1, "only the public hop was contacted");
+    }
+
+    #[tokio::test]
+    async fn same_origin_redirect_inside_a_local_origin_is_followed() {
+        let peer = Peer::new(vec![]);
+        drop(peer);
+        let probe = Peer::new(vec![]);
+        let port = probe.address.port();
+        drop(probe);
+        let peer = Peer::new(vec![redirect("/final"), Peer::response("final page")]);
+        let port2 = peer.address.port();
+        let _ = port;
+        let origin = format!("http://local.invalid:{port2}");
+        let client = local_client(&peer, &[&origin]);
+        let (_, page) = client
+            .execute(&format!("{origin}/start"), get_request(), "web_fetch", true)
+            .await
+            .unwrap();
+        assert_eq!(page.text, "final page");
+        assert_eq!(peer.count(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn long_prompt_re_resolves_and_re_asks_only_when_the_destination_set_changed() {
+        let peer = Peer::new(vec![]);
+        let mut client = fixture_client(&peer);
+        let a = SocketAddr::new("93.184.216.34".parse().unwrap(), 80);
+        let b = SocketAddr::new("93.184.216.35".parse().unwrap(), 80);
+        client.test_resolution = Some((vec![a], vec![peer.address]));
+        client.test_resolution_queue =
+            Some(Arc::new(std::sync::Mutex::new(vec![vec![a], vec![b]])));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        client.ask_tx = Some(tx);
+        client.permission = Some(web_deadline_tests::standard_checker());
+        let fetch = client.execute(
+            "http://fixture.invalid/docs",
+            get_request(),
+            "web_fetch",
+            true,
+        );
+        let user = async {
+            let first = rx.recv().await.unwrap().into_permission();
+            assert!(first.input.contains("93.184.216.34"), "{}", first.input);
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            first
+                .reply
+                .send(crate::permission::ask::UserDecision::AllowOnce)
+                .unwrap();
+            let second = rx.recv().await.unwrap().into_permission();
+            assert!(second.input.contains("93.184.216.35"), "{}", second.input);
+            second
+                .reply
+                .send(crate::permission::ask::UserDecision::Deny)
+                .unwrap();
+        };
+        let (result, ()) = tokio::join!(fetch, user);
+        assert!(result.is_err());
+        assert_eq!(peer.count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unchanged_destination_set_after_a_long_prompt_is_not_asked_again() {
+        let peer = Peer::new(vec![]);
+        let mut client = fixture_client(&peer);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        client.ask_tx = Some(tx);
+        client.permission = Some(web_deadline_tests::standard_checker());
+        // The transport target refuses connections, so nothing real is awaited
+        // after approval; a second prompt would show up in `rx`.
+        client.test_resolution = Some((
+            vec![SocketAddr::new("93.184.216.34".parse().unwrap(), 80)],
+            vec!["127.0.0.1:1".parse().unwrap()],
+        ));
+        let fetch = client.execute(
+            "http://fixture.invalid/docs",
+            get_request(),
+            "web_fetch",
+            true,
+        );
+        let user = async {
+            let first = rx.recv().await.unwrap().into_permission();
+            tokio::time::sleep(Duration::from_secs(12)).await;
+            first
+                .reply
+                .send(crate::permission::ask::UserDecision::AllowOnce)
+                .unwrap();
+        };
+        let (result, ()) = tokio::join!(fetch, user);
+        let error = result.unwrap_err().to_string();
+        assert!(!error.contains("timed out"), "{error}");
+        assert!(
+            rx.try_recv().is_err(),
+            "no second prompt for an unchanged set"
+        );
+    }
+}
+
+#[cfg(test)]
+mod web_socks_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use web_http_tests::Peer;
+
+    fn get_request() -> &'static FetchRequest {
+        static REQUEST: OnceLock<FetchRequest> = OnceLock::new();
+        REQUEST.get_or_init(FetchRequest::get)
+    }
+
+    /// Minimal SOCKS5 server: no auth, CONNECT only. It records the requested
+    /// target (address type and host) and relays to `upstream` regardless.
+    struct Socks5 {
+        address: SocketAddr,
+        seen: Arc<std::sync::Mutex<Vec<(u8, String)>>>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Socks5 {
+        fn new(upstream: SocketAddr) -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (seen_in, stop_in) = (seen.clone(), stop.clone());
+            let thread = std::thread::spawn(move || {
+                let end = Instant::now() + Duration::from_secs(15);
+                while !stop_in.load(std::sync::atomic::Ordering::Acquire) && Instant::now() < end {
+                    let Ok((mut client, _)) = listener.accept() else {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    };
+                    client.set_nonblocking(false).unwrap();
+                    client
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    let mut head = [0u8; 2];
+                    client.read_exact(&mut head).unwrap();
+                    let mut methods = vec![0u8; usize::from(head[1])];
+                    client.read_exact(&mut methods).unwrap();
+                    client.write_all(&[5, 0]).unwrap();
+                    let mut request = [0u8; 4];
+                    client.read_exact(&mut request).unwrap();
+                    let host = match request[3] {
+                        1 => {
+                            let mut ip = [0u8; 4];
+                            client.read_exact(&mut ip).unwrap();
+                            std::net::Ipv4Addr::from(ip).to_string()
+                        }
+                        3 => {
+                            let mut len = [0u8; 1];
+                            client.read_exact(&mut len).unwrap();
+                            let mut name = vec![0u8; usize::from(len[0])];
+                            client.read_exact(&mut name).unwrap();
+                            String::from_utf8(name).unwrap()
+                        }
+                        other => panic!("unexpected address type {other}"),
+                    };
+                    let mut port = [0u8; 2];
+                    client.read_exact(&mut port).unwrap();
+                    seen_in.lock().unwrap().push((request[3], host));
+                    let mut target = std::net::TcpStream::connect(upstream).unwrap();
+                    client.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
+                    let (mut c2, mut t2) =
+                        (client.try_clone().unwrap(), target.try_clone().unwrap());
+                    let up = std::thread::spawn(move || {
+                        let _ = std::io::copy(&mut c2, &mut t2);
+                        let _ = t2.shutdown(std::net::Shutdown::Write);
+                    });
+                    let _ = std::io::copy(&mut target, &mut client);
+                    let _ = up.join();
+                }
+            });
+            Self {
+                address,
+                seen,
+                stop,
+                thread: Some(thread),
+            }
+        }
+    }
+    impl Drop for Socks5 {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Release);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn env(var: &str, value: String) -> super::super::web_proxy::ProxyEnv {
+        super::super::web_proxy::ProxyEnv::from_lookup(|name| (name == var).then(|| value.clone()))
+    }
+
+    async fn through(scheme: &str) -> (Vec<(u8, String)>, String) {
+        let peer = Peer::new(vec![Peer::response("via socks")]);
+        let socks = Socks5::new(peer.address);
+        let _guard = super::super::web_proxy::set_test_proxy_env(env(
+            "ALL_PROXY",
+            format!("{scheme}://127.0.0.1:{}", socks.address.port()),
+        ));
+        let client = web_http_tests::fixture_client(&peer);
+        let (_, page) = client
+            .execute(
+                "http://fixture.invalid/docs",
+                get_request(),
+                "web_fetch",
+                true,
+            )
+            .await
+            .unwrap();
+        let seen = socks.seen.lock().unwrap().clone();
+        (seen, page.text)
+    }
+
+    #[tokio::test]
+    async fn socks5h_proxy_receives_the_host_name_and_carries_the_request() {
+        let (seen, text) = through("socks5h").await;
+        assert_eq!(text, "via socks");
+        assert_eq!(seen, vec![(3, "fixture.invalid".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn socks5_proxy_receives_the_locally_resolved_pinned_address() {
+        let (seen, text) = through("socks5").await;
+        assert_eq!(text, "via socks");
+        assert_eq!(seen, vec![(1, "127.0.0.1".to_owned())]);
+    }
+
+    #[test]
+    fn only_socks5h_defers_name_resolution_to_the_proxy() {
+        let url = Url::parse("https://example.com/").unwrap();
+        for (scheme, deferred) in [("socks5h", true), ("socks5", false), ("http", true)] {
+            let _guard = super::super::web_proxy::set_test_proxy_env(env(
+                "ALL_PROXY",
+                format!("{scheme}://127.0.0.1:1080"),
+            ));
+            assert_eq!(
+                super::super::web_proxy::proxied_dns_name(&url),
+                Ok(deferred),
+                "{scheme}"
+            );
+        }
     }
 }

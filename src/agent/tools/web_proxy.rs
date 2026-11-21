@@ -5,6 +5,11 @@
 //! with `NO_PROXY` exclusions, like the provider and MCP clients. Loopback and
 //! `localhost` destinations never use a proxy.
 //!
+//! `socks5h://` proxies (proxy-side DNS) behave like HTTP proxies for that
+//! purpose; `socks5://` resolves the name locally, so those requests are
+//! validated and pinned exactly like direct connections. `socks4` and other
+//! schemes fail closed.
+//!
 //! Trade-off: a proxied request is resolved by the proxy, so local DNS
 //! resolution and address pinning are impossible for DNS names. Those hosts are
 //! instead screened by name ([`validate_proxied_host_name`]: no `localhost`,
@@ -18,7 +23,7 @@ use reqwest::Url;
 use std::net::IpAddr;
 
 /// A proxy variable's outcome: a usable URL, or the name of a variable that
-/// is set but unusable (unsupported scheme such as `socks5://`, or unparsable).
+/// is set but unusable (unsupported scheme such as `socks4://`, or unparsable).
 /// An unusable value must fail closed, never fall back to a direct connection.
 type ProxySlot = Result<String, String>;
 
@@ -43,8 +48,9 @@ fn clean_proxy(name: &str, value: Option<String>) -> Option<ProxySlot> {
         format!("http://{value}")
     };
     // Only schemes the HTTP client is built to speak.
-    let usable = Url::parse(&candidate)
-        .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some());
+    let usable = Url::parse(&candidate).is_ok_and(|url| {
+        matches!(url.scheme(), "http" | "https" | "socks5" | "socks5h") && url.host_str().is_some()
+    });
     Some(if usable {
         Ok(candidate)
     } else {
@@ -106,11 +112,18 @@ impl ProxyEnv {
                 return true;
             }
             if let Some((network, bits)) = entry.split_once('/')
-                && let (Some(IpAddr::V4(host)), Ok(IpAddr::V4(network)), Ok(bits)) =
-                    (ip, network.parse::<IpAddr>(), bits.parse::<u8>())
-                && bits <= 32
+                && let Ok(bits) = bits.parse::<u8>()
+                && let Ok(network) = network.trim_matches(['[', ']']).parse::<IpAddr>()
             {
-                return super::web_http::ipv4_in_prefix(u32::from(host), u32::from(network), bits);
+                return match (ip, network) {
+                    (Some(IpAddr::V4(host)), IpAddr::V4(network)) if bits <= 32 => {
+                        super::web_http::ipv4_in_prefix(u32::from(host), u32::from(network), bits)
+                    }
+                    (Some(IpAddr::V6(host)), IpAddr::V6(network)) if bits <= 128 => {
+                        super::web_http::ipv6_in_prefix(u128::from(host), u128::from(network), bits)
+                    }
+                    _ => false,
+                };
             }
             // `host:port` entries only match that port; bare IPv6 keeps colons.
             let (name, entry_port) = match entry.rsplit_once(':') {
@@ -190,12 +203,15 @@ pub(crate) fn proxy_for_url(url: &Url) -> Result<Option<String>, FetchError> {
 }
 
 /// Whether `url` goes through a proxy that must resolve its (DNS) name, so no
-/// local resolution or pinning is possible.
+/// local resolution or pinning is possible. A `socks5://` proxy receives an
+/// already-resolved address, so its names are resolved and pinned locally.
 pub(crate) fn proxied_dns_name(url: &Url) -> Result<bool, FetchError> {
-    Ok(proxy_for_url(url)?.is_some()
-        && url
-            .host_str()
-            .is_some_and(|host| host.trim_matches(['[', ']']).parse::<IpAddr>().is_err()))
+    Ok(
+        proxy_for_url(url)?.is_some_and(|proxy| !proxy.starts_with("socks5://"))
+            && url
+                .host_str()
+                .is_some_and(|host| host.trim_matches(['[', ']']).parse::<IpAddr>().is_err()),
+    )
 }
 
 /// Name-level screening for a host the proxy will resolve.
@@ -352,12 +368,12 @@ mod tests {
     #[test]
     fn unusable_proxy_values_fail_closed_naming_the_variable() {
         for (var, value) in [
-            ("ALL_PROXY", "socks5://127.0.0.1:1080"),
-            ("ALL_PROXY", "socks5h://h:1"),
+            ("ALL_PROXY", "socks4://127.0.0.1:1080"),
+            ("ALL_PROXY", "socks4a://h:1"),
             ("HTTPS_PROXY", "ftp://x"),
             ("HTTPS_PROXY", "http://"),
             ("HTTP_PROXY", "http://[::1"),
-            ("https_proxy", "socks5://h:1"),
+            ("https_proxy", "socks4://h:1"),
         ] {
             let e = env(&[(var, value)]);
             let https = e.proxy_for(&url("https://example.com/"));
@@ -377,7 +393,7 @@ mod tests {
         }
         // The unusable variable only matters where it would apply.
         let e = env(&[
-            ("HTTP_PROXY", "socks5://h:1"),
+            ("HTTP_PROXY", "socks4://h:1"),
             ("HTTPS_PROXY", "http://p:1"),
         ]);
         assert_eq!(
@@ -386,8 +402,54 @@ mod tests {
         );
         assert!(e.proxy_for(&url("http://example.com/")).is_err());
         // Bypasses still go direct without error.
-        let e = env(&[("ALL_PROXY", "socks5://h:1"), ("NO_PROXY", "skip.test")]);
+        let e = env(&[("ALL_PROXY", "socks4://h:1"), ("NO_PROXY", "skip.test")]);
         assert_eq!(e.proxy_for(&url("https://skip.test/")), Ok(None));
         assert_eq!(e.proxy_for(&url("https://localhost/")), Ok(None));
+    }
+
+    #[test]
+    fn socks5_proxies_are_usable_and_socks5_resolves_locally() {
+        let e = env(&[("ALL_PROXY", "socks5h://127.0.0.1:1080")]);
+        assert_eq!(
+            e.proxy_for(&url("https://example.com/")),
+            Ok(Some("socks5h://127.0.0.1:1080".to_owned()))
+        );
+        assert_eq!(
+            e.proxy_for(&url("http://example.com/")),
+            Ok(Some("socks5h://127.0.0.1:1080".to_owned()))
+        );
+        let e = env(&[("https_proxy", "socks5://10.0.0.1:9050")]);
+        assert_eq!(
+            e.proxy_for(&url("https://example.com/")),
+            Ok(Some("socks5://10.0.0.1:9050".to_owned()))
+        );
+        // socks4 and unparsable values still fail closed.
+        let e = env(&[("ALL_PROXY", "socks4://127.0.0.1:1080")]);
+        assert!(matches!(
+            e.proxy_for(&url("https://example.com/")),
+            Err(FetchError::ProxyUnusable(_))
+        ));
+        assert!(proxy_config("socks5h://127.0.0.1:1080").is_ok());
+        assert!(proxy_config("socks5://127.0.0.1:1080").is_ok());
+    }
+
+    #[test]
+    fn no_proxy_accepts_ipv6_cidr_entries() {
+        let e = env(&[
+            ("HTTPS_PROXY", "http://p:1"),
+            ("NO_PROXY", "fd00::/8,[2001:db8::]/32,10.0.0.0/8"),
+        ]);
+        assert!(e.proxy_for(&url("https://[fd12::1]/")).unwrap().is_none());
+        assert!(
+            e.proxy_for(&url("https://[2001:db8::5]/"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            e.proxy_for(&url("https://[2606:4700::1]/"))
+                .unwrap()
+                .is_some()
+        );
+        assert!(e.proxy_for(&url("https://10.9.9.9/")).unwrap().is_none());
     }
 }

@@ -20,6 +20,12 @@ Notable changes to mini-agent are documented in this file. The format follows
 - `$CLAUDE_PROJECT_DIR`/`$MINI_AGENT_PROJECT_DIR` prefixes in hook `command`/args are expanded at launch and `CLAUDE_PROJECT_DIR` is exported to hooks; a Claude-style command string with shell operators skips only that handler instead of the whole file (mini-agent-nvnkx.181).
 - `--trust-project-hooks` (env `MINI_AGENT_TRUST_PROJECT_HOOKS`) and `mini-agent hooks trust [--list|--yes]` let headless and CI runs approve project hooks; skipped bindings now raise a startup notice (mini-agent-nvnkx.179).
 - Brokered JS `writeFile`, `fetch` and `spawn` effects run PreToolUse hooks as `write`, `web_fetch` and `bash` (spawn also still as `js_spawn`), and PostToolUse/PostToolUseFailure after they settle (mini-agent-nvnkx.335).
+- `web-fetch-local-origins` (user config only; project layers are ignored) lists exact loopback or private origins (`http://localhost:3000`, `http://127.0.0.1:*`) that `web_fetch` may reach after the usual per-origin approval, keeping `http://` for them; a redirect from another origin into one is refused, and link-local/cloud-metadata ranges (169.254.0.0/16, Azure WireServer 168.63.129.16) stay denied. The denial text now names the setting (mini-agent-nvnkx.245).
+- `socks5://` and `socks5h://` proxies in `ALL_PROXY`/`HTTPS_PROXY`/`HTTP_PROXY` now work for `web_fetch`, `web_search` and JS `fetch()` (`socks5h` resolves on the proxy and is screened by name; `socks5` resolves locally and is validated and pinned like a direct connection); socks4 and unparsable values still fail closed, and `NO_PROXY` accepts IPv6 CIDR entries (mini-agent-nvnkx.244).
+- `web_fetch` prefers the page's `<main>`/`role=main` (else `<article>`, else the page minus nav/aside/header/footer/form) with a one-line note, falling back to the whole page when the result is nearly empty, and sends `Accept: text/markdown, text/html;q=0.9, ...` (mini-agent-nvnkx.27).
+- `web_fetch`'s `prompt` now ranks the sections of a page longer than 50,000 characters by term overlap (no model call) and returns the best matches first, with a table of headings and spill line numbers; the result says so (mini-agent-nvnkx.26).
+- `/sandbox network <deny|allowlist|allow>` and `--sandbox-network` change the shell network policy for the session (never saved, bounded by a managed `max_network`/`allowed_hosts` ceiling) (mini-agent-nvnkx.70).
+- With `sandbox-network = "allowlist"` the proxy keeps a bounded log of refused hosts: the shell tool ends a command's result (foreground, background job or deadline) with `[sandbox network: blocked host:port (reason)]`, each refusal is logged at info level and `/sandbox` lists recent ones (mini-agent-nvnkx.186).
 
 ### Fixed
 
@@ -151,6 +157,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Chat Completions requests send the generated `prompt_cache_key` and the global `reasoning_effort` default only to the built-in OpenAI endpoint and Azure, not to custom gateways; an explicit `null` in `extra_body` removes a generated default (mini-agent-nvnkx.33).
 - Responses requests send `store: false` by default while encrypted reasoning content is requested; `[reasoning] store = true` opts back in (mini-agent-nvnkx.204).
 - The configured `[reasoning] effort` now reaches non-Claude OpenRouter models as `reasoning.effort` (mini-agent-nvnkx.156).
+- The `web_fetch`/`web_search` network deadline no longer runs while an approval prompt is open, so a slow answer is not turned into `fetch timed out`; the prompt has its own 10-minute bound and says the approval expired, and the destination is re-resolved (and re-asked only if it changed) after a wait over 3 s (mini-agent-nvnkx.232).
+- `web_fetch` Markdown no longer splits headings, links, list items or table rows at source line breaks (mini-agent-nvnkx.28), and decodes the HTML 4 named entities (`&mdash;`, `&rsquo;`, `&hellip;`, `&copy;`, `&eacute;`, ...) once (mini-agent-nvnkx.29).
+- Sandbox failure notes now also cover failed background jobs polled with `job_status` and commands that hit their deadline, recognise resolver/npm/cargo/proxy spellings (`Temporary failure in name resolution`, `ENOTFOUND`, `EAI_AGAIN`, `failed to lookup address information`, `CONNECT tunnel failed`), and state that the network is denied instead of "may be"; the shell tool description mentions the denied network (mini-agent-nvnkx.69).
 
 ### Added
 

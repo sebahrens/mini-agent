@@ -1102,6 +1102,13 @@ pub struct Cli {
     pub sandbox_profile: Option<crate::sandbox::SandboxProfile>,
 
     #[arg(
+        long = "sandbox-network",
+        value_enum,
+        help = "Network policy for contained shell commands: deny, allowlist (sandbox-network-hosts plus prompted hosts) or allow; overrides sandbox-network and is bounded by a managed max_network"
+    )]
+    pub sandbox_network: Option<crate::sandbox::SandboxNetwork>,
+
+    #[arg(
         long = "windows-appcontainer-read-root",
         value_name = "PATH",
         help = "Add an explicit Windows AppContainer read/execute root (repeatable; relative paths resolve from the workspace)"
@@ -1991,6 +1998,12 @@ impl Cli {
         } else {
             crate::sandbox::default_sandbox_read_roots()
         }
+    }
+
+    pub fn resolve_sandbox_network(&self, cfg: &config::Config) -> crate::sandbox::SandboxNetwork {
+        self.sandbox_network
+            .or(cfg.sandbox_network)
+            .unwrap_or_default()
     }
 
     pub fn resolve_sandbox_profile(&self, cfg: &config::Config) -> crate::sandbox::SandboxProfile {

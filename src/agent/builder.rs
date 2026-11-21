@@ -1320,15 +1320,18 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         let edit_tool = edit_tool.with_lsp(lsp_manager.clone());
         let mut base_tools: SmallVec<[Box<dyn rig::tool::ToolDyn>; 8]> = SmallVec::new();
         if cli.tool_is_eligible(cfg, "web_fetch") {
-            base_tools.push(Box::new(tools::web_fetch::WebFetchTool::new(
-                permission.clone(),
-                ask_tx.clone(),
-                cfg.web_fetch_origins.as_deref(),
-                cfg.web_fetch_allow_http.unwrap_or(false),
-                tool_output_session_id,
-                tool_result_spills.clone(),
-                cfg.web_fetch_timeout_secs,
-            )));
+            base_tools.push(Box::new(
+                tools::web_fetch::WebFetchTool::new(
+                    permission.clone(),
+                    ask_tx.clone(),
+                    cfg.web_fetch_origins.as_deref(),
+                    cfg.web_fetch_allow_http.unwrap_or(false),
+                    tool_output_session_id,
+                    tool_result_spills.clone(),
+                    cfg.web_fetch_timeout_secs,
+                )
+                .with_local_origins(cfg.web_fetch_local_origins.as_deref()),
+            ));
         }
         // Without EXA_API_KEY the native tool could only fail, so it is not
         // registered; the keyless built-in Exa MCP server is the fallback.

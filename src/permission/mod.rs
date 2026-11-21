@@ -280,6 +280,11 @@ pub(crate) fn resolve_execution_authority_under(
         {
             return Err(ExecutionAuthorityError::ManagedPolicy(message));
         }
+        if cli.sandbox_network.is_some()
+            && let Some(message) = policy.network_violation(cli.resolve_sandbox_network(cfg))
+        {
+            return Err(ExecutionAuthorityError::ManagedPolicy(message));
+        }
         let flag_roots = cli
             .sandbox_toolchain_roots
             .iter()
@@ -393,7 +398,7 @@ impl ConfiguredSandboxKey {
             appcontainer_read_roots: cli.resolve_windows_appcontainer_read_roots(cfg),
             appcontainer_write_roots: cli.resolve_windows_appcontainer_write_roots(cfg),
             toolchain_roots: cli.resolve_sandbox_toolchain_roots(cfg),
-            network: cfg.sandbox_network.unwrap_or_default(),
+            network: cli.resolve_sandbox_network(cfg),
             network_hosts: cfg.sandbox_network_hosts.clone(),
             shell_env: cfg.shell_env_policy(),
             max_background_jobs: cfg

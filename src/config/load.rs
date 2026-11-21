@@ -2229,6 +2229,8 @@ fn split_project_override_with_sensitive_fields(
                 | "permission_checks_required"
                 | "shell-env-allow-secrets"
                 | "shell_env_allow_secrets"
+                | "web-fetch-local-origins"
+                | "web_fetch_local_origins"
         ) {
             tracing::warn!("project config: {key} is global-only and was ignored");
             continue;

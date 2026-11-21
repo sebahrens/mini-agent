@@ -1219,6 +1219,8 @@ impl FetchRequest {
             method,
             headers,
             body,
+            accept: None,
+            direct: false,
         })
     }
 }
