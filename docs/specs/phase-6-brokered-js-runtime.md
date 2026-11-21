@@ -1743,3 +1743,31 @@ Coverage: `approval_pause_is_parent_clocked_scoped_and_capped` (types),
 `worker_approval_pause` (contained worker: slow approval within the bound succeeds, the overall
 bound still ends an unanswered approval, effect wait without an approval earns no credit, no
 allowance excludes nothing) and the worst-case frame-size tests in `host.rs`.
+
+## Delivered corrections (2026-11-21 JS availability)
+
+`mini-agent-nvnkx.147/.167/.168/.169`: one root cause, the agent build took a single non-blocking
+snapshot of the process-wide worker probe and substituted the pending placeholder. Every caller that
+is about to run a turn (headless `-p`/`--loop`, `ensure_agent` for a TUI turn including the
+auto-triggered initial prompt, each ACP prompt turn inside `run_owned_pre_run`) now first calls
+`provider::settle_js_probe`, which joins the already running probe (bounded by its own preflight
+timeout). The idle TUI prebuild and `build_agent_in_workspace` never wait. Fail-closed is unchanged:
+only a completed `Available` result registers `js`. Because no turn is built with a pending probe,
+no native record is pinned `omitted` by a startup timing accident. Residual: sessions already pinned
+by the old race keep their pin (prefix stability); they need a new session.
+
+`mini-agent-nvnkx.148/.172`: on macOS the worker source is `current_exe()` canonicalised once, so a
+launcher symlink validates the real file. A source that is itself a symlink, hard-linked
+(link count != 1), group/other writable, foreign-owned or not executable is still refused, and the
+reason names the failed property. Decision: hard-linked sources stay refused.
+
+`mini-agent-nvnkx.171`: when the working directory cannot hold the workspace sentinel the macOS
+preflight places it in its private matrix directory instead of failing.
+
+`mini-agent-nvnkx.113`: with `js-read-roots` and `js-read-unrestricted` both absent the read policy
+defaults to the bound workspace (`["."]` relative to the workspace root) once the workspace binding is
+attached. Reads remain typed brokered effects under an invocation grant and the `js/read_file`
+permission key; writes stay default-deny; `js-read-roots = []` is the explicit opt-out.
+
+`mini-agent-nvnkx.173`: idle worker shutdown is cleanup. It uses a 1 s deadline, forces the tree
+teardown on any fault, logs a warning, and a completed run keeps its own exit code.

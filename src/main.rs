@@ -260,19 +260,30 @@ async fn run(cli: cli::Cli) -> anyhow::Result<()> {
     #[cfg(feature = "js")]
     {
         let shutdown = extras::js::supervisor::JsWorkerSupervisor::shutdown_shared().await;
-        match (result, shutdown) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Ok(()), Err(error)) => Err(anyhow::anyhow!(
-                "failed to shut down JavaScript worker: {error}"
-            )),
-            (Err(error), Ok(())) => Err(error),
-            (Err(error), Err(shutdown)) => {
-                Err(error.context(format!("JavaScript worker cleanup also failed: {shutdown}")))
-            }
-        }
+        combine_run_and_js_shutdown(result, shutdown)
     }
     #[cfg(not(feature = "js"))]
     result
+}
+
+/// Worker shutdown is cleanup: a completed run keeps its result and exit code even
+/// when the idle worker cannot be retired cleanly (mini-agent-nvnkx.173).
+#[cfg(feature = "js")]
+fn combine_run_and_js_shutdown<E: std::fmt::Display>(
+    result: anyhow::Result<()>,
+    shutdown: Result<(), E>,
+) -> anyhow::Result<()> {
+    match (result, shutdown) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(error)) => {
+            tracing::warn!(%error, "JavaScript worker shutdown failed after a completed run");
+            Ok(())
+        }
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(shutdown)) => {
+            Err(error.context(format!("JavaScript worker cleanup also failed: {shutdown}")))
+        }
+    }
 }
 
 /// A command that does one thing and exits instead of starting a session.
@@ -502,6 +513,11 @@ async fn run_one_shot(
                 "true color",
                 "not negotiated; environment hints are not capability proof",
             );
+            let checks = startup::heap_future(|| {
+                diagnostics::live::run_all(cli, &cfg, app_paths, workspace.clone())
+            })
+            .await;
+            diagnostics::live::render_into(&mut report, &checks);
             std::io::stdout()
                 .lock()
                 .write_all(report.render().as_bytes())?;
@@ -510,6 +526,11 @@ async fn run_one_shot(
                 broken.is_empty(),
                 "doctor found {} configuration problem(s) that prevent a layer from loading (exit 1)",
                 broken.len()
+            );
+            let (failed, _, _) = diagnostics::live::summary(&checks);
+            anyhow::ensure!(
+                failed == 0,
+                "doctor: {failed} required check(s) failed (see the Live checks section)"
             );
             Ok(())
         }
@@ -1202,6 +1223,15 @@ mod one_shot_tests {
             one_shot_command(&cli(&["--print-config"])).unwrap().needs(),
             Needs::ConfigNotices
         );
+    }
+
+    #[cfg(feature = "js")]
+    #[test]
+    fn a_failed_idle_worker_shutdown_does_not_fail_a_completed_run() {
+        assert!(combine_run_and_js_shutdown(Ok(()), Err("worker died")).is_ok());
+        assert!(combine_run_and_js_shutdown(Ok(()), Ok::<(), &str>(())).is_ok());
+        let failed = combine_run_and_js_shutdown(Err(anyhow::anyhow!("run")), Err("worker died"));
+        assert!(format!("{:#}", failed.unwrap_err()).contains("cleanup also failed"));
     }
 
     /// Stages are ordered by how much startup has happened, so a command is

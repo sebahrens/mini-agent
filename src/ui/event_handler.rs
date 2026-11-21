@@ -25,6 +25,14 @@ pub async fn ensure_agent(
     ui: &mut UiContext<'_>,
     reasoning_enabled: bool,
 ) {
+    // A turn is about to run: let the process's worker probe finish so this
+    // agent is never built (or kept) with the pending placeholder. The idle
+    // prebuild does not come through here and never waits (nvnkx.169).
+    #[cfg(feature = "js")]
+    crate::startup::heap_future(|| {
+        crate::provider::settle_js_probe(ui.cli, ui.cfg, ui.session.native_js_context().omitted())
+    })
+    .await;
     #[cfg(feature = "js")]
     if agent.as_ref().is_some_and(|captured| {
         captured.js_readiness_changed() && ui.session.native_history_snapshot().is_none()

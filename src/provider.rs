@@ -3114,6 +3114,13 @@ pub(crate) struct NativeJsContext {
     retained: bool,
 }
 
+impl NativeJsContext {
+    /// True when the saved native prefix was bound without JavaScript.
+    pub(crate) fn omitted(&self) -> bool {
+        self.omitted
+    }
+}
+
 impl NativeHostCompatibility {
     pub(crate) fn js_context(&self) -> NativeJsContext {
         NativeJsContext {
@@ -6483,6 +6490,45 @@ async fn build_openai_agent(
     }
 }
 
+/// Wait (bounded by the preflight's own timeout) for this process's full
+/// worker verification before a turn-owning caller builds its agent.
+///
+/// Headless `-p`/`--loop`, a TUI turn about to run and every ACP prompt turn
+/// call this first, so the single build they make sees the completed result
+/// instead of the pending placeholder (mini-agent-nvnkx.147/.167/.168/.169).
+/// The idle TUI prebuild and `build_agent_in_workspace` itself never wait.
+/// Fail-closed is unchanged: only a completed `Available` result registers
+/// the tool. The scoped waiter shares the process-wide result, so it can
+/// neither cancel nor poison the startup owner's initializer.
+pub(crate) async fn settle_js_probe(cli: &Cli, cfg: &Config, context_omitted: bool) {
+    #[cfg(feature = "js")]
+    {
+        if context_omitted || !cli.tool_is_eligible(cfg, "js") {
+            return;
+        }
+        settle_probe_snapshot(crate::sandbox::worker::known_containment_status, || async {
+            let owned = crate::sandbox::worker::StartupWorkerProbe::start().await;
+            let _ = owned.retire().await;
+        })
+        .await;
+    }
+    #[cfg(not(feature = "js"))]
+    let _ = (cli, cfg, context_omitted);
+}
+
+/// Returns the settled result, awaiting `wait` only while none is known.
+#[cfg(feature = "js")]
+async fn settle_probe_snapshot<Fut: std::future::Future<Output = ()>>(
+    known: impl Fn() -> Option<crate::sandbox::worker::WorkerContainmentStatus>,
+    wait: impl FnOnce() -> Fut,
+) -> Option<crate::sandbox::worker::WorkerContainmentStatus> {
+    if let Some(status) = known() {
+        return Some(status);
+    }
+    wait().await;
+    known()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn build_agent_in_workspace(
     model: AnyModel,
@@ -6511,17 +6557,10 @@ pub async fn build_agent_in_workspace(
     #[cfg(feature = "js")]
     let completed_probe = {
         let completed = crate::sandbox::worker::known_containment_status();
-        if native_js_context.retained
-            && !native_js_context.omitted
-            && completed.is_none()
-            && cli.tool_is_eligible(cfg, "js")
-        {
+        if native_js_context.retained && !native_js_context.omitted {
             // A prior native prefix may already advertise JS. Wait for this
             // process's unchanged full proof rather than replacing its tools.
-            // The startup owner still retains/joins the original probe; this
-            // scoped waiter cannot cancel or poison its OnceLock initializer.
-            let owned = crate::sandbox::worker::StartupWorkerProbe::start().await;
-            let _ = owned.retire().await;
+            settle_js_probe(cli, cfg, native_js_context.omitted).await;
             crate::sandbox::worker::known_containment_status()
         } else {
             completed
@@ -7018,7 +7057,7 @@ pub struct JsRuntimeReport {
 /// Placeholder used before any agent build has performed the worker probe.
 /// It is an unknown state, not a containment refusal.
 pub(crate) const JS_RUNTIME_PROBE_PENDING_REASON: &str =
-    "JavaScript containment verification is pending until a session builds its agent";
+    "JavaScript containment verification has not finished yet; it settles before the first turn";
 
 impl JsRuntimeReport {
     /// The report to show before any agent build has recorded one. A compiled-in

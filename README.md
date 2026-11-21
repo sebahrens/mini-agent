@@ -184,13 +184,12 @@ model.
 
 ### Getting the `js` tool used
 
-Two things decide whether the model reaches for `js` on everyday work. First, brokered JS reads are
-default-deny: set `js-read-roots = ["."]` (read-only, workspace) in `config.toml`, otherwise every
-`read_file` in a script fails with `no js-read-roots configured`. Second, the model needs routing
-guidance: a persona prompt needs a
-"Built-in tool routing" section that sends cross-file questions (per-file counts, "which X has no
-Y", cross-file references, JSON parsing) to a single `js` call and keeps single lookups on
-`read`/`grep`. Several mini-agent processes can use `js` at the same time; each takes its own
+Routing guidance is built in: whenever the `js` tool is present the harness appends instructions that
+send cross-file questions (per-file counts, "which X has no Y", cross-file references, JSON parsing) to
+a single `js` call and keep single lookups on `read`/`grep`. A persona prompt may refine that routing
+but does not need to supply it. Brokered JS reads default to the bound workspace (read-only); writes
+stay default-deny. Set `js-read-roots = []` to opt out of reads, or list other roots to widen them.
+Several mini-agent processes can use `js` at the same time; each takes its own
 effect-audit slot (see [platform paths](docs/specs/platform-paths.md)).
 
 ## An agent-curated library of JavaScript tools

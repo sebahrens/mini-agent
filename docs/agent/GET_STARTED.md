@@ -724,7 +724,7 @@ heap, a 512 KiB JavaScript stack, a 64 KiB result, 256 effects, 1 MiB per file r
 console records capped at 8 KiB each and 256 KiB total. Fetch request bodies are POST-only and
 capped at 256 KiB; fetch responses and each spawn output stream are capped at 1 MiB. Use `read` or
 `grep` for direct lookup and the shell for repository toolchains; use `js` to combine bounded reads
-with parsing or aggregation in one call. Return strings, primitives, or accessor-free plain JSON
+with parsing or aggregation in one call. Reads in a script default to the bound workspace (read-only, like the `read` and `grep` tools); `js-read-roots = []` turns them off, other roots widen them, and writes stay denied until `js-write-roots` is set. Return strings, primitives, or accessor-free plain JSON
 objects/arrays. For Date, Map, Set, class instances, accessors, sparse arrays, or objects containing
 `undefined` or non-finite numbers, return `JSON.stringify(value)` (or another explicit string) so
 result conversion stays predictable and does not implicitly execute object hooks.
@@ -735,11 +735,11 @@ omitted), credential source, provider/model/context and pricing source, cached
 sandbox/worker/integration status, application paths and terminal metadata.
 `--doctor` works with missing or invalid configuration and requires no API key;
 it creates no default config, repairs no permissions, makes no network request,
-and runs no sandbox or worker preflight. Invalid configuration is reported by
+and makes no provider call. The one-shot `mini-agent --doctor` (not `/doctor`) does run bounded live checks: the sandbox preflight, git and python3 inside the sandbox, the JavaScript worker preflight, a symlinked-launch warning, credential presence and price resolution. It prints a summary line and exits non-zero when a required check (credential, or the sandbox when enabled) fails. Invalid configuration is reported by
 error class without parser excerpts. `/doctor` also works during an agent turn
 without queuing input, warming a model cache, or saving session history.
 
-Fresh CLI status is explicitly unprobed. The TUI shows recorded manager state,
+Fresh `/doctor` status (and the captured-state sections of the CLI report) is explicitly unprobed. The TUI shows recorded manager state,
 including cached LSP failures, rather than making liveness requests. CLI disk
 sizes include only up to 128 immediate entries per directory, so nested files
 or unreadable entries make them partial; the TUI does not scan disk. When LSP

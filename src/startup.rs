@@ -3378,6 +3378,16 @@ impl Startup {
                 )
                 .await?;
             }
+            // The single headless build must see the finished worker probe
+            // (mini-agent-nvnkx.147/.167); nothing interactive is waiting.
+            heap_future(|| {
+                provider::settle_js_probe(
+                    &self.cli,
+                    &self.cfg,
+                    self.session.native_js_context().omitted(),
+                )
+            })
+            .await;
             // Boxed: building an agent pulls in every provider's setup, and this
             // future is inlined into the startup frame otherwise.
             let agent = heap_future(|| {
@@ -3970,6 +3980,14 @@ impl Startup {
             validate_tool_allowlist_after_mcp(&self.cli, &self.cfg, self.workspace.root(), manager)
                 .await?;
         }
+        heap_future(|| {
+            provider::settle_js_probe(
+                &self.cli,
+                &self.cfg,
+                self.session.native_js_context().omitted(),
+            )
+        })
+        .await;
         let agent = provider::build_agent_in_workspace(
             model_completion,
             &self.cli,
