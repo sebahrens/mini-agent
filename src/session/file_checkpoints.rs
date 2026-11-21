@@ -476,7 +476,7 @@ impl FileCheckpoints {
             )
         };
         let external = if state.data.external.range(index..).next().is_some() {
-            "; shell or git commands also ran in this range and their changes are not restorable"
+            "; shell or git commands also ran in this range and any file changes they made are not restorable"
         } else {
             ""
         };

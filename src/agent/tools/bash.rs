@@ -507,6 +507,8 @@ impl Tool for ShellTool {
     }
 
     async fn call(&self, args: BashArgs) -> Result<String, ToolError> {
+        // Shell effects are not file-checkpointed: flag the turn for /rewind.
+        crate::session::file_checkpoints::external_mutation();
         self.execute(args)
             .await
             .map(|(text, _)| self.with_job_notices(text))
@@ -517,6 +519,7 @@ impl Tool for ShellTool {
         args: BashArgs,
         _extensions: &rig::tool::ToolCallExtensions,
     ) -> Result<rig::tool::ToolReturn<String>, ToolError> {
+        crate::session::file_checkpoints::external_mutation();
         self.execute(args).await.map(|(text, metadata)| {
             let result = rig::tool::ToolReturn::success(self.with_job_notices(text));
             match metadata {

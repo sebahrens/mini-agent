@@ -56,6 +56,16 @@ pub struct PermissionConfig {
     pub git_tag: Option<ToolPerm>,
     #[serde(rename = "git/restore")]
     pub git_restore: Option<ToolPerm>,
+    #[serde(rename = "git/merge")]
+    pub git_merge: Option<ToolPerm>,
+    #[serde(rename = "git/cherry_pick")]
+    pub git_cherry_pick: Option<ToolPerm>,
+    #[serde(rename = "git/revert")]
+    pub git_revert: Option<ToolPerm>,
+    #[serde(rename = "git/reset")]
+    pub git_reset: Option<ToolPerm>,
+    #[serde(rename = "git/branch_delete")]
+    pub git_branch_delete: Option<ToolPerm>,
     #[serde(rename = "js/fetch", alias = "fetch")]
     pub js_fetch: Option<ToolPerm>,
     pub web_fetch: Option<ToolPerm>,
@@ -116,6 +126,11 @@ pub(crate) fn is_configurable_tool_name(tool: &str) -> bool {
             | "git/stash"
             | "git/tag"
             | "git/restore"
+            | "git/merge"
+            | "git/cherry_pick"
+            | "git/revert"
+            | "git/reset"
+            | "git/branch_delete"
             | "js/fetch"
             | "web_fetch"
             | "web_search"
