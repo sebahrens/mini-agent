@@ -1503,8 +1503,12 @@ impl OpenRouterPricingRefresh {
     ) -> Option<anyhow::Result<OpenRouterPricingMap>> {
         if let Some(handle) = self.handle.as_mut()
             && !handle.is_finished()
+            // A handle that completed inside the wait has been consumed;
+            // polling it again panics ("JoinHandle polled after completion").
+            && let Ok(joined) = tokio::time::timeout(wait, &mut *handle).await
         {
-            let _ = tokio::time::timeout(wait, &mut *handle).await;
+            self.handle = None;
+            return joined.ok();
         }
         self.finish_without_wait().await
     }
