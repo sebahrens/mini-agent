@@ -4277,6 +4277,20 @@ mod tests {
             crate::headless_control::Reply::Deny(_)
         ));
     }
+    /// `pipe(2)` fds are inheritable; a child spawned by a concurrent test
+    /// would keep the write end open and defeat the EOF assertions.
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    fn cloexec_pair(fds: [i32; 2]) {
+        for fd in fds {
+            // SAFETY: fd is a live descriptor just created by pipe(2).
+            assert_eq!(
+                unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+                0
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     #[allow(unsafe_code)]
@@ -4284,6 +4298,7 @@ mod tests {
         let mut fds = [0i32; 2];
         // SAFETY: fds is a valid two-element array for pipe(2).
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        cloexec_pair(fds);
         let (r, w) = (fds[0], fds[1]);
         assert!(!super::fd_readable_within(r, 50), "open silent pipe");
         // SAFETY: w is a live descriptor owned by this test.
@@ -4306,6 +4321,7 @@ mod tests {
         let mut fds = [0i32; 2];
         // SAFETY: fds is a valid two-element array for pipe(2).
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        cloexec_pair(fds);
         let (r, w) = (fds[0], fds[1]);
         let writer = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(400));
