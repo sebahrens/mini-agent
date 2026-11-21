@@ -1454,9 +1454,10 @@ impl Tool for TaskTool {
     type Output = String;
 
     fn description(&self) -> String {
-        "Delegate work via a fresh-context subagent, read-only by default. A trusted mode: write persona may implement edits only when [subagents] allow_write = true; the parent permissions and sandbox still apply. \
-Use for any cross-file question: where is X used, how does Y work, \
-find/list/count all X across the codebase, what calls Z, audit Q. \
+        concat!("Delegate work via a fresh-context subagent, read-only by default. A trusted mode: write persona may implement edits only when [subagents] allow_write = true; the parent permissions and sandbox still apply. ",
+crate::agent::prompt::task_delegation_rule!(),
+" Typical delegated work: where is X used, how does Y work, \
+find/list/count all X across an unknown part of the codebase, what calls Z, audit Q. \
 The subagent uses its configured subset of read, grep, file discovery, \
 directory listing, and read-only memory tools, then returns a verified summary. \
 Send exactly one of `prompts` (plain investigation strings) or `briefs` \
@@ -1465,9 +1466,7 @@ Multiple prompts or briefs use bounded parallelism and return in input order. \
 A failed child does not cancel its siblings. If the deadline or an aggregate \
 resource limit is reached, remaining work is cancelled, in-flight children \
 return their narration so far marked [partial: cancelled ...], and explicit \
-partial statuses are returned. \
-Skip only for known-location work: reading one identified file, \
-editing in a known location, grepping for a literal you will act on immediately."
+partial statuses are returned.")
             .to_string()
     }
 
@@ -2136,7 +2135,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                 )
                 .map_err(|error| ToolError::Msg(error.to_string()))?;
             return Ok(format!(
-                "Background task started: {id}. Use task_result with this id, or /tasks to list or cancel it."
+                "Background task started: {id}. Its result is announced automatically when it settles; do not poll. In headless -p runs call task_result with this id once and a long wait_secs (for example 300). Use /tasks to list or cancel it."
             ));
         }
         let report =

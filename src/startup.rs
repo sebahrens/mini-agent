@@ -126,7 +126,7 @@ pub(crate) fn diagnostic_startup_pricing(
     ) {
         return (
             quick.resolved_prices(),
-            if cli.quick_model.is_some() {
+            if cli.quick_model_name(cfg).is_some() {
                 "selected quick-model configuration"
             } else {
                 "selected config alias"
@@ -146,7 +146,7 @@ fn resolve_startup_cache_prices(
 ) -> crate::pricing::CachePrices {
     let raw_env_override =
         provider == "openrouter" && openrouter_model.is_some_and(|model| !model.is_empty());
-    let selected = cli.quick_model.as_deref().or_else(|| {
+    let selected = cli.quick_model_name(cfg).or_else(|| {
         (cli.model.is_none() && !raw_env_override)
             .then_some(cfg.model.as_deref())
             .flatten()
@@ -404,6 +404,12 @@ impl ResumeProviderDecision {
     }
 }
 
+fn target_provider_is_saved(cli: &Cli, saved: &ProviderIdentity) -> bool {
+    cli.resume_provider
+        .as_deref()
+        .is_none_or(|p| p == saved.provider.as_str())
+}
+
 fn resolve_resume_provider_decision(
     cli: &Cli,
     cfg: &Config,
@@ -418,7 +424,31 @@ fn resolve_resume_provider_decision(
         .as_deref()
         .map(CompactString::new)
         .unwrap_or_else(|| saved.provider.clone());
-    let target_model = if let Some(model) = cli.resume_model.as_deref() {
+    // An explicit command-line --provider/--model (not the MINI_AGENT_*
+    // environment defaults) is honoured on resume instead of being silently
+    // ignored (mini-agent-nvnkx.212).
+    if cli.provider_on_command_line
+        && cli.resume_provider.is_none()
+        && cli
+            .provider
+            .as_deref()
+            .is_some_and(|p| p != saved.provider.as_str())
+    {
+        anyhow::bail!(
+            "--provider {} differs from the resumed session's provider '{}'; resuming with another provider sends saved context to it, so pass --resume-provider {} to confirm",
+            cli.provider.as_deref().unwrap_or_default(),
+            saved.provider,
+            cli.provider.as_deref().unwrap_or_default()
+        );
+    }
+    let cli_model = if cli.model_on_command_line {
+        cli.model.as_deref()
+    } else {
+        None
+    };
+    let target_model = if let Some(model) = cli.resume_model.as_deref().or_else(|| {
+        cli_model.filter(|_| cli.resume_provider.is_none() || target_provider_is_saved(cli, &saved))
+    }) {
         CompactString::new(model)
     } else if target_provider != saved.provider {
         let (model, _) = provider::default_model_for_provider(&target_provider, cfg)
@@ -3546,6 +3576,13 @@ impl Startup {
                 )
                 .await,
             );
+            // A run killed by a timeout or SIGKILL must leave a session that
+            // `--continue` can load: write the prompt to disk before the first
+            // request. The in-memory session is restored, because the finished
+            // turn adds its own rows and rewrites the file (mini-agent-nvnkx.269).
+            if !self.cli.no_session && self.native_headless.is_none() {
+                self.checkpoint_headless_prompt(&msg);
+            }
             // Construct the child in heap_future's short frame; Box::pin alone
             // still reserves its temporary in this parent poll frame. The
             // regression consumer uses the unchanged 1 MiB default stack.
@@ -3628,6 +3665,21 @@ impl Startup {
         }
         eprintln!("{}", cause.notice());
         Ok(())
+    }
+
+    /// Save the session with `prompt` appended as its open user turn, then
+    /// drop the row again from memory. Best effort: a failed checkpoint must
+    /// not stop the run.
+    fn checkpoint_headless_prompt(&mut self, prompt: &str) {
+        let start = self.session.messages.len();
+        self.session.add_message(session::MessageRole::User, prompt);
+        let saved = session::storage::save_session_recovering(&mut self.session, |notice| {
+            eprintln!("warning: {notice}")
+        });
+        self.session.truncate_to(start);
+        if let Err(error) = saved {
+            tracing::warn!(%error, "headless prompt checkpoint was not saved");
+        }
     }
 
     async fn prepare_print_schema(
@@ -3877,6 +3929,11 @@ impl Startup {
                     .is_some()
             }) {
                 crate::print::HeadlessStopReason::Budget
+            } else if failure
+                .as_ref()
+                .is_some_and(|error| error.is::<crate::cli::MaxTurnsStopped>())
+            {
+                crate::print::HeadlessStopReason::MaxTurns
             } else if failure.is_some() || persistence_failure.is_some() {
                 crate::print::HeadlessStopReason::Failed
             } else if schema_outcome.exhausted {
@@ -8793,6 +8850,37 @@ mod tests {
                 model: "claude-saved".into(),
             })
         );
+    }
+
+    // mini-agent-nvnkx.212: a command-line --model/--provider is honoured on
+    // resume; the MINI_AGENT_* environment defaults are not.
+    #[test]
+    fn session_resume_honours_command_line_model_and_provider() {
+        let session = Session::new("anthropic", "claude-saved", 200_000, "");
+        let cfg = Config::default();
+        let explicit = Cli {
+            model: Some("claude-new".to_string()),
+            model_on_command_line: true,
+            ..Cli::default()
+        };
+        let decision = resolve_resume_provider_decision(&explicit, &cfg, &session).unwrap();
+        assert_eq!(decision.target().model, "claude-new");
+        assert!(decision.override_identities().is_some());
+        let from_env = Cli {
+            model: Some("claude-new".to_string()),
+            ..Cli::default()
+        };
+        let decision = resolve_resume_provider_decision(&from_env, &cfg, &session).unwrap();
+        assert_eq!(decision.target().model, "claude-saved");
+        let other_provider = Cli {
+            provider: Some("openai".to_string()),
+            provider_on_command_line: true,
+            ..Cli::default()
+        };
+        let error = resolve_resume_provider_decision(&other_provider, &cfg, &session)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--resume-provider openai"), "{error}");
     }
 
     #[test]

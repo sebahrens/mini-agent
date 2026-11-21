@@ -3841,6 +3841,10 @@ fn streamed_permission_denials_are_correlated_errors_without_mutation() {
     );
     assert!(!root.0.join("effect.txt").exists());
     assert_eq!(rows.last().unwrap()["tool_calls"]["total"], 1);
+    // mini-agent-nvnkx.100: the refusal is listed in the result.
+    let denials = &rows.last().unwrap()["permission_denials"];
+    assert_eq!(denials.as_array().map(Vec::len), Some(1), "{denials}");
+    assert_eq!(denials[0]["tool_name"], "write");
 }
 
 #[test]

@@ -6125,10 +6125,9 @@ where
     let (prior_turns, prior_tokens) = budget_carry.as_ref().map_or((0, 0), |c| c.spent());
     let max_turns = max_turns_total.saturating_sub(prior_turns);
     if max_turns == 0 {
-        return HeadlessTurn::failed_before_start(anyhow::anyhow!(
-            "Agent exhausted its maximum turn budget ({max_turns_total}) before completing.{}",
-            crate::cli::MAX_AGENT_TURNS_HINT
-        ));
+        return HeadlessTurn::failed_before_start(anyhow::Error::new(crate::cli::MaxTurnsStopped(
+            max_turns_exhausted_message(max_turns_total),
+        )));
     }
     if let Some(message) = carried_token_budget_exhausted(prior_tokens, turn_token_budget) {
         return HeadlessTurn::failed_before_start(anyhow::anyhow!(message));
@@ -6517,7 +6516,9 @@ where
                         park_question!();
                         match turn.on_stream_error(&e, retry_config, true) {
                             turn_state::StreamErrorAction::MaxTurns => {
-                                fail_turn!(max_turns_exhausted_message(max_turns_total));
+                                fail_turn!(anyhow::Error::new(crate::cli::MaxTurnsStopped(
+                                    max_turns_exhausted_message(max_turns_total)
+                                )));
                             }
                             turn_state::StreamErrorAction::Truncated {
                                 notice,

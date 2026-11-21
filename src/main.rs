@@ -227,11 +227,12 @@ fn finish_runtime_error(
     if !headless {
         return Err(error);
     }
+    let code = print::exit_code_for_failure(&error);
     report_runtime_headless_error(runtime, format!("Error: {error:?}\n"));
     if print::headless_force_stopped() {
         print::exit_force_stopped();
     }
-    Ok(ExitCode::from(1))
+    Ok(ExitCode::from(code))
 }
 
 fn normal_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
@@ -858,8 +859,29 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
     if run_argument_one_shot(one_shot, Needs::Nothing)? {
         return Ok(());
     }
-    let config_overrides = config::layers::parse_cli_overrides(&cli.config_overrides)
+    #[allow(unused_mut)]
+    let mut config_overrides = config::layers::parse_cli_overrides(&cli.config_overrides)
         .map_err(|message| anyhow::Error::new(startup::HeadlessUsageError(message)))?;
+    // `--mcp-config` definitions ride the same override path as `--config`
+    // (mini-agent-nvnkx.142).
+    #[allow(unused_mut, unused_variables)]
+    let mut mcp_config_names = std::collections::BTreeSet::<String>::new();
+    if !cli.mcp_config.is_empty() {
+        #[cfg(feature = "mcp")]
+        {
+            let (overrides, names) =
+                extras::mcp::cli_config::overrides_from_args(&cli.mcp_config, &|name| {
+                    std::env::var(name).ok()
+                })
+                .map_err(|message| anyhow::Error::new(startup::HeadlessUsageError(message)))?;
+            config_overrides.extend(overrides);
+            mcp_config_names = names;
+        }
+        #[cfg(not(feature = "mcp"))]
+        return Err(anyhow::Error::new(startup::HeadlessUsageError(
+            "--mcp-config needs a build with the `mcp` feature".into(),
+        )));
+    }
     if let Err(error) = output_schema::prepare(&mut cli) {
         print::emit_headless_preflight_failure(&cli, std::path::Path::new("."), &error.to_string())
             .await?;
@@ -984,6 +1006,10 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
 
     let loaded_warning_count = cfg.load_warnings.len();
     config::layers::apply_overrides(&mut cfg, &config_overrides).map_err(anyhow::Error::msg)?;
+    #[cfg(feature = "mcp")]
+    if cli.strict_mcp_config {
+        extras::mcp::cli_config::retain_only(&mut cfg, &mcp_config_names);
+    }
     sandbox::set_command_timeout_secs(
         cfg.command_timeout_secs
             .unwrap_or(sandbox::DEFAULT_COMMAND_TIMEOUT_SECS),

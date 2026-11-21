@@ -401,7 +401,9 @@ when startup fails before a turn (missing credential, unknown session): `is_erro
 | Exit | Meaning |
 | ---- | ------- |
 | `0` | Success (a met goal is also `0`). |
-| `1` | Runtime failure: provider, tool, budget or schema failure. |
+| `1` | Runtime failure: provider, tool or schema failure. |
+| `3` | The `--max-agent-turns` cap was exhausted (`stop_reason: "max_turns"`); continue the session or raise the cap. |
+| `4` | The spend budget was exhausted (`stop_reason: "budget"`). |
 | `2` | Usage error: bad or conflicting flags, empty prompt, unknown quick model or tool name, malformed `--config`, unknown session. Retrying cannot succeed. |
 | `20`-`24` | Goal outcome: impossible, blocked, awaiting an answer (`22`), paused, budget limited (see [COMMANDS.md](COMMANDS.md#goal-feature-gated)). |
 | `22` | Also: `-p` is waiting for an answer to a question; send a new user message. |
@@ -474,7 +476,7 @@ every Claude Code field.
 `mini-agent -p --input-format stream-json --output stream-json` keeps one session open for
 programmatic multi-turn control. Each stdin line is one user message, in Claude Code's shape
 `{"type":"user","message":{"role":"user","content":"..."}}` (content may also be an array of
-`{"type":"text","text":"..."}` blocks, plus `{"type":"image","source":{"type":"base64","media_type":"image/png","data":"..."}}` or `{"type":"image","source":{"type":"path","path":"shot.png"}}` image blocks that need accompanying text and obey the `-i` limits) or the flat `{"type":"user","content":"..."}`. An argument
+`{"type":"text","text":"..."}` blocks, plus `{"type":"image","source":{"type":"base64","media_type":"image/png","data":"..."}}` or `{"type":"image","source":{"type":"path","path":"shot.png"}}` image blocks that obey the `-i` limits (an image-only message is accepted; document blocks and `url` sources are not yet supported)) or the flat `{"type":"user","content":"..."}`. An argument
 prompt, if given, runs first. Every turn emits its normal records (`system`, `assistant_text`,
 `tool_call`, `tool_result`, `usage`, …) and its own final `result`; the next line is read only
 after that `result`. Malformed, non-`user`, unsupported-block, invalid or too-large image, or oversized lines produce an

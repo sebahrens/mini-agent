@@ -54,6 +54,9 @@ impl TurnStop {
     pub(super) fn into_error(self) -> anyhow::Error {
         match self {
             Self::NonTerminalEof(error) => anyhow::Error::new(error),
+            Self::TurnBudget { .. } => {
+                anyhow::Error::new(crate::cli::MaxTurnsStopped(self.message()))
+            }
             other => anyhow::anyhow!(other.message()),
         }
     }

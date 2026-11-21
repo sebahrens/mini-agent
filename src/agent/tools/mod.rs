@@ -1242,6 +1242,34 @@ pub struct ListDirArgs {
 /// `handle_ask_inner` (failing closed with the non-interactive diagnostic when
 /// no prompt channel exists).
 async fn settle_check(
+    checked: (CheckResult, crate::permission::ask::AskDiagnostic),
+    ask_tx: &Option<AskSender>,
+    perm: &PermCheck,
+    tool: &str,
+    input: &str,
+    suggested_pattern: Option<String>,
+    additional_allow_patterns: Vec<String>,
+) -> Result<Option<String>, ToolError> {
+    let settled = settle_check_inner(
+        checked,
+        ask_tx,
+        perm,
+        tool,
+        input,
+        suggested_pattern,
+        additional_allow_patterns,
+    )
+    .await;
+    // The headless result lists refused calls (mini-agent-nvnkx.100).
+    if let Err(ToolError::Msg(message)) = &settled
+        && message.starts_with("Permission denied")
+    {
+        crate::print::record_permission_denial(tool, input, message);
+    }
+    settled
+}
+
+async fn settle_check_inner(
     (result, diagnostic): (CheckResult, crate::permission::ask::AskDiagnostic),
     ask_tx: &Option<AskSender>,
     perm: &PermCheck,

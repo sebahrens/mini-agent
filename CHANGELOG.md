@@ -31,6 +31,11 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Added: edit/write diff previews carry a line-number gutter (old line for deletions, new line otherwise); stored previews without numbers render as before (mini-agent-nvnkx.257, intra-line highlighting not yet).
 - Added: replacing a file keeps its group and extended attributes (ACLs on Linux) and tells the model when other hard links keep the previous content (mini-agent-nvnkx.193).
 - Added: a failed format-after-edit command reports its exit status or signal to the model, logs and notifies the user with a stderr tail once per extension, and is skipped after three consecutive failures (mini-agent-nvnkx.246).
+- `--mcp-config <FILE|JSON>` (repeatable) and `--strict-mcp-config` give one run its own MCP servers: definitions use the `.mcp.json` shape, are operator-supplied (no project trust prompt, `CLI --config` origin, managed policy still applies), and strict mode drops every other server (mini-agent-nvnkx.142).
+- `--permission-mode <standard|restrictive|readonly|guarded|yolo>` and the Claude Code spellings `--max-turns`, `--allowed-tools`/`--allowedTools` and `--disallowed-tools`/`--disallowedTools` (mini-agent-nvnkx.103).
+- Headless results (native and `--stream-json-schema claude`) list refused tool calls in `permission_denials` (tool, input, reason; bounded, with `permission_denials_truncated`), replacing the always-empty list (mini-agent-nvnkx.100).
+- An exhausted `--max-agent-turns` reports stop reason `max_turns` and exits 3, and an exhausted budget exits 4, classified from typed errors rather than message text (mini-agent-nvnkx.101).
+- stream-json input accepts an image-only user message (mini-agent-nvnkx.248).
 
 ### Fixed
 
@@ -184,6 +189,14 @@ Notable changes to mini-agent are documented in this file. The format follows
 - ACP pending-call previews are bounded per session (one busy session cannot evict another's edit preview) and tool-result failure status is joined to stored rows in arrival order, so identical outputs with one failure replay with the right status (mini-agent-nvnkx.284).
 - ACP `/tasks` rows and completion notices show each task's label, persona and child count, and `/tasks result|cancel` accept an unambiguous id prefix (mini-agent-nvnkx.229).
 - The ACP `model` picker also lists baked catalogue models of providers with a usable credential (after the quick models, at most 128 entries; providers denied by the managed policy are left out) as `catalog:<provider>/<model>` (mini-agent-nvnkx.230).
+- `--model` and `MINI_AGENT_MODEL` resolve a `[quick_models]` name like config `model` does; `--model` with `--quick-model` on the command line is a usage error (mini-agent-nvnkx.351).
+- Headless `-p` runs write the session (with the prompt) before the first model request, so a run killed by a timeout leaves something `--continue` can load, and SIGHUP (and Windows ctrl-break/close) cancels the turn and saves it like SIGTERM (mini-agent-nvnkx.269, .58, .226).
+- A command-line `--model` applies to a resumed session (`--continue`/`--session`) as `--resume-model`, and a differing command-line `--provider` is refused with a pointer to `--resume-provider`, instead of both being ignored (mini-agent-nvnkx.212).
+- `--no-session` runs no longer offer `memory_write`/`memory_edit`, so an ephemeral run leaves no durable memory (mini-agent-nvnkx.153).
+- Headless `files_changed` no longer lists the sandbox's containment sentinel files (mini-agent-nvnkx.152).
+- Default headless stderr no longer carries the withheld-built-in-LSP warning or the ignored-`%%grant=` warning (now debug logs) (mini-agent-nvnkx.154).
+- `--accept-all` help states that it selects standard mode (shell and web still ask) (mini-agent-nvnkx.73).
+- The `task` tool description and the system prompt share one delegation rule (read known files directly; delegate unknown search spaces), and the background start message says the result is announced and to wait once with a long `wait_secs` (mini-agent-nvnkx.175).
 
 ### Added
 

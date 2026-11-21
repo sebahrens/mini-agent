@@ -928,16 +928,26 @@ pub struct Cli {
     #[arg(long = "name", help = "Name for the session")]
     pub name: Option<String>,
 
-    #[arg(long = "no-session", help = "Ephemeral mode, do not save")]
+    #[arg(
+        long = "no-session",
+        help = "Ephemeral mode: do not save the session, and do not offer the memory write/edit tools (memory read/search stay available)"
+    )]
     pub no_session: bool,
 
     #[arg(long = "provider", env = "MINI_AGENT_PROVIDER", help = "API provider")]
     pub provider: Option<String>,
 
-    #[arg(long = "model", env = "MINI_AGENT_MODEL", help = "Model name")]
+    #[arg(
+        long = "model",
+        env = "MINI_AGENT_MODEL",
+        help = "Model name, or a [quick_models] name (selects that entry's provider and model)"
+    )]
     pub model: Option<String>,
 
-    #[arg(long = "quick-model", help = "Use a named quick model from config")]
+    #[arg(
+        long = "quick-model",
+        help = "Use a named quick model from config (--model also accepts a quick-model name)"
+    )]
     pub quick_model: Option<String>,
 
     #[arg(
@@ -962,6 +972,7 @@ pub struct Cli {
 
     #[arg(
         long = "max-agent-turns",
+        visible_alias = "max-turns",
         help = "Maximum model round trips per prompt (default 1000)"
     )]
     pub max_agent_turns: Option<usize>,
@@ -979,6 +990,8 @@ pub struct Cli {
 
     #[arg(
         long,
+        alias = "allowed-tools",
+        alias = "allowedTools",
         value_name = "TOOL:PATTERN",
         help = "Add an invocation-only allow rule (repeatable); shell scripts match exactly, other tools use globs"
     )]
@@ -986,6 +999,8 @@ pub struct Cli {
 
     #[arg(
         long,
+        alias = "disallowed-tools",
+        alias = "disallowedTools",
         value_name = "TOOL:PATTERN",
         help = "Add an invocation-only deny rule (repeatable); deny rules win in every permission mode"
     )]
@@ -997,6 +1012,19 @@ pub struct Cli {
         help = "Add an invocation-only simple shell argv-prefix allow (repeatable); rejects quoting, operators and expansion"
     )]
     pub allow_prefix: Vec<crate::permission::cli_rules::CliPermissionRule>,
+
+    #[arg(
+        long = "mcp-config",
+        value_name = "FILE|JSON",
+        help = "Add MCP servers for this run from a .mcp.json-style file or inline JSON (repeatable); operator-supplied, no project trust prompt"
+    )]
+    pub mcp_config: Vec<String>,
+
+    #[arg(
+        long = "strict-mcp-config",
+        help = "Use only the MCP servers given with --mcp-config, ignoring global, project and built-in servers"
+    )]
+    pub strict_mcp_config: bool,
 
     #[arg(long = "no-tools", help = "Disable all tools")]
     pub no_tools: bool,
@@ -1041,6 +1069,22 @@ pub struct Cli {
     )]
     pub hooks_test_input: Option<String>,
 
+    /// Set by [`Cli::try_parse_command_line_from`]: `--model` / `--provider`
+    /// came from argv rather than the `MINI_AGENT_*` environment defaults.
+    #[arg(skip)]
+    pub model_on_command_line: bool,
+    #[arg(skip)]
+    pub provider_on_command_line: bool,
+
+    #[arg(
+        long = "permission-mode",
+        value_name = "MODE",
+        value_parser = ["standard", "restrictive", "readonly", "guarded", "yolo"],
+        conflicts_with_all = ["restrictive", "read_only", "guarded", "accept_all", "yolo", "dangerously_skip_permissions"],
+        help = "Select the permission mode by name (same names as /mode); alternative to --restrictive/--read-only/--guarded/--accept-all/--yolo"
+    )]
+    pub permission_mode: Option<String>,
+
     #[arg(long = "restrictive", short = 'R', help = "Ask for all operations")]
     pub restrictive: bool,
 
@@ -1052,7 +1096,7 @@ pub struct Cli {
 
     #[arg(
         long = "accept-all",
-        help = "Auto-accept all operations within the working directory"
+        help = "Select standard mode: file reads and edits in the working directory are accepted; shell, web and other operations still ask (refused with -p). See --allow, --yolo"
     )]
     pub accept_all: bool,
 
@@ -1509,7 +1553,21 @@ impl Cli {
                 .mut_arg("provider", |arg| arg.env(None::<&str>))
                 .mut_arg("model", |arg| arg.env(None::<&str>));
         }
-        let cli = Self::from_arg_matches(&command.try_get_matches_from(args)?)?;
+        let matches = command.try_get_matches_from(args)?;
+        let mut cli = Self::from_arg_matches(&matches)?;
+        let on_command_line =
+            |id: &str| matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine);
+        cli.model_on_command_line = on_command_line("model");
+        cli.provider_on_command_line = on_command_line("provider");
+        // The MINI_AGENT_MODEL environment default never conflicts; only an
+        // explicit --model does (mini-agent-nvnkx.351).
+        if cli.model_on_command_line && cli.quick_model.is_some() {
+            return Err(Self::command().error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "the argument '--model' cannot be used with '--quick-model'",
+            ));
+        }
+        cli.apply_permission_mode();
         cli.validate_combinations()?;
         Ok(cli)
     }
@@ -1639,12 +1697,43 @@ impl Cli {
         }
     }
 
+    /// Fold `--permission-mode <name>` into the boolean mode flags the rest of
+    /// startup reads (mini-agent-nvnkx.103).
+    fn apply_permission_mode(&mut self) {
+        match self.permission_mode.as_deref() {
+            Some("standard") => self.accept_all = true,
+            Some("restrictive") => self.restrictive = true,
+            Some("readonly") => self.read_only = true,
+            Some("guarded") => self.guarded = true,
+            Some("yolo") => self.yolo = true,
+            _ => {}
+        }
+    }
+
     pub fn resolve_quick_model<'a>(
         &self,
         cfg: &'a config::Config,
     ) -> Option<&'a config::QuickModelConfig> {
-        let name = self.quick_model.as_deref()?;
+        let name = self.quick_model_name(cfg)?;
         cfg.quick_models.as_ref().and_then(|m| m.get(name))
+    }
+
+    /// The `[quick_models]` name selected on the command line: `--quick-model`,
+    /// or `--model` when it names an alias and no `--provider` was given (an
+    /// alias wins over a raw id of the same spelling, as `model = "..."` in
+    /// config does; mini-agent-nvnkx.351).
+    pub(crate) fn quick_model_name<'a>(&'a self, cfg: &config::Config) -> Option<&'a str> {
+        if let Some(name) = self.quick_model.as_deref() {
+            return Some(name);
+        }
+        let name = self.model.as_deref()?;
+        if self.provider.is_some() {
+            return None;
+        }
+        cfg.quick_models
+            .as_ref()
+            .is_some_and(|m| m.contains_key(name))
+            .then_some(name)
     }
 
     /// Reject a `--quick-model` name that is not in `[quick_models]` instead of
@@ -2717,6 +2806,87 @@ model = "claude-sonnet-test"
 input_token_cost = 0.0
 output_token_cost = 0.0
 "#;
+
+    // mini-agent-nvnkx.351: --model resolves a [quick_models] name like config.
+    #[test]
+    fn model_flag_resolves_a_quick_model_name() {
+        let cfg: config::Config = toml::from_str(DEFAULT_LIKE_CONFIG).unwrap();
+        let cli = Cli::try_parse_command_line_from(["mini-agent", "--model", "sonnet"]).unwrap();
+        assert_eq!(
+            cli.resolve_provider_and_model(&cfg),
+            (
+                compact_str::CompactString::new("anthropic"),
+                compact_str::CompactString::new("claude-sonnet-test")
+            )
+        );
+        // A raw model id is untouched, and --provider disables the lookup.
+        let raw = Cli::try_parse_command_line_from(["mini-agent", "--model", "x/y"]).unwrap();
+        assert!(raw.resolve_quick_model(&cfg).is_none());
+        let pinned = Cli::try_parse_command_line_from([
+            "mini-agent",
+            "--provider",
+            "openrouter",
+            "--model",
+            "sonnet",
+        ])
+        .unwrap();
+        assert!(pinned.resolve_quick_model(&cfg).is_none());
+        let both = Cli::try_parse_command_line_from([
+            "mini-agent",
+            "--model",
+            "x",
+            "--quick-model",
+            "sonnet",
+        ]);
+        assert!(both.is_err());
+    }
+
+    // mini-agent-nvnkx.103: Claude Code spellings and --permission-mode.
+    #[test]
+    fn claude_code_flag_aliases_and_permission_mode() {
+        let cli = Cli::try_parse_command_line_from([
+            "mini-agent",
+            "--max-turns",
+            "7",
+            "--allowedTools",
+            "read:*",
+            "--disallowed-tools",
+            "shell:rm*",
+            "--permission-mode",
+            "readonly",
+        ])
+        .unwrap();
+        assert_eq!(cli.max_agent_turns, Some(7));
+        assert_eq!(cli.allow.len(), 1);
+        assert_eq!(cli.deny.len(), 1);
+        assert!(cli.read_only);
+        for (mode, check) in [
+            ("standard", (|c: &Cli| c.accept_all) as fn(&Cli) -> bool),
+            ("restrictive", |c| c.restrictive),
+            ("guarded", |c| c.guarded),
+            ("yolo", |c| c.yolo),
+        ] {
+            let cli = Cli::try_parse_command_line_from(["mini-agent", "--permission-mode", mode])
+                .unwrap();
+            assert!(check(&cli), "{mode}");
+        }
+        assert!(
+            Cli::try_parse_command_line_from([
+                "mini-agent",
+                "--permission-mode",
+                "readonly",
+                "--yolo"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn accept_all_help_describes_standard_mode() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("Select standard mode"), "{help}");
+        assert!(!help.contains("Auto-accept all operations within"));
+    }
 
     // mini-agent-rgdf5: an unknown --quick-model is a usage error, never a
     // silent fall-through to the default provider/model.
@@ -3835,6 +4005,20 @@ pub fn resolve_response_max_tokens(explicit: Option<u64>, provider: &str, model:
 pub(crate) const DEFAULT_MAX_AGENT_TURNS: usize = 1000;
 
 /// Suffix of the turn-budget exhaustion error: what was kept and how to go on.
+/// The typed marker for an exhausted `--max-agent-turns` budget, so headless
+/// classifies the stop from the error rather than from its wording
+/// (mini-agent-nvnkx.101).
+#[derive(Debug)]
+pub(crate) struct MaxTurnsStopped(pub String);
+
+impl std::fmt::Display for MaxTurnsStopped {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for MaxTurnsStopped {}
+
 pub(crate) const MAX_AGENT_TURNS_HINT: &str = " Completed tool work and messages are kept in the session; ask the agent to continue (or rerun with --continue), or raise max_agent_turns / --max-agent-turns.";
 
 #[cfg(test)]

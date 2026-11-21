@@ -341,7 +341,9 @@ fn strip_grant_directive(name: &str, content: String) -> String {
     let Some(grant) = directives.grant else {
         return content;
     };
-    tracing::warn!(
+    // Debug, not warn: a stale on-disk copy of a built-in prompt carries the
+    // directive on every run and the notice is not actionable (nvnkx.154).
+    tracing::debug!(
         prompt = name,
         grant,
         "ignoring %%grant= directive: only built-in prompts may request a scoped grant"

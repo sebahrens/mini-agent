@@ -17,6 +17,9 @@ pub(crate) enum ImageSource {
     Path(PathBuf),
 }
 
+/// The prompt a message that carries only images runs with.
+pub(crate) const IMAGE_ONLY_PROMPT: &str = "(The user sent the attached image(s) without text.)";
+
 /// One parsed `--input-format stream-json` user line.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct StreamUserInput {
@@ -63,11 +66,13 @@ pub(crate) fn parse_stream_user_input(line: &str) -> Result<StreamUserInput, Str
         _ => return Err("content must be a string or an array of content blocks".into()),
     }
     if input.text.trim().is_empty() {
-        return Err(if input.images.is_empty() {
-            "empty user message".into()
-        } else {
-            "an image message needs accompanying text".into()
-        });
+        if input.images.is_empty() {
+            return Err("empty user message".into());
+        }
+        // An image-only message is valid input (as in Claude Code); the turn
+        // still needs a prompt string, so name what was sent
+        // (mini-agent-nvnkx.248).
+        input.text = IMAGE_ONLY_PROMPT.into();
     }
     Ok(input)
 }
@@ -292,7 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn image_blocks_parse_in_both_source_shapes_but_need_text() {
+    fn image_blocks_parse_in_both_source_shapes_and_image_only_is_accepted() {
         let parsed = parse_stream_user_input(
             r#"{"type":"user","message":{"content":[
                 {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}},
@@ -312,11 +317,9 @@ mod tests {
             ]
         );
         let image_only = r#"{"type":"user","content":[{"type":"image","source":{"type":"path","path":"a.png"}}]}"#;
-        assert!(
-            parse_stream_user_input(image_only)
-                .unwrap_err()
-                .contains("needs accompanying text")
-        );
+        let parsed = parse_stream_user_input(image_only).unwrap();
+        assert_eq!(parsed.text, IMAGE_ONLY_PROMPT);
+        assert_eq!(parsed.images.len(), 1);
     }
 
     #[cfg(not(feature = "multimodal"))]
