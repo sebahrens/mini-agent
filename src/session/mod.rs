@@ -2994,22 +2994,16 @@ impl Session {
         {
             return title.to_string();
         }
-        let first = self
-            .first_prompt
-            .as_deref()
-            .or_else(|| {
-                self.messages
-                    .iter()
-                    .find(|m| m.is_user_authored() && !m.content.trim().is_empty())
-                    .map(|m| m.content.as_str())
-            });
+        let first = self.first_prompt.as_deref().or_else(|| {
+            self.messages
+                .iter()
+                .find(|m| m.is_user_authored() && !m.content.trim().is_empty())
+                .map(|m| m.content.as_str())
+        });
         let Some(first) = first else {
             return String::new();
         };
-        let line = first
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
+        let line = first.split_whitespace().collect::<Vec<_>>().join(" ");
         if line.chars().count() <= SESSION_TITLE_CHARS {
             return line;
         }
@@ -3202,7 +3196,11 @@ impl Session {
                         .take(SESSION_TITLE_CHARS)
                         .collect::<Vec<_>>()
                         .join(" ");
-                    CompactString::new(line.chars().take(SESSION_TITLE_CHARS * 2).collect::<String>())
+                    CompactString::new(
+                        line.chars()
+                            .take(SESSION_TITLE_CHARS * 2)
+                            .collect::<String>(),
+                    )
                 });
         }
 

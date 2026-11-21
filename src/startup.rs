@@ -906,6 +906,20 @@ async fn settle_housekeeping(handle: Option<std::thread::JoinHandle<()>>) {
     }
 }
 
+/// Dispatch `PreCompact` unless this compaction already did.
+#[cfg(feature = "hooks")]
+async fn dispatch_pre_compact_once(
+    sent: &std::sync::atomic::AtomicBool,
+    instructions: Option<&str>,
+) {
+    if !sent.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        crate::startup::heap_future(|| {
+            crate::extras::hooks::dispatch_pre_compact(true, instructions)
+        })
+        .await;
+    }
+}
+
 /// Compact the headless session; `force` is context relief (see
 /// [`headless_compaction_plan_with`]). Returns the summarizer usage (already
 /// charged to the session) and whether any history was compacted.
@@ -948,10 +962,16 @@ async fn compact_headless_session(
     let request_observer = observed.clone();
     // Same model on a native prompt-cache route: fork the conversation's own
     // request instead of re-serializing it (mini-agent-o2nut).
+    // `PreCompact` fires once, before the first summarizer request of either
+    // path, so a successful fork still announces itself (mini-agent-sskdu.239).
+    #[cfg(feature = "hooks")]
+    let pre_compact_sent = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let fork: Option<HeadlessFork<'_>> = agent
         .filter(|agent| compaction_model.is_none() && agent.supports_cache_fork())
         .map(|agent| {
             let observed = observed.clone();
+            #[cfg(feature = "hooks")]
+            let pre_compact_sent = pre_compact_sent.clone();
             Box::new(
                 move |history, messages_included, input_token_budget, response_token_budget| {
                     let (input_token_budget, response_token_budget) =
@@ -960,16 +980,24 @@ async fn compact_headless_session(
                             input_token_budget,
                             response_token_budget,
                         );
-                    Box::pin(agent.compress_forked(
-                        history,
-                        messages_included,
-                        instructions,
-                        input_token_budget,
-                        response_token_budget,
-                        &cfg.retry,
-                        observed,
-                        cfg.resolve_compaction_timeout(),
-                    )) as futures::future::BoxFuture<'_, _>
+                    #[cfg(feature = "hooks")]
+                    let pre_compact_sent = pre_compact_sent.clone();
+                    Box::pin(async move {
+                        #[cfg(feature = "hooks")]
+                        dispatch_pre_compact_once(&pre_compact_sent, instructions).await;
+                        agent
+                            .compress_forked(
+                                history,
+                                messages_included,
+                                instructions,
+                                input_token_budget,
+                                response_token_budget,
+                                &cfg.retry,
+                                observed,
+                                cfg.resolve_compaction_timeout(),
+                            )
+                            .await
+                    }) as futures::future::BoxFuture<'_, _>
                 },
             ) as HeadlessFork<'_>
         });
@@ -983,10 +1011,7 @@ async fn compact_headless_session(
         fork,
         |model, messages, previous_summary, input_token_budget, response_token_budget| async move {
             #[cfg(feature = "hooks")]
-            crate::startup::heap_future(|| {
-                crate::extras::hooks::dispatch_pre_compact(true, instructions)
-            })
-            .await;
+            dispatch_pre_compact_once(&pre_compact_sent, instructions).await;
             let model = compaction_model.unwrap_or(model);
             let (input_token_budget, response_token_budget) =
                 crate::config::CompactionBudgetCap::apply(
@@ -1027,7 +1052,10 @@ async fn compact_headless_session(
     #[cfg(feature = "hooks")]
     if let Some(compacted) = &compacted {
         crate::startup::heap_future(|| {
-            crate::extras::hooks::dispatch_post_compact(true, Some(&compacted.summary))
+            crate::extras::hooks::dispatch_post_compact(
+                true,
+                session.compacted_context().0.or(Some(&compacted.summary)),
+            )
         })
         .await;
         let notices =
@@ -1045,6 +1073,18 @@ async fn compact_headless_session(
         );
     }
     let happened = compacted.is_some();
+    if let Some(compacted) = &compacted {
+        // The auto-compacting line announced the work; say what it did so a
+        // script log shows the run was compacted (mini-agent-sskdu.243).
+        eprintln!(
+            "compacted {} messages into a summary (freed ~{} tokens net)",
+            compacted.first_kept_index,
+            session
+                .compactions
+                .last()
+                .map_or(0, |compaction| compaction.token_savings),
+        );
+    }
     Ok((
         compacted
             .map(|compacted| compacted.usage)

@@ -820,7 +820,10 @@ fn recorded_token_savings_are_net_of_the_inserted_summary() {
     session.add_message(MessageRole::User, "tiny");
     session.add_message(MessageRole::Assistant, "tiny");
     session.add_message(MessageRole::User, "keep");
-    let removed: u64 = session.messages[..2].iter().map(|m| m.estimated_tokens).sum();
+    let removed: u64 = session.messages[..2]
+        .iter()
+        .map(|m| m.estimated_tokens)
+        .sum();
     session.compress("s".repeat(4000), 2, removed);
     assert_eq!(session.compactions[0].token_savings, 0);
     let mut session = Session::new("openai", "gpt-4", 128_000, "");
@@ -829,7 +832,10 @@ fn recorded_token_savings_are_net_of_the_inserted_summary() {
     let removed = session.messages[0].estimated_tokens;
     session.compress("short".into(), 1, removed);
     let summary_tokens = session.messages[0].estimated_tokens;
-    assert_eq!(session.compactions[0].token_savings, removed - summary_tokens);
+    assert_eq!(
+        session.compactions[0].token_savings,
+        removed - summary_tokens
+    );
 }
 
 #[test]
@@ -877,5 +883,8 @@ fn previous_summary_for_the_next_compaction_is_the_prose_only() {
     session.compress("MODEL PROSE".into(), 4, 0);
     let stored = session.compactions.last().unwrap().summary.to_string();
     assert!(stored.len() > "MODEL PROSE".len(), "{stored}");
-    assert_eq!(session.previous_summary_prose().as_deref(), Some("MODEL PROSE"));
+    assert_eq!(
+        session.previous_summary_prose().as_deref(),
+        Some("MODEL PROSE")
+    );
 }

@@ -563,7 +563,20 @@ impl SessionHistory {
                 self.fall_back_after_summary_failure();
                 return Some(usage);
             };
-            self.session.compress(output.summary, completed_cut, 0);
+            // Honour the summarizer's window-scaled byte budget instead of the
+            // fixed 16 KiB clamp, and record the tokens removed
+            // (mini-agent-sskdu.230, partial).
+            let removed: u64 = self.session.messages[..completed_cut]
+                .iter()
+                .map(|message| message.estimated_tokens)
+                .sum();
+            self.session.compress_with_budget_restoring(
+                output.summary,
+                completed_cut,
+                removed,
+                output.summary_byte_budget,
+                0,
+            );
             self.manual_compact = false;
             needs = self.needs_compaction();
         }
@@ -5439,6 +5452,8 @@ async fn execute_prompt(
     let mut compaction_usage = crate::event::UsageDelta::default();
     if needs_compaction {
         #[cfg(feature = "hooks")]
+        let compactions_before = history.session.compaction_count();
+        #[cfg(feature = "hooks")]
         crate::startup::heap_future(|| crate::extras::hooks::dispatch_pre_compact(true, None))
             .await;
         let quick_models = crate::config::quick_models_map(&state.cfg);
@@ -5538,8 +5553,11 @@ async fn execute_prompt(
                 "retained historical image evidence exceeds the ACP history limit; start a fresh session or provide fewer/smaller images".into(),
             ));
         }
+        // `PostCompact` and `SessionStart(compact)` fire only when a
+        // `Compaction` record was committed, not when nothing was cut or the
+        // summarizer failed (mini-agent-sskdu.239).
         #[cfg(feature = "hooks")]
-        {
+        if history.session.compaction_count() > compactions_before {
             let summary = history.session.compacted_context().0.map(str::to_owned);
             crate::startup::heap_future(|| {
                 crate::extras::hooks::dispatch_post_compact(true, summary.as_deref())

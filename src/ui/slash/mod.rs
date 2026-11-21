@@ -47,7 +47,9 @@ use crate::permission::ask::AskSender;
 use crate::permission::checker::PermCheck;
 use crate::provider::{AnyAgent, AnyClient};
 use crate::sandbox::Sandbox;
-use crate::session::{MessageRole, Session};
+#[cfg(test)]
+use crate::session::MessageRole;
+use crate::session::Session;
 use crate::ui::events::render_session;
 use crate::ui::input::InputEditor;
 use crate::ui::renderer::Renderer;
@@ -781,7 +783,11 @@ async fn handle_compress_unfloored(
     // Report what was freed, not the size of what was removed: the summary,
     // restored file windows and todo/goal blocks were added back
     // (mini-agent-sskdu.242).
-    let summary_tokens = ui.session.messages.first().map_or(0, |m| m.estimated_tokens);
+    let summary_tokens = ui
+        .session
+        .messages
+        .first()
+        .map_or(0, |m| m.estimated_tokens);
     renderer.write_line(
         &format!(
             "compressed {} messages (freed ~{} tokens net; removed ~{}, new summary ~{})",
