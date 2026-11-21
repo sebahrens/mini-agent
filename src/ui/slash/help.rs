@@ -218,6 +218,10 @@ pub(crate) fn help_lines(
     }
     emit(
         false,
+        "  /find <text>           search the transcript (alt+s); n/N step, Esc goes back",
+    );
+    emit(
+        false,
         "  /effort [level|default] session effort; low/medium/high/xhigh/max",
     );
     emit(
@@ -534,6 +538,7 @@ const ACTION_HELP: &[(&str, &str)] = &[
     ("cycle_mode", "cycle the security mode"),
     ("cycle_reasoning", "cycle reasoning: collapsed/full/off"),
     ("history_search", "search input history"),
+    ("transcript_search", "find text in the transcript"),
     ("page_up", "scroll chat history up a page"),
     ("page_down", "scroll chat history down a page"),
     ("transcript_top", "jump to the top of chat"),

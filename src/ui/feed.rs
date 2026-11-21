@@ -178,6 +178,19 @@ pub struct Block {
     fold: Option<Box<Fold>>,
 }
 
+/// One transcript search match (see [`Feed::search`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SearchHit {
+    /// Laid-out row holding the match.
+    pub line: usize,
+    pub block: usize,
+    /// Byte range of the match inside that row's text.
+    pub range: std::ops::Range<usize>,
+    /// The match is only in the hidden form of a collapsed fold: unfold the
+    /// block, then search again to find its row.
+    pub hidden: bool,
+}
+
 /// The hidden form of a foldable block.
 #[derive(Clone, Debug)]
 struct Fold {
@@ -933,6 +946,69 @@ impl Feed {
             .into_iter()
             .find(|&(_, start, len)| line >= start && line < start + len)
             .map(|(index, start, _)| (index, line - start))
+    }
+
+    /// Every row of the transcript at `width` that contains `query`, plus the
+    /// collapsed folds (tool results) that hold it only in their hidden form.
+    /// Matching is case-insensitive for ASCII unless `query` has an uppercase
+    /// letter (smart case); a match split across a wrapped row boundary is not
+    /// found.
+    pub(crate) fn search(&self, width: usize, query: &str) -> Vec<SearchHit> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let sensitive = query.chars().any(char::is_uppercase);
+        let needle = if sensitive {
+            query.to_string()
+        } else {
+            query.to_ascii_lowercase()
+        };
+        let find = |text: &str| -> Option<std::ops::Range<usize>> {
+            let start = if sensitive {
+                text.find(&needle)?
+            } else {
+                text.to_ascii_lowercase().find(&needle)?
+            };
+            Some(start..start + needle.len())
+        };
+        let lines = self.lines(width);
+        let mut hits = Vec::new();
+        for (block, start, len) in self.block_row_spans(width) {
+            let mut found = false;
+            for line in start..start + len {
+                let Some(entry) = lines.get(line) else {
+                    continue;
+                };
+                if let Some(range) = find(&entry.text) {
+                    hits.push(SearchHit {
+                        line,
+                        block,
+                        range,
+                        hidden: false,
+                    });
+                    found = true;
+                }
+            }
+            if !found
+                && let Some(fold) = self.blocks[block].fold.as_ref()
+                && !fold.expanded
+                && find(&fold.alternate).is_some()
+            {
+                hits.push(SearchHit {
+                    line: start,
+                    block,
+                    range: 0..0,
+                    hidden: true,
+                });
+            }
+        }
+        hits
+    }
+
+    /// Unfold the foldable block `index` (a search hit hidden in its folded
+    /// form). Returns whether it changed.
+    pub(crate) fn expand_block(&mut self, index: usize) -> bool {
+        self.set_fold_at(index, Some(true)) == Some(true)
     }
 
     /// First row and row count of block `index` at `width`.

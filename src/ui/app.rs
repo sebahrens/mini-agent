@@ -5,6 +5,8 @@ mod job_wake_app;
 #[cfg(feature = "mcp")]
 #[path = "mcp_admin_app.rs"]
 mod mcp_admin_app;
+#[path = "search_app.rs"]
+mod search_app;
 #[cfg(feature = "export")]
 #[path = "share_app.rs"]
 mod share_app;
@@ -803,6 +805,8 @@ pub(crate) struct App<'a> {
     /// Event-loop scheduling: running tick, Git polling, batched painting.
     loop_state: EventLoopState,
     rewind_escape: Option<std::time::Instant>,
+    /// The open transcript search (`transcript_search` key, `/find`).
+    transcript_search: Option<search_app::TranscriptSearch>,
     git_status_tx: mpsc::Sender<GitStatusRefresh>,
     git_status_rx: mpsc::Receiver<GitStatusRefresh>,
     git_status_in_flight: bool,
@@ -1464,6 +1468,7 @@ impl<'a> App<'a> {
             input,
             loop_state: EventLoopState::default(),
             rewind_escape: None,
+            transcript_search: None,
             git_status_tx,
             git_status_rx,
             git_status_in_flight: false,
@@ -3361,6 +3366,16 @@ impl<'a> App<'a> {
         key: KeyEvent,
         action: Option<KeyAction>,
     ) -> anyhow::Result<()> {
+        if self.transcript_search.is_some() {
+            return self.handle_search_key(key);
+        }
+        if action == Some(KeyAction::TranscriptSearch)
+            && self.permission_prompt.is_none()
+            && self.question_prompt.is_none()
+            && !self.input.picker.as_ref().is_some_and(Picker::active)
+        {
+            return self.start_transcript_search(None);
+        }
         let eligible_escape = key.code == KeyCode::Esc
             && key.modifiers.is_empty()
             && key.kind == crossterm::event::KeyEventKind::Press
@@ -6163,6 +6178,9 @@ impl<'a> App<'a> {
         if share_app::is_confirm(text) {
             return self.start_share();
         }
+        if search_app::is_find_command(text) {
+            return self.run_find_command(text);
+        }
 
         // Commands that hand the tty to a synchronous stdin consumer must not
         // race the crossterm event thread for keystrokes (same pattern as
@@ -8255,6 +8273,10 @@ mod input_reader_lifecycle_tests;
 #[cfg(test)]
 #[path = "app_tests/interrupt_rewind_tests.rs"]
 mod interrupt_rewind_tests;
+
+#[cfg(test)]
+#[path = "app_tests/transcript_search_tests.rs"]
+mod transcript_search_tests;
 
 #[cfg(all(test, unix))]
 mod explicit_shell_persistence_tests {

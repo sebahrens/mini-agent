@@ -27,6 +27,7 @@ pub(super) fn fixture_app(ui: UiContext<'_>) -> App<'_> {
         input,
         loop_state: EventLoopState::default(),
         rewind_escape: None,
+        transcript_search: None,
         git_status_tx,
         git_status_rx,
         git_status_in_flight: false,
