@@ -13,7 +13,7 @@
 //!
 //! Owning specification: `docs/specs/goals.md` (Verification tiers).
 
-use super::gate::{CheckOutcome, VerifyRequest};
+use super::gate::{CheckFailureKind, CheckOutcome, VerifyRequest};
 use super::{Goal, VerificationKind};
 use crate::sandbox::{CommandLimits, Sandbox};
 
@@ -35,9 +35,9 @@ fn limits(cfg: &crate::config::Config) -> CommandLimits {
 /// it: a completion claim made in a read-only round is usually claiming credit
 /// for edits that landed earlier, and those still have to hold up.
 ///
-/// Gated with its only consumer: every other surface can be interrupted while
-/// a check runs and uses [`run_with_interrupt`].
-#[cfg(any(feature = "acp", test))]
+/// Test-only: every surface can be interrupted while a check runs and uses
+/// [`run_with_interrupt`].
+#[cfg(test)]
 pub async fn run(
     goal: &Goal,
     request: &VerifyRequest,
@@ -91,6 +91,7 @@ where
         if let Err(error) = crate::spend::run::admit_current_effect().await {
             return (
                 Some(CheckOutcome {
+                    failure_kind: CheckFailureKind::Unavailable,
                     all_passed: false,
                     failure_tail: Some(error.to_string()),
                     verified,
@@ -140,6 +141,7 @@ where
             );
             return (
                 Some(CheckOutcome {
+                    failure_kind: failure_kind(&result),
                     all_passed: false,
                     failure_tail: Some(format!(
                         "{} failed:\n{}",
@@ -158,12 +160,24 @@ where
 
     (
         Some(CheckOutcome {
+            failure_kind: CheckFailureKind::Exit,
             all_passed: true,
             failure_tail: None,
             verified,
         }),
         false,
     )
+}
+
+/// Whether a failed check is a finding about the work or about the check: a
+/// timeout or a command that never started says nothing about the objective
+/// and no edit fixes it.
+fn failure_kind(result: &crate::extras::validation::ValidationResult) -> CheckFailureKind {
+    use crate::extras::validation::ValidationStatus;
+    match result.status {
+        ValidationStatus::TimedOut | ValidationStatus::Failed => CheckFailureKind::Unavailable,
+        _ => CheckFailureKind::Exit,
+    }
 }
 
 /// A check cut short by an interrupt: never evidence the objective was met,
@@ -174,6 +188,7 @@ fn interrupted_outcome(
     verified: Vec<VerificationKind>,
 ) -> CheckOutcome {
     CheckOutcome {
+        failure_kind: CheckFailureKind::Exit,
         all_passed: false,
         failure_tail: Some(format!(
             "{} interrupted:\n{}",
@@ -255,6 +270,37 @@ mod tests {
         );
         assert_eq!(outcome.verified, vec![VerificationKind::Checks]);
         assert!(outcome.failure_tail.is_none());
+    }
+
+    /// A check that exits non-zero is a finding about the work; one that times
+    /// out says nothing about it and is classed apart (mini-agent-sskdu.219).
+    #[tokio::test]
+    async fn a_timeout_is_unavailable_and_a_non_zero_exit_is_not() {
+        use crate::extras::goal::gate::CheckFailureKind;
+        let failing = run(
+            &goal_with(&["false"]),
+            &request(false, true),
+            &sandbox(),
+            &Default::default(),
+        )
+        .await
+        .expect("checks ran");
+        assert_eq!(failing.failure_kind, CheckFailureKind::Exit);
+
+        let cfg = crate::config::Config {
+            verify_timeout_secs: Some(1),
+            ..Default::default()
+        };
+        let slow = run(
+            &goal_with(&["sleep 30"]),
+            &request(false, true),
+            &sandbox(),
+            &cfg,
+        )
+        .await
+        .expect("checks ran");
+        assert!(!slow.all_passed);
+        assert_eq!(slow.failure_kind, CheckFailureKind::Unavailable);
     }
 
     #[tokio::test]

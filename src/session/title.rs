@@ -22,6 +22,11 @@ pub const TITLE_FIRST_REQUEST_TOKENS: u64 = TITLE_MAX_TOKENS + 960;
 /// Output cap of the single retry after an empty (reasoning-consumed) reply.
 pub const TITLE_RETRY_REQUEST_TOKENS: u64 = 4096;
 
+/// Failed title attempts after which a session is left untitled. Each attempt
+/// can bill up to two requests, and the request is built from the first
+/// exchange, so a later attempt rarely succeeds where earlier ones did not.
+pub const MAX_TITLE_ATTEMPTS: u8 = 2;
+
 /// What to ask, and which model to ask it of.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TitleRequest {
@@ -38,7 +43,10 @@ pub struct TitleRequest {
 /// generation is enabled. Unset uses the session model; `off` opts out,
 /// and a known quick-model alias selects an explicit override.
 pub fn title_request(cfg: &crate::config::Config, session: &Session) -> Option<TitleRequest> {
-    if !session.name.trim().is_empty() || session.generated_title.is_some() {
+    if !session.name.trim().is_empty()
+        || session.generated_title.is_some()
+        || session.title_attempts >= MAX_TITLE_ATTEMPTS
+    {
         return None;
     }
     let (provider, model) = match cfg.session_title_model.as_deref().map(str::trim) {
@@ -311,6 +319,8 @@ pub(crate) struct TitleOutcome {
     usage: crate::event::UsageDelta,
     interrupted: bool,
     title: Option<CompactString>,
+    /// Whether a model request was actually made (not skipped for budget).
+    ran: bool,
 }
 
 impl TitleJob {
@@ -372,6 +382,7 @@ impl TitleJob {
                 usage: Default::default(),
                 interrupted: false,
                 title: None,
+                ran: false,
             };
         }
         let ledger = UsageLedger::with_spend(spend.clone());
@@ -411,6 +422,7 @@ impl TitleJob {
             usage,
             interrupted,
             title,
+            ran: true,
         }
     }
 }
@@ -430,6 +442,7 @@ impl TitleOutcome {
             usage,
             interrupted: false,
             title: title.map(CompactString::new),
+            ran: true,
         }
     }
 
@@ -444,6 +457,9 @@ impl TitleOutcome {
         let applied = self
             .title
             .is_some_and(|title| apply(session, &self.request.session_id, title));
+        if !applied && self.ran && !self.interrupted && session.generated_title.is_none() {
+            session.title_attempts = session.title_attempts.saturating_add(1);
+        }
         (self.usage, self.interrupted, applied)
     }
 }
@@ -481,6 +497,29 @@ pub fn apply(session: &mut Session, session_id: &str, title: CompactString) -> b
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn failed_title_attempts_are_capped_and_survive_a_round_trip() {
+        let mut session = Session::new("openai", "gpt", 1000, "");
+        session.add_message(MessageRole::User, "hello");
+        session.add_message(MessageRole::Assistant, "hi there");
+        let cfg = cfg(None);
+        assert!(title_request(&cfg, &session).is_some());
+        session.title_attempts = MAX_TITLE_ATTEMPTS - 1;
+        assert!(title_request(&cfg, &session).is_some());
+        session.title_attempts = MAX_TITLE_ATTEMPTS;
+        assert!(title_request(&cfg, &session).is_none());
+        let json = serde_json::to_string(&session).unwrap();
+        let loaded: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.title_attempts, MAX_TITLE_ATTEMPTS);
+        assert!(title_request(&cfg, &loaded).is_none());
+        session.title_attempts = 0;
+        assert!(
+            !serde_json::to_string(&session)
+                .unwrap()
+                .contains("title_attempts")
+        );
+    }
+
     #[test]
     fn title_retry_requests_are_summed_not_max_merged() {
         let ledger = UsageLedger::default();

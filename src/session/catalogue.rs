@@ -109,6 +109,8 @@ struct IndexRecord {
     id: CompactString,
     name: String,
     generated_title: Option<String>,
+    #[serde(default)]
+    first_prompt: Option<String>,
     updated_at: CompactString,
     working_dir: CompactString,
     provider: CompactString,
@@ -137,6 +139,7 @@ impl IndexRecord {
             id: header.id.clone(),
             name: header.name.clone(),
             generated_title: header.generated_title.clone(),
+            first_prompt: header.first_prompt.clone(),
             updated_at: header.updated_at.clone(),
             working_dir: header.working_dir.clone(),
             provider: header.provider.clone(),
@@ -156,6 +159,7 @@ impl IndexRecord {
                 id: self.id,
                 name: self.name,
                 generated_title: self.generated_title,
+                first_prompt: self.first_prompt,
                 updated_at: self.updated_at,
                 working_dir: self.working_dir,
                 provider: self.provider,
@@ -204,6 +208,7 @@ fn messages<'de, D: Deserializer<'de>>(deserializer: D) -> Result<MessageSummary
                 if summary.first_user.is_empty()
                     && message.role == "user"
                     && !message.content.trim().is_empty()
+                    && !super::is_continuation_prompt(&message.content)
                 {
                     summary.first_user = short_text(&message.content);
                 }
@@ -221,6 +226,8 @@ struct Header {
     name: String,
     #[serde(default)]
     generated_title: Option<String>,
+    #[serde(default)]
+    first_prompt: Option<String>,
     #[serde(default)]
     updated_at: CompactString,
     #[serde(default)]
@@ -721,6 +728,13 @@ fn list_with_limits(
                 .as_deref()
                 .map(short_text)
                 .filter(|title| !title.is_empty())
+                .or_else(|| {
+                    header
+                        .first_prompt
+                        .as_deref()
+                        .map(short_text)
+                        .filter(|title| !title.is_empty())
+                })
                 .unwrap_or(header.messages.first_user)
         };
         catalogue.rows.push(SessionRow {

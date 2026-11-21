@@ -243,24 +243,48 @@ impl OutputSchema {
         )
     }
 
-    pub(crate) fn validate(&self, answer: &str) -> Result<Value, &'static str> {
+    pub(crate) fn validate(&self, answer: &str) -> Result<Value, String> {
         if answer.len() > MAX_ANSWER_BYTES {
-            return Err("answer exceeds the 256 KiB validation limit");
+            return Err("answer exceeds the 256 KiB validation limit".to_string());
         }
-        let value: Value =
-            serde_json::from_str(answer).map_err(|_| "answer is not exactly one JSON value")?;
+        let answer = strip_json_fence(answer);
+        let value: Value = serde_json::from_str(answer)
+            .map_err(|_| "answer is not exactly one JSON value".to_string())?;
         let mut nodes = 0;
         count_nodes(&value, 0, &mut nodes, MAX_ANSWER_NODES)
-            .map_err(|_| "answer exceeds structural validation limits")?;
+            .map_err(|_| "answer exceeds structural validation limits".to_string())?;
         if self.work.saturating_mul(nodes) > MAX_VALIDATION_WORK {
-            return Err("answer exceeds validation work limits");
+            return Err("answer exceeds validation work limits".to_string());
         }
         if !self.validator.is_valid(&value) {
-            return Err(
-                "JSON answer does not satisfy required fields, types, or constraints in the output schema",
-            );
+            return Err(self.violation_summary(&value));
         }
         Ok(value)
+    }
+
+    /// Bounded "instance path: keyword" hints for the first few violations.
+    /// Instance values are omitted so a repair prompt cannot grow with them.
+    fn violation_summary(&self, value: &Value) -> String {
+        const MAX_HINTS: usize = 5;
+        let hints: Vec<String> = self
+            .validator
+            .iter_errors(value)
+            .take(MAX_HINTS)
+            .map(|error| {
+                let path = error.instance_path().to_string();
+                let path = if path.is_empty() { "/" } else { path.as_str() };
+                match error.kind() {
+                    jsonschema::error::ValidationErrorKind::Required { property } => {
+                        format!("{path}: required property {property} is missing")
+                    }
+                    kind => format!("{path}: {}", kind.keyword()),
+                }
+            })
+            .collect();
+        format!(
+            "JSON answer does not satisfy the output schema ({})",
+            hints.join("; ")
+        )
     }
 
     pub(crate) fn repair_prompt(&self, answer: &str, error: &str) -> Option<String> {
@@ -322,6 +346,24 @@ pub(crate) struct SchemaOutcome {
     pub(crate) exhausted: bool,
 }
 
+/// Trims whitespace and one surrounding Markdown code fence, the most common
+/// deviation from "exactly one JSON value", so it needs no repair round.
+fn strip_json_fence(answer: &str) -> &str {
+    let trimmed = answer.trim();
+    let Some(rest) = trimmed.strip_prefix("```") else {
+        return trimmed;
+    };
+    let Some(body) = rest.strip_suffix("```") else {
+        return trimmed;
+    };
+    match body.split_once('\n') {
+        Some((info, inner)) if info.trim().chars().all(|c| c.is_ascii_alphanumeric()) => {
+            inner.trim()
+        }
+        _ => trimmed,
+    }
+}
+
 /// Persist each rejected answer before admitting its tool-free repair. A
 /// forced stop can therefore never erase effects from the original attempt.
 #[allow(clippy::too_many_arguments)]
@@ -380,7 +422,7 @@ pub(crate) async fn repair_rounds(
         if attempt == MAX_REPAIRS {
             break;
         }
-        let Some(repair_prompt) = schema.repair_prompt(&response, error) else {
+        let Some(repair_prompt) = schema.repair_prompt(&response, &error) else {
             break;
         };
         let normalized = cfg.normalize_usage(&session.provider, rounds.turn.usage.into());
@@ -438,7 +480,8 @@ pub(crate) async fn repair_rounds(
         #[cfg(not(feature = "hooks"))]
         let repaired = future.await;
         attempt_usage = repaired.usage;
-        prompt = repair_prompt;
+        // Persist a short host note, not the schema plus the escaped answer.
+        prompt = format!("JSON repair {}: {error}", attempt + 1);
         response = repaired.response;
         interactions = repaired.interactions;
         rounds.turn.usage = crate::event::UsageDelta::from(rounds.turn.usage)
@@ -547,6 +590,10 @@ mod tests {
         let schema = compile(serde_json::json!({"$defs":{"name":{"type":"string"}},"type":"object","properties":{"name":{"$ref":"#/$defs/name"}},"required":["name"]})).unwrap();
         assert!(schema.validate(r#"{"name":"yes"}"#).is_ok());
         assert!(schema.validate(r#"{"name":7}"#).is_err());
+        assert!(schema.validate("```json\n{\"name\":\"yes\"}\n```").is_ok());
+        let missing = compile(serde_json::json!({"type":"object","required":["id"]})).unwrap();
+        let error = missing.validate("{}").unwrap_err();
+        assert!(error.contains("\"id\""), "{error}");
         for reference in [
             "https://example.test/schema",
             "file:///private/key",

@@ -5,6 +5,9 @@ mod job_wake_app;
 #[cfg(feature = "mcp")]
 #[path = "mcp_admin_app.rs"]
 mod mcp_admin_app;
+#[cfg(feature = "export")]
+#[path = "share_app.rs"]
+mod share_app;
 
 use std::io;
 use std::ops::ControlFlow;
@@ -37,7 +40,7 @@ use crate::ui::renderer::{
     self as renderer_mod, ChainPrompt, ClipboardCopyOutcome, Renderer, SelectionPoint,
     copy_to_clipboard, read_from_clipboard,
 };
-use crate::ui::slash::{C_RESULT, apply_prompt_model, handle_compress};
+use crate::ui::slash::{C_RESULT, DeferredSlash, apply_prompt_model, handle_compress};
 use crate::ui::state::{
     AgentRunState, BtwStats, ChainState, PendingMainTurn, SlashState, UiContext,
 };
@@ -865,6 +868,32 @@ pub(crate) fn clipboard_shortcut(
         Some(ClipboardShortcut::Paste)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Links `App::open_link` was asked to open in tests (nothing is spawned).
+    static OPENED_LINKS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl App<'_> {
+    /// Open `url` in the browser without blocking the event loop.
+    fn open_link(&self, url: String) {
+        #[cfg(test)]
+        {
+            let _ = renderer_mod::open_url;
+            OPENED_LINKS.with(|opened| opened.borrow_mut().push(url));
+        }
+        #[cfg(not(test))]
+        {
+            let tx = self.user_tx.clone();
+            tokio::spawn(async move {
+                if let Err(error) = renderer_mod::open_url(&url).await {
+                    let _ = tx.send(UserEvent::LinkOpenFailed(error.to_string())).await;
+                }
+            });
+        }
     }
 }
 
@@ -1771,6 +1800,101 @@ mod startup_work_tests {
 mod reasoning_display_tests {
     use super::*;
     use crate::config::ReasoningDisplay;
+
+    #[tokio::test]
+    async fn a_url_opens_on_a_plain_click_release_and_never_on_a_drag() {
+        let root = crate::tests::OwnedTestDirectory::new("link-click-controls");
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            (
+                "MINI_AGENT_CONFIG_DIR",
+                Some(root.path().join("config").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_DATA_DIR",
+                Some(root.path().join("data").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_STATE_DIR",
+                Some(root.path().join("state").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_CACHE_DIR",
+                Some(root.path().join("cache").into_os_string()),
+            ),
+        ]);
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let cfg = crate::config::Config::default();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session =
+            crate::session::Session::new("openrouter", "unused-test-model", 128_000, "");
+        let client = crate::provider::create_client(
+            "openrouter",
+            Some("unused-test-key"),
+            cfg.custom_providers_map(),
+            cfg.api_keys.as_ref(),
+        )
+        .unwrap();
+        let ui = UiContext::new(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+            client,
+            None,
+            None,
+            crate::sandbox::Sandbox::new(false, "none"),
+            None,
+        );
+        let mut app = test_support::fixture_app(ui);
+        app.renderer.feed_mut().push_line(
+            crate::ui::feed::BlockStyle::Plain,
+            "see https://example.com/x ok",
+        );
+        let row = (0..app.renderer.visible_lines() as u16)
+            .find(|row| app.renderer.buffer_line_at_row(*row) == Some(0))
+            .unwrap();
+        let col = 8u16;
+        let opened = || OPENED_LINKS.with(|o| o.borrow().len());
+        let before = opened();
+        let _ = app
+            .handle_user_event(UserEvent::MouseDown { row, col })
+            .await
+            .unwrap();
+        assert_eq!(opened(), before, "button-down alone opens nothing");
+        let _ = app
+            .handle_user_event(UserEvent::MouseUp { row, col })
+            .await
+            .unwrap();
+        assert_eq!(opened(), before + 1);
+        // A drag across the URL selects and never opens.
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        let _ = app
+            .handle_user_event(UserEvent::MouseDown { row, col: 6 })
+            .await
+            .unwrap();
+        assert!(app.renderer.selection_active);
+        let _ = app
+            .handle_user_event(UserEvent::MouseDrag { row, col: 14 })
+            .await
+            .unwrap();
+        let _ = app
+            .handle_user_event(UserEvent::MouseUp { row, col: 14 })
+            .await
+            .unwrap();
+        assert_eq!(
+            opened(),
+            before + 1,
+            "a drag over a URL selects, never opens"
+        );
+        OPENED_LINKS.with(|o| assert_eq!(o.borrow().last().unwrap(), "https://example.com/x"));
+    }
 
     #[tokio::test]
     async fn actual_reasoning_controls_preserve_the_turn_and_persist_every_cycle() {
@@ -2752,6 +2876,16 @@ impl<'a> App<'a> {
                 .filter(|_| !self.git_status_in_flight);
             let cron_wakeup = self.cron_wakeup();
             let cron_repaint = self.cron_label_repaint_at();
+            let retry_repaint = self
+                .run
+                .retry_wait
+                .as_ref()
+                .filter(|_| self.run.is_running)
+                .and_then(|(deadline, _)| {
+                    let now = std::time::Instant::now();
+                    crate::ui::statusline::retry_wait_repaint_in(*deadline, now)
+                        .map(|delay| tokio::time::Instant::now() + delay)
+                });
             let job_wake = self.job_wake_armed();
             let job_queue = self.ui.sandbox.job_notice_queue().clone();
 
@@ -2889,6 +3023,12 @@ impl<'a> App<'a> {
                 // A background shell job ended while the session is idle.
                 _ = job_queue.wait_pending(), if job_wake => {
                     crate::startup::heap_future(|| self.wake_for_job_notices()).await?;
+                }
+                // The retry-wait countdown stepped to its next second.
+                _ = tokio::time::sleep_until(
+                    retry_repaint.unwrap_or_else(tokio::time::Instant::now)
+                ), if retry_repaint.is_some() => {
+                    self.refresh()?;
                 }
                 // The `/cron` statusline countdown rolled to its next minute.
                 _ = tokio::time::sleep_until(
@@ -3800,13 +3940,6 @@ impl<'a> App<'a> {
                 {
                     if self.renderer.toggle_reasoning_at_line(idx) {
                         self.renderer.clear_selection();
-                    } else if let Some(url) = self.renderer.link_url_at(idx, col) {
-                        let tx = self.user_tx.clone();
-                        tokio::spawn(async move {
-                            if let Err(error) = renderer_mod::open_url(&url).await {
-                                let _ = tx.send(UserEvent::LinkOpenFailed(error.to_string())).await;
-                            }
-                        });
                     } else {
                         let text_col = self.renderer.chat_text_col(col);
                         let double = self.renderer.register_click(row, col);
@@ -3851,8 +3984,15 @@ impl<'a> App<'a> {
                         // and unfold or fold a tool result clicked on its
                         // summary row.
                         let clicked = self.renderer.selection_start.map(|point| point.line);
+                        // A link opens on the release of a plain click, so a
+                        // press on a URL can still start a drag selection.
+                        let url = clicked.and_then(|line| self.renderer.link_url_at(line, col));
                         self.renderer.clear_selection();
-                        if let Some(line) = clicked {
+                        if let Some(url) = url {
+                            self.renderer
+                                .show_notice(&format!("opening {url}"), C_AGENT);
+                            self.open_link(url);
+                        } else if let Some(line) = clicked {
                             self.renderer.toggle_tool_output_at_line(line);
                         }
                     }
@@ -3873,6 +4013,8 @@ impl<'a> App<'a> {
                 let _ = self.save_session();
                 return Ok(ControlFlow::Break(()));
             }
+            #[cfg(feature = "export")]
+            UserEvent::ShareDone(result) => self.finish_share(result)?,
             UserEvent::LinkOpenFailed(error) => {
                 self.renderer
                     .write_line(&format!("cannot open link: {error}"), C_ERROR)?;
@@ -4111,7 +4253,7 @@ impl<'a> App<'a> {
             self.input.picker = None;
             self.renderer.invalidate();
             match outcome {
-                crate::ui::pickers::sessions::SessionPick::Reload(all) => {
+                crate::ui::pickers::sessions::SessionPick::Reload { all, query } => {
                     if self.run.is_running || self.run.pending_turn.is_some() {
                         self.input.picker = None;
                         self.renderer.write_line(
@@ -4122,7 +4264,7 @@ impl<'a> App<'a> {
                         return Ok(true);
                     }
                     self.input
-                        .start_loading_session_picker(self.ui.workspace.clone(), all);
+                        .start_loading_session_picker(self.ui.workspace.clone(), all, &query);
                 }
                 crate::ui::pickers::sessions::SessionPick::Cancelled => {}
                 crate::ui::pickers::sessions::SessionPick::Selected(selection) => {
@@ -4230,6 +4372,11 @@ impl<'a> App<'a> {
             self.renderer.clear_selection();
             return Ok(());
         }
+        #[cfg(feature = "export")]
+        if key.code == KeyCode::Esc && share_app::cancel_active() {
+            self.renderer.write_line("share cancelled", C_AGENT)?;
+            return Ok(());
+        }
 
         if action == Some(KeyAction::HistorySearch) {
             if self.input.history_search_active() {
@@ -4284,7 +4431,11 @@ impl<'a> App<'a> {
 
         // Ctrl+T is unbound by default; a user binding for it wins.
         if action.is_none() && is_tool_output_key(key) {
-            if self.renderer.set_tool_output_fold(1, None).is_none() {
+            if self
+                .renderer
+                .set_tool_output_fold(self.renderer.ctrl_t_fold_target(), None)
+                .is_none()
+            {
                 self.renderer
                     .show_notice("no tool output to expand yet", Color::DarkGrey);
             }
@@ -4435,6 +4586,9 @@ impl<'a> App<'a> {
 
         // Chain prompt active: intercept Y/N/B keystrokes
         if self.renderer.chain_prompt.is_some() && !self.renderer.chain_but_mode {
+            if self.chain_prompt_premature(key) {
+                return Ok(());
+            }
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     self.renderer.chain_prompt = None;
@@ -4479,9 +4633,7 @@ impl<'a> App<'a> {
         if self.renderer.chain_but_mode && key.code == KeyCode::Esc {
             self.renderer.chain_but_mode = false;
             if let Some(phase) = self.chain.pending {
-                self.renderer.chain_prompt = Some(ChainPrompt {
-                    question: compact_str::CompactString::from(phase.chain_label()),
-                });
+                self.renderer.chain_prompt = Some(ChainPrompt::new(phase.chain_label()));
                 self.chain.label_msg = Some(phase.chain_label().to_string());
             }
             self.input.clear_buffer();
@@ -4524,9 +4676,7 @@ impl<'a> App<'a> {
                 if trimmed.is_empty() {
                     self.chain.pending = Some(phase);
                     self.chain.label_msg = Some(phase.chain_label().to_string());
-                    self.renderer.chain_prompt = Some(ChainPrompt {
-                        question: compact_str::CompactString::from(phase.chain_label()),
-                    });
+                    self.renderer.chain_prompt = Some(ChainPrompt::new(phase.chain_label()));
                     return Ok(());
                 }
                 self.run_chain_transition(
@@ -4549,6 +4699,8 @@ impl<'a> App<'a> {
                     return Ok(());
                 }
                 super::SubmitAction::RejectWhileRunning => {
+                    // Keep the refused command so it can be sent once the run ends.
+                    self.restore_interrupted_prompt(&text);
                     self.renderer.write_line(
                         "agent is running — wait for it to finish or press Ctrl-C before running a command",
                         C_ERROR,
@@ -4579,11 +4731,13 @@ impl<'a> App<'a> {
                 let t = text.trim_start();
                 if t == "/queue" || t.starts_with("/queue ") {
                     let arg = t.strip_prefix("/queue").unwrap_or("").trim();
+                    echo_submission(&mut self.renderer, text.trim_start())?;
                     self.run_queue_command(arg)?;
                     return Ok(());
                 }
             }
             if let Some((expand, arg)) = crate::ui::tool_output::fold_command(&text) {
+                echo_submission(&mut self.renderer, &text)?;
                 self.run_fold_command(expand, arg);
                 return Ok(());
             }
@@ -5099,9 +5253,7 @@ impl<'a> App<'a> {
             self.chain.pending = Some(phase);
             self.chain.label_msg = Some(phase.chain_label().to_string());
             self.renderer.chain_but_mode = false;
-            self.renderer.chain_prompt = Some(ChainPrompt {
-                question: compact_str::CompactString::from(phase.chain_label()),
-            });
+            self.renderer.chain_prompt = Some(ChainPrompt::new(phase.chain_label()));
         }
 
         if !self.run.is_running {
@@ -5191,6 +5343,9 @@ impl<'a> App<'a> {
         self.renderer.feed_mut().finish_reasoning();
         self.cancel_pending_permissions();
         let preserve_progress = preserve_pending_main_turn_progress(&mut self.run, self.ui.session);
+        if preserve_progress {
+            super::record_interrupted_turn_notice(self.ui.session);
+        }
         #[cfg(feature = "loop")]
         self.run.cancel_validation();
         if let Some(handle) = self.run.main_abort.take() {
@@ -5254,6 +5409,9 @@ impl<'a> App<'a> {
         }
         self.cancel_pending_permissions();
         let preserve_progress = preserve_pending_main_turn_progress(&mut self.run, self.ui.session);
+        if preserve_progress {
+            super::record_interrupted_turn_notice(self.ui.session);
+        }
         let validation_active = self.run.cancel_validation();
 
         if !validation_active {
@@ -5417,9 +5575,7 @@ impl<'a> App<'a> {
             )?,
         }
         self.renderer.chain_but_mode = false;
-        self.renderer.chain_prompt = Some(ChainPrompt {
-            question: proposal.action.label().into(),
-        });
+        self.renderer.chain_prompt = Some(ChainPrompt::new(proposal.action.label()));
         self.chain.git.pending = Some(proposal);
         self.refresh()?;
         Ok(())
@@ -5739,6 +5895,9 @@ impl<'a> App<'a> {
         {
             return Ok(true);
         }
+        if self.chain_prompt_premature(key) {
+            return Ok(true);
+        }
         match key.code {
             KeyCode::Char('y' | 'Y') => {
                 let proposal = self.chain.git.pending.take().unwrap();
@@ -5800,11 +5959,25 @@ impl<'a> App<'a> {
         false
     }
 
+    /// True while the chain/plan/git prompt is not armed yet: keys typed into
+    /// the draft just before it appeared must not answer it.
+    fn chain_prompt_premature(&self, key: KeyEvent) -> bool {
+        self.chain_prompt_premature_with(key, super::permission_handler::prompt_arming_delay())
+    }
+
+    fn chain_prompt_premature_with(&self, key: KeyEvent, delay: std::time::Duration) -> bool {
+        self.renderer.chain_prompt.as_ref().is_some_and(|p| {
+            super::permission_handler::premature_prompt_key(
+                &UserEvent::Key(key),
+                p.opened.elapsed(),
+                delay,
+            )
+        })
+    }
+
     fn show_plan_approval(&mut self) -> anyhow::Result<()> {
         self.renderer.chain_but_mode = false;
-        self.renderer.chain_prompt = Some(ChainPrompt {
-            question: compact_str::CompactString::from(crate::ui::plan::QUESTION),
-        });
+        self.renderer.chain_prompt = Some(ChainPrompt::new(crate::ui::plan::QUESTION));
         self.renderer
             .write_line(crate::ui::plan::QUESTION, C_AGENT)?;
         self.refresh()?;
@@ -5894,6 +6067,9 @@ impl<'a> App<'a> {
             return Ok(true);
         }
         if !(key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) {
+            return Ok(true);
+        }
+        if self.chain_prompt_premature(key) {
             return Ok(true);
         }
         match key.code {
@@ -6051,7 +6227,7 @@ impl<'a> App<'a> {
             self.chain.git.work.is_none(),
             "Git command cleanup is still pending; no next turn admitted"
         );
-        if self.budget_admission_notice()? {
+        if self.budget_admission_notice_for_user()? {
             self.restore_interrupted_prompt(text);
             return Ok(());
         }
@@ -6088,15 +6264,8 @@ impl<'a> App<'a> {
             .session
             .is_irreducible_with_pending(reserve, pending_tokens)
         {
-            #[cfg(feature = "multimodal")]
-            if self.ui.session.pending_media.iter().any(|item| {
-                matches!(
-                    item,
-                    crate::extras::multimodal::MediaAttachment::Image { .. }
-                )
-            }) {
-                self.input.load_text(text);
-            }
+            // The advice below is to shorten the message: keep it to edit.
+            self.restore_interrupted_prompt(text);
             let available = self
                 .ui
                 .session
@@ -6107,7 +6276,7 @@ impl<'a> App<'a> {
                 &format!(
                     "message too large to fit: estimated {pending_tokens} tokens, \
                      only ~{available} tokens available after overhead and reserve \
-                     (use /clear to free space or reduce message size)"
+                     (use /compact or /clear to free space, or shorten the message)"
                 ),
                 C_ERROR,
             );
@@ -6164,7 +6333,7 @@ impl<'a> App<'a> {
             self.renderer.write_line("Finish or cancel the MCP operation before starting a model turn; input remains in the editor",C_ERROR)?;
             return Ok(());
         }
-        if self.budget_admission_notice()? {
+        if self.budget_admission_notice_for_user()? {
             return Ok(());
         }
         start_main_run(
@@ -6179,10 +6348,32 @@ impl<'a> App<'a> {
         .await
     }
 
+    /// Automatic starts (queue drain, cron, job wake): the notice is shown once
+    /// per session, since nothing the user did triggered the refusal.
     fn budget_admission_notice(&mut self) -> anyhow::Result<bool> {
+        let Some(text) = self.budget_refusal_text()? else {
+            return Ok(false);
+        };
+        if self.ui.session.spend_account.take_budget_notice() {
+            self.renderer.write_line(&text, C_ERROR)?;
+        }
+        Ok(true)
+    }
+
+    /// User-initiated starts (submit, /review, /init): every refusal says why,
+    /// so a retry after the first notice scrolled away is never silent.
+    fn budget_admission_notice_for_user(&mut self) -> anyhow::Result<bool> {
+        let Some(text) = self.budget_refusal_text()? else {
+            return Ok(false);
+        };
+        self.renderer.write_line(&text, C_ERROR)?;
+        Ok(true)
+    }
+
+    fn budget_refusal_text(&mut self) -> anyhow::Result<Option<String>> {
         let usd_capped = self.ui.cli.resolve_max_budget_usd(self.ui.cfg)?.is_some();
         if !usd_capped && !self.ui.cfg.has_session_token_ceiling() {
-            return Ok(false);
+            return Ok(None);
         }
         let run = crate::spend::run::Run::for_session(
             self.ui.session,
@@ -6190,17 +6381,13 @@ impl<'a> App<'a> {
             crate::spend::RequestKind::Turn,
         );
         if run.admit().is_ok() {
-            return Ok(false);
+            return Ok(None);
         }
-        if self.ui.session.spend_account.take_budget_notice() {
-            let label = if usd_capped {
-                "USD budget"
-            } else {
-                "Token budget"
-            };
-            self.renderer.write_line(&format!("{label}: further model requests/effects stopped; queued input is retained. Use /cost to inspect recorded estimates."), C_ERROR)?;
-        }
-        Ok(true)
+        let reason = run.account.admit_reason(run.prices).err();
+        Ok(Some(crate::spend::budget_notice_text(
+            reason,
+            run.account.snapshot(),
+        )))
     }
 
     async fn ensure_agent(&mut self) {
@@ -6504,7 +6691,7 @@ impl<'a> App<'a> {
             .map(|s| s.trim())
             .unwrap_or("");
         if btw_text.is_empty() {
-            self.renderer.write_line("usage: /btw <message>", C_AGENT)?;
+            self.renderer.write_line("usage: /btw <message>", C_ERROR)?;
             return Ok(());
         }
         if self.btw_inflight >= BTW_MAX_INFLIGHT {
@@ -6607,6 +6794,7 @@ impl<'a> App<'a> {
         if command != "/effort" && !native_mode {
             return Ok(false);
         }
+        echo_submission(&mut self.renderer, text)?;
         let current = self.ui.session.reasoning_controls;
         if command == "/effort" && parts.len() == 1 {
             match self
@@ -6792,10 +6980,13 @@ impl<'a> App<'a> {
             return Ok(());
         }
         if self.run.is_running && !super::allowed_while_running(text) {
-            self.renderer.write_line(
-                "finish or stop the current turn before changing model, session or context",
-                C_ERROR,
-            )?;
+            let message = if text.split_whitespace().next() == Some("/goal") {
+                "a goal round is running: press Esc or run /goal pause first \
+                 (/goal status, bounds and check work while it runs)"
+            } else {
+                "finish or stop the current turn before changing model, session or context"
+            };
+            self.renderer.write_line(message, C_ERROR)?;
             return Ok(());
         }
         if (selected_session.is_some() || text.split_whitespace().next() == Some("/fork"))
@@ -6853,6 +7044,10 @@ impl<'a> App<'a> {
         } else {
             echo_submission(&mut self.renderer, text)?;
         }
+        #[cfg(feature = "export")]
+        if share_app::is_confirm(text) {
+            return self.start_share();
+        }
 
         // Commands that hand the tty to a synchronous stdin consumer must not
         // race the crossterm event thread for keystrokes (same pattern as
@@ -6890,6 +7085,8 @@ impl<'a> App<'a> {
             self.rebind_event_thread();
         }
         if prior_question_session != self.ui.session.id {
+            // /new and /resume start a fresh wake budget.
+            job_wake_app::user_turn_started();
             self.adopt_saved_cron()?;
         }
         if prior_question_session != self.ui.session.id
@@ -7010,6 +7207,7 @@ impl<'a> App<'a> {
         }
         let services = self.ui.instruction_services()?;
         if name == "skills" {
+            echo_submission(&mut self.renderer, text)?;
             if text.trim() != "/skills" {
                 self.renderer.write_line("usage: /skills", C_ERROR)?;
                 return Ok(true);
@@ -7366,16 +7564,16 @@ impl<'a> App<'a> {
                     )?;
                 }
             }
-            Err(e) if e.to_string().starts_with("DEFER_COMPRESS:") => {
-                let err_msg = e.to_string();
-                let instructions = err_msg.strip_prefix("DEFER_COMPRESS:").and_then(|s| {
-                    let s = s.trim();
-                    if s.is_empty() || s == "(none)" {
-                        None
-                    } else {
-                        Some(s.to_string())
-                    }
-                });
+            Err(e)
+                if matches!(
+                    e.downcast_ref::<DeferredSlash>(),
+                    Some(DeferredSlash::Compress(_))
+                ) =>
+            {
+                let Ok(DeferredSlash::Compress(instructions)) = e.downcast::<DeferredSlash>()
+                else {
+                    unreachable!("guard matched Compress")
+                };
                 let compress_result = handle_compress(
                     instructions.as_deref(),
                     false,
@@ -7393,15 +7591,14 @@ impl<'a> App<'a> {
             }
             #[cfg(feature = "mcp")]
             Err(e)
-                if e.to_string()
-                    .starts_with(crate::ui::slash::settings::DEFER_MCP_LOGIN) =>
+                if matches!(
+                    e.downcast_ref::<DeferredSlash>(),
+                    Some(DeferredSlash::McpLogin(_))
+                ) =>
             {
-                let server = e
-                    .to_string()
-                    .strip_prefix(crate::ui::slash::settings::DEFER_MCP_LOGIN)
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
+                let Ok(DeferredSlash::McpLogin(server)) = e.downcast::<DeferredSlash>() else {
+                    unreachable!("guard matched McpLogin")
+                };
                 crate::startup::heap_future(|| self.start_mcp_login(server)).await?;
             }
             #[cfg(feature = "git-worktree")]
@@ -7482,12 +7679,15 @@ impl<'a> App<'a> {
                     }
                 }
             }
-            Err(e) if e.to_string().starts_with("DEFER_INIT:") => {
-                let prompt = e
-                    .to_string()
-                    .strip_prefix("DEFER_INIT:")
-                    .unwrap_or("")
-                    .to_string();
+            Err(e)
+                if matches!(
+                    e.downcast_ref::<DeferredSlash>(),
+                    Some(DeferredSlash::Init(_))
+                ) =>
+            {
+                let Ok(DeferredSlash::Init(prompt)) = e.downcast::<DeferredSlash>() else {
+                    unreachable!("guard matched Init")
+                };
                 if matches!(&self.ui.client, crate::provider::AnyClient::Anthropic(_))
                     || self.ui.session.native_history_snapshot().is_some()
                 {
@@ -7559,22 +7759,29 @@ impl<'a> App<'a> {
                     }
                 }
             }
-            Err(e) if e.to_string().starts_with("DEFER_REVIEW:") => {
-                let msg = e
-                    .to_string()
-                    .strip_prefix("DEFER_REVIEW:")
-                    .unwrap_or("")
-                    .to_string();
+            Err(e)
+                if matches!(
+                    e.downcast_ref::<DeferredSlash>(),
+                    Some(DeferredSlash::Review(_))
+                ) =>
+            {
+                let Ok(DeferredSlash::Review(msg)) = e.downcast::<DeferredSlash>() else {
+                    unreachable!("guard matched Review")
+                };
                 self.chain.dot_prompt_restore = self.ui.context.one_shot_restore.take();
                 self.start_internal_main_run(&msg).await?;
             }
             #[cfg(feature = "memory")]
-            Err(e) if e.to_string().starts_with("DEFER_EDITOR:") => {
-                let path = e
-                    .to_string()
-                    .strip_prefix("DEFER_EDITOR:")
-                    .unwrap_or("")
-                    .to_string();
+            Err(e)
+                if matches!(
+                    e.downcast_ref::<DeferredSlash>(),
+                    Some(DeferredSlash::Editor(_))
+                ) =>
+            {
+                let Ok(DeferredSlash::Editor(path)) = e.downcast::<DeferredSlash>() else {
+                    unreachable!("guard matched Editor")
+                };
+                let path = path.display().to_string();
                 let editor = self
                     .ui
                     .cfg
@@ -7702,6 +7909,103 @@ impl<'a> App<'a> {
         Ok(())
     }
 
+    /// One user event while a `!` command runs. Resizes, scrolling and plain
+    /// editing keys act at once; the interrupt key (as bound, plus Ctrl+C)
+    /// cancels the command. Anything else is returned so the caller can park
+    /// it until the command ends.
+    fn bang_live_event(
+        &mut self,
+        event: UserEvent,
+        cancellation: &CommandCancellation,
+    ) -> anyhow::Result<Option<UserEvent>> {
+        match &event {
+            UserEvent::Resize => {
+                self.renderer.resize();
+                self.renderer.invalidate();
+                self.refresh()?;
+                return Ok(None);
+            }
+            UserEvent::ScrollPageUp => {
+                self.renderer.scroll_page_up();
+                return Ok(None);
+            }
+            UserEvent::ScrollPageDown => {
+                self.renderer.scroll_page_down();
+                return Ok(None);
+            }
+            UserEvent::ScrollUp => {
+                for _ in 0..self.ui.cfg.resolve_mouse_scroll_lines() {
+                    self.renderer.scroll_line_up();
+                }
+                return Ok(None);
+            }
+            UserEvent::ScrollDown => {
+                for _ in 0..self.ui.cfg.resolve_mouse_scroll_lines() {
+                    self.renderer.scroll_line_down();
+                }
+                return Ok(None);
+            }
+            UserEvent::Key(key) => {
+                let key = *key;
+                if key.kind == crossterm::event::KeyEventKind::Release {
+                    return Ok(None);
+                }
+                let action = self.keyboard_action(key);
+                let ctrl_c =
+                    key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+                if matches!(action, Some(KeyAction::Interrupt | KeyAction::Eof)) || ctrl_c {
+                    cancellation.cancel();
+                    self.renderer.show_notice("cancelling…", Color::Yellow);
+                    self.refresh()?;
+                    return Ok(None);
+                }
+                match action {
+                    Some(KeyAction::PageUp) => {
+                        self.renderer.scroll_page_up();
+                        return Ok(None);
+                    }
+                    Some(KeyAction::PageDown) => {
+                        self.renderer.scroll_page_down();
+                        return Ok(None);
+                    }
+                    Some(KeyAction::TranscriptTop) => {
+                        self.renderer.scroll_to_top();
+                        return Ok(None);
+                    }
+                    Some(KeyAction::TranscriptBottom) => {
+                        self.renderer.scroll_to_bottom()?;
+                        return Ok(None);
+                    }
+                    _ => {}
+                }
+                // Typing and cursor movement go to the draft; Enter and
+                // chords that could submit or open pickers wait.
+                let plain = !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+                let editing = plain
+                    && matches!(
+                        key.code,
+                        KeyCode::Char(_)
+                            | KeyCode::Backspace
+                            | KeyCode::Delete
+                            | KeyCode::Left
+                            | KeyCode::Right
+                    );
+                if editing && self.input.picker.is_none() && !self.input.vim_enabled() {
+                    if let Some(submitted) = self.input.handle_key(key) {
+                        // Never submit while the command runs.
+                        self.input.load_text(&submitted);
+                    }
+                    self.refresh()?;
+                    return Ok(None);
+                }
+            }
+            _ => {}
+        }
+        Ok(Some(event))
+    }
+
     async fn run_bang_command(&mut self, text: &str) -> anyhow::Result<()> {
         /// Live output of a `!` command is repainted at most this often.
         const BANG_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
@@ -7727,6 +8031,18 @@ impl<'a> App<'a> {
         })?;
 
         let cancellation = CommandCancellation::new();
+        let interrupt_key = self
+            .input
+            .keybindings
+            .action_keys()
+            .into_iter()
+            .find(|(name, _)| *name == "interrupt")
+            .and_then(|(_, keys)| keys.into_iter().next())
+            .unwrap_or_else(|| "ctrl+c".to_owned());
+        self.renderer.show_notice(
+            &format!("running… {interrupt_key} cancels"),
+            Color::DarkGrey,
+        );
         let sandbox = self.ui.sandbox.clone();
         let progress = crate::sandbox::CommandProgress::new();
         let mut progress_changes = progress.subscribe();
@@ -7771,19 +8087,14 @@ impl<'a> App<'a> {
                         cancellation.cancel();
                         break operation.await?;
                     };
-                    let interrupt = matches!(
-                        &event,
-                        UserEvent::Key(key)
-                            if matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d'))
-                                && key.modifiers.contains(KeyModifiers::CONTROL)
-                    );
-                    if interrupt {
-                        cancellation.cancel();
-                    } else if matches!(event, UserEvent::Quit) {
-                        cancellation.cancel();
-                        self.deferred_user_events.push_back(event);
-                    } else {
-                        self.deferred_user_events.push_back(event);
+                    match self.bang_live_event(event, &cancellation)? {
+                        None => {}
+                        Some(event) => {
+                            if matches!(event, UserEvent::Quit) {
+                                cancellation.cancel();
+                            }
+                            self.deferred_user_events.push_back(event);
+                        }
                     }
                 }
             }
@@ -8895,6 +9206,45 @@ mod initial_turn_tests {
                 .contains(crate::agent::runner::UNKNOWN_TOOL_OUTCOME)
         );
         assert_eq!(session.messages[5].content, "partial explanation");
+        // The closing result keeps the real tool name, and an interrupt adds
+        // a host row after the partial text.
+        assert!(
+            synthetic.content.starts_with("edit:\n"),
+            "{}",
+            synthetic.content
+        );
+        crate::ui::record_interrupted_turn_notice(&mut session);
+        let notice = session.messages.last().unwrap();
+        assert_eq!(notice.role, MessageRole::System);
+        assert!(crate::agent::input::is_host_instruction(&notice.content));
+    }
+
+    #[test]
+    fn interrupted_batch_keeps_the_real_result_of_a_call_that_finished() {
+        let mut session = Session::new("openrouter", "test-model", 128_000, "/workspace");
+        let mut run = AgentRunState::default();
+        let pending_turn = PendingMainTurn::capture(&session, "edit then test");
+        crate::ui::mark_main_turn_started(&mut session, &mut run, pending_turn);
+        session.add_tool_call_with_id("settled-edit", "edit", &serde_json::json!({}));
+        session.add_tool_call_with_id("running-test", "shell", &serde_json::json!({}));
+        crate::agent::runner::record_settled_result_for_tests("settled-edit", "edit applied");
+
+        assert!(crate::ui::preserve_pending_main_turn_progress(
+            &mut run,
+            &mut session
+        ));
+        let results: Vec<_> = session
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::ToolResult)
+            .map(|message| message.content.to_string())
+            .collect();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].contains("edit applied"), "{results:?}");
+        assert!(
+            results[1].contains(crate::agent::runner::UNKNOWN_TOOL_OUTCOME),
+            "{results:?}"
+        );
     }
 
     #[test]
@@ -9140,6 +9490,7 @@ mod input_reader_lifecycle_tests {
                 UserEvent::GoalVerificationDone(Box::new(crate::event::GoalVerificationEvent {
                     operation_id,
                     checks: Some(crate::extras::goal::gate::CheckOutcome {
+                        failure_kind: Default::default(),
                         all_passed: true,
                         failure_tail: Some(format!("completion-{round}")),
                         verified: Vec::new(),
@@ -9295,7 +9646,7 @@ mod interrupt_rewind_tests {
         app.run.is_running = false;
         app.handle_key_event(escape).await.unwrap();
         app.handle_key_event(escape).await.unwrap();
-        for code in [KeyCode::Down, KeyCode::Enter, KeyCode::Enter] {
+        for code in [KeyCode::Up, KeyCode::Enter, KeyCode::Enter] {
             app.handle_key_event(KeyEvent::new(code, KeyModifiers::NONE))
                 .await
                 .unwrap();
@@ -9368,7 +9719,7 @@ mod interrupt_rewind_tests {
             app.input.load_text("");
             app.handle_key_event(escape).await.unwrap();
             app.handle_key_event(escape).await.unwrap();
-            for code in [KeyCode::Down, KeyCode::Enter, KeyCode::Down, KeyCode::Enter] {
+            for code in [KeyCode::Up, KeyCode::Enter, KeyCode::Down, KeyCode::Enter] {
                 app.handle_key_event(KeyEvent::new(code, KeyModifiers::NONE))
                     .await
                     .unwrap();
@@ -9387,7 +9738,7 @@ mod interrupt_rewind_tests {
             app.input.load_text("");
             app.handle_key_event(escape).await.unwrap();
             app.handle_key_event(escape).await.unwrap();
-            for code in [KeyCode::Down, KeyCode::Enter, KeyCode::Down, KeyCode::Enter] {
+            for code in [KeyCode::Up, KeyCode::Enter, KeyCode::Down, KeyCode::Enter] {
                 app.handle_key_event(KeyEvent::new(code, KeyModifiers::NONE))
                     .await
                     .unwrap();
@@ -9424,7 +9775,7 @@ mod interrupt_rewind_tests {
             app.handle_key_event(escape).await.unwrap();
             app.handle_key_event(escape).await.unwrap();
             for code in [
-                KeyCode::Down,
+                KeyCode::Up,
                 KeyCode::Enter,
                 KeyCode::Down,
                 KeyCode::Down,
@@ -10217,6 +10568,116 @@ mod explicit_shell_persistence_tests {
             "the live tail block is removed after the run: {texts:?}"
         );
         assert_eq!(texts.iter().filter(|text| *text == "EARLY_LINE").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn chain_plan_and_git_prompts_discard_type_ahead_until_armed() {
+        use std::time::Duration;
+        let root = crate::tests::OwnedTestDirectory::new("chain-prompt-arming");
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let cfg = crate::config::Config::default();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new("openrouter", "fixture", 128_000, "");
+        let ui = shell_ui(&cli, &cfg, &mut session, &mut context, workspace);
+        let mut app = fixture_app(ui);
+        let y = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
+        // No prompt: nothing is premature.
+        assert!(!app.chain_prompt_premature_with(y, Duration::from_secs(60)));
+        // A freshly opened prompt (plan approval, git proposal and the chain
+        // prompt all share `ChainPrompt::new`) ignores answer keys until armed.
+        app.renderer.chain_prompt = Some(ChainPrompt::new("approve?"));
+        assert!(app.chain_prompt_premature_with(y, Duration::from_secs(60)));
+        assert!(!app.chain_prompt_premature_with(y, Duration::ZERO));
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!app.chain_prompt_premature_with(esc, Duration::from_secs(60)));
+    }
+
+    #[tokio::test]
+    async fn typed_keys_edit_the_draft_while_a_bang_command_runs() {
+        let root = crate::tests::OwnedTestDirectory::new("bang-live-typing");
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            (
+                "MINI_AGENT_CONFIG_DIR",
+                Some(root.path().join("config").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_DATA_DIR",
+                Some(root.path().join("data").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_LOCAL_DATA_DIR",
+                Some(root.path().join("local-data").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_STATE_DIR",
+                Some(root.path().join("state").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_CACHE_DIR",
+                Some(root.path().join("cache").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_CREDENTIALS_DIR",
+                Some(root.path().join("credentials").into_os_string()),
+            ),
+        ]);
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_sandbox: true,
+            tools: vec!["shell".into()],
+            ..Default::default()
+        };
+        let cfg = crate::config::Config::default();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new("openrouter", "fixture", 128_000, "");
+        let _session_release = SessionRelease(session.id.to_string());
+        let ui = shell_ui(&cli, &cfg, &mut session, &mut context, workspace);
+        let mut app = fixture_app(ui);
+        app.user_tx
+            .try_send(UserEvent::Key(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        app.run_bang_command("!sleep 0.5; printf DONE")
+            .await
+            .unwrap();
+        assert_eq!(
+            app.input.buffer.as_str(),
+            "x",
+            "typed key reaches the draft"
+        );
+        assert!(
+            app.deferred_user_events.is_empty(),
+            "an editing key is not parked until the command ends"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_command_refused_while_running_stays_in_the_draft() {
+        let root = crate::tests::OwnedTestDirectory::new("reject-keeps-draft");
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let cfg = crate::config::Config::default();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new("openrouter", "fixture", 128_000, "");
+        let ui = shell_ui(&cli, &cfg, &mut session, &mut context, workspace);
+        let mut app = fixture_app(ui);
+        app.run.is_running = true;
+        app.input.load_text("/model x");
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        app.handle_key_event_with(enter, None).await.unwrap();
+        assert_eq!(app.input.buffer.as_str(), "/model x");
     }
 
     #[tokio::test]
@@ -11515,9 +11976,7 @@ mod permission_loop_tests {
         app.input.start_command_picker();
         assert!(!app.paste_clipboard_image(&reader).await.unwrap());
         app.input.picker = None;
-        app.renderer.chain_prompt = Some(ChainPrompt {
-            question: "operator approval".into(),
-        });
+        app.renderer.chain_prompt = Some(ChainPrompt::new("operator approval"));
         assert!(!app.paste_clipboard_image(&reader).await.unwrap());
         assert_eq!(reader.0.load(Ordering::SeqCst), reads);
         assert!(app.run.agent_rx.is_none());
@@ -11542,13 +12001,51 @@ mod permission_loop_tests {
         .unwrap();
         let after = app.renderer.captured_output();
         assert!(
-            after[before.len()..].contains("USD budget: further model requests/effects stopped"),
+            after[before.len()..].contains("USD budget reached"),
             "image-only Enter must enter ordinary budget admission"
         );
         assert_eq!(app.ui.session.pending_media.len(), 1);
         assert!(app.ui.session.messages.is_empty());
         assert!(!app.run.is_running);
         assert!(app.run.agent_rx.is_none());
+    }
+
+    // mini-agent-sskdu.6: a user submit refused at the cap says why every time,
+    // not only the first time (the once-per-session latch is for automatic starts).
+    #[tokio::test]
+    async fn every_refused_submit_at_the_budget_cap_prints_a_notice() {
+        let root = crate::tests::OwnedTestDirectory::new("budget-notice-twice-app");
+        let _environment = environment(&root);
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let mut cfg = fixture_config();
+        cfg.max_budget_usd = Some(0.0);
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new("permission-fixture", "test-model", 128_000, "");
+        let mut app = fixture_app(fixture_ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+        ));
+        for _ in 0..2 {
+            app.input.buffer = "hello".into();
+            app.input.cursor = app.input.buffer.len();
+            crate::startup::heap_future(|| {
+                app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            })
+            .await
+            .unwrap();
+        }
+        let output = app.renderer.captured_output();
+        assert_eq!(output.matches("USD budget reached").count(), 2, "{output}");
+        assert!(!app.run.is_running);
     }
 
     #[tokio::test]
@@ -14498,7 +14995,7 @@ mod git_feature_off_consumer_tests {
         assert_eq!(
             (0..app.renderer.feed().block_count())
                 .filter_map(|index| app.renderer.feed().block_text(index))
-                .filter(|text| text.contains("Git commands require the git-worktree feature"))
+                .filter(|text| text.contains("git command requires the 'git-worktree' feature"))
                 .count(),
             3
         );
@@ -18317,7 +18814,14 @@ mod plan_approval_tests {
         let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
         for response in ["unknown-tool", "hold-open"] {
             let roots = Roots::new();
-            let provider = Provider::new(vec![response]).await;
+            // An unknown tool name is answered with a corrective tool result
+            // (mini-agent-sskdu.246), so that turn needs a second response.
+            let provider = Provider::new(if response == "unknown-tool" {
+                vec![response, "recovered"]
+            } else {
+                vec![response]
+            })
+            .await;
             let mut cfg = provider.config();
             cfg.max_budget_usd = Some(1.0);
             let cli = crate::cli::Cli {
@@ -18370,7 +18874,22 @@ mod plan_approval_tests {
                 assert!(app.run.agent_rx.is_none() && app.run.main_abort.is_none());
                 assert!(app.run.pending_inputs.is_empty());
             } else {
-                assert!(!finish_turn(&mut app).await);
+                // The unknown tool is skipped with a corrective result and the
+                // model's next response completes the turn instead of aborting it.
+                assert!(finish_turn(&mut app).await);
+                let calls = provider.calls();
+                assert_eq!(calls.len(), 2);
+                assert!(
+                    calls[1]
+                        .to_string()
+                        .contains("unknown_unregistered_cost_tool` is not available"),
+                    "{}",
+                    calls[1]
+                );
+                assert!(!app.run.is_running);
+                drop(app);
+                provider.finish().await;
+                continue;
             }
             assert_eq!(provider.calls().len(), 1);
             assert!(app.ui.session.spend_account.snapshot().tracking_error);

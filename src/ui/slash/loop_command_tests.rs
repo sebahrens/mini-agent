@@ -258,6 +258,41 @@ async fn loop_stop_clears_only_a_loop_goal() {
     assert!(session.goal_store.snapshot().is_none());
 }
 
+/// A prompt that merely starts with `stop` or `status` is a prompt.
+#[tokio::test]
+async fn loop_verbs_apply_only_when_nothing_follows() {
+    let root = fixture_root("loop-verbs");
+    let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(&root.path).unwrap());
+    let mut context = context_for(workspace.root());
+    let mut session = Session::new("openrouter", "loop-model", 128_000, "loop-verbs");
+    run_loop_command(
+        "/loop status page returns 500, fix it",
+        &mut session,
+        &mut context,
+        &workspace,
+    )
+    .await;
+    assert_eq!(
+        session.goal_store.snapshot().unwrap().objective,
+        "status page returns 500, fix it"
+    );
+    session.goal_store.clear();
+    run_loop_command(
+        "/loop stop the flaky retry test from failing",
+        &mut session,
+        &mut context,
+        &workspace,
+    )
+    .await;
+    assert!(
+        session
+            .goal_store
+            .snapshot()
+            .is_some_and(|goal| goal.objective.starts_with("stop the flaky")),
+        "an objective starting with stop starts a loop"
+    );
+}
+
 #[tokio::test]
 async fn loop_stop_during_a_run_clears_future_rounds_without_rebuilding_current_runner() {
     let root = fixture_root("loop-active-stop");

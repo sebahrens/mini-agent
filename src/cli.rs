@@ -14,6 +14,42 @@ fn default_sandbox_backend() -> String {
     }
 }
 
+fn parse_choice(value: &str, choices: &[&str], what: &str) -> Result<String, String> {
+    let lower = value.to_ascii_lowercase();
+    if choices.contains(&lower.as_str()) {
+        Ok(lower)
+    } else {
+        Err(format!(
+            "unknown {what} '{value}' (expected one of: {})",
+            choices.join(", ")
+        ))
+    }
+}
+
+fn parse_login_provider(value: &str) -> Result<String, String> {
+    // `anthropic` is accepted so its dedicated "unavailable" message is shown.
+    parse_choice(value, &["openai", "copilot", "anthropic"], "provider")
+}
+
+fn parse_logout_provider(value: &str) -> Result<String, String> {
+    parse_choice(value, &["openai", "copilot"], "provider")
+}
+
+fn parse_log_level(value: &str) -> Result<String, String> {
+    parse_choice(
+        value,
+        &["off", "error", "warn", "info", "debug", "trace"],
+        "log level",
+    )
+}
+
+#[cfg(feature = "hooks")]
+fn parse_hooks_test_input(value: &str) -> Result<String, String> {
+    serde_json::from_str::<serde_json::Value>(value)
+        .map(|_| value.to_owned())
+        .map_err(|error| format!("--hooks-test-input is not valid JSON: {error}"))
+}
+
 fn parse_system_prompt_argument(value: &str) -> Result<String, String> {
     use std::io::Read;
 
@@ -98,7 +134,9 @@ pub enum InputFormat {
 #[derive(Parser, Debug, Default, Clone)]
 #[command(name = "mini-agent", version,
     long_version = concat!(env!("CARGO_PKG_VERSION"), "\nbuild: ", env!("MINI_AGENT_BUILD_FINGERPRINT"), "\ntarget: ", env!("MINI_AGENT_BUILD_TARGET")),
-    about = "Minimal coding agent")]
+    about = "Minimal coding agent",
+    after_help = "Commands:\n  mini-agent update    Update mini-agent in place (see `mini-agent update --help`)")]
+#[command(group(clap::ArgGroup::new("permission_mode_flags").args(["restrictive", "read_only", "guarded", "accept_all", "yolo", "dangerously_skip_permissions"]).multiple(false)))]
 #[command(group(clap::ArgGroup::new("fork_resume_source").args(["continue_session", "session", "resume"]).multiple(true)))]
 #[cfg_attr(all(feature = "acp", feature = "loop"), command(group(clap::ArgGroup::new("idle_server_mode").args(["acp_enabled", "loop_mode"]).multiple(true))))]
 #[cfg_attr(all(feature = "acp", not(feature = "loop")), command(group(clap::ArgGroup::new("idle_server_mode").args(["acp_enabled"]))))]
@@ -108,6 +146,7 @@ pub struct Cli {
         long,
         value_name = "PROVIDER",
         conflicts_with = "logout",
+        value_parser = parse_login_provider,
         help = "Sign in to a provider account and exit (openai, copilot)"
     )]
     pub login: Option<String>,
@@ -122,6 +161,7 @@ pub struct Cli {
         long,
         value_name = "PROVIDER",
         conflicts_with = "login",
+        value_parser = parse_logout_provider,
         help = "Sign out of a provider account and exit (openai, copilot)"
     )]
     pub logout: Option<String>,
@@ -164,6 +204,7 @@ pub struct Cli {
 
     #[arg(
         long = "pure-stdout",
+        requires = "print",
         help = "With -p: also print tool calls/results to stdout"
     )]
     pub pure_stdout: bool,
@@ -766,7 +807,13 @@ pub struct Cli {
     )]
     pub memory_editor_preservation_check: bool,
 
-    #[arg(long = "setup", help = "Interactive setup wizard")]
+    #[arg(
+        long = "setup",
+        conflicts_with_all = ["print", "print_config"],
+        help = "Interactive setup wizard (needs a terminal)"
+    )]
+    #[cfg_attr(feature = "loop", arg(conflicts_with = "loop_mode"))]
+    #[cfg_attr(feature = "acp", arg(conflicts_with = "acp_enabled"))]
     pub setup: bool,
 
     #[arg(long = "tutor", help = "Show getting started guide")]
@@ -937,6 +984,7 @@ pub struct Cli {
     #[cfg(feature = "hooks")]
     #[arg(
         long = "hooks-test-input",
+        value_parser = parse_hooks_test_input,
         help = "tool_input JSON for --hooks-test (default: {})"
     )]
     pub hooks_test_input: Option<String>,
@@ -1017,7 +1065,7 @@ pub struct Cli {
 
     #[arg(
         long = "shell",
-        help = "Executable for the shell tool: bash/sh, or PowerShell/pwsh on Windows"
+        help = "Executable for the shell tool: bash/sh, or on Windows cmd.exe (default), PowerShell/pwsh or Git Bash"
     )]
     pub shell: Option<String>,
 
@@ -1044,7 +1092,7 @@ pub struct Cli {
     #[cfg(feature = "acp")]
     #[arg(
         long = "acp",
-        help = "Enable ACP (Agent Communication Protocol) support"
+        help = "Run as an Agent Client Protocol (ACP) server (stdio, or TCP with --acp-host/--acp-port)"
     )]
     pub acp_enabled: bool,
 
@@ -1127,7 +1175,7 @@ pub struct Cli {
     #[cfg(feature = "acp")]
     #[arg(
         long = "acp-accept-timeout-secs",
-        help = "Seconds to wait for the first authenticated ACP TCP peer [default: 300]"
+        help = "Seconds to wait for the first authenticated ACP TCP peer, then exit (0 = wait indefinitely) [default: 300]"
     )]
     pub acp_accept_timeout_secs: Option<u64>,
 
@@ -1238,7 +1286,8 @@ pub struct Cli {
 
     #[arg(
         long = "log-level",
-        help = "Set stderr log level (trace, debug, info, warn, error)"
+        value_parser = parse_log_level,
+        help = "Set stderr log level (off, error, warn, info, debug, trace)"
     )]
     pub log_level: Option<String>,
 
@@ -1249,6 +1298,7 @@ pub struct Cli {
 /// Goal selection and bounds. Boxed by `Cli` so the startup future stays small.
 #[cfg(feature = "goal")]
 #[derive(clap::Args, Debug, Clone, Default)]
+#[command(group(clap::ArgGroup::new("goal_target").args(["goal", "goal_resume"])))]
 pub struct GoalArgs {
     #[arg(
         long = "goal",
@@ -1272,8 +1322,9 @@ pub struct GoalArgs {
 
     #[arg(
         long = "goal-max-rounds",
-        requires = "goal",
-        help = "Maximum goal rounds before wrapping up [default: 50]"
+        requires = "goal_target",
+        help = "Maximum goal rounds before wrapping up [default: 50]; with --goal-resume, \
+                the new bound for the resumed goal"
     )]
     pub goal_max_rounds: Option<u32>,
 
@@ -1284,6 +1335,14 @@ pub struct GoalArgs {
         help = "Whether each goal round keeps the conversation or starts fresh"
     )]
     pub goal_continuation: Option<String>,
+
+    #[arg(
+        long = "goal-resume",
+        conflicts_with = "goal",
+        help = "Resume the session's parked goal (budget limited, paused, blocked or awaiting \
+                your answer) with --continue; the prompt is the answer to a question"
+    )]
+    pub goal_resume: bool,
 
     #[arg(
         long = "goal-replace",
@@ -1396,7 +1455,79 @@ impl Cli {
                 .mut_arg("provider", |arg| arg.env(None::<&str>))
                 .mut_arg("model", |arg| arg.env(None::<&str>));
         }
-        Self::from_arg_matches(&command.try_get_matches_from(args)?)
+        let cli = Self::from_arg_matches(&command.try_get_matches_from(args)?)?;
+        cli.validate_combinations()?;
+        Ok(cli)
+    }
+
+    /// Cross-flag rules clap's declarative `requires` cannot express (they
+    /// depend on a flag's value). Failures are usage errors, exit code 2.
+    fn validate_combinations(&self) -> Result<(), clap::Error> {
+        use clap::error::ErrorKind;
+        let fail = |kind: ErrorKind, message: String| Err(Self::command().error(kind, message));
+        let stream_output = self.output_format() == OutputFormat::StreamJson;
+        if self.input_format() == InputFormat::StreamJson && !stream_output {
+            return fail(
+                ErrorKind::MissingRequiredArgument,
+                "--input-format stream-json requires --output stream-json".into(),
+            );
+        }
+        for (set, flag) in [
+            (self.include_partial_messages, "--include-partial-messages"),
+            (self.stream_json_schema.is_some(), "--stream-json-schema"),
+            (
+                self.stream_json_preview_bytes.is_some(),
+                "--stream-json-preview-bytes",
+            ),
+            (self.stream_json_control, "--stream-json-control"),
+        ] {
+            if set && !stream_output {
+                return fail(
+                    ErrorKind::MissingRequiredArgument,
+                    format!("{flag} requires --output stream-json"),
+                );
+            }
+        }
+        if self.stream_json_control && self.input_format() != InputFormat::StreamJson {
+            return fail(
+                ErrorKind::MissingRequiredArgument,
+                "--stream-json-control requires --input-format stream-json".into(),
+            );
+        }
+        #[cfg(feature = "skills")]
+        if self.learned_skill_json && !self.has_learned_skill_command() {
+            return fail(
+                ErrorKind::MissingRequiredArgument,
+                "--json/--learned-skill-json only applies to learned-skill operator commands; \
+                 use --output json with -p for machine-readable run output"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "skills")]
+    fn has_learned_skill_command(&self) -> bool {
+        self.learned_skill_stats
+            || self.list_learned_skill_proposals
+            || self.learned_skill_proposal.is_some()
+            || self.purge_learned_skill.is_some()
+            || self.compact_learned_skill_events
+            || self.learned_skill_feedback.is_some()
+            || self.learned_skill_feedback_record.is_some()
+            || self.list_learned_skill_feedback.is_some()
+            || self.correct_learned_skill_feedback.is_some()
+            || self.import_learned_skill.is_some()
+            || self.install_learned_skill_seeds
+            || self.approve_learned_skill.is_some()
+            || self.reject_learned_skill.is_some()
+            || self.activate_learned_skill.is_some()
+            || self.promote_learned_skill.is_some()
+            || self.retire_learned_skill.is_some()
+            || self.reevaluate_learned_skill.is_some()
+            || self.list_learned_skill_suites
+            || self.disable_learned_skill_suite.is_some()
+            || self.distill_learned_skill.is_some()
     }
 
     pub fn input_format(&self) -> InputFormat {
@@ -1411,6 +1542,23 @@ impl Cli {
                 OutputFormat::Text
             }
         })
+    }
+
+    /// A one-shot command that only reports state. It must not prompt for
+    /// project-config trust (a "y" is recorded and applies to later sessions)
+    /// and `--print-config`/`--tutor` must not create the default config file.
+    pub(crate) fn is_informational_command(&self) -> bool {
+        #[allow(unused_mut)]
+        let mut informational = self.print_config || self.tutor;
+        #[cfg(feature = "hooks")]
+        {
+            informational |= self.hooks_test.is_some();
+        }
+        #[cfg(feature = "skills")]
+        {
+            informational |= self.has_learned_skill_command();
+        }
+        informational
     }
 
     pub(crate) fn is_loop_mode(&self) -> bool {
@@ -1447,6 +1595,53 @@ impl Cli {
 
     /// Reject a `--quick-model` name that is not in `[quick_models]` instead of
     /// silently falling through to the default provider/model.
+    /// Reject a `--tools` allowlist that names tools nothing can supply. A
+    /// name that is not a built-in may still be an MCP server tool, which is
+    /// unknowable before the servers connect, so unknown names are an error
+    /// only when no MCP server is configured (they would otherwise leave the
+    /// model with no tools and only a log line to say why).
+    pub fn validate_tool_allowlist(&self, cfg: &config::Config) -> anyhow::Result<()> {
+        let unknown: Vec<&str> = self
+            .tools
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !crate::agent::builder::is_reserved_builtin_tool_name(name))
+            .collect();
+        if unknown.is_empty() || self.resolve_no_tools(cfg) {
+            return Ok(());
+        }
+        let hints: Vec<Option<&str>> = unknown
+            .iter()
+            .map(|name| {
+                config::keys::nearest_field(name, crate::agent::builder::BUILTIN_TOOL_NAMES)
+            })
+            .collect();
+        // A near miss of a built-in name is a typo even when MCP servers exist.
+        #[cfg(feature = "mcp")]
+        if hints.iter().all(Option::is_none)
+            && cfg
+                .mcp_servers
+                .as_ref()
+                .is_some_and(|servers| !servers.is_empty())
+        {
+            return Ok(());
+        }
+        let listed = unknown
+            .iter()
+            .zip(&hints)
+            .map(|(name, hint)| match hint {
+                Some(hint) => format!("'{name}' (did you mean '{hint}'?)"),
+                None => format!("'{name}'"),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!(
+            "--tools: unknown tool{} {listed}; built-in tools: {}",
+            if unknown.len() == 1 { "" } else { "s" },
+            crate::agent::builder::BUILTIN_TOOL_NAMES.join(", ")
+        )
+    }
+
     pub fn validate_quick_model(&self, cfg: &config::Config) -> anyhow::Result<()> {
         let Some(name) = self.quick_model.as_deref() else {
             return Ok(());
@@ -1670,17 +1865,30 @@ impl Cli {
     /// `--import-agent-skill`, `--import-learned-skill`,
     /// `--distill-learned-skill-out`, `--sandbox-toolchain-root` and
     /// `--wt-base-dir` keep meaning "relative to where I typed the command". `~`-prefixed
-    /// entries are left for their own home expansion.
+    /// entries of `--add-dir`, `--image`, `--output-schema` and `--log-file` are
+    /// home-expanded here (a shell does not expand `--flag=~/x`); the other
+    /// flags leave `~` for their own home expansion.
     pub fn absolutize_launch_paths(&mut self, base: &std::path::Path) {
         fn fix(path: &mut std::path::PathBuf, base: &std::path::Path) {
             if path.is_relative() && !path.starts_with("~") {
                 *path = base.join(&*path);
             }
         }
-        self.add_dir.iter_mut().for_each(|p| fix(p, base));
-        self.image.iter_mut().for_each(|p| fix(p, base));
-        self.output_schema.iter_mut().for_each(|p| fix(p, base));
-        self.log_file.iter_mut().for_each(|p| fix(p, base));
+        fn fix_home(path: &mut std::path::PathBuf, base: &std::path::Path) {
+            if path.starts_with("~")
+                && let Some(text) = path.to_str()
+            {
+                let expanded = crate::fs::expand_tilde(text);
+                *path = std::path::PathBuf::from(expanded);
+            }
+            fix(path, base);
+        }
+        self.add_dir.iter_mut().for_each(|p| fix_home(p, base));
+        self.image.iter_mut().for_each(|p| fix_home(p, base));
+        self.output_schema
+            .iter_mut()
+            .for_each(|p| fix_home(p, base));
+        self.log_file.iter_mut().for_each(|p| fix_home(p, base));
         #[cfg(feature = "agent-skills")]
         self.import_agent_skill
             .iter_mut()
@@ -1883,13 +2091,107 @@ mod tests {
             cli.add_dir,
             vec![
                 base.join("./x"),
-                std::path::PathBuf::from("~/h"),
+                std::path::PathBuf::from(crate::fs::expand_tilde("~/h")),
                 std::path::PathBuf::from("/abs")
             ]
         );
         assert_eq!(cli.image, vec![base.join("a.png")]);
         assert_eq!(cli.output_schema, Some(base.join("s.json")));
         assert_eq!(cli.sandbox_toolchain_roots, vec![base.join("tools")]);
+    }
+
+    #[test]
+    fn launch_paths_expand_home_for_equals_spelling() {
+        let mut cli = Cli::try_parse_from([
+            "mini-agent",
+            "-p",
+            "--log-file=~/a.log",
+            "--image=~/a.png",
+            "--output-schema=~/s.json",
+            "--add-dir=~/d",
+            "q",
+        ])
+        .unwrap();
+        cli.absolutize_launch_paths(std::path::Path::new("/launch/sub"));
+        let home = |rest: &str| std::path::PathBuf::from(crate::fs::expand_tilde(rest));
+        assert_eq!(cli.log_file, Some(home("~/a.log")));
+        assert_eq!(cli.image, vec![home("~/a.png")]);
+        assert_eq!(cli.output_schema, Some(home("~/s.json")));
+        assert_eq!(cli.add_dir, vec![home("~/d")]);
+    }
+
+    #[test]
+    fn informational_commands_are_recognised() {
+        assert!(
+            !Cli::try_parse_from(["mini-agent"])
+                .unwrap()
+                .is_informational_command()
+        );
+        assert!(
+            !Cli::try_parse_from(["mini-agent", "-p", "q"])
+                .unwrap()
+                .is_informational_command()
+        );
+        for flag in ["--print-config", "--tutor"] {
+            assert!(
+                Cli::try_parse_from(["mini-agent", flag])
+                    .unwrap()
+                    .is_informational_command()
+            );
+        }
+    }
+
+    #[test]
+    fn misspelled_tool_allowlist_names_are_rejected_without_mcp_servers() {
+        let cfg = config::Config::default();
+        let parse = |tools: &str| Cli::try_parse_from(["mini-agent", "--tools", tools]).unwrap();
+        assert!(
+            parse("read,grep,bash")
+                .validate_tool_allowlist(&cfg)
+                .is_ok()
+        );
+        let all_unknown = parse("reed,greb")
+            .validate_tool_allowlist(&cfg)
+            .unwrap_err();
+        assert!(
+            all_unknown
+                .to_string()
+                .contains("'reed' (did you mean 'read'?), 'greb'"),
+            "{all_unknown}"
+        );
+        let mixed = parse("read,greb")
+            .validate_tool_allowlist(&cfg)
+            .unwrap_err();
+        assert!(mixed.to_string().contains("'greb'") && !mixed.to_string().contains("'read'"));
+        assert!(
+            Cli::try_parse_from(["mini-agent"])
+                .unwrap()
+                .validate_tool_allowlist(&cfg)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn permission_mode_flags_are_mutually_exclusive() {
+        let flags = [
+            "--restrictive",
+            "--read-only",
+            "--guarded",
+            "--accept-all",
+            "--yolo",
+            "--dangerously-skip-permissions",
+        ];
+        for (i, a) in flags.iter().enumerate() {
+            assert!(Cli::try_parse_from(["mini-agent", a]).is_ok(), "{a}");
+            for b in &flags[i + 1..] {
+                let err = Cli::try_parse_from(["mini-agent", a, b]).unwrap_err();
+                assert_eq!(
+                    err.kind(),
+                    clap::error::ErrorKind::ArgumentConflict,
+                    "{a} {b}"
+                );
+            }
+        }
     }
 
     #[cfg(feature = "mcp")]
@@ -2537,6 +2839,25 @@ output_token_cost = 0.0
         ] {
             assert!(Cli::try_parse_from(args).is_err());
         }
+    }
+
+    #[cfg(feature = "goal")]
+    #[test]
+    fn goal_resume_takes_a_new_bound_and_excludes_a_new_goal() {
+        let cli = Cli::try_parse_from([
+            "mini-agent",
+            "--continue",
+            "--goal-resume",
+            "--goal-max-rounds",
+            "80",
+        ])
+        .expect("resume with a new bound parses");
+        assert!(cli.goal_args.goal_resume);
+        assert_eq!(cli.goal_args.goal_max_rounds, Some(80));
+        assert!(
+            Cli::try_parse_from(["mini-agent", "--goal", "x", "--goal-resume"]).is_err(),
+            "a new goal and a resume are different requests"
+        );
     }
 
     /// Every goal flag parses, and the ones that only make sense alongside an

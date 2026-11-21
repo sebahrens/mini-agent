@@ -1,3 +1,4 @@
+use crate::ui::slash::write_usage;
 use compact_str::CompactString;
 
 use crate::ui::events::render_session;
@@ -88,7 +89,7 @@ async fn handle_export(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
 }
 
 #[cfg(feature = "export")]
-fn default_export_filename(session_id: &str) -> String {
+pub(super) fn default_export_filename(session_id: &str) -> String {
     format!("mini-agent-session-{}.html", short_id(session_id))
 }
 
@@ -105,7 +106,7 @@ fn resolve_export_path(workspace_root: &std::path::Path, requested: &str) -> std
 #[cfg(feature = "export")]
 async fn handle_import(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     let Some(path) = parts.get(1).map(|p| p.trim()).filter(|p| !p.is_empty()) else {
-        write_error(ctx.renderer, "usage: /import <file.jsonl|session.json>");
+        write_usage(ctx.renderer, "usage: /import <file.jsonl|session.json>");
         return Ok(());
     };
     let content = match read_bounded_import(path) {
@@ -363,23 +364,34 @@ pub(crate) fn share_confirmation(session: &crate::session::Session, html_bytes: 
 #[cfg(feature = "export")]
 async fn handle_share(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     let filename = default_export_filename(&ctx.session.id);
-    let html = crate::extras::export::session_to_html(ctx.session);
+    // Render the export only for the branches that need it: a usage error
+    // must not pay for a full HTML export.
     match parts.get(1).map(|arg| arg.trim()) {
         Some("confirm") if parts.len() == 2 => {}
         None | Some("") => {
+            let html = crate::extras::export::session_to_html(ctx.session);
             write_result(ctx.renderer, share_confirmation(ctx.session, html.len()));
             return Ok(());
         }
         Some(_) => {
-            write_error(ctx.renderer, "usage: /share, then /share confirm to upload");
+            write_usage(ctx.renderer, "usage: /share, then /share confirm to upload");
             return Ok(());
         }
     }
+    let html = crate::extras::export::session_to_html(ctx.session);
     let description = if ctx.session.name.is_empty() {
         "mini-agent session".to_string()
     } else {
         format!("mini-agent session: {}", ctx.session.name)
     };
+    // The upload can take up to its request timeout: say so before waiting.
+    write_ok(
+        ctx.renderer,
+        format!(
+            "uploading {} to gist.github.com…",
+            crate::agent::tools::list_dir::format_size(html.len() as u64)
+        ),
+    );
     match crate::extras::export::share_gist(&filename, &html, &description).await {
         Ok(url) => write_ok(ctx.renderer, format!("shared as secret gist: {}", url)),
         Err(e) => write_error(ctx.renderer, format!("share failed: {}", e)),
@@ -513,15 +525,15 @@ async fn handle_sessions(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
         // The catalogue parses up to 100 session files: read it off the UI
         // task while the picker shows "loading sessions…".
         ctx.input
-            .start_loading_session_picker(ctx.workspace.clone(), all);
+            .start_loading_session_picker(ctx.workspace.clone(), all, "");
     } else if parts[1] == "delete" && parts.len() < 3 {
-        write_error(ctx.renderer, "usage: /sessions delete <id-or-name>");
+        write_usage(ctx.renderer, "usage: /sessions delete <id-or-name>");
     } else if parts[1] == "delete" {
         let prefix = parts[2].trim();
         let sessions = crate::session::storage::find_sessions_by_prefix(prefix)?;
         match crate::session::storage::select_session(prefix, sessions) {
             crate::session::storage::SessionSelection::NoMatch => {
-                write_ok(ctx.renderer, format!("no session matching '{}'", prefix));
+                write_error(ctx.renderer, format!("no session matching '{}'", prefix));
             }
             crate::session::storage::SessionSelection::One(s) => {
                 if s.id == ctx.session.id {
@@ -547,7 +559,7 @@ async fn handle_sessions(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
                 }
             }
             crate::session::storage::SessionSelection::Ambiguous(sessions) => {
-                write_ok(
+                write_error(
                     ctx.renderer,
                     format!("multiple sessions match '{}', be more specific", prefix),
                 );
@@ -561,13 +573,13 @@ async fn handle_sessions(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
         let sessions = crate::session::storage::find_sessions_by_prefix(prefix)?;
         match crate::session::storage::select_session(prefix, sessions) {
             crate::session::storage::SessionSelection::NoMatch => {
-                write_ok(ctx.renderer, format!("no session matching '{}'", prefix));
+                write_error(ctx.renderer, format!("no session matching '{}'", prefix));
             }
             crate::session::storage::SessionSelection::One(s) => {
                 crate::startup::heap_future(|| resume_selected_session(*s, ctx)).await?;
             }
             crate::session::storage::SessionSelection::Ambiguous(sessions) => {
-                write_ok(
+                write_error(
                     ctx.renderer,
                     format!("multiple sessions match '{}':", prefix),
                 );
@@ -646,12 +658,12 @@ async fn handle_fork(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
         [_, value] => match value.parse::<usize>() {
             Ok(turn) => Some(turn),
             Err(_) => {
-                write_error(ctx.renderer, "usage: /fork [user-turn number]");
+                write_usage(ctx.renderer, "usage: /fork [user-turn number]");
                 return Ok(());
             }
         },
         _ => {
-            write_error(ctx.renderer, "usage: /fork [user-turn number]");
+            write_usage(ctx.renderer, "usage: /fork [user-turn number]");
             return Ok(());
         }
     };

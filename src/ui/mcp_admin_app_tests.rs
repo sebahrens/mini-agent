@@ -1071,6 +1071,14 @@ async fn actual_app_global_add_catalogue_status_and_remove_are_owned_and_never_c
     command(&mut app, "/doctor").await;
     assert!(app.renderer.captured_output().contains("failed: Failed"));
     assert_eq!(server.requests.lock().unwrap().len(), requests_before);
+    command(&mut app, "/mcp").await;
+    let status = app.renderer.captured_output();
+    assert!(
+        status.contains("attempt #") && status.contains(": failed"),
+        "{status}"
+    );
+    assert!(status.contains("reason:"), "{status}");
+    assert!(status.contains("tools: "), "{status}");
     command(&mut app, "/mcp remove failed").await;
     drain(&mut app).await;
     command(&mut app, "/mcp remove owned").await;
@@ -1999,6 +2007,14 @@ async fn native_deferred_wire_case(same_response: bool, hook: Option<&str>, cost
                     .unwrap()
                     .push_back(completion(Vec::new(), Some("native owned terminal")));
             }
+        } else {
+            // The hidden call is skipped with a corrective result; the model
+            // answers on the next request.
+            server
+                .provider_streams
+                .lock()
+                .unwrap()
+                .push_back(completion(Vec::new(), Some("native owned terminal")));
         }
         let cli = crate::cli::Cli {
             no_session: true,
@@ -2104,7 +2120,8 @@ async fn native_deferred_wire_case(same_response: bool, hook: Option<&str>, cost
             }
             let result = tokio::time::timeout(Duration::from_secs(3), &mut turn).await.unwrap();
             if same_response {
-                assert!(result.expect_err("unadvertised hidden wire call must be rejected").to_string().contains("owned_echo"));
+                // Skipped with a corrective result, never executed: the turn continues.
+                assert_eq!(result.unwrap().0, "native owned terminal");
             } else if cost_cap {
                 assert!(result.expect_err("canonical second response exhausts the cap before MCP effect").to_string().contains(crate::spend::run::BUDGET_STOP));
                 let run = spend.as_ref().unwrap();
@@ -2124,7 +2141,7 @@ async fn native_deferred_wire_case(same_response: bool, hook: Option<&str>, cost
             assert_eq!(server.method_count("tools/list"), cached_calls, "cached deferred status must not perform an RPC");
             command(&mut diagnostic_app, "/mcp").await;
             let rendered = diagnostic_app.renderer.captured_output();
-            assert!(rendered.contains("schema loading: Deferred"));
+            assert!(rendered.contains("schema loading: deferred"));
             assert!(rendered.contains(&format!("1 deferred schemas, {} enabled by search",usize::from(!same_response))));
             assert_eq!(server.method_count("tools/list"),cached_calls,"actual cached status command must not query the server");
             assert!(questions.try_recv().is_err());
@@ -2132,7 +2149,7 @@ async fn native_deferred_wire_case(same_response: bool, hook: Option<&str>, cost
             assert!(server.provider_streams.lock().unwrap().is_empty());
             assert!(matches!(permission.lock().unwrap().check_mcp("mcp_tool:owned:owned_echo", None, "owned_echo"), crate::permission::checker::CheckResult::Ask));
             let wire = server.requests.lock().unwrap().iter().filter(|(route,_)|route.starts_with("POST /v1/chat/completions ")).map(|(_,body)|body.clone()).collect::<Vec<_>>();
-            assert_eq!(wire.len(),if same_response{1}else if cost_cap{2}else{3});
+            assert_eq!(wire.len(),if same_response || cost_cap {2} else {3});
             if let Some(mode) = hook {
                 let calls = server.requests.lock().unwrap().iter().filter(|(_,body)|body["method"]=="tools/call").map(|(_,body)|body.clone()).collect::<Vec<_>>();
                 let model_tool_results = serde_json::to_string(&wire[2]["messages"]).unwrap();
@@ -2772,12 +2789,14 @@ async fn native_deferred_case(case: &str) {
             request.reply.send(if deny { crate::permission::ask::UserDecision::Deny } else { crate::permission::ask::UserDecision::AllowOnce }).unwrap();
         }
         let result = tokio::time::timeout(Duration::from_secs(3), &mut turn).await.unwrap();
-        if matches!(case, "same-response" | "terminate") {
+        if case == "terminate" {
             let error = result.unwrap_err().to_string();
-            assert!(error.contains(if case == "terminate" {"owned discovery termination"} else {"UnknownToolCall"}), "{error}");
+            assert!(error.contains("owned discovery termination"), "{error}");
         } else { assert_eq!(result.unwrap().0,"owned native terminal"); }
         let wire = server.requests.lock().unwrap().iter().filter(|(route,_)|route.starts_with("POST /v1/messages ")).map(|(_,body)|body.clone()).collect::<Vec<_>>();
-        assert_eq!(wire.len(),if matches!(case,"same-response" | "terminate") {1} else if no_effect || eager {2} else {3}, "{case}");
+        // A same-response hidden call is no longer fatal (mini-agent-sskdu.246): it is
+        // skipped with a corrective result and never executed, so the turn goes on.
+        assert_eq!(wire.len(),if case == "terminate" {1} else if case == "same-response" {3} else if no_effect || eager {2} else {3}, "{case}");
         let raw_prefixes=server.native_raw_prefixes.lock().unwrap();
         assert_eq!(raw_prefixes.len(),wire.len());
         assert!(raw_prefixes.iter().all(|prefix|prefix==&raw_prefixes[0]),"native system/tools bytes changed: {case}");
@@ -2808,8 +2827,12 @@ async fn native_deferred_case(case: &str) {
         }
         if wire.len() > 1 {
             let results = wire[1]["messages"].as_array().unwrap().iter().flat_map(|message| message["content"].as_array().unwrap()).filter(|block|block["type"]=="tool_result").collect::<Vec<_>>();
-            assert_eq!(results.len(),1);
+            // A same-response hidden call is answered with its own corrective result.
+            assert_eq!(results.len(),if case == "same-response" {2} else {1});
             assert_eq!(results[0]["tool_use_id"],"owned-search-call");
+            if case == "same-response" {
+                assert_eq!(results[1]["tool_use_id"],"owned-hidden-call");
+            }
             let references = results[0]["content"].as_array().unwrap().iter().filter(|block|block["type"]=="tool_reference").collect::<Vec<_>>();
             if no_effect || eager { assert!(references.is_empty(),"{case}"); }
             else { assert_eq!(references,vec![&serde_json::json!({"type":"tool_reference","tool_name":"owned_echo"})]); }

@@ -277,6 +277,29 @@ fn regen_resource(
 /// Validate the complete configured policy before any provider, model, tool,
 /// transport, or UI construction. All execution modes share `Startup::init`,
 /// including ACP, headless print, loop, and interactive startup.
+/// Marker recording that the one-time recommended-MCP questions were asked.
+#[cfg(feature = "mcp")]
+fn onboarding_marker() -> Option<std::path::PathBuf> {
+    crate::paths::process_paths_ref()
+        .ok()
+        .map(|paths| paths.data_dir.join("onboarding_done"))
+}
+
+/// The one-time "Enable Context7 / Grep.app MCP?" questions are due in an
+/// interactive session while a choice is still unset and they were never
+/// asked. Decided from config content and a marker, not from whether the
+/// config file already existed: a first `--setup`, `--print-config` or `-p`
+/// run creates that file without ever reaching the questions.
+#[cfg(feature = "mcp")]
+fn recommended_mcp_prompt_due(
+    is_interactive: bool,
+    context7: Option<bool>,
+    grepapp: Option<bool>,
+    marker_exists: bool,
+) -> bool {
+    is_interactive && !marker_exists && (context7.is_none() || grepapp.is_none())
+}
+
 fn validate_startup_permission_policy(cli: &Cli, cfg: &Config) -> anyhow::Result<()> {
     let authority = crate::permission::resolve_execution_authority(
         cli,
@@ -299,6 +322,54 @@ fn require_recent_session(
         .next()
         .ok_or_else(|| anyhow::anyhow!("cannot continue: no saved sessions for this workspace ({}); use --session or /sessions", workspace.display()))
 }
+/// One line per unreadable session file ("skipped unreadable session <id>:
+/// <reason>"), plus a count of any beyond those listed.
+fn skipped_sessions_lines(skips: &[session::storage::SkippedSession], total: usize) -> Vec<String> {
+    let mut lines: Vec<String> = skips
+        .iter()
+        .map(|skip| format!("skipped unreadable session {}: {}", skip.id, skip.reason))
+        .collect();
+    if total > skips.len() {
+        lines.push(format!(
+            "{} more session file(s) could not be read",
+            total - skips.len()
+        ));
+    }
+    lines
+}
+
+/// `--continue`: say so when a newer session file was skipped (the resumed one
+/// is then an older conversation), and when nothing could be read, name the
+/// unreadable files instead of claiming there are no saved sessions.
+fn require_recent_session_reporting(
+    result: anyhow::Result<(Vec<Session>, session::storage::DiscoverySkips)>,
+    workspace: &std::path::Path,
+) -> anyhow::Result<Session> {
+    let (sessions, skips) = match result {
+        Ok(found) => found,
+        Err(error) => return require_recent_session(Err(error), workspace),
+    };
+    let lines = skipped_sessions_lines(&skips.first, skips.total);
+    if sessions.is_empty() && skips.total > 0 {
+        anyhow::bail!(
+            "cannot continue: {} session file(s) for this workspace could not be read (first: {}); use --session or /sessions",
+            skips.total,
+            lines.first().map(String::as_str).unwrap_or("unknown")
+        );
+    }
+    for line in &lines {
+        eprintln!("{line}");
+    }
+    require_recent_session(Ok(sessions), workspace)
+}
+
+/// Print mode generates a title only for an explicitly configured
+/// `session_title_model`; the default session-model title never delays or
+/// bills a scripted run (mini-agent-sskdu.12).
+fn headless_title_wanted(cfg: &Config) -> bool {
+    cfg.session_title_model.is_some()
+}
+
 fn unavailable_sandbox_must_fail(cli: &Cli, cfg: &Config, is_windows: bool) -> bool {
     cli.resolve_sandbox(cfg) && (is_windows || cli.sandbox_explicitly_requested(cfg))
 }
@@ -719,7 +790,9 @@ fn headless_compaction_plan_with(
     let projected =
         session.context_messages_with_pruned_tool_results(cfg.resolve_keep_recent_tool_results());
     let cut_idx = Session::select_compaction_cut(&projected, keep_recent);
-    if cut_idx == 0 {
+    // At or before the live start there is nothing but the previous summary
+    // to cut (mini-agent-sskdu.227).
+    if cut_idx <= session.compacted_context().1 {
         return None;
     }
     let tokens_before = session.messages[..cut_idx]
@@ -904,6 +977,20 @@ async fn settle_housekeeping(handle: Option<std::thread::JoinHandle<()>>) {
     }
 }
 
+/// Dispatch `PreCompact` unless this compaction already did.
+#[cfg(feature = "hooks")]
+async fn dispatch_pre_compact_once(
+    sent: &std::sync::atomic::AtomicBool,
+    instructions: Option<&str>,
+) {
+    if !sent.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        crate::startup::heap_future(|| {
+            crate::extras::hooks::dispatch_pre_compact(true, instructions)
+        })
+        .await;
+    }
+}
+
 /// Compact the headless session; `force` is context relief (see
 /// [`headless_compaction_plan_with`]). Returns the summarizer usage (already
 /// charged to the session) and whether any history was compacted.
@@ -946,10 +1033,16 @@ async fn compact_headless_session(
     let request_observer = observed.clone();
     // Same model on a native prompt-cache route: fork the conversation's own
     // request instead of re-serializing it (mini-agent-o2nut).
+    // `PreCompact` fires once, before the first summarizer request of either
+    // path, so a successful fork still announces itself (mini-agent-sskdu.239).
+    #[cfg(feature = "hooks")]
+    let pre_compact_sent = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let fork: Option<HeadlessFork<'_>> = agent
         .filter(|agent| compaction_model.is_none() && agent.supports_cache_fork())
         .map(|agent| {
             let observed = observed.clone();
+            #[cfg(feature = "hooks")]
+            let pre_compact_sent = pre_compact_sent.clone();
             Box::new(
                 move |history, messages_included, input_token_budget, response_token_budget| {
                     let (input_token_budget, response_token_budget) =
@@ -958,16 +1051,24 @@ async fn compact_headless_session(
                             input_token_budget,
                             response_token_budget,
                         );
-                    Box::pin(agent.compress_forked(
-                        history,
-                        messages_included,
-                        instructions,
-                        input_token_budget,
-                        response_token_budget,
-                        &cfg.retry,
-                        observed,
-                        cfg.resolve_compaction_timeout(),
-                    )) as futures::future::BoxFuture<'_, _>
+                    #[cfg(feature = "hooks")]
+                    let pre_compact_sent = pre_compact_sent.clone();
+                    Box::pin(async move {
+                        #[cfg(feature = "hooks")]
+                        dispatch_pre_compact_once(&pre_compact_sent, instructions).await;
+                        agent
+                            .compress_forked(
+                                history,
+                                messages_included,
+                                instructions,
+                                input_token_budget,
+                                response_token_budget,
+                                &cfg.retry,
+                                observed,
+                                cfg.resolve_compaction_timeout(),
+                            )
+                            .await
+                    }) as futures::future::BoxFuture<'_, _>
                 },
             ) as HeadlessFork<'_>
         });
@@ -981,10 +1082,7 @@ async fn compact_headless_session(
         fork,
         |model, messages, previous_summary, input_token_budget, response_token_budget| async move {
             #[cfg(feature = "hooks")]
-            crate::startup::heap_future(|| {
-                crate::extras::hooks::dispatch_pre_compact(true, instructions)
-            })
-            .await;
+            dispatch_pre_compact_once(&pre_compact_sent, instructions).await;
             let model = compaction_model.unwrap_or(model);
             let (input_token_budget, response_token_budget) =
                 crate::config::CompactionBudgetCap::apply(
@@ -1025,7 +1123,10 @@ async fn compact_headless_session(
     #[cfg(feature = "hooks")]
     if let Some(compacted) = &compacted {
         crate::startup::heap_future(|| {
-            crate::extras::hooks::dispatch_post_compact(true, Some(&compacted.summary))
+            crate::extras::hooks::dispatch_post_compact(
+                true,
+                session.compacted_context().0.or(Some(&compacted.summary)),
+            )
         })
         .await;
         let notices =
@@ -1043,6 +1144,19 @@ async fn compact_headless_session(
         );
     }
     let happened = compacted.is_some();
+    if let Some(compacted) = &compacted {
+        // The auto-compacting line announced the work; say what it did so a
+        // script log shows the run was compacted (mini-agent-sskdu.243).
+        let freed = session
+            .compactions
+            .last()
+            .map_or(0, |compaction| compaction.token_savings);
+        eprintln!(
+            "compacted {} messages into a summary (freed ~{freed} tokens net)",
+            compacted.first_kept_index,
+        );
+        crate::print::record_headless_compaction(compacted.first_kept_index, freed);
+    }
     Ok((
         compacted
             .map(|compacted| compacted.usage)
@@ -1136,10 +1250,7 @@ where
     let model = session.model.to_string();
     let (skipped, messages) =
         session.compaction_input(plan.cut_idx, cfg.resolve_keep_recent_tool_results());
-    let previous_summary = session
-        .compactions
-        .last()
-        .map(|compaction| compaction.summary.to_string());
+    let previous_summary = session.previous_summary_prose();
     let keep_recent_tool_results = cfg.resolve_keep_recent_tool_results();
     let mut output = None;
     if let Some(fork) = fork
@@ -1411,7 +1522,10 @@ impl Startup {
         if cli.input_format() == crate::cli::InputFormat::StreamJson
             && cli.output_format() != OutputFormat::StreamJson
         {
-            anyhow::bail!("--input-format stream-json requires --output stream-json");
+            return Err(HeadlessUsageError(
+                "--input-format stream-json requires --output stream-json".to_owned(),
+            )
+            .into());
         }
         #[allow(unused_mut)]
         let mut expand_custom =
@@ -1481,6 +1595,14 @@ impl Startup {
             }
             // Headless: a usage error (exit 2) with a machine-readable
             // failure record, before any provider/session setup.
+            let message = error.to_string();
+            crate::print::emit_headless_preflight_failure(&cli, workspace.root(), &message).await?;
+            return Err(HeadlessUsageError(message).into());
+        }
+        if let Err(error) = cli.validate_tool_allowlist(&cfg) {
+            if !cli.print {
+                return Err(error);
+            }
             let message = error.to_string();
             crate::print::emit_headless_preflight_failure(&cli, workspace.root(), &message).await?;
             return Err(HeadlessUsageError(message).into());
@@ -1568,22 +1690,42 @@ impl Startup {
         }
 
         if cli.continue_session && cli.session.is_none() {
-            session = require_recent_session(
-                session::storage::find_recent_sessions_for_workspace(1, workspace.root()),
+            session = require_recent_session_reporting(
+                session::storage::find_recent_sessions_for_workspace_reporting(1, workspace.root()),
                 workspace.root(),
             )?;
             session_resumed = true;
         }
 
         if let Some(session_id) = &cli.session {
-            let candidates = session::storage::find_sessions_by_prefix(session_id)?;
+            let (candidates, skips) =
+                session::storage::find_sessions_by_prefix_reporting(session_id)?;
+            let relevant: Vec<_> = skips
+                .first
+                .iter()
+                .filter(|skip| skip.id.starts_with(session_id.as_str()))
+                .cloned()
+                .collect();
+            for line in skipped_sessions_lines(&relevant, relevant.len()) {
+                eprintln!("{line}");
+            }
             match session::storage::select_session(session_id, candidates) {
                 session::storage::SessionSelection::One(selected) => {
                     session = *selected;
                     session_resumed = true;
                 }
                 session::storage::SessionSelection::NoMatch => {
-                    anyhow::bail!("no session matching '{}'", session_id);
+                    if let Some(skip) = relevant.first() {
+                        anyhow::bail!(
+                            "session '{}' exists but could not be read ({}: {})",
+                            session_id,
+                            skip.id,
+                            skip.reason
+                        );
+                    }
+                    return Err(
+                        HeadlessUsageError(format!("no session matching '{session_id}'")).into(),
+                    );
                 }
                 session::storage::SessionSelection::Ambiguous(sessions) => {
                     eprintln!("multiple sessions match '{}':", session_id);
@@ -1614,7 +1756,12 @@ impl Startup {
         }
 
         if let Some(original) = fork_source {
-            anyhow::ensure!(session_resumed, "--fork-session requires a saved session");
+            if !session_resumed {
+                return Err(HeadlessUsageError(
+                    "--fork-session requires a saved session".to_owned(),
+                )
+                .into());
+            }
             // A cross-workspace selection has already created its fresh fork.
             if session.id == original {
                 session = session::lock::fork_at_turn(&session, None)?;
@@ -1662,9 +1809,11 @@ impl Startup {
             Some(resolve_resume_provider_decision(&cli, &cfg, &session)?)
         } else {
             if cli.resume_provider.is_some() || cli.resume_model.is_some() {
-                anyhow::bail!(
+                return Err(HeadlessUsageError(
                     "--resume-provider/--resume-model require --continue or --session with an existing saved session"
-                );
+                        .to_owned(),
+                )
+                .into());
             }
             None
         };
@@ -2229,7 +2378,12 @@ impl Startup {
 
         // Recommended MCP prompts on first startup
         #[cfg(feature = "mcp")]
-        if self.is_first_startup && self.is_interactive {
+        if recommended_mcp_prompt_due(
+            self.is_interactive,
+            self.cfg.enable_context7_mcp,
+            self.cfg.enable_grepapp_mcp,
+            onboarding_marker().is_some_and(|marker| marker.exists()),
+        ) {
             let prompted =
                 self.cfg.enable_context7_mcp.is_none() || self.cfg.enable_grepapp_mcp.is_none();
             if prompted {
@@ -2261,6 +2415,10 @@ impl Startup {
                 config::inject_mcp_defaults(&mut self.cfg);
                 if let Err(e) = config::save_config_changes(&config_before_prompts, &self.cfg) {
                     tracing::warn!("Failed to save config with MCP choices: {e}");
+                }
+                if let Some(marker) = onboarding_marker() {
+                    let _ = std::fs::create_dir_all(marker.parent().unwrap_or(&marker));
+                    let _ = std::fs::write(&marker, b"recommended MCP servers offered\n");
                 }
             }
         }
@@ -2398,10 +2556,12 @@ impl Startup {
                     self.client = new_client;
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "Failed to rebuild client for prompt-mapped provider '{}': {}",
-                        self.provider,
-                        e
+                    // Continuing would send the mapped provider's model id to
+                    // the original provider while the session records the
+                    // mapped one.
+                    anyhow::bail!(
+                        "`prompt_to_model` maps the active prompt to provider '{}', but its client cannot be built: {e:#}",
+                        self.provider
                     );
                 }
             }
@@ -2829,7 +2989,7 @@ impl Startup {
         let identity = (self.session.id.to_string(), self.session.name.to_string());
         let result = heap_future(|| self.dispatch_print_inner()).await;
         if let Err(error) = &result
-            && output_format == OutputFormat::StreamJson
+            && output_format != OutputFormat::Text
             && !crate::print::headless_result_emitted()
         {
             crate::print::emit_headless_failure(
@@ -2870,14 +3030,13 @@ impl Startup {
     }
 
     async fn dispatch_print_inner(&mut self) -> anyhow::Result<()> {
-        let mut msg = self.cli.message.join(" ").trim().to_string();
+        let msg = self.cli.message.join(" ").trim().to_string();
         #[cfg_attr(not(feature = "multimodal"), allow(unused_variables))]
         let media = self.take_headless_media(msg.starts_with('!'))?;
         let schema = self.cli.loaded_output_schema.clone();
-        if let Some(schema) = &schema {
-            msg.push_str("\n\n");
-            msg.push_str(&schema.instructions());
-        }
+        // The schema contract is host text for this request only: a directive
+        // keeps it out of the saved prompt, hooks, title and chat history.
+        let schema_directive = schema.as_ref().map(|schema| schema.instructions());
         let output = crate::print::HeadlessOutputPolicy::from_cli(&self.cli);
         let json_output = output.format != OutputFormat::Text;
         let identity = (self.session.id.to_string(), self.session.name.to_string());
@@ -3022,7 +3181,8 @@ impl Startup {
                     "message is too large to fit in the context window \
                      (estimated {pending_tokens} tokens; overhead {oh} tokens; \
                      window {cw} tokens; reserve {reserve} tokens): \
-                     reduce the message size or clear the session with /clear",
+                     reduce the message size, or start fresh by omitting \
+                     --continue/--session (or pass --no-session)",
                     oh = self.session.overhead_tokens,
                     cw = self.session.context_window,
                 );
@@ -3141,7 +3301,15 @@ impl Startup {
             // state it did when it was taken before MCP connect.
             let change_baseline = join_change_baseline(baseline_task).await;
             #[cfg(feature = "subagents")]
-            let agent = agent.with_headless_turn_directive(self.headless_agent_directive.take());
+            let agent_directive = self.headless_agent_directive.take();
+            #[cfg(not(feature = "subagents"))]
+            let agent_directive: Option<String> = None;
+            let agent = agent.with_headless_turn_directive(
+                match (agent_directive, schema_directive.clone()) {
+                    (Some(first), Some(second)) => Some(format!("{first}\n\n{second}")),
+                    (first, second) => first.or(second),
+                },
+            );
             #[cfg(all(feature = "hooks", feature = "mcp"))]
             if let Some(scope) = crate::agent::runner::current_hook_work_scope() {
                 scope.set_hook_mcp_peers(
@@ -3463,7 +3631,11 @@ impl Startup {
                 // Persist the actual turn first; title failure cannot lose
                 // history. This awaited no-tools request owns its work and
                 // adds observed usage at its captured model prices.
-                if failure.is_none() {
+                // Print mode never shows the title and a scripted run is
+                // latency-sensitive, so the default (session model) title is
+                // left to the next interactive resume; only an explicit
+                // `session_title_model` is generated here (mini-agent-sskdu.12).
+                if failure.is_none() && headless_title_wanted(&self.cfg) {
                     let cost_before = session.total_cost;
                     // This measured large title child must not add its
                     // construction copies to the primary request's poll.
@@ -3859,6 +4031,34 @@ fn apply_goal_flags(cli: &Cli, cfg: &config::Config, session: &Session) -> anyho
         .map(str::trim)
         .filter(|o| !o.is_empty())
     else {
+        if cli.goal_args.goal_resume {
+            if cli.resolve_no_tools(cfg) {
+                anyhow::bail!("a goal needs the goal_report tool; remove --no-tools");
+            }
+            let max_rounds = cli.goal_args.goal_max_rounds;
+            let resumed = session.goal_store.with_mut(|goal| {
+                if let Some(max_rounds) = max_rounds {
+                    goal.bounds.max_rounds = max_rounds.max(1);
+                }
+                goal.resume()
+            });
+            return match resumed {
+                Some(true) => Ok(()),
+                Some(false) => anyhow::bail!(
+                    "the session's goal is finished and cannot resume; start a new one with --goal"
+                ),
+                None => anyhow::bail!("--goal-resume needs a session with a goal (use --continue)"),
+            };
+        }
+        // The answer to a goal's question is what it was waiting for, as in
+        // the terminal: with a prompt given, the goal resumes.
+        if !cli.message.is_empty() {
+            session.goal_store.with_mut(|goal| {
+                if goal.status == crate::extras::goal::GoalStatus::AwaitingUser {
+                    goal.resume();
+                }
+            });
+        }
         if has_live_goal && cli.resolve_no_tools(cfg) {
             anyhow::bail!(
                 "this session has an unfinished goal, which needs the goal_report tool; \
@@ -4889,6 +5089,7 @@ async fn run_headless_goal_rounds_inner(
                 &session.provider,
                 &session.model,
             );
+            session.goal_store.record_judge(judge.as_ref());
             // The round that just ran is persisted after the gate settles, so
             // the session does not contain it yet and the judge would be shown
             // every round except the one it was asked about. The turn's own
@@ -5659,7 +5860,7 @@ pub(crate) fn current_environment_record(
     }
 }
 
-/// Notices a session entered after startup (the `/resume` picker, `/fork`,
+/// Notices a session entered after startup (the `/sessions` picker, `/fork`,
 /// `/import`) owes the model, as a `--resume` launch already gives it: the
 /// environment-change notice and the "child ids are no longer resumable"
 /// notice. Subagent conversations live in memory only, so a saved
@@ -5694,6 +5895,24 @@ fn tool_set_label(no_tools: bool, allowlist: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn recommended_mcp_questions_survive_a_non_interactive_first_run() {
+        use super::recommended_mcp_prompt_due;
+        // A headless first run creates the config file but asks nothing; the
+        // next interactive start must still ask (choices unset, no marker).
+        assert!(!recommended_mcp_prompt_due(false, None, None, false));
+        assert!(recommended_mcp_prompt_due(true, None, None, false));
+        assert!(recommended_mcp_prompt_due(true, Some(true), None, false));
+        assert!(!recommended_mcp_prompt_due(
+            true,
+            Some(false),
+            Some(true),
+            false
+        ));
+        assert!(!recommended_mcp_prompt_due(true, None, None, true));
+    }
+
     #[test]
     fn explicit_model_flags_pin_startup_model_against_prompt_to_model() {
         use super::*;
@@ -5721,9 +5940,9 @@ mod tests {
         OpenRouterPricingRefresh, ResumeProviderDecision, apply_openrouter_pricing_refresh_result,
         apply_resume_provider_decision, compact_headless_session_with, headless_compaction_plan,
         interactive_initial_message, js_runtime_banner_lines, needs_openrouter_context_refresh,
-        relieve_headless_turn, require_recent_session, resolve_resume_provider_decision,
-        run_startup_probes_concurrently, unavailable_sandbox_must_fail,
-        validate_startup_permission_policy,
+        relieve_headless_turn, require_recent_session, require_recent_session_reporting,
+        resolve_resume_provider_decision, run_startup_probes_concurrently,
+        unavailable_sandbox_must_fail, validate_startup_permission_policy,
     };
     use crate::cli::Cli;
 
@@ -5731,7 +5950,7 @@ mod tests {
     /// that `Session::sync_environment` compares on resume: an unchanged tool
     /// set must not look like a change, and a changed one must produce the
     /// resume notice (mini-agent-jn5e7).
-    // mini-agent-ji9iy: a session entered after startup (/resume picker, /fork,
+    // mini-agent-ji9iy: a session entered after startup (/sessions picker, /fork,
     // /import) gets the stale-child-id and environment-change notices exactly
     // once, as a `--resume` launch does.
     #[test]
@@ -5951,6 +6170,36 @@ mod tests {
     #[test]
     fn continue_requires_a_readable_existing_session() {
         let workspace = std::path::Path::new("/workspace/project");
+        let default_cfg = Config::default();
+        assert!(
+            !super::headless_title_wanted(&default_cfg),
+            "default title is skipped in print mode"
+        );
+        let explicit = Config {
+            session_title_model: Some("fast".into()),
+            ..Default::default()
+        };
+        assert!(super::headless_title_wanted(&explicit));
+        let skipped = require_recent_session_reporting(
+            Ok((
+                Vec::new(),
+                crate::session::storage::DiscoverySkips {
+                    total: 1,
+                    first: vec![crate::session::storage::SkippedSession {
+                        id: "abc".into(),
+                        reason: "invalid persisted session JSON (line 1, column 9)".into(),
+                    }],
+                },
+            )),
+            workspace,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            skipped.contains("could not be read") && skipped.contains("abc"),
+            "{skipped}"
+        );
+        assert!(!skipped.contains("no saved sessions"), "{skipped}");
         let missing = require_recent_session(Ok(Vec::new()), workspace).unwrap_err();
         assert!(
             missing
@@ -8901,5 +9150,20 @@ mod headless_session_lifetime_tests {
             next_pool.ensure_open().is_err(),
             "EOF closes admission for the same retained pool"
         );
+    }
+}
+
+#[cfg(all(test, feature = "hooks"))]
+mod pre_compact_once_tests {
+    #[tokio::test]
+    async fn pre_compact_is_announced_once_per_compaction() {
+        // mini-agent-sskdu.239: the fork and the text path share one flag.
+        let sent = std::sync::atomic::AtomicBool::new(false);
+        super::dispatch_pre_compact_once(&sent, None).await;
+        assert!(sent.load(std::sync::atomic::Ordering::SeqCst));
+        // A second request of the same compaction must not dispatch again; the
+        // flag staying set is the observable contract.
+        super::dispatch_pre_compact_once(&sent, None).await;
+        assert!(sent.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

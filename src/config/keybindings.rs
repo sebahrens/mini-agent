@@ -377,6 +377,24 @@ impl KeyBindings {
     }
 
     pub(crate) fn describe(&self) -> Vec<String> {
+        self.action_keys()
+            .into_iter()
+            .map(|(name, keys)| {
+                format!(
+                    "{name}: {}",
+                    if keys.is_empty() {
+                        "unbound".into()
+                    } else {
+                        keys.join(", ")
+                    }
+                )
+            })
+            .collect()
+    }
+
+    /// Each action's config name with the keys currently bound to it
+    /// (overrides first, else the defaults that are available and unshadowed).
+    pub(crate) fn action_keys(&self) -> Vec<(&'static str, Vec<String>)> {
         SPECS
             .iter()
             .map(|spec| {
@@ -408,15 +426,7 @@ impl KeyBindings {
                         .map(|(text, _)| (*text).to_owned())
                         .collect()
                 };
-                format!(
-                    "{}: {}",
-                    spec.name,
-                    if keys.is_empty() {
-                        "unbound".into()
-                    } else {
-                        keys.join(", ")
-                    }
-                )
+                (spec.name, keys)
             })
             .collect()
     }

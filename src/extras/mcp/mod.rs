@@ -641,10 +641,18 @@ impl McpClientManager {
                         })
                         .await
                     };
-                    attempt.finish(match &result {
-                        Ok(_) => health::AttemptOutcome::Succeeded,
-                        Err(error) => connect_failure_outcome(error),
-                    });
+                    match &result {
+                        Ok(_) => attempt.finish(health::AttemptOutcome::Succeeded),
+                        Err(error) => {
+                            // One credential-safe reason, shared with the
+                            // startup notice.
+                            let reason = connect_failure_detail(&name, error);
+                            attempt.finish_with(
+                                connect_failure_outcome(error),
+                                reason.trim_start_matches(": ").trim(),
+                            );
+                        }
+                    }
                     (name, result)
                 }
             })
@@ -1093,7 +1101,7 @@ impl McpClientManager {
         {
             Ok(handle) => handle,
             Err(error) => {
-                attempt.finish(health::AttemptOutcome::Failed);
+                attempt.finish_with(health::AttemptOutcome::Failed, &format!("{error:#}"));
                 return Err(error);
             }
         };

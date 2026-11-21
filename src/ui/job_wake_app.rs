@@ -44,28 +44,50 @@ impl App<'_> {
             self.finish_startup_work().await?;
         }
         self.ensure_agent().await;
+        // Say which jobs ended before the budget check: the notices are
+        // already drained, so a blocked wake must not swallow them silently.
+        let headline = format!(
+            "⟳ background job{} reported: {}",
+            if notices.len() == 1 { "" } else { "s" },
+            notices
+                .iter()
+                .map(crate::sandbox::job_notices::JobNotice::headline)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         if self.budget_admission_notice()? {
+            self.renderer.write_line(&headline, Color::Cyan)?;
             return Ok(());
         }
-        CONSECUTIVE_WAKES.fetch_add(1, Ordering::Relaxed);
+        let wakes = CONSECUTIVE_WAKES.fetch_add(1, Ordering::Relaxed) + 1;
         let prompt = crate::sandbox::job_notices::wake_prompt(&notices);
-        self.renderer.write_line(
-            &format!(
-                "⟳ background job{} reported: {}",
-                if notices.len() == 1 { "" } else { "s" },
-                notices
-                    .iter()
-                    .map(crate::sandbox::job_notices::JobNotice::headline)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-            Color::Cyan,
-        )?;
+        self.renderer.write_line(&headline, Color::Cyan)?;
+        if wakes >= MAX_CONSECUTIVE_WAKES {
+            self.renderer.write_line(
+                &format!(
+                    "auto-wake paused after {MAX_CONSECUTIVE_WAKES} wakes; send a message to continue"
+                ),
+                Color::DarkGrey,
+            )?;
+        }
         crate::startup::heap_future(|| {
             self.start_main_run(&prompt, crate::question::QuestionOrigin::Scheduled)
         })
         .await?;
         self.refresh()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_session_change_or_user_turn_restores_the_wake_budget() {
+        CONSECUTIVE_WAKES.store(MAX_CONSECUTIVE_WAKES, Ordering::Relaxed);
+        assert!(CONSECUTIVE_WAKES.load(Ordering::Relaxed) >= MAX_CONSECUTIVE_WAKES);
+        user_turn_started();
+        assert_eq!(CONSECUTIVE_WAKES.load(Ordering::Relaxed), 0);
     }
 }

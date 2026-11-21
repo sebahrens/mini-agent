@@ -311,6 +311,65 @@ fn render(ctx: &Ctx) -> io::Result<()> {
     }
 }
 
+/// Row assignments of the setup main menu for a terminal `rows` high.
+#[derive(Debug, PartialEq, Eq)]
+struct MainMenuLayout {
+    /// Provider entries drawn, and how many more are hidden ("+N more").
+    providers_shown: usize,
+    providers_hidden: usize,
+    /// Quick-model entries drawn, and how many more are hidden.
+    models_shown: usize,
+    models_hidden: usize,
+    /// Row of the rule above the action keys, and of the first action row.
+    rule_row: u16,
+    actions_row: u16,
+}
+
+/// Fit the provider and model lists above an action menu that stays on screen.
+/// The action keys (three rows) and a message row are pinned to the bottom when
+/// the lists would otherwise push them off; short lists keep the menu directly
+/// below them. A list that does not fit shows a "+N more" line.
+fn main_menu_layout(rows: u16, providers: usize, models: usize) -> MainMenuLayout {
+    // Rows of header and spacing around the lists: title block (4), the
+    // PROVIDERS and QUICK MODELS captions and the blank between them.
+    const TOP: usize = 4;
+    const CAPTIONS: usize = 3;
+    // Rule, blank, three action rows, message row.
+    const FOOTER: usize = 6;
+    let natural_rows = providers.max(1) + models.max(1);
+    let natural_rule = TOP + CAPTIONS + natural_rows + 1;
+    let pinned_rule = (rows as usize).saturating_sub(FOOTER);
+    let rule = natural_rule.min(pinned_rule.max(TOP + CAPTIONS + 2 + 1));
+    // Entry lines available between the captions: everything above the rule
+    // except one blank row.
+    let budget = rule.saturating_sub(TOP + CAPTIONS + 1).max(2);
+    let (provider_slots, model_slots) = if providers.max(1) + models.max(1) <= budget {
+        (providers.max(1), models.max(1))
+    } else {
+        let model_slots = models.max(1).min((budget / 3).max(1));
+        (budget - model_slots, model_slots)
+    };
+    let fit = |len: usize, slots: usize| {
+        if len <= slots {
+            (len, 0)
+        } else {
+            let shown = slots.saturating_sub(1);
+            (shown, len - shown)
+        }
+    };
+    let (providers_shown, providers_hidden) = fit(providers, provider_slots);
+    let (models_shown, models_hidden) = fit(models, model_slots);
+    let rule_row = rule.min(u16::MAX as usize - 4) as u16;
+    MainMenuLayout {
+        providers_shown,
+        providers_hidden,
+        models_shown,
+        models_hidden,
+        rule_row,
+        actions_row: rule_row + 2,
+    }
+}
+
 fn render_main_menu(ctx: &Ctx) -> io::Result<()> {
     write_centered(
         0,
@@ -319,21 +378,43 @@ fn render_main_menu(ctx: &Ctx) -> io::Result<()> {
     )?;
     write_hline(2, Color::DarkGrey)?;
 
+    let providers = collect_provider_names(&ctx.cfg);
+    let models = collect_models(&ctx.cfg);
+    let layout = main_menu_layout(ctx.rows, providers.len(), models.len());
     let mut row = 4u16;
 
     write_line(row, 2, "PROVIDERS", Color::Yellow)?;
     row += 1;
-    let providers = collect_provider_names(&ctx.cfg);
     if providers.is_empty() {
         write_line(row, 4, "(none)", Color::DarkGrey)?;
         row += 1;
     } else {
-        for name in &providers {
+        for name in providers.iter().take(layout.providers_shown) {
             let type_str = provider_type_display(name, &ctx.cfg);
+            let credential = provider_credential_source(
+                &ctx.cfg,
+                name,
+                ctx.cli_key.as_deref(),
+                &ctx.credentials_dir,
+            )
+            .setup_label();
             write_line(row, 4, name, Color::White)?;
             let type_col =
                 (4 + crate::ui::utils::display_width(name) + 2).min(u16::MAX as usize) as u16;
             write_line(row, type_col, &type_str, Color::DarkGrey)?;
+            let credential_col =
+                (type_col as usize + crate::ui::utils::display_width(&type_str) + 2)
+                    .min(u16::MAX as usize) as u16;
+            write_line(row, credential_col, credential, Color::DarkGrey)?;
+            row += 1;
+        }
+        if layout.providers_hidden > 0 {
+            write_line(
+                row,
+                4,
+                &format!("+{} more (P to manage)", layout.providers_hidden),
+                Color::DarkGrey,
+            )?;
             row += 1;
         }
     }
@@ -341,20 +422,26 @@ fn render_main_menu(ctx: &Ctx) -> io::Result<()> {
     row += 1;
     write_line(row, 2, "QUICK MODELS", Color::Yellow)?;
     row += 1;
-    let models = collect_models(&ctx.cfg);
     if models.is_empty() {
         write_line(row, 4, "(none)", Color::DarkGrey)?;
-        row += 1;
     } else {
-        for (name, qm) in &models {
+        for (name, qm) in models.iter().take(layout.models_shown) {
             let line = format!("{}  \u{2192}  {} / {}", name, qm.provider, qm.model);
             write_line(row, 4, &line, Color::White)?;
             row += 1;
         }
+        if layout.models_hidden > 0 {
+            write_line(
+                row,
+                4,
+                &format!("+{} more (M to manage)", layout.models_hidden),
+                Color::DarkGrey,
+            )?;
+        }
     }
 
-    write_hline(row + 1, Color::DarkGrey)?;
-    row += 3;
+    write_hline(layout.rule_row, Color::DarkGrey)?;
+    let mut row = layout.actions_row;
 
     write_line(row, 2, "P) Manage Providers", Color::White)?;
     write_line(row, 28, "M) Manage Models", Color::White)?;
@@ -370,7 +457,7 @@ fn render_main_menu(ctx: &Ctx) -> io::Result<()> {
     )?;
 
     if let Some(msg) = &ctx.message {
-        write_line(row + 2, 2, msg, Color::DarkYellow)?;
+        write_line(row + 1, 2, msg, Color::DarkYellow)?;
     }
 
     stdout_flush()?;
@@ -1767,6 +1854,35 @@ fn handle_model_detail_key(ctx: &Ctx, key: KeyEvent) -> anyhow::Result<KeyResult
 
 #[cfg(test)]
 mod tests {
+    use super::main_menu_layout;
+
+    #[test]
+    fn main_menu_keeps_the_action_keys_on_screen() {
+        // Default config on an 80x24 terminal: 9 providers, 3 quick models.
+        let layout = main_menu_layout(24, 9, 3);
+        assert!(layout.actions_row + 2 < 24, "{layout:?}");
+        assert!(layout.providers_hidden > 0);
+        assert_eq!(layout.models_hidden, 0);
+        // Everything drawn stays above the rule.
+        let used = 4
+            + 1
+            + layout.providers_shown
+            + usize::from(layout.providers_hidden > 0)
+            + 1
+            + 1
+            + layout.models_shown
+            + usize::from(layout.models_hidden > 0);
+        assert!(used < layout.rule_row as usize, "{layout:?}");
+        // Many custom providers and models still leave the menu visible.
+        let crowded = main_menu_layout(24, 30, 30);
+        assert!(crowded.actions_row + 2 < 24, "{crowded:?}");
+        assert!(crowded.providers_hidden > 0 && crowded.models_hidden > 0);
+        // A tall terminal shows every entry with the menu right below them.
+        let tall = main_menu_layout(60, 9, 3);
+        assert_eq!((tall.providers_hidden, tall.models_hidden), (0, 0));
+        assert_eq!(tall.rule_row, 4 + 3 + 9 + 3 + 1);
+    }
+
     use super::*;
     #[test]
     fn azure81_setup_source_uses_typed_auth_and_custom_isolation() {

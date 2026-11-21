@@ -282,30 +282,53 @@ fn tool_call_summary(name: &str, args: &serde_json::Value, compact: bool) -> Str
     }
 
     let primary_keys: &[&str] = match name {
-        "read" | "write" | "edit" | "list_dir" => &["path"],
+        "read" | "write" | "edit" | "list_dir" | "notebook_edit" | "lsp_diagnostics" => &["path"],
         "grep" => &["pattern", "path"],
         "find_files" => &["pattern"],
-        "bash" => &["command"],
+        "bash" | "shell" => &["command"],
+        "web_fetch" => &["url"],
+        "web_search" => &["query"],
+        "js" => &["code"],
+        "lsp_navigate" => &["op", "path"],
+        "job_status" => &["action", "id"],
         _ => &[],
     };
+    let is_shell = matches!(name, "bash" | "shell");
 
     let mut shown = Vec::new();
     for key in primary_keys {
-        if let Some(serde_json::Value::String(val)) = obj.get(*key) {
-            let display_val = match (name, compact) {
-                ("bash", false) => val.clone(),
-                ("bash", true) => compact_value(val, false),
-                _ => show(val),
-            };
-            shown.push(display_val);
-        }
+        let val = match obj.get(*key) {
+            Some(serde_json::Value::String(val)) => val.clone(),
+            Some(serde_json::Value::Number(n)) => n.to_string(),
+            _ => continue,
+        };
+        let display_val = match (is_shell, compact) {
+            (true, false) => val,
+            (true, true) => compact_value(&val, false),
+            _ => show(&val),
+        };
+        shown.push(display_val);
     }
 
     if shown.is_empty() {
-        if let Some((_, serde_json::Value::String(val))) = obj.iter().next() {
-            format!("{} {}", name, show(val))
-        } else {
+        // Unknown tools (MCP servers): a bounded `key=value` list of the scalar
+        // arguments, so the line does not depend on the model's key order.
+        const MAX_PAIRS: usize = 4;
+        let mut pairs: Vec<String> = obj
+            .iter()
+            .filter_map(|(key, val)| match val {
+                serde_json::Value::String(s) => Some(format!("{key}={}", show(s))),
+                serde_json::Value::Number(n) => Some(format!("{key}={n}")),
+                serde_json::Value::Bool(b) => Some(format!("{key}={b}")),
+                _ => None,
+            })
+            .collect();
+        pairs.sort();
+        pairs.truncate(MAX_PAIRS);
+        if pairs.is_empty() {
             name.to_string()
+        } else {
+            format!("{} {}", name, pairs.join(" "))
         }
     } else {
         format!("{} {}", name, shown.join(" "))
@@ -450,6 +473,27 @@ mod tests {
         assert_eq!(
             format_tool_call_display("js", &js),
             "js \"const x = 1;\" (+1 lines, 22 chars)"
+        );
+        let shell = serde_json::json!({ "background": true, "command": "npm run dev" });
+        assert_eq!(
+            format_tool_call_summary("shell", &shell),
+            "shell npm run dev"
+        );
+        let fetch =
+            serde_json::json!({ "prompt": "find the changelog", "url": "https://x.example" });
+        assert_eq!(
+            format_tool_call_display("web_fetch", &fetch),
+            "web_fetch \"https://x.example\""
+        );
+        let nav = serde_json::json!({ "op": "references", "path": "a.rs" });
+        assert_eq!(
+            format_tool_call_display("lsp_navigate", &nav),
+            "lsp_navigate \"references\" \"a.rs\""
+        );
+        let mcp = serde_json::json!({ "n": 3, "flag": true, "obj": {}, "q": "hi" });
+        assert_eq!(
+            format_tool_call_display("srv__tool", &mcp),
+            "srv__tool flag=true n=3 q=\"hi\""
         );
         let read = serde_json::json!({ "path": "/a/b.rs" });
         assert_eq!(

@@ -554,12 +554,16 @@ mod themes_tests {
             text: "welcome".into(),
             color: Color::Cyan,
             theme_accent: true,
+            cont: crate::ui::renderer::Cont::None,
+            lead: 0,
             syntax_spans: None,
         };
         let markdown_heading = LineEntry {
             text: "heading".into(),
             color: Color::Cyan,
             theme_accent: false,
+            cont: crate::ui::renderer::Cont::None,
+            lead: 0,
             syntax_spans: None,
         };
         assert_eq!(renderer.line_color_for_test(&welcome), orange_rgb);

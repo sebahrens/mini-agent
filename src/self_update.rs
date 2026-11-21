@@ -49,29 +49,86 @@ pub(crate) struct UpdateArgs {
 /// `--allow-unattested` and `--allow-downgrade`
 /// after it. Anything else (including `mini-agent update the docs`) is left to
 /// the normal command line, where it stays an ordinary prompt.
+#[cfg(test)]
 pub(crate) fn parse_update_args(args: &[OsString]) -> Option<UpdateArgs> {
-    let mut args = args.iter().skip(1);
-    if args.next()?.to_str()? != "update" {
+    match parse_update_invocation(args)? {
+        UpdateInvocation::Run(parsed) => Some(parsed),
+        UpdateInvocation::Help | UpdateInvocation::Invalid(_) => None,
+    }
+}
+
+/// Usage text for `mini-agent update --help` and for option errors.
+pub(crate) const UPDATE_USAGE: &str = "\
+Usage: mini-agent update [--check] [--release X.Y.Z] [--allow-unattested] [--allow-downgrade]
+
+Replace this mini-agent with the latest (or a given) GitHub release.
+
+Options:
+      --check             Report whether an update exists; install nothing
+      --release X.Y.Z     Install this version instead of the latest
+      --allow-unattested  Install when build provenance cannot be verified with `gh`
+      --allow-downgrade   Allow --release to pick a version older than the running one
+  -h, --help              Print this help";
+
+/// What `mini-agent update ...` means.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum UpdateInvocation {
+    Run(UpdateArgs),
+    Help,
+    /// An option-shaped argument that is not a valid update option.
+    Invalid(String),
+}
+
+/// Like [`parse_update_args`] but also claims `update` followed by an
+/// option-shaped argument (`--help`, a mistyped `--chek`, a `--release` with no
+/// value) so those are update usage rather than a stray top-level flag or a
+/// prompt sent to the model.
+pub(crate) fn parse_update_invocation(args: &[OsString]) -> Option<UpdateInvocation> {
+    let mut rest = args.iter().skip(1);
+    if rest.next()?.to_str()? != "update" {
         return None;
     }
+    let rest: Vec<&OsString> = rest.collect();
+    let first = rest.first().and_then(|arg| arg.to_str());
+    let option_shaped = first.is_some_and(|arg| arg.starts_with('-'));
     let mut parsed = UpdateArgs {
         check: false,
         release: None,
         allow_unattested: false,
         allow_downgrade: false,
     };
-    while let Some(arg) = args.next() {
-        match arg.to_str()? {
+    let mut iter = rest.iter();
+    while let Some(arg) = iter.next() {
+        let Some(arg) = arg.to_str() else {
+            return option_shaped
+                .then(|| UpdateInvocation::Invalid("arguments must be valid UTF-8".into()));
+        };
+        let invalid = |message: String| option_shaped.then_some(UpdateInvocation::Invalid(message));
+        match arg {
+            "-h" | "--help" if option_shaped => return Some(UpdateInvocation::Help),
             "--check" if !parsed.check => parsed.check = true,
             "--allow-unattested" if !parsed.allow_unattested => parsed.allow_unattested = true,
             "--allow-downgrade" if !parsed.allow_downgrade => parsed.allow_downgrade = true,
-            "--release" if parsed.release.is_none() => {
-                parsed.release = Some(args.next()?.to_str()?.to_owned());
+            "--release" if parsed.release.is_none() => match iter.next().and_then(|v| v.to_str()) {
+                Some(value) if !value.starts_with('-') => parsed.release = Some(value.to_owned()),
+                _ => {
+                    return invalid(
+                        "--release requires a version, for example --release 1.2.3".into(),
+                    );
+                }
+            },
+            "--check" | "--allow-unattested" | "--allow-downgrade" | "--release" => {
+                return invalid(format!("{arg} was given more than once"));
             }
-            _ => return None,
+            other if other.starts_with('-') => {
+                return invalid(format!("unknown update option '{other}'"));
+            }
+            other => {
+                return invalid(format!("unexpected argument '{other}' for update"));
+            }
         }
     }
-    Some(parsed)
+    Some(UpdateInvocation::Run(parsed))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1085,23 +1142,43 @@ mod tests {
                 allow_downgrade: true
             })
         );
-        // Ordinary prompts and malformed forms stay with the normal command line.
+        // Ordinary prompts stay with the normal command line.
         for other in [
             vec!["mini-agent", "update", "the", "docs"],
-            vec!["mini-agent", "update", "--release"],
-            vec!["mini-agent", "update", "--check", "--check"],
-            vec![
-                "mini-agent",
-                "update",
-                "--allow-downgrade",
-                "--allow-downgrade",
-            ],
+            vec!["mini-agent", "update", "check"],
+            vec!["mini-agent", "update", "docs", "--check"],
             vec!["mini-agent", "-p", "update"],
             vec!["mini-agent"],
             vec!["mini-agent", "updates"],
         ] {
-            assert_eq!(parse_update_args(&args(&other)), None, "{other:?}");
+            assert_eq!(parse_update_invocation(&args(&other)), None, "{other:?}");
         }
+    }
+
+    #[test]
+    fn update_help_and_option_mistakes_are_update_usage() {
+        let invocation = |line: &[&str]| parse_update_invocation(&args(line));
+        assert_eq!(
+            invocation(&["mini-agent", "update", "--help"]),
+            Some(UpdateInvocation::Help)
+        );
+        assert_eq!(
+            invocation(&["mini-agent", "update", "-h"]),
+            Some(UpdateInvocation::Help)
+        );
+        for bad in [
+            vec!["mini-agent", "update", "--chek"],
+            vec!["mini-agent", "update", "--release"],
+            vec!["mini-agent", "update", "--release", "--check"],
+            vec!["mini-agent", "update", "--check", "--check"],
+            vec!["mini-agent", "update", "--check", "extra"],
+        ] {
+            assert!(
+                matches!(invocation(&bad), Some(UpdateInvocation::Invalid(_))),
+                "{bad:?}"
+            );
+        }
+        assert!(UPDATE_USAGE.contains("--allow-downgrade"));
     }
 
     #[test]

@@ -639,7 +639,8 @@ pub fn session_to_markdown(session: &Session) -> String {
             "messages": session.messages.len(),
             "input_tokens": session.total_input_tokens,
             "output_tokens": session.total_output_tokens,
-            "cost": session.total_cost,
+            "cost": session.recorded_total_cost(),
+            "cost_incomplete": session.cost_is_incomplete(),
         })
         .to_string(),
     );
@@ -811,14 +812,14 @@ pub fn session_to_html(session: &Session) -> String {
 
     let title = escape_html(&session_title(session));
     let meta = escape_html(&format!(
-        "{} / {} · {} · {} messages · {} in / {} out tokens · ${:.4}",
+        "{} / {} · {} · {} messages · {} in / {} out tokens · {}",
         session.provider,
         session.model,
         session.created_at,
         session.messages.len(),
         session.total_input_tokens,
         session.total_output_tokens,
-        session.total_cost,
+        session.cost_display(),
     ));
     fill_template(
         TEMPLATE,

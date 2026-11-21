@@ -271,6 +271,17 @@ fn draw_main_frame(
     // running (see `GoalStore::status_label`).
     #[cfg(feature = "goal")]
     let goal_label = ui.session.goal_store.status_label();
+    let retry_label =
+        run.retry_wait
+            .as_ref()
+            .filter(|_| run.is_running)
+            .and_then(|(deadline, reason)| {
+                crate::ui::statusline::retry_wait_label(
+                    *deadline,
+                    reason,
+                    std::time::Instant::now(),
+                )
+            });
     let statusline_ctx = crate::ui::statusline::StatusContext {
         workspace: ui.workspace.root(),
         loop_label: chain.loop_label.as_deref(),
@@ -279,6 +290,7 @@ fn draw_main_frame(
         #[cfg(not(feature = "goal"))]
         goal_label: None,
         cron_label,
+        retry_label: retry_label.as_deref(),
         prompt_name: ui.context.current_prompt_name.as_deref(),
         reasoning_effort: ui
             .session
@@ -337,7 +349,9 @@ fn draw_main_frame(
                     fg: None,
                     bg: None,
                     layout: crate::ui::statusline::SpanLayout::Item {
-                        priority: 0,
+                        // Above every ordinary item: an attachment that is not
+                        // shown gets sent by accident.
+                        priority: 255,
                         plain: format!("{image_label} "),
                         compact: None,
                         dynamic_color: false,
@@ -355,9 +369,13 @@ fn draw_main_frame(
                     fg: None,
                     bg: None,
                     layout: crate::ui::statusline::SpanLayout::Item {
-                        priority: 0,
+                        // Modal editing without a mode indicator misreads
+                        // keystrokes, and the search echo has no other home.
+                        priority: 255,
                         plain: format!("{vim_label} "),
-                        compact: None,
+                        compact: (!vim_label.contains('/'))
+                            .then(|| vim_label.chars().next().map(|c| format!("{c} ")))
+                            .flatten(),
                         dynamic_color: false,
                     },
                 },
@@ -686,6 +704,61 @@ pub(crate) fn spawn_event_thread(
     spawn_event_thread_with_events(user_tx, running, VecDeque::new())
 }
 
+/// The compaction currently awaiting its summarizer, if any. The input thread
+/// consumes an Esc or Ctrl-C while one is registered and wakes it, since the
+/// event loop is busy awaiting the compaction and cannot read input itself
+/// (mini-agent-sskdu.232).
+static ACTIVE_COMPACTION: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>> =
+    std::sync::Mutex::new(None);
+
+/// Registration of a cancellable compaction; deregisters on drop.
+pub(crate) struct CompactionCancel(Arc<tokio::sync::Notify>);
+
+impl CompactionCancel {
+    pub(crate) fn begin() -> Self {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        *ACTIVE_COMPACTION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(notify.clone());
+        Self(notify)
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        self.0.notified().await;
+    }
+}
+
+impl Drop for CompactionCancel {
+    fn drop(&mut self) {
+        *ACTIVE_COMPACTION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
+/// Whether `key` cancels a running compaction.
+fn is_compaction_cancel_key(key: &crossterm::event::KeyEvent) -> bool {
+    key.code == KeyCode::Esc
+        || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+/// Wake the registered compaction for a cancel key; true when one consumed it.
+fn cancel_active_compaction(key: &crossterm::event::KeyEvent) -> bool {
+    if !is_compaction_cancel_key(key) {
+        return false;
+    }
+    let active = ACTIVE_COMPACTION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match active.as_ref() {
+        Some(notify) => {
+            notify.notify_one();
+            true
+        }
+        None => false,
+    }
+}
+
 pub(crate) fn spawn_event_thread_with_events(
     user_tx: mpsc::Sender<UserEvent>,
     running: Arc<AtomicBool>,
@@ -734,6 +807,9 @@ pub(crate) fn spawn_event_thread_with_events(
             match next_event {
                 Ok(event::Event::Key(key)) => {
                     if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
+                    if cancel_active_compaction(&key) {
                         continue;
                     }
                     // A paste-newline key (bare Enter, or Ctrl+J — a raw
@@ -961,12 +1037,19 @@ fn loop_control_while_running(_text: &str) -> bool {
     false
 }
 
-/// `/goal status` and `/goal pause`, and only those two.
+/// `/goal status`, `pause`, `bounds` and `check`: the verbs that only read or
+/// edit the goal record. `resume`, `reopen`, `clear` and a new objective wait.
 #[cfg(feature = "goal")]
 fn goal_control_while_running(text: &str) -> bool {
     matches!(
         text.split_whitespace().collect::<Vec<_>>().as_slice(),
-        ["/goal", "status"] | ["/goal", "pause"] | ["/goal"]
+        ["/goal", "status"]
+            | ["/goal", "pause"]
+            | ["/goal"]
+            // These only edit the record the gate reads at the next round
+            // boundary, so they are safe while a round runs.
+            | ["/goal", "bounds", ..]
+            | ["/goal", "check", ..]
     )
 }
 
@@ -1282,12 +1365,12 @@ pub(crate) async fn start_main_run(
 /// Register the turn-scoped `schedule_wakeup` tool when the scheduler armed
 /// [`AgentRunState::cron_wakeup`] for this turn; a no-op otherwise.
 async fn register_cron_wakeup(run: &mut AgentRunState) -> anyhow::Result<()> {
-    if let Some(slot) = run.cron_wakeup.as_ref()
+    if let Some(cell) = run.cron_wakeup_cell.as_ref()
         && let Some(agent) = run.agent.as_ref()
     {
         agent
             .add_turn_tool(crate::agent::tools::schedule_wakeup::ScheduleWakeup::new(
-                slot.clone(),
+                cell.clone(),
             ))
             .await?;
     }
@@ -1358,8 +1441,10 @@ pub(crate) async fn start_main_run_with_directive(
         || ui.session.native_history_snapshot().is_some();
     #[cfg(feature = "goal")]
     anyhow::ensure!(
-        !native || !ui.session.goal_store.is_live(),
-        "native automatic goal work requires its round publication owner; the input is retained"
+        !native || !ui.session.goal_store.is_active(),
+        "a goal is running, and the direct Anthropic route cannot drive automatic goal rounds; \
+         the input is retained. Run /goal pause or /goal clear, or switch to a non-native \
+         provider route"
     );
     let mut native_owner = if native {
         let scope = crate::agent::runner::AgentWorkScope::new();
@@ -1381,7 +1466,7 @@ pub(crate) async fn start_main_run_with_directive(
     // `/goal resume` to get the work moving again.
     #[cfg(feature = "goal")]
     ui.session.goal_store.with_mut(|goal| {
-        if goal.status == crate::extras::goal::GoalStatus::AwaitingUser {
+        if !native && goal.status == crate::extras::goal::GoalStatus::AwaitingUser {
             goal.resume();
         }
     });
@@ -1421,9 +1506,9 @@ pub(crate) async fn start_main_run_with_directive(
     ensure_agent(&mut run.agent, ui, slash.reasoning_enabled).await;
     // A self-paced `/cron` fire offers `schedule_wakeup` on the exact agent
     // this turn runs (after any rebuild above), before its first request.
-    if matches!(question_origin, crate::question::QuestionOrigin::Scheduled) {
-        register_cron_wakeup(run).await?;
-    }
+    // Every turn re-registers it (idempotent) while a self-paced entry exists,
+    // so a rebuilt agent keeps the same tool list as the one it replaced.
+    register_cron_wakeup(run).await?;
     run.request_tool_results_cleared = ui
         .session
         .tool_results_cleared_for_retention(ui.cfg.resolve_keep_recent_tool_results());
@@ -1803,6 +1888,21 @@ pub(crate) fn preserve_pending_main_turn_progress(
     true
 }
 
+/// Record in the transcript that the turn was cut off by an interrupt or a
+/// failure, so the next request does not read a truncated assistant message as
+/// a finished one and does not re-run a call whose effects may already have
+/// happened (mini-agent-sskdu.191). Not used when the turn continues after a
+/// compaction, where nothing was cut off.
+pub(crate) fn record_interrupted_turn_notice(session: &mut Session) {
+    session.add_message(
+        MessageRole::System,
+        &crate::agent::input::host_instruction(
+            "the previous turn was cut off",
+            "The previous turn ended here before the model finished it (the user interrupted it, or it failed). Text above may be incomplete, and tool calls marked unknown may have run partially or completely: inspect the workspace before repeating them.",
+        ),
+    );
+}
+
 /// Persist only a settled session. Tool events mutate the live transaction,
 /// but the disk snapshot remains at the pre-turn state until the turn reaches
 /// one terminal success/failure/cancellation transition.
@@ -1822,18 +1922,9 @@ pub(crate) fn persist_session_if_settled(
     Ok(true)
 }
 
-/// Continuation prompt injected after a mid-turn compaction. Hardcoded as a
-/// `const` rather than a `prompts/*.md` file: every `.md` under `prompts/` is
-/// loaded as a selectable mode, so a file here would pollute the prompt picker.
-/// Acknowledging the compaction is deliberate — it frames the summary as "what
-/// I already did," not as new user instructions. The narrow-tool-calls line is
-/// always present because any mid-turn fire means the configured ceiling was
-/// hit, so the urgency always applies.
-const MID_TURN_CONTINUE_PROMPT: &str = "[Context was compacted to save space; \
-the full prior history is in the system summary above.]\n\nContinue with the \
-user's original task. Do not redo work already completed per the summary; focus \
-on what remains. Context was tight, so prefer narrower follow-up tool calls over \
-wide ones until pressure subsides.";
+/// Continuation prompt injected after a mid-turn compaction; shared with the
+/// headless and ACP paths (mini-agent-sskdu.186).
+const MID_TURN_CONTINUE_PROMPT: &str = crate::agent::runner::HEADLESS_CONTEXT_RELIEF_PROMPT;
 
 /// Mid-turn auto-compaction (PR H). Invoked when real provider prompt pressure
 /// (`CompletionCall` usage / context window) crosses
@@ -1907,13 +1998,8 @@ async fn compact_and_respawn(
     if !run.response_buf.trim().is_empty() {
         recap.push_str(run.response_buf.trim());
     }
-    if let Some(todo_context) = ui.session.todos.critical_context() {
-        if !recap.is_empty() {
-            recap.push('\n');
-        }
-        recap.push_str(&todo_context);
-        recap.push('\n');
-    }
+    // The open-todo block is not repeated here: compaction re-attaches it to
+    // the summary itself (mini-agent-sskdu.236).
     let recap = recap.trim();
     if !recap.is_empty() {
         ui.session.add_message(MessageRole::Assistant, recap);
@@ -1939,7 +2025,7 @@ async fn compact_and_respawn(
 
     // Measured provider pressure is authoritative even when the local
     // window-minus-reserve estimate is lower (mini-agent-p0h9g.3).
-    let compactions_before = ui.session.compactions.len();
+    let compactions_before = ui.session.compaction_count();
     crate::ui::slash::handle_compress_with_force(
         None,
         true,
@@ -1959,7 +2045,7 @@ async fn compact_and_respawn(
     })?;
     // No old prefix is a legitimate no-op, not a successful relief. Continue
     // this prompt without repeatedly stopping at the same irreducible batch.
-    run.mid_turn_compaction_disabled = ui.session.compactions.len() == compactions_before;
+    run.mid_turn_compaction_disabled = ui.session.compaction_count() == compactions_before;
 
     // 4. Respawn on the compacted history with the continuation prompt.
     ensure_agent(&mut run.agent, ui, slash.reasoning_enabled).await;
@@ -2676,5 +2762,41 @@ mod main_start_budget_carry_tests {
             assert!(std::sync::Arc::ptr_eq(&carry, &run.budget_carry));
             run.budget_carry = std::sync::Arc::clone(&previous);
         }
+    }
+}
+
+#[cfg(test)]
+mod compaction_cancel_tests {
+    use super::*;
+
+    #[test]
+    fn only_esc_and_ctrl_c_cancel_a_compaction() {
+        // mini-agent-sskdu.232
+        let key = |code, modifiers| crossterm::event::KeyEvent::new(code, modifiers);
+        assert!(is_compaction_cancel_key(&key(
+            KeyCode::Esc,
+            KeyModifiers::NONE
+        )));
+        assert!(is_compaction_cancel_key(&key(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(!is_compaction_cancel_key(&key(
+            KeyCode::Char('c'),
+            KeyModifiers::NONE
+        )));
+        assert!(!is_compaction_cancel_key(&key(
+            KeyCode::Enter,
+            KeyModifiers::NONE
+        )));
+    }
+
+    #[tokio::test]
+    async fn a_registered_compaction_is_woken() {
+        let cancel = CompactionCancel::begin();
+        cancel.0.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), cancel.cancelled())
+            .await
+            .expect("a notified compaction wakes");
     }
 }

@@ -7,6 +7,7 @@ fn ctx() -> StatusContext<'static> {
         workspace: std::path::Path::new("/var/lib/mini-agent-demo/project"),
         loop_label: None,
         cron_label: None,
+        retry_label: None,
         goal_label: None,
         prompt_name: None,
         reasoning_effort: None,
@@ -1063,4 +1064,55 @@ fn the_cron_countdown_repaints_exactly_when_its_minute_bucket_rolls_over() {
         ..cron_summary(1, Some(600))
     };
     assert_eq!(statusline::cron_label_repaint_in(suspended, false), None);
+}
+
+#[test]
+fn retry_wait_label_counts_down_and_ends() {
+    let now = std::time::Instant::now();
+    let deadline = now + std::time::Duration::from_millis(44_500);
+    assert_eq!(
+        statusline::retry_wait_label(deadline, "rate limited", now).as_deref(),
+        Some("retry in 45s (rate limited)")
+    );
+    let later = now + std::time::Duration::from_secs(10);
+    assert_eq!(
+        statusline::retry_wait_label(deadline, "", later).as_deref(),
+        Some("retry in 35s")
+    );
+    assert!(statusline::retry_wait_label(deadline, "", deadline).is_none());
+    assert!(statusline::retry_wait_repaint_in(deadline, now).is_some());
+    let mut with = ctx();
+    with.retry_label = Some("retry in 45s");
+    let lines = statusline::build_lines(
+        &statusline::default_spec(),
+        &Session::new("p", "m", 1000, ""),
+        &with,
+    );
+    assert!(format!("{:?}", lines[0]).contains("retry in 45s"));
+}
+
+#[test]
+fn a_high_priority_vim_label_survives_a_narrow_fit() {
+    let session = Session::new("p", "provider/very-long-model-name", 1_000_000, "");
+    let mut context = ctx();
+    context.prompt_name = Some("code");
+    context.perm_mode = Some("yolo");
+    let mut spans =
+        statusline::build_lines(&statusline::default_spec(), &session, &context).remove(0);
+    spans.insert(
+        0,
+        StatusSpan::Text {
+            text: "NORMAL ".into(),
+            fg: None,
+            bg: None,
+            layout: statusline::SpanLayout::Item {
+                priority: 255,
+                plain: "NORMAL ".into(),
+                compact: Some("N ".into()),
+                dynamic_color: false,
+            },
+        },
+    );
+    let text = line_text(&statusline::fit_line(&spans, 20));
+    assert!(text.contains("NORMAL") || text.contains("N "), "{text}");
 }

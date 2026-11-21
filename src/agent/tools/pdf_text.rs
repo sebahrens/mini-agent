@@ -641,6 +641,10 @@ impl std::fmt::Display for PdfError {
 }
 
 impl Document {
+    fn reset_decoded_budget(&self) {
+        self.decoded_budget.set(MAX_TOTAL_DECODED);
+    }
+
     pub(crate) fn parse(data: &[u8]) -> Result<Self, PdfError> {
         Self::parse_until(data, std::time::Instant::now() + PARSE_DEADLINE)
     }
@@ -1918,6 +1922,7 @@ pub(crate) fn render(
 /// text layer but paint images get their page images lifted (at most
 /// `max_images` blocks) so a vision model can read them. Errors are
 /// model-facing guidance.
+#[cfg(test)]
 pub(crate) fn render_with_images(
     bytes: &[u8],
     path: &str,
@@ -1928,6 +1933,95 @@ pub(crate) fn render_with_images(
 ) -> Result<Rendered, String> {
     let document = Document::parse(bytes)
         .map_err(|error| format!("Cannot read '{path}' as PDF text: {error}."))?;
+    render_document(&document, path, pages, budget, max_images, native_pdf)
+}
+
+/// Identity of a PDF on disk for [`DocumentCache`]: the same path with the
+/// same length and modification time is the same parsed document.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DocumentKey {
+    pub(crate) path: String,
+    pub(crate) len: u64,
+    pub(crate) modified: Option<std::time::SystemTime>,
+}
+
+/// Largest source PDF whose parsed object table is kept between reads.
+const MAX_CACHED_PDF_BYTES: u64 = 32 * 1024 * 1024;
+
+/// One-entry cache of the last parsed PDF, so consecutive page windows of one
+/// unchanged file parse it once. Reading another PDF evicts the entry.
+#[derive(Default)]
+pub(crate) struct DocumentCache {
+    slot: std::sync::Mutex<Option<(DocumentKey, Arc<std::sync::Mutex<Document>>)>>,
+    #[cfg(test)]
+    parses: std::sync::atomic::AtomicUsize,
+}
+
+impl std::fmt::Debug for DocumentCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("DocumentCache")
+    }
+}
+
+impl DocumentCache {
+    /// The cached document for `key`, if still current.
+    pub(crate) fn get(&self, key: &DocumentKey) -> Option<Arc<std::sync::Mutex<Document>>> {
+        let slot = self.slot.lock().unwrap_or_else(|error| error.into_inner());
+        slot.as_ref()
+            .filter(|(cached, _)| cached == key)
+            .map(|(_, document)| Arc::clone(document))
+    }
+
+    fn put(&self, key: DocumentKey, document: Arc<std::sync::Mutex<Document>>) {
+        let mut slot = self.slot.lock().unwrap_or_else(|error| error.into_inner());
+        *slot = (key.len <= MAX_CACHED_PDF_BYTES).then_some((key, document));
+    }
+}
+
+/// [`render_with_images`] through `cache`: reuse `cached` when the caller
+/// found it, otherwise parse `bytes` (which the caller read because the cache
+/// missed) and remember the result.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_cached(
+    cache: &DocumentCache,
+    key: DocumentKey,
+    cached: Option<Arc<std::sync::Mutex<Document>>>,
+    bytes: Option<&[u8]>,
+    path: &str,
+    pages: Option<&str>,
+    budget: usize,
+    max_images: usize,
+    native_pdf: bool,
+) -> Result<Rendered, String> {
+    let document = match (cached, bytes) {
+        (Some(document), _) => document,
+        (None, Some(bytes)) => {
+            let parsed = Document::parse(bytes)
+                .map_err(|error| format!("Cannot read '{path}' as PDF text: {error}."))?;
+            #[cfg(test)]
+            cache
+                .parses
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let document = Arc::new(std::sync::Mutex::new(parsed));
+            cache.put(key, Arc::clone(&document));
+            document
+        }
+        (None, None) => return Err(format!("Cannot read '{path}' as PDF text.")),
+    };
+    let document = document.lock().unwrap_or_else(|error| error.into_inner());
+    // The decoded-byte budget bounds one read, not the cached document's life.
+    document.reset_decoded_budget();
+    render_document(&document, path, pages, budget, max_images, native_pdf)
+}
+
+fn render_document(
+    document: &Document,
+    path: &str,
+    pages: Option<&str>,
+    budget: usize,
+    max_images: usize,
+    native_pdf: bool,
+) -> Result<Rendered, String> {
     let count = document.page_count();
     let selected = match pages {
         Some(spec) => parse_page_selection(spec, count)?,
@@ -2448,6 +2542,49 @@ mod tests {
         );
         assert!(!output.contains("probably scanned"), "{output}");
         assert!(!output.contains("pdftoppm"), "{output}");
+    }
+
+    // mini-agent-sskdu.94: page windows of one unchanged file parse once.
+    #[test]
+    fn page_windows_of_one_file_parse_once_and_another_file_evicts() {
+        let pdf = build(
+            &[
+                Content::Plain(HELLO_PAGE.into()),
+                Content::Plain(HELLO_PAGE.into()),
+            ],
+            false,
+        );
+        let cache = DocumentCache::default();
+        let key = |path: &str| DocumentKey {
+            path: path.into(),
+            len: pdf.len() as u64,
+            modified: None,
+        };
+        let read = |name: &str, pages: &str| {
+            let key = key(name);
+            let cached = cache.get(&key);
+            let bytes = cached.is_none().then_some(pdf.as_slice());
+            render_cached(
+                &cache,
+                key,
+                cached,
+                bytes,
+                name,
+                Some(pages),
+                10_000,
+                0,
+                false,
+            )
+            .unwrap()
+            .text
+        };
+        assert!(read("a.pdf", "1").contains("--- page 1 ---"));
+        let second = read("a.pdf", "2");
+        assert!(second.contains("--- page 2 ---"), "{second}");
+        assert_eq!(cache.parses.load(std::sync::atomic::Ordering::Relaxed), 1);
+        read("b.pdf", "1");
+        assert_eq!(cache.parses.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert!(cache.get(&key("a.pdf")).is_none(), "another PDF evicts");
     }
 
     #[test]

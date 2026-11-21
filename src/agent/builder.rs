@@ -49,47 +49,49 @@ mod subagent_registration_tests {
     }
 }
 
-#[cfg(any(feature = "mcp", all(test, feature = "goal", feature = "js")))]
+/// Every built-in tool name, including ones gated behind features this build
+/// may lack. MCP tools may not take these names, and `--tools` accepts them.
+pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
+    "read",
+    "write",
+    "edit",
+    "notebook_edit",
+    "web_fetch",
+    "web_search",
+    "grep",
+    "find_files",
+    "list_dir",
+    "todo_write",
+    "todo_read",
+    "goal_report",
+    "shell",
+    "job_status",
+    "bash",
+    "git",
+    "js",
+    "task",
+    "task_result",
+    "task_list",
+    "task_cancel",
+    "task_send",
+    "task_evidence",
+    "memory_write",
+    "memory_edit",
+    "memory_read",
+    "memory_search",
+    "advisor",
+    "lsp_diagnostics",
+    "lsp_navigate",
+    "skills_search",
+    "ask_user_question",
+    "mcp_search",
+    "list_mcp_resources",
+    "read_mcp_resource",
+    "schedule_wakeup",
+];
+
 pub(crate) fn is_reserved_builtin_tool_name(name: &str) -> bool {
-    matches!(
-        name,
-        "read"
-            | "write"
-            | "edit"
-            | "notebook_edit"
-            | "web_fetch"
-            | "web_search"
-            | "grep"
-            | "find_files"
-            | "list_dir"
-            | "todo_write"
-            | "todo_read"
-            | "goal_report"
-            | "shell"
-            | "job_status"
-            | "bash"
-            | "git"
-            | "js"
-            | "task"
-            | "task_result"
-            | "task_list"
-            | "task_cancel"
-            | "task_send"
-            | "task_evidence"
-            | "memory_write"
-            | "memory_edit"
-            | "memory_read"
-            | "memory_search"
-            | "advisor"
-            | "lsp_diagnostics"
-            | "lsp_navigate"
-            | "skills_search"
-            | "ask_user_question"
-            | "mcp_search"
-            | "list_mcp_resources"
-            | "read_mcp_resource"
-            | "schedule_wakeup"
-    )
+    BUILTIN_TOOL_NAMES.contains(&name)
 }
 
 #[cfg(feature = "mcp")]
@@ -255,9 +257,35 @@ impl PreambleSnapshot {
 struct PreambleComposition {
     text: String,
     parts: Vec<(&'static str, std::ops::Range<usize>)>,
+    /// Byte offset where the user-owned tail (active goal, `SUFFIX.md`) begins.
+    /// Built-in sections added later are inserted here so the suffix stays the
+    /// very end of the prompt.
+    tail_start: usize,
 }
 
 impl PreambleComposition {
+    /// Insert a built-in section before the goal/suffix tail, keeping the
+    /// recorded part ranges consistent.
+    fn insert_before_tail(&mut self, label: &'static str, section: &str) {
+        if section.is_empty() {
+            return;
+        }
+        let at = self.tail_start;
+        let len = section.len();
+        self.text.insert_str(at, section);
+        let index = self
+            .parts
+            .iter()
+            .position(|(_, range)| range.start >= at)
+            .unwrap_or(self.parts.len());
+        for (_, range) in &mut self.parts[index..] {
+            range.start += len;
+            range.end += len;
+        }
+        self.parts.insert(index, (label, at..at + len));
+        self.tail_start += len;
+    }
+
     fn snapshot(&self) -> PreambleSnapshot {
         PreambleSnapshot {
             tokens: crate::session::Session::estimate_tokens(&self.text),
@@ -445,6 +473,13 @@ fn compose_preamble(
     if !cwd.is_empty() {
         preamble.push_str("\n\nCurrent working directory: ");
         preamble.push_str(&cwd);
+        // Session-start facts only: the date is fixed when the agent is built
+        // so the cached prompt prefix does not change between turns.
+        preamble.push_str(&format!(
+            "\nToday's date (UTC): {}. Platform: {}.",
+            &jiff::Timestamp::now().to_string()[..10],
+            std::env::consts::OS
+        ));
         if let Some(alias) = shell_cwd_alias {
             preamble.push_str("\nSandboxed shell commands see this workspace at ");
             preamble.push_str(&alias.display().to_string());
@@ -462,6 +497,9 @@ fn compose_preamble(
         preamble.push_str(appended);
     }
     record_part(&mut parts, &preamble, "Appended system prompt");
+    // Unconditional: skill context can be injected per turn even when
+    // `skills_search` is not offered, and native (signed-prefix) sessions
+    // require this static policy in the captured system prompt.
     #[cfg(feature = "agent-skills")]
     {
         preamble.push_str(crate::extras::skills::selection::POLICY);
@@ -472,6 +510,7 @@ fn compose_preamble(
         crate::extras::memory::append_memory_block(&mut preamble, context.memory.as_deref());
     }
     record_part(&mut parts, &preamble, "Memory");
+    let tail_start = preamble.len();
     // The active objective. Static for the goal's life so the cached prompt
     // prefix does not move between rounds.
     if let Some(block) = goal_block {
@@ -487,6 +526,7 @@ fn compose_preamble(
     PreambleComposition {
         text: preamble,
         parts,
+        tail_start,
     }
 }
 
@@ -550,77 +590,78 @@ fn compose_registered_preamble(
         sandbox.shell_cwd_alias().as_deref(),
     );
     let has = |name: &str| registered_tools.contains(&name);
+    // Bullets are collected under one "## Tools" heading so none attaches to
+    // user-authored text; self-contained sections follow them.
+    let mut bullets = String::new();
+    let mut sections = String::new();
     if has("js") {
-        composition.text.push_str(JS_TOOL_PROMPT);
+        sections.push_str(JS_TOOL_PROMPT);
     }
     if has("read") {
-        composition.text.push_str(READ_TOOL_PROMPT);
+        bullets.push_str(READ_TOOL_PROMPT);
     }
     if has("write") {
-        composition.text.push_str(WRITE_TOOL_PROMPT);
+        bullets.push_str(WRITE_TOOL_PROMPT);
     }
     if has("edit") {
-        composition.text.push_str(EDIT_TOOL_PROMPT);
+        bullets.push_str(EDIT_TOOL_PROMPT);
     }
     if has("grep") {
-        composition.text.push_str(GREP_TOOL_PROMPT);
+        bullets.push_str(GREP_TOOL_PROMPT);
     }
     if has("find_files") {
-        composition.text.push_str(FIND_FILES_TOOL_PROMPT);
+        bullets.push_str(FIND_FILES_TOOL_PROMPT);
     }
     if has("list_dir") {
-        composition.text.push_str(LIST_DIR_TOOL_PROMPT);
+        bullets.push_str(LIST_DIR_TOOL_PROMPT);
+    }
+    if has("git") {
+        bullets.push_str(crate::agent::prompt::GIT_TOOL_PROMPT);
     }
     if has("todo_write") || has("todo_read") {
-        composition.text.push_str(TODO_TOOL_PROMPT);
+        bullets.push_str(TODO_TOOL_PROMPT);
     }
     if has("task") {
-        composition.text.push_str(TASK_TOOL_PROMPT);
+        bullets.push_str(TASK_TOOL_PROMPT);
     }
     #[cfg(feature = "memory")]
     {
         if has("memory_write") {
-            composition
-                .text
-                .push_str(crate::agent::prompt::MEMORY_WRITE_TOOL_PROMPT);
+            bullets.push_str(crate::agent::prompt::MEMORY_WRITE_TOOL_PROMPT);
         }
         if has("memory_edit") {
-            composition
-                .text
-                .push_str(crate::agent::prompt::MEMORY_EDIT_TOOL_PROMPT);
+            bullets.push_str(crate::agent::prompt::MEMORY_EDIT_TOOL_PROMPT);
         }
         if has("memory_search") {
-            composition
-                .text
-                .push_str(crate::agent::prompt::MEMORY_SEARCH_TOOL_PROMPT);
+            bullets.push_str(crate::agent::prompt::MEMORY_SEARCH_TOOL_PROMPT);
         }
         if has("memory_read") {
-            composition
-                .text
-                .push_str(crate::agent::prompt::MEMORY_READ_TOOL_PROMPT);
-        }
-    }
-    #[cfg(feature = "lsp")]
-    if has("lsp_navigate") {
-        composition
-            .text
-            .push_str(crate::agent::prompt::LSP_NAVIGATE_PROMPT);
-    }
-    #[cfg(feature = "lsp")]
-    if has("lsp_diagnostics") {
-        composition.text.push_str(crate::agent::prompt::LSP_PROMPT);
-        if has("edit") || has("write") {
-            composition
-                .text
-                .push_str(crate::agent::prompt::LSP_MUTATION_PROMPT);
+            bullets.push_str(crate::agent::prompt::MEMORY_READ_TOOL_PROMPT);
         }
     }
     if has("shell")
         && let Some(capability) = sandbox.shell_capability()
     {
-        composition.text.push_str(&capability.model_guidance());
+        bullets.push_str(&capability.model_guidance());
     }
-    record_part(&mut composition.parts, &composition.text, "Tool guidance");
+    #[cfg(feature = "lsp")]
+    if has("lsp_navigate") {
+        sections.push_str(crate::agent::prompt::LSP_NAVIGATE_PROMPT);
+    }
+    #[cfg(feature = "lsp")]
+    if has("lsp_diagnostics") {
+        sections.push_str(crate::agent::prompt::LSP_PROMPT);
+        if has("edit") || has("write") {
+            sections.push_str(crate::agent::prompt::LSP_MUTATION_PROMPT);
+        }
+    }
+    let mut guidance = String::new();
+    if !bullets.is_empty() {
+        guidance.push_str("\n\n## Tools");
+        guidance.push_str(&bullets);
+    }
+    guidance.push_str(&sections);
+    composition.insert_before_tail("Tool guidance", &guidance);
     composition
 }
 
@@ -709,6 +750,20 @@ fn estimated_registered_tools(cli: &Cli, cfg: &Config, sandbox: &Sandbox) -> Vec
 #[cfg(feature = "subagents")]
 fn task_tool_available(cfg: &Config) -> bool {
     should_register_task_tool(cfg.task_enabled, crate::extras::subagents::is_initialized())
+}
+
+/// Whether grep may suggest `task` in its result hint: only when the main
+/// agent actually has that tool (mini-agent-sskdu.91).
+fn grep_task_hint(cfg: &Config) -> bool {
+    #[cfg(feature = "subagents")]
+    {
+        task_tool_available(cfg)
+    }
+    #[cfg(not(feature = "subagents"))]
+    {
+        let _ = cfg;
+        false
+    }
 }
 
 #[cfg(feature = "subagents")]
@@ -1222,6 +1277,7 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         }
         base_tools.push(Box::new(
             tools::GrepTool::new(permission.clone(), ask_tx.clone(), max_grep_results)
+                .with_task_hint(grep_task_hint(cfg))
                 .with_workspace_binding(workspace.clone()),
         ));
         base_tools.push(Box::new(tools::notebook::NotebookTool::new(
@@ -1740,24 +1796,14 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
     );
     #[cfg(feature = "mcp")]
     if !discovery_index.is_empty() {
-        composition.text.push_str(&discovery_index);
-        record_part(
-            &mut composition.parts,
-            &composition.text,
-            "Deferred MCP tool index",
-        );
+        composition.insert_before_tail("Deferred MCP tool index", &discovery_index);
     }
     #[cfg(feature = "mcp")]
     if let Some(manager) = mcp_manager {
-        let section = manager.instructions_section_for(&admitted_mcp_servers);
-        if !section.is_empty() {
-            composition.text.push_str(&section);
-            record_part(
-                &mut composition.parts,
-                &composition.text,
-                "MCP server instructions",
-            );
-        }
+        composition.insert_before_tail(
+            "MCP server instructions",
+            &manager.instructions_section_for(&admitted_mcp_servers),
+        );
     }
     if let Some(instructions) = &instructions {
         let overlay = instructions.initial_overlay();
@@ -1766,23 +1812,12 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
                 .iter()
                 .any(|name| registered_tools.contains(name))
         {
-            composition
-                .text
-                .push_str(crate::context::instructions::POLICY);
-            record_part(
-                &mut composition.parts,
-                &composition.text,
+            composition.insert_before_tail(
                 "Workspace instruction policy",
+                crate::context::instructions::POLICY,
             );
         }
-        if !overlay.is_empty() {
-            composition.text.push_str(&overlay);
-            record_part(
-                &mut composition.parts,
-                &composition.text,
-                "Root instruction includes",
-            );
-        }
+        composition.insert_before_tail("Root instruction includes", &overlay);
     }
     let mut snapshot = composition.snapshot();
     snapshot.instruction_sources = instructions.clone();
@@ -2521,7 +2556,7 @@ mod extra_file_tests {
             .unwrap();
         assert!(shell.description.contains("321 second deadline"));
         assert!(
-            shell.parameters["properties"]["timeout"]["description"]
+            shell.parameters["properties"]["timeout_ms"]["description"]
                 .as_str()
                 .unwrap()
                 .contains("321000 foreground")
@@ -3026,6 +3061,90 @@ mod js_tests {
             None,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn tool_guidance_is_one_tools_section_and_routes_git_to_the_git_tool() {
+        let workspace = workspace_binding();
+        let sandbox = shell_sandbox();
+        let preamble = build_registered_preamble(
+            &empty_context(),
+            false,
+            workspace.root(),
+            &sandbox,
+            &["js", "git", "write", "shell"],
+            &crate::cli::Cli::default(),
+            None,
+        );
+        assert_eq!(preamble.matches("\n\n## Tools").count(), 1);
+        assert!(preamble.contains("- **git**"));
+        assert!(!preamble.contains("version-control"));
+        assert!(!preamble.contains("`bash` name"));
+        assert!(!preamble.contains("File reads"));
+        assert!(preamble.contains("Today's date (UTC): "));
+        let tools = preamble.find("## Tools").unwrap();
+        assert!(preamble.find("- **write**").unwrap() > tools);
+        assert!(preamble.find("- **shell**").unwrap() > tools);
+    }
+
+    /// Built-in tool definitions have a size budget like MCP tools do: a
+    /// definition is paid for in every request. Tools above the default budget
+    /// are listed with their own ceiling; raising one needs a reason here.
+    #[tokio::test]
+    async fn built_in_tool_definitions_stay_within_their_size_budgets() {
+        const DEFAULT_BUDGET: usize = 4096;
+        let workspace = workspace_binding();
+        let sandbox = shell_sandbox();
+        let cli = crate::cli::Cli::default();
+        let agent = test_main_agent(&cli, sandbox, workspace).await;
+        let definitions = agent.tool_server_handle.get_tool_defs(None).await.unwrap();
+        for definition in &definitions {
+            let size = definition.description.len() + definition.parameters.to_string().len();
+            let budget = match definition.name.as_str() {
+                "js" => 11_000,
+                "task" => 9_000,
+                "git" => 7_000,
+                "shell" | "read" | "job_status" | "lsp_navigate" | "grep" | "find_files" => 6_500,
+                _ => DEFAULT_BUDGET,
+            };
+            assert!(
+                size <= budget,
+                "{} is {size} bytes (budget {budget})",
+                definition.name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn built_in_sections_precede_the_user_tail() {
+        let workspace = workspace_binding();
+        let sandbox = shell_sandbox();
+        let compose = |tools: &[&str]| {
+            super::compose_registered_preamble(
+                &empty_context(),
+                false,
+                workspace.root(),
+                &sandbox,
+                tools,
+                &crate::cli::Cli::default(),
+                Some("GOAL_TAIL"),
+            )
+        };
+        let mut composition = compose(&["write", "shell"]);
+        composition.insert_before_tail("Test section", "\n\nEXTRA_SECTION");
+        assert!(composition.text.ends_with("GOAL_TAIL"));
+        assert!(composition.text.find("EXTRA_SECTION") < composition.text.find("GOAL_TAIL"));
+        assert!(composition.text.find("## Tools") < composition.text.find("GOAL_TAIL"));
+        for (label, range) in &composition.parts {
+            assert!(range.end <= composition.text.len(), "{label}");
+        }
+        #[cfg(feature = "agent-skills")]
+        {
+            let policy = crate::extras::skills::selection::POLICY;
+            // Part of the static base, and before the user tail.
+            assert!(composition.text.contains(policy));
+            assert!(composition.text.find(policy) < composition.text.find("GOAL_TAIL"));
+        }
     }
 
     #[tokio::test]
@@ -3769,8 +3888,16 @@ mod js_tests {
             let first = preamble_with(Some(&goal));
             goal.progress.rounds = 31;
             goal.progress.tokens_used = 250_000;
-            goal.set_status(GoalStatus::Blocked, None);
             assert_eq!(preamble_with(Some(&goal)), first);
+
+            // Parking changes the rules paragraph once (a parked goal must not
+            // tell the model to call a tool that refuses); it is still stable
+            // for as long as the goal stays parked.
+            goal.set_status(GoalStatus::Blocked, None);
+            let parked = preamble_with(Some(&goal));
+            assert_ne!(parked, first);
+            goal.progress.rounds = 40;
+            assert_eq!(preamble_with(Some(&goal)), parked);
         }
 
         #[test]

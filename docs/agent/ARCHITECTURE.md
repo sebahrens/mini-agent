@@ -195,8 +195,10 @@ reproducing code; focus on structure, relationships, and rationale.
 - The TUI conversation feed caches immutable rendered-row segments per semantic block. Streaming
   invalidates only the active block and keeps completed markdown rows shared. Completed history is
   bounded by 4,096 blocks and 16 MiB of display text; a live block is separately bounded to 2 MiB.
-  Truncation is explicit, and retention eviction resets scroll and selection indices before the
-  next viewport draw.
+  Truncation is explicit. Pruning the front keeps a scrolled-up view in place (the offset counts
+  from the bottom) and drops the selection; a clear or block compaction resets scroll and
+  selection indices before the next viewport draw. Laid-out rows carry a continuation kind
+  (`Cont`) so copy and URL clicks rejoin soft-wrapped lines.
 - mpsc channels for agent events, user events, and permission requests
 
 ## Dependencies

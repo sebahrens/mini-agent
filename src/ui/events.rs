@@ -285,7 +285,7 @@ fn push_session_records(
                 }
             }
             MessageRole::ToolResult => {
-                let block = tool_result_block(&msg.content, cfg);
+                let block = tool_result_block(&msg.content, persisted_error(msg), cfg);
                 let anchor = msg.tool_call_id.as_deref().unwrap_or("");
                 if feed.place_block_after_anchor(anchor, block) {
                     // Sits under its call, before the call's own spacer.
@@ -322,14 +322,26 @@ fn push_runtime_availability(
 /// The transcript block for a stored tool result: folded per `tool_output`
 /// like the live view. The live `is_error` flag is not persisted, so a
 /// replayed failure is recognised by its text.
-fn tool_result_block(content: &str, cfg: &Config) -> crate::ui::feed::Block {
+/// The stored failure flag of a tool result, when the record carries one.
+fn persisted_error(msg: &crate::session::SessionMessage) -> Option<bool> {
+    match &msg.tool {
+        Some(crate::session::PersistedToolMessage::Result { is_error: true, .. }) => Some(true),
+        _ => None,
+    }
+}
+
+fn tool_result_block(
+    content: &str,
+    stored_error: Option<bool>,
+    cfg: &Config,
+) -> crate::ui::feed::Block {
     let (name, output) = content.split_once(":\n").unwrap_or(("", content));
     if name == "todo_write" {
         return crate::ui::feed::Block::new(BlockStyle::ToolResult, sanitize_output(output));
     }
     let view = crate::ui::tool_output::tool_result_view(
         output,
-        crate::ui::tool_output::looks_like_error(output),
+        stored_error.unwrap_or_else(|| crate::ui::tool_output::looks_like_error(output)),
         cfg.resolve_tool_output(),
     );
     if view.foldable() {

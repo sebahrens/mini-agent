@@ -168,6 +168,62 @@ pub(super) async fn checkpoint(
     }
 }
 
+/// Why `session/load` refused, each with its own bounded message. The
+/// underlying error is logged, never returned, so no stored path or file
+/// content beyond the saved workspace label reaches the client.
+#[derive(Debug, PartialEq, Eq)]
+enum LoadFailure {
+    InvalidWorkspace,
+    NotFound,
+    WorkspaceMismatch { saved: String },
+    Incompatible,
+    Unavailable,
+}
+
+impl LoadFailure {
+    fn unavailable(error: &dyn std::fmt::Display) -> Self {
+        tracing::warn!("ACP session load could not use session storage: {error}");
+        Self::Unavailable
+    }
+
+    fn from_error(error: &anyhow::Error) -> Self {
+        use crate::session::storage::ExactLoadRefusal;
+        match error.downcast_ref::<ExactLoadRefusal>() {
+            Some(ExactLoadRefusal::WorkspaceMismatch { saved }) => Self::WorkspaceMismatch {
+                saved: saved.clone(),
+            },
+            Some(ExactLoadRefusal::Incompatible | ExactLoadRefusal::IdentityMismatch) => {
+                tracing::warn!("ACP session load refused an unreadable session file");
+                Self::Incompatible
+            }
+            None => Self::unavailable(&format_args!("{error:#}")),
+        }
+    }
+
+    fn message(&self) -> String {
+        match self {
+            Self::InvalidWorkspace => {
+                "session/load needs an absolute, existing workspace folder".to_owned()
+            }
+            Self::NotFound => "no saved session has that id".to_owned(),
+            Self::WorkspaceMismatch { saved } => format!(
+                "that session was saved for another workspace folder ({}); open that folder to resume it",
+                super::toolcall::clip(saved, 120)
+            ),
+            Self::Incompatible => {
+                "the saved session file is not readable by this version of mini-agent".to_owned()
+            }
+            Self::Unavailable => {
+                "session storage is unsafe or unavailable; see the mini-agent log".to_owned()
+            }
+        }
+    }
+
+    fn into_error(self) -> agent_client_protocol::Error {
+        agent_client_protocol::Error::new(-32602, self.message())
+    }
+}
+
 pub(super) async fn handle_load(
     req: LoadSessionRequest,
     responder: Responder<LoadSessionResponse>,
@@ -201,18 +257,20 @@ pub(super) async fn handle_load(
             crate::agent::runner::spawn_blocking_scoped(move || {
                 let workspace = Arc::new(
                     super::canonical_session_workspace(&requested_cwd)
-                        .map_err(|_| anyhow::anyhow!("invalid ACP load workspace"))?,
+                        .map_err(|_| LoadFailure::InvalidWorkspace)?,
                 );
-                let paths = crate::paths::process_paths_ref()?;
+                let paths = crate::paths::process_paths_ref()
+                    .map_err(|error| LoadFailure::unavailable(&error))?;
                 let sessions = crate::paths::WorkspaceBinding::capture(&paths.sessions_dir())
-                    .map_err(anyhow::Error::msg)?;
+                    .map_err(|error| LoadFailure::unavailable(&error))?;
                 let session = crate::session::storage::load_session_exact_read_only(
                     &sessions,
                     &requested_id,
                     &workspace,
-                )?
-                .ok_or_else(|| anyhow::anyhow!("saved ACP session not found"))?;
-                Ok::<_, anyhow::Error>((session, workspace))
+                )
+                .map_err(|error| LoadFailure::from_error(&error))?
+                .ok_or(LoadFailure::NotFound)?;
+                Ok::<_, LoadFailure>((session, workspace))
             })
             .await
         })
@@ -220,12 +278,7 @@ pub(super) async fn handle_load(
     cleanup.settle().await;
     let (session, workspace) = loaded
         .map_err(|_| agent_client_protocol::Error::new(-32603, "ACP session load task failed"))?
-        .map_err(|_| {
-            agent_client_protocol::Error::new(
-                -32602,
-                "saved ACP session is missing, incompatible or unsafe",
-            )
-        })?;
+        .map_err(LoadFailure::into_error)?;
     #[cfg(not(feature = "multimodal"))]
     if session
         .messages
@@ -243,7 +296,7 @@ pub(super) async fn handle_load(
             "ACP session load was cancelled",
         ));
     }
-    let replay = replay_updates(&req.session_id, &session)?;
+    let replay = replay_updates(&req.session_id, &session, workspace.root())?;
     let modes = super::install_session(
         state,
         req.session_id.clone(),
@@ -277,9 +330,11 @@ pub(super) async fn handle_load(
 fn replay_updates(
     id: &SessionId,
     session: &crate::session::Session,
+    workspace_root: &std::path::Path,
 ) -> Result<Vec<SessionNotification>, agent_client_protocol::Error> {
     use crate::session::MessageRole;
     let mut notifications = Vec::new();
+    let mut open_calls: Vec<String> = Vec::new();
     for message in &session.messages {
         if message.role == MessageRole::User {
             let blocks = match &message.user {
@@ -314,6 +369,7 @@ fn replay_updates(
             ));
         } else if message.role == MessageRole::ToolResult {
             if let Some(call_id) = &message.tool_call_id {
+                open_calls.retain(|open| open != call_id.as_str());
                 let fields = ToolCallUpdateFields::new()
                     .status(ToolCallStatus::Completed)
                     .content(vec![ToolCallContent::from(ContentBlock::Text(
@@ -330,15 +386,32 @@ fn replay_updates(
                 Some(crate::session::PersistedToolMessage::Call { name, arguments }),
             ) = (&message.tool_call_id, &message.tool)
         {
+            // The same announcement the live relay builds: title, kind and
+            // absolute locations.
+            open_calls.push(call_id.to_string());
             notifications.push(SessionNotification::new(
                 id.clone(),
-                SessionUpdate::ToolCall(
-                    ToolCall::new(call_id.to_string(), name.to_string())
-                        .raw_input(arguments.clone())
-                        .status(ToolCallStatus::Pending),
-                ),
+                SessionUpdate::ToolCall(super::announce_tool_call(
+                    call_id,
+                    name,
+                    arguments,
+                    workspace_root,
+                )),
             ));
         }
+    }
+    // A call whose result was never saved (an interrupted turn) must not be
+    // left Pending: the editor would show a spinner on yesterday's call.
+    for call_id in open_calls {
+        let fields = ToolCallUpdateFields::new()
+            .status(ToolCallStatus::Failed)
+            .content(vec![ToolCallContent::from(ContentBlock::Text(
+                TextContent::new("interrupted before a result was recorded"),
+            ))]);
+        notifications.push(SessionNotification::new(
+            id.clone(),
+            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(call_id, fields)),
+        ));
     }
     Ok(notifications)
 }
@@ -365,7 +438,7 @@ mod canonical_tests {
         session.add_user_message(input);
         session.add_message(crate::session::MessageRole::Assistant, "visible answer");
         let id = SessionId::new(session.id.to_string());
-        let updates = replay_updates(&id, &session).unwrap();
+        let updates = replay_updates(&id, &session, std::path::Path::new("/work")).unwrap();
         assert_eq!(updates.len(), 4);
         assert!(
             matches!(&updates[0].update, SessionUpdate::UserMessageChunk(chunk) if matches!(&chunk.content, ContentBlock::Text(text) if text.text == "before /undo"))
@@ -379,5 +452,79 @@ mod canonical_tests {
         assert!(
             matches!(&updates[3].update, SessionUpdate::AgentMessageChunk(chunk) if matches!(&chunk.content, ContentBlock::Text(text) if text.text == "visible answer"))
         );
+    }
+
+    #[test]
+    fn replay_matches_live_announcements_and_closes_unfinished_calls() {
+        let root = std::env::temp_dir().join("acp-replay");
+        let mut session = crate::session::Session::new("logical", "model", 128_000, "");
+        session.add_tool_call_with_id("done", "edit", &serde_json::json!({"path": "src/main.rs"}));
+        session.add_tool_result_with_id("done", "edit", "ok");
+        session.add_tool_call_with_id(
+            "lost",
+            "shell",
+            &serde_json::json!({"command": "cargo test"}),
+        );
+        let id = SessionId::new(session.id.to_string());
+        let updates = replay_updates(&id, &session, &root).unwrap();
+        assert_eq!(updates.len(), 4);
+        let SessionUpdate::ToolCall(call) = &updates[0].update else {
+            panic!("expected a tool call");
+        };
+        assert_eq!(call.title, "edit src/main.rs");
+        assert_eq!(call.kind, ToolKind::Edit);
+        assert_eq!(call.locations[0].path, root.join("src/main.rs"));
+        let SessionUpdate::ToolCallUpdate(done) = &updates[1].update else {
+            panic!("expected a result update");
+        };
+        assert_eq!(done.fields.status, Some(ToolCallStatus::Completed));
+        let SessionUpdate::ToolCall(lost) = &updates[2].update else {
+            panic!("expected a tool call");
+        };
+        assert_eq!(lost.title, "shell cargo test");
+        let SessionUpdate::ToolCallUpdate(closed) = &updates[3].update else {
+            panic!("expected the unfinished call to be closed");
+        };
+        assert_eq!(closed.tool_call_id.0.as_ref(), "lost");
+        assert_eq!(closed.fields.status, Some(ToolCallStatus::Failed));
+    }
+
+    #[test]
+    fn load_failures_have_one_distinct_bounded_message_each() {
+        use crate::session::storage::ExactLoadRefusal;
+        let mismatch =
+            LoadFailure::from_error(&anyhow::Error::new(ExactLoadRefusal::WorkspaceMismatch {
+                saved: "/other/project".into(),
+            }));
+        assert_eq!(
+            mismatch,
+            LoadFailure::WorkspaceMismatch {
+                saved: "/other/project".into()
+            }
+        );
+        assert!(mismatch.message().contains("/other/project"));
+        let incompatible =
+            LoadFailure::from_error(&anyhow::Error::new(ExactLoadRefusal::Incompatible));
+        assert_eq!(incompatible, LoadFailure::Incompatible);
+        let other = LoadFailure::from_error(&anyhow::anyhow!("secret /etc/shadow detail"));
+        assert_eq!(other, LoadFailure::Unavailable);
+        let messages = [
+            LoadFailure::InvalidWorkspace.message(),
+            LoadFailure::NotFound.message(),
+            mismatch.message(),
+            incompatible.message(),
+            other.message(),
+        ];
+        for (index, message) in messages.iter().enumerate() {
+            assert!(!message.contains("shadow"));
+            assert!(!message.contains("missing, incompatible or unsafe"));
+            for later in &messages[index + 1..] {
+                assert_ne!(message, later);
+            }
+        }
+        let long = LoadFailure::WorkspaceMismatch {
+            saved: "x".repeat(5000),
+        };
+        assert!(long.message().chars().count() < 300);
     }
 }

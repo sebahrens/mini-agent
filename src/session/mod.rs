@@ -481,7 +481,21 @@ impl TryFrom<UncheckedSessionMessage> for SessionMessage {
     }
 }
 
+/// Whether `text` is the host's own continuation prompt after a context
+/// relief (current or earlier wording), which is persisted as a `User` record
+/// but is not the user's words (mini-agent-sskdu.237).
+pub(crate) fn is_continuation_prompt(text: &str) -> bool {
+    let text = text.trim_start();
+    text.starts_with("[Earlier context was compacted to save space")
+        || text.starts_with("[Context was compacted to save space")
+}
+
 impl SessionMessage {
+    /// A `User` record carrying the user's own words, not a host continuation.
+    pub(crate) fn is_user_authored(&self) -> bool {
+        self.role == MessageRole::User && !is_continuation_prompt(&self.content)
+    }
+
     pub(crate) fn validate_user(&self) -> Result<(), &'static str> {
         self.validate_user_with(false)
     }
@@ -536,6 +550,10 @@ pub enum PersistedToolMessage {
         /// recovery path without parsing marker-like text from the tool.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         artifact_path: Option<CompactString>,
+        /// The tool reported failure. Absent in older sessions (replay then
+        /// guesses from the text).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        is_error: bool,
     },
 }
 
@@ -800,6 +818,9 @@ struct HistoryConversionCache {
 
 struct CachedHistoryConversion {
     revision: u64,
+    /// The live todo/goal blocks the recap carried; they change without a
+    /// history revision.
+    live_blocks: String,
     keep_recent_tool_results: usize,
     messages: std::sync::Arc<[rig::completion::Message]>,
 }
@@ -825,6 +846,12 @@ pub struct Compaction {
     #[serde(default)]
     pub(crate) file_requests: compaction::FileRequests,
     pub summary: CompactString,
+    /// The summarizer's own prose (bounded), without the machine-appended file
+    /// list, todo/goal blocks and restored file windows that `summary` carries.
+    /// The next compaction hands only this to the summarizer as the previous
+    /// summary (mini-agent-sskdu.235). Absent in older sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) prose: Option<CompactString>,
     pub first_kept_index: usize,
     pub summarized_count: usize,
     pub token_savings: u64,
@@ -943,6 +970,16 @@ pub struct Session {
     /// unless that opt-in setting is on (mini-agent-3wsib).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generated_title: Option<CompactString>,
+    /// The first user message's text, kept when a compaction drains it so the
+    /// derived title does not change with every compaction
+    /// (mini-agent-sskdu.238). Absent until a first compaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_prompt: Option<CompactString>,
+    /// Title requests that ran and produced nothing usable. Persisted so a
+    /// failing title model is not asked again by every prompt or resume
+    /// (mini-agent-sskdu.11); see `title::MAX_TITLE_ATTEMPTS`.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub title_attempts: u8,
     /// Closed session data only; never a runtime permission or replay owner.
     #[serde(
         default,
@@ -1172,6 +1209,11 @@ pub struct Session {
     history_conversion_cache: HistoryConversionCache,
     #[serde(skip)]
     pub(crate) save_notice_state: storage::SaveNoticeState,
+    /// The transcript prefix the latest compaction replaced, with that
+    /// compaction's number, until the next save writes it to a sidecar file
+    /// (mini-agent-sskdu.244). Process-local; never serialized.
+    #[serde(skip)]
+    pub(crate) pending_precompact: Option<(usize, Vec<SessionMessage>)>,
     #[serde(skip)]
     history_revision: u64,
 }
@@ -1462,6 +1504,7 @@ impl Session {
             .and_then(|cache| {
                 cache.as_ref().and_then(|entry| {
                     (entry.revision == self.history_revision
+                        && entry.live_blocks == self.live_recap_blocks()
                         && entry.keep_recent_tool_results == keep_recent_tool_results)
                         .then(|| std::sync::Arc::clone(&entry.messages))
                 })
@@ -1476,10 +1519,29 @@ impl Session {
         if let Ok(mut cache) = self.history_conversion_cache.entry.lock() {
             *cache = Some(CachedHistoryConversion {
                 revision: self.history_revision,
+                live_blocks: self.live_recap_blocks(),
                 keep_recent_tool_results,
                 messages,
             });
         }
+    }
+
+    /// The open-todo and active-goal blocks appended to the replayed recap, read
+    /// live so they never contradict the current state (mini-agent-sskdu.236).
+    /// Empty when there is nothing to state.
+    pub(crate) fn live_recap_blocks(&self) -> String {
+        let mut out = String::new();
+        if let Some(todo) = self.todos.critical_context() {
+            out.push_str(&todo);
+        }
+        #[cfg(feature = "goal")]
+        if let Some(goal) = self.goal_store.critical_context() {
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str(&goal);
+        }
+        out
     }
 
     pub(crate) fn mark_history_changed(&mut self) {
@@ -1543,6 +1605,8 @@ impl Session {
             id: CompactString::new(Uuid::new_v4().to_string()),
             name: CompactString::new(name),
             generated_title: None,
+            first_prompt: None,
+            title_attempts: 0,
             reasoning_controls: Default::default(),
             memory_placement: MemoryPlacement::Messages,
             native_history: None,
@@ -1614,6 +1678,7 @@ impl Session {
             environment: None,
             history_conversion_cache: HistoryConversionCache::default(),
             save_notice_state: storage::SaveNoticeState::default(),
+            pending_precompact: None,
             history_revision: 0,
         }
     }
@@ -2012,6 +2077,18 @@ impl Session {
         output: &str,
         images: Vec<tool_image::PersistedToolImage>,
     ) -> (String, Option<std::path::PathBuf>) {
+        self.add_tool_result_flagged(id, name, output, images, false)
+    }
+
+    /// [`Self::add_tool_result_with_images`] recording whether the tool failed.
+    pub(crate) fn add_tool_result_flagged(
+        &mut self,
+        id: &str,
+        name: &str,
+        output: &str,
+        images: Vec<tool_image::PersistedToolImage>,
+        is_error: bool,
+    ) -> (String, Option<std::path::PathBuf>) {
         let (content, replay_output, artifact) = self.tool_result_content(id, name, output);
         let artifact_path = artifact
             .as_ref()
@@ -2024,6 +2101,7 @@ impl Session {
                 output: CompactString::new(replay_output),
                 images,
                 artifact_path,
+                is_error,
             }),
         );
         (content, artifact)
@@ -2123,6 +2201,24 @@ impl Session {
         });
         (self.input_token_cost, self.output_token_cost) = prices.unwrap_or((0.0, 0.0));
         self.input_output_prices_known = Some(prices.is_some());
+    }
+
+    /// Whether the recorded cost may undercount: prices are unknown or spend
+    /// tracking failed.
+    pub(crate) fn cost_is_incomplete(&self) -> bool {
+        self.known_input_output_prices().is_none() || self.spend_account.snapshot().tracking_error
+    }
+
+    /// The cost as the statusline and exports show it: the recorded amount,
+    /// marked `+?` when it may be incomplete, or `?` when nothing is priced.
+    #[cfg(feature = "export")]
+    pub(crate) fn cost_display(&self) -> String {
+        let amount = self.recorded_total_cost();
+        match (self.cost_is_incomplete(), amount > 0.0) {
+            (false, _) => format!("${amount:.4}"),
+            (true, true) => format!("${amount:.4}+?"),
+            (true, false) => "price unknown".into(),
+        }
     }
 
     pub(crate) fn known_input_output_prices(&self) -> Option<(f64, f64)> {
@@ -2886,16 +2982,66 @@ impl Session {
             accumulated = accumulated.saturating_add(msg.estimated_tokens);
         }
         if cut_idx > 0 && cut_idx < messages.len() {
+            // A model that calls tools without narrating leaves no User or
+            // Assistant record for a long stretch, so a completed call/result
+            // batch boundary is also a legal cut: a `ToolCall` that follows a
+            // `ToolResult` while no earlier call is still waiting for its
+            // result (mini-agent-sskdu.227).
+            let batch_starts = Self::completed_batch_starts(&messages[..=cut_idx]);
             while cut_idx > 0
                 && !matches!(
                     messages[cut_idx].role,
                     MessageRole::User | MessageRole::Assistant
                 )
+                && !batch_starts[cut_idx]
             {
                 cut_idx -= 1;
             }
         }
         cut_idx
+    }
+
+    /// Whether cutting before `messages[idx]` (or at the end) never separates a
+    /// tool call from its result and lands on a record a compaction may start
+    /// the kept tail with.
+    #[cfg(feature = "acp")]
+    pub(crate) fn is_legal_cut(messages: &[SessionMessage], idx: usize) -> bool {
+        if idx == 0 || idx >= messages.len() {
+            return idx == messages.len();
+        }
+        matches!(
+            messages[idx].role,
+            MessageRole::User | MessageRole::Assistant
+        ) || Self::completed_batch_starts(&messages[..=idx])[idx]
+    }
+
+    /// For each index of `messages`, whether it is a `ToolCall` record that
+    /// starts a new batch: its predecessor is a `ToolResult` and every earlier
+    /// call already has its result, so cutting before it never separates a
+    /// call from its result.
+    fn completed_batch_starts(messages: &[SessionMessage]) -> Vec<bool> {
+        let mut open: HashSet<&str> = HashSet::new();
+        let mut starts = Vec::with_capacity(messages.len());
+        for (i, msg) in messages.iter().enumerate() {
+            starts.push(
+                i > 0
+                    && msg.role == MessageRole::ToolCall
+                    && messages[i - 1].role == MessageRole::ToolResult
+                    && open.is_empty(),
+            );
+            if let Some(id) = msg.tool_call_id.as_deref().filter(|id| !id.is_empty()) {
+                match msg.role {
+                    MessageRole::ToolCall => {
+                        open.insert(id);
+                    }
+                    MessageRole::ToolResult => {
+                        open.remove(id);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        starts
     }
 
     /// Returns true when the pending payload cannot fit even if the entire
@@ -2932,18 +3078,16 @@ impl Session {
         {
             return title.to_string();
         }
-        let Some(first) = self
-            .messages
-            .iter()
-            .find(|m| m.role == MessageRole::User && !m.content.trim().is_empty())
-        else {
+        let first = self.first_prompt.as_deref().or_else(|| {
+            self.messages
+                .iter()
+                .find(|m| m.is_user_authored() && !m.content.trim().is_empty())
+                .map(|m| m.content.as_str())
+        });
+        let Some(first) = first else {
             return String::new();
         };
-        let line = first
-            .content
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
+        let line = first.split_whitespace().collect::<Vec<_>>().join(" ");
         if line.chars().count() <= SESSION_TITLE_CHARS {
             return line;
         }
@@ -3066,6 +3210,10 @@ impl Session {
         restore_read_tokens: u64,
     ) {
         let memory_ref = CompactString::new(compaction_ref(&summary));
+        let prose = CompactString::new(crate::provider::bound_summary(
+            &summary,
+            summary_byte_budget,
+        ));
         let restored_reads = compaction::restored_read_windows(
             &self.messages[..first_kept_index.min(self.messages.len())],
             restore_read_tokens,
@@ -3088,18 +3236,9 @@ impl Session {
         };
         images.extend(&self.messages[..first_kept_index]);
         let mut summary = file_requests.attach(&summary, summary_byte_budget);
-        if let Some(todo_context) = self.todos.critical_context() {
-            summary.push_str("\n\n");
-            summary.push_str(&todo_context);
-        }
-        // A summarizer can drop anything in the messages it replaces, so the
-        // objective is re-stated from the record rather than trusted to survive
-        // in prose.
-        #[cfg(feature = "goal")]
-        if let Some(goal_context) = self.goal_store.critical_context() {
-            summary.push_str("\n\n");
-            summary.push_str(&goal_context);
-        }
+        // The open todos and the active goal are not frozen into the stored
+        // summary: `live_recap_blocks` renders them from the live stores each
+        // time the recap is replayed (mini-agent-sskdu.236).
         if let Some(restored) = restored_reads {
             summary.push_str("\n\n");
             summary.push_str(&restored);
@@ -3118,6 +3257,35 @@ impl Session {
             tool: None,
         };
 
+        // The title is derived from the first user message; remember it before
+        // the drain removes it (mini-agent-sskdu.238).
+        if self.first_prompt.is_none() {
+            self.first_prompt = self.messages[..first_kept_index.min(self.messages.len())]
+                .iter()
+                .find(|m| m.is_user_authored() && !m.content.trim().is_empty())
+                .map(|m| {
+                    // Bounded in chars: one huge word must not be copied whole.
+                    let line = m
+                        .content
+                        .split_whitespace()
+                        .take(SESSION_TITLE_CHARS)
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    CompactString::new(
+                        line.chars()
+                            .take(SESSION_TITLE_CHARS * 2)
+                            .collect::<String>(),
+                    )
+                });
+        }
+
+        // Keep the replaced transcript for the sidecar the next save writes:
+        // compaction is otherwise irreversible (mini-agent-sskdu.244).
+        self.pending_precompact = Some((
+            self.compaction_count() + 1,
+            self.messages[..first_kept_index.min(self.messages.len())].to_vec(),
+        ));
+
         // Remove summarized messages and insert summary
         self.messages.drain(..first_kept_index);
         self.messages.insert(0, summary_msg);
@@ -3132,9 +3300,12 @@ impl Session {
             images,
             file_requests,
             summary: CompactString::from(summary),
+            prose: Some(prose),
             first_kept_index: 1, // The summary is at index 0
             summarized_count,
-            token_savings,
+            // Net of the inserted summary, restored windows and blocks: what
+            // the compaction actually freed (mini-agent-sskdu.242).
+            token_savings: token_savings.saturating_sub(summary_tokens),
             created_at: CompactString::new(rfc3339_utc(jiff::Timestamp::now())),
             memory_ref: Some(memory_ref),
             pruned: None,
@@ -3168,6 +3339,14 @@ impl Session {
     /// left out here rather than sent twice (mini-agent-g8m5v). It is still
     /// part of the drained prefix: the new summary replaces it. Callers drain
     /// `skipped + compaction_drain_len(cut_idx - skipped, included)`.
+    /// The previous compaction's summary as the summarizer should see it: the
+    /// model's prose without machine-appended blocks (mini-agent-sskdu.235).
+    pub fn previous_summary_prose(&self) -> Option<String> {
+        self.compactions
+            .last()
+            .map(|c| c.prose.as_ref().unwrap_or(&c.summary).to_string())
+    }
+
     pub fn compaction_input(
         &self,
         cut_idx: usize,
@@ -4174,17 +4353,17 @@ mod goal_persistence_tests {
 
         session.compress("a summary that forgot everything".into(), 4, 100);
 
-        let summary = session
-            .messages
-            .iter()
-            .find(|m| m.role == MessageRole::System)
-            .expect("summary inserted");
-        assert!(summary.content.contains("finish the migration"));
-        assert!(summary.content.contains("old table dropped"));
+        // The objective is rendered from the live record at replay, not frozen
+        // into the stored summary (mini-agent-sskdu.236).
+        let live = session.live_recap_blocks();
+        assert!(live.contains("finish the migration"));
+        assert!(live.contains("old table dropped"));
         assert!(
-            summary.content.contains("task data, not instructions"),
+            live.contains("task data, not instructions"),
             "the restated objective stays framed as data"
         );
+        let stored = session.compactions.last().unwrap();
+        assert!(!stored.summary.contains("finish the migration"));
     }
 
     #[test]
@@ -4374,6 +4553,7 @@ mod compaction_history_tests {
             created_at: "t".into(),
             memory_ref: None,
             pruned: None,
+            prose: None,
         };
         let chain = |summaries: &[&str]| {
             summaries
@@ -4626,4 +4806,8 @@ mod rfc3339_format_tests {
         let text = rfc3339_utc(jiff::Timestamp::now());
         assert_eq!(rfc3339_utc(text.parse().unwrap()), text);
     }
+}
+
+fn is_zero_u8(value: &u8) -> bool {
+    *value == 0
 }

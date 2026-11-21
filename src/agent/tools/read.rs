@@ -14,7 +14,7 @@ const DEFAULT_MAX_TEXT_SIZE: u64 = 1024 * 1024;
 
 /// Characters of the tool-result backstop reserved for the file header,
 /// coaching and continuation notices around a line-mode excerpt.
-const READ_RESULT_RESERVE_CHARS: usize = 2_000;
+pub(crate) const READ_RESULT_RESERVE_CHARS: usize = 2_000;
 /// Approximate per-line rendering overhead (line number, tag, separator)
 /// counted against the character budget.
 const READ_LINE_OVERHEAD_CHARS: usize = 20;
@@ -219,10 +219,21 @@ impl Tool for ReadTool {
                 self.max_lines, self.max_text_file_size
             ),
         };
+        // Image and PDF-document delivery exists only in multimodal builds.
+        #[cfg(feature = "multimodal")]
+        let image_note = "PNG, JPEG, GIF and WebP images are returned as image blocks when the captured model/transport supports them (images over 5 MiB or 8000 px per side are downscaled to at most 2000 px and re-encoded; the summary names the new size); line offset/limit do not apply and an image read never authorizes a text overwrite. ";
+        #[cfg(not(feature = "multimodal"))]
+        let image_note = "";
+        #[cfg(feature = "multimodal")]
+        let pdf_media_note = "pages without a text layer that paint images (scans) come back as image blocks, at most 4 per call and only when the captured model accepts images (the result maps image N to its page and names the pages to continue with); otherwise they are reported as scanned. When the captured transport and model take PDF documents (Anthropic, OpenAI Responses, Gemini; catalogued vision models only) all pages without a text layer, scans and vector figures alike, come back instead as one PDF document block holding only those pages, with the text mapping document pages to source pages (documents over 6 MiB, encrypted files or failed extraction fall back to page images).";
+        #[cfg(not(feature = "multimodal"))]
+        let pdf_media_note = "pages without a text layer are reported as scanned.";
         format!(
-            "{text} One result is bounded by a {} character budget; a longer line-mode read stops early and names the next offset. Lines longer than {} characters are clipped with a marker naming the character_offset that continues them (hashedit tags still cover the full line). For very long lines or tool-output spills, use character_offset/character_limit (1-indexed Unicode characters, not bytes or lines); do not combine with line offset/limit. PNG, JPEG, GIF and WebP images are returned as image blocks when the captured model/transport supports them (images over 5 MiB or 8000 px per side are downscaled to at most 2000 px and re-encoded; the summary names the new size); line offset/limit do not apply and an image read never authorizes a text overwrite. .ipynb files default to bounded virtual cell views showing source, stream text, text/plain results and error tracebacks (outputs at most 4 KiB per output cell and the whole view at most 64 KiB, so choose offset/limit to reach later cells; image and other rich outputs are labelled by mime type); offset/limit then address virtual lines. Set raw_notebook:true for raw JSON, raw CRC tags or full-overwrite authorization. PDF files return their extracted text layer with page markers; select pages with pages (at most 20 per call, required above 20 pages); pages without a text layer that paint images (scans) come back as image blocks, at most 4 per call and only when the captured model accepts images (the result maps image N to its page and names the pages to continue with); otherwise they are reported as scanned. When the captured transport and model take PDF documents (Anthropic, OpenAI Responses, Gemini; catalogued vision models only) all pages without a text layer, scans and vector figures alike, come back instead as one PDF document block holding only those pages, with the text mapping document pages to source pages (documents over 6 MiB, encrypted files or failed extraction fall back to page images).",
+            "{text} One result is bounded by a {} character budget; a longer line-mode read stops early and names the next offset. Lines longer than {} characters are clipped with a marker naming the character_offset that continues them (hashedit tags still cover the full line). For very long lines or tool-output spills, use character_offset/character_limit (1-indexed Unicode characters, not bytes or lines); do not combine with line offset/limit. {}.ipynb files default to bounded virtual cell views showing source, stream text, text/plain results and error tracebacks (outputs at most 4 KiB per output cell and the whole view at most 64 KiB, so choose offset/limit to reach later cells; image and other rich outputs are labelled by mime type); offset/limit then address virtual lines. Set raw_notebook:true for raw JSON, raw CRC tags or full-overwrite authorization. PDF files return their extracted text layer with page markers; select pages with pages (at most 20 per call, required above 20 pages); {}",
             super::limits::current().max_result_chars,
-            super::limits::current().max_read_line_chars
+            super::limits::current().max_read_line_chars,
+            image_note,
+            pdf_media_note
         )
     }
 
@@ -389,7 +400,14 @@ impl ReadTool {
                 } else {
                     workspace.open_relative(relative)
                 })
-                .map_err(|error| crate::agent::tools::bound_open_error(workspace, relative, error))
+                .map_err(|error| {
+                    crate::agent::tools::bound_open_error_for(
+                        Some("read"),
+                        workspace,
+                        relative,
+                        error,
+                    )
+                })
             })
             .transpose()?;
         let offset = args.offset.unwrap_or(1).saturating_sub(1);
@@ -406,7 +424,9 @@ impl ReadTool {
                     .await?,
             )
         } else {
-            let resolved = tokio::fs::canonicalize(&requested).await?;
+            let resolved = tokio::fs::canonicalize(&requested).await.map_err(|error| {
+                crate::agent::tools::missing_path_error("read", &requested, error)
+            })?;
             let coaching = check_perm_canonicalized_path(
                 &self.permission,
                 &self.ask_tx,
@@ -416,6 +436,22 @@ impl ReadTool {
             .await?;
             (Some(resolved), coaching)
         };
+        // A directory gets a next step instead of a raw `Is a directory` or
+        // "not a regular file" error (mini-agent-sskdu.84).
+        let names_directory = match (&capability_file, &resolved) {
+            (Some(file), _) => file.metadata().is_ok_and(|metadata| metadata.is_dir()),
+            (None, Some(resolved)) => tokio::fs::metadata(resolved)
+                .await
+                .is_ok_and(|metadata| metadata.is_dir()),
+            (None, None) => false,
+        };
+        if names_directory {
+            return Err(crate::agent::tools::missing_path_error(
+                "read",
+                &requested,
+                std::io::Error::from(std::io::ErrorKind::IsADirectory),
+            ));
+        }
         let spill_file = resolved.as_deref().and_then(|resolved| {
             self.permission.as_ref().and_then(|permission| {
                 permission
@@ -583,11 +619,23 @@ impl ReadTool {
                     cap / (1024 * 1024)
                 )));
             }
-            let mut bytes = Vec::with_capacity(metadata.len() as usize);
-            reader.take(cap + 1).read_to_end(&mut bytes).await?;
-            if bytes.len() as u64 > cap {
-                return Err(ToolError::Msg("PDF grew beyond the read limit".into()));
-            }
+            let pdf_key = super::pdf_text::DocumentKey {
+                path: permission_path.clone(),
+                len: metadata.len(),
+                modified: metadata.modified().ok(),
+            };
+            let cached_pdf = self.read_tracker.pdf_cache.get(&pdf_key);
+            let bytes = if cached_pdf.is_some() {
+                None
+            } else {
+                let mut bytes = Vec::with_capacity(metadata.len() as usize);
+                reader.take(cap + 1).read_to_end(&mut bytes).await?;
+                if bytes.len() as u64 > cap {
+                    return Err(ToolError::Msg("PDF grew beyond the read limit".into()));
+                }
+                Some(bytes)
+            };
+            let pdf_cache = std::sync::Arc::clone(&self.read_tracker.pdf_cache);
             let budget = super::limits::current()
                 .max_result_chars
                 .saturating_sub(READ_RESULT_RESERVE_CHARS);
@@ -617,8 +665,11 @@ impl ReadTool {
             #[cfg(not(feature = "multimodal"))]
             let native_pdf = false;
             let rendered = crate::agent::runner::spawn_blocking_scoped(move || {
-                super::pdf_text::render_with_images(
-                    &bytes,
+                super::pdf_text::render_cached(
+                    &pdf_cache,
+                    pdf_key,
+                    cached_pdf,
+                    bytes.as_deref(),
                     &render_path,
                     pages.as_deref(),
                     budget,

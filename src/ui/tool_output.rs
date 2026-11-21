@@ -60,9 +60,18 @@ pub(crate) fn looks_like_error(output: &str) -> bool {
         .take(24)
         .collect::<String>()
         .to_ascii_lowercase();
+    // Whole-token prefixes: `errors.rs` or `error_codes.go:12:` are file names,
+    // not failures.
     ["error", "tool error", "permission denied", "denied:"]
         .iter()
-        .any(|prefix| head.starts_with(prefix))
+        .any(|prefix| {
+            head.strip_prefix(prefix).is_some_and(|rest| {
+                !rest
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '-' | '/'))
+            })
+        })
 }
 
 fn plural(count: usize, one: &str) -> String {
