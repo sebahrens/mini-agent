@@ -141,6 +141,7 @@ fn effect_response(sequence: u64, ordinal: u32) -> ParentWireFrame {
             result: EffectResult::ReadFile {
                 content: "contents".into(),
             },
+            approval_wait_ms: 0,
         }),
     )
 }
@@ -153,6 +154,7 @@ fn outcome_unknown_response(sequence: u64, ordinal: u32) -> ParentWireFrame {
             result: EffectResult::Error(crate::extras::js::protocol::EffectError::new(
                 crate::extras::js::protocol::EffectErrorCode::OutcomeUnknown,
             )),
+            approval_wait_ms: 0,
         }),
     )
 }

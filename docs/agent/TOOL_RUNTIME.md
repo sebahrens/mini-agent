@@ -622,7 +622,7 @@ held-out skill tests) keep the strict 64 KiB contract and fail with
 
 | Limit | Value | When exceeded |
 |-------|-------|---------------|
-| Whole call (queueing, IPC, JavaScript, brokered effects) | 30 s; `js-step-timeout-secs` 1..=300 | `execution timed out` naming the limit |
+| Whole call (queueing, IPC, JavaScript, brokered effects; approval wait excluded up to one further step timeout) | 30 s; `js-step-timeout-secs` 1..=300 | `execution timed out` naming the limit |
 | Brokered `spawn` | The remaining whole-call deadline | `timed_out: true`, process tree killed |
 | JavaScript heap / stack | 64 MiB / 512 KiB (fixed, Phase 6 invariant 4) | `out of memory` / `stack_limit` |
 | Worker CPU (native) | 35 s per worker process on Linux (`RLIMIT_CPU`) and Windows (Job) | Worker killed; workers within 30 s of it are retired first |
