@@ -291,8 +291,14 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
         .described("Global-only: permit credential-looking names (GH_TOKEN, *_API_KEY) in shell-inherit-env and shell-env.")
         .shaped(ConfigShape::Bool),
     aliased("sandbox-network-hosts", &["sandbox_network_hosts"])
-        .described("Hosts shell commands may reach when sandbox-network = allowlist (example.com, *.example.com, optional :port). Other hosts prompt. Project layers need trust.")
+        .described("Hosts shell commands may reach when sandbox-network = allowlist (example.com, *.example.com, optional :port, or presets @cargo @npm @pypi @github @go). Other hosts prompt. Project layers need trust.")
         .shaped(ConfigShape::Strings),
+    aliased("sandbox-network-private-hosts", &["sandbox_network_private_hosts"])
+        .described("Global-only: exact hosts (also listed in sandbox-network-hosts) the allowlist proxy may reach at private RFC 1918 addresses, such as an intranet package mirror. Loopback, link-local and metadata addresses stay refused.")
+        .shaped(ConfigShape::Strings),
+    aliased("sandbox-network-upstream-proxy", &["sandbox_network_upstream_proxy"])
+        .described("Global-only: http://[user:password@]host:port corporate proxy the allowlist proxy tunnels through after its own allowlist decision.")
+        .shaped(ConfigShape::String),
     aliased(
         "windows-appcontainer-read-roots",
         &["windows_appcontainer_read_roots"],

@@ -91,6 +91,10 @@ enum PromptInput {
     /// `x`: any literal command starting with the offered argv prefix, for
     /// this session (mini-agent-sskdu.149).
     AllowPrefix,
+    /// `r`: as `x`, and remember the prefix for this project.
+    AllowProjectPrefix,
+    /// `d`: as `f`, and remember the folder for this project.
+    AllowProjectFolder,
     Deny,
     /// `t`: deny once and tell the model what to do differently (one line).
     DenyWithNote,
@@ -112,14 +116,16 @@ fn grant_support(tool: &str) -> (bool, bool) {
     // (offers a session grant, may persist it for the project)
     match tool {
         "sandbox_escalation" => (false, false),
-        "sandbox_network" => (true, false),
+        // The proxy remembers a session approval itself; `(p)` stores the host
+        // in the per-project approvals loaded into the proxy at startup.
+        "sandbox_network" => (true, true),
         _ => (true, true),
     }
 }
 
 /// Plain-words scope of what `(a)` / `(p)` grant for this request, so the user
 /// sees it before answering and in the decision line (mini-agent-sskdu.40).
-fn grant_scope(tool: &str, input: &str, pattern: &str) -> String {
+pub(crate) fn grant_scope(tool: &str, input: &str, pattern: &str) -> String {
     const MAX: usize = 100;
     let scope = if tool == "sandbox_network" {
         input.to_string()
@@ -188,6 +194,8 @@ fn classify_prompt_key(key: KeyEvent) -> PromptInput {
         KeyCode::Char('f' | 'F') if plain => PromptInput::AllowFolder,
         KeyCode::Char('w' | 'W') if plain => PromptInput::AllowWorkspaceEdits,
         KeyCode::Char('x' | 'X') if plain => PromptInput::AllowPrefix,
+        KeyCode::Char('r' | 'R') if plain => PromptInput::AllowProjectPrefix,
+        KeyCode::Char('d' | 'D') if plain => PromptInput::AllowProjectFolder,
         KeyCode::Char('n' | 'N') if plain => PromptInput::Deny,
         KeyCode::Char('t' | 'T') if plain => PromptInput::DenyWithNote,
         KeyCode::Char('s' | 'S') if plain => PromptInput::StopWithInstruction,
@@ -468,6 +476,24 @@ impl PermissionState {
                 sanitize_for_review(prefix)
             ));
         }
+        if self.offer.is_none()
+            && self.project.is_some()
+            && let Some(prefix) = &self.shell_prefix
+        {
+            options.push_str(&format!(
+                "  (r) always allow commands starting with \"{}\" in this project",
+                sanitize_for_review(prefix)
+            ));
+        }
+        if self.offer.is_none()
+            && self.project.is_some()
+            && let Some(folder) = &self.folder
+        {
+            options.push_str(&format!(
+                "  (d) always allow read+edit+list in {} in this project",
+                folder.display()
+            ));
+        }
         if self.offer.is_none() && self.project.is_some() {
             options.push_str(&format!(
                 "  (p) always allow {} in this project",
@@ -675,6 +701,10 @@ impl PermissionState {
             || (input == PromptInput::AllowPrefix
                 && (self.shell_prefix.is_none() || self.offer.is_some()))
             || (input == PromptInput::AllowProject && self.project.is_none())
+            || (input == PromptInput::AllowProjectPrefix
+                && (self.shell_prefix.is_none() || self.offer.is_some() || self.project.is_none()))
+            || (input == PromptInput::AllowProjectFolder
+                && (self.folder.is_none() || self.offer.is_some() || self.project.is_none()))
             || (input == PromptInput::AllowSession
                 && self.offer.is_none()
                 && self.grant_scope.is_none())
@@ -684,6 +714,8 @@ impl PermissionState {
                     PromptInput::AllowSession
                         | PromptInput::AllowFolder
                         | PromptInput::AllowProject
+                        | PromptInput::AllowProjectPrefix
+                        | PromptInput::AllowProjectFolder
                 ))
         {
             return Ok(PermissionEvent::Waiting);
@@ -793,7 +825,11 @@ impl PermissionState {
             return Ok(PermissionEvent::Finished);
         }
         let request = self.request.take().expect("approval owns its request");
-        if input == PromptInput::AllowPrefix {
+        if matches!(
+            input,
+            PromptInput::AllowPrefix | PromptInput::AllowProjectPrefix
+        ) {
+            let persist = input == PromptInput::AllowProjectPrefix && self.project.is_some();
             let mut allowed = false;
             let mut scope = String::new();
             let entries = if request.reply.send(UserDecision::AllowOnce).is_ok() {
@@ -818,13 +854,24 @@ impl PermissionState {
                     renderer,
                     &request.tool,
                     &request.input,
-                    &format!("allowed (this session: {scope})"),
+                    &if persist {
+                        format!("allowed (always, this project: {scope})")
+                    } else {
+                        format!("allowed (this session: {scope})")
+                    },
                 )?;
+            }
+            if persist && let Some(project) = &self.project {
+                persist_project_rules(&entries, project, renderer)?;
             }
             record_session_grants(entries, renderer, ui, run)?;
             return Ok(PermissionEvent::Finished);
         }
-        if input == PromptInput::AllowFolder {
+        if matches!(
+            input,
+            PromptInput::AllowFolder | PromptInput::AllowProjectFolder
+        ) {
+            let persist = input == PromptInput::AllowProjectFolder && self.project.is_some();
             let mut allowed = false;
             let entries = if request.reply.send(UserDecision::AllowOnce).is_ok() {
                 allowed = true;
@@ -847,12 +894,20 @@ impl PermissionState {
                     renderer,
                     &request.tool,
                     &request.input,
-                    "allowed (folder, this session)",
+                    if persist {
+                        "allowed (folder, always in this project)"
+                    } else {
+                        "allowed (folder, this session)"
+                    },
                 )?;
+            }
+            if persist && let Some(project) = &self.project {
+                persist_project_rules(&entries, project, renderer)?;
             }
             record_session_grants(entries, renderer, ui, run)?;
             return Ok(PermissionEvent::Finished);
         }
+        let mut persist_entries: Option<Vec<(String, String)>> = None;
         let (decision, entries) = match input {
             PromptInput::AllowOnce => (UserDecision::AllowOnce, Vec::new()),
             PromptInput::AllowSession | PromptInput::AllowProject => {
@@ -869,7 +924,8 @@ impl PermissionState {
                 );
                 // The sender remembers its own grant; a checker entry for it
                 // would be saved with the session yet never consulted.
-                if !grant_support(&request.tool).1 {
+                if request.tool == "sandbox_network" {
+                    persist_entries = Some(vec![(request.tool.to_string(), request.input.clone())]);
                     entries.clear();
                 }
                 (UserDecision::AllowAlways(pattern), entries)
@@ -893,7 +949,11 @@ impl PermissionState {
             note_decision(renderer, &request.tool, &request.input, &verb)?;
         }
         if persist && let Some(project) = &self.project {
-            persist_project_rules(&entries, project, renderer)?;
+            persist_project_rules(
+                persist_entries.as_deref().unwrap_or(&entries),
+                project,
+                renderer,
+            )?;
         }
         record_session_grants(entries, renderer, ui, run)?;
         Ok(PermissionEvent::Finished)
@@ -1098,8 +1158,8 @@ mod tests {
         let options = permission_options(None, None);
         assert!(!options.contains("(a)"), "{options}");
         assert!(options.contains("(y) allow once"));
-        // A network host lasts for the session in the proxy only.
-        assert_eq!(grant_support("sandbox_network"), (true, false));
+        // A network host lasts for the session in the proxy; `(p)` stores it.
+        assert_eq!(grant_support("sandbox_network"), (true, true));
         assert_eq!(grant_support("edit"), (true, true));
     }
 

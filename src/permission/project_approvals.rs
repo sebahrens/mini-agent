@@ -74,6 +74,26 @@ pub(crate) fn load(state_dir: &Path, workspace: &Path) -> anyhow::Result<Vec<Pro
     Ok(read(state_dir, workspace)?.rules)
 }
 
+/// Pseudo-tool of approved sandbox network hosts (`host:port` patterns). They
+/// feed the allowlist proxy, never the permission checker.
+pub(crate) const NETWORK_TOOL: &str = "sandbox_network";
+
+/// Split loaded approvals into checker rules and approved network hosts.
+pub(crate) fn split_network_hosts(
+    rules: Vec<ProjectApproval>,
+) -> (Vec<(String, String)>, Vec<String>) {
+    let mut checker = Vec::new();
+    let mut hosts = Vec::new();
+    for rule in rules {
+        if rule.tool == NETWORK_TOOL {
+            hosts.push(rule.pattern);
+        } else {
+            checker.push((rule.tool, rule.pattern));
+        }
+    }
+    (checker, hosts)
+}
+
 /// Persist `rule` for `workspace`; an identical rule is not duplicated.
 pub(crate) fn add(state_dir: &Path, workspace: &Path, rule: ProjectApproval) -> anyhow::Result<()> {
     anyhow::ensure!(
@@ -130,6 +150,29 @@ mod tests {
             tool: tool.into(),
             pattern: pattern.into(),
         }
+    }
+
+    #[test]
+    fn network_hosts_are_split_from_checker_rules_and_feed_a_fresh_proxy() {
+        let root = crate::tests::OwnedTestDirectory::new("project-approvals-net");
+        let state = root.path().join("state");
+        let project = root.path().join("project");
+        add(&state, &project, rule(NETWORK_TOOL, "index.crates.io:443")).unwrap();
+        add(&state, &project, rule(NETWORK_TOOL, "index.crates.io:443")).unwrap();
+        add(&state, &project, rule("shell", "cargo test")).unwrap();
+        let loaded = load(&state, &project).unwrap();
+        assert_eq!(loaded.len(), 2, "written once");
+        let (checker, hosts) = split_network_hosts(loaded);
+        assert_eq!(checker, [("shell".to_string(), "cargo test".to_string())]);
+        assert_eq!(hosts, ["index.crates.io:443"]);
+
+        // A fresh proxy for the same project allows the host without asking.
+        let sandbox = crate::sandbox::Sandbox::new(false, "seatbelt");
+        sandbox.set_project_network_hosts(hosts);
+        assert_eq!(sandbox.project_network_hosts(), ["index.crates.io:443"]);
+        let other = crate::tests::OwnedTestDirectory::new("project-approvals-net-other");
+        let (_, other_hosts) = split_network_hosts(load(&state, other.path()).unwrap());
+        assert!(other_hosts.is_empty(), "scoped to its workspace");
     }
 
     #[test]

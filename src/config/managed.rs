@@ -860,15 +860,24 @@ impl ManagedPolicy {
     }
 
     /// Whether a user host entry stays inside the managed `allowed_hosts` pin.
-    fn host_entry_allowed(&self, entry: &str) -> bool {
+    /// A preset (`@cargo`) is allowed only when every host it expands to is.
+    pub(crate) fn host_entry_allowed(&self, entry: &str) -> bool {
         let Some(pinned) = &self.file.sandbox.allowed_hosts else {
             return true;
         };
-        let Ok(rule) = crate::sandbox::net_proxy::HostRule::parse(entry) else {
+        use crate::sandbox::net_proxy::{HostRule, expand_entries, expand_entry};
+        let Ok(entries) = expand_entry(entry) else {
             return false;
         };
-        pinned.iter().any(|pin| {
-            crate::sandbox::net_proxy::HostRule::parse(pin).is_ok_and(|pin| rule.covered_by(&pin))
+        let Ok(pins) = expand_entries(pinned) else {
+            return false;
+        };
+        let pins: Vec<HostRule> = pins
+            .iter()
+            .filter_map(|pin| HostRule::parse(pin).ok())
+            .collect();
+        entries.iter().all(|entry| {
+            HostRule::parse(entry).is_ok_and(|rule| pins.iter().any(|pin| rule.covered_by(pin)))
         })
     }
 
@@ -1094,6 +1103,14 @@ impl ManagedPolicy {
                         "sandbox-network-hosts entries outside the managed allowed_hosts were removed by the managed policy {file}"
                     ),
                 );
+            }
+        }
+        if sandbox.allowed_hosts.is_some() {
+            let before = cfg.sandbox_network_private_hosts.len();
+            cfg.sandbox_network_private_hosts
+                .retain(|entry| self.host_entry_allowed(entry));
+            if cfg.sandbox_network_private_hosts.len() != before {
+                mark_managed(cfg, "sandbox-network-private-hosts", true);
             }
         }
         if sandbox.max_profile.is_some() {
@@ -1570,6 +1587,35 @@ mod tests {
                 && summary.contains("no home mounts"),
             "{summary}"
         );
+    }
+
+    // mini-agent-nvnkx.189
+    #[test]
+    fn a_preset_is_allowed_only_when_the_managed_pin_covers_every_host() {
+        let cargo_pin = policy(
+            "[sandbox]\nallowed_hosts = [\"index.crates.io\", \"static.crates.io\", \"crates.io\"]\n",
+        );
+        assert!(cargo_pin.host_entry_allowed("@cargo"));
+        assert!(!cargo_pin.host_entry_allowed("@pypi"));
+        let partial = policy("[sandbox]\nallowed_hosts = [\"crates.io\"]\n");
+        assert!(
+            !partial.host_entry_allowed("@cargo"),
+            "a pin that misses a host rejects it"
+        );
+        assert!(partial.host_entry_allowed("crates.io"));
+        let wildcard = policy("[sandbox]\nallowed_hosts = [\"*.crates.io\", \"crates.io\"]\n");
+        assert!(wildcard.host_entry_allowed("@cargo"));
+        let by_preset = policy("[sandbox]\nallowed_hosts = [\"@cargo\"]\n");
+        assert!(
+            by_preset.host_entry_allowed("@cargo") && by_preset.host_entry_allowed("crates.io")
+        );
+        let mut cfg: super::super::Config = toml::from_str(
+            "sandbox_network_hosts = [\"@cargo\", \"@pypi\"]\nsandbox_network_private_hosts = [\"crates.io\", \"evil.example\"]\n",
+        )
+        .unwrap();
+        cargo_pin.apply(&mut cfg);
+        assert_eq!(cfg.sandbox_network_hosts, ["@cargo"]);
+        assert_eq!(cfg.sandbox_network_private_hosts, ["crates.io"]);
     }
 
     #[test]

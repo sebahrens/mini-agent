@@ -165,8 +165,8 @@ the sandbox after a fresh interactive approval in every mode (deny rules still
 win, nothing is remembered, headless runs refuse, the use is logged to the
 `mini_agent::audit::sandbox_escalation` target). `sandbox-network = "allowlist"`
 routes contained shell traffic through a loopback filtering proxy
-(`src/sandbox/net_proxy.rs`) limited to `sandbox-network-hosts` plus prompted
-hosts, on Seatbelt and Linux bwrap (Unix-socket proxy plus the in-namespace forwarder in
+(`src/sandbox/net_proxy.rs`) limited to `sandbox-network-hosts` (with `@preset` expansion) plus prompted and per-project approved
+hosts (optionally `sandbox-network-private-hosts` and a chained `sandbox-network-upstream-proxy`), on Seatbelt and Linux bwrap (Unix-socket proxy plus the in-namespace forwarder in
 `src/sandbox/net_forwarder.rs`). The proxy keeps a bounded log of refused `host:port`s (`NetworkProxy::refusal_mark`/`refusals_since`); the shell tool captures the mark when a command or background job starts and appends `[sandbox network: blocked ...]` when the command ends, independent of any output marker. `sandbox_failure_note` (foreground, auto-background, `job_status` terminal failures) and `sandbox_timeout_note` (deadline stops) attribute network-looking failures to the sandbox outright when the session network is denied. `/sandbox network <mode>` and `--sandbox-network` change the policy. See CONFIG.md for the rules.
 
 | Command class | Deadline |

@@ -74,6 +74,11 @@ Notable changes to mini-agent are documented in this file. The format follows
 - MCP server `notifications/message` log lines are kept in a bounded per-server ring, shown by `/mcp <server>` and appended (fenced as untrusted) to a failed tool call's error; subscribed resources the server reports updated are re-read with a note (mini-agent-nvnkx.80; argument completion not implemented).
 - ACP advertises `mcpCapabilities.http` and accepts client-supplied HTTP MCP servers (https, or loopback http) for the session when the same gate as client stdio servers is open; headers are used as given and never persisted (mini-agent-nvnkx.108).
 - `mcp_search` replies list further matches by name (`more`) without schemas (mini-agent-nvnkx.183).
+- `sandbox-network-hosts` accepts presets `@cargo`, `@npm`, `@pypi`, `@github` and `@go` that expand to fixed host sets (shown by `/sandbox`, bounded by a managed `allowed_hosts` pin); the `sandbox_network` prompt's `(p)` stores the approved `host:port` in the per-project approvals so a later session allows it without asking (mini-agent-nvnkx.189).
+- The allowlist proxy's command environment adds `NODE_USE_ENV_PROXY=1`, `npm_config_proxy` and `npm_config_https_proxy`; the shell tool description and CONFIG.md state which client families work and give a JVM recipe (mini-agent-nvnkx.188).
+- Global-only `sandbox-network-private-hosts` lets exact listed intranet hosts resolve to RFC 1918 addresses (loopback, link-local and metadata stay refused) and global-only `sandbox-network-upstream-proxy` chains the allowlist proxy through a corporate HTTP proxy with `CONNECT` after its own decision (mini-agent-nvnkx.187).
+- `/permissions session` lists the running session's grants in plain words and `/permissions revoke <n|all>` removes them (checker rebuilt, session saved); `/permissions rules` also shows configured rules and built-ins, and `forget` now applies to the running session (mini-agent-nvnkx.67).
+- The approval prompt offers `(r)` (prefix) and `(d)` (folder) project-scoped variants of `(x)` and `(f)` under `persist_project_approvals`; project approvals live in their own checker list that `/resume` no longer clears (mini-agent-nvnkx.68).
 
 ### Fixed
 

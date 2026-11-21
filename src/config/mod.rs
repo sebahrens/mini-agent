@@ -561,6 +561,24 @@ pub struct Config {
         alias = "sandbox_network_hosts"
     )]
     pub sandbox_network_hosts: Vec<String>,
+    /// `sandbox-network-private-hosts`: exact hosts the allowlist proxy may
+    /// reach at private (RFC 1918) addresses. Global-only.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        rename = "sandbox-network-private-hosts",
+        alias = "sandbox_network_private_hosts"
+    )]
+    pub sandbox_network_private_hosts: Vec<String>,
+    /// `sandbox-network-upstream-proxy`: corporate HTTP proxy the allowlist
+    /// proxy chains to. Global-only.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "sandbox-network-upstream-proxy",
+        alias = "sandbox_network_upstream_proxy"
+    )]
+    pub sandbox_network_upstream_proxy: Option<String>,
     /// `shell-inherit-env`: variable names (or `*` globs) copied from the
     /// parent process into contained shell commands, on top of the fixed
     /// allowlist. Credential-looking names are refused. Sensitive in project

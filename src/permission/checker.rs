@@ -446,6 +446,10 @@ pub struct PermissionChecker {
     /// Argv-prefix shell grants approved at a prompt for this session; they
     /// follow the same precedence as configured prefixes (deny rules win).
     session_shell_prefixes: Vec<crate::permission::shell_prefix::ShellPrefix>,
+    /// Persisted per-project approvals (`persist_project_approvals`). Kept
+    /// apart from the session grants so replacing the session's allowlist
+    /// (`/resume`, `/permissions revoke`) re-applies them.
+    project_entries: Vec<(String, String)>,
     last_call: Option<(String, String)>,
     consecutive_repeat_count: usize,
     mode: SecurityMode,
@@ -643,6 +647,7 @@ impl PermissionChecker {
             plan_write_root: Some(plan_write_root),
             session_allowlist: Vec::new(),
             session_shell_prefixes: Vec::new(),
+            project_entries: Vec::new(),
             last_call: None,
             consecutive_repeat_count: 0,
             mode: self.mode,
@@ -946,6 +951,7 @@ impl PermissionChecker {
             plan_write_root: Some(plan_write_root),
             session_allowlist: Vec::new(),
             session_shell_prefixes: Vec::new(),
+            project_entries: Vec::new(),
             last_call: None,
             consecutive_repeat_count: 0,
             mode,
@@ -2310,6 +2316,60 @@ impl PermissionChecker {
         self.last_call = None;
         self.consecutive_repeat_count = 0;
         self.load_session_allowlist(entries);
+        let project = self.project_entries.clone();
+        self.load_session_allowlist(&project);
+    }
+
+    /// The configured allow/ask/deny rules and built-in shell allows, one line
+    /// each, for `/permissions rules`.
+    pub(crate) fn effective_rule_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        let mut tools: Vec<&String> = self.rules.keys().collect();
+        tools.sort();
+        for tool in tools {
+            for (pattern, action) in &self.rules[tool] {
+                let action = match action {
+                    Action::Allow => "allow",
+                    Action::Ask => "ask",
+                    Action::Deny => "deny",
+                };
+                lines.push(format!("{action} {tool}: {}", pattern.original));
+            }
+        }
+        for prefix in &self.shell_allow_prefixes {
+            lines.push(format!(
+                "allow shell prefix: {}",
+                prefix.compatibility_fields().0.join(" ")
+            ));
+        }
+        if self.builtin_shell_allows {
+            lines.push(
+                "built-in: read-only shell commands (ls, cat, git status, ...) run without asking"
+                    .into(),
+            );
+        }
+        lines
+    }
+
+    /// Load the persisted project approvals. They survive
+    /// [`Self::replace_session_allowlist`], which re-applies them after the
+    /// incoming session's own grants.
+    pub(crate) fn load_project_allowlist(&mut self, entries: &[(String, String)]) {
+        self.project_entries.extend_from_slice(entries);
+        self.load_session_allowlist(entries);
+    }
+
+    /// Drop project approvals that `/permissions forget` removed from the
+    /// store, effective immediately; `session_entries` is the running
+    /// session's own grant list, which is re-applied unchanged.
+    pub(crate) fn forget_project_allowlist(
+        &mut self,
+        removed: &[(String, String)],
+        session_entries: &[(String, String)],
+    ) {
+        self.project_entries
+            .retain(|entry| !removed.contains(entry));
+        self.replace_session_allowlist(session_entries);
     }
 
     pub fn load_session_allowlist(&mut self, entries: &[(String, String)]) {
@@ -6365,6 +6425,44 @@ mod harness_review_policy_tests {
         });
         let mut c = checker(&allow, SecurityMode::Standard);
         assert_eq!(c.check("shell", "cargo test"), CheckResult::Ask);
+    }
+
+    // mini-agent-nvnkx.68, .67
+    #[test]
+    fn project_approvals_survive_a_session_replacement_and_forget_applies_live() {
+        let mut c = checker(&PermissionConfigs::default(), SecurityMode::Standard);
+        let prefix = (
+            SESSION_SHELL_PREFIX_TOOL.to_owned(),
+            "make build".to_owned(),
+        );
+        c.load_project_allowlist(std::slice::from_ref(&prefix));
+        assert_eq!(c.check("shell", "make build x"), CheckResult::Allowed);
+        // /resume into a session with no grants keeps the project approval.
+        c.replace_session_allowlist(&[]);
+        assert_eq!(c.check("shell", "make build x"), CheckResult::Allowed);
+        // The session's own grants come and go without touching it.
+        let own = (SESSION_SHELL_PREFIX_TOOL.to_owned(), "make test".to_owned());
+        c.replace_session_allowlist(std::slice::from_ref(&own));
+        assert_eq!(c.check("shell", "make test a"), CheckResult::Allowed);
+        c.replace_session_allowlist(&[]);
+        assert_eq!(c.check("shell", "make test a"), CheckResult::Ask);
+        // /permissions forget drops it from the running checker.
+        c.forget_project_allowlist(std::slice::from_ref(&prefix), &[]);
+        assert_eq!(c.check("shell", "make build x"), CheckResult::Ask);
+    }
+
+    #[test]
+    fn effective_rule_lines_show_configured_rules_and_builtins() {
+        let deny = PermissionConfigs::from(PermissionConfig {
+            deny_entries: Some([("shell".to_owned(), vec!["curl **".to_owned()])].into()),
+            ..PermissionConfig::default()
+        });
+        let c = checker(&deny, SecurityMode::Standard);
+        let lines = c.effective_rule_lines();
+        assert!(
+            lines.iter().any(|line| line == "deny shell: curl **"),
+            "{lines:?}"
+        );
     }
 
     // mini-agent-nvnkx.59

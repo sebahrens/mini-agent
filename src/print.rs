@@ -3464,6 +3464,10 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
     )
     .with_network(cli.resolve_sandbox_network(cfg))
     .with_network_hosts(cfg.sandbox_network_hosts.clone())
+    .with_network_routes(
+        cfg.sandbox_network_private_hosts.clone(),
+        cfg.sandbox_network_upstream_proxy.clone(),
+    )
     .with_shell_env(cfg.shell_env_policy())
     .with_max_background_jobs(
         cfg.shell_max_background_jobs

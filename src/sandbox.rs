@@ -506,6 +506,12 @@ pub struct SandboxConfig {
     /// `sandbox-network-hosts`: the proxy allowlist for
     /// `sandbox-network = "allowlist"`.
     network_hosts: Vec<String>,
+    /// `sandbox-network-private-hosts`: exact hosts the proxy may reach at
+    /// private addresses.
+    network_private_hosts: Vec<String>,
+    /// `sandbox-network-upstream-proxy`: corporate proxy the filtering proxy
+    /// chains to.
+    network_upstream_proxy: Option<String>,
     /// `shell-max-background-jobs`: running background jobs allowed at once.
     max_background_jobs: usize,
     /// `shell-max-processes` / `shell-max-file-size-mb` (Unix rlimits).
@@ -566,6 +572,9 @@ pub struct Sandbox {
     command_log_dir: Arc<Mutex<Option<PathBuf>>>,
     /// Where the proxy asks about unlisted hosts; set once the UI exists.
     network_prompt: Arc<Mutex<Option<crate::permission::ask::AskSender>>>,
+    /// `host:port` approvals persisted for this project, shared by all clones
+    /// and applied to every proxy that starts.
+    project_network_hosts: Arc<Mutex<Vec<String>>>,
     /// Canonicalized cache directory computed once per instance.
     cached_cache_dir: Arc<Mutex<Option<Arc<PathBuf>>>>,
     /// Cached Seatbelt profiles keyed by escaped workspace/cache/private roots and network policy.
@@ -3172,6 +3181,64 @@ impl Sandbox {
         &self.network_hosts
     }
 
+    /// `sandbox-network-private-hosts` and `sandbox-network-upstream-proxy`
+    /// (both global-only). Entries are validated by the config loader; an
+    /// invalid value fails closed when the proxy would start.
+    pub fn with_network_routes(
+        mut self,
+        private_hosts: Vec<String>,
+        upstream_proxy: Option<String>,
+    ) -> Self {
+        self.network_private_hosts = private_hosts;
+        self.network_upstream_proxy = upstream_proxy;
+        self.network_proxy = Arc::new(OnceLock::new());
+        self
+    }
+
+    pub fn network_private_hosts(&self) -> &[String] {
+        &self.network_private_hosts
+    }
+
+    /// The upstream proxy as `host:port` (credentials omitted), if configured.
+    pub fn network_upstream_display(&self) -> Option<String> {
+        self.network_upstream_proxy
+            .as_deref()
+            .and_then(|url| net_proxy::Upstream::parse(url).ok())
+            .map(|upstream| upstream.display())
+    }
+
+    /// Hosts approved earlier for this project (`host:port`), loaded from the
+    /// private per-user store. Entries a managed `allowed_hosts` pin does not
+    /// cover are dropped, so a pin bounds persisted approvals too.
+    pub fn set_project_network_hosts(&self, hosts: Vec<String>) {
+        let pin = crate::config::managed::active();
+        let kept: Vec<String> = hosts
+            .into_iter()
+            .map(|host| host.to_ascii_lowercase())
+            .filter(|host| net_proxy::HostRule::parse(host).is_ok())
+            .filter(|host| {
+                pin.as_ref()
+                    .is_none_or(|policy| policy.host_entry_allowed(host))
+            })
+            .collect();
+        if let Some(Ok(proxy)) = self.network_proxy.get() {
+            for host in &kept {
+                proxy.allow_for_session(host);
+            }
+        }
+        *self
+            .project_network_hosts
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = kept;
+    }
+
+    pub fn project_network_hosts(&self) -> Vec<String> {
+        self.project_network_hosts
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
     /// Route the allowlist proxy's "allow this host?" questions to the user.
     /// Without a sender every unlisted host is refused.
     pub fn set_network_prompt(&self, sender: Option<crate::permission::ask::AskSender>) {
@@ -3202,16 +3269,28 @@ impl Sandbox {
         self.network_proxy
             .get_or_init(|| {
                 let rules = net_proxy::parse_rules(&self.network_hosts)?;
+                let options = net_proxy::ProxyOptions {
+                    private_hosts: net_proxy::parse_private_hosts(&self.network_private_hosts)?,
+                    upstream: self
+                        .network_upstream_proxy
+                        .as_deref()
+                        .map(net_proxy::Upstream::parse)
+                        .transpose()?,
+                };
                 // bwrap's empty network namespace reaches the proxy over a
                 // private Unix socket instead of host loopback.
-                #[cfg(unix)]
-                let started = if self.backend == "bwrap" {
-                    net_proxy::NetworkProxy::start_with_socket(rules, self.network_prompt.clone())
-                } else {
-                    net_proxy::NetworkProxy::start(rules, self.network_prompt.clone())
-                };
-                #[cfg(not(unix))]
-                let started = net_proxy::NetworkProxy::start(rules, self.network_prompt.clone());
+                let with_socket = cfg!(unix) && self.backend == "bwrap";
+                let started = net_proxy::NetworkProxy::start_with_options(
+                    rules,
+                    self.network_prompt.clone(),
+                    with_socket,
+                    options,
+                );
+                if let Ok(proxy) = &started {
+                    for host in self.project_network_hosts() {
+                        proxy.allow_for_session(&host);
+                    }
+                }
                 started.map_err(|error| format!("sandbox network proxy failed to start: {error}"))
             })
             .clone()
@@ -3495,6 +3574,8 @@ impl Sandbox {
                 network: SandboxNetwork::Deny,
                 shell_env: ShellEnvPolicy::default(),
                 network_hosts: Vec::new(),
+                network_private_hosts: Vec::new(),
+                network_upstream_proxy: None,
                 max_background_jobs: DEFAULT_MAX_BACKGROUND_JOBS,
                 resource_limits: ShellResourceLimits::default(),
                 read_roots: Vec::new(),
@@ -3528,6 +3609,7 @@ impl Sandbox {
             net_forwarder_exe: None,
             command_log_dir: Arc::new(Mutex::new(None)),
             network_prompt: Arc::default(),
+            project_network_hosts: Arc::default(),
             cached_cache_dir: Arc::new(Mutex::new(None)),
             cached_seatbelt_profiles: Arc::new(Mutex::new(SeatbeltProfileMap::default())),
             cached_general_roots: Arc::new(Mutex::new(Vec::new())),

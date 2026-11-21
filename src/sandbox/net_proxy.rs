@@ -160,35 +160,133 @@ impl AcceptBackoff {
     }
 }
 
-/// Parse and bound the configured list.
-pub fn parse_rules(entries: &[String]) -> Result<Vec<HostRule>, String> {
+/// Named host sets accepted in `sandbox-network-hosts` as `@name`. The sets are
+/// fixed in the binary, so a preset never widens beyond what is listed here.
+pub const PRESETS: &[(&str, &[&str])] = &[
+    (
+        "@cargo",
+        &["index.crates.io", "static.crates.io", "crates.io"],
+    ),
+    ("@npm", &["registry.npmjs.org", "registry.yarnpkg.com"]),
+    ("@pypi", &["pypi.org", "files.pythonhosted.org"]),
+    (
+        "@github",
+        &[
+            "github.com",
+            "codeload.github.com",
+            "objects.githubusercontent.com",
+        ],
+    ),
+    ("@go", &["proxy.golang.org", "sum.golang.org"]),
+];
+
+/// The hosts one `sandbox-network-hosts` entry stands for: a preset expands to
+/// its fixed set, anything else is itself.
+pub fn expand_entry(entry: &str) -> Result<Vec<String>, String> {
+    let trimmed = entry.trim();
+    if !trimmed.starts_with('@') {
+        return Ok(vec![entry.to_string()]);
+    }
+    let name = trimmed.to_ascii_lowercase();
+    match PRESETS.iter().find(|(preset, _)| *preset == name) {
+        Some((_, hosts)) => Ok(hosts.iter().map(|host| (*host).to_string()).collect()),
+        None => Err(format!(
+            "sandbox-network-hosts: unknown preset {entry:?} (known: {})",
+            PRESETS
+                .iter()
+                .map(|(preset, _)| *preset)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+/// Every entry with presets expanded, in order.
+pub fn expand_entries(entries: &[String]) -> Result<Vec<String>, String> {
+    let mut hosts = Vec::new();
+    for entry in entries {
+        hosts.extend(expand_entry(entry)?);
+    }
+    Ok(hosts)
+}
+
+/// Parse `sandbox-network-private-hosts`: exact host names only (no presets,
+/// no wildcards), so an intranet exception never covers a whole domain.
+pub fn parse_private_hosts(entries: &[String]) -> Result<Vec<HostRule>, String> {
     if entries.len() > MAX_RULES {
+        return Err(format!(
+            "sandbox-network-private-hosts accepts at most {MAX_RULES} entries"
+        ));
+    }
+    entries
+        .iter()
+        .map(|entry| {
+            if entry.trim().starts_with(['@', '*']) {
+                return Err(format!(
+                    "sandbox-network-private-hosts: {entry:?} must be an exact host name"
+                ));
+            }
+            HostRule::parse(entry)
+        })
+        .collect()
+}
+
+/// `@preset -> hosts` lines for entries that name a preset (`/sandbox`).
+pub fn describe_presets(entries: &[String]) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|entry| entry.trim().starts_with('@'))
+        .filter_map(|entry| {
+            expand_entry(entry)
+                .ok()
+                .map(|hosts| format!("{} = {}", entry.trim(), hosts.join(", ")))
+        })
+        .collect()
+}
+
+/// Parse and bound the configured list (presets expanded).
+pub fn parse_rules(entries: &[String]) -> Result<Vec<HostRule>, String> {
+    let expanded = expand_entries(entries)?;
+    if expanded.len() > MAX_RULES {
         return Err(format!(
             "sandbox-network-hosts accepts at most {MAX_RULES} entries"
         ));
     }
-    entries.iter().map(|entry| HostRule::parse(entry)).collect()
+    expanded
+        .iter()
+        .map(|entry| HostRule::parse(entry))
+        .collect()
 }
 
 /// Destinations the proxy never connects to, whatever the allowlist says.
+#[cfg(test)]
 pub fn is_forbidden_ip(ip: IpAddr) -> bool {
+    is_forbidden_ip_with(ip, false)
+}
+
+/// As [`is_forbidden_ip`]. With `private_ok` (a host named in
+/// `sandbox-network-private-hosts`) the RFC 1918, carrier-grade NAT and IPv6
+/// unique-local ranges are reachable; loopback, link-local (including the cloud
+/// metadata addresses), unspecified, multicast and the other special ranges
+/// stay refused.
+pub fn is_forbidden_ip_with(ip: IpAddr, private_ok: bool) -> bool {
     match ip {
-        IpAddr::V4(v4) => forbidden_v4(v4),
+        IpAddr::V4(v4) => forbidden_v4(v4, private_ok),
         IpAddr::V6(v6) => {
             if let Some(mapped) = v6.to_ipv4_mapped() {
-                return forbidden_v4(mapped);
+                return forbidden_v4(mapped, private_ok);
             }
             if embedded_prefix_always_forbidden(v6) {
                 return true;
             }
             if let Some(embedded) = embedded_v4(v6) {
-                return forbidden_v4(embedded);
+                return forbidden_v4(embedded, private_ok);
             }
             let first = v6.segments()[0];
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
-                || (first & 0xfe00) == 0xfc00 // unique local
+                || (!private_ok && (first & 0xfe00) == 0xfc00) // unique local
                 || (first & 0xffc0) == 0xfe80 // link local
                 || v6 == Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0, 0)
         }
@@ -229,8 +327,12 @@ fn embedded_prefix_always_forbidden(v6: Ipv6Addr) -> bool {
     (s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1) || (s[0] == 0x2001 && s[1] == 0)
 }
 
-fn forbidden_v4(ip: Ipv4Addr) -> bool {
+fn forbidden_v4(ip: Ipv4Addr, private_ok: bool) -> bool {
     let [a, b, ..] = ip.octets();
+    let cgnat = a == 100 && (64..=127).contains(&b);
+    if private_ok && (ip.is_private() || cgnat) {
+        return false;
+    }
     ip.is_loopback()
         || ip.is_private()
         || ip.is_link_local()
@@ -239,7 +341,7 @@ fn forbidden_v4(ip: Ipv4Addr) -> bool {
         || ip.is_multicast()
         || ip.is_documentation()
         || a == 0
-        || (a == 100 && (64..=127).contains(&b)) // carrier-grade NAT
+        || cgnat // carrier-grade NAT
         || (a == 198 && (b == 18 || b == 19)) // benchmarking 198.18.0.0/15
         || ip.octets()[..3] == [192, 0, 0] // IETF protocol assignments 192.0.0.0/24
         || ip.octets() == [168, 63, 129, 16] // Azure WireServer
@@ -263,7 +365,7 @@ impl RefusalReason {
         match self {
             Self::NotAllowed => "not in sandbox-network-hosts; add it there or approve the prompt",
             Self::PrivateAddress => {
-                "resolves only to loopback, private or link-local addresses, which the sandbox never reaches"
+                "resolves only to loopback, private or link-local addresses, which the sandbox never reaches (an intranet host can be listed in sandbox-network-private-hosts)"
             }
             Self::Unreachable => "could not resolve or connect",
         }
@@ -298,6 +400,12 @@ struct Shared {
     /// only copy: the 403 body is also sent to the client).
     refusals: Mutex<RefusalLog>,
     rules: Vec<HostRule>,
+    /// Exact hosts (`sandbox-network-private-hosts`) that may resolve to
+    /// private address ranges.
+    private_hosts: Vec<HostRule>,
+    /// Corporate proxy the filtering proxy tunnels through after its own
+    /// allowlist decision (`sandbox-network-upstream-proxy`).
+    upstream: Option<Upstream>,
     session: Mutex<HashSet<String>>,
     prompt: Arc<Mutex<Option<AskSender>>>,
     /// Asks in progress, by `host:port`; later connections wait on the answer.
@@ -305,6 +413,72 @@ struct Shared {
     /// Refusals remembered for `DENY_MEMORY`.
     denied: Mutex<HashMap<String, std::time::Instant>>,
     expected_auth: String,
+}
+
+/// Optional proxy behaviour beyond the allowlist itself.
+#[derive(Debug, Clone, Default)]
+pub struct ProxyOptions {
+    /// Hosts that may resolve to private ranges (never loopback, link-local or
+    /// metadata addresses).
+    pub private_hosts: Vec<HostRule>,
+    /// Corporate HTTP proxy to chain to.
+    pub upstream: Option<Upstream>,
+}
+
+/// An upstream HTTP proxy that receives `CONNECT host:port` after the
+/// allowlist decision, in place of a direct connection.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Upstream {
+    host: String,
+    port: u16,
+    /// `Basic ...` value for `Proxy-Authorization`.
+    auth: Option<String>,
+}
+
+impl std::fmt::Debug for Upstream {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Upstream")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("auth", &self.auth.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+impl Upstream {
+    /// `http://[user:password@]host:port`. Credentials are used verbatim.
+    pub fn parse(url: &str) -> Result<Self, String> {
+        let invalid = |why: &str| format!("sandbox-network-upstream-proxy: {why}");
+        let rest = url
+            .trim()
+            .strip_prefix("http://")
+            .ok_or_else(|| invalid("expected http://[user:password@]host:port"))?;
+        let rest = rest.trim_end_matches('/');
+        let (userinfo, authority) = match rest.rsplit_once('@') {
+            Some((userinfo, authority)) => (Some(userinfo), authority),
+            None => (None, rest),
+        };
+        if authority.contains(['/', '?', ' ']) {
+            return Err(invalid("no path is allowed"));
+        }
+        let (host, port) = split_authority(authority, 0).map_err(invalid)?;
+        if port == 0 {
+            return Err(invalid("a port is required"));
+        }
+        let auth = userinfo.map(|userinfo| {
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(userinfo)
+            )
+        });
+        Ok(Self { host, port, auth })
+    }
+
+    /// `host:port` of the corporate proxy, without credentials.
+    pub fn display(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
 }
 
 /// The running proxy. Lives for the rest of the process.
@@ -371,27 +545,40 @@ impl std::fmt::Debug for NetworkProxy {
 impl NetworkProxy {
     /// Bind `127.0.0.1:0` and serve on a dedicated thread, independent of the
     /// caller's runtime.
+    #[cfg(test)]
     pub fn start(
         rules: Vec<HostRule>,
         prompt: Arc<Mutex<Option<AskSender>>>,
     ) -> std::io::Result<Arc<Self>> {
-        Self::start_inner(rules, prompt, false)
+        Self::start_inner(rules, prompt, false, ProxyOptions::default())
     }
 
     /// As [`Self::start`], and also listen on a private Unix socket for
     /// network namespaces that cannot reach host loopback.
-    #[cfg(unix)]
+    #[cfg(all(test, unix))]
     pub fn start_with_socket(
         rules: Vec<HostRule>,
         prompt: Arc<Mutex<Option<AskSender>>>,
     ) -> std::io::Result<Arc<Self>> {
-        Self::start_inner(rules, prompt, true)
+        Self::start_inner(rules, prompt, true, ProxyOptions::default())
+    }
+
+    /// As [`Self::start`] / [`Self::start_with_socket`] (`with_socket` is
+    /// ignored off Unix), with private-host and upstream-proxy options.
+    pub fn start_with_options(
+        rules: Vec<HostRule>,
+        prompt: Arc<Mutex<Option<AskSender>>>,
+        with_socket: bool,
+        options: ProxyOptions,
+    ) -> std::io::Result<Arc<Self>> {
+        Self::start_inner(rules, prompt, with_socket, options)
     }
 
     fn start_inner(
         rules: Vec<HostRule>,
         prompt: Arc<Mutex<Option<AskSender>>>,
         with_socket: bool,
+        options: ProxyOptions,
     ) -> std::io::Result<Arc<Self>> {
         #[cfg(not(unix))]
         let _ = with_socket;
@@ -424,6 +611,8 @@ impl NetworkProxy {
         let shared = Arc::new(Shared {
             refusals: Mutex::default(),
             rules,
+            private_hosts: options.private_hosts,
+            upstream: options.upstream,
             session: Mutex::new(HashSet::new()),
             prompt,
             inflight: Mutex::default(),
@@ -492,6 +681,16 @@ impl NetworkProxy {
         }))
     }
 
+    /// Treats `host:port` as approved for the rest of the session without
+    /// asking (a persisted project approval loaded after the proxy started).
+    pub fn allow_for_session(&self, host_port: &str) {
+        self.shared
+            .session
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(host_port.to_ascii_lowercase());
+    }
+
     /// Position in the refusal log now; pass it to [`Self::refusals_since`]
     /// after a command to get the refusals that happened during it.
     pub fn refusal_mark(&self) -> u64 {
@@ -554,6 +753,11 @@ impl NetworkProxy {
         }
         vars.push(("NO_PROXY".into(), String::new()));
         vars.push(("no_proxy".into(), String::new()));
+        // Clients that ignore the generic variables: Node's fetch/undici only
+        // follows them with NODE_USE_ENV_PROXY, and npm reads its own keys.
+        vars.push(("NODE_USE_ENV_PROXY".into(), "1".into()));
+        vars.push(("npm_config_proxy".into(), url.clone()));
+        vars.push(("npm_config_https_proxy".into(), url));
         vars
     }
 }
@@ -726,8 +930,8 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(mut client: S, shared: Arc<Sh
         shared.record_refusal(&request.host, request.port, RefusalReason::NotAllowed);
         return respond(&mut client, "403 Forbidden", &why, "").await;
     }
-    let upstream = match connect_public(&request.host, request.port).await {
-        Ok(stream) => stream,
+    let (upstream, early) = match shared.connect(&request.host, request.port).await {
+        Ok(connected) => connected,
         Err((reason, why)) => {
             shared.record_refusal(&request.host, request.port, reason);
             return respond(&mut client, "403 Forbidden", &why, "").await;
@@ -745,15 +949,32 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(mut client: S, shared: Arc<Sh
     } else if upstream.write_all(&request.forward_head).await.is_err() {
         return;
     }
+    if !early.is_empty() && client.write_all(&early).await.is_err() {
+        return;
+    }
     if !leftover.is_empty() && upstream.write_all(&leftover).await.is_err() {
         return;
     }
     let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
 }
 
+/// The resolved addresses a connection may use: public ones, plus private
+/// ranges when the host is in `sandbox-network-private-hosts`. Loopback,
+/// link-local and metadata addresses never pass.
+fn usable_addrs(addrs: Vec<SocketAddr>, private_ok: bool) -> Vec<SocketAddr> {
+    addrs
+        .into_iter()
+        .filter(|addr| !is_forbidden_ip_with(addr.ip(), private_ok))
+        .collect()
+}
+
 /// Resolve `host` ourselves, drop non-public addresses and connect to the
 /// first reachable one, so the address that was checked is the one used.
-async fn connect_public(host: &str, port: u16) -> Result<TcpStream, (RefusalReason, String)> {
+async fn connect_public(
+    host: &str,
+    port: u16,
+    private_ok: bool,
+) -> Result<TcpStream, (RefusalReason, String)> {
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
         .await
         .map_err(|error| {
@@ -763,15 +984,12 @@ async fn connect_public(host: &str, port: u16) -> Result<TcpStream, (RefusalReas
             )
         })?
         .collect();
-    let allowed: Vec<SocketAddr> = addrs
-        .into_iter()
-        .filter(|addr| !is_forbidden_ip(addr.ip()))
-        .collect();
+    let allowed = usable_addrs(addrs, private_ok);
     if allowed.is_empty() {
         return Err((
             RefusalReason::PrivateAddress,
             format!(
-                "{host} resolves only to loopback, private or link-local addresses, which the sandbox proxy never reaches"
+                "{host} resolves only to loopback, private or link-local addresses, which the sandbox proxy never reaches (an intranet host can be listed in sandbox-network-private-hosts)"
             ),
         ));
     }
@@ -786,6 +1004,51 @@ async fn connect_public(host: &str, port: u16) -> Result<TcpStream, (RefusalReas
         RefusalReason::Unreachable,
         format!("could not connect to {host}:{port}"),
     ))
+}
+
+/// Open a tunnel to `host:port` through the corporate proxy. The corporate
+/// proxy resolves the name, so only literal addresses can be vetted here.
+async fn connect_via_upstream(
+    upstream: &Upstream,
+    host: &str,
+    port: u16,
+) -> Result<(TcpStream, Vec<u8>), (RefusalReason, String)> {
+    let unreachable = |why: String| (RefusalReason::Unreachable, why);
+    let via = upstream.display();
+    let mut stream = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        TcpStream::connect((upstream.host.as_str(), upstream.port)),
+    )
+    .await
+    .map_err(|_| unreachable(format!("upstream proxy {via} timed out")))?
+    .map_err(|error| unreachable(format!("cannot reach upstream proxy {via}: {error}")))?;
+    let target = if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    let mut head = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n");
+    if let Some(auth) = &upstream.auth {
+        head.push_str(&format!("Proxy-Authorization: {auth}\r\n"));
+    }
+    head.push_str("\r\n");
+    stream
+        .write_all(head.as_bytes())
+        .await
+        .map_err(|error| unreachable(format!("upstream proxy {via}: {error}")))?;
+    let (reply, early) = tokio::time::timeout(CONNECT_TIMEOUT, read_head(&mut stream))
+        .await
+        .map_err(|_| unreachable(format!("upstream proxy {via} did not answer")))?
+        .map_err(|error| unreachable(format!("upstream proxy {via}: {error}")))?;
+    let status = String::from_utf8_lossy(&reply);
+    let status = status.lines().next().unwrap_or_default();
+    if status.split(' ').nth(1) != Some("200") {
+        return Err(unreachable(format!(
+            "upstream proxy {via} refused the tunnel to {target}: {}",
+            status.chars().take(80).collect::<String>()
+        )));
+    }
+    Ok((stream, early))
 }
 
 /// How long a refused or unanswered `host:port` stays refused without asking
@@ -811,6 +1074,43 @@ impl Drop for InflightGuard<'_> {
 }
 
 impl Shared {
+    /// Connect to an already allowlisted destination: directly (after
+    /// resolving and vetting the addresses) or through the upstream proxy.
+    ///
+    /// The second value is data the upstream sent right behind its tunnel
+    /// reply (a server-first banner), to be relayed to the client first.
+    async fn connect(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Result<(TcpStream, Vec<u8>), (RefusalReason, String)> {
+        let private_ok = self
+            .private_hosts
+            .iter()
+            .any(|rule| rule.matches(host, port));
+        let Some(upstream) = &self.upstream else {
+            return connect_public(host, port, private_ok)
+                .await
+                .map(|stream| (stream, Vec::new()));
+        };
+        let refused = || {
+            (
+                RefusalReason::PrivateAddress,
+                format!(
+                    "{host} is a loopback, private or link-local destination, which the sandbox proxy never reaches"
+                ),
+            )
+        };
+        let local_name = host == "localhost" || host.ends_with(".localhost");
+        let literal_forbidden = host
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| is_forbidden_ip_with(ip, private_ok));
+        if local_name || literal_forbidden {
+            return Err(refused());
+        }
+        connect_via_upstream(upstream, host, port).await
+    }
+
     fn refusal_mark(&self) -> u64 {
         self.refusals
             .lock()

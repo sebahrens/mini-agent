@@ -220,6 +220,10 @@ pub(crate) fn validate_extra_body(cfg: &mut Config) -> Result<Vec<String>, Strin
     // charges hosted searches at this one price.
     crate::pricing::set_hosted_search_usd_per_1k(cfg.hosted_web_search_cost_per_1k);
     crate::sandbox::net_proxy::parse_rules(&cfg.sandbox_network_hosts)?;
+    crate::sandbox::net_proxy::parse_private_hosts(&cfg.sandbox_network_private_hosts)?;
+    if let Some(url) = &cfg.sandbox_network_upstream_proxy {
+        crate::sandbox::net_proxy::Upstream::parse(url)?;
+    }
     if let Some(max) = cfg.shell_max_background_jobs
         && !(1..=crate::sandbox::MAX_BACKGROUND_JOBS_LIMIT).contains(&max)
     {
@@ -2453,6 +2457,8 @@ const GLOBAL_ONLY_PROJECT_KEYS: &[&str] = &[
     "sandbox_required",
     "permission_checks_required",
     "shell_env_allow_secrets",
+    "sandbox_network_private_hosts",
+    "sandbox_network_upstream_proxy",
     "web_fetch_local_origins",
     "max_budget_usd",
     "max_session_input_tokens",
