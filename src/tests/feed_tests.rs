@@ -1770,3 +1770,93 @@ fn a_long_prose_line_does_not_turn_off_highlighting_for_a_small_fence() {
         .unwrap();
     assert!(lines[row].syntax_spans.is_some());
 }
+
+fn streamed_rows(width: usize, chunks: &[&str]) -> Vec<LineEntry> {
+    let mut feed = Feed::new();
+    feed.push_streaming_block(BlockStyle::Agent);
+    for chunk in chunks {
+        assert!(feed.append_to_last(chunk));
+    }
+    let lines = feed.lines(width);
+    indexed_rows(&lines).cloned().collect()
+}
+
+#[test]
+fn the_unfinished_streamed_line_already_has_its_markdown_styling() {
+    use crate::ui::highlight::ATTR_BOLD;
+    let rows = streamed_rows(80, &["**bold** and `code` text"]);
+    let row = &rows[0];
+    assert_eq!(row.text, "< bold and code text");
+    assert!(!row.text.contains('*') && !row.text.contains('`'));
+    let spans = row.syntax_spans.as_ref().expect("styled tail");
+    assert!(spans.iter().any(|span| span.attrs & ATTR_BOLD != 0));
+}
+
+#[test]
+fn an_unclosed_marker_in_the_streamed_line_stays_literal() {
+    let rows = streamed_rows(80, &["a **half-written bold"]);
+    assert_eq!(rows[0].text, "< a **half-written bold");
+}
+
+#[test]
+fn the_unfinished_line_inside_a_code_fence_is_code_and_hard_wrapped() {
+    let rows = streamed_rows(12, &["```rust\nlet x = aaaa bbbb cccc dddd"]);
+    let code: Vec<_> = rows
+        .iter()
+        .filter(|row| {
+            row.text.contains("let") || row.text.contains("cccc") || row.text.contains("dddd")
+        })
+        .collect();
+    assert!(
+        code.iter().all(|row| row.color == Color::DarkYellow),
+        "{rows:?}"
+    );
+    // Hard wrap: the first row is filled to the width, not cut at a word.
+    let first = rows.iter().find(|row| row.text.starts_with("let")).unwrap();
+    assert_eq!(first.text.chars().count(), 12, "{rows:?}");
+}
+
+#[test]
+fn a_wrapped_first_paragraph_is_laid_out_after_the_prefix_without_an_orphan() {
+    let text = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu";
+    let mut feed = Feed::new();
+    feed.push_block(BlockStyle::Agent, text);
+    let lines = feed.lines(20);
+    let rows: Vec<_> = indexed_rows(&lines)
+        .filter(|r| !r.text.is_empty())
+        .collect();
+    assert!(rows[0].text.starts_with("< "));
+    for row in &rows {
+        assert!(crate::ui::utils::display_width(&row.text) <= 20, "{rows:?}");
+    }
+    // No row is a short orphan between two long ones.
+    for pair in rows.windows(2).take(rows.len().saturating_sub(2)) {
+        assert!(
+            pair[0].text.chars().count() + 12 >= pair[1].text.chars().count(),
+            "{rows:?}"
+        );
+    }
+    assert!(rows[1].text.chars().count() >= 12, "{rows:?}");
+}
+
+#[test]
+fn a_bold_wrapped_first_row_keeps_its_span() {
+    use crate::ui::highlight::ATTR_BOLD;
+    let mut feed = Feed::new();
+    feed.push_block(BlockStyle::Agent, "**alpha beta gamma delta epsilon zeta**");
+    let lines = feed.lines(20);
+    let first = &lines[0];
+    assert!(first.text.starts_with("< alpha"));
+    let spans = first.syntax_spans.as_ref().expect("bold span kept");
+    assert!(
+        spans
+            .iter()
+            .any(|span| span.attrs & ATTR_BOLD != 0 && span.range.start == 2)
+    );
+}
+
+#[test]
+fn paragraph_spacing_streams_like_a_fresh_parse() {
+    assert_streamed_matches_fresh("one\n\ntwo\n\nthree\n");
+    assert_streamed_matches_fresh("one\n\ntwo\n\nthree");
+}
