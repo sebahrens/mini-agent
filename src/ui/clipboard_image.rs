@@ -160,7 +160,14 @@ async fn read_helper(
         ));
     }
     if !result.exit_status.is_some_and(|status| status.success()) {
-        return Err(io::Error::other("clipboard image is unavailable"));
+        // wl-paste and xclip (raw output) exit non-zero when the clipboard
+        // holds no image/png target: that is "no image", not a failure. The
+        // scripted helpers throw on a real problem such as the size limit.
+        return if encoded {
+            Err(io::Error::other("clipboard image is unavailable"))
+        } else {
+            Ok(None)
+        };
     }
     decode_output(result.stdout, encoded)
 }
@@ -174,7 +181,8 @@ impl ClipboardImageReader for SystemClipboard {
             #[cfg(target_os = "macos")]
             {
                 let mut command = tokio::process::Command::new("/usr/bin/osascript");
-                command.args(["-l", "JavaScript", "-e", MACOS_IMAGE_SCRIPT]);
+                let script = image_script(MACOS_IMAGE_SCRIPT_TEMPLATE);
+                command.args(["-l", "JavaScript", "-e", script.as_str()]);
                 read_helper(sandbox, command, true).await
             }
             #[cfg(windows)]
@@ -184,13 +192,14 @@ impl ClipboardImageReader for SystemClipboard {
                 let program = std::path::PathBuf::from(root)
                     .join("System32/WindowsPowerShell/v1.0/powershell.exe");
                 let mut command = tokio::process::Command::new(program);
+                let script = image_script(WINDOWS_IMAGE_SCRIPT_TEMPLATE);
                 command.args([
                     "-NoLogo",
                     "-NoProfile",
                     "-NonInteractive",
                     "-STA",
                     "-Command",
-                    WINDOWS_IMAGE_SCRIPT,
+                    script.as_str(),
                 ]);
                 read_helper(sandbox, command, true).await
             }
@@ -207,7 +216,14 @@ impl ClipboardImageReader for SystemClipboard {
                     };
                 let mut command = tokio::process::Command::new(program);
                 command.args(args);
-                read_helper(sandbox, command, false).await
+                read_helper(sandbox, command, false)
+                    .await
+                    .map_err(|error| match error.kind() {
+                        io::ErrorKind::NotFound => {
+                            io::Error::other(format!("{program} is not installed"))
+                        }
+                        _ => error,
+                    })
             }
             #[cfg(not(any(unix, windows)))]
             {
@@ -220,8 +236,11 @@ impl ClipboardImageReader for SystemClipboard {
     }
 }
 
-#[cfg(target_os = "macos")]
-const MACOS_IMAGE_SCRIPT: &str = r#"function run() {
+/// The scripted readers enforce only the raw byte bound and the pixel bound;
+/// `decode_png` shrinks anything over `MAX_USER_IMAGE_BYTES`. The numbers are
+/// substituted from the Rust constants so the two sides cannot drift.
+#[cfg(any(target_os = "macos", test))]
+const MACOS_IMAGE_SCRIPT_TEMPLATE: &str = r#"function run() {
 ObjC.import('AppKit');
 var p = $.NSPasteboard.generalPasteboard;
 var d = p.dataForType($('public.png'));
@@ -230,25 +249,92 @@ if (d.isNil()) {
   if (t.isNil()) return '';
   if (Number(t.length) > 67108864) throw Error('image limit');
   var b = $.NSBitmapImageRep.imageRepWithData(t);
-  if (b.isNil() || Number(b.pixelsWide) * Number(b.pixelsHigh) > 16777216) throw Error('image limit');
+  if (b.isNil() || Number(b.pixelsWide) * Number(b.pixelsHigh) > {MAX_PIXELS}) throw Error('image limit');
   d = b.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $.NSDictionary.dictionary);
 }
-if (d.isNil() || Number(d.length) > 2097152) throw Error('image limit');
+if (d.isNil() || Number(d.length) > {MAX_BYTES}) throw Error('image limit');
 return ObjC.unwrap(d.base64EncodedStringWithOptions(0));
 }"#;
 
-#[cfg(windows)]
-const WINDOWS_IMAGE_SCRIPT: &str = r#"$ErrorActionPreference='Stop';
+#[cfg(any(windows, test))]
+const WINDOWS_IMAGE_SCRIPT_TEMPLATE: &str = r#"$ErrorActionPreference='Stop';
 Add-Type -AssemblyName System.Windows.Forms,System.Drawing;
 $image=[System.Windows.Forms.Clipboard]::GetImage();
 if ($null -eq $image) { exit 0 };
 $stream=[System.IO.MemoryStream]::new();
 try {
- if ([long]$image.Width * [long]$image.Height -gt 16777216) { throw 'image limit' };
+ if ([long]$image.Width * [long]$image.Height -gt {MAX_PIXELS}) { throw 'image limit' };
  $image.Save($stream,[System.Drawing.Imaging.ImageFormat]::Png);
- if ($stream.Length -gt 2097152) { throw 'image limit' };
+ if ($stream.Length -gt {MAX_BYTES}) { throw 'image limit' };
  [Console]::Out.Write([Convert]::ToBase64String($stream.ToArray()));
 } finally { $stream.Dispose(); $image.Dispose() }"#;
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn image_script(template: &str) -> String {
+    template
+        .replace("{MAX_BYTES}", &MAX_CLIPBOARD_BYTES.to_string())
+        .replace("{MAX_PIXELS}", &MAX_PIXELS.to_string())
+}
+
+/// The file path a paste stands for when it is one single-line path to an
+/// image: a terminal pastes the path when a file is dragged into it, with
+/// backslash-escaped spaces, surrounding quotes or a `file://` URL. `None`
+/// for anything else (multi-line text, other extensions).
+pub(super) fn pasted_image_path(data: &str) -> Option<String> {
+    let text = data.trim();
+    if text.is_empty() || text.len() > 4096 || text.contains(['\n', '\r', '\0']) {
+        return None;
+    }
+    let unquoted = match (text.chars().next()?, text.chars().next_back()?) {
+        ('\'', '\'') | ('"', '"') if text.len() >= 2 => &text[1..text.len() - 1],
+        _ => text,
+    };
+    let mut path = String::with_capacity(unquoted.len());
+    if let Some(rest) = unquoted.strip_prefix("file://") {
+        // `file://localhost/x` and `file:///x`: keep the absolute part.
+        let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+        if !rest.starts_with('/') {
+            return None;
+        }
+        let bytes = rest.as_bytes();
+        let mut decoded = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'%' && index + 2 < bytes.len() {
+                let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).ok()?;
+                decoded.push(u8::from_str_radix(hex, 16).ok()?);
+                index += 3;
+            } else {
+                decoded.push(bytes[index]);
+                index += 1;
+            }
+        }
+        path = String::from_utf8(decoded).ok()?;
+    } else {
+        // Shell escaping: a backslash makes the next character literal.
+        let mut chars = unquoted.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                path.push(chars.next()?);
+            } else {
+                path.push(c);
+            }
+        }
+    }
+    // Only absolute (or home-relative) paths: dragged files arrive that way,
+    // and "describe /tmp/a.png" is a sentence, not a path.
+    let absolute = path.starts_with('/')
+        || path.starts_with("~/")
+        || path.as_bytes().get(1..3) == Some(b":\\".as_slice());
+    if !absolute {
+        return None;
+    }
+    let extension = std::path::Path::new(&path)
+        .extension()?
+        .to_str()?
+        .to_ascii_lowercase();
+    matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp").then_some(path)
+}
 
 pub(super) fn stage_image(
     pending: &mut Vec<MediaAttachment>,
@@ -360,6 +446,60 @@ pub(super) mod tests {
 
     pub(crate) fn png() -> Vec<u8> {
         base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+XklcAAAAASUVORK5CYII=").unwrap()
+    }
+
+    #[test]
+    fn pasted_paths_are_unescaped_and_only_image_files_qualify() {
+        assert_eq!(
+            pasted_image_path("/Users/me/Screen\\ Shot\\ 1.png ").as_deref(),
+            Some("/Users/me/Screen Shot 1.png")
+        );
+        assert_eq!(
+            pasted_image_path("'/tmp/a b.JPG'").as_deref(),
+            Some("/tmp/a b.JPG")
+        );
+        assert_eq!(
+            pasted_image_path("file:///tmp/a%20b.webp").as_deref(),
+            Some("/tmp/a b.webp")
+        );
+        assert_eq!(
+            pasted_image_path("~/shot.png").as_deref(),
+            Some("~/shot.png")
+        );
+        for text in [
+            "/src/main.rs",
+            "/tmp/a.png\n/tmp/b.png",
+            "",
+            "describe /tmp/a.png",
+            "file://remote/tmp/a.png",
+            "shot.png",
+            "/tmp/clip.mp3",
+        ] {
+            assert_eq!(pasted_image_path(text), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn scripted_helpers_enforce_the_rust_byte_limit_so_downscaling_can_run() {
+        let max = MAX_CLIPBOARD_BYTES.to_string();
+        let macos = image_script(MACOS_IMAGE_SCRIPT_TEMPLATE);
+        let windows = image_script(WINDOWS_IMAGE_SCRIPT_TEMPLATE);
+        assert!(
+            macos.contains(&format!("Number(d.length) > {max}")),
+            "{macos}"
+        );
+        assert!(
+            windows.contains(&format!("$stream.Length -gt {max}")),
+            "{windows}"
+        );
+        for script in [&macos, &windows] {
+            assert!(
+                !script.contains("2097152"),
+                "the per-image limit must not gate the helper"
+            );
+            assert!(!script.contains("{MAX_"), "placeholder left in script");
+            assert!(script.contains(&MAX_PIXELS.to_string()));
+        }
     }
 
     #[test]

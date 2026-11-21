@@ -237,3 +237,35 @@ fn steering_command_bypasses_running_gate_without_matching_other_commands() {
         SubmitAction::RejectWhileRunning
     );
 }
+
+#[test]
+fn path_leading_input_is_a_prompt_not_a_command() {
+    use crate::ui::is_slash_command_text;
+    for text in [
+        "/usr/local/bin/tool fails, why?",
+        "/Users/a/b.png describe",
+        "/etc/hosts what is this file?",
+        "/tmp/x.log",
+        "/~/notes why",
+    ] {
+        assert!(!is_slash_command_text(text), "{text}");
+        assert_eq!(
+            classify_submission(true, text),
+            SubmitAction::Queue,
+            "{text}"
+        );
+    }
+    for text in [
+        "/hepl",
+        "/help keys",
+        "/",
+        "/frontend:component arg",
+        "  /model x",
+    ] {
+        assert!(is_slash_command_text(text), "{text}");
+    }
+    assert_eq!(
+        classify_submission(true, "/hepl"),
+        SubmitAction::RejectWhileRunning
+    );
+}

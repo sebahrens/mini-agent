@@ -21,7 +21,7 @@ pub(crate) struct QuestionState {
     draft: String,
     text_mode: bool,
     was_at_bottom: bool,
-    /// When the overlay opened; answer keys are ignored briefly after this.
+    /// When the overlay opened or last discarded a key (quiet period).
     opened: std::time::Instant,
 }
 impl Drop for QuestionState {
@@ -144,9 +144,10 @@ impl QuestionState {
             self.show(renderer)?;
             return Ok(QuestionEvent::Waiting);
         }
-        if super::permission_handler::premature_prompt_key(
+        if super::permission_handler::prompt_key_premature(
+            &mut self.opened,
             event,
-            self.opened.elapsed(),
+            std::time::Instant::now(),
             super::permission_handler::prompt_arming_delay(),
         ) {
             return Ok(QuestionEvent::Waiting);
@@ -193,7 +194,8 @@ impl QuestionState {
                     answer = Some(Answer::Text(self.draft.clone()))
                 }
                 KeyCode::Backspace => {
-                    self.draft.pop();
+                    let start = crate::ui::input::prev_char_boundary(&self.draft, self.draft.len());
+                    self.draft.truncate(start);
                 }
                 KeyCode::Char(c)
                     if !key
@@ -382,8 +384,9 @@ mod tests {
         state
             .handle(&key(KeyCode::Char('t')), &mut renderer)
             .unwrap();
-        // CR-separated lines (iTerm2, VTE) arrive as `\n`; tabs expand.
-        let answer = "first line\n    雪; allow_once";
+        // CR-separated lines (iTerm2, VTE) arrive as `\n`; tabs are kept
+        // (the overlay expands them only when drawing).
+        let answer = "first line\n\t雪; allow_once";
         state
             .handle(
                 &UserEvent::Paste("first line\r\n\t雪; allow_once".into()),

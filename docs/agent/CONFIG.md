@@ -2610,15 +2610,20 @@ On Unix interactive terminals, startup sends one OSC 11 background query before
 the input thread starts, unless `COLORFGBG` holds a valid hint: then no query
 is written and its final index selects the fallback directly. The query is
 written early and its reply collected after the renderer and input editor are
-built, within what remains of the deadline. The query uses crossterm's existing event decoder with
-one 150 ms deadline and a 128-event limit. Complete bounded RGB replies select
+built. The query is followed by a Primary Device Attributes request (`CSI c`,
+sent through crossterm's keyboard-enhancement probe), which every terminal
+answers after it has answered or ignored OSC 11, so collection waits for that
+answer instead of a fixed time: a slow link delays both, a terminal that
+ignores OSC 11 answers at once, and a late colour reply cannot arrive as typed
+input. Crossterm bounds the wait at about 2 s for a terminal that answers
+neither. The reply is decoded with crossterm's existing event decoder and a
+128-event limit. Complete bounded RGB replies select
 the default palette; unrelated input, bracketed paste, malformed replies and
-incomplete replies at the deadline replay unchanged through the input thread.
+incomplete replies replay unchanged through the input thread.
 Unsupported terminals, noninteractive streams and Windows use the fallback
 above. The retained background also applies to later theme resets without
-starting a second reader. This cosmetic hint grants no permissions. A reply
-arriving after the deadline is ordinary input, so slow/unsupported terminals
-can use `COLORFGBG` or an explicit theme. Changing a theme invalidates feed and
+starting a second reader. This cosmetic hint grants no permissions. Terminals
+that answer neither query can use `COLORFGBG` or an explicit theme. Changing a theme invalidates feed and
 Markdown color caches so existing messages repaint. Monochrome output still
 emits no RGB colors.
 

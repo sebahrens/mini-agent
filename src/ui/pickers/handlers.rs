@@ -6,7 +6,9 @@ use super::list::ListPicker;
 use super::models::ModelsPicker;
 
 use crate::ui::input::Picker;
-use crate::ui::input::cursor::{next_char_boundary, prev_char_boundary};
+use crate::ui::input::cursor::{
+    next_scalar_boundary as next_char_boundary, prev_scalar_boundary as prev_char_boundary,
+};
 use crate::ui::input::is_modifier_chord;
 
 fn floor_char_boundary(text: &str, offset: usize) -> usize {

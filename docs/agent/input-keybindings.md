@@ -26,18 +26,34 @@ serve keyboards without PageUp/PageDown/Home/End. Alt+Up/Down used to fall
 through to the editor as plain Up/Down; Alt+Left/Right word motions and every
 Vim binding are unchanged. The permission prompt uses the same default table.
 
-Vim starts in Insert mode when enabled. Escape enters Normal mode; `hjkl`,
-`w`, `b`, `0`, `$`, `x`, `dd`, `u`, `i`, `a`, `I` and `A` affect only the input
-draft. `/` collects a literal search of at most 256 bytes; Enter finds the next
-match with wrapping, `n` repeats it, and Escape cancels. Movements preserve UTF-8
-byte boundaries. Active pickers retain their existing handling.
+Vim starts in Insert mode when enabled. Escape enters Normal mode. Normal mode
+parses `[count] [operator] [count] motion`: the operators are `d`, `c` and `y`
+(doubled for whole lines: `dd`, `cc`, `yy`), the motions are `h j k l w e b 0 ^ $`,
+`gg`/`G` (`3G` goes to line 3), `f`/`F`/`t`/`T` plus a character, and the text
+objects `iw` and `aw`. `x`, `X`, `D`, `C`, `p`, `P`, `o`, `O`, `r`, `~`, `u`, `i`,
+`a`, `I` and `A` are single commands; `.` repeats the last change, including the
+text typed before the Escape that ended it. Deletes and yanks fill one register
+that `p`/`P` put (whole lines go on their own line) and that Ctrl+Y also yanks.
+Operators never cross a line break for `h`, `l` or `w`. There is no Visual mode.
+All of it affects only the input draft. `/` collects a literal search of at most
+256 bytes; Enter finds the next match with wrapping, `n` repeats it, and Escape
+cancels. Cursor motion and deletion work on grapheme clusters (a ZWJ emoji, a
+flag, a letter with combining marks is one unit) and preserve UTF-8 byte
+boundaries. Active pickers retain their existing handling.
+
+Default editor keys: Ctrl+U kills to the start of the current line and Ctrl+K to
+its end (at the edge they join the adjacent line); Ctrl+Y yanks the last kill.
+Ctrl+C clears the whole draft. `undo` defaults to Ctrl+_ (also sent as Ctrl+/ or
+Ctrl+7 by most terminals). A paste of more than 10 lines or 1,000 characters
+becomes a `[Pasted text #N +M lines]` chip that the cursor steps over and
+Backspace removes whole; submission, history and Ctrl+G (external editor) use
+the full text. Tabs in pasted text are kept and drawn as four columns.
 
 The input editor records at most 32 undo snapshots with an aggregate limit of
-2 MiB while Vim is enabled or an undo shortcut is configured. Paste uses the
+2 MiB; a run of typed non-space characters is one step. Paste uses the
 existing sanitizer. Loading a draft, clearing or submitting it clears undo
 history; oversized drafts clear history. Picker and operator modal boundaries
 also clear undo history and keep the raw key for the event that closes them.
-With Vim disabled and no undo shortcut, editing does not copy undo snapshots.
 
 Validation follows code-indexer evidence for parser, input and paste entry
 points, cursor helpers, App callers and their owning tests. The default/advisor

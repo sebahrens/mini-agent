@@ -92,7 +92,7 @@ const SPECS: &[ActionSpec] = &[
     editor!(Newline, "newline", "shift+enter", "alt+enter"),
     editor!(Submit, "submit", "enter"),
     editor!(Complete, "complete", "tab"),
-    editor!(Undo, "undo",),
+    editor!(Undo, "undo", "ctrl+_", "ctrl+/", "ctrl+7"),
     app!(Interrupt, "interrupt", "ctrl+c"),
     app!(Eof, "eof", "ctrl+d"),
     app!(CycleMode, "cycle_mode", "shift+tab", "backtab"),
@@ -356,12 +356,6 @@ impl KeyBindings {
         (!self.removed_default(key, true)).then_some(key)
     }
 
-    pub(crate) fn has_override(&self, action: KeyAction) -> bool {
-        self.overrides
-            .iter()
-            .any(|(candidate, chords)| *candidate == action && !chords.is_empty())
-    }
-
     pub(crate) fn is_explicit_binding(&self, key: KeyEvent) -> bool {
         self.overrides
             .iter()
@@ -530,6 +524,11 @@ fn legacy_default_event(key: KeyEvent, editor: bool, windows: bool) -> Option<Ke
         KeyCode::Char(
             c @ ('a' | 'e' | 'b' | 'f' | 'p' | 'n' | 'w' | 'u' | 'k' | 'd' | 'y' | 'h'),
         ) if ctrl => return event(KeyCode::Char(c), KeyModifiers::CONTROL),
+        // Undo: terminals send Ctrl+_ as Ctrl+/ or 0x1F, which crossterm
+        // reports as Ctrl+7; the shifted form arrives with SHIFT set.
+        KeyCode::Char(c @ ('_' | '/' | '7')) if ctrl && !alt => {
+            return event(KeyCode::Char(c), KeyModifiers::CONTROL);
+        }
         code @ (KeyCode::Left | KeyCode::Right) if ctrl && !alt => {
             return event(code, KeyModifiers::CONTROL);
         }

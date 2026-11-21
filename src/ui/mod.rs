@@ -12,6 +12,8 @@ pub(crate) use app::{
 mod app;
 #[cfg(feature = "multimodal")]
 mod clipboard_image;
+#[cfg_attr(windows, allow(dead_code))]
+mod clipboard_route;
 #[cfg(test)]
 pub(crate) use app::retire_scoped_task;
 #[cfg(all(test, feature = "git-worktree"))]
@@ -220,7 +222,23 @@ pub(crate) fn refresh_display(
     // write and flush per refresh instead of one per painted row. The frame
     // closes before a picker draws, because pickers write their overlay
     // directly and must land on top of it.
+    // A permission, question or chain prompt owns the bottom area and the keys,
+    // so an open picker (for a draft that is not on screen) stays undrawn until
+    // the prompt closes. Its rows already painted above the prompt are marked
+    // for repaint once, when the prompt appears.
+    let prompt_open = renderer.permission_prompt.is_some() || renderer.chain_prompt.is_some();
+    if prompt_open {
+        if !input.picker_hidden && input.picker.as_ref().is_some_and(|p| p.active()) {
+            renderer.overlay_painted_above_picker_floor();
+            input.picker_hidden = true;
+        }
+    } else {
+        input.picker_hidden = false;
+    }
     renderer.frame(|renderer| draw_main_frame(renderer, input, ui, run, chain, btw, cron_label))?;
+    if prompt_open {
+        return Ok(());
+    }
     if let Some(ref mut picker) = input.picker {
         let was_active = picker.active();
         picker.draw_with_renderer(renderer)?;
@@ -1190,6 +1208,20 @@ pub(crate) fn dot_submission<'a>(
     }
 }
 
+/// Whether `text` is a slash command rather than a prompt that happens to
+/// start with `/`. A terminal inserts an absolute path when a file is dragged
+/// into it (`/Users/me/x.png why is this blurry`), so a first word that holds
+/// another `/`, a `.` extension or a `~` is a path, not a command name.
+/// Command names (built-in, and custom ones, which use `namespace:name`) never
+/// contain those characters; a mistyped command such as `/hepl` still counts.
+pub(crate) fn is_slash_command_text(text: &str) -> bool {
+    let Some(rest) = text.trim_start().strip_prefix('/') else {
+        return false;
+    };
+    let word = rest.split_whitespace().next().unwrap_or("");
+    !word.contains(['/', '\\', '.', '~'])
+}
+
 pub(crate) fn classify_submission(
     is_running: bool,
     text: &str,
@@ -1207,7 +1239,7 @@ pub(crate) fn classify_submission(
     let t = text.trim_start();
     if t.is_empty() {
         SubmitAction::Ignore
-    } else if t.starts_with('/')
+    } else if is_slash_command_text(t)
         || t.starts_with('!')
         || dot_submission(text, prompts) != DotSubmission::Literal
     {

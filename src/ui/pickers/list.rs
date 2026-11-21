@@ -240,6 +240,12 @@ pub struct ListPicker {
     /// One-line description per entry of `items`, shown after the name;
     /// empty when the list has none. Filtering only looks at the names.
     descriptions: Vec<String>,
+    /// Optional longer text per entry (one line, original case) that the
+    /// query is matched against instead of the name, for example the whole
+    /// history entry behind a 200-character preview. Empty when unused.
+    haystacks: Vec<String>,
+    /// Lowercase form of `haystacks`.
+    haystacks_lower: Vec<String>,
     /// The entry marked `(current)` and highlighted while the query is empty.
     current: Option<String>,
     monochrome: bool,
@@ -258,6 +264,8 @@ impl ListPicker {
             items_lower: Vec::new(),
             name_width: 0,
             descriptions: Vec::new(),
+            haystacks: Vec::new(),
+            haystacks_lower: Vec::new(),
             current: None,
             monochrome: false,
             accent: None,
@@ -313,6 +321,23 @@ impl ListPicker {
     pub fn set_items(&mut self, items: Vec<String>) {
         self.set_names(items);
         self.descriptions.clear();
+        self.haystacks.clear();
+        self.haystacks_lower.clear();
+    }
+
+    /// Set display `items` (previews) that are matched through the longer
+    /// `haystacks` text (same length and order). A match that lies beyond
+    /// the preview is shown as a window around it.
+    pub(crate) fn set_items_with_haystacks(&mut self, items: Vec<String>, haystacks: Vec<String>) {
+        debug_assert_eq!(items.len(), haystacks.len());
+        self.set_items(items);
+        self.haystacks_lower = haystacks.iter().map(|text| text.to_lowercase()).collect();
+        self.haystacks = haystacks;
+    }
+
+    /// Index into the items set by the caller of the highlighted match.
+    pub(crate) fn selected_item_index(&self) -> Option<usize> {
+        self.match_indices.get(self.selected).copied()
     }
 
     /// Set `(name, description)` entries. Names are matched and inserted;
@@ -343,6 +368,12 @@ impl ListPicker {
     pub(crate) fn display_row(&self, index: usize) -> Cow<'_, str> {
         let item = self.match_indices[index];
         let name: &str = &self.items[item];
+        if !self.haystacks.is_empty()
+            && !self.query.is_empty()
+            && let Some(window) = self.match_window(item)
+        {
+            return Cow::Owned(window);
+        }
         if self.descriptions.is_empty() {
             return Cow::Borrowed(name);
         }
@@ -358,6 +389,27 @@ impl ListPicker {
         };
         let width = self.name_width;
         Cow::Owned(format!("{name:<width$}  {description}{marker}"))
+    }
+
+    /// A one-line window of the entry around the query when the match lies
+    /// past the end of the item's preview; `None` when the preview shows it.
+    fn match_window(&self, item: usize) -> Option<String> {
+        const BEFORE: usize = 40;
+        const SHOWN: usize = 160;
+        let lower = self.haystacks_lower.get(item)?;
+        let position = lower.find(&self.query.to_lowercase())?;
+        let at = lower[..position].chars().count();
+        let preview_chars = self.items[item].trim_end_matches('…').chars().count();
+        if at + self.query.chars().count() <= preview_chars {
+            return None;
+        }
+        let from = at.saturating_sub(BEFORE);
+        let window: String = self.haystacks[item]
+            .chars()
+            .skip(from)
+            .take(SHOWN)
+            .collect();
+        Some(format!("…{window}…"))
     }
 
     pub fn activate(&mut self) {
@@ -430,9 +482,13 @@ impl ListPicker {
             // Every name ranks 0: the caller's order is the answer.
             self.match_indices = (0..self.items_lower.len()).take(50).collect();
         } else {
-            let mut ranked: Vec<(u8, usize)> = self
-                .items_lower
-                .iter()
+            let names: Vec<&str> = if self.haystacks_lower.is_empty() {
+                self.items_lower.iter().map(|name| &**name).collect()
+            } else {
+                self.haystacks_lower.iter().map(String::as_str).collect()
+            };
+            let mut ranked: Vec<(u8, usize)> = names
+                .into_iter()
                 .enumerate()
                 .filter_map(|(index, name)| {
                     match_rank_lower(name, &query_lower).map(|rank| (rank, index))

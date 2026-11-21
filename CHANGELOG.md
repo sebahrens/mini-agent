@@ -66,6 +66,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 - JS `csv_parse` takes `{delimiter}` and rejects unknown options; `console.info`/`console.debug` are logged as `[console.log]` records (mini-agent-nvnkx.330, mini-agent-nvnkx.325).
 - Saved sessions carry `session_format` and `written_by`; a build refuses a file written by a newer format with a "saved by a newer mini-agent" message (not as corruption), and top-level fields it does not know are written back unchanged (mini-agent-nvnkx.214).
 - Native refusal messages name a way out: `/fork` (or `--continue --fork-session`) continues from the visible transcript, and a fork of any recoverable refused or in-flight native session starts a fresh chain over its rows (mini-agent-nvnkx.271).
+- Large pastes (more than 10 lines or 1,000 characters) become an atomic `[Pasted text #N +M lines]` chip in the prompt that the cursor steps over and Backspace removes whole; submit, history and the external editor use the full text (mini-agent-nvnkx.88).
+- `/vim` Normal mode: operators `d`/`c`/`y` with counts, motions (`w e b 0 ^ $ gg G f F t T`, `iw`/`aw`), `x X D C p P o O r ~` and `.` repeat of the last change (mini-agent-nvnkx.89).
+- Pasting or dragging an image file path into the prompt attaches the image as `/add <path>` would, when the permission policy allows reading it (mini-agent-nvnkx.256).
 
 ### Fixed
 
@@ -276,6 +279,19 @@ Notable changes to mini-agent are documented in this file. The format follows
 - A failed native checkpoint write no longer ends the conversation for the process: the same writer restarts a new epoch from the transcript on the next save or prompt (mini-agent-nvnkx.266). A native session continued on a non-Anthropic model (`/model`, `--resume-provider`) keeps saving (mini-agent-nvnkx.264). ACP restarts a refused chain (cancelled or failed turn, bounds) before the next prompt as the TUI does (mini-agent-nvnkx.265).
 - TUI `/fork` of an Anthropic session publishes the copy through its own owner, and switching sessions rebinds the idle owner, startup ticket and blocked state to the entered session, so prompts, restarts and exit work after `/fork` and `/sessions` (mini-agent-nvnkx.267, .268).
 - Session saves keep working on filesystems without advisory locks (legacy sessions are replaced atomically, the degraded state is reported once, a native-bearing file is never replaced) (mini-agent-nvnkx.211). Deleting a session from `/sessions` also removes its lock file (mini-agent-nvnkx.54).
+- The prompt editor moves and deletes by grapheme cluster: Backspace, Delete, Ctrl+D, the arrows and Vim `h`/`l`/`x` treat a ZWJ emoji family, a flag, a skin-tone emoji or a base letter with combining marks as one unit (mini-agent-nvnkx.85).
+- Ctrl+U and Ctrl+K kill to the start or end of the current line, and join lines at the edge, instead of clearing the whole draft (mini-agent-nvnkx.86).
+- Pasted tabs stay in the prompt text and reach the model byte for byte; the input box draws them as four columns (mini-agent-nvnkx.87).
+- Prompt undo is bound by default to Ctrl+_ (also Ctrl+/ and Ctrl+7) and snapshots are always recorded, one step per typed word (mini-agent-nvnkx.90).
+- The `@` file picker ranks matches (file-name matches first, fuzzy subsequences allowed, shorter paths first) instead of taking the first 50 substring hits, and lists root dot-files such as `.gitignore`, `.env.example` and `.gitlab-ci.yml` unless the ignore rules or the credential-file policy exclude them (mini-agent-nvnkx.251, .258).
+- Ctrl+R history search matches the whole entry rather than its first 200 characters, and long entries with equal previews stay distinct (mini-agent-nvnkx.259).
+- Permission, question and plan/git prompts arm only after a quiet period: every discarded key restarts the 350 ms window, so a user still typing a queued draft cannot answer them by accident (mini-agent-nvnkx.250).
+- A late OSC 11 background reply can no longer arrive as typed input: startup waits for the terminal's Primary Device Attributes answer instead of a fixed 150 ms (mini-agent-nvnkx.288).
+- An open picker is no longer drawn over a permission, question or chain prompt (mini-agent-nvnkx.260).
+- Input that starts with a file path (`/etc/hosts what is this?`, a dragged `/Users/me/x.png`) is a prompt, also while a turn runs, not an unknown slash command (mini-agent-nvnkx.254).
+- Ctrl+V with no clipboard image pastes the clipboard text (`pbpaste`, `wl-paste`, `xclip`) or says there is nothing to paste, instead of reporting an unavailable platform; a missing Linux image target is "no image" (mini-agent-nvnkx.255).
+- macOS and Windows clipboard image helpers accept PNGs up to the 24 MiB raw bound so large Retina screenshots reach the downscaler (mini-agent-nvnkx.249).
+- Copying selected text over SSH or inside tmux uses OSC 52 or `tmux load-buffer -w` instead of the remote machine's clipboard helpers, names the route in the notice, refuses payloads too large for OSC 52, and `MINI_AGENT_CLIPBOARD=auto|osc52|helper|tmux` overrides the choice (mini-agent-nvnkx.285).
 
 ### Added
 

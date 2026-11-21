@@ -6,6 +6,35 @@
 //! editor (Up/Down) share one layout.
 
 use crate::ui::utils::{char_display_width, display_width};
+use std::borrow::Cow;
+
+/// Display width of one input character. A tab kept in the buffer is drawn
+/// as `PASTE_TAB_WIDTH` spaces, so it occupies that many columns.
+fn cell_width(c: char) -> usize {
+    if c == '\t' {
+        super::PASTE_TAB_WIDTH
+    } else {
+        char_display_width(c)
+    }
+}
+
+/// Display width of input text, counting each tab as `PASTE_TAB_WIDTH`.
+pub fn text_width(s: &str) -> usize {
+    let mut segments = s.split('\t');
+    let first = segments.next().map_or(0, display_width);
+    segments.fold(first, |total, segment| {
+        total + super::PASTE_TAB_WIDTH + display_width(segment)
+    })
+}
+
+/// `s` with every tab replaced by `PASTE_TAB_WIDTH` spaces, for painting.
+pub fn expand_tabs(s: &str) -> Cow<'_, str> {
+    if s.contains('\t') {
+        Cow::Owned(s.replace('\t', &" ".repeat(super::PASTE_TAB_WIDTH)))
+    } else {
+        Cow::Borrowed(s)
+    }
+}
 
 /// One visual row: `buffer[start..end]`, never containing `\n`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,7 +58,7 @@ pub fn wrap_rows(buffer: &str, width: usize) -> Vec<VisualRow> {
     if let Some(last) = rows.last()
         && last.end == buffer.len()
         && last.end > last.start
-        && display_width(&buffer[last.start..last.end]) >= width
+        && text_width(&buffer[last.start..last.end]) >= width
     {
         rows.push(VisualRow {
             start: buffer.len(),
@@ -119,7 +148,7 @@ pub fn rewrap_edit(
         && let Some(last) = rows.last()
         && last.end == new_len
         && last.end > last.start
-        && display_width(&new[last.start..last.end]) >= width
+        && text_width(&new[last.start..last.end]) >= width
     {
         rows.push(VisualRow {
             start: new_len,
@@ -136,7 +165,7 @@ fn wrap_line(line: &str, offset: usize, width: usize, rows: &mut Vec<VisualRow>)
     let mut break_after: Option<usize> = None;
     let mut indices = line.char_indices().peekable();
     while let Some((index, c)) = indices.next() {
-        let cw = char_display_width(c);
+        let cw = cell_width(c);
         if row_width + cw > width && c.is_whitespace() {
             // Whitespace at the edge hangs off the row it ends, so the next
             // row starts with the following word instead of a lone space.
@@ -157,7 +186,7 @@ fn wrap_line(line: &str, offset: usize, width: usize, rows: &mut Vec<VisualRow>)
                 end: offset + end,
             });
             row_start = end;
-            row_width = display_width(&line[row_start..index]);
+            row_width = text_width(&line[row_start..index]);
             break_after = None;
         }
         row_width += cw;
@@ -187,7 +216,7 @@ pub fn cursor_position(buffer: &str, rows: &[VisualRow], cursor: usize) -> (usiz
         return (0, 0);
     };
     let end = cursor.clamp(row.start, row.end);
-    (row_index, display_width(&buffer[row.start..end]))
+    (row_index, text_width(&buffer[row.start..end]))
 }
 
 /// Byte offset in `row` at display column `column` (the nearest character
@@ -195,7 +224,7 @@ pub fn cursor_position(buffer: &str, rows: &[VisualRow], cursor: usize) -> (usiz
 pub fn offset_at_column(buffer: &str, row: VisualRow, column: usize) -> usize {
     let mut width = 0;
     for (index, c) in buffer[row.start..row.end].char_indices() {
-        let cw = char_display_width(c);
+        let cw = cell_width(c);
         if width + cw > column {
             return row.start + index;
         }

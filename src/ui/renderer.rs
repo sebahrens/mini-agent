@@ -3508,8 +3508,8 @@ impl Renderer {
 
             // A hanging space at a wrap point may overrun by one column;
             // `display_prefix` keeps the row inside the text area.
-            let display =
-                crate::ui::utils::display_prefix(&input_line[row.start..row.end], visible_width);
+            let row_text = crate::ui::input::wrap::expand_tabs(&input_line[row.start..row.end]);
+            let display = crate::ui::utils::display_prefix(&row_text, visible_width);
             write!(stdout, "{}", display)?;
             write!(stdout, "{}", Clear(ClearType::UntilNewLine))?;
             write!(stdout, "{}", ResetColor)?;
@@ -4034,6 +4034,7 @@ pub(crate) fn osc52_request(text: &str) -> String {
     format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()))
 }
 
+#[cfg(windows)]
 fn request_terminal_clipboard(text: &str) -> anyhow::Result<ClipboardCopyOutcome> {
     let mut stdout = std::io::stdout().lock();
     stdout.write_all(osc52_request(text).as_bytes())?;
@@ -4057,19 +4058,7 @@ pub async fn copy_to_clipboard(text: &str) -> anyhow::Result<ClipboardCopyOutcom
 
     #[cfg(not(windows))]
     {
-        let cmds: &[(&str, &[&str])] = &[
-            ("wl-copy", &[]),
-            ("xclip", &["-selection", "clipboard"]),
-            ("pbcopy", &[]),
-        ];
-        for &(cmd, args) in cmds {
-            let mut command = tokio::process::Command::new(cmd);
-            command.args(args);
-            if run_clipboard_command(command, text, std::time::Duration::from_secs(2)).await {
-                return Ok(ClipboardCopyOutcome::Confirmed);
-            }
-        }
-        request_terminal_clipboard(text)
+        super::clipboard_route::copy_unix(text).await
     }
 }
 
@@ -4136,13 +4125,13 @@ pub(crate) async fn run_clipboard_command(
     receiver.await.unwrap_or(false)
 }
 
-pub fn read_from_clipboard() -> anyhow::Result<String> {
+pub async fn read_from_clipboard() -> anyhow::Result<String> {
     #[cfg(windows)]
     {
         return Ok(windows_clipboard::read()?);
     }
     #[cfg(not(windows))]
-    anyhow::bail!("native clipboard paste is unavailable on this platform")
+    super::clipboard_route::read_unix_text().await
 }
 
 #[cfg(windows)]

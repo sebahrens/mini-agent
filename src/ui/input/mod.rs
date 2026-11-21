@@ -4,7 +4,8 @@ pub(crate) mod wrap;
 
 pub use cursor::cursor_to_line_col;
 pub use cursor::{
-    count_lines, line_col_to_cursor, line_end, line_start, next_char_boundary, prev_char_boundary,
+    count_lines, floor_char_boundary, line_col_to_cursor, line_end, line_start, next_char_boundary,
+    prev_char_boundary,
 };
 pub use pickers::Picker;
 
@@ -248,14 +249,15 @@ fn read_editor_text(reader: impl std::io::Read) -> std::io::Result<String> {
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
-/// Spaces a pasted tab expands to. The input box draws a tab as zero width,
-/// so it is expanded rather than kept.
+/// Columns a tab in the draft occupies. The buffer keeps the tab byte for
+/// byte; the input box draws it as this many spaces.
 const PASTE_TAB_WIDTH: usize = 4;
 
 /// Make pasted text safe for the input buffer: line endings become `\n`
-/// (iTerm2 and VTE send pasted newlines as `\r`), tabs expand to spaces, and
-/// escape sequences and other control characters are dropped so they can
-/// neither reach the terminal when the prompt is drawn nor the model.
+/// (iTerm2 and VTE send pasted newlines as `\r`), tabs are kept (they are
+/// expanded only when the prompt is drawn, so the model receives the pasted
+/// bytes), and escape sequences and other control characters are dropped so
+/// they can neither reach the terminal when the prompt is drawn nor the model.
 pub(crate) fn sanitize_paste(data: &str) -> String {
     let mut out = String::with_capacity(data.len());
     let mut chars = data.chars().peekable();
@@ -266,7 +268,7 @@ pub(crate) fn sanitize_paste(data: &str) -> String {
                 out.push('\n');
             }
             '\n' => out.push('\n'),
-            '\t' => out.extend(std::iter::repeat_n(' ', PASTE_TAB_WIDTH)),
+            '\t' => out.push('\t'),
             '\x1b' => skip_escape_sequence(&mut chars),
             // C1 CSI and OSC introducers start sequences as well.
             '\u{9b}' => skip_csi(&mut chars),
@@ -317,12 +319,28 @@ mod vim;
 
 const MAX_KILL_RING: usize = 30;
 const MAX_PICKER_PASTE_CHARS: usize = 256;
+/// A paste of more than this many lines or characters becomes a chip.
+const PASTE_CHIP_LINES: usize = 10;
+const PASTE_CHIP_CHARS: usize = 1000;
+/// Most chips one draft keeps; further large pastes are inserted verbatim.
+const MAX_PASTE_CHIPS: usize = 64;
 
 pub struct InputEditor {
     pub(crate) keybindings: crate::config::keybindings::KeyBindings,
     vim: vim::VimState,
     undo: std::collections::VecDeque<(CompactString, usize)>,
     undo_bytes: usize,
+    /// Cursor after the last coalesced single-character insert: the next
+    /// plain insert at that offset extends the same undo step.
+    undo_run_end: Option<usize>,
+    /// Large pastes held outside the buffer: `(chip text, full text)`. The
+    /// buffer carries only the chip, which the cursor steps over and Backspace
+    /// removes whole; submit and the external editor expand it. Append-only
+    /// for a draft, so undo snapshots stay valid.
+    pastes: Vec<(CompactString, String)>,
+    /// A prompt took the bottom area while a picker was open, so the picker
+    /// is not drawn until the prompt closes (set by `refresh_display`).
+    pub(crate) picker_hidden: bool,
     pub buffer: CompactString,
     pub cursor: usize,
     history: Vec<CompactString>,
@@ -387,6 +405,9 @@ impl InputEditor {
             vim: vim::VimState::default(),
             undo: std::collections::VecDeque::new(),
             undo_bytes: 0,
+            undo_run_end: None,
+            pastes: Vec::new(),
+            picker_hidden: false,
             buffer: CompactString::new(""),
             cursor: 0,
             history: Vec::new(),
@@ -478,11 +499,7 @@ impl InputEditor {
     /// within the buffer. Used when a mouse click places the cursor.
     pub fn set_cursor(&mut self, pos: usize) {
         let pos = pos.min(self.buffer.len());
-        let pos = if self.buffer.is_char_boundary(pos) {
-            pos
-        } else {
-            prev_char_boundary(&self.buffer, pos)
-        };
+        let pos = self.snap_out_of_chip(floor_char_boundary(&self.buffer, pos));
         if pos != self.cursor {
             // A query picker assumes the caret sits at the end of its query.
             self.close_query_picker();
@@ -494,16 +511,12 @@ impl InputEditor {
     /// Keep `cursor` a valid byte offset on a char boundary so no edit can
     /// slice or remove inside a multi-byte character.
     fn clamp_cursor(&mut self) {
-        let pos = self.cursor.min(self.buffer.len());
-        self.cursor = if self.buffer.is_char_boundary(pos) {
-            pos
-        } else {
-            prev_char_boundary(&self.buffer, pos)
-        };
+        self.cursor = self.snap_out_of_chip(floor_char_boundary(&self.buffer, self.cursor));
     }
 
     pub fn clear_buffer(&mut self) {
         self.clear_undo();
+        self.pastes.clear();
         self.buffer.clear();
         self.cursor = 0;
         self.history_pos = None;
@@ -515,6 +528,10 @@ impl InputEditor {
     /// the text on the kill ring so Ctrl+Y brings it back.
     pub fn discard_draft(&mut self) {
         let draft = std::mem::take(&mut self.buffer);
+        let draft = match self.expand_pastes(&draft) {
+            std::borrow::Cow::Owned(full) => CompactString::from(full),
+            std::borrow::Cow::Borrowed(_) => draft,
+        };
         self.push_kill(draft);
         self.close_query_picker();
         self.clear_buffer();
@@ -524,6 +541,7 @@ impl InputEditor {
     /// rewind flow to drop the chosen user turn back into the box for editing.
     pub fn load_text(&mut self, text: &str) {
         self.clear_undo();
+        self.pastes.clear();
         // History text (imported or foreign sessions) is untrusted: strip
         // escape sequences and tabs exactly as for a paste.
         self.buffer = CompactString::new(sanitize_paste(text));
@@ -789,14 +807,14 @@ impl InputEditor {
     /// Open the Ctrl+R reverse history search. The current draft is kept and
     /// restored on Esc; the buffer holds the query meanwhile.
     pub fn start_history_search(&mut self) {
-        let (items, full) = crate::ui::pickers::history::history_items(&self.history);
+        let (items, full, haystacks) = crate::ui::pickers::history::history_items(&self.history);
         if items.is_empty() {
             return;
         }
         let mut picker = ListPicker::new();
         picker.set_monochrome(self.monochrome);
         picker.set_accent_color(self.accent);
-        picker.set_items(items);
+        picker.set_items_with_haystacks(items, haystacks);
         picker.activate();
         let draft = std::mem::take(&mut self.buffer);
         let search = crate::ui::pickers::history::HistorySearch {
@@ -1115,7 +1133,8 @@ impl InputEditor {
             .or_else(|| std::env::var("EDITOR").ok())
             .unwrap_or_else(|| "editor".to_string());
 
-        let mut tmp = EditorTemp::create(self.buffer.as_bytes())?;
+        let expanded = self.expand_pastes(&self.buffer).into_owned();
+        let mut tmp = EditorTemp::create(expanded.as_bytes())?;
 
         let result = std::process::Command::new("sh")
             .arg("-c")
@@ -1128,7 +1147,7 @@ impl InputEditor {
             .read_contents()
             .context("could not read edited draft; original input retained");
         if let Ok(content) = &contents
-            && content != self.buffer.as_str()
+            && *content != expanded
         {
             self.load_text(content.trim_end());
         }
@@ -1209,11 +1228,14 @@ impl InputEditor {
             if self.picker.as_ref().is_some_and(Picker::active) {
                 self.picker = None;
             }
-            self.buffer.insert_str(self.cursor, &data);
-            self.cursor += data.len();
+            let (data_len, ends_with_at) = (data.len(), data.ends_with('@'));
+            let inserted = self.paste_chip_or_text(data);
+            self.buffer.insert_str(self.cursor, &inserted);
+            self.cursor += inserted.len();
             // A pasted trailing `@` at a mention start opens completion just
             // as typing it would.
-            if data.ends_with('@')
+            if inserted.len() == data_len
+                && ends_with_at
                 && self.cursor == self.buffer.len()
                 && mention_can_start_at(&self.buffer, self.cursor - 1)
             {
@@ -1302,16 +1324,10 @@ impl InputEditor {
     fn clear_undo(&mut self) {
         self.undo.clear();
         self.undo_bytes = 0;
+        self.undo_run_end = None;
     }
 
     fn undo_snapshot(&mut self) -> Option<(CompactString, usize)> {
-        if !self.vim.enabled
-            && !self
-                .keybindings
-                .has_override(crate::config::keybindings::KeyAction::Undo)
-        {
-            return None;
-        }
         if self.buffer.len() > 2 * 1024 * 1024 {
             self.clear_undo();
             return None;
@@ -1328,6 +1344,23 @@ impl InputEditor {
         if before.0 == self.buffer {
             return;
         }
+        // One undo step per run of typed non-space characters.
+        let inserted = self.buffer.len().checked_sub(before.0.len());
+        let typed = inserted.is_some_and(|n| {
+            n > 0
+                && self.cursor == before.1 + n
+                && self.buffer.is_char_boundary(before.1)
+                && self.buffer[before.1..self.cursor]
+                    .chars()
+                    .all(|c| !c.is_whitespace())
+                && self.buffer[..before.1] == before.0[..before.1]
+                && self.buffer[self.cursor..] == before.0[before.1..]
+        });
+        let extends_run = typed && self.undo_run_end == Some(before.1);
+        self.undo_run_end = typed.then_some(self.cursor);
+        if extends_run {
+            return;
+        }
         self.undo_bytes += before.0.len();
         self.undo.push_back(before);
         while self.undo.len() > 32 || self.undo_bytes > 2 * 1024 * 1024 {
@@ -1340,50 +1373,22 @@ impl InputEditor {
     fn apply_vim_action(&mut self, action: vim::VimAction) {
         use vim::VimAction;
         match action {
-            VimAction::Left => self.cursor = prev_char_boundary(&self.buffer, self.cursor),
-            VimAction::Right | VimAction::InsertAfter => {
-                self.cursor = next_char_boundary(&self.buffer, self.cursor);
-            }
-            VimAction::Up | VimAction::Down => {
-                let (line, col) = cursor_to_line_col(&self.buffer, self.cursor);
-                let line = if action == VimAction::Up {
-                    line.saturating_sub(1)
-                } else {
-                    (line + 1).min(count_lines(&self.buffer) - 1)
-                };
-                self.cursor = line_col_to_cursor(&self.buffer, line, col);
-            }
-            VimAction::WordNext => self.cursor = vim::next_word_start(&self.buffer, self.cursor),
-            VimAction::WordPrevious => {
-                self.cursor = vim::previous_word_start(&self.buffer, self.cursor);
-            }
-            VimAction::LineStart | VimAction::InsertLineStart => {
-                self.cursor = line_start(&self.buffer, self.cursor);
-            }
-            VimAction::LineEnd | VimAction::InsertLineEnd => {
-                self.cursor = line_end(&self.buffer, self.cursor);
-            }
-            VimAction::Delete => {
-                if self.cursor < self.buffer.len() {
-                    self.buffer.remove(self.cursor);
-                }
-            }
-            VimAction::DeleteLine => {
-                let start = line_start(&self.buffer, self.cursor);
-                let end = line_end(&self.buffer, self.cursor);
-                let (start, end) = if end < self.buffer.len() {
-                    (start, end + 1)
-                } else if start > 0 {
-                    (start - 1, end)
-                } else {
-                    (start, end)
-                };
-                let deleted: CompactString = self.buffer[start..end].into();
-                self.buffer.replace_range(start..end, "");
-                self.cursor = start.min(self.buffer.len());
-                self.push_kill(deleted);
-            }
+            VimAction::Move { motion, count } => self.vim_move(motion, count),
+            VimAction::Operate {
+                operator,
+                motion,
+                count,
+            } => self.vim_operate(operator, motion, count),
+            VimAction::Put { after, count } => self.vim_put(after, count),
+            VimAction::Open { above } => self.vim_open(above),
+            VimAction::Replace { ch, count } => self.vim_replace(ch, count),
+            VimAction::ToggleCase { count } => self.vim_toggle_case(count),
+            VimAction::Repeat => self.vim_repeat(),
+            VimAction::InsertAfter => self.cursor = self.next_boundary(self.cursor),
+            VimAction::InsertLineStart => self.cursor = line_start(&self.buffer, self.cursor),
+            VimAction::InsertLineEnd => self.cursor = line_end(&self.buffer, self.cursor),
             VimAction::Undo => {
+                self.undo_run_end = None;
                 if let Some((text, cursor)) = self.undo.pop_back() {
                     self.undo_bytes -= text.len();
                     self.buffer = text;
@@ -1427,6 +1432,96 @@ impl InputEditor {
         }
     }
 
+    /// `text` with every paste chip replaced by the text it stands for.
+    fn expand_pastes<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {
+        let mut out = std::borrow::Cow::Borrowed(text);
+        for (chip, full) in &self.pastes {
+            if out.contains(chip.as_str()) {
+                out = std::borrow::Cow::Owned(out.replace(chip.as_str(), full));
+            }
+        }
+        out
+    }
+
+    /// The chip to put in the buffer for pasted `data`, or `data` itself when
+    /// it is small or the draft already holds the most chips.
+    fn paste_chip_or_text(&mut self, data: String) -> CompactString {
+        let lines = data.lines().count();
+        let chars = data.chars().count();
+        if (lines <= PASTE_CHIP_LINES && chars <= PASTE_CHIP_CHARS)
+            || self.pastes.len() >= MAX_PASTE_CHIPS
+        {
+            return CompactString::from(data);
+        }
+        let id = self.pastes.len() + 1;
+        let chip: CompactString = if lines > 1 {
+            format!("[Pasted text #{id} +{lines} lines]").into()
+        } else {
+            format!("[Pasted text #{id} {chars} chars]").into()
+        };
+        self.pastes.push((chip.clone(), data));
+        chip
+    }
+
+    /// Start of the chip that ends exactly at `pos`.
+    fn chip_before(&self, pos: usize) -> Option<usize> {
+        let head = self.buffer.get(..pos)?;
+        self.pastes
+            .iter()
+            .find(|(chip, _)| head.ends_with(chip.as_str()))
+            .map(|(chip, _)| pos - chip.len())
+    }
+
+    /// End of the chip that starts exactly at `pos`.
+    fn chip_after(&self, pos: usize) -> Option<usize> {
+        let tail = self.buffer.get(pos..)?;
+        self.pastes
+            .iter()
+            .find(|(chip, _)| tail.starts_with(chip.as_str()))
+            .map(|(chip, _)| pos + chip.len())
+    }
+
+    /// Move `pos` to the start of a chip it falls strictly inside.
+    fn snap_out_of_chip(&self, pos: usize) -> usize {
+        for (chip, _) in &self.pastes {
+            for (start, _) in self.buffer.match_indices(chip.as_str()) {
+                if start < pos && pos < start + chip.len() {
+                    return start;
+                }
+            }
+        }
+        pos
+    }
+
+    /// Previous cursor stop: a whole chip or one grapheme cluster.
+    fn prev_boundary(&self, pos: usize) -> usize {
+        self.chip_before(pos)
+            .unwrap_or_else(|| prev_char_boundary(&self.buffer, pos))
+    }
+
+    /// Next cursor stop: a whole chip or one grapheme cluster.
+    fn next_boundary(&self, pos: usize) -> usize {
+        self.chip_after(pos)
+            .unwrap_or_else(|| next_char_boundary(&self.buffer, pos))
+    }
+
+    /// Remove the grapheme cluster before the cursor (Backspace).
+    fn delete_prev_grapheme(&mut self) {
+        if self.cursor > 0 {
+            let start = self.prev_boundary(self.cursor);
+            self.buffer.replace_range(start..self.cursor, "");
+            self.cursor = start;
+        }
+    }
+
+    /// Remove the grapheme cluster at the cursor (Delete, Ctrl+D, Vim `x`).
+    fn delete_next_grapheme(&mut self) {
+        if self.cursor < self.buffer.len() {
+            let end = self.next_boundary(self.cursor);
+            self.buffer.replace_range(self.cursor..end, "");
+        }
+    }
+
     fn handle_editor_key(&mut self, key: KeyEvent) -> Option<CompactString> {
         self.clamp_cursor();
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -1447,14 +1542,14 @@ impl InputEditor {
                 }
                 KeyCode::Char('b') => {
                     if self.cursor > 0 {
-                        self.cursor = prev_char_boundary(&self.buffer, self.cursor);
+                        self.cursor = self.prev_boundary(self.cursor);
                     }
                     self.yank_pos = None;
                     return None;
                 }
                 KeyCode::Char('f') => {
                     if self.cursor < self.buffer.len() {
-                        self.cursor = next_char_boundary(&self.buffer, self.cursor);
+                        self.cursor = self.next_boundary(self.cursor);
                     }
                     self.yank_pos = None;
                     return None;
@@ -1474,30 +1569,37 @@ impl InputEditor {
                     return None;
                 }
                 KeyCode::Char('u') => {
-                    // `cursor` is a byte offset; slice bytes, never chars.
-                    if self.cursor > 0 {
-                        let deleted: CompactString = self.buffer[..self.cursor].into();
-                        let remaining: CompactString = self.buffer[self.cursor..].into();
-                        self.buffer = remaining;
-                        self.cursor = 0;
+                    // Kill to the start of the current line; at the line start
+                    // join with the previous line, as readline does.
+                    let start = line_start(&self.buffer, self.cursor);
+                    if self.cursor > start {
+                        let deleted: CompactString = self.buffer[start..self.cursor].into();
+                        self.buffer.replace_range(start..self.cursor, "");
+                        self.cursor = start;
                         self.push_kill(deleted);
+                    } else if self.cursor > 0 {
+                        self.buffer.replace_range(self.cursor - 1..self.cursor, "");
+                        self.cursor -= 1;
                     }
                     self.yank_pos = None;
                     return None;
                 }
                 KeyCode::Char('k') => {
-                    if self.cursor < self.buffer.len() {
-                        let deleted: CompactString = self.buffer[self.cursor..].into();
-                        self.buffer.truncate(self.cursor);
+                    // Kill to the end of the current line; at the line end
+                    // join with the next line.
+                    let end = line_end(&self.buffer, self.cursor);
+                    if self.cursor < end {
+                        let deleted: CompactString = self.buffer[self.cursor..end].into();
+                        self.buffer.replace_range(self.cursor..end, "");
                         self.push_kill(deleted);
+                    } else if self.cursor < self.buffer.len() {
+                        self.buffer.replace_range(self.cursor..self.cursor + 1, "");
                     }
                     self.yank_pos = None;
                     return None;
                 }
                 KeyCode::Char('d') => {
-                    if self.cursor < self.buffer.len() {
-                        self.buffer.remove(self.cursor);
-                    }
+                    self.delete_next_grapheme();
                     self.yank_pos = None;
                     return None;
                 }
@@ -1650,13 +1752,17 @@ impl InputEditor {
                 if self.picker.as_ref().is_some_and(|p| p.active()) {
                     return None;
                 }
-                let text = self.buffer.clone();
+                let text = match self.expand_pastes(&self.buffer) {
+                    std::borrow::Cow::Owned(full) => CompactString::from(full),
+                    std::borrow::Cow::Borrowed(_) => self.buffer.clone(),
+                };
                 let is_blank = text.trim().is_empty();
                 if !is_blank && !crate::ui::slash::config::is_command(&text) {
                     self.history.push(text.clone());
                 }
                 self.history_pos = None;
                 self.draft = None;
+                self.pastes.clear();
                 self.buffer.clear();
                 self.cursor = 0;
                 self.yank_pos = None;
@@ -1666,10 +1772,7 @@ impl InputEditor {
             KeyCode::Char(c)
                 if c == '\x08' || (c == 'h' && key.modifiers.contains(KeyModifiers::CONTROL)) =>
             {
-                if self.cursor > 0 {
-                    self.cursor = prev_char_boundary(&self.buffer, self.cursor);
-                    self.buffer.remove(self.cursor);
-                }
+                self.delete_prev_grapheme();
                 None
             }
             KeyCode::Char('?') if self.buffer.is_empty() => Some("/help keys".into()),
@@ -1710,30 +1813,25 @@ impl InputEditor {
                 None
             }
             KeyCode::Backspace => {
-                if self.cursor > 0 {
-                    self.cursor = prev_char_boundary(&self.buffer, self.cursor);
-                    self.buffer.remove(self.cursor);
-                }
+                self.delete_prev_grapheme();
                 self.yank_pos = None;
                 None
             }
             KeyCode::Delete => {
-                if self.cursor < self.buffer.len() {
-                    self.buffer.remove(self.cursor);
-                }
+                self.delete_next_grapheme();
                 self.yank_pos = None;
                 None
             }
             KeyCode::Left => {
                 if self.cursor > 0 {
-                    self.cursor = prev_char_boundary(&self.buffer, self.cursor);
+                    self.cursor = self.prev_boundary(self.cursor);
                 }
                 self.yank_pos = None;
                 None
             }
             KeyCode::Right => {
                 if self.cursor < self.buffer.len() {
-                    self.cursor = next_char_boundary(&self.buffer, self.cursor);
+                    self.cursor = self.next_boundary(self.cursor);
                 }
                 self.yank_pos = None;
                 None
@@ -2348,12 +2446,13 @@ mod settings_history_tests {
     }
 
     #[test]
-    fn load_text_strips_escape_sequences_and_tabs() {
+    fn load_text_strips_escape_sequences_and_keeps_tabs() {
         // mini-agent-x894j: history text must not reach the terminal raw.
         let mut input = InputEditor::new();
         input.load_text("a\x1b]52;c;ZXZpbA==\x07b\tc\nnext");
         assert!(!input.buffer.contains('\x1b'));
-        assert!(!input.buffer.contains('\t'));
+        // Tabs are kept; only drawing expands them (mini-agent-nvnkx.87).
+        assert!(input.buffer.contains('\t'));
         assert!(input.buffer.starts_with('a') && input.buffer.ends_with("c\nnext"));
         assert_eq!(input.cursor, input.buffer.len());
     }
