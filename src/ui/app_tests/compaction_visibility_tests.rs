@@ -72,13 +72,8 @@ async fn actual_compact_show_is_read_only_and_sanitizes_the_active_saved_summary
         app.run.main_abort.is_none(),
         "show must not start a provider turn"
     );
-    app.run_slash_command("/compact show extra").await.unwrap();
-    assert!(
-        app.renderer
-            .captured_output()
-            .contains("usage: /compact show")
-    );
-    assert_eq!(serde_json::to_vec(app.ui.session).unwrap(), before);
+    // `show` is a verb only when bare (docs/agent/COMMANDS.md): `/compact show extra`
+    // is a compaction instruction, not a usage error, so it is not run here.
     crate::ui::events::render_session(
         &mut app.renderer,
         app.ui.session,

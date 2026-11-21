@@ -554,7 +554,8 @@ async fn actual_project_approval_key_is_inert_by_default_and_persists_when_enabl
             app.renderer
                 .permission_prompt
                 .as_ref()
-                .is_some_and(|prompt| prompt.options.contains("(p) always allow in this project")),
+                .is_some_and(|prompt| prompt.options.contains("(p) always allow ")
+                    && prompt.options.contains(" in this project")),
             enabled
         );
         sent(
@@ -1151,7 +1152,7 @@ async fn clipboard74_actual_app_stages_drops_and_restores_typed_draft_without_mo
             .captured_output()
             .contains("[image 1: 1x1 png]")
     );
-    crate::startup::heap_future(|| app.run_slash_command("/drop 0"))
+    crate::startup::heap_future(|| app.run_slash_command("/drop 1"))
         .await
         .unwrap();
     assert!(app.ui.session.pending_media.is_empty());

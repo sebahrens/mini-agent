@@ -62,7 +62,6 @@ use super::{
 const TURN_TRACE_MAX: usize = 64;
 const BTW_MAX_INFLIGHT: usize = 4;
 
-#[cfg(feature = "mcp")]
 /// `--no-color`, or a non-empty `NO_COLOR` in the environment (no-color.org):
 /// either one drops syntax colours so spans are not computed for nothing.
 fn monochrome_requested(flag: bool) -> bool {
@@ -73,6 +72,7 @@ fn monochrome_from(flag: bool, env: Option<&std::ffi::OsStr>) -> bool {
     flag || env.is_some_and(|value| !value.is_empty())
 }
 
+#[cfg(feature = "mcp")]
 fn mcp_notice_color(level: McpNoticeLevel) -> Color {
     match level {
         McpNoticeLevel::Info => C_RESULT,
@@ -8688,7 +8688,7 @@ mod git_command_consumer_tests {
         assert!(app.run.is_running);
         terminal(&mut app).await;
         let body = wire.body();
-        assert_eq!(body["max_tokens"], 1024);
+        assert_eq!(body["max_tokens"], crate::provider::GIT_PROPOSAL_MAX_TOKENS);
         assert!(
             body.get("tools")
                 .is_none_or(|value| value.as_array().is_some_and(Vec::is_empty))
@@ -8721,9 +8721,8 @@ mod git_command_consumer_tests {
         let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
         let repo = Repo::seeded().await;
         let before = repo.git(&["rev-parse", "HEAD"]).await;
-        let mut wire = crate::provider::git_proposal_test_support::Wire::new(
-            r#"{"message":"never","paths":["unrelated.txt"]}"#,
-        );
+        let mut wire =
+            crate::provider::git_proposal_test_support::Wire::new(r#"{"paths":["unrelated.txt"]}"#);
         let cfg = wire.config();
         let cli = crate::cli::Cli {
             no_session: true,
@@ -8923,7 +8922,7 @@ mod git_command_consumer_tests {
         app.run_slash_command("/pr").await.unwrap();
         terminal(&mut app).await;
         let body = wire.body();
-        assert_eq!(body["max_tokens"], 1024);
+        assert_eq!(body["max_tokens"], crate::provider::GIT_PROPOSAL_MAX_TOKENS);
         assert!(
             body.get("tools")
                 .is_none_or(|v| v.as_array().is_some_and(Vec::is_empty))

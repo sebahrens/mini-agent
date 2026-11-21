@@ -4037,7 +4037,7 @@ async fn ask_user_actual_app_numbered_text_batch_is_data_once_and_has_no_permiss
             .as_ref()
             .unwrap()
             .tool
-            .contains(&turn_id)
+            .starts_with("[question 1/")
     );
     app.input.load_text("ordinary follow-up draft雪");
     key(&mut app, KeyCode::Char('y')).await;
@@ -4619,7 +4619,7 @@ async fn context_length_rejection_compacts_once_and_resumes_the_tui_turn() {
                 "summary reaches the retried request"
             );
             assert!(
-                last.contains("Context was compacted"),
+                last.contains("Earlier context was compacted"),
                 "continuation prompt is sent"
             );
             assert!(

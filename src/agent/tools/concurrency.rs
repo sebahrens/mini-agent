@@ -138,6 +138,7 @@ fn access_for_call(access: ToolAccess, args: &str) -> ToolAccess {
 /// became a write). A `PreToolUse` rewrite happens after admission, so such a
 /// rewrite is refused instead of racing the other calls holding the lane
 /// (mini-agent-sskdu.263).
+#[cfg(any(test, feature = "hooks"))]
 pub(crate) fn rewrite_needs_stronger_lane(name: &str, original: &str, effective: &str) -> bool {
     let access = access_for(name);
     access_for_call(access, original) == ToolAccess::Read

@@ -2320,7 +2320,7 @@ pub fn child_usage_delta(session_id: &str) -> crate::event::UsageDelta {
 /// `usage` plus the usage finished `task` children of `session_id` recorded
 /// since the last round, so headless and editor rounds count subagent work
 /// toward `max_tokens` (mini-agent-sskdu.266).
-#[cfg_attr(not(feature = "subagents"), allow(unused_variables))]
+#[cfg_attr(not(feature = "subagents"), allow(unused_variables, unused_mut))]
 pub fn with_child_usage(
     session_id: &str,
     mut usage: rig::completion::Usage,

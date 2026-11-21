@@ -1989,6 +1989,7 @@ pub(crate) fn record_settled_result(internal_call_id: &str, result: &str) {
 /// of the one the model proposed (mini-agent-sskdu.263).
 static EFFECTIVE_ARGS: std::sync::Mutex<VecDeque<(String, String)>> =
     std::sync::Mutex::new(VecDeque::new());
+#[cfg(feature = "hooks")]
 const EFFECTIVE_ARGS_MAX_ENTRIES: usize = 128;
 
 #[cfg(feature = "hooks")]
