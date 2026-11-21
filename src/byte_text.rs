@@ -12,6 +12,7 @@
 //! `extras::truncate::truncate_cjk` keeps its older "marker is appended after
 //! `max` bytes" contract; use [`clip_with_marker`] when the total must fit.
 
+#[cfg(any(test, feature = "subagents", feature = "mcp"))]
 use std::borrow::Cow;
 
 /// The longest prefix of `s` that is at most `max` bytes and ends on a UTF-8
@@ -42,7 +43,7 @@ pub(crate) fn clip_with_marker<'a>(s: &'a str, max: usize, marker: &str) -> Cow<
 }
 
 /// In-place [`clip_to_bytes`]; returns whether the text was cut.
-#[cfg(any(test, feature = "mcp", feature = "js"))]
+#[cfg(any(test, feature = "mcp", all(feature = "js", feature = "skills")))]
 pub(crate) fn truncate_to_bytes(text: &mut String, max: usize) -> bool {
     let (kept, cut) = clip_to_bytes(text, max);
     if cut {

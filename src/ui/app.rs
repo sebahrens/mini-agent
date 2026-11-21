@@ -62,7 +62,6 @@ use super::{
 const TURN_TRACE_MAX: usize = 64;
 const BTW_MAX_INFLIGHT: usize = 4;
 
-#[cfg(feature = "mcp")]
 /// `--no-color`, or a non-empty `NO_COLOR` in the environment (no-color.org):
 /// either one drops syntax colours so spans are not computed for nothing.
 fn monochrome_requested(flag: bool) -> bool {
@@ -73,6 +72,7 @@ fn monochrome_from(flag: bool, env: Option<&std::ffi::OsStr>) -> bool {
     flag || env.is_some_and(|value| !value.is_empty())
 }
 
+#[cfg(feature = "mcp")]
 fn mcp_notice_color(level: McpNoticeLevel) -> Color {
     match level {
         McpNoticeLevel::Info => C_RESULT,
