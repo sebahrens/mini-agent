@@ -14,7 +14,16 @@ const MAX_LABEL_BYTES: usize = 96;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ToolMetadata {
-    Known { count: usize, tokens: u64 },
+    Known {
+        count: usize,
+        tokens: u64,
+    },
+    /// The live lookup was too slow; this is the estimate of the last
+    /// successful one.
+    Stale {
+        count: usize,
+        tokens: u64,
+    },
     Unavailable(&'static str),
 }
 
@@ -80,11 +89,16 @@ impl ContextDiagnostic {
                 });
             }
         }
-        if let ToolMetadata::Known { tokens, .. } = schemas {
-            rows.push(ContextRow {
+        match schemas {
+            ToolMetadata::Known { tokens, .. } => rows.push(ContextRow {
                 label: "Registered tool definitions",
                 tokens: i128::from(tokens),
-            });
+            }),
+            ToolMetadata::Stale { tokens, .. } => rows.push(ContextRow {
+                label: "Tool definitions (as of last request)",
+                tokens: i128::from(tokens),
+            }),
+            ToolMetadata::Unavailable(_) => {}
         }
         let (summary, first_live) = session.compacted_context();
         let mut categories = [0i128; 6];
@@ -201,6 +215,15 @@ impl ContextDiagnostic {
     }
 
     pub(crate) fn render(&self) -> String {
+        self.render_with(false)
+    }
+
+    /// `/context verbose`: adds the preamble capture and calibration notes.
+    pub(crate) fn render_verbose(&self) -> String {
+        self.render_with(true)
+    }
+
+    fn render_with(&self, verbose: bool) -> String {
         use std::fmt::Write as _;
         let mut text = String::with_capacity(4096);
         writeln!(
@@ -211,12 +234,16 @@ impl ContextDiagnostic {
             if self.estimated {
                 "cold estimate"
             } else {
-                "provider-calibrated anchor"
+                "measured by the provider"
             }
         )
         .unwrap();
-        writeln!(text, "Preamble source: {}", self.source).unwrap();
-        if let (Some(bytes), Some(parts)) = (self.preamble_bytes, self.preamble_parts) {
+        if verbose {
+            writeln!(text, "Preamble source: {}", self.source).unwrap();
+        }
+        if let (Some(bytes), Some(parts)) = (self.preamble_bytes, self.preamble_parts)
+            && verbose
+        {
             writeln!(
                 text,
                 "Captured preamble: {bytes} bytes in {parts} exact ranges"
@@ -247,7 +274,9 @@ impl ContextDiagnostic {
                 )
                 .unwrap();
             }
-            writeln!(text,"Snapshot metadata only; loaded sources and notice counts are not runner delivery acknowledgements.").unwrap();
+            if verbose {
+                writeln!(text,"Snapshot metadata only; loaded sources and notice counts are not runner delivery acknowledgements.").unwrap();
+            }
         } else {
             writeln!(
                 text,
@@ -258,15 +287,11 @@ impl ContextDiagnostic {
         }
         writeln!(
             text,
-            "Section                              est. tokens   % of context"
+            "Section                              est. tokens    % of window"
         )
         .unwrap();
         for row in &self.rows {
-            let percent = if self.total == 0 {
-                0.0
-            } else {
-                row.tokens as f64 * 100.0 / self.total as f64
-            };
+            let percent = self.window_share(row.tokens);
             if row.label == "Calibration/tokenizer adjustment" {
                 writeln!(
                     text,
@@ -286,14 +311,39 @@ impl ContextDiagnostic {
         }
         writeln!(
             text,
-            "{:<36} {:>11}",
-            "TOTAL (matches current context)", self.total
+            "{:<36} {:>11} {:>13.1}%",
+            "TOTAL (matches current context)",
+            self.total,
+            self.window_share(i128::from(self.total))
         )
         .unwrap();
+        let free = self.window.saturating_sub(self.total);
+        writeln!(
+            text,
+            "{:<36} {:>11} {:>13.1}%",
+            "Free space",
+            free,
+            self.window_share(i128::from(free))
+        )
+        .unwrap();
+        if self.compact_enabled {
+            writeln!(
+                text,
+                "{:<36} {:>11}",
+                "Until auto-compaction",
+                self.threshold.saturating_sub(self.total)
+            )
+            .unwrap();
+        }
         match self.schemas {
             ToolMetadata::Known { count, .. } => writeln!(
                 text,
                 "Tool schemas: {count} already-registered definitions; serialized metadata estimate"
+            )
+            .unwrap(),
+            ToolMetadata::Stale { count, .. } => writeln!(
+                text,
+                "Tool schemas: {count} definitions, as of the last request (the live lookup was slow)"
             )
             .unwrap(),
             ToolMetadata::Unavailable(reason) => writeln!(
@@ -302,7 +352,15 @@ impl ContextDiagnostic {
             )
             .unwrap(),
         }
-        writeln!(text, "Section estimates are not billed usage. Signed adjustment reconciles provider/tokenizer differences, section rounding and cold schema accounting.").unwrap();
+        if verbose {
+            writeln!(text, "Section estimates are not billed usage. Signed adjustment reconciles provider/tokenizer differences, section rounding and cold schema accounting.").unwrap();
+        } else {
+            writeln!(
+                text,
+                "Estimates, not billed usage; /context verbose adds the calibration notes."
+            )
+            .unwrap();
+        }
         writeln!(
             text,
             "Compactions: {}; active saved summary: {}",
@@ -335,6 +393,17 @@ impl ContextDiagnostic {
             writeln!(text, "  none").unwrap();
         }
         text
+    }
+}
+
+impl ContextDiagnostic {
+    /// `tokens` as a percentage of the context window (0 when unknown).
+    fn window_share(&self, tokens: i128) -> f64 {
+        if self.window == 0 {
+            0.0
+        } else {
+            tokens as f64 * 100.0 / self.window as f64
+        }
     }
 }
 
@@ -424,26 +493,45 @@ pub(crate) fn metadata_estimate(definitions: &[rig::completion::ToolDefinition])
     }
 }
 
+/// Estimate of the last successful tool-definition lookup, so a slow lookup
+/// (MCP servers still attaching) reports the previous figure, labelled.
+static LAST_TOOL_ESTIMATE: std::sync::Mutex<Option<(usize, u64)>> = std::sync::Mutex::new(None);
+
 async fn bounded_existing_metadata(
     pending: impl std::future::Future<Output = anyhow::Result<Vec<rig::completion::ToolDefinition>>>,
+    cache: &std::sync::Mutex<Option<(usize, u64)>>,
 ) -> ToolMetadata {
-    match tokio::time::timeout(std::time::Duration::from_millis(100), pending).await {
+    let live = match tokio::time::timeout(std::time::Duration::from_millis(100), pending).await {
         Ok(Ok(definitions)) => metadata_estimate(&definitions),
         _ => ToolMetadata::Unavailable("existing metadata handle unavailable"),
+    };
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    match live {
+        ToolMetadata::Known { count, tokens } => {
+            *cache = Some((count, tokens));
+            live
+        }
+        other => match *cache {
+            Some((count, tokens)) => ToolMetadata::Stale { count, tokens },
+            None => other,
+        },
     }
 }
 
 pub(crate) async fn handle(parts: &[&str], ctx: &mut super::SlashCtx<'_>) -> anyhow::Result<()> {
-    if parts.len() != 1 {
-        ctx.renderer.write_line("usage: /context", super::C_ERROR)?;
+    let verbose = parts.get(1) == Some(&"verbose");
+    if parts.len() > 2 || (parts.len() == 2 && !verbose) {
+        ctx.renderer
+            .write_line("usage: /context [verbose]", super::C_ERROR)?;
         return Ok(());
     }
     let schemas = match ctx.agent.as_ref() {
         None => ToolMetadata::Unavailable("agent not built; no lazy initialization performed"),
         Some(agent) => {
-            bounded_existing_metadata(crate::startup::heap_future(|| {
-                agent.context_tool_definitions()
-            }))
+            bounded_existing_metadata(
+                crate::startup::heap_future(|| agent.context_tool_definitions()),
+                &LAST_TOOL_ESTIMATE,
+            )
             .await
         }
     };
@@ -460,7 +548,11 @@ pub(crate) async fn handle(parts: &[&str], ctx: &mut super::SlashCtx<'_>) -> any
             .and_then(crate::provider::AnyAgent::context_snapshot),
         schemas,
     );
-    let report = diagnostic.render();
+    let report = if verbose {
+        diagnostic.render_verbose()
+    } else {
+        diagnostic.render()
+    };
     // The whole report paints as one frame.
     ctx.renderer.frame(|renderer| {
         for line in report.lines() {
@@ -523,7 +615,7 @@ mod tests {
             calibrated.rows.iter().map(|row| row.tokens).sum::<i128>(),
             3
         );
-        assert!(calibrated.render().contains("provider-calibrated anchor"));
+        assert!(calibrated.render().contains("measured by the provider"));
         assert!(calibrated.render().contains("not billed usage"));
         session.calibrated_tokens = 0;
         session.calibrated_msg_count = 0;
@@ -706,10 +798,14 @@ mod tests {
         let dropped = Arc::new(AtomicBool::new(false));
         let lifetime = ReadLifetime(dropped.clone());
         let started = std::time::Instant::now();
-        let timed_out = bounded_existing_metadata(async move {
-            let _lifetime = lifetime;
-            std::future::pending().await
-        })
+        let cache = std::sync::Mutex::new(None);
+        let timed_out = bounded_existing_metadata(
+            async move {
+                let _lifetime = lifetime;
+                std::future::pending().await
+            },
+            &cache,
+        )
         .await;
         assert_eq!(
             timed_out,
@@ -720,8 +816,11 @@ mod tests {
             dropped.load(Ordering::SeqCst),
             "metadata read must be dropped before returning"
         );
-        let failed =
-            bounded_existing_metadata(async { Err(anyhow::anyhow!("PRIVATE_ERROR_DETAIL")) }).await;
+        let failed = bounded_existing_metadata(
+            async { Err(anyhow::anyhow!("PRIVATE_ERROR_DETAIL")) },
+            &cache,
+        )
+        .await;
         let shown = ContextDiagnostic::capture(
             &Session::new("test", "test", 0, ""),
             &Config::default(),
@@ -733,12 +832,51 @@ mod tests {
         assert!(shown.contains("existing metadata handle unavailable"));
         assert!(!shown.contains("PRIVATE_ERROR_DETAIL"));
         assert_eq!(
-            bounded_existing_metadata(async { Ok(Vec::new()) }).await,
+            bounded_existing_metadata(async { Ok(Vec::new()) }, &cache).await,
             ToolMetadata::Known {
                 count: 0,
                 tokens: 0
             }
         );
+        // A later slow lookup reuses that last figure, labelled as such.
+        *cache.lock().unwrap() = Some((3, 77));
+        assert_eq!(
+            bounded_existing_metadata(std::future::pending(), &cache).await,
+            ToolMetadata::Stale {
+                count: 3,
+                tokens: 77
+            }
+        );
+    }
+
+    #[test]
+    fn nvnkx296_rows_and_free_space_sum_to_the_window() {
+        let mut session = Session::new("test", "test", 10_000, "");
+        session.overhead_tokens = 100;
+        session.overhead_parts = vec![("System prompt", 100)];
+        session.add_message(MessageRole::User, "several ordinary words here");
+        let diagnostic = ContextDiagnostic::capture(
+            &session,
+            &Config::default(),
+            None,
+            None,
+            ToolMetadata::Stale {
+                count: 2,
+                tokens: 500,
+            },
+        );
+        let rows: i128 = diagnostic.rows.iter().map(|row| row.tokens).sum();
+        let free = i128::from(diagnostic.window - diagnostic.total);
+        assert_eq!(rows + free, i128::from(diagnostic.window));
+        let text = diagnostic.render();
+        assert!(
+            text.contains("% of window") && text.contains("Free space"),
+            "{text}"
+        );
+        assert!(text.contains("as of last request"), "{text}");
+        assert!(!text.contains("provider-calibrated anchor"), "{text}");
+        assert!(diagnostic.render_verbose().contains("Preamble source"));
+        assert!(!text.contains("Preamble source"));
     }
 
     #[test]
@@ -822,7 +960,11 @@ mod tests {
                 .contains("33 sources; 84 newly retained bytes; 2 load failures; 5 notice results")
         );
         assert!(rendered.contains("32 more captured sources omitted"));
-        assert!(rendered.contains("not runner delivery acknowledgements"));
+        assert!(
+            diagnostic
+                .render_verbose()
+                .contains("not runner delivery acknowledgements")
+        );
         assert!(!rendered.contains('\u{1b}'));
         assert!(!rendered.contains('\u{202e}'));
         assert!(!rendered.contains('\r'));

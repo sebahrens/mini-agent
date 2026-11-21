@@ -483,12 +483,23 @@ pub fn ensure_global() -> anyhow::Result<()> {
     let dir = global_dir();
     if !dir.exists() {
         crate::context::copy_embedded_to(&EMBEDDED, &dir)?;
+        crate::context::record_embedded_install(&EMBEDDED, &dir)?;
+        return Ok(());
+    }
+    // Replace copies the user never edited with the running version's text,
+    // in every launch mode and independently of the docs version marker.
+    let report = crate::context::sync_embedded_to(&EMBEDDED, &dir)?;
+    if !report.refreshed.is_empty() {
+        tracing::info!(files = ?report.refreshed, "refreshed unedited bundled files");
     }
     Ok(())
 }
 
 pub(crate) fn regen() -> anyhow::Result<crate::context::RegenReport> {
-    crate::context::regen_embedded_to(&EMBEDDED, &global_dir())
+    let dir = global_dir();
+    let report = crate::context::regen_embedded_to(&EMBEDDED, &dir)?;
+    crate::context::record_embedded_install(&EMBEDDED, &dir)?;
+    Ok(report)
 }
 
 /// (embedded file count, user-edited file names) for the global directory.
@@ -545,6 +556,67 @@ mod tests {
     fn write_prompt(path: &PathBuf, name: &str, content: &str) {
         std::fs::create_dir_all(path).unwrap();
         std::fs::write(path.join(format!("{}.md", name)), content).unwrap();
+    }
+
+    fn sha(text: &str) -> String {
+        use sha2::{Digest, Sha256};
+        crate::hex::encode_lower(Sha256::digest(text.as_bytes()))
+    }
+
+    #[test]
+    fn nvnkx343_unedited_bundled_prompts_refresh_and_edited_ones_stay() {
+        let td = TestDir::new();
+        let dir = td.global_dir();
+        let old_ask = "old ask text";
+        let old_autoconfig = "old autoconfig text";
+        let old_plan = "old plan text";
+        write_prompt(&dir, "ask", old_ask);
+        write_prompt(&dir, "autoconfig", old_autoconfig);
+        write_prompt(&dir, "plan", "plan edited by the user");
+        // Written by an older version: it recorded what it installed.
+        let manifest = serde_json::json!({
+            "version": "0.0.1",
+            "files": {
+                "ask.md": sha(old_ask),
+                "autoconfig.md": sha(old_autoconfig),
+                "plan.md": sha(old_plan),
+            }
+        });
+        std::fs::write(dir.join(".bundled-manifest"), manifest.to_string()).unwrap();
+
+        let report = crate::context::sync_embedded_to(&EMBEDDED, &dir).unwrap();
+        assert_eq!(report.refreshed, ["ask.md", "autoconfig.md"]);
+        assert_eq!(report.kept_edited, ["plan.md"]);
+        let embedded = |name: &str| EMBEDDED.get_file(name).unwrap().contents_utf8().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("ask.md")).unwrap(),
+            embedded("ask.md")
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("plan.md")).unwrap(),
+            "plan edited by the user"
+        );
+        // The refreshed autoconfig is the bundled text again, so it keeps
+        // the embedded source (and with it its %%grant= directive).
+        let user = crate::context::load_dir_files(&dir, "md");
+        let merged = merge_sources(user, Vec::new());
+        assert_eq!(merged["autoconfig"].source, PromptSource::Embedded);
+        assert_eq!(merged["plan"].source, PromptSource::User);
+        // Same version again: nothing is scanned or rewritten.
+        assert_eq!(
+            crate::context::sync_embedded_to(&EMBEDDED, &dir).unwrap(),
+            crate::context::SyncReport::default()
+        );
+    }
+
+    #[test]
+    fn nvnkx343_installs_without_a_manifest_are_never_overwritten() {
+        let td = TestDir::new();
+        let dir = td.global_dir();
+        write_prompt(&dir, "ask", "legacy copy of unknown origin");
+        let report = crate::context::sync_embedded_to(&EMBEDDED, &dir).unwrap();
+        assert!(report.refreshed.is_empty());
+        assert_eq!(report.kept_edited, ["ask.md"]);
     }
 
     #[test]

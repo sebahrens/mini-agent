@@ -377,6 +377,10 @@ pub struct Config {
     /// user-global layer. Default: `false` (opt-in). User/global config only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claude_user_agents: Option<bool>,
+    /// Read the user's `~/.claude/commands/*.md` as custom commands, below
+    /// mini-agent's own command directory. Default: `true`; `false` opts out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude_user_commands: Option<bool>,
     /// Mid-turn compaction threshold, as a fraction of the context window
     /// (0.0–1.0) of real provider prompt pressure. `None` (default) resolves
     /// to [`DEFAULT_MID_TURN_COMPACT_THRESHOLD`]; an explicit `0` disables
@@ -1031,6 +1035,12 @@ pub struct Config {
     /// (mini-agent-4l9rf).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_instruction_files: Option<bool>,
+    /// Read `AGENTS.md`/`CLAUDE.md` from the enclosing git repository root and
+    /// from each directory between it and the launch directory, as inert
+    /// instruction text. Default `true`; `false` reads only the launch
+    /// directory's files. Executable assets are never read from ancestors.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_root_instruction_files: Option<bool>,
     /// Opt in to following `.claude/rules` (and `~/.claude/rules`) symlinks
     /// whose canonical target is anywhere inside the user's home directory
     /// (never `.git`, markdown files and directories only). Default off; a
@@ -2076,6 +2086,10 @@ impl Config {
             Some(quick_model) => PromptRoute::Mapped { alias, quick_model },
             None => PromptRoute::Dangling { alias },
         }
+    }
+
+    pub fn resolve_claude_user_commands(&self) -> bool {
+        self.claude_user_commands.unwrap_or(true)
     }
 
     pub fn resolve_claude_user_agents(&self) -> bool {

@@ -16,6 +16,11 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Persona frontmatter `background: true` (delegations detach as background tasks), `memory: user|project|local` (private notes directory injected at start and writable through an `agent_memory` tool) and `hooks:` (scoped to the child's tool calls) are now implemented; memory and hooks are opt-in via `[subagents] agent_memory` / `agent_hooks` (mini-agent-scu2y).
 - Skills run with `/<name> args` now substitute `$ARGUMENTS`, `$ARGUMENTS[N]`, `$N` and `${CLAUDE_SKILL_DIR}`, rewrite ``!`cmd` `` spans into shell-tool instructions (`skills_shell_placeholders`), and honour `context: fork` with `agent:` by delegating the body to one `task` child (mini-agent-h7wxv).
 - Skill frontmatter `model` (forked skills; the `task` tool takes a per-call `model` limited to configured `[quick_models]` aliases and never overrides a persona-pinned model) and `paths` (automatic selection only when the request names a matching file); `effort` and `hooks` now report a reason (mini-agent-h7wxv).
+- Custom commands load `~/.claude/commands` (below `<config_dir>/commands`; `claude_user_commands = false` opts out) and nested namespaces up to four levels (`team/frontend/review.md` is `/team:frontend:review`); other frontmatter keys are ignored with a `/help` notice instead of rejecting the file (mini-agent-nvnkx.78, .82, .77).
+- Inline ``!`command` `` in custom commands runs in the interactive session only after the ordinary shell permission rules allow every span (deny refuses; an approval-needing span refuses and is named), through the sandboxed user-shell path, output spliced in as fenced untrusted data capped at 32 KiB; headless and ACP fail closed (mini-agent-nvnkx.144).
+- `AGENTS.md`/`CLAUDE.md` from the enclosing git repository root and the directories down to the launch directory load by default (outermost first, inert text under the context budget; `repo_root_instruction_files = false` turns it off), `/reload` re-reads instruction files, and a submit after an edit prints one notice naming the changed file (mini-agent-nvnkx.231, .219).
+- `/resume`, `/status`, `/usage`, `/agents`, `/todos` and `/plan` dispatch to their mini-agent equivalents, `/add-dir` and friends print a pointer, and an unknown command suggests the closest name; custom commands of the same name win (mini-agent-nvnkx.131).
+- `/context` reports each row as a share of the window with `Free space` and `Until auto-compaction`, falls back to the last tool-definition estimate (labelled) when the live lookup is slow, and moves calibration notes behind `/context verbose` (mini-agent-nvnkx.296).
 
 ### Fixed
 
@@ -98,6 +103,11 @@ Notable changes to mini-agent are documented in this file. The format follows
   caps concurrent relays at 256 (mini-agent-y42nd). `update` and `install.sh` treat a `gh` whose
   `attestation verify --help` lacks the pin flags as unavailable (upgrade gh), not a failed
   verification (mini-agent-0cshc).
+- Custom command placeholders follow the skill rules: `$ARGUMENTS[N]` works, positional `$N` is skipped in fenced code and stays literal without arguments, `$$` escapes, and arguments are appended as `ARGUMENTS: ...` when the template has no placeholder; an `@word` that names no workspace file stays literal text instead of failing the command (mini-agent-nvnkx.75, .76, .74).
+- Bundled prompts and themes copied into the user directory are refreshed silently on upgrade when never edited (install manifest with its own version marker, every launch mode), `auto_update_prompts`/`auto_update_themes = true` apply in headless and ACP runs, and the question is asked only when files really differ (mini-agent-nvnkx.343).
+- `--load-prompt` no longer inherits the default prompt's `[prompt_to_model]` route (mini-agent-nvnkx.352).
+- `/model` refuses an id missing from a known provider listing and suggests near matches (`/model --force <id>` overrides); `/provider` refuses a switch to a provider with no default model that cannot take the current id; `/prompt` restores the model and provider a routed prompt replaced when another prompt is selected or the prompt is cleared, and a failing route leaves the previous prompt active (mini-agent-nvnkx.294, .298, .292).
+- A repeated bare `/export` writes the next numbered file instead of refusing (mini-agent-nvnkx.295).
 
 ### Added
 

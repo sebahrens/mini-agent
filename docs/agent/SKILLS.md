@@ -86,7 +86,7 @@ are one word; a missing word is empty; at most 127), and `${CLAUDE_SKILL_DIR}` i
 directory. Positional `$N` is substituted only when arguments were given and never inside fenced
 code blocks (so `awk '{print $1}'` is untouched); write `$$1` for a literal `$1` (likewise
 `$$ARGUMENTS`). When the body mentions none of the argument forms the arguments are appended as
-`ARGUMENTS: ...`. Arguments over 32 KiB are refused. Automatically selected skills and
+`ARGUMENTS: ...`. Arguments over 32 KiB are refused. Custom commands (`.claude/commands`) share these rules except that bare `$N` stays one-based there (`$1` is the first word, `$0` is literal); see COMMANDS.md. Automatically selected skills and
 `skills_search` results are not rendered: their placeholders stay literal. A ``!`command` `` span in
 a pinned body is rewritten into an instruction for the model to run the command with its shell
 tool, so the normal shell permission check and sandbox apply; the harness itself never runs it, and

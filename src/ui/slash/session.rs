@@ -71,7 +71,28 @@ async fn handle_export(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
     } else {
         (crate::extras::export::session_to_html(ctx.session), "HTML")
     };
-    match crate::fs::atomic_create_sync(&path, content.as_bytes()) {
+    let explicit = parts.get(1).is_some_and(|p| !p.trim().is_empty());
+    let mut path = path;
+    // The default name is per session, so a second bare /export takes the
+    // first free numbered name instead of refusing.
+    let mut attempt = 1u32;
+    let result = loop {
+        match crate::fs::atomic_create_sync(&path, content.as_bytes()) {
+            Err(error)
+                if !explicit
+                    && error.kind() == std::io::ErrorKind::AlreadyExists
+                    && attempt < 100 =>
+            {
+                attempt += 1;
+                path = resolve_export_path(
+                    ctx.workspace.root(),
+                    &numbered_export_filename(&default_name, attempt),
+                );
+            }
+            other => break other,
+        }
+    };
+    match result {
         Ok(()) => write_ok(
             ctx.renderer,
             format!("exported {} to {}", kind, path.display()),
@@ -79,13 +100,22 @@ async fn handle_export(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => write_error(
             ctx.renderer,
             format!(
-                "export refused to overwrite existing file: {}",
+                "export refused to overwrite existing file: {} (pass another path)",
                 path.display()
             ),
         ),
         Err(e) => write_error(ctx.renderer, format!("export failed: {}", e)),
     }
     Ok(())
+}
+
+/// `mini-agent-session-ab12.html` -> `mini-agent-session-ab12-2.html`.
+#[cfg(feature = "export")]
+fn numbered_export_filename(name: &str, attempt: u32) -> String {
+    match name.rsplit_once('.') {
+        Some((stem, extension)) => format!("{stem}-{attempt}.{extension}"),
+        None => format!("{name}-{attempt}"),
+    }
 }
 
 #[cfg(feature = "export")]
@@ -1275,6 +1305,14 @@ mod import_tests {
             super::default_export_filename(""),
             "mini-agent-session-.html"
         );
+    }
+    #[test]
+    fn nvnkx295_repeat_default_exports_take_numbered_names() {
+        assert_eq!(
+            super::numbered_export_filename("mini-agent-session-ab12.html", 2),
+            "mini-agent-session-ab12-2.html"
+        );
+        assert_eq!(super::numbered_export_filename("noext", 3), "noext-3");
     }
     use super::{commit_staged_import, parse_imported_session, resolve_export_path};
     use crate::config::Config;

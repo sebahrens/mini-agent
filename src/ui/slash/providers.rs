@@ -665,6 +665,26 @@ async fn handle_provider(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
         );
         return Ok(());
     }
+    // Without a default model for the new provider the old id would be
+    // carried over; refuse unless that id is a listed model of the new provider.
+    if crate::provider::default_model_for_provider(new_provider, ctx.cfg).is_none() {
+        let is_custom = ctx.cfg.custom_providers_map().contains_key(new_provider);
+        let carried = ctx.session.model.as_str();
+        let listed = !is_custom
+            && baked_agent_models(new_provider)
+                .is_some_and(|models| models.iter().any(|m| m.id == carried));
+        if !listed {
+            write_error(
+                ctx.renderer,
+                format!(
+                    "provider {new_provider} has no default model and {carried} is not one of its models; staying on {} (pick one with /model <alias>, a [quick_models] entry for {new_provider}, or set model on the custom provider)",
+                    ctx.session.provider
+                ),
+            );
+            return Ok(());
+        }
+    }
+    super::route_origin_clear(&ctx.session.id);
     // Create the client first: a failure must not leave the session's model
     // or costs switched to the new provider while the old one stays active.
     ctx.switch_client(new_provider)?;
@@ -760,7 +780,54 @@ async fn handle_model(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<
         );
         return Ok(());
     }
-    switch_model(ctx, parts[1].trim()).await
+    // `--force` skips the listing check for unlisted or brand-new ids.
+    let (force, arg) = match parts[1].trim() {
+        "--force" | "-f" => (true, parts.get(2).map(|s| s.trim()).unwrap_or("")),
+        other => (false, other),
+    };
+    if arg.is_empty() {
+        write_usage(ctx.renderer, "usage: /model --force <id>");
+        return Ok(());
+    }
+    switch_model(ctx, arg, force).await
+}
+
+/// Closest listed ids to a mistyped `id`: substring and edit-distance matches.
+fn nearest_model_ids(listing: &[ModelEntry], id: &str) -> Vec<String> {
+    let wanted = id.to_ascii_lowercase();
+    let mut scored: Vec<(usize, &str)> = listing
+        .iter()
+        .filter_map(|entry| {
+            let candidate = entry.id.to_ascii_lowercase();
+            let distance = crate::config::keys::edit_distance(&wanted, &candidate);
+            let near = distance <= 3.max(wanted.len() / 4)
+                || candidate.contains(&wanted)
+                || wanted.contains(&candidate);
+            near.then_some((distance, entry.id.as_str()))
+        })
+        .collect();
+    scored.sort_unstable();
+    scored
+        .into_iter()
+        .take(3)
+        .map(|(_, id)| id.to_owned())
+        .collect()
+}
+
+/// `Err(suggestions)` when a non-empty `listing` does not contain `id`.
+/// No listing (custom endpoint, nothing cached) accepts the id.
+fn check_raw_model(listing: Option<&[ModelEntry]>, id: &str) -> Result<(), Vec<String>> {
+    let Some(listing) = listing.filter(|listing| !listing.is_empty()) else {
+        return Ok(());
+    };
+    if listing
+        .iter()
+        .any(|entry| entry.id.eq_ignore_ascii_case(id))
+    {
+        Ok(())
+    } else {
+        Err(nearest_model_ids(listing, id))
+    }
 }
 
 /// How `/model <arg>` resolves its argument.
@@ -792,9 +859,37 @@ fn quick_price_notice(quick: &config::QuickModelConfig) -> String {
     )
 }
 
-async fn switch_model(ctx: &mut SlashCtx<'_>, arg: &str) -> anyhow::Result<()> {
+async fn switch_model(ctx: &mut SlashCtx<'_>, arg: &str, force: bool) -> anyhow::Result<()> {
     let qm = config::quick_models_map(ctx.cfg);
-    match resolve_model_target(arg, qm) {
+    let target = resolve_model_target(arg, qm);
+    if let ModelTarget::Raw(id) = &target
+        && !force
+    {
+        let provider = ctx.session.provider.to_string();
+        let is_custom = ctx.cfg.custom_providers_map().contains_key(&provider);
+        let listing = ctx
+            .client
+            .listing_key(&provider)
+            .ok()
+            .and_then(|key| cached_or_baked(&provider, is_custom, &key));
+        if let Err(suggestions) = check_raw_model(listing.as_deref(), id) {
+            let hint = if suggestions.is_empty() {
+                String::new()
+            } else {
+                format!("; did you mean {}?", suggestions.join(", "))
+            };
+            write_error(
+                ctx.renderer,
+                format!(
+                    "unknown model {id} on {provider}{hint} (/models lists them; /model --force {id} uses it anyway)"
+                ),
+            );
+            return Ok(());
+        }
+    }
+    // An explicit choice ends any prompt-route provenance.
+    super::route_origin_clear(&ctx.session.id);
+    match target {
         ModelTarget::Quick(name) => {
             let q = &qm[name];
             ctx.switch_client(&q.provider)?;
@@ -847,7 +942,7 @@ async fn handle_models(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
 
     // /models <name-or-id> — same as /model <name-or-id>.
     if parts.len() >= 2 && !refresh {
-        return switch_model(ctx, parts[1].trim()).await;
+        return switch_model(ctx, parts[1].trim(), false).await;
     }
 
     // ---- list mode (+ optional refresh) ----
@@ -1491,9 +1586,12 @@ mod model_pricing_tests {
             #[cfg(feature = "mcp")]
             mcp_manager: None,
         };
-        handle(&["/model", "unknown-pricing-test-model"], &mut ctx)
-            .await
-            .unwrap();
+        handle(
+            &["/model", "--force", "unknown-pricing-test-model"],
+            &mut ctx,
+        )
+        .await
+        .unwrap();
         assert!(ctx.agent.is_some());
         assert_eq!(ctx.session.model, "unknown-pricing-test-model");
         assert_eq!(
@@ -1532,27 +1630,49 @@ mod model_pricing_tests {
             "known model emitted a pricing warning"
         );
         assert!(crate::provider::default_model_for_provider("unpriced-gateway", &cfg).is_none());
+        // No default model there and the carried id is not one of its
+        // models: the switch is refused and nothing changes (nvnkx.298).
+        let before = (ctx.session.provider.clone(), ctx.session.model.clone());
         handle(&["/provider", "unpriced-gateway"], &mut ctx)
             .await
             .unwrap();
-        assert_eq!(ctx.session.provider, "unpriced-gateway");
         assert_eq!(
-            (ctx.session.input_token_cost, ctx.session.output_token_cost),
-            (0.0, 0.0)
-        );
-        assert!(
-            ctx.renderer
-                .notice_text()
-                .unwrap()
-                .contains("no pricing known for")
+            (ctx.session.provider.clone(), ctx.session.model.clone()),
+            before
         );
         assert!(
             ctx.renderer
                 .feed()
-                .block_text(4)
+                .block_text(3)
                 .unwrap()
-                .contains("switched to provider: unpriced-gateway")
+                .contains("has no default model"),
         );
+    }
+
+    #[test]
+    fn nvnkx294_unknown_raw_model_ids_are_checked_against_the_listing() {
+        let listing: Vec<ModelEntry> = ["claude-sonnet-4", "claude-opus-4", "gpt-5"]
+            .iter()
+            .map(|id| ModelEntry {
+                id: (*id).to_owned(),
+                display: (*id).to_owned(),
+                context_length: None,
+                kind: None,
+                input_price: None,
+                output_price: None,
+                cache_read_price: None,
+                cache_write_price: None,
+            })
+            .collect();
+        let suggestions = check_raw_model(Some(&listing), "claude-sonet-4").unwrap_err();
+        assert_eq!(
+            suggestions.first().map(String::as_str),
+            Some("claude-sonnet-4")
+        );
+        assert!(check_raw_model(Some(&listing), "CLAUDE-SONNET-4").is_ok());
+        // No listing (custom endpoint) accepts any id.
+        assert!(check_raw_model(None, "anything").is_ok());
+        assert!(check_raw_model(Some(&[]), "anything").is_ok());
     }
 
     #[test]

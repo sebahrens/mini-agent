@@ -619,6 +619,14 @@ fn cli_pins_startup_model(cli: &Cli) -> bool {
     cli.model.is_some() || cli.provider.is_some() || cli.quick_model.is_some()
 }
 
+/// The prompt a fresh session starts with: `--load-prompt` when given, else
+/// the configured default prompt.
+pub(crate) fn effective_startup_prompt(cli: &Cli, cfg: &Config) -> String {
+    cli.load_prompt
+        .clone()
+        .unwrap_or_else(|| cfg.resolve_default_prompt().to_string())
+}
+
 /// The provider a `[prompt_to_model]` route sends the startup prompt to, when
 /// that route will be applied (fresh session, no explicit model flag, prompt
 /// exists).
@@ -631,10 +639,7 @@ fn startup_prompt_provider(
     if session_resumed || cli_pins_startup_model(cli) {
         return None;
     }
-    let name = cli
-        .load_prompt
-        .clone()
-        .unwrap_or_else(|| cfg.resolve_default_prompt().to_string());
+    let name = effective_startup_prompt(cli, cfg);
     if !prompts.contains_key(&name) {
         return None;
     }
@@ -1748,6 +1753,7 @@ impl Startup {
             cfg.context_files_max_bytes,
         ));
         context::set_user_instruction_files(cfg.user_instruction_files == Some(true));
+        context::set_repo_root_instruction_files(cfg.repo_root_instruction_files != Some(false));
         context::set_rule_external_symlinks(cfg.rule_external_symlinks == Some(true));
         #[cfg(feature = "agent-skills")]
         crate::extras::skills::placeholders::set_shell_placeholders(
@@ -2457,7 +2463,10 @@ impl Startup {
     /// prompt directive.
     pub(crate) async fn resolve_prompts(&mut self) -> anyhow::Result<()> {
         // Version-change prompts
-        if self.version_changed && self.is_interactive && !self.is_first_startup {
+        // `auto_update_*` applies in every mode; only the question needs a
+        // terminal, and unedited bundled copies were already refreshed
+        // silently by the prompts/themes manifest sync.
+        if self.version_changed && !self.is_first_startup {
             let prompts_dir = context::prompts::global_dir();
             let themes_dir = context::themes::global_dir();
             let mut regenerated = false;
@@ -2467,6 +2476,8 @@ impl Startup {
                     regenerated |= regen_resource(context::prompts::regen, "Prompts", "");
                 }
                 Some(false) => { /* skip: user explicitly denied */ }
+                // Unattended runs never ask; nothing differs means nothing to ask.
+                None if !self.is_interactive || context::prompts::regen_preview().1.is_empty() => {}
                 None => {
                     if !prompts_dir.exists() {
                         regenerated |=
@@ -2496,6 +2507,8 @@ impl Startup {
                     regenerated |= regen_resource(context::themes::regen, "Themes", "");
                 }
                 Some(false) => { /* skip: user explicitly denied */ }
+                // Unattended runs never ask; nothing differs means nothing to ask.
+                None if !self.is_interactive || context::themes::regen_preview().1.is_empty() => {}
                 None => {
                     if !themes_dir.exists() {
                         regenerated |=
@@ -2635,37 +2648,29 @@ impl Startup {
             });
         }
 
-        // Default prompt resolution (after prompts may have been regenerated)
+        // Startup prompt resolution (after prompts may have been regenerated):
+        // `--load-prompt` replaces the default prompt (validated earlier, before
+        // any hook or session effect, by `unknown_prompt_check`), and only the
+        // prompt that is actually used contributes its `[prompt_to_model]`
+        // route, so an unmapped loaded prompt never inherits the default's.
         {
-            let default_prompt = self.cfg.resolve_default_prompt().to_string();
-            if self.context.activate_main_prompt(&default_prompt).is_some()
+            let mut startup_prompt = effective_startup_prompt(&self.cli, &self.cfg);
+            if self.context.activate_main_prompt(&startup_prompt).is_none() {
+                startup_prompt = self.cfg.resolve_default_prompt().to_string();
+                self.context.activate_main_prompt(&startup_prompt);
+            }
+            if self.context.current_prompt_name.as_deref() == Some(startup_prompt.as_str())
                 && !self.session_resumed
                 && !cli_pins_startup_model(&self.cli)
             {
                 apply_startup_prompt_model(
-                    &default_prompt,
+                    &startup_prompt,
                     &self.cfg,
                     &mut self.provider,
                     &mut self.model,
                     &mut self.session,
                 );
             }
-        }
-
-        // --load-prompt overrides the default prompt (validated earlier, before
-        // any hook or session effect, by `unknown_prompt_check`).
-        if let Some(ref name) = self.cli.load_prompt
-            && self.context.activate_main_prompt(name).is_some()
-            && !self.session_resumed
-            && !cli_pins_startup_model(&self.cli)
-        {
-            apply_startup_prompt_model(
-                name,
-                &self.cfg,
-                &mut self.provider,
-                &mut self.model,
-                &mut self.session,
-            );
         }
 
         // Rebuild client if the provider changed due to prompt-to-model mapping
@@ -5991,6 +5996,42 @@ mod tests {
         assert_eq!(
             startup_prompt_provider(&missing, &cfg, false, &prompts),
             None
+        );
+    }
+
+    #[test]
+    fn nvnkx352_only_the_loaded_prompts_route_applies() {
+        use super::*;
+        let mut cfg: Config = toml::from_str(
+            "default_prompt = \"code\"\n[quick_models.a]\nprovider = \"acme\"\nmodel = \"model-a\"\n[quick_models.b]\nprovider = \"acme\"\nmodel = \"model-b\"\n[prompt_to_model]\ncode = \"b\"\n",
+        )
+        .unwrap();
+        let cli = Cli {
+            load_prompt: Some("review".into()),
+            ..Cli::default()
+        };
+        assert_eq!(effective_startup_prompt(&cli, &cfg), "review");
+        assert_eq!(effective_startup_prompt(&Cli::default(), &cfg), "code");
+        let start = |name: &str, cfg: &Config| {
+            let mut provider = CompactString::new("acme");
+            let mut model = CompactString::new("model-a");
+            let mut session = Session::new("acme", "model-a", 128_000, "");
+            apply_startup_prompt_model(name, cfg, &mut provider, &mut model, &mut session);
+            model.to_string()
+        };
+        // The unmapped loaded prompt keeps the configured model ...
+        assert_eq!(
+            start(&effective_startup_prompt(&cli, &cfg), &cfg),
+            "model-a"
+        );
+        // ... and a mapped one switches to its route.
+        cfg = toml::from_str(
+            "default_prompt = \"code\"\n[quick_models.a]\nprovider = \"acme\"\nmodel = \"model-a\"\n[quick_models.b]\nprovider = \"acme\"\nmodel = \"model-b\"\n[prompt_to_model]\ncode = \"b\"\nreview = \"b\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            start(&effective_startup_prompt(&cli, &cfg), &cfg),
+            "model-b"
         );
     }
 

@@ -77,7 +77,10 @@ pub fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) {
     }
     let skipped = crate::context::commands::skipped_commands();
     if !skipped.is_empty() {
-        write_ok(ctx.renderer, "skipped custom command files:");
+        write_ok(
+            ctx.renderer,
+            "custom command file notices (skipped or partly applied):",
+        );
         for line in skipped {
             write_result(
                 ctx.renderer,
@@ -426,6 +429,10 @@ pub(crate) fn help_lines(
     emit(false, "  /prompt                list available prompts");
     emit(false, "  /prompt <name>         activate a prompt");
     emit(false, "  /prompt default        clear active prompt");
+    emit(
+        false,
+        "  /reload                re-read AGENTS.md/CLAUDE.md after editing them",
+    );
     emit(false, "  /rename <name>         rename current session");
     emit(false, "  /theme                 list available themes");
     emit(false, "  /theme <name>          activate a theme");
