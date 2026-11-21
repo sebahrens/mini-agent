@@ -719,7 +719,9 @@ fn headless_compaction_plan_with(
     let projected =
         session.context_messages_with_pruned_tool_results(cfg.resolve_keep_recent_tool_results());
     let cut_idx = Session::select_compaction_cut(&projected, keep_recent);
-    if cut_idx == 0 {
+    // At or before the live start there is nothing but the previous summary
+    // to cut (mini-agent-sskdu.227).
+    if cut_idx <= session.compacted_context().1 {
         return None;
     }
     let tokens_before = session.messages[..cut_idx]

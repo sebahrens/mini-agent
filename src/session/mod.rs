@@ -2886,16 +2886,52 @@ impl Session {
             accumulated = accumulated.saturating_add(msg.estimated_tokens);
         }
         if cut_idx > 0 && cut_idx < messages.len() {
+            // A model that calls tools without narrating leaves no User or
+            // Assistant record for a long stretch, so a completed call/result
+            // batch boundary is also a legal cut: a `ToolCall` that follows a
+            // `ToolResult` while no earlier call is still waiting for its
+            // result (mini-agent-sskdu.227).
+            let batch_starts = Self::completed_batch_starts(&messages[..=cut_idx]);
             while cut_idx > 0
                 && !matches!(
                     messages[cut_idx].role,
                     MessageRole::User | MessageRole::Assistant
                 )
+                && !batch_starts[cut_idx]
             {
                 cut_idx -= 1;
             }
         }
         cut_idx
+    }
+
+    /// For each index of `messages`, whether it is a `ToolCall` record that
+    /// starts a new batch: its predecessor is a `ToolResult` and every earlier
+    /// call already has its result, so cutting before it never separates a
+    /// call from its result.
+    fn completed_batch_starts(messages: &[SessionMessage]) -> Vec<bool> {
+        let mut open: HashSet<&str> = HashSet::new();
+        let mut starts = Vec::with_capacity(messages.len());
+        for (i, msg) in messages.iter().enumerate() {
+            starts.push(
+                i > 0
+                    && msg.role == MessageRole::ToolCall
+                    && messages[i - 1].role == MessageRole::ToolResult
+                    && open.is_empty(),
+            );
+            if let Some(id) = msg.tool_call_id.as_deref().filter(|id| !id.is_empty()) {
+                match msg.role {
+                    MessageRole::ToolCall => {
+                        open.insert(id);
+                    }
+                    MessageRole::ToolResult => {
+                        open.remove(id);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        starts
     }
 
     /// Returns true when the pending payload cannot fit even if the entire

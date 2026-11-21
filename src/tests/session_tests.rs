@@ -730,3 +730,67 @@ fn javascript_scratch_is_process_local_and_never_serialized_with_a_session() {
         None
     );
 }
+
+#[test]
+fn compaction_cut_may_stop_at_a_completed_tool_batch() {
+    // mini-agent-sskdu.227: a model that never narrates leaves only
+    // User, ToolCall, ToolResult, ... and must still have a legal cut.
+    let mut session = Session::new("openai", "gpt-4", 128_000, "");
+    session.add_message(MessageRole::User, "do the work");
+    for i in 0..6 {
+        let id = format!("a{i}");
+        session.add_tool_call_with_id(&id, "read", &serde_json::json!({"path": "f"}));
+        session.add_tool_result_with_id(&id, "read", &"x".repeat(400));
+    }
+    // A parallel batch: both calls precede both results.
+    session.add_tool_call_with_id("p1", "read", &serde_json::json!({"path": "p1"}));
+    session.add_tool_call_with_id("p2", "read", &serde_json::json!({"path": "p2"}));
+    session.add_tool_result_with_id("p1", "read", &"x".repeat(400));
+    session.add_tool_result_with_id("p2", "read", &"x".repeat(400));
+    for keep in [1, 50, 150, 300, 500, 900] {
+        let cut = Session::select_compaction_cut(&session.messages, keep);
+        if cut == 0 {
+            continue;
+        }
+        let mut open = std::collections::HashSet::new();
+        for message in &session.messages[..cut] {
+            let id = message.tool_call_id.as_deref().unwrap_or_default();
+            match message.role {
+                MessageRole::ToolCall => {
+                    open.insert(id.to_string());
+                }
+                MessageRole::ToolResult => {
+                    open.remove(id);
+                }
+                _ => {}
+            }
+        }
+        assert!(open.is_empty(), "cut {cut} splits a call from its result");
+    }
+    let cut = Session::select_compaction_cut(&session.messages, 300);
+    assert!(cut > 1, "a tool-only stretch must have a cut, got {cut}");
+    assert_eq!(session.messages[cut].role, MessageRole::ToolCall);
+}
+
+#[test]
+fn tui_compaction_plan_never_resummarises_only_the_previous_summary() {
+    // mini-agent-sskdu.227: [summary, User, tool pairs...] must not cut at 1.
+    let mut session = Session::new("openai", "gpt-4", 128_000, "");
+    session.add_message(MessageRole::User, "old");
+    session.add_message(MessageRole::Assistant, "old answer");
+    session.compress("summary of old work".to_string(), 2, 0);
+    session.add_message(MessageRole::User, &"y".repeat(400));
+    for i in 0..4 {
+        let id = format!("b{i}");
+        session.add_tool_call_with_id(&id, "read", &serde_json::json!({"path": "f"}));
+        session.add_tool_result_with_id(&id, "read", &"x".repeat(400));
+    }
+    for keep in [0, 10, 100, 250, 450] {
+        let gate = crate::ui::slash::plan_tui_compaction(&session, false, false, 0, keep, 0);
+        assert_ne!(
+            gate,
+            crate::ui::slash::TuiCompactionGate::Cut(1),
+            "keep {keep}"
+        );
+    }
+}

@@ -830,8 +830,11 @@ pub(crate) fn plan_tui_compaction(
         return TuiCompactionGate::WithinBudget;
     }
     let projected = session.context_messages_with_pruned_tool_results(keep_recent_tool_results);
+    // A cut at or before the live start would only re-summarize the previous
+    // summary (mini-agent-sskdu.227).
+    let first_live = session.compacted_context().1;
     match Session::select_compaction_cut(&projected, keep_recent) {
-        0 => TuiCompactionGate::NothingToSummarize,
+        cut_idx if cut_idx <= first_live => TuiCompactionGate::NothingToSummarize,
         cut_idx => TuiCompactionGate::Cut(cut_idx),
     }
 }
