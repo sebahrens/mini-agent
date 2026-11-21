@@ -2387,6 +2387,15 @@ where
     .await
 }
 
+/// `response` with the truncation marker appended when the provider reported
+/// that it stopped at the output limit.
+pub(crate) fn mark_cut_off_summary(mut response: String, cut_off: bool) -> String {
+    if cut_off {
+        response.push_str(SUMMARY_TRUNCATED_MARKER);
+    }
+    response
+}
+
 /// Appended to a summary whose response used the whole output allowance.
 pub(crate) const SUMMARY_TRUNCATED_MARKER: &str = "\n\n[summary truncated by the output limit]";
 
@@ -2432,18 +2441,7 @@ where
         )
         .await
         {
-            Ok((mut text, usage)) => {
-                // A response that used its whole output allowance was cut off:
-                // say so instead of storing it as complete (mini-agent-sskdu.233).
-                if max_output_tokens > 0 && usage.output_tokens >= max_output_tokens {
-                    tracing::warn!(
-                        max_output_tokens,
-                        "compaction summary hit the output limit and was cut off"
-                    );
-                    text.push_str(SUMMARY_TRUNCATED_MARKER);
-                }
-                return Ok((text, usage));
-            }
+            Ok(done) => return Ok(done),
             Err(SummarizerFailure::Fatal(error)) => return Err(error),
             Err(SummarizerFailure::Retry(delay, error)) => {
                 tracing::warn!(
@@ -2575,6 +2573,7 @@ where
     let mut usage = rig::completion::Usage::new();
     let mut finished = false;
     let mut unexpected_tool = false;
+    let mut cut_off = false;
     while let Some(item) = stream.next().await {
         match item {
             Ok(StreamedAssistantContent::Text(text)) => {
@@ -2591,6 +2590,9 @@ where
                 usage = crate::event::UsageDelta::from(usage)
                     .saturating_add(delta)
                     .into();
+                // The provider's own stop reason: the response hit the output
+                // limit (mini-agent-sskdu.233).
+                cut_off |= raw.output_truncated();
                 finished = true;
             }
             Ok(
@@ -2616,7 +2618,13 @@ where
     if response.is_empty() {
         return Err(anyhow::anyhow!("Compression returned empty response").into());
     }
-    Ok((response, usage))
+    if cut_off {
+        tracing::warn!(
+            max_output_tokens,
+            "compaction summary hit the output limit and was cut off"
+        );
+    }
+    Ok((mark_cut_off_summary(response, cut_off), usage))
 }
 
 #[derive(Default)]

@@ -1730,25 +1730,43 @@ kept recent history, surfaces the error, which points to `/compress` and
 `compact_enabled` recovery. Native Anthropic replay history cannot be compacted in
 place, so those turns surface the error directly.
 
-Per-front-end notes. The TUI and headless keep the most recent
-`keep_recent_tokens` verbatim, bound the stored summary by the window-scaled budget,
-re-attach file windows and may fork the conversation's own cached request; the TUI
-reports tokens freed net of the inserted summary. After a relief the continuation
-prompt tells the model that its earlier work is condensed in the
-"[Recap of my prior work in this conversation]" message above and that details
-missing from the recap must be re-read; it is host text, so `/undo`, session titles
-and later summaries do not treat it as the user's words. A session's derived title is
-remembered at its first compaction and survives later ones. The summarizer's output
-replaces the previous summary, and only the summarizer's own prose (not the appended
-file list, todo/goal blocks or restored windows) is handed back as the previous
-summary. A summary that used its whole output allowance ends with
-`[summary truncated by the output limit]`. ACP compacts at its own turn
-boundaries, compacts at most three times per non-native prompt, does not restore file
-windows and bounds the stored summary at 16 KiB; when the summarizer fails it evicts
-history only if the hard byte bound or the turn cap forces it, otherwise the prompt
-runs on the unchanged history. `PostCompact` and `SessionStart(compact)` fire only when
-a compaction record was committed; headless `PreCompact` fires once per compaction,
-before the first summarizer request of either path.
+#### Compaction by front end
+
+| | TUI | Headless (`-p`, `--loop`, goals) | ACP |
+|---|---|---|---|
+| Triggers | between turns over `context_window - reserve_tokens`; mid-turn at `mid_turn_compact_threshold`; reactive after a provider length error; `/compress` | pre-turn; mid-turn relief; one reactive retry | between prompts under token pressure, the turn cap or the byte bound; mid-turn relief; one reactive retry; `/compact` |
+| Kept verbatim | the most recent `keep_recent_tokens`, cut at a user/assistant record or a completed tool batch | same | mid-turn relief keeps `keep_recent_tokens` at the same legal cuts (falling back to the whole history when the tail alone is too large); turn-count/byte pressure and `/compact` cut at a turn boundary or summarize everything |
+| Stored summary bound | window-scaled (see above) | window-scaled | the summarizer's window-scaled budget |
+| File windows restored | yes (`compact_restore_read_tokens`) | yes | yes |
+| Cache fork | yes, on a native prompt-cache route | yes | no |
+| Relief cap per prompt | none | none (stops on no progress) | 3 for non-native sessions |
+| Native (Anthropic replay) session | chain restarted as a new epoch | same | between prompts and mid-turn at a tool-batch boundary; chain restarted |
+| Summarizer failure | history kept, error shown | history kept, run continues | history kept under token pressure, evicted only for the byte bound or turn cap; the client is told why |
+| Cancel | Esc or Ctrl-C while compacting; history is unchanged | interrupt | prompt cancellation |
+| Report | line with messages, tokens freed net of the summary and the sidecar path | stderr line and a `compactions` object (`count`, `messages`, `tokens_freed`) on the final JSON / stream-json result | agent-thought notice, or the `/compact` reply; `/compact show` prints the active summary |
+| User instructions | `/compact <instructions>` (manual only) | `--compact-instructions` | none |
+
+After a relief the continuation prompt tells the model that its earlier work is
+condensed in the "[Recap of my prior work in this conversation]" message above and
+that details missing from the recap must be re-read; it is host text, so `/undo`,
+session titles and later summaries do not treat it as the user's words. A session's
+derived title is remembered at its first compaction and survives later ones. The
+summarizer's output replaces the previous summary, and only its own prose (not the
+appended file list or restored windows) is handed back as the previous summary. The
+open todo list and the active goal are not stored in the summary: they are rendered
+from their live stores into the replayed recap, so they never contradict the current
+state. A summary the provider cut off at its output limit ends with
+`[summary truncated by the output limit]`. `PostCompact` and `SessionStart(compact)`
+fire only when a compaction record was committed; `PreCompact` fires once per
+compaction, before the first summarizer request of either path.
+
+Compaction is otherwise irreversible, so each committed compaction also writes the
+transcript it replaced to `<session id>.precompact-<n>.jsonl` beside the session file
+(private permissions, one persisted message per line; the newest five are kept and all
+go when the session is deleted or pruned by `session_retention_days`). To recover from
+a bad summary, copy the sidecar's records back into the `messages` array of the session
+JSON, ahead of the kept messages, and remove the unwanted `compactions` entry. There is
+no `/compact undo`: restoring in place would conflict with native replay publication.
 
 Compaction is paid for like any other completion. The summarizer runs on the
 session's model (or on `compaction_model` when set, at that model's prices), so the usage of every rolling request is summed and charged to

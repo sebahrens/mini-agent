@@ -881,8 +881,13 @@ Explicit local-owner promotion remains its existing, separate authorization path
 
 `-p --compact-instructions "preserve file names and blockers"` supplies a bounded
 4096-byte compaction preference when automatic compaction actually runs. It does
-not force a compaction and is unavailable in TUI, ACP, or loop mode. Preferences
-are fenced below the summarization contract, just like manual `/compact` instructions.
+not force a compaction and is unavailable in TUI, ACP, or loop mode. It is the only
+standing preference: automatic compaction in the TUI and ACP takes none, and the TUI's
+manual `/compact <instructions>` applies to that one compaction. Preferences are fenced
+below the summarization contract. A headless result that compacted carries a
+`compactions` object (`count`, `messages`, `tokens_freed`); ACP answers `/compact` with
+what it did and `/compact show` with the active summary. Esc or Ctrl-C cancels a TUI
+compaction in progress and leaves the history unchanged.
 
 ## Custom prompt commands
 

@@ -479,6 +479,7 @@ fn prepare_save_recovering_with(
     measure_native: bool,
 ) -> anyhow::Result<PreparedSave> {
     report_pending_save_notices(session, &mut notice);
+    flush_precompact(session, &mut notice);
     let native = super::native_publication::is_native_bearing(session);
     let last_native_size = session.save_notice_state.encoded_bytes;
     let prepare = |session: &Session| -> anyhow::Result<(PreparedSave, Option<usize>)> {
@@ -1045,6 +1046,53 @@ pub fn delete_session(id: &str) -> anyhow::Result<()> {
     result
 }
 
+/// Newest pre-compaction sidecars kept per session.
+const MAX_PRECOMPACT_SIDECARS: usize = 5;
+
+/// `<id>.precompact-<n>.jsonl`: the transcript compaction number `n` replaced,
+/// one persisted message per line, in the private session directory.
+pub(crate) fn precompact_path(session_id: &str, number: usize) -> anyhow::Result<PathBuf> {
+    crate::paths::validate_portable_component(session_id)?;
+    Ok(session_dir().join(format!("{session_id}.precompact-{number}.jsonl")))
+}
+
+/// Write the transcript the latest compaction replaced to its sidecar so a bad
+/// summary can be repaired from the original. Best effort: a failure becomes a
+/// notice and never blocks the save. Retention follows the session: deleting
+/// or pruning it removes its sidecars, and only the newest
+/// [`MAX_PRECOMPACT_SIDECARS`] are kept.
+fn flush_precompact(session: &mut Session, _notice: &mut impl FnMut(&str)) {
+    let Some((number, messages)) = session.pending_precompact.take() else {
+        return;
+    };
+    if disabled("sessions") || messages.is_empty() {
+        return;
+    }
+    let result = (|| -> anyhow::Result<PathBuf> {
+        let path = precompact_path(&session.id, number)?;
+        let mut body = String::new();
+        for message in &messages {
+            body.push_str(&serde_json::to_string(message)?);
+            body.push('\n');
+        }
+        anyhow::ensure!(
+            body.len() <= MAX_SESSION_BYTES,
+            "replaced transcript exceeds the session size limit"
+        );
+        atomic_write(&path, &body)?;
+        if number > MAX_PRECOMPACT_SIDECARS
+            && let Ok(old) = precompact_path(&session.id, number - MAX_PRECOMPACT_SIDECARS)
+        {
+            let _ = std::fs::remove_file(old);
+        }
+        Ok(path)
+    })();
+    match result {
+        Ok(path) => tracing::info!("pre-compaction transcript kept at {}", path.display()),
+        Err(error) => tracing::warn!("could not keep the pre-compaction transcript: {error:#}"),
+    }
+}
+
 fn delete_session_files(id: &str) -> anyhow::Result<()> {
     let Some(dir) = existing_session_dir()? else {
         tracing::debug!("session delete skipped (not found): id={}", id);
@@ -1064,6 +1112,14 @@ fn delete_session_files(id: &str) -> anyhow::Result<()> {
     }
     // The catalogue's metadata sidecar goes with its session.
     let _ = std::fs::remove_file(dir.join(format!("{id}.index")));
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        let prefix = format!("{id}.precompact-");
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
     remove_tool_output_dir(id);
     Ok(())
 }

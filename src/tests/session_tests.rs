@@ -888,3 +888,17 @@ fn previous_summary_for_the_next_compaction_is_the_prose_only() {
         Some("MODEL PROSE")
     );
 }
+
+#[test]
+fn compaction_queues_the_replaced_transcript_for_a_sidecar() {
+    // mini-agent-sskdu.244
+    let mut session = Session::new("openai", "gpt-4", 128_000, "");
+    session.add_message(MessageRole::User, "first");
+    session.add_message(MessageRole::Assistant, "second");
+    session.add_message(MessageRole::User, "kept");
+    session.compress("summary".into(), 2, 0);
+    let (number, messages) = session.pending_precompact.take().expect("queued");
+    assert_eq!(number, 1);
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].content, "first");
+}

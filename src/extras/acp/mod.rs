@@ -132,6 +132,13 @@ struct SessionHistory {
     /// assessment) is carried to the next admitted prompt here.
     #[cfg(feature = "goal")]
     pending_goal_instruction: Option<String>,
+    /// Mid-turn or reactive context relief is pending: the next compaction
+    /// keeps a recent tail at a legal cut instead of summarizing everything
+    /// (mini-agent-sskdu.230).
+    relief_pending: bool,
+    /// What the last compaction did or why it did not, for the client
+    /// (mini-agent-sskdu.229, .243). Drained after each compaction.
+    compaction_events: Vec<String>,
     /// Servers and managers that outlive a single prompt.
     reuse: SessionReuse,
     /// Compaction triggers, refreshed from config and the routed model's
@@ -157,6 +164,9 @@ struct AcpHistoryLimits {
     max_turns: usize,
     max_bytes: usize,
     token_pressure: Option<AcpTokenPressure>,
+    /// Tokens of recent `read` windows a compaction re-attaches, as in the
+    /// TUI (`compact_restore_read_tokens`); `0` restores none.
+    restore_read_tokens: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -175,6 +185,7 @@ impl Default for AcpHistoryLimits {
             max_turns: MAX_ACP_HISTORY_TURNS,
             max_bytes: MAX_ACP_HISTORY_BYTES,
             token_pressure: None,
+            restore_read_tokens: 0,
         }
     }
 }
@@ -193,6 +204,7 @@ impl AcpHistoryLimits {
             // transcript and the thinking chain is restarted from it
             // (`restart_native_after_compaction`). The mid-turn path closes
             // the native epoch at a tool-batch boundary and does the same.
+            restore_read_tokens: cfg.resolve_compact_restore_read_tokens(window),
             token_pressure: (cfg.resolve_compact_enabled() && window > 0).then(|| {
                 AcpTokenPressure {
                     window,
@@ -302,6 +314,8 @@ impl Default for SessionHistory {
             manual_compact: false,
             #[cfg(feature = "goal")]
             pending_goal_instruction: None,
+            relief_pending: false,
+            compaction_events: Vec::new(),
             reuse: Default::default(),
             limits: Default::default(),
             context_window: 0,
@@ -398,7 +412,8 @@ impl SessionHistory {
     }
 
     fn needs_compaction(&self) -> bool {
-        (self.manual_compact && self.live_start() < self.session.messages.len())
+        ((self.manual_compact || self.relief_pending)
+            && self.live_start() < self.session.messages.len())
             || self.over_turn_cap()
             || self.over_token_pressure().is_some()
             || self.exceeds_hard_bound()
@@ -421,6 +436,26 @@ impl SessionHistory {
         .then_some(pressure)
     }
     fn next_cut(&self) -> usize {
+        if self.relief_pending && !self.manual_compact {
+            // Keep the most recent tokens verbatim, cutting at a legal
+            // boundary (a user or assistant record or a completed tool batch);
+            // when the recent tail alone is the problem, summarize everything
+            // rather than wedge.
+            let live = self.live_start();
+            let keep = self
+                .limits
+                .token_pressure
+                .map_or(20_000, |pressure| pressure.keep_recent_tokens);
+            let relative = crate::session::Session::select_compaction_cut(
+                &self.session.messages[live..],
+                keep,
+            );
+            return if relative == 0 {
+                self.session.messages.len()
+            } else {
+                live + relative
+            };
+        }
         if self.manual_compact {
             return self.session.messages.len();
         }
@@ -505,6 +540,7 @@ impl SessionHistory {
             // Retained pixels cannot be shrunk by repeatedly summarizing a recap.
             // Let the caller report the remaining fixed evidence pressure.
             if cut <= self.live_start() {
+                self.relief_pending = false;
                 // Nothing left to summarize: later byte-pressure checks must
                 // know a further relief cannot shrink what remains
                 // (mini-agent-cbjft).
@@ -528,16 +564,22 @@ impl SessionHistory {
             let output = match result {
                 Ok(output) if output.messages_included > 0 => output,
                 failed => {
-                    match &failed {
-                        Err(error) => tracing::warn!(
-                            %error,
-                            "ACP summarizer failed; history compaction skipped"
-                        ),
-                        Ok(_) => tracing::warn!(
-                            "ACP summarizer included no messages; history compaction skipped"
-                        ),
-                    }
-                    self.fall_back_after_summary_failure();
+                    let reason = match &failed {
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                "ACP summarizer failed; history compaction skipped"
+                            );
+                            format!("{error:#}")
+                        }
+                        Ok(_) => {
+                            tracing::warn!(
+                                "ACP summarizer included no messages; history compaction skipped"
+                            );
+                            "the summarizer covered no messages".to_owned()
+                        }
+                    };
+                    self.fall_back_after_summary_failure(&reason);
                     return Some(usage);
                 }
             };
@@ -562,14 +604,21 @@ impl SessionHistory {
                 .min(cut);
             // A partial summarizer prefix must finish a complete User-started
             // interval; otherwise take the explicit bounded emergency recap.
-            let completed_cut = self
-                .user_starts()
-                .into_iter()
-                .filter(|start| *start > self.live_start() && *start <= consumed)
-                .max()
-                .or_else(|| (consumed == self.session.messages.len()).then_some(consumed));
+            let completed_cut = if self.relief_pending && !self.manual_compact {
+                // Relief cuts mid-turn: any legal boundary at or before what
+                // the summarizer covered completes the compaction.
+                (self.live_start() + 1..=consumed)
+                    .rev()
+                    .find(|idx| crate::session::Session::is_legal_cut(&self.session.messages, *idx))
+            } else {
+                self.user_starts()
+                    .into_iter()
+                    .filter(|start| *start > self.live_start() && *start <= consumed)
+                    .max()
+                    .or_else(|| (consumed == self.session.messages.len()).then_some(consumed))
+            };
             let Some(completed_cut) = completed_cut else {
-                self.fall_back_after_summary_failure();
+                self.fall_back_after_summary_failure("the summary did not cover a whole turn");
                 return Some(usage);
             };
             // Honour the summarizer's window-scaled byte budget instead of the
@@ -584,9 +633,18 @@ impl SessionHistory {
                 completed_cut,
                 removed,
                 output.summary_byte_budget,
-                0,
+                self.limits.restore_read_tokens,
             );
             self.manual_compact = false;
+            self.relief_pending = false;
+            self.compaction_events.push(format!(
+                "compacted {} records into a summary (~{} tokens freed)",
+                completed_cut,
+                self.session
+                    .compactions
+                    .last()
+                    .map_or(0, |compaction| compaction.token_savings)
+            ));
             needs = self.needs_compaction();
         }
         Some(usage)
@@ -599,15 +657,23 @@ impl SessionHistory {
     /// byte guard or the turn cap) leaves no other way to proceed; plain token
     /// pressure keeps the transcript intact and lets the prompt run, since the
     /// reactive path still covers a real overflow (mini-agent-sskdu.229).
-    fn fall_back_after_summary_failure(&mut self) {
+    fn fall_back_after_summary_failure(&mut self, reason: &str) {
         if self.over_turn_cap() || self.exceeds_hard_bound() {
             self.emergency_compact();
+            self.compaction_events.push(format!(
+                "compaction failed ({reason}); older history was evicted to stay within the session limits"
+            ));
         } else {
             self.manual_compact = false;
+            self.relief_pending = false;
+            self.compaction_events.push(format!(
+                "compaction failed ({reason}); the history was kept unchanged"
+            ));
         }
     }
     fn emergency_compact(&mut self) {
         self.manual_compact = false;
+        self.relief_pending = false;
         while self.needs_compaction() {
             let cut = self.next_cut();
             if cut <= self.live_start() {
@@ -2217,6 +2283,8 @@ async fn install_session(
                 manual_compact: false,
                 #[cfg(feature = "goal")]
                 pending_goal_instruction: None,
+                relief_pending: false,
+                compaction_events: Vec::new(),
                 reuse: Default::default(),
                 limits: Default::default(),
                 context_window: 0,
@@ -4676,6 +4744,23 @@ fn native_relief_stop(reliefs: usize, progress: &[Message], compacted: bool) -> 
     None
 }
 
+/// `/compact show`: the active compaction summary, bounded like the TUI's
+/// (mini-agent-sskdu.243).
+fn compaction_show_text(session: &crate::session::Session) -> String {
+    let Some(summary) = session.compacted_context().0 else {
+        return "no active compaction summary".to_owned();
+    };
+    let mut end = summary.len().min(64 * 1024);
+    while !summary.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "previous summary ({} lines):\n{}",
+        summary.lines().count(),
+        &summary[..end]
+    )
+}
+
 /// Text of the final assistant message of `progress`, if it ends with one.
 fn last_assistant_text(progress: &[Message]) -> String {
     match progress.last() {
@@ -4733,7 +4818,8 @@ async fn run_prompt(
             commands::Command::Undo | commands::Command::Compact | commands::Command::Rename(_) => {
                 true
             }
-            commands::Command::Model(_)
+            commands::Command::CompactShow
+            | commands::Command::Model(_)
             | commands::Command::Effort(_)
             | commands::Command::Cost => false,
             #[cfg(feature = "goal")]
@@ -4914,6 +5000,7 @@ async fn run_prompt(
                 history.manual_compact = true;
                 None
             }
+            commands::Command::CompactShow => Some(compaction_show_text(&history.session)),
         };
         if let Some(line) = line {
             if !registration.control.complete() {
@@ -5066,6 +5153,7 @@ async fn run_prompt(
         // A compaction that could not shrink the history must not leave the
         // forced-compaction flag armed for the next prompt.
         history.manual_compact = false;
+        history.relief_pending = false;
         let mut outcome = match result {
             Ok(outcome)
                 if outcome.compaction_boundary
@@ -5181,8 +5269,9 @@ async fn run_prompt(
                 }),
             ))),
         ));
-        // The next segment compacts the whole persisted history first.
-        history.manual_compact = true;
+        // The next segment compacts the persisted history first, keeping a
+        // recent tail (mini-agent-sskdu.230).
+        history.relief_pending = true;
         // A manager this segment connected stays at the session's disposal so
         // the next segment reuses it instead of reconnecting.
         #[cfg(feature = "mcp")]
@@ -6245,9 +6334,11 @@ async fn execute_prompt(
     if needs_compaction {
         #[cfg(feature = "hooks")]
         let compactions_before = history.session.compaction_count();
+        // `PreCompact` fires from the first summarizer request, so a relief
+        // that finds nothing to cut does not announce a compaction that never
+        // ran (mini-agent-sskdu.239).
         #[cfg(feature = "hooks")]
-        crate::startup::heap_future(|| crate::extras::hooks::dispatch_pre_compact(true, None))
-            .await;
+        let pre_compact_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let quick_models = crate::config::quick_models_map(&state.cfg);
         let context_window =
             state
@@ -6308,7 +6399,16 @@ async fn execute_prompt(
                 move |messages, previous_summary| {
                     let observed = observed.clone();
                     let provider_str = provider_str.clone();
+                    #[cfg(feature = "hooks")]
+                    let pre_compact_sent = pre_compact_sent.clone();
                     async move {
+                        #[cfg(feature = "hooks")]
+                        if !pre_compact_sent.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                            crate::startup::heap_future(|| {
+                                crate::extras::hooks::dispatch_pre_compact(true, None)
+                            })
+                            .await;
+                        }
                         let mut output = compaction_client
                             .compress_messages_observed_with_timeout(
                                 compaction_model,
@@ -6367,6 +6467,32 @@ async fn execute_prompt(
         }
         #[cfg(not(feature = "goal"))]
         let _ = usage;
+    }
+    // Tell the client what the compaction did, or why it did nothing; a
+    // `/compact` otherwise ends as an empty reply (mini-agent-sskdu.229, .243).
+    let events = std::mem::take(&mut history.compaction_events);
+    if compact_only {
+        let line = if events.is_empty() {
+            "Nothing to compact: the session has no history older than its current summary."
+                .to_owned()
+        } else {
+            events.join("\n")
+        };
+        let _ = cx.send_notification(SessionNotification::new(
+            session_id.clone(),
+            SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                TextContent::new(line),
+            ))),
+        ));
+    } else {
+        for event in events {
+            let _ = cx.send_notification(SessionNotification::new(
+                session_id.clone(),
+                SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
+                    TextContent::new(event),
+                ))),
+            ));
+        }
     }
     if compact_only {
         return Ok(PromptOutcome {
@@ -8130,6 +8256,110 @@ mod history_tests {
         assert!(result.is_some());
         assert_eq!(history.session.messages.len(), before);
         assert_eq!(history.session.compaction_count(), 0);
+        // The client is told why (mini-agent-sskdu.229).
+        assert!(
+            history
+                .compaction_events
+                .iter()
+                .any(|event| event.contains("429 after retries") && event.contains("kept")),
+            "{:?}",
+            history.compaction_events
+        );
+    }
+
+    /// mini-agent-sskdu.230: relief keeps a recent tail at a legal cut and does
+    /// not re-clamp a long summary to 16 KiB.
+    #[tokio::test]
+    async fn relief_keeps_the_recent_tool_pair_and_the_long_summary() {
+        let mut history = SessionHistory::default();
+        history.limits.token_pressure = Some(AcpTokenPressure {
+            window: 1_000_000,
+            reserve: 1_000,
+            keep_recent_tokens: 400,
+            keep_recent_tool_results: 4,
+        });
+        history
+            .session
+            .add_message(crate::session::MessageRole::User, "do the work");
+        for i in 0..6 {
+            let id = format!("c{i}");
+            history
+                .session
+                .add_tool_call_with_id(&id, "read", &serde_json::json!({"path": "f"}));
+            history
+                .session
+                .add_tool_result_with_id(&id, "read", &"x".repeat(800));
+        }
+        history.relief_pending = true;
+        assert!(history.needs_compaction());
+        let long = "s".repeat(40 * 1024);
+        let result = history
+            .compact_with(
+                &TurnControl::new(),
+                #[cfg(feature = "goal")]
+                None,
+                |messages, _| {
+                    let long = long.clone();
+                    async move {
+                        let mut output = compaction_output(&long, messages.len());
+                        output.summary_byte_budget = 64 * 1024;
+                        Ok(output)
+                    }
+                },
+            )
+            .await;
+        assert!(result.is_some());
+        assert!(!history.relief_pending);
+        assert_eq!(history.session.compaction_count(), 1);
+        let last = history.session.messages.last().unwrap();
+        assert_eq!(last.role, crate::session::MessageRole::ToolResult);
+        assert!(history.session.messages.len() > 2, "a recent tail is kept");
+        let (summary, _) = history.session.compacted_context();
+        assert!(summary.unwrap().len() > 16 * 1024);
+        // No call is separated from its result.
+        let calls = history
+            .session
+            .messages
+            .iter()
+            .filter(|m| m.role == crate::session::MessageRole::ToolCall)
+            .count();
+        let results = history
+            .session
+            .messages
+            .iter()
+            .filter(|m| m.role == crate::session::MessageRole::ToolResult)
+            .count();
+        assert_eq!(calls, results);
+    }
+
+    #[tokio::test]
+    async fn successful_compaction_records_a_client_event_and_show_text() {
+        // mini-agent-sskdu.243
+        let mut history = SessionHistory::default();
+        history.commit_completed_turn(
+            &"oversized".repeat(MAX_ACP_HISTORY_BYTES),
+            vec![Message::assistant("old answer")],
+        );
+        history
+            .compact_with(
+                &TurnControl::new(),
+                #[cfg(feature = "goal")]
+                None,
+                |messages, _| async move { Ok(compaction_output("the recap", messages.len())) },
+            )
+            .await
+            .unwrap();
+        assert!(
+            history
+                .compaction_events
+                .iter()
+                .any(|event| event.starts_with("compacted ") && event.contains("tokens freed"))
+        );
+        assert!(compaction_show_text(&history.session).contains("the recap"));
+        assert_eq!(
+            compaction_show_text(&crate::session::Session::new("", "", 1, "")),
+            "no active compaction summary"
+        );
     }
 
     /// mini-agent-p9oyv: the turn's memory block leaves out a daily-log copy
@@ -16389,14 +16619,11 @@ mod goal_acp_tests {
             })
             .await;
 
-        let summary = history
-            .session
-            .compacted_context()
-            .0
-            .expect("history was summarized");
+        assert!(history.session.compacted_context().0.is_some());
+        let recap = history.session.live_recap_blocks();
         assert!(
-            summary.contains("finish the migration"),
-            "the objective must survive ACP compaction: {summary}"
+            recap.contains("finish the migration"),
+            "the objective must survive ACP compaction: {recap}"
         );
     }
 

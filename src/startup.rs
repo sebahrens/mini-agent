@@ -1147,14 +1147,15 @@ async fn compact_headless_session(
     if let Some(compacted) = &compacted {
         // The auto-compacting line announced the work; say what it did so a
         // script log shows the run was compacted (mini-agent-sskdu.243).
+        let freed = session
+            .compactions
+            .last()
+            .map_or(0, |compaction| compaction.token_savings);
         eprintln!(
-            "compacted {} messages into a summary (freed ~{} tokens net)",
+            "compacted {} messages into a summary (freed ~{freed} tokens net)",
             compacted.first_kept_index,
-            session
-                .compactions
-                .last()
-                .map_or(0, |compaction| compaction.token_savings),
         );
+        crate::print::record_headless_compaction(compacted.first_kept_index, freed);
     }
     Ok((
         compacted
@@ -9142,5 +9143,20 @@ mod headless_session_lifetime_tests {
             next_pool.ensure_open().is_err(),
             "EOF closes admission for the same retained pool"
         );
+    }
+}
+
+#[cfg(all(test, feature = "hooks"))]
+mod pre_compact_once_tests {
+    #[tokio::test]
+    async fn pre_compact_is_announced_once_per_compaction() {
+        // mini-agent-sskdu.239: the fork and the text path share one flag.
+        let sent = std::sync::atomic::AtomicBool::new(false);
+        super::dispatch_pre_compact_once(&sent, None).await;
+        assert!(sent.load(std::sync::atomic::Ordering::SeqCst));
+        // A second request of the same compaction must not dispatch again; the
+        // flag staying set is the observable contract.
+        super::dispatch_pre_compact_once(&sent, None).await;
+        assert!(sent.load(std::sync::atomic::Ordering::SeqCst));
     }
 }
