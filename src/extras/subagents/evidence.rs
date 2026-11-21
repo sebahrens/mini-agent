@@ -166,21 +166,11 @@ impl EvidenceMeta {
     }
 
     pub(crate) fn size(&self) -> String {
-        let mut parts = vec![human_bytes(self.text_bytes)];
+        let mut parts = vec![crate::byte_text::format_bytes(self.text_bytes)];
         for image in &self.images {
             parts.push(format!("{}x{}", image.width, image.height));
         }
         parts.join(", ")
-    }
-}
-
-fn human_bytes(bytes: u64) -> String {
-    if bytes < 1024 {
-        format!("{bytes} B")
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1} KiB", bytes as f64 / 1024.0)
-    } else {
-        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
     }
 }
 

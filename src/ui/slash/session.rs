@@ -355,7 +355,7 @@ pub(crate) fn share_confirmation(session: &crate::session::Session, html_bytes: 
         "/share uploads this session's full transcript ({}, {} tool output{}, which may include \
          file contents and secrets) as a secret GitHub gist, readable by anyone with the link.\n\
          Run /share confirm to upload it.",
-        crate::agent::tools::list_dir::format_size(html_bytes as u64),
+        crate::byte_text::format_bytes(html_bytes as u64),
         tool_outputs,
         if tool_outputs == 1 { "" } else { "s" },
     )
@@ -389,7 +389,7 @@ async fn handle_share(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<
         ctx.renderer,
         format!(
             "uploading {} to gist.github.com…",
-            crate::agent::tools::list_dir::format_size(html.len() as u64)
+            crate::byte_text::format_bytes(html.len() as u64)
         ),
     );
     match crate::extras::export::share_gist(&filename, &html, &description).await {
