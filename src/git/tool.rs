@@ -3148,6 +3148,7 @@ fn guarded(guard: &[String], args: Vec<String>) -> Vec<String> {
 /// Parses `git config -z --get-regexp '^filter\.'` output (`key LF value NUL`
 /// or `key NUL`) into the sorted, distinct driver names. A name that cannot
 /// be expressed as a `-c filter.<name>.<var>=` override fails closed.
+#[cfg(test)]
 fn parse_filter_driver_names(stdout: &[u8]) -> Result<Vec<String>, ToolError> {
     parse_filter_drivers(stdout).map(|drivers| drivers.names)
 }

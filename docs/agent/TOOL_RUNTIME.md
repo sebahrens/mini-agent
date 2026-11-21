@@ -914,9 +914,21 @@ accepts `revision_to` (two-commit diff) and `staged` (index vs HEAD, or vs `revi
 cannot be combined with those. `log` accepts `skip` and returns `skip`/`next_skip` (non-null when a
 full `max_count` page was returned) so history beyond 100 commits is reachable, plus fixed-string
 `author` and `grep` filters (`grep` matches the whole message). Each log commit carries `subject` plus `body` (the rest of the message including trailers, at most 2 KiB, `body_truncated` when cut; read the full message with `show`). If the output cap cuts a page short, `truncated` is set and `next_skip` continues from the last complete commit. `blame` (one `path`, optional `start_line`/`end_line`/`revision`) is
-paged like `diff` and uses the `git/show` permission key. `reset`, `revert`, `cherry-pick`,
-`merge`, `rebase`, `fetch`, `pull` and `push` are intentionally not offered: they rewrite history
-or touch remotes/network, outside the fixed local-only surface (mini-agent-kg67c).
+paged like `diff` and uses the `git/show` permission key. Local history operations
+(mini-agent-nvnkx.50) are `merge`, `cherry_pick` and `revert` (`--no-edit`, with `*_abort`
+operations; a conflict leaves the operation in progress and the result lists `conflicted_paths`),
+`reset` (`mode` `soft` or `mixed`, never `--hard`, refused when HEAD is in a remote-tracking ref),
+`branch_delete` (`-d`) and `branch_rename` (never the checked-out branch), `stash_apply` and
+`stash_drop` (`index`) and `stash_push` `include_untracked`; each runs through the same hardened
+runner and has its own permission key (`git/merge`, `git/cherry_pick`, `git/revert`, `git/reset`,
+`git/branch_delete`; stash operations use `git/stash`). `status` reports `in_progress` (merge, rebase,
+cherry-pick, revert, bisect) and `commit` refuses inside a rebase or cherry-pick unless
+`allow_in_progress` is set (mini-agent-nvnkx.316). In Git LFS repositories the stock `lfs` filter is
+neutralised, results carry `lfs_pointers_not_resolved`, and staging or committing LFS-tracked paths
+and rewriting the working tree are refused (mini-agent-nvnkx.317). `rebase`, `fetch`, `pull`, `push`
+and `reset --hard` are intentionally not offered: they discard work or touch remotes/network,
+outside the fixed local-only surface (mini-agent-kg67c). The spec is
+[structured-git-mutations.md](../specs/structured-git-mutations.md).
 
 `src/ui/slash/git.rs` owns parsing, bounded request-path selection, proposal
 validation and SDK-free native actors for `/diff`, `/commit` and `/pr`. The App

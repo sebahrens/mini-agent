@@ -2485,7 +2485,6 @@ mod tests {
     #[test]
     fn nvnkx57_platform_skip_reason_is_readable() {
         assert!(SkipReason::Platform.describe().contains("not supported"));
-        assert!(FILE_RESTORE_SUPPORTED, "macOS and Linux restore files");
     }
     #[test]
     fn nvnkx140_rewind_restores_what_a_shell_turn_edited_created_and_deleted() {

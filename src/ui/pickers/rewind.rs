@@ -117,7 +117,7 @@ const CONFIRM_CANCEL: &str = "Cancel";
 /// loop, which owns the session and performs the actual rewind.
 pub struct RewindPicker {
     active: bool,
-    binding: RewindBinding,
+    binding: Box<RewindBinding>,
     stage: Stage,
     list: ListPicker,
     /// Message index of each rewind-able user turn, in order. The list shows
@@ -140,7 +140,7 @@ impl RewindPicker {
         let (targets, previews): (Vec<usize>, Vec<String>) = targets.into_iter().unzip();
         RewindPicker {
             active: false,
-            binding,
+            binding: Box::new(binding),
             stage: Stage::PickMessage,
             list,
             targets,
@@ -303,7 +303,7 @@ impl RewindPicker {
                             5 => RewindMode::Workspace,
                             _ => RewindMode::Conversation,
                         },
-                        self.binding.clone(),
+                        (*self.binding).clone(),
                     )
                 } else {
                     RewindOutcome::Cancelled
