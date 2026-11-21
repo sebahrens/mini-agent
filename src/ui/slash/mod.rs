@@ -426,7 +426,7 @@ pub fn undo_last(session: &mut Session) -> usize {
     let Some(start) = session
         .messages
         .iter()
-        .rposition(|message| message.role == MessageRole::User)
+        .rposition(|message| message.is_user_authored())
     else {
         return 0;
     };
@@ -778,10 +778,17 @@ async fn handle_compress_unfloored(
             crate::ui::C_ERROR,
         )?,
     }
+    // Report what was freed, not the size of what was removed: the summary,
+    // restored file windows and todo/goal blocks were added back
+    // (mini-agent-sskdu.242).
+    let summary_tokens = ui.session.messages.first().map_or(0, |m| m.estimated_tokens);
     renderer.write_line(
         &format!(
-            "compressed {} messages (saved ~{} tokens)",
-            first_kept_index, tokens_before,
+            "compressed {} messages (freed ~{} tokens net; removed ~{}, new summary ~{})",
+            first_kept_index,
+            tokens_before.saturating_sub(summary_tokens),
+            tokens_before,
+            summary_tokens,
         ),
         C_AGENT,
     )?;
@@ -922,10 +929,7 @@ where
         None => None,
     };
     let (skipped, messages) = session.compaction_input(cut_idx, keep_recent_tool_results);
-    let previous_summary = session
-        .compactions
-        .last()
-        .map(|compaction| compaction.summary.to_string());
+    let previous_summary = session.previous_summary_prose();
     let crate::provider::CompactionOutput {
         summary,
         summary_byte_budget,

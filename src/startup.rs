@@ -1138,10 +1138,7 @@ where
     let model = session.model.to_string();
     let (skipped, messages) =
         session.compaction_input(plan.cut_idx, cfg.resolve_keep_recent_tool_results());
-    let previous_summary = session
-        .compactions
-        .last()
-        .map(|compaction| compaction.summary.to_string());
+    let previous_summary = session.previous_summary_prose();
     let keep_recent_tool_results = cfg.resolve_keep_recent_tool_results();
     let mut output = None;
     if let Some(fork) = fork

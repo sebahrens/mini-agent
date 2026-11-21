@@ -2378,6 +2378,9 @@ where
     .await
 }
 
+/// Appended to a summary whose response used the whole output allowance.
+pub(crate) const SUMMARY_TRUNCATED_MARKER: &str = "\n\n[summary truncated by the output limit]";
+
 async fn run_summarizer_with<M, F, Fut>(
     make_request: F,
     max_output_tokens: u64,
@@ -2420,7 +2423,18 @@ where
         )
         .await
         {
-            Ok(done) => return Ok(done),
+            Ok((mut text, usage)) => {
+                // A response that used its whole output allowance was cut off:
+                // say so instead of storing it as complete (mini-agent-sskdu.233).
+                if max_output_tokens > 0 && usage.output_tokens >= max_output_tokens {
+                    tracing::warn!(
+                        max_output_tokens,
+                        "compaction summary hit the output limit and was cut off"
+                    );
+                    text.push_str(SUMMARY_TRUNCATED_MARKER);
+                }
+                return Ok((text, usage));
+            }
             Err(SummarizerFailure::Fatal(error)) => return Err(error),
             Err(SummarizerFailure::Retry(delay, error)) => {
                 tracing::warn!(
@@ -2783,11 +2797,13 @@ where
 /// summarizer contract plus the user's compression preference, applied to the
 /// conversation that precedes it.
 pub(crate) fn fork_instruction(instructions: Option<&str>) -> String {
-    let mut text = summarizer_preamble();
+    // The user's global suffix is already part of the forked agent's system
+    // prompt, so it is not repeated here (mini-agent-sskdu.241).
+    let mut text = prompt::COMPACTION_FORK_PROMPT.to_string();
     text.push_str(
         "\n\n---\n\nThis message is a summarization request, not a continuation of the work. \
          Do not call tools and do not answer the conversation. Summarize the entire conversation \
-         above, including any earlier compaction summary it begins with, following the contract above.",
+         above, following the contract above.",
     );
     if let Some(instructions) = instructions {
         text.push_str(
@@ -2864,6 +2880,8 @@ pub(crate) fn defang_closing_tags<'a>(text: &'a str, names: &[&str]) -> Cow<'a, 
 /// never injectable.
 fn serialize_message(msg: &SessionMessage) -> String {
     let role_tag = match msg.role {
+        // The host's relief continuation is not the user's own words.
+        crate::session::MessageRole::User if !msg.is_user_authored() => "host_continuation",
         crate::session::MessageRole::User => "user",
         crate::session::MessageRole::Assistant => "assistant",
         crate::session::MessageRole::System => "system",
@@ -4115,7 +4133,7 @@ impl AnyAgent {
                 )
             })??;
         Ok(CompactionOutput {
-            summary: prefix_at_most(&summary, summary_byte_budget).to_string(),
+            summary: bound_summary(&summary, summary_byte_budget),
             summary_byte_budget,
             messages_included,
             usage: usage.into(),
