@@ -852,14 +852,27 @@ async fn hooks60_actual_paused_gate_keeps_media_and_canonical_notice_before_star
     assert_eq!(requests.len(), 1);
     assert!(!requests[0]["system"].to_string().contains("HOOK60_CONTEXT"));
     let messages = requests[0]["messages"].as_array().unwrap();
-    assert_eq!(messages[0]["role"], "assistant");
+    // Hook context is marked user-side text, never an assistant message
+    // (mini-agent-sskdu.190); the wire may merge adjacent user turns.
+    assert!(
+        messages
+            .iter()
+            .all(|message| message["role"] != "assistant")
+    );
     assert!(messages[0].to_string().contains("HOOK60_CONTEXT"));
-    assert_eq!(messages[1]["role"], "user");
-    let parts = messages[1]["content"].as_array().unwrap();
-    assert_eq!(parts.len(), 3);
-    assert_eq!(parts[0]["text"], "LITERAL_BEFORE60");
-    assert_eq!(parts[2]["text"], "LITERAL_AFTER60");
-    assert_eq!(parts[1]["type"], "image");
+    assert!(messages[0].to_string().contains("[Host:"));
+    let user = messages
+        .iter()
+        .find(|message| message.to_string().contains("LITERAL_BEFORE60"))
+        .unwrap();
+    assert_eq!(user["role"], "user");
+    let parts = user["content"].as_array().unwrap();
+    let before = parts
+        .iter()
+        .position(|part| part["text"] == "LITERAL_BEFORE60")
+        .unwrap();
+    assert_eq!(parts[before + 2]["text"], "LITERAL_AFTER60");
+    assert_eq!(parts[before + 1]["type"], "image");
 }
 
 /// mini-agent-5eoy7.3: the Anthropic wire carries the host directive as the

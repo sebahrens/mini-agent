@@ -216,6 +216,32 @@ pub struct ToolResult {
     pub call_id: Option<String>,
     /// One or more content items produced by the tool.
     pub content: OneOrMany<ToolResultContent>,
+    /// Whether the call failed or was refused. Providers that have a native
+    /// error flag on tool results (Anthropic `is_error`) send it; others ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_error: Option<bool>,
+}
+
+impl ToolResult {
+    /// A tool result with no error flag.
+    pub fn new(
+        id: impl Into<String>,
+        call_id: Option<String>,
+        content: OneOrMany<ToolResultContent>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            call_id,
+            content,
+            is_error: None,
+        }
+    }
+
+    /// Mark this result as a failure (or clear the flag).
+    pub fn with_is_error(mut self, is_error: bool) -> Self {
+        self.is_error = is_error.then_some(true);
+        self
+    }
 }
 
 /// Describes the content of a tool result, which can be text or an image.
@@ -642,7 +668,7 @@ impl Message {
             content: OneOrMany::one(UserContent::ToolResult(ToolResult {
                 id: id.into(),
                 call_id: None,
-                content: OneOrMany::one(ToolResultContent::text(content)),
+                content: OneOrMany::one(ToolResultContent::text(content)), is_error: None,
             })),
         }
     }
@@ -656,7 +682,7 @@ impl Message {
             content: OneOrMany::one(UserContent::ToolResult(ToolResult {
                 id: id.into(),
                 call_id,
-                content: OneOrMany::one(ToolResultContent::text(content)),
+                content: OneOrMany::one(ToolResultContent::text(content)), is_error: None,
             })),
         }
     }
@@ -798,7 +824,7 @@ impl UserContent {
         UserContent::ToolResult(ToolResult {
             id: id.into(),
             call_id: None,
-            content,
+            content, is_error: None,
         })
     }
 
@@ -811,7 +837,7 @@ impl UserContent {
         UserContent::ToolResult(ToolResult {
             id: id.into(),
             call_id: Some(call_id),
-            content,
+            content, is_error: None,
         })
     }
 }
@@ -1378,7 +1404,7 @@ impl From<ToolResultContent> for Message {
             content: OneOrMany::one(UserContent::ToolResult(ToolResult {
                 id: String::new(),
                 call_id: None,
-                content: OneOrMany::one(tool_result_content),
+                content: OneOrMany::one(tool_result_content), is_error: None,
             })),
         }
     }
@@ -1458,7 +1484,7 @@ mod tests {
                         ToolResultContent::text("x"),
                         ToolResultContent::pdf_base64("JVBERg=="),
                     ])
-                    .unwrap(),
+                    .unwrap(), is_error: None,
                 })),
             },
         ];

@@ -710,6 +710,9 @@ where
     // tool-end / model-visible output for the same reason.) The hook still
     // observes the tool's actual output via `result` and the structured
     // classification via `outcome` / `extensions`.
+    // Failed, denied and hook-skipped calls are flagged so providers with a
+    // native error marker on tool results (Anthropic `is_error`) can send it.
+    let result_failed = !exec.outcome.is_success();
     let mut references = (!synthetic && matches!(exec.outcome, ToolOutcome::Success))
         .then(|| {
             exec.extensions
@@ -802,6 +805,9 @@ where
             Ok(ToolCallOutcome { content, execution })
         }
     }?;
+    if result_failed && let UserContent::ToolResult(result) = &mut outcome.content {
+        result.is_error = Some(true);
+    }
     if let Some(references) = references
         && let UserContent::ToolResult(result) = &mut outcome.content
     {

@@ -2616,6 +2616,7 @@ async fn mcp_image_result_survives_call_bounds_and_rig_conversion() {
         id: "mcp-image".into(),
         call_id: None,
         content: rig::message::ToolResultContent::from_tool_output(output),
+        is_error: None,
     };
     assert!(
         matches!(result.content.first(), rig::message::ToolResultContent::Text(text)

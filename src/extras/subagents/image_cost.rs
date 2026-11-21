@@ -257,6 +257,7 @@ mod tests {
                 id: "r".into(),
                 call_id: None,
                 content: OneOrMany::one(ToolResultContent::text(text)),
+                is_error: None,
             })),
         };
         let history = vec![
@@ -319,6 +320,7 @@ mod tests {
                         ToolResultContent::Image(image),
                     ])
                     .unwrap(),
+                    is_error: None,
                 }),
             ])
             .unwrap(),

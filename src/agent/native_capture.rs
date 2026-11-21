@@ -1088,11 +1088,13 @@ mod tests {
                     serde_json::json!({"owned_reference_metadata":["exact bytes"]}),
                 ),
             })),
+            is_error: None,
         };
         let second = ToolResult {
             id: "canonical-two".into(),
             call_id: None,
             content: OneOrMany::one(ToolResultContent::text("actual second result")),
+            is_error: None,
         };
         let capture = fresh();
         capture.tool_result("internal-two", &second);
@@ -1215,6 +1217,7 @@ mod tests {
             id: format!("call-{turn}"),
             call_id: None,
             content: OneOrMany::one(rig::message::ToolResultContent::text("x".repeat(8 * 1024))),
+            is_error: None,
         }
     }
 

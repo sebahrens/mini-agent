@@ -1259,7 +1259,7 @@ impl AgentRun {
                 let skipped_tool_result = ToolResult {
                     id: invalid.tool_call.id.clone(),
                     call_id: invalid.tool_call.call_id.clone(),
-                    content: OneOrMany::one(ToolResultContent::text(reason.clone())),
+                    content: OneOrMany::one(ToolResultContent::text(reason.clone())), is_error: None,
                 };
                 let Some((assistant_message, user_message)) =
                     partial.rollback_messages(invalid.tool_call.clone(), reason)

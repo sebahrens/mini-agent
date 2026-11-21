@@ -421,6 +421,7 @@ mod tests {
                     ToolResultContent::Image(image(len)),
                 ])
                 .unwrap(),
+                is_error: None,
             })),
         }
     }

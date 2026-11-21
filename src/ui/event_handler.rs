@@ -195,7 +195,17 @@ pub async fn handle_agent_event(
                     rig::completion::Message::System { .. } => return Err(anyhow::anyhow!("steering cannot inject system authority")),
                     rig::completion::Message::User { content } => {
                         for item in content {
-                            if let rig::message::UserContent::Text(text) = item {
+                            let rig::message::UserContent::Text(text) = item else {
+                                continue;
+                            };
+                            if crate::agent::input::is_host_context_message(&text.text) {
+                                // Hook context rides in front of the steered prompt; it
+                                // is stored as the context row it is, never as the user's.
+                                ui.session.add_message(
+                                    MessageRole::System,
+                                    crate::agent::input::strip_host_marker(&text.text),
+                                );
+                            } else {
                                 user_turn = Some(ui.session.messages.len());
                                 ui.session.add_message(MessageRole::User, &text.text);
                                 renderer.write_line(&format!("> {}", sanitize_output(&text.text)), Color::Green)?;
@@ -302,7 +312,33 @@ pub async fn handle_agent_event(
             );
             // Anchored so the result renders directly under this call even
             // when the model issued several calls before any result arrived.
-            renderer.write_line_anchored(&id, &sanitize_output(&line), C_TOOL)?;
+            // A row already written while the arguments streamed is completed
+            // in place instead of duplicated.
+            if !(run.streaming_call_rows.remove(id.as_str())
+                && renderer.replace_anchored_line(&id, &sanitize_output(&line))?)
+            {
+                renderer.write_line_anchored(&id, &sanitize_output(&line), C_TOOL)?;
+            }
+        }
+        AgentEvent::ToolCallArgsStreaming { id, name, bytes } => {
+            run.was_reasoning = false;
+            finalize_response_segment(renderer, run)?;
+            if run.agent_line_started {
+                renderer.write_line("", Color::White)?;
+                run.agent_line_started = false;
+            }
+            let size = if bytes >= 1024 {
+                format!("{:.1} kB", bytes as f64 / 1024.0)
+            } else {
+                format!("{bytes} B")
+            };
+            let line = format!("◈ {name} (receiving arguments, {size})");
+            if !(run.streaming_call_rows.contains(id.as_str())
+                && renderer.replace_anchored_line(&id, &sanitize_output(&line))?)
+            {
+                renderer.write_line_anchored(&id, &sanitize_output(&line), C_TOOL)?;
+                run.streaming_call_rows.insert(id);
+            }
         }
         #[cfg(feature = "subagents")]
         AgentEvent::SubagentToolCall { name, args } => {
@@ -627,6 +663,7 @@ fn persist_host_instructions(session: &mut Session, interactions: &[Message]) {
         for item in content.iter() {
             if let rig::message::UserContent::Text(text) = item
                 && crate::agent::input::is_host_instruction(&text.text)
+                && !crate::agent::input::is_host_context_message(&text.text)
             {
                 session.add_message(MessageRole::System, &text.text);
             }

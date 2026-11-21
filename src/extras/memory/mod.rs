@@ -324,14 +324,30 @@ const PATCH_MARGIN_BYTES: usize = 400;
 fn reconstruct_memory(history: &[rig::completion::Message]) -> Option<(String, usize)> {
     let mut current: Option<(String, usize)> = None;
     for message in history {
-        let rig::completion::Message::Assistant { content, .. } = message else {
-            continue;
+        // Snapshots are delivered as marked user-side context; older sessions
+        // replayed them as assistant text, which is still understood.
+        let texts: Vec<&str> = match message {
+            rig::completion::Message::Assistant { content, .. } => content
+                .iter()
+                .filter_map(|part| match part {
+                    rig::completion::AssistantContent::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect(),
+            rig::completion::Message::User { content } => content
+                .iter()
+                .filter_map(|part| match part {
+                    rig::message::UserContent::Text(text)
+                        if crate::agent::input::is_host_context_message(&text.text) =>
+                    {
+                        Some(crate::agent::input::strip_host_marker(&text.text))
+                    }
+                    _ => None,
+                })
+                .collect(),
+            _ => continue,
         };
-        for part in content.iter() {
-            let rig::completion::AssistantContent::Text(text) = part else {
-                continue;
-            };
-            let text = text.text.as_str();
+        for text in texts {
             if let Some(rest) = text.strip_prefix(CONTEXT_NOTICE) {
                 current = rest
                     .split_once('\n')
@@ -2285,6 +2301,19 @@ mod cache_placement_tests {
         assert!(total < first.len() * 2, "{total} vs {}", first.len());
         let cleared = context_notice("", &history).unwrap();
         assert!(cleared.starts_with(CONTEXT_NOTICE));
+    }
+
+    /// mini-agent-sskdu.190: a snapshot delivered as marked user-side context
+    /// is found by the dedupe exactly like the older assistant-role form.
+    #[test]
+    fn marked_user_context_snapshots_dedupe_like_assistant_ones() {
+        use rig::completion::Message;
+        let first = context_notice("raw memory", &[]).unwrap();
+        let marked = Message::user(crate::agent::input::host_context_text(&first));
+        let history = vec![marked, Message::user("hi"), Message::assistant("ok")];
+        assert!(context_notice("raw memory", &history).is_none());
+        let updated = context_notice("new memory", &history).unwrap();
+        assert!(updated.ends_with("new memory"));
     }
 
     #[test]

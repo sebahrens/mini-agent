@@ -2476,6 +2476,10 @@ fn persist_user_delta_blocks(
         };
         // Host continuation text (verification failure, hook reason, truncation
         // or retry notice) is stored as a host row, never as the user's words.
+        // Context notices are persisted by their own path (System rows).
+        if crate::agent::input::is_host_context_message(&text) {
+            return Ok(());
+        }
         let role = if crate::agent::input::is_host_instruction(&text) {
             MessageRole::System
         } else {

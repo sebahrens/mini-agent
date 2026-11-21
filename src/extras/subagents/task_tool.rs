@@ -9292,6 +9292,7 @@ mod evidence_contract_tests {
                     id: id.into(),
                     call_id: None,
                     content: OneOrMany::one(ToolResultContent::Text(Text::from(body))),
+                    is_error: None,
                 })),
             });
         }

@@ -1042,6 +1042,34 @@ impl Feed {
         true
     }
 
+    /// Replace the text of the most recent block anchored at `anchor`, in
+    /// place. Returns whether such a block was found.
+    pub fn replace_anchored_text(&mut self, anchor: &str, text: impl Into<String>) -> bool {
+        if anchor.is_empty() {
+            return false;
+        }
+        let Some(block) = self
+            .blocks
+            .iter_mut()
+            .rev()
+            .find(|block| block.anchor.as_deref() == Some(anchor))
+        else {
+            return false;
+        };
+        self.generation += 1;
+        let old_len = block.text.len();
+        block.text = terminal_safe(text.into());
+        self.total_bytes = self
+            .total_bytes
+            .saturating_sub(old_len)
+            .saturating_add(block.text.len());
+        block.revision = block.revision.wrapping_add(1);
+        block.clear_md_cache();
+        block.clear_syntax_cache();
+        *block.render_cache.borrow_mut() = None;
+        true
+    }
+
     /// Remove the live progress block under `anchor`. It is kept (stale but
     /// harmless) when removing it would shift a still-running block whose
     /// index a producer tracks. Returns whether a block was removed.

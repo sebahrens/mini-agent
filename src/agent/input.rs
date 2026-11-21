@@ -145,6 +145,45 @@ pub(crate) fn is_host_instruction(text: &str) -> bool {
     text.starts_with(HOST_MESSAGE_PREFIX)
 }
 
+/// The kind label of host context (memory snapshot, hook context, background
+/// job and task notices). Delivered as a marked user-role message: as an
+/// assistant message the model would read untrusted program output or hook
+/// text as its own earlier words (mini-agent-sskdu.190).
+const HOST_CONTEXT_KIND: &str = "context notice";
+
+/// Whether `text` is host context built by [`host_context_text`].
+pub(crate) fn is_host_context_message(text: &str) -> bool {
+    text.starts_with(&format!("{HOST_MESSAGE_PREFIX} {HOST_CONTEXT_KIND};"))
+}
+
+/// Wrap a raw context notice for delivery in a user-role message.
+pub(crate) fn host_context_text(notice: &str) -> String {
+    host_instruction(HOST_CONTEXT_KIND, notice)
+}
+
+/// The notice inside a host-marked message, or the text unchanged.
+pub(crate) fn strip_host_marker(text: &str) -> &str {
+    if is_host_instruction(text) {
+        text.split_once('\n').map_or(text, |(_, rest)| rest)
+    } else {
+        text
+    }
+}
+
+/// Whether a stored System row is a raw context notice (written by
+/// `append_context_session` and the memory snapshot code before the notices
+/// were marked), which replays as marked user-side text.
+pub(crate) fn is_context_notice_row(content: &str) -> bool {
+    const PREFIXES: [&str; 5] = [
+        "Persistent memory snapshot",
+        "Persistent memory update",
+        "[Configured ",
+        "[Background shell job",
+        "[Background task",
+    ];
+    PREFIXES.iter().any(|prefix| content.starts_with(prefix))
+}
+
 fn bounded_turn_directive(directive: String) -> Option<String> {
     let trimmed = directive.trim();
     if trimmed.is_empty() {
@@ -189,8 +228,7 @@ pub(crate) fn append_context_history(
     history.extend(
         notices
             .iter()
-            .cloned()
-            .map(rig::completion::Message::assistant),
+            .map(|notice| rig::completion::Message::user(host_context_text(notice))),
     );
     history.into()
 }

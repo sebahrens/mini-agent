@@ -963,6 +963,7 @@ mod tests {
             id: "mcp-image".into(),
             call_id: None,
             content: rig::message::ToolResultContent::from_tool_output(output),
+            is_error: None,
         };
         crate::session::tool_image::from_result(&result).unwrap()
     }

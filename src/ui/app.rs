@@ -9066,7 +9066,7 @@ mod initial_turn_tests {
         crate::ui::mark_main_turn_started(&mut session, &mut run, pending_turn);
         session.add_tool_call_with_id("settled-edit", "edit", &serde_json::json!({}));
         session.add_tool_call_with_id("running-test", "shell", &serde_json::json!({}));
-        crate::agent::runner::record_settled_result_for_tests("settled-edit", "edit applied");
+        crate::agent::runner::record_settled_result("settled-edit", "edit applied");
 
         assert!(crate::ui::preserve_pending_main_turn_progress(
             &mut run,
