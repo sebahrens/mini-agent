@@ -5437,7 +5437,10 @@ async fn run_prompt(
                     .filter(|todo| !matches!(todo.status.as_str(), "completed" | "cancelled"))
                     .count();
                 let cost = crate::extras::goal::driver::RoundCost {
-                    usage: outcome.usage,
+                    usage: crate::extras::goal::driver::with_child_usage(
+                        &history.session.id,
+                        outcome.usage,
+                    ),
                     active: round_started.elapsed().saturating_sub(
                         std::time::Duration::from_millis(
                             blocked_ms.load(std::sync::atomic::Ordering::Relaxed),
@@ -5478,7 +5481,10 @@ async fn run_prompt(
             &sandbox_for_gate,
             &control,
             &crate::extras::goal::driver::RoundCost {
-                usage: outcome.usage,
+                usage: crate::extras::goal::driver::with_child_usage(
+                    &history.session.id,
+                    outcome.usage,
+                ),
                 // What the agent worked for, excluding whatever the user spent
                 // deciding on a permission prompt.
                 active: round_started

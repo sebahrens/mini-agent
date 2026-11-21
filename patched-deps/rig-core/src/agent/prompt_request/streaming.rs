@@ -728,7 +728,7 @@ where
     }
 
     Box::pin(async_stream::stream! {
-        let full_history_for_errors = run.full_history();
+        let full_history_for_errors = || run.full_history();
         let call_count = calls.len();
 
         // Assign each call a stable internal_call_id and, for calls that will

@@ -741,3 +741,28 @@ mod settings127_tests {
         assert_eq!(installed.config.resolve_subagent_max_tokens(), before);
     }
 }
+
+/// Provider usage of finished `task` children (foreground and background) not
+/// yet counted by a goal round, by session id. Goal rounds on every surface
+/// (terminal, headless, editor) fold it into the round's tokens so
+/// `max_tokens` bounds the work subagents did (mini-agent-sskdu.266).
+static UNCOUNTED_CHILD_USAGE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, crate::event::UsageDelta>>,
+> = std::sync::LazyLock::new(Default::default);
+
+pub(crate) fn record_child_usage(session_id: &str, usage: crate::event::UsageDelta) {
+    let mut map = UNCOUNTED_CHILD_USAGE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let slot = map.entry(session_id.to_owned()).or_default();
+    *slot = slot.saturating_add(usage);
+}
+
+/// Takes (and clears) the child usage recorded for `session_id`.
+pub(crate) fn take_child_usage(session_id: &str) -> crate::event::UsageDelta {
+    UNCOUNTED_CHILD_USAGE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(session_id)
+        .unwrap_or_default()
+}

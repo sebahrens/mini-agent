@@ -2413,6 +2413,14 @@ impl ChildPlan {
         let cancellation_relief_usage = relief_usage.clone();
         let cancellation_repair_usage = repair_usage.clone();
         let cancellation_writeup_usage = writeup_usage.clone();
+        let report_pool = pool_weak.clone();
+        let report_ledgers = [
+            initial_usage.clone(),
+            retry_usage.clone(),
+            relief_usage.clone(),
+            repair_usage.clone(),
+            writeup_usage.clone(),
+        ];
         let cancellation_cost = Arc::new(move || {
             // Streaming usage may be known before ModelTurnFinished. Keep
             // it when cancellation retires an in-flight request, without
@@ -2926,6 +2934,16 @@ impl ChildPlan {
                 drop(crate::agent::runner::spawn_async_scoped(async move {
                     manager.shutdown().await;
                 }));
+            }
+            // Report the child's real usage so goal token bounds count it,
+            // whether it ran in the foreground or as a background job.
+            if let Some(pool) = report_pool.as_ref().and_then(std::sync::Weak::upgrade) {
+                let total = report_ledgers.iter().fold(Usage::new(), |sum, ledger| {
+                    usage_saturating_add(sum, ledger.total())
+                });
+                if total.has_values() {
+                    super::record_child_usage(pool.session_id(), total.into());
+                }
             }
             ChildExecution {
                 output,

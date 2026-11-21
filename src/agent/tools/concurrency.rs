@@ -133,6 +133,17 @@ fn access_for_call(access: ToolAccess, args: &str) -> ToolAccess {
     }
 }
 
+/// Whether a call admitted on the lane its `original` arguments need would run
+/// with `effective` arguments that need a stronger one (a shared lease for what
+/// became a write). A `PreToolUse` rewrite happens after admission, so such a
+/// rewrite is refused instead of racing the other calls holding the lane
+/// (mini-agent-sskdu.263).
+pub(crate) fn rewrite_needs_stronger_lane(name: &str, original: &str, effective: &str) -> bool {
+    let access = access_for(name);
+    access_for_call(access, original) == ToolAccess::Read
+        && access_for_call(access, effective) != ToolAccess::Read
+}
+
 /// One reader/writer lane plus the ticket that keeps exclusive calls in order.
 ///
 /// An exclusive call takes the `order` ticket first and keeps it for the whole
@@ -424,6 +435,29 @@ pub(crate) fn bind_with_shared(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_rewrite_that_needs_a_stronger_lane_is_detected() {
+        use super::rewrite_needs_stronger_lane as stronger;
+        let status = r#"{"operation":"status"}"#;
+        let stage = r#"{"operation":"stage"}"#;
+        assert!(stronger("git", status, stage));
+        assert!(
+            !stronger("git", stage, status),
+            "a write lease covers a read"
+        );
+        assert!(!stronger("git", status, r#"{"operation":"log"}"#));
+        assert!(
+            !stronger("shell", "{}", r#"{"command":"x"}"#),
+            "already exclusive"
+        );
+        assert!(stronger(
+            "job_status",
+            r#"{"action":"poll"}"#,
+            r#"{"action":"stop"}"#
+        ));
+        assert!(!stronger("read", r#"{"path":"a"}"#, r#"{"path":"b"}"#));
+    }
+
     #[test]
     fn tool_concurrency_setting_is_bounded_and_defaults_to_four() {
         assert_eq!(resolve_tool_concurrency(None), 4);

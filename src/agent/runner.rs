@@ -406,6 +406,9 @@ impl ToolLoopState {
         outcome: &rig::tool::ToolOutcome,
         result: &str,
     ) -> Option<String> {
+        if super::read_loop::resets_read_loop(tool_name) {
+            self.successful_reads.clear_after_mutation();
+        }
         if super::read_loop::invalidates_evidence(tool_name) {
             self.successful_reads.clear_after_mutation();
             // A completed mutation changes what an identical call would now
@@ -502,14 +505,6 @@ pub(crate) struct ToolLoopGuard;
 impl<M: CompletionModel> AgentHook<M> for ToolLoopGuard {
     async fn on_event(&self, ctx: &HookContext, event: StepEvent<'_, M>) -> Flow {
         match event {
-            StepEvent::CompletionCall { .. } => {
-                let stop = update_loop_state(ctx, |state| state.successful_reads.stop_requested());
-                if stop {
-                    Flow::terminate(super::read_loop::STOP_REASON)
-                } else {
-                    Flow::cont()
-                }
-            }
             StepEvent::ToolCall {
                 tool_name,
                 args,
@@ -533,11 +528,26 @@ impl<M: CompletionModel> AgentHook<M> for ToolLoopGuard {
                     state
                         .pending
                         .insert(internal_call_id.to_owned(), (raw, fingerprint));
-                    state.exact_failure_notice(fingerprint).or_else(|| {
-                        (tool_name == "edit")
-                            .then(|| state.alternating_edit_notice(fingerprint))
-                            .flatten()
-                    })
+                    state
+                        .exact_failure_notice(fingerprint)
+                        .or_else(|| {
+                            (tool_name == "edit")
+                                .then(|| state.alternating_edit_notice(fingerprint))
+                                .flatten()
+                        })
+                        .or_else(|| {
+                            // The read would only return the same unchanged
+                            // evidence again: answer it with a notice the
+                            // model sees instead of ending the run.
+                            (super::read_loop::is_evidence_read(tool_name)
+                                && state.successful_reads.is_stuck(&fingerprint.0))
+                            .then(|| {
+                                format!(
+                                    "{TOOL_LOOP_NOTICE_PREFIX} {}",
+                                    super::read_loop::UNCHANGED_READ_NOTICE
+                                )
+                            })
+                        })
                 });
                 if let Some(notice) = &notice {
                     record_tool_loop_notice(internal_call_id, notice);
@@ -557,6 +567,8 @@ impl<M: CompletionModel> AgentHook<M> for ToolLoopGuard {
                 }
                 record_settled_result(internal_call_id, result);
                 show_settled_call(internal_call_id, outcome, result);
+                let rewritten = take_effective_args(internal_call_id);
+                let args = rewritten.as_deref().unwrap_or(args);
                 let raw = raw_args_hash(args);
                 let cached = update_loop_state(ctx, |state: &mut ToolLoopState| {
                     state
@@ -1970,6 +1982,29 @@ pub(crate) fn record_settled_result(internal_call_id: &str, result: &str) {
     while settled.len() > SETTLED_RESULT_MAX_ENTRIES {
         settled.pop_front();
     }
+}
+
+/// Arguments a `PreToolUse` hook rewrote before the call ran, by internal call
+/// id, so the loop guard fingerprints the call that actually executed instead
+/// of the one the model proposed (mini-agent-sskdu.263).
+static EFFECTIVE_ARGS: std::sync::Mutex<VecDeque<(String, String)>> =
+    std::sync::Mutex::new(VecDeque::new());
+const EFFECTIVE_ARGS_MAX_ENTRIES: usize = 128;
+
+#[cfg(feature = "hooks")]
+pub(crate) fn record_effective_args(internal_call_id: &str, args: &str) {
+    let mut entries = EFFECTIVE_ARGS.lock().unwrap_or_else(|e| e.into_inner());
+    entries.retain(|(id, _)| id != internal_call_id);
+    entries.push_back((internal_call_id.to_owned(), args.to_owned()));
+    while entries.len() > EFFECTIVE_ARGS_MAX_ENTRIES {
+        entries.pop_front();
+    }
+}
+
+fn take_effective_args(internal_call_id: &str) -> Option<String> {
+    let mut entries = EFFECTIVE_ARGS.lock().unwrap_or_else(|e| e.into_inner());
+    let position = entries.iter().position(|(id, _)| id == internal_call_id)?;
+    entries.remove(position).map(|(_, args)| args)
 }
 
 /// The result a call produced before its batch settled, consuming it.
@@ -3813,6 +3848,13 @@ pub(crate) fn convert_history_prefix(
 /// in the prefix, or the prefix would not fit the summarizer's input budget.
 /// The caller still has to check the agent route (`supports_cache_fork`) and
 /// that no separate `compaction_model` is configured (mini-agent-o2nut).
+///
+/// Native Anthropic sessions are deliberately ineligible (mini-agent-sskdu.265):
+/// their requests replay signed thinking blocks from the native history, which
+/// the text projection used for this prefix cannot reproduce byte for byte, so a
+/// fork built from it would miss the cache it exists to reuse. The text
+/// summarizer is used instead; rebuilding the prefix from native frames is a
+/// separate feature.
 pub(crate) fn cache_fork_history(
     session: &Session,
     cut_idx: usize,
@@ -4410,13 +4452,72 @@ where
         .await
 }
 
+/// The images a tool result carries, as the transcript retains them. A `read`
+/// result whose image cannot be decoded is a hard error for the turn (the
+/// model would otherwise reason about a file it never saw); other tools keep
+/// their legacy text projection. One rule for the interactive loop, the
+/// headless loop and headless persistence (mini-agent-sskdu.101).
+pub(crate) fn tool_result_images(
+    tool_name: &str,
+    result: &ToolResult,
+) -> Result<Vec<crate::session::tool_image::PersistedToolImage>, &'static str> {
+    match crate::session::tool_image::from_result(result) {
+        Ok(images) => Ok(images),
+        Err(error) if tool_name == "read" => Err(error),
+        Err(_) => Ok(Vec::new()),
+    }
+}
+
+/// User-facing notices produced while a request round ran and not yet shown:
+/// images elided from the request, hook problems and language-server notices.
+/// Drained once per round by the interactive loop (as UI events) and the
+/// headless loop (on stderr), so neither surface leaves a queue growing
+/// unseen (mini-agent-sskdu.101).
+fn take_round_user_notices() -> Vec<String> {
+    #[cfg(feature = "hooks")]
+    let hook_notices = crate::extras::hooks::take_hook_problem_notices();
+    #[cfg(not(feature = "hooks"))]
+    let hook_notices: Vec<String> = Vec::new();
+    #[cfg(feature = "lsp")]
+    let hook_notices: Vec<String> = hook_notices
+        .into_iter()
+        .chain(crate::extras::lsp::take_user_notices())
+        .collect();
+    crate::agent::image_budget::take_notices()
+        .into_iter()
+        .chain(hook_notices)
+        .collect()
+}
+
+/// Whether `message` is an assistant message made only of reasoning blocks.
+fn is_thinking_only_assistant(message: &Message) -> bool {
+    match message {
+        Message::Assistant { content, .. } => content
+            .iter()
+            .all(|block| matches!(block, AssistantContent::Reasoning(_))),
+        _ => false,
+    }
+}
+
+/// A stream that died while a large tool call was still streaming leaves an
+/// assistant message whose only block is the completed thinking block.
+/// Anthropic-style APIs reject a replayed assistant turn that ends in thinking
+/// (and the thinking belongs to the abandoned attempt), so the continuation
+/// bridge drops such a trailing message (mini-agent-sskdu.261).
+fn without_thinking_only_tail(interactions: &[Message]) -> &[Message] {
+    match interactions.split_last() {
+        Some((last, rest)) if is_thinking_only_assistant(last) => rest,
+        _ => interactions,
+    }
+}
+
 fn normalized_continuation_bridge(
     completed_interactions: Vec<Message>,
     uncommitted_interactions: &[Message],
     continuation_instruction: &str,
 ) -> Vec<Message> {
     let mut bridge = completed_interactions;
-    bridge.extend_from_slice(uncommitted_interactions);
+    bridge.extend_from_slice(without_thinking_only_tail(uncommitted_interactions));
     // The continuation instruction stays its own trailing user message: the
     // OpenAI-family converters (chat completions, Responses, OpenRouter) drop
     // text parts that share a user message with tool results, so folding it into
@@ -5157,9 +5258,9 @@ where
                         let is_error = take_tool_failure(&internal_call_id);
                         // Delivered normally: the interrupt fallback is not needed.
                         let _ = take_settled_result(&internal_call_id);
-                        let images = match crate::session::tool_image::from_result(&tool_result) {
+                        let images = match tool_result_images(&tool_name, &tool_result) {
                             Ok(images) => images,
-                            Err(error) if tool_name == "read" => {
+                            Err(error) => {
                                 let _ = event_tx
                                     .send(AgentEvent::error_with(
                                         CompactString::from(error),
@@ -5168,8 +5269,6 @@ where
                                     .await;
                                 return;
                             }
-                            // Preserve legacy text projection of nonliteral remote image tools.
-                            Err(_) => Vec::new(),
                         };
                         // The notice precedes its result so the UI can render the
                         // diagnostic instead of the normal result view.
@@ -5229,19 +5328,7 @@ where
                         };
                         completed_interactions.extend(completed_delta);
                         // Tell the user when older images were left out of a request.
-                        #[cfg(feature = "hooks")]
-                        let hook_notices = crate::extras::hooks::take_hook_problem_notices();
-                        #[cfg(not(feature = "hooks"))]
-                        let hook_notices: Vec<String> = Vec::new();
-                        #[cfg(feature = "lsp")]
-                        let hook_notices: Vec<String> = hook_notices
-                            .into_iter()
-                            .chain(crate::extras::lsp::take_user_notices())
-                            .collect();
-                        for notice in crate::agent::image_budget::take_notices()
-                            .into_iter()
-                            .chain(hook_notices)
-                        {
+                        for notice in take_round_user_notices() {
                             tracing::warn!("{notice}");
                             let _ = event_tx
                                 .send(AgentEvent::OutputTruncated {
@@ -6251,6 +6338,11 @@ where
                         #[cfg(feature = "acp")]
                         crate::permission::ask::finish_tool_call(&name, &internal_call_id);
                         goal_report_accepted |= is_accepted_goal_report(&name, &output);
+                        // A `read` image that cannot be decoded ends the turn here, as
+                        // it does interactively, instead of failing at persistence.
+                        if let Err(error) = tool_result_images(&name, &tool_result) {
+                            fail_turn!(error);
+                        }
                         // Append the actual result before awaiting machine output;
                         // interruption must retain the successful tool transcript.
                         if let Some(mutations) = mutations
@@ -6330,7 +6422,7 @@ where
                         }
                         // Tell the operator when older images were left out of a
                         // request, as the interactive loop does (mini-agent-sskdu.93).
-                        for notice in crate::agent::image_budget::take_notices() {
+                        for notice in take_round_user_notices() {
                             tracing::warn!("{notice}");
                             if let Err(error) =
                                 crate::print::headless_stderr_async(format!("{notice}\n")).await
@@ -8352,6 +8444,56 @@ mod tests {
         assert_eq!(model.requests().len(), 2);
     }
 
+    /// A stream that dies after only a completed thinking block (a large
+    /// tool_use was still streaming) must not replay that thinking-only
+    /// assistant message in the retry request (mini-agent-sskdu.261).
+    #[tokio::test]
+    async fn mid_stream_retry_does_not_replay_a_thinking_only_assistant_message() {
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::reasoning("a long plan"),
+                MockStreamEvent::error("connection reset by peer"),
+            ],
+            vec![
+                MockStreamEvent::text("recovered"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .default_max_turns(3)
+            .build();
+        let mut runner = super::spawn_agent(
+            agent,
+            "start".to_string(),
+            Vec::new(),
+            immediate_retry_config(3),
+            None,
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+        loop {
+            match runner.event_rx.recv().await.expect("runner terminal event") {
+                crate::event::AgentEvent::Done { response, .. } => {
+                    assert_eq!(response, "recovered");
+                    break;
+                }
+                crate::event::AgentEvent::Error { message, .. } => {
+                    panic!("transient error was not recovered: {message}")
+                }
+                _ => {}
+            }
+        }
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        let replayed: Vec<Message> = requests[1].chat_history.iter().cloned().collect();
+        assert!(
+            !replayed.iter().any(super::is_thinking_only_assistant),
+            "retry replayed a thinking-only assistant message: {replayed:?}"
+        );
+    }
+
     #[tokio::test]
     async fn interactive_retries_transient_error_after_tool_without_repeating_tool() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -9895,8 +10037,55 @@ mod tests {
         turns
     }
 
+    /// The sixth identical unchanged read is answered with a notice the model
+    /// sees; the run continues to its answer instead of ending in an error.
     #[tokio::test]
-    async fn unchanged_successful_reads_preserve_last_result_then_stop_before_sixth_request() {
+    async fn sixth_unchanged_read_is_skipped_with_a_notice_and_the_run_continues() {
+        let model = MockCompletionModel::from_stream_turns(evidence_turns(6));
+        let executions = Arc::new(AtomicUsize::new(0));
+        let agent = AgentBuilder::new(model.clone())
+            .tool(ReadEvidenceProbe {
+                executions: executions.clone(),
+                outputs: vec!["retained fact"],
+            })
+            .add_hook(super::ToolLoopGuard)
+            .default_max_turns(8)
+            .build();
+        let (response, _, interactions) = super::run_print(
+            &agent,
+            "inspect evidence",
+            false,
+            &crate::retry::RetryConfig::default(),
+            None,
+            Vec::new(),
+            #[cfg(feature = "hooks")]
+            None,
+        )
+        .await
+        .expect("an unchanged-read loop must not end the run");
+        assert_eq!(response, "done");
+        assert_eq!(executions.load(Ordering::SeqCst), 5);
+        let results = tool_result_texts(&interactions);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|text| **text == "retained fact")
+                .count(),
+            5
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|text| text.contains(super::super::read_loop::UNCHANGED_READ_NOTICE))
+                .count(),
+            1
+        );
+    }
+
+    /// `job_status` polling between reads restarts the counters: the job may
+    /// have changed what the same read returns.
+    #[tokio::test]
+    async fn job_status_polling_resets_the_unchanged_read_counters() {
         let mut turns = evidence_turns(6);
         for (index, turn) in turns.iter_mut().take(6).enumerate() {
             turn.insert(
@@ -9911,7 +10100,7 @@ mod tests {
         let model = MockCompletionModel::from_stream_turns(turns);
         let executions = Arc::new(AtomicUsize::new(0));
         let polls = Arc::new(AtomicUsize::new(0));
-        let agent = AgentBuilder::new(model.clone())
+        let agent = AgentBuilder::new(model)
             .tool(PollingProbe(polls.clone()))
             .tool(ReadEvidenceProbe {
                 executions: executions.clone(),
@@ -9920,66 +10109,65 @@ mod tests {
             .add_hook(super::ToolLoopGuard)
             .default_max_turns(8)
             .build();
-        let mut runner = super::spawn_agent(
-            agent,
-            "inspect evidence".into(),
+        let (response, _, interactions) = super::run_print(
+            &agent,
+            "inspect evidence",
+            false,
+            &crate::retry::RetryConfig::default(),
+            None,
             Vec::new(),
-            crate::retry::RetryConfig::default(),
-            None,
-            #[cfg(feature = "skills")]
-            None,
             #[cfg(feature = "hooks")]
             None,
-        );
-        let mut outputs = Vec::new();
-        let mut stopped = false;
-        while let Some(event) = runner.event_rx.recv().await {
-            match event {
-                crate::event::AgentEvent::ToolResult {
-                    name,
-                    output,
-                    is_error,
-                    ..
-                } if name == ReadEvidenceProbe::NAME => {
-                    assert!(!is_error);
-                    outputs.push(output.to_string());
-                }
-                crate::event::AgentEvent::Error {
-                    message,
-                    interactions,
-                } => {
-                    assert_eq!(
-                        tool_result_texts(&interactions)
-                            .into_iter()
-                            .filter(|text| *text == "retained fact")
-                            .count(),
-                        5
-                    );
-                    assert!(
-                        message.contains(super::super::read_loop::STOP_REASON),
-                        "{message}"
-                    );
-                    stopped = true;
-                    break;
-                }
-                crate::event::AgentEvent::Retrying { .. } => {
-                    panic!("read-loop stops must never retry the provider")
-                }
-                crate::event::AgentEvent::Done { .. } => panic!("unchanged read loop must stop"),
-                _ => {}
-            }
-        }
-        assert!(stopped);
-        assert_eq!(executions.load(Ordering::SeqCst), 5);
-        assert_eq!(model.requests().len(), 5);
-        assert_eq!(outputs.len(), 5);
-        assert_eq!(polls.load(Ordering::SeqCst), 5);
+        )
+        .await
+        .unwrap();
+        assert_eq!(response, "done");
+        assert_eq!(executions.load(Ordering::SeqCst), 6);
         assert!(
-            outputs
+            tool_result_texts(&interactions)
                 .iter()
-                .all(|output| output.contains("retained fact"))
+                .all(|text| !text.contains(super::super::read_loop::UNCHANGED_READ_NOTICE))
         );
-        assert!(outputs.iter().all(|output| output == "retained fact"));
+    }
+
+    #[cfg(feature = "hooks")]
+    #[test]
+    fn rewritten_args_are_taken_once_for_the_loop_guard_fingerprint() {
+        super::record_effective_args("rewrite-id-1", r#"{"path":"effective"}"#);
+        let effective = super::take_effective_args("rewrite-id-1").unwrap();
+        assert_ne!(
+            super::tool_call_fingerprint("read", &effective),
+            super::tool_call_fingerprint("read", r#"{"path":"proposed"}"#)
+        );
+        assert!(super::take_effective_args("rewrite-id-1").is_none());
+    }
+
+    #[test]
+    fn continuation_bridge_drops_a_trailing_thinking_only_assistant_message() {
+        let thinking = Message::Assistant {
+            id: None,
+            content: OneOrMany::one(AssistantContent::Reasoning(rig::message::Reasoning::new(
+                "thought",
+            ))),
+        };
+        let bridge = super::normalized_continuation_bridge(
+            vec![Message::user("kept")],
+            &[Message::user("tool result stand-in"), thinking.clone()],
+            "continue",
+        );
+        assert_eq!(bridge.len(), 3);
+        assert!(!bridge.iter().any(super::is_thinking_only_assistant));
+        // Thinking followed by real content is a normal assistant turn.
+        let mixed = Message::Assistant {
+            id: None,
+            content: OneOrMany::many(vec![
+                AssistantContent::Reasoning(rig::message::Reasoning::new("thought")),
+                AssistantContent::text("answer"),
+            ])
+            .unwrap(),
+        };
+        let bridge = super::normalized_continuation_bridge(Vec::new(), &[mixed], "continue");
+        assert_eq!(bridge.len(), 2);
     }
 
     #[tokio::test]

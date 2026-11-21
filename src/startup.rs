@@ -933,6 +933,20 @@ async fn settle_headless_preparation_failure(
     }
 }
 
+#[cfg(feature = "memory")]
+tokio::task_local! {
+    /// The memory block the running headless turn was prepared with, so its
+    /// mid-turn context relief reserves for it exactly as the pre-turn
+    /// compaction did (mini-agent-sskdu.240).
+    static HEADLESS_RELIEF_MEMORY: Option<String>;
+}
+
+/// The memory block of the current headless turn, if one was scoped.
+#[cfg(feature = "memory")]
+fn headless_relief_memory() -> Option<String> {
+    HEADLESS_RELIEF_MEMORY.try_with(Clone::clone).ok().flatten()
+}
+
 async fn compact_headless_session_if_needed(
     session: &mut Session,
     client: &AnyClient,
@@ -3489,7 +3503,9 @@ impl Startup {
             // Construct the child in heap_future's short frame; Box::pin alone
             // still reserves its temporary in this parent poll frame. The
             // regression consumer uses the unchanged 1 MiB default stack.
-            let response_result = heap_future(|| {
+            #[cfg(feature = "memory")]
+            let relief_memory = self.context.memory.clone();
+            let rounds = heap_future(|| {
                 run_headless_goal_rounds(
                     &agent,
                     &mut self.session,
@@ -3508,8 +3524,11 @@ impl Startup {
                     #[cfg(feature = "hooks")]
                     false,
                 )
-            })
-            .await;
+            });
+            #[cfg(feature = "memory")]
+            let response_result = HEADLESS_RELIEF_MEMORY.scope(relief_memory, rounds).await;
+            #[cfg(not(feature = "memory"))]
+            let response_result = rounds.await;
             let mut response_result = response_result;
             // Schema HTTP runs before the measured large final persistence
             // frame is polled; effects, accounting and repair order are unchanged.
@@ -4628,12 +4647,14 @@ async fn relieve_native_headless_segment(
 ) -> anyhow::Result<NativeRelief> {
     let pending_tokens =
         Session::estimate_tokens(crate::agent::runner::HEADLESS_CONTEXT_RELIEF_PROMPT);
+    #[cfg(feature = "memory")]
+    let memory = headless_relief_memory();
     if headless_compaction_plan_with(
         session,
         cfg,
         pending_tokens,
         #[cfg(feature = "memory")]
-        None,
+        memory.as_deref(),
         true,
     )
     .is_none()
@@ -4652,7 +4673,7 @@ async fn relieve_native_headless_segment(
         client,
         cfg,
         #[cfg(feature = "memory")]
-        None,
+        memory.as_deref(),
         pending_tokens,
         cli.compact_instructions.as_deref(),
         true,
@@ -5145,7 +5166,7 @@ async fn run_headless_goal_rounds_inner(
                 &goal,
                 &round_interactions,
                 &driver::RoundCost {
-                    usage: turn.usage,
+                    usage: crate::extras::goal::driver::with_child_usage(&session.id, turn.usage),
                     active: round_elapsed,
                 },
                 turn.failure.as_ref(),
@@ -5516,13 +5537,15 @@ async fn run_relieved_headless_turn(
         async |session: &mut Session, pending_tokens| {
             let keep = cfg.resolve_keep_recent_tool_results();
             let before = session.cold_context_tokens_after_tool_result_pruning(keep);
+            #[cfg(feature = "memory")]
+            let memory = headless_relief_memory();
             let (usage, happened) = heap_future(|| {
                 compact_headless_session(
                     session,
                     client,
                     cfg,
                     #[cfg(feature = "memory")]
-                    None,
+                    memory.as_deref(),
                     pending_tokens,
                     cli.compact_instructions.as_deref(),
                     true,
@@ -7202,6 +7225,28 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(result.summary, "TEXT_SUMMARY");
+    }
+
+    /// Mid-turn relief reserves for the same memory block the pre-turn
+    /// compaction used (mini-agent-sskdu.240).
+    #[cfg(feature = "memory")]
+    #[tokio::test]
+    async fn headless_relief_sees_the_turns_memory_block() {
+        assert_eq!(super::headless_relief_memory(), None);
+        let scoped = super::HEADLESS_RELIEF_MEMORY
+            .scope(Some("remembered".to_string()), async {
+                super::headless_relief_memory()
+            })
+            .await;
+        assert_eq!(scoped.as_deref(), Some("remembered"));
+        let (mut session, cfg) = fork_test_session();
+        session.memory_placement = crate::session::MemoryPlacement::LegacySystem;
+        let plan = |memory: Option<&str>| {
+            super::headless_compaction_plan_with(&session, &cfg, 0, memory, true)
+                .unwrap()
+                .response_token_budget
+        };
+        assert!(plan(Some(&"m".repeat(400))) > plan(None));
     }
 
     #[test]

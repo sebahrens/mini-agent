@@ -857,6 +857,36 @@ mod tests {
         assert_eq!(summary.tokens_used, 5_600);
     }
 
+    /// Child usage recorded for a session is taken once, by the round that
+    /// settles next (mini-agent-sskdu.266).
+    #[cfg(feature = "subagents")]
+    #[test]
+    fn child_usage_is_taken_once_per_session() {
+        let usage = crate::event::UsageDelta {
+            input_tokens: 3_000,
+            output_tokens: 400,
+            ..crate::event::UsageDelta::default()
+        };
+        crate::extras::subagents::record_child_usage("goal-child-usage-a", usage);
+        crate::extras::subagents::record_child_usage("goal-child-usage-a", usage);
+        assert_eq!(
+            crate::extras::subagents::take_child_usage("goal-child-usage-b").input_tokens,
+            0
+        );
+        let mut collector = RoundCollector::new();
+        collector.add_usage(crate::extras::subagents::take_child_usage(
+            "goal-child-usage-a",
+        ));
+        assert_eq!(
+            collector.finish(&goal(), RoundEnd::Done, 0).tokens_used,
+            6_800
+        );
+        assert_eq!(
+            crate::extras::subagents::take_child_usage("goal-child-usage-a").input_tokens,
+            0
+        );
+    }
+
     #[test]
     fn a_streamed_error_makes_the_round_a_failure_even_when_the_stream_closes() {
         let mut collector = RoundCollector::new();
@@ -2261,6 +2291,37 @@ mod settle_tests {
 pub struct RoundCost {
     pub usage: rig::completion::Usage,
     pub active: Duration,
+}
+
+/// Usage of finished `task` children of `session_id` since the last round.
+#[cfg_attr(not(feature = "subagents"), allow(unused_variables))]
+pub fn child_usage_delta(session_id: &str) -> crate::event::UsageDelta {
+    #[cfg(feature = "subagents")]
+    {
+        crate::extras::subagents::take_child_usage(session_id)
+    }
+    #[cfg(not(feature = "subagents"))]
+    {
+        crate::event::UsageDelta::default()
+    }
+}
+
+/// `usage` plus the usage finished `task` children of `session_id` recorded
+/// since the last round, so headless and editor rounds count subagent work
+/// toward `max_tokens` (mini-agent-sskdu.266).
+#[cfg_attr(not(feature = "subagents"), allow(unused_variables))]
+pub fn with_child_usage(
+    session_id: &str,
+    mut usage: rig::completion::Usage,
+) -> rig::completion::Usage {
+    #[cfg(feature = "subagents")]
+    {
+        let child = crate::extras::subagents::take_child_usage(session_id);
+        usage.input_tokens = usage.input_tokens.saturating_add(child.input_tokens);
+        usage.output_tokens = usage.output_tokens.saturating_add(child.output_tokens);
+        usage.total_tokens = usage.total_tokens.saturating_add(child.total_tokens);
+    }
+    usage
 }
 
 pub fn summary_from_headless_turn(
