@@ -1026,11 +1026,21 @@ mod tests {
         // Keys every 200 ms for 2 s: every one is discarded.
         for _ in 0..10 {
             now += Duration::from_millis(200);
-            assert!(prompt_key_premature(&mut quiet_since, &key('y'), now, delay));
+            assert!(prompt_key_premature(
+                &mut quiet_since,
+                &key('y'),
+                now,
+                delay
+            ));
         }
         // After a 400 ms pause the next key answers.
         now += Duration::from_millis(400);
-        assert!(!prompt_key_premature(&mut quiet_since, &key('y'), now, delay));
+        assert!(!prompt_key_premature(
+            &mut quiet_since,
+            &key('y'),
+            now,
+            delay
+        ));
         // Esc is never premature and never restarts the window.
         let esc = UserEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         let mut fresh = now;

@@ -1242,7 +1242,7 @@ fn is_dot_entry(entry: &ignore::DirEntry, root: &Path) -> bool {
     // Regular dot-files at the root that the ignore rules did not exclude
     // (`.gitignore`, `.env.example`, `.gitlab-ci.yml`) are project files.
     let is_file = entry.file_type().is_some_and(|kind| kind.is_file());
-    !(is_file && !is_hidden_by_policy(&name))
+    !is_file || is_hidden_by_policy(&name)
 }
 
 /// Root dot-files the picker never lists: the repository marker, OS litter and
@@ -1251,7 +1251,10 @@ fn is_dot_entry(entry: &ignore::DirEntry, root: &Path) -> bool {
 fn is_hidden_by_policy(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     if let Some(suffix) = lower.strip_prefix(".env.") {
-        return !matches!(suffix, "example" | "sample" | "template" | "dist" | "defaults");
+        return !matches!(
+            suffix,
+            "example" | "sample" | "template" | "dist" | "defaults"
+        );
     }
     matches!(
         lower.as_str(),
@@ -1807,7 +1810,9 @@ mod cache_tests {
         }
         picker.select_next();
         let chosen = picker.matches[picker.selected].clone();
-        picker.file_cache.push(CacheEntry::new(PathBuf::from("ab"), false));
+        picker
+            .file_cache
+            .push(CacheEntry::new(PathBuf::from("ab"), false));
         let from = picker.file_cache.len() - 1;
         picker.filter_from(from);
         assert_eq!(picker.matches[0], PathBuf::from("ab"));

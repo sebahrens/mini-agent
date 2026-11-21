@@ -2227,16 +2227,18 @@ async fn nvnkx256_pasted_image_path_attaches_the_image_and_other_pastes_stay_tex
     let png = root.path().join("shot.png");
     std::fs::write(&png, clipboard_image::tests::png()).unwrap();
     std::fs::write(root.path().join("main.rs"), "fn main() {}").unwrap();
-    std::fs::write(outside.path().join("far.png"), clipboard_image::tests::png()).unwrap();
+    std::fs::write(
+        outside.path().join("far.png"),
+        clipboard_image::tests::png(),
+    )
+    .unwrap();
 
     macro_rules! paste {
-        ($app:expr, $text:expr) => {
-            drop(
-                crate::startup::heap_future(|| $app.handle_user_event(UserEvent::Paste($text)))
-                    .await
-                    .unwrap(),
-            )
-        };
+        ($app:expr, $text:expr) => {{
+            let _ = crate::startup::heap_future(|| $app.handle_user_event(UserEvent::Paste($text)))
+                .await
+                .unwrap();
+        }};
     }
     // The workspace image attaches and nothing reaches the draft.
     paste!(app, format!("{} ", png.display()));

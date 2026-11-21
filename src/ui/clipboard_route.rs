@@ -142,8 +142,7 @@ pub(crate) async fn copy_unix(text: &str) -> anyhow::Result<super::renderer::Cli
                 for &(program, args) in helpers {
                     let mut command = tokio::process::Command::new(program);
                     command.args(args);
-                    if run_clipboard_command(command, text, std::time::Duration::from_secs(2))
-                        .await
+                    if run_clipboard_command(command, text, std::time::Duration::from_secs(2)).await
                     {
                         remember(method);
                         return Ok(ClipboardCopyOutcome::Confirmed);
@@ -263,18 +262,11 @@ mod tests {
         let auto = ClipboardMode::Auto;
         assert_eq!(
             clipboard_route(env(false, false, auto)),
-            [
-                Helper,
-                Osc52 {
-                    passthrough: false
-                }
-            ]
+            [Helper, Osc52 { passthrough: false }]
         );
         assert_eq!(
             clipboard_route(env(true, false, auto)),
-            [Osc52 {
-                passthrough: false
-            }]
+            [Osc52 { passthrough: false }]
         );
         assert_eq!(
             clipboard_route(env(false, true, auto)),
@@ -294,9 +286,7 @@ mod tests {
         );
         assert_eq!(
             clipboard_route(env(false, false, ClipboardMode::Osc52)),
-            [Osc52 {
-                passthrough: false
-            }]
+            [Osc52 { passthrough: false }]
         );
         assert_eq!(
             clipboard_route(env(false, false, ClipboardMode::Tmux)),

@@ -2138,8 +2138,7 @@ impl<'a> App<'a> {
         let loaded = crate::agent::runner::spawn_blocking_scoped(move || {
             let mut attachment = crate::extras::multimodal::load_attachment(&canonical)
                 .map_err(|error| error.to_string())?;
-            crate::extras::multimodal::fit_image_attachment(&mut attachment)
-                .map(|_| attachment)
+            crate::extras::multimodal::fit_image_attachment(&mut attachment).map(|_| attachment)
         })
         .await
         .unwrap_or_else(|_| Err("image load job failed".to_owned()));
@@ -2208,14 +2207,15 @@ impl<'a> App<'a> {
         }
         match read_text().await {
             Ok(text) if text.is_empty() => {
-                self.renderer
-                    .show_notice("nothing to paste: the clipboard has no image or text", C_TOOL);
+                self.renderer.show_notice(
+                    "nothing to paste: the clipboard has no image or text",
+                    C_TOOL,
+                );
             }
             Ok(text) => self.input.handle_paste(text),
-            Err(error) => self.renderer.write_line(
-                &format!("paste from clipboard failed: {error}"),
-                C_ERROR,
-            )?,
+            Err(error) => self
+                .renderer
+                .write_line(&format!("paste from clipboard failed: {error}"), C_ERROR)?,
         }
         Ok(())
     }
@@ -3075,7 +3075,7 @@ impl<'a> App<'a> {
                             self.paste_clipboard_key(
                                 #[cfg(feature = "multimodal")]
                                 &super::clipboard_image::SystemClipboard,
-                                || read_from_clipboard(),
+                                read_from_clipboard,
                             )
                         })
                         .await?;

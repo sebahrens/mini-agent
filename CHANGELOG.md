@@ -17,6 +17,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Skills run with `/<name> args` now substitute `$ARGUMENTS`, `$ARGUMENTS[N]`, `$N` and `${CLAUDE_SKILL_DIR}`, rewrite ``!`cmd` `` spans into shell-tool instructions (`skills_shell_placeholders`), and honour `context: fork` with `agent:` by delegating the body to one `task` child (mini-agent-h7wxv).
 - Skill frontmatter `model` (forked skills; the `task` tool takes a per-call `model` limited to configured `[quick_models]` aliases and never overrides a persona-pinned model) and `paths` (automatic selection only when the request names a matching file); `effort` and `hooks` now report a reason (mini-agent-h7wxv).
 - `install.sh --uninstall` removes the binary and its `share/doc/mini-agent` directory (mini-agent-nvnkx.356).
+- Large pastes (more than 10 lines or 1,000 characters) become an atomic `[Pasted text #N +M lines]` chip in the prompt that the cursor steps over and Backspace removes whole; submit, history and the external editor use the full text (mini-agent-nvnkx.88).
+- `/vim` Normal mode: operators `d`/`c`/`y` with counts, motions (`w e b 0 ^ $ gg G f F t T`, `iw`/`aw`), `x X D C p P o O r ~` and `.` repeat of the last change (mini-agent-nvnkx.89).
+- Pasting or dragging an image file path into the prompt attaches the image as `/add <path>` would, when the permission policy allows reading it (mini-agent-nvnkx.256).
 
 ### Fixed
 
@@ -120,6 +123,19 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Exact-URL `web_fetch`/`web_search`/`fetch` allow and ask rules match the bare URL of a live fetch (mini-agent-nvnkx.66).
 - The destructive-command recognizer (yolo ask) knows cmd.exe and PowerShell forms such as `del /s /q`, `rd /s /q`, `Remove-Item -Recurse -Force`, and strips `cmd /c`, `call`, `start` and `powershell -Command` wrappers (mini-agent-nvnkx.362).
 - `guarded` auto-allows scripts proven read-only and withholds the built-in `cargo fmt/build/test/check/clippy` allows; `readonly` and `planwrite` allow proven read-only scripts when the sandbox is enforced (mini-agent-nvnkx.64).
+- The prompt editor moves and deletes by grapheme cluster: Backspace, Delete, Ctrl+D, the arrows and Vim `h`/`l`/`x` treat a ZWJ emoji family, a flag, a skin-tone emoji or a base letter with combining marks as one unit (mini-agent-nvnkx.85).
+- Ctrl+U and Ctrl+K kill to the start or end of the current line, and join lines at the edge, instead of clearing the whole draft (mini-agent-nvnkx.86).
+- Pasted tabs stay in the prompt text and reach the model byte for byte; the input box draws them as four columns (mini-agent-nvnkx.87).
+- Prompt undo is bound by default to Ctrl+_ (also Ctrl+/ and Ctrl+7) and snapshots are always recorded, one step per typed word (mini-agent-nvnkx.90).
+- The `@` file picker ranks matches (file-name matches first, fuzzy subsequences allowed, shorter paths first) instead of taking the first 50 substring hits, and lists root dot-files such as `.gitignore`, `.env.example` and `.gitlab-ci.yml` unless the ignore rules or the credential-file policy exclude them (mini-agent-nvnkx.251, .258).
+- Ctrl+R history search matches the whole entry rather than its first 200 characters, and long entries with equal previews stay distinct (mini-agent-nvnkx.259).
+- Permission, question and plan/git prompts arm only after a quiet period: every discarded key restarts the 350 ms window, so a user still typing a queued draft cannot answer them by accident (mini-agent-nvnkx.250).
+- A late OSC 11 background reply can no longer arrive as typed input: startup waits for the terminal's Primary Device Attributes answer instead of a fixed 150 ms (mini-agent-nvnkx.288).
+- An open picker is no longer drawn over a permission, question or chain prompt (mini-agent-nvnkx.260).
+- Input that starts with a file path (`/etc/hosts what is this?`, a dragged `/Users/me/x.png`) is a prompt, also while a turn runs, not an unknown slash command (mini-agent-nvnkx.254).
+- Ctrl+V with no clipboard image pastes the clipboard text (`pbpaste`, `wl-paste`, `xclip`) or says there is nothing to paste, instead of reporting an unavailable platform; a missing Linux image target is "no image" (mini-agent-nvnkx.255).
+- macOS and Windows clipboard image helpers accept PNGs up to the 24 MiB raw bound so large Retina screenshots reach the downscaler (mini-agent-nvnkx.249).
+- Copying selected text over SSH or inside tmux uses OSC 52 or `tmux load-buffer -w` instead of the remote machine's clipboard helpers, names the route in the notice, refuses payloads too large for OSC 52, and `MINI_AGENT_CLIPBOARD=auto|osc52|helper|tmux` overrides the choice (mini-agent-nvnkx.285).
 
 ### Added
 

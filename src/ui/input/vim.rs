@@ -841,10 +841,8 @@ impl InputEditor {
             _ => {
                 let target = self.vim_target(motion, count, true)?;
                 let (mut start, mut end) = (self.cursor.min(target), self.cursor.max(target));
-                let inclusive = matches!(
-                    motion,
-                    Motion::WordEnd | Motion::Find { forward: true, .. }
-                );
+                let inclusive =
+                    matches!(motion, Motion::WordEnd | Motion::Find { forward: true, .. });
                 if inclusive && end < buffer.len() {
                     end = self.next_boundary(end);
                 }
@@ -1027,19 +1025,31 @@ mod tests {
             VimAction::Consume
         );
         assert_eq!(state.label(), "vim:NORMAL");
-        assert_eq!(state.action(key('h')), VimAction::Move { motion: Motion::Left, count: 1 });
+        assert_eq!(
+            state.action(key('h')),
+            VimAction::Move {
+                motion: Motion::Left,
+                count: 1
+            }
+        );
         assert_eq!(state.action(key('d')), VimAction::Consume);
-        assert_eq!(state.action(key('h')), VimAction::Operate {
-            operator: Operator::Delete,
-            motion: Motion::Left,
-            count: 1,
-        });
+        assert_eq!(
+            state.action(key('h')),
+            VimAction::Operate {
+                operator: Operator::Delete,
+                motion: Motion::Left,
+                count: 1,
+            }
+        );
         assert_eq!(state.action(key('d')), VimAction::Consume);
-        assert_eq!(state.action(key('d')), VimAction::Operate {
-            operator: Operator::Delete,
-            motion: Motion::Line,
-            count: 1,
-        });
+        assert_eq!(
+            state.action(key('d')),
+            VimAction::Operate {
+                operator: Operator::Delete,
+                motion: Motion::Line,
+                count: 1,
+            }
+        );
         assert_eq!(state.action(key('i')), VimAction::Consume);
         assert_eq!(state.label(), "vim:INSERT");
     }

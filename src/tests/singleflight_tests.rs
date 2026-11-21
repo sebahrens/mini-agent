@@ -249,9 +249,19 @@ fn path_leading_input_is_a_prompt_not_a_command() {
         "/~/notes why",
     ] {
         assert!(!is_slash_command_text(text), "{text}");
-        assert_eq!(classify_submission(true, text), SubmitAction::Queue, "{text}");
+        assert_eq!(
+            classify_submission(true, text),
+            SubmitAction::Queue,
+            "{text}"
+        );
     }
-    for text in ["/hepl", "/help keys", "/", "/frontend:component arg", "  /model x"] {
+    for text in [
+        "/hepl",
+        "/help keys",
+        "/",
+        "/frontend:component arg",
+        "  /model x",
+    ] {
         assert!(is_slash_command_text(text), "{text}");
     }
     assert_eq!(

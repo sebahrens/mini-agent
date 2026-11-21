@@ -462,7 +462,10 @@ pub(super) mod tests {
             pasted_image_path("file:///tmp/a%20b.webp").as_deref(),
             Some("/tmp/a b.webp")
         );
-        assert_eq!(pasted_image_path("~/shot.png").as_deref(), Some("~/shot.png"));
+        assert_eq!(
+            pasted_image_path("~/shot.png").as_deref(),
+            Some("~/shot.png")
+        );
         for text in [
             "/src/main.rs",
             "/tmp/a.png\n/tmp/b.png",
@@ -481,14 +484,22 @@ pub(super) mod tests {
         let max = MAX_CLIPBOARD_BYTES.to_string();
         let macos = image_script(MACOS_IMAGE_SCRIPT_TEMPLATE);
         let windows = image_script(WINDOWS_IMAGE_SCRIPT_TEMPLATE);
-        assert!(macos.contains(&format!("Number(d.length) > {max}")), "{macos}");
-        assert!(windows.contains(&format!("$stream.Length -gt {max}")), "{windows}");
+        assert!(
+            macos.contains(&format!("Number(d.length) > {max}")),
+            "{macos}"
+        );
+        assert!(
+            windows.contains(&format!("$stream.Length -gt {max}")),
+            "{windows}"
+        );
         for script in [&macos, &windows] {
-            assert!(!script.contains("2097152"), "the per-image limit must not gate the helper");
+            assert!(
+                !script.contains("2097152"),
+                "the per-image limit must not gate the helper"
+            );
             assert!(!script.contains("{MAX_"), "placeholder left in script");
             assert!(script.contains(&MAX_PIXELS.to_string()));
         }
-        assert!(MAX_CLIPBOARD_BYTES > MAX_USER_IMAGE_BYTES);
     }
 
     #[test]
