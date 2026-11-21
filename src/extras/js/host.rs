@@ -31,10 +31,10 @@ use crate::agent::tools::grep::{GrepTool, truncate_output_line};
 #[cfg(any(test, feature = "skills"))]
 use crate::extras::js::broker::GrantPrincipal;
 use crate::extras::js::broker::{
-    AuthorizedEffect, AuthorizedTarget, ExecutablePreparationControl,
+    AuthorizedEffect, AuthorizedTarget, BatchExecution, ExecutablePreparationControl,
     ExecutablePreparationWaitError, HostEffectError, NormalizedTarget, ParentEffectFuture,
-    ParentEffectService, SpawnExecutableIdentity, resolve_program_identity_controlled,
-    run_executable_preparation,
+    ParentEffectService, PreparedEffect, SpawnExecutableIdentity,
+    resolve_program_identity_controlled, run_executable_preparation,
 };
 #[cfg(target_os = "linux")]
 use crate::extras::js::broker::{
@@ -42,6 +42,7 @@ use crate::extras::js::broker::{
     resolve_program_identity_unhashed_controlled,
 };
 use crate::extras::js::protocol::{
+    CALL_TOOL_ARGUMENTS_MAX_BYTES, CALL_TOOL_NAME_MAX_BYTES, CALL_TOOL_RESULT_MAX_BYTES,
     DirectoryEntry, DirectoryEntryKind, EffectOperation, EffectResult, GrepMatch, GrepOptions,
     GrepSkipped, SpawnOptions,
 };
@@ -56,6 +57,7 @@ use crate::extras::js::skills::proposal::{
 #[cfg(all(feature = "skills", test))]
 use crate::extras::js::skills::proposal::{ProposalError, ProposalHost};
 use crate::extras::js::tool::{PermissionBridge, PermissionBridgeError};
+use crate::extras::js::tool_bridge::{ToolAccess, ToolBridge, ToolInvokeFailure};
 use crate::extras::js::types::PermCancellation;
 #[cfg(any(feature = "sandbox", test))]
 use crate::extras::js::types::STEP_TIMEOUT;
@@ -154,6 +156,18 @@ enum PathPolicy {
     Unrestricted,
 }
 
+/// What a file policy lets the model do, for the tool description (mini-agent-nvnkx.115).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FilePolicySummary {
+    /// Every call fails: no roots configured, or the configuration is invalid.
+    Disabled {
+        invalid: bool,
+    },
+    Unrestricted,
+    /// Allowed roots, relative to the workspace when inside it.
+    Roots(Vec<String>),
+}
+
 /// Canonical, component-aware narrowing policy for the JS file host globals.
 ///
 /// Relative configured roots are resolved against `base`, which is captured
@@ -227,6 +241,37 @@ impl AllowConfig {
         }
         self.workspace_binding = Some(workspace);
         self
+    }
+
+    pub(crate) fn read_summary(&self) -> FilePolicySummary {
+        self.summarize(&self.read)
+    }
+
+    pub(crate) fn write_summary(&self) -> FilePolicySummary {
+        self.summarize(&self.write)
+    }
+
+    fn summarize(&self, policy: &PathPolicy) -> FilePolicySummary {
+        match policy {
+            PathPolicy::Deny(reason) => FilePolicySummary::Disabled {
+                invalid: !matches!(reason, AllowPolicyReason::NoConfiguredRoots(_)),
+            },
+            PathPolicy::Unrestricted => FilePolicySummary::Unrestricted,
+            PathPolicy::Roots(roots) => {
+                let base = self.effect_base();
+                let base = std::fs::canonicalize(&base).unwrap_or(base);
+                FilePolicySummary::Roots(
+                    roots
+                        .iter()
+                        .map(|root| match root.strip_prefix(&base) {
+                            Ok(relative) if relative.as_os_str().is_empty() => ".".to_string(),
+                            Ok(relative) => relative.display().to_string(),
+                            Err(_) => root.display().to_string(),
+                        })
+                        .collect(),
+                )
+            }
+        }
     }
 
     fn effect_base(&self) -> PathBuf {
@@ -4084,7 +4129,86 @@ fn execute_discovery(
     }
 }
 
+/// Concurrent items a batch effect runs at once.
+pub(crate) const BATCH_PARALLELISM: usize = 4;
+
+/// The brokered `call_tool` effect: dispatches one read-only tool through the agent's tool
+/// server, bound late through a [`ToolBridge`].
+pub(crate) struct CallToolEffectService {
+    bridge: ToolBridge,
+    timeout: Duration,
+}
+
+impl CallToolEffectService {
+    pub(crate) fn new(bridge: ToolBridge, timeout: Duration) -> Self {
+        Self { bridge, timeout }
+    }
+
+    /// `None` until the agent builder has bound the tool server.
+    fn classify(&self, name: &str) -> Option<ToolAccess> {
+        self.bridge.invoker().map(|invoker| invoker.classify(name))
+    }
+
+    async fn call(
+        &self,
+        name: &str,
+        arguments_json: &str,
+        cancellation: PermCancellation,
+    ) -> Result<EffectResult, HostEffectError> {
+        let invoker = self
+            .bridge
+            .invoker()
+            .ok_or(HostEffectError::BackendFailure)?;
+        // Re-check at execution: the registered set may have changed since validation.
+        if invoker.classify(name) != ToolAccess::Allowed {
+            return Err(HostEffectError::TargetDenied);
+        }
+        let outcome = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Err(HostEffectError::InvocationCancelled),
+            result = timeout(self.timeout, invoker.invoke(name, arguments_json)) => {
+                result.map_err(|_| HostEffectError::EffectTimedOut)?
+            }
+        };
+        let (ok, text) = match outcome {
+            Ok(text) => (true, text),
+            Err(ToolInvokeFailure::Failed(message)) => (false, message),
+            Err(ToolInvokeFailure::Retired) => return Err(HostEffectError::BackendFailure),
+        };
+        let (clipped, truncated) =
+            crate::byte_text::clip_to_bytes(&text, CALL_TOOL_RESULT_MAX_BYTES);
+        Ok(EffectResult::CallTool {
+            ok,
+            text: clipped.to_owned(),
+            truncated,
+        })
+    }
+}
+
+/// Shape checks for a `call_tool` request, shared by the worker-facing validation.
+fn validate_call_tool_request(name: &str, arguments_json: &str) -> Result<(), HostEffectError> {
+    if name.is_empty()
+        || name.len() > CALL_TOOL_NAME_MAX_BYTES
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+    {
+        return Err(HostEffectError::InvalidTarget);
+    }
+    if arguments_json.len() > CALL_TOOL_ARGUMENTS_MAX_BYTES {
+        return Err(HostEffectError::OutputLimit);
+    }
+    match serde_json::from_str::<serde_json::Value>(arguments_json) {
+        Ok(serde_json::Value::Object(_)) => Ok(()),
+        _ => Err(HostEffectError::InvalidTarget),
+    }
+}
+
 enum PreparedParentEffect {
+    CallTool {
+        name: String,
+        arguments_json: String,
+    },
     Read(PreparedReadEffect),
     ReadMany(Vec<PreparedReadEffect>),
     Discovery(PreparedDiscoveryEffect),
@@ -4102,6 +4226,10 @@ enum PreparedParentEffect {
     ScratchGet {
         key: String,
     },
+    ScratchDelete {
+        key: String,
+    },
+    ScratchKeys,
     Spawn(PreparedSpawnEffect),
     #[cfg(feature = "sandbox")]
     Fetch(PreparedFetchEffect),
@@ -4116,10 +4244,34 @@ enum PreparedParentEffect {
     Proposal(PreparedProposalEffect),
 }
 
+/// Canonical text of the working directory and environment a spawn asked for; `None` when it set
+/// neither. The audit only ever stores a keyed digest of it (mini-agent-nvnkx.328).
+fn spawn_options_fingerprint(options: &SpawnOptions) -> Option<String> {
+    if options.cwd.is_none() && options.env.is_empty() {
+        return None;
+    }
+    let mut env: Vec<_> = options
+        .env
+        .iter()
+        .map(|variable| (variable.name.as_str(), variable.value.as_str()))
+        .collect();
+    env.sort_unstable();
+    let mut text = format!("cwd={}", options.cwd.as_deref().unwrap_or(""));
+    for (name, value) in env {
+        text.push('\0');
+        text.push_str(name);
+        text.push('=');
+        text.push_str(value);
+    }
+    Some(text)
+}
+
 fn session_state_error(error: SessionStateError) -> HostEffectError {
     match error {
         SessionStateError::Invalid => HostEffectError::InvalidTarget,
         SessionStateError::TooLarge => HostEffectError::OutputLimit,
+        SessionStateError::EntryLimit => HostEffectError::ScratchEntryLimit,
+        SessionStateError::TotalBytesLimit => HostEffectError::ScratchByteLimit,
         SessionStateError::Unavailable => HostEffectError::BackendFailure,
     }
 }
@@ -4328,6 +4480,7 @@ pub(crate) struct ParentHostEffectService {
     file: FileEffectService,
     spawn: SpawnEffectService,
     scratch: ScratchStore,
+    call_tool: Option<CallToolEffectService>,
     #[cfg(feature = "sandbox")]
     fetch: Option<FetchEffectService>,
     #[cfg(feature = "skills")]
@@ -4344,6 +4497,7 @@ impl ParentHostEffectService {
             file,
             spawn,
             scratch: ScratchStore::default(),
+            call_tool: None,
             #[cfg(feature = "sandbox")]
             fetch: None,
             #[cfg(feature = "skills")]
@@ -4355,6 +4509,11 @@ impl ParentHostEffectService {
 
     pub(crate) fn with_scratch_store(mut self, scratch: ScratchStore) -> Self {
         self.scratch = scratch;
+        self
+    }
+
+    pub(crate) fn with_call_tool(mut self, service: CallToolEffectService) -> Self {
+        self.call_tool = Some(service);
         self
     }
 
@@ -4378,15 +4537,19 @@ impl ParentHostEffectService {
 #[cfg(feature = "hooks")]
 fn brokered_hook_gates(
     operation: &EffectOperation,
-) -> Option<Vec<(&'static str, serde_json::Value)>> {
+) -> Option<Vec<(std::borrow::Cow<'static, str>, serde_json::Value)>> {
+    use std::borrow::Cow;
     match operation {
         EffectOperation::WriteFile { path, content } => Some(vec![(
-            "write",
+            Cow::Borrowed("write"),
             serde_json::json!({ "path": path, "content": content }),
         )]),
-        EffectOperation::Fetch { url, .. } => {
-            Some(vec![("web_fetch", serde_json::json!({ "url": url }))])
-        }
+        EffectOperation::Fetch { url, .. } => Some(vec![(
+            Cow::Borrowed("web_fetch"),
+            serde_json::json!({ "url": url }),
+        )]),
+        // `call_tool` is not gated here: it dispatches through the agent's tool server, whose
+        // tools already run the PreToolUse/PostToolUse hooks exactly as for a model-issued call.
         EffectOperation::Spawn {
             program,
             arguments,
@@ -4409,8 +4572,11 @@ fn brokered_hook_gates(
                 spawn_policy_input_with(program, arguments, options)
             };
             Some(vec![
-                ("js_spawn", js_spawn),
-                ("bash", serde_json::json!({ "command": command })),
+                (Cow::Borrowed("js_spawn"), js_spawn),
+                (
+                    Cow::Borrowed("bash"),
+                    serde_json::json!({ "command": command }),
+                ),
             ])
         }
         _ => None,
@@ -4428,15 +4594,15 @@ async fn gate_brokered_effect_with_hooks(
         return Ok(());
     };
     for (tool, original) in gates {
-        let gated = crate::extras::hooks::gate_brokered_pre_tool_use(tool, original.clone())
+        let gated = crate::extras::hooks::gate_brokered_pre_tool_use(&tool, original.clone())
             .await
             .map_err(|reason| {
-                tracing::warn!(reason, tool, "hooks: brokered effect blocked by PreToolUse");
+                tracing::warn!(reason, %tool, "hooks: brokered effect blocked by PreToolUse");
                 HostEffectError::PermissionDenied
             })?;
         if gated != original {
             tracing::warn!(
-                tool,
+                %tool,
                 "hooks: brokered effect rewrite rejected because the grant is bound to the original target"
             );
             return Err(HostEffectError::InvalidTarget);
@@ -4471,7 +4637,170 @@ async fn dispatch_brokered_post_hooks(
         Ok(_) => Ok("completed".to_owned()),
         Err(error) => Err(format!("brokered effect failed: {error:?}")),
     };
-    crate::extras::hooks::dispatch_brokered_post_tool_use(tool, input, outcome).await;
+    crate::extras::hooks::dispatch_brokered_post_tool_use(&tool, input, outcome).await;
+}
+
+impl ParentHostEffectService {
+    /// Runs one authorized, prepared effect. It only borrows the service immutably, so a batch
+    /// can run several at once.
+    async fn run_prepared(
+        &self,
+        prepared: PreparedParentEffect,
+        operation: &EffectOperation,
+        cancellation: PermCancellation,
+    ) -> Result<EffectResult, HostEffectError> {
+        match prepared {
+            PreparedParentEffect::Read(target) => {
+                let bridge = self.file.permission_bridge.for_host_call(cancellation);
+                if let EffectOperation::ReadLines { from, count, .. } = operation {
+                    let (lines, eof) = self
+                        .file
+                        .execute_read_lines(target, *from, *count, bridge)
+                        .await
+                        .map_err(HostEffectError::from)?;
+                    return Ok(EffectResult::ReadLines { lines, eof });
+                }
+                let content = self
+                    .file
+                    .execute_read(target, bridge)
+                    .await
+                    .map_err(HostEffectError::from)?;
+                Ok(EffectResult::ReadFile { content })
+            }
+            PreparedParentEffect::ReadMany(targets) => {
+                let bridge = self.file.permission_bridge.for_host_call(cancellation);
+                let mut contents = Vec::with_capacity(targets.len());
+                let mut encoded_bytes = 2usize;
+                for (index, target) in targets.into_iter().enumerate() {
+                    let index = index as u32;
+                    let content = match self.file.execute_read(target, bridge.clone()).await {
+                        Ok(content) => content,
+                        Err(error) => return read_files_item_failure(error, index),
+                    };
+                    let item_bytes =
+                        json_encoded_len(&content).map_err(|_| HostEffectError::BackendFailure)?;
+                    encoded_bytes = encoded_bytes
+                        .checked_add(item_bytes)
+                        .and_then(|bytes| bytes.checked_add(usize::from(!contents.is_empty())))
+                        .ok_or(HostEffectError::OutputLimit)?;
+                    if encoded_bytes > READ_FILES_MAX_RESULT_BYTES {
+                        // `index` leading items fit within the aggregate cap.
+                        return read_files_item_failure(EffectServiceError::OutputLimit, index);
+                    }
+                    contents.push(content);
+                }
+                Ok(EffectResult::ReadFiles { contents })
+            }
+            PreparedParentEffect::Discovery(target) => {
+                let deadline = Instant::now()
+                    .checked_add(self.file.timeout)
+                    .ok_or(HostEffectError::EffectTimedOut)?;
+                run_executable_preparation(deadline, cancellation, move |control| {
+                    execute_discovery(target, &control)
+                })
+                .await
+                .map_err(executable_preparation_service_error)
+                .map_err(HostEffectError::from)?
+                .map_err(HostEffectError::from)
+            }
+            PreparedParentEffect::Write { target, content } => {
+                let bridge = self.file.permission_bridge.for_host_call(cancellation);
+                self.file
+                    .execute_write(target, content, bridge)
+                    .await
+                    .map_err(HostEffectError::from)?;
+                Ok(EffectResult::WriteFile)
+            }
+            PreparedParentEffect::Result { json } => Ok(EffectResult::ResultAccepted { json }),
+            PreparedParentEffect::ScratchPut { key, json } => {
+                self.scratch.put(key, json).map_err(session_state_error)?;
+                Ok(EffectResult::ScratchPut)
+            }
+            PreparedParentEffect::ScratchGet { key } => Ok(EffectResult::ScratchGet {
+                json: self.scratch.get(&key).map_err(session_state_error)?,
+            }),
+            PreparedParentEffect::ScratchDelete { key } => Ok(EffectResult::ScratchDelete {
+                existed: self.scratch.delete(&key).map_err(session_state_error)?,
+            }),
+            PreparedParentEffect::ScratchKeys => Ok(EffectResult::ScratchKeys {
+                keys: self.scratch.keys().map_err(session_state_error)?,
+            }),
+            PreparedParentEffect::CallTool {
+                name,
+                arguments_json,
+            } => {
+                self.call_tool
+                    .as_ref()
+                    .ok_or(HostEffectError::BackendFailure)?
+                    .call(&name, &arguments_json, cancellation)
+                    .await
+            }
+            PreparedParentEffect::Spawn(target) => {
+                let bridge = self.spawn.permission_bridge.for_host_call(cancellation);
+                let result = self
+                    .spawn
+                    .execute_prepared(target, bridge)
+                    .await
+                    .map_err(HostEffectError::from)?;
+                Ok(EffectResult::Spawn {
+                    stdout: result.stdout,
+                    stderr: result.stderr,
+                    exit_code: result.code,
+                    timed_out: result.timed_out,
+                    stdout_truncated: result.stdout_truncated,
+                    stderr_truncated: result.stderr_truncated,
+                    signal: result.signal,
+                })
+            }
+            #[cfg(feature = "sandbox")]
+            PreparedParentEffect::Fetch(target) => {
+                let fetch = self.fetch.as_ref().ok_or(HostEffectError::BackendFailure)?;
+                let result = fetch
+                    .execute_prepared(target, cancellation)
+                    .await
+                    .map_err(|error| HostEffectError::from(fetch_service_error(&error)))?;
+                Ok(EffectResult::Fetch {
+                    status: result.status,
+                    body: result.text,
+                    truncated: result.truncated,
+                    lossy: result.lossy,
+                    location: result.location,
+                })
+            }
+            #[cfg(feature = "sandbox")]
+            PreparedParentEffect::FetchPending { .. } => Err(HostEffectError::BackendFailure),
+            #[cfg(feature = "skills")]
+            PreparedParentEffect::Proposal(prepared) => {
+                let proposal = self
+                    .proposal
+                    .as_ref()
+                    .ok_or(HostEffectError::BackendFailure)?;
+                let result = proposal
+                    .execute_prepared_cancellable(prepared, cancellation)
+                    .await
+                    .map_err(HostEffectError::from)?;
+                Ok(EffectResult::ProposalAccepted {
+                    skill_id: result.skill_id,
+                    proposal_id: result.proposal_id,
+                    status: result.status,
+                    report_id: result.report_id,
+                })
+            }
+        }
+    }
+
+    /// [`Self::run_prepared`] followed by the observation-only PostToolUse hooks.
+    async fn run_prepared_with_hooks(
+        &self,
+        prepared: PreparedParentEffect,
+        operation: &EffectOperation,
+        cancellation: PermCancellation,
+    ) -> Result<EffectResult, HostEffectError> {
+        let result = self.run_prepared(prepared, operation, cancellation).await;
+        #[cfg(feature = "hooks")]
+        dispatch_brokered_post_hooks(operation, &result).await;
+        result
+    }
 }
 
 impl ParentEffectService for ParentHostEffectService {
@@ -4583,6 +4912,35 @@ impl ParentEffectService for ParentHostEffectService {
                 self.validated = Some(PreparedParentEffect::ScratchGet { key: key.clone() });
                 Ok(())
             }
+            EffectOperation::ScratchDelete { key } => {
+                validate_scratch_key(key).map_err(session_state_error)?;
+                self.validated = Some(PreparedParentEffect::ScratchDelete { key: key.clone() });
+                Ok(())
+            }
+            EffectOperation::ScratchKeys => {
+                self.validated = Some(PreparedParentEffect::ScratchKeys);
+                Ok(())
+            }
+            EffectOperation::CallTool {
+                name,
+                arguments_json,
+            } => {
+                validate_call_tool_request(name, arguments_json)?;
+                match self
+                    .call_tool
+                    .as_ref()
+                    .and_then(|service| service.classify(name))
+                {
+                    Some(ToolAccess::Unknown) => return Err(HostEffectError::NotFound),
+                    Some(ToolAccess::NotReadOnly) => return Err(HostEffectError::TargetDenied),
+                    Some(ToolAccess::Allowed) | None => {}
+                }
+                self.validated = Some(PreparedParentEffect::CallTool {
+                    name: name.clone(),
+                    arguments_json: arguments_json.clone(),
+                });
+                Ok(())
+            }
             EffectOperation::Spawn {
                 program,
                 arguments,
@@ -4674,6 +5032,14 @@ impl ParentEffectService for ParentHostEffectService {
             }
             #[cfg(not(feature = "skills"))]
             EffectOperation::ProposeSkill { .. } => Err(HostEffectError::BackendFailure),
+            EffectOperation::CallTool { .. }
+                if self
+                    .call_tool
+                    .as_ref()
+                    .is_none_or(|service| service.classify("").is_none()) =>
+            {
+                Err(HostEffectError::BackendFailure)
+            }
             _ => Ok(()),
         }
     }
@@ -4721,6 +5087,9 @@ impl ParentEffectService for ParentHostEffectService {
                     | EffectOperation::Result { .. }
                     | EffectOperation::ScratchPut { .. }
                     | EffectOperation::ScratchGet { .. }
+                    | EffectOperation::ScratchDelete { .. }
+                    | EffectOperation::ScratchKeys
+                    | EffectOperation::CallTool { .. }
             ) {
                 self.validated = None;
             }
@@ -4862,12 +5231,16 @@ impl ParentEffectService for ParentHostEffectService {
                 EffectOperation::Result { .. }
                 | EffectOperation::ScratchPut { .. }
                 | EffectOperation::ScratchGet { .. }
+                | EffectOperation::ScratchDelete { .. }
+                | EffectOperation::ScratchKeys
                     if matches!(
                         self.validated.as_ref(),
                         Some(
                             PreparedParentEffect::Result { .. }
                                 | PreparedParentEffect::ScratchPut { .. }
                                 | PreparedParentEffect::ScratchGet { .. }
+                                | PreparedParentEffect::ScratchDelete { .. }
+                                | PreparedParentEffect::ScratchKeys
                         )
                     ) =>
                 {
@@ -4875,7 +5248,18 @@ impl ParentEffectService for ParentHostEffectService {
                 }
                 EffectOperation::Result { .. }
                 | EffectOperation::ScratchPut { .. }
-                | EffectOperation::ScratchGet { .. } => Err(HostEffectError::BackendFailure),
+                | EffectOperation::ScratchGet { .. }
+                | EffectOperation::ScratchDelete { .. }
+                | EffectOperation::ScratchKeys => Err(HostEffectError::BackendFailure),
+                EffectOperation::CallTool { .. }
+                    if matches!(
+                        self.validated.as_ref(),
+                        Some(PreparedParentEffect::CallTool { .. })
+                    ) =>
+                {
+                    Ok(NormalizedTarget::CallTool)
+                }
+                EffectOperation::CallTool { .. } => Err(HostEffectError::BackendFailure),
                 EffectOperation::Spawn {
                     program,
                     arguments,
@@ -4965,6 +5349,10 @@ impl ParentEffectService for ParentHostEffectService {
                     Ok(NormalizedTarget::ProposeSkill)
                 }
                 EffectOperation::ProposeSkill { .. } => Err(HostEffectError::BackendFailure),
+                // The broker expands a batch into its items before the service sees any of them.
+                EffectOperation::FetchAll { .. } | EffectOperation::SpawnAll { .. } => {
+                    Err(HostEffectError::BackendFailure)
+                }
             }
         })
     }
@@ -5155,6 +5543,32 @@ impl ParentEffectService for ParentHostEffectService {
                         encoded_bytes: 0,
                     },
                 ),
+                PreparedParentEffect::ScratchDelete { key } => (
+                    PreparedParentEffect::ScratchDelete { key: key.clone() },
+                    AuthorizedTarget::SessionState {
+                        operation: "scratch_delete",
+                        key: Some(key),
+                        encoded_bytes: 0,
+                    },
+                ),
+                PreparedParentEffect::ScratchKeys => (
+                    PreparedParentEffect::ScratchKeys,
+                    AuthorizedTarget::SessionState {
+                        operation: "scratch_keys",
+                        key: None,
+                        encoded_bytes: 0,
+                    },
+                ),
+                PreparedParentEffect::CallTool {
+                    name,
+                    arguments_json,
+                } => (
+                    PreparedParentEffect::CallTool {
+                        name: name.clone(),
+                        arguments_json,
+                    },
+                    AuthorizedTarget::CallTool { tool_name: name },
+                ),
                 PreparedParentEffect::Spawn(target) => {
                     if self.spawn.sandbox.policy() == SandboxPolicy::RequiredButUnavailable {
                         return Err(HostEffectError::BackendFailure);
@@ -5163,10 +5577,12 @@ impl ParentEffectService for ParentHostEffectService {
                     // identity) captured after the raw operation passed permission policy.
                     target.revalidate().map_err(HostEffectError::from)?;
                     let resolved_executable = target.executable.canonical_path().to_string();
+                    let options_fingerprint = spawn_options_fingerprint(&target.options);
                     (
                         PreparedParentEffect::Spawn(target),
                         AuthorizedTarget::Spawn {
                             resolved_executable,
+                            options_fingerprint,
                         },
                     )
                 }
@@ -5221,143 +5637,48 @@ impl ParentEffectService for ParentHostEffectService {
                     .authorized
                     .take()
                     .ok_or(HostEffectError::BackendFailure)?;
-                match prepared {
-                    PreparedParentEffect::Read(target) => {
-                        let bridge = self.file.permission_bridge.for_host_call(cancellation);
-                        if let EffectOperation::ReadLines { from, count, .. } = operation {
-                            let (lines, eof) = self
-                                .file
-                                .execute_read_lines(target, *from, *count, bridge)
-                                .await
-                                .map_err(HostEffectError::from)?;
-                            return Ok(EffectResult::ReadLines { lines, eof });
-                        }
-                        let content = self
-                            .file
-                            .execute_read(target, bridge)
-                            .await
-                            .map_err(HostEffectError::from)?;
-                        Ok(EffectResult::ReadFile { content })
-                    }
-                    PreparedParentEffect::ReadMany(targets) => {
-                        let bridge = self.file.permission_bridge.for_host_call(cancellation);
-                        let mut contents = Vec::with_capacity(targets.len());
-                        let mut encoded_bytes = 2usize;
-                        for (index, target) in targets.into_iter().enumerate() {
-                            let index = index as u32;
-                            let content = match self.file.execute_read(target, bridge.clone()).await
-                            {
-                                Ok(content) => content,
-                                Err(error) => return read_files_item_failure(error, index),
-                            };
-                            let item_bytes = json_encoded_len(&content)
-                                .map_err(|_| HostEffectError::BackendFailure)?;
-                            encoded_bytes = encoded_bytes
-                                .checked_add(item_bytes)
-                                .and_then(|bytes| {
-                                    bytes.checked_add(usize::from(!contents.is_empty()))
-                                })
-                                .ok_or(HostEffectError::OutputLimit)?;
-                            if encoded_bytes > READ_FILES_MAX_RESULT_BYTES {
-                                // `index` leading items fit within the aggregate cap.
-                                return read_files_item_failure(
-                                    EffectServiceError::OutputLimit,
-                                    index,
-                                );
-                            }
-                            contents.push(content);
-                        }
-                        Ok(EffectResult::ReadFiles { contents })
-                    }
-                    PreparedParentEffect::Discovery(target) => {
-                        let deadline = Instant::now()
-                            .checked_add(self.file.timeout)
-                            .ok_or(HostEffectError::EffectTimedOut)?;
-                        run_executable_preparation(deadline, cancellation, move |control| {
-                            execute_discovery(target, &control)
-                        })
-                        .await
-                        .map_err(executable_preparation_service_error)
-                        .map_err(HostEffectError::from)?
-                        .map_err(HostEffectError::from)
-                    }
-                    PreparedParentEffect::Write { target, content } => {
-                        let bridge = self.file.permission_bridge.for_host_call(cancellation);
-                        self.file
-                            .execute_write(target, content, bridge)
-                            .await
-                            .map_err(HostEffectError::from)?;
-                        Ok(EffectResult::WriteFile)
-                    }
-                    PreparedParentEffect::Result { json } => {
-                        Ok(EffectResult::ResultAccepted { json })
-                    }
-                    PreparedParentEffect::ScratchPut { key, json } => {
-                        self.scratch.put(key, json).map_err(session_state_error)?;
-                        Ok(EffectResult::ScratchPut)
-                    }
-                    PreparedParentEffect::ScratchGet { key } => Ok(EffectResult::ScratchGet {
-                        json: self.scratch.get(&key).map_err(session_state_error)?,
-                    }),
-                    PreparedParentEffect::Spawn(target) => {
-                        let bridge = self.spawn.permission_bridge.for_host_call(cancellation);
-                        let result = self
-                            .spawn
-                            .execute_prepared(target, bridge)
-                            .await
-                            .map_err(HostEffectError::from)?;
-                        Ok(EffectResult::Spawn {
-                            stdout: result.stdout,
-                            stderr: result.stderr,
-                            exit_code: result.code,
-                            timed_out: result.timed_out,
-                            stdout_truncated: result.stdout_truncated,
-                            stderr_truncated: result.stderr_truncated,
-                            signal: result.signal,
-                        })
-                    }
-                    #[cfg(feature = "sandbox")]
-                    PreparedParentEffect::Fetch(target) => {
-                        let fetch = self.fetch.as_ref().ok_or(HostEffectError::BackendFailure)?;
-                        let result = fetch
-                            .execute_prepared(target, cancellation)
-                            .await
-                            .map_err(|error| HostEffectError::from(fetch_service_error(&error)))?;
-                        Ok(EffectResult::Fetch {
-                            status: result.status,
-                            body: result.text,
-                            truncated: result.truncated,
-                            lossy: result.lossy,
-                            location: result.location,
-                        })
-                    }
-                    #[cfg(feature = "sandbox")]
-                    PreparedParentEffect::FetchPending { .. } => {
-                        Err(HostEffectError::BackendFailure)
-                    }
-                    #[cfg(feature = "skills")]
-                    PreparedParentEffect::Proposal(prepared) => {
-                        let proposal = self
-                            .proposal
-                            .as_ref()
-                            .ok_or(HostEffectError::BackendFailure)?;
-                        let result = proposal
-                            .execute_prepared_cancellable(prepared, cancellation)
-                            .await
-                            .map_err(HostEffectError::from)?;
-                        Ok(EffectResult::ProposalAccepted {
-                            skill_id: result.skill_id,
-                            proposal_id: result.proposal_id,
-                            status: result.status,
-                            report_id: result.report_id,
-                        })
-                    }
-                }
+                self.run_prepared(prepared, operation, cancellation).await
             }
             .await;
             #[cfg(feature = "hooks")]
             dispatch_brokered_post_hooks(operation, &result).await;
             result
+        })
+    }
+    fn take_prepared(&mut self) -> Option<PreparedEffect> {
+        self.authorized
+            .take()
+            .map(|prepared| PreparedEffect(Box::new(prepared)))
+    }
+
+    fn execute_batch<'a>(
+        &'a mut self,
+        items: Vec<BatchExecution>,
+        cancellation: PermCancellation,
+    ) -> ParentEffectFuture<'a, Vec<Result<EffectResult, HostEffectError>>> {
+        use futures::StreamExt;
+        let service: &'a Self = self;
+        Box::pin(async move {
+            futures::stream::iter(items.into_iter().map(|item| {
+                let cancellation = cancellation.clone();
+                async move {
+                    let BatchExecution {
+                        operation,
+                        prepared,
+                    } = item;
+                    match prepared.0.downcast::<PreparedParentEffect>() {
+                        Ok(prepared) => {
+                            service
+                                .run_prepared_with_hooks(*prepared, &operation, cancellation)
+                                .await
+                        }
+                        Err(_) => Err(HostEffectError::BackendFailure),
+                    }
+                }
+            }))
+            .buffered(BATCH_PARALLELISM)
+            .collect::<Vec<_>>()
+            .await
         })
     }
 }
@@ -6548,6 +6869,7 @@ mod tests {
                 headers: Vec::new(),
                 body: None,
             },
+            console: Vec::new(),
         };
         let audit_root = directory.path().join(format!("audit-{tag}"));
         let audit = EffectAudit::open(
@@ -6658,6 +6980,7 @@ mod tests {
             grant_id: grant.grant_id().clone(),
             advisory: AdvisoryAttribution::default(),
             operation,
+            console: Vec::new(),
         };
 
         let listed = broker
@@ -6855,6 +7178,7 @@ mod tests {
             grant_id: grant.grant_id().clone(),
             advisory: AdvisoryAttribution::default(),
             operation,
+            console: Vec::new(),
         }
     }
 
@@ -7433,6 +7757,7 @@ mod tests {
                 export: Some("run".to_string()),
             },
             operation,
+            console: Vec::new(),
         };
         let capability = match &request.operation {
             EffectOperation::ReadFile { .. }
@@ -7442,12 +7767,19 @@ mod tests {
             | EffectOperation::Glob { .. }
             | EffectOperation::Grep { .. } => HostCapability::ReadFile,
             EffectOperation::WriteFile { .. } => HostCapability::WriteFile,
-            EffectOperation::Fetch { .. } => HostCapability::Fetch,
-            EffectOperation::Spawn { .. } => HostCapability::Spawn,
+            EffectOperation::Fetch { .. } | EffectOperation::FetchAll { .. } => {
+                HostCapability::Fetch
+            }
+            EffectOperation::Spawn { .. } | EffectOperation::SpawnAll { .. } => {
+                HostCapability::Spawn
+            }
             EffectOperation::Result { .. }
             | EffectOperation::ScratchPut { .. }
-            | EffectOperation::ScratchGet { .. } => HostCapability::SessionState,
+            | EffectOperation::ScratchGet { .. }
+            | EffectOperation::ScratchDelete { .. }
+            | EffectOperation::ScratchKeys => HostCapability::SessionState,
             EffectOperation::ProposeSkill { .. } => HostCapability::ProposeSkill,
+            EffectOperation::CallTool { .. } => HostCapability::CallTool,
         };
         let audit_root = directory.path().join(format!("audit-{tag}"));
         let audit = EffectAudit::open(
@@ -7784,6 +8116,7 @@ mod tests {
                 arguments: vec![],
                 options: Default::default(),
             },
+            console: Vec::new(),
         };
         let audit_root = directory.path().join("audit-spawn-replacement");
         let audit = EffectAudit::open(
@@ -8065,6 +8398,7 @@ mod tests {
                 ],
                 options: Default::default(),
             },
+            console: Vec::new(),
         };
         let audit_root = directory.path().join("audit-spawn-escape-heavy-output");
         let audit = EffectAudit::open(
@@ -8165,6 +8499,7 @@ mod tests {
                 arguments: vec![],
                 options: Default::default(),
             },
+            console: Vec::new(),
         };
         let audit_root = directory.path().join("audit-spawn-snapshot-overwrite");
         let audit = EffectAudit::open(
@@ -8354,6 +8689,7 @@ mod tests {
                 arguments: vec!["available".into()],
                 options: Default::default(),
             },
+            console: Vec::new(),
         };
         let audit_root = directory.path().join("audit-model-spawn");
         let audit = EffectAudit::open(

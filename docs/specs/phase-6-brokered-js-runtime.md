@@ -704,13 +704,33 @@ already have happened, this fail-closed rule means no continuation or replay, no
 non-occurrence. Deterministic verification fakes write their verification transcript, not
 production effect-audit records.
 
-Reaching the configured segment ceiling returns the distinct retention-limit error and continues
-to deny new effects, but it does not poison the writer as a durability failure. An operator may
-archive and remove every segment file while no writer holds the lock; the next process start then
-creates a fresh zero-anchored chain even though the state-root initialization marker remains.
-Removing only part of a chain, changing a retained record, or losing the target-correlation key
-continues to fail closed. The archived chain is operational evidence and remains subject to the
-operator's retention policy; it is not consulted as authorization for the fresh generation.
+Retention is checkpointed, not a hard stop (mini-agent-nvnkx.118). The chain is divided into
+epochs of at most 16 segments (`DEFAULT_MAX_SEGMENTS`). When the epoch that is ending has reached
+that length, the next rotation opens its new segment with a `checkpoint` flag on the `Open`
+record, whose `previous_segment_hash` and first `previous_hash` become the accepted chain origin,
+and the segments older than the epoch that just ended are deleted (best effort; a failed
+deletion only leaves old files for the next checkpoint). At most about two epochs are on disk and
+the chain never refuses a new effect because of age. Opening reads the first record of each
+segment newest first to find the newest checkpoint and validates only from there, so first-call
+latency and memory are bounded by the epoch, not by lifetime usage; a corrupt or missing segment
+older than that checkpoint cannot block the audit. Unterminated intents are recovered as before
+(always within the validated range, since every open resolves them). A chain written before
+checkpoints existed (no flag, any length) is validated once in full, then checkpointed and pruned
+on that first open. A history that neither starts at segment 0 nor at a checkpoint, a gap after
+the origin, a changed retained record or a lost target-correlation key still fail closed. The
+distinct retention-limit error remains only for pruning that cannot keep up (more than four
+epochs of stale segments left behind by failing deletes). When a process cannot open a slot because its stored data is
+corrupt, incomplete or over the retention limit, the slot directory is renamed to
+`<slot>.quarantine-<unix-ms>` beside it (kept for inspection), one warning names that path, and
+the process continues with the next free slot. An operator may still archive and remove every
+segment file while no writer holds the lock; the next process start then creates a fresh
+zero-anchored chain even though the state-root initialization marker remains. The archived
+chain is operational evidence and remains subject to the operator's retention policy; it is not
+consulted as authorization for the fresh generation.
+
+A spawn target also carries an optional keyed digest of the requested working directory and
+environment (`options_tag`, absent when neither was set), so two spawns of one executable that
+differ only in cwd or env are distinguishable in the audit without storing either.
 
 Authorization, intent, and completion records are evidence, not permission tokens. Recovery never
 turns an old record into a live grant, silently fills a missing completion, or replays an effect.
@@ -1524,7 +1544,12 @@ bead is closed with its required regression tests, so all items are part of the 
    identity or heap state between runtimes. The store is process-local and deliberately absent
    from session persistence, exports, compaction, and learned-skill storage. Agent rebuilds borrow
    the same session owner, workspace rebinding creates an empty store, and independently opened
-   sessions never share values.
+   sessions never share values. `scratch_delete(key)` and `scratch_keys()` (mini-agent-nvnkx.120)
+   are the same kind of typed `session_state` effect (audited by a keyed tag of the key, or no
+   key for the listing); a write that hits a cap reports `too_large` with the closed refinement
+   `scratch_entry_limit` or `scratch_byte_limit`. Because the store never survives `--resume`,
+   the first `scratch_get` miss on a store that was never written in the process queues a one-line
+   note, appended by the parent to that `js` result.
 
    Every result, scratch read, and scratch write consumes one normal effect ordinal and receives
    the usual durable intent/completion pair. Audit targets contain only a keyed tag of the scratch
@@ -1710,6 +1735,38 @@ exit immediately — runs on one stable, named, long-lived thread.
 ignored, real-backend regression, gated like `linux_js_worker_containment`, that launches through
 the real production path from a transient thread which then exits, waits past the race window, and
 asserts the worker is still alive, repeated 20 times.
+
+## Delivered corrections (2026-11-21 js runtime review)
+
+- Queueing and launch are not charged to the step (mini-agent-nvnkx.117, .170). The tool first
+  takes the single worker's transport lease under its own cancellable queue cap (three times the
+  step timeout; expiry reports `JS error: waited Ns for another js call to finish; the script did
+  not run, retry`), then starts the step deadline, the grant expiry and the effect-service
+  deadlines. The supervisor starts the step clock only once the worker is Ready (a launch gets
+  its own allowance, the supervisor watchdog), so a cold first call is not charged either. The
+  hard bound is unchanged in kind: step plus the approval allowance, enforced by the parent.
+- Diagnostics are parent-derived only (invariant 6). An uncaught effect failure appends
+  `; last failed effect: <operation> -> <code> (<reason>)` from the broker's own record of the
+  last failed effect (operation, closed code, closed reason). A parent-side deadline appends
+  `; deadline reached during <operation>` and keeps the console the worker streamed with its
+  effect requests (a bounded `console` delta on each `EffectRequest`, validated against the
+  terminal-result caps). ReferenceError and TypeError results name the identifier from the
+  parent's own copy of the model script (a trailing `near <name>` note), with a closed "did you mean" from
+  the static helper catalogue; no worker text is used. An awaited promise that never settles is
+  its own closed code (`unsettled`) instead of `job_limit`.
+- Teardown of a worker that will not be reused (a failed reuse policy or any non-reusable
+  terminal) runs on the blocking pool and is awaited before the lease is released
+  (mini-agent-nvnkx.174); one live worker and ordering are unchanged.
+- `call_tool`, `fetch_all` and `spawn_all` (mini-agent-nvnkx.116, .119) are closed typed
+  operations (`CallTool`, `FetchAll`, `SpawnAll`) validated by the parent and bound to invocation
+  grants: `call_tool` needs the model-only `call_tool` capability and is denied to any skill
+  principal (the tool's own permission rule and hooks run inside the tool server, not in
+  the broker); the batch effects need the `fetch` / `spawn` capability of their items. The broker
+  expands a batch into its items, runs each item through the single-effect policy pipeline and
+  writes one intent per item before anything runs, executes the authorized items together
+  (four at a time, one effect ordinal for the whole call), then writes one completion per item.
+  A denied or failed item is a per-item error result; cancellation, expiry and audit failures
+  fail the whole call, and an interrupted batch marks every unfinished item `outcome_unknown`.
 
 ## Delivered corrections (2026-11-21 approval wait and the step deadline)
 

@@ -684,7 +684,7 @@ async fn source_and_agent_failures_are_source_free_closed_errors() {
         .unwrap();
     assert!(
         agent_error.starts_with("JS exception at ")
-            && agent_error.ends_with("(stage: evaluation; script: model)"),
+            && agent_error.contains("(stage: evaluation; script: model)"),
         "unexpected: {agent_error}"
     );
     assert!(!agent_error.contains("agent.js"));

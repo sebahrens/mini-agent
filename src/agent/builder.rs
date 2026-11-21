@@ -989,7 +989,7 @@ fn register_js_tool(
     #[cfg(feature = "skills")] skill_services: Option<
         Arc<crate::extras::js::skills::session::SkillSessionServices>,
     >,
-) {
+) -> Option<crate::extras::js::tool_bridge::ToolBridge> {
     register_js_tool_with_status(
         tools,
         sandbox,
@@ -1002,7 +1002,7 @@ fn register_js_tool(
         read_tracker,
         #[cfg(feature = "skills")]
         skill_services,
-    );
+    )
 }
 
 #[cfg(feature = "js")]
@@ -1020,7 +1020,7 @@ fn register_js_tool_with_status(
     #[cfg(feature = "skills")] skill_services: Option<
         Arc<crate::extras::js::skills::session::SkillSessionServices>,
     >,
-) {
+) -> Option<crate::extras::js::tool_bridge::ToolBridge> {
     let workspace_root = workspace.root();
     use crate::extras::js::host::AllowConfig;
     use crate::extras::js::tool::JsTool;
@@ -1040,7 +1040,7 @@ fn register_js_tool_with_status(
             reason = %reason,
             "JavaScript tool unavailable ({backend}): {reason}"
         );
-        return;
+        return None;
     }
 
     if cfg.js_fetch_origins.is_none() {
@@ -1088,6 +1088,8 @@ fn register_js_tool_with_status(
     let mut js_tool = JsTool::new(sandbox, permission, ask_tx, allow_config)
         .with_scratch_store(scratch)
         .with_step_timeout_secs(step_timeout_secs);
+    let bridge = crate::extras::js::tool_bridge::ToolBridge::default();
+    js_tool = js_tool.with_tool_bridge(bridge.clone());
     if let Some(guard) = write_guard {
         js_tool = js_tool.with_write_guard(guard);
     }
@@ -1106,6 +1108,7 @@ fn register_js_tool_with_status(
     }
 
     tools.push(Box::new(js_tool));
+    Some(bridge)
 }
 
 #[cfg(test)]
@@ -1253,6 +1256,11 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
     let mut search_registered = false;
     #[cfg(feature = "js")]
     let js_tool_enabled = cli.tool_is_eligible(cfg, "js");
+    // `call_tool` reaches the agent's own tool server, which exists only after the build below.
+    #[cfg(feature = "js")]
+    let mut js_tool_bridge: Option<crate::extras::js::tool_bridge::ToolBridge> = None;
+    #[cfg(all(feature = "js", feature = "mcp"))]
+    let mut js_read_only_mcp: Vec<String> = Vec::new();
     #[cfg(feature = "lsp")]
     let lsp_manager = if !cli.tool_is_eligible(cfg, "lsp_diagnostics")
         && !cli.tool_is_eligible(cfg, "lsp_navigate")
@@ -1730,6 +1738,14 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
                 {
                     parallel_mcp_names.insert(rig::tool::ToolDyn::name(&t));
                 }
+                #[cfg(feature = "js")]
+                if t.definition
+                    .annotations
+                    .as_ref()
+                    .is_some_and(|a| a.read_only_hint == Some(true))
+                {
+                    js_read_only_mcp.push(rig::tool::ToolDyn::name(&t));
+                }
                 #[cfg(feature = "hooks")]
                 mcp_hook_identities.insert(
                     rig::tool::ToolDyn::name(&t),
@@ -1832,7 +1848,7 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
 
         #[cfg(feature = "js")]
         if js_tool_enabled {
-            register_js_tool(
+            js_tool_bridge = register_js_tool(
                 &mut all_tools,
                 sandbox.clone(),
                 permission.clone(),
@@ -2042,6 +2058,21 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         search_binding
             .set_server(agent.tool_server_handle.downgrade())
             .expect("new per-build MCP search binding");
+    }
+    #[cfg(feature = "js")]
+    if let Some(bridge) = js_tool_bridge {
+        #[cfg(feature = "mcp")]
+        let read_only_mcp = js_read_only_mcp;
+        #[cfg(not(feature = "mcp"))]
+        let read_only_mcp = Vec::<String>::new();
+        let invoker = crate::extras::js::tool_bridge::ServerToolInvoker::new(
+            agent.tool_server_handle.downgrade(),
+            registered_tool_names,
+            read_only_mcp,
+        );
+        bridge
+            .bind(std::sync::Arc::new(invoker))
+            .expect("new per-build js tool bridge");
     }
     agent
 }

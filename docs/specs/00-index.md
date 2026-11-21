@@ -449,6 +449,16 @@ See "Delivered corrections (2026-10-22 launch-thread fix)" in
 [`phase-6-brokered-js-runtime.md`](phase-6-brokered-js-runtime.md). The canonical invariant
 checklist is unchanged; this is an implementation detail of invariant 1.
 
+## Delivered corrections (2026-11-21 js runtime review)
+
+Queue and launch time no longer count against `js-step-timeout-secs`; failures name the
+last failed effect, the in-flight effect at a parent deadline and the offending identifier;
+the effect audit is checkpointed and pruned instead of refusing at a cap (corrupt slots are
+quarantined); scratch gains `scratch_delete` / `scratch_keys`; and `call_tool`, `fetch_all` and
+`spawn_all` are brokered typed effects. See "Delivered corrections (2026-11-21 js runtime review)"
+in [`phase-6-brokered-js-runtime.md`](phase-6-brokered-js-runtime.md)
+(mini-agent-nvnkx.114, .115, .116, .117, .118, .119, .120, .122, .123, .125, .170, .174, .329).
+
 ## Delivered corrections (2026-11-21 approval wait)
 
 `mini-agent-sskdu.267`: user-approval wait inside a `js` step no longer counts against the step

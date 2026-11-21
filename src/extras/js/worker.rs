@@ -648,6 +648,297 @@ fn install_model_effect_globals(
     })
 }
 
+/// Result of `call_tool`: the tool's output (or its own error message when `ok` is false).
+struct WorkerCallToolResult {
+    ok: bool,
+    text: String,
+    truncated: bool,
+}
+
+impl<'js> IntoJs<'js> for WorkerCallToolResult {
+    fn into_js(self, ctx: &Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        let object = Object::new(ctx.clone())?;
+        object.set("ok", self.ok)?;
+        object.set("text", self.text)?;
+        object.set("truncated", self.truncated)?;
+        Ok(object.into())
+    }
+}
+
+/// One item of a batch result as the script sees it: the usual result object, or
+/// `{error: code, message}` for a denied or failed item.
+enum WorkerBatchItem {
+    #[cfg(feature = "sandbox")]
+    Fetch(WorkerFetchResult),
+    Spawn(WorkerSpawnResult),
+    Error {
+        code: &'static str,
+        message: String,
+    },
+}
+
+impl<'js> IntoJs<'js> for WorkerBatchItem {
+    fn into_js(self, ctx: &Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        match self {
+            #[cfg(feature = "sandbox")]
+            Self::Fetch(result) => result.into_js(ctx),
+            Self::Spawn(result) => result.into_js(ctx),
+            Self::Error { code, message } => {
+                let object = Object::new(ctx.clone())?;
+                object.set("error", code)?;
+                object.set("message", message)?;
+                Ok(object.into())
+            }
+        }
+    }
+}
+
+struct WorkerBatchResult(Vec<WorkerBatchItem>);
+
+impl<'js> IntoJs<'js> for WorkerBatchResult {
+    fn into_js(self, ctx: &Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        let array = rquickjs::Array::new(ctx.clone())?;
+        for (index, item) in self.0.into_iter().enumerate() {
+            array.set(index, item.into_js(ctx)?)?;
+        }
+        Ok(array.into_value())
+    }
+}
+
+fn batch_item_error(tool: &str, error: &super::protocol::EffectError) -> WorkerBatchItem {
+    let (message, code) = effect_error_text(tool, error);
+    WorkerBatchItem::Error { code, message }
+}
+
+/// Wraps the Rust `call_tool` dispatcher so the script's argument object is serialized by the
+/// realm's own JSON before it reaches the parent (which re-validates it as a JSON object).
+const CALL_TOOL_WRAPPER_JS: &str = "(function (dispatch) {\
+  const stringify = JSON.stringify;\
+  const isArray = Array.isArray;\
+  return function call_tool(name, args) {\
+    let json = '{}';\
+    if (args !== undefined && args !== null) {\
+      if (typeof args !== 'object' || isArray(args)) throw new TypeError('call_tool: args must be an object');\
+      json = stringify(args);\
+      if (typeof json !== 'string') json = '{}';\
+    }\
+    return dispatch(name, json);\
+  };\
+})";
+
+/// Globals beyond the base set: `call_tool` (when the parent bound a tool server) and the batch
+/// effects `fetch_all` / `spawn_all`, present exactly when `fetch` / `spawn` are. Each sends one
+/// typed request; the parent authorizes it per item and under the same grant.
+fn install_extended_effect_globals(
+    context: &Context,
+    effects: ModelEffectDispatcher,
+    spawn_available: bool,
+    call_tool_available: bool,
+) -> rquickjs::Result<()> {
+    context.with(|ctx| {
+        if call_tool_available {
+            let call_effects = effects.clone();
+            let dispatch = Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>, name: String, arguments_json: String| {
+                    if name.is_empty()
+                        || name.len() > super::protocol::CALL_TOOL_NAME_MAX_BYTES
+                        || name.contains('\0')
+                    {
+                        return Err(effect_error(
+                            &ctx,
+                            "call_tool",
+                            EffectErrorCode::InvalidTarget,
+                        ));
+                    }
+                    if arguments_json.len() > super::protocol::CALL_TOOL_ARGUMENTS_MAX_BYTES {
+                        return Err(effect_error(&ctx, "call_tool", EffectErrorCode::TooLarge));
+                    }
+                    super::memory::ensure_healthy(&ctx)?;
+                    match call_effects(EffectOperation::CallTool {
+                        name,
+                        arguments_json,
+                    }) {
+                        EffectResult::CallTool {
+                            ok,
+                            text,
+                            truncated,
+                        } => Ok(WorkerCallToolResult {
+                            ok,
+                            text,
+                            truncated,
+                        }),
+                        EffectResult::Error(error) => {
+                            Err(effect_error_from(&ctx, "call_tool", &error))
+                        }
+                        _ => Err(rquickjs::Error::Unknown),
+                    }
+                },
+            )?;
+            let wrapper: Function = ctx.eval(CALL_TOOL_WRAPPER_JS)?;
+            let call_tool: Function = wrapper.call((dispatch,))?;
+            ctx.globals().set("call_tool", call_tool)?;
+        }
+        #[cfg(feature = "sandbox")]
+        {
+            let fetch_effects = effects.clone();
+            let fetch_all = Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>, requests: Vec<Object<'_>>| {
+                    if requests.is_empty() || requests.len() > super::protocol::MAX_BATCH_ITEMS {
+                        return Err(effect_error(
+                            &ctx,
+                            "fetch_all",
+                            EffectErrorCode::InvalidTarget,
+                        ));
+                    }
+                    let mut items = Vec::with_capacity(requests.len());
+                    for request in &requests {
+                        let url = request
+                            .get::<_, Option<String>>("url")
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default();
+                        if url.is_empty() || url.contains('\0') || url.len() > FETCH_URL_MAX_BYTES {
+                            return Err(effect_error(
+                                &ctx,
+                                "fetch_all",
+                                EffectErrorCode::InvalidTarget,
+                            ));
+                        }
+                        let (method, headers, body) =
+                            parse_fetch_options_with(Some(request), true)?;
+                        items.push(super::protocol::FetchBatchItem {
+                            url,
+                            method,
+                            headers,
+                            body,
+                        });
+                    }
+                    super::memory::ensure_healthy(&ctx)?;
+                    match fetch_effects(EffectOperation::FetchAll { requests: items }) {
+                        EffectResult::FetchAll { items } => {
+                            let mut converted = Vec::with_capacity(items.len());
+                            for item in items {
+                                converted.push(match item {
+                                    EffectResult::Fetch {
+                                        status,
+                                        body,
+                                        truncated,
+                                        lossy,
+                                        location,
+                                    } => WorkerBatchItem::Fetch(WorkerFetchResult {
+                                        status,
+                                        text: body,
+                                        truncated,
+                                        lossy,
+                                        location,
+                                    }),
+                                    EffectResult::Error(error) => batch_item_error("fetch", &error),
+                                    _ => return Err(rquickjs::Error::Unknown),
+                                });
+                            }
+                            Ok(WorkerBatchResult(converted))
+                        }
+                        EffectResult::Error(error) => {
+                            Err(effect_error_from(&ctx, "fetch_all", &error))
+                        }
+                        _ => Err(rquickjs::Error::Unknown),
+                    }
+                },
+            )?;
+            ctx.globals().set("fetch_all", fetch_all)?;
+        }
+        if spawn_available {
+            let spawn_effects = effects.clone();
+            let spawn_all = Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>, commands: Vec<Object<'_>>| {
+                    if commands.is_empty() || commands.len() > super::protocol::MAX_BATCH_ITEMS {
+                        return Err(effect_error(
+                            &ctx,
+                            "spawn_all",
+                            EffectErrorCode::InvalidTarget,
+                        ));
+                    }
+                    let mut items = Vec::with_capacity(commands.len());
+                    for command in &commands {
+                        for key in command.keys::<String>() {
+                            let key = key?;
+                            if !matches!(key.as_str(), "program" | "args" | "options") {
+                                return Err(effect_error(
+                                    &ctx,
+                                    "spawn_all",
+                                    EffectErrorCode::InvalidTarget,
+                                ));
+                            }
+                        }
+                        let program = command
+                            .get::<_, Option<String>>("program")
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default();
+                        let arguments = command
+                            .get::<_, Option<Vec<String>>>("args")
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default();
+                        validate_spawn(&program, &arguments)
+                            .map_err(|code| effect_error(&ctx, "spawn_all", code))?;
+                        let options = command
+                            .get::<_, Option<Object<'_>>>("options")
+                            .ok()
+                            .flatten();
+                        let options = parse_spawn_options(options.as_ref())
+                            .map_err(|code| effect_error(&ctx, "spawn_all", code))?;
+                        items.push(super::protocol::SpawnBatchItem {
+                            program,
+                            arguments,
+                            options,
+                        });
+                    }
+                    super::memory::ensure_healthy(&ctx)?;
+                    match spawn_effects(EffectOperation::SpawnAll { commands: items }) {
+                        EffectResult::SpawnAll { items } => {
+                            let mut converted = Vec::with_capacity(items.len());
+                            for item in items {
+                                converted.push(match item {
+                                    EffectResult::Spawn {
+                                        stdout,
+                                        stderr,
+                                        exit_code,
+                                        timed_out,
+                                        stdout_truncated,
+                                        stderr_truncated,
+                                        signal,
+                                    } => WorkerBatchItem::Spawn(WorkerSpawnResult {
+                                        stdout,
+                                        stderr,
+                                        code: exit_code,
+                                        timed_out,
+                                        stdout_truncated,
+                                        stderr_truncated,
+                                        signal,
+                                    }),
+                                    EffectResult::Error(error) => batch_item_error("spawn", &error),
+                                    _ => return Err(rquickjs::Error::Unknown),
+                                });
+                            }
+                            Ok(WorkerBatchResult(converted))
+                        }
+                        EffectResult::Error(error) => {
+                            Err(effect_error_from(&ctx, "spawn_all", &error))
+                        }
+                        _ => Err(rquickjs::Error::Unknown),
+                    }
+                },
+            )?;
+            ctx.globals().set("spawn_all", spawn_all)?;
+        }
+        Ok(())
+    })
+}
+
 fn install_session_state_globals(
     context: &Context,
     effects: ModelEffectDispatcher,
@@ -693,11 +984,12 @@ fn install_session_state_globals(
             .restore(&ctx)?
             .call((scratch_put_dispatch,))?;
 
+        let get_effects = effects.clone();
         let scratch_get_dispatch = Function::new(ctx.clone(), move |ctx: Ctx<'_>, key: String| {
             validate_scratch_key_worker(&key)
                 .map_err(|code| effect_error(&ctx, "scratch_get", code))?;
             super::memory::ensure_healthy(&ctx)?;
-            match effects(EffectOperation::ScratchGet { key }) {
+            match get_effects(EffectOperation::ScratchGet { key }) {
                 EffectResult::ScratchGet { json } => Ok(json),
                 EffectResult::Error(error) => Err(effect_error_from(&ctx, "scratch_get", &error)),
                 _ => Err(rquickjs::Error::Unknown),
@@ -707,9 +999,33 @@ fn install_session_state_globals(
             .restore(&ctx)?
             .call((scratch_get_dispatch,))?;
 
+        let delete_effects = effects.clone();
+        let scratch_delete = Function::new(ctx.clone(), move |ctx: Ctx<'_>, key: String| {
+            validate_scratch_key_worker(&key)
+                .map_err(|code| effect_error(&ctx, "scratch_delete", code))?;
+            super::memory::ensure_healthy(&ctx)?;
+            match delete_effects(EffectOperation::ScratchDelete { key }) {
+                EffectResult::ScratchDelete { existed } => Ok(existed),
+                EffectResult::Error(error) => {
+                    Err(effect_error_from(&ctx, "scratch_delete", &error))
+                }
+                _ => Err(rquickjs::Error::Unknown),
+            }
+        })?;
+        let scratch_keys = Function::new(ctx.clone(), move |ctx: Ctx<'_>| {
+            super::memory::ensure_healthy(&ctx)?;
+            match effects(EffectOperation::ScratchKeys) {
+                EffectResult::ScratchKeys { keys } => Ok(keys),
+                EffectResult::Error(error) => Err(effect_error_from(&ctx, "scratch_keys", &error)),
+                _ => Err(rquickjs::Error::Unknown),
+            }
+        })?;
+
         ctx.globals().set("result", result)?;
         ctx.globals().set("scratch_put", scratch_put)?;
         ctx.globals().set("scratch_get", scratch_get)?;
+        ctx.globals().set("scratch_delete", scratch_delete)?;
+        ctx.globals().set("scratch_keys", scratch_keys)?;
         Ok(())
     })
 }
@@ -960,12 +1276,21 @@ fn parse_spawn_options(options: Option<&Object<'_>>) -> Result<SpawnOptions, Eff
 fn parse_fetch_options(
     options: Option<&Object<'_>>,
 ) -> rquickjs::Result<(HttpMethod, Vec<HttpHeader>, Option<String>)> {
+    parse_fetch_options_with(options, false)
+}
+
+/// `allow_url` admits the `url` key of a `fetch_all` item (read separately by the caller).
+#[cfg(feature = "sandbox")]
+fn parse_fetch_options_with(
+    options: Option<&Object<'_>>,
+    allow_url: bool,
+) -> rquickjs::Result<(HttpMethod, Vec<HttpHeader>, Option<String>)> {
     let Some(options) = options else {
         return Ok((HttpMethod::Get, Vec::new(), None));
     };
     for key in options.keys::<String>() {
         let key = key?;
-        if !matches!(key.as_str(), "method" | "headers" | "body") {
+        if !(matches!(key.as_str(), "method" | "headers" | "body") || allow_url && key == "url") {
             return Err(rquickjs::Error::new_from_js_message(
                 "fetch options",
                 "fetch",
@@ -1093,6 +1418,12 @@ pub(super) fn effect_error_text(
             Some("outside configured roots; path is outside the allowed read roots")
         }
         Some(DenialReason::PermissionDenied) => Some("permission denied"),
+        Some(DenialReason::ScratchEntryLimit) => Some(
+            "the scratch store already holds 128 entries; remove one with scratch_delete(key) (list them with scratch_keys())",
+        ),
+        Some(DenialReason::ScratchByteLimit) => Some(
+            "the scratch store would exceed its 4 MiB total; remove entries with scratch_delete(key) (list them with scratch_keys())",
+        ),
         Some(DenialReason::UnreadOverwrite) => Some(
             "existing file was not fully read in this session; read the whole current file with the read tool first, or write a new path",
         ),
@@ -2297,7 +2628,7 @@ impl ClosedFailure {
             JsErrorCode::StackLimit | JsErrorCode::JobLimit | JsErrorCode::EffectLimit => {
                 DiagnosticClass::ResourceLimit
             }
-            JsErrorCode::InvalidResult => DiagnosticClass::Contract,
+            JsErrorCode::InvalidResult | JsErrorCode::Unsettled => DiagnosticClass::Contract,
             JsErrorCode::Internal => DiagnosticClass::Internal,
         };
         Self {
@@ -2907,7 +3238,13 @@ fn execute_brokered_run_step<R: std::io::Read + Send + 'static, W: Write + Send 
     let effect_limit_reached = Arc::new(AtomicBool::new(false));
     let terminal_requested = Arc::new(AtomicBool::new(false));
     let terminal_result = Arc::new(Mutex::new(None::<String>));
+    // Console records are streamed with each effect request (as a delta) so a parent-side
+    // deadline kill, which discards this process before a terminal frame, keeps the progress.
+    let console_stream: Arc<Mutex<Vec<ConsoleRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let console_streamed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let wire_dispatcher: WorkerEffectDispatcher = {
+        let console_stream = console_stream.clone();
+        let console_streamed = console_streamed.clone();
         let effect_build = build.clone();
         let effect_invocation_id = invocation_id.clone();
         let ordinal = ordinal.clone();
@@ -2944,11 +3281,19 @@ fn execute_brokered_run_step<R: std::io::Read + Send + 'static, W: Write + Send 
                 return backend_failure();
             }
             let effect_ordinal = ordinal.fetch_add(1, Ordering::AcqRel);
+            let console = {
+                let records = console_stream
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let already = console_streamed.swap(records.len(), Ordering::AcqRel);
+                records.get(already..).unwrap_or_default().to_vec()
+            };
             let request = EffectRequest {
                 effect_ordinal,
                 grant_id,
                 advisory,
                 operation,
+                console,
             };
             let requested_terminal_result =
                 matches!(&request.operation, EffectOperation::Result { .. });
@@ -3035,6 +3380,7 @@ fn execute_brokered_run_step<R: std::io::Read + Send + 'static, W: Write + Send 
         model_dispatcher,
         wire_dispatcher,
         terminal_requested,
+        console_stream,
         #[cfg(feature = "skills")]
         skill_call_authorizer,
     );
@@ -3449,6 +3795,7 @@ mod skill_authority_bound_tests {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_run_step(
     request: RunStep,
     #[cfg(feature = "skills")] artifacts: Vec<CachedSkillArtifact>,
@@ -3456,6 +3803,7 @@ fn execute_run_step(
     effects: Option<ModelEffectDispatcher>,
     _wire_effects: WorkerEffectDispatcher,
     terminal_requested: Arc<AtomicBool>,
+    console: Arc<Mutex<Vec<ConsoleRecord>>>,
     #[cfg(feature = "skills")] authorize_skill_call: WorkerSkillCallAuthorizer,
 ) -> StepResult {
     #[cfg(feature = "skills")]
@@ -3476,7 +3824,6 @@ fn execute_run_step(
             evidence_complete: false,
         };
     }
-    let console = Arc::new(Mutex::new(Vec::new()));
     #[cfg(feature = "skills")]
     let event_state = Arc::new(Mutex::new(WorkerEventState::default()));
     #[cfg(feature = "skills")]
@@ -3534,6 +3881,7 @@ fn execute_run_step(
         effects,
         terminal_requested,
         request.spawn_available,
+        request.call_tool_available,
         request.model_effect_profile,
         #[cfg(feature = "skills")]
         proposal_effects,
@@ -3607,6 +3955,7 @@ fn execute_fresh_step(
     effects: Option<ModelEffectDispatcher>,
     terminal_requested: Arc<AtomicBool>,
     spawn_available: bool,
+    call_tool_available: bool,
     model_effect_profile: ModelEffectProfile,
     #[cfg(feature = "skills")] proposal_effects: Option<ModelEffectDispatcher>,
     #[cfg(feature = "skills")] artifacts: &[CachedSkillArtifact],
@@ -3667,6 +4016,24 @@ fn execute_fresh_step(
                     functions.session_result_wrapper.clone(),
                     functions.scratch_put_wrapper.clone(),
                     functions.scratch_get_wrapper.clone(),
+                )
+                .map_err(|error| {
+                    classify_error(
+                        &context,
+                        error,
+                        deadline,
+                        &interrupted,
+                        DiagnosticStage::Initialization,
+                        role,
+                    )
+                })?;
+            }
+            if model_effect_profile == ModelEffectProfile::Full {
+                install_extended_effect_globals(
+                    &context,
+                    effects.clone(),
+                    spawn_available,
+                    call_tool_available,
                 )
                 .map_err(|error| {
                     classify_error(
@@ -4061,7 +4428,7 @@ fn settle_and_convert(
                     }
                     PromiseState::Pending => {
                         return Err(ClosedFailure::error(
-                            JsErrorCode::JobLimit,
+                            JsErrorCode::Unsettled,
                             DiagnosticStage::JobDrain,
                             role,
                         ));
@@ -4779,6 +5146,11 @@ fn execute_verification_fake(
         EffectOperation::Result { .. }
         | EffectOperation::ScratchPut { .. }
         | EffectOperation::ScratchGet { .. }
+        | EffectOperation::ScratchDelete { .. }
+        | EffectOperation::ScratchKeys
+        | EffectOperation::CallTool { .. }
+        | EffectOperation::FetchAll { .. }
+        | EffectOperation::SpawnAll { .. }
         | EffectOperation::ProposeSkill { .. } => Err(CapabilityError::DispatchDenied),
     }
 }
@@ -4861,6 +5233,11 @@ fn verification_scope_allows(
         EffectOperation::Result { .. }
         | EffectOperation::ScratchPut { .. }
         | EffectOperation::ScratchGet { .. }
+        | EffectOperation::ScratchDelete { .. }
+        | EffectOperation::ScratchKeys
+        | EffectOperation::CallTool { .. }
+        | EffectOperation::FetchAll { .. }
+        | EffectOperation::SpawnAll { .. }
         | EffectOperation::ProposeSkill { .. } => false,
     }
 }

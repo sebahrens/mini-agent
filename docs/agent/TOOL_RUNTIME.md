@@ -639,16 +639,48 @@ JavaScript calls run in a fresh QuickJS runtime, but model-authored code can pas
 validated plain JSON between calls with `scratch_put(key, value)` and
 `scratch_get(key)`. Scratch keys are restricted to 1–128 ASCII letters, digits,
 `.`, `_`, `-`, or `:`; values are capped at 1 MiB each, 4 MiB and 128 entries per
-logical session/workspace. Scratch is process-local, omitted from persisted
-sessions, and cleared when the session changes workspace. Stored skills cannot
-access these globals.
+logical session/workspace. `scratch_delete(key)` (returns whether the key
+existed) frees a slot and its bytes, and `scratch_keys()` lists the sorted keys;
+a `scratch_put` that hits the 128-entry or 4 MiB cap fails `too_large` with a
+message naming which limit and the remedy. Scratch is process-local, omitted
+from persisted sessions, and cleared when the session changes workspace, so it
+does not survive `--resume`, a restart or a new headless run: the first
+`scratch_get` that finds nothing in a store that has never been written in the
+process appends a one-line note to that `js` result saying a null may mean the
+value was lost. Stored skills cannot access these globals.
 
 Exploration subagents use a distinct read-only JS profile when worker
 containment is available. That realm exposes only `read_file`, `list_dir`, and
 `grep` as brokered effects, and its parent-issued grant contains only read
 authority. It has no scratch, structured-result, writer, network, process,
-proposal, batch-read, or glob global. Active pure learned-JS exports may be
-bound; every effectful tier and canary replacement is excluded.
+proposal, batch-read, batch-fetch, batch-spawn, tool-call, or glob global. Active
+pure learned-JS exports may be bound; every effectful tier and canary replacement
+is excluded.
+
+#### Brokered tool calls and batches
+
+`call_tool(name, args?)` is a closed typed effect (`CallTool`) available to
+model-authored scripts only, and only once the agent builder has bound the
+agent's tool server (`src/extras/js/tool_bridge.rs`; a stored-skill realm never
+gets it, and the broker denies the capability to a skill principal whatever its
+worker sends). The parent validates the name and the JSON-object arguments,
+classifies the tool, dispatches through the same tool server a model-issued call
+uses (so the tool's own permission rule, PreToolUse/PostToolUse hooks, MCP client
+and result shaping apply) and returns `{ok, text, truncated}`. Only
+read-only tools are reachable: `read`, `grep`, `find_files`, `list_dir`,
+`lsp_navigate`, `lsp_diagnostics`, `web_search`, `web_fetch`, `memory_read`,
+`memory_search`, `list_mcp_resources`, `read_mcp_resource`, `job_status`,
+`task_evidence`, `todo_read`, plus eager MCP tools whose definition declares
+`readOnlyHint`. A tool's own approval prompt is not credited against the step
+deadline (only prompts the JS effects themselves raise are), so a script that
+calls a tool the permission rules ask about should expect the prompt to consume
+part of its 30 s. The audit record names the tool only by a keyed tag.
+
+`fetch_all(requests)` and `spawn_all(commands)` carry up to 8 independent items.
+The parent authorizes each item one after another through the same pipeline as
+`fetch` / `spawn` (validation, hooks, permission, target narrowing), writes each
+item's own audit intent, runs the authorized items together four at a time, and
+writes each completion. Results come back in request order.
 
 `result(value)` is the terminal structured-return channel. It accepts
 descriptor-only plain JSON up to 256 KiB, is parent-validated and durably
@@ -667,7 +699,8 @@ held-out skill tests) keep the strict 64 KiB contract and fail with
 
 | Limit | Value | When exceeded |
 |-------|-------|---------------|
-| Whole call (queueing, IPC, JavaScript, brokered effects; approval wait excluded up to one further step timeout) | 30 s; `js-step-timeout-secs` 1..=300 | `execution timed out` naming the limit |
+| Whole call (worker launch excluded; IPC, JavaScript, brokered effects; approval wait excluded up to one further step timeout). The clock starts when the call holds the single worker, so time spent queued behind another `js` call is not charged | 30 s; `js-step-timeout-secs` 1..=300 | `execution timed out` naming the limit; when the parent ends the call while an effect runs, the result adds `; deadline reached during <effect>` and keeps the console the script logged before it |
+| Queue wait for the single worker | 3 x the step timeout | `JS error: waited Ns for another js call to finish; the script did not run, retry` |
 | Brokered `spawn` | The remaining whole-call deadline, or `timeout_ms` when shorter; `cwd` inside the workspace, validated `env`, `stdin` up to 256 KiB | `timed_out: true`, process tree killed; `signal` names a signal death |
 | JavaScript heap / stack | 64 MiB / 512 KiB (fixed, Phase 6 invariant 4) | `out of memory` / `stack_limit` |
 | Worker CPU (native) | 35 s per worker process on Linux (`RLIMIT_CPU`) and Windows (Job) | Worker killed; workers within 30 s of it are retired first |
@@ -678,7 +711,9 @@ held-out skill tests) keep the strict 64 KiB contract and fail with
 | `read_files` | 256 paths, 6 MiB encoded results | `too_large` with `e.index` (the failing path, or the first one that did not fit) |
 | `spawn` output | 1 MiB stdout, 1 MiB stderr, 1.5 MiB combined; 4,096 arguments, 1 MiB argument bytes | Output truncated flags / `too_large` (program binary over 64 MiB or over 4,096 arguments also yields `too_large`, with a hint to use the shell tool) |
 | `fetch` | 256 KiB request body (POST only), 1 MiB response body | Body cut with `truncated: true`; a 3xx returns `status` + `location` (never followed); DNS failure is `dns_failed` |
-| `scratch_put` | 128-byte keys, 1 MiB values, 4 MiB and 128 entries per session | `too_large` |
+| `scratch_put` | 128-byte keys, 1 MiB values, 4 MiB and 128 entries per session | `too_large` (the message names the entry or byte limit; free space with `scratch_delete`) |
+| `call_tool` | 256 KiB of JSON arguments, 1 MiB result text | `too_large` for arguments; the result text is cut with `truncated: true`; an unknown tool is `not_found`, a tool outside the read-only set is `denied` |
+| `fetch_all` / `spawn_all` | 1-8 items per call; one effect toward the 256 | `invalid_target` outside the bounds; a denied or failed item is an `{error, message}` item, never a failed batch |
 | Final expression value | 64 KiB UTF-8 (`MAX_RESULT_BYTES`) | Model steps: truncated with a size marker; verification roles: `invalid_result` |
 | `result(value)` structured result | 256 KiB | The call throws `too_large` |
 | Console records | 256 per step | Later records are dropped; the last kept record is marked `[truncated]` and the result ends with a cap notice |

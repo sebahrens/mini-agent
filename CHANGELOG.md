@@ -132,6 +132,11 @@ Notable changes to mini-agent are documented in this file. The format follows
 - `/feedback [--open] [text]` drafts a redacted issue and opens the prefilled new-issue page; `/release-notes` prints the running version's changelog section, mentioned after `mini-agent update` (mini-agent-nvnkx.145).
 - `/unshare` deletes the session's shared gist, a second `/share confirm` updates it, and `gh auth token` is the credential fallback when no token variable is set (mini-agent-nvnkx.55).
 - `mini-agent schedule add|list|remove|run` installs launchd, systemd user-timer or Task Scheduler entries that run a headless turn and record its result (mini-agent-nvnkx.138).
+- Added: brokered JS `call_tool(name, args?)` calls one read-only tool (`read`, `grep`, `find_files`, `list_dir`, `lsp_*`, `web_search`, `web_fetch`, `memory_*`, MCP resource tools, `job_status`, `task_evidence`, `todo_read` and eager MCP tools declaring `readOnlyHint`) through the agent's tool server under that tool's own permission rules and hooks, so a script can loop over tool calls and return only the aggregate; stored skills never get it (mini-agent-nvnkx.116).
+- Added: brokered JS `fetch_all(requests)` and `spawn_all(commands)` authorize up to 8 independent items one by one (own audit intent and completion each) and run them four at a time; a denied item is an `{error, message}` entry, not a failed batch (mini-agent-nvnkx.119).
+- Added: JS `scratch_delete(key)` and `scratch_keys()`; a full scratch store names the entry or byte limit it hit, and the first `scratch_get` miss on a never-written store appends a note that scratch does not survive resume (mini-agent-nvnkx.120).
+- Added: the `js` tool description names every catalogued pure helper and states the file policy (allowed roots, or the config key that disables reads/writes) instead of advertising globals that can only fail (mini-agent-nvnkx.115, .123).
+- Added: JS effect audit retention checkpoints and prunes old segments (a new epoch every 16 segments) instead of refusing every effect at a cap, a reopen validates only the newest checkpoint window, and a corrupt slot is renamed `*.quarantine-<ms>` so the next free slot is used; spawn audit targets carry a keyed cwd/env digest (mini-agent-nvnkx.118, .328).
 
 ### Fixed
 
@@ -1973,6 +1978,12 @@ upstream changes that are new relative to this fork.
 - `mcp_search` matches whole words (plurals and prefixes count), ignores stop words and words under three letters, ranks name hits first and publishes only entries matching at least half the meaningful words, so natural-language queries no longer activate unrelated tools (mini-agent-nvnkx.183).
 - An MCP link that exhausted its reconnect attempts records the last attempt's class (shown in `/mcp` and the tool error), stops early on 401/403, and retries after a 2/5/15 minute cool-down instead of staying failed for the session (mini-agent-nvnkx.182).
 - `/mcp add` reads flags only before the server command: `--`, `--project` and `--allow-local` after a command are the server's own arguments (mini-agent-nvnkx.287).
+- Fixed: time a `js` call spends queued behind another one (or the first call's worker launch) no longer counts against `js-step-timeout-secs`; a call that waited past its queue cap says the script never ran (mini-agent-nvnkx.117, .170).
+- Fixed: a `js` call ended by the parent deadline now names the in-flight effect and keeps the console logged before it (mini-agent-nvnkx.125).
+- Fixed: `js` ReferenceError/TypeError results name the offending identifier from the model's own source, with a closed did-you-mean from the helper catalogue (mini-agent-nvnkx.122).
+- Fixed: an uncaught `js` effect failure reports the failed operation, its closed code and denial reason (`; last failed effect: read_file -> denied (...)`) (mini-agent-nvnkx.114).
+- Fixed: an awaited promise that never settles is reported as such instead of `job limit exceeded` (mini-agent-nvnkx.329).
+- Fixed: a `js` worker that will not be reused is torn down on the blocking pool instead of stalling the async executor (mini-agent-nvnkx.174).
 
 ## [1.10.4] - 2026-10-24
 

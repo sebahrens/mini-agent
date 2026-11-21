@@ -17,15 +17,16 @@ use tokio::task::{AbortHandle, JoinSet};
 use crate::agent::tools::ToolError;
 use crate::extras::js::audit::{AuditError, EffectAudit};
 use crate::extras::js::broker::{
-    GrantPrincipal, HostCapability, InvocationBroker, InvocationGrant, SharedEffectAudit,
+    EffectTrace, FailedEffect, GrantPrincipal, HostCapability, InvocationBroker, InvocationGrant,
+    SharedEffectAudit,
 };
 #[cfg(feature = "skills")]
 use crate::extras::js::broker::{
     PreparedSkillManifest, SkillCallAuthority, SkillExportAuthoritySpec,
 };
 use crate::extras::js::host::{
-    AllowConfig, FileEffectService, JsWriteGuard, ParentHostEffectService, SPAWN_STDERR_MAX_BYTES,
-    SPAWN_STDOUT_MAX_BYTES, SpawnEffectService,
+    AllowConfig, CallToolEffectService, FileEffectService, FilePolicySummary, JsWriteGuard,
+    ParentHostEffectService, SPAWN_STDERR_MAX_BYTES, SPAWN_STDOUT_MAX_BYTES, SpawnEffectService,
 };
 #[cfg(feature = "sandbox")]
 use crate::extras::js::host::{
@@ -34,10 +35,10 @@ use crate::extras::js::host::{
 #[cfg(test)]
 use crate::extras::js::protocol::JsDiagnosticHint;
 use crate::extras::js::protocol::{
-    ConsoleLevel, ConsoleRecord, Diagnostic, DiagnosticClass, DiagnosticStage, InvocationId,
-    JsErrorCode, JsExceptionClass, MAX_CONSOLE_BYTES, MAX_CONSOLE_RECORD_BYTES,
-    MAX_CONSOLE_RECORDS, MAX_EFFECTS_PER_STEP, MAX_RESULT_BYTES, ModelEffectProfile, RunStep,
-    ScriptRole, StepOutcome, StepResult, source_position_is_valid,
+    ConsoleLevel, ConsoleRecord, DenialReason, Diagnostic, DiagnosticClass, DiagnosticStage,
+    EffectErrorCode, InvocationId, JsErrorCode, JsExceptionClass, MAX_CONSOLE_BYTES,
+    MAX_CONSOLE_RECORD_BYTES, MAX_CONSOLE_RECORDS, MAX_EFFECTS_PER_STEP, MAX_RESULT_BYTES,
+    ModelEffectProfile, RunStep, ScriptRole, StepOutcome, StepResult, source_position_is_valid,
 };
 #[cfg(feature = "skills")]
 use crate::extras::js::protocol::{
@@ -55,6 +56,7 @@ use crate::extras::js::skills::proposal::{
     AttemptBudget, DEFAULT_SESSION_ATTEMPTS, ProposalHost, ProposalWorker,
 };
 use crate::extras::js::supervisor::{JsWorkerSupervisor, WorkerError};
+use crate::extras::js::tool_bridge::ToolBridge;
 use crate::extras::js::types::{
     MEMORY_LIMIT, PermCancellation, PermOutcome, PermRequest, PermRequestBuildError, PermResponse,
     PermResponseRejection, PermissionBackendFailure, PermissionDenial, READ_FILE_MAX_BYTES,
@@ -746,6 +748,8 @@ pub struct JsTool {
     write_guard: Option<JsWriteGuardConfig>,
     /// Whole-invocation deadline (`js-step-timeout-secs`, default 30 s).
     step_timeout: Duration,
+    /// Late-bound agent tool server for `call_tool`; `None` leaves the global out entirely.
+    tool_bridge: Option<ToolBridge>,
 }
 
 impl JsTool {
@@ -837,6 +841,7 @@ impl JsTool {
             skill_tool_call_ordinal: AtomicU64::new(0),
             profile: ModelEffectProfile::Full,
             write_guard: None,
+            tool_bridge: None,
             step_timeout: STEP_TIMEOUT,
         }
     }
@@ -870,6 +875,17 @@ impl JsTool {
         self
     }
 
+    /// Offer scripts `call_tool` over the agent's tool server. The bridge is bound by the agent
+    /// builder after the agent exists; until then every call fails closed.
+    pub(crate) fn with_tool_bridge(mut self, bridge: ToolBridge) -> Self {
+        self.tool_bridge = Some(bridge);
+        self
+    }
+
+    fn call_tool_available(&self) -> bool {
+        self.profile == ModelEffectProfile::Full && self.tool_bridge.is_some()
+    }
+
     fn spawn_available(&self) -> bool {
         self.profile == ModelEffectProfile::Full && self.sandbox.owns_complete_process_tree()
     }
@@ -887,6 +903,9 @@ impl JsTool {
         };
         if self.spawn_available() {
             capabilities.insert(HostCapability::Spawn);
+        }
+        if self.call_tool_available() {
+            capabilities.insert(HostCapability::CallTool);
         }
         capabilities
     }
@@ -1125,9 +1144,29 @@ fn open_first_free_audit_slot(
     paths: &crate::paths::AppPaths,
 ) -> Result<SharedEffectAudit, AuditError> {
     for slot in 0..MAX_AUDIT_SLOTS {
-        match EffectAudit::open(paths.effect_audit_slot(slot)) {
+        let owner = paths.effect_audit_slot(slot);
+        match EffectAudit::open(owner.clone()) {
             Ok(audit) => return Ok(Arc::new(std::sync::Mutex::new(audit))),
             Err(AuditError::WriterLocked) => continue,
+            Err(error) if audit_error_is_slot_data(error) => {
+                // One corrupt or unprunable slot must not take the js tool away for every later
+                // process that lands on it (mini-agent-nvnkx.118): keep it for inspection under
+                // a new name and continue with the next free slot.
+                match quarantine_audit_slot(owner.directory()) {
+                    Some(moved) => {
+                        tracing::warn!(
+                            %error,
+                            slot,
+                            quarantined_to = %moved.display(),
+                            "JS effect audit slot was unusable; it was moved aside for inspection and the next free slot is used"
+                        );
+                    }
+                    None => {
+                        tracing::warn!(%error, slot, "JS effect audit could not be opened");
+                        return Err(error);
+                    }
+                }
+            }
             Err(error) => {
                 tracing::warn!(%error, slot, "JS effect audit could not be opened");
                 return Err(error);
@@ -1141,6 +1180,31 @@ fn open_first_free_audit_slot(
     Err(AuditError::WriterLocked)
 }
 
+/// Errors that mean the slot's stored data is unusable (as opposed to the environment or a
+/// concurrent writer), so moving the slot aside can fix the next open.
+fn audit_error_is_slot_data(error: AuditError) -> bool {
+    matches!(
+        error,
+        AuditError::CorruptRecord
+            | AuditError::HashMismatch
+            | AuditError::MissingSegment
+            | AuditError::InvalidMetadata
+            | AuditError::RetentionLimit
+            | AuditError::KeyUnavailable
+    )
+}
+
+/// Renames a slot directory to `<name>.quarantine-<unix-ms>` beside it; `None` when that fails.
+fn quarantine_audit_slot(directory: &std::path::Path) -> Option<std::path::PathBuf> {
+    let name = directory.file_name()?.to_str()?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis());
+    let target = directory.with_file_name(format!("{name}.quarantine-{stamp}"));
+    std::fs::rename(directory, &target).ok()?;
+    Some(target)
+}
+
 /// Upper bound on concurrent audit writers (one slot directory per live mini-agent process).
 const MAX_AUDIT_SLOTS: u32 = 64;
 
@@ -1152,13 +1216,57 @@ const IDIOMS: &str = "Idioms: one script per question. If the format is unknown,
     Parse JSON that may hold integers above 2^53 with `json_exact`; `JSON.parse` silently \
     rounds them. Use `grep` or `read_lines` for huge files, not `read_file`. To explore a \
     repo, use one script: list the tree with `list_dir`/`glob`, then print the first ~15 lines \
-    of each interesting file via `read_lines(path, 1, 15).lines`, not many separate calls. Other \
-    pure helpers are listed by `help()`.";
+    of each interesting file via `read_lines(path, 1, 15).lines`, not many separate calls.";
 
 const READ_ONLY_IDIOMS: &str = "Idioms: one script per question; log one sample first if the \
     format is unknown; answer with the last expression, not `return`; count with \
     `splitLines(t).length`, not `split('\\n')`; use `json_exact` for integers above 2^53; use `grep` \
-    or `read_lines` for huge files. Other pure helpers are listed by `help()`.";
+    or `read_lines` for huge files.";
+
+/// Names-only pointer to every catalogued pack helper (usage stays behind `help(name)`), so a
+/// model that needs YAML or a diff knows the helper exists without spending a `help()` call.
+fn pack_names_sentence() -> String {
+    let names = super::pack::catalog_names().collect::<Vec<_>>();
+    format!(
+        "Other pure helpers (usage via help('name'), list via `help()`): {}.",
+        names.join(", ")
+    )
+}
+
+/// One sentence per file policy, naming the roots or the config key that governs it, so the
+/// description never advertises a global that can only fail (mini-agent-nvnkx.115).
+fn file_policy_note(reads: &FilePolicySummary, writes: Option<&FilePolicySummary>) -> String {
+    let mut note = String::new();
+    match reads {
+        FilePolicySummary::Disabled { invalid } => note.push_str(if *invalid {
+            " File reads are disabled: js-read-roots is invalid, so read_file, read_files, read_lines, list_dir, glob and grep fail with denied."
+        } else {
+            " File reads are disabled (no js-read-roots set), so read_file, read_files, read_lines, list_dir, glob and grep fail with denied."
+        }),
+        FilePolicySummary::Roots(roots) => {
+            note.push_str(&format!(
+                " File reads are limited to: {} (js-read-roots).",
+                roots.join(", ")
+            ));
+        }
+        FilePolicySummary::Unrestricted => {}
+    }
+    match writes {
+        Some(FilePolicySummary::Disabled { invalid }) => note.push_str(if *invalid {
+            " write_file is disabled (js-write-roots is invalid)."
+        } else {
+            " write_file is disabled (js-write-roots unset)."
+        }),
+        Some(FilePolicySummary::Roots(roots)) => {
+            note.push_str(&format!(
+                " write_file is limited to: {} (js-write-roots).",
+                roots.join(", ")
+            ));
+        }
+        Some(FilePolicySummary::Unrestricted) | None => {}
+    }
+    note
+}
 
 /// Contracts for `splitLines`, `json_exact`, and `read_lines`, shared by both description variants.
 fn helper_globals_doc() -> [String; 4] {
@@ -1188,6 +1296,11 @@ impl Tool for JsTool {
 
     fn description(&self) -> String {
         if self.profile == ModelEffectProfile::ReadOnly {
+            let idioms = format!(
+                "{READ_ONLY_IDIOMS} {}{}",
+                pack_names_sentence(),
+                file_policy_note(&self.allow_config.read_summary(), None)
+            );
             return format!(
                 "Execute JavaScript for bounded read-only codebase exploration and local \
                  computation. Code runs as a strict script in a fresh runtime for every call, \
@@ -1208,7 +1321,7 @@ impl Tool for JsTool {
                  heap, {} KiB JavaScript stack, {} KiB result (excess is cut with a size \
                  note), and {} read effects.",
                 helper_globals_doc().join(" "),
-                READ_ONLY_IDIOMS,
+                idioms,
                 self.step_timeout.as_secs(),
                 MEMORY_LIMIT / (1024 * 1024),
                 STACK_LIMIT / 1024,
@@ -1226,7 +1339,6 @@ impl Tool for JsTool {
                 READ_FILES_MAX_PATHS,
                 READ_FILES_MAX_RESULT_BYTES / (1024 * 1024)
             ),
-            helper_globals_doc().join(" "),
             "`list_dir(path?: string, options?: {include_ignored?: boolean}): {entries: {name: string, kind: 'file'|'directory'|'symlink', size: number}[], truncated: boolean, ignored: number}` (synchronous; defaults to '.'; ignored, VCS and dependency/build entries are omitted and counted in `ignored` unless include_ignored; symlinks are listed, not followed).".to_string(),
             "`glob(pattern: string, options?: {path?: string, include_ignored?: boolean}): {paths: string[], truncated: boolean, ignored: number}` (synchronous, recursive, skips symlinks, respects ignore files; pruned entries are counted in `ignored`, include_ignored searches them). Example: `const files = glob('**/*.rs').paths;`".to_string(),
             "`grep(pattern: string, options?: {path?: string, include?: string, case_sensitive?: boolean, include_ignored?: boolean}): {matches: {path: string, line: number, text: string}[], truncated: boolean, ignored: number, skipped: {large: number, binary: number, non_utf8: number, unreadable: number}}` (synchronous Rust regex search; ignored files are skipped unless include_ignored; case-sensitive by default; matched lines only; invalid UTF-8 decoded lossily; `skipped` counts files NOT searched (large >10 MiB, binary, unreadable) and non_utf8 files searched lossily: no matches with skipped>0 is not proof of absence).".to_string(),
@@ -1240,7 +1352,7 @@ impl Tool for JsTool {
                 MAX_RESULT_BYTES / 1024
             ),
             format!(
-                "`scratch_put(key: string, value): void` / `scratch_get(key: string): JSON|null` (synchronous, parent-owned across fresh runtimes; keys max {} bytes, values max {} MiB, {} MiB/{} entries per session).",
+                "`scratch_put(key: string, value): void` / `scratch_get(key: string): JSON|null` / `scratch_delete(key: string): boolean` (existed) / `scratch_keys(): string[]` (synchronous, parent-owned across fresh runtimes but process-local: it does not survive --resume, a restart or a new headless run; keys max {} bytes, values max {} MiB, {} MiB/{} entries per session; delete a key to free its slot).",
                 SCRATCH_KEY_MAX_BYTES,
                 SCRATCH_VALUE_MAX_BYTES / (1024 * 1024),
                 SCRATCH_TOTAL_MAX_BYTES / (1024 * 1024),
@@ -1253,12 +1365,38 @@ impl Tool for JsTool {
                 MAX_CONSOLE_BYTES / 1024
             ),
         ];
+        globals.splice(2..2, helper_globals_doc());
+        let reads = self.allow_config.read_summary();
+        let writes = self.allow_config.write_summary();
+        let reads_disabled = matches!(reads, FilePolicySummary::Disabled { .. });
+        let writes_disabled = matches!(writes, FilePolicySummary::Disabled { .. });
+        // Omit the contracts of globals the file policy can only deny; the note below says why.
+        globals.retain(|doc| {
+            let denied_read = [
+                "`read_file(",
+                "`read_files(",
+                "`list_dir(",
+                "`glob(",
+                "`grep(",
+                "`read_lines(",
+            ]
+            .iter()
+            .any(|prefix| doc.starts_with(prefix));
+            (!reads_disabled || !denied_read)
+                && (!writes_disabled || !doc.starts_with("`write_file("))
+        });
+        let policy_note = file_policy_note(&reads, Some(&writes));
         #[cfg(feature = "sandbox")]
         {
             globals.push(format!(
                 "`fetch(url: string, options?: {{method?: 'GET'|'POST', headers?: Record<string,string>, body?: string}}): {{status: number, text: string, truncated: boolean, lossy: boolean, location?: string}}` (synchronous; request bodies are POST-only and capped at {} KiB; a body over {} MiB is cut (`truncated`); non-UTF-8 is decoded by charset or lossily (`lossy`); redirects are not followed: a 3xx returns `location`, fetch it again; the result has no `ok`, `headers`, or `json()`). Example: `const r = fetch('https://example.com/data', {{method: 'GET'}}); console.log(r.status, r.text);`",
                 FETCH_REQUEST_BODY_MAX_BYTES / 1024,
                 FETCH_RESPONSE_BODY_MAX_BYTES / (1024 * 1024)
+            ));
+            globals.push(format!(
+                "`fetch_all(requests: {{url: string, method?, headers?, body?}}[]): (fetch result | {{error: string, message: string}})[]` (synchronous batch of 1-{} independent fetches, authorized and audited one by one then run {} at a time, results in request order; a denied or failed item is `{{error, message}}` without failing the others). Example: `const rs = fetch_all([{{url: 'https://a.example/x'}}, {{url: 'https://b.example/y'}}]);`",
+                crate::extras::js::protocol::MAX_BATCH_ITEMS,
+                crate::extras::js::host::BATCH_PARALLELISM,
             ));
         }
         if self.sandbox.owns_complete_process_tree() {
@@ -1268,6 +1406,17 @@ impl Tool for JsTool {
                 crate::extras::js::broker::MAX_SPAWN_EXECUTABLE_BYTES / (1024 * 1024),
                 crate::extras::js::types::SPAWN_ARGUMENT_MAX_COUNT
             ));
+            globals.push(format!(
+                "`spawn_all(commands: {{program: string, args: string[], options?: <spawn options>}}[]): (spawn result | {{error: string, message: string}})[]` (synchronous batch of 1-{} independent commands, each permission-checked and audited on its own then run {} at a time, results in request order; independent `git`/test commands finish in the time of the slowest). Example: `const rs = spawn_all([{{program: 'git', args: ['status', '--short']}}, {{program: 'git', args: ['log', '-1', '--oneline']}}]);`",
+                crate::extras::js::protocol::MAX_BATCH_ITEMS,
+                crate::extras::js::host::BATCH_PARALLELISM,
+            ));
+        }
+        if self.call_tool_available() {
+            globals.push(
+                "`call_tool(name: string, args?: object): {ok: boolean, text: string, truncated: boolean}` (synchronous; calls one read-only tool through the agent's tool server under that tool's own permission rules and hooks: read, grep, find_files, list_dir, lsp_navigate, lsp_diagnostics, web_search, web_fetch, memory_read, memory_search, list_mcp_resources, read_mcp_resource, job_status, todo_read and MCP tools that declare readOnlyHint. `text` is the tool's output (max 1 MiB, then `truncated`); `ok` false means the tool reported an error and `text` is its message. An unknown tool throws not_found; a tool that can change state throws denied). Example: `const hits = call_tool('grep', {pattern: 'TODO', path: 'src'}).text;`"
+                    .to_string(),
+            );
         }
         #[cfg(feature = "skills")]
         let mut proposal_guidance = "";
@@ -1299,6 +1448,7 @@ impl Tool for JsTool {
         }
         #[cfg(not(feature = "skills"))]
         let proposal_guidance = "";
+        let idioms = format!("{IDIOMS} {}{policy_note}", pack_names_sentence());
         format!(
             "Execute JavaScript code. Prefer this tool for computation, parsing, data \
              transformation, control flow, and cross-platform automation instead of invoking \
@@ -1306,9 +1456,7 @@ impl Tool for JsTool {
              tools for builds, tests, version control, or shell semantics. Code runs as a strict script \
              in a fresh runtime for every call, with top-level `await` supported; no variables or \
              other JavaScript state persist between calls. Host globals are synchronous, \
-             so awaiting them is optional. Available global contracts and examples: {} Worked \
-             multi-file aggregate: `const total = read_files(glob('**/*.txt').paths).reduce((n, \
-             text) => n + text.length, 0); total`. Strings, finite numbers, booleans, and \
+             so awaiting them is optional. Available global contracts and examples: {} {}Strings, finite numbers, booleans, and \
              accessor-free plain JSON objects/arrays are valid results. For values containing \
              `undefined`, NaN/Infinity, holes, accessors, Date, Map, Set, or class instances, end \
              the script with `JSON.stringify(value)` or an explicit string. Use `result(value)` for \
@@ -1321,7 +1469,12 @@ impl Tool for JsTool {
              `invalid_target`, or `too_large`; messages never include the target. Runtime failures \
              use closed, source-free error classes.{}",
             globals.join(" "),
-            IDIOMS,
+            if reads_disabled {
+                ""
+            } else {
+                "Worked multi-file aggregate: `const total = read_files(glob('**/*.txt').paths).reduce((n, text) => n + text.length, 0); total`. "
+            },
+            idioms,
             self.step_timeout.as_secs(),
             MEMORY_LIMIT / (1024 * 1024),
             STACK_LIMIT / 1024,
@@ -1397,12 +1550,31 @@ impl JsTool {
         }
         .map_err(audit_error)?;
 
-        // Create one absolute deadline for the entire invocation (30s from start)
+        let cancellation = PermCancellation::new();
+        let mut cancel_on_drop = CancelOnDrop::new(cancellation.clone());
+        // Queueing is not charged to the step (mini-agent-nvnkx.117/.170): wait for the single
+        // worker's lease under its own cancellable cap, then start the step deadline, the grant
+        // expiry and the effect-service deadlines. Only the parent supervisor measures either.
+        let queue_started = Instant::now();
+        let queue_deadline = queue_started
+            .checked_add(queue_wait_cap(self.step_timeout))
+            .ok_or_else(|| ToolError::Msg("JS tool deadline unavailable".into()))?;
+        let lease = match self
+            .supervisor
+            .acquire_lease(&cancellation, queue_deadline)
+            .await
+        {
+            Ok(lease) => lease,
+            Err(WorkerError::QueueTimedOut) => {
+                return Ok(queue_timeout_message(queue_started.elapsed()));
+            }
+            Err(error) => return Err(worker_tool_error(error)),
+        };
+        // One absolute deadline for the step itself (default 30s), started at lease acquisition.
+        // The supervisor shifts it past worker launch so a cold start is not charged either.
         let call_deadline = Instant::now()
             .checked_add(self.step_timeout)
             .ok_or_else(|| ToolError::Msg("JS tool deadline unavailable".into()))?;
-
-        let cancellation = PermCancellation::new();
         // Phase 6 timing rule: time spent awaiting a user approval is excluded from the step
         // budget, but at most one permission-prompt timeout (the step timeout, see
         // `with_step_timeout_secs`) in total. The parent supervisor enforces the resulting hard
@@ -1412,7 +1584,6 @@ impl JsTool {
         let hard_deadline = call_deadline
             .checked_add(approval_allowance)
             .ok_or_else(|| ToolError::Msg("JS tool deadline unavailable".into()))?;
-        let mut cancel_on_drop = CancelOnDrop::new(cancellation.clone());
         #[cfg(feature = "skills")]
         let skill_bundle = self.skill_turn_context.snapshot();
         #[cfg(feature = "skills")]
@@ -1438,7 +1609,11 @@ impl JsTool {
         #[cfg(feature = "skills")]
         let prepared_skill_manifests =
             prepare_skill_manifests(&skill_bundle, call_deadline, cancellation.clone()).await?;
-        let grant_expires_at = hard_deadline;
+        // The supervisor may spend up to its launch allowance starting the worker before the step
+        // clock starts, so the grant outlives that as well; the parent still enforces the clock.
+        let grant_expires_at = hard_deadline
+            .checked_add(self.supervisor.launch_allowance())
+            .unwrap_or(hard_deadline);
         let model_capabilities = self.model_capabilities();
         let grant = InvocationGrant::issue(
             invocation_id.clone(),
@@ -1503,6 +1678,13 @@ impl JsTool {
             SpawnEffectService::new(self.sandbox.clone(), bridge.clone(), remaining_deadline),
         )
         .with_scratch_store(self.scratch.clone());
+        let service = match (&self.tool_bridge, self.call_tool_available()) {
+            (Some(bridge), true) => service.with_call_tool(CallToolEffectService::new(
+                bridge.clone(),
+                remaining_deadline,
+            )),
+            _ => service,
+        };
         #[cfg(feature = "sandbox")]
         let service = service.with_fetch(FetchEffectService::new(
             bridge,
@@ -1527,6 +1709,7 @@ impl JsTool {
         )
         .map_err(|_| ToolError::Msg("JS invocation authority unavailable".into()))?
         .with_structured_result_receipt(structured_result_receipt.clone());
+        let effect_trace = broker.effect_trace();
         #[cfg(feature = "skills")]
         let broker = broker.with_skill_call_authority(skill_call_authority);
         #[cfg(feature = "skills")]
@@ -1536,6 +1719,7 @@ impl JsTool {
             .with_model_grant(model_grant_id)
             .with_model_effect_profile(self.profile)
             .with_spawn_available(self.spawn_available())
+            .with_call_tool_available(self.call_tool_available())
             .with_timeout(self.step_timeout);
         #[cfg(feature = "skills")]
         let run_step = if let Some(grant_id) = proposal_grant_id {
@@ -1558,14 +1742,16 @@ impl JsTool {
             broker,
             cancellation,
             Some(call_deadline),
+            Some(lease),
         );
         #[cfg(not(feature = "skills"))]
-        let execution = self.supervisor.execute_bound_with_deadline(
+        let execution = self.supervisor.execute_bound_leased(
             invocation_id,
             run_step,
             broker,
             cancellation,
             Some(call_deadline),
+            Some(lease),
         );
         let execution_result = execution.await;
         // Effect completions are group-committed (phase-6 spec, effect-audit ordering): make any
@@ -1578,6 +1764,7 @@ impl JsTool {
                     error,
                     invocation_state.permission_prompt_blocked_deadline(),
                     self.step_timeout,
+                    &effect_trace,
                 );
             }
         };
@@ -1612,9 +1799,20 @@ impl JsTool {
             );
         }
 
-        let mut output = render_step_result_for(&response, self.step_timeout);
+        let mut output = render_step_result_with(
+            &response,
+            self.step_timeout,
+            &RenderContext {
+                model_source: &model_source,
+                last_failed_effect: effect_trace.snapshot().last_failed,
+            },
+        );
         if let Some(notice) = crate::session::file_checkpoints::take_uncaptured_notice() {
             output.push_str(&notice);
+        }
+        if let Some(note) = self.scratch.take_reset_note() {
+            output.push('\n');
+            output.push_str(note);
         }
         #[cfg(feature = "skills")]
         let output = match self.proposal_service.as_ref() {
@@ -1911,15 +2109,47 @@ fn render_worker_execution_error(
     error: WorkerError,
     permission_prompt_blocked_deadline: bool,
     budget: Duration,
+    trace: &EffectTrace,
 ) -> Result<String, ToolError> {
     match error {
         WorkerError::PermissionPromptTimedOut => Ok(permission_prompt_timeout_message(budget)),
         WorkerError::TimedOut if permission_prompt_blocked_deadline => {
             Ok(permission_prompt_timeout_message(budget))
         }
-        WorkerError::TimedOut => Ok(step_timeout_headline(budget)),
+        WorkerError::TimedOut => Ok(parent_timeout_message(budget, trace)),
         error => Err(worker_tool_error(error)),
     }
+}
+
+/// The parent ended the call at its deadline. The worker's terminal frame never arrived, so the
+/// console it streamed with earlier effect requests and the operation that was in flight (both
+/// parent-recorded) are the only context the model can get about where the time went.
+fn parent_timeout_message(budget: Duration, trace: &EffectTrace) -> String {
+    let mut text = step_timeout_headline(budget);
+    if let Some(operation) = trace.snapshot().in_flight {
+        text.push_str(&format!("; deadline reached during {operation}"));
+    }
+    let console = trace.console();
+    if !console.is_empty() {
+        text.push('\n');
+        render_console(&console, &mut text);
+        text.pop();
+    }
+    text
+}
+
+/// How long a call may queue for the single worker before it gives up without running: the
+/// hard bound (step plus approval allowance) of the call it is waiting behind, plus slack for
+/// that call's worker launch.
+fn queue_wait_cap(step_timeout: Duration) -> Duration {
+    step_timeout.saturating_mul(3)
+}
+
+fn queue_timeout_message(waited: Duration) -> String {
+    format!(
+        "JS error: waited {}s for another js call to finish; the script did not run, retry",
+        waited.as_secs()
+    )
 }
 
 /// Parent-side ceilings for worker-supplied result and console payloads.
@@ -2087,7 +2317,7 @@ fn validate_step_diagnostic(result: &StepResult, model_source: &str) -> Result<(
             diagnostic.class == DiagnosticClass::ResourceLimit
                 && diagnostic.exception_class.is_none()
         }
-        StepOutcome::Error(JsErrorCode::InvalidResult) => {
+        StepOutcome::Error(JsErrorCode::InvalidResult | JsErrorCode::Unsettled) => {
             diagnostic.class == DiagnosticClass::Contract && diagnostic.exception_class.is_none()
         }
         StepOutcome::Error(JsErrorCode::Internal) => {
@@ -2113,7 +2343,25 @@ fn render_step_result(result: &StepResult) -> String {
 /// Static note rendered when a script finishes without a value.
 const VOID_RESULT_NOTE: &str = "[js completed; the script returned undefined. End with an expression or call result(value) to return data]";
 
+#[cfg(test)]
 fn render_step_result_for(result: &StepResult, budget: Duration) -> String {
+    render_step_result_with(result, budget, &RenderContext::default())
+}
+
+/// Parent-owned facts used to enrich a failure without trusting worker text: the model's own
+/// source (its position is already validated against it) and the closed effect trace the broker
+/// recorded itself (Phase 6 invariant 6).
+#[derive(Default)]
+struct RenderContext<'a> {
+    model_source: &'a str,
+    last_failed_effect: Option<FailedEffect>,
+}
+
+fn render_step_result_with(
+    result: &StepResult,
+    budget: Duration,
+    context: &RenderContext<'_>,
+) -> String {
     match &result.outcome {
         StepOutcome::Value(value) => {
             let mut text = String::with_capacity(value.len());
@@ -2144,19 +2392,25 @@ fn render_step_result_for(result: &StepResult, budget: Duration) -> String {
         StepOutcome::Error(code) => render_failure(
             &js_error_headline(*code, result.diagnostic.as_ref()),
             result,
+            context,
         ),
-        StepOutcome::Timeout => render_failure(&step_timeout_headline(budget), result),
-        StepOutcome::OutOfMemory => {
-            render_failure("JS error: out of memory (64 MiB limit exceeded)", result)
-        }
+        StepOutcome::Timeout => render_failure(&step_timeout_headline(budget), result, context),
+        StepOutcome::OutOfMemory => render_failure(
+            "JS error: out of memory (64 MiB limit exceeded)",
+            result,
+            context,
+        ),
     }
 }
 
-fn render_failure(headline: &str, result: &StepResult) -> String {
+fn render_failure(headline: &str, result: &StepResult, context: &RenderContext<'_>) -> String {
     let mut text = String::from(headline);
     if let Some(diagnostic) = &result.diagnostic {
         if let (Some(line), Some(column)) = (diagnostic.line, diagnostic.column) {
             text.push_str(&format!(" at {line}:{column}"));
+            if let Some(near) = identifier_note(diagnostic, context.model_source, line, column) {
+                text.push_str(&near);
+            }
         }
         if let Some(hint) = diagnostic.hint {
             text.push_str(": ");
@@ -2165,6 +2419,12 @@ fn render_failure(headline: &str, result: &StepResult) -> String {
         text.push_str(" (");
         render_diagnostic(diagnostic, &mut text);
         text.push(')');
+        if diagnostic.exception_class == Some(JsExceptionClass::Other)
+            && let Some(failed) = context.last_failed_effect
+        {
+            text.push_str("; ");
+            text.push_str(&failed_effect_note(failed));
+        }
     }
     if !result.console.is_empty() {
         text.push('\n');
@@ -2172,6 +2432,412 @@ fn render_failure(headline: &str, result: &StepResult) -> String {
         text.pop();
     }
     text
+}
+
+/// Closed wording for the effect the parent last saw fail, e.g.
+/// `last failed effect: read_file -> denied (no js-read-roots configured)`.
+fn failed_effect_note(failed: FailedEffect) -> String {
+    let mut note = format!(
+        "last failed effect: {} -> {}",
+        failed.operation,
+        effect_code_name(failed.code)
+    );
+    if let Some(reason) = failed.reason {
+        note.push_str(" (");
+        note.push_str(denial_reason_text(reason));
+        note.push(')');
+    }
+    note
+}
+
+fn effect_code_name(code: EffectErrorCode) -> &'static str {
+    match code {
+        EffectErrorCode::Denied => "denied",
+        EffectErrorCode::CapabilityDenied => "capability_denied",
+        EffectErrorCode::InvalidTarget => "invalid_target",
+        EffectErrorCode::NotFound => "not_found",
+        EffectErrorCode::IsDirectory => "is_directory",
+        EffectErrorCode::Cancelled => "cancelled",
+        EffectErrorCode::TimedOut => "timed_out",
+        EffectErrorCode::TooLarge => "too_large",
+        EffectErrorCode::BackendFailure => "backend_failure",
+        EffectErrorCode::AuditFailure => "audit_failure",
+        EffectErrorCode::OutcomeUnknown => "outcome_unknown",
+        EffectErrorCode::NotText => "not_text",
+        EffectErrorCode::DnsFailed => "dns_failed",
+    }
+}
+
+fn denial_reason_text(reason: DenialReason) -> &'static str {
+    match reason {
+        DenialReason::NoConfiguredRoots => {
+            "no roots configured: set js-read-roots or js-write-roots"
+        }
+        DenialReason::OutsideRoots => "outside the configured roots",
+        DenialReason::PermissionDenied => "permission policy denied it",
+        DenialReason::UnreadOverwrite => "existing file was not fully read first",
+        DenialReason::ScratchEntryLimit => "scratch store entry limit reached",
+        DenialReason::ScratchByteLimit => "scratch store byte limit reached",
+    }
+}
+
+/// Host globals that always exist (see the description); candidates for a "did you mean".
+const HOST_GLOBAL_NAMES: &[&str] = &[
+    "read_file",
+    "read_files",
+    "read_lines",
+    "list_dir",
+    "glob",
+    "grep",
+    "write_file",
+    "result",
+    "scratch_put",
+    "scratch_get",
+    "scratch_delete",
+    "scratch_keys",
+    "fetch",
+    "spawn",
+    "call_tool",
+    "fetch_all",
+    "spawn_all",
+    "splitLines",
+    "json_exact",
+    "toml_parse",
+    "csv_parse",
+    "help",
+];
+
+/// ` near `name`` (and a closed "did you mean" for an unknown global), derived only from the
+/// parent's own copy of the model script at a position it already validated.
+fn identifier_note(
+    diagnostic: &Diagnostic,
+    model_source: &str,
+    line: u32,
+    column: u32,
+) -> Option<String> {
+    if diagnostic.script_role != ScriptRole::Model {
+        return None;
+    }
+    let class = diagnostic.exception_class?;
+    if !matches!(
+        class,
+        JsExceptionClass::ReferenceError | JsExceptionClass::TypeError
+    ) {
+        return None;
+    }
+    // QuickJS reports the start of the enclosing statement or function for many failures, so a
+    // token at that position is trusted only when it is a plain (non-keyword) identifier. An
+    // unknown global is better found from the whole source: a name that is only ever called and
+    // never declared anywhere in the model's own script.
+    let positional = identifier_at(model_source, line, column)
+        .filter(|name| !JS_KEYWORDS.contains(&name.split('.').next().unwrap_or_default()));
+    let name = if class == JsExceptionClass::ReferenceError {
+        undeclared_called_identifier(model_source).or(positional)?
+    } else {
+        positional?
+    };
+    let mut note = format!(" near `{name}`");
+    if class == JsExceptionClass::ReferenceError
+        && let Some(suggestion) = suggest_global(&name)
+    {
+        note.push_str(&format!(" (did you mean `{suggestion}`?)"));
+    }
+    Some(note)
+}
+
+const JS_KEYWORDS: &[&str] = &[
+    "await",
+    "async",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "debugger",
+    "default",
+    "delete",
+    "do",
+    "else",
+    "export",
+    "extends",
+    "finally",
+    "for",
+    "function",
+    "if",
+    "import",
+    "in",
+    "instanceof",
+    "let",
+    "new",
+    "of",
+    "return",
+    "super",
+    "switch",
+    "this",
+    "throw",
+    "try",
+    "typeof",
+    "var",
+    "void",
+    "while",
+    "with",
+    "yield",
+];
+
+/// Standard globals QuickJS provides; never reported as an undeclared name.
+const STANDARD_GLOBALS: &[&str] = &[
+    "Object",
+    "Function",
+    "Array",
+    "Number",
+    "parseFloat",
+    "parseInt",
+    "Boolean",
+    "String",
+    "Symbol",
+    "Date",
+    "Promise",
+    "RegExp",
+    "Error",
+    "AggregateError",
+    "EvalError",
+    "RangeError",
+    "ReferenceError",
+    "SyntaxError",
+    "TypeError",
+    "URIError",
+    "InternalError",
+    "JSON",
+    "Math",
+    "ArrayBuffer",
+    "SharedArrayBuffer",
+    "Uint8Array",
+    "Int8Array",
+    "Uint8ClampedArray",
+    "Int16Array",
+    "Uint16Array",
+    "Int32Array",
+    "Uint32Array",
+    "Float32Array",
+    "Float64Array",
+    "BigInt64Array",
+    "BigUint64Array",
+    "DataView",
+    "Map",
+    "Set",
+    "WeakMap",
+    "WeakSet",
+    "WeakRef",
+    "FinalizationRegistry",
+    "Proxy",
+    "Reflect",
+    "BigInt",
+    "Atomics",
+    "eval",
+    "isFinite",
+    "isNaN",
+    "decodeURI",
+    "decodeURIComponent",
+    "encodeURI",
+    "encodeURIComponent",
+    "escape",
+    "unescape",
+    "globalThis",
+    "console",
+    "require",
+];
+
+/// The first identifier the model's own script only ever calls (`name(`), never declares and
+/// never reads any other way, that is also not a standard or host global. Derived purely from
+/// the parent's copy of the script (strings, template text and comments skipped).
+fn undeclared_called_identifier(source: &str) -> Option<String> {
+    let bytes = source.as_bytes();
+    let mut index = 0;
+    // (identifier, called, declared_or_bare, preceded_by_dot)
+    let mut seen: Vec<(String, bool, bool)> = Vec::new();
+    let mut previous_word: Option<String> = None;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match byte {
+            b'\'' | b'"' | b'`' => {
+                index += 1;
+                while index < bytes.len() && bytes[index] != byte {
+                    if bytes[index] == b'\\' {
+                        index += 1;
+                    }
+                    index += 1;
+                }
+                index += 1;
+                previous_word = None;
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                {
+                    index += 1;
+                }
+                index += 2;
+            }
+            _ if is_identifier_byte(byte) && !byte.is_ascii_digit() => {
+                let start = index;
+                while index < bytes.len() && is_identifier_byte(bytes[index]) {
+                    index += 1;
+                }
+                let word = &source[start..index];
+                let after = bytes[index..]
+                    .iter()
+                    .find(|byte| !byte.is_ascii_whitespace())
+                    .copied();
+                let before = bytes[..start]
+                    .iter()
+                    .rev()
+                    .find(|byte| !byte.is_ascii_whitespace())
+                    .copied();
+                if before != Some(b'.') && !JS_KEYWORDS.contains(&word) {
+                    let called = after == Some(b'(')
+                        && !matches!(previous_word.as_deref(), Some("function" | "class"));
+                    let bare = !called;
+                    match seen.iter_mut().find(|entry| entry.0 == word) {
+                        Some(entry) => entry.2 |= bare,
+                        None => seen.push((word.to_string(), called, bare)),
+                    }
+                }
+                previous_word = Some(word.to_string());
+            }
+            _ => {
+                if !byte.is_ascii_whitespace() {
+                    previous_word = None;
+                }
+                index += 1;
+            }
+        }
+    }
+    seen.into_iter()
+        .find(|(name, called, bare)| {
+            *called
+                && !*bare
+                && !STANDARD_GLOBALS.contains(&name.as_str())
+                && !HOST_GLOBAL_NAMES.contains(&name.as_str())
+                && !super::pack::catalog_names().any(|known| known == name)
+                && !name.starts_with("__")
+        })
+        .map(|(name, _, _)| name)
+}
+
+fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$'
+}
+
+/// The (possibly dotted) identifier at or just before a 1-based byte column of `line`.
+fn identifier_at(source: &str, line: u32, column: u32) -> Option<String> {
+    const MAX_NAME_BYTES: usize = 64;
+    let source_line = source
+        .split('\n')
+        .nth(usize::try_from(line.checked_sub(1)?).ok()?)?;
+    let bytes = source_line.as_bytes();
+    let mut index = usize::try_from(column.checked_sub(1)?)
+        .ok()?
+        .min(bytes.len());
+    if index >= bytes.len() || !is_identifier_byte(bytes[index]) {
+        // The position may sit on the call paren, a dot or just past the token.
+        let mut back = index;
+        let mut steps = 0;
+        while back > 0 && steps < 3 && matches!(bytes[back - 1], b'(' | b'.' | b' ' | b'[') {
+            back -= 1;
+            steps += 1;
+        }
+        if back == 0 || !is_identifier_byte(bytes[back - 1]) {
+            return None;
+        }
+        index = back - 1;
+    }
+    let mut start = index;
+    let mut end = index + 1;
+    loop {
+        while start > 0 && is_identifier_byte(bytes[start - 1]) {
+            start -= 1;
+        }
+        // Include a dotted receiver (`obj.items.length`) so the name is the whole access path.
+        if start >= 2 && bytes[start - 1] == b'.' && is_identifier_byte(bytes[start - 2]) {
+            start -= 1;
+            continue;
+        }
+        break;
+    }
+    loop {
+        while end < bytes.len() && is_identifier_byte(bytes[end]) {
+            end += 1;
+        }
+        // ...and the rest of a dotted path (`foo.bar.baz`).
+        if end + 1 < bytes.len() && bytes[end] == b'.' && is_identifier_byte(bytes[end + 1]) {
+            end += 1;
+            continue;
+        }
+        break;
+    }
+    let name = source_line.get(start..end)?;
+    (name.len() <= MAX_NAME_BYTES && !name.starts_with(|c: char| c.is_ascii_digit()))
+        .then(|| name.to_string())
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut previous = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let current = row[j + 1];
+            row[j + 1] = (previous + usize::from(ca != *cb))
+                .min(row[j] + 1)
+                .min(row[j + 1] + 1);
+            previous = current;
+        }
+    }
+    row[b.len()]
+}
+
+/// A closed suggestion from the static helper catalogue: a case/underscore-insensitive match
+/// (`readFile`), a near spelling, or the closest helper sharing the `yaml_`-style family prefix.
+fn suggest_global(name: &str) -> Option<&'static str> {
+    if name.contains('.') {
+        return None;
+    }
+    let normalize = |text: &str| text.replace('_', "").to_ascii_lowercase();
+    let wanted = normalize(name);
+    let family = name.split('_').next().filter(|family| family.len() >= 3);
+    let candidates = HOST_GLOBAL_NAMES
+        .iter()
+        .copied()
+        .chain(super::pack::catalog_names());
+    let mut best: Option<(usize, &'static str)> = None;
+    for candidate in candidates {
+        if candidate == name {
+            continue;
+        }
+        let distance = if normalize(candidate) == wanted {
+            0
+        } else {
+            let distance = edit_distance(name, candidate);
+            let same_family = name.contains('_')
+                && family.is_some_and(|family| candidate.starts_with(&format!("{family}_")));
+            if distance <= 2 || (same_family && distance <= 8) {
+                distance
+            } else {
+                continue;
+            }
+        };
+        if best.is_none_or(|(current, _)| distance < current) {
+            best = Some((distance, candidate));
+        }
+    }
+    best.map(|(_, candidate)| candidate)
 }
 
 fn js_error_headline(code: JsErrorCode, diagnostic: Option<&Diagnostic>) -> String {
@@ -2275,6 +2941,9 @@ fn script_role_name(role: ScriptRole) -> &'static str {
     }
 }
 
+/// Static text for a completion promise that never settled: no limit was hit.
+const UNSETTLED_PROMISE_HEADLINE: &str = "an awaited promise never settled; this runtime has no timers or callbacks and host globals are synchronous, so call them directly and remove the await";
+
 fn js_error_code(code: JsErrorCode) -> &'static str {
     match code {
         JsErrorCode::Syntax => "syntax error",
@@ -2283,6 +2952,7 @@ fn js_error_code(code: JsErrorCode) -> &'static str {
         JsErrorCode::JobLimit => "job limit exceeded",
         JsErrorCode::EffectLimit => "effect limit exceeded",
         JsErrorCode::InvalidResult => "invalid result",
+        JsErrorCode::Unsettled => UNSETTLED_PROMISE_HEADLINE,
         JsErrorCode::Internal => "internal error",
     }
 }
@@ -3795,6 +4465,13 @@ mod js_permission_bridge {
                 );
             }
             assert!(description.contains("Idioms:"));
+            // Every catalogued pack helper is named (usage stays behind help(name)).
+            for name in crate::extras::js::pack::catalog_names() {
+                assert!(
+                    description.contains(name),
+                    "{profile:?} description must name the pack helper {name}"
+                );
+            }
             // Pack helpers stay out of the always-sent description: they are asserted through
             // the `help()` catalogue and `typeof` (which triggers the lazy load).
             assert!(description.contains("`help()`"), "{profile:?}");
@@ -3829,6 +4506,9 @@ mod js_permission_bridge {
         // baseline plus 227 bytes for toml_parse/csv_parse (4831 measured); it must stay modest.
         // The bound later absorbed other work (4956 bytes before the help() sentence) and rises
         // by exactly the 43 bytes of " Other pure helpers are listed by `help()`." (4999 measured).
+        // The names-only pack helper sentence, the scratch delete/keys contract and `fetch_all`
+        // (mini-agent-nvnkx.115/.120/.123/.119) add about 1.3 KiB; `call_tool` and `spawn_all`
+        // add their lines only when a tool bridge or process tree is present.
         // The oversized-result note " (excess is cut with a size note)" adds 33 bytes.
         // The grep `skipped` counts (mini-agent-azgi7) add 290 bytes.
         // The write_file overwrite guard and the read_lines EOF-seek note add 95 bytes
@@ -3837,7 +4517,7 @@ mod js_permission_bridge {
             .description()
             .len();
         assert!(
-            full < 3384 + 1350 + 230 + 43 + 33 + 290 + 100 + 200 + 1100,
+            full < 3384 + 1350 + 230 + 43 + 33 + 290 + 100 + 200 + 1100 + 1500,
             "full description is {full} bytes"
         );
     }
@@ -3851,7 +4531,10 @@ mod js_permission_bridge {
         let size = tool.description().len() + tool.parameters().to_string().len();
         // 6_000 before the effect options of mini-agent-nvnkx.319-.328 (include_ignored, spawn
         // options, fetch fields, read_file decoding) added their one-line contracts.
-        assert!(size <= 6_600, "js definition is {size} bytes");
+        // 7_000 -> 8_000 for the pack helper names, scratch delete/keys and the batch fetch
+        // contract (mini-agent-nvnkx.119/.120/.123); `call_tool` / `spawn_all` lines appear
+        // only when a tool bridge or a process-tree sandbox is configured.
+        assert!(size <= 8_000, "js definition is {size} bytes");
     }
 
     #[tokio::test]
@@ -3945,6 +4628,57 @@ mod js_permission_bridge {
                 out.chars().count()
             );
         }
+    }
+
+    #[test]
+    fn a_parent_side_deadline_names_the_inflight_effect_and_keeps_streamed_console() {
+        let trace = EffectTrace::for_test(
+            Some("read_files"),
+            &[ConsoleRecord {
+                level: ConsoleLevel::Log,
+                text: "scanned 3 of 9".into(),
+                truncated: false,
+            }],
+        );
+        let rendered =
+            render_worker_execution_error(WorkerError::TimedOut, false, STEP_TIMEOUT, &trace)
+                .unwrap();
+        assert_eq!(
+            rendered,
+            "JS error: execution timed out (30s limit exceeded); deadline reached during read_files\n[console.log] scanned 3 of 9"
+        );
+        // Nothing in flight and nothing logged keeps the historical headline byte for byte.
+        let bare = render_worker_execution_error(
+            WorkerError::TimedOut,
+            false,
+            STEP_TIMEOUT,
+            &EffectTrace::default(),
+        )
+        .unwrap();
+        assert_eq!(bare, "JS error: execution timed out (30s limit exceeded)");
+    }
+
+    #[test]
+    fn identifier_extraction_stays_inside_the_models_own_line_and_skips_keywords() {
+        let source = "const a = 1;\nconst doc = yaml_load('a');\nfoo.bar.baz();";
+        assert_eq!(identifier_at(source, 3, 5).as_deref(), Some("foo.bar.baz"));
+        assert_eq!(identifier_at(source, 3, 12).as_deref(), Some("foo.bar.baz"));
+        assert_eq!(identifier_at(source, 9, 1), None);
+        assert_eq!(identifier_at(source, 1, 200), None);
+        assert_eq!(
+            undeclared_called_identifier(source).as_deref(),
+            Some("yaml_load")
+        );
+        // Declared names, methods, strings and comments never count.
+        assert_eq!(
+            undeclared_called_identifier(
+                "function f(){}\nconst g = () => 1;\nf(); g(); x.y(); // z()\n'w()'"
+            ),
+            None
+        );
+        assert_eq!(suggest_global("readFile"), Some("read_file"));
+        assert_eq!(suggest_global("yaml_load"), Some("yaml_parse"));
+        assert_eq!(suggest_global("zzzzzz"), None);
     }
 
     #[test]
@@ -4558,6 +5292,52 @@ mod audit_slots {
         drop((first, third, reused));
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// mini-agent-nvnkx.118: a slot whose stored data is corrupt is moved aside (kept for
+    /// inspection) and the next free slot is used, instead of failing the js tool for good.
+    #[test]
+    fn a_corrupt_audit_slot_is_quarantined_and_the_next_slot_is_used() {
+        let root = std::env::temp_dir().join(format!(
+            "mini-agent-audit-quarantine-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = paths(&root);
+        let slot_zero = paths.effect_audit_slot(0).directory().to_path_buf();
+        {
+            let _ = open_first_free_audit_slot(&paths).expect("first audit");
+        }
+        // Corrupt slot 0's only segment.
+        let segment = std::fs::read_dir(&slot_zero)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("segment-"))
+            })
+            .expect("a segment file");
+        std::fs::write(&segment, b"not an audit record").unwrap();
+
+        let audit = open_first_free_audit_slot(&paths).expect("falls through to a fresh slot");
+        assert!(
+            paths
+                .effect_audit_slot(1)
+                .directory()
+                .join("writer.lock")
+                .exists(),
+            "slot 1 now holds the live writer"
+        );
+        assert!(!slot_zero.exists(), "the corrupt slot was renamed");
+        let moved: Vec<_> = std::fs::read_dir(slot_zero.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".quarantine-"))
+            .collect();
+        assert_eq!(moved.len(), 1, "exactly one quarantined copy is kept");
+        drop(audit);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 #[cfg(test)]
@@ -4748,6 +5528,7 @@ mod step_result_rendering {
             WorkerError::PermissionPromptTimedOut,
             false,
             STEP_TIMEOUT,
+            &EffectTrace::default(),
         )
         .expect("permission timeout is a closed model-visible result");
 
@@ -4757,13 +5538,23 @@ mod step_result_rendering {
         assert!(rendered.contains("do not retry"));
         assert!(!rendered.contains("execution timed out"));
         assert_eq!(
-            render_worker_execution_error(WorkerError::TimedOut, true, STEP_TIMEOUT)
-                .expect("sticky prompt attribution must survive the effect boundary"),
+            render_worker_execution_error(
+                WorkerError::TimedOut,
+                true,
+                STEP_TIMEOUT,
+                &EffectTrace::default(),
+            )
+            .expect("sticky prompt attribution must survive the effect boundary"),
             permission_prompt_timeout_message(STEP_TIMEOUT)
         );
         assert_eq!(
-            render_worker_execution_error(WorkerError::TimedOut, false, STEP_TIMEOUT)
-                .expect("ordinary execution timeout stays model-visible"),
+            render_worker_execution_error(
+                WorkerError::TimedOut,
+                false,
+                STEP_TIMEOUT,
+                &EffectTrace::default(),
+            )
+            .expect("ordinary execution timeout stays model-visible"),
             "JS error: execution timed out (30s limit exceeded)"
         );
     }
@@ -4780,13 +5571,24 @@ mod step_result_rendering {
     fn configured_step_timeout_is_named_by_the_producers_not_patched_in() {
         let budget = Duration::from_secs(60);
         assert_eq!(
-            render_worker_execution_error(WorkerError::TimedOut, false, budget).unwrap(),
+            render_worker_execution_error(
+                WorkerError::TimedOut,
+                false,
+                budget,
+                &EffectTrace::default(),
+            )
+            .unwrap(),
             "JS error: execution timed out (60s js-step-timeout-secs limit exceeded)"
         );
         assert!(
-            render_worker_execution_error(WorkerError::PermissionPromptTimedOut, false, budget)
-                .unwrap()
-                .contains("within the 60s budget")
+            render_worker_execution_error(
+                WorkerError::PermissionPromptTimedOut,
+                false,
+                budget,
+                &EffectTrace::default(),
+            )
+            .unwrap()
+            .contains("within the 60s budget")
         );
         // A successful result that merely contains the default wording is untouched.
         let echoed = step(
@@ -5190,7 +5992,14 @@ mod xml_bpmn_pack_tests {
                 "bpmn_summary",
                 "bpmn_from_outline",
             ] {
-                assert!(!description.contains(name), "{profile:?} {name}");
+                // The description names each helper (mini-agent-nvnkx.123) but never carries its
+                // signature or usage: those stay behind help().
+                assert!(description.contains(name), "{profile:?} {name}");
+                assert!(
+                    !description.contains(&format!("{name}("))
+                        && !description.contains(&format!("`{name}")),
+                    "{profile:?} {name}"
+                );
                 assert!(help.contains(&format!("{name}(")), "{profile:?}: {help}");
             }
             let out = tool.call(JsArgs { code: code.into() }).await.unwrap();

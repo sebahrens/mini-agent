@@ -32,6 +32,18 @@ fn catalog(source: &str) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// Every catalogued helper name, in catalogue order, from the `//@ ` header lines.
+pub(super) fn catalog_names() -> impl Iterator<Item = &'static str> {
+    SEGMENTS.iter().flat_map(|source| {
+        source
+            .lines()
+            .filter_map(|line| line.strip_prefix("//@ "))
+            .filter_map(|entry| entry.split('|').next())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+    })
+}
+
 /// Install `help` and the lazy getters for the first-party pack (both effect profiles).
 pub(super) fn install(ctx: &Ctx<'_>) -> rquickjs::Result<()> {
     install_sources(ctx, SEGMENTS)

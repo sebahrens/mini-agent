@@ -17,11 +17,11 @@ use crate::extras::js::audit::{
     SanitizedTarget,
 };
 use crate::extras::js::broker::{
-    AuthorizedEffect, AuthorizedTarget, EffectOperation, EffectResult, ExecutableCopyError,
-    ExecutablePreparationWaitError, GrantPrincipal, HostCapability, HostEffectError,
-    InvocationBroker, InvocationGrant, MAX_SPAWN_EXECUTABLE_BYTES, NormalizedTarget,
-    ParentEffectService, copy_and_hash_executable, copy_and_hash_executable_controlled,
-    resolve_program_identity, run_executable_preparation,
+    AuthorizedEffect, AuthorizedTarget, BatchExecution, EffectOperation, EffectResult,
+    ExecutableCopyError, ExecutablePreparationWaitError, GrantPrincipal, HostCapability,
+    HostEffectError, InvocationBroker, InvocationGrant, MAX_SPAWN_EXECUTABLE_BYTES,
+    NormalizedTarget, ParentEffectService, PreparedEffect, copy_and_hash_executable,
+    copy_and_hash_executable_controlled, resolve_program_identity, run_executable_preparation,
 };
 #[cfg(feature = "skills")]
 use crate::extras::js::broker::{SkillCallAuthority, SkillExportAuthoritySpec};
@@ -83,6 +83,8 @@ struct RecordingService {
     normalized_target: Option<Result<NormalizedTarget, HostEffectError>>,
     pending_permission: bool,
     permission_delay_until: Option<Instant>,
+    /// When set, the service batches: each item runs for this long, concurrently.
+    batch_delay: Option<Duration>,
     record: Arc<Mutex<ServiceRecord>>,
 }
 
@@ -138,7 +140,12 @@ impl ParentEffectService for RecordingService {
         _operation: &'a EffectOperation,
         _cancellation: PermCancellation,
     ) -> ServiceFuture<'a, Result<AuthorizedTarget, HostEffectError>> {
-        let result = self.failures.permission.map_or(Ok(()), Err);
+        let mut result = self.failures.permission.map_or(Ok(()), Err);
+        if let EffectOperation::Fetch { url, .. } = _operation
+            && url.contains("denied")
+        {
+            result = Err(HostEffectError::PermissionDenied);
+        }
         let target = authorized_target(_operation);
         self.record.lock().unwrap().authorizations += 1;
         if self.pending_permission {
@@ -174,6 +181,29 @@ impl ParentEffectService for RecordingService {
             Ok(result)
         })
     }
+    fn take_prepared(&mut self) -> Option<PreparedEffect> {
+        self.batch_delay.map(|_| PreparedEffect(Box::new(())))
+    }
+
+    fn execute_batch<'a>(
+        &'a mut self,
+        items: Vec<BatchExecution>,
+        _cancellation: PermCancellation,
+    ) -> ServiceFuture<'a, Vec<Result<EffectResult, HostEffectError>>> {
+        let delay = self.batch_delay.unwrap_or_default();
+        let record = Arc::clone(&self.record);
+        Box::pin(async move {
+            futures::future::join_all(items.into_iter().map(|item| {
+                let record = Arc::clone(&record);
+                async move {
+                    tokio::time::sleep(delay).await;
+                    record.lock().unwrap().executions += 1;
+                    Ok(success_for(&item.operation))
+                }
+            }))
+            .await
+        })
+    }
 }
 
 fn normalized_target(operation: &EffectOperation) -> Result<NormalizedTarget, HostEffectError> {
@@ -193,7 +223,9 @@ fn normalized_target(operation: &EffectOperation) -> Result<NormalizedTarget, Ho
         }),
         EffectOperation::Result { .. }
         | EffectOperation::ScratchPut { .. }
-        | EffectOperation::ScratchGet { .. } => Ok(NormalizedTarget::SessionState),
+        | EffectOperation::ScratchGet { .. }
+        | EffectOperation::ScratchDelete { .. }
+        | EffectOperation::ScratchKeys => Ok(NormalizedTarget::SessionState),
         EffectOperation::Fetch { url, method, .. } => {
             let url = reqwest::Url::parse(url).map_err(|_| HostEffectError::InvalidTarget)?;
             Ok(NormalizedTarget::Fetch {
@@ -210,6 +242,10 @@ fn normalized_target(operation: &EffectOperation) -> Result<NormalizedTarget, Ho
             resolved_executable: resolve_program_identity(program)?,
         }),
         EffectOperation::ProposeSkill { .. } => Ok(NormalizedTarget::ProposeSkill),
+        EffectOperation::CallTool { .. } => Ok(NormalizedTarget::CallTool),
+        EffectOperation::FetchAll { .. } | EffectOperation::SpawnAll { .. } => {
+            Err(HostEffectError::BackendFailure)
+        }
     }
 }
 
@@ -238,6 +274,7 @@ fn authorized_target(operation: &EffectOperation) -> AuthorizedTarget {
         },
         EffectOperation::Spawn { program, .. } => AuthorizedTarget::Spawn {
             resolved_executable: program.clone(),
+            options_fingerprint: None,
         },
         EffectOperation::Result { json } => AuthorizedTarget::SessionState {
             operation: "result",
@@ -254,7 +291,23 @@ fn authorized_target(operation: &EffectOperation) -> AuthorizedTarget {
             key: Some(key.clone()),
             encoded_bytes: 0,
         },
+        EffectOperation::ScratchDelete { key } => AuthorizedTarget::SessionState {
+            operation: "scratch_delete",
+            key: Some(key.clone()),
+            encoded_bytes: 0,
+        },
+        EffectOperation::ScratchKeys => AuthorizedTarget::SessionState {
+            operation: "scratch_keys",
+            key: None,
+            encoded_bytes: 0,
+        },
         EffectOperation::ProposeSkill { .. } => AuthorizedTarget::ProposeSkill,
+        EffectOperation::CallTool { name, .. } => AuthorizedTarget::CallTool {
+            tool_name: name.clone(),
+        },
+        EffectOperation::FetchAll { .. } | EffectOperation::SpawnAll { .. } => {
+            unreachable!("batch operations are expanded by the broker")
+        }
     }
 }
 
@@ -374,6 +427,38 @@ fn operation_cases(invocation_id: &InvocationId) -> Vec<OperationCase> {
             advisory: AdvisoryAttribution::default(),
         },
         OperationCase {
+            name: "call_tool",
+            operation: EffectOperation::CallTool {
+                name: "grep".into(),
+                arguments_json: "{\"pattern\":\"needle\"}".into(),
+            },
+            capability: HostCapability::CallTool,
+            principal: GrantPrincipal::ModelAuthored {
+                tool_call_id: "tool-call-call-tool".into(),
+            },
+            advisory: AdvisoryAttribution::default(),
+        },
+        OperationCase {
+            name: "scratch_delete",
+            operation: EffectOperation::ScratchDelete {
+                key: "turn:1".into(),
+            },
+            capability: HostCapability::SessionState,
+            principal: GrantPrincipal::ModelAuthored {
+                tool_call_id: "tool-call-delete".into(),
+            },
+            advisory: AdvisoryAttribution::default(),
+        },
+        OperationCase {
+            name: "scratch_keys",
+            operation: EffectOperation::ScratchKeys,
+            capability: HostCapability::SessionState,
+            principal: GrantPrincipal::ModelAuthored {
+                tool_call_id: "tool-call-keys".into(),
+            },
+            advisory: AdvisoryAttribution::default(),
+        },
+        OperationCase {
             name: "list_dir",
             operation: EffectOperation::ListDir {
                 path: "docs".into(),
@@ -452,6 +537,8 @@ fn success_for(operation: &EffectOperation) -> EffectResult {
         EffectOperation::Result { json } => EffectResult::ResultAccepted { json: json.clone() },
         EffectOperation::ScratchPut { .. } => EffectResult::ScratchPut,
         EffectOperation::ScratchGet { .. } => EffectResult::ScratchGet { json: None },
+        EffectOperation::ScratchDelete { .. } => EffectResult::ScratchDelete { existed: false },
+        EffectOperation::ScratchKeys => EffectResult::ScratchKeys { keys: Vec::new() },
         EffectOperation::Fetch { .. } => EffectResult::Fetch {
             status: 200,
             body: "ok".into(),
@@ -474,6 +561,14 @@ fn success_for(operation: &EffectOperation) -> EffectResult {
             status: crate::extras::js::protocol::ProposalStatus::Pending,
             report_id: None,
         },
+        EffectOperation::CallTool { .. } => EffectResult::CallTool {
+            ok: true,
+            text: "tool output".into(),
+            truncated: false,
+        },
+        EffectOperation::FetchAll { .. } | EffectOperation::SpawnAll { .. } => {
+            unreachable!("batch operations are expanded by the broker")
+        }
     }
 }
 
@@ -536,7 +631,7 @@ fn manifest_for(case: &OperationCase, allow_target: bool) -> CapabilityManifest 
         HostCapability::Spawn => CapabilityScope::Spawn {
             programs: vec![if allow_target { "printf" } else { "echo" }.into()],
         },
-        HostCapability::SessionState | HostCapability::ProposeSkill => {
+        HostCapability::SessionState | HostCapability::ProposeSkill | HostCapability::CallTool => {
             unreachable!("skill manifests cannot grant agent-only capabilities")
         }
     };
@@ -549,6 +644,7 @@ fn request(case: &OperationCase, grant: &InvocationGrant) -> EffectRequest {
         grant_id: grant.grant_id().clone(),
         advisory: case.advisory.clone(),
         operation: case.operation.clone(),
+        console: Vec::new(),
     }
 }
 
@@ -582,6 +678,7 @@ fn broker_with_normalized_target(
         normalized_target,
         pending_permission: false,
         permission_delay_until: None,
+        batch_delay: None,
         record: Arc::clone(&record),
     };
     let root = AuditTempRoot::new("broker");
@@ -1010,6 +1107,7 @@ async fn scoped_spawn_keeps_each_program_bound_to_its_own_executable_identity() 
         grant_id: grant.grant_id().clone(),
         advisory,
         operation,
+        console: Vec::new(),
     };
     let (mut broker, record, _audit_root) = broker_with_normalized_target(
         invocation_id,
@@ -1074,6 +1172,7 @@ async fn scoped_spawn_content_mismatch_denies_before_permission_audit_and_effect
             arguments: vec![],
             options: Default::default(),
         },
+        console: Vec::new(),
     };
     let (mut broker, record, _audit_root) = broker_with_normalized_target(
         invocation_id,
@@ -1967,6 +2066,7 @@ async fn worker_effect_cancellation_cancels_pending_ask_before_execution() {
         normalized_target: None,
         pending_permission: true,
         permission_delay_until: None,
+        batch_delay: None,
         record: Arc::clone(&record),
     };
     let audit_root = AuditTempRoot::new("pending-ask");
@@ -2262,6 +2362,7 @@ async fn worker_broker_grants_expiring_during_ask_never_execute() {
         normalized_target: None,
         pending_permission: false,
         permission_delay_until: Some(expires_at),
+        batch_delay: None,
         record: Arc::clone(&record),
     };
     let audit_root = AuditTempRoot::new("expiring-ask");
@@ -2301,6 +2402,7 @@ async fn worker_broker_grants_expiring_while_waiting_for_audit_never_execute() {
         normalized_target: None,
         pending_permission: false,
         permission_delay_until: None,
+        batch_delay: None,
         record: Arc::clone(&record),
     };
     let audit_root = AuditTempRoot::new("expiring-audit-lock");
@@ -2402,6 +2504,7 @@ async fn js_effect_audit_ordering_requires_durable_intent_before_read_file() {
         normalized_target: None,
         pending_permission: false,
         permission_delay_until: None,
+        batch_delay: None,
         record,
     };
     let root = AuditTempRoot::new("ordering-red");
@@ -2699,7 +2802,8 @@ fn raw_effect_fragments(operation: &EffectOperation) -> Vec<&str> {
         EffectOperation::WriteFile { path, content } => vec![path, content],
         EffectOperation::Result { json } => vec![json],
         EffectOperation::ScratchPut { key, json } => vec![key, json],
-        EffectOperation::ScratchGet { key } => vec![key],
+        EffectOperation::ScratchGet { key } | EffectOperation::ScratchDelete { key } => vec![key],
+        EffectOperation::ScratchKeys => Vec::new(),
         EffectOperation::Fetch { .. } => vec!["example.test", "/api"],
         EffectOperation::Spawn {
             program, arguments, ..
@@ -2711,6 +2815,11 @@ fn raw_effect_fragments(operation: &EffectOperation) -> Vec<&str> {
         EffectOperation::ProposeSkill { draft } => {
             vec![draft.source.as_str(), draft.description.as_str()]
         }
+        EffectOperation::CallTool {
+            name,
+            arguments_json,
+        } => vec![name, arguments_json],
+        EffectOperation::FetchAll { .. } | EffectOperation::SpawnAll { .. } => Vec::new(),
     }
 }
 
@@ -3190,7 +3299,7 @@ fn js_effect_audit_storage_hash_chain_privacy_and_crash_recovery_are_truthful() 
         let mut fetch = audit_intent("effect-fetch", fetch_target);
         fetch.capability = AuditCapability::Fetch;
         audit.append_intent(fetch).unwrap();
-        let spawn_target = audit.spawn_target("helper");
+        let spawn_target = audit.spawn_target("helper", None);
         let mut spawn = audit_intent("effect-spawn", spawn_target);
         spawn.capability = AuditCapability::Spawn;
         audit.append_intent(spawn).unwrap();
@@ -3326,7 +3435,9 @@ fn js_effect_audit_storage_final_prefix_corruption_is_not_truncated_as_a_crash_t
 fn js_effect_audit_storage_rotation_missing_segments_replay_and_hash_mismatch_fail_closed() {
     let root = AuditTempRoot::new("rotation");
     let owner = root.owner();
-    let options = AuditOpenOptions::for_test(1_024);
+    // A long epoch keeps every segment in the validated range (checkpoints, which let a history
+    // lose its oldest segments, have their own tests).
+    let options = AuditOpenOptions::for_test(1_024).with_max_segments(1_000);
     {
         let mut audit = EffectAudit::open_with_options(owner.clone(), options.clone()).unwrap();
         for index in 0..12 {
@@ -3465,45 +3576,100 @@ fn js_effect_audit_storage_rotation_missing_segments_replay_and_hash_mismatch_fa
         .unwrap();
 }
 
-#[test]
-fn js_effect_audit_storage_retention_limit_allows_explicit_operator_reset() {
-    let root = AuditTempRoot::new("retention-limit");
-    let owner = root.owner();
-    let options = AuditOpenOptions::for_test(2_048).with_max_segments(1);
-    let mut audit = EffectAudit::open_with_options(owner.clone(), options.clone()).unwrap();
-
-    let first_target = audit.file_target("safe/first");
-    audit
-        .append_intent(audit_intent("effect-first", first_target))
-        .unwrap();
+fn append_effect_pair(audit: &mut EffectAudit, id: &str) {
+    let target = audit.file_target(&format!("safe/{id}"));
+    audit.append_intent(audit_intent(id, target)).unwrap();
     audit
         .append_completion(EffectCompletion {
-            effect_id: "effect-first".into(),
+            effect_id: id.into(),
             result_code: AuditResultCode::Succeeded,
         })
         .unwrap();
+}
 
-    let second_target = audit.file_target("safe/second");
-    assert!(matches!(
-        audit.append_intent(audit_intent("effect-second", second_target)),
-        Err(AuditError::RetentionLimit)
-    ));
-    let later_target = audit.file_target("safe/later");
-    assert!(matches!(
-        audit.append_intent(audit_intent("effect-later", later_target)),
-        Err(AuditError::RetentionLimit)
-    ));
-
-    drop(audit);
-    for segment in audit_segments(&owner) {
-        std::fs::remove_file(segment).unwrap();
+/// mini-agent-nvnkx.118: reaching the segment cap checkpoints and prunes instead of failing every
+/// later effect, and reopening validates only the retained epoch.
+#[test]
+fn js_effect_audit_retention_checkpoints_and_prunes_instead_of_refusing_appends() {
+    let root = AuditTempRoot::new("retention-prune");
+    let owner = root.owner();
+    let options = AuditOpenOptions::for_test(2_048).with_max_segments(2);
+    let mut audit = EffectAudit::open_with_options(owner.clone(), options.clone()).unwrap();
+    for index in 0..60 {
+        append_effect_pair(&mut audit, &format!("effect-prune-{index}"));
     }
+    let on_disk = audit_segments(&owner).len();
+    assert!(
+        (2..=2 * 2 + 1).contains(&on_disk),
+        "history stays bounded by two epochs: {on_disk} segments"
+    );
+    drop(audit);
+    let total_written = 60 * 2 * 600_u64;
 
-    let mut reset = EffectAudit::open_with_options(owner, options).unwrap();
-    let reset_target = reset.file_target("safe/reset");
-    reset
-        .append_intent(audit_intent("effect-reset", reset_target))
-        .unwrap();
+    let mut reopened = EffectAudit::open_with_options(owner.clone(), options.clone()).unwrap();
+    assert!(
+        reopened.open_bytes_read_for_test() <= 3 * 2_048 + 4_096,
+        "open read {} bytes of retained history, a window far below the {} written",
+        reopened.open_bytes_read_for_test(),
+        total_written
+    );
+    append_effect_pair(&mut reopened, "effect-after-reopen");
+    drop(reopened);
+
+    // A corrupt segment older than the newest checkpoint no longer blocks opening.
+    let oldest = audit_segments(&owner).into_iter().next().unwrap();
+    std::fs::write(&oldest, b"garbage that is not an audit record").unwrap();
+    let mut again = EffectAudit::open_with_options(owner, options).unwrap();
+    append_effect_pair(&mut again, "effect-after-old-corruption");
+}
+
+/// A chain written before retention existed (no checkpoints, more segments than the cap) is
+/// validated once, then checkpointed and pruned.
+#[test]
+fn js_effect_audit_retention_checkpoints_an_oversized_legacy_chain_on_open() {
+    let root = AuditTempRoot::new("retention-legacy");
+    let owner = root.owner();
+    let wide = AuditOpenOptions::for_test(2_048).with_max_segments(1_000);
+    let mut audit = EffectAudit::open_with_options(owner.clone(), wide).unwrap();
+    for index in 0..30 {
+        append_effect_pair(&mut audit, &format!("effect-legacy-{index}"));
+    }
+    drop(audit);
+    let before = audit_segments(&owner).len();
+    assert!(before > 10, "fixture must span many segments: {before}");
+
+    let narrow = AuditOpenOptions::for_test(2_048).with_max_segments(3);
+    let mut reopened = EffectAudit::open_with_options(owner.clone(), narrow.clone()).unwrap();
+    append_effect_pair(&mut reopened, "effect-after-legacy-open");
+    drop(reopened);
+    // Appending again past the new cap prunes the pre-checkpoint history.
+    let mut again = EffectAudit::open_with_options(owner.clone(), narrow.clone()).unwrap();
+    for index in 0..40 {
+        append_effect_pair(&mut again, &format!("effect-legacy-more-{index}"));
+    }
+    drop(again);
+    let after = audit_segments(&owner).len();
+    assert!(after <= 3 * 2 + 1, "legacy history was pruned: {after}");
+    EffectAudit::open_with_options(owner, narrow).unwrap();
+}
+
+/// A history that lost its beginning without a checkpoint is still rejected.
+#[test]
+fn js_effect_audit_missing_first_segment_without_a_checkpoint_is_still_rejected() {
+    let root = AuditTempRoot::new("retention-missing-first");
+    let owner = root.owner();
+    let options = AuditOpenOptions::for_test(2_048).with_max_segments(1_000);
+    let mut audit = EffectAudit::open_with_options(owner.clone(), options.clone()).unwrap();
+    for index in 0..10 {
+        append_effect_pair(&mut audit, &format!("effect-missing-{index}"));
+    }
+    drop(audit);
+    let first = audit_segments(&owner).into_iter().next().unwrap();
+    std::fs::remove_file(first).unwrap();
+    assert!(matches!(
+        EffectAudit::open_with_options(owner, options),
+        Err(AuditError::MissingSegment)
+    ));
 }
 
 #[test]
@@ -3766,6 +3932,7 @@ async fn usd_budget_js_broker_denies_before_preparation_and_after_late_approval_
                 normalized_target: None,
                 pending_permission: false,
                 permission_delay_until: None,
+                batch_delay: None,
                 record: record.clone(),
             },
             entered: entered.clone(),
@@ -3880,4 +4047,357 @@ mod program_hash_memoization {
             "racy-window files are always rehashed"
         );
     }
+}
+
+/// mini-agent-nvnkx.125/.114: the broker records, from its own results, the operation in flight
+/// when its future is dropped by a parent-side deadline, the console the worker streamed with the
+/// request, and the closed code of the last failed effect.
+#[tokio::test]
+async fn effect_trace_keeps_inflight_operation_streamed_console_and_last_failure() {
+    use crate::extras::js::protocol::{ConsoleLevel, ConsoleRecord};
+
+    let invocation_id = invocation("inv-trace");
+    let case = operation_cases(&invocation_id).remove(0);
+    let grant = grant(
+        &case,
+        &invocation_id,
+        Instant::now() + Duration::from_secs(30),
+    );
+    let record = Arc::new(Mutex::new(ServiceRecord::default()));
+    let service = RecordingService {
+        failures: ServiceFailures::default(),
+        normalized_target: None,
+        pending_permission: true,
+        permission_delay_until: None,
+        batch_delay: None,
+        record: Arc::clone(&record),
+    };
+    let audit_root = AuditTempRoot::new("trace");
+    let audit = EffectAudit::open(audit_root.owner()).unwrap();
+    let mut broker = InvocationBroker::new(
+        invocation_id,
+        vec![grant.clone()],
+        HostCapability::all(),
+        service,
+        Arc::new(Mutex::new(audit)),
+    )
+    .unwrap();
+    let trace = broker.effect_trace();
+    let mut effect = request(&case, &grant);
+    effect.console = vec![ConsoleRecord {
+        level: ConsoleLevel::Log,
+        text: "before the slow effect".into(),
+        truncated: false,
+    }];
+    let pending = tokio::time::timeout(
+        Duration::from_millis(100),
+        InvocationEffectHandler::handle_effect(&mut broker, effect, PermCancellation::new()),
+    )
+    .await;
+    assert!(pending.is_err(), "the effect must still be in flight");
+    let snapshot = trace.snapshot();
+    assert_eq!(snapshot.in_flight, Some("read_file"));
+    assert_eq!(snapshot.last_failed, None);
+    let console = trace.console();
+    assert_eq!(console.len(), 1);
+    assert_eq!(console[0].text, "before the slow effect");
+}
+
+#[tokio::test]
+async fn effect_trace_records_the_closed_code_and_reason_of_the_last_failure() {
+    let invocation_id = invocation("inv-trace-failure");
+    let case = operation_cases(&invocation_id).remove(0);
+    let grant = grant(
+        &case,
+        &invocation_id,
+        Instant::now() + Duration::from_secs(30),
+    );
+    let (mut broker, _record, _root) = broker(
+        invocation_id,
+        vec![grant.clone()],
+        HostCapability::all(),
+        ServiceFailures {
+            execution: Some(HostEffectError::NoConfiguredRoots),
+            ..ServiceFailures::default()
+        },
+    );
+    let trace = broker.effect_trace();
+    let result = InvocationEffectHandler::handle_effect(
+        &mut broker,
+        request(&case, &grant),
+        PermCancellation::new(),
+    )
+    .await;
+    assert!(matches!(result, EffectResult::Error(_)));
+    let failed = trace.snapshot().last_failed.expect("failure recorded");
+    assert_eq!(failed.operation, "read_file");
+    assert_eq!(failed.code, EffectErrorCode::Denied);
+    assert_eq!(
+        failed.reason,
+        Some(crate::extras::js::protocol::DenialReason::NoConfiguredRoots)
+    );
+    assert_eq!(trace.snapshot().in_flight, None);
+}
+
+fn batch_fetch(urls: &[&str]) -> EffectOperation {
+    EffectOperation::FetchAll {
+        requests: urls
+            .iter()
+            .map(|url| crate::extras::js::protocol::FetchBatchItem {
+                url: (*url).into(),
+                method: HttpMethod::Get,
+                headers: Vec::new(),
+                body: None,
+            })
+            .collect(),
+    }
+}
+
+fn batch_broker(
+    name: &str,
+    batch_delay: Option<Duration>,
+) -> (
+    InvocationBroker<RecordingService>,
+    InvocationGrant,
+    Arc<Mutex<ServiceRecord>>,
+    AuditTempRoot,
+) {
+    let invocation_id = invocation(name);
+    let grant = InvocationGrant::issue(
+        invocation_id.clone(),
+        GrantPrincipal::ModelAuthored {
+            tool_call_id: format!("tool-call-{name}"),
+        },
+        BTreeSet::from([HostCapability::Fetch, HostCapability::Spawn]),
+        Instant::now() + Duration::from_secs(30),
+    );
+    let record = Arc::new(Mutex::new(ServiceRecord::default()));
+    let service = RecordingService {
+        failures: ServiceFailures::default(),
+        normalized_target: None,
+        pending_permission: false,
+        permission_delay_until: None,
+        batch_delay,
+        record: Arc::clone(&record),
+    };
+    let root = AuditTempRoot::new(name);
+    let audit = EffectAudit::open(root.owner()).unwrap();
+    let broker = InvocationBroker::new(
+        invocation_id,
+        vec![grant.clone()],
+        HostCapability::all(),
+        service,
+        Arc::new(Mutex::new(audit)),
+    )
+    .unwrap();
+    (broker, grant, record, root)
+}
+
+fn batch_request(operation: EffectOperation, grant: &InvocationGrant) -> EffectRequest {
+    EffectRequest {
+        effect_ordinal: 0,
+        grant_id: grant.grant_id().clone(),
+        advisory: AdvisoryAttribution::default(),
+        operation,
+        console: Vec::new(),
+    }
+}
+
+/// mini-agent-nvnkx.119: N independent items are authorized one by one (each with its own
+/// audit intent and completion) and then run together.
+#[tokio::test]
+async fn batch_effects_run_items_concurrently_with_their_own_audit_records() {
+    let (mut broker, grant, record, _root) =
+        batch_broker("inv-batch-concurrent", Some(Duration::from_millis(250)));
+    let urls = [
+        "https://example.test/a",
+        "https://example.test/b",
+        "https://example.test/c",
+        "https://example.test/d",
+    ];
+    let started = Instant::now();
+    let result = broker
+        .dispatch(
+            batch_request(batch_fetch(&urls), &grant),
+            PermCancellation::new(),
+        )
+        .await
+        .expect("batch dispatch");
+    let elapsed = started.elapsed();
+    let EffectResult::FetchAll { items } = result else {
+        panic!("expected a FetchAll result");
+    };
+    assert_eq!(items.len(), 4);
+    assert!(
+        items
+            .iter()
+            .all(|item| matches!(item, EffectResult::Fetch { status: 200, .. })),
+        "{items:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(700),
+        "4 x 250 ms items must overlap, took {elapsed:?}"
+    );
+    assert_eq!(record.lock().unwrap().executions, 4);
+    let records = broker.audit_records_for_test();
+    assert_eq!(records.len(), 8, "one intent and one completion per item");
+    let mut ids: Vec<_> = records
+        .iter()
+        .map(|record| record.effect_id.clone())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), 4, "every item has its own audit identity");
+    assert!(records.iter().all(|record| record.capability == "fetch"));
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.state == AuditState::Completed)
+            .count(),
+        4
+    );
+}
+
+#[tokio::test]
+async fn one_denied_batch_item_is_a_per_item_error_and_the_rest_still_run() {
+    let (mut broker, grant, record, _root) =
+        batch_broker("inv-batch-denied", Some(Duration::from_millis(10)));
+    let result = broker
+        .dispatch(
+            batch_request(
+                batch_fetch(&[
+                    "https://example.test/ok-1",
+                    "https://example.test/denied",
+                    "https://example.test/ok-2",
+                ]),
+                &grant,
+            ),
+            PermCancellation::new(),
+        )
+        .await
+        .expect("a denied item must not fail the batch");
+    let EffectResult::FetchAll { items } = result else {
+        panic!("expected a FetchAll result");
+    };
+    assert!(matches!(items[0], EffectResult::Fetch { .. }));
+    assert!(matches!(items[2], EffectResult::Fetch { .. }));
+    let EffectResult::Error(error) = &items[1] else {
+        panic!("the denied item must be an error result: {:?}", items[1]);
+    };
+    assert_eq!(error.code, EffectErrorCode::Denied);
+    assert_eq!(
+        error.reason,
+        Some(crate::extras::js::protocol::DenialReason::PermissionDenied)
+    );
+    assert_eq!(record.lock().unwrap().executions, 2);
+    // Two executed items (intent + completion each) and one terminal denial record.
+    assert_eq!(broker.audit_records_for_test().len(), 5);
+}
+
+#[tokio::test]
+async fn a_service_without_batch_support_fails_each_item_without_running_any() {
+    let (mut broker, grant, record, _root) = batch_broker("inv-batch-unsupported", None);
+    let result = broker
+        .dispatch(
+            batch_request(batch_fetch(&["https://example.test/a"]), &grant),
+            PermCancellation::new(),
+        )
+        .await
+        .expect("batch dispatch");
+    let EffectResult::FetchAll { items } = result else {
+        panic!("expected a FetchAll result");
+    };
+    assert!(matches!(
+        &items[0],
+        EffectResult::Error(error) if error.code == EffectErrorCode::BackendFailure
+    ));
+    assert_eq!(record.lock().unwrap().executions, 0);
+}
+
+#[tokio::test]
+async fn a_batch_over_the_item_cap_or_with_no_items_is_rejected_before_any_effect() {
+    let (mut broker, grant, record, _root) =
+        batch_broker("inv-batch-bounds", Some(Duration::from_millis(1)));
+    let too_many: Vec<String> = (0..crate::extras::js::protocol::MAX_BATCH_ITEMS + 1)
+        .map(|index| format!("https://example.test/{index}"))
+        .collect();
+    let refs: Vec<&str> = too_many.iter().map(String::as_str).collect();
+    for operation in [batch_fetch(&refs), batch_fetch(&[])] {
+        assert_eq!(
+            broker
+                .dispatch(batch_request(operation, &grant), PermCancellation::new())
+                .await,
+            Err(HostEffectError::InvalidTarget)
+        );
+    }
+    assert_eq!(record.lock().unwrap().execute_calls, 0);
+}
+
+#[tokio::test]
+async fn a_batch_needs_the_single_effect_capability_of_its_items() {
+    let invocation_id = invocation("inv-batch-capability");
+    let grant = InvocationGrant::issue(
+        invocation_id.clone(),
+        GrantPrincipal::ModelAuthored {
+            tool_call_id: "tool-call-batch-capability".into(),
+        },
+        BTreeSet::from([HostCapability::ReadFile]),
+        Instant::now() + Duration::from_secs(30),
+    );
+    let (mut broker, _record, _root) = broker(
+        invocation_id,
+        vec![grant.clone()],
+        HostCapability::all(),
+        ServiceFailures::default(),
+    );
+    let result = broker
+        .dispatch(
+            batch_request(batch_fetch(&["https://example.test/a"]), &grant),
+            PermCancellation::new(),
+        )
+        .await
+        .expect("an unauthorized item is an item error");
+    let EffectResult::FetchAll { items } = result else {
+        panic!("expected a FetchAll result");
+    };
+    assert!(matches!(
+        &items[0],
+        EffectResult::Error(error) if error.code == EffectErrorCode::CapabilityDenied
+    ));
+}
+
+/// mini-agent-nvnkx.328: a spawn's cwd and env are distinguishable in the audit without being
+/// stored, and records written before the field existed still validate.
+#[test]
+fn js_effect_audit_spawn_target_digests_cwd_and_env_without_storing_them() {
+    let root = AuditTempRoot::new("spawn-options-tag");
+    let owner = root.owner();
+    let mut audit = EffectAudit::open(owner.clone()).unwrap();
+    let plain = audit.spawn_target("tool", None);
+    let in_workspace = audit.spawn_target("tool", Some("cwd=/work\0TOKEN=secret-one"));
+    let other_env = audit.spawn_target("tool", Some("cwd=/work\0TOKEN=secret-two"));
+    assert_ne!(plain, in_workspace);
+    assert_ne!(in_workspace, other_env);
+    let encoded = serde_json::to_string(&in_workspace).unwrap();
+    assert!(encoded.contains("options_tag"), "{encoded}");
+    for secret in ["/work", "TOKEN", "secret-one"] {
+        assert!(!encoded.contains(secret), "{secret} leaked into {encoded}");
+    }
+    assert!(
+        !serde_json::to_string(&plain)
+            .unwrap()
+            .contains("options_tag"),
+        "an absent digest keeps the legacy record shape"
+    );
+    let mut intent = audit_intent("effect-spawn-options", in_workspace);
+    intent.capability = AuditCapability::Spawn;
+    audit.append_intent(intent).unwrap();
+    audit
+        .append_completion(EffectCompletion {
+            effect_id: "effect-spawn-options".into(),
+            result_code: AuditResultCode::Succeeded,
+        })
+        .unwrap();
+    drop(audit);
+    EffectAudit::open(owner).expect("the chain with an options tag reopens and validates");
 }

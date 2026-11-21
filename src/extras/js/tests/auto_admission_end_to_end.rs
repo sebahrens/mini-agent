@@ -278,7 +278,7 @@ async fn auto_admission_failure_matrix_rejects_bypasses_and_reproposal_is_termin
         .unwrap();
     assert!(
         invalid.starts_with("JS exception at ")
-            && invalid.ends_with("(stage: evaluation; script: model)"),
+            && invalid.contains("(stage: evaluation; script: model)"),
         "unexpected: {invalid}"
     );
 

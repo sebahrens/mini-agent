@@ -26,6 +26,7 @@ impl TempPaths {
 mod agent_skill_catalog;
 #[cfg(feature = "skills")]
 mod auto_admission_end_to_end;
+mod brokered_tools;
 #[cfg(feature = "skills")]
 mod capability_manifest_v2;
 mod effect_options;
@@ -37,6 +38,7 @@ mod evidence_promotion_policy;
 mod phase5_operations_benchmark;
 #[cfg(feature = "skills")]
 mod propose_skill_host;
+mod runtime_diagnostics;
 #[cfg(feature = "skills")]
 mod self_learning_end_to_end;
 #[cfg(feature = "skills")]
@@ -664,7 +666,9 @@ async fn test_host_globals_enforce_restrictive_permissions() {
         .expect("read call failed");
     assert!(
         read_result.starts_with("JS exception at ")
-            && read_result.ends_with("(stage: evaluation; script: model)"),
+            && read_result.contains(
+                "(stage: evaluation; script: model); last failed effect: read_file -> denied"
+            ),
         "unexpected: {read_result}"
     );
 
@@ -676,7 +680,9 @@ async fn test_host_globals_enforce_restrictive_permissions() {
         .expect("write call failed");
     assert!(
         write_result.starts_with("JS exception at ")
-            && write_result.ends_with("(stage: evaluation; script: model)"),
+            && write_result.contains(
+                "(stage: evaluation; script: model); last failed effect: write_file -> denied"
+            ),
         "unexpected: {write_result}"
     );
     assert!(
@@ -693,7 +699,9 @@ async fn test_host_globals_enforce_restrictive_permissions() {
         .expect("spawn call failed");
     assert!(
         spawn_result.starts_with("JS exception at ")
-            && spawn_result.ends_with("(stage: evaluation; script: model)"),
+            && spawn_result.contains(
+                "(stage: evaluation; script: model); last failed effect: spawn -> denied"
+            ),
         "unexpected: {spawn_result}"
     );
     assert!(!path.exists(), "denied spawn created {}", path.display());

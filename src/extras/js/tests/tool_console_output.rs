@@ -143,7 +143,11 @@ async fn js_tool_type_and_reference_errors_keep_only_closed_metadata() {
         reference.starts_with("JS ReferenceError at 1:"),
         "{reference}"
     );
-    assert!(!reference.contains("missing_identifier_xyz"), "{reference}");
+    // The name comes from the model's own source text, never from the thrown message.
+    assert!(
+        reference.contains("near `missing_identifier_xyz`"),
+        "{reference}"
+    );
 }
 
 #[tokio::test]

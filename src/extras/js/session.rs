@@ -19,6 +19,10 @@ pub(crate) const JSON_MAX_NODES: usize = 100_000;
 pub(crate) enum SessionStateError {
     Invalid,
     TooLarge,
+    /// A new key while the store already holds [`SCRATCH_MAX_ENTRIES`] entries.
+    EntryLimit,
+    /// A value that would push the store past [`SCRATCH_TOTAL_MAX_BYTES`].
+    TotalBytesLimit,
     Unavailable,
 }
 
@@ -26,7 +30,19 @@ pub(crate) enum SessionStateError {
 struct ScratchEntries {
     values: BTreeMap<String, String>,
     total_bytes: usize,
+    /// Any `scratch_put` has succeeded in this process.
+    ever_written: bool,
+    /// The one-time "store is empty, values may have been lost" note was already queued.
+    miss_noted: bool,
+    /// A note is waiting for the next `js` result.
+    pending_note: bool,
 }
+
+/// One-line note appended to a `js` result when `scratch_get` finds nothing in a store that has
+/// never been written in this process: the store is process-local and is not serialized with a
+/// session, so after `--resume`, a restart or a new headless process an earlier `scratch_put`
+/// in the transcript is gone. Without the note a null reads as "never stored".
+pub(crate) const SCRATCH_RESET_NOTE: &str = "[note: the scratch store is empty. It is process-local and does not survive --resume, a restart or a new headless run, so a null from scratch_get may mean a value stored earlier in the conversation was lost, not that it was never stored. Recompute it and scratch_put it again.]";
 
 /// Bounded, parent-owned JSON scratch values for one logical session and workspace.
 #[derive(Clone, Debug, Default)]
@@ -35,10 +51,40 @@ pub(crate) struct ScratchStore(Arc<Mutex<ScratchEntries>>);
 impl ScratchStore {
     pub(crate) fn get(&self, key: &str) -> Result<Option<String>, SessionStateError> {
         validate_scratch_key(key)?;
+        let mut entries = self.0.lock().map_err(|_| SessionStateError::Unavailable)?;
+        let found = entries.values.get(key).cloned();
+        if found.is_none() && !entries.ever_written && !entries.miss_noted {
+            entries.miss_noted = true;
+            entries.pending_note = true;
+        }
+        Ok(found)
+    }
+
+    /// Remove a key; reports whether it existed. Frees its bytes and its entry slot.
+    pub(crate) fn delete(&self, key: &str) -> Result<bool, SessionStateError> {
+        validate_scratch_key(key)?;
+        let mut entries = self.0.lock().map_err(|_| SessionStateError::Unavailable)?;
+        match entries.values.remove(key) {
+            Some(removed) => {
+                entries.total_bytes = entries.total_bytes.saturating_sub(removed.len());
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Every stored key, sorted (at most [`SCRATCH_MAX_ENTRIES`]).
+    pub(crate) fn keys(&self) -> Result<Vec<String>, SessionStateError> {
         self.0
             .lock()
-            .map(|entries| entries.values.get(key).cloned())
+            .map(|entries| entries.values.keys().cloned().collect())
             .map_err(|_| SessionStateError::Unavailable)
+    }
+
+    /// Takes the reset note queued by a `scratch_get` miss on a never-written store.
+    pub(crate) fn take_reset_note(&self) -> Option<&'static str> {
+        let mut entries = self.0.lock().ok()?;
+        std::mem::take(&mut entries.pending_note).then_some(SCRATCH_RESET_NOTE)
     }
 
     pub(crate) fn put(&self, key: String, json: String) -> Result<(), SessionStateError> {
@@ -52,13 +98,14 @@ impl ScratchStore {
             .and_then(|bytes| bytes.checked_add(json.len()))
             .ok_or(SessionStateError::TooLarge)?;
         if next_total > SCRATCH_TOTAL_MAX_BYTES {
-            return Err(SessionStateError::TooLarge);
+            return Err(SessionStateError::TotalBytesLimit);
         }
         if !entries.values.contains_key(&key) && entries.values.len() >= SCRATCH_MAX_ENTRIES {
-            return Err(SessionStateError::TooLarge);
+            return Err(SessionStateError::EntryLimit);
         }
         entries.values.insert(key, json);
         entries.total_bytes = next_total;
+        entries.ever_written = true;
         Ok(())
     }
 
@@ -210,7 +257,7 @@ mod tests {
         assert_eq!(entries.len(), SCRATCH_MAX_ENTRIES);
         assert_eq!(
             entries.put("entry:overflow".into(), "0".into()),
-            Err(SessionStateError::TooLarge)
+            Err(SessionStateError::EntryLimit)
         );
 
         let bytes = ScratchStore::default();
@@ -220,12 +267,71 @@ mod tests {
         }
         assert_eq!(
             bytes.put("chunk:overflow".into(), "0".into()),
-            Err(SessionStateError::TooLarge)
+            Err(SessionStateError::TotalBytesLimit)
         );
 
         assert_eq!(
             ScratchStore::default().put("invalid".into(), "not-json".into()),
             Err(SessionStateError::Invalid)
+        );
+    }
+
+    #[test]
+    fn delete_frees_the_entry_slot_and_its_bytes_and_keys_lists_what_is_left() {
+        let store = ScratchStore::default();
+        for index in 0..SCRATCH_MAX_ENTRIES {
+            store.put(format!("k:{index:03}"), "\"v\"".into()).unwrap();
+        }
+        assert_eq!(
+            store.put("extra".into(), "1".into()),
+            Err(SessionStateError::EntryLimit)
+        );
+        assert_eq!(store.delete("k:000"), Ok(true));
+        assert_eq!(
+            store.delete("k:000"),
+            Ok(false),
+            "a second delete is a no-op"
+        );
+        store.put("extra".into(), "1".into()).unwrap();
+        let keys = store.keys().unwrap();
+        assert_eq!(keys.len(), SCRATCH_MAX_ENTRIES);
+        assert!(keys.contains(&"extra".to_string()) && !keys.contains(&"k:000".to_string()));
+        assert!(
+            keys.windows(2).all(|pair| pair[0] < pair[1]),
+            "keys are sorted"
+        );
+        assert_eq!(store.delete("bad/key"), Err(SessionStateError::Invalid));
+
+        // Byte accounting: a big value's bytes come back after delete.
+        let big = ScratchStore::default();
+        let chunk = format!("\"{}\"", "0".repeat(SCRATCH_VALUE_MAX_BYTES - 2));
+        for index in 0..(SCRATCH_TOTAL_MAX_BYTES / SCRATCH_VALUE_MAX_BYTES) {
+            big.put(format!("chunk:{index}"), chunk.clone()).unwrap();
+        }
+        assert_eq!(
+            big.put("more".into(), chunk.clone()),
+            Err(SessionStateError::TotalBytesLimit)
+        );
+        assert_eq!(big.delete("chunk:0"), Ok(true));
+        big.put("more".into(), chunk).unwrap();
+    }
+
+    #[test]
+    fn a_miss_on_a_never_written_store_queues_one_reset_note() {
+        let store = ScratchStore::default();
+        assert_eq!(store.take_reset_note(), None);
+        assert_eq!(store.get("answer").unwrap(), None);
+        assert_eq!(store.take_reset_note(), Some(SCRATCH_RESET_NOTE));
+        assert_eq!(store.get("answer").unwrap(), None);
+        assert_eq!(store.take_reset_note(), None, "the note is queued once");
+
+        let written = ScratchStore::default();
+        written.put("a".into(), "1".into()).unwrap();
+        assert_eq!(written.get("missing").unwrap(), None);
+        assert_eq!(
+            written.take_reset_note(),
+            None,
+            "a written store is not reset"
         );
     }
 

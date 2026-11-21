@@ -28,8 +28,9 @@ use super::audit::{
     EffectDenial, EffectIntent, SanitizedTarget,
 };
 use super::protocol::{
-    AdvisoryAttribution, DenialReason, EffectError, EffectErrorCode, EffectRequest, GrantId,
-    InvocationId,
+    AdvisoryAttribution, ConsoleRecord, DenialReason, EffectError, EffectErrorCode, EffectRequest,
+    GrantId, InvocationId, MAX_BATCH_ITEMS, MAX_CONSOLE_BYTES, MAX_CONSOLE_RECORD_BYTES,
+    MAX_CONSOLE_RECORDS,
 };
 pub(crate) use super::protocol::{EffectOperation, EffectResult};
 #[cfg(feature = "skills")]
@@ -57,6 +58,8 @@ pub(crate) enum HostCapability {
     Spawn,
     SessionState,
     ProposeSkill,
+    /// Brokered read-only tool calls (`call_tool`). Model-authored invocations only.
+    CallTool,
 }
 
 impl HostCapability {
@@ -69,6 +72,7 @@ impl HostCapability {
             Self::Spawn,
             Self::SessionState,
             Self::ProposeSkill,
+            Self::CallTool,
         ])
     }
 
@@ -83,10 +87,13 @@ impl HostCapability {
             EffectOperation::WriteFile { .. } => Self::WriteFile,
             EffectOperation::Result { .. }
             | EffectOperation::ScratchPut { .. }
-            | EffectOperation::ScratchGet { .. } => Self::SessionState,
-            EffectOperation::Fetch { .. } => Self::Fetch,
-            EffectOperation::Spawn { .. } => Self::Spawn,
+            | EffectOperation::ScratchGet { .. }
+            | EffectOperation::ScratchDelete { .. }
+            | EffectOperation::ScratchKeys => Self::SessionState,
+            EffectOperation::Fetch { .. } | EffectOperation::FetchAll { .. } => Self::Fetch,
+            EffectOperation::Spawn { .. } | EffectOperation::SpawnAll { .. } => Self::Spawn,
             EffectOperation::ProposeSkill { .. } => Self::ProposeSkill,
+            EffectOperation::CallTool { .. } => Self::CallTool,
         }
     }
 }
@@ -141,6 +148,119 @@ impl CapabilityDenialTracker {
 
     pub(crate) fn snapshot(&self) -> Option<SkillDenialSnapshot> {
         self.0.lock().ok().map(|denials| denials.clone())
+    }
+}
+
+/// Closed failure vocabulary the parent remembers about the effects of one invocation.
+///
+/// Both fields are produced by the parent itself (the broker's own typed results and the
+/// operation it dispatched), never copied from worker-supplied text, so rendering them cannot
+/// carry file contents, paths or thrown values to the model (Phase 6 invariant 6).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FailedEffect {
+    pub(crate) operation: &'static str,
+    pub(crate) code: EffectErrorCode,
+    pub(crate) reason: Option<DenialReason>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct EffectTraceSnapshot {
+    /// The brokered operation that was executing when the snapshot was taken.
+    pub(crate) in_flight: Option<&'static str>,
+    pub(crate) last_failed: Option<FailedEffect>,
+}
+
+#[derive(Default)]
+struct EffectTraceState {
+    summary: EffectTraceSnapshot,
+    /// Console records the worker streamed with its effect requests, bounded by the caps that
+    /// apply to a terminal step result.
+    console: Vec<ConsoleRecord>,
+    console_bytes: usize,
+}
+
+/// Shared handle the tool keeps while the broker moves into the supervisor.
+#[derive(Clone, Default)]
+pub(crate) struct EffectTrace(Arc<Mutex<EffectTraceState>>);
+
+impl EffectTrace {
+    /// Keep streamed console records within the parent-side caps; an over-long record or any
+    /// overflow is dropped rather than trusted.
+    fn record_console(&self, records: &[ConsoleRecord]) {
+        let Ok(mut state) = self.0.lock() else {
+            return;
+        };
+        for record in records {
+            if state.console.len() >= MAX_CONSOLE_RECORDS
+                || record.text.len() > MAX_CONSOLE_RECORD_BYTES
+                || state.console_bytes.saturating_add(record.text.len()) > MAX_CONSOLE_BYTES
+            {
+                return;
+            }
+            state.console_bytes += record.text.len();
+            state.console.push(record.clone());
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(in_flight: Option<&'static str>, console: &[ConsoleRecord]) -> Self {
+        let trace = Self::default();
+        if let Some(operation) = in_flight {
+            trace.begin(operation);
+        }
+        trace.record_console(console);
+        trace
+    }
+
+    /// Console records streamed so far (what a parent-side kill would otherwise lose).
+    pub(crate) fn console(&self) -> Vec<ConsoleRecord> {
+        self.0
+            .lock()
+            .map(|state| state.console.clone())
+            .unwrap_or_default()
+    }
+
+    fn begin(&self, operation: &'static str) {
+        if let Ok(mut state) = self.0.lock() {
+            state.summary.in_flight = Some(operation);
+        }
+    }
+
+    fn finish(&self, failure: Option<FailedEffect>) {
+        if let Ok(mut state) = self.0.lock() {
+            state.summary.in_flight = None;
+            if failure.is_some() {
+                state.summary.last_failed = failure;
+            }
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> EffectTraceSnapshot {
+        self.0.lock().map(|state| state.summary).unwrap_or_default()
+    }
+}
+
+/// The JavaScript global that issues `operation`, used only in parent-rendered diagnostics.
+pub(crate) fn effect_operation_name(operation: &EffectOperation) -> &'static str {
+    match operation {
+        EffectOperation::ReadFile { .. } => "read_file",
+        EffectOperation::ReadFiles { .. } => "read_files",
+        EffectOperation::ReadLines { .. } => "read_lines",
+        EffectOperation::ListDir { .. } => "list_dir",
+        EffectOperation::Glob { .. } => "glob",
+        EffectOperation::Grep { .. } => "grep",
+        EffectOperation::WriteFile { .. } => "write_file",
+        EffectOperation::Result { .. } => "result",
+        EffectOperation::ScratchPut { .. } => "scratch_put",
+        EffectOperation::ScratchGet { .. } => "scratch_get",
+        EffectOperation::ScratchDelete { .. } => "scratch_delete",
+        EffectOperation::ScratchKeys => "scratch_keys",
+        EffectOperation::Fetch { .. } => "fetch",
+        EffectOperation::Spawn { .. } => "spawn",
+        EffectOperation::ProposeSkill { .. } => "propose_skill",
+        EffectOperation::CallTool { .. } => "call_tool",
+        EffectOperation::FetchAll { .. } => "fetch_all",
+        EffectOperation::SpawnAll { .. } => "spawn_all",
     }
 }
 
@@ -607,7 +727,9 @@ impl InvocationGrant {
             HostCapability::WriteFile => SkillHostCapability::WriteFile,
             HostCapability::Fetch => SkillHostCapability::Fetch,
             HostCapability::Spawn => SkillHostCapability::Spawn,
-            HostCapability::SessionState | HostCapability::ProposeSkill => {
+            HostCapability::SessionState
+            | HostCapability::ProposeSkill
+            | HostCapability::CallTool => {
                 return Err(BrokerBuildError::InvalidManifest);
             }
         };
@@ -779,6 +901,10 @@ pub(crate) enum HostEffectError {
     EffectTimedOut,
     #[error("effect output exceeded its limit")]
     OutputLimit,
+    #[error("scratch store entry limit reached")]
+    ScratchEntryLimit,
+    #[error("scratch store byte limit reached")]
+    ScratchByteLimit,
     #[error("effect backend is unavailable")]
     BackendFailure,
     #[error("effect audit is unavailable")]
@@ -802,7 +928,9 @@ impl HostEffectError {
             }
             Self::InvocationCancelled => EffectErrorCode::Cancelled,
             Self::AskTimedOut | Self::EffectTimedOut => EffectErrorCode::TimedOut,
-            Self::OutputLimit => EffectErrorCode::TooLarge,
+            Self::OutputLimit | Self::ScratchEntryLimit | Self::ScratchByteLimit => {
+                EffectErrorCode::TooLarge
+            }
             Self::BackendFailure => EffectErrorCode::BackendFailure,
             Self::AuditFailure => EffectErrorCode::AuditFailure,
             Self::OutcomeUnknown => EffectErrorCode::OutcomeUnknown,
@@ -828,6 +956,8 @@ impl HostEffectError {
             Self::OutsideRoots => Some(DenialReason::OutsideRoots),
             Self::PermissionDenied => Some(DenialReason::PermissionDenied),
             Self::OverwriteNotAuthorized => Some(DenialReason::UnreadOverwrite),
+            Self::ScratchEntryLimit => Some(DenialReason::ScratchEntryLimit),
+            Self::ScratchByteLimit => Some(DenialReason::ScratchByteLimit),
             _ => None,
         }
     }
@@ -909,6 +1039,9 @@ pub(crate) enum AuthorizedTarget {
     },
     Spawn {
         resolved_executable: String,
+        /// Canonical text of the working directory and environment, present only when the call
+        /// set either. It is only ever hashed (keyed) into the audit record.
+        options_fingerprint: Option<String>,
     },
     SessionState {
         operation: &'static str,
@@ -917,6 +1050,9 @@ pub(crate) enum AuthorizedTarget {
     },
     #[cfg(any(test, feature = "skills"))]
     ProposeSkill,
+    CallTool {
+        tool_name: String,
+    },
 }
 
 /// Parent-normalized, source-free target used only for manifest intersection.
@@ -943,6 +1079,7 @@ pub(crate) enum NormalizedTarget {
     SessionState,
     #[cfg(any(test, feature = "skills"))]
     ProposeSkill,
+    CallTool,
 }
 
 impl AuthorizedEffect {
@@ -1016,6 +1153,38 @@ pub(crate) trait ParentEffectService: Send {
         operation: &'a EffectOperation,
         cancellation: PermCancellation,
     ) -> ParentEffectFuture<'a, Result<EffectResult, HostEffectError>>;
+
+    /// Moves the effect prepared by the last successful `authorize` out of the service, so a
+    /// batch can authorize several items one after another and run them together. `None` means
+    /// this service cannot batch.
+    fn take_prepared(&mut self) -> Option<PreparedEffect> {
+        None
+    }
+
+    /// Runs items previously taken with [`Self::take_prepared`], concurrently up to the service's
+    /// parallelism limit, and returns one outcome per item in the same order. The default
+    /// refuses every item.
+    fn execute_batch<'a>(
+        &'a mut self,
+        items: Vec<BatchExecution>,
+        _cancellation: PermCancellation,
+    ) -> ParentEffectFuture<'a, Vec<Result<EffectResult, HostEffectError>>> {
+        Box::pin(async move {
+            items
+                .iter()
+                .map(|_| Err(HostEffectError::BackendFailure))
+                .collect()
+        })
+    }
+}
+
+/// An authorized effect the service has prepared but not yet run (opaque to the broker).
+pub(crate) struct PreparedEffect(pub(crate) Box<dyn std::any::Any + Send>);
+
+/// One authorized batch item handed back to the service for concurrent execution.
+pub(crate) struct BatchExecution {
+    pub(crate) operation: EffectOperation,
+    pub(crate) prepared: PreparedEffect,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1053,6 +1222,19 @@ pub(crate) enum BrokerBuildError {
     InvalidSkillCallAuthority,
 }
 
+/// Everything `persist_intent` needs, captured by value so it can run on the blocking pool.
+struct PersistIntent {
+    effect_id: String,
+    sequence: u64,
+    timestamp_ms: i64,
+    artifact_id: Option<String>,
+    export: Option<String>,
+    grant_id: String,
+    expires_at: Instant,
+    capability: HostCapability,
+    audit_target: AuthorizedTarget,
+}
+
 /// One invocation's parent-owned grant table and policy state.
 pub(crate) struct InvocationBroker<S> {
     spend: Option<crate::spend::run::Run>,
@@ -1066,7 +1248,7 @@ pub(crate) struct InvocationBroker<S> {
     /// Durable intent currently handed to the effect service. This parent-only marker survives
     /// dropping an uncooperative service future so cancellation can append a truthful unknown
     /// completion before authority is erased.
-    in_flight_effect: Option<String>,
+    in_flight_effects: Vec<String>,
     structured_result_receipt: super::session::StructuredResultReceipt,
     #[cfg(feature = "skills")]
     skill_calls: Option<SkillCallAuthority>,
@@ -1078,6 +1260,7 @@ pub(crate) struct InvocationBroker<S> {
     /// `handle_effect` to attribute the denial to the right telemetry class.
     #[cfg(feature = "skills")]
     last_manifest_denial: Option<ManifestDenial>,
+    trace: EffectTrace,
     #[cfg(test)]
     fail_completion_durability: Option<super::audit::AuditFailurePoint>,
 }
@@ -1105,7 +1288,7 @@ impl<S: ParentEffectService> InvocationBroker<S> {
             state: InvocationState::Active,
             service,
             audit,
-            in_flight_effect: None,
+            in_flight_effects: Vec::new(),
             structured_result_receipt: super::session::StructuredResultReceipt::default(),
             #[cfg(feature = "skills")]
             skill_calls: None,
@@ -1115,9 +1298,15 @@ impl<S: ParentEffectService> InvocationBroker<S> {
             capability_denials: CapabilityDenialTracker::default(),
             #[cfg(feature = "skills")]
             last_manifest_denial: None,
+            trace: EffectTrace::default(),
             #[cfg(test)]
             fail_completion_durability: None,
         })
+    }
+
+    /// Handle onto this invocation's closed effect trace (in-flight operation, last failure).
+    pub(crate) fn effect_trace(&self) -> EffectTrace {
+        self.trace.clone()
     }
 
     pub(crate) fn with_structured_result_receipt(
@@ -1245,6 +1434,12 @@ impl<S: ParentEffectService> InvocationBroker<S> {
         request: EffectRequest,
         cancellation: PermCancellation,
     ) -> Result<EffectResult, HostEffectError> {
+        if matches!(
+            request.operation,
+            EffectOperation::FetchAll { .. } | EffectOperation::SpawnAll { .. }
+        ) {
+            return self.dispatch_batch(request, cancellation).await;
+        }
         let capability = HostCapability::for_operation(&request.operation);
         // Capture only parent-authoritative attribution before preparation can retire an expired
         // grant. A denial must never fall back to the worker's advisory identity.
@@ -1290,80 +1485,20 @@ impl<S: ParentEffectService> InvocationBroker<S> {
                 return Err(error);
             }
         };
-        if let Some(run) = &self.spend {
-            // Persistence may wait, but never while holding the synchronous
-            // audit mutex. The authoritative check below still runs after it.
-            run.flush().await;
-        }
-        // The intent append fsyncs, so it runs on the blocking pool; the executor never holds
-        // the std audit mutex across a sync. Ordering is unchanged: the intent is durable
-        // before `execute`, because this await completes first.
-        let intent_result = {
-            let audit_store = Arc::clone(&self.audit);
-            let spend = self.spend.clone();
-            let expires_at = grant.expires_at;
-            let effect_id = effect_id.clone();
-            let invocation_id = self.invocation_id.to_string();
-            let grant_id = authorized.grant_id.get().to_string();
-            let sequence = u64::from(request.effect_ordinal) + 1;
-            let artifact_id = artifact_id.clone();
-            let export = export.clone();
-            let audit_capability = audit_capability(capability);
-            match crate::agent::runner::spawn_blocking_scoped(move || {
-                audit_store
-                    .lock()
-                    .map_err(|_| HostEffectError::AuditFailure)
-                    .and_then(|mut audit| {
-                        // The shared writer can be contended by another invocation. Authority is
-                        // a lease, so recheck it after acquiring that lock and before persisting
-                        // intent.
-                        if Instant::now() >= expires_at {
-                            audit
-                                .append_denial(EffectDenial {
-                                    effect_id: effect_id.clone(),
-                                    invocation_id: invocation_id.clone(),
-                                    grant_id: grant_id.clone(),
-                                    sequence,
-                                    timestamp_ms,
-                                    artifact_id: artifact_id.clone(),
-                                    export: export.clone(),
-                                    capability: audit_capability,
-                                    result_code: AuditResultCode::Denied,
-                                })
-                                .map_err(HostEffectError::from)?;
-                            return Err(HostEffectError::ExpiredGrant);
-                        }
-                        // Recheck the explicitly captured parent account after approval
-                        // and audit lock waits, immediately before durable effect intent.
-                        if match spend.as_ref() {
-                            Some(run) => run.admit_effect().is_err(),
-                            None => false,
-                        } {
-                            return Err(HostEffectError::SessionDenied);
-                        }
-                        let normalized_target = sanitize_target(&audit, capability, audit_target)?;
-                        audit
-                            .append_intent(EffectIntent {
-                                effect_id,
-                                invocation_id,
-                                grant_id,
-                                sequence,
-                                timestamp_ms,
-                                artifact_id,
-                                export,
-                                capability: audit_capability,
-                                normalized_target,
-                                decision: AuditDecision::Authorized,
-                            })
-                            .map_err(HostEffectError::from)
-                    })
+        let intent_result = self
+            .intent_writer()
+            .persist(PersistIntent {
+                effect_id: effect_id.clone(),
+                sequence: u64::from(request.effect_ordinal) + 1,
+                timestamp_ms,
+                artifact_id: artifact_id.clone(),
+                export: export.clone(),
+                grant_id: authorized.grant_id.get().to_string(),
+                expires_at: grant.expires_at,
+                capability,
+                audit_target,
             })
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(HostEffectError::AuditFailure),
-            }
-        };
+            .await;
         if let Err(error) = intent_result {
             if error == HostEffectError::SessionDenied {
                 self.service.discard_prepared();
@@ -1380,7 +1515,7 @@ impl<S: ParentEffectService> InvocationBroker<S> {
             return Err(HostEffectError::AuditFailure);
         }
 
-        self.in_flight_effect = Some(effect_id.clone());
+        self.in_flight_effects = vec![effect_id.clone()];
 
         let execution_result = self
             .service
@@ -1418,7 +1553,7 @@ impl<S: ParentEffectService> InvocationBroker<S> {
             self.erase_authority(InvocationState::Terminal);
             return Err(HostEffectError::AuditFailure);
         }
-        self.in_flight_effect = None;
+        self.in_flight_effects.clear();
         if matches!(execution_result, Err(HostEffectError::InvocationCancelled)) {
             self.cancel_invocation();
         } else if let (EffectOperation::Result { .. }, Ok(EffectResult::ResultAccepted { json })) =
@@ -1434,6 +1569,365 @@ impl<S: ParentEffectService> InvocationBroker<S> {
         execution_result
     }
 
+    /// `fetch_all` / `spawn_all`: every item goes through the same policy pipeline as its
+    /// single-effect form (validation, backend check, hooks, permission, normalization, target
+    /// authorization) and gets its own audit intent and completion, sequentially. Only then do
+    /// the authorized items run together. A denied or failed item is a per-item error result;
+    /// it never fails the batch. Cancellation, expiry and audit failures stay whole-call
+    /// failures.
+    async fn dispatch_batch(
+        &mut self,
+        request: EffectRequest,
+        cancellation: PermCancellation,
+    ) -> Result<EffectResult, HostEffectError> {
+        let capability = HostCapability::for_operation(&request.operation);
+        let denial_identity = self
+            .grants
+            .get(&request.grant_id)
+            .map(|grant| audit_identity(&grant.principal))
+            .unwrap_or((None, None));
+        let (fetch, operations): (bool, Vec<EffectOperation>) = match &request.operation {
+            EffectOperation::FetchAll { requests } => (
+                true,
+                requests
+                    .iter()
+                    .map(|item| EffectOperation::Fetch {
+                        url: item.url.clone(),
+                        method: item.method,
+                        headers: item.headers.clone(),
+                        body: item.body.clone(),
+                    })
+                    .collect(),
+            ),
+            EffectOperation::SpawnAll { commands } => (
+                false,
+                commands
+                    .iter()
+                    .map(|item| EffectOperation::Spawn {
+                        program: item.program.clone(),
+                        arguments: item.arguments.clone(),
+                        options: item.options.clone(),
+                    })
+                    .collect(),
+            ),
+            _ => return Err(HostEffectError::InvalidTarget),
+        };
+        if operations.is_empty() || operations.len() > MAX_BATCH_ITEMS {
+            self.append_pre_intent_outcome(
+                &request,
+                capability,
+                HostEffectError::InvalidTarget,
+                denial_identity,
+            )?;
+            return Err(HostEffectError::InvalidTarget);
+        }
+        let count = operations.len();
+        let mut results: Vec<Option<EffectResult>> = vec![None; count];
+        let mut ready: Vec<(usize, String)> = Vec::new();
+        let mut executions: Vec<BatchExecution> = Vec::new();
+
+        for (index, operation) in operations.into_iter().enumerate() {
+            let item_effect_id = item_effect_id(&self.invocation_id, request.effect_ordinal, index);
+            let item_request = EffectRequest {
+                effect_ordinal: request.effect_ordinal,
+                grant_id: request.grant_id.clone(),
+                advisory: request.advisory.clone(),
+                operation: operation.clone(),
+                console: Vec::new(),
+            };
+            let preparation = if match self.spend.as_ref() {
+                Some(run) => run.admit_effect_ready().await.is_err(),
+                None => false,
+            } {
+                Err(HostEffectError::SessionDenied)
+            } else {
+                self.prepare_effect(&item_request, capability, cancellation.clone())
+                    .await
+            };
+            let (grant, authorized, audit_target) = match preparation {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    self.service.discard_prepared();
+                    if self
+                        .append_denial_record(
+                            item_effect_id,
+                            &item_request,
+                            capability,
+                            error,
+                            denial_identity.clone(),
+                        )
+                        .is_err()
+                    {
+                        self.erase_authority(InvocationState::Terminal);
+                        return Err(HostEffectError::AuditFailure);
+                    }
+                    if error == HostEffectError::InvocationCancelled {
+                        self.cancel_invocation();
+                        return Err(error);
+                    }
+                    results[index] = Some(error.into_wire_result());
+                    continue;
+                }
+            };
+            let Some(prepared) = self.service.take_prepared() else {
+                self.service.discard_prepared();
+                results[index] = Some(HostEffectError::BackendFailure.into_wire_result());
+                continue;
+            };
+            let (artifact_id, export) = audit_identity(&authorized.principal);
+            let timestamp_ms = match timestamp_ms() {
+                Ok(timestamp_ms) => timestamp_ms,
+                Err(error) => {
+                    self.erase_authority(InvocationState::Terminal);
+                    return Err(error);
+                }
+            };
+            let intent = self
+                .intent_writer()
+                .persist(PersistIntent {
+                    effect_id: item_effect_id.clone(),
+                    sequence: u64::from(request.effect_ordinal) + 1,
+                    timestamp_ms,
+                    artifact_id,
+                    export,
+                    grant_id: authorized.grant_id.get().to_string(),
+                    expires_at: grant.expires_at,
+                    capability,
+                    audit_target,
+                })
+                .await;
+            match intent {
+                Ok(()) => {
+                    ready.push((index, item_effect_id));
+                    executions.push(BatchExecution {
+                        operation,
+                        prepared,
+                    });
+                }
+                Err(HostEffectError::SessionDenied) => {
+                    self.append_denial_record(
+                        item_effect_id,
+                        &item_request,
+                        capability,
+                        HostEffectError::SessionDenied,
+                        denial_identity.clone(),
+                    )?;
+                    results[index] = Some(HostEffectError::SessionDenied.into_wire_result());
+                }
+                Err(HostEffectError::ExpiredGrant) => {
+                    let _ = self.ensure_grant_unexpired(&request.grant_id, grant.expires_at);
+                    results[index] = Some(HostEffectError::ExpiredGrant.into_wire_result());
+                }
+                Err(_) => {
+                    self.erase_authority(InvocationState::Terminal);
+                    return Err(HostEffectError::AuditFailure);
+                }
+            }
+        }
+
+        if !executions.is_empty() {
+            self.in_flight_effects = ready.iter().map(|(_, id)| id.clone()).collect();
+            let outcomes = self.service.execute_batch(executions, cancellation).await;
+            let mut cancelled = false;
+            for ((index, effect_id), outcome) in ready.into_iter().zip(outcomes) {
+                let outcome = match outcome {
+                    Ok(result)
+                        if matches!(
+                            (&result, fetch),
+                            (EffectResult::Fetch { .. }, true)
+                                | (EffectResult::Spawn { .. }, false)
+                        ) =>
+                    {
+                        Ok(result)
+                    }
+                    Ok(_) => Err(HostEffectError::BackendFailure),
+                    Err(error) => Err(error),
+                };
+                let code = audit_result_code(&outcome);
+                let completion = {
+                    let audit_store = Arc::clone(&self.audit);
+                    let completed_id = effect_id.clone();
+                    crate::agent::runner::spawn_blocking_scoped(move || {
+                        audit_store
+                            .lock()
+                            .map_err(|_| HostEffectError::AuditFailure)
+                            .and_then(|mut audit| {
+                                audit
+                                    .append_completion(EffectCompletion {
+                                        effect_id: completed_id,
+                                        result_code: code,
+                                    })
+                                    .map_err(HostEffectError::from)
+                            })
+                    })
+                    .await
+                    .unwrap_or(Err(HostEffectError::AuditFailure))
+                };
+                if completion.is_err() {
+                    self.erase_authority(InvocationState::Terminal);
+                    return Err(HostEffectError::AuditFailure);
+                }
+                self.in_flight_effects.retain(|id| id != &effect_id);
+                if outcome == Err(HostEffectError::InvocationCancelled) {
+                    cancelled = true;
+                }
+                results[index] = Some(match outcome {
+                    Ok(result) => result,
+                    Err(error) => error.into_wire_result(),
+                });
+            }
+            if !self.in_flight_effects.is_empty() {
+                // Fewer outcomes than items: the rest are unknown, never silently dropped.
+                let _ = self.reconcile_interrupted_effect();
+                return Err(HostEffectError::OutcomeUnknown);
+            }
+            if cancelled {
+                self.cancel_invocation();
+                return Err(HostEffectError::InvocationCancelled);
+            }
+        }
+
+        let items = results
+            .into_iter()
+            .map(|item| item.unwrap_or_else(|| HostEffectError::BackendFailure.into_wire_result()))
+            .collect();
+        Ok(if fetch {
+            EffectResult::FetchAll { items }
+        } else {
+            EffectResult::SpawnAll { items }
+        })
+    }
+
+    fn append_denial_record(
+        &mut self,
+        effect_id: String,
+        request: &EffectRequest,
+        capability: HostCapability,
+        error: HostEffectError,
+        (artifact_id, export): (Option<String>, Option<String>),
+    ) -> Result<(), HostEffectError> {
+        let timestamp_ms = timestamp_ms()?;
+        match self
+            .audit
+            .lock()
+            .map_err(|_| HostEffectError::AuditFailure)?
+            .append_denial(EffectDenial {
+                effect_id,
+                invocation_id: self.invocation_id.to_string(),
+                grant_id: request.grant_id.get().to_string(),
+                sequence: u64::from(request.effect_ordinal) + 1,
+                timestamp_ms,
+                artifact_id,
+                export,
+                capability: audit_capability(capability),
+                result_code: audit_result_code(&Err(error)),
+            }) {
+            Ok(_) | Err(AuditError::ReplayedEffect) => Ok(()),
+            Err(error) => Err(HostEffectError::from(error)),
+        }
+    }
+
+    /// Durably appends the intent record for one authorized effect. Used by the single-effect
+    /// path and, once per item, by the batch path.
+    fn intent_writer(&self) -> IntentWriter {
+        IntentWriter {
+            audit: Arc::clone(&self.audit),
+            spend: self.spend.clone(),
+            invocation_id: self.invocation_id.to_string(),
+        }
+    }
+}
+
+/// Owned handles for writing intent records, so the write future does not borrow the broker.
+struct IntentWriter {
+    audit: SharedEffectAudit,
+    spend: Option<crate::spend::run::Run>,
+    invocation_id: String,
+}
+
+impl IntentWriter {
+    async fn persist(self, spec: PersistIntent) -> Result<(), HostEffectError> {
+        let PersistIntent {
+            effect_id,
+            sequence,
+            timestamp_ms,
+            artifact_id,
+            export,
+            grant_id,
+            expires_at,
+            capability,
+            audit_target,
+        } = spec;
+        if let Some(run) = &self.spend {
+            // Persistence may wait, but never while holding the synchronous
+            // audit mutex. The authoritative check below still runs after it.
+            run.flush().await;
+        }
+        // The intent append fsyncs, so it runs on the blocking pool; the executor never holds
+        // the std audit mutex across a sync. Ordering is unchanged: the intent is durable
+        // before `execute`, because this await completes first.
+        let audit_store = self.audit;
+        let spend = self.spend;
+        let invocation_id = self.invocation_id;
+        let audit_capability = audit_capability(capability);
+        match crate::agent::runner::spawn_blocking_scoped(move || {
+            audit_store
+                .lock()
+                .map_err(|_| HostEffectError::AuditFailure)
+                .and_then(|mut audit| {
+                    // The shared writer can be contended by another invocation. Authority is
+                    // a lease, so recheck it after acquiring that lock and before persisting
+                    // intent.
+                    if Instant::now() >= expires_at {
+                        audit
+                            .append_denial(EffectDenial {
+                                effect_id: effect_id.clone(),
+                                invocation_id: invocation_id.clone(),
+                                grant_id: grant_id.clone(),
+                                sequence,
+                                timestamp_ms,
+                                artifact_id: artifact_id.clone(),
+                                export: export.clone(),
+                                capability: audit_capability,
+                                result_code: AuditResultCode::Denied,
+                            })
+                            .map_err(HostEffectError::from)?;
+                        return Err(HostEffectError::ExpiredGrant);
+                    }
+                    // Recheck the explicitly captured parent account after approval
+                    // and audit lock waits, immediately before durable effect intent.
+                    if match spend.as_ref() {
+                        Some(run) => run.admit_effect().is_err(),
+                        None => false,
+                    } {
+                        return Err(HostEffectError::SessionDenied);
+                    }
+                    let normalized_target = sanitize_target(&audit, capability, audit_target)?;
+                    audit
+                        .append_intent(EffectIntent {
+                            effect_id,
+                            invocation_id,
+                            grant_id,
+                            sequence,
+                            timestamp_ms,
+                            artifact_id,
+                            export,
+                            capability: audit_capability,
+                            normalized_target,
+                            decision: AuditDecision::Authorized,
+                        })
+                        .map_err(HostEffectError::from)
+                })
+        })
+        .await
+        {
+            Ok(result) => result.map(|_| ()),
+            Err(_) => Err(HostEffectError::AuditFailure),
+        }
+    }
+}
+
+impl<S: ParentEffectService> InvocationBroker<S> {
     async fn prepare_effect(
         &mut self,
         request: &EffectRequest,
@@ -1464,7 +1958,7 @@ impl<S: ParentEffectService> InvocationBroker<S> {
         #[cfg(any(test, feature = "skills"))]
         if matches!(
             capability,
-            HostCapability::ProposeSkill | HostCapability::SessionState
+            HostCapability::ProposeSkill | HostCapability::SessionState | HostCapability::CallTool
         ) && matches!(grant.principal, GrantPrincipal::Skill { .. })
         {
             return Err(HostEffectError::CapabilityDenied);
@@ -1642,31 +2136,36 @@ impl<S: ParentEffectService> InvocationBroker<S> {
     fn erase_authority(&mut self, state: InvocationState) {
         self.grants.clear();
         self.retired_grants.clear();
-        self.in_flight_effect = None;
+        self.in_flight_effects.clear();
         self.state = state;
     }
 
     fn reconcile_interrupted_effect(&mut self) -> EffectResult {
-        let Some(effect_id) = self.in_flight_effect.take() else {
+        let effect_ids = std::mem::take(&mut self.in_flight_effects);
+        if effect_ids.is_empty() {
             return HostEffectError::InvocationCancelled.into_wire_result();
-        };
+        }
         let completion = self
             .audit
             .lock()
             .map_err(|_| HostEffectError::AuditFailure)
             .and_then(|mut audit| {
-                audit
-                    .append_completion(EffectCompletion {
+                // A batch leaves one intent per item; every one of them becomes unknown.
+                for effect_id in effect_ids {
+                    match audit.append_completion(EffectCompletion {
                         effect_id,
                         result_code: AuditResultCode::OutcomeUnknown,
-                    })
-                    // The interrupted invocation may never reach its terminal flush, so the
-                    // truthful unknown record is made durable before it is reported.
-                    .and_then(|record| audit.sync_pending().map(|()| record))
-                    .map_err(HostEffectError::from)
+                    }) {
+                        Ok(_) | Err(AuditError::ReplayedEffect | AuditError::UnknownEffect) => {}
+                        Err(error) => return Err(HostEffectError::from(error)),
+                    }
+                }
+                // The interrupted invocation may never reach its terminal flush, so the
+                // truthful unknown records are made durable before they are reported.
+                audit.sync_pending().map_err(HostEffectError::from)
             });
         match completion {
-            Ok(_) => HostEffectError::OutcomeUnknown.into_wire_result(),
+            Ok(()) => HostEffectError::OutcomeUnknown.into_wire_result(),
             Err(error) => {
                 self.erase_authority(InvocationState::Terminal);
                 error.into_wire_result()
@@ -1796,7 +2295,7 @@ fn skill_capability(capability: HostCapability) -> SkillHostCapability {
         HostCapability::WriteFile => SkillHostCapability::WriteFile,
         HostCapability::Fetch => SkillHostCapability::Fetch,
         HostCapability::Spawn => SkillHostCapability::Spawn,
-        HostCapability::SessionState | HostCapability::ProposeSkill => {
+        HostCapability::SessionState | HostCapability::ProposeSkill | HostCapability::CallTool => {
             unreachable!("skills cannot receive model-only grants")
         }
     }
@@ -2191,8 +2690,12 @@ fn sanitize_target(
             HostCapability::Spawn,
             AuthorizedTarget::Spawn {
                 resolved_executable,
+                options_fingerprint,
             },
-        ) => Ok(audit.spawn_target(&resolved_executable)),
+        ) => Ok(audit.spawn_target(&resolved_executable, options_fingerprint.as_deref())),
+        (HostCapability::CallTool, AuthorizedTarget::CallTool { tool_name }) => {
+            Ok(audit.call_tool_target(&tool_name))
+        }
         #[cfg(any(test, feature = "skills"))]
         (HostCapability::ProposeSkill, AuthorizedTarget::ProposeSkill) => {
             Ok(audit.proposal_target())
@@ -2217,6 +2720,7 @@ fn audit_capability(capability: HostCapability) -> AuditCapability {
         HostCapability::Spawn => AuditCapability::Spawn,
         HostCapability::SessionState => AuditCapability::SessionState,
         HostCapability::ProposeSkill => AuditCapability::ProposeSkill,
+        HostCapability::CallTool => AuditCapability::CallTool,
     }
 }
 
@@ -2255,13 +2759,29 @@ fn audit_result_code(result: &Result<EffectResult, HostEffectError>) -> AuditRes
         Err(HostEffectError::AskTimedOut | HostEffectError::EffectTimedOut) => {
             AuditResultCode::TimedOut
         }
-        Err(HostEffectError::OutputLimit) => AuditResultCode::OutputLimit,
+        Err(
+            HostEffectError::OutputLimit
+            | HostEffectError::ScratchEntryLimit
+            | HostEffectError::ScratchByteLimit,
+        ) => AuditResultCode::OutputLimit,
         Err(HostEffectError::OutcomeUnknown) => AuditResultCode::OutcomeUnknown,
         Err(HostEffectError::BackendFailure | HostEffectError::AuditFailure) => {
             AuditResultCode::BackendFailure
         }
         Err(_) => AuditResultCode::Denied,
     }
+}
+
+/// Audit identity of one batch item: distinct per `(invocation, ordinal, index)`.
+fn item_effect_id(invocation_id: &InvocationId, ordinal: u32, index: usize) -> String {
+    let bytes = invocation_id.as_str().as_bytes();
+    let mut digest = Sha256::new();
+    digest.update(b"mini-agent-js-batch-item-effect-id-v1\0");
+    digest.update((bytes.len() as u64).to_be_bytes());
+    digest.update(bytes);
+    digest.update(ordinal.to_be_bytes());
+    digest.update((index as u64).to_be_bytes());
+    format!("effect-{}", crate::hex::encode_lower(digest.finalize()))
 }
 
 fn effect_id(invocation_id: &InvocationId, ordinal: u32) -> String {
@@ -2300,8 +2820,27 @@ impl<S: ParentEffectService> InvocationEffectHandler for InvocationBroker<S> {
         {
             self.last_manifest_denial = None;
         }
+        let operation_name = effect_operation_name(&request.operation);
+        let trace = self.trace.clone();
+        trace.record_console(&request.console);
         Box::pin(async move {
-            match self.dispatch(request, cancellation).await {
+            trace.begin(operation_name);
+            let outcome = self.dispatch(request, cancellation).await;
+            let failure = match &outcome {
+                Ok(EffectResult::Error(error)) => Some(FailedEffect {
+                    operation: operation_name,
+                    code: error.code,
+                    reason: error.reason,
+                }),
+                Err(error) => Some(FailedEffect {
+                    operation: operation_name,
+                    code: error.wire_code(),
+                    reason: error.denial_reason(),
+                }),
+                Ok(_) => None,
+            };
+            trace.finish(failure);
+            match outcome {
                 Ok(result) => result,
                 Err(error) => {
                     #[cfg(feature = "skills")]

@@ -12,6 +12,7 @@ pub(crate) mod session;
 pub mod skills;
 pub(crate) mod supervisor;
 pub mod tool;
+pub(crate) mod tool_bridge;
 pub mod types;
 pub(crate) mod worker;
 

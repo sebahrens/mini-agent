@@ -384,6 +384,7 @@ impl InvocationCapabilityRuntime {
                         export: Some(export),
                     },
                     operation: decoded_operation,
+                    console: Vec::new(),
                 },
             }
         };
@@ -587,6 +588,11 @@ fn encode_effect_result(result: EffectResult) -> Result<String, CapabilityError>
         | EffectResult::ResultAccepted { .. }
         | EffectResult::ScratchPut
         | EffectResult::ScratchGet { .. }
+        | EffectResult::ScratchDelete { .. }
+        | EffectResult::ScratchKeys { .. }
+        | EffectResult::CallTool { .. }
+        | EffectResult::FetchAll { .. }
+        | EffectResult::SpawnAll { .. }
         | EffectResult::ProposalAccepted { .. } => {
             return Err(CapabilityError::DispatchDenied);
         }
