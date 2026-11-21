@@ -1634,10 +1634,32 @@ async fn try_merge_transaction(
         };
     }
 
+    squash_and_commit(
+        info,
+        target,
+        &main_repo_path,
+        &target_ref,
+        response_tx,
+        state,
+    )
+    .await
+}
+
+/// The last phase of the merge transaction: squash the source branch into the
+/// checked-out target, verify the index and the resulting commit, and
+/// classify a failed squash as conflicts or a rolled-back error.
+async fn squash_and_commit(
+    info: &WorktreeInfo,
+    target: &str,
+    main_repo_path: &Path,
+    target_ref: &str,
+    response_tx: &mut oneshot::Sender<MergeResponse>,
+    mut state: MergeState,
+) -> SupervisedMerge {
     match await_merge_step(
         response_tx,
         run_local(
-            &main_repo_path,
+            main_repo_path,
             "merge-squash",
             ["merge", "--squash", "--", info.branch.as_str()],
         ),
@@ -1651,7 +1673,7 @@ async fn try_merge_transaction(
                 .expect("pre-merge HEAD was captured before squash");
             if let Err(error) = await_merge_step(
                 response_tx,
-                verify_target_checkout_at(&main_repo_path, target, &pre_merge_head),
+                verify_target_checkout_at(main_repo_path, target, &pre_merge_head),
             )
             .await
             {
@@ -1676,7 +1698,7 @@ async fn try_merge_transaction(
             }
             let (expected_tree, index_tree, target_tree) = match await_merge_step(
                 response_tx,
-                squash_tree_state(&main_repo_path, &pre_merge_head, &state.source_head_oid),
+                squash_tree_state(main_repo_path, &pre_merge_head, &state.source_head_oid),
             )
             .await
             {
@@ -1722,15 +1744,15 @@ async fn try_merge_transaction(
             }
             match await_merge_step(
                 response_tx,
-                run_local(&main_repo_path, "merge-commit", ["commit", "--no-edit"]),
+                run_local(main_repo_path, "merge-commit", ["commit", "--no-edit"]),
             )
             .await
             {
                 Ok(_) => match await_merge_step(
                     response_tx,
                     verify_squash_commit(
-                        &main_repo_path,
-                        &target_ref,
+                        main_repo_path,
+                        target_ref,
                         &pre_merge_head,
                         &expected_tree,
                     ),
@@ -1741,7 +1763,7 @@ async fn try_merge_transaction(
                         state.target_head_after_commit = Some(oid.clone());
                         match await_merge_step(
                             response_tx,
-                            verify_target_checkout_at(&main_repo_path, target, &oid),
+                            verify_target_checkout_at(main_repo_path, target, &oid),
                         )
                         .await
                         {
@@ -1805,7 +1827,7 @@ async fn try_merge_transaction(
         }
         Err(MergeStepError::Command(error)) => {
             let conflict = match await_merge_step(response_tx, async {
-                Ok(has_merge_conflict_at(&main_repo_path).await)
+                Ok(has_merge_conflict_at(main_repo_path).await)
             })
             .await
             {
@@ -1817,7 +1839,7 @@ async fn try_merge_transaction(
             };
             if conflict {
                 let files = match await_merge_step(response_tx, async {
-                    Ok(conflicted_files_at(&main_repo_path).await)
+                    Ok(conflicted_files_at(main_repo_path).await)
                 })
                 .await
                 {
