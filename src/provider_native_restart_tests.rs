@@ -356,9 +356,6 @@ async fn headless_resume(
     let mut config = json!({
         "session_title_model":"off",
         "custom_providers":{"restart-headless":{"provider_type":"anthropic","base_url":wire.base}},
-        // `--api-key` is scoped to the startup provider, which a resumed session does not
-        // select; the resumed run resolves this provider's key from its own config slot.
-        "api_keys":{"restart-headless":"unused-key"},
         "quick_models":{
             "model-a":{"provider":"restart-headless","model":"claude-opus-5-5","context_window":200000,"input_token_cost":2.0,"output_token_cost":4.0},
             "model-b":{"provider":"restart-headless","model":"claude-sonnet-5-0","context_window":200000,"input_token_cost":2.0,"output_token_cost":4.0}
@@ -576,9 +573,6 @@ fn headless_fixture(
     let cfg: crate::config::Config = serde_json::from_value(json!({
         "session_title_model":"off",
         "custom_providers":{"media-headless":{"provider_type":"anthropic","base_url":wire.base}},
-        // `--api-key` is scoped to the startup provider, which a resumed session does not
-        // select; the resumed run resolves this provider's key from its own config slot.
-        "api_keys":{"media-headless":"unused-key"},
         "quick_models":{"model-a":{"provider":"media-headless","model":"claude-opus-5-5",
             "context_window":200000,"input_token_cost":2.0,"output_token_cost":4.0}},
     }))
