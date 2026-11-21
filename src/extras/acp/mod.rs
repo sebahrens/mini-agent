@@ -4330,6 +4330,7 @@ mod mcp_bridge_tests {
 
     fn ask(reply: tokio::sync::oneshot::Sender<UserDecision>) -> AskRequest {
         AskRequest {
+            workdir: None,
             diagnostic: None,
             #[cfg(feature = "subagents")]
             background: None,
@@ -4522,6 +4523,7 @@ mod tool_presentation_tests {
 
         let (reply, _receiver) = tokio::sync::oneshot::channel();
         let ask = crate::permission::ask::AskRequest {
+            workdir: None,
             diagnostic: None,
             #[cfg(feature = "subagents")]
             background: None,
@@ -11367,6 +11369,7 @@ mod protocol_tests {
                     ask_tx
                         .send(
                             AskRequest {
+                                workdir: None,
                                 diagnostic: Some(crate::permission::ask::AskDiagnostic {
                                     effective_mode: SecurityMode::Guarded,
                                     selected_mode: SecurityMode::Yolo,
@@ -11487,6 +11490,7 @@ mod protocol_tests {
                 ask_tx
                     .send(
                         AskRequest {
+                            workdir: None,
                             diagnostic: None,
                             #[cfg(feature = "subagents")]
                             background: None,
@@ -11562,6 +11566,7 @@ mod protocol_tests {
         let (reply, _receiver) = tokio::sync::oneshot::channel();
         let (descendants, exact) = crate::permission::pattern::search_root_allow_scope("/repo");
         let ask = crate::permission::ask::AskRequest {
+            workdir: None,
             diagnostic: None,
             #[cfg(feature = "subagents")]
             background: None,
@@ -11586,6 +11591,7 @@ mod protocol_tests {
 
         let (reply, _receiver) = tokio::sync::oneshot::channel();
         let shell = crate::permission::ask::AskRequest {
+            workdir: None,
             diagnostic: None,
             #[cfg(feature = "subagents")]
             background: None,
@@ -11667,6 +11673,7 @@ mod protocol_tests {
                         let send_ask = |name: &str| {
                             let (reply, receiver) = tokio::sync::oneshot::channel();
                             let ask = AskRequest {
+                                workdir: None,
                                 diagnostic: None,
                                 #[cfg(feature = "subagents")]
                                 background: None,

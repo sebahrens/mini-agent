@@ -44,8 +44,8 @@ off by default, rank below every other root for name clashes (added dirs before 
 user authority with the normal read-permission check, and cannot be set by an untrusted project
 config. Entries expand `~`/`~user`, resolve relative to their config file (or the launch directory
 for `--add-dir`), and each dropped one (over the 16 cap, missing, not a directory) is a startup
-warning and a line in `/skills`. `--add-dir` does not by itself let the file tools read DIR; set
-`add_dir_tool_access = true` for that (see CONFIG.md). Skills under `.claude/skills` (any
+warning and a line in `/skills`. `--add-dir` does not by itself let the file tools or the shell sandbox reach DIR; set
+`add_dir_tool_access = true` or use `--add-workspace-dir DIR` for that (see CONFIG.md). Skills under `.claude/skills` (any
 location) also load without frontmatter: `name` defaults to the directory name, `description` to
 the first non-empty body line (cut at 1,024 characters), malformed YAML falls back to its simple
 `key: value` lines, and `yes/no/on/off/1/0` work for the boolean flags; other roots keep the

@@ -287,6 +287,9 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     aliased("shell-allow-escalation", &["shell_allow_escalation"])
         .described("Offer the shell escalate parameter: retry one sandbox-blocked command without the sandbox after interactive approval. Default false; ignored under sandbox-required. Project layers need trust.")
         .shaped(ConfigShape::Bool),
+    aliased("shell-auto-allow-sandboxed", &["shell_auto_allow_sandboxed"])
+        .described("Global-only: in standard and guarded modes run an unmatched shell command without a prompt while an enforced sandbox (workspace or host-read profile, sandbox-network deny or allowlist) contains it. Deny and ask rules, destructive-command asks and escalation requests still prompt. Default false.")
+        .shaped(ConfigShape::Bool),
     aliased("shell-env-allow-secrets", &["shell_env_allow_secrets"])
         .described("Global-only: permit credential-looking names (GH_TOKEN, *_API_KEY) in shell-inherit-env and shell-env.")
         .shaped(ConfigShape::Bool),

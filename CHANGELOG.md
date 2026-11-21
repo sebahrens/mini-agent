@@ -69,6 +69,8 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Large pastes (more than 10 lines or 1,000 characters) become an atomic `[Pasted text #N +M lines]` chip in the prompt that the cursor steps over and Backspace removes whole; submit, history and the external editor use the full text (mini-agent-nvnkx.88).
 - `/vim` Normal mode: operators `d`/`c`/`y` with counts, motions (`w e b 0 ^ $ gg G f F t T`, `iw`/`aw`), `x X D C p P o O r ~` and `.` repeat of the last change (mini-agent-nvnkx.89).
 - Pasting or dragging an image file path into the prompt attaches the image as `/add <path>` would, when the permission policy allows reading it (mini-agent-nvnkx.256).
+- `shell-auto-allow-sandboxed` (global-only, default off; a managed policy can force it off with `forbid_shell_auto_allow`) lets standard mode run unmatched shell commands without a prompt while an enforced `workspace`/`host-read` sandbox with network `deny`/`allowlist` contains them; deny and ask rules, destructive commands and escalation still prompt, and `/sandbox` and the status line show the state (mini-agent-nvnkx.62).
+- `--add-workspace-dir DIR` (and `--add-dir` under `add_dir_tool_access = true`) gives DIR to the file tools and the shell sandbox write roots together, and `/add-dir DIR` grants file-tool access for the running session (mini-agent-nvnkx.71).
 
 ### Fixed
 
@@ -292,6 +294,7 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Ctrl+V with no clipboard image pastes the clipboard text (`pbpaste`, `wl-paste`, `xclip`) or says there is nothing to paste, instead of reporting an unavailable platform; a missing Linux image target is "no image" (mini-agent-nvnkx.255).
 - macOS and Windows clipboard image helpers accept PNGs up to the 24 MiB raw bound so large Retina screenshots reach the downscaler (mini-agent-nvnkx.249).
 - Copying selected text over SSH or inside tmux uses OSC 52 or `tmux load-buffer -w` instead of the remote machine's clipboard helpers, names the route in the notice, refuses payloads too large for OSC 52, and `MINI_AGENT_CLIPBOARD=auto|osc52|helper|tmux` overrides the choice (mini-agent-nvnkx.285).
+- Shell calls with `workdir` are checked on the plain command with the directory as a separate field: built-in and configured allows, session prefix grants and the read-only classifier (confined to the directory) now match, so `cargo test` or `ls` with a `workdir` no longer prompt every time; an "always" approval stays per directory and a deny rule still wins (mini-agent-nvnkx.60).
 
 ### Added
 

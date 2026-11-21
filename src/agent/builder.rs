@@ -1367,6 +1367,17 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         sandbox.set_command_log_dir(crate::session::storage::command_log_dir(
             tool_output_session_id,
         ));
+        // The opt-in auto-allow follows the live sandbox, so a `/sandbox`
+        // switch (which rebuilds the agent) is reflected here.
+        if let Some(permission) = &permission {
+            permission
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .set_sandbox_auto_allow(
+                    cfg.shell_auto_allow_sandboxed.unwrap_or(false)
+                        && sandbox.contains_shell_for_auto_allow(),
+                );
+        }
         if shell_tool_enabled {
             // Unlisted hosts of `sandbox-network = "allowlist"` prompt here.
             sandbox.set_network_prompt(ask_tx.clone());

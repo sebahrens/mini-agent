@@ -122,6 +122,7 @@ pub(crate) fn prepare(
             | "cache_ttl"
             | "permission_mode_cycle"
             | "sandbox_required"
+            | "shell_auto_allow_sandboxed"
             | "permission_checks_required"
     ) {
         return Err("This setting can only be changed in global configuration");

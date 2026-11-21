@@ -3683,6 +3683,22 @@ impl Sandbox {
         }
     }
 
+    /// Whether an enforced sandbox bounds model shell commands tightly enough
+    /// for `shell-auto-allow-sandboxed`: the backend is available and active,
+    /// the profile is `workspace` or `host-read` and the shell network is
+    /// `deny` or `allowlist`.
+    pub(crate) fn contains_shell_for_auto_allow(&self) -> bool {
+        self.policy() == SandboxPolicy::RequiredAndAvailable
+            && matches!(
+                self.profile,
+                SandboxProfile::Workspace | SandboxProfile::HostRead
+            )
+            && matches!(
+                self.network,
+                SandboxNetwork::Deny | SandboxNetwork::Allowlist
+            )
+    }
+
     /// One honest line answering "am I contained?": enforcement status, backend and
     /// profile, with the closed diagnostic when the backend is unavailable.
     pub(crate) fn status_line(&self) -> String {
@@ -4153,16 +4169,19 @@ impl Sandbox {
         self.command_in_workdir_aliased(workdir, command, self.shell_cwd_alias().as_deref())
     }
 
-    /// `alias` is where the sandbox mounts the workspace when it differs from
-    /// the host path (bwrap `/workspace`): an absolute `workdir` spelled with
-    /// it maps back to the host root, and the emitted `cd` targets the
-    /// namespace path, which is the only one that exists inside the sandbox.
-    pub(crate) fn command_in_workdir_aliased(
+    /// The validated host directory a shell `workdir` names (symlinks resolved,
+    /// inside the workspace, an existing directory). The permission layer uses
+    /// it as the base for path confinement and as the approval's directory.
+    pub(crate) fn resolve_workdir(&self, workdir: &str) -> Result<PathBuf, String> {
+        self.resolve_workdir_aliased(workdir, self.shell_cwd_alias().as_deref())
+            .map(|(_, resolved)| resolved)
+    }
+
+    fn resolve_workdir_aliased(
         &self,
         workdir: &str,
-        command: &str,
         alias: Option<&Path>,
-    ) -> Result<String, String> {
+    ) -> Result<(PathBuf, PathBuf), String> {
         let workdir = workdir.trim();
         if workdir.is_empty() || workdir.contains('\0') {
             return Err("workdir must be a non-empty path".into());
@@ -4195,6 +4214,20 @@ impl Sandbox {
         if !resolved.is_dir() {
             return Err(format!("workdir {workdir:?} is not a directory"));
         }
+        Ok((root, resolved))
+    }
+
+    /// `alias` is where the sandbox mounts the workspace when it differs from
+    /// the host path (bwrap `/workspace`): an absolute `workdir` spelled with
+    /// it maps back to the host root, and the emitted `cd` targets the
+    /// namespace path, which is the only one that exists inside the sandbox.
+    pub(crate) fn command_in_workdir_aliased(
+        &self,
+        workdir: &str,
+        command: &str,
+        alias: Option<&Path>,
+    ) -> Result<String, String> {
+        let (root, resolved) = self.resolve_workdir_aliased(workdir, alias)?;
         let namespace_path;
         let shown = match alias {
             Some(alias) => {
@@ -13212,6 +13245,56 @@ printf {pass_token}
             .unwrap();
         assert!(output.exit_status.is_some_and(|status| status.success()));
         assert_eq!(output.stdout, b"DECLARED_EXECUTABLE\n");
+    }
+
+    /// mini-agent-nvnkx.71: a directory added as a sandbox write root (what
+    /// `--add-workspace-dir` does) is writable by a contained command; the
+    /// same directory without the root is not.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn seatbelt_added_workspace_dir_is_writable_only_with_its_root() {
+        assert!(seatbelt_exists(), "Seatbelt is unavailable");
+        let scratch = TempDir::new("sandbox");
+        let home = scratch.path().join("system-home");
+        let workspace = scratch.path().join("workspace");
+        let added = scratch.path().join("added");
+        for path in [&home, &workspace, &added] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let home = std::fs::canonicalize(home).unwrap();
+        let _env = crate::tests::ScopedProcessEnv::set(&[
+            ("HOME", Some(home.as_os_str().to_owned())),
+            ("MINI_AGENT_HOME", None),
+            ("MINI_AGENT_CONFIG_DIR", None),
+            ("MINI_AGENT_DATA_DIR", None),
+            ("MINI_AGENT_LOCAL_DATA_DIR", None),
+            ("MINI_AGENT_STATE_DIR", None),
+            ("MINI_AGENT_CACHE_DIR", None),
+            ("MINI_AGENT_CREDENTIALS_DIR", None),
+        ]);
+        let workspace = std::fs::canonicalize(workspace).unwrap();
+        let added = std::fs::canonicalize(added).unwrap();
+        let touch = format!("touch '{}/x'", added.display());
+        let denied = Sandbox::new(true, "seatbelt").with_working_dir(&workspace);
+        let output = denied
+            .output_command_with_limits(&touch, DEFAULT_COMMAND_LIMITS)
+            .await
+            .unwrap();
+        assert!(!output.exit_status.is_some_and(|status| status.success()));
+        assert!(!added.join("x").exists());
+        let allowed = Sandbox::new(true, "seatbelt")
+            .with_working_dir(&workspace)
+            .with_general_profile(SandboxProfile::Workspace, Vec::new(), vec![added.clone()]);
+        let output = allowed
+            .output_command_with_limits(&touch, DEFAULT_COMMAND_LIMITS)
+            .await
+            .unwrap();
+        assert!(
+            output.exit_status.is_some_and(|status| status.success()),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(added.join("x").exists());
     }
 
     #[cfg(target_os = "macos")]

@@ -469,7 +469,7 @@ impl Tool for ShellTool {
                 },
                 "workdir": {
                     "type": "string",
-                    "description": "Directory to run the command in: workspace-relative or absolute inside the workspace (default: the workspace root). It must exist; symlinks and .. that leave the workspace are refused. Every call starts a fresh shell, so cd does NOT persist between calls: pass workdir each time. The permission check sees the command with the directory change, so rules and approvals are for that directory."
+                    "description": "Directory to run the command in: workspace-relative or absolute inside the workspace (default: the workspace root). It must exist; symlinks and .. that leave the workspace are refused. Every call starts a fresh shell, so cd does NOT persist between calls: pass workdir each time. Permission rules and prefix grants see the plain command; an \"always\" approval is for that directory."
                 },
                 "background": {
                     "type": "boolean",
@@ -656,27 +656,23 @@ impl ShellTool {
                 },
             )?),
         };
+        // The permission layer sees the plain command plus the validated
+        // directory as a separate field; only the executed script carries the
+        // directory change (mini-agent-nvnkx.60).
+        let mut permission_workdir = None;
+        let mut permission_command = None;
         if let Some(workdir) = args.workdir.take() {
             let plain = args.command.clone();
+            permission_workdir = Some(
+                self.sandbox
+                    .resolve_workdir(&workdir)
+                    .map_err(ToolError::Msg)?,
+            );
             args.command = self
                 .sandbox
                 .command_in_workdir(&workdir, &plain)
                 .map_err(ToolError::Msg)?;
-            // The permission key is the script with the directory change, so
-            // approvals are per directory, but a deny rule on the command
-            // itself still applies.
-            // The probe is side-effect free so it cannot spend a hook
-            // decision or split doom-loop tracking from the real check below.
-            if let Some(permission) = &self.permission
-                && permission
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .call_is_denied("shell", &plain)
-            {
-                return Err(ToolError::Msg(
-                    "Permission denied: Blocked by deny rule".to_string(),
-                ));
-            }
+            permission_command = Some(plain);
         }
         let maximum = if args.background {
             DEFAULT_BACKGROUND_COMMAND_TIMEOUT
@@ -701,13 +697,26 @@ impl ShellTool {
         // programs from syntax that ad-hoc command splitting cannot classify.
         // The prompt gives the exclusive lane back; no effect precedes it and
         // the command captures no file identity, so nothing needs re-capture.
-        let (coaching, _released) = super::concurrency::prompt_unlocked(check_perm(
-            &self.permission,
-            &self.ask_tx,
-            "shell",
-            &args.command,
-        ))
-        .await;
+        let (coaching, _released) = match (&permission_workdir, &permission_command) {
+            (Some(dir), Some(plain)) => {
+                super::concurrency::prompt_unlocked(super::check_shell_perm_in(
+                    &self.permission,
+                    &self.ask_tx,
+                    plain,
+                    dir,
+                ))
+                .await
+            }
+            _ => {
+                super::concurrency::prompt_unlocked(check_perm(
+                    &self.permission,
+                    &self.ask_tx,
+                    "shell",
+                    &args.command,
+                ))
+                .await
+            }
+        };
         let coaching = coaching?;
 
         if args.background {
@@ -5211,6 +5220,50 @@ mod tests {
             .await
             .unwrap();
         assert!(ok.contains("fine"), "{ok}");
+        std::fs::remove_dir_all(&fixture).unwrap();
+    }
+
+    /// mini-agent-nvnkx.60: the prompt carries the plain command plus the
+    /// directory, an "always" answer is per directory, and the second call in
+    /// the same directory runs without asking.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workdir_prompt_is_plain_and_always_approval_is_per_directory() {
+        use crate::permission::ask::{UserDecision, UserRequest};
+        use crate::permission::{PermissionConfig, SecurityMode};
+        let fixture = workdir_fixture("always");
+        let name = fixture.file_name().unwrap().to_string_lossy().into_owned();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<UserRequest>(4);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        tokio::spawn(async move {
+            while let Some(UserRequest::Permission(ask)) = rx.recv().await {
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push((ask.input.clone(), ask.workdir.clone()));
+                let _ = ask.reply.send(UserDecision::AllowAlways(ask.input.clone()));
+            }
+        });
+        let mut shell = test_tool();
+        shell.ask_tx = Some(tx);
+        shell.permission = Some(shell_permission(
+            PermissionConfig::default(),
+            SecurityMode::Standard,
+        ));
+        let call = |dir: &str| BashArgs {
+            command: "touch ok.txt".into(),
+            workdir: Some(format!("{name}/{dir}")),
+            ..Default::default()
+        };
+        shell.call(call("sub")).await.unwrap();
+        shell.call(call("sub")).await.unwrap();
+        shell.call(call("sub/deep")).await.unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(seen.iter().all(|(input, _)| input == "touch ok.txt"));
+        assert!(seen[0].1.as_deref().unwrap().ends_with("/sub"));
+        assert!(seen[1].1.as_deref().unwrap().ends_with("/sub/deep"));
         std::fs::remove_dir_all(&fixture).unwrap();
     }
 

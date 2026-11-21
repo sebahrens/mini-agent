@@ -431,6 +431,10 @@ pub struct PermissionChecker {
     readonly_git_auto_allow: bool,
     /// The shell is contained by an active sandbox (recursive reads may auto-allow).
     readonly_contained: bool,
+    /// `shell-auto-allow-sandboxed` is on and an enforced sandbox with a
+    /// contained profile and network currently backs the shell. Refreshed on
+    /// every agent build, so `/sandbox` switches take effect.
+    sandbox_auto_allow: bool,
     /// Dialect of the shell that will run scripts. The read-only classifier
     /// lexes with POSIX rules, so only `Posix` may auto-allow (nvnkx.358).
     shell_dialect: crate::sandbox::ShellDialect,
@@ -634,6 +638,7 @@ impl PermissionChecker {
             shell_allow_prefixes: self.shell_allow_prefixes.clone(),
             readonly_git_auto_allow: self.readonly_git_auto_allow,
             readonly_contained: self.readonly_contained,
+            sandbox_auto_allow: self.sandbox_auto_allow,
             shell_dialect: self.shell_dialect,
             builtin_shell_allows: self.builtin_shell_allows,
             default_action: self.default_action,
@@ -937,6 +942,7 @@ impl PermissionChecker {
             readonly_git_auto_allow: sandbox
                 != crate::permission::SandboxResolution::DegradedUnavailable,
             readonly_contained: sandbox == crate::permission::SandboxResolution::Enforced,
+            sandbox_auto_allow: false,
             shell_dialect: crate::permission::default_shell_dialect(),
             builtin_shell_allows: !user_configured_shell,
             default_action,
@@ -1395,7 +1401,32 @@ impl PermissionChecker {
     }
 
     pub fn check(&mut self, tool: &str, input: &str) -> CheckResult {
-        self.check_inner(tool, input, input, false)
+        self.check_inner(tool, input, input, false, None)
+    }
+
+    /// Whether unmatched shell scripts auto-allow in standard mode because an
+    /// enforced sandbox contains them (`shell-auto-allow-sandboxed`).
+    pub fn sandbox_auto_allow(&self) -> bool {
+        self.sandbox_auto_allow
+    }
+
+    /// Set from the opt-in and the live sandbox state; see
+    /// [`crate::sandbox::Sandbox::contains_shell_for_auto_allow`].
+    pub fn set_sandbox_auto_allow(&mut self, enabled: bool) {
+        if self.sandbox_auto_allow != enabled {
+            self.sandbox_auto_allow = enabled;
+            self.policy_changed();
+        }
+    }
+
+    /// Shell check for a call that passed `workdir`. Rules, prefix grants and
+    /// the read-only classifier all see the plain `command`; the validated
+    /// workspace directory is only the classifier's base for path confinement
+    /// and part of the session-approval identity, so approvals made with
+    /// "always" stay per directory. The directory never widens a rule.
+    pub(crate) fn check_shell_in(&mut self, command: &str, workdir: &Path) -> CheckResult {
+        let identity = shell_workdir_identity(command, workdir);
+        self.check_inner("shell", command, &identity, false, Some(workdir))
     }
 
     /// Evaluate policy against a compatibility rendering while keeping a
@@ -1407,7 +1438,7 @@ impl PermissionChecker {
         policy_input: &str,
         identity: &str,
     ) -> CheckResult {
-        self.check_inner(tool, policy_input, identity, false)
+        self.check_inner(tool, policy_input, identity, false, None)
     }
 
     #[cfg(feature = "mcp")]
@@ -1419,7 +1450,7 @@ impl PermissionChecker {
     ) -> CheckResult {
         let read_only_exempt =
             trusted_identity.is_some_and(|identity| identity.exempts_read_only_tool(mcp_tool_name));
-        self.check_inner("mcp_tool", input, input, read_only_exempt)
+        self.check_inner("mcp_tool", input, input, read_only_exempt, None)
     }
 
     /// Auxiliary RPCs retain ordinary MCP policy/deny checks, but their
@@ -1434,7 +1465,7 @@ impl PermissionChecker {
     ) -> CheckResult {
         let read_only_exempt =
             trusted_identity.is_some_and(|trusted| trusted.exempts_read_only_tool(operation));
-        self.check_inner("mcp_tool", policy_input, identity, read_only_exempt)
+        self.check_inner("mcp_tool", policy_input, identity, read_only_exempt, None)
     }
 
     fn matched_script_rules(
@@ -1529,16 +1560,23 @@ impl PermissionChecker {
     /// resolves (following symlinks) inside the workspace and passes the read
     /// policy's deny and protected-path checks, and recursive commands run
     /// under an active sandbox.
-    fn read_only_script_verified(&self, script: &str) -> bool {
+    fn read_only_script_verified(&self, script: &str, workdir: Option<&Path>) -> bool {
         // cmd.exe and PowerShell quote, escape and expand differently from
         // POSIX (`'` is ordinary in cmd, `%VAR%` expands, `-Path:x` is a
         // parameter), so a POSIX parse proves nothing about them: ask.
         if self.shell_dialect != crate::sandbox::ShellDialect::Posix {
             return false;
         }
+        // A shell `workdir` is the base for every relative argument; it was
+        // validated to lie inside the workspace, and `..` is refused by the
+        // classifier, so confinement is judged against it, never widened.
+        let base = workdir.map_or_else(
+            || self.working_dir.clone(),
+            |dir| dir.to_string_lossy().into_owned(),
+        );
         let Some(report) = crate::permission::readonly_shell::classify(
             script,
-            &self.working_dir,
+            &base,
             self.readonly_git_auto_allow,
         ) else {
             return false;
@@ -1560,24 +1598,31 @@ impl PermissionChecker {
         let Some(cwd) = self.cached_resolved_cwd.as_deref() else {
             return false;
         };
-        report.paths.iter().all(|arg| {
-            let Some(resolved) = self.resolve_check_target(arg) else {
-                return false;
-            };
-            if !resolved.starts_with(cwd) {
-                return false;
-            }
-            let abs = resolved.to_string_lossy();
-            let relative = self.workspace_relative(&abs);
-            let mut inputs: SmallVec<[&str; 3]> = SmallVec::new();
-            inputs.push(&abs);
-            inputs.push(arg);
-            if let Some(relative) = relative.as_deref() {
-                inputs.push(relative);
-            }
-            !self.matches_deny_rule("read", &inputs)
-                && self.isolation_denial("read", &inputs).is_none()
-        })
+        // The directory itself is read by `ls`, `rg foo` and friends, so it
+        // passes the same read screening as an explicit path argument.
+        let workdir_argument = workdir.map(|dir| dir.to_string_lossy().into_owned());
+        report
+            .paths
+            .iter()
+            .chain(workdir_argument.as_ref())
+            .all(|arg| {
+                let Some(resolved) = self.resolve_check_target_from(arg, &base) else {
+                    return false;
+                };
+                if !resolved.starts_with(cwd) {
+                    return false;
+                }
+                let abs = resolved.to_string_lossy();
+                let relative = self.workspace_relative(&abs);
+                let mut inputs: SmallVec<[&str; 3]> = SmallVec::new();
+                inputs.push(&abs);
+                inputs.push(arg);
+                if let Some(relative) = relative.as_deref() {
+                    inputs.push(relative);
+                }
+                !self.matches_deny_rule("read", &inputs)
+                    && self.isolation_denial("read", &inputs).is_none()
+            })
     }
 
     fn check_inner(
@@ -1586,6 +1631,7 @@ impl PermissionChecker {
         policy_input: &str,
         identity: &str,
         mcp_read_only_exempt: bool,
+        shell_workdir: Option<&Path>,
     ) -> CheckResult {
         let tool = canonical_permission_tool(tool);
         tracing::debug!(
@@ -1638,7 +1684,21 @@ impl PermissionChecker {
             && tool == "shell"
             && matched.is_empty()
             && action == Action::Ask
-            && self.read_only_script_verified(policy_input)
+            && self.read_only_script_verified(policy_input, shell_workdir)
+        {
+            action = Action::Allow;
+        }
+        // Opt-in (`shell-auto-allow-sandboxed`): an unmatched script in
+        // standard mode runs without a prompt when an enforced, contained
+        // sandbox bounds it. A configured rule of any action, a deny, a
+        // destructive-looking script and the hook/doom-loop paths keep their
+        // result; escalation never reaches this check.
+        if self.sandbox_auto_allow
+            && self.mode == SecurityMode::Standard
+            && tool == "shell"
+            && matched.is_empty()
+            && action == Action::Ask
+            && !crate::permission::is_destructive_shell_script(policy_input)
         {
             action = Action::Allow;
         }
@@ -1650,7 +1710,7 @@ impl PermissionChecker {
             && matched.is_empty()
             && action == Action::Deny
             && self.readonly_contained
-            && self.read_only_script_verified(policy_input)
+            && self.read_only_script_verified(policy_input, shell_workdir)
         {
             action = Action::Allow;
         }
@@ -1686,8 +1746,13 @@ impl PermissionChecker {
     /// subject for another guard resolves once here and passes the result to
     /// [`Self::check_path_with_resolution`].
     pub(crate) fn resolve_check_target(&self, path: &str) -> Option<PathBuf> {
+        self.resolve_check_target_from(path, &self.working_dir)
+    }
+
+    /// [`Self::resolve_check_target`] with relative paths anchored at `base`.
+    fn resolve_check_target_from(&self, path: &str, base: &str) -> Option<PathBuf> {
         let expanded = crate::fs::expand_tilde(path);
-        let unresolved_abs_path = resolve_absolute(&expanded, &self.working_dir);
+        let unresolved_abs_path = resolve_absolute(&expanded, base);
         resolve_path_allow_missing(Path::new(&unresolved_abs_path))
     }
 
@@ -3136,6 +3201,16 @@ pub(crate) fn exact_allow_scope_for_input(tool: &str, input: &str) -> Option<Str
     Some(crate::permission::pattern::exact_path_pattern(
         &normalize_path(Path::new(&expanded)),
     ))
+}
+
+/// The session-approval identity of a shell command run from `workdir`: the
+/// same spelling as the script the shell receives, so it is readable in
+/// `/permissions` and per directory.
+pub(crate) fn shell_workdir_identity(command: &str, workdir: &Path) -> String {
+    format!(
+        "cd -- '{}' || exit 1; {command}",
+        workdir.to_string_lossy().replace('\'', "'\\''")
+    )
 }
 
 /// The strings a deny rule is matched against for one call: the policy input,
@@ -6485,5 +6560,218 @@ mod harness_review_policy_tests {
                 "{mode:?}"
             );
         }
+    }
+
+    /// A scratch workspace with `src/` and `crates/x/` directories.
+    fn workdir_workspace(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("perm2-{label}-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("crates/x")).unwrap();
+        root.canonicalize().unwrap()
+    }
+
+    fn workdir_checker(root: &Path, mode: SecurityMode) -> PermissionChecker {
+        PermissionChecker::new_for_sandbox(
+            &PermissionConfigs::default(),
+            mode,
+            Some(root.to_path_buf()),
+            None,
+            crate::permission::SandboxResolution::Enforced,
+        )
+        .unwrap()
+    }
+
+    // mini-agent-nvnkx.60
+    #[test]
+    fn shell_workdir_calls_match_rules_prefixes_and_the_read_only_classifier() {
+        let root = workdir_workspace("match");
+        let mut checker = workdir_checker(&root, SecurityMode::Standard);
+        let crate_dir = root.join("crates/x");
+        // Built-in exact allow and the read-only classifier see the plain command.
+        assert_eq!(
+            checker.check_shell_in("cargo test", &crate_dir),
+            CheckResult::Allowed
+        );
+        assert_eq!(
+            checker.check_shell_in("ls", &root.join("src")),
+            CheckResult::Allowed
+        );
+        assert_eq!(
+            checker.check_shell_in("git status", &root.join("src")),
+            CheckResult::Allowed
+        );
+        // Not read-only and not allowed: still asks.
+        assert_eq!(
+            checker.check_shell_in("make deploy", &crate_dir),
+            CheckResult::Ask
+        );
+        // A path that leaves the workdir (hence maybe the workspace) asks.
+        assert_eq!(
+            checker.check_shell_in("cat ../secret", &root.join("src")),
+            CheckResult::Ask
+        );
+        assert_eq!(
+            checker.check_shell_in("cat /etc/passwd", &root.join("src")),
+            CheckResult::Ask
+        );
+        // A session prefix grant covers a workdir call of the same argv prefix.
+        checker.add_session_shell_prefix("make build");
+        assert_eq!(
+            checker.check_shell_in("make build all", &crate_dir),
+            CheckResult::Allowed
+        );
+        assert_eq!(
+            checker.check_shell_in("make buildx", &crate_dir),
+            CheckResult::Ask
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // mini-agent-nvnkx.60
+    #[test]
+    fn shell_workdir_never_widens_deny_rules_or_session_approvals() {
+        let root = workdir_workspace("deny");
+        let configs = PermissionConfigs::from(PermissionConfig {
+            deny_entries: Some([("bash".to_owned(), vec!["rm *".to_owned()])].into()),
+            ..PermissionConfig::default()
+        });
+        let mut checker = PermissionChecker::new_for_sandbox(
+            &configs,
+            SecurityMode::Yolo,
+            Some(root.clone()),
+            None,
+            crate::permission::SandboxResolution::Enforced,
+        )
+        .unwrap();
+        assert!(matches!(
+            checker.check_shell_in("rm -rf build", &root.join("src")),
+            CheckResult::Denied(_)
+        ));
+        // An "always" approval for one directory does not cover another, nor
+        // the same command without a directory.
+        let mut checker = workdir_checker(&root, SecurityMode::Standard);
+        let identity = shell_workdir_identity("make deploy", &root.join("src"));
+        checker.add_session_allowlist("shell".into(), &identity);
+        assert_eq!(
+            checker.check_shell_in("make deploy", &root.join("src")),
+            CheckResult::Allowed
+        );
+        assert_eq!(
+            checker.check_shell_in("make deploy", &root.join("crates/x")),
+            CheckResult::Ask
+        );
+        assert_eq!(checker.check("shell", "make deploy"), CheckResult::Ask);
+        // A workdir whose own path is read-denied is not auto-allowed for
+        // `ls`, as `ls <that path>` would not be.
+        let configs = PermissionConfigs::from(PermissionConfig {
+            deny_entries: Some([("read".to_owned(), vec!["**/crates/**".to_owned()])].into()),
+            ..PermissionConfig::default()
+        });
+        let mut checker = PermissionChecker::new_for_sandbox(
+            &configs,
+            SecurityMode::Standard,
+            Some(root.clone()),
+            None,
+            crate::permission::SandboxResolution::Enforced,
+        )
+        .unwrap();
+        assert_eq!(
+            checker.check_shell_in("ls", &root.join("crates/x")),
+            CheckResult::Ask
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // mini-agent-nvnkx.62
+    #[test]
+    fn sandbox_auto_allow_is_opt_in_standard_only_and_keeps_deny_and_destructive_asks() {
+        use crate::permission::SandboxResolution;
+        let root = workdir_workspace("auto");
+        let make = |mode, sandbox, auto, configs: &PermissionConfigs| {
+            let mut checker = PermissionChecker::new_for_sandbox(
+                configs,
+                mode,
+                Some(root.clone()),
+                None,
+                sandbox,
+            )
+            .unwrap();
+            checker.set_sandbox_auto_allow(auto);
+            checker
+        };
+        let none = PermissionConfigs::default();
+        // Off by default.
+        assert_eq!(
+            make(
+                SecurityMode::Standard,
+                SandboxResolution::Enforced,
+                false,
+                &none
+            )
+            .check("shell", "pytest -k x"),
+            CheckResult::Ask
+        );
+        let mut on = make(
+            SecurityMode::Standard,
+            SandboxResolution::Enforced,
+            true,
+            &none,
+        );
+        for command in ["cargo test -p x", "npm test", "make", "python script.py"] {
+            assert_eq!(
+                on.check("shell", command),
+                CheckResult::Allowed,
+                "{command}"
+            );
+        }
+        assert_eq!(
+            on.check_shell_in("pytest -k x", &root.join("src")),
+            CheckResult::Allowed
+        );
+        // A destructive script keeps its ask.
+        assert_eq!(on.check("shell", "rm -rf build"), CheckResult::Ask);
+        // Other modes keep their policy.
+        assert_eq!(
+            make(
+                SecurityMode::Guarded,
+                SandboxResolution::Enforced,
+                true,
+                &none
+            )
+            .check("shell", "make"),
+            CheckResult::Ask
+        );
+        assert!(matches!(
+            make(
+                SecurityMode::ReadOnly,
+                SandboxResolution::Enforced,
+                true,
+                &none
+            )
+            .check("shell", "make"),
+            CheckResult::Denied(_)
+        ));
+        // A configured deny and a configured ask rule win.
+        let rules = PermissionConfigs::from(PermissionConfig {
+            deny_entries: Some([("bash".to_owned(), vec!["make deploy*".to_owned()])].into()),
+            ask_entries: Some([("bash".to_owned(), vec!["make lint".to_owned()])].into()),
+            ..PermissionConfig::default()
+        });
+        let mut with_rules = make(
+            SecurityMode::Standard,
+            SandboxResolution::Enforced,
+            true,
+            &rules,
+        );
+        assert!(matches!(
+            with_rules.check("shell", "make deploy now"),
+            CheckResult::Denied(_)
+        ));
+        assert_eq!(with_rules.check("shell", "make lint"), CheckResult::Ask);
+        assert_eq!(with_rules.check("shell", "make test"), CheckResult::Allowed);
+        // Turning the state off (sandbox switched to host-full, say) asks again.
+        on.set_sandbox_auto_allow(false);
+        assert_eq!(on.check("shell", "make"), CheckResult::Ask);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

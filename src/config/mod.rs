@@ -638,6 +638,17 @@ pub struct Config {
         alias = "shell_allow_escalation"
     )]
     pub shell_allow_escalation: Option<bool>,
+    /// `shell-auto-allow-sandboxed`: in standard and guarded modes, run an
+    /// unmatched shell script without a prompt while an enforced sandbox
+    /// (workspace or host-read profile, network deny or allowlist) contains
+    /// it. Default false; global-only; a managed policy can forbid it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "shell-auto-allow-sandboxed",
+        alias = "shell_auto_allow_sandboxed"
+    )]
+    pub shell_auto_allow_sandboxed: Option<bool>,
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",

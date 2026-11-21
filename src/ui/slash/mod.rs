@@ -1480,9 +1480,8 @@ pub(crate) async fn handle_slash(
             content::handle(&parts, &mut ctx).await
         }
         "/cost" | "/reasoning" | "/thinking" | "/mode" | "/permissions" | "/sandbox"
-        | "/toggle" | "/mcp" | "/editsys" | "/advisor" | "/keys" | "/vim" | "/top" | "/bottom" => {
-            settings::handle(&parts, &mut ctx).await
-        }
+        | "/add-dir" | "/toggle" | "/mcp" | "/editsys" | "/advisor" | "/keys" | "/vim" | "/top"
+        | "/bottom" => settings::handle(&parts, &mut ctx).await,
         "/sessions" | "/fork" | "/rename" | "/clear" | "/new" | "/undo" | "/redo" | "/rewind"
         | "/retry" | "/copy" | "/quit" | "/exit" | "/history" => {
             crate::startup::heap_future(|| session::handle(&parts, &mut ctx)).await

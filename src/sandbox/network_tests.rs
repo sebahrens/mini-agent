@@ -514,3 +514,42 @@ fn bwrap_argv_never_carries_environment_values() {
     );
     assert!(args.windows(2).any(|w| w[0] == "--args"));
 }
+
+// mini-agent-nvnkx.62
+#[test]
+fn auto_allow_containment_needs_an_enforced_contained_profile_and_network() {
+    // Off, an open network and the host-full profile never qualify, whatever
+    // the backend's availability.
+    assert!(!Sandbox::new(false, "seatbelt").contains_shell_for_auto_allow());
+    assert!(
+        !Sandbox::new(true, "seatbelt")
+            .with_network(SandboxNetwork::Allow)
+            .contains_shell_for_auto_allow()
+    );
+    assert!(
+        !Sandbox::new(true, "seatbelt")
+            .with_general_profile(crate::sandbox::SandboxProfile::HostFull, vec![], vec![])
+            .contains_shell_for_auto_allow()
+    );
+    assert!(!Sandbox::new(true, "no-such-backend").contains_shell_for_auto_allow());
+    #[cfg(target_os = "macos")]
+    {
+        let contained = Sandbox::new(true, "seatbelt");
+        assert_eq!(
+            contained.contains_shell_for_auto_allow(),
+            contained.policy() == crate::sandbox::SandboxPolicy::RequiredAndAvailable
+        );
+    }
+}
+
+#[test]
+fn auto_allow_status_label_marks_the_opt_in() {
+    use crate::ui::statusline::sandbox_auto_allow_label as label;
+    assert_eq!(label(None, true), Some("sandbox:auto"));
+    assert_eq!(label(None, false), None);
+    assert_eq!(
+        label(Some("sandbox:host-read"), true),
+        Some("sandbox:host-read+auto")
+    );
+    assert_eq!(label(Some("sandbox:net"), true), Some("sandbox:net"));
+}

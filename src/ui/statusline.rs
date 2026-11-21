@@ -196,6 +196,24 @@ pub(crate) fn sandbox_label(sandbox: &crate::sandbox::Sandbox) -> Option<&'stati
     }
 }
 
+/// [`sandbox_label`] with the `shell-auto-allow-sandboxed` state: while an
+/// enforced sandbox lets unmatched shell commands run without a prompt, the
+/// indicator says so (the profile and network are then workspace/host-read
+/// and deny/allowlist, so the plain label is `None` or `sandbox:host-read`).
+pub(crate) fn sandbox_auto_allow_label(
+    label: Option<&'static str>,
+    auto_allow: bool,
+) -> Option<&'static str> {
+    if !auto_allow {
+        return label;
+    }
+    match label {
+        None => Some("sandbox:auto"),
+        Some("sandbox:host-read") => Some("sandbox:host-read+auto"),
+        other => other,
+    }
+}
+
 static SPEC: OnceLock<StatusLineConfig> = OnceLock::new();
 static NEEDS_GIT_STATUS: OnceLock<bool> = OnceLock::new();
 static TIME_ITEMS: OnceLock<TimeItems> = OnceLock::new();

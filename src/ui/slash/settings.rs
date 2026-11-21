@@ -91,6 +91,7 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
         "/mode" => handle_mode(parts, ctx).await,
         "/permissions" => handle_permissions(parts, ctx).await,
         "/sandbox" => handle_sandbox(parts, ctx).await,
+        "/add-dir" => handle_add_dir(parts, ctx),
         "/toggle" => handle_toggle(parts, ctx).await,
         "/editsys" => handle_editsys(parts, ctx).await,
         "/advisor" => {
@@ -320,11 +321,63 @@ async fn handle_advisor(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resul
     Ok(())
 }
 
+/// `/add-dir DIR`: let the file tools reach DIR for this session (an allowed
+/// external directory; read/edit rules, protected paths and denies still
+/// apply). The shell sandbox is built at startup, so its write roots come
+/// from `--add-workspace-dir`, not from this command (mini-agent-nvnkx.71).
+fn handle_add_dir(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
+    if parts.len() < 2 {
+        write_usage(ctx.renderer, "usage: /add-dir <directory>");
+        return Ok(());
+    }
+    let Some(permission) = ctx.permission.as_ref() else {
+        write_error(ctx.renderer, "permission checks are off; nothing to grant");
+        return Ok(());
+    };
+    let raw = parts[1..].join(" ");
+    let expanded = std::path::PathBuf::from(crate::fs::expand_tilde(&raw));
+    let absolute = if expanded.is_absolute() {
+        expanded
+    } else {
+        ctx.workspace.root().join(expanded)
+    };
+    let dir = match absolute.canonicalize() {
+        Ok(dir) if dir.is_dir() => dir,
+        _ => {
+            write_error(ctx.renderer, format!("{raw}: not an existing directory"));
+            return Ok(());
+        }
+    };
+    if dir.parent().is_none() {
+        write_error(ctx.renderer, "refusing to grant the filesystem root");
+        return Ok(());
+    }
+    if let Some(message) = crate::config::managed::active()
+        .and_then(|policy| policy.sandbox_root_violation("/add-dir", &dir))
+    {
+        write_error(ctx.renderer, message);
+        return Ok(());
+    }
+    permission
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .allow_external_directory(&dir);
+    write_ok(
+        ctx.renderer,
+        format!(
+            "file tools may now reach {} for this session (read/edit rules and denies still apply). Shell commands keep their sandbox roots; start with --add-workspace-dir to add a shell write root",
+            dir.display()
+        ),
+    );
+    Ok(())
+}
+
 async fn handle_sandbox(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     use crate::sandbox::SandboxProfile;
     if parts.len() == 1 {
         write_ok(ctx.renderer, ctx.sandbox.status_line());
         write_result(ctx.renderer, shell_network_line(ctx.sandbox));
+        write_result(ctx.renderer, shell_auto_allow_line(ctx));
         write_result(
             ctx.renderer,
             format!(
@@ -389,6 +442,26 @@ async fn handle_sandbox(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resul
         ),
     );
     Ok(())
+}
+
+/// `/sandbox` line for `shell-auto-allow-sandboxed`: whether unmatched shell
+/// commands currently run without a prompt because the sandbox contains them.
+fn shell_auto_allow_line(ctx: &SlashCtx<'_>) -> String {
+    let active = ctx.permission.as_ref().is_some_and(|permission| {
+        permission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .sandbox_auto_allow()
+    });
+    let configured = ctx.cfg.shell_auto_allow_sandboxed.unwrap_or(false);
+    let detail = if active {
+        "on: unmatched shell commands in standard mode run without a prompt while the sandbox contains them; deny/ask rules, destructive commands and escalation still prompt"
+    } else if configured {
+        "configured but inactive: needs an enforced sandbox with the workspace or host-read profile and network deny or allowlist"
+    } else {
+        "off (shell-auto-allow-sandboxed = false)"
+    };
+    format!("  shell auto-allow: {detail}")
 }
 
 /// `/sandbox` listing line for the network subcommand.

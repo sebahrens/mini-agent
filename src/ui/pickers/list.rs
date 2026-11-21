@@ -10,6 +10,7 @@ use super::draw_picker_rows;
 /// Kept in alphabetical order for ease of maintenance.
 const BASE_COMMANDS: &[&str] = &[
     "/add",
+    "/add-dir",
     "/agent",
     "/bottom",
     "/btw",
