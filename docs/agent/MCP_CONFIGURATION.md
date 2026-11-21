@@ -24,6 +24,14 @@ unavailable feature keys, unrelated values, and JSON/TOML/YAML format.
 inherited project TOML entry. Removal refuses a different selected owning
 source. Built-in servers retain their dedicated enable settings.
 
+`--mcp-config <FILE|JSON>` (repeatable) gives one invocation its own servers in the
+same `{"mcpServers": {...}}` shape (a path, or inline JSON starting with `{`). The
+definitions are operator-supplied: they need no project trust prompt, are recorded
+with the `CLI --config` origin, override same-named servers from the file layers, and
+remain subject to managed policy. `${VAR}` placeholders expand from the environment.
+`--strict-mcp-config` additionally drops every server not defined by `--mcp-config`
+(global, project and built-in).
+
 Project JSON uses the `mcpServers` object. Precedence is global config, trusted
 `.mcp.json`, trusted `.mini-agent/config.toml`, then built-in injection. A project
 file is bounded to 1 MiB and 128 server entries, read without following symbolic

@@ -1,5 +1,6 @@
 mod bounded_http;
 pub(crate) mod catalogue;
+pub(crate) mod cli_config;
 pub mod client;
 pub mod config;
 pub(crate) mod deferred;

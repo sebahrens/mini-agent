@@ -302,6 +302,87 @@ fn take_run_duration_ms() -> u64 {
 }
 
 /// `--stream-json-schema claude`: emit Claude Code SDK-shaped records.
+/// Tool calls the permission layer refused in the current run, reported as
+/// `permission_denials` in the result (mini-agent-nvnkx.100). Only recorded
+/// once a headless run is configured, so the TUI and unit tests stay clean.
+static PERMISSION_DENIALS: std::sync::Mutex<PermissionDenialLog> =
+    std::sync::Mutex::new(PermissionDenialLog::new());
+static RECORD_PERMISSION_DENIALS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+const PERMISSION_DENIAL_ENTRIES: usize = 50;
+const PERMISSION_DENIAL_INPUT_BYTES: usize = 512;
+
+#[derive(Debug, Default, Serialize, PartialEq, Eq, Clone)]
+pub(crate) struct PermissionDenial {
+    pub tool_name: String,
+    pub tool_input: String,
+    pub reason: String,
+}
+
+struct PermissionDenialLog {
+    entries: Vec<PermissionDenial>,
+    total: u64,
+}
+
+impl PermissionDenialLog {
+    const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            total: 0,
+        }
+    }
+
+    fn push(&mut self, tool: &str, input: &str, reason: &str) {
+        self.total += 1;
+        if self.entries.len() < PERMISSION_DENIAL_ENTRIES {
+            self.entries.push(PermissionDenial {
+                tool_name: tool.to_string(),
+                tool_input: truncate_utf8(input, PERMISSION_DENIAL_INPUT_BYTES),
+                reason: truncate_utf8(reason, PERMISSION_DENIAL_INPUT_BYTES),
+            });
+        }
+    }
+
+    /// The entries and how many denials were counted past the bound.
+    fn drain(&mut self) -> (Vec<PermissionDenial>, u64) {
+        let entries = std::mem::take(&mut self.entries);
+        let omitted = self.total.saturating_sub(entries.len() as u64);
+        self.total = 0;
+        (entries, omitted)
+    }
+}
+
+fn truncate_utf8(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &text[..end])
+}
+
+/// Record a refused tool call (bounded: a count plus the first entries).
+pub(crate) fn record_permission_denial(tool: &str, input: &str, reason: &str) {
+    if !RECORD_PERMISSION_DENIALS.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let mut log = PERMISSION_DENIALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    log.push(tool, input, reason);
+}
+
+/// Drain the denials recorded since the last result: the entries and how many
+/// were dropped past the bound.
+fn take_permission_denials() -> (Vec<PermissionDenial>, u64) {
+    let mut log = PERMISSION_DENIALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    log.drain()
+}
+
 static CLAUDE_SCHEMA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static CLAUDE_SESSION_ID: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
@@ -555,10 +636,7 @@ fn claude_result_record(value: &mut serde_json::Value) {
         .to_owned();
     // Turn-budget exhaustion is a failed run whose message carries the
     // shared hint; the SDK names it `error_max_turns`.
-    let max_turns = value
-        .get("result")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|text| text.contains(crate::cli::MAX_AGENT_TURNS_HINT));
+    let max_turns = reason == "max_turns";
     value["subtype"] = match reason.as_str() {
         "completed" | "goal_met" => "success",
         "budget" => "error_max_budget_usd",
@@ -567,9 +645,9 @@ fn claude_result_record(value: &mut serde_json::Value) {
     }
     .into();
     value["uuid"] = uuid::Uuid::new_v4().to_string().into();
-    // Denied tool calls are reported inline as error tool results; the SDK's
-    // structured list is always present, and empty here.
-    value["permission_denials"] = serde_json::json!([]);
+    if value.get("permission_denials").is_none() {
+        value["permission_denials"] = serde_json::json!([]);
+    }
     if let Some(cached) = value["usage"].get("cached_input_tokens").cloned() {
         value["usage"]["cache_read_input_tokens"] = cached;
     }
@@ -598,6 +676,7 @@ fn current_message_id() -> String {
 /// enforced their ranges) and `--include-partial-messages`.
 pub(crate) fn configure_headless_limits(cli: &cli::Cli) {
     mark_headless_run_start();
+    RECORD_PERMISSION_DENIALS.store(true, std::sync::atomic::Ordering::Relaxed);
     CLAUDE_SCHEMA.store(
         cli.stream_json_schema == Some(cli::StreamJsonSchema::Claude),
         std::sync::atomic::Ordering::Relaxed,
@@ -1701,6 +1780,8 @@ pub(crate) enum HeadlessInterrupts {
     Os {
         interrupt: tokio::signal::unix::Signal,
         terminate: tokio::signal::unix::Signal,
+        /// A closed terminal or dropped SSH session (mini-agent-nvnkx.226).
+        hangup: tokio::signal::unix::Signal,
     },
     #[cfg(not(unix))]
     Os,
@@ -1720,12 +1801,16 @@ impl HeadlessInterrupts {
             match (
                 signal(SignalKind::interrupt()),
                 signal(SignalKind::terminate()),
+                signal(SignalKind::hangup()),
             ) {
-                (Ok(interrupt), Ok(terminate)) => Self::Os {
+                (Ok(interrupt), Ok(terminate), Ok(hangup)) => Self::Os {
                     interrupt,
                     terminate,
+                    hangup,
                 },
-                (Err(error), _) | (_, Err(error)) => Self::Failed(Some(error)),
+                (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+                    Self::Failed(Some(error))
+                }
             }
         }
         #[cfg(not(unix))]
@@ -1760,14 +1845,33 @@ impl HeadlessInterrupts {
             Self::Os {
                 interrupt,
                 terminate,
+                hangup,
             } => {
                 tokio::select! {
                     _ = interrupt.recv() => Ok(()),
                     _ = terminate.recv() => Ok(()),
+                    _ = hangup.recv() => Ok(()),
                 }
             }
             #[cfg(not(unix))]
-            Self::Os => tokio::signal::ctrl_c().await,
+            Self::Os => {
+                // ctrl_break and ctrl_close are the closest Windows
+                // equivalents of SIGTERM and SIGHUP (mini-agent-nvnkx.226).
+                #[cfg(windows)]
+                {
+                    let (mut brk, mut close) = (
+                        tokio::signal::windows::ctrl_break()?,
+                        tokio::signal::windows::ctrl_close()?,
+                    );
+                    tokio::select! {
+                        result = tokio::signal::ctrl_c() => result,
+                        _ = brk.recv() => Ok(()),
+                        _ = close.recv() => Ok(()),
+                    }
+                }
+                #[cfg(not(windows))]
+                tokio::signal::ctrl_c().await
+            }
             Self::Failed(error) => match error.take() {
                 Some(error) => Err(error),
                 None => std::future::pending().await,
@@ -2083,6 +2187,12 @@ pub(crate) struct HeadlessJsonOutput {
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub cost_unpriced: bool,
     pub stop_reason: HeadlessStopReason,
+    /// Tool calls the permission layer refused during this run (bounded;
+    /// mini-agent-nvnkx.100).
+    pub permission_denials: Vec<PermissionDenial>,
+    /// Denials past the bound that are counted but not listed.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub permission_denials_truncated: bool,
     /// Present only when the run carried a goal, so existing output is
     /// byte-identical for every run that does not.
     #[cfg(feature = "goal")]
@@ -2149,6 +2259,8 @@ pub(crate) enum HeadlessStopReason {
     Budget,
     SchemaFailed,
     AwaitingUser,
+    /// `--max-agent-turns` was exhausted (mini-agent-nvnkx.101).
+    MaxTurns,
     /// A goal stopped for a reason of its own. Each maps to a distinct process
     /// exit code so a script can tell "resume me, I ran out of budget" from
     /// "stop retrying, this cannot be done".
@@ -2179,7 +2291,20 @@ impl HeadlessStopReason {
     }
 }
 
-#[cfg(feature = "goal")]
+/// Exit code of a headless run that failed with `error`: a spent turn cap and
+/// a spent budget have their own codes, away from the goal range
+/// (mini-agent-nvnkx.101), every other failure is 1.
+pub(crate) fn exit_code_for_failure(error: &anyhow::Error) -> u8 {
+    if error.is::<cli::MaxTurnsStopped>() {
+        HeadlessStopReason::MaxTurns.exit_code() as u8
+    } else if error.is::<crate::spend::run::BudgetStopped>() {
+        HeadlessStopReason::Budget.exit_code() as u8
+    } else {
+        1
+    }
+}
+
+#[cfg_attr(not(feature = "goal"), allow(dead_code))]
 impl HeadlessStopReason {
     /// Process exit code.
     ///
@@ -2188,15 +2313,18 @@ impl HeadlessStopReason {
     pub(crate) fn exit_code(self) -> i32 {
         match self {
             Self::Completed => 0,
-            Self::Failed | Self::SchemaFailed | Self::Budget => 1,
+            Self::Failed | Self::SchemaFailed => 1,
+            Self::MaxTurns => 3,
+            Self::Budget => 4,
             #[cfg(feature = "goal")]
             Self::GoalMet => 0,
             #[cfg(feature = "goal")]
             Self::GoalImpossible => 20,
             #[cfg(feature = "goal")]
             Self::GoalBlocked => 21,
+            Self::AwaitingUser => 22,
             #[cfg(feature = "goal")]
-            Self::GoalAwaitingUser | Self::AwaitingUser => 22,
+            Self::GoalAwaitingUser => 22,
             #[cfg(feature = "goal")]
             Self::GoalPaused => 23,
             #[cfg(feature = "goal")]
@@ -2439,6 +2567,14 @@ fn interaction_summary(
     (HeadlessToolCalls { total, by_name }, files)
 }
 
+/// Containment sentinels the sandbox creates in the workspace and removes
+/// again; they are never the model's changes (mini-agent-nvnkx.152).
+fn is_containment_sentinel(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name.starts_with(".mini-agent-macos-workspace-sentinel-")
+        || name.starts_with(".mini-agent-lpac-workspace-sentinel-")
+}
+
 pub(crate) async fn files_changed_since(
     root: &Path,
     baseline: Option<&WorkspaceChangeBaseline>,
@@ -2459,7 +2595,10 @@ pub(crate) async fn files_changed_since(
             }
         }
     }
-    files.into_iter().collect()
+    files
+        .into_iter()
+        .filter(|path| !is_containment_sentinel(path))
+        .collect()
 }
 
 /// The headless result's `subagent_usage`: one row per finished `task`
@@ -2502,6 +2641,7 @@ pub(crate) fn render_headless_json(
         .collect();
     let cost = pricing.cost(usage);
     let cost = if cost.is_finite() { cost } else { 0.0 };
+    let (permission_denials, omitted) = take_permission_denials();
     serde_json::to_string(&HeadlessJsonOutput {
         session_id: None,
         session_name: None,
@@ -2520,6 +2660,8 @@ pub(crate) fn render_headless_json(
         is_error: stop_reason.is_error(),
         cost_unpriced: pricing.is_unpriced() && usage.reported_cost_nano_usd == 0,
         stop_reason,
+        permission_denials,
+        permission_denials_truncated: omitted > 0,
         #[cfg(feature = "goal")]
         goal: goal.map(HeadlessGoal::from_goal),
     })
@@ -5632,5 +5774,55 @@ mod config69_source_tests {
         ] {
             assert!(super::parse_stream_input_line(bad).is_err(), "{bad}");
         }
+    }
+
+    // mini-agent-nvnkx.100 / .101
+    #[test]
+    fn permission_denial_log_is_bounded_and_drains() {
+        let mut log = super::PermissionDenialLog::new();
+        log.push("write", "a.txt", "Permission denied: read-only");
+        for n in 0..super::PERMISSION_DENIAL_ENTRIES + 5 {
+            log.push("shell", &"x".repeat(2000), &format!("denied {n}"));
+        }
+        let (entries, omitted) = log.drain();
+        assert_eq!(entries.len(), super::PERMISSION_DENIAL_ENTRIES);
+        assert_eq!(entries[0].tool_name, "write");
+        assert!(entries[1].tool_input.len() < 600);
+        assert_eq!(omitted, 6);
+        assert_eq!(log.drain().0.len(), 0);
+    }
+
+    #[test]
+    fn turn_cap_has_its_own_stop_reason_and_exit_codes() {
+        use super::HeadlessStopReason as R;
+        assert_eq!(R::MaxTurns.exit_code(), 3);
+        assert_eq!(R::Budget.exit_code(), 4);
+        assert_eq!(R::Failed.exit_code(), 1);
+        let capped =
+            anyhow::Error::new(crate::cli::MaxTurnsStopped("cap".into())).context("while running");
+        assert_eq!(super::exit_code_for_failure(&capped), 3);
+        assert_eq!(super::exit_code_for_failure(&anyhow::anyhow!("boom")), 1);
+        // Text that merely quotes the hint is not a turn cap.
+        let mut quoted = serde_json::json!({
+            "stop_reason": "failed",
+            "result": format!("echo{}", crate::cli::MAX_AGENT_TURNS_HINT),
+            "usage": {}
+        });
+        super::claude_result_record(&mut quoted);
+        assert_eq!(quoted["subtype"], "error_during_execution");
+        let mut capped = serde_json::json!({"stop_reason": "max_turns", "result": "", "usage": {}});
+        super::claude_result_record(&mut capped);
+        assert_eq!(capped["subtype"], "error_max_turns");
+    }
+
+    #[test]
+    fn containment_sentinels_are_not_changed_files() {
+        assert!(super::is_containment_sentinel(
+            ".mini-agent-macos-workspace-sentinel-abc"
+        ));
+        assert!(super::is_containment_sentinel(
+            "sub/.mini-agent-lpac-workspace-sentinel-abc"
+        ));
+        assert!(!super::is_containment_sentinel("src/main.rs"));
     }
 }

@@ -173,7 +173,10 @@ pub(crate) fn split_untrusted_builtins(
     let withheld = withheld
         .into_iter()
         .map(|(name, cfg)| {
-            tracing::warn!(
+            // Debug: the withheld set is surfaced (WithheldBuiltin::explanation)
+            // when a file this server would handle is actually touched, so a
+            // project without such files stays quiet (nvnkx.154).
+            tracing::debug!(
                 "lsp[{name}]: built-in server not started because it evaluates project build files and this project's config is not trusted; set lsp.trust_builtins = [\"{name}\"] in your user config, trust the project config, or define [lsp.servers.{name}] yourself"
             );
             WithheldBuiltin {

@@ -50,6 +50,11 @@ Notable changes to mini-agent are documented in this file. The format follows
 - `web_fetch`'s `prompt` now ranks the sections of a page longer than 50,000 characters by term overlap (no model call) and returns the best matches first, with a table of headings and spill line numbers; the result says so (mini-agent-nvnkx.26).
 - `/sandbox network <deny|allowlist|allow>` and `--sandbox-network` change the shell network policy for the session (never saved, bounded by a managed `max_network`/`allowed_hosts` ceiling) (mini-agent-nvnkx.70).
 - With `sandbox-network = "allowlist"` the proxy keeps a bounded log of refused hosts: the shell tool ends a command's result (foreground, background job or deadline) with `[sandbox network: blocked host:port (reason)]`, each refusal is logged at info level and `/sandbox` lists recent ones (mini-agent-nvnkx.186).
+- `--mcp-config <FILE|JSON>` (repeatable) and `--strict-mcp-config` give one run its own MCP servers: definitions use the `.mcp.json` shape, are operator-supplied (no project trust prompt, `CLI --config` origin, managed policy still applies), and strict mode drops every other server (mini-agent-nvnkx.142).
+- `--permission-mode <standard|restrictive|readonly|guarded|yolo>` and the Claude Code spellings `--max-turns`, `--allowed-tools`/`--allowedTools` and `--disallowed-tools`/`--disallowedTools` (mini-agent-nvnkx.103).
+- Headless results (native and `--stream-json-schema claude`) list refused tool calls in `permission_denials` (tool, input, reason; bounded, with `permission_denials_truncated`), replacing the always-empty list (mini-agent-nvnkx.100).
+- An exhausted `--max-agent-turns` reports stop reason `max_turns` and exits 3, and an exhausted budget exits 4, classified from typed errors rather than message text (mini-agent-nvnkx.101).
+- stream-json input accepts an image-only user message (mini-agent-nvnkx.248).
 
 ### Fixed
 
@@ -232,6 +237,14 @@ Notable changes to mini-agent are documented in this file. The format follows
 - The `web_fetch`/`web_search` network deadline no longer runs while an approval prompt is open, so a slow answer is not turned into `fetch timed out`; the prompt has its own 10-minute bound and says the approval expired, and the destination is re-resolved (and re-asked only if it changed) after a wait over 3 s (mini-agent-nvnkx.232).
 - `web_fetch` Markdown no longer splits headings, links, list items or table rows at source line breaks (mini-agent-nvnkx.28), and decodes the HTML 4 named entities (`&mdash;`, `&rsquo;`, `&hellip;`, `&copy;`, `&eacute;`, ...) once (mini-agent-nvnkx.29).
 - Sandbox failure notes now also cover failed background jobs polled with `job_status` and commands that hit their deadline, recognise resolver/npm/cargo/proxy spellings (`Temporary failure in name resolution`, `ENOTFOUND`, `EAI_AGAIN`, `failed to lookup address information`, `CONNECT tunnel failed`), and state that the network is denied instead of "may be"; the shell tool description mentions the denied network (mini-agent-nvnkx.69).
+- `--model` and `MINI_AGENT_MODEL` resolve a `[quick_models]` name like config `model` does; `--model` with `--quick-model` on the command line is a usage error (mini-agent-nvnkx.351).
+- Headless `-p` runs write the session (with the prompt) before the first model request, so a run killed by a timeout leaves something `--continue` can load, and SIGHUP (and Windows ctrl-break/close) cancels the turn and saves it like SIGTERM (mini-agent-nvnkx.269, .58, .226).
+- A command-line `--model` applies to a resumed session (`--continue`/`--session`) as `--resume-model`, and a differing command-line `--provider` is refused with a pointer to `--resume-provider`, instead of both being ignored (mini-agent-nvnkx.212).
+- `--no-session` runs no longer offer `memory_write`/`memory_edit`, so an ephemeral run leaves no durable memory (mini-agent-nvnkx.153).
+- Headless `files_changed` no longer lists the sandbox's containment sentinel files (mini-agent-nvnkx.152).
+- Default headless stderr no longer carries the withheld-built-in-LSP warning or the ignored-`%%grant=` warning (now debug logs) (mini-agent-nvnkx.154).
+- `--accept-all` help states that it selects standard mode (shell and web still ask) (mini-agent-nvnkx.73).
+- The `task` tool description and the system prompt share one delegation rule (read known files directly; delegate unknown search spaces), and the background start message says the result is announced and to wait once with a long `wait_secs` (mini-agent-nvnkx.175).
 
 ### Added
 

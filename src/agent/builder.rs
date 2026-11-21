@@ -842,12 +842,12 @@ fn estimated_registered_tools(cli: &Cli, cfg: &Config, sandbox: &Sandbox) -> Vec
         names.push("task");
     }
     #[cfg(feature = "memory")]
-    names.extend([
-        "memory_write",
-        "memory_edit",
-        "memory_read",
-        "memory_search",
-    ]);
+    {
+        if !cli.no_session {
+            names.extend(["memory_write", "memory_edit"]);
+        }
+        names.extend(["memory_read", "memory_search"]);
+    }
     #[cfg(feature = "lsp")]
     if cli.tool_is_eligible(cfg, "lsp_diagnostics") && cfg.resolve_lsp().is_some() {
         names.push("lsp_diagnostics");
@@ -1607,14 +1607,18 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         #[cfg(feature = "memory")]
         {
             use crate::extras::memory::{MemoryEdit, MemoryRead, MemorySearch, MemoryWrite};
-            all_tools.push(Box::new(MemoryWrite::new(
-                permission.clone(),
-                ask_tx.clone(),
-            )));
-            all_tools.push(Box::new(MemoryEdit::new(
-                permission.clone(),
-                ask_tx.clone(),
-            )));
+            // An ephemeral run leaves no durable state, so the memory write
+            // tools are withheld (reads stay; mini-agent-nvnkx.153).
+            if !cli.no_session {
+                all_tools.push(Box::new(MemoryWrite::new(
+                    permission.clone(),
+                    ask_tx.clone(),
+                )));
+                all_tools.push(Box::new(MemoryEdit::new(
+                    permission.clone(),
+                    ask_tx.clone(),
+                )));
+            }
             all_tools.push(Box::new(MemoryRead::new(
                 permission.clone(),
                 ask_tx.clone(),
@@ -3044,6 +3048,23 @@ mod notebook_registration_tests {
             ..Default::default()
         };
         assert!(estimated_registered_tools(&disabled, &cfg, &sandbox).is_empty());
+    }
+
+    // mini-agent-nvnkx.153: an ephemeral run withholds the memory write tools.
+    #[cfg(feature = "memory")]
+    #[test]
+    fn no_session_withholds_memory_write_tools() {
+        let cfg = crate::config::Config::default();
+        let sandbox = Sandbox::new(false, "bwrap");
+        let normal = estimated_registered_tools(&crate::cli::Cli::default(), &cfg, &sandbox);
+        assert!(normal.contains(&"memory_write") && normal.contains(&"memory_edit"));
+        let ephemeral = crate::cli::Cli {
+            no_session: true,
+            ..Default::default()
+        };
+        let names = estimated_registered_tools(&ephemeral, &cfg, &sandbox);
+        assert!(!names.contains(&"memory_write") && !names.contains(&"memory_edit"));
+        assert!(names.contains(&"memory_read") && names.contains(&"memory_search"));
     }
 }
 

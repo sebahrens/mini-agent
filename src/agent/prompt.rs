@@ -82,7 +82,23 @@ pub const FIND_FILES_TOOL_PROMPT: &str =
 pub const LIST_DIR_TOOL_PROMPT: &str =
     "\n- **list_dir** lists a directory; do not re-list unchanged directories.";
 pub const TODO_TOOL_PROMPT: &str = "\n- **todo_write** replaces the session's persistent task list; use it for work with at least three dependent steps or progress that must survive compaction. Keep at most one item in progress and update milestones. The list holds at most 50 short items (500 characters each). **todo_read** recalls the list after compaction or an agent rebuild.";
-pub const TASK_TOOL_PROMPT: &str = "\n- **task** delegates investigation to fresh-context subagents (read-only unless a configured persona has write access). Keep single-file or known-location work local; delegate when research crosses several files or has two or more independent, bounded questions. Prefer structured `briefs` with a precise objective, file scope hints, constraints, and expected evidence; use legacy `prompts` only for simple questions, and never send both. Verify and reuse the returned findings. For domain-specific work, select an optional specialist `agent_type` from the tool schema. When the user writes `@agent:<name>`, delegate that part through **task** with `agent_type` set to `<name>` and write the brief yourself.";
+/// The one delegation cost rule shared by the `task` tool description and the
+/// system prompt, so the two never disagree (mini-agent-nvnkx.175). A macro so
+/// both can splice it into `concat!`.
+macro_rules! task_delegation_rule {
+    () => {
+        "Delegate when the search space is unknown or there are two or more independent, bounded questions; read files whose paths are already known directly, however many, and do known-location edits yourself. Use `run_in_background` only for long, independent work while you continue; its result is announced automatically when it settles, so do not poll. In headless runs call `task_result` once with a long `wait_secs` (for example 300) instead of short polls."
+    };
+}
+pub(crate) use task_delegation_rule;
+#[cfg(test)]
+pub const TASK_DELEGATION_RULE: &str = task_delegation_rule!();
+
+pub const TASK_TOOL_PROMPT: &str = concat!(
+    "\n- **task** delegates investigation to fresh-context subagents (read-only unless a configured persona has write access). ",
+    task_delegation_rule!(),
+    " Prefer structured `briefs` with a precise objective, file scope hints, constraints, and expected evidence; use legacy `prompts` only for simple questions, and never send both. Verify and reuse the returned findings. For domain-specific work, select an optional specialist `agent_type` from the tool schema. When the user writes `@agent:<name>`, delegate that part through **task** with `agent_type` set to `<name>` and write the brief yourself."
+);
 
 /// Appended to the preamble when LSP integration is active (`[lsp]
 /// enabled = true`) and its query tool is registered.
@@ -226,6 +242,17 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains("ask the user")
         );
+    }
+
+    // mini-agent-nvnkx.175: the tool description and the system prompt share
+    // one delegation rule.
+    #[cfg(feature = "subagents")]
+    #[test]
+    fn task_tool_prompt_and_rule_agree() {
+        assert!(TASK_TOOL_PROMPT.contains(super::TASK_DELEGATION_RULE));
+        assert!(!TASK_TOOL_PROMPT.contains("any cross-file question"));
+        assert!(super::TASK_DELEGATION_RULE.contains("wait_secs"));
+        assert!(super::TASK_DELEGATION_RULE.contains("paths are already known"));
     }
 
     #[test]
