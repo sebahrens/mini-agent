@@ -3831,6 +3831,16 @@ mod js_permission_bridge {
         );
     }
 
+    /// A definition is paid for in every request (mini-agent-sskdu.174);
+    /// `js` has a ceiling above the 4 KiB default, raising it needs a reason.
+    #[tokio::test]
+    async fn the_js_definition_stays_within_its_size_budget() {
+        let root = std::env::current_dir().unwrap();
+        let tool = helper_tool(ModelEffectProfile::Full, &root);
+        let size = tool.description().len() + tool.parameters().to_string().len();
+        assert!(size <= 6_000, "js definition is {size} bytes");
+    }
+
     #[tokio::test]
     async fn split_lines_has_no_phantom_trailing_element_and_handles_crlf() {
         let root = std::env::current_dir().unwrap();

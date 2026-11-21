@@ -7698,6 +7698,16 @@ fn main() {
         );
     }
 
+    /// A definition is paid for in every request (mini-agent-sskdu.174).
+    #[test]
+    fn the_task_definition_stays_within_its_size_budget() {
+        for allow_write in [false, true] {
+            let tool = TaskTool::new(None, None, allow_write);
+            let size = tool.description().len() + tool.parameters().to_string().len();
+            assert!(size <= 6_200, "task definition is {size} bytes");
+        }
+    }
+
     #[test]
     fn task_args_accept_per_call_run_settings() {
         let args: TaskArgs = serde_json::from_value(serde_json::json!({

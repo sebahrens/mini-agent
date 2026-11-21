@@ -1116,19 +1116,40 @@ pub(crate) fn append_stdin_reference(prompt: &str, stdin: &str) -> String {
 }
 
 /// Compactions this headless run performed: (count, records summarized,
-/// tokens freed net of the summary), reported once on the next final result
-/// so scripts can tell a run was lossy (mini-agent-sskdu.243).
+/// tokens freed net of the summary, summarizer usage), reported once on the
+/// next final result so scripts can tell a run was lossy
+/// (mini-agent-sskdu.243).
+type CompactionTotals = (u64, u64, u64, Option<crate::event::UsageDelta>);
 #[cfg(not(test))]
-static HEADLESS_COMPACTIONS: std::sync::Mutex<(u64, u64, u64)> = std::sync::Mutex::new((0, 0, 0));
+static HEADLESS_COMPACTIONS: std::sync::Mutex<CompactionTotals> =
+    std::sync::Mutex::new((0, 0, 0, None));
 // Tests run in parallel in one process: keep each test's counters to its own
 // thread so a compaction in one cannot leak a field into another's output.
 #[cfg(test)]
 thread_local! {
-    static HEADLESS_COMPACTIONS_TEST: std::cell::Cell<(u64, u64, u64)> =
-        const { std::cell::Cell::new((0, 0, 0)) };
+    static HEADLESS_COMPACTIONS_TEST: std::cell::Cell<CompactionTotals> =
+        const { std::cell::Cell::new((0, 0, 0, None)) };
 }
 
-pub(crate) fn record_headless_compaction(messages: usize, tokens_freed: u64) {
+/// The stream-json record for one finished compaction.
+fn compaction_event(
+    messages: usize,
+    tokens_freed: u64,
+    usage: crate::event::UsageDelta,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "compaction",
+        "messages": messages,
+        "tokens_freed": tokens_freed,
+        "usage": usage,
+    })
+}
+
+pub(crate) fn record_headless_compaction(
+    messages: usize,
+    tokens_freed: u64,
+    usage: crate::event::UsageDelta,
+) {
     #[cfg(not(test))]
     {
         let mut totals = HEADLESS_COMPACTIONS
@@ -1137,14 +1158,30 @@ pub(crate) fn record_headless_compaction(messages: usize, tokens_freed: u64) {
         totals.0 += 1;
         totals.1 = totals.1.saturating_add(messages as u64);
         totals.2 = totals.2.saturating_add(tokens_freed);
+        totals.3 = Some(totals.3.unwrap_or_default().saturating_add(usage));
+        // `--output-format stream-json` also gets the record as it happens.
+        if FATAL_CONFIG_OUTPUT.get() == Some(&cli::OutputFormat::StreamJson)
+            && !HEADLESS_STDOUT_CLOSED.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let event = compaction_event(messages, tokens_freed, usage);
+            let records = if claude_schema() {
+                claude_stream_records(event)
+            } else {
+                vec![event]
+            };
+            for record in records {
+                headless_stdout(format_args!("{}\n", terminal_safe_json(&record)));
+            }
+        }
     }
     #[cfg(test)]
     HEADLESS_COMPACTIONS_TEST.with(|totals| {
-        let (count, seen, freed) = totals.get();
+        let (count, seen, freed, spent) = totals.get();
         totals.set((
             count + 1,
             seen.saturating_add(messages as u64),
             freed.saturating_add(tokens_freed),
+            Some(spent.unwrap_or_default().saturating_add(usage)),
         ));
     });
 }
@@ -1153,16 +1190,22 @@ pub(crate) fn record_headless_compaction(messages: usize, tokens_freed: u64) {
 /// when nothing was compacted so existing output is unchanged.
 fn take_headless_compactions() -> Option<serde_json::Value> {
     #[cfg(not(test))]
-    let (count, messages, tokens_freed) = std::mem::take(
+    let (count, messages, tokens_freed, usage) = std::mem::take(
         &mut *HEADLESS_COMPACTIONS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner),
     );
     #[cfg(test)]
-    let (count, messages, tokens_freed) = HEADLESS_COMPACTIONS_TEST.with(|totals| totals.take());
-    (count > 0).then(
-        || serde_json::json!({"count": count, "messages": messages, "tokens_freed": tokens_freed}),
-    )
+    let (count, messages, tokens_freed, usage) =
+        HEADLESS_COMPACTIONS_TEST.with(|totals| totals.take());
+    (count > 0).then(|| {
+        serde_json::json!({
+            "count": count,
+            "messages": messages,
+            "tokens_freed": tokens_freed,
+            "usage": usage.unwrap_or_default(),
+        })
+    })
 }
 
 static FATAL_CONFIG_OUTPUT: std::sync::OnceLock<cli::OutputFormat> = std::sync::OnceLock::new();
@@ -2558,6 +2601,42 @@ pub(crate) fn persist_headless_turn_input(
     response: &str,
     interactions: &[Message],
 ) -> anyhow::Result<()> {
+    persist_headless_turn_rows(session, prompt, false, response, interactions)
+}
+
+/// Like [`persist_headless_turn`] for a turn the host started (an output
+/// schema repair): `note` is stored as a System row, never as a user prompt,
+/// so a resumed session does not read it as the user's words.
+pub(crate) fn persist_headless_host_turn(
+    session: &mut Session,
+    note: &str,
+    response: &str,
+    interactions: &[Message],
+) {
+    let start = session.messages.len();
+    if let Err(error) = persist_headless_turn_rows(
+        session,
+        &crate::agent::input::PromptInput::text(note.to_owned()),
+        true,
+        response,
+        interactions,
+    ) {
+        tracing::warn!(%error, "canonical user-content projection was incomplete");
+        session.truncate_to(start);
+        session.add_message(MessageRole::System, note);
+        if !response.is_empty() {
+            session.add_message(MessageRole::Assistant, response);
+        }
+    }
+}
+
+fn persist_headless_turn_rows(
+    session: &mut Session,
+    prompt: &crate::agent::input::PromptInput,
+    host_note: bool,
+    response: &str,
+    interactions: &[Message],
+) -> anyhow::Result<()> {
     // Only host gates produce leading System notices in an observed turn.
     // Persist their append-only transcript representation before the exact
     // initial User so reload/native feed order matches the actual request.
@@ -2571,7 +2650,9 @@ pub(crate) fn persist_headless_turn_input(
         }
     }
     let interactions = &interactions[notices..];
-    if let Some(user) = prompt.persisted_user() {
+    if host_note {
+        session.add_message(MessageRole::System, prompt.literal_text());
+    } else if let Some(user) = prompt.persisted_user() {
         session.add_user_message(user.clone());
     } else {
         session.add_message(MessageRole::User, prompt.literal_text());
@@ -2706,7 +2787,13 @@ pub(crate) fn persist_headless_turn_input(
                         .join("\n");
                     let images = crate::agent::runner::tool_result_images(name, result)
                         .map_err(anyhow::Error::msg)?;
-                    session.add_tool_result_with_images(&identifier, name, &output, images);
+                    session.add_tool_result_flagged(
+                        &identifier,
+                        name,
+                        &output,
+                        images,
+                        result.is_error == Some(true),
+                    );
                 }
                 persist_user_delta_blocks(session, user_blocks)?;
             }
@@ -3681,16 +3768,77 @@ mod headless_goal_tests {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_schema_repair_turn_is_a_system_note_not_a_user_prompt() {
+        // mini-agent-sskdu.193
+        let mut session = super::Session::new("anthropic", "claude-sonnet-5-5", 200_000, "test");
+        super::persist_headless_turn(&mut session, "answer the question", "\"wrong\"", &[]);
+        super::persist_headless_host_turn(
+            &mut session,
+            "JSON repair 1: expected integer",
+            "42",
+            &[],
+        );
+        let rows: Vec<(super::MessageRole, String)> = session
+            .messages
+            .iter()
+            .map(|message| (message.role, message.content.to_string()))
+            .collect();
+        assert_eq!(
+            rows.iter()
+                .filter(|(role, _)| *role == super::MessageRole::User)
+                .count(),
+            1,
+            "{rows:?}"
+        );
+        assert!(rows.contains(&(
+            super::MessageRole::System,
+            "JSON repair 1: expected integer".to_string()
+        )));
+        assert_eq!(rows.last().unwrap().1, "42");
+        assert!(rows.iter().all(|(_, text)| !text.contains("Schema:")));
+    }
+
+    #[test]
     fn compactions_are_reported_once_and_only_when_they_happened() {
         // mini-agent-sskdu.243
         assert!(super::take_headless_compactions().is_none());
-        super::record_headless_compaction(5, 100);
-        super::record_headless_compaction(2, 30);
+        let usage = |input, output| crate::event::UsageDelta {
+            input_tokens: input,
+            output_tokens: output,
+            total_tokens: input + output,
+            ..Default::default()
+        };
+        super::record_headless_compaction(5, 100, usage(1_000, 200));
+        super::record_headless_compaction(2, 30, usage(500, 50));
         let value = super::take_headless_compactions().unwrap();
         assert_eq!(value["count"], 2);
         assert_eq!(value["messages"], 7);
         assert_eq!(value["tokens_freed"], 130);
+        assert_eq!(value["usage"]["input_tokens"], 1_500);
+        assert_eq!(value["usage"]["output_tokens"], 250);
+        assert_eq!(value["usage"]["total_tokens"], 1_750);
         assert!(super::take_headless_compactions().is_none());
+    }
+
+    #[test]
+    fn compaction_event_is_a_typed_stream_json_record() {
+        // mini-agent-sskdu.243
+        let event = super::compaction_event(
+            4,
+            90,
+            crate::event::UsageDelta {
+                input_tokens: 10,
+                output_tokens: 3,
+                total_tokens: 13,
+                ..Default::default()
+            },
+        );
+        assert_eq!(event["type"], "compaction");
+        assert_eq!(event["messages"], 4);
+        assert_eq!(event["tokens_freed"], 90);
+        assert_eq!(event["usage"]["total_tokens"], 13);
+        // The Claude-schema mapper passes it through unchanged.
+        assert_eq!(super::claude_stream_records(event.clone()), vec![event]);
     }
 
     use super::{Path, normalize_tool_path};

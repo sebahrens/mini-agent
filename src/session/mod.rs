@@ -3159,6 +3159,55 @@ impl Session {
         }
     }
 
+    /// Reverses the newest compaction using the transcript it replaced
+    /// (`replaced`, from its `.precompact-<n>.jsonl` sidecar): the summary
+    /// record at the front is swapped for the original messages
+    /// (mini-agent-sskdu.244). Refused when the summary is no longer the first
+    /// record, the sidecar does not hold exactly what the compaction replaced,
+    /// or a native (Anthropic replay) history is attached, whose digest was
+    /// bound to the compacted feed. Returns the number of messages restored.
+    pub(crate) fn undo_last_compaction(
+        &mut self,
+        replaced: Vec<SessionMessage>,
+    ) -> anyhow::Result<usize> {
+        anyhow::ensure!(
+            self.native_history_snapshot().is_none(),
+            "this session has a native Anthropic replay history; compaction cannot be undone"
+        );
+        let Some(last) = self.compactions.last() else {
+            anyhow::bail!("there is no compaction to undo");
+        };
+        anyhow::ensure!(
+            matches!(self.compacted_context(), (Some(_), 1)),
+            "the compaction summary is no longer the first record; it cannot be undone"
+        );
+        anyhow::ensure!(
+            replaced.len() == last.summarized_count && !replaced.is_empty(),
+            "the saved transcript does not match the newest compaction"
+        );
+        anyhow::ensure!(
+            self.compactions.len() > 1 || self.compactions[0].pruned.is_none(),
+            "the compaction history was folded; the newest compaction cannot be undone"
+        );
+        let removed = replaced.len();
+        self.messages.remove(0);
+        self.messages.splice(0..0, replaced);
+        self.compactions.pop();
+        if let Some(active) = self.compactions.last_mut() {
+            active.images.activate();
+        }
+        self.file_checkpoints.uncompact_prefix(removed);
+        self.total_estimated_tokens = self.messages.iter().map(|m| m.estimated_tokens).sum();
+        self.reset_calibration();
+        self.rewind_undo = None;
+        self.mark_history_changed();
+        self.read_tracker.clear();
+        self.bytes_after_last_compaction = None;
+        self.pending_precompact = None;
+        self.updated_at = CompactString::new(rfc3339_utc(jiff::Timestamp::now()));
+        Ok(removed)
+    }
+
     /// Fold records beyond [`MAX_RETAINED_COMPACTIONS`] into the first
     /// retained record's [`PrunedCompactions`].
     fn prune_compaction_history(&mut self) {

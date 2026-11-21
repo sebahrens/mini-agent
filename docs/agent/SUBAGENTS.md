@@ -1504,6 +1504,7 @@ Key files:
 | `src/extras/subagents/inline_images.rs`      | Opt-in inline image lane (`task_inline_images`) |
 | `src/extras/subagents/prompt.rs`             | Subagent system prompt                |
 | `src/agent/runner.rs` (`run_subagent`)       | Silent agent execution                |
+| `src/agent/runner/turn_state.rs`             | Turn decisions shared by the interactive, headless and subagent loops (`TurnState`) |
 | `src/agent/builder.rs`                       | Wires `TaskTool` into main agent      |
 | `src/provider.rs` (`AnyAgent::run_subagent`) | Type-erased dispatch                  |
 | `src/main.rs`                                | Initializes `SubagentConfig`          |

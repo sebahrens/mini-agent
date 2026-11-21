@@ -1742,12 +1742,12 @@ place, so those turns surface the error directly.
 | Kept verbatim | the most recent `keep_recent_tokens`, cut at a user/assistant record or a completed tool batch | same | mid-turn relief keeps `keep_recent_tokens` at the same legal cuts (falling back to the whole history when the tail alone is too large); turn-count/byte pressure and `/compact` cut at a turn boundary or summarize everything |
 | Stored summary bound | window-scaled (see above) | window-scaled | the summarizer's window-scaled budget |
 | File windows restored | yes (`compact_restore_read_tokens`) | yes | yes |
-| Cache fork | yes, on a native prompt-cache route, for sessions without a native (Anthropic replay) history; once a native Anthropic turn has run the session takes the text summarizer | same | no |
+| Cache fork | yes, on a native prompt-cache route. A native Anthropic session forks from its native wire history (signed thinking blocks intact), cut before the user prompt at the compaction cut after the prompt sequence is proven identical to the session replay; otherwise, and for mid-turn relief, the text summarizer runs | same between turns | no |
 | Relief cap per prompt | none | none (stops on no progress) | 3 for non-native sessions |
 | Native (Anthropic replay) session | chain restarted as a new epoch | same | between prompts and mid-turn at a tool-batch boundary; chain restarted |
 | Summarizer failure | history kept, error shown | history kept, run continues | history kept under token pressure, evicted only for the byte bound or turn cap; the client is told why |
-| Cancel | Esc or Ctrl-C while compacting; history is unchanged | interrupt | prompt cancellation |
-| Report | line with messages, tokens freed net of the summary and the sidecar path | stderr line and a `compactions` object (`count`, `messages`, `tokens_freed`) on the final JSON / stream-json result | agent-thought notice, or the `/compact` reply; `/compact show` prints the active summary |
+| Cancel | Esc or Ctrl-C while compacting; history is unchanged. A progress line (elapsed time, `request k of ~n`) prints every ten seconds | interrupt | prompt cancellation |
+| Report | line with messages, tokens freed net of the summary and the sidecar path | stderr line and a `compactions` object (`count`, `messages`, `tokens_freed`, `usage`) on the final JSON / stream-json result, plus a `compaction` record in stream-json as each one finishes | agent-thought notice, or the `/compact` reply; `/compact show` prints the active summary |
 | User instructions | `/compact <instructions>` (manual only) | `--compact-instructions` | none |
 
 The summarizer is asked for a handoff summary with fixed sections in this order:
@@ -1777,10 +1777,14 @@ compaction, before the first summarizer request of either path.
 Compaction is otherwise irreversible, so each committed compaction also writes the
 transcript it replaced to `<session id>.precompact-<n>.jsonl` beside the session file
 (private permissions, one persisted message per line; the newest five are kept and all
-go when the session is deleted or pruned by `session_retention_days`). To recover from
-a bad summary, copy the sidecar's records back into the `messages` array of the session
-JSON, ahead of the kept messages, and remove the unwanted `compactions` entry. There is
-no `/compact undo`: restoring in place would conflict with native replay publication.
+go when the session is deleted or pruned by `session_retention_days`). `/compact undo`
+(TUI) swaps the newest compaction's summary back for its sidecar's records and removes
+that compaction record, while the summary is still the first record and the sidecar
+exists. It is refused on native Anthropic sessions, whose replay history is bound to the
+compacted transcript, and while a turn is running. Rewind checkpoints of the summarized
+turns stay retired (their files cannot be restored), and a restored session that is still
+over budget compacts again on the next turn. Headless and ACP sessions can copy the
+sidecar's records back into the session JSON by hand.
 
 Compaction is paid for like any other completion. The summarizer runs on the
 session's model (or on `compaction_model` when set, at that model's prices), so the usage of every rolling request is summed and charged to

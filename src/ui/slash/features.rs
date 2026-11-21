@@ -28,6 +28,10 @@ fn handle_compress(_parts: &[&str], _ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
         super::show_compaction_summary(_ctx.renderer, _ctx.session);
         return Ok(());
     }
+    if _parts.len() == 2 && _parts[1] == "undo" {
+        super::undo_compaction(_ctx);
+        return Ok(());
+    }
     let instructions = if _parts.len() > 1 {
         Some(_parts[1..].join(" "))
     } else {

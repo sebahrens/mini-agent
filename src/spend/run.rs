@@ -792,8 +792,18 @@ impl SdkRequest {
 pub(crate) struct UsageObserver {
     usage: Arc<std::sync::Mutex<UsageDelta>>,
     run: Option<Run>,
+    /// Summarizer requests started so far, for a "request k of n" progress
+    /// line while a compaction runs (mini-agent-sskdu.232).
+    requests: Arc<std::sync::atomic::AtomicU64>,
 }
 impl UsageObserver {
+    pub(crate) fn request_started(&self) {
+        self.requests
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub(crate) fn requests_started(&self) -> u64 {
+        self.requests.load(std::sync::atomic::Ordering::Relaxed)
+    }
     pub(crate) fn cache_ttl(&self) -> crate::config::PromptCacheTtl {
         self.run
             .as_ref()
@@ -804,6 +814,7 @@ impl UsageObserver {
         Self {
             usage: Default::default(),
             run: Some(run),
+            requests: Default::default(),
         }
     }
     pub(crate) fn record(&self, usage: UsageDelta) {

@@ -740,8 +740,9 @@ impl ShellTool {
                     )
                 })
                 .unwrap_or_default();
+            let pty_note = if args.pty { PTY_INPUT_GUIDANCE } else { "" };
             let result = format!(
-                "Background job started: {id}\nUse job_status with this id to poll output or stop it; each poll returns only output not returned before.{log}{monitor_note}"
+                "Background job started: {id}\nUse job_status with this id to poll output or stop it; each poll returns only output not returned before.{log}{monitor_note}{pty_note}"
             );
             return Ok((
                 match coaching {
@@ -1427,6 +1428,10 @@ const MAX_PENDING_INPUT_LINE_BYTES: usize = 16 * 1024;
 /// Output must be silent this long after typed input before the result is
 /// returned.
 const INPUT_QUIET_WINDOW: std::time::Duration = std::time::Duration::from_millis(200);
+/// How to type into a `pty=true` job. Sent with the start result of such a job
+/// rather than in every request's `job_status` definition (mini-agent-sskdu.174).
+const PTY_INPUT_GUIDANCE: &str = "\nTyping into this job: job_status action=input with input=<text> (include \\n to press Enter; permission-checked like a shell command; control characters other than newline and carriage return and history expansions are refused; the write gives up after 5 seconds if the program is not reading, and the result shows the output produced until it goes quiet, at most 3 seconds) or keys=[...] instead (named keys pressed in order, for pagers, TUIs and REPLs: ctrl_c and ctrl_d are always allowed, enter is judged like input, cursor, history, function and esc keys make the line unknowable so the next enter is judged as an opaque edited line (ctrl_c clears it), tab on a partly typed line is refused).";
+
 /// Longest `action=input` waits for the program's reply to settle.
 const INPUT_SETTLE_MAX: std::time::Duration = std::time::Duration::from_secs(3);
 
@@ -1458,14 +1463,14 @@ impl Tool for JobStatusTool {
                 "input": {
                     "type": "string",
                     "maxLength": 16384,
-                    "description": "Only with action=input: text typed into the pty=true job's terminal (at most 16384 bytes; include \\n to press Enter), permission-checked like a shell command. Control characters other than newline and carriage return, and history expansions, are refused; use keys for Ctrl-C, Ctrl-D, Esc and arrows. Writing gives up after 5 seconds if the program is not reading; the result shows the output produced until it goes quiet (at most 3 seconds)."
+                    "description": "Only with action=input: text typed into the pty=true job's terminal (at most 16384 bytes; include \\n to press Enter), permission-checked like a shell command. The start result of a pty=true job has the rules."
                 },
                 "keys": {
                     "type": "array",
                     "minItems": 1,
                     "maxItems": MAX_JOB_KEYS,
                     "items": {"type": "string", "enum": JobKey::NAMES},
-                    "description": "Only with action=input, instead of input: named keys pressed in order, for pagers, TUIs and REPLs. ctrl_c and ctrl_d are always allowed; enter is judged like input; cursor, history, function and esc keys make the line unknowable so the next enter is judged as an opaque edited line (ctrl_c clears it); tab on a partly typed line is refused."
+                    "description": "Only with action=input, instead of input: named keys pressed in order, for pagers, TUIs and REPLs (ctrl_c, ctrl_d, enter, arrows, esc, ...)."
                 },
                 "timeout_ms": {
                     "type": "integer",
@@ -4235,6 +4240,9 @@ mod tests {
             })
             .await
             .unwrap();
+        // The typing rules left the job_status definition for this result.
+        assert!(started.contains("action=input"), "{started}");
+        assert!(started.contains("keys=["), "{started}");
         let id = background_id(&started);
         let mut seen = job_input(&status, &id, line).await.unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);

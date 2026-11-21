@@ -1668,3 +1668,88 @@ async fn delimiter_colliding_mcp_labels_keep_distinct_registration_provenance() 
     }
     assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
+
+/// A `git` stand-in that records how many calls run at once.
+struct OverlapProbe {
+    active: Arc<std::sync::atomic::AtomicUsize>,
+    peak: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ToolDyn for OverlapProbe {
+    fn name(&self) -> String {
+        "git".to_string()
+    }
+
+    fn description(&self) -> String {
+        String::new()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({})
+    }
+
+    fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
+        use std::sync::atomic::Ordering;
+        Box::pin(async move {
+            let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(args)
+        })
+    }
+}
+
+async fn peak_overlap_of_two_status_calls(rewrite_to: Option<&str>) -> usize {
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let probes = || -> Vec<Box<dyn ToolDyn>> {
+        vec![
+            Box::new(OverlapProbe {
+                active: active.clone(),
+                peak: peak.clone(),
+            }),
+            Box::new(OverlapProbe {
+                active: active.clone(),
+                peak: peak.clone(),
+            }),
+        ]
+    };
+    let tools = match rewrite_to {
+        Some(operation) => {
+            let dispatcher = dispatcher_with(
+                "PreToolUse",
+                vec![handler(&format!(
+                    r#"echo '{{"updatedInput":{{"operation":"{operation}"}}}}'"#
+                ))],
+            );
+            wrap_all(probes(), dispatcher, permission(), None)
+        }
+        None => probes(),
+    };
+    let tools = crate::agent::tools::concurrency::bind(tools);
+    let status = r#"{"operation":"status"}"#;
+    let (one, two) = tokio::join!(
+        tools[0].call(status.to_string()),
+        tools[1].call(status.to_string())
+    );
+    one.unwrap();
+    two.unwrap();
+    peak.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+// mini-agent-sskdu.263: the lane follows the arguments a hook rewrote.
+#[tokio::test]
+async fn a_hook_rewrite_chooses_the_lane_of_the_effective_arguments() {
+    assert_eq!(peak_overlap_of_two_status_calls(None).await, 2, "control");
+    assert_eq!(
+        peak_overlap_of_two_status_calls(Some("log")).await,
+        2,
+        "a read rewritten to another read still shares the lane"
+    );
+    assert_eq!(
+        peak_overlap_of_two_status_calls(Some("stage")).await,
+        1,
+        "a read rewritten into a write runs exclusively instead of being refused"
+    );
+}

@@ -133,18 +133,6 @@ fn access_for_call(access: ToolAccess, args: &str) -> ToolAccess {
     }
 }
 
-/// Whether a call admitted on the lane its `original` arguments need would run
-/// with `effective` arguments that need a stronger one (a shared lease for what
-/// became a write). A `PreToolUse` rewrite happens after admission, so such a
-/// rewrite is refused instead of racing the other calls holding the lane
-/// (mini-agent-sskdu.263).
-#[cfg(any(test, feature = "hooks"))]
-pub(crate) fn rewrite_needs_stronger_lane(name: &str, original: &str, effective: &str) -> bool {
-    let access = access_for(name);
-    access_for_call(access, original) == ToolAccess::Read
-        && access_for_call(access, effective) != ToolAccess::Read
-}
-
 /// One reader/writer lane plus the ticket that keeps exclusive calls in order.
 ///
 /// An exclusive call takes the `order` ticket first and keeps it for the whole
@@ -183,10 +171,63 @@ enum Lease {
 /// re-capture it under the re-acquired lease.
 struct LaneSlot {
     lane: Lane,
+    /// How the bound tool classifies its calls; [`readmit_for_effective_args`]
+    /// re-derives the lease from the arguments that will actually run.
+    #[cfg_attr(not(any(test, feature = "hooks")), allow(dead_code))]
+    access: ToolAccess,
     lease: std::sync::Mutex<Option<Lease>>,
     /// The exclusive ordering ticket; held until the call ends.
-    #[allow(dead_code)]
-    ticket: Option<tokio::sync::OwnedMutexGuard<()>>,
+    #[cfg_attr(not(any(test, feature = "hooks")), allow(dead_code))]
+    ticket: std::sync::Mutex<Option<tokio::sync::OwnedMutexGuard<()>>>,
+}
+
+impl Lane {
+    /// Take the lease a call needs: shared for a read, otherwise the ordering
+    /// ticket first and then the writer lease (a ticket holder is the only
+    /// exclusive call that can be waiting on the lease).
+    async fn acquire(&self, exclusive: bool) -> (Lease, Option<tokio::sync::OwnedMutexGuard<()>>) {
+        if exclusive {
+            let ticket = Arc::clone(&self.order).lock_owned().await;
+            (
+                Lease::Exclusive(Arc::clone(&self.rw).write_owned().await),
+                Some(ticket),
+            )
+        } else {
+            (Lease::Shared(Arc::clone(&self.rw).read_owned().await), None)
+        }
+    }
+}
+
+/// Re-derive the calling tool's lease from the arguments that will actually
+/// run. A `PreToolUse` hook may rewrite a call after it was admitted on the
+/// lane its original arguments needed; a read that became a write must not
+/// keep a shared lease, and a write that became a read need not block the
+/// readers (mini-agent-sskdu.263). The lease is given back and re-acquired
+/// before anything runs, so no other call can observe the gap as an effect.
+/// A no-op outside a bound tool call, or while the lease is suspended for a
+/// prompt.
+#[cfg(any(test, feature = "hooks"))]
+pub(crate) async fn readmit_for_effective_args(effective: &str) {
+    let Ok(slot) = LANE.try_with(Arc::clone) else {
+        return;
+    };
+    let want_exclusive = access_for_call(slot.access, effective) != ToolAccess::Read;
+    {
+        let mut lease = slot.lease.lock().unwrap_or_else(|e| e.into_inner());
+        let have_exclusive = match &*lease {
+            Some(Lease::Exclusive(_)) => true,
+            Some(Lease::Shared(_)) => false,
+            None => return,
+        };
+        if have_exclusive == want_exclusive {
+            return;
+        }
+        *lease = None;
+        *slot.ticket.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+    let (lease, ticket) = slot.lane.acquire(want_exclusive).await;
+    *slot.lease.lock().unwrap_or_else(|e| e.into_inner()) = Some(lease);
+    *slot.ticket.lock().unwrap_or_else(|e| e.into_inner()) = ticket;
 }
 
 /// Set by a tool around its permission check to allow that check to release
@@ -278,25 +319,13 @@ impl ConcurrencyBoundTool {
     }
 
     async fn lease(&self, args: &str) -> Arc<LaneSlot> {
-        let (lease, ticket) = match access_for_call(self.access, args) {
-            ToolAccess::Read => (
-                Lease::Shared(Arc::clone(&self.lane.rw).read_owned().await),
-                None,
-            ),
-            ToolAccess::Write | ToolAccess::JobStatus | ToolAccess::Task | ToolAccess::Git => {
-                // Ticket first, then the writer lease: a ticket holder is the
-                // only exclusive call that can be waiting on the lease.
-                let ticket = Arc::clone(&self.lane.order).lock_owned().await;
-                (
-                    Lease::Exclusive(Arc::clone(&self.lane.rw).write_owned().await),
-                    Some(ticket),
-                )
-            }
-        };
+        let exclusive = access_for_call(self.access, args) != ToolAccess::Read;
+        let (lease, ticket) = self.lane.acquire(exclusive).await;
         Arc::new(LaneSlot {
             lane: self.lane.clone(),
+            access: self.access,
             lease: std::sync::Mutex::new(Some(lease)),
-            ticket,
+            ticket: std::sync::Mutex::new(ticket),
         })
     }
 
@@ -436,27 +465,95 @@ pub(crate) fn bind_with_shared(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn a_rewrite_that_needs_a_stronger_lane_is_detected() {
-        use super::rewrite_needs_stronger_lane as stronger;
-        let status = r#"{"operation":"status"}"#;
-        let stage = r#"{"operation":"stage"}"#;
-        assert!(stronger("git", status, stage));
-        assert!(
-            !stronger("git", stage, status),
-            "a write lease covers a read"
-        );
-        assert!(!stronger("git", status, r#"{"operation":"log"}"#));
-        assert!(
-            !stronger("shell", "{}", r#"{"command":"x"}"#),
-            "already exclusive"
-        );
-        assert!(stronger(
-            "job_status",
-            r#"{"action":"poll"}"#,
-            r#"{"action":"stop"}"#
-        ));
-        assert!(!stronger("read", r#"{"path":"a"}"#, r#"{"path":"b"}"#));
+    /// A `git` tool that, like the hook decorator after a `PreToolUse`
+    /// rewrite, re-derives its lease from `effective_operation` before it runs.
+    struct RewritingGit {
+        exclusive: Arc<std::sync::Mutex<Vec<bool>>>,
+        active: Arc<AtomicUsize>,
+        maximum: Arc<AtomicUsize>,
+    }
+
+    impl Tool for RewritingGit {
+        const NAME: &'static str = "git";
+        type Error = Infallible;
+        type Args = serde_json::Value;
+        type Output = String;
+
+        fn description(&self) -> String {
+            String::new()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+            let effective = serde_json::json!({"operation": args["effective_operation"]});
+            readmit_for_effective_args(&effective.to_string()).await;
+            let exclusive = LANE
+                .try_with(|slot| {
+                    matches!(
+                        *slot.lease.lock().unwrap_or_else(|e| e.into_inner()),
+                        Some(Lease::Exclusive(_))
+                    )
+                })
+                .unwrap();
+            self.exclusive.lock().unwrap().push(exclusive);
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.maximum.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(String::new())
+        }
+    }
+
+    async fn peak_overlap(original: &str, effective: &str) -> usize {
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let tools = bind(vec![
+            Box::new(RewritingGit {
+                exclusive: Arc::default(),
+                active: Arc::clone(&active),
+                maximum: Arc::clone(&maximum),
+            }),
+            Box::new(RewritingGit {
+                exclusive: Arc::default(),
+                active: Arc::clone(&active),
+                maximum: Arc::clone(&maximum),
+            }),
+        ]);
+        let args = serde_json::json!({"operation": original, "effective_operation": effective})
+            .to_string();
+        let (one, two) = tokio::join!(tools[0].call(args.clone()), tools[1].call(args));
+        one.unwrap();
+        two.unwrap();
+        maximum.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn a_read_rewritten_into_a_write_is_readmitted_exclusively() {
+        assert_eq!(peak_overlap("status", "stage").await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_write_rewritten_into_a_read_gives_up_the_exclusive_lease() {
+        let exclusive = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tools = bind(vec![Box::new(RewritingGit {
+            exclusive: Arc::clone(&exclusive),
+            active: Arc::default(),
+            maximum: Arc::default(),
+        })]);
+        for (original, effective) in [("stage", "status"), ("status", "stage")] {
+            let args = serde_json::json!({"operation": original, "effective_operation": effective});
+            tools[0].call(args.to_string()).await.unwrap();
+        }
+        assert_eq!(*exclusive.lock().unwrap(), vec![false, true]);
+    }
+
+    #[tokio::test]
+    async fn unchanged_lane_classes_are_kept_across_a_rewrite() {
+        assert_eq!(peak_overlap("status", "log").await, 2);
+        assert_eq!(peak_overlap("stage", "commit").await, 1);
     }
 
     #[test]
