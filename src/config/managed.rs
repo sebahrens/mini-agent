@@ -459,6 +459,7 @@ pub(crate) fn check_administrator_authority(path: &Path) -> Result<(), String> {
 fn windows_sddl(path: &Path) -> Result<String, String> {
     let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
     let exe = Path::new(&root).join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+    use crate::process_creation::StdCommandCreationExt;
     let output = std::process::Command::new(exe)
         .args([
             "-NoProfile",
@@ -467,7 +468,7 @@ fn windows_sddl(path: &Path) -> Result<String, String> {
             "(Get-Acl -LiteralPath $env:MINI_AGENT_ACL_PATH).Sddl",
         ])
         .env("MINI_AGENT_ACL_PATH", path)
-        .output()
+        .output_guarded()
         .map_err(|error| error.to_string())?;
     if !output.status.success() {
         return Err("Get-Acl failed".into());

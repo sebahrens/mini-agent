@@ -901,6 +901,54 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ("src/sandbox.rs", ".spawn(move || {", 2, "NON-PROCESS"),
     // 2026-11-07: Cli::parse_command_line runs clap on an 8 MiB thread (stack headroom); a thread, not a process.
     ("src/cli.rs", ".spawn(parse)", 1, "NON-PROCESS"),
+    // Fixed-grammar clipboard helpers (tmux load-buffer, wl-copy/xclip/pbcopy, readers) all
+    // launch through the guarded clipboard owner; mini-agent-nvnkx clipboard route.
+    (
+        "src/ui/clipboard_route.rs",
+        "let mut command = tokio::process::Command::new(program);",
+        2,
+        "TC-SUPPORT-UTILITY",
+    ),
+    (
+        "src/ui/clipboard_route.rs",
+        "let mut command = tokio::process::Command::new(\"tmux\");",
+        1,
+        "TC-SUPPORT-UTILITY",
+    ),
+    (
+        "src/ui/clipboard_route.rs",
+        "let Ok(mut child) = command.spawn() else {",
+        1,
+        "TC-SUPPORT-UTILITY",
+    ),
+    // Windows-only managed-file ACL probe: fixed PowerShell argv, path in the environment.
+    (
+        "src/config/managed.rs",
+        "let output = std::process::Command::new(exe)",
+        1,
+        "TC-SUPPORT-UTILITY",
+    ),
+    (
+        "src/config/managed.rs",
+        ".output()",
+        1,
+        "TC-SUPPORT-UTILITY",
+    ),
+    // Thread, task and HTTP-status expressions that are not process launches.
+    ("src/setup/mod.rs", ".spawn(|| {", 1, "NON-PROCESS"),
+    ("src/logging.rs", ".spawn(move || {", 1, "NON-PROCESS"),
+    (
+        "src/extras/subagents/resume.rs",
+        "handle.spawn(async move {",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/mcp/sse_legacy.rs",
+        "let status = response.status();",
+        2,
+        "NON-PROCESS",
+    ),
     // perf 2026-10-19: test-only kill/status, thread spawns and a signature type.
     (
         "src/sandbox.rs",
@@ -988,7 +1036,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/acp/commands.rs",
         "AvailableCommand::new(",
-        4,
+        6,
         "NON-PROCESS",
     ),
     (
@@ -1387,7 +1435,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/agent/tools/web_http.rs",
         "status: response.status().as_u16(),",
-        1,
+        2,
         "NON-PROCESS",
     ),
     // Native web exchange: the HTTP status code of a response.
@@ -2044,12 +2092,6 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/ui/renderer.rs",
-        "let mut command = tokio::process::Command::new(cmd);",
-        1,
-        "TC-SUPPORT-UTILITY",
-    ),
-    (
-        "src/ui/renderer.rs",
         "mut command: tokio::process::Command,",
         1,
         "TC-SUPPORT-UTILITY",
@@ -2151,6 +2193,19 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/git/tool.rs",
         "\"path_records\": parse_status_paths(&output.stdout, truncated),",
+        1,
+        "NON-PROCESS",
+    ),
+    // ACP shell tool-call JSON field and legacy-SSE connect error text: data tokens.
+    (
+        "src/extras/acp/mod.rs",
+        "\"output\": output,",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/mcp/sse_legacy.rs",
+        "anyhow::bail!(\"MCP SSE connect failed: HTTP {}\", status.as_u16());",
         1,
         "NON-PROCESS",
     ),
@@ -2486,6 +2541,21 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
             1,
         )],
     ),
+    // ACP tool-call JSON literal and legacy-SSE connect error text: `status` is data.
+    (
+        "src/extras/acp/mod.rs",
+        &[(
+            "507e238df2f2cf837c9b48e11a7a5d36f84e37aceded84b559884f43dd600358",
+            1,
+        )],
+    ),
+    (
+        "src/extras/mcp/sse_legacy.rs",
+        &[(
+            "592051efd78e59cfbf0844e29d89296a5590ba61966a2057c5d82b5b7e77b463",
+            1,
+        )],
+    ),
     // Exact select bodies inspect captured I/O/status and JoinSet tasks;
     // actual child creation remains outside these macros and guarded.
     // This status JSON reads captured CommandOutput.stdout; no launch occurs.
@@ -2600,6 +2670,54 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     ("src/extras/acp/mod.rs", ".status()", 1, "TEST-ONLY"),
     ("src/sandbox.rs", ".spawn(move || {", 2, "NON-PROCESS"),
     ("src/cli.rs", ".spawn(parse)", 1, "NON-PROCESS"),
+    // Fixed-grammar clipboard helpers (tmux load-buffer, wl-copy/xclip/pbcopy, readers) all
+    // launch through the guarded clipboard owner; mini-agent-nvnkx clipboard route.
+    (
+        "src/ui/clipboard_route.rs",
+        "let mut command = tokio::process::Command::new(program);",
+        2,
+        "TC-SUPPORT-UTILITY",
+    ),
+    (
+        "src/ui/clipboard_route.rs",
+        "let mut command = tokio::process::Command::new(\"tmux\");",
+        1,
+        "TC-SUPPORT-UTILITY",
+    ),
+    (
+        "src/ui/clipboard_route.rs",
+        "let Ok(mut child) = command.spawn() else {",
+        1,
+        "TC-SUPPORT-UTILITY",
+    ),
+    // Windows-only managed-file ACL probe: fixed PowerShell argv, path in the environment.
+    (
+        "src/config/managed.rs",
+        "let output = std::process::Command::new(exe)",
+        1,
+        "TC-SUPPORT-UTILITY",
+    ),
+    (
+        "src/config/managed.rs",
+        ".output()",
+        1,
+        "TC-SUPPORT-UTILITY",
+    ),
+    // Thread, task and HTTP-status expressions that are not process launches.
+    ("src/setup/mod.rs", ".spawn(|| {", 1, "NON-PROCESS"),
+    ("src/logging.rs", ".spawn(move || {", 1, "NON-PROCESS"),
+    (
+        "src/extras/subagents/resume.rs",
+        "handle.spawn(async move {",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/mcp/sse_legacy.rs",
+        "let status = response.status();",
+        2,
+        "NON-PROCESS",
+    ),
     (
         "src/extras/acp/mod.rs",
         "std::process::Command::new(\"kill\")",
@@ -2690,7 +2808,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/acp/commands.rs",
         "AvailableCommand::new(",
-        4,
+        6,
         "NON-PROCESS",
     ),
     (
@@ -3231,7 +3349,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/agent/tools/web_http.rs",
         "status: response.status().as_u16(),",
-        1,
+        2,
         "NON-PROCESS",
     ),
     // Native web exchange: the HTTP status code of a response.
