@@ -99,10 +99,7 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
             }
             #[cfg(not(feature = "advisor"))]
             {
-                write_error(
-                    ctx.renderer,
-                    "Advisor support not enabled (build with --features advisor)",
-                );
+                write_error(ctx.renderer, super::feature_missing("/advisor", "advisor"));
                 Ok(())
             }
         }
@@ -110,10 +107,7 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
         "/mcp" => handle_mcp(parts, ctx).await,
         #[cfg(not(feature = "mcp"))]
         "/mcp" => {
-            write_error(
-                ctx.renderer,
-                "MCP support not enabled (build with --features mcp)",
-            );
+            write_error(ctx.renderer, super::feature_missing("/mcp", "mcp"));
             Ok(())
         }
         _ => Ok(()),
@@ -444,10 +438,19 @@ async fn handle_mode(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
 
 /// Present the permission policies using approval-oriented names while keeping
 /// `/mode` as the complete low-level security-mode interface.
+/// Shared by `/permissions` and `/mode` when no permission checker exists.
+const PERMISSION_SYSTEM_DISABLED: &str =
+    "permission system disabled at startup; restart without --dangerously-skip-permissions";
+
 async fn handle_permissions(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     if parts.len() < 2 {
-        ctx.input
-            .start_argument_picker("/permissions ", ["yolo", "auto", "manual", "rules"]);
+        // One list for this picker and for Tab/slash completion.
+        if let Some((items, prefix)) =
+            crate::ui::pickers::handlers::argument_picker_spec("/permissions")
+        {
+            ctx.input
+                .start_argument_picker(prefix, items.iter().copied());
+        }
         return Ok(());
     }
 
@@ -467,7 +470,7 @@ async fn handle_permissions(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::R
         None => write_error(
             ctx.renderer,
             format!(
-                "unknown permissions mode: {} (use yolo, auto, or manual)",
+                "unknown permissions argument: {} (use yolo, auto, manual, rules, or forget)",
                 parts[1]
             ),
         ),
@@ -548,10 +551,7 @@ fn set_permission_mode(ctx: &mut SlashCtx<'_>, mode: SecurityMode, label: &str) 
             .set_mode(mode);
         write_ok(ctx.renderer, format!("permissions: {label}"));
     } else {
-        write_error(
-            ctx.renderer,
-            "permission system disabled at startup; restart without --dangerously-skip-permissions",
-        );
+        write_error(ctx.renderer, PERMISSION_SYSTEM_DISABLED);
     }
 }
 
@@ -589,7 +589,7 @@ async fn set_mode(ctx: &mut SlashCtx<'_>, mode: SecurityMode) {
         p.lock().unwrap_or_else(|e| e.into_inner()).set_mode(mode);
         write_ok(ctx.renderer, format!("security mode: {mode}"));
     } else {
-        write_error(ctx.renderer, "permission system not active");
+        write_error(ctx.renderer, PERMISSION_SYSTEM_DISABLED);
     }
 }
 
@@ -793,12 +793,6 @@ async fn handle_editsys(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resul
     Ok(())
 }
 
-/// Prefix understood by the caller in `ui::mod` to start the interactive OAuth
-/// login for a server. The login (browser wait) runs there as a background task
-/// so the TUI stays responsive; on success the server is reconnected.
-#[cfg(feature = "mcp")]
-pub(crate) const DEFER_MCP_LOGIN: &str = "DEFER_MCP_LOGIN:";
-
 #[cfg(feature = "mcp")]
 async fn handle_mcp(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     if parts.len() >= 2 && parts[1] == "login" {
@@ -946,7 +940,7 @@ async fn handle_mcp_login(name: Option<&str>, ctx: &mut SlashCtx<'_>) -> anyhow:
         write_error(ctx.renderer, e);
         return Ok(());
     }
-    Err(anyhow::anyhow!("{}{}", DEFER_MCP_LOGIN, name))
+    Err(super::DeferredSlash::McpLogin(name.to_string()).into())
 }
 
 #[cfg(feature = "mcp")]

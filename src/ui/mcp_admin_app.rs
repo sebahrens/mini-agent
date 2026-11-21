@@ -870,11 +870,9 @@ impl App<'_> {
                     self.mcp_state().approval = Some(captured);
                     self.renderer
                         .write_line(&sanitize_output(&review), C_AGENT)?;
-                    self.renderer.chain_prompt = Some(ChainPrompt {
-                        question:
-                            "Trust this exact resulting .mcp.json? [Y] approve [N] keep inactive"
-                                .into(),
-                    });
+                    self.renderer.chain_prompt = Some(ChainPrompt::new(
+                        "Trust this exact resulting .mcp.json? [Y] approve [N] keep inactive",
+                    ));
                     self.renderer.write_line(
                         "Trust this exact resulting .mcp.json? [Y] approve [N] keep inactive",
                         C_PERM,

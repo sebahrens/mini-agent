@@ -38,10 +38,7 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
     #[cfg(not(feature = "memory"))]
     {
         let _ = parts;
-        write_error(
-            ctx.renderer,
-            "/memory is not available. Rebuild with:\n  cargo install --path . --debug --features memory",
-        );
+        write_error(ctx.renderer, super::feature_missing("/memory", "memory"));
     }
     #[cfg(feature = "memory")]
     {
@@ -239,7 +236,7 @@ fn handle_editor(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
         ctx.renderer,
         format!("opening {} in editor...", path.display()),
     );
-    Err(anyhow::anyhow!("DEFER_EDITOR:{}", path.display()))
+    Err(super::DeferredSlash::Editor(path).into())
 }
 
 struct EditorTempFile {

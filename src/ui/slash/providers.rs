@@ -549,7 +549,11 @@ fn known_selected_model_capacity(
         .or_else(|| Config::catalog_context_window(provider, model))
 }
 
-async fn apply_model(ctx: &mut SlashCtx<'_>, model_id: &str, selected_alias: Option<&str>) {
+pub(super) async fn apply_model(
+    ctx: &mut SlashCtx<'_>,
+    model_id: &str,
+    selected_alias: Option<&str>,
+) {
     let new_model = compact_str::CompactString::new(model_id);
     let new_agent = ctx
         .agent_build_ctx()

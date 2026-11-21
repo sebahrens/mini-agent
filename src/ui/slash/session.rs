@@ -513,7 +513,7 @@ async fn handle_sessions(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
         // The catalogue parses up to 100 session files: read it off the UI
         // task while the picker shows "loading sessions…".
         ctx.input
-            .start_loading_session_picker(ctx.workspace.clone(), all);
+            .start_loading_session_picker(ctx.workspace.clone(), all, "");
     } else if parts[1] == "delete" && parts.len() < 3 {
         write_error(ctx.renderer, "usage: /sessions delete <id-or-name>");
     } else if parts[1] == "delete" {
@@ -521,7 +521,7 @@ async fn handle_sessions(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
         let sessions = crate::session::storage::find_sessions_by_prefix(prefix)?;
         match crate::session::storage::select_session(prefix, sessions) {
             crate::session::storage::SessionSelection::NoMatch => {
-                write_ok(ctx.renderer, format!("no session matching '{}'", prefix));
+                write_error(ctx.renderer, format!("no session matching '{}'", prefix));
             }
             crate::session::storage::SessionSelection::One(s) => {
                 if s.id == ctx.session.id {
@@ -547,7 +547,7 @@ async fn handle_sessions(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
                 }
             }
             crate::session::storage::SessionSelection::Ambiguous(sessions) => {
-                write_ok(
+                write_error(
                     ctx.renderer,
                     format!("multiple sessions match '{}', be more specific", prefix),
                 );
@@ -561,13 +561,13 @@ async fn handle_sessions(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
         let sessions = crate::session::storage::find_sessions_by_prefix(prefix)?;
         match crate::session::storage::select_session(prefix, sessions) {
             crate::session::storage::SessionSelection::NoMatch => {
-                write_ok(ctx.renderer, format!("no session matching '{}'", prefix));
+                write_error(ctx.renderer, format!("no session matching '{}'", prefix));
             }
             crate::session::storage::SessionSelection::One(s) => {
                 crate::startup::heap_future(|| resume_selected_session(*s, ctx)).await?;
             }
             crate::session::storage::SessionSelection::Ambiguous(sessions) => {
-                write_ok(
+                write_error(
                     ctx.renderer,
                     format!("multiple sessions match '{}':", prefix),
                 );

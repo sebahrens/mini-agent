@@ -37,7 +37,7 @@ use crate::ui::renderer::{
     self as renderer_mod, ChainPrompt, ClipboardCopyOutcome, Renderer, SelectionPoint,
     copy_to_clipboard, read_from_clipboard,
 };
-use crate::ui::slash::{C_RESULT, apply_prompt_model, handle_compress};
+use crate::ui::slash::{C_RESULT, DeferredSlash, apply_prompt_model, handle_compress};
 use crate::ui::state::{
     AgentRunState, BtwStats, ChainState, PendingMainTurn, SlashState, UiContext,
 };
@@ -4098,7 +4098,7 @@ impl<'a> App<'a> {
             self.input.picker = None;
             self.renderer.invalidate();
             match outcome {
-                crate::ui::pickers::sessions::SessionPick::Reload(all) => {
+                crate::ui::pickers::sessions::SessionPick::Reload { all, query } => {
                     if self.run.is_running || self.run.pending_turn.is_some() {
                         self.input.picker = None;
                         self.renderer.write_line(
@@ -4109,7 +4109,7 @@ impl<'a> App<'a> {
                         return Ok(true);
                     }
                     self.input
-                        .start_loading_session_picker(self.ui.workspace.clone(), all);
+                        .start_loading_session_picker(self.ui.workspace.clone(), all, &query);
                 }
                 crate::ui::pickers::sessions::SessionPick::Cancelled => {}
                 crate::ui::pickers::sessions::SessionPick::Selected(selection) => {
@@ -4422,6 +4422,9 @@ impl<'a> App<'a> {
 
         // Chain prompt active: intercept Y/N/B keystrokes
         if self.renderer.chain_prompt.is_some() && !self.renderer.chain_but_mode {
+            if self.chain_prompt_premature(key) {
+                return Ok(());
+            }
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     self.renderer.chain_prompt = None;
@@ -4466,9 +4469,7 @@ impl<'a> App<'a> {
         if self.renderer.chain_but_mode && key.code == KeyCode::Esc {
             self.renderer.chain_but_mode = false;
             if let Some(phase) = self.chain.pending {
-                self.renderer.chain_prompt = Some(ChainPrompt {
-                    question: compact_str::CompactString::from(phase.chain_label()),
-                });
+                self.renderer.chain_prompt = Some(ChainPrompt::new(phase.chain_label()));
                 self.chain.label_msg = Some(phase.chain_label().to_string());
             }
             self.input.clear_buffer();
@@ -4511,9 +4512,7 @@ impl<'a> App<'a> {
                 if trimmed.is_empty() {
                     self.chain.pending = Some(phase);
                     self.chain.label_msg = Some(phase.chain_label().to_string());
-                    self.renderer.chain_prompt = Some(ChainPrompt {
-                        question: compact_str::CompactString::from(phase.chain_label()),
-                    });
+                    self.renderer.chain_prompt = Some(ChainPrompt::new(phase.chain_label()));
                     return Ok(());
                 }
                 self.run_chain_transition(
@@ -4536,6 +4535,8 @@ impl<'a> App<'a> {
                     return Ok(());
                 }
                 super::SubmitAction::RejectWhileRunning => {
+                    // Keep the refused command so it can be sent once the run ends.
+                    self.restore_interrupted_prompt(&text);
                     self.renderer.write_line(
                         "agent is running — wait for it to finish or press Ctrl-C before running a command",
                         C_ERROR,
@@ -5086,9 +5087,7 @@ impl<'a> App<'a> {
             self.chain.pending = Some(phase);
             self.chain.label_msg = Some(phase.chain_label().to_string());
             self.renderer.chain_but_mode = false;
-            self.renderer.chain_prompt = Some(ChainPrompt {
-                question: compact_str::CompactString::from(phase.chain_label()),
-            });
+            self.renderer.chain_prompt = Some(ChainPrompt::new(phase.chain_label()));
         }
 
         if !self.run.is_running {
@@ -5404,9 +5403,7 @@ impl<'a> App<'a> {
             )?,
         }
         self.renderer.chain_but_mode = false;
-        self.renderer.chain_prompt = Some(ChainPrompt {
-            question: proposal.action.label().into(),
-        });
+        self.renderer.chain_prompt = Some(ChainPrompt::new(proposal.action.label()));
         self.chain.git.pending = Some(proposal);
         self.refresh()?;
         Ok(())
@@ -5726,6 +5723,9 @@ impl<'a> App<'a> {
         {
             return Ok(true);
         }
+        if self.chain_prompt_premature(key) {
+            return Ok(true);
+        }
         match key.code {
             KeyCode::Char('y' | 'Y') => {
                 let proposal = self.chain.git.pending.take().unwrap();
@@ -5787,11 +5787,25 @@ impl<'a> App<'a> {
         false
     }
 
+    /// True while the chain/plan/git prompt is not armed yet: keys typed into
+    /// the draft just before it appeared must not answer it.
+    fn chain_prompt_premature(&self, key: KeyEvent) -> bool {
+        self.chain_prompt_premature_with(key, super::permission_handler::prompt_arming_delay())
+    }
+
+    fn chain_prompt_premature_with(&self, key: KeyEvent, delay: std::time::Duration) -> bool {
+        self.renderer.chain_prompt.as_ref().is_some_and(|p| {
+            super::permission_handler::premature_prompt_key(
+                &UserEvent::Key(key),
+                p.opened.elapsed(),
+                delay,
+            )
+        })
+    }
+
     fn show_plan_approval(&mut self) -> anyhow::Result<()> {
         self.renderer.chain_but_mode = false;
-        self.renderer.chain_prompt = Some(ChainPrompt {
-            question: compact_str::CompactString::from(crate::ui::plan::QUESTION),
-        });
+        self.renderer.chain_prompt = Some(ChainPrompt::new(crate::ui::plan::QUESTION));
         self.renderer
             .write_line(crate::ui::plan::QUESTION, C_AGENT)?;
         self.refresh()?;
@@ -5881,6 +5895,9 @@ impl<'a> App<'a> {
             return Ok(true);
         }
         if !(key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) {
+            return Ok(true);
+        }
+        if self.chain_prompt_premature(key) {
             return Ok(true);
         }
         match key.code {
@@ -6075,15 +6092,8 @@ impl<'a> App<'a> {
             .session
             .is_irreducible_with_pending(reserve, pending_tokens)
         {
-            #[cfg(feature = "multimodal")]
-            if self.ui.session.pending_media.iter().any(|item| {
-                matches!(
-                    item,
-                    crate::extras::multimodal::MediaAttachment::Image { .. }
-                )
-            }) {
-                self.input.load_text(text);
-            }
+            // The advice below is to shorten the message: keep it to edit.
+            self.restore_interrupted_prompt(text);
             let available = self
                 .ui
                 .session
@@ -6094,7 +6104,7 @@ impl<'a> App<'a> {
                 &format!(
                     "message too large to fit: estimated {pending_tokens} tokens, \
                      only ~{available} tokens available after overhead and reserve \
-                     (use /clear to free space or reduce message size)"
+                     (use /compact or /clear to free space, or shorten the message)"
                 ),
                 C_ERROR,
             );
@@ -6491,7 +6501,7 @@ impl<'a> App<'a> {
             .map(|s| s.trim())
             .unwrap_or("");
         if btw_text.is_empty() {
-            self.renderer.write_line("usage: /btw <message>", C_AGENT)?;
+            self.renderer.write_line("usage: /btw <message>", C_ERROR)?;
             return Ok(());
         }
         if self.btw_inflight >= BTW_MAX_INFLIGHT {
@@ -7346,16 +7356,16 @@ impl<'a> App<'a> {
                     )?;
                 }
             }
-            Err(e) if e.to_string().starts_with("DEFER_COMPRESS:") => {
-                let err_msg = e.to_string();
-                let instructions = err_msg.strip_prefix("DEFER_COMPRESS:").and_then(|s| {
-                    let s = s.trim();
-                    if s.is_empty() || s == "(none)" {
-                        None
-                    } else {
-                        Some(s.to_string())
-                    }
-                });
+            Err(e)
+                if matches!(
+                    e.downcast_ref::<DeferredSlash>(),
+                    Some(DeferredSlash::Compress(_))
+                ) =>
+            {
+                let Ok(DeferredSlash::Compress(instructions)) = e.downcast::<DeferredSlash>()
+                else {
+                    unreachable!("guard matched Compress")
+                };
                 let compress_result = handle_compress(
                     instructions.as_deref(),
                     false,
@@ -7373,15 +7383,14 @@ impl<'a> App<'a> {
             }
             #[cfg(feature = "mcp")]
             Err(e)
-                if e.to_string()
-                    .starts_with(crate::ui::slash::settings::DEFER_MCP_LOGIN) =>
+                if matches!(
+                    e.downcast_ref::<DeferredSlash>(),
+                    Some(DeferredSlash::McpLogin(_))
+                ) =>
             {
-                let server = e
-                    .to_string()
-                    .strip_prefix(crate::ui::slash::settings::DEFER_MCP_LOGIN)
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
+                let Ok(DeferredSlash::McpLogin(server)) = e.downcast::<DeferredSlash>() else {
+                    unreachable!("guard matched McpLogin")
+                };
                 crate::startup::heap_future(|| self.start_mcp_login(server)).await?;
             }
             #[cfg(feature = "git-worktree")]
@@ -7462,12 +7471,15 @@ impl<'a> App<'a> {
                     }
                 }
             }
-            Err(e) if e.to_string().starts_with("DEFER_INIT:") => {
-                let prompt = e
-                    .to_string()
-                    .strip_prefix("DEFER_INIT:")
-                    .unwrap_or("")
-                    .to_string();
+            Err(e)
+                if matches!(
+                    e.downcast_ref::<DeferredSlash>(),
+                    Some(DeferredSlash::Init(_))
+                ) =>
+            {
+                let Ok(DeferredSlash::Init(prompt)) = e.downcast::<DeferredSlash>() else {
+                    unreachable!("guard matched Init")
+                };
                 if matches!(&self.ui.client, crate::provider::AnyClient::Anthropic(_))
                     || self.ui.session.native_history_snapshot().is_some()
                 {
@@ -7539,22 +7551,29 @@ impl<'a> App<'a> {
                     }
                 }
             }
-            Err(e) if e.to_string().starts_with("DEFER_REVIEW:") => {
-                let msg = e
-                    .to_string()
-                    .strip_prefix("DEFER_REVIEW:")
-                    .unwrap_or("")
-                    .to_string();
+            Err(e)
+                if matches!(
+                    e.downcast_ref::<DeferredSlash>(),
+                    Some(DeferredSlash::Review(_))
+                ) =>
+            {
+                let Ok(DeferredSlash::Review(msg)) = e.downcast::<DeferredSlash>() else {
+                    unreachable!("guard matched Review")
+                };
                 self.chain.dot_prompt_restore = self.ui.context.one_shot_restore.take();
                 self.start_internal_main_run(&msg).await?;
             }
             #[cfg(feature = "memory")]
-            Err(e) if e.to_string().starts_with("DEFER_EDITOR:") => {
-                let path = e
-                    .to_string()
-                    .strip_prefix("DEFER_EDITOR:")
-                    .unwrap_or("")
-                    .to_string();
+            Err(e)
+                if matches!(
+                    e.downcast_ref::<DeferredSlash>(),
+                    Some(DeferredSlash::Editor(_))
+                ) =>
+            {
+                let Ok(DeferredSlash::Editor(path)) = e.downcast::<DeferredSlash>() else {
+                    unreachable!("guard matched Editor")
+                };
+                let path = path.display().to_string();
                 let editor = self
                     .ui
                     .cfg
@@ -7682,6 +7701,103 @@ impl<'a> App<'a> {
         Ok(())
     }
 
+    /// One user event while a `!` command runs. Resizes, scrolling and plain
+    /// editing keys act at once; the interrupt key (as bound, plus Ctrl+C)
+    /// cancels the command. Anything else is returned so the caller can park
+    /// it until the command ends.
+    fn bang_live_event(
+        &mut self,
+        event: UserEvent,
+        cancellation: &CommandCancellation,
+    ) -> anyhow::Result<Option<UserEvent>> {
+        match &event {
+            UserEvent::Resize => {
+                self.renderer.resize();
+                self.renderer.invalidate();
+                self.refresh()?;
+                return Ok(None);
+            }
+            UserEvent::ScrollPageUp => {
+                self.renderer.scroll_page_up();
+                return Ok(None);
+            }
+            UserEvent::ScrollPageDown => {
+                self.renderer.scroll_page_down();
+                return Ok(None);
+            }
+            UserEvent::ScrollUp => {
+                for _ in 0..self.ui.cfg.resolve_mouse_scroll_lines() {
+                    self.renderer.scroll_line_up();
+                }
+                return Ok(None);
+            }
+            UserEvent::ScrollDown => {
+                for _ in 0..self.ui.cfg.resolve_mouse_scroll_lines() {
+                    self.renderer.scroll_line_down();
+                }
+                return Ok(None);
+            }
+            UserEvent::Key(key) => {
+                let key = *key;
+                if key.kind == crossterm::event::KeyEventKind::Release {
+                    return Ok(None);
+                }
+                let action = self.keyboard_action(key);
+                let ctrl_c =
+                    key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+                if matches!(action, Some(KeyAction::Interrupt | KeyAction::Eof)) || ctrl_c {
+                    cancellation.cancel();
+                    self.renderer.show_notice("cancelling…", Color::Yellow);
+                    self.refresh()?;
+                    return Ok(None);
+                }
+                match action {
+                    Some(KeyAction::PageUp) => {
+                        self.renderer.scroll_page_up();
+                        return Ok(None);
+                    }
+                    Some(KeyAction::PageDown) => {
+                        self.renderer.scroll_page_down();
+                        return Ok(None);
+                    }
+                    Some(KeyAction::TranscriptTop) => {
+                        self.renderer.scroll_to_top();
+                        return Ok(None);
+                    }
+                    Some(KeyAction::TranscriptBottom) => {
+                        self.renderer.scroll_to_bottom()?;
+                        return Ok(None);
+                    }
+                    _ => {}
+                }
+                // Typing and cursor movement go to the draft; Enter and
+                // chords that could submit or open pickers wait.
+                let plain = !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+                let editing = plain
+                    && matches!(
+                        key.code,
+                        KeyCode::Char(_)
+                            | KeyCode::Backspace
+                            | KeyCode::Delete
+                            | KeyCode::Left
+                            | KeyCode::Right
+                    );
+                if editing && self.input.picker.is_none() && !self.input.vim_enabled() {
+                    if let Some(submitted) = self.input.handle_key(key) {
+                        // Never submit while the command runs.
+                        self.input.load_text(&submitted);
+                    }
+                    self.refresh()?;
+                    return Ok(None);
+                }
+            }
+            _ => {}
+        }
+        Ok(Some(event))
+    }
+
     async fn run_bang_command(&mut self, text: &str) -> anyhow::Result<()> {
         /// Live output of a `!` command is repainted at most this often.
         const BANG_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
@@ -7707,6 +7823,18 @@ impl<'a> App<'a> {
         })?;
 
         let cancellation = CommandCancellation::new();
+        let interrupt_key = self
+            .input
+            .keybindings
+            .action_keys()
+            .into_iter()
+            .find(|(name, _)| *name == "interrupt")
+            .and_then(|(_, keys)| keys.into_iter().next())
+            .unwrap_or_else(|| "ctrl+c".to_owned());
+        self.renderer.show_notice(
+            &format!("running… {interrupt_key} cancels"),
+            Color::DarkGrey,
+        );
         let sandbox = self.ui.sandbox.clone();
         let progress = crate::sandbox::CommandProgress::new();
         let mut progress_changes = progress.subscribe();
@@ -7751,19 +7879,14 @@ impl<'a> App<'a> {
                         cancellation.cancel();
                         break operation.await?;
                     };
-                    let interrupt = matches!(
-                        &event,
-                        UserEvent::Key(key)
-                            if matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d'))
-                                && key.modifiers.contains(KeyModifiers::CONTROL)
-                    );
-                    if interrupt {
-                        cancellation.cancel();
-                    } else if matches!(event, UserEvent::Quit) {
-                        cancellation.cancel();
-                        self.deferred_user_events.push_back(event);
-                    } else {
-                        self.deferred_user_events.push_back(event);
+                    match self.bang_live_event(event, &cancellation)? {
+                        None => {}
+                        Some(event) => {
+                            if matches!(event, UserEvent::Quit) {
+                                cancellation.cancel();
+                            }
+                            self.deferred_user_events.push_back(event);
+                        }
                     }
                 }
             }
@@ -9275,7 +9398,7 @@ mod interrupt_rewind_tests {
         app.run.is_running = false;
         app.handle_key_event(escape).await.unwrap();
         app.handle_key_event(escape).await.unwrap();
-        for code in [KeyCode::Down, KeyCode::Enter, KeyCode::Enter] {
+        for code in [KeyCode::Up, KeyCode::Enter, KeyCode::Enter] {
             app.handle_key_event(KeyEvent::new(code, KeyModifiers::NONE))
                 .await
                 .unwrap();
@@ -9348,7 +9471,7 @@ mod interrupt_rewind_tests {
             app.input.load_text("");
             app.handle_key_event(escape).await.unwrap();
             app.handle_key_event(escape).await.unwrap();
-            for code in [KeyCode::Down, KeyCode::Enter, KeyCode::Down, KeyCode::Enter] {
+            for code in [KeyCode::Up, KeyCode::Enter, KeyCode::Down, KeyCode::Enter] {
                 app.handle_key_event(KeyEvent::new(code, KeyModifiers::NONE))
                     .await
                     .unwrap();
@@ -9367,7 +9490,7 @@ mod interrupt_rewind_tests {
             app.input.load_text("");
             app.handle_key_event(escape).await.unwrap();
             app.handle_key_event(escape).await.unwrap();
-            for code in [KeyCode::Down, KeyCode::Enter, KeyCode::Down, KeyCode::Enter] {
+            for code in [KeyCode::Up, KeyCode::Enter, KeyCode::Down, KeyCode::Enter] {
                 app.handle_key_event(KeyEvent::new(code, KeyModifiers::NONE))
                     .await
                     .unwrap();
@@ -9404,7 +9527,7 @@ mod interrupt_rewind_tests {
             app.handle_key_event(escape).await.unwrap();
             app.handle_key_event(escape).await.unwrap();
             for code in [
-                KeyCode::Down,
+                KeyCode::Up,
                 KeyCode::Enter,
                 KeyCode::Down,
                 KeyCode::Down,
@@ -10197,6 +10320,116 @@ mod explicit_shell_persistence_tests {
             "the live tail block is removed after the run: {texts:?}"
         );
         assert_eq!(texts.iter().filter(|text| *text == "EARLY_LINE").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn chain_plan_and_git_prompts_discard_type_ahead_until_armed() {
+        use std::time::Duration;
+        let root = crate::tests::OwnedTestDirectory::new("chain-prompt-arming");
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let cfg = crate::config::Config::default();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new("openrouter", "fixture", 128_000, "");
+        let ui = shell_ui(&cli, &cfg, &mut session, &mut context, workspace);
+        let mut app = fixture_app(ui);
+        let y = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
+        // No prompt: nothing is premature.
+        assert!(!app.chain_prompt_premature_with(y, Duration::from_secs(60)));
+        // A freshly opened prompt (plan approval, git proposal and the chain
+        // prompt all share `ChainPrompt::new`) ignores answer keys until armed.
+        app.renderer.chain_prompt = Some(ChainPrompt::new("approve?"));
+        assert!(app.chain_prompt_premature_with(y, Duration::from_secs(60)));
+        assert!(!app.chain_prompt_premature_with(y, Duration::ZERO));
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!app.chain_prompt_premature_with(esc, Duration::from_secs(60)));
+    }
+
+    #[tokio::test]
+    async fn typed_keys_edit_the_draft_while_a_bang_command_runs() {
+        let root = crate::tests::OwnedTestDirectory::new("bang-live-typing");
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            (
+                "MINI_AGENT_CONFIG_DIR",
+                Some(root.path().join("config").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_DATA_DIR",
+                Some(root.path().join("data").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_LOCAL_DATA_DIR",
+                Some(root.path().join("local-data").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_STATE_DIR",
+                Some(root.path().join("state").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_CACHE_DIR",
+                Some(root.path().join("cache").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_CREDENTIALS_DIR",
+                Some(root.path().join("credentials").into_os_string()),
+            ),
+        ]);
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_sandbox: true,
+            tools: vec!["shell".into()],
+            ..Default::default()
+        };
+        let cfg = crate::config::Config::default();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new("openrouter", "fixture", 128_000, "");
+        let _session_release = SessionRelease(session.id.to_string());
+        let ui = shell_ui(&cli, &cfg, &mut session, &mut context, workspace);
+        let mut app = fixture_app(ui);
+        app.user_tx
+            .try_send(UserEvent::Key(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        app.run_bang_command("!sleep 0.5; printf DONE")
+            .await
+            .unwrap();
+        assert_eq!(
+            app.input.buffer.as_str(),
+            "x",
+            "typed key reaches the draft"
+        );
+        assert!(
+            app.deferred_user_events.is_empty(),
+            "an editing key is not parked until the command ends"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_command_refused_while_running_stays_in_the_draft() {
+        let root = crate::tests::OwnedTestDirectory::new("reject-keeps-draft");
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let cfg = crate::config::Config::default();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new("openrouter", "fixture", 128_000, "");
+        let ui = shell_ui(&cli, &cfg, &mut session, &mut context, workspace);
+        let mut app = fixture_app(ui);
+        app.run.is_running = true;
+        app.input.load_text("/model x");
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        app.handle_key_event_with(enter, None).await.unwrap();
+        assert_eq!(app.input.buffer.as_str(), "/model x");
     }
 
     #[tokio::test]
@@ -11495,9 +11728,7 @@ mod permission_loop_tests {
         app.input.start_command_picker();
         assert!(!app.paste_clipboard_image(&reader).await.unwrap());
         app.input.picker = None;
-        app.renderer.chain_prompt = Some(ChainPrompt {
-            question: "operator approval".into(),
-        });
+        app.renderer.chain_prompt = Some(ChainPrompt::new("operator approval"));
         assert!(!app.paste_clipboard_image(&reader).await.unwrap());
         assert_eq!(reader.0.load(Ordering::SeqCst), reads);
         assert!(app.run.agent_rx.is_none());
@@ -14478,7 +14709,7 @@ mod git_feature_off_consumer_tests {
         assert_eq!(
             (0..app.renderer.feed().block_count())
                 .filter_map(|index| app.renderer.feed().block_text(index))
-                .filter(|text| text.contains("Git commands require the git-worktree feature"))
+                .filter(|text| text.contains("git command requires the 'git-worktree' feature"))
                 .count(),
             3
         );

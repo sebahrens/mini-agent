@@ -126,7 +126,7 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
             return Ok(());
         }
         write_ok(ctx.renderer, "delegating AGENTS.md creation to agent...");
-        return Err(anyhow::anyhow!("DEFER_INIT:{}", AGENTS_CREATION_PROMPT));
+        return Err(super::DeferredSlash::Init(AGENTS_CREATION_PROMPT.to_owned()).into());
     }
 
     Ok(())

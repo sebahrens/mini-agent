@@ -42,12 +42,19 @@ async fn handle_add(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
             write_ok(ctx.renderer, "no files added (use /add <path>)");
         } else {
             write_ok(ctx.renderer, "added files:");
+            // One 1-based sequence over files, then media: `/drop N` uses it.
+            let mut number = 0usize;
             for f in &ctx.context.extra_files {
+                number += 1;
                 let size = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
-                write_result(ctx.renderer, format!("  {} ({size}B)", f.display()));
+                write_result(
+                    ctx.renderer,
+                    format!("  {number}. {} ({size}B)", f.display()),
+                );
             }
             #[cfg(feature = "multimodal")]
             for m in &ctx.session.pending_media {
+                number += 1;
                 let (kind, size) = match m {
                     crate::extras::multimodal::MediaAttachment::Image { data, .. } => {
                         ("image", data.len())
@@ -61,11 +68,11 @@ async fn handle_add(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
                 };
                 write_result(
                     ctx.renderer,
-                    format!("  [{kind}] {} ({size}B)", m.path().display()),
+                    format!("  {number}. [{kind}] {} ({size}B)", m.path().display()),
                 );
             }
         }
-        write_result(ctx.renderer, "usage: /add <path>");
+        write_result(ctx.renderer, "usage: /add <path>  |  /drop <number|path>");
         return Ok(());
     }
 
@@ -208,16 +215,43 @@ async fn add_one(arg: &str, ctx: &mut SlashCtx<'_>) -> bool {
 
 async fn handle_drop(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     if parts.len() < 2 {
-        write_error(ctx.renderer, "usage: /drop <path-or-index>...");
+        write_error(
+            ctx.renderer,
+            "usage: /drop <number|path>...  (numbers: see /add)",
+        );
         return Ok(());
     }
 
+    // Numbers are resolved against the list as it is now, before anything is
+    // removed, so `/drop 1 2` drops what `/add` showed as 1 and 2.
+    let files = ctx.context.extra_files.clone();
+    #[cfg(feature = "multimodal")]
+    let media: Vec<std::path::PathBuf> = ctx
+        .session
+        .pending_media
+        .iter()
+        .map(|m| m.path().to_path_buf())
+        .collect();
+    #[cfg(not(feature = "multimodal"))]
+    let media: Vec<std::path::PathBuf> = Vec::new();
     let mut rebuild = false;
-    // Highest media index first so earlier removals do not shift later ones.
-    let mut args: Vec<&str> = parts[1..].to_vec();
-    args.sort_by_key(|arg| std::cmp::Reverse(arg.parse::<usize>().ok()));
-    for arg in args {
-        rebuild |= drop_one(arg, ctx);
+    for arg in &parts[1..] {
+        match arg.parse::<usize>() {
+            Ok(number) => match drop_target(number, &files, &media) {
+                Some(DropTarget::File(path)) => {
+                    rebuild |= drop_one(&path.to_string_lossy(), ctx);
+                }
+                Some(DropTarget::Media(path)) => drop_media(&path, ctx),
+                None => write_error(
+                    ctx.renderer,
+                    format!(
+                        "no item {number}: /add lists 1..{} (use ./{number} for a file named {number})",
+                        files.len() + media.len()
+                    ),
+                ),
+            },
+            Err(_) => rebuild |= drop_one(arg, ctx),
+        }
     }
     if rebuild {
         ctx.rebuild_agent().await;
@@ -225,7 +259,48 @@ async fn handle_drop(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
     Ok(())
 }
 
-/// Drop one path or media index; returns whether a text file left the context.
+/// The item `/add` numbers `number` (1-based, files then media), as a path.
+fn drop_target(
+    number: usize,
+    files: &[std::path::PathBuf],
+    media: &[std::path::PathBuf],
+) -> Option<DropTarget> {
+    let index = number.checked_sub(1)?;
+    if let Some(file) = files.get(index) {
+        return Some(DropTarget::File(file.clone()));
+    }
+    media
+        .get(index.checked_sub(files.len())?)
+        .map(|path| DropTarget::Media(path.clone()))
+}
+
+#[derive(Debug, PartialEq)]
+enum DropTarget {
+    File(std::path::PathBuf),
+    Media(std::path::PathBuf),
+}
+
+/// Drop the pending attachment with exactly this path (media paths need not
+/// exist on disk, so they are not resolved like `/drop <path>` arguments).
+fn drop_media(path: &std::path::Path, ctx: &mut SlashCtx<'_>) {
+    #[cfg(feature = "multimodal")]
+    if let Some(i) = ctx
+        .session
+        .pending_media
+        .iter()
+        .position(|m| m.path() == path)
+    {
+        ctx.session.pending_media.remove(i);
+        write_ok(ctx.renderer, format!("dropped media: {}", path.display()));
+        return;
+    }
+    write_error(
+        ctx.renderer,
+        format!("not in context: {} (use /add to see)", path.display()),
+    );
+}
+
+/// Drop one path; returns whether a text file left the context.
 fn drop_one(arg: &str, ctx: &mut SlashCtx<'_>) -> bool {
     let path = resolve_path(ctx.workspace.root(), arg);
     let canonical = path.canonicalize().unwrap_or(path);
@@ -252,17 +327,6 @@ fn drop_one(arg: &str, ctx: &mut SlashCtx<'_>) -> bool {
             write_ok(
                 ctx.renderer,
                 format!("dropped media: {}", canonical.display()),
-            );
-            return false;
-        }
-        // Also try parsing as an index into the pending_media list.
-        if let Ok(idx) = arg.parse::<usize>()
-            && idx < ctx.session.pending_media.len()
-        {
-            let removed = ctx.session.pending_media.remove(idx);
-            write_ok(
-                ctx.renderer,
-                format!("dropped media: {}", removed.path().display()),
             );
             return false;
         }
@@ -306,4 +370,34 @@ async fn handle_drop_all(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     }
     write_ok(ctx.renderer, format!("dropped {}", parts.join(", ")));
     Ok(())
+}
+
+#[cfg(test)]
+mod drop_index_tests {
+    use super::{DropTarget, drop_target};
+    use std::path::PathBuf;
+
+    #[test]
+    fn numbers_address_files_then_media_one_based() {
+        let files: Vec<PathBuf> = vec!["/ws/a.txt".into(), "/ws/b.txt".into()];
+        let media: Vec<PathBuf> = vec!["/ws/img.png".into()];
+        assert_eq!(
+            drop_target(1, &files, &media),
+            Some(DropTarget::File("/ws/a.txt".into()))
+        );
+        assert_eq!(
+            drop_target(2, &files, &media),
+            Some(DropTarget::File("/ws/b.txt".into()))
+        );
+        assert_eq!(
+            drop_target(3, &files, &media),
+            Some(DropTarget::Media("/ws/img.png".into()))
+        );
+        assert_eq!(drop_target(0, &files, &media), None);
+        assert_eq!(drop_target(4, &files, &media), None);
+        assert_eq!(
+            drop_target(1, &[], &media),
+            Some(DropTarget::Media("/ws/img.png".into()))
+        );
+    }
 }

@@ -1176,10 +1176,7 @@ pub(crate) async fn handle_slash(
             }
             #[cfg(not(feature = "git-worktree"))]
             {
-                write_error(
-                    ctx.renderer,
-                    "Git commands require the git-worktree feature",
-                );
+                write_error(ctx.renderer, feature_missing("git command", "git-worktree"));
                 Ok(())
             }
         }
@@ -1279,10 +1276,7 @@ pub(crate) async fn handle_slash(
         }
         #[cfg(not(feature = "goal"))]
         "/goal" => {
-            write_error(
-                ctx.renderer,
-                "/goal requires the 'goal' feature: cargo install --path . --features goal",
-            );
+            write_error(ctx.renderer, feature_missing("/goal", "goal"));
             Ok(())
         }
         _ => {
@@ -1311,6 +1305,58 @@ pub(crate) async fn handle_slash(
         }
     }
 }
+
+/// The one message for a command whose Cargo feature is not compiled in.
+pub(crate) fn feature_missing(command: &str, feature: &str) -> String {
+    format!(
+        "{command} requires the '{feature}' feature: cargo install --path . --features {feature}"
+    )
+}
+
+#[cfg(test)]
+mod feature_missing_tests {
+    #[test]
+    fn names_the_install_command_never_cargo_build() {
+        let message = super::feature_missing("/loop", "loop");
+        assert_eq!(
+            message,
+            "/loop requires the 'loop' feature: cargo install --path . --features loop"
+        );
+        assert!(!message.contains("cargo build"));
+    }
+}
+
+/// A slash command that finishes in the app loop (it needs the runner, the
+/// terminal or the event thread), signalled through `Err` and downcast once in
+/// `App::handle_slash_result`.
+#[derive(Debug)]
+#[allow(dead_code)] // some variants exist only in feature builds
+pub(crate) enum DeferredSlash {
+    /// `/compact [instructions]`.
+    Compress(Option<String>),
+    /// `/init`: the prompt that creates AGENTS.md.
+    Init(String),
+    /// `/review`: the prompt to run as an internal turn.
+    Review(String),
+    /// `/memory editor`: the file to open.
+    Editor(std::path::PathBuf),
+    /// `/mcp login <server>`: the OAuth login runs as a background task.
+    McpLogin(String),
+}
+
+impl std::fmt::Display for DeferredSlash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Compress(_) => "deferred slash action: compact",
+            Self::Init(_) => "deferred slash action: init",
+            Self::Review(_) => "deferred slash action: review",
+            Self::Editor(_) => "deferred slash action: editor",
+            Self::McpLogin(_) => "deferred slash action: mcp login",
+        })
+    }
+}
+
+impl std::error::Error for DeferredSlash {}
 
 #[cfg(test)]
 mod argument_split_tests {

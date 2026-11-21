@@ -38,22 +38,28 @@ fn run_tutor(terminal_guard: &mut TerminalGuard) -> anyhow::Result<()> {
 
 pub fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) {
     if parts.get(1) == Some(&"keys") {
-        keys_lines(&mut |heading, text| {
+        keys_lines(
+            &mut |heading, text| {
+                if heading {
+                    write_ok(ctx.renderer, text);
+                } else {
+                    write_result(ctx.renderer, text);
+                }
+            },
+            &ctx.input.keybindings,
+        );
+        return;
+    }
+    help_lines(
+        &mut |heading, text| {
             if heading {
                 write_ok(ctx.renderer, text);
             } else {
                 write_result(ctx.renderer, text);
             }
-        });
-        return;
-    }
-    help_lines(&mut |heading, text| {
-        if heading {
-            write_ok(ctx.renderer, text);
-        } else {
-            write_result(ctx.renderer, text);
-        }
-    });
+        },
+        &ctx.input.keybindings,
+    );
     // A live view never reloads templates while its runner owns context.
     if *ctx.is_running {
         return;
@@ -82,7 +88,10 @@ pub fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) {
 }
 
 /// Every line `/help` prints, in order; `true` marks a section heading.
-pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
+pub(crate) fn help_lines(
+    emit: &mut dyn FnMut(bool, &str),
+    bindings: &crate::config::keybindings::KeyBindings,
+) {
     emit(true, "commands:");
     emit(
         false,
@@ -477,24 +486,97 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
             "  /subagent-models <n>   switch subagent to a quick model",
         );
     }
-    keys_lines(emit);
+    keys_lines(emit, bindings);
 }
 
-fn keys_lines(emit: &mut dyn FnMut(bool, &str)) {
+/// One-line meaning of each rebindable action, keyed by its config name
+/// (`KeyBindings::action_keys`). Every action needs a row here.
+const ACTION_HELP: &[(&str, &str)] = &[
+    ("submit", "send the message"),
+    (
+        "newline",
+        "insert a newline (also Ctrl+J, or backslash then Enter)",
+    ),
+    ("complete", "insert the picker choice / complete"),
+    ("line_start", "line start (empty input: top of chat)"),
+    ("line_end", "line end (empty input: bottom of chat)"),
+    ("left", "move left"),
+    ("right", "move right"),
+    ("up", "move up; history at input boundaries"),
+    ("down", "move down; history at input boundaries"),
+    ("word_left", "move word left"),
+    ("word_right", "move word right"),
+    ("delete_backward", "delete the previous character"),
+    ("delete_forward", "delete the next character"),
+    ("delete_word_backward", "delete the word before the cursor"),
+    ("delete_word_forward", "delete the next word"),
+    ("kill_before", "delete before the cursor"),
+    ("kill_after", "delete after the cursor"),
+    ("yank", "yank the kill ring"),
+    ("yank_previous", "rotate the kill ring"),
+    ("undo", "undo the last edit"),
+    (
+        "interrupt",
+        "interrupt/clear; press again consecutively to exit",
+    ),
+    ("eof", "interrupt; idle: delete, or exit when empty"),
+    ("cycle_mode", "cycle the security mode"),
+    ("cycle_reasoning", "cycle reasoning: collapsed/full/off"),
+    ("history_search", "search input history"),
+    ("page_up", "scroll chat history up a page"),
+    ("page_down", "scroll chat history down a page"),
+    ("transcript_top", "jump to the top of chat"),
+    ("transcript_bottom", "jump to the bottom of chat"),
+    ("open_editor", "edit input in $EDITOR"),
+    ("lazygit", "launch lazygit"),
+    ("copy_selection", "copy selected text"),
+    ("paste_clipboard", "paste clipboard text or image"),
+    ("toggle_vim", "toggle vim editing"),
+    ("show_keys", "list the effective key bindings"),
+];
+
+/// "ctrl+shift+o" -> "Ctrl+Shift+O", "pageup" -> "PgUp".
+fn pretty_key(chord: &str) -> String {
+    chord
+        .split('+')
+        .map(|part| match part {
+            "pageup" => "PgUp".to_owned(),
+            "pagedown" => "PgDn".to_owned(),
+            "backtab" => "Shift+Tab".to_owned(),
+            other => {
+                let mut chars = other.chars();
+                chars
+                    .next()
+                    .map(|first| first.to_uppercase().chain(chars).collect())
+                    .unwrap_or_default()
+            }
+        })
+        .collect::<Vec<String>>()
+        .join("+")
+}
+
+fn keys_lines(
+    emit: &mut dyn FnMut(bool, &str),
+    bindings: &crate::config::keybindings::KeyBindings,
+) {
     emit(true, "keys:");
     emit(false, "  ? (empty input)        show these shortcuts");
-    emit(
-        false,
-        "  PgUp/PgDn, Alt+Up/Down scroll chat history by a page (Shift/Ctrl+wheel too)",
-    );
-    emit(
-        false,
-        "  Home/End               line start/end (empty input: top/bottom)",
-    );
-    emit(
-        false,
-        "  Ctrl+Home/Ctrl+End     jump to top/bottom of chat (also Alt+Shift+Up/Down, Alt+</Alt+>)",
-    );
+    // Rebindable actions: the keys shown are the effective ones, as in /keys.
+    for (name, keys) in bindings.action_keys() {
+        if keys.is_empty() {
+            continue;
+        }
+        let description = ACTION_HELP
+            .iter()
+            .find(|(action, _)| *action == name)
+            .map_or(name, |(_, description)| description);
+        let keys = keys
+            .iter()
+            .map(|key| pretty_key(key))
+            .collect::<Vec<_>>()
+            .join(", ");
+        emit(false, &format!("  {keys:<22} {description}"));
+    }
     emit(
         false,
         "  /<command>             command picker (Tab insert, Enter run, Esc cancel)",
@@ -510,6 +592,10 @@ fn keys_lines(emit: &mut dyn FnMut(bool, &str)) {
     );
     emit(
         false,
+        "  Esc Esc                rewind picker (empty input)",
+    );
+    emit(
+        false,
         "  mouse drag             select text (copies to clipboard on release)",
     );
     emit(
@@ -517,52 +603,24 @@ fn keys_lines(emit: &mut dyn FnMut(bool, &str)) {
         "  mouse double-click     select and copy the word under the pointer",
     );
     emit(false, "  Esc (while selected)   clear selection (no copy)");
-    #[cfg(windows)]
-    emit(false, "  Ctrl+Shift+C           copy selected text");
-    #[cfg(windows)]
-    emit(
-        false,
-        "  Ctrl+V                 paste Unicode clipboard text",
-    );
-    emit(
-        false,
-        "  Ctrl+R                 cycle reasoning: collapsed/full/off",
-    );
     emit(
         false,
         "  Ctrl+T                 fold/unfold the latest tool result (or click its summary)",
     );
-    emit(false, "  Ctrl+G                 edit input in $EDITOR");
-    emit(false, "  Ctrl+O                 launch lazygit");
     emit(
         false,
-        "  Ctrl+W/U/K             delete word/before/after cursor",
+        "  mouse scroll           scroll chat (Shift/Ctrl+wheel: a page)",
     );
-    emit(false, "  Ctrl+A/E/B/F           move line edge/character");
-    emit(
-        false,
-        "  Ctrl+P/Ctrl+N          move up/down; history at input boundaries",
-    );
-    emit(false, "  Alt+B/F/D              move word/delete next word");
-    emit(
-        false,
-        "  Alt/Ctrl+Left/Right    move word; Alt+Backspace deletes word",
-    );
-    emit(false, "  Ctrl+Y / Alt+Y         yank/rotate kill ring");
-    emit(
-        false,
-        "  Ctrl+C                 interrupt/clear; press again consecutively to exit",
-    );
-    emit(
-        false,
-        "  Ctrl+D                 interrupt; idle: delete, or exit when empty",
-    );
-    emit(false, "  mouse scroll           scroll chat");
 }
 
 #[cfg(test)]
 mod tests {
-    use super::help_lines;
+    use super::{help_lines as help_lines_with, pretty_key};
+    use crate::config::keybindings::KeyBindings;
+
+    fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
+        help_lines_with(emit, &KeyBindings::default());
+    }
     use crate::ui::pickers::list::{COMMAND_ALIASES, available_commands, is_command_alias};
 
     /// Command names `/help` mentions, skipping lines that describe a feature
@@ -628,9 +686,15 @@ mod tests {
             "{lines:?}"
         );
         assert!(
-            lines.iter().any(|line| line.contains("Ctrl+P")
-                && line.contains("Ctrl+N")
-                && line.contains("history")),
+            lines
+                .iter()
+                .any(|line| line.contains("Ctrl+P") && line.contains("history")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Ctrl+N") && line.contains("history")),
             "{lines:?}"
         );
     }
@@ -691,5 +755,56 @@ mod tests {
                 !cfg!(feature = "git-worktree")
             );
         }
+    }
+
+    /// mini-agent-sskdu.41: the key list is generated from the bindings.
+    #[test]
+    fn help_lists_every_default_binding_and_follows_rebinding() {
+        let bindings = KeyBindings::default();
+        let mut lines = Vec::new();
+        help_lines_with(&mut |_, line| lines.push(line.to_owned()), &bindings);
+        for (name, keys) in bindings.action_keys() {
+            assert!(
+                super::ACTION_HELP.iter().any(|(action, _)| *action == name),
+                "{name} has no help text"
+            );
+            if keys.is_empty() {
+                continue;
+            }
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| keys.iter().all(|key| line.contains(&pretty_key(key)))),
+                "{name} ({keys:?}) missing from the key list: {lines:?}"
+            );
+        }
+        let reasoning = lines
+            .iter()
+            .find(|line| line.contains("cycle reasoning"))
+            .unwrap();
+        assert!(
+            reasoning.contains("Alt+R") && !reasoning.contains("Ctrl+R"),
+            "{reasoning}"
+        );
+        let search = lines
+            .iter()
+            .find(|line| line.contains("search input history"))
+            .unwrap();
+        assert!(search.contains("Ctrl+R"), "{search}");
+        let overrides = crate::config::keybindings::KeyOverrides::from([(
+            "history_search".to_owned(),
+            vec!["ctrl+x".to_owned()],
+        )]);
+        let rebound = KeyBindings::from_overrides(Some(&overrides)).unwrap();
+        let mut lines = Vec::new();
+        help_lines_with(&mut |_, line| lines.push(line.to_owned()), &rebound);
+        let search = lines
+            .iter()
+            .find(|line| line.contains("search input history"))
+            .unwrap();
+        assert!(
+            search.contains("Ctrl+X") && !search.contains("Ctrl+R"),
+            "{search}"
+        );
     }
 }

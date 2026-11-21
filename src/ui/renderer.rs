@@ -199,6 +199,18 @@ pub struct PermissionPrompt {
 
 pub struct ChainPrompt {
     pub question: CompactString,
+    /// When the prompt appeared; answer keys typed before it is armed were
+    /// meant for the draft (see `permission_handler::premature_prompt_key`).
+    pub opened: std::time::Instant,
+}
+
+impl ChainPrompt {
+    pub fn new(question: impl Into<CompactString>) -> Self {
+        Self {
+            question: question.into(),
+            opened: std::time::Instant::now(),
+        }
+    }
 }
 
 /// Everything that affects what the chat viewport paints. Compared between
@@ -605,6 +617,49 @@ fn prompt_header_shortened(header: &str, options: &str, width: usize, rows: &[St
     rows[..rows.len() - option_rows] != full[..]
 }
 
+/// Rows for the options block of a prompt, at most `room` of them. Each
+/// `\n`-separated line is its own row group (a question overlay lists one
+/// option per line, then its answer draft and key hint). When they do not
+/// fit, the last two lines (the draft and the key legend) are kept and the
+/// earlier ones shrink to one row each, so the tail is never what is cut.
+fn option_block_rows(options: &str, width: usize, room: usize) -> Vec<String> {
+    use crate::ui::utils::{display_prefix, wrap_to_width};
+    let options = crate::ui::events::sanitize_output(options);
+    let lines: Vec<&str> = options.split('\n').collect();
+    if lines.len() == 1 {
+        let mut rows = wrap_to_width(lines[0], width);
+        rows.truncate(room);
+        return rows;
+    }
+    let all: Vec<Vec<String>> = lines.iter().map(|l| wrap_to_width(l, width)).collect();
+    if all.iter().map(Vec::len).sum::<usize>() <= room {
+        return all.into_iter().flatten().collect();
+    }
+    let keep = lines.len().min(2);
+    let (head, tail) = all.split_at(all.len() - keep);
+    let mut tail_rows: Vec<String> = tail.iter().flatten().cloned().collect();
+    if tail_rows.len() > room {
+        // Keep the legend (last rows), drop the front of a long draft.
+        tail_rows.drain(..tail_rows.len() - room);
+    }
+    let head_room = room - tail_rows.len();
+    let mut rows: Vec<String> = head
+        .iter()
+        .take(head_room)
+        .map(|group| {
+            let first = group.first().map(String::as_str).unwrap_or("");
+            display_prefix(first, width).to_string()
+        })
+        .collect();
+    if head.len() > head_room && head_room > 0 {
+        let hidden = head.len() - head_room + 1;
+        let note = format!("  … {hidden} more option(s)");
+        *rows.last_mut().expect("head_room > 0") = display_prefix(&note, width).to_string();
+    }
+    rows.extend(tail_rows);
+    rows
+}
+
 /// Lay out a permission (or chain) prompt as terminal rows: the sanitized
 /// `header` hard-wrapped to `width`, then the `options`, in at most
 /// `max_rows` rows. Nothing is ever written raw: a multi-line header (a
@@ -623,9 +678,7 @@ pub(crate) fn prompt_block_rows(
     let width = width.max(1);
     let max_rows = max_rows.max(2);
     let header = crate::ui::events::sanitize_for_review(header);
-    let options = crate::ui::events::sanitize_output(options).replace('\n', " ");
-    let mut option_rows = wrap_to_width(&options, width);
-    option_rows.truncate(max_rows - 1);
+    let option_rows = option_block_rows(options, width, max_rows - 1);
     let budget = max_rows - option_rows.len();
     let lines: Vec<&str> = header.split('\n').collect();
 
