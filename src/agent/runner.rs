@@ -377,6 +377,13 @@ impl ToolLoopState {
     ) -> Option<String> {
         if super::read_loop::invalidates_evidence(tool_name) {
             self.successful_reads.clear_after_mutation();
+            // A completed mutation changes what an identical call would now
+            // do (a re-read after an edit, a test run after a fix), so the
+            // counters for calls that failed before it no longer predict
+            // anything. A failed mutation changes nothing the model can rely on.
+            if outcome.is_success() {
+                self.failures.clear();
+            }
         }
         if outcome.is_success() {
             self.failures.remove(&fingerprint);
@@ -409,8 +416,14 @@ impl ToolLoopState {
 }
 
 /// Run-scoped guard against repeated failures, unchanged reads and edit/undo oscillation.
-/// Rig creates a fresh [`HookContext`] for every user turn, so no state leaks
-/// between turns or agents.
+/// Rig creates a fresh [`HookContext`] for every provider stream (`drive_agent`),
+/// so no state leaks between user turns or agents. A forced continuation inside
+/// one user turn (empty response, truncation, Stop-hook block, verification
+/// retry, transient retry) starts a new stream and therefore a fresh state:
+/// the counters are per stream, not per user turn (mini-agent-sskdu.258).
+///
+/// It also answers a call to a tool that is not advertised: instead of the
+/// run-ending default, the model gets a corrective tool result.
 pub(crate) struct ToolLoopGuard;
 
 impl<M: CompletionModel> AgentHook<M> for ToolLoopGuard {
@@ -473,6 +486,7 @@ impl<M: CompletionModel> AgentHook<M> for ToolLoopGuard {
                     Flow::rewrite_result(format!("{result}\n\n{notice}"))
                 })
             }
+            StepEvent::InvalidToolCall(context) => Flow::skip(unknown_tool_message(context)),
             _ => Flow::cont(),
         }
     }
@@ -480,9 +494,84 @@ impl<M: CompletionModel> AgentHook<M> for ToolLoopGuard {
     fn observes(&self, kind: StepEventKind) -> bool {
         matches!(
             kind,
-            StepEventKind::CompletionCall | StepEventKind::ToolCall | StepEventKind::ToolResult
+            StepEventKind::CompletionCall
+                | StepEventKind::ToolCall
+                | StepEventKind::ToolResult
+                | StepEventKind::InvalidToolCall
         )
     }
+}
+
+/// Levenshtein distance over chars, for suggesting the tool a model meant.
+fn tool_name_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut previous: Vec<usize> = (0..=b.len()).collect();
+    let mut current = vec![0; b.len() + 1];
+    for (i, ca) in a.chars().enumerate() {
+        current[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let substitution = previous[j] + usize::from(ca != *cb);
+            current[j + 1] = substitution.min(previous[j + 1] + 1).min(current[j] + 1);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[b.len()]
+}
+
+/// Up to three advertised names closest to `wanted`, best first.
+fn closest_tool_names<'a>(wanted: &str, candidates: &'a [String]) -> Vec<&'a str> {
+    let wanted = wanted.to_ascii_lowercase();
+    let mut scored: Vec<(usize, &str)> = candidates
+        .iter()
+        .map(|candidate| {
+            let lower = candidate.to_ascii_lowercase();
+            let mut distance = tool_name_distance(&wanted, &lower);
+            // Aliases such as `bash` for `shell`, or `read_file` for `read`,
+            // are not close in edit distance; a shared word is.
+            if lower.contains(&wanted) || wanted.contains(&lower) {
+                distance = distance.min(1);
+            }
+            (distance, candidate.as_str())
+        })
+        .filter(|(distance, name)| {
+            *distance <= (wanted.chars().count().max(name.chars().count()) / 2).max(2)
+        })
+        .collect();
+    scored.sort_by_key(|(distance, name)| (*distance, *name));
+    scored.into_iter().take(3).map(|(_, name)| name).collect()
+}
+
+/// The corrective tool result for a call to a tool the model was not offered.
+///
+/// A wrong tool name is an ordinary tool-calling mistake. Rig's default is to
+/// end the run, which costs the user the turn; the model should instead read
+/// what went wrong and call a valid tool.
+fn unknown_tool_message(context: &rig::agent::InvalidToolCallContext) -> String {
+    let name = context.tool_name.as_str();
+    let mut message = format!("Tool `{name}` is not available; it was not executed.");
+    let known = context.available_tools.iter().any(|tool| tool == name);
+    if known {
+        message.push_str(" It is registered but not allowed for this turn.");
+    }
+    let suggestions = closest_tool_names(name, &context.allowed_tools);
+    if !suggestions.is_empty() {
+        message.push_str(&format!(" Did you mean: {}?", suggestions.join(", ")));
+    }
+    if name.starts_with("mcp__") || name.contains("__") {
+        message.push_str(
+            " If this is a deferred MCP tool from the \"Deferred MCP tool index\", load it with the MCP tool search first, then call it.",
+        );
+    }
+    let mut allowed: Vec<&str> = context.allowed_tools.iter().map(String::as_str).collect();
+    allowed.sort_unstable();
+    const MAX_LISTED: usize = 60;
+    let listed = allowed.len().min(MAX_LISTED);
+    message.push_str(&format!(" Available tools: {}", allowed[..listed].join(", ")));
+    if allowed.len() > listed {
+        message.push_str(&format!(", and {} more", allowed.len() - listed));
+    }
+    message.push('.');
+    message
 }
 
 pub(crate) fn is_tool_loop_notice(output: &str) -> bool {
@@ -773,19 +862,7 @@ on what remains. Context was tight, so prefer narrower follow-up tool calls over
 wide ones until pressure subsides.";
 
 pub(crate) fn tool_may_mutate_workspace(name: &str) -> bool {
-    !matches!(
-        name,
-        "read"
-            | "grep"
-            | "find_files"
-            | "list_dir"
-            | "web_search"
-            | "skill_search"
-            | "skill_list"
-            | "todo_read"
-            | "ask_user_question"
-            | "schedule_wakeup"
-    )
+    super::tools::tool_class(name) == super::tools::ToolClass::Mutating
 }
 
 pub struct AgentRunner {
@@ -9355,8 +9432,13 @@ mod tests {
             "find_files",
             "list_dir",
             "web_search",
-            "skill_search",
-            "skill_list",
+            "web_fetch",
+            "skills_search",
+            "lsp_navigate",
+            "memory_search",
+            "job_status",
+            "task_evidence",
+            "advisor",
             "todo_read",
         ] {
             assert!(!super::tool_may_mutate_workspace(name), "{name}");
@@ -11219,6 +11301,54 @@ mod tests {
                 .contains("normalized invalid-tool retry sentinel"),
             "Rig's normalized retry feedback must survive unchanged"
         );
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_call_gets_a_corrective_result_and_the_turn_continues() {
+        let agent = AgentBuilder::new(MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call(
+                    "wrong-name",
+                    "bash",
+                    serde_json::json!({"command": "ls"}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("recovered"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]))
+        .add_hook(super::ToolLoopGuard)
+        .build();
+        let mut stream = agent.runner("run ls").max_turns(3).stream().await;
+        let messages = loop {
+            match stream.next().await {
+                Some(Ok(MultiTurnStreamItem::FinalResponse(response))) => {
+                    break response.messages.expect("Rig final messages");
+                }
+                Some(Ok(_)) => {}
+                Some(Err(error)) => panic!("unknown tool aborted the turn: {error}"),
+                None => panic!("stream ended without FinalResponse"),
+            }
+        };
+        let transcript = serde_json::to_string(&messages).unwrap();
+        assert!(
+            transcript.contains("Tool `bash` is not available; it was not executed."),
+            "{transcript}"
+        );
+        assert!(transcript.contains("recovered"), "{transcript}");
+    }
+
+    #[test]
+    fn closest_tool_names_suggest_aliases_and_typos() {
+        let tools: Vec<String> = ["shell", "read", "write", "find_files", "grep"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(super::closest_tool_names("Read", &tools)[0], "read");
+        assert_eq!(super::closest_tool_names("shel", &tools)[0], "shell");
+        assert!(super::closest_tool_names("multi_tool_use.parallel", &tools).is_empty());
     }
 
     #[tokio::test]
