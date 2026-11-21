@@ -452,6 +452,107 @@ impl TaskLimits {
     }
 }
 
+/// The persona MCP connection of one `task` call, opened by its first child and
+/// shared by the rest. Every child still derives its own tool wrappers and an
+/// independent permission checker; only the server processes and their
+/// initialize/list exchanges are shared. Isolated children (a different
+/// workspace) own their connection instead.
+#[cfg(feature = "mcp")]
+#[derive(Clone, Default)]
+struct SharedPersonaMcp(Arc<tokio::sync::Mutex<Option<SharedConnection>>>);
+
+/// The outcome of the call's one connection attempt: the manager and its
+/// connection notices, or the error every child then reports.
+#[cfg(feature = "mcp")]
+type SharedConnection =
+    Result<Option<(Arc<crate::extras::mcp::McpClientManager>, Vec<String>)>, String>;
+
+#[cfg(feature = "mcp")]
+impl SharedPersonaMcp {
+    #[allow(clippy::type_complexity)]
+    async fn tools_for(
+        &self,
+        persona: &builder::PersonaExecution,
+        config: &crate::config::Config,
+        authorization: &SubagentAuthorization,
+    ) -> Result<
+        (
+            Option<Arc<crate::extras::mcp::McpClientManager>>,
+            Vec<Box<dyn rig::tool::ToolDyn>>,
+            builder::GrantedMcp,
+        ),
+        String,
+    > {
+        let manager = {
+            let mut state = self.0.lock().await;
+            if state.is_none() {
+                let connected = match authorization.workspace() {
+                    Some(workspace) => builder::connect_persona_mcp(persona, config, workspace)
+                        .await
+                        .map(|manager| {
+                            manager.map(|mut manager| {
+                                let notices = builder::take_notice_text(&mut manager);
+                                (Arc::new(manager), notices)
+                            })
+                        }),
+                    None if persona
+                        .mcp_servers
+                        .as_ref()
+                        .is_none_or(std::collections::BTreeMap::is_empty) =>
+                    {
+                        Ok(None)
+                    }
+                    None => Err("task: persona MCP requires a captured workspace".to_string()),
+                };
+                *state = Some(connected);
+            }
+            state.clone().expect("initialized above")?
+        };
+        let Some((manager, notices)) = manager else {
+            return Ok((None, Vec::new(), Default::default()));
+        };
+        let (tools, granted) =
+            builder::persona_mcp_tools(&manager, &notices, persona, config, authorization).await?;
+        Ok((Some(manager), tools, granted))
+    }
+
+    /// Shut the shared servers down once the call's children are done, off
+    /// the result path; the owning scope joins it before retiring.
+    fn shutdown_off_path(&self) {
+        let state = self.0.clone();
+        drop(crate::agent::runner::spawn_async_scoped(async move {
+            let taken = state.lock().await.take();
+            if let Some(Ok(Some((manager, _)))) = taken {
+                match Arc::try_unwrap(manager) {
+                    Ok(manager) => manager.shutdown().await,
+                    // A straggling holder keeps the servers alive; dropping
+                    // the last clone tears them down.
+                    Err(_) => tracing::debug!("persona MCP connection still referenced"),
+                }
+            }
+        }));
+    }
+}
+
+/// The resolved defaults the tool schema quotes to the model.
+struct SchemaDefaults {
+    max_turns: usize,
+    timeout_secs: u64,
+    background_timeout_secs: u64,
+    resume_children: usize,
+}
+
+impl Default for SchemaDefaults {
+    fn default() -> Self {
+        Self {
+            max_turns: 20,
+            timeout_secs: DEFAULT_CALL_TIMEOUT.as_secs(),
+            background_timeout_secs: DEFAULT_BACKGROUND_TIMEOUT.as_secs(),
+            resume_children: super::resume::MAX_RESUMABLE_CHILDREN,
+        }
+    }
+}
+
 /// The configured ceilings for per-call and persona run settings.
 fn run_ceilings(config: &crate::config::Config) -> (usize, u64) {
     let policy = config.subagents.as_ref();
@@ -518,6 +619,31 @@ fn apply_run_settings(
     Ok(())
 }
 
+/// The checks on per-call options that need neither the persona nor the
+/// permission answer: the isolation enum, `base_ref` syntax and the
+/// call-level `max_turns`/`timeout_secs` bounds.
+fn validate_call_options(
+    options: &TaskCallOptions,
+    config: &crate::config::Config,
+) -> Result<(), ToolError> {
+    match options.isolation.as_deref() {
+        None | Some("none") | Some("worktree") => {}
+        Some(other) => {
+            return Err(ToolError::Msg(format!(
+                "task: isolation must be \"worktree\" or \"none\", got {other:?}"
+            )));
+        }
+    }
+    if let Some(base) = options.base_ref.as_deref() {
+        super::isolation::validate_base_ref(base).map_err(ToolError::Msg)?;
+    }
+    // Reuses the ceiling checks with no persona, which only validates the
+    // call's own values.
+    let mut turns = 1;
+    let mut limits = TaskLimits::from_config(config);
+    apply_run_settings(options, None, config, &mut turns, &mut limits)
+}
+
 /// A persona's tool narrowing with the opt-in read-only shell added, when it
 /// is eligible (the parsed narrowing of a read persona never contains it).
 fn with_read_only_shell_tool(
@@ -571,6 +697,16 @@ fn validate_prompts(prompts: &[String], limits: TaskLimits) -> Result<(), ToolEr
 }
 
 fn prepare_task_prompts(args: &TaskArgs, limits: TaskLimits) -> Result<Vec<String>, ToolError> {
+    prepare_task_prompts_for(args, limits, false)
+}
+
+/// As [`prepare_task_prompts`], with the structured-brief trailer worded for
+/// a persona whose report is free-form (`contract: none`).
+fn prepare_task_prompts_for(
+    args: &TaskArgs,
+    limits: TaskLimits,
+    free_form: bool,
+) -> Result<Vec<String>, ToolError> {
     let Some(briefs) = args.briefs.as_ref() else {
         validate_prompts(&args.prompts, limits)?;
         return Ok(args.prompts.clone());
@@ -589,11 +725,20 @@ fn prepare_task_prompts(args: &TaskArgs, limits: TaskLimits) -> Result<Vec<Strin
     briefs
         .iter()
         .enumerate()
-        .map(|(index, brief)| render_task_brief(index, brief))
+        .map(|(index, brief)| render_task_brief_for(index, brief, free_form))
         .collect()
 }
 
+#[cfg(test)]
 fn render_task_brief(index: usize, brief: &TaskBrief) -> Result<String, ToolError> {
+    render_task_brief_for(index, brief, false)
+}
+
+fn render_task_brief_for(
+    index: usize,
+    brief: &TaskBrief,
+    free_form: bool,
+) -> Result<String, ToolError> {
     if brief.objective.trim().is_empty() {
         return Err(ToolError::Msg(format!(
             "task: brief {} objective must not be empty",
@@ -648,11 +793,16 @@ fn render_task_brief(index: usize, brief: &TaskBrief) -> Result<String, ToolErro
          ### Files\n{}\n\n\
          ### Constraints\n{}\n\n\
          ### Expected content\n{}\n\n\
-         Place expected content inside the host-required Findings, Unverified, and Coverage sections; do not replace those headings.",
+         {}",
         json(brief.objective.trim()),
         json_list(&brief.files),
         json_list(&brief.constraints),
         json_list(&brief.expected_sections),
+        if free_form {
+            "Cover the expected content in your plain-text answer."
+        } else {
+            "Place expected content inside the host-required Findings, Unverified, and Coverage sections; do not replace those headings."
+        },
     );
     if rendered.len() > MAX_BRIEF_BYTES {
         return Err(ToolError::Msg(format!(
@@ -1322,16 +1472,34 @@ editing in a known location, grepping for a literal you will act on immediately.
     }
 
     fn parameters(&self) -> serde_json::Value {
-        let (max_prompts, (turns_ceiling, timeout_ceiling)) = with_config(|cfg| {
+        let (max_prompts, (turns_ceiling, timeout_ceiling), defaults) = with_config(|cfg| {
             (
                 cfg.config.resolve_task_max_prompts(),
                 run_ceilings(&cfg.config),
+                SchemaDefaults {
+                    max_turns: cfg.max_turns,
+                    timeout_secs: cfg.config.resolve_task_timeout_secs(),
+                    background_timeout_secs: cfg
+                        .config
+                        .subagents
+                        .as_ref()
+                        .and_then(|policy| policy.task_background_timeout_secs)
+                        .unwrap_or(DEFAULT_BACKGROUND_TIMEOUT.as_secs()),
+                    resume_children: super::resume::ResumeLimits::from_config(&cfg.config).children,
+                },
             )
         })
         .unwrap_or((
             DEFAULT_MAX_PROMPTS,
             (DEFAULT_MAX_TURNS_CEILING, DEFAULT_TIMEOUT_CEILING_SECS),
+            SchemaDefaults::default(),
         ));
+        let SchemaDefaults {
+            max_turns: default_turns,
+            timeout_secs: default_timeout,
+            background_timeout_secs: default_background_timeout,
+            resume_children: default_resume_children,
+        } = defaults;
         let allow_write = with_config(|cfg| {
             cfg.config
                 .subagents
@@ -1403,13 +1571,13 @@ editing in a known location, grepping for a literal you will act on immediately.
                     "type": "integer",
                     "minimum": 1,
                     "maximum": turns_ceiling,
-                    "description": format!("Optional model turns per child for this call (default: the persona's max_turns, else task_max_turns, normally 20). Values above the configured ceiling ({turns_ceiling}, [subagents] task_max_turns_ceiling) are rejected.")
+                    "description": format!("Optional model turns per child for this call (default: the persona's max_turns, else task_max_turns, currently {default_turns}). Values above the configured ceiling ({turns_ceiling}, [subagents] task_max_turns_ceiling) are rejected.")
                 },
                 "timeout_secs": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": timeout_ceiling,
-                    "description": format!("Optional whole-call deadline in seconds (default: the persona's timeout_secs, else task_timeout_secs 300 in the foreground or task_background_timeout_secs 3600 in the background). Values above the configured ceiling ({timeout_ceiling}, [subagents] task_timeout_ceiling_secs) are rejected.")
+                    "description": format!("Optional whole-call deadline in seconds (default: the persona's timeout_secs, else task_timeout_secs {default_timeout} in the foreground or task_background_timeout_secs {default_background_timeout} in the background). Values above the configured ceiling ({timeout_ceiling}, [subagents] task_timeout_ceiling_secs) are rejected.")
                 },
                 "model": {
                     "type": "string",
@@ -1417,7 +1585,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                 },
                 "resume": {
                     "type": "string",
-                    "description": "Optional child id printed after an earlier child's report ([child id: …]). Continues that child's conversation, tool results included, with the single prompt as a follow-up; same agent_type, permissions and budgets. Ids expire after the most recent children (default 16, [subagents] task_resume_max_children) or when a conversation exceeds [subagents] task_resume_max_bytes; a session's ids are restored by --continue/--resume subject to those count/byte limits, but not by a fresh session."
+                    "description": format!("Optional child id printed after an earlier child's report ([child id: …]). Continues that child's conversation, tool results included, with the single prompt as a follow-up; same agent_type, permissions and budgets. Ids expire after the most recent children (currently {default_resume_children}, [subagents] task_resume_max_children) or when a conversation exceeds [subagents] task_resume_max_bytes; a session's ids are restored by --continue/--resume subject to those count/byte limits, but not by a fresh session.")
                 },
                 "run_in_background": {
                     "type": "boolean",
@@ -1539,6 +1707,17 @@ editing in a known location, grepping for a literal you will act on immediately.
         let permission_source = agent_type.as_deref().map(|agent_type| {
             crate::context::agents::source_hint_for_workspace(agent_type, self.workspace.as_deref())
         });
+        // Argument-only mistakes are reported before any permission prompt, so
+        // a corrected retry does not ask the user to approve the same
+        // delegation twice.
+        validate_call_options(&args.options, &config)?;
+        if args.run_in_background
+            && let Some(pool) =
+                crate::spend::run::Run::current().and_then(|run| run.background_pool())
+        {
+            pool.check_capacity()
+                .map_err(|error| ToolError::Msg(error.to_string()))?;
+        }
         let delegation_input = permission_input(
             &prompts,
             agent_type.as_deref(),
@@ -1572,6 +1751,13 @@ editing in a known location, grepping for a literal you will act on immediately.
             args.run_in_background = true;
             limits = limits.for_background(&config)?;
             prompts = prepare_task_prompts(&args, limits)?;
+        }
+        if specialization
+            .as_ref()
+            .is_some_and(|persona| persona.run.free_form)
+            && args.briefs.is_some()
+        {
+            prompts = prepare_task_prompts_for(&args, limits, true)?;
         }
         let write_mode = specialization
             .as_ref()
@@ -1836,6 +2022,7 @@ editing in a known location, grepping for a literal you will act on immediately.
         )
         .with_workspace_binding(self.workspace.clone())
         .with_workspace_instructions(self.instructions.clone())
+        .with_tool_output_session(self.parent_web.as_ref().map(|web| web.session_id.clone()))
         .with_code_tools(self.parent_code.clone())
         .with_write_tools(if write_mode {
             self.write_tools.clone()
@@ -1858,6 +2045,7 @@ editing in a known location, grepping for a literal you will act on immediately.
             authorization
         };
         let lane_workspace = self.workspace.clone();
+        let abandoned = super::isolation::AbandonedNotes::default();
         let isolation = if isolated {
             Some(super::isolation::IsolationPlan {
                 parent_root: self
@@ -1872,6 +2060,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                     })?,
                 base_dir: self.isolation_base_dir.clone(),
                 base_ref: args.options.base_ref.clone(),
+                abandoned: abandoned.clone(),
                 #[cfg(test)]
                 create_gate: None,
             })
@@ -1904,7 +2093,13 @@ editing in a known location, grepping for a literal you will act on immediately.
         let resume_history = resumed.map(|stored| Arc::new(stored.history));
         let job_inbox = admission.as_ref().map(super::background::Admission::inbox);
         let resume_agent_type = agent_type.clone();
+        #[cfg(feature = "mcp")]
+        let shared_mcp = SharedPersonaMcp::default();
+        #[cfg(feature = "mcp")]
+        let executor_mcp = shared_mcp.clone();
         let executor: TaskExecutor = Arc::new(move |index, prompt_text| {
+            #[cfg(feature = "mcp")]
+            let shared_mcp = executor_mcp.clone();
             let details_sink = executor_sink.clone();
             let resume_history = resume_history.clone();
             let resume_store = resume_store.clone();
@@ -1964,6 +2159,8 @@ editing in a known location, grepping for a literal you will act on immediately.
             let authorization = authorization.clone();
             let lane_workspace = lane_workspace.clone();
             let isolation = isolation.clone();
+            #[cfg(feature = "mcp")]
+            let isolated_child = isolation.is_some();
             #[cfg(feature = "skills")]
             let skill_services = skill_services
                 .as_ref()
@@ -2027,7 +2224,9 @@ editing in a known location, grepping for a literal you will act on immediately.
                 )
                 .await
                 {
-                    Some(extra) => format!("{extra}\n\n{prompt_text}"),
+                    // Labelled, capped hook text goes after the brief so the
+                    // child cannot mistake it for the delegated objective.
+                    Some(extra) => format!("{prompt_text}\n\n{extra}"),
                     None => prompt_text,
                 };
                 #[cfg(not(feature = "hooks"))]
@@ -2099,9 +2298,11 @@ editing in a known location, grepping for a literal you will act on immediately.
                 // the trusted persona names, with an independent permission
                 // checker; outer-agent MCP connections are never inherited.
                 #[cfg(feature = "mcp")]
-                let (mcp_manager, mcp_tools, mcp_granted) =
+                let (mcp_manager, mcp_shared, mcp_tools, mcp_granted) = if isolated_child {
+                    // An isolated child's workspace differs: it owns its
+                    // connection.
                     match builder::build_persona_mcp(&persona, &config, &authorization).await {
-                        Ok(runtime) => runtime,
+                        Ok((manager, tools, granted)) => (manager, None, tools, granted),
                         Err(error) => {
                             return ChildExecution {
                                 output: Err(error),
@@ -2109,7 +2310,25 @@ editing in a known location, grepping for a literal you will act on immediately.
                                 host_suffix: None,
                             };
                         }
-                    };
+                    }
+                } else {
+                    // One connection per `task` call, shared by its children;
+                    // each child still derives its own tools and an
+                    // independent permission checker.
+                    match shared_mcp
+                        .tools_for(&persona, &config, &authorization)
+                        .await
+                    {
+                        Ok((shared, tools, granted)) => (None, shared, tools, granted),
+                        Err(error) => {
+                            return ChildExecution {
+                                output: Err(error),
+                                cost_units: 0,
+                                host_suffix: None,
+                            };
+                        }
+                    }
+                };
                 // Evidence is re-judged by the parent later: anchor relative
                 // paths at THIS child's directory (a worktree when isolated)
                 // and remember which MCP tools it could call.
@@ -2125,6 +2344,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                         mcp_manager
                             .as_ref()
                             .map(|manager| manager.hook_peers())
+                            .or_else(|| mcp_shared.as_ref().map(|manager| manager.hook_peers()))
                             .unwrap_or_default(),
                     ),
                 };
@@ -2419,6 +2639,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                         withheld,
                         &selection.listed,
                         &selection.notes,
+                        report_policy.free_form,
                     ),
                     _ => None,
                 };
@@ -2473,9 +2694,15 @@ editing in a known location, grepping for a literal you will act on immediately.
                     None => output,
                 };
                 let cost_units = child_budget.used.load(std::sync::atomic::Ordering::Acquire);
+                // The persona's MCP servers are shut down off the result path
+                // (a slow server stop used to add seconds to every child's
+                // wall-clock and to the call deadline); the owning scope
+                // still joins the shutdown before it retires.
                 #[cfg(feature = "mcp")]
                 if let Some(manager) = mcp_manager {
-                    manager.shutdown().await;
+                    drop(crate::agent::runner::spawn_async_scoped(async move {
+                        manager.shutdown().await;
+                    }));
                 }
                 ChildExecution {
                     output,
@@ -2501,19 +2728,28 @@ editing in a known location, grepping for a literal you will act on immediately.
         });
 
         if let Some(admission) = admission {
+            admission.describe(&task_label, agent_type.as_deref(), prompts.len());
+            let cancel_scope = admission.cancel_scope();
             let id = admission
                 .start_with_details(
                     async move {
-                        let report = execute_tasks_with_budget(
+                        let report = execute_tasks_with_budget_cancellable(
                             prompts,
                             limits,
                             executor,
                             result_notice,
                             Some(live_budget),
+                            Some(cancel_scope),
                         )
                         .await;
+                        #[cfg(feature = "mcp")]
+                        shared_mcp.shutdown_off_path();
                         let failed = report.failed();
-                        let text = super::inline_images::guard_text_output(report.render());
+                        let mut rendered = report.render();
+                        if let Some(section) = abandoned.render().await {
+                            rendered.push_str(&section);
+                        }
+                        let text = super::inline_images::guard_text_output(rendered);
                         let details = Some(details_sink.take());
                         (if failed { Err(text) } else { Ok(text) }, details)
                     },
@@ -2530,10 +2766,23 @@ editing in a known location, grepping for a literal you will act on immediately.
         if let Some(pool) = &task_pool {
             pool.record_foreground(task_label, report.failed(), details_sink.take());
         }
+        if report.failed() {
+            // The full report is still returned as ordinary text (not an
+            // error string), but the call is flagged so ACP, hooks and the
+            // loop bookkeeping see a failed delegation, as the background
+            // path already records it.
+            crate::agent::runner::mark_current_tool_failed();
+        }
         // Only the host builds the envelope: the quoted text report first,
         // the admitted images appended after it, in prompt order.
+        #[cfg(feature = "mcp")]
+        shared_mcp.shutdown_off_path();
         let images = inline_sink.take(&report);
-        Ok(super::inline_images::envelope(report.render(), &images))
+        let mut rendered = report.render();
+        if let Some(section) = abandoned.render().await {
+            rendered.push_str(&section);
+        }
+        Ok(super::inline_images::envelope(rendered, &images))
     }
 }
 
@@ -2612,11 +2861,25 @@ fn turn_budget_header(turns: u32, tool_calls: u32, written_up: bool) -> String {
 }
 
 /// Final prompt for a child out of turns: report from the conversation so far.
-fn turn_budget_writeup_prompt(turns: u32, tool_calls: u32, max_report_bytes: usize) -> String {
-    format!(
+fn turn_budget_writeup_prompt(
+    turns: u32,
+    tool_calls: u32,
+    max_report_bytes: usize,
+    free_form: bool,
+) -> String {
+    let lead = format!(
         "Your turn budget is exhausted after {turns} model turns and {tool_calls} tool calls. \
          You cannot call tools any more and must not try. Using only what your earlier tool \
-         results in this conversation established, write your final report now, in exactly \
+         results in this conversation established, write your final report now"
+    );
+    if free_form {
+        return format!(
+            "{lead}, in plain text. Lead with caveats and missing evidence, and say what you did \
+             not check.\n\nKeep the report under {max_report_bytes} bytes."
+        );
+    }
+    format!(
+        "{lead}, in exactly \
          these sections in this order:\n\n\
          ## Findings\n\
          - [confidence: high|medium|low] Evidence-backed finding citing the files or results \
@@ -2730,7 +2993,12 @@ where
         if !run.history.is_empty() && !budget_exhausted() {
             let writeup = continue_tool_free(
                 Continuation::WriteUp,
-                turn_budget_writeup_prompt(run.turns, run.tool_calls, max_report_bytes),
+                turn_budget_writeup_prompt(
+                    run.turns,
+                    run.tool_calls,
+                    max_report_bytes,
+                    policy.free_form,
+                ),
                 run.history.clone(),
             )
             .await;
@@ -3146,6 +3414,9 @@ enum StopReason {
     OutputLimit,
     CostLimit,
     Deadline,
+    /// The call's own cancellation scope was cancelled (a background job:
+    /// `/tasks cancel`, `task_cancel`, or compaction pausing the pool).
+    Cancelled,
 }
 
 impl StopReason {
@@ -3164,6 +3435,7 @@ impl StopReason {
                 "wall-clock deadline of {}s reached",
                 limits.timeout.as_secs()
             ),
+            Self::Cancelled => "cancelled before it finished".to_string(),
         }
     }
 }
@@ -3403,20 +3675,28 @@ fn render_evidence_section(
     withheld: bool,
     attached: &std::collections::BTreeSet<usize>,
     inline_notes: &[String],
+    free_form: bool,
 ) -> Option<String> {
     use super::evidence::Retention;
     let total = stored.metas.len();
     if total == 0 && stored.unrecorded == 0 {
         return None;
     }
-    let scan = scan_report(report, Some(total));
+    // A free-form report has no Findings section, so its citations are
+    // collected from the whole text.
+    let (cited, uncited_high) = if free_form {
+        (free_form_citations(report, total), 0)
+    } else {
+        let scan = scan_report(report, Some(total));
+        (scan.cited, scan.uncited_high)
+    };
     let rows: Vec<_> = if withheld {
         stored.metas.iter().take(WITHHELD_EVIDENCE_ROWS).collect()
     } else {
         stored
             .metas
             .iter()
-            .filter(|meta| scan.cited.contains(&meta.number) || attached.contains(&meta.number))
+            .filter(|meta| cited.contains(&meta.number) || attached.contains(&meta.number))
             .collect()
     };
     let mut section = format!(
@@ -3469,10 +3749,9 @@ fn render_evidence_section(
             stored.unrecorded
         ));
     }
-    if !withheld && scan.uncited_high > 0 {
+    if !withheld && uncited_high > 0 {
         section.push_str(&format!(
-            "Note: {} high-confidence finding(s) cite no evidence.\n",
-            scan.uncited_high
+            "Note: {uncited_high} high-confidence finding(s) cite no evidence.\n"
         ));
     }
     if !inline_notes.is_empty() {
@@ -3558,7 +3837,25 @@ async fn execute_tasks_with_budget(
     notice: Option<String>,
     live_budget: Option<LiveTaskBudget>,
 ) -> TaskReport {
+    execute_tasks_with_budget_cancellable(prompts, limits, executor, notice, live_budget, None)
+        .await
+}
+
+/// As [`execute_tasks_with_budget`], and stops as a resource stop when `cancel`
+/// is cancelled: children already finished keep their reports, in-flight ones
+/// return their narration marked partial, queued ones are not started. A
+/// background job passes its own scope, so cancelling it (or compaction
+/// pausing the pool) does not discard completed work.
+async fn execute_tasks_with_budget_cancellable(
+    prompts: Vec<String>,
+    limits: TaskLimits,
+    executor: TaskExecutor,
+    notice: Option<String>,
+    live_budget: Option<LiveTaskBudget>,
+    cancel: Option<Arc<crate::agent::runner::AgentWorkScope>>,
+) -> TaskReport {
     let task_count = prompts.len();
+    let is_cancelled = || cancel.as_ref().is_some_and(|scope| scope.is_cancelled());
     let mut outcomes: Vec<Option<TaskOutcome>> =
         std::iter::repeat_with(|| None).take(task_count).collect();
     let mut started = vec![false; task_count];
@@ -3584,6 +3881,10 @@ async fn execute_tasks_with_budget(
         && next_index < task_count
         && in_flight.len() < limits.max_concurrency
     {
+        if is_cancelled() {
+            stop_reason = Some(StopReason::Cancelled);
+            break;
+        }
         if clock.expired(deadline) {
             stop_reason = Some(StopReason::Deadline);
             break;
@@ -3625,6 +3926,10 @@ async fn execute_tasks_with_budget(
                 Some(budget) => budget.stopped().await,
                 None => std::future::pending::<()>().await,
             } } => { stop_reason = Some(StopReason::CostLimit); break; }
+            () = async { match &cancel {
+                Some(scope) => scope.cancelled().await,
+                None => std::future::pending::<()>().await,
+            } } => { stop_reason = Some(StopReason::Cancelled); break; }
             () = &mut changed => continue,
         };
         let Some((index, child)) = next else {
@@ -3700,6 +4005,10 @@ async fn execute_tasks_with_budget(
             // Retain the result, but do not let it admit another child.
             if live_budget.as_ref().is_some_and(LiveTaskBudget::exhausted) {
                 stop_reason = Some(StopReason::CostLimit);
+                break;
+            }
+            if is_cancelled() {
+                stop_reason = Some(StopReason::Cancelled);
                 break;
             }
             if clock.expired(deadline) {
@@ -3928,6 +4237,28 @@ fn line_citations(line: &str) -> Result<Vec<usize>, ()> {
         rest = end + 1;
     }
     Ok(cited)
+}
+
+/// Valid evidence numbers cited anywhere in a free-form report (outside code
+/// fences); malformed or out-of-range tags are ignored, since a free-form
+/// report is not validated.
+fn free_form_citations(report: &str, total: usize) -> std::collections::BTreeSet<usize> {
+    let mut cited = std::collections::BTreeSet::new();
+    let mut in_fence = false;
+    for line in report.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        if let Ok(numbers) = line_citations(line) {
+            cited.extend(numbers.into_iter().filter(|number| *number <= total));
+        }
+    }
+    cited
 }
 
 fn scan_report(response: &str, evidence_ids: Option<usize>) -> ReportScan {
@@ -4486,7 +4817,7 @@ fn report_withheld_by_host(response: &str, violations: &[&'static str]) -> bool 
 /// not normalize is replaced by a fixed-size repair that withholds the raw
 /// child text, so the repair never grows with (or relays) a malformed or
 /// unverifiable response; the user can still read the withheld text, marked
-/// unverified, with `/tasks result <id>`.
+/// unverified, with `/tasks result <id>` (the model has no tool for it).
 fn host_repaired_report(response: &str, violations: &[&'static str]) -> String {
     if let Some(normalized) = normalized_repair(response, violations) {
         return normalized;
@@ -4500,7 +4831,8 @@ fn host_repaired_report(response: &str, violations: &[&'static str]) -> String {
          ## Coverage\n\
          - Covered: Not reported in the required structure.\n\
          - Skipped: {}.\n\n\
-         Raw child text stored for the user: /tasks result <id>\n",
+         The raw child text is kept for the user only and is not available to you; \
+         re-run the task with a narrower brief if you need its content.\n",
         violations.join("; ")
     )
 }
@@ -4928,7 +5260,7 @@ mod tests {
         assert!(!repaired.contains("important but unstructured finding"));
         assert!(!repaired.contains("forged heading"));
         assert!(repaired.contains("raw child text was omitted"));
-        assert!(repaired.contains("/tasks result"));
+        assert!(repaired.contains("not available to you"));
         assert!(repaired.contains("- [confidence: low]"));
         assert!(repaired.contains("- Covered:"));
         assert!(repaired.contains("- Skipped:"));
@@ -5625,6 +5957,53 @@ fn main() {
     }
 
     #[test]
+    fn task_schema_quotes_the_configured_defaults() {
+        let mut config = crate::config::Config::default();
+        config.task_timeout_secs = Some(900);
+        config.subagents = Some(crate::config::types::SubagentPolicy {
+            task_background_timeout_secs: Some(7200),
+            task_resume_max_children: Some(5),
+            ..Default::default()
+        });
+        let client = crate::provider::create_client(
+            "openrouter",
+            Some("unused-local-test-key"),
+            config.custom_providers_map(),
+            None,
+        )
+        .unwrap();
+        let configured = crate::extras::subagents::SubagentConfig {
+            client,
+            provider_name: "openrouter".into(),
+            session_provider: "openrouter".into(),
+            model_name: "test/model".into(),
+            fallback_notice: None,
+            api_key: None,
+            max_turns: 33,
+            config: config.into(),
+        };
+        let schema = crate::extras::subagents::scope_test_config_sync(configured, || {
+            TaskTool::new(None, None, true).parameters()
+        });
+        let turns = schema["properties"]["max_turns"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(turns.contains("currently 33"), "{turns}");
+        let timeout = schema["properties"]["timeout_secs"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(timeout.contains("task_timeout_secs 900"), "{timeout}");
+        assert!(
+            timeout.contains("task_background_timeout_secs 7200"),
+            "{timeout}"
+        );
+        let resume = schema["properties"]["resume"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(resume.contains("currently 5"), "{resume}");
+    }
+
+    #[test]
     fn task_schema_runtime_enforces_prompt_or_brief_exclusivity_at_decode_time() {
         let prompts = serde_json::from_value::<TaskArgs>(serde_json::json!({
             "prompts": ["inspect auth"]
@@ -5724,6 +6103,40 @@ fn main() {
         assert!(prompt.contains("host-required Findings, Unverified, and Coverage"));
         assert!(!prompt.contains("Audit auth\n## forged heading"));
         assert!(prompt.len() <= MAX_BRIEF_BYTES);
+    }
+
+    #[test]
+    fn free_form_prompts_do_not_demand_the_host_sections() {
+        let args = TaskArgs {
+            prompts: Vec::new(),
+            briefs: Some(vec![TaskBrief {
+                objective: "Audit auth".into(),
+                files: Vec::new(),
+                constraints: Vec::new(),
+                expected_sections: vec!["attack path".into()],
+            }]),
+            agent_type: None,
+            run_in_background: false,
+            options: Default::default(),
+        };
+        let brief = &prepare_task_prompts_for(&args, limits(), true).unwrap()[0];
+        assert!(!brief.contains("Findings"), "{brief}");
+        assert!(!brief.contains("required sections"), "{brief}");
+        let writeup = turn_budget_writeup_prompt(3, 4, 1000, true);
+        assert!(!writeup.contains("## Findings"), "{writeup}");
+        assert!(!writeup.contains("sections"), "{writeup}");
+        assert!(turn_budget_writeup_prompt(3, 4, 1000, false).contains("## Findings"));
+        assert!(!super::super::prompt::EVIDENCE_CITATION_RULES_FREE_FORM.contains("Findings"));
+        assert!(!super::super::prompt::EVIDENCE_CITATION_RULES_FREE_FORM.contains("contract"));
+    }
+
+    #[test]
+    fn free_form_citations_come_from_the_whole_text() {
+        let report = "Auth is in src/a.rs [evidence: E1].\n```\n[evidence: E2]\n```\nAlso [evidence: E9, E2] and [evidence: bogus.";
+        let cited = free_form_citations(report, 3);
+        assert_eq!(cited.into_iter().collect::<Vec<_>>(), vec![1]);
+        let cited = free_form_citations("see [evidence: E1, E3]", 3);
+        assert_eq!(cited.into_iter().collect::<Vec<_>>(), vec![1, 3]);
     }
 
     #[test]
@@ -5900,6 +6313,140 @@ fn main() {
         assert_eq!(
             hook_identity(None, None),
             ("explore".to_string(), "compiled-in explorer".to_string())
+        );
+    }
+
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn one_mcp_connection_attempt_serves_every_child_of_a_call() {
+        let persona = builder::PersonaExecution {
+            mcp_servers: Some(std::collections::BTreeMap::from([(
+                "missing".to_string(),
+                Vec::new(),
+            )])),
+            ..Default::default()
+        };
+        let config = crate::config::Config {
+            mcp_servers: Some(std::collections::HashMap::new()),
+            ..Default::default()
+        };
+        let workspace = Arc::new(
+            crate::paths::WorkspaceBinding::capture(&std::env::current_dir().unwrap()).unwrap(),
+        );
+        let authorization =
+            SubagentAuthorization::new(None, None, true).with_workspace_binding(Some(workspace));
+        let shared = SharedPersonaMcp::default();
+        for _ in 0..3 {
+            let error = shared
+                .tools_for(&persona, &config, &authorization)
+                .await
+                .err()
+                .expect("unconfigured server");
+            assert!(error.contains("not configured"), "{error}");
+        }
+        // The attempt was made once and its outcome kept for later children.
+        assert!(shared.0.lock().await.as_ref().is_some_and(Result::is_err));
+        // A persona with no MCP servers connects nothing, for any child.
+        let none = SharedPersonaMcp::default();
+        let (manager, tools, granted) = none
+            .tools_for(&Default::default(), &config, &authorization)
+            .await
+            .ok()
+            .unwrap();
+        assert!(manager.is_none() && tools.is_empty() && granted.is_empty());
+    }
+
+    #[test]
+    fn call_option_errors_are_found_without_the_persona() {
+        let config = crate::config::Config::default();
+        for (options, needle) in [
+            (
+                TaskCallOptions {
+                    isolation: Some("branch".into()),
+                    ..Default::default()
+                },
+                "isolation must be",
+            ),
+            (
+                TaskCallOptions {
+                    max_turns: Some(100_000),
+                    ..Default::default()
+                },
+                "exceeds the ceiling",
+            ),
+            (
+                TaskCallOptions {
+                    timeout_secs: Some(0),
+                    ..Default::default()
+                },
+                "at least 1",
+            ),
+        ] {
+            let error = validate_call_options(&options, &config)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(needle), "{error}");
+        }
+        validate_call_options(&TaskCallOptions::default(), &config).unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_isolation_is_rejected_before_any_permission_prompt() {
+        let config = crate::config::Config::default();
+        let client = crate::provider::create_client(
+            "openrouter",
+            Some("unused-local-test-key"),
+            config.custom_providers_map(),
+            None,
+        )
+        .unwrap();
+        let configured = crate::extras::subagents::SubagentConfig {
+            client,
+            provider_name: "openrouter".into(),
+            session_provider: "openrouter".into(),
+            model_name: "test/model".into(),
+            fallback_notice: None,
+            api_key: None,
+            max_turns: 2,
+            config: config.into(),
+        };
+        let checker = crate::permission::checker::PermissionChecker::new(
+            &crate::permission::PermissionConfigs::from(crate::permission::PermissionConfig {
+                default: Some(crate::permission::Action::Ask),
+                ..Default::default()
+            }),
+            crate::permission::SecurityMode::Standard,
+            Some(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .canonicalize()
+                    .unwrap(),
+            ),
+            Some(vec!["guarded".into(), "standard".into(), "yolo".into()]),
+        )
+        .unwrap();
+        let permission: Option<PermCheck> = Some(Arc::new(std::sync::Mutex::new(checker)));
+        let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(4);
+        let task = TaskTool::new(permission, Some(ask_tx), true);
+        let bad: TaskArgs =
+            serde_json::from_value(serde_json::json!({"prompts": ["look"], "isolation": "branch"}))
+                .unwrap();
+        let error = crate::extras::subagents::scope_test_config(configured.clone(), task.call(bad))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("isolation must be"), "{error}");
+        assert!(ask_rx.try_recv().is_err(), "the bad call must not prompt");
+        // A valid call does reach the permission prompt (and then waits).
+        let good: TaskArgs =
+            serde_json::from_value(serde_json::json!({"prompts": ["look"]})).unwrap();
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(300),
+            crate::extras::subagents::scope_test_config(configured, task.call(good)),
+        )
+        .await;
+        assert!(
+            ask_rx.try_recv().is_ok(),
+            "a valid call asks once: {outcome:?}"
         );
     }
 
@@ -8934,7 +9481,9 @@ mod child_continuation_tests {
             !parent_text.contains("RAW_CHILD_TEXT"),
             "raw text must not reach the parent"
         );
-        assert!(parent_text.contains("/tasks result"));
+        assert!(parent_text.contains("not available to you"));
+        assert!(!parent_text.contains("/tasks result"));
+        assert!(!parent_text.contains("<id>"));
     }
 
     #[tokio::test]
@@ -9315,7 +9864,8 @@ mod evidence_contract_tests {
     async fn evidence_section_lists_only_cited_metadata_and_never_content() {
         let stored = stored().await;
         let section =
-            render_evidence_section(&stored, REPORT, false, &Default::default(), &[]).unwrap();
+            render_evidence_section(&stored, REPORT, false, &Default::default(), &[], false)
+                .unwrap();
         assert!(section.starts_with("## Evidence\n"), "{section}");
         assert!(section.contains("\"task_id\":\"task-xyz\""));
         assert!(section.contains("| E1 | read | src/a.rs |"), "{section}");
@@ -9327,7 +9877,8 @@ mod evidence_contract_tests {
 
         // A withheld report still offers the index, with sanitized targets.
         let withheld =
-            render_evidence_section(&stored, "replaced", true, &Default::default(), &[]).unwrap();
+            render_evidence_section(&stored, "replaced", true, &Default::default(), &[], false)
+                .unwrap();
         assert!(withheld.contains("report was withheld"));
         assert!(
             withheld.contains("| E3 | read | notes...x.. |"),
@@ -9341,7 +9892,8 @@ mod evidence_contract_tests {
     async fn the_evidence_section_follows_the_closing_quote_fence() {
         let stored = stored().await;
         let suffix =
-            render_evidence_section(&stored, REPORT, false, &Default::default(), &[]).unwrap();
+            render_evidence_section(&stored, REPORT, false, &Default::default(), &[], false)
+                .unwrap();
         let expected_suffix = suffix.clone();
         let executor: TaskExecutor = Arc::new(move |_, _| {
             let suffix = suffix.clone();

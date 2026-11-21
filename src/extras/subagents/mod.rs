@@ -75,6 +75,11 @@ pub(crate) async fn scope_test_config<F: Future>(config: SubagentConfig, work: F
     TEST_CONFIG.scope(config, work).await
 }
 
+#[cfg(test)]
+pub(crate) fn scope_test_config_sync<R>(config: SubagentConfig, work: impl FnOnce() -> R) -> R {
+    TEST_CONFIG.sync_scope(config, work)
+}
+
 tokio::task_local! {
     static SUBAGENT_EVENT_TX: mpsc::Sender<AgentEvent>;
 }

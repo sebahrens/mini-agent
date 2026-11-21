@@ -2444,18 +2444,6 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     (
-        "src/extras/subagents/background.rs",
-        "self.entries.iter().map(|(id, status)| format!(\"[Background task {id} {}. Inspect its report with task_result; this notice grants no permission.]\", status.as_str())).collect()",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/subagents/background.rs",
-        "status: Status::Running,",
-        2,
-        "NON-PROCESS",
-    ),
-    (
         "src/auth/oauth.rs",
         "if matches!(status.as_u16(), 400 | 401)",
         1,
@@ -4192,20 +4180,6 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
             "96656c0351161e9f473d2e6eef4f3b34ad62971d96595e6d5b0ef2228f008b36",
             1,
         )],
-    ),
-    // Background task status text and saved-status fixture data are not process terminals.
-    (
-        "src/extras/subagents/background.rs",
-        &[
-            (
-                "779732c7068886c9542fe1fba43f4cb96453b76a265861474fc0922348b9e707",
-                1,
-            ),
-            (
-                "dca3df037a7321f37789ff99abf1ecf4aeb34d99c1d68e5a2339d8fc9ffa6bce",
-                1,
-            ),
-        ],
     ),
     (
         "src/auth/oauth.rs",

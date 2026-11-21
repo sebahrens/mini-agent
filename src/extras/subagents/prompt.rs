@@ -59,6 +59,18 @@ Cite only results you actually received; an unknown or malformed ID breaks the r
 contract. Citations are optional, but a `[confidence: high]` finding should cite its evidence. \
 The caller can open each cited result itself, so cite rather than paste long tool output.";
 
+/// Citation rules for a persona whose report is free-form (`contract: none`):
+/// the same host-minted IDs, without the Findings section the structured
+/// wording refers to.
+pub(crate) const EVIDENCE_CITATION_RULES_FREE_FORM: &str = "\
+## Evidence citations (host policy)
+
+The host numbers your tool results E1, E2, E3, ... in the order you called the tools. \
+A statement in your answer may end with `[evidence: E3, E7]` naming the tool results it rests on. \
+Cite only results you actually received. Citations are optional, but a claim you are \
+certain of should cite its evidence. \
+The caller can open each cited result itself, so cite rather than paste long tool output.";
+
 pub(crate) fn write_rules() -> String {
     NON_OVERRIDABLE_EXPLORE_RULES.replace(
         "- Do NOT modify files. You are read-only.\n- Do NOT run shell commands. Use only the tools provided by the host.",
@@ -119,6 +131,53 @@ pub(crate) fn explore_prompt() -> String {
     EXPLORE_PROMPT.to_string()
 }
 
+/// `preamble` with the base prompt's `## Tools` list reduced to the tools the
+/// child actually has. The base prompt documents the whole default set; a
+/// persona that narrows `tools:` must not be told it can call the others.
+/// Only the (single) copy of the base prompt is edited, never persona text.
+pub(crate) fn with_registered_tools(preamble: &str, registered: &[String]) -> String {
+    const HEADING: &str = "## Tools\n\n";
+    const NEXT: &str = "\n\n## Rules";
+    let base = explore_prompt();
+    let (Some(at), Some(rel_start), Some(rel_end)) = (
+        preamble.find(&base),
+        base.find(HEADING).map(|i| i + HEADING.len()),
+        base.find(NEXT),
+    ) else {
+        return preamble.to_string();
+    };
+    let block = &base[rel_start..rel_end];
+    // An entry starts at "- **name**"; indented lines continue the previous one.
+    let mut entries: Vec<(&str, String)> = Vec::new();
+    for line in block.lines() {
+        if let Some(rest) = line.strip_prefix("- **")
+            && let Some(name) = rest.split("**").next()
+        {
+            entries.push((name, line.to_string()));
+        } else if let Some((_, text)) = entries.last_mut() {
+            text.push('\n');
+            text.push_str(line);
+        }
+    }
+    let kept: Vec<&str> = entries
+        .iter()
+        .filter(|(name, _)| registered.iter().any(|tool| tool == name))
+        .map(|(_, text)| text.as_str())
+        .collect();
+    let narrowed = if kept.is_empty() {
+        "- None of the documented file tools are available; rely on the tools the host supplies."
+            .to_string()
+    } else {
+        kept.join("\n")
+    };
+    format!(
+        "{}{}{}",
+        &preamble[..at + rel_start],
+        narrowed,
+        &preamble[at + rel_end..]
+    )
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "memory")]
@@ -151,6 +210,40 @@ mod tests {
         assert!(!free.contains("## Findings"));
         assert!(free.contains("Answer in plain text"));
         assert!(free.contains("override them."));
+    }
+
+    #[test]
+    fn tool_section_follows_the_registered_tools() {
+        let preamble = format!(
+            "persona\n\n---\n\n{}\n\n---\n\nrules",
+            super::explore_prompt()
+        );
+        let registered = ["read".to_string(), "grep".to_string()];
+        let narrowed = super::with_registered_tools(&preamble, &registered);
+        assert!(narrowed.starts_with("persona"));
+        assert!(narrowed.contains("- **read**: Read file contents"));
+        assert!(
+            narrowed.contains("come back as images"),
+            "continuation kept"
+        );
+        assert!(narrowed.contains("- **grep**"));
+        assert!(!narrowed.contains("**find_files**"));
+        assert!(!narrowed.contains("**list_dir**"));
+        assert!(narrowed.contains("## Rules"));
+        assert!(narrowed.ends_with("rules"));
+        let none = super::with_registered_tools(&preamble, &[]);
+        assert!(none.contains("None of the documented file tools"));
+        // Unchanged when every documented tool is registered.
+        let all = [
+            "read",
+            "grep",
+            "find_files",
+            "list_dir",
+            "memory_read",
+            "memory_search",
+        ]
+        .map(String::from);
+        assert_eq!(super::with_registered_tools(&preamble, &all), preamble);
     }
 
     #[test]

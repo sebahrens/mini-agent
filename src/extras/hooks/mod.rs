@@ -931,8 +931,9 @@ pub(crate) async fn dispatch_session_end(reason: &str) {
 }
 
 /// Testable core: dispatches `SubagentStart`, matching on the normalized agent
-/// type. Returns hook-injected context to prepend to the child's prompt, if
-/// any.
+/// type. Returns the labelled hook context to append to the child's prompt, if
+/// any (the same extraction, 32 KiB cap and label as `SessionStart` and
+/// `UserPromptSubmit`; the flat and the nested `hookSpecificOutput` shapes).
 #[cfg(any(feature = "subagents", test))]
 pub(crate) async fn gate_subagent_start(
     dispatcher: &dispatcher::HookDispatcher,
@@ -954,8 +955,8 @@ pub(crate) async fn gate_subagent_start(
         )
         .await;
     match decision {
-        Decision::Rewrite { content } => Some(content),
-        Decision::Continue | Decision::Block { .. } | Decision::AdditionalContext { .. } => None,
+        Decision::AdditionalContext { notices } => Some(notices.join("\n\n")),
+        Decision::Continue | Decision::Block { .. } | Decision::Rewrite { .. } => None,
     }
 }
 

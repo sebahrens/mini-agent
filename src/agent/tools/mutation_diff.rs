@@ -905,6 +905,32 @@ mod tests {
         ))
     }
 
+    #[cfg(feature = "hooks")]
+    #[tokio::test]
+    async fn file_changed_target_is_reported_for_native_mutations_only() {
+        use crate::agent::tools::{ReadTracker, WriteArgs, WriteTool};
+        use rig::tool::{Tool, ToolCallExtensions};
+        let root = crate::tests::OwnedTestDirectory::new("file-changed-target");
+        let write = WriteTool::new_with_tracker(None, None, None, ReadTracker::new(true))
+            .with_workspace(root.path());
+        let created = write
+            .call_structured(
+                WriteArgs {
+                    path: "new.txt".into(),
+                    content: "x\n".into(),
+                    overwrite: false,
+                },
+                &ToolCallExtensions::new(),
+            )
+            .await
+            .unwrap();
+        let (path, tool) = changed_file("write", &created.extensions).unwrap();
+        assert!(path.ends_with("new.txt"), "{path}");
+        assert_eq!(tool, "write");
+        assert!(changed_file("grep", &created.extensions).is_none());
+        assert!(changed_file("write", &Default::default()).is_none());
+    }
+
     #[tokio::test]
     async fn actual_tools_emit_only_successful_authorized_snapshots_and_keep_string_results() {
         use crate::agent::tools::{
@@ -1963,6 +1989,59 @@ pub(crate) async fn scope_observer<F: std::future::Future>(
         .await
 }
 
+/// Fire `FileChanged` for a successful native file mutation carried by a
+/// `ToolResult` step event.
+#[cfg(feature = "hooks")]
+async fn dispatch_file_changed_for<M: rig::completion::CompletionModel>(
+    event: &rig::agent::StepEvent<'_, M>,
+) {
+    if let rig::agent::StepEvent::ToolResult {
+        tool_name,
+        outcome: rig::tool::ToolOutcome::Success,
+        extensions,
+        ..
+    } = event
+        && let Some((path, tool)) = changed_file(tool_name, extensions)
+    {
+        crate::startup::heap_future(|| crate::extras::hooks::dispatch_file_changed(&path, &tool))
+            .await;
+    }
+}
+
+/// The path and tool of a native file mutation, when `tool_name` is one that
+/// reports its change through a [`MutationDiff`].
+#[cfg(feature = "hooks")]
+fn changed_file(
+    tool_name: &str,
+    extensions: &rig::tool::ToolResultExtensions,
+) -> Option<(String, String)> {
+    if !matches!(tool_name, "edit" | "write" | "notebook_edit" | "js") {
+        return None;
+    }
+    let diff = extensions.get::<MutationDiff>()?;
+    Some((diff.path.clone(), tool_name.to_string()))
+}
+
+/// Dispatches only the `FileChanged` hook for successful native mutations.
+/// Subagents install this (the parent's [`MutationDiffHook`] also forwards
+/// diffs to the interactive event sink, which a child must not do), so edits
+/// made by a write persona fire the same hook as the parent's own.
+#[cfg(feature = "hooks")]
+#[derive(Clone, Copy)]
+pub(crate) struct FileChangedHook;
+
+#[cfg(feature = "hooks")]
+impl<M: rig::completion::CompletionModel> rig::agent::AgentHook<M> for FileChangedHook {
+    async fn on_event(
+        &self,
+        _context: &rig::agent::HookContext,
+        event: rig::agent::StepEvent<'_, M>,
+    ) -> rig::agent::Flow {
+        dispatch_file_changed_for(&event).await;
+        rig::agent::Flow::cont()
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct MutationDiffHook;
 
@@ -1973,21 +2052,7 @@ impl<M: rig::completion::CompletionModel> rig::agent::AgentHook<M> for MutationD
         event: rig::agent::StepEvent<'_, M>,
     ) -> rig::agent::Flow {
         #[cfg(feature = "hooks")]
-        if let rig::agent::StepEvent::ToolResult {
-            tool_name,
-            outcome: rig::tool::ToolOutcome::Success,
-            extensions,
-            ..
-        } = &event
-            && matches!(*tool_name, "edit" | "write" | "notebook_edit" | "js")
-            && let Some(diff) = extensions.get::<MutationDiff>()
-        {
-            let (path, tool) = (diff.path.clone(), tool_name.to_string());
-            crate::startup::heap_future(|| {
-                crate::extras::hooks::dispatch_file_changed(&path, &tool)
-            })
-            .await;
-        }
+        dispatch_file_changed_for(&event).await;
         if let rig::agent::StepEvent::ToolResult {
             tool_name,
             internal_call_id,

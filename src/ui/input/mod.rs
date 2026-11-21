@@ -333,6 +333,9 @@ pub struct InputEditor {
     accent: Option<crossterm::style::Color>,
     prompt_names: Vec<String>,
     agent_names: Vec<String>,
+    /// Live background task id prefixes for the `/tasks ` picker.
+    #[cfg(feature = "subagents")]
+    task_ids: Vec<String>,
     theme_names: Vec<String>,
     custom_commands: Vec<(String, String)>,
     #[cfg(feature = "mcp")]
@@ -394,6 +397,8 @@ impl InputEditor {
             accent: None,
             prompt_names: Vec::new(),
             agent_names: Vec::new(),
+            #[cfg(feature = "subagents")]
+            task_ids: Vec::new(),
             theme_names: Vec::new(),
             custom_commands: Vec::new(),
             #[cfg(feature = "mcp")]
@@ -669,6 +674,13 @@ impl InputEditor {
 
     pub fn set_agent_names(&mut self, names: Vec<String>) {
         self.agent_names = names;
+    }
+
+    /// Short ids of the session's background tasks, offered by the `/tasks `
+    /// argument picker next to its verbs.
+    #[cfg(feature = "subagents")]
+    pub(crate) fn set_task_ids(&mut self, ids: Vec<String>) {
+        self.task_ids = ids;
     }
 
     pub fn set_theme_names(&mut self, names: Vec<String>) {
@@ -949,6 +961,17 @@ impl InputEditor {
                 self.load_text(&format!("{prefix}{query}"));
                 return true;
             }
+        }
+
+        #[cfg(feature = "subagents")]
+        if let Some(query) = command_argument_query(&line, "/tasks") {
+            let items: Vec<String> = ["result", "cancel", "clear"]
+                .into_iter()
+                .map(str::to_string)
+                .chain(self.task_ids.iter().cloned())
+                .collect();
+            self.start_argument_picker_with_query("/tasks ", items, query);
+            return true;
         }
 
         for command in crate::ui::pickers::handlers::FINITE_ARGUMENT_COMMANDS {

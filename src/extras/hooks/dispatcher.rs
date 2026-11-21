@@ -1433,14 +1433,7 @@ fn parse_decision(event: &str, output: &HookOutput) -> Decision {
                     .to_string();
                 return Decision::Block { reason };
             }
-            if event == "SubagentStart"
-                && let Some(content) = value.get("additionalContext").and_then(|v| v.as_str())
-            {
-                return Decision::Rewrite {
-                    content: content.to_string(),
-                };
-            }
-            if matches!(event, "SessionStart" | "UserPromptSubmit") {
+            if matches!(event, "SessionStart" | "UserPromptSubmit" | "SubagentStart") {
                 let context = value
                     .get("hookSpecificOutput")
                     .filter(|specific| {

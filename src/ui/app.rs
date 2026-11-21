@@ -2890,7 +2890,13 @@ impl<'a> App<'a> {
                     #[cfg(feature = "subagents")]
                     if let Some(pool) = background_pool { pool.wait_changed().await; return; }
                     std::future::pending::<()>().await;
-                } => { self.refresh()?; }
+                } => {
+                    self.refresh()?;
+                    // A finished background task wakes an idle session like a
+                    // finished shell job does.
+                    #[cfg(feature = "subagents")]
+                    crate::startup::heap_future(|| self.wake_for_task_notices()).await?;
+                }
                 Some(result) = async { Some(self.update_notice.as_mut()?.await) } => {
                     self.update_notice = None;
                     if let Ok(notice) = result {
@@ -3288,6 +3294,15 @@ impl<'a> App<'a> {
             self.loop_state.frames += 1;
         }
         self.input.set_file_workspace(self.ui.workspace.clone());
+        #[cfg(feature = "subagents")]
+        self.input.set_task_ids(
+            self.ui
+                .session
+                .background_tasks()
+                .iter()
+                .map(|row| crate::extras::subagents::background::short_id(&row.id).to_string())
+                .collect(),
+        );
         self.sync_live_model_names(false);
         let cron_label = self.cron_status_label();
         refresh_display(
@@ -5528,6 +5543,18 @@ impl<'a> App<'a> {
                 &format!(
                     "{jobs} background job{} still running; /jobs lists them and /jobs stop <id> ends one",
                     if jobs == 1 { "" } else { "s" }
+                ),
+                C_AGENT,
+            )?;
+        }
+        #[cfg(feature = "subagents")]
+        if let Some(pool) = &self.ui.session.background_pool
+            && let tasks @ 1.. = pool.counts().0
+        {
+            self.renderer.write_line(
+                &format!(
+                    "{tasks} background task{} still running; /tasks lists them and /tasks cancel <id> ends one",
+                    if tasks == 1 { "" } else { "s" }
                 ),
                 C_AGENT,
             )?;
@@ -8690,9 +8717,21 @@ impl<'a> App<'a> {
             Some(i) => i,
             None => return Ok(()),
         };
-        let target = crate::extras::git_worktree::default_branch(&info.main_repo_path)
-            .await
-            .unwrap_or_else(|| "main".to_string());
+        let Some((target, source)) = crate::extras::git_worktree::resolve_merge_target(&info).await
+        else {
+            let _ = self.renderer.write_line(
+                &format!(
+                    "worktree '{}' was not auto-merged: no target branch could be detected; run /wt-merge <branch>",
+                    info.branch
+                ),
+                C_ERROR,
+            );
+            return Ok(());
+        };
+        let _ = self.renderer.write_line(
+            &format!("auto-merge target '{target}' ({})", source.describe()),
+            C_AGENT,
+        );
 
         self.handle_worktree_merge(info, target, false).await
     }

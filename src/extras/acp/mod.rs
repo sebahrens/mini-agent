@@ -527,6 +527,14 @@ impl SessionHistory {
         } else {
             None
         };
+        // Compaction cancels running background tasks; tell the client, since
+        // nothing else reports it.
+        #[cfg(feature = "subagents")]
+        if let Some(pause) = &_background_pause
+            && let Some(notice) = pause.notice()
+        {
+            self.compaction_events.push(notice);
+        }
         let mut usage = crate::event::UsageDelta::default();
         #[cfg(feature = "goal")]
         if let Some(goal) = goal_store {

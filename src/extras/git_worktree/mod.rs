@@ -109,6 +109,10 @@ struct CreateState {
     target: PathBuf,
     branch: String,
     expected_branch_oid: String,
+    /// The branch the new branch was created from (the repository's checked
+    /// out branch when `HEAD` was the base), recorded in the branch config so
+    /// `/wt-merge` can merge back into it.
+    base_branch: Option<String>,
     ownership_ref: String,
     branch_reservation_owned: bool,
     branch_reservation_uncertain: bool,
@@ -513,6 +517,114 @@ pub async fn current_branch(repo_path: &Path) -> Option<String> {
     current_branch_at(&repo_path).await.ok().flatten()
 }
 
+/// The branch config key recording what a worktree's branch was created from.
+fn base_config_key(branch: &str) -> String {
+    format!("branch.{branch}.mini-agent-base")
+}
+
+/// Where a merge target came from, for the line printed before merging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeTargetSource {
+    RecordedBase,
+    CheckedOut,
+    OriginHead,
+    InitDefaultBranch,
+    MainOrMaster,
+}
+
+impl MergeTargetSource {
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::RecordedBase => "the branch the worktree was created from",
+            Self::CheckedOut => "the branch checked out in the main repository",
+            Self::OriginHead => "origin/HEAD",
+            Self::InitDefaultBranch => "init.defaultBranch",
+            Self::MainOrMaster => "main/master",
+        }
+    }
+}
+
+/// The branch a worktree's work should merge into, and where that was decided:
+/// (1) the base recorded at creation, (2) the branch checked out in the main
+/// repository, (3) `origin/HEAD`, (4) `init.defaultBranch`, (5) `main`/`master`.
+/// Each candidate must be an existing local branch other than the worktree's
+/// own. One function for `/wt-merge` and the exit auto-merge.
+pub async fn resolve_merge_target(info: &WorktreeInfo) -> Option<(String, MergeTargetSource)> {
+    let repo = canonical_path(&info.main_repo_path, "repository").ok()?;
+    let usable = |name: String| {
+        let repo = repo.clone();
+        let own = info.branch.clone();
+        async move {
+            if name.is_empty() || name == own || name.starts_with('-') {
+                return None;
+            }
+            optional_ref_oid(&repo, &format!("refs/heads/{name}"))
+                .await
+                .ok()
+                .flatten()
+                .map(|_| name)
+        }
+    };
+    let config_value = |key: String| {
+        let repo = repo.clone();
+        async move {
+            let output = worktree_runner()
+                .run_allow_exit(
+                    &repo,
+                    "read-merge-target-config",
+                    ["config", "--get", key.as_str()],
+                    QUERY_LIMITS,
+                )
+                .await
+                .ok()?;
+            (output.exit_status.and_then(|status| status.code()) == Some(0))
+                .then(|| String::from_utf8_lossy(trim_line(&output.stdout)).into_owned())
+        }
+    };
+    if let Some(base) = config_value(base_config_key(&info.branch)).await
+        && let Some(name) = usable(base).await
+    {
+        return Some((name, MergeTargetSource::RecordedBase));
+    }
+    if let Some(Some(name)) = current_branch_at(&repo).await.ok()
+        && let Some(name) = usable(name).await
+    {
+        return Some((name, MergeTargetSource::CheckedOut));
+    }
+    let origin_head = worktree_runner()
+        .run_allow_exit(
+            &repo,
+            "read-origin-head",
+            [
+                "symbolic-ref",
+                "--quiet",
+                "--short",
+                "refs/remotes/origin/HEAD",
+            ],
+            QUERY_LIMITS,
+        )
+        .await
+        .ok()
+        .filter(|output| output.exit_status.and_then(|status| status.code()) == Some(0))
+        .map(|output| String::from_utf8_lossy(trim_line(&output.stdout)).into_owned());
+    if let Some(name) = origin_head
+        .as_deref()
+        .and_then(|head| head.strip_prefix("origin/"))
+        && let Some(name) = usable(name.to_string()).await
+    {
+        return Some((name, MergeTargetSource::OriginHead));
+    }
+    if let Some(configured) = config_value("init.defaultBranch".to_string()).await
+        && let Some(name) = usable(configured).await
+    {
+        return Some((name, MergeTargetSource::InitDefaultBranch));
+    }
+    default_branch(&repo)
+        .await
+        .filter(|name| *name != info.branch)
+        .map(|name| (name, MergeTargetSource::MainOrMaster))
+}
+
 pub async fn default_branch(repo_path: &Path) -> Option<String> {
     let repo_path = canonical_path(repo_path, "repository").ok()?;
     // One `for-each-ref` lists whichever of the two local branches exist.
@@ -671,12 +783,17 @@ async fn create_with_limits(
             .map_err(|error| format!("base revision {revision} is not a commit: {error}"))?
         }
     };
+    let base_branch = match base_revision {
+        None => current_branch_at(&repo_path).await.ok().flatten(),
+        Some(_) => None,
+    };
     let state = CreateState {
         repo_path,
         common_dir,
         target,
         branch: name.to_string(),
         expected_branch_oid,
+        base_branch,
         ownership_ref: format!("refs/mini-agent/worktree-create/{}", uuid::Uuid::new_v4()),
         branch_reservation_owned: false,
         branch_reservation_uncertain: false,
@@ -841,6 +958,24 @@ async fn create_transaction(
         ),
     )
     .await?;
+    if let Some(base) = &state.base_branch {
+        // Best effort: without the record `/wt-merge` falls back to the other
+        // sources in `resolve_merge_target`.
+        if let Err(error) = run_local(
+            &state.repo_path,
+            "record-worktree-base",
+            [
+                OsString::from("config"),
+                OsString::from("--local"),
+                OsString::from(base_config_key(&state.branch)),
+                OsString::from(base),
+            ],
+        )
+        .await
+        {
+            tracing::warn!(%error, "could not record the worktree's base branch");
+        }
+    }
     let worktree_path =
         canonical_path(&state.target, "worktree path").map_err(CreateStepError::Command)?;
     let common_dir = state.common_dir.clone();
@@ -871,11 +1006,11 @@ async fn create_transaction(
     ))
 }
 
+/// Whether a failed branch reservation may still have created the branch: the
+/// command was cut off or could not be observed, as opposed to refused by Git.
 fn reservation_error_is_uncertain(error: &str) -> bool {
-    error.contains("timed out")
-        || error.contains("was cancelled")
-        || error.contains("output limit")
-        || error.contains("runner failed")
+    use crate::git::runner::GitRunError;
+    GitRunError::kind_is_uncertain(GitRunError::classify(error))
 }
 
 async fn delete_owned_ref(

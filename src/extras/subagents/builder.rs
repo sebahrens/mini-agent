@@ -91,6 +91,11 @@ pub(crate) struct SubagentAuthorization {
     read_only_js: Option<ReadOnlyJsAuthorization>,
     /// Generic spill bound for this child's unbounded tool results.
     spill_limits: crate::session::ToolResultSpillLimits,
+    /// The parent's logical session id. Oversized child tool results spill
+    /// into that session's private tool-output directory, the one directory
+    /// the shared checker auto-allows reads from, so the child can follow its
+    /// own "[full output saved to: ...]" pointer.
+    tool_output_session_id: Option<String>,
     /// Opt-in read-only shell of a read-mode persona (`[subagents]
     /// allow_read_only_shell`), bound to a private scratch workspace.
     read_only_shell: ReadOnlyShellState,
@@ -270,10 +275,28 @@ impl SubagentAuthorization {
             #[cfg(feature = "js")]
             read_only_js: None,
             spill_limits: Default::default(),
+            tool_output_session_id: None,
             read_only_shell: ReadOnlyShellState::None,
             web: None,
             code: None,
         }
+    }
+
+    /// The parent's tool-output session (see the field).
+    pub(crate) fn with_tool_output_session(mut self, session_id: Option<String>) -> Self {
+        self.tool_output_session_id = session_id;
+        self
+    }
+
+    /// The spill hook of a child: its oversized results are saved where the
+    /// child's own `read` is allowed to open them.
+    fn child_spill_hook(&self) -> crate::agent::runner::ToolResultSpillHook {
+        let session_id = self
+            .tool_output_session_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        crate::agent::runner::ToolResultSpillHook::new(session_id, None)
+            .with_limits(self.spill_limits)
     }
 
     /// Parent Git / LSP capabilities for a persona that names them.
@@ -658,26 +681,25 @@ impl SubagentAuthorization {
     }
 }
 
+/// The exact server -> tool names a persona was granted, with a bare
+/// server-name reference (an empty list) resolved to the tools it exposes.
 #[cfg(feature = "mcp")]
-pub(crate) async fn build_persona_mcp(
+pub(crate) type GrantedMcp = std::collections::BTreeMap<String, Vec<String>>;
+
+/// Connect the MCP servers a persona names (none when it names none). The
+/// connection can be shared by every child of a call; each child then derives
+/// its own tools and permission checker with [`persona_mcp_tools`].
+#[cfg(feature = "mcp")]
+pub(crate) async fn connect_persona_mcp(
     persona: &PersonaExecution,
     cfg: &crate::config::Config,
-    authorization: &SubagentAuthorization,
-) -> Result<
-    (
-        Option<crate::extras::mcp::McpClientManager>,
-        Vec<Box<dyn rig::tool::ToolDyn>>,
-        // The exact server -> tool names granted, with a bare server-name
-        // reference (an empty list) resolved to the tools it exposes.
-        std::collections::BTreeMap<String, Vec<String>>,
-    ),
-    String,
-> {
+    workspace: &std::sync::Arc<crate::paths::WorkspaceBinding>,
+) -> Result<Option<crate::extras::mcp::McpClientManager>, String> {
     let Some(allowlist) = persona.mcp_servers.as_ref() else {
-        return Ok((None, Vec::new(), Default::default()));
+        return Ok(None);
     };
     if allowlist.is_empty() {
-        return Ok((None, Vec::new(), Default::default()));
+        return Ok(None);
     }
     let configured = cfg
         .mcp_servers
@@ -690,16 +712,31 @@ pub(crate) async fn build_persona_mcp(
             .ok_or_else(|| format!("task: persona MCP server '{server}' is not configured"))?;
         selected.insert(server.clone(), config.clone());
     }
-    let workspace = authorization
-        .workspace
-        .as_ref()
-        .ok_or_else(|| "task: persona MCP requires a captured workspace".to_string())?;
-    let mut manager =
-        crate::extras::mcp::McpClientManager::connect_all_in_binding(&selected, workspace).await;
+    Ok(Some(
+        crate::extras::mcp::McpClientManager::connect_all_in_binding(&selected, workspace).await,
+    ))
+}
+
+/// The persona's allowlisted MCP tools over an existing connection, each with
+/// an independent permission checker, plus the exact grants. Fails (without
+/// shutting the connection down) when the allowlist names an unavailable tool.
+#[cfg(feature = "mcp")]
+pub(crate) async fn persona_mcp_tools(
+    manager: &crate::extras::mcp::McpClientManager,
+    // Connection notices taken when the servers were connected, quoted when
+    // the allowlist names a tool that is unavailable.
+    notices: &[String],
+    persona: &PersonaExecution,
+    cfg: &crate::config::Config,
+    authorization: &SubagentAuthorization,
+) -> Result<(Vec<Box<dyn rig::tool::ToolDyn>>, GrantedMcp), String> {
+    let Some(allowlist) = persona.mcp_servers.as_ref() else {
+        return Ok((Vec::new(), Default::default()));
+    };
     let permission = authorization.independent_mcp_permission(cfg)?;
     let timeouts = crate::extras::mcp::McpToolTimeouts::from_config_secs(cfg.mcp_tool_timeout_secs);
     let mut tools = crate::agent::builder::collect_mcp_tools(
-        &manager,
+        manager,
         permission,
         authorization.ask_tx.clone(),
         timeouts,
@@ -733,12 +770,6 @@ pub(crate) async fn build_persona_mcp(
             .map(|(server, _)| format!("{server}:*")),
     );
     if !missing.is_empty() {
-        let notices = manager
-            .take_notices()
-            .into_iter()
-            .map(|notice| notice.to_string())
-            .collect::<Vec<_>>();
-        manager.shutdown().await;
         let detail = if notices.is_empty() {
             String::new()
         } else {
@@ -753,11 +784,60 @@ pub(crate) async fn build_persona_mcp(
         .into_iter()
         .map(|tool| Box::new(tool) as Box<dyn rig::tool::ToolDyn>)
         .collect();
-    let mut granted = std::collections::BTreeMap::<String, Vec<String>>::new();
+    let mut granted = GrantedMcp::new();
     for (server, name) in discovered {
         granted.entry(server).or_default().push(name);
     }
-    Ok((Some(manager), tools, granted))
+    Ok((tools, granted))
+}
+
+/// The connection notices of a freshly connected manager, as text.
+#[cfg(feature = "mcp")]
+pub(crate) fn take_notice_text(manager: &mut crate::extras::mcp::McpClientManager) -> Vec<String> {
+    manager
+        .take_notices()
+        .into_iter()
+        .map(|notice| notice.to_string())
+        .collect()
+}
+
+/// Connect and derive in one step, for a child that owns its connection (an
+/// isolated child, whose workspace differs from the call's).
+#[cfg(feature = "mcp")]
+pub(crate) async fn build_persona_mcp(
+    persona: &PersonaExecution,
+    cfg: &crate::config::Config,
+    authorization: &SubagentAuthorization,
+) -> Result<
+    (
+        Option<crate::extras::mcp::McpClientManager>,
+        Vec<Box<dyn rig::tool::ToolDyn>>,
+        GrantedMcp,
+    ),
+    String,
+> {
+    if persona
+        .mcp_servers
+        .as_ref()
+        .is_none_or(std::collections::BTreeMap::is_empty)
+    {
+        return Ok((None, Vec::new(), Default::default()));
+    }
+    let workspace = authorization
+        .workspace
+        .as_ref()
+        .ok_or_else(|| "task: persona MCP requires a captured workspace".to_string())?;
+    let Some(mut manager) = connect_persona_mcp(persona, cfg, workspace).await? else {
+        return Ok((None, Vec::new(), Default::default()));
+    };
+    let notices = take_notice_text(&mut manager);
+    match persona_mcp_tools(&manager, &notices, persona, cfg, authorization).await {
+        Ok((tools, granted)) => Ok((Some(manager), tools, granted)),
+        Err(error) => {
+            manager.shutdown().await;
+            Err(error)
+        }
+    }
 }
 
 /// The memory tools a subagent is granted: read-only access ONLY
@@ -1072,7 +1152,11 @@ fn build_explore_agent_inner_with_suffix<M: CompletionModel + 'static>(
             .expect("host policy is always appended");
         preamble.truncate(policy_start);
         preamble.push_str(&prompt::write_rules());
-        preamble.push_str("\n\nWrite-capable child tools: write, edit, shell (only the parent's eligible tools). Implement the delegated objective; report edits, checks, and any missing evidence in the required sections.");
+        preamble.push_str(if persona.free_form {
+            "\n\nWrite-capable child tools: write, edit, shell (only the parent's eligible tools). Implement the delegated objective; report edits, checks, and any missing evidence in your answer."
+        } else {
+            "\n\nWrite-capable child tools: write, edit, shell (only the parent's eligible tools). Implement the delegated objective; report edits, checks, and any missing evidence in the required sections."
+        });
     }
     if !persona.write_mode
         && persona
@@ -1092,7 +1176,11 @@ fn build_explore_agent_inner_with_suffix<M: CompletionModel + 'static>(
     }
     if persona.evidence {
         preamble.push_str("\n\n");
-        preamble.push_str(prompt::EVIDENCE_CITATION_RULES);
+        preamble.push_str(if persona.free_form {
+            prompt::EVIDENCE_CITATION_RULES_FREE_FORM
+        } else {
+            prompt::EVIDENCE_CITATION_RULES
+        });
         if persona.inline_images > 0 {
             preamble.push_str("\n\n");
             preamble.push_str(&super::inline_images::attach_rules(persona.inline_images));
@@ -1131,6 +1219,10 @@ fn build_explore_agent_inner_with_suffix<M: CompletionModel + 'static>(
     // (`build_persona_mcp`); outer-agent MCP connections are never inherited.
     let mut tools = tools;
     tools.append(&mut additional_tools);
+    // The base prompt documents the default file tools; keep only the ones
+    // this child (after persona narrowing) actually has.
+    let registered = tools.iter().map(|tool| tool.name()).collect::<Vec<_>>();
+    preamble = prompt::with_registered_tools(&preamble, &registered);
     let tools = tools::memoize::definitions(tools);
 
     // The persona's own hooks wrap closest to the tools; the global hooks
@@ -1167,10 +1259,13 @@ fn build_explore_agent_inner_with_suffix<M: CompletionModel + 'static>(
     if let Some(inbox) = &persona.inbox {
         builder = builder.add_hook(super::inbox::ChildInboxHook(inbox.clone()));
     }
-    builder = builder.add_hook(
-        crate::agent::runner::ToolResultSpillHook::new(uuid::Uuid::new_v4().to_string(), None)
-            .with_limits(authorization.spill_limits),
-    );
+    builder = builder.add_hook(authorization.child_spill_hook());
+    // `FileChanged` fires for a child's native edits as it does for the
+    // parent's; only the parent forwards diffs to the interactive sink.
+    #[cfg(feature = "hooks")]
+    {
+        builder = builder.add_hook(crate::agent::tools::mutation_diff::FileChangedHook);
+    }
 
     builder = builder.add_hook(crate::context::instructions::WorkspaceInstructionHook(
         authorization.instructions.clone(),
@@ -2070,6 +2165,16 @@ mod tests {
     use crate::permission::{PermissionConfigs, SecurityMode};
 
     use super::{SubagentAuthorization, build_explore_preamble};
+
+    #[test]
+    fn child_spills_go_to_the_parent_session_directory_the_checker_allows() {
+        let bound = SubagentAuthorization::new(None, None, true)
+            .with_tool_output_session(Some("parent-session".into()));
+        assert_eq!(bound.child_spill_hook().session_id(), "parent-session");
+        // Without a captured parent session a private id is used, as before.
+        let unbound = SubagentAuthorization::new(None, None, true);
+        assert_ne!(unbound.child_spill_hook().session_id(), "parent-session");
+    }
 
     #[cfg(feature = "archmd")]
     #[test]

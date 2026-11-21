@@ -148,6 +148,10 @@ use crate::session::SessionMessage;
 
 const MAX_COMPACTION_REQUESTS: usize = 16;
 const MAX_ROLLING_SUMMARY_BYTES: usize = 16 * 1024;
+/// Output cap of a `/commit` or `/pr` proposal request: a JSON title plus a
+/// multi-paragraph body does not fit in 1024 tokens.
+#[cfg(feature = "git-worktree")]
+pub(crate) const GIT_PROPOSAL_MAX_TOKENS: u64 = 2048;
 const PROVIDER_ENVELOPE_TOKEN_RESERVE: u64 = 512;
 const MIN_SUMMARY_OUTPUT_TOKENS: u64 = 256;
 const MAX_SUMMARY_OUTPUT_TOKENS: u64 = 4_096;
@@ -1121,7 +1125,7 @@ impl AnyClient {
             cfg,
             cfg.resolve_extra_body(model_name, crate::config::quick_models_map(cfg)),
             session_id,
-            1024,
+            GIT_PROPOSAL_MAX_TOKENS,
         )?;
         macro_rules! complete {
             ($model:expr) => {
@@ -2744,7 +2748,7 @@ where
         let mut request = model
             .completion_request(prompt.clone())
             .preamble(preamble.clone())
-            .max_tokens(1024);
+            .max_tokens(GIT_PROPOSAL_MAX_TOKENS);
         if let Some(params) = params.clone() {
             request = request.additional_params(params);
         }
@@ -8935,7 +8939,7 @@ mod git_proposal_wire_tests {
         let body = wire.body();
         assert_eq!(answer.unwrap(), r#"{"message":"wire literal proposal"}"#);
         assert_eq!(body["model"], "fixture");
-        assert_eq!(body["max_tokens"], 1024);
+        assert_eq!(body["max_tokens"], GIT_PROPOSAL_MAX_TOKENS);
         assert_eq!(body["provider"]["data_collection"], "deny");
         assert_eq!(body["provider"]["zdr"], true);
         assert_eq!(body["provider"]["enforce_distillable_text"], false);
@@ -9035,7 +9039,7 @@ mod git_proposal_wire_tests {
         let requests = model.requests();
         assert_eq!(requests.len(), 1);
         assert!(requests[0].tools.is_empty());
-        assert_eq!(requests[0].max_tokens, Some(1024));
+        assert_eq!(requests[0].max_tokens, Some(GIT_PROPOSAL_MAX_TOKENS));
         let usage = ledger.take();
         assert_eq!((usage.input_tokens, usage.output_tokens), (21, 7));
         assert!(!ledger.take().has_values());

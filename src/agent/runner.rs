@@ -128,6 +128,11 @@ impl ToolResultSpillHook {
         }
     }
 
+    #[cfg(all(test, feature = "subagents"))]
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
     #[cfg(test)]
     pub(crate) fn limits(&self) -> crate::session::ToolResultSpillLimits {
         self.limits
@@ -1827,6 +1832,16 @@ fn record_tool_failure(internal_call_id: &str) {
             .unwrap_or_else(|e| e.into_inner())
             .insert(internal_call_id.to_owned());
     });
+}
+
+/// Flag the tool call running in this task as failed although it returns
+/// `Ok` (the `task` tool returns its full report as text even when every
+/// child failed). A no-op outside a tool call or work scope.
+#[cfg(feature = "subagents")]
+pub(crate) fn mark_current_tool_failed() {
+    if let Some(id) = crate::agent::tools::bash::current_tool_call_id() {
+        record_tool_failure(&id);
+    }
 }
 
 fn record_tool_loop_notice(internal_call_id: &str, notice: &str) {
@@ -6930,6 +6945,29 @@ mod tests {
     /// spawner and each wrapper reserved a full copy of that future, which
     /// overflowed a 2 MiB libtest thread under `--features acp,hooks`. CI sets
     /// `RUST_MIN_STACK` to 8 MiB, so this pins the budget explicitly.
+    #[cfg(feature = "subagents")]
+    #[tokio::test]
+    async fn a_tool_can_flag_its_own_ok_result_as_failed() {
+        let scope = super::AgentWorkScope::new();
+        scope
+            .run(crate::agent::tools::bash::scope_tool_call_id(
+                Some("call-1".into()),
+                async {
+                    super::mark_current_tool_failed();
+                },
+            ))
+            .await;
+        scope
+            .run(async {
+                assert!(super::take_tool_failure("call-1"));
+                assert!(!super::take_tool_failure("call-1"), "consumed once");
+                assert!(!super::take_tool_failure("call-2"));
+            })
+            .await;
+        // No-op outside a tool call or work scope.
+        super::mark_current_tool_failed();
+    }
+
     #[test]
     fn spawning_a_turn_keeps_the_turn_state_machine_off_the_caller_stack() {
         std::thread::Builder::new()

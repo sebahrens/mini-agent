@@ -89,7 +89,22 @@ it, and finished, cancelling, unknown or restored tasks are refused. The
 message is data: it grants no permission and changes no tool, sandbox or
 budget. Children do not message each other; there is no team mode.
 Agent controls obey ordinary tool ceilings and permissions. Cancellation reports
-`cancelling` until the actual model, approvals and effects settle. The default
+`cancelling` until the actual model, approvals and effects settle. A cancelled job
+(`/tasks cancel`, `task_cancel`, or compaction) lets its scheduler finish its own
+cancellation, so `task_result` and `/tasks result` still return the reports and
+tool logs of children that had already finished (in-flight children appear as
+`[partial: cancelled ...]`). Each row also records `label`, `agent_type`,
+`children`, `started_at` and, for a cancelled task, `cancel_reason`; `task_list`
+returns them. The new row fields are optional and omitted when unset, so a
+session with no background tasks stays readable by an older binary; a session
+that saved tasks with these fields is rejected by an older binary (it validates
+saved task rows strictly). Persona MCP servers are connected once per `task`
+call and shared by its children (each child keeps its own tools and permission
+checker; worktree-isolated children connect their own). Context compaction (`/compact` and automatic compaction) cancels
+every running background task with the reason "cancelled by context compaction;
+relaunch it if the work is still needed"; the TUI and headless runs print
+`compaction cancelled N background task(s): <ids>`, and the model's completion
+notice carries the same reason. The default
 `background_tasks` footer item shows active tasks and reports awaiting delivery.
 The next admitted main turn receives one literal completion notice; an abandoned
 preparation keeps it pending. Notices contain status/ID only and grant no authority.
@@ -468,9 +483,12 @@ For each isolated child the host:
    worktree path, base commit, commit list and diff stat. Nothing is applied to
    the parent. Merge explicitly, for example `git merge subagent-<id>` from the
    parent or `/worktree <path>` then `/wt-merge`.
-5. Removes the worktree and branch when the child made no changes, and when the
-   child is cancelled, times out or its task call is dropped. Worktrees with
-   commits are kept until you merge and delete them.
+5. Removes the worktree and branch when the child made no changes. A child that
+   is cancelled, times out or whose task call is dropped has whatever it left
+   committed and the branch kept (an untouched worktree is removed), and the
+   call's report gets an `## Isolated worktrees of stopped children` section
+   saying which happened. A failed removal is reported with the path. Worktrees
+   with commits are kept until you merge and delete them.
 
 Limits: concurrent children editing the same lines produce conflicting
 branches; resolve at merge time. Committing needs a git identity (repository

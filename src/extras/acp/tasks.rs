@@ -160,11 +160,9 @@ mod tests {
 
     fn row(id: &str, status: Status) -> SavedTask {
         SavedTask {
-            id: id.to_owned(),
             status,
             result: Some("report".to_owned()),
-            details: None,
-            notified: false,
+            ..SavedTask::new(id.to_owned())
         }
     }
 
