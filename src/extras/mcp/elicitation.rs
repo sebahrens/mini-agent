@@ -23,6 +23,7 @@ pub(crate) struct Request {
     pub valid: Arc<dyn Fn() -> bool + Send + Sync>,
     /// Set by a front end that cannot answer MCP elicitation at all (ACP)
     /// before it replies `Cancelled`, so the call result can say why.
+    #[cfg_attr(not(feature = "acp"), allow(dead_code))]
     pub cannot_answer: Arc<AtomicBool>,
 }
 #[derive(Clone)]
