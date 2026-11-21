@@ -184,7 +184,11 @@ const PROFILE_INTENT_VERSION: u32 = 1;
 const PROFILE_INTENT_EXTENSION: &str = "intent";
 const JOB_NAME_PREFIX: &str = "Global\\mini-agent-general-job-";
 const STALE_JOB_CLEANUP_EXIT_CODE: u32 = 126;
-const MAX_JOB_PROCESSES: u32 = 64;
+/// Bounds fork bombs without starving real builds: `ninja`, `msbuild -m`,
+/// `pytest -n auto` and browser test runs count every descendant. Exceeding
+/// it fails CreateProcess with ERROR_NOT_ENOUGH_QUOTA, which the shell tool
+/// ties back to the sandbox in its failure note.
+const MAX_JOB_PROCESSES: u32 = 1024;
 const ACL_MUTEX_WAIT_MS: u32 = 5_000;
 const GENERAL_PREFLIGHT_RUN_TIMEOUT: Duration = Duration::from_secs(30);
 const GENERAL_PREFLIGHT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -300,6 +304,10 @@ struct LaunchRequest {
     /// Run the target under a ConPTY of this size hosted by the helper.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pty: Option<PtyRequest>,
+    /// Resolved `shell-env` / `shell-inherit-env` entries for the contained
+    /// shell, layered over the fixed environment.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    extra_env: Vec<(String, String)>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, Eq, PartialEq)]
@@ -1929,6 +1937,7 @@ pub(crate) fn build_shell_helper(
     configured_read_roots: &[PathBuf],
     configured_write_roots: &[PathBuf],
     pty: Option<&crate::sandbox::pty::PtyLaunch>,
+    extra_env: &[(String, String)],
 ) -> Result<tokio::process::Command, String> {
     let program = resolve_program(shell, cwd)?;
     let arguments = prefix_args
@@ -1944,6 +1953,7 @@ pub(crate) fn build_shell_helper(
         configured_read_roots,
         configured_write_roots,
         pty,
+        extra_env,
     )
 }
 
@@ -1964,6 +1974,7 @@ pub(crate) fn build_direct_helper(
         configured_read_roots,
         configured_write_roots,
         None,
+        &[],
     )
 }
 
@@ -2073,7 +2084,7 @@ fn build_helper(
     cwd: &Path,
     cache: &Path,
 ) -> Result<tokio::process::Command, String> {
-    build_helper_configured(program, arguments, cwd, cache, &[], &[], None)
+    build_helper_configured(program, arguments, cwd, cache, &[], &[], None, &[])
 }
 
 fn build_helper_configured(
@@ -2084,8 +2095,9 @@ fn build_helper_configured(
     configured_read_roots: &[PathBuf],
     configured_write_roots: &[PathBuf],
     pty: Option<&crate::sandbox::pty::PtyLaunch>,
+    extra_env: &[(String, String)],
 ) -> Result<tokio::process::Command, String> {
-    build_helper_with_ready_and_roots(
+    build_helper_with_ready_roots_and_env(
         program,
         arguments,
         cwd,
@@ -2095,6 +2107,7 @@ fn build_helper_configured(
         configured_write_roots,
         None,
         pty,
+        extra_env,
     )
 }
 
@@ -2182,6 +2195,7 @@ fn prepare_launch_request(
         ready_path,
         preflight_witness: None,
         pty: None,
+        extra_env: Vec::new(),
     })
 }
 
@@ -2196,6 +2210,32 @@ fn build_helper_with_ready_and_roots(
     workspace: Option<&Path>,
     pty: Option<&crate::sandbox::pty::PtyLaunch>,
 ) -> Result<tokio::process::Command, String> {
+    build_helper_with_ready_roots_and_env(
+        program,
+        arguments,
+        cwd,
+        cache,
+        ready_path,
+        configured_read_roots,
+        configured_write_roots,
+        workspace,
+        pty,
+        &[],
+    )
+}
+
+fn build_helper_with_ready_roots_and_env(
+    program: PathBuf,
+    arguments: Vec<String>,
+    cwd: &Path,
+    cache: &Path,
+    ready_path: Option<PathBuf>,
+    configured_read_roots: &[PathBuf],
+    configured_write_roots: &[PathBuf],
+    workspace: Option<&Path>,
+    pty: Option<&crate::sandbox::pty::PtyLaunch>,
+    extra_env: &[(String, String)],
+) -> Result<tokio::process::Command, String> {
     let mut request = prepare_launch_request(
         program,
         arguments,
@@ -2206,6 +2246,7 @@ fn build_helper_with_ready_and_roots(
         configured_write_roots,
         workspace,
     )?;
+    request.extra_env = extra_env.to_vec();
     request.pty = pty.map(|launch| PtyRequest {
         rows: launch.rows,
         cols: launch.cols,
@@ -3252,6 +3293,7 @@ fn run_helper() -> Result<i32, String> {
     preflight_witness::mark(42); // setup_canary
     let omitted_handle = inheritable_omitted_canary()?;
     let mut arguments = request.arguments;
+    let extra_env = request.extra_env;
     let authority_probe_requested =
         arguments.first().map(String::as_str) == Some(AUTHORITY_PROBE_ARG);
     if authority_probe_requested {
@@ -3302,6 +3344,7 @@ fn run_helper() -> Result<i32, String> {
         &cwd,
         &cache,
         &grants.profile.storage,
+        &extra_env,
         pty.as_ref(),
     ) {
         Ok(child) => child,
@@ -4370,6 +4413,9 @@ fn create_appcontainer_profile(
         std::fs::create_dir_all(profile.storage.join("Temp")).map_err(|error| {
             format!("sandbox: create private AppContainer temporary storage: {error}")
         })?;
+        std::fs::create_dir_all(profile.storage.join("Roaming")).map_err(|error| {
+            format!("sandbox: create private AppContainer roaming storage: {error}")
+        })?;
         // Protected machine-wide executables are only admitted when their existing DACL already
         // grants AppContainer read/execute access. `grant_read_root` never mutates them, so do not
         // journal them as cleanup targets: recovery must never request WRITE_DAC on Program Files
@@ -4929,9 +4975,10 @@ fn sweep_stale_profiles_until_locked(
                 stages.push(path)
             }
             _ => {
-                return Err(
-                    "sandbox: unexpected entry in AppContainer cleanup journal root".into(),
-                );
+                return Err(format!(
+                    "sandbox: unexpected entry in AppContainer cleanup journal root: {}",
+                    path.display()
+                ));
             }
         }
     }
@@ -4945,7 +4992,7 @@ fn sweep_stale_profiles_until_locked(
             if Instant::now() >= deadline || error.contains("did not drain all descendants") {
                 break;
             }
-            return Err(error);
+            return Err(format!("{error} (cleanup journal {})", path.display()));
         }
     }
     for path in intents {
@@ -5043,10 +5090,19 @@ fn sweep_stale_profile_journal(
         return Err("sandbox: stale AppContainer journal SID mismatch".into());
     }
     wait_for_stale_job_quiescence_until(&journal.job_name, deadline)?;
-    let roots = canonicalize_access_roots(
-        journal.roots.iter().map(PathBuf::as_path),
-        journal_root.path(),
-    )?;
+    // A root that no longer exists (deleted workspace or worktree, removed
+    // tool directory, unplugged drive) carries no ACE, so it is already clean.
+    // A root that exists but cannot be inspected still fails closed, naming
+    // the root so the operator can repair it.
+    let mut roots = Vec::new();
+    for root in super::roots_present_on_disk(&journal.roots, journal_root.path()) {
+        roots.extend(
+            canonicalize_access_roots([root.as_path()], journal_root.path())
+                .map_err(|error| format!("{error}: {}", root.display()))?,
+        );
+    }
+    roots.sort();
+    roots.dedup();
     for root in roots {
         ensure_preflight_cleanup_deadline(deadline)?;
         let stale_effective = effective_path_rights(&root, sid.0)?;
@@ -5404,6 +5460,7 @@ fn launch_appcontainer(
     cwd: &Path,
     cache: &Path,
     private_storage: &Path,
+    extra_env: &[(String, String)],
     pty: Option<&crate::sandbox::conpty::ConPty>,
 ) -> Result<Handle, String> {
     // Preserve verbatim canonical paths for policy/identity checks, but use
@@ -5499,7 +5556,7 @@ fn launch_appcontainer(
     }
     let mut command_line = wide_string(&command_line);
     let cwd = wide_null(child_cwd.as_os_str())?;
-    let environment = appcontainer_environment(cache, private_storage);
+    let environment = appcontainer_environment(cache, private_storage, extra_env);
     let mut information = PROCESS_INFORMATION::default();
     if unsafe {
         CreateProcessAsUserW(
@@ -5646,21 +5703,32 @@ fn target_inherited_omitted_canary(target: &Handle, canary: &Handle) -> Result<b
     Ok(unsafe { CompareObjectHandles(canary.raw(), candidate.raw()) } != 0)
 }
 
-fn appcontainer_environment(cache: &Path, private_storage: &Path) -> Vec<u16> {
-    let mut entries = essential_windows_environment();
+fn appcontainer_environment(
+    cache: &Path,
+    private_storage: &Path,
+    extra_env: &[(String, String)],
+) -> Vec<u16> {
     let private_storage = private_storage.as_os_str().to_string_lossy().into_owned();
     let private_temp = Path::new(&private_storage)
         .join("Temp")
         .as_os_str()
         .to_string_lossy()
         .into_owned();
+    let private_roaming = Path::new(&private_storage)
+        .join("Roaming")
+        .as_os_str()
+        .to_string_lossy()
+        .into_owned();
     let cache = cache.as_os_str().to_string_lossy().into_owned();
-    entries.push(("LOCALAPPDATA".into(), private_storage.clone()));
-    entries.push(("USERPROFILE".into(), private_storage));
-    entries.push(("TEMP".into(), private_temp.clone()));
-    entries.push(("TMP".into(), private_temp));
-    entries.push(("MINI_AGENT_CACHE_DIR".into(), cache));
-    entries.sort_by(|a, b| a.0.to_ascii_uppercase().cmp(&b.0.to_ascii_uppercase()));
+    let private = [
+        ("LOCALAPPDATA".to_string(), private_storage.clone()),
+        ("APPDATA".to_string(), private_roaming),
+        ("USERPROFILE".to_string(), private_storage),
+        ("TEMP".to_string(), private_temp.clone()),
+        ("TMP".to_string(), private_temp),
+        ("MINI_AGENT_CACHE_DIR".to_string(), cache),
+    ];
+    let entries = super::merge_environment(essential_windows_environment(), extra_env, &private);
     let mut block = Vec::new();
     for (name, value) in entries {
         block.extend(wide_string(&format!("{name}={value}")));
@@ -5681,6 +5749,17 @@ fn essential_windows_environment() -> Vec<(String, String)> {
         "LC_ALL",
         "TERM",
         "NO_COLOR",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramW6432",
+        "ProgramData",
+        "CommonProgramFiles",
+        "CommonProgramFiles(x86)",
+        "CommonProgramW6432",
+        "PROCESSOR_ARCHITECTURE",
+        "NUMBER_OF_PROCESSORS",
+        "OS",
+        "USERNAME",
     ]
     .iter()
     .filter_map(|name| {
@@ -5703,11 +5782,7 @@ fn essential_windows_environment() -> Vec<(String, String)> {
 }
 
 fn windows_command_line(program: &Path, arguments: &[String]) -> String {
-    std::iter::once(program.as_os_str().to_string_lossy().into_owned())
-        .chain(arguments.iter().cloned())
-        .map(|argument| quote_windows_argument(&argument))
-        .collect::<Vec<_>>()
-        .join(" ")
+    super::windows_command_line_text(&program.as_os_str().to_string_lossy(), arguments)
 }
 
 pub(crate) fn child_process_path(path: &Path) -> PathBuf {
@@ -5732,31 +5807,6 @@ pub(crate) fn child_process_path(path: &Path) -> PathBuf {
         return PathBuf::from(std::ffi::OsString::from_wide(&units[VERBATIM.len()..]));
     }
     path.to_path_buf()
-}
-
-fn quote_windows_argument(argument: &str) -> String {
-    if !argument.is_empty() && !argument.chars().any(|c| c == ' ' || c == '\t' || c == '"') {
-        return argument.to_string();
-    }
-    let mut quoted = String::from("\"");
-    let mut slashes = 0usize;
-    for ch in argument.chars() {
-        if ch == '\\' {
-            slashes += 1;
-            continue;
-        }
-        if ch == '"' {
-            quoted.push_str(&"\\".repeat(slashes * 2 + 1));
-            quoted.push('"');
-        } else {
-            quoted.push_str(&"\\".repeat(slashes));
-            quoted.push(ch);
-        }
-        slashes = 0;
-    }
-    quoted.push_str(&"\\".repeat(slashes * 2));
-    quoted.push('"');
-    quoted
 }
 
 fn open_and_verify_parent(pid: u32, created: u64) -> Result<Handle, String> {
@@ -8795,18 +8845,32 @@ mod tests {
     }
 
     #[test]
-    fn windows_argument_quoting_handles_empty_quotes_and_trailing_slashes() {
-        assert_eq!(quote_windows_argument("plain"), "plain");
-        assert_eq!(quote_windows_argument(""), "\"\"");
-        assert_eq!(quote_windows_argument("a b"), "\"a b\"");
-        assert_eq!(quote_windows_argument("a\\\"b"), "\"a\\\\\\\"b\"");
-        assert_eq!(quote_windows_argument("a b\\"), "\"a b\\\\\"");
+    fn cmd_command_line_passes_the_script_verbatim() {
+        let line = windows_command_line(
+            Path::new(r"C:\Windows\System32\cmd.exe"),
+            &[
+                "/D".into(),
+                "/S".into(),
+                "/C".into(),
+                r#"echo "a b""#.into(),
+            ],
+        );
+        assert!(line.ends_with(r#"/D /S /C "echo "a b"""#), "{line}");
     }
 
     #[test]
     fn appcontainer_environment_uses_container_local_profile_and_temp() {
         let storage = Path::new(r"C:\Users\runner\AppData\Local\Packages\mini-agent\AC");
-        let block = appcontainer_environment(Path::new(r"C:\cache"), storage);
+        let block = appcontainer_environment(
+            Path::new(r"C:\cache"),
+            storage,
+            &[
+                ("JAVA_HOME".to_string(), r"C:\jdk".to_string()),
+                ("x".to_string(), "1".to_string()),
+                ("userprofile".to_string(), r"C:\Users\real".to_string()),
+                ("Temp".to_string(), r"C:\real-temp".to_string()),
+            ],
+        );
         let entries = String::from_utf16(&block)
             .expect("environment UTF-16")
             .split('\0')
@@ -8828,6 +8892,20 @@ mod tests {
                 .iter()
                 .any(|entry| entry == r"MINI_AGENT_CACHE_DIR=C:\cache")
         );
+        assert!(entries.iter().any(|entry| entry == r"JAVA_HOME=C:\jdk"));
+        assert!(entries.iter().any(|entry| entry == "x=1"));
+        assert!(entries.iter().any(|entry| {
+            entry == r"APPDATA=C:\Users\runner\AppData\Local\Packages\mini-agent\AC\Roaming"
+        }));
+        let mut names = entries
+            .iter()
+            .map(|entry| entry.split('=').next().unwrap().to_ascii_uppercase())
+            .collect::<Vec<_>>();
+        let total = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), total, "each variable occurs once: {entries:?}");
+        assert!(!entries.iter().any(|entry| entry.contains("real")));
     }
 
     #[test]

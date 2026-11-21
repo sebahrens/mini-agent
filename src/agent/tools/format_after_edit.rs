@@ -170,6 +170,11 @@ impl FormatAfterEdit {
                 "Formatter skipped: shell unavailable; edit remains committed.",
             ));
         };
+        if shell.dialect() == ShellDialect::Cmd {
+            return Some(unavailable(
+                "Formatter skipped: cmd.exe cannot run format-after-edit; set shell = \"powershell\"; edit remains committed.",
+            ));
+        }
         let Some(command) = command(template, operand, shell.dialect()) else {
             return Some(unavailable(
                 "Formatter skipped: invalid command template; edit remains committed.",

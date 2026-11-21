@@ -9,6 +9,21 @@ pub(crate) enum PrivateFileAccess {
     Append,
 }
 
+/// Name the path and the likely cause when a private directory cannot be
+/// owned or given its closed ACL: a volume without persistent ACLs (exFAT,
+/// FAT32, some network or container mounts) or an owner other than the
+/// current user (an elevated shell, a provisioning script).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn private_path_error(path: &std::path::Path, error: &std::io::Error) -> std::io::Error {
+    std::io::Error::new(
+        error.kind(),
+        format!(
+            "{}: {error}; private state needs a directory on NTFS that is owned by the current user (check MINI_AGENT_DATA_DIR / MINI_AGENT_CONFIG_DIR; exFAT/FAT32 volumes and directories created by another account cannot hold it)",
+            path.display()
+        ),
+    )
+}
+
 fn private_file_error() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::PermissionDenied,
@@ -1054,7 +1069,14 @@ mod windows {
         let handle = open_handle(path, READ_CONTROL | WRITE_DAC, OPEN_EXISTING, flags, None)?;
         let result = apply_private_dacl(handle, directory);
         let _ = unsafe { CloseHandle(handle) };
-        result
+        // Sharing violations (32/33) are retried by callers on their raw code.
+        result.map_err(|error| {
+            if matches!(error.raw_os_error(), Some(32 | 33)) {
+                error
+            } else {
+                private_path_error(path, &error)
+            }
+        })
     }
 
     /// Create only a new directory, with its explicit user owner and protected
@@ -3559,4 +3581,21 @@ pub(crate) use windows::validate_directory_checked;
 #[cfg(not(any(unix, windows)))]
 pub(crate) fn validate_directory_checked(_file: &std::fs::File) -> std::io::Result<()> {
     Err(unsupported())
+}
+
+#[cfg(test)]
+mod private_path_error_tests {
+    #[test]
+    fn private_path_error_names_the_path_and_keeps_the_kind() {
+        let source = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "private path is not owned by the current user",
+        );
+        let error = super::private_path_error(std::path::Path::new("E:/data/mini-agent"), &source);
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        let text = error.to_string();
+        assert!(text.contains("E:/data/mini-agent"), "{text}");
+        assert!(text.contains("not owned by the current user"), "{text}");
+        assert!(text.contains("MINI_AGENT_DATA_DIR"), "{text}");
+    }
 }

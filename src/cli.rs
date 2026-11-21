@@ -4,6 +4,22 @@ use compact_str::CompactString;
 use crate::config;
 use crate::config::types::EditSystem;
 
+/// The Windows default shell: `pwsh.exe`, then Windows PowerShell, with
+/// cmd.exe only when neither is on `PATH`. Models are far more fluent in
+/// PowerShell, and cmd.exe cannot run format-after-edit or `/pr`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn default_windows_shell(
+    path_dirs: impl IntoIterator<Item = std::path::PathBuf>,
+    is_file: impl Fn(&std::path::Path) -> bool,
+) -> String {
+    let dirs: Vec<_> = path_dirs.into_iter().collect();
+    ["pwsh.exe", "powershell.exe"]
+        .into_iter()
+        .find(|name| dirs.iter().any(|dir| is_file(&dir.join(name))))
+        .unwrap_or("cmd.exe")
+        .to_string()
+}
+
 fn default_sandbox_backend() -> String {
     if cfg!(target_os = "windows") {
         "appcontainer".to_string()
@@ -1978,7 +1994,10 @@ impl Cli {
             .or_else(|| cfg.shell.clone())
             .unwrap_or_else(|| {
                 if cfg!(target_os = "windows") {
-                    "cmd.exe".to_string()
+                    let path = std::env::var_os("PATH").unwrap_or_default();
+                    default_windows_shell(std::env::split_paths(&path), |candidate| {
+                        candidate.is_file()
+                    })
                 } else {
                     "bash".to_string()
                 }
@@ -2080,6 +2099,24 @@ pub fn write_completions(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn windows_default_shell_prefers_pwsh_then_powershell_then_cmd() {
+        use std::path::{Path, PathBuf};
+        let dirs = || vec![PathBuf::from("a"), PathBuf::from("b")];
+        let only = |present: &'static [&'static str]| {
+            move |path: &Path| present.iter().any(|name| path == Path::new(name))
+        };
+        assert_eq!(
+            super::default_windows_shell(dirs(), only(&["b/pwsh.exe", "a/powershell.exe"])),
+            "pwsh.exe"
+        );
+        assert_eq!(
+            super::default_windows_shell(dirs(), only(&["a/powershell.exe"])),
+            "powershell.exe"
+        );
+        assert_eq!(super::default_windows_shell(dirs(), only(&[])), "cmd.exe");
+    }
+
     #[test]
     fn launch_paths_become_absolute_against_the_launch_dir() {
         let mut cli = Cli::try_parse_from([

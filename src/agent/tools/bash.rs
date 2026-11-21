@@ -2272,14 +2272,19 @@ fn bound_output_lines_with_hint(text: String, max_output_lines: Option<u64>, hin
 
 /// Output fragments that a sandbox denial produces and that an unrelated
 /// failure rarely does. Matched case-insensitively against the retained output.
-const SANDBOX_FAILURE_MARKERS: [&str; 6] = [
+const SANDBOX_FAILURE_MARKERS: [&str; 7] = [
     "operation not permitted",
     "read-only file system",
     "could not resolve host",
     "network is unreachable",
     "sandbox-exec",
     "bwrap:",
+    "not enough quota is available",
 ];
+
+/// Windows ERROR_NOT_ENOUGH_QUOTA text: the AppContainer Job's active-process
+/// cap refused a further CreateProcess (mini-agent-nvnkx.361).
+const WINDOWS_PROCESS_CAP_MARKER: &str = "not enough quota is available";
 
 /// One bracketed line telling the model (and user) that a failed command may
 /// have been stopped by the sandbox rather than by its own logic
@@ -2308,6 +2313,11 @@ fn sandbox_failure_note(
     );
     if sandbox.profile() != crate::sandbox::SandboxProfile::HostFull {
         note.push_str(" Writes are limited to the workspace.");
+    }
+    if lowered.contains(WINDOWS_PROCESS_CAP_MARKER) {
+        note.push_str(
+            " \"Not enough quota\" means the sandbox's active-process cap was reached; lower build/test parallelism (for example make -j, msbuild -m, pytest -n).",
+        );
     }
     note.push_str(" See /sandbox");
     if allow_escalation {
@@ -3411,6 +3421,7 @@ mod tests {
             "connect: Network is unreachable",
             "sandbox-exec: sandbox_apply: denied",
             "bwrap: Can't mount proc",
+            "CreateProcess: Not enough quota is available to process this command.",
         ] {
             let note = sandbox_failure_note(&on, false, true, output)
                 .unwrap_or_else(|| panic!("no note for {output}"));
@@ -3427,6 +3438,16 @@ mod tests {
             assert_eq!(sandbox_failure_note(&off, false, true, output), None);
             assert_eq!(sandbox_failure_note(&on, false, false, output), None);
         }
+        assert!(
+            sandbox_failure_note(
+                &on,
+                false,
+                true,
+                "Not enough quota is available to process this command."
+            )
+            .unwrap()
+            .contains("active-process cap")
+        );
         assert_eq!(
             sandbox_failure_note(&on, false, true, "grep: no match"),
             None

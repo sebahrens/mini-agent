@@ -368,7 +368,7 @@ If you want to use mini-agent from scripts or other programs, these CLI flags ar
 | `--sandbox` | Explicitly require the platform general-process sandbox; fail if unavailable |
 | `--no-sandbox` | Disable the default-on general-process sandbox |
 | `--sandbox-profile workspace\|host-read\|host-full` | Select ordinary command filesystem reach; does not change permission mode or network policy. Unix host-full is explicit and warns; Windows uses workspace plus AppContainer root keys. |
-| `--shell <path>` | Select Bash/sh; Windows also accepts Command Prompt (`cmd.exe`, the default), PowerShell/pwsh, and native Git Bash. |
+| `--shell <path>` | Select Bash/sh; Windows also accepts Command Prompt (`cmd.exe`), PowerShell/pwsh, and native Git Bash. Without a value the default is `pwsh.exe`, then `powershell.exe`, then `cmd.exe` (first found on `PATH`). |
 | `--no-color` | Disable colored TUI output. |
 | `--tutor` | Print the getting-started guide through the pager and exit. |
 | `--loop`, `--loop-prompt`, `--loop-plan`, `--loop-max`, `--loop-run` | Configure the bounded headless iterative loop and optional validation command. |

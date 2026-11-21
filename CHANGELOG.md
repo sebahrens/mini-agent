@@ -98,6 +98,16 @@ Notable changes to mini-agent are documented in this file. The format follows
   caps concurrent relays at 256 (mini-agent-y42nd). `update` and `install.sh` treat a `gh` whose
   `attestation verify --help` lacks the pin flags as unavailable (upgrade gh), not a failed
   verification (mini-agent-0cshc).
+- macOS `workspace` sandbox: `/usr/bin/python3`, `git` and `make` now run (metadata reads of `/`, `/Library`, `/Library/Developer`, `/etc`; `/private/etc/gitconfig` readable with network denied; `GIT_CONFIG_GLOBAL=/dev/null` in shell commands because the home config is unreadable); a negative-control test keeps outside reads and writes denied. (mini-agent-nvnkx.149)
+- macOS: an EPERM from `killpg` on a group of unreaped zombies is no longer logged as a failed SIGTERM/SIGKILL. (mini-agent-nvnkx.157)
+- Windows: the cmd.exe `/C` script is passed verbatim inside one pair of outer quotes (AppContainer helper and sandbox-disabled path) instead of CRT-escaped, so commands containing double quotes reach their program intact. (mini-agent-nvnkx.299)
+- Windows: the shell tool's `workdir` no longer emits a `\\?\` verbatim path into `cd` for cmd, PowerShell or Git Bash. (mini-agent-nvnkx.300)
+- Windows AppContainer shell commands receive `shell-env`/`shell-inherit-env` entries and the standard machine variables (`ProgramFiles*`, `ProgramData`, `PROCESSOR_ARCHITECTURE`, `NUMBER_OF_PROCESSORS`, `OS`, `USERNAME`, private `APPDATA`); each name occurs once and the private profile and temp values win. (mini-agent-nvnkx.360)
+- Windows: stale AppContainer cleanup journals whose roots no longer exist are recovered instead of failing every later launch; journal errors name the journal file and root. (mini-agent-nvnkx.359)
+- Windows sandboxed commands may run up to 1024 processes in the Job (was 64), and a `Not enough quota is available` failure now carries a sandbox note naming the process cap. (mini-agent-nvnkx.361)
+- Windows: cmd.exe and PowerShell shell commands ask for UTF-8 output (`chcp 65001`, `[Console]::OutputEncoding`). (mini-agent-nvnkx.303)
+- Windows: git for Windows is found behind a scoop shim (`<scoop>\\shims\\git.exe` to `apps\\git\\current`), and an unrecognised layout is refused with the resolved path and accepted layouts. (mini-agent-nvnkx.305)
+- Windows: a private directory that cannot be owned or given its closed ACL (exFAT, foreign owner) now reports the path and the likely cause. (mini-agent-nvnkx.363)
 
 ### Added
 
