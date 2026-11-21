@@ -22,10 +22,6 @@ pub(crate) enum ImageMime {
 }
 
 impl ImageMime {
-    #[allow(
-        dead_code,
-        reason = "shared API is intentionally dormant before its frontend consumer lands"
-    )]
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
             "image/png" => Some(Self::Png),
@@ -35,10 +31,6 @@ impl ImageMime {
             _ => None,
         }
     }
-    #[allow(
-        dead_code,
-        reason = "shared typed API precedes its ACP session consumer"
-    )]
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
             Self::Png => "image/png",
@@ -100,10 +92,6 @@ impl PersistedUserMessage {
         message.validate()?;
         Ok(message)
     }
-    #[allow(
-        dead_code,
-        reason = "shared typed API precedes its ACP session consumer"
-    )]
     pub(crate) fn blocks(&self) -> &[UserBlock] {
         &self.blocks
     }

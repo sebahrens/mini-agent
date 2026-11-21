@@ -1,9 +1,4 @@
-//! Dormant compatibility data and validation; ordinary frontend replay remains disabled.
-#![allow(
-    dead_code,
-    reason = "native compatibility API precedes strict frontend publication adoption"
-)]
-//! Protocol-specific history compatibility. Labels are formatting data, never
+//! Protocol-specific history compatibility data and validation. Labels are formatting data, never
 //! permission grants, provider-stored item authority, or signature verification.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -143,7 +138,9 @@ struct FrontierCheckpoint {
     activated: bool,
 }
 
+#[cfg(test)]
 pub(crate) struct NativeRetirement(NativeFrontier);
+#[cfg(test)]
 impl Drop for NativeRetirement {
     fn drop(&mut self) {
         self.0.checkpoint().retiring = false;
@@ -247,6 +244,7 @@ impl NativeFrontier {
         Ok(saved.epoch)
     }
 
+    #[cfg(test)]
     pub(crate) fn begin_retirement(
         &self,
         expected: u64,
@@ -863,6 +861,7 @@ impl NativeHistory {
         self.saved_boundary().map(|_| ())
     }
 
+    #[cfg(test)]
     pub(crate) fn require_completed_boundary(&self) -> Result<(), RestartReason> {
         if self.saved_boundary()? != ReplayBoundary::CompletedTurn {
             return Err(RestartReason::IncompleteTurn);

@@ -180,10 +180,6 @@ impl NativeCapture {
             .clone()
     }
 
-    #[allow(
-        dead_code,
-        reason = "shared API is intentionally dormant before its frontend consumer lands"
-    )]
     pub(crate) fn reserve_retired_history(
         &self,
         retired: &[crate::session::native_replay::NativeHistory],
@@ -207,10 +203,6 @@ impl NativeCapture {
 
     /// Accepted canonical turns are progress even when they contain only an
     /// empty-display signed block. This never counts incomplete stream deltas.
-    #[allow(
-        dead_code,
-        reason = "shared API is intentionally dormant before its frontend consumer lands"
-    )]
     pub(crate) fn accepted_progress(&self) -> bool {
         self.0
             .lock()
@@ -218,10 +210,7 @@ impl NativeCapture {
             .accepted_new_turn
     }
 
-    #[allow(
-        dead_code,
-        reason = "shared API is intentionally dormant before its frontend consumer lands"
-    )]
+    #[cfg(test)]
     pub(crate) fn replay_failure(&self) -> Option<RestartReason> {
         let state = self.0.lock().unwrap_or_else(|error| error.into_inner());
         state
@@ -245,10 +234,6 @@ impl NativeCapture {
 
     /// Construct only from the actual typed native adapter. The factory is
     /// owned by this invocation and never observes headers or sends HTTP.
-    #[allow(
-        dead_code,
-        reason = "shared API is intentionally dormant before its frontend consumer lands"
-    )]
     pub(crate) fn for_replay(
         model: rig::providers::anthropic::completion::CompletionModel<
             crate::provider_http::ProviderHttpClient,
@@ -285,10 +270,6 @@ impl NativeCapture {
         }))))
     }
 
-    #[allow(
-        dead_code,
-        reason = "shared API is intentionally dormant before its frontend consumer lands"
-    )]
     pub(crate) fn for_new_replay(
         model: rig::providers::anthropic::completion::CompletionModel<
             crate::provider_http::ProviderHttpClient,
@@ -306,10 +287,6 @@ impl NativeCapture {
         Ok(capture)
     }
 
-    #[allow(
-        dead_code,
-        reason = "shared API is intentionally dormant before its frontend consumer lands"
-    )]
     pub(crate) fn persisted_history(
         &self,
     ) -> Result<crate::session::native_replay::NativeHistory, RestartReason> {
@@ -334,10 +311,6 @@ impl NativeCapture {
         )
     }
 
-    #[allow(
-        dead_code,
-        reason = "shared API is intentionally dormant before its frontend consumer lands"
-    )]
     pub(crate) fn for_restored_replay(
         model: rig::providers::anthropic::completion::CompletionModel<
             crate::provider_http::ProviderHttpClient,

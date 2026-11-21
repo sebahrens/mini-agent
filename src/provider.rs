@@ -1089,10 +1089,7 @@ impl AnyClient {
     }
     /// Classify the actual adapter; logical aliases and model names are not
     /// replay authority. This does not attest endpoint/account compatibility.
-    #[allow(
-        dead_code,
-        reason = "shared API is intentionally dormant before its frontend consumer lands"
-    )]
+    #[cfg(test)]
     pub(crate) fn history_protocol(&self) -> crate::session::native_replay::HistoryProtocol {
         use crate::session::native_replay::HistoryProtocol;
         match self {
@@ -1487,6 +1484,7 @@ impl AnyClient {
         }
     }
 
+    #[cfg(test)]
     #[allow(
         clippy::too_many_arguments,
         reason = "Preserves existing compaction inputs and adds request-owned usage settlement"
@@ -3448,10 +3446,6 @@ struct CapturedReasoning {
 /// The frontend declares which exact IDs its own transcript transport records.
 /// This is formatting provenance, never a permission or execution claim.
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[allow(
-    dead_code,
-    reason = "shared API is intentionally dormant before its frontend consumer lands"
-)]
 pub(crate) enum RecordedToolIds {
     Lifecycle,
     Canonical,
@@ -3459,10 +3453,6 @@ pub(crate) enum RecordedToolIds {
 
 /// One ordinary invocation's capture and exact retired-session attachment.
 /// Cached agents and deserialized sessions cannot recreate this runtime owner.
-#[allow(
-    dead_code,
-    reason = "shared API is intentionally dormant before its frontend consumer lands"
-)]
 pub(crate) struct NativeTurnBinding {
     session_id: compact_str::CompactString,
     epoch: u64,
@@ -3477,10 +3467,6 @@ pub(crate) struct NativeTurnBinding {
     capture: Option<crate::agent::native_capture::NativeCapture>,
 }
 
-#[allow(
-    dead_code,
-    reason = "shared API is intentionally dormant before its frontend consumer lands"
-)]
 impl NativeTurnBinding {
     /// Consume only the exact runtime SessionStart result, after restoring
     /// the untouched saved feed and before pairing or preparing this actor.
@@ -3630,6 +3616,7 @@ impl NativeTurnBinding {
             .is_some_and(|capture| capture.accepted_progress())
     }
 
+    #[cfg(test)]
     pub(crate) fn refusal(&self) -> Option<crate::session::native_replay::RestartReason> {
         self.capture
             .as_ref()
@@ -3639,6 +3626,7 @@ impl NativeTurnBinding {
     /// Project an exact retired canonical turn into the ordinary Session feed
     /// once, then attach its native framing. The caller supplies normalized
     /// observed usage and admission-time prices; this never mints a receipt.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit_canonical_into(
         &self,
@@ -3659,6 +3647,7 @@ impl NativeTurnBinding {
         )
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit_canonical_into_with_outcome(
         &self,
@@ -3684,6 +3673,7 @@ impl NativeTurnBinding {
     /// Typed initial User content and subsequent model-visible User deltas
     /// enter the same feed. Projection failure preserves observed accounting
     /// and refuses another commit/replay; it never mints a usage receipt.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit_canonical_input_into(
         &self,
@@ -3799,6 +3789,7 @@ impl NativeTurnBinding {
 
     /// Call only after the exact actor and all its effects/accounting settle.
     /// A foreign Session or newer cutoff cannot be poisoned by a stale actor.
+    #[cfg(test)]
     pub(crate) fn settle_into(
         &self,
         session: &mut crate::session::Session,
@@ -4085,10 +4076,6 @@ impl AnyAgent {
 
     /// Bind native framing to the actual adapter and this precise Session,
     /// keeping normal permissions, QuestionTurn and spend profiles separate.
-    #[allow(
-        dead_code,
-        reason = "shared API is intentionally dormant before its frontend consumer lands"
-    )]
     pub(crate) fn bind_native_turn(
         mut self,
         session: &crate::session::Session,
@@ -4187,10 +4174,6 @@ impl AnyAgent {
 
     /// History belongs to the actual target wire protocol, including custom
     /// providers. Persisted labels alone cannot select this classification.
-    #[allow(
-        dead_code,
-        reason = "shared API is intentionally dormant before its frontend consumer lands"
-    )]
     pub(crate) fn history_protocol(&self) -> crate::session::native_replay::HistoryProtocol {
         use crate::session::native_replay::HistoryProtocol;
         match &self.inner {
