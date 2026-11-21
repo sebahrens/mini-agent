@@ -396,6 +396,12 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
         std::io::stdout()
             .lock()
             .write_all(report.render().as_bytes())?;
+        let broken = diagnostics::error_class_warnings(&cfg.load_warnings);
+        anyhow::ensure!(
+            broken.is_empty(),
+            "doctor found {} configuration problem(s) that prevent a layer from loading (exit 1)",
+            broken.len()
+        );
         return Ok(());
     }
     paths::prepare_storage_roots(&app_paths)?;
@@ -514,6 +520,7 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
     // Commands that only report state never ask for project trust, and
     // `--print-config` never creates the default config file.
     config::set_create_default_config(!cli.print_config);
+    print::arm_fatal_config_record(&cli);
     let (mut cfg, is_first_startup) = config::load_in_workspace(
         &app_paths,
         &workspace,

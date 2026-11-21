@@ -129,6 +129,10 @@ pub(super) async fn checkpoint(
         lease.writer.load(std::sync::atomic::Ordering::Acquire),
         "ACP session writer was not claimed"
     );
+    // Native-bearing rows are fenced; their prefix is never rewritten here.
+    if !crate::session::native_publication::is_native_bearing(&history.session) {
+        super::toolcall::apply_failed_results(&mut history.session);
+    }
     // Legacy sessions are encoded here from the borrow (no deep clone of every
     // message); only native-bearing ones keep an owned snapshot for the writer.
     // A validation/size failure is carried into the blocking job so it is
@@ -370,11 +374,18 @@ fn replay_updates(
         } else if message.role == MessageRole::ToolResult {
             if let Some(call_id) = &message.tool_call_id {
                 open_calls.retain(|open| open != call_id.as_str());
-                let fields = ToolCallUpdateFields::new()
+                let failed = matches!(
+                    &message.tool,
+                    Some(crate::session::PersistedToolMessage::Result { is_error: true, .. })
+                );
+                let mut fields = ToolCallUpdateFields::new()
                     .status(ToolCallStatus::Completed)
                     .content(vec![ToolCallContent::from(ContentBlock::Text(
                         TextContent::new(message.content.to_string()),
                     ))]);
+                if failed {
+                    fields.status = Some(ToolCallStatus::Failed);
+                }
                 notifications.push(SessionNotification::new(
                     id.clone(),
                     SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(call_id.to_string(), fields)),
@@ -460,6 +471,9 @@ mod canonical_tests {
         let mut session = crate::session::Session::new("logical", "model", 128_000, "");
         session.add_tool_call_with_id("done", "edit", &serde_json::json!({"path": "src/main.rs"}));
         session.add_tool_result_with_id("done", "edit", "ok");
+        session.add_tool_call_with_id("bad", "shell", &serde_json::json!({"command": "false"}));
+        session.add_tool_result_with_id("bad", "shell", "exit 1");
+        session.mark_failed_tool_results(|output| output == "exit 1");
         session.add_tool_call_with_id(
             "lost",
             "shell",
@@ -467,7 +481,7 @@ mod canonical_tests {
         );
         let id = SessionId::new(session.id.to_string());
         let updates = replay_updates(&id, &session, &root).unwrap();
-        assert_eq!(updates.len(), 4);
+        assert_eq!(updates.len(), 6);
         let SessionUpdate::ToolCall(call) = &updates[0].update else {
             panic!("expected a tool call");
         };
@@ -478,11 +492,15 @@ mod canonical_tests {
             panic!("expected a result update");
         };
         assert_eq!(done.fields.status, Some(ToolCallStatus::Completed));
-        let SessionUpdate::ToolCall(lost) = &updates[2].update else {
+        let SessionUpdate::ToolCallUpdate(bad) = &updates[3].update else {
+            panic!("expected a result update");
+        };
+        assert_eq!(bad.fields.status, Some(ToolCallStatus::Failed));
+        let SessionUpdate::ToolCall(lost) = &updates[4].update else {
             panic!("expected a tool call");
         };
         assert_eq!(lost.title, "shell cargo test");
-        let SessionUpdate::ToolCallUpdate(closed) = &updates[3].update else {
+        let SessionUpdate::ToolCallUpdate(closed) = &updates[5].update else {
             panic!("expected the unfinished call to be closed");
         };
         assert_eq!(closed.tool_call_id.0.as_ref(), "lost");

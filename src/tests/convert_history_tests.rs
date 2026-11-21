@@ -621,6 +621,10 @@ fn continuation_prompt_names_the_recap_label_the_replay_uses() {
     assert!(prompt.contains(crate::agent::runner::COMPACTION_RECAP_LABEL));
     assert!(!prompt.contains("full prior history"));
     assert!(!prompt.contains("system summary"));
+    // It names what the recap now holds and where to resume.
+    assert!(prompt.contains("restored file windows"));
+    assert!(prompt.contains("live todo list and goal"));
+    assert!(prompt.contains("Next Step"));
 
     let mut session = sample_session();
     session.add_message(MessageRole::User, "q");

@@ -1788,6 +1788,37 @@ fn compaction_contract_says_output_replaces_the_previous_summary() {
 }
 
 #[test]
+fn compaction_contract_demands_handoff_sections_in_order_and_anti_drift() {
+    // Research practices: verbatim user constraints, progress, decisions with
+    // reasons, errors/identifiers, one next step, files last, no drift.
+    for prompt in [
+        crate::agent::prompt::COMPACTION_SYSTEM_PROMPT,
+        crate::agent::prompt::COMPACTION_FORK_PROMPT,
+    ] {
+        let mut at = 0;
+        for heading in [
+            "## Task",
+            "## Progress",
+            "## Decisions",
+            "## Findings",
+            "## Open Items",
+            "## Next Step",
+            "## Files",
+        ] {
+            let found = prompt[at..]
+                .find(heading)
+                .unwrap_or_else(|| panic!("{heading}"));
+            at += found + heading.len();
+        }
+        assert!(prompt.contains("do not call tools"));
+        assert!(prompt.contains("mark the latest request"));
+        assert!(prompt.contains("copied exactly"));
+        assert!(prompt.contains("do not copy them"));
+        assert!(prompt.contains("re-paraphrasing"));
+    }
+}
+
+#[test]
 fn a_summary_cut_off_at_the_output_limit_says_so() {
     // mini-agent-sskdu.233: rig's `output_truncated()` is the stop reason.
     let capped = crate::provider::mark_cut_off_summary("## Task\nlong".into(), true);

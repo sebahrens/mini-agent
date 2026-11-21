@@ -179,27 +179,6 @@ pub(crate) fn resolve_images(
     Ok(out)
 }
 
-/// Refuse images for a model the catalog lists as text-only. An unknown model
-/// is allowed: the provider then reports its own error.
-#[cfg(feature = "multimodal")]
-pub(crate) fn ensure_vision(provider: &str, model: &str) -> Result<(), String> {
-    vision_verdict(
-        crate::models_catalog::model_image_input(provider, model),
-        provider,
-        model,
-    )
-}
-
-#[cfg(feature = "multimodal")]
-fn vision_verdict(known: Option<bool>, provider: &str, model: &str) -> Result<(), String> {
-    match known {
-        Some(false) => Err(format!(
-            "model {model} ({provider}) does not accept image input; choose a vision model or drop the images"
-        )),
-        _ => Ok(()),
-    }
-}
-
 /// The typed user message that persists and replays the images.
 #[cfg(feature = "multimodal")]
 pub(crate) fn images_user_message(
@@ -443,6 +422,7 @@ mod tests {
 
         #[test]
         fn text_only_catalog_models_refuse_images_and_unknown_models_pass() {
+            use crate::extras::multimodal::{ensure_vision, vision_verdict};
             assert!(ensure_vision("no-such-provider", "no-such-model").is_ok());
             assert!(vision_verdict(None, "p", "m").is_ok());
             assert!(vision_verdict(Some(true), "p", "m").is_ok());

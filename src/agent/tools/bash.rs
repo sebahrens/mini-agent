@@ -49,6 +49,7 @@ pub(crate) async fn scope_tool_call_id<F: std::future::Future>(
 }
 
 /// The internal call id of the tool call running in this task, if known.
+#[cfg(any(feature = "mcp", feature = "subagents"))]
 pub(crate) fn current_tool_call_id() -> Option<CompactString> {
     TOOL_CALL_ID.try_with(Clone::clone).ok().flatten()
 }

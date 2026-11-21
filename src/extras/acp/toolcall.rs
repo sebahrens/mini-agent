@@ -29,7 +29,9 @@ pub(super) fn kind_for(tool: &str) -> ToolKind {
         "shell" | "job_status" => ToolKind::Execute,
         "grep" | "find_files" | "web_search" | "lsp_diagnostics" => ToolKind::Search,
         "web_fetch" => ToolKind::Fetch,
-        "todo_write" | "todo_read" => ToolKind::Think,
+        "todo_write" | "todo_read" | "task" | "task_send" => ToolKind::Think,
+        "git" => ToolKind::Execute,
+        "memory_read" | "memory_search" => ToolKind::Search,
         _ => ToolKind::Other,
     }
 }
@@ -95,6 +97,13 @@ fn git_subject(args: &Value) -> Option<String> {
 /// Descriptive title: the tool plus its path, command, pattern or, for
 /// `task`, `git` and `job_status`, the subject that tells calls apart.
 pub(super) fn title_for(tool: &str, args: &Value) -> String {
+    // MCP tools are namespaced `<server>__<tool>`; show them as `mcp server/tool`.
+    if let Some((server, name)) = tool.split_once("__")
+        && !server.is_empty()
+        && !name.is_empty()
+    {
+        return clip(&format!("mcp {server}/{name}"), TITLE_MAX_CHARS);
+    }
     let subject = match tool {
         "shell" => str_arg(args, "command").map(str::to_owned),
         "grep" | "find_files" => str_arg(args, "pattern").map(str::to_owned),
@@ -138,6 +147,9 @@ pub(super) fn locations_for(
         return Vec::new();
     };
     let mut location = ToolCallLocation::new(absolute_path(root, path));
+    // The `read` offset is 1-based. The schema leaves the base of `line`
+    // unspecified (only `fs/read_text_file` says 1-based); clients such as Zed
+    // treat it as 0-based, so the offset is converted.
     if tool == "read"
         && let Some(offset) = args.get("offset").and_then(Value::as_u64)
         && let Ok(offset) = u32::try_from(offset)
@@ -392,6 +404,46 @@ pub(super) fn forget_args(tool_call_id: &str) {
         .retain(|call| call.id != tool_call_id);
 }
 
+/// Outputs of failed tool results by session, until a checkpoint stamps them
+/// onto the stored rows. Rig interactions carry no error flag and the model's
+/// call ids differ from the lifecycle ids events use, so the output text is the
+/// join key. Bounded; display data only.
+const MAX_FAILED: usize = 128;
+
+fn failed_results() -> &'static Mutex<VecDeque<(String, String)>> {
+    static FAILED: OnceLock<Mutex<VecDeque<(String, String)>>> = OnceLock::new();
+    FAILED.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+pub(super) fn record_failed_result(session_id: &str, output: &str) {
+    let mut guard = failed_results().lock().unwrap_or_else(|e| e.into_inner());
+    if guard.len() >= MAX_FAILED {
+        guard.pop_front();
+    }
+    guard.push_back((session_id.to_owned(), output.to_owned()));
+}
+
+/// Stamp recorded failures onto this session's stored tool results.
+pub(super) fn apply_failed_results(session: &mut crate::session::Session) {
+    let mut guard = failed_results().lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_empty() {
+        return;
+    }
+    let id = session.id.to_string();
+    session.mark_failed_tool_results(|output| {
+        match guard
+            .iter()
+            .position(|(owner, text)| *owner == id && text == output)
+        {
+            Some(position) => {
+                guard.remove(position);
+                true
+            }
+            None => false,
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,6 +512,34 @@ mod tests {
             "job_status job-3"
         );
         assert_eq!(title_for("task", &json!({})), "task");
+        assert_eq!(
+            title_for("github__create_issue", &json!({})),
+            "mcp github/create_issue"
+        );
+        assert_eq!(kind_for("git"), ToolKind::Execute);
+        assert_eq!(kind_for("task"), ToolKind::Think);
+        assert_eq!(kind_for("memory_search"), ToolKind::Search);
+    }
+
+    #[test]
+    fn failed_results_are_stamped_onto_matching_stored_rows_once() {
+        let mut session = crate::session::Session::new("p", "m", 1000, "");
+        session.add_tool_result_with_id("a", "shell", "boom");
+        session.add_tool_result_with_id("b", "shell", "fine");
+        record_failed_result(session.id.as_ref(), "boom");
+        record_failed_result("another-session", "fine");
+        apply_failed_results(&mut session);
+        let flags: Vec<bool> = session
+            .messages
+            .iter()
+            .filter_map(|m| match &m.tool {
+                Some(crate::session::PersistedToolMessage::Result { is_error, .. }) => {
+                    Some(*is_error)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(flags, vec![true, false]);
     }
 
     #[test]

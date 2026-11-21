@@ -825,10 +825,12 @@ mod tests {
         collector.observe(&AgentEvent::SubagentToolCall {
             name: "read".into(),
             args: serde_json::json!({}),
+            outer: None,
         });
         collector.observe(&AgentEvent::SubagentToolCall {
             name: "edit".into(),
             args: serde_json::json!({}),
+            outer: None,
         });
         let summary = collector.finish(&goal(), RoundEnd::Done, 0);
         assert_eq!(summary.tool_calls, 2);

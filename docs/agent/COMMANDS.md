@@ -61,6 +61,7 @@ Completed and cancelled todos count as done; a temporarily locked store displays
 | `/share confirm` | Upload the HTML export as a secret GitHub gist and print the URL. The upload gives up after 10 seconds connecting or 30 seconds in total. Requires `GITHUB_TOKEN` or `GH_TOKEN` and the `export` feature. |
 | `/queue` | List input queued while the agent is busy (same as `/queue ls`). Interrupting or failing the main run drops queued inputs and reports how many were dropped. |
 | `/jobs` | List this session's retained background job IDs, command summaries, statuses and exit codes; captured output is not included. Works while the main agent runs. |
+| `/notices` | Print the last 20 status-line notices (copy confirmations, `/expand` errors, "opening <url>"). The status line shows a notice for a few seconds and truncates it; error notices are also written to the transcript. |
 | `/jobs stop <job-id>` | Request cancellation of that exact owned job. `stopping` is a request, not proof of cleanup; the record stays owned until its process family settles. Works while busy. |
 | `/queue clear` | Empty the queue. |
 | `/queue pop` | Remove the last queued input. |
@@ -252,7 +253,7 @@ row, and its result becomes one summary row under it:
 
 | Row | Meaning |
 | --- | ------- |
-| `  ▸ 126 lines, 4963 chars` | Folded result; unfold with `Ctrl+T` (latest), `/expand [n]`, or a click on the row. |
+| `  ▸ 126 lines, 4963 chars` | Folded result; unfold with `Ctrl+T` (the newest result in view, else the latest; the newest summary shows a `(Ctrl+T)` hint), `/expand [n]`, or a click on the row. |
 | `  ▾ 126 lines, 4963 chars` | Unfolded result; the full output follows. Fold it again the same way. |
 | `  ⎿ ok: 3 files` | A short one-line result shown verbatim; there is nothing to unfold. |
 | `  ✗ Error: file not found (3 lines, 80 chars)` | A failed call: its first line always stays visible, and the rest unfolds like any result. |

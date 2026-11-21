@@ -885,10 +885,10 @@ async fn finished_background_task_wakes_an_idle_session() {
         .await
         .unwrap();
     assert!(app.run.is_running, "an idle session starts a turn");
-    let output = app.renderer.captured_output();
+    let screen = app.renderer.captured_output();
     assert!(
-        output.contains("background task reported: audit the parser completed"),
-        "{output}"
+        screen.contains("background task reported: audit the parser completed"),
+        "{screen}"
     );
     assert!(settle(&mut app).await);
     assert_eq!(provider.calls().len(), 1);

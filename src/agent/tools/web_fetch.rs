@@ -1117,6 +1117,7 @@ mod web_fetch_persistence_tests {
                 output,
                 artifact_path,
                 images,
+                ..
             }) => {
                 assert!(images.is_empty());
                 assert_eq!(output.as_str(), page);

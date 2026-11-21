@@ -4039,6 +4039,7 @@ impl NativeTurnBinding {
                     output,
                     images,
                     artifact_path,
+                    ..
                 }) = &row.tool
                 else {
                     return Err(RestartReason::UnavailableSource);

@@ -336,7 +336,7 @@ If you want to use mini-agent from scripts or other programs, these CLI flags ar
 | Flag | Action |
 | ---- | ------ |
 | `-p <msg>` | Sends a message |
-| `update [--check] [--release X.Y.Z]` | Not a flag: `mini-agent update` replaces the binary with a checksum-verified release (see `update_check` in [CONFIG.md](CONFIG.md)); `--check` only reports. Refuses package-manager, VS Code extension and Windows installs with the right command. Before installing it runs `gh attestation verify` on the archive when an authenticated `gh` is available and aborts on failure; without `gh` (or with one whose `gh attestation verify --help` lacks `--signer-workflow`/`--source-ref`, which is reported as "upgrade gh" rather than a failed verification) it prints the manual command and needs `--allow-unattested` (or an interactive yes). `MINI_AGENT_SKIP_ATTESTATION=1` skips the check as in `install.sh`; `--release` older than the running version needs `--allow-downgrade` (or an interactive yes). The explicit command honours `HTTPS_PROXY`. |
+| `update [--check] [--release X.Y.Z]` | Not a flag: `mini-agent update` replaces the binary with a checksum-verified release (see `update_check` in [CONFIG.md](CONFIG.md)); `--check` only reports and exits `10` when a newer release exists (`0` up to date, `1` check failed). Refuses package-manager, VS Code extension and Windows installs with the right command. Before installing it runs `gh attestation verify` on the archive when an authenticated `gh` is available and aborts on failure; without `gh` (or with one whose `gh attestation verify --help` lacks `--signer-workflow`/`--source-ref`, which is reported as "upgrade gh" rather than a failed verification) it prints the manual command and needs `--allow-unattested` (or an interactive yes). `MINI_AGENT_SKIP_ATTESTATION=1` skips the check as in `install.sh`; `--release` older than the running version needs `--allow-downgrade` (or an interactive yes). The explicit command honours `HTTPS_PROXY`. |
 | `--pure-stdout` | With `-p`, include tool calls and results on stdout rather than reserving stdout for the final answer. |
 | `--max-budget-usd AMOUNT` | Finite nonnegative recorded-spend ceiling for the logical session, including auxiliary requests. Refused required continuation reports `budget` and exits nonzero; admitted work can exceed the estimate. See [COST_TRACKING.md](COST_TRACKING.md). |
 | `--output-schema FILE` | With plain `-p`, validate an answer against a bounded offline JSON schema; default JSON envelope, at most two tool-free repairs. |
@@ -750,7 +750,8 @@ and environment values. Terminal protocol emission is reported separately from
 confirmed terminal support. The report names the model catalogue in use (embedded
 snapshot or models.dev cache) with its generation date and age, lists each
 distinct config load-warning class with a count, and points to `--print-config`
-for the full warnings.
+for the full warnings. `--doctor` exits `1` when a config layer cannot be parsed or inspected
+(an invalid or unreadable global or project file); unknown keys and other warnings still exit `0`.
 Review local paths and custom server/model names before sharing the report.
 For build identity alone, `mini-agent --version` prints the version, fingerprint
 and compilation target without initializing application storage.

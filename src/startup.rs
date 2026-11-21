@@ -576,6 +576,31 @@ fn cli_pins_startup_model(cli: &Cli) -> bool {
     cli.model.is_some() || cli.provider.is_some() || cli.quick_model.is_some()
 }
 
+/// The provider a `[prompt_to_model]` route sends the startup prompt to, when
+/// that route will be applied (fresh session, no explicit model flag, prompt
+/// exists).
+fn startup_prompt_provider(
+    cli: &Cli,
+    cfg: &Config,
+    session_resumed: bool,
+    prompts: &std::collections::HashMap<String, String>,
+) -> Option<CompactString> {
+    if session_resumed || cli_pins_startup_model(cli) {
+        return None;
+    }
+    let name = cli
+        .load_prompt
+        .clone()
+        .unwrap_or_else(|| cfg.resolve_default_prompt().to_string());
+    if !prompts.contains_key(&name) {
+        return None;
+    }
+    match cfg.resolve_prompt_route(&name) {
+        config::PromptRoute::Mapped { quick_model, .. } => Some(quick_model.provider.clone()),
+        _ => None,
+    }
+}
+
 /// Apply the `[prompt_to_model]` mapping at startup before the TUI is
 /// available. Updates `provider`, `model`, and `session` fields so the
 /// initial agent is built with the correct model.
@@ -1505,10 +1530,76 @@ pub(crate) async fn wait_headless_background_tasks(session: &Session, cfg: &Conf
     }
 }
 
+/// A piped-stdin read running beside `Startup::init`.
+struct PendingStdin {
+    task: tokio::task::JoinHandle<anyhow::Result<String>>,
+    cli: Cli,
+    root: std::path::PathBuf,
+}
+
+static PENDING_STDIN: std::sync::Mutex<Option<PendingStdin>> = std::sync::Mutex::new(None);
+
+fn take_pending_stdin() -> Option<PendingStdin> {
+    PENDING_STDIN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+}
+
 impl Startup {
     /// Phase 1: context load, provider/model resolution, session
     /// creation/resolution, client creation.
+    ///
+    /// A piped stdin read overlaps the work below. When the work fails first,
+    /// the read is still settled so an unreadable stdin or an interrupt keeps
+    /// precedence over later failures, as it did when the read ran first.
     pub(crate) async fn init(
+        cli: Cli,
+        cfg: Config,
+        paths: AppPaths,
+        workspace: std::sync::Arc<crate::paths::WorkspaceBinding>,
+        is_first_startup: bool,
+        version_changed: bool,
+        is_interactive: bool,
+    ) -> anyhow::Result<Self> {
+        match Self::init_overlapped(
+            cli,
+            cfg,
+            paths,
+            workspace,
+            is_first_startup,
+            version_changed,
+            is_interactive,
+        )
+        .await
+        {
+            Ok(startup) => Ok(startup),
+            Err(error) => {
+                let Some(pending) = take_pending_stdin() else {
+                    return Err(error);
+                };
+                match pending
+                    .task
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .and_then(|read| read)
+                {
+                    Ok(_) => Err(error),
+                    Err(stdin_error) => {
+                        crate::print::emit_headless_preflight_failure(
+                            &pending.cli,
+                            &pending.root,
+                            &stdin_error.to_string(),
+                        )
+                        .await?;
+                        Err(stdin_error)
+                    }
+                }
+            }
+        }
+    }
+
+    async fn init_overlapped(
         mut cli: Cli,
         mut cfg: Config,
         paths: AppPaths,
@@ -1570,27 +1661,23 @@ impl Startup {
             // `--quiet` silences the warning for text output only: machine
             // output must not hide that the piped input was dropped
             // (mini-agent-54j41).
-            let stdin = match crate::print::read_headless_stdin(
-                cli.quiet && cli.output_format() == crate::cli::OutputFormat::Text,
-                !cli.message.join(" ").trim().is_empty(),
-            )
-            .await
-            {
-                Ok(stdin) => stdin,
-                Err(error) => {
-                    crate::print::emit_headless_preflight_failure(
-                        &cli,
-                        workspace.root(),
-                        &error.to_string(),
-                    )
-                    .await?;
-                    return Err(error);
-                }
-            };
-            cli.message = vec![crate::print::append_stdin_reference(
-                &cli.message.join(" "),
-                &stdin,
-            )];
+            // The gated read waits up to `--stdin-idle-secs` on a silent open
+            // pipe. It owns its interrupt scope, so run it as a task and keep
+            // initialising; nothing below reads `cli.message` until the task
+            // is joined just before `Startup` is built.
+            let quiet = cli.quiet && cli.output_format() == crate::cli::OutputFormat::Text;
+            let explicit_prompt = !cli.message.join(" ").trim().is_empty();
+            let task = tokio::spawn(async move {
+                crate::print::read_headless_stdin(quiet, explicit_prompt).await
+            });
+            // Registered so `init` can settle the read if setup fails first.
+            *PENDING_STDIN
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(PendingStdin {
+                task,
+                cli: cli.clone(),
+                root: workspace.root().to_path_buf(),
+            });
         }
 
         if let Err(error) = cli.validate_quick_model(&cfg) {
@@ -1948,9 +2035,16 @@ impl Startup {
         // not split tools across a different root during startup.
         session.working_dir = CompactString::new(workspace.root().to_string_lossy());
 
+        // A `[prompt_to_model]` route for the startup prompt decides the provider
+        // the session will really use; build that client first so a user whose
+        // only credential belongs to the mapped provider is not refused for
+        // the pre-mapping one.
+        let client_provider =
+            startup_prompt_provider(&cli, &cfg, session_resumed, &context.prompts)
+                .unwrap_or_else(|| provider.clone());
         let client = provider::create_client(
-            &provider,
-            cli.api_key.as_deref(),
+            &client_provider,
+            cli.api_key_for(&cfg, &client_provider),
             cfg.custom_providers_map(),
             cfg.api_keys.as_ref(),
         )?;
@@ -2056,6 +2150,30 @@ impl Startup {
         } else {
             None
         };
+
+        if let Some(pending) = take_pending_stdin() {
+            let stdin = match pending
+                .task
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|read| read)
+            {
+                Ok(stdin) => stdin,
+                Err(error) => {
+                    crate::print::emit_headless_preflight_failure(
+                        &cli,
+                        workspace.root(),
+                        &error.to_string(),
+                    )
+                    .await?;
+                    return Err(error);
+                }
+            };
+            cli.message = vec![crate::print::append_stdin_reference(
+                &cli.message.join(" "),
+                &stdin,
+            )];
+        }
 
         Ok(Self {
             cli,
@@ -3028,7 +3146,7 @@ impl Startup {
         }
         anyhow::ensure!(!is_bang, "images cannot be attached to a `!` shell command");
         #[cfg(feature = "multimodal")]
-        crate::headless_media::ensure_vision(&self.session.provider, &self.session.model)
+        crate::extras::multimodal::ensure_vision(&self.session.provider, &self.session.model)
             .map_err(anyhow::Error::msg)?;
         Ok(media)
     }
@@ -5915,6 +6033,38 @@ mod tests {
             false
         ));
         assert!(!recommended_mcp_prompt_due(true, None, None, true));
+    }
+
+    #[test]
+    fn startup_client_follows_the_prompt_mapped_provider() {
+        use super::*;
+        let cfg: Config = toml::from_str(
+            "[quick_models.fast]\nprovider = \"acme\"\nmodel = \"m\"\n[prompt_to_model]\nplan = \"fast\"\n",
+        )
+        .unwrap();
+        let prompts: std::collections::HashMap<String, String> =
+            [("plan".to_owned(), String::new())].into();
+        let plan = Cli {
+            load_prompt: Some("plan".into()),
+            ..Cli::default()
+        };
+        assert_eq!(
+            startup_prompt_provider(&plan, &cfg, false, &prompts).as_deref(),
+            Some("acme")
+        );
+        assert_eq!(startup_prompt_provider(&plan, &cfg, true, &prompts), None);
+        assert_eq!(
+            startup_prompt_provider(&Cli::default(), &cfg, false, &prompts),
+            None
+        );
+        let missing = Cli {
+            load_prompt: Some("nope".into()),
+            ..Cli::default()
+        };
+        assert_eq!(
+            startup_prompt_provider(&missing, &cfg, false, &prompts),
+            None
+        );
     }
 
     #[test]

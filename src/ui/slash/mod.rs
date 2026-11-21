@@ -22,6 +22,10 @@ pub(crate) use memory::verify_memory_editor_preservation;
 pub(crate) mod providers;
 pub(crate) mod review;
 mod session;
+#[cfg(feature = "export")]
+pub(crate) fn default_export_filename(session_id: &str) -> String {
+    session::default_export_filename(session_id)
+}
 pub(crate) use session::{is_persistence_restart_required, rewind_selected_turn};
 pub(crate) mod settings;
 
@@ -1274,6 +1278,15 @@ pub(crate) async fn handle_slash(
         "/context" => crate::startup::heap_future(|| context::handle(&parts, &mut ctx)).await,
         "/doctor" => in_one_frame(&mut ctx, |ctx| doctor::handle(&parts, ctx))?,
         "/jobs" => in_one_frame(&mut ctx, |ctx| jobs::handle(&parts, ctx))?,
+        "/notices" => in_one_frame(&mut ctx, |ctx| {
+            let notices = ctx.renderer.recent_notices();
+            if notices.is_empty() {
+                write_ok(ctx.renderer, "no recent notices");
+            }
+            for notice in notices {
+                write_ok(ctx.renderer, notice);
+            }
+        }),
         #[cfg(feature = "subagents")]
         "/tasks" => in_one_frame(&mut ctx, |ctx| tasks::handle(&parts, ctx))?,
         "/help" => in_one_frame(&mut ctx, |ctx| help::handle(&parts, ctx)),

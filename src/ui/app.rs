@@ -5,6 +5,9 @@ mod job_wake_app;
 #[cfg(feature = "mcp")]
 #[path = "mcp_admin_app.rs"]
 mod mcp_admin_app;
+#[cfg(feature = "export")]
+#[path = "share_app.rs"]
+mod share_app;
 
 use std::io;
 use std::ops::ControlFlow;
@@ -865,6 +868,32 @@ pub(crate) fn clipboard_shortcut(
         Some(ClipboardShortcut::Paste)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Links `App::open_link` was asked to open in tests (nothing is spawned).
+    static OPENED_LINKS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl App<'_> {
+    /// Open `url` in the browser without blocking the event loop.
+    fn open_link(&self, url: String) {
+        #[cfg(test)]
+        {
+            let _ = renderer_mod::open_url;
+            OPENED_LINKS.with(|opened| opened.borrow_mut().push(url));
+        }
+        #[cfg(not(test))]
+        {
+            let tx = self.user_tx.clone();
+            tokio::spawn(async move {
+                if let Err(error) = renderer_mod::open_url(&url).await {
+                    let _ = tx.send(UserEvent::LinkOpenFailed(error.to_string())).await;
+                }
+            });
+        }
     }
 }
 
@@ -1770,6 +1799,101 @@ mod startup_work_tests {
 mod reasoning_display_tests {
     use super::*;
     use crate::config::ReasoningDisplay;
+
+    #[tokio::test]
+    async fn a_url_opens_on_a_plain_click_release_and_never_on_a_drag() {
+        let root = crate::tests::OwnedTestDirectory::new("link-click-controls");
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            (
+                "MINI_AGENT_CONFIG_DIR",
+                Some(root.path().join("config").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_DATA_DIR",
+                Some(root.path().join("data").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_STATE_DIR",
+                Some(root.path().join("state").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_CACHE_DIR",
+                Some(root.path().join("cache").into_os_string()),
+            ),
+        ]);
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let cfg = crate::config::Config::default();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session =
+            crate::session::Session::new("openrouter", "unused-test-model", 128_000, "");
+        let client = crate::provider::create_client(
+            "openrouter",
+            Some("unused-test-key"),
+            cfg.custom_providers_map(),
+            cfg.api_keys.as_ref(),
+        )
+        .unwrap();
+        let ui = UiContext::new(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+            client,
+            None,
+            None,
+            crate::sandbox::Sandbox::new(false, "none"),
+            None,
+        );
+        let mut app = test_support::fixture_app(ui);
+        app.renderer.feed_mut().push_line(
+            crate::ui::feed::BlockStyle::Plain,
+            "see https://example.com/x ok",
+        );
+        let row = (0..app.renderer.visible_lines() as u16)
+            .find(|row| app.renderer.buffer_line_at_row(*row) == Some(0))
+            .unwrap();
+        let col = 8u16;
+        let opened = || OPENED_LINKS.with(|o| o.borrow().len());
+        let before = opened();
+        let _ = app
+            .handle_user_event(UserEvent::MouseDown { row, col })
+            .await
+            .unwrap();
+        assert_eq!(opened(), before, "button-down alone opens nothing");
+        let _ = app
+            .handle_user_event(UserEvent::MouseUp { row, col })
+            .await
+            .unwrap();
+        assert_eq!(opened(), before + 1);
+        // A drag across the URL selects and never opens.
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        let _ = app
+            .handle_user_event(UserEvent::MouseDown { row, col: 6 })
+            .await
+            .unwrap();
+        assert!(app.renderer.selection_active);
+        let _ = app
+            .handle_user_event(UserEvent::MouseDrag { row, col: 14 })
+            .await
+            .unwrap();
+        let _ = app
+            .handle_user_event(UserEvent::MouseUp { row, col: 14 })
+            .await
+            .unwrap();
+        assert_eq!(
+            opened(),
+            before + 1,
+            "a drag over a URL selects, never opens"
+        );
+        OPENED_LINKS.with(|o| assert_eq!(o.borrow().last().unwrap(), "https://example.com/x"));
+    }
 
     #[tokio::test]
     async fn actual_reasoning_controls_preserve_the_turn_and_persist_every_cycle() {
@@ -3127,6 +3251,19 @@ impl<'a> App<'a> {
             )?;
             return Ok(true);
         }
+        // A text-only model cannot use the image: say so instead of staging it.
+        if matches!(result, Ok(Some(_)))
+            && let Err(refusal) = crate::extras::multimodal::ensure_vision(
+                &self.ui.session.provider,
+                &self.ui.session.model,
+            )
+        {
+            self.renderer.write_line(
+                &format!("clipboard image was not attached: {refusal}"),
+                C_ERROR,
+            )?;
+            return Ok(true);
+        }
         match result.and_then(|image| {
             image
                 .map(|image| {
@@ -3818,13 +3955,6 @@ impl<'a> App<'a> {
                 {
                     if self.renderer.toggle_reasoning_at_line(idx) {
                         self.renderer.clear_selection();
-                    } else if let Some(url) = self.renderer.link_url_at(idx, col) {
-                        let tx = self.user_tx.clone();
-                        tokio::spawn(async move {
-                            if let Err(error) = renderer_mod::open_url(&url).await {
-                                let _ = tx.send(UserEvent::LinkOpenFailed(error.to_string())).await;
-                            }
-                        });
                     } else {
                         let text_col = self.renderer.chat_text_col(col);
                         let double = self.renderer.register_click(row, col);
@@ -3869,8 +3999,15 @@ impl<'a> App<'a> {
                         // and unfold or fold a tool result clicked on its
                         // summary row.
                         let clicked = self.renderer.selection_start.map(|point| point.line);
+                        // A link opens on the release of a plain click, so a
+                        // press on a URL can still start a drag selection.
+                        let url = clicked.and_then(|line| self.renderer.link_url_at(line, col));
                         self.renderer.clear_selection();
-                        if let Some(line) = clicked {
+                        if let Some(url) = url {
+                            self.renderer
+                                .show_notice(&format!("opening {url}"), C_AGENT);
+                            self.open_link(url);
+                        } else if let Some(line) = clicked {
                             self.renderer.toggle_tool_output_at_line(line);
                         }
                     }
@@ -3891,6 +4028,8 @@ impl<'a> App<'a> {
                 let _ = self.save_session();
                 return Ok(ControlFlow::Break(()));
             }
+            #[cfg(feature = "export")]
+            UserEvent::ShareDone(result) => self.finish_share(result)?,
             UserEvent::LinkOpenFailed(error) => {
                 self.renderer
                     .write_line(&format!("cannot open link: {error}"), C_ERROR)?;
@@ -4248,6 +4387,11 @@ impl<'a> App<'a> {
             self.renderer.clear_selection();
             return Ok(());
         }
+        #[cfg(feature = "export")]
+        if key.code == KeyCode::Esc && share_app::cancel_active() {
+            self.renderer.write_line("share cancelled", C_AGENT)?;
+            return Ok(());
+        }
 
         if action == Some(KeyAction::HistorySearch) {
             if self.input.history_search_active() {
@@ -4302,7 +4446,11 @@ impl<'a> App<'a> {
 
         // Ctrl+T is unbound by default; a user binding for it wins.
         if action.is_none() && is_tool_output_key(key) {
-            if self.renderer.set_tool_output_fold(1, None).is_none() {
+            if self
+                .renderer
+                .set_tool_output_fold(self.renderer.ctrl_t_fold_target(), None)
+                .is_none()
+            {
                 self.renderer
                     .show_notice("no tool output to expand yet", Color::DarkGrey);
             }
@@ -6923,6 +7071,10 @@ impl<'a> App<'a> {
         } else {
             echo_submission(&mut self.renderer, text)?;
         }
+        #[cfg(feature = "export")]
+        if share_app::is_confirm(text) {
+            return self.start_share();
+        }
 
         // Commands that hand the tty to a synchronous stdin consumer must not
         // race the crossterm event thread for keystrokes (same pattern as
@@ -6960,6 +7112,8 @@ impl<'a> App<'a> {
             self.rebind_event_thread();
         }
         if prior_question_session != self.ui.session.id {
+            // /new and /resume start a fresh wake budget.
+            job_wake_app::user_turn_started();
             self.adopt_saved_cron()?;
         }
         if prior_question_session != self.ui.session.id
@@ -18093,7 +18247,7 @@ mod plan_approval_tests {
             );
             let calls = provider.calls();
             assert_eq!(calls.len(), 2);
-            assert!(calls[0].to_string().contains("Planning-Only Mode"));
+            assert!(calls[0].to_string().contains("Planning Mode"));
             assert!(calls[1].to_string().contains("Coding Mode"));
             let submitted = app
                 .ui

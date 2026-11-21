@@ -550,6 +550,10 @@ pub enum PersistedToolMessage {
         /// recovery path without parsing marker-like text from the tool.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         artifact_path: Option<CompactString>,
+        /// The tool reported failure. Absent in older sessions (replay then
+        /// guesses from the text).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        is_error: bool,
     },
 }
 
@@ -2073,6 +2077,18 @@ impl Session {
         output: &str,
         images: Vec<tool_image::PersistedToolImage>,
     ) -> (String, Option<std::path::PathBuf>) {
+        self.add_tool_result_flagged(id, name, output, images, false)
+    }
+
+    /// [`Self::add_tool_result_with_images`] recording whether the tool failed.
+    pub(crate) fn add_tool_result_flagged(
+        &mut self,
+        id: &str,
+        name: &str,
+        output: &str,
+        images: Vec<tool_image::PersistedToolImage>,
+        is_error: bool,
+    ) -> (String, Option<std::path::PathBuf>) {
         let (content, replay_output, artifact) = self.tool_result_content(id, name, output);
         let artifact_path = artifact
             .as_ref()
@@ -2085,9 +2101,27 @@ impl Session {
                 output: CompactString::new(replay_output),
                 images,
                 artifact_path,
+                is_error,
             }),
         );
         (content, artifact)
+    }
+
+    /// Flag stored tool results whose output `failed` recognises, so a replay
+    /// can show them as failed. Already-flagged rows are left alone.
+    #[cfg(feature = "acp")]
+    pub(crate) fn mark_failed_tool_results(&mut self, mut failed: impl FnMut(&str) -> bool) {
+        for message in &mut self.messages {
+            if let Some(PersistedToolMessage::Result {
+                output,
+                is_error: is_error @ false,
+                ..
+            }) = &mut message.tool
+                && failed(output)
+            {
+                *is_error = true;
+            }
+        }
     }
 
     /// Evidence that an imported/legacy transcript may contain prior model
@@ -2184,6 +2218,24 @@ impl Session {
         });
         (self.input_token_cost, self.output_token_cost) = prices.unwrap_or((0.0, 0.0));
         self.input_output_prices_known = Some(prices.is_some());
+    }
+
+    /// Whether the recorded cost may undercount: prices are unknown or spend
+    /// tracking failed.
+    pub(crate) fn cost_is_incomplete(&self) -> bool {
+        self.known_input_output_prices().is_none() || self.spend_account.snapshot().tracking_error
+    }
+
+    /// The cost as the statusline and exports show it: the recorded amount,
+    /// marked `+?` when it may be incomplete, or `?` when nothing is priced.
+    #[cfg(feature = "export")]
+    pub(crate) fn cost_display(&self) -> String {
+        let amount = self.recorded_total_cost();
+        match (self.cost_is_incomplete(), amount > 0.0) {
+            (false, _) => format!("${amount:.4}"),
+            (true, true) => format!("${amount:.4}+?"),
+            (true, false) => "price unknown".into(),
+        }
     }
 
     pub(crate) fn known_input_output_prices(&self) -> Option<(f64, f64)> {

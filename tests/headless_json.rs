@@ -1171,6 +1171,52 @@ fn startup_errors_keep_provider_guidance_without_mislabeling_other_failures() {
 }
 
 #[test]
+fn fatal_config_error_still_ends_machine_output_with_a_failure_record() {
+    for format in ["json", "stream-json"] {
+        let root = TempRoot::new();
+        std::fs::write(root.0.join("config.toml"), "model = [\n").unwrap();
+        let mut command = root.command();
+        command.args(["--no-tools", "-p", "--output", format, "q"]);
+        let output = bounded_output(command);
+        assert_eq!(output.status.code(), Some(1));
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(stdout.lines().count(), 1, "{format}: {stdout}");
+        let record: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+        assert_eq!(record["is_error"], true, "{stdout}");
+        assert!(
+            record["result"]
+                .as_str()
+                .unwrap()
+                .contains("not a valid config")
+        );
+    }
+}
+
+#[test]
+fn print_config_keeps_sensitive_project_keys_inactive_without_asking() {
+    let root = TempRoot::new();
+    let project = root.0.join("proj");
+    std::fs::create_dir_all(project.join(".git")).unwrap();
+    std::fs::create_dir_all(project.join(".mini-agent")).unwrap();
+    std::fs::write(project.join(".mini-agent/config.toml"), "yolo = true\n").unwrap();
+    let mut command = root.command();
+    command.current_dir(&project).arg("--print-config");
+    let output = bounded_output(command);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("permission-mode: yolo"), "{stdout}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("inactive"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn usage_errors_found_after_parsing_exit_two_not_one() {
     for (args, detail) in [
         (&["--config", "model=gpt-5"][..], "--config #1"),
