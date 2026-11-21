@@ -1165,6 +1165,62 @@ fn take_headless_compactions() -> Option<serde_json::Value> {
     )
 }
 
+static FATAL_CONFIG_OUTPUT: std::sync::OnceLock<cli::OutputFormat> = std::sync::OnceLock::new();
+
+/// Remember the machine output format of this `-p` run so a fatal config error
+/// (which exits from synchronous loading code) can still end stdout with a
+/// failure record.
+pub(crate) fn arm_fatal_config_record(cli: &cli::Cli) {
+    if cli.print && cli.output_format() != cli::OutputFormat::Text {
+        let _ = FATAL_CONFIG_OUTPUT.set(cli.output_format());
+    }
+}
+
+/// Synchronously print the failure record for a fatal config error, if armed.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn emit_fatal_config_record(message: &str) {
+    let Some(&format) = FATAL_CONFIG_OUTPUT.get() else {
+        return;
+    };
+    if headless_result_emitted() {
+        return;
+    }
+    let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let Ok(rendered) = render_headless_json(
+        &root,
+        message.trim(),
+        &[],
+        Usage::default(),
+        Vec::new(),
+        HeadlessPricing {
+            anthropic_native: false,
+            input_token_cost: 0.0,
+            output_token_cost: 0.0,
+            cache_prices: crate::pricing::CachePrices::default(),
+        },
+        HeadlessStopReason::Failed,
+        #[cfg(feature = "goal")]
+        None,
+    ) else {
+        return;
+    };
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&rendered) else {
+        return;
+    };
+    value["session_id"] = serde_json::Value::Null;
+    value["session_name"] = serde_json::Value::Null;
+    value["session_persisted"] = false.into();
+    value["duration_ms"] = take_run_duration_ms().into();
+    if format == cli::OutputFormat::StreamJson {
+        value["type"] = "result".into();
+    }
+    HEADLESS_RESULT_EMITTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    use std::io::Write as _;
+    let mut out = io::stdout().lock();
+    let _ = writeln!(out, "{}", terminal_safe_json(&value));
+    let _ = out.flush();
+}
+
 /// Final records alone may claim durable session identity.
 pub(crate) async fn emit_headless_result(
     rendered: &str,

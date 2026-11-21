@@ -562,6 +562,26 @@ fn directory_bytes(path: &Path) -> String {
     )
 }
 
+/// Load warnings that mean a config layer could not be used at all (as opposed
+/// to a harmless unknown key). `--doctor` exits 1 when any is present.
+const ERROR_CLASS_WARNINGS: [&str; 3] = [
+    "global config could not be parsed",
+    "global config cannot be inspected",
+    "selected project config could not be inspected",
+];
+
+pub(crate) fn error_class_warnings(warnings: &[String]) -> Vec<&str> {
+    warnings
+        .iter()
+        .map(String::as_str)
+        .filter(|warning| {
+            ERROR_CLASS_WARNINGS
+                .iter()
+                .any(|class| warning.starts_with(class))
+        })
+        .collect()
+}
+
 /// Distinct warning lines in first-seen order with their multiplicity. The
 /// diagnostic loader has already reduced each warning to a value-free class.
 fn warning_classes(warnings: &[String]) -> Vec<(&str, usize)> {
@@ -580,6 +600,20 @@ fn warning_classes(warnings: &[String]) -> Vec<(&str, usize)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn error_class_warnings_exclude_unknown_keys() {
+        let warnings: Vec<String> = [
+            "global config has an unknown or unavailable key (name/value omitted)",
+            "global config could not be parsed (values omitted)",
+        ]
+        .map(String::from)
+        .into();
+        assert_eq!(
+            super::error_class_warnings(&warnings),
+            vec!["global config could not be parsed (values omitted)"]
+        );
+    }
+
     #[test]
     fn warning_classes_count_repeats_in_first_seen_order() {
         let warnings: Vec<String> = ["a", "b", "a", "a"].map(String::from).into();

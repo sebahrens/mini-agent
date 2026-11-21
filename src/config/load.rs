@@ -1498,6 +1498,7 @@ fn fatal_config_load(message: String) -> ! {
     #[cfg(not(test))]
     {
         eprintln!("{message}");
+        crate::print::emit_fatal_config_record(&message);
         std::process::exit(1);
     }
 }
