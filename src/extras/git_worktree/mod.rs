@@ -930,10 +930,7 @@ async fn create_transaction(
                 ref_limits,
             )
             .await
-            .map_err(|error| {
-                reservation_failure = Some(error.kind());
-                error
-            })
+            .inspect_err(|error| reservation_failure = Some(error.kind()))
     })
     .await
     {

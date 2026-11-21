@@ -3732,7 +3732,7 @@ mod tests {
         let rows: Vec<(super::MessageRole, String)> = session
             .messages
             .iter()
-            .map(|message| (message.role.clone(), message.content.to_string()))
+            .map(|message| (message.role, message.content.to_string()))
             .collect();
         assert_eq!(
             rows.iter()
