@@ -3912,6 +3912,7 @@ impl<'a> App<'a> {
                 self.renderer.resize();
             }
             UserEvent::ScrollUp => {
+                self.ctrl_c_exit_armed = false;
                 if !self.renderer.input_scroll_up() {
                     for _ in 0..self.ui.cfg.resolve_mouse_scroll_lines() {
                         self.renderer.scroll_line_up();
@@ -3919,6 +3920,7 @@ impl<'a> App<'a> {
                 }
             }
             UserEvent::ScrollDown => {
+                self.ctrl_c_exit_armed = false;
                 if self.renderer.is_scrolling() {
                     for _ in 0..self.ui.cfg.resolve_mouse_scroll_lines() {
                         self.renderer.scroll_line_down();
@@ -3927,8 +3929,14 @@ impl<'a> App<'a> {
                     self.renderer.input_scroll_down();
                 }
             }
-            UserEvent::ScrollPageUp => self.renderer.scroll_page_up(),
-            UserEvent::ScrollPageDown => self.renderer.scroll_page_down(),
+            UserEvent::ScrollPageUp => {
+                self.ctrl_c_exit_armed = false;
+                self.renderer.scroll_page_up();
+            }
+            UserEvent::ScrollPageDown => {
+                self.ctrl_c_exit_armed = false;
+                self.renderer.scroll_page_down();
+            }
             UserEvent::MouseDown { row, col } => {
                 if let Some(pos) =
                     self.renderer

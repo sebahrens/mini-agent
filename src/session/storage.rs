@@ -1754,14 +1754,23 @@ pub fn suffix_path() -> PathBuf {
 }
 
 pub fn load_suffix() -> Option<String> {
-    let path = suffix_path();
-    if path.exists() {
-        std::fs::read_to_string(path)
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-    } else {
-        None
-    }
+    read_suffix_bounded(&suffix_path())
+}
+
+/// Upper bound on SUFFIX.md bytes read into the system prompt, matching the
+/// `/add` file cap so an oversized file cannot stall every preamble build.
+const MAX_SUFFIX_BYTES: u64 = 512 * 1024;
+
+fn read_suffix_bounded(path: &std::path::Path) -> Option<String> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(MAX_SUFFIX_BYTES)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    (!text.trim().is_empty()).then_some(text)
 }
 
 fn theme_file_path() -> PathBuf {
@@ -1786,6 +1795,28 @@ pub fn load_theme_name() -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&content).ok()?;
     value.get("theme")?.as_str().map(|s| s.to_string())
+}
+
+#[cfg(test)]
+mod suffix_bound_tests {
+    use super::*;
+
+    #[test]
+    fn suffix_reads_are_bounded_and_blank_files_are_none() {
+        let dir = std::env::temp_dir().join(format!("ma-suffix-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let big = dir.join("SUFFIX.md");
+        std::fs::write(&big, "x".repeat(MAX_SUFFIX_BYTES as usize + 4096)).unwrap();
+        assert_eq!(
+            read_suffix_bounded(&big).unwrap().len(),
+            MAX_SUFFIX_BYTES as usize
+        );
+        let blank = dir.join("BLANK.md");
+        std::fs::write(&blank, " \n").unwrap();
+        assert!(read_suffix_bounded(&blank).is_none());
+        assert!(read_suffix_bounded(&dir.join("missing.md")).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
