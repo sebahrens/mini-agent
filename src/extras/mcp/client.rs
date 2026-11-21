@@ -58,8 +58,47 @@ const MCP_CONNECT_RETRY_BASE: Duration = Duration::from_millis(500);
 /// Whether a failed first connection is worth retrying: a timeout, a refused
 /// or reset connection, or an HTTP 5xx. Authentication problems, other 4xx
 /// responses, refused redirects and cancellation are final.
+/// An HTTP connection failure that keeps the user's server name apart from
+/// the transport's own text, so retry classification reads only the latter: a
+/// server named `disabled-tests` must not look like a disabled server.
+#[derive(Debug)]
+pub(crate) struct NamedConnectError {
+    server: String,
+    detail: String,
+}
+
+impl NamedConnectError {
+    fn new(server: &str, detail: impl std::fmt::Display) -> anyhow::Error {
+        anyhow::Error::new(Self {
+            server: server.to_owned(),
+            detail: detail.to_string(),
+        })
+    }
+}
+
+impl std::fmt::Display for NamedConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "MCP HTTP connection failed for '{}': {}",
+            self.server, self.detail
+        )
+    }
+}
+
+impl std::error::Error for NamedConnectError {}
+
+/// The text retry decisions read: the transport detail without the server
+/// name when the error is a [`NamedConnectError`], else the full rendering.
+fn classifiable_text(error: &anyhow::Error) -> String {
+    match error.downcast_ref::<NamedConnectError>() {
+        Some(named) => named.detail.clone(),
+        None => format!("{error:#}"),
+    }
+}
+
 pub(crate) fn is_transient_connect_error(error: &anyhow::Error) -> bool {
-    let text = format!("{error:#}");
+    let text = classifiable_text(error);
     let lower = text.to_ascii_lowercase();
     const FINAL: [&str; 7] = [
         "cancelled",
@@ -100,7 +139,7 @@ pub(crate) fn is_transient_connect_error(error: &anyhow::Error) -> bool {
 /// Server-requested wait (`Retry-After` seconds) recorded in an HTTP error
 /// message as `[retry-after: N]`.
 fn retry_after_hint(error: &anyhow::Error) -> Option<Duration> {
-    let text = format!("{error:#}");
+    let text = classifiable_text(error);
     let rest = text.split_once("[retry-after: ")?.1;
     let seconds = rest.split_once(']')?.0.trim().parse::<u64>().ok()?;
     Some(Duration::from_secs(seconds))
@@ -1045,17 +1084,13 @@ impl McpClientHandle {
                 let transport = AuthHttpClient::with_client(auth_client, cfg);
                 serve_client(elicitation.clone(), transport)
                     .await
-                    .map_err(|e| {
-                        anyhow::anyhow!("MCP HTTP connection failed for '{server_name}': {e}")
-                    })
+                    .map_err(|e| NamedConnectError::new(&server_name, e))
             } else {
                 type HttpClient = rmcp::transport::StreamableHttpClientTransport<BoundedHttpClient>;
                 let transport = HttpClient::with_client(http_client, cfg);
                 serve_client(elicitation.clone(), transport)
                     .await
-                    .map_err(|e| {
-                        anyhow::anyhow!("MCP HTTP connection failed for '{server_name}': {e}")
-                    })
+                    .map_err(|e| NamedConnectError::new(&server_name, e))
             }
         };
         let initialized = tokio::select! {
@@ -1065,10 +1100,15 @@ impl McpClientHandle {
         };
         let running_service = match initialized {
             Ok(result) => result?,
-            Err(_) => anyhow::bail!(
-                "MCP HTTP connection failed for '{server_name}': initialization timed out after {} ms",
-                initialize_timeout.as_millis()
-            ),
+            Err(_) => {
+                return Err(NamedConnectError::new(
+                    &server_name,
+                    format!(
+                        "initialization timed out after {} ms",
+                        initialize_timeout.as_millis()
+                    ),
+                ));
+            }
         };
         Ok(Self {
             server_name,
@@ -2595,5 +2635,29 @@ mod local_policy_tests {
                 .await
                 .is_ok()
         );
+    }
+}
+
+#[cfg(test)]
+mod connect_classification_tests {
+    use super::*;
+
+    #[test]
+    fn server_names_do_not_steer_retry_classification() {
+        for name in ["disabled-tests", "forbidden-zone", "unauthorized-proxy"] {
+            let refused = NamedConnectError::new(name, "error sending request: connection refused");
+            assert!(is_transient_connect_error(&refused), "{name}");
+            let auth = NamedConnectError::new(name, "HTTP 401 unauthorized");
+            assert!(!is_transient_connect_error(&auth), "{name}");
+        }
+        // A name that looks like a status code is not read as one.
+        let named = NamedConnectError::new("HTTP 404 service", "connection reset by peer");
+        assert!(is_transient_connect_error(&named));
+        let hinted = NamedConnectError::new("x [retry-after: 9]", "HTTP 503 [retry-after: 2]");
+        assert_eq!(retry_after_hint(&hinted), Some(Duration::from_secs(2)));
+        // Errors from elsewhere keep full-text classification.
+        assert!(!is_transient_connect_error(&anyhow::anyhow!(
+            "MCP server disabled by policy"
+        )));
     }
 }
