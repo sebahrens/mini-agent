@@ -1342,36 +1342,11 @@ impl AnyClient {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     /// One no-tools completion used to judge a goal's completion claim.
     ///
     /// Shares the summarizer's request path: no tool definitions are sent, one
     /// turn, a bounded response. The judge must not be able to act, only to
     /// read and answer.
-    #[cfg(feature = "goal")]
-    #[allow(
-        dead_code,
-        reason = "Compatibility wrapper for callers without owned usage observers"
-    )]
-    pub async fn judge_completion(
-        &self,
-        model_name: &str,
-        prompt: String,
-        preamble: String,
-        max_output_tokens: u64,
-        retry_config: &RetryConfig,
-    ) -> anyhow::Result<(String, rig::completion::Usage)> {
-        self.judge_completion_observed(
-            model_name,
-            prompt,
-            preamble,
-            max_output_tokens,
-            retry_config,
-            Default::default(),
-        )
-        .await
-    }
-
     #[cfg(feature = "goal")]
     pub(crate) async fn judge_completion_observed(
         &self,
@@ -1395,30 +1370,6 @@ impl AnyClient {
 
     /// One no-tools, single-turn completion with a bounded response, on the
     /// summarizer's request path. Used for goal judging.
-    #[cfg(feature = "goal")]
-    #[allow(
-        dead_code,
-        reason = "Compatibility wrapper for callers without owned usage observers"
-    )]
-    pub async fn plain_completion(
-        &self,
-        model_name: &str,
-        prompt: String,
-        preamble: String,
-        max_output_tokens: u64,
-        retry_config: &RetryConfig,
-    ) -> anyhow::Result<(String, rig::completion::Usage)> {
-        self.plain_completion_observed(
-            model_name,
-            prompt,
-            preamble,
-            max_output_tokens,
-            retry_config,
-            Default::default(),
-        )
-        .await
-    }
-
     #[cfg(any(feature = "goal", feature = "hooks"))]
     pub(crate) async fn plain_completion_observed(
         &self,
@@ -1534,34 +1485,6 @@ impl AnyClient {
             AnyModel::Ollama(model) => complete!(model),
             AnyModel::Copilot(model) => complete!(model),
         }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    #[allow(
-        dead_code,
-        reason = "Compatibility wrapper for callers without owned usage observers"
-    )]
-    pub async fn compress_messages(
-        &self,
-        model_name: &str,
-        messages: &[SessionMessage],
-        previous_summary: Option<&str>,
-        instructions: Option<&str>,
-        input_token_budget: u64,
-        response_token_budget: u64,
-        retry_config: &RetryConfig,
-    ) -> anyhow::Result<CompactionOutput> {
-        self.compress_messages_observed(
-            model_name,
-            messages,
-            previous_summary,
-            instructions,
-            input_token_budget,
-            response_token_budget,
-            retry_config,
-            Default::default(),
-        )
-        .await
     }
 
     #[allow(

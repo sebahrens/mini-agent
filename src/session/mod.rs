@@ -3342,7 +3342,7 @@ impl Session {
 
     /// Number of leading messages to drain after a compaction whose summarizer
     /// reported `messages_included` summarized messages for a cut of
-    /// `cut_idx`. The summarizer contract (`provider::compress_messages`)
+    /// `cut_idx`. The summarizer contract (`provider::AnyClient::compress_messages_observed`)
     /// counts an oldest prefix of the cut slice, so with full coverage this is
     /// `cut_idx`; a partial count drains only the summarized prefix and leaves
     /// the unsummarized remainder for a later pass. Zero is an error because
