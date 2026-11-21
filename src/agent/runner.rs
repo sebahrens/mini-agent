@@ -69,6 +69,43 @@ impl Drop for UncommittedToolResultSpill {
     }
 }
 
+/// Whether `result` is a multimodal envelope carrying an image or document
+/// part. A cheap textual test rejects ordinary results first; the rest is
+/// parsed into borrowed raw values instead of a `Value` tree.
+fn result_has_image_parts(result: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Envelope<'a> {
+        #[serde(borrow)]
+        response: &'a serde_json::value::RawValue,
+        #[serde(borrow)]
+        parts: Vec<Part<'a>>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Part<'a> {
+        #[serde(rename = "type", borrow, default)]
+        kind: Option<&'a serde_json::value::RawValue>,
+        #[serde(borrow, default)]
+        data: Option<&'a serde_json::value::RawValue>,
+        #[serde(rename = "mimeType", borrow, default)]
+        mime_type: Option<&'a serde_json::value::RawValue>,
+    }
+    fn is_string(raw: &serde_json::value::RawValue) -> bool {
+        raw.get().trim_start().starts_with('"')
+    }
+    if !result.trim_start().starts_with('{') || !result.contains("\"parts\"") {
+        return false;
+    }
+    serde_json::from_str::<Envelope>(result).is_ok_and(|envelope| {
+        is_string(envelope.response)
+            && envelope.parts.iter().any(|part| {
+                part.kind
+                    .is_some_and(|kind| matches!(kind.get(), "\"image\"" | "\"document\""))
+                    && part.data.is_some_and(is_string)
+                    && part.mime_type.is_some_and(is_string)
+            })
+    })
+}
+
 /// Caps unbounded textual tool results before Rig commits them to the live model
 /// history. The complete output is written to the logical session's private
 /// artifact directory and handed to transcript persistence out-of-band.
@@ -136,18 +173,7 @@ impl<M: CompletionModel> AgentHook<M> for ToolResultSpillHook {
         // this envelope. Rig parses it only after hooks, and hook rewrites are
         // deliberately literal text: spilling even a reserialized envelope
         // here would discard its image parts.
-        let has_images = serde_json::from_str::<serde_json::Value>(result)
-            .ok()
-            .is_some_and(|value| {
-                value["response"].is_string()
-                    && value["parts"].as_array().is_some_and(|parts| {
-                        parts.iter().any(|part| {
-                            (part["type"] == "image" || part["type"] == "document")
-                                && part["data"].is_string()
-                                && part["mimeType"].is_string()
-                        })
-                    })
-            });
+        let has_images = result_has_image_parts(result);
         if has_images {
             return Flow::cont();
         }
@@ -6534,6 +6560,28 @@ where
 
 #[cfg(test)]
 mod tests {
+    // mini-agent-sskdu.100: the envelope test needs no `Value` tree and keeps
+    // the same verdicts.
+    #[test]
+    fn image_envelope_detection_matches_the_value_based_check() {
+        use super::result_has_image_parts as has;
+        let image =
+            r#"{"response":"ok","parts":[{"type":"image","data":"AAAA","mimeType":"image/png"}]}"#;
+        let document = r#"{"response":"ok","parts":[{"type":"document","data":"AAAA","mimeType":"application/pdf"}]}"#;
+        assert!(has(image) && has(document));
+        assert!(!has(
+            r#"{"response":"ok","parts":[{"type":"text","data":"x","mimeType":"t"}]}"#
+        ));
+        assert!(!has(
+            r#"{"response":1,"parts":[{"type":"image","data":"A","mimeType":"i"}]}"#
+        ));
+        assert!(!has(
+            r#"{"response":"ok","parts":[{"type":"image","mimeType":"i"}]}"#
+        ));
+        assert!(!has("plain text"));
+        assert!(!has(r#"{"rows":[1,2,3]}"#));
+    }
+
     use super::{
         MAX_PENDING_TOOL_CALLS, NonTerminalStreamExhausted, RunnerStreamPolicy,
         TRANSIENT_PROVIDER_CONTINUATION, ToolCallTracker, ToolCallTrackerError,

@@ -48,11 +48,12 @@ installed-binary path because libtest is not a production worker executable.
 
 Foreground shell commands default to a 120 s deadline. `shell_timeout_secs`
 sets it between 1 and 600 seconds; the tool definition publishes the effective
-deadline. A call's millisecond `timeout` can only lower that deadline and must
-be positive. Other sandbox command classes retain their existing limits;
+deadline. A call's millisecond `timeout_ms` (alias `timeout`) can only lower that deadline and
+must be at least 1000 (a smaller value is refused with a "did you mean N000" hint, because
+models often pass seconds). Other sandbox command classes retain their existing limits;
 brokered JS `spawn` is bounded by the remaining `js-step-timeout-secs` deadline. A shell call with
 `background = true` instead returns a session-scoped job id immediately and
-uses a 24-hour maximum (again lowerable with `timeout`).
+uses a 24-hour maximum (again lowerable with `timeout_ms`).
 
 With `auto_background = true` on the call (or `shell_auto_background = true` in
 config) a foreground command runs as a job from the start: if it finishes
@@ -170,7 +171,7 @@ hosts, on Seatbelt and Linux bwrap (Unix-socket proxy plus the in-namespace forw
 
 | Command class | Deadline |
 |---------------|----------|
-| `shell` foreground | `shell_timeout_secs` (default 120 s, 1..=600); call `timeout` can only lower it; optional promotion to a job |
+| `shell` foreground | `shell_timeout_secs` (default 120 s, 1..=600); call `timeout_ms` can only lower it; optional promotion to a job |
 | `shell` background job | 24 h, call `timeout` can lower it |
 | `!` commands (TUI and headless) | `command_timeout_secs` (default 120 s, 1..=600); a leading `!timeout=<s>` sets one command's deadline |
 | Loop and goal validation commands | Their own configured validation limits |
@@ -2270,3 +2271,22 @@ plus their bounded metadata may accompany that tail. Image bytes cannot hide an
 over-budget tail, and compaction stops rather than repeatedly summarizing an
 unshrinkable image-only recap. Active retained pixels remain recoverable in the
 saved session under the retention limits above.
+
+## Tool result and argument conventions (2026-11-21 review)
+
+- A missing path or a directory given to `read`, `edit`, `grep`, `find_files` or `list_dir` returns
+  `<tool>: '<path>' does not exist. <next step>` (or `is a directory` for `read`) instead of a raw
+  errno string.
+- A shell command that exits 0 and prints nothing returns `[exit code 0; no output]`. When the line
+  cap drops lines and the full output was saved to a log, the omission marker names the log instead
+  of suggesting a re-run.
+- `grep`, `find_files` and `list_dir` validate arguments before any permission prompt, and all
+  three reject a per-call cap of 0 with an example, and serve one above the configured cap at the
+  cap with a one-line note. `grep` context
+  lines use the same shape as match lines: `path:N:text` and `path:N-text`.
+- Numeric and boolean arguments of the built-in tools also accept string spellings (`"200"`,
+  `"true"`) and integral floats; other type errors name the field.
+- Tool descriptions for `grep`, `find_files` and `list_dir` list the directories skipped according
+  to `[tool_limits] skip_dirs`.
+- `read` keeps the last parsed PDF (up to 32 MiB of source) so consecutive `pages` windows of one
+  unchanged file parse it once.
