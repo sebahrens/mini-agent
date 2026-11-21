@@ -44,6 +44,12 @@ Notable changes to mini-agent are documented in this file. The format follows
 - `/effort` and `/reasoning` map to OpenRouter's unified `reasoning` object for every non-Claude model, to Ollama's `think`, and to `reasoning_effort` for Claude and Gemini ids on Copilot (mini-agent-nvnkx.34).
 - Unlisted official-looking Claude ids newer than a listed sibling (for example `claude-fable-5-2`) inherit that sibling's context window, output limit and prices, with a startup notice (mini-agent-nvnkx.36).
 - `scripts/check_catalog_age.py` fails a release when `data/models.generated` is older than 45 days (mini-agent-nvnkx.36).
+- `web-fetch-local-origins` (user config only; project layers are ignored) lists exact loopback or private origins (`http://localhost:3000`, `http://127.0.0.1:*`) that `web_fetch` may reach after the usual per-origin approval, keeping `http://` for them; a redirect from another origin into one is refused, and link-local/cloud-metadata ranges (169.254.0.0/16, Azure WireServer 168.63.129.16) stay denied. The denial text now names the setting (mini-agent-nvnkx.245).
+- `socks5://` and `socks5h://` proxies in `ALL_PROXY`/`HTTPS_PROXY`/`HTTP_PROXY` now work for `web_fetch`, `web_search` and JS `fetch()` (`socks5h` resolves on the proxy and is screened by name; `socks5` resolves locally and is validated and pinned like a direct connection); socks4 and unparsable values still fail closed, and `NO_PROXY` accepts IPv6 CIDR entries (mini-agent-nvnkx.244).
+- `web_fetch` prefers the page's `<main>`/`role=main` (else `<article>`, else the page minus nav/aside/header/footer/form) with a one-line note, falling back to the whole page when the result is nearly empty, and sends `Accept: text/markdown, text/html;q=0.9, ...` (mini-agent-nvnkx.27).
+- `web_fetch`'s `prompt` now ranks the sections of a page longer than 50,000 characters by term overlap (no model call) and returns the best matches first, with a table of headings and spill line numbers; the result says so (mini-agent-nvnkx.26).
+- `/sandbox network <deny|allowlist|allow>` and `--sandbox-network` change the shell network policy for the session (never saved, bounded by a managed `max_network`/`allowed_hosts` ceiling) (mini-agent-nvnkx.70).
+- With `sandbox-network = "allowlist"` the proxy keeps a bounded log of refused hosts: the shell tool ends a command's result (foreground, background job or deadline) with `[sandbox network: blocked host:port (reason)]`, each refusal is logged at info level and `/sandbox` lists recent ones (mini-agent-nvnkx.186).
 
 ### Fixed
 
@@ -223,6 +229,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 - The OpenRouter price list is awaited for a bounded time (5 s headless, 1.5 s interactive) instead of being discarded, and a capped OpenRouter run with no price warns that the cap cannot be enforced (mini-agent-nvnkx.150).
 - Rolling-compaction summarizer usage is charged at the `compaction_model`'s prices in the session total (mini-agent-nvnkx.165).
 - Headless and ACP sessions calibrate the context estimate from the turn's provider usage and take the built preamble's size as prompt overhead, so the compaction gate fires where the TUI's does (mini-agent-nvnkx.163).
+- The `web_fetch`/`web_search` network deadline no longer runs while an approval prompt is open, so a slow answer is not turned into `fetch timed out`; the prompt has its own 10-minute bound and says the approval expired, and the destination is re-resolved (and re-asked only if it changed) after a wait over 3 s (mini-agent-nvnkx.232).
+- `web_fetch` Markdown no longer splits headings, links, list items or table rows at source line breaks (mini-agent-nvnkx.28), and decodes the HTML 4 named entities (`&mdash;`, `&rsquo;`, `&hellip;`, `&copy;`, `&eacute;`, ...) once (mini-agent-nvnkx.29).
+- Sandbox failure notes now also cover failed background jobs polled with `job_status` and commands that hit their deadline, recognise resolver/npm/cargo/proxy spellings (`Temporary failure in name resolution`, `ENOTFOUND`, `EAI_AGAIN`, `failed to lookup address information`, `CONNECT tunnel failed`), and state that the network is denied instead of "may be"; the shell tool description mentions the denied network (mini-agent-nvnkx.69).
 
 ### Added
 

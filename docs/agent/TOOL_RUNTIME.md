@@ -167,7 +167,7 @@ win, nothing is remembered, headless runs refuse, the use is logged to the
 routes contained shell traffic through a loopback filtering proxy
 (`src/sandbox/net_proxy.rs`) limited to `sandbox-network-hosts` plus prompted
 hosts, on Seatbelt and Linux bwrap (Unix-socket proxy plus the in-namespace forwarder in
-`src/sandbox/net_forwarder.rs`). See CONFIG.md for the rules.
+`src/sandbox/net_forwarder.rs`). The proxy keeps a bounded log of refused `host:port`s (`NetworkProxy::refusal_mark`/`refusals_since`); the shell tool captures the mark when a command or background job starts and appends `[sandbox network: blocked ...]` when the command ends, independent of any output marker. `sandbox_failure_note` (foreground, auto-background, `job_status` terminal failures) and `sandbox_timeout_note` (deadline stops) attribute network-looking failures to the sandbox outright when the session network is denied. `/sandbox network <mode>` and `--sandbox-network` change the policy. See CONFIG.md for the rules.
 
 | Command class | Deadline |
 |---------------|----------|
@@ -2177,6 +2177,18 @@ headless requests fail closed without explicit permission. Readonly/planwrite
 modes do not silently authorize network access. Host-wide interactive grants
 still run all URL, origin and public-address checks on every request. An origin
 allowlist restricts possible destinations; it does not grant permission.
+The network deadline (`NetworkBudget` in `web_http.rs`) is paused while the
+approval prompt is open, so a slow answer is never a `fetch timed out`; the prompt
+itself is bounded separately (10 minutes, then "the approval prompt expired", with
+no grant installed and nothing dispatched). A prompt open longer than 3 s makes the
+client resolve the name again before dispatch and ask again only if the address set
+changed. The user-config-only `web-fetch-local-origins` list admits exact loopback
+or private origins to `web_fetch` (never `web_search` or JS fetch): the origin is
+approved like any other, connects without an environment proxy, and may reach only
+public, loopback and private ranges (`validate_local_destinations`), so link-local,
+cloud-metadata and the Azure WireServer address stay denied. Redirects never carry
+that admission across an origin change. `socks5h://` proxies are treated like HTTP
+proxies (proxy-side DNS, name screening); `socks5://` resolves and pins locally.
 The explicit operator `--dangerously-skip-permissions` mode disables ordinary
 permission checks as for other native tools. It retains mandatory financial
 admission, concurrency, destination checks, network caps and cancellation.

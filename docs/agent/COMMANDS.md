@@ -161,6 +161,7 @@ built-in prompts, or create a custom `code.md` prompt).
 | `/mode accept` | Alias for `/mode standard`, matching `default_permission_mode`. |
 | `/sandbox` | Show the current ordinary command filesystem profile and describe `workspace`, `host-read` and `host-full`. Works while the agent runs. |
 | `/sandbox <profile>` | Switch this idle session's profile and rebuild its agent, without saving config. Active turns, background tasks and commands must settle first. Profiles never widen the JS worker; see [CONFIG.md](CONFIG.md) (`sandbox-profile`). |
+| `/sandbox network <deny\|allowlist\|allow>` | Switch this idle session's shell network policy and rebuild its agent, without saving config; refused above a managed `max_network` ceiling and while commands run. `allowlist` asks per host. Bare `/sandbox` also lists hosts the allowlist proxy recently refused. |
 
 Prompts can set the security mode automatically via `%%mode=<mode>` on
 the first line. When a prompt with `%%mode=last_user_mode` is activated,

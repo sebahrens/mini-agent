@@ -656,6 +656,28 @@ impl ManagedPolicy {
         })
     }
 
+    /// Refusal when a run-time network switch asks for more than the managed
+    /// ceiling (`max_network`, or `allowlist` when a host pin is set).
+    pub(crate) fn network_violation(
+        &self,
+        network: crate::sandbox::SandboxNetwork,
+    ) -> Option<String> {
+        use crate::sandbox::SandboxNetwork;
+        let sandbox = &self.file.sandbox;
+        let max = match (sandbox.max_network, sandbox.allowed_hosts.is_some()) {
+            (Some(max), true) if max.rank() > SandboxNetwork::Allowlist.rank() => {
+                Some(SandboxNetwork::Allowlist)
+            }
+            (None, true) => Some(SandboxNetwork::Allowlist),
+            (max, _) => max,
+        }?;
+        (network.rank() > max.rank()).then(|| {
+            self.refusal(&format!(
+                "sandbox network `{network}` (widest permitted: {max})"
+            ))
+        })
+    }
+
     /// True when `sandbox.allowed_hosts` pins the network host list.
     pub(crate) fn network_hosts_pinned(&self) -> bool {
         self.file.sandbox.allowed_hosts.is_some()
@@ -1478,6 +1500,39 @@ mod tests {
                 .err()
                 .is_none_or(|e| !e.contains("managed-config.toml"))
         );
+    }
+
+    #[test]
+    fn runtime_network_switch_refuses_above_max_network_naming_the_file() {
+        use crate::sandbox::SandboxNetwork;
+        let ceiling = policy("[sandbox]\nmax_network = \"deny\"\n");
+        let mut sandbox = crate::sandbox::Sandbox::new(true, "seatbelt");
+        for network in [SandboxNetwork::Allowlist, SandboxNetwork::Allow] {
+            let error = sandbox
+                .set_network_under(Some(&ceiling), network)
+                .unwrap_err();
+            assert!(error.contains("managed-config.toml"), "{error}");
+            assert_eq!(sandbox.network(), SandboxNetwork::Deny);
+        }
+        // A host pin caps the network at allowlist even without max_network.
+        let pinned = policy("[sandbox]\nallowed_hosts = [\"registry.npmjs.org\"]\n");
+        assert!(
+            sandbox
+                .set_network_under(Some(&pinned), SandboxNetwork::Allow)
+                .is_err()
+        );
+        sandbox
+            .set_network_under(Some(&pinned), SandboxNetwork::Allowlist)
+            .unwrap();
+        assert_eq!(sandbox.network(), SandboxNetwork::Allowlist);
+        // Lowering is always allowed; without a policy nothing is refused.
+        sandbox
+            .set_network_under(Some(&ceiling), SandboxNetwork::Deny)
+            .unwrap();
+        sandbox
+            .set_network_under(None, SandboxNetwork::Allow)
+            .unwrap();
+        assert_eq!(sandbox.network(), SandboxNetwork::Allow);
     }
 
     #[test]

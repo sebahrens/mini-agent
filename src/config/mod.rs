@@ -716,6 +716,16 @@ pub struct Config {
         alias = "web_fetch_allow_http"
     )]
     pub web_fetch_allow_http: Option<bool>,
+    /// `web-fetch-local-origins`: exact loopback/private origins `web_fetch`
+    /// may reach after approval, for example `http://localhost:3000` or
+    /// `http://127.0.0.1:*`. User configuration only (project layers are
+    /// ignored); cloud metadata ranges stay denied.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "web-fetch-local-origins",
+        alias = "web_fetch_local_origins"
+    )]
+    pub web_fetch_local_origins: Option<Vec<String>>,
     #[serde(
         skip_serializing_if = "Option::is_none",
         rename = "web-search-provider",

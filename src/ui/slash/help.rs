@@ -241,6 +241,10 @@ pub(crate) fn help_lines(
     );
     emit(
         false,
+        "  /sandbox network <m>   shell network for this session: deny|allowlist|allow",
+    );
+    emit(
+        false,
         "  /expand [n|all]        unfold the latest (or nth latest, or every) tool result",
     );
     emit(

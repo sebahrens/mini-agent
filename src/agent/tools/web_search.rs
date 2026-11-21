@@ -363,6 +363,7 @@ fn render_results_with_credential(
 mod web_search_tests {
     use super::super::web_http::web_http_tests::{Peer, fixture_client};
     use super::*;
+    use std::time::Duration;
     #[test]
     fn web_search_lists_fragment_urls_without_the_fragment_and_counts_unusable() {
         let out = render_results(&serde_json::json!({"results":[
@@ -405,6 +406,55 @@ mod web_search_tests {
         assert!(captured.contains("x-api-key: owned-search-secret"));
         assert!(captured.contains("\"numResults\":5"));
         assert!(!captured.contains("summary"));
+    }
+    /// The default search client has a 10 s network deadline; a user who takes
+    /// 12 s to answer the approval prompt must not lose the call to it.
+    #[tokio::test(start_paused = true)]
+    async fn web_search_approval_wait_beyond_the_default_deadline_is_not_a_timeout() {
+        use super::super::web_http::FETCH_TOTAL_TIMEOUT;
+        let checker = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::permission::checker::PermissionChecker::new(
+                &crate::permission::PermissionConfigs::default(),
+                crate::permission::SecurityMode::Standard,
+                None,
+                None,
+            )
+            .unwrap(),
+        ));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let peer = Peer::new(vec![]);
+        let mut client = fixture_client(&peer).with_permissions_for_test(Some(checker), Some(tx));
+        // Nothing listens at the transport address, so the exchange after
+        // approval fails at once instead of waiting on real I/O.
+        client.test_resolution = Some((
+            vec!["93.184.216.34:443".parse().unwrap()],
+            vec!["127.0.0.1:1".parse().unwrap()],
+        ));
+        client.test_transport_http = true;
+        let tool = WebSearchTool {
+            client,
+            provider: "exa".into(),
+            api_key: Some("owned-search-secret".into()),
+        };
+        let delay = FETCH_TOTAL_TIMEOUT + Duration::from_secs(2);
+        let user = async {
+            let ask = rx.recv().await.unwrap().into_permission();
+            tokio::time::sleep(delay).await;
+            ask.reply
+                .send(crate::permission::ask::UserDecision::AllowOnce)
+                .unwrap();
+        };
+        let call = Tool::call(
+            &tool,
+            WebSearchArgs {
+                query: "docs".into(),
+                ..Default::default()
+            },
+        );
+        let (result, ()) = tokio::join!(call, user);
+        let message = result.unwrap_err().to_string();
+        assert!(!message.contains("timed out"), "{message}");
+        assert!(!message.contains("expired"), "{message}");
     }
     #[tokio::test]
     async fn web_search_missing_key_unknown_provider_and_empty_query_fail_before_io() {

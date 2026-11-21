@@ -3212,10 +3212,10 @@ fn write_sessions(
     Ok(())
 }
 
-fn sandbox_network_entry(cfg: &config::Config) -> (&'static str, String) {
+fn sandbox_network_entry(cli: &cli::Cli, cfg: &config::Config) -> (&'static str, String) {
     (
         "sandbox-network",
-        match cfg.sandbox_network.unwrap_or_default() {
+        match cli.resolve_sandbox_network(cfg) {
             crate::sandbox::SandboxNetwork::Allowlist => {
                 format!("allowlist [{}]", cfg.sandbox_network_hosts.join(", "))
             }
@@ -3320,7 +3320,7 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
         cfg.sandbox_home_mounts.clone(),
         cfg.sandbox_home_masks.clone(),
     )
-    .with_network(cfg.sandbox_network.unwrap_or_default())
+    .with_network(cli.resolve_sandbox_network(cfg))
     .with_network_hosts(cfg.sandbox_network_hosts.clone())
     .with_shell_env(cfg.shell_env_policy())
     .with_max_background_jobs(
@@ -3466,7 +3466,7 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
             ("edit-system", edit_system.to_string()),
             ("sandbox", sandbox.to_string()),
             sandbox_profile_entry(cli, cfg),
-            sandbox_network_entry(cfg),
+            sandbox_network_entry(cli, cfg),
             ("shell-env", cfg.shell_env_policy().summary()),
             ("no-tools", no_tools.to_string()),
             ("tools", tools_allowlist),
@@ -3569,6 +3569,7 @@ fn config_source_entries(cli: &cli::Cli, cfg: &config::Config) -> Vec<(&'static 
         ("sandbox", cli.sandbox || cli.no_sandbox),
         ("sandbox-backend", cli.sandbox_backend.is_some()),
         ("sandbox-profile", cli.sandbox_profile.is_some()),
+        ("sandbox-network", cli.sandbox_network.is_some()),
         ("shell", cli.shell.is_some()),
         ("edit_system", cli.edit_system.is_some()),
         (

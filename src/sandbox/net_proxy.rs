@@ -246,7 +246,57 @@ fn forbidden_v4(ip: Ipv4Addr) -> bool {
         || a >= 240
 }
 
+/// Why the proxy refused a `host:port`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalReason {
+    /// Not in `sandbox-network-hosts` and not approved at a prompt.
+    NotAllowed,
+    /// The name resolves only to loopback, private or link-local addresses.
+    PrivateAddress,
+    /// The name did not resolve, or no resolved address accepted a connection.
+    Unreachable,
+}
+
+impl RefusalReason {
+    /// Short, model-facing explanation.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::NotAllowed => "not in sandbox-network-hosts; add it there or approve the prompt",
+            Self::PrivateAddress => {
+                "resolves only to loopback, private or link-local addresses, which the sandbox never reaches"
+            }
+            Self::Unreachable => "could not resolve or connect",
+        }
+    }
+}
+
+/// One refused destination, newest-wins and coalesced per `host:port` and
+/// reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    /// Increases with every recorded refusal; compare with a mark taken
+    /// earlier (see [`NetworkProxy::refusal_mark`]).
+    pub seq: u64,
+    pub host_port: String,
+    pub reason: RefusalReason,
+    /// Times this destination was refused since it was first recorded.
+    pub count: u32,
+    pub at: std::time::Instant,
+}
+
+/// Refusals kept; older ones are dropped.
+const MAX_REFUSALS: usize = 32;
+
+#[derive(Debug, Default)]
+struct RefusalLog {
+    next_seq: u64,
+    entries: std::collections::VecDeque<Refusal>,
+}
+
 struct Shared {
+    /// Recent refusals for the shell tool and `/sandbox` (never the model's
+    /// only copy: the 403 body is also sent to the client).
+    refusals: Mutex<RefusalLog>,
     rules: Vec<HostRule>,
     session: Mutex<HashSet<String>>,
     prompt: Arc<Mutex<Option<AskSender>>>,
@@ -261,6 +311,7 @@ struct Shared {
 pub struct NetworkProxy {
     port: u16,
     token: String,
+    shared: Arc<Shared>,
     /// Private Unix socket for namespaces without host loopback (Linux bwrap).
     #[cfg(unix)]
     socket: Option<UnixSocket>,
@@ -371,6 +422,7 @@ impl NetworkProxy {
             base64::engine::general_purpose::STANDARD.encode(format!("mini-agent:{token}"))
         );
         let shared = Arc::new(Shared {
+            refusals: Mutex::default(),
             rules,
             session: Mutex::new(HashSet::new()),
             prompt,
@@ -381,6 +433,7 @@ impl NetworkProxy {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
+        let shared_for_handle = shared.clone();
         std::thread::Builder::new()
             .name("sandbox-net-proxy".into())
             .spawn(move || {
@@ -433,9 +486,32 @@ impl NetworkProxy {
         Ok(Arc::new(Self {
             port,
             token,
+            shared: shared_for_handle,
             #[cfg(unix)]
             socket,
         }))
+    }
+
+    /// Position in the refusal log now; pass it to [`Self::refusals_since`]
+    /// after a command to get the refusals that happened during it.
+    pub fn refusal_mark(&self) -> u64 {
+        self.shared.refusal_mark()
+    }
+
+    /// Refusals recorded after `mark`, oldest first.
+    pub fn refusals_since(&self, mark: u64) -> Vec<Refusal> {
+        self.shared.refusals_since(mark)
+    }
+
+    /// The retained recent refusals, oldest first.
+    pub fn recent_refusals(&self) -> Vec<Refusal> {
+        self.shared.refusals_since(0)
+    }
+
+    /// Records a refusal as if a connection had been refused (tests).
+    #[cfg(test)]
+    pub fn record_refusal_for_test(&self, host: &str, port: u16, reason: RefusalReason) {
+        self.shared.record_refusal(host, port, reason);
     }
 
     /// Host path of the Unix socket, when started with one.
@@ -647,11 +723,15 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(mut client: S, shared: Arc<Sh
         .await;
     }
     if let Err(why) = shared.decide(&request.host, request.port).await {
+        shared.record_refusal(&request.host, request.port, RefusalReason::NotAllowed);
         return respond(&mut client, "403 Forbidden", &why, "").await;
     }
     let upstream = match connect_public(&request.host, request.port).await {
         Ok(stream) => stream,
-        Err(why) => return respond(&mut client, "403 Forbidden", &why, "").await,
+        Err((reason, why)) => {
+            shared.record_refusal(&request.host, request.port, reason);
+            return respond(&mut client, "403 Forbidden", &why, "").await;
+        }
     };
     let mut upstream = upstream;
     if request.connect {
@@ -673,18 +753,26 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(mut client: S, shared: Arc<Sh
 
 /// Resolve `host` ourselves, drop non-public addresses and connect to the
 /// first reachable one, so the address that was checked is the one used.
-async fn connect_public(host: &str, port: u16) -> Result<TcpStream, String> {
+async fn connect_public(host: &str, port: u16) -> Result<TcpStream, (RefusalReason, String)> {
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
         .await
-        .map_err(|error| format!("cannot resolve {host}: {error}"))?
+        .map_err(|error| {
+            (
+                RefusalReason::Unreachable,
+                format!("cannot resolve {host}: {error}"),
+            )
+        })?
         .collect();
     let allowed: Vec<SocketAddr> = addrs
         .into_iter()
         .filter(|addr| !is_forbidden_ip(addr.ip()))
         .collect();
     if allowed.is_empty() {
-        return Err(format!(
-            "{host} resolves only to loopback, private or link-local addresses, which the sandbox proxy never reaches"
+        return Err((
+            RefusalReason::PrivateAddress,
+            format!(
+                "{host} resolves only to loopback, private or link-local addresses, which the sandbox proxy never reaches"
+            ),
         ));
     }
     for addr in allowed {
@@ -694,7 +782,10 @@ async fn connect_public(host: &str, port: u16) -> Result<TcpStream, String> {
             return Ok(stream);
         }
     }
-    Err(format!("could not connect to {host}:{port}"))
+    Err((
+        RefusalReason::Unreachable,
+        format!("could not connect to {host}:{port}"),
+    ))
 }
 
 /// How long a refused or unanswered `host:port` stays refused without asking
@@ -720,6 +811,62 @@ impl Drop for InflightGuard<'_> {
 }
 
 impl Shared {
+    fn refusal_mark(&self) -> u64 {
+        self.refusals
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .next_seq
+    }
+
+    fn refusals_since(&self, mark: u64) -> Vec<Refusal> {
+        self.refusals
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entries
+            .iter()
+            .filter(|entry| entry.seq > mark)
+            .cloned()
+            .collect()
+    }
+
+    /// Remembers a refusal (bounded, coalesced per destination and reason) and
+    /// logs it. The 403 body reaches only the client, and CONNECT clients such
+    /// as curl, cargo, npm, pip and git print just "403", so the shell tool
+    /// reads this log to name the blocked host to the model.
+    fn record_refusal(&self, host: &str, port: u16, reason: RefusalReason) {
+        let host_port = format!("{host}:{port}");
+        tracing::info!(
+            target: "mini_agent::sandbox_network",
+            destination = %host_port,
+            reason = reason.describe(),
+            "sandbox proxy refused a connection"
+        );
+        let mut log = self
+            .refusals
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let count = match log
+            .entries
+            .iter()
+            .position(|entry| entry.host_port == host_port && entry.reason == reason)
+        {
+            Some(index) => log.entries.remove(index).map_or(1, |old| old.count + 1),
+            None => 1,
+        };
+        let seq = log.next_seq + 1;
+        log.next_seq = seq;
+        if log.entries.len() >= MAX_REFUSALS {
+            log.entries.pop_front();
+        }
+        log.entries.push_back(Refusal {
+            seq,
+            host_port,
+            reason,
+            count,
+            at: std::time::Instant::now(),
+        });
+    }
+
     async fn decide(&self, host: &str, port: u16) -> Result<(), String> {
         self.decide_with(host, port, crate::headless_control::state())
             .await

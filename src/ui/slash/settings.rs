@@ -342,12 +342,19 @@ async fn handle_sandbox(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resul
                 format!("  /sandbox {profile}: {}", profile.description()),
             );
         }
+        write_result(ctx.renderer, format!("  {SANDBOX_NETWORK_USAGE_LINE}"));
+        for line in recent_refusal_lines(ctx.sandbox) {
+            write_result(ctx.renderer, line);
+        }
         return Ok(());
+    }
+    if parts[1] == "network" {
+        return handle_sandbox_network(&parts[2..], ctx).await;
     }
     if parts.len() != 2 {
         write_usage(
             ctx.renderer,
-            "usage: /sandbox [workspace|host-read|host-full]",
+            "usage: /sandbox [workspace|host-read|host-full|network <deny|allowlist|allow>]",
         );
         return Ok(());
     }
@@ -384,6 +391,81 @@ async fn handle_sandbox(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resul
     Ok(())
 }
 
+/// `/sandbox` listing line for the network subcommand.
+const SANDBOX_NETWORK_USAGE_LINE: &str = "/sandbox network <deny|allowlist|allow>: shell network policy for this session (allowlist asks per host; never saved; bounded by a managed ceiling)";
+
+/// `/sandbox network [deny|allowlist|allow]`: switch the shell network policy
+/// of an idle session (mini-agent-nvnkx.70).
+async fn handle_sandbox_network(args: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
+    use crate::sandbox::SandboxNetwork;
+    let [mode] = args else {
+        write_usage(
+            ctx.renderer,
+            "usage: /sandbox network <deny|allowlist|allow>",
+        );
+        return Ok(());
+    };
+    let Ok(network) = <SandboxNetwork as clap::ValueEnum>::from_str(mode, false) else {
+        write_error(ctx.renderer, "expected deny, allowlist or allow");
+        return Ok(());
+    };
+    if let Some(refusal) = profile_switch_refusal(ctx.sandbox) {
+        write_error(
+            ctx.renderer,
+            refusal.replace(
+                "the profile has no effect",
+                "the network policy has no effect",
+            ),
+        );
+        return Ok(());
+    }
+    #[cfg(feature = "subagents")]
+    let background_active = ctx.session.background_task_counts().0 != 0;
+    #[cfg(not(feature = "subagents"))]
+    let background_active = false;
+    if *ctx.is_running || background_active {
+        write_error(
+            ctx.renderer,
+            "finish or cancel active turns/tasks before changing the sandbox network",
+        );
+        return Ok(());
+    }
+    if let Err(error) = ctx.sandbox.set_network(network) {
+        write_error(ctx.renderer, error);
+        return Ok(());
+    }
+    ctx.rebuild_agent().await;
+    write_ok(
+        ctx.renderer,
+        format!("sandbox network: {network} (this session only; not saved to configuration)"),
+    );
+    write_result(ctx.renderer, shell_network_line(ctx.sandbox));
+    Ok(())
+}
+
+/// Recent hosts the allowlist proxy refused, newest last, for `/sandbox`.
+fn recent_refusal_lines(sandbox: &crate::sandbox::Sandbox) -> Vec<String> {
+    let refusals = sandbox.recent_network_refusals();
+    if refusals.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec!["  recently blocked by the network allowlist:".to_string()];
+    for refusal in refusals.iter().rev().take(8) {
+        let times = if refusal.count > 1 {
+            format!(" x{}", refusal.count)
+        } else {
+            String::new()
+        };
+        lines.push(format!(
+            "    {}{times} ({}, {}s ago)",
+            crate::ui::events::sanitize_output(&refusal.host_port),
+            refusal.reason.describe(),
+            refusal.at.elapsed().as_secs()
+        ));
+    }
+    lines
+}
+
 /// A profile switch changes nothing while the sandbox is off (or fell back to
 /// unsandboxed), so it is refused rather than reported as applied.
 fn profile_switch_refusal(sandbox: &crate::sandbox::Sandbox) -> Option<&'static str> {
@@ -403,7 +485,7 @@ fn shell_network_line(sandbox: &crate::sandbox::Sandbox) -> String {
     } else if network.is_allowlist() || network.allows() {
         "not supported by this backend; shell network stays denied"
     } else {
-        "shell commands have no network; set sandbox-network = \"allow\" in config to opt in"
+        "shell commands have no network; /sandbox network allowlist|allow opens it for this session, or set sandbox-network in config"
     };
     let hosts = if network.is_allowlist() {
         format!(" [{}]", sandbox.network_hosts().join(", "))
@@ -1356,6 +1438,32 @@ mod profile100_tests {
         assert!(ctx.permission.is_none());
         assert!(cfg.sandbox_profile.is_none(), "no config persistence");
         assert!(crate::ui::pickers::list::reserved_command("sandbox"));
+
+        // mini-agent-nvnkx.70: the shell network policy switches for the idle
+        // session only, and the listing advertises the subcommand.
+        assert!(SANDBOX_NETWORK_USAGE_LINE.contains("/sandbox network"));
+        *ctx.sandbox = crate::sandbox::Sandbox::new(true, "seatbelt")
+            .with_workspace_binding(workspace.clone());
+        assert_eq!(ctx.sandbox.network(), crate::sandbox::SandboxNetwork::Deny);
+        handle(&["/sandbox", "network", "bogus"], &mut ctx)
+            .await
+            .unwrap();
+        handle(&["/sandbox", "network"], &mut ctx).await.unwrap();
+        assert_eq!(ctx.sandbox.network(), crate::sandbox::SandboxNetwork::Deny);
+        *ctx.is_running = true;
+        handle(&["/sandbox", "network", "allow"], &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(ctx.sandbox.network(), crate::sandbox::SandboxNetwork::Deny);
+        *ctx.is_running = false;
+        handle(&["/sandbox", "network", "allowlist"], &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(
+            ctx.sandbox.network(),
+            crate::sandbox::SandboxNetwork::Allowlist
+        );
+        assert!(cfg.sandbox_network.is_none(), "no config persistence");
     }
 }
 
