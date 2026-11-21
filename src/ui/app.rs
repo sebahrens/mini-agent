@@ -943,16 +943,18 @@ impl<'a> App<'a> {
         super::bind_current_mcp_hook_peers(ui.mcp_manager.as_ref());
         let keybindings =
             KeyBindings::from_overrides(ui.cfg.keys.as_ref()).map_err(anyhow::Error::msg)?;
+        let screen_reader = ui.cfg.resolve_screen_reader(ui.cli.screen_reader);
+        let reduce_motion = ui.cfg.resolve_reduce_motion(screen_reader);
         let terminal_guard = TerminalGuard::new(crate::ui::terminal::TerminalOptions {
-            mouse_capture: ui.cfg.resolve_mouse_capture(),
-            title_status: ui.cfg.resolve_terminal_title(),
+            mouse_capture: ui.cfg.resolve_mouse_capture() && !screen_reader,
+            title_status: ui.cfg.resolve_terminal_title() && !screen_reader,
         })?;
 
         // No input thread exists yet: retain every unrelated decoded event for
         // its sole owner instead of flushing or racing raw terminal input.
         // The query is sent now and its reply collected after the renderer,
         // input editor and history are built, overlapping the round trip.
-        let background_query = crate::ui::terminal::start_background_query(!ui.cli.no_color);
+        let background_query = crate::ui::terminal::start_background_query(!(ui.cli.no_color || screen_reader));
 
         ui.session.show_cost_always = ui.cfg.resolve_show_cost_always();
         crate::ui::statusline::init(ui.cfg);
@@ -961,8 +963,9 @@ impl<'a> App<'a> {
 
         let mut renderer = Renderer::new()?;
         renderer.set_statusline_height(crate::ui::statusline::line_count());
-        renderer.set_monochrome(monochrome_requested(ui.cli.no_color));
-        renderer.set_title_status(ui.cfg.resolve_terminal_title());
+        renderer.set_monochrome(monochrome_requested(ui.cli.no_color || screen_reader));
+        renderer.set_reduce_motion(reduce_motion);
+        renderer.set_title_status(ui.cfg.resolve_terminal_title() && !screen_reader);
         renderer.set_activity_signals(crate::ui::terminal::ActivitySignals {
             notify: ui.cfg.resolve_terminal_notify(),
             prompt_marks: ui.cfg.resolve_terminal_prompt_marks(),
@@ -975,7 +978,7 @@ impl<'a> App<'a> {
         input.keybindings = keybindings;
         input.set_vim_enabled(ui.cfg.vim_mode.unwrap_or(false));
         input.set_file_workspace(ui.workspace.clone());
-        input.set_monochrome(monochrome_requested(ui.cli.no_color));
+        input.set_monochrome(monochrome_requested(ui.cli.no_color || screen_reader));
 
         input.set_prompt_names(ui.context.prompts.keys().cloned().collect());
         input.set_custom_commands(

@@ -498,6 +498,17 @@ fn input_text_width(cols: u16) -> usize {
     (cols as usize).saturating_sub(display_width("> ")).max(1)
 }
 
+/// Marker shown at the prompt while a run is active when animation is off.
+const STATIC_RUNNING_MARK: &str = "* ";
+
+fn spinner_glyph(reduce_motion: bool, frame: u8) -> &'static str {
+    if reduce_motion {
+        STATIC_RUNNING_MARK
+    } else {
+        SPINNER[frame as usize % SPINNER.len()]
+    }
+}
+
 const SPINNER: &[&str] = &["⠋ ", "⠙ ", "⠹ ", "⠸ ", "⠼ ", "⠴ ", "⠦ ", "⠧ ", "⠇ ", "⠏ "];
 
 /// Clamp a chat scroll offset to the scrollable range `0..=total - visible`.
@@ -1067,6 +1078,9 @@ pub struct Renderer {
     /// the chat once for all of them.
     deferred_line_paint: bool,
     spinner_frame: u8,
+    /// Static running marker instead of the animated spinner (`reduce_motion`
+    /// or `screen_reader`), so a screen reader is not fed a changing glyph.
+    reduce_motion: bool,
     feed: Feed,
     seen_feed_retention_generation: u64,
     seen_feed_reset_generation: u64,
@@ -1255,6 +1269,7 @@ impl Renderer {
             deferred_line_paint: false,
             seen_resume_epoch: crate::ui::terminal::resume_epoch(),
             spinner_frame: 0,
+            reduce_motion: false,
             feed: Feed::new(),
             seen_feed_retention_generation: 0,
             seen_feed_reset_generation: 0,
@@ -1645,6 +1660,11 @@ impl Renderer {
     /// Rows reserved at the bottom: statusline lines + separator + input baseline.
     fn statusline_reserve(&self) -> u16 {
         self.statusline_height as u16 + 2
+    }
+
+    /// Turns the prompt spinner animation off (config `reduce_motion`).
+    pub fn set_reduce_motion(&mut self, reduce_motion: bool) {
+        self.reduce_motion = reduce_motion;
     }
 
     pub fn set_monochrome(&mut self, monochrome: bool) {
@@ -3418,8 +3438,10 @@ impl Renderer {
         let need_scroll = line_count > max_input_rows;
 
         let raw_prompt = if is_running {
-            let frame = SPINNER[self.spinner_frame as usize];
-            self.spinner_frame = (self.spinner_frame + 1) % SPINNER.len() as u8;
+            let frame = spinner_glyph(self.reduce_motion, self.spinner_frame);
+            if !self.reduce_motion {
+                self.spinner_frame = (self.spinner_frame + 1) % SPINNER.len() as u8;
+            }
             frame
         } else {
             "> "
@@ -3566,6 +3588,9 @@ impl Renderer {
     /// Advance only the running prompt's spinner cell. The 100 ms UI tick uses
     /// this after an ordinary full draw has established the input geometry.
     pub(crate) fn tick_spinner(&mut self) -> io::Result<()> {
+        if self.reduce_motion {
+            return Ok(());
+        }
         self.frame(Self::tick_spinner_in_frame)
     }
 
@@ -3590,7 +3615,7 @@ impl Renderer {
             stdout,
             "{}{}{}",
             SetForegroundColor(self.color(self.palette.tool)),
-            SPINNER[drawn_frame as usize],
+            spinner_glyph(self.reduce_motion, drawn_frame),
             ResetColor
         )?;
         self.spinner_frame = (self.spinner_frame + 1) % SPINNER.len() as u8;
@@ -6130,5 +6155,23 @@ mod resume_repaint_tests {
         let frame = renderer.frame_stats().since(before);
         assert_eq!(frame.viewport_rows, renderer.visible_lines());
         assert_eq!(frame.bottom_full_paints, 1);
+    }
+}
+
+#[cfg(test)]
+mod reduce_motion_tests {
+    use super::*;
+
+    #[test]
+    fn reduced_motion_uses_one_static_ascii_marker() {
+        for frame in 0..SPINNER.len() as u8 {
+            assert_eq!(spinner_glyph(true, frame), STATIC_RUNNING_MARK);
+            assert_eq!(spinner_glyph(false, frame), SPINNER[frame as usize]);
+        }
+        assert!(STATIC_RUNNING_MARK.is_ascii());
+        assert_eq!(
+            STATIC_RUNNING_MARK.chars().count(),
+            SPINNER[0].chars().count()
+        );
     }
 }

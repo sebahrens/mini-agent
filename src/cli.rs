@@ -1062,6 +1062,12 @@ pub struct Cli {
     #[arg(long = "no-color", help = "Disable colored TUI output")]
     pub no_color: bool,
 
+    #[arg(
+        long = "screen-reader",
+        help = "Screen-reader friendly TUI: monochrome, no spinner animation, no mouse capture, no title updates (see ACCESSIBILITY.md)"
+    )]
+    pub screen_reader: bool,
+
     #[cfg(feature = "hooks")]
     #[arg(long = "no-hooks", help = "Disable all hooks")]
     pub no_hooks: bool,

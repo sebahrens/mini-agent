@@ -109,7 +109,61 @@ pub fn builtin_servers() -> Vec<(&'static str, LspServerConfig)> {
         ),
         ("swift", server("sourcekit-lsp", &[], &[".swift"])),
         ("zig", server("zls", &[], &[".zig"])),
+        (
+            "vue",
+            server("vue-language-server", &["--stdio"], &[".vue"]),
+        ),
+        ("svelte", server("svelteserver", &["--stdio"], &[".svelte"])),
+        ("astro", server("astro-ls", &["--stdio"], &[".astro"])),
+        (
+            "elixir",
+            server("elixir-ls", &[], &[".ex", ".exs", ".heex", ".eex"]),
+        ),
+        ("dart", server("dart", &["language-server"], &[".dart"])),
+        (
+            "yaml",
+            server("yaml-language-server", &["--stdio"], &[".yaml", ".yml"]),
+        ),
+        (
+            "terraform",
+            server("terraform-ls", &["serve"], &[".tf", ".tfvars", ".tofu"]),
+        ),
+        ("scala", server("metals", &[], &[".scala", ".sc"])),
     ]
+}
+
+/// What to install when a built-in server's binary is not on PATH. mini-agent
+/// never installs anything itself; this only names the binary and a source.
+pub fn install_hint(command: &str) -> Option<&'static str> {
+    Some(match command {
+        "rust-analyzer" => "rustup component add rust-analyzer",
+        "gopls" => "go install golang.org/x/tools/gopls@latest",
+        "typescript-language-server" => "npm i -g typescript-language-server typescript",
+        "pyright-langserver" => "npm i -g pyright (or pip install pyright)",
+        "clangd" => "install clangd from your LLVM or system package manager",
+        "bash-language-server" => "npm i -g bash-language-server",
+        "lua-language-server" => "install lua-language-server from your package manager",
+        "jdtls" => "install Eclipse JDT LS (https://github.com/eclipse-jdtls/eclipse.jdt.ls)",
+        "csharp-ls" => "dotnet tool install -g csharp-ls",
+        "ruby-lsp" => "gem install ruby-lsp",
+        "intelephense" => "npm i -g intelephense",
+        "kotlin-language-server" => {
+            "install kotlin-language-server (https://github.com/fwcd/kotlin-language-server)"
+        }
+        "sourcekit-lsp" => "install a Swift toolchain (sourcekit-lsp ships with it)",
+        "zls" => "install zls (https://github.com/zigtools/zls)",
+        "vue-language-server" => "npm i -g @vue/language-server",
+        "svelteserver" => "npm i -g svelte-language-server",
+        "astro-ls" => "npm i -g @astrojs/language-server",
+        "elixir-ls" => {
+            "install elixir-ls (https://github.com/elixir-lsp/elixir-ls) and put it on PATH"
+        }
+        "dart" => "install the Dart SDK (dart language-server ships with it)",
+        "yaml-language-server" => "npm i -g yaml-language-server",
+        "terraform-ls" => "install terraform-ls (https://github.com/hashicorp/terraform-ls)",
+        "metals" => "cs install metals (Coursier)",
+        _ => return None,
+    })
 }
 
 /// Built-ins whose servers evaluate repository build definitions or run
@@ -133,6 +187,12 @@ pub const BUILD_EVALUATING_BUILTINS: &[&str] = &[
     "python",
     "typescript",
     "go",
+    "vue",
+    "svelte",
+    "astro",
+    "elixir",
+    "dart",
+    "scala",
 ];
 
 /// A built-in left out of the registered set because the project is untrusted.
@@ -262,6 +322,27 @@ pub fn server_for_path<'a>(
         .find(|(_, cfg)| cfg.extensions.iter().any(|e| e.as_str() == dot_ext))
 }
 
+/// Every server claiming this path's extension, in registry order (user
+/// servers first, then built-ins). The first is the primary: it answers
+/// navigation queries; all of them contribute diagnostics.
+pub fn servers_for_path<'a>(
+    servers: &'a [(String, LspServerConfig)],
+    path: &std::path::Path,
+) -> Vec<&'a (String, LspServerConfig)> {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return Vec::new();
+    };
+    let dot_ext = format!(".{}", ext.to_ascii_lowercase());
+    servers
+        .iter()
+        .filter(|(_, cfg)| {
+            cfg.extensions
+                .iter()
+                .any(|e| e.to_ascii_lowercase() == dot_ext)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod language_coverage_tests {
     use super::*;
@@ -286,6 +367,57 @@ mod language_coverage_tests {
                 .unwrap_or_else(|| panic!("no server for {file}"));
             assert_eq!(server.command, expected, "{file}");
         }
+    }
+
+    #[test]
+    fn new_builtins_claim_their_extensions_and_have_install_hints() {
+        let servers = resolve_servers(&HashMap::new());
+        for (file, expected) in [
+            ("A.vue", "vue-language-server"),
+            ("a.svelte", "svelteserver"),
+            ("a.astro", "astro-ls"),
+            ("a.ex", "elixir-ls"),
+            ("a.exs", "elixir-ls"),
+            ("a.dart", "dart"),
+            ("ci.yml", "yaml-language-server"),
+            ("a.yaml", "yaml-language-server"),
+            ("main.tf", "terraform-ls"),
+            ("a.scala", "metals"),
+        ] {
+            let (_, server) = server_for_path(&servers, std::path::Path::new(file))
+                .unwrap_or_else(|| panic!("no server for {file}"));
+            assert_eq!(server.command, expected, "{file}");
+        }
+        for (_, cfg) in builtin_servers() {
+            assert!(
+                install_hint(cfg.command.as_str()).is_some(),
+                "{} needs an install hint",
+                cfg.command
+            );
+        }
+    }
+
+    #[test]
+    fn a_path_claimed_by_two_servers_resolves_to_both_in_order() {
+        let mut user = HashMap::new();
+        user.insert(
+            "eslint".to_string(),
+            server("eslint-lsp", &[], &[".ts", ".TSX"]),
+        );
+        let servers = resolve_servers(&user);
+        let names = |file: &str| {
+            servers_for_path(&servers, std::path::Path::new(file))
+                .into_iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names("a.ts"), ["eslint", "typescript"]);
+        assert_eq!(names("b.tsx"), ["eslint", "typescript"]);
+        assert_eq!(names("c.js"), ["typescript"]);
+        assert!(names("README").is_empty());
+        // The single-server accessor keeps returning the primary.
+        let (primary, _) = server_for_path(&servers, std::path::Path::new("a.ts")).unwrap();
+        assert_eq!(primary, "eslint");
     }
 
     fn fixture(name: &str, extension: &str) -> (String, LspServerConfig) {

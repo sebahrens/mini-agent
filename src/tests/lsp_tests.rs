@@ -3477,3 +3477,62 @@ async fn a_first_start_failure_queues_one_user_notice() {
         "{notices:?}"
     );
 }
+
+// mini-agent-nvnkx.81: two servers claiming one extension both report after one edit.
+#[tokio::test]
+async fn two_servers_for_one_extension_both_report_diagnostics_after_an_edit() {
+    let root = TempDir::new("two-servers-one-extension");
+    let file = root.path().join("sample.mine");
+    std::fs::write(&file, "content").unwrap();
+    let file = file.canonicalize().unwrap();
+    let mut cfg = LspConfig::default();
+    for name in ["a-checker", "b-linter"] {
+        cfg.servers.insert(
+            name.to_string(),
+            LspServerConfig {
+                command: name.into(),
+                extensions: vec![".mine".into()],
+                ..Default::default()
+            },
+        );
+    }
+    let manager = LspManager::new(&cfg, root.path().to_path_buf());
+    assert!(manager.handles(&file));
+    let uri = crate::extras::lsp::client::file_uri(&file).unwrap();
+    manager.set_synced_document_for_test(&uri, 1, true);
+    manager.set_secondary_baseline_for_test(&uri, "b-linter", 0);
+    assert!(manager.publish_synced_diagnostics_for_test(
+        &uri,
+        "a-checker",
+        None,
+        vec![diag(
+            lsp_types::DiagnosticSeverity::ERROR,
+            0,
+            0,
+            "type mismatch"
+        )],
+    ));
+    assert!(manager.publish_synced_diagnostics_for_test(
+        &uri,
+        "b-linter",
+        None,
+        vec![diag(
+            lsp_types::DiagnosticSeverity::WARNING,
+            0,
+            1,
+            "unused import"
+        )],
+    ));
+    let block = manager
+        .diagnostics_block_for_edit(&file, Some(0))
+        .await
+        .unwrap();
+    assert!(
+        block.contains("type mismatch") && block.contains("a-checker"),
+        "{block}"
+    );
+    assert!(
+        block.contains("unused import") && block.contains("b-linter"),
+        "{block}"
+    );
+}
