@@ -169,7 +169,10 @@ const NULL_REDIRECTS: [&str; 4] = ["2>/dev/null", "2>&1", ">/dev/null", "&>/dev/
 /// When `first` plus the iterator's remaining chars start with an accepted
 /// redirect token that is followed by a delimiter (or the end), the number of
 /// characters after `first` to consume.
-fn null_redirect_len(first: char, chars: &std::iter::Peekable<std::str::Chars<'_>>) -> Option<usize> {
+fn null_redirect_len(
+    first: char,
+    chars: &std::iter::Peekable<std::str::Chars<'_>>,
+) -> Option<usize> {
     if !matches!(first, '2' | '>' | '&') {
         return None;
     }
@@ -350,9 +353,7 @@ fn search_pattern_index(command: &str, args: &[String]) -> Option<usize> {
     // Any spelling of the pattern/file options anywhere means the first
     // operand is not the pattern (or is read as a file): keep it confined.
     if args.iter().any(|a| {
-        long_opt_is(a, "regexp")
-            || long_opt_is(a, "file")
-            || short_cluster_has(a, &['e', 'f'])
+        long_opt_is(a, "regexp") || long_opt_is(a, "file") || short_cluster_has(a, &['e', 'f'])
     }) {
         return None;
     }
@@ -485,8 +486,13 @@ fn command_is_read_only(
                 || long_opt_is(a, "files0-from")
         }),
         // A second operand of `uniq` is an OUTPUT file.
-        "uniq" => args.iter().filter(|a| *a == "-" || !a.starts_with('-')).count() <= 1
-            && !args.iter().any(|a| a == "--"),
+        "uniq" => {
+            args.iter()
+                .filter(|a| *a == "-" || !a.starts_with('-'))
+                .count()
+                <= 1
+                && !args.iter().any(|a| a == "--")
+        }
         "du" => {
             report.recursive = true;
             !args.iter().any(|a| long_opt_is(a, "files0-from"))

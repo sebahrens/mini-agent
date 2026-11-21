@@ -4742,7 +4742,10 @@ mod step_result_rendering {
             Vec::new(),
             None,
         );
-        assert_eq!(render_step_result_for(&echoed, budget), "(30s limit exceeded)");
+        assert_eq!(
+            render_step_result_for(&echoed, budget),
+            "(30s limit exceeded)"
+        );
         let timeout = step(StepOutcome::Timeout, Vec::new(), None);
         assert_eq!(
             render_step_result_for(&timeout, budget),

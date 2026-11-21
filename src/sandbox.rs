@@ -1133,6 +1133,9 @@ pub(crate) enum CommandStatus {
     Cancelled,
     OutputLimitExceeded(CommandOutputLimit),
     Failed,
+    /// Preparation or spawn failed: the command never ran, and `stderr` holds
+    /// this program's own explanation rather than anything the command wrote.
+    NotStarted,
 }
 
 pub(crate) struct CommandOutput {
@@ -1658,6 +1661,9 @@ impl ExplicitShellRun {
                 SHELL_HARD_OUTPUT_BYTES / (1024 * 1024)
             )),
             CommandStatus::Failed => Some(format!("explicit shell failed; boundary={boundary}")),
+            CommandStatus::NotStarted => {
+                Some(format!("explicit shell did not start; boundary={boundary}"))
+            }
         };
         if self.output.descendants_escaped {
             let warning = format!(
@@ -5625,7 +5631,11 @@ impl Sandbox {
                 .await
             {
                 Ok(output) => {
-                    if output.status == CommandStatus::Failed && capture.total_bytes() == 0 {
+                    if matches!(
+                        output.status,
+                        CommandStatus::Failed | CommandStatus::NotStarted
+                    ) && capture.total_bytes() == 0
+                    {
                         // Preparation/spawn failures report through stderr
                         // without ever reaching the capture.
                         let _ = capture.push(
@@ -6144,7 +6154,11 @@ impl Sandbox {
         let output = response_rx.await.map_err(|_| {
             std::io::Error::other("command output worker stopped before returning a result")
         })?;
-        if output.status == CommandStatus::Failed && failure_capture.total_bytes() == 0 {
+        if matches!(
+            output.status,
+            CommandStatus::Failed | CommandStatus::NotStarted
+        ) && failure_capture.total_bytes() == 0
+        {
             // Preparation/spawn failures report through stderr without ever
             // reaching the capture; keep the reason visible to the caller.
             let _ = failure_capture.push(
@@ -6454,7 +6468,7 @@ impl Sandbox {
                                 exit_status: None,
                                 stdout: Vec::new(),
                                 stderr: error.into_bytes(),
-                                status: CommandStatus::Failed,
+                                status: CommandStatus::NotStarted,
                                 descendants_escaped: false,
                             },
                             response_tx,
@@ -6476,7 +6490,7 @@ impl Sandbox {
                     stdout: Vec::new(),
                     stderr: b"pty=true on Windows requires the AppContainer sandbox backend (sandbox enabled and available); this command cannot run under a pseudo-terminal here. Run it without pty."
                         .to_vec(),
-                    status: CommandStatus::Failed,
+                    status: CommandStatus::NotStarted,
                     descendants_escaped: false,
                 },
                 response_tx,
@@ -6497,7 +6511,7 @@ impl Sandbox {
                 stdout: Vec::new(),
                 stderr: b"sandbox: Windows AppContainer commands cannot accept caller stdin"
                     .to_vec(),
-                status: CommandStatus::Failed,
+                status: CommandStatus::NotStarted,
                 descendants_escaped: false,
             };
             if let Some(audit) = &audit {
@@ -6528,7 +6542,7 @@ impl Sandbox {
                             stdout: Vec::new(),
                             stderr: format!("failed to prepare merged output pipe: {error}")
                                 .into_bytes(),
-                            status: CommandStatus::Failed,
+                            status: CommandStatus::NotStarted,
                             descendants_escaped: false,
                         },
                         response_tx,
@@ -6550,7 +6564,7 @@ impl Sandbox {
                             stdout: Vec::new(),
                             stderr: format!("failed to prepare pseudo-terminal: {error}")
                                 .into_bytes(),
-                            status: CommandStatus::Failed,
+                            status: CommandStatus::NotStarted,
                             descendants_escaped: false,
                         },
                         response_tx,
@@ -6574,7 +6588,7 @@ impl Sandbox {
                     exit_status: None,
                     stdout: Vec::new(),
                     stderr: format!("failed to spawn command: {error}").into_bytes(),
-                    status: CommandStatus::Failed,
+                    status: CommandStatus::NotStarted,
                     descendants_escaped: false,
                 };
                 if let Some(audit) = &audit {
@@ -6780,7 +6794,7 @@ impl Sandbox {
                         exit_status: None,
                         stdout: Vec::new(),
                         stderr: format!("failed to spawn support command: {error}").into_bytes(),
-                        status: CommandStatus::Failed,
+                        status: CommandStatus::NotStarted,
                         descendants_escaped: false,
                     };
                     audit.emit(&output);
@@ -7032,6 +7046,7 @@ fn audit_explicit_shell(audit: &ExplicitShellAudit, output: &CommandOutput) {
         CommandStatus::Cancelled => "cancelled",
         CommandStatus::OutputLimitExceeded(_) => "output-limit",
         CommandStatus::Failed => "failed",
+        CommandStatus::NotStarted => "not-started",
     };
     let descendants_escaped = output.descendants_escaped;
     if succeeded {
@@ -7069,6 +7084,7 @@ fn audit_support_command(audit: &OwnedSupportCommandAudit, output: &CommandOutpu
         CommandStatus::Cancelled => "cancelled",
         CommandStatus::OutputLimitExceeded(_) => "output-limit",
         CommandStatus::Failed => "failed",
+        CommandStatus::NotStarted => "not-started",
     };
     let descendants_escaped = output.descendants_escaped;
     if succeeded {
@@ -7202,7 +7218,7 @@ fn background_terminal(output: CommandOutput) -> BackgroundJobTerminal {
         CommandStatus::TimedOut => BackgroundJobStatus::TimedOut,
         CommandStatus::Cancelled => BackgroundJobStatus::Cancelled,
         CommandStatus::OutputLimitExceeded(_) => BackgroundJobStatus::OutputLimitExceeded,
-        CommandStatus::Failed => BackgroundJobStatus::Failed,
+        CommandStatus::Failed | CommandStatus::NotStarted => BackgroundJobStatus::Failed,
     };
     BackgroundJobTerminal {
         status,

@@ -937,8 +937,10 @@ mod tests {
             options.contains(&format!("(a) allow {scope} for this session")),
             "{options}"
         );
-        assert!(decision_line("edit", edit, &format!("allowed (this session: {scope})"))
-            .contains(&scope));
+        assert!(
+            decision_line("edit", edit, &format!("allowed (this session: {scope})"))
+                .contains(&scope)
+        );
         let long = "x".repeat(300);
         assert!(grant_scope("shell", &long, "other").chars().count() <= 100);
     }

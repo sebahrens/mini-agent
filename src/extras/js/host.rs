@@ -3246,7 +3246,9 @@ impl SpawnEffectService {
         };
         match output.status {
             CommandStatus::Cancelled => return Err(EffectServiceError::OutcomeUnknown),
-            CommandStatus::Failed => return Err(EffectServiceError::BackendFailure),
+            CommandStatus::Failed | CommandStatus::NotStarted => {
+                return Err(EffectServiceError::BackendFailure);
+            }
             CommandStatus::Completed
             | CommandStatus::TimedOut
             | CommandStatus::OutputLimitExceeded(_) => {}
