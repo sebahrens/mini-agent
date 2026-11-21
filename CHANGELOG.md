@@ -69,6 +69,11 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Large pastes (more than 10 lines or 1,000 characters) become an atomic `[Pasted text #N +M lines]` chip in the prompt that the cursor steps over and Backspace removes whole; submit, history and the external editor use the full text (mini-agent-nvnkx.88).
 - `/vim` Normal mode: operators `d`/`c`/`y` with counts, motions (`w e b 0 ^ $ gg G f F t T`, `iw`/`aw`), `x X D C p P o O r ~` and `.` repeat of the last change (mini-agent-nvnkx.89).
 - Pasting or dragging an image file path into the prompt attaches the image as `/add <path>` would, when the permission policy allows reading it (mini-agent-nvnkx.256).
+- `/mcp add` accepts `--env KEY` (inherit, no secret stored), `--env KEY=VALUE`, `--header 'Name: value'`, `--oauth` and `--sse`; `/mcp login` on a URL server without an `oauth` block attempts OAuth discovery and saves the block on success; `/mcp enable|disable <name>` flips a server's `enabled` flag (mini-agent-nvnkx.286).
+- MCP servers that only speak the legacy HTTP+SSE transport work through `"type": "sse"` (`legacy_sse = true`, `/mcp add --sse`), on the same egress pinning, event size cap and OAuth path as streamable HTTP (mini-agent-nvnkx.79).
+- MCP server `notifications/message` log lines are kept in a bounded per-server ring, shown by `/mcp <server>` and appended (fenced as untrusted) to a failed tool call's error; subscribed resources the server reports updated are re-read with a note (mini-agent-nvnkx.80; argument completion not implemented).
+- ACP advertises `mcpCapabilities.http` and accepts client-supplied HTTP MCP servers (https, or loopback http) for the session when the same gate as client stdio servers is open; headers are used as given and never persisted (mini-agent-nvnkx.108).
+- `mcp_search` replies list further matches by name (`more`) without schemas (mini-agent-nvnkx.183).
 
 ### Fixed
 
@@ -1868,6 +1873,10 @@ upstream changes that are new relative to this fork.
   picker loads in the background.
 - Development builds compile dependencies at opt-level 1. Release builds use opt-level 3
   (previously `z`), with thin LTO and one codegen unit.
+- A 401 on a `headersHelper` MCP server retires the connection and runs one reconnect cycle (re-running the helper) before the error is reported; the failed call is not replayed (mini-agent-nvnkx.184).
+- `mcp_search` matches whole words (plurals and prefixes count), ignores stop words and words under three letters, ranks name hits first and publishes only entries matching at least half the meaningful words, so natural-language queries no longer activate unrelated tools (mini-agent-nvnkx.183).
+- An MCP link that exhausted its reconnect attempts records the last attempt's class (shown in `/mcp` and the tool error), stops early on 401/403, and retries after a 2/5/15 minute cool-down instead of staying failed for the session (mini-agent-nvnkx.182).
+- `/mcp add` reads flags only before the server command: `--`, `--project` and `--allow-local` after a command are the server's own arguments (mini-agent-nvnkx.287).
 
 ## [1.10.4] - 2026-10-24
 

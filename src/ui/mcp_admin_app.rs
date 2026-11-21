@@ -298,7 +298,7 @@ impl App<'_> {
                                 | crate::extras::mcp::health::AttemptOutcome::TimedOut
                         ) {
                             rows.push(format!(
-                                "    next: check the {name} command or URL in .mcp.json; /mcp login {name} re-authorizes OAuth servers"
+                                "    next: check the {name} command or URL in .mcp.json; /mcp login {name} signs in to (or re-authorizes) a remote server"
                             ));
                         }
                     }
@@ -473,16 +473,23 @@ impl App<'_> {
         let crate::extras::mcp::config::McpServerConfig::Url {
             url,
             allow_local,
-            oauth: Some(oauth),
+            oauth,
             ..
         } = &server
         else {
-            anyhow::bail!("MCP server is not an OAuth URL server");
+            anyhow::bail!("MCP server is not a URL server");
         };
         let url = url.clone();
-        let settings = oauth
-            .settings()
-            .ok_or_else(|| anyhow::anyhow!("MCP OAuth settings are unavailable"))?;
+        // A URL server without an oauth block attempts discovery with default
+        // settings (dynamic registration); success persists the block.
+        let discovery = oauth.is_none();
+        let settings = match oauth {
+            Some(oauth) => oauth
+                .settings()
+                .ok_or_else(|| anyhow::anyhow!("MCP OAuth settings are unavailable"))?,
+            None => crate::extras::mcp::config::OAuthSettings::default(),
+        };
+        self.mcp_state().oauth_write = discovery.then(|| name.clone());
         let allow_local = *allow_local;
         let allowed_cidrs = server.options().allowed_cidrs;
         let setup_timeout = server
@@ -586,6 +593,73 @@ impl App<'_> {
         Ok(())
     }
 
+    /// Turn `/mcp enable|disable <name>` into an edit of the owning source
+    /// that only flips the entry's `enabled` flag.
+    fn mcp_enable_action(&self, name: &str, enabled: bool) -> Result<Action, &'static str> {
+        self.mcp_replace_action(name, |options, _| {
+            options.enabled = if enabled { None } else { Some(false) };
+        })
+    }
+
+    /// An edit of the owning source that rewrites one existing entry.
+    fn mcp_replace_action(
+        &self,
+        name: &str,
+        mutate: impl FnOnce(
+            &mut crate::extras::mcp::config::McpServerOptions,
+            Option<&mut Option<crate::extras::mcp::config::OAuthConfig>>,
+        ),
+    ) -> Result<Action, &'static str> {
+        let server = self
+            .mcp_server_config(name)
+            .ok_or("MCP server is inactive or absent")?;
+        let selected = self
+            .mcp_current_config()
+            .mcp_origins
+            .get(name)
+            .and_then(|origins| origins.iter().find(|origin| origin.selected));
+        let project = match selected {
+            Some(origin) if origin.source == ".mcp.json" => true,
+            Some(origin)
+                if self
+                    .ui
+                    .cfg
+                    .provenance
+                    .global_file
+                    .as_ref()
+                    .is_some_and(|path| origin.source == path.to_string_lossy()) =>
+            {
+                false
+            }
+            Some(_) => {
+                return Err(
+                    "MCP server is defined in a source /mcp cannot edit; set enabled there manually",
+                );
+            }
+            None => false,
+        };
+        if server.trusted_identity().is_some() {
+            return Err("Built-in MCP servers use their dedicated disable settings");
+        }
+        let mut server = server;
+        match &mut server {
+            crate::extras::mcp::config::McpServerConfig::Command { options, .. } => {
+                mutate(options, None);
+            }
+            crate::extras::mcp::config::McpServerConfig::Url { options, oauth, .. } => {
+                mutate(options, Some(oauth));
+            }
+            crate::extras::mcp::config::McpServerConfig::BuiltIn { .. } => {
+                return Err("Built-in MCP servers use their dedicated disable settings");
+            }
+        }
+        Ok(Action::Add {
+            name: name.to_owned(),
+            server,
+            project,
+        })
+    }
+
     pub(super) async fn handle_mcp_command(&mut self, text: &str) -> anyhow::Result<bool> {
         if text.trim_start().starts_with("/mcp:")
             || text.trim_start().starts_with("/add mcp:")
@@ -619,13 +693,36 @@ impl App<'_> {
                 if parts.len() != 3 {
                     self.renderer
                         .write_line("usage: /mcp login|logout <server>", C_ERROR)?;
-                } else if self.mcp_edit_busy() || self.mcp_admin.as_ref().is_some_and(|state| state.work.is_some() || state.approval.is_some()) {
-                    self.renderer.write_line("Finish or stop active work before MCP login", C_ERROR)?;
-                } else if !self.mcp_server_config(parts[2]).is_some_and(|server| matches!(server, crate::extras::mcp::config::McpServerConfig::Url {oauth:Some(oauth),..} if oauth.settings().is_some())) {
-                    self.renderer.write_line("MCP server is inactive or is not an OAuth URL server", C_ERROR)?;
+                } else if self.mcp_edit_busy()
+                    || self
+                        .mcp_admin
+                        .as_ref()
+                        .is_some_and(|state| state.work.is_some() || state.approval.is_some())
+                {
+                    self.renderer
+                        .write_line("Finish or stop active work before MCP login", C_ERROR)?;
+                } else if !self
+                    .mcp_server_config(parts[2])
+                    .is_some_and(|server| match server {
+                        crate::extras::mcp::config::McpServerConfig::Url { oauth, .. } => {
+                            // Login on a URL server without an oauth block attempts
+                            // discovery; logout needs stored OAuth settings.
+                            parts[1] == "login" && oauth.is_none()
+                                || oauth.is_some_and(|oauth| oauth.settings().is_some())
+                        }
+                        _ => false,
+                    })
+                {
+                    self.renderer.write_line(
+                        "MCP server is inactive or is not an OAuth URL server",
+                        C_ERROR,
+                    )?;
                 } else {
-                    if parts[1]=="login" { self.start_mcp_login(parts[2].to_owned()).await?; }
-                    else { self.start_mcp_logout(parts[2].to_owned()).await?; }
+                    if parts[1] == "login" {
+                        self.start_mcp_login(parts[2].to_owned()).await?;
+                    } else {
+                        self.start_mcp_logout(parts[2].to_owned()).await?;
+                    }
                 }
                 return Ok(true);
             }
@@ -679,11 +776,27 @@ impl App<'_> {
             )?;
             return Ok(true);
         }
+        let mut replacing = false;
+        let action = if let Action::SetEnabled { name, enabled } = action {
+            match self.mcp_enable_action(&name, enabled) {
+                Ok(action) => {
+                    replacing = true;
+                    action
+                }
+                Err(error) => {
+                    self.renderer.write_line(error, C_ERROR)?;
+                    return Ok(true);
+                }
+            }
+        } else {
+            action
+        };
         let name = match &action {
             Action::Add { name, .. } | Action::Remove { name, .. } => name.clone(),
             _ => unreachable!(),
         };
         if matches!(action, Action::Add { .. })
+            && !replacing
             && self
                 .mcp_current_config()
                 .mcp_servers
@@ -911,6 +1024,13 @@ impl App<'_> {
                 // A project content edit invalidates every old receipt from
                 // that file. Retire those handles before asking about new trust.
                 let old = self.mcp_current_config().mcp_origins.clone();
+                let disabled_now = !remove
+                    && approval.is_none()
+                    && cfg
+                        .mcp_servers
+                        .as_ref()
+                        .and_then(|servers| servers.get(&name))
+                        .is_some_and(|server| !server.options().is_enabled());
                 let mut closing = Vec::new();
                 if let Some(manager) = &mut self.ui.mcp_manager {
                     for index in (0..manager.handles.len()).rev() {
@@ -921,7 +1041,7 @@ impl App<'_> {
                                     .iter()
                                     .any(|origin| origin.selected && origin.source == ".mcp.json")
                             });
-                        if from_json || remove && old_name == name {
+                        if from_json || (remove || disabled_now) && old_name == name {
                             closing.push(manager.handles.remove(index));
                         }
                     }
@@ -963,6 +1083,11 @@ impl App<'_> {
                     )?;
                 } else if remove {
                     self.renderer.write_line("MCP entry removed; connection closed (shadowed definitions remain separately configured)",C_AGENT)?;
+                } else if disabled_now {
+                    self.renderer.write_line(
+                        "MCP server disabled; connection closed (/mcp enable <name> turns it back on)",
+                        C_AGENT,
+                    )?;
                 } else {
                     self.start_mcp_reconnect(name).await?;
                 }
@@ -1062,7 +1187,44 @@ impl App<'_> {
                 })?;
             }
             Ok(Completion::Authorized) => {
-                self.start_mcp_reconnect(name).await?;
+                let discovered = self.mcp_state().oauth_write.take().as_deref()
+                    == Some(name.as_str())
+                    && self.mcp_server_config(&name).is_some_and(|server| {
+                        matches!(
+                            server,
+                            crate::extras::mcp::config::McpServerConfig::Url { oauth: None, .. }
+                        )
+                    });
+                let edit = if discovered {
+                    self.mcp_replace_action(&name, |_, oauth| {
+                        if let Some(oauth) = oauth {
+                            *oauth = Some(crate::extras::mcp::config::OAuthConfig::Enabled(true));
+                        }
+                    })
+                    .ok()
+                } else {
+                    None
+                };
+                if let Some(action) = edit {
+                    self.mcp_invalidate_agent().await?;
+                    let workspace = self.ui.workspace.clone();
+                    let global_path = self.mcp_global_path()?;
+                    self.spawn_mcp_work(name, None, None, async move {
+                        crate::agent::runner::spawn_blocking_scoped(move || {
+                            mcp_admin::prepare(action, &workspace, &global_path)
+                        })
+                        .await
+                        .map_err(|_| "MCP edit worker failed".to_owned())?
+                        .map(|(_, completion)| completion)
+                        .map_err(|error| sanitize_output(&error.to_string()).to_string())
+                    })?;
+                    self.renderer.write_line(
+                        "MCP signed in; saving the oauth setting for this server",
+                        C_AGENT,
+                    )?;
+                } else {
+                    self.start_mcp_reconnect(name).await?;
+                }
             }
             Ok(Completion::LoggedOut { removed }) => {
                 let message = if removed {
@@ -1089,6 +1251,14 @@ impl App<'_> {
                 if remove {
                     self.renderer.write_line(
                         "MCP removal saved; remaining exact project content approved",
+                        C_AGENT,
+                    )?;
+                } else if self
+                    .mcp_server_config(&name)
+                    .is_some_and(|server| !server.options().is_enabled())
+                {
+                    self.renderer.write_line(
+                        "MCP server disabled; /mcp enable <name> turns it back on",
                         C_AGENT,
                     )?;
                 } else {

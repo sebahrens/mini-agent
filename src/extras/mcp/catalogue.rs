@@ -71,6 +71,37 @@ impl RpcClient {
             None => Ok((self.peer.clone(), self.elicitation.clone())),
         }
     }
+    fn live_handler(&self) -> super::elicitation::Handler {
+        self.link
+            .as_ref()
+            .map_or_else(|| self.elicitation.clone(), |link| link.conn().elicitation)
+    }
+
+    /// Whether the server reported `uri` changed since it was last asked.
+    pub(crate) fn take_resource_updated(&self, uri: &str) -> bool {
+        self.live_handler().take_resource_updated(uri)
+    }
+
+    /// Subscribe to `uri` when the server advertises resource subscriptions,
+    /// so a later `notifications/resources/updated` marks it stale. Best
+    /// effort: a failure only means no staleness notice.
+    pub(crate) async fn subscribe_best_effort(&self, uri: &str) {
+        let peer = self.live_peer();
+        let supports = peer.peer_info().is_some_and(|info| {
+            info.capabilities
+                .resources
+                .as_ref()
+                .and_then(|resources| resources.subscribe)
+                == Some(true)
+        });
+        if !supports || !self.live_handler().claim_subscription(uri) {
+            return;
+        }
+        #[allow(deprecated)]
+        let request = peer.subscribe(rmcp::model::SubscribeRequestParams::new(uri));
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), request).await;
+    }
+
     pub(crate) fn is_current(&self) -> bool {
         // A link-managed server may have a closed transport that the next
         // call re-establishes, so only handle retirement counts for it.

@@ -13,6 +13,68 @@ const MAX_SESSIONS: usize = 128;
 const MAX_QUERY_BYTES: usize = 2048;
 const MAX_SEARCH_RESULTS: usize = 8;
 const MAX_SEARCH_BYTES: usize = 128 * 1024;
+/// Names (without schemas) of further matches returned beside the published ones.
+const MAX_MORE_NAMES: usize = 16;
+const MAX_MORE_NAME_BYTES: usize = 96;
+
+/// Words too common to select a tool; a query made only of these (and short
+/// words) matches nothing unless it is an exact tool name.
+const STOP_WORDS: &[&str] = &[
+    "the", "and", "for", "with", "how", "can", "you", "are", "was", "this", "that", "from", "into",
+    "your", "its", "all", "any", "has", "have", "need", "want", "what", "when", "where", "which",
+    "who", "why", "will", "would", "should", "please", "not", "but", "one", "some", "tool",
+    "tools",
+];
+
+/// Lowercase alphanumeric tokens of `text`.
+fn tokens(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Meaningful query terms: tokens of at least three characters that are not
+/// stop words, deduplicated.
+fn search_terms(query: &str) -> Vec<String> {
+    let mut terms: Vec<String> = Vec::new();
+    for token in tokens(query) {
+        if token.chars().count() >= 3
+            && !STOP_WORDS.contains(&token.as_str())
+            && !terms.contains(&token)
+        {
+            terms.push(token);
+        }
+    }
+    terms
+}
+
+/// Light stemmer: plural endings only.
+fn stem(word: &str) -> String {
+    if let Some(base) = word.strip_suffix("ies").filter(|base| base.len() >= 2) {
+        format!("{base}y")
+    } else if let Some(base) = word.strip_suffix("es").filter(|base| base.len() >= 3)
+        && (base.ends_with(['s', 'x', 'z']) || base.ends_with("ch") || base.ends_with("sh"))
+    {
+        base.to_owned()
+    } else if let Some(base) = word.strip_suffix('s').filter(|base| base.len() >= 3)
+        && !base.ends_with('s')
+    {
+        base.to_owned()
+    } else {
+        word.to_owned()
+    }
+}
+
+/// Whole-token match: equal after plural stemming, or the token starts with
+/// the term (prefix, term of at least three characters).
+fn token_matches(term: &str, token: &str) -> bool {
+    if term == token {
+        return true;
+    }
+    let (term, token) = (stem(term), stem(token));
+    term == token || (term.chars().count() >= 3 && token.starts_with(&term))
+}
 /// Returned only with an empty result, so a model does not mistake a query
 /// that matched nothing for an unavailable server.
 const NO_MATCH_HINT: &str = "No catalogue tool name or description contains any query word. Search with exact names from the MCP tool index; several names may be listed in one query.";
@@ -381,42 +443,85 @@ impl McpSearch {
             return Err(discovery_error("MCP discovery invocation has retired"));
         }
         let query = query.to_lowercase();
-        let words: Vec<&str> = query.split_whitespace().collect();
+        let words: Vec<&str> = query
+            .split_whitespace()
+            .map(|word| word.trim_matches(|c: char| !c.is_alphanumeric() && c != '_'))
+            .filter(|word| !word.is_empty())
+            .collect();
         if words.len() > 32 {
             return Err(discovery_error("MCP search query exceeds 32 terms"));
         }
+        // Words that are exact tool names select those tools alone; only the
+        // remaining words are matched fuzzily (a name's own tokens would
+        // otherwise pull in every sibling sharing a prefix).
+        let exact_names: std::collections::HashSet<String> = view
+            .entries
+            .iter()
+            .map(|entry| entry.definition.name.to_lowercase())
+            .collect();
+        let free_words: Vec<&str> = words
+            .iter()
+            .copied()
+            .filter(|word| !exact_names.contains(*word))
+            .collect();
+        let terms = search_terms(&free_words.join(" "));
         let mut matching: Vec<_> = view
             .entries
             .iter()
             .filter_map(|entry| {
                 let name = entry.definition.name.to_lowercase();
-                let description = entry.definition.description.to_lowercase();
-                // Every word is matched independently, so one query may name
-                // several tools; entries matching more words rank first.
-                let matched = words
-                    .iter()
-                    .filter(|word| name.contains(*word) || description.contains(*word))
-                    .count();
-                let score = if name == query {
-                    0
+                let exact = if name == query.trim() {
+                    Some(0)
                 } else if words.contains(&name.as_str()) {
-                    1
-                } else if words.iter().all(|word| name.contains(word)) {
-                    2
-                } else if matched == words.len() {
-                    3
-                } else if matched > 0 {
-                    4 + (words.len() - matched)
+                    Some(1)
                 } else {
+                    None
+                };
+                let name_tokens = tokens(&name);
+                let description_tokens = tokens(&entry.definition.description.to_lowercase());
+                // Whole-token match with a light plural/prefix rule; a term
+                // may hit the name, the description, or both.
+                let in_name = terms
+                    .iter()
+                    .filter(|term| name_tokens.iter().any(|token| token_matches(term, token)))
+                    .count();
+                let matched = terms
+                    .iter()
+                    .filter(|term| {
+                        name_tokens.iter().any(|token| token_matches(term, token))
+                            || description_tokens
+                                .iter()
+                                .any(|token| token_matches(term, token))
+                    })
+                    .count();
+                let score = if let Some(exact) = exact {
+                    exact
+                } else if terms.is_empty() || matched == 0 {
+                    return None;
+                } else if in_name == terms.len() {
+                    2
+                } else if matched == terms.len() {
+                    3
+                } else if matched * 2 >= terms.len() {
+                    4 + (terms.len() - matched)
+                } else {
+                    // Fewer than half of the meaningful words: a coincidental
+                    // hit must not publish a schema for the rest of the session.
                     return None;
                 };
-                Some((score, entry))
+                // Exact names keep plain name order; the rest rank name hits first.
+                Some((score, if score <= 1 { 0 } else { in_name }, entry))
             })
             .collect();
-        matching.sort_by(|(left, a), (right, b)| {
+        matching.sort_by(|(left, left_names, a), (right, right_names, b)| {
             left.cmp(right)
+                .then(right_names.cmp(left_names))
                 .then(a.definition.name.cmp(&b.definition.name))
         });
+        let matching: Vec<_> = matching
+            .into_iter()
+            .map(|(score, _, entry)| (score, entry))
+            .collect();
         let total = matching.len();
         let mut selected = Vec::new();
         // Reserve the complete JSON envelope (false is longer than true),
@@ -426,7 +531,12 @@ impl McpSearch {
         )
         .map_err(ToolError::JsonError)?
         .len();
-        for (_, entry) in matching.into_iter().take(MAX_SEARCH_RESULTS) {
+        // Reserve room for the names of further candidates (no schemas).
+        bytes = bytes.saturating_add(MAX_MORE_NAMES * (MAX_MORE_NAME_BYTES + 4) + 12);
+        for &(_, entry) in matching.iter() {
+            if selected.len() >= MAX_SEARCH_RESULTS {
+                break;
+            }
             let size = serde_json::to_vec(&entry.definition)
                 .map_err(ToolError::JsonError)?
                 .len();
@@ -439,6 +549,15 @@ impl McpSearch {
             bytes = next;
             selected.push(entry);
         }
+        // Entries that matched but were not published: names only, so the
+        // model can ask for them exactly (an exact name always ranks first).
+        let more: Vec<String> = matching
+            .iter()
+            .skip(selected.len())
+            .map(|(_, entry)| entry.definition.name.clone())
+            .filter(|name| name.len() <= MAX_MORE_NAME_BYTES)
+            .take(MAX_MORE_NAMES)
+            .collect();
         // Validate the whole selection before publishing ANY definition.
         if !current() || selected.iter().any(|entry| !entry.is_current()) {
             return Err(stale_selection_error(&selected));
@@ -447,6 +566,9 @@ impl McpSearch {
         let mut result = serde_json::json!({"matches":definitions,"omitted":total>selected.len(),"permissions_changed":false});
         if total == 0 {
             result["hint"] = NO_MATCH_HINT.into();
+        }
+        if !more.is_empty() {
+            result["more"] = more.clone().into();
         }
         let result = serde_json::to_string(&result).map_err(ToolError::JsonError)?;
         if result.len() > MAX_SEARCH_BYTES {
@@ -497,6 +619,9 @@ impl McpSearch {
             if total == 0 {
                 result["hint"] = NO_MATCH_HINT.into();
             }
+            if !more.is_empty() {
+                result["more"] = more.clone().into();
+            }
             serde_json::to_string(&result).map_err(ToolError::JsonError)?
         } else {
             result
@@ -510,7 +635,7 @@ impl ToolDyn for McpSearch {
         "mcp_search".into()
     }
     fn description(&self) -> String {
-        "Search the captured MCP tool catalogue by names and descriptions. Each query word matches independently, so several exact tool names may be listed in one query; tools matching more words rank first. Returns at most eight matching schemas and enables those exact tools for this session. Does not grant tool permission or call an external server.".into()
+        "Search the captured MCP tool catalogue by names and descriptions. Query words match whole words of tool names and descriptions (plurals and prefixes count; short and common words are ignored), so several exact tool names may be listed in one query; name hits and tools matching more words rank first. Returns at most eight matching schemas and enables those exact tools for this session; a `more` list names further matches without schemas, which can be requested by exact name. Does not grant tool permission or call an external server.".into()
     }
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({"type":"object","properties":{"query":{"type":"string","maxLength":MAX_QUERY_BYTES}},"required":["query"],"additionalProperties":false})
@@ -1169,6 +1294,104 @@ mod tests {
         let none = search("zzzz qqqq").await;
         assert!(none["matches"].as_array().unwrap().is_empty());
         assert_eq!(none["hint"], NO_MATCH_HINT);
+        scope.cancellation_handle().cancel();
+        scope.wait_idle().await;
+    }
+
+    /// mini-agent-nvnkx.183: stop words and one-word coincidences publish nothing.
+    #[tokio::test]
+    async fn natural_language_queries_do_not_activate_unrelated_tools() {
+        use super::*;
+        let root = crate::tests::OwnedTestDirectory::new("mcp-search-relevance");
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let activation = DiscoverySessions::default()
+            .capture("relevance", &workspace, "relevance-catalogue".into())
+            .unwrap();
+        let mut catalogue: Vec<(String, String)> = (0..36)
+            .map(|n| {
+                (
+                    format!("tool_{n:02}"),
+                    format!("Does thing number {n} to an object"),
+                )
+            })
+            .collect();
+        catalogue.push((
+            "create_issue".into(),
+            "Open a new ticket in a tracker".into(),
+        ));
+        catalogue.push((
+            "list_repos".into(),
+            "List repositories for an account".into(),
+        ));
+        catalogue.push(("close_issue".into(), "Close a ticket".into()));
+        let entries = catalogue
+            .into_iter()
+            .map(|(name, description)| {
+                let definition = ToolDefinition {
+                    name,
+                    description,
+                    parameters: serde_json::json!({"type":"object"}),
+                };
+                DeferredEntry {
+                    server_name: "gh".into(),
+                    tool: Arc::new(MetadataOnlyTool(definition.clone())),
+                    definition,
+                    source: None,
+                    is_live: Arc::new(|| true),
+                }
+            })
+            .collect();
+        let binding = SearchBinding::default();
+        binding
+            .set_view(Arc::new(DiscoveryView::new(activation.clone(), entries)))
+            .unwrap();
+        let server = ToolServer::new().run();
+        server.add_tool(McpSearch(binding.clone())).await.unwrap();
+        binding.set_server(server.downgrade()).unwrap();
+        let scope = crate::agent::runner::AgentWorkScope::new();
+        let extensions = ToolCallExtensions::new();
+        let search = |query: &str| {
+            let args = serde_json::json!({ "query": query }).to_string();
+            let server = server.clone();
+            let extensions = &extensions;
+            let scope = &scope;
+            async move {
+                let result = scope
+                    .run(server.call_tool_structured("mcp_search", &args, extensions))
+                    .await;
+                assert!(matches!(result.outcome(), ToolOutcome::Success));
+                serde_json::from_str::<serde_json::Value>(result.model_output()).unwrap()
+            }
+        };
+        let names = |value: &serde_json::Value| -> Vec<String> {
+            value["matches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["name"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        let found = search("how to create an issue").await;
+        let found = names(&found);
+        assert_eq!(found[0], "create_issue");
+        assert!(found.contains(&"close_issue".to_owned()));
+        assert!(
+            !found
+                .iter()
+                .any(|n| n == "list_repos" || n.starts_with("tool_"))
+        );
+        assert!(activation.is_active("create_issue") && !activation.is_active("list_repos"));
+        assert!(!activation.is_active("tool_00"));
+        let plural = names(&search("issues").await);
+        assert!(plural.contains(&"create_issue".to_owned()), "{plural:?}");
+        let stop_only = search("how to do an").await;
+        assert!(stop_only["matches"].as_array().unwrap().is_empty());
+        // More than eight matches: eight published, the rest named without schemas.
+        let many = search("object").await;
+        assert_eq!(many["matches"].as_array().unwrap().len(), 8);
+        assert_eq!(many["omitted"], true);
+        let more = many["more"].as_array().unwrap();
+        assert!(!more.is_empty() && more.len() <= 16);
         scope.cancellation_handle().cancel();
         scope.wait_idle().await;
     }

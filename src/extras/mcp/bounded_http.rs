@@ -385,7 +385,7 @@ fn is_event_cap_error(error: &SseError) -> Option<usize> {
 /// Parse a capped SSE body. When an event exceeds the cap and `request_id`
 /// names the request this stream answers, the stream first yields a JSON-RPC
 /// error response for it, then the cap error, then ends.
-fn capped_sse_stream(
+pub(crate) fn capped_sse_stream(
     response: reqwest::Response,
     cap: usize,
     request_id: Option<RequestId>,

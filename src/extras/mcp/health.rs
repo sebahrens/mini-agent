@@ -39,7 +39,7 @@ pub(crate) struct ServerHealth {
 /// Longest stored failure reason, in characters.
 const MAX_DETAIL_CHARS: usize = 160;
 
-fn bound_detail(reason: &str) -> String {
+pub(crate) fn bound_detail(reason: &str) -> String {
     let flat: String = reason
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })

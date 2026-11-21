@@ -1178,6 +1178,65 @@ async fn actual_explicit_loopback_transport_bypasses_proxy_and_refuses_redirects
     trap.finish().await;
 }
 
+/// mini-agent-nvnkx.286: a URL server added without an `oauth` block can
+/// still sign in: `/mcp login` attempts discovery instead of refusing.
+#[tokio::test]
+async fn login_on_a_url_server_without_an_oauth_block_attempts_discovery() {
+    let root = crate::tests::OwnedTestDirectory::new("mcp-app-login-discovery");
+    let _environment = environment(root.path());
+    let server = Server::new(false).await;
+    let cfg = config(root.path(), &server);
+    let cli = crate::cli::Cli {
+        no_session: true,
+        ..Default::default()
+    };
+    let mut session = Session::new(
+        "mcp286",
+        "owned-model",
+        128_000,
+        root.path().to_str().unwrap(),
+    );
+    let mut context = crate::context::load(true);
+    let mut app = app(root.path(), &cli, &cfg, &mut session, &mut context);
+    command(
+        &mut app,
+        &format!("/mcp add owned {} --allow-local", server.url()),
+    )
+    .await;
+    drain(&mut app).await;
+    command(&mut app, "/mcp login owned").await;
+    drain(&mut app).await;
+    let rendered = app.renderer.captured_output();
+    assert!(
+        !rendered.contains("not an OAuth URL server"),
+        "login must not refuse a URL server without an oauth block: {rendered}"
+    );
+    assert!(rendered.contains("MCP OAuth login started"), "{rendered}");
+    // The fixture serves no authorization metadata, so discovery fails
+    // visibly and nothing is persisted.
+    assert!(rendered.contains("MCP OAuth setup failed"), "{rendered}");
+    assert!(
+        !std::fs::read_to_string(app.ui.cfg.provenance.global_file.as_ref().unwrap())
+            .unwrap_or_default()
+            .contains("oauth")
+    );
+    // Logout still needs stored OAuth settings.
+    command(&mut app, "/mcp logout owned").await;
+    assert!(
+        app.renderer
+            .captured_output()
+            .contains("not an OAuth URL server")
+    );
+    app.retire_mcp_work().await.unwrap();
+    if let Some(manager) = app.ui.mcp_manager.as_mut() {
+        for mut handle in manager.handles.drain(..) {
+            handle.running_service.close().await.unwrap();
+        }
+    }
+    drop(app);
+    server.finish().await;
+}
+
 #[tokio::test]
 async fn actual_reconnect_failure_keeps_prior_usable_handle_and_changed_workspace_blocks_launch() {
     let root = crate::tests::OwnedTestDirectory::new("mcp-app-reconnect");

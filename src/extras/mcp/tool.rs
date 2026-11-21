@@ -404,6 +404,16 @@ fn format_unsaved_mcp_output(
     )
 }
 
+/// Whether a call failed because the server rejected its credential (401).
+/// A transport error may carry the status only in its text.
+fn is_unauthorized(error: &ServiceError) -> bool {
+    let text = format!("{error} {error:?}").to_ascii_lowercase();
+    text.contains("401")
+        || text.contains("unauthorized")
+        || text.contains("auth required")
+        || text.contains("authrequired")
+}
+
 impl ToolDyn for McpTool {
     fn name(&self) -> String {
         self.registered_name.to_string()
@@ -506,6 +516,9 @@ impl ToolDyn for McpTool {
                 }
                 None => (peer, elicitation),
             };
+            // Log lines the server emits while this call runs explain a failure.
+            let server_log = elicitation.logs.clone();
+            let log_mark = server_log.mark();
             let proof = source_proof.clone();
             let live = client_is_live.clone();
             let elicitation_lease = elicitation.enter(
@@ -521,9 +534,17 @@ impl ToolDyn for McpTool {
             let display = crate::agent::tools::bash::current_tool_call_id()
                 .zip(crate::agent::tools::mutation_diff::scoped_event_sender())
                 .map(|(id, events)| (elicitation.progress.clone(), id, events));
-            let result = call_tool_observed(&peer, params, call_timeout, display)
-                .await
-                .map_err(|e| {
+            let result = call_tool_observed(&peer, params, call_timeout, display).await;
+            // A 401 on a `headersHelper` server: retire the connection and run
+            // one reconnect cycle (re-running the helper) before reporting.
+            // The failed call is never replayed.
+            let refreshed = match (&result, &reconnect) {
+                (Err(error), Some(link)) if is_unauthorized(error) => {
+                    Some(link.reauthenticate().await)
+                }
+                _ => None,
+            };
+            let result = result.map_err(|e| {
                     let message = match e {
                         ServiceError::Timeout { timeout } if timeout > call_timeout => format!(
                             "MCP tool '{tool_name}' on server '{server_name}' was stopped after \
@@ -542,7 +563,14 @@ impl ToolDyn for McpTool {
                         other if reconnect.is_some() && peer.is_transport_closed() => format!(
                             "MCP tool error: {other}; the connection to '{server_name}' dropped and will be re-established on the next call"
                         ),
+                        other if refreshed == Some(true) => format!(
+                            "MCP tool error: {other}; the credential was rejected, so the headers helper was re-run and '{server_name}' reconnected. Retry the call"
+                        ),
                         other => format!("MCP tool error: {other}"),
+                    };
+                    let message = match server_log.fenced_since(log_mark) {
+                        Some(block) => format!("{message}{block}"),
+                        None => message,
                     };
                     ToolError::ToolCallError(Box::new(McpToolError(CompactString::new(message))))
                 })?;
@@ -583,6 +611,9 @@ impl ToolDyn for McpTool {
                 if let Some(note) = elicitation_lease.take_unanswerable_note() {
                     msg.push('\n');
                     msg.push_str(&note);
+                }
+                if let Some(block) = server_log.fenced_since(log_mark) {
+                    msg.push_str(&block);
                 }
                 return Err(ToolError::ToolCallError(Box::new(McpToolError(
                     CompactString::new(msg),

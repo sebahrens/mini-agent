@@ -8,7 +8,9 @@
 //! (only names in `inherit_env` are delegated), can be placed in a
 //! workspace-service sandbox, is bounded to 10 s and 64 KiB of output, and
 //! its failure text never includes its output, so tokens cannot leak into
-//! notices. It runs once per (re)connect.
+//! notices. It runs once per (re)connect, and again when a call on a live
+//! connection is rejected with 401 (the link then reconnects once; the failed
+//! call is not replayed).
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};

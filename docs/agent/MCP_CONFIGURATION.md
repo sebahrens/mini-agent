@@ -10,7 +10,12 @@ removed, cancelled, failed and pending attempts remain distinguishable.
 
 ```text
 /mcp add local http://localhost:3000/mcp --allow-local
-/mcp add runner "C:\Program Files\runner.exe" "literal argument" --project
+/mcp add --project runner "C:\Program Files\runner.exe" "literal argument"
+/mcp add --env API_KEY --env MODE=fast tool npx -y some-mcp-server -- --stdio
+/mcp add --header "Authorization: Bearer ${TOKEN}" remote https://example.com/mcp
+/mcp add --oauth linear https://mcp.linear.app/mcp
+/mcp disable local
+/mcp enable local
 /mcp remove local
 /mcp remove runner --project
 ```
@@ -59,21 +64,18 @@ to notices or origin metadata. Literal secrets explicitly placed in a project
 file remain file content; review redaction does not make those bytes inaccessible
 to another reader already authorized to read that file.
 
-Project URL servers may use `"type": "http"` or `"streamable-http"`; the legacy
-`"type": "sse"` (and `ws`) is rejected with a message naming the `http`
-alternative.
+Project URL servers may use `"type": "http"`, `"streamable-http"` or `"sse"`; `ws` is
+rejected with a message naming the `http` alternative.
 
-Decision (mini-agent-ufqu7): the legacy HTTP+SSE transport (the 2024-11-05
-protocol: a long-lived `GET` event stream announcing a separate `POST` endpoint)
-is deliberately **not supported**. It was replaced by streamable HTTP in the
-2025-03-26 MCP specification, the locked `rmcp` client offers only streamable
-HTTP, and a hand-written second transport would need its own copy of the pinned
-DNS, same-origin redirect, header-helper, OAuth and body-bound controls that the
-streamable client already carries, widening the audited network surface for a
-deprecated protocol. A server that only speaks legacy SSE can be reached through
-a streamable-HTTP bridge or gateway placed in front of it. The refusal names the
-`http` alternative so the configured entry can be corrected. Revisit if `rmcp`
-ships a maintained SSE client that can run on the pinned egress layer.
+`"type": "sse"` (config key `legacy_sse = true`, `/mcp add --sse`) selects the legacy
+HTTP+SSE transport (the 2024-11-05 protocol: one long-lived `GET` event stream whose first
+`endpoint` event names the same-origin URL that receives every client message as a `POST`)
+for servers that never gained streamable HTTP (mini-agent-nvnkx.79). It reuses the
+egress-pinned client (pinned DNS, no redirects, CIDR policy), the configured headers and the
+OAuth authorization manager of streamable HTTP, caps every SSE event at the transport body
+limit (an oversized event ends the stream), and refuses an `endpoint` that names another
+origin. `headersHelper` runs once per (re)connect as for streamable HTTP. Prefer streamable
+HTTP whenever the server offers it.
 
 For auth headers sourced from the environment, `bearerTokenEnvVar`
 (`Authorization: Bearer ${VAR}`) and `envHttpHeaders` (`{"Header": "VAR"}`) are
@@ -254,9 +256,16 @@ reconnected automatically: when one exits, `/mcp` shows it as `disconnected` and
 - **Dropped connection.** When a connected server's transport closes mid-session (server restart,
   network drop, expired session), the next tool call to it reconnects first, from the exact
   definition and source that connected: up to 5 attempts, waiting 1 s, 2 s, 4 s, 8 s, 16 s
-  before them. While this runs the server shows as `pending`; after the last failed attempt it
-  shows as `failed` ("run /mcp reconnect <server>") and further calls fail fast until you run
-  `/mcp reconnect <server>`. A call that was already in flight when the connection dropped is never replayed (it
+  before them (a 401/403 stops the cycle after one attempt: retrying cannot help until the
+  credential changes). While this runs the server shows as `pending`; after the last failed
+  attempt it shows as `failed` with the last attempt's class (DNS, refused, timed out, 5xx,
+  authentication) in `/mcp` and in the tool error, and calls fail fast during a cool-down. The
+  cool-down is 2, then 5, then 15 minutes after consecutive failed cycles; once it has passed the
+  next call runs one new cycle, so a long unattended session (`-p`, `--loop`, goal, ACP) heals
+  when the server is back, without `/mcp reconnect <server>` (which still works at any time).
+  A URL server with a `headersHelper` whose call is rejected with 401 retires the connection and
+  runs one reconnect cycle (re-running the helper for a fresh token, at most once per 30 s)
+  before the error is reported; the failed call itself is never replayed. A call that was already in flight when the connection dropped is never replayed (it
   reports the drop; the following call reconnects), so a non-idempotent tool does not run twice.
   A changed or revoked source, or a retired connection, never reconnects.
 - **What reconnects.** The first of any of these after a drop reconnects: a tool call, a

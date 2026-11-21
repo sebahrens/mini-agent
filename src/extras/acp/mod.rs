@@ -2112,7 +2112,8 @@ async fn handle_initialize(
 ) -> Result<(), agent_client_protocol::Error> {
     let _activity = state.idle.admit()?;
     state.client_fs.record(&req.client_capabilities);
-    let caps = acp_capabilities();
+    let caps = acp_capabilities()
+        .mcp_capabilities(McpCapabilities::new().http(client_mcp_http_available(state)));
 
     let resp = InitializeResponse::new(acp_protocol_version())
         .agent_capabilities(caps)
@@ -2726,6 +2727,34 @@ fn client_mcp_policy(is_tcp: bool, trusted_by_operator: bool) -> ClientMcpPolicy
     }
 }
 
+/// Whether client-supplied remote (HTTP) MCP servers can be accepted: the same
+/// trust/sandbox gate as client stdio servers (never a TCP peer; the dedicated
+/// workspace-service sandbox must be available unless the operator opted out).
+/// Advertised as `mcpCapabilities.http`; SSE stays unadvertised.
+fn client_mcp_http_available(state: &AcpState) -> bool {
+    #[cfg(not(feature = "mcp"))]
+    {
+        let _ = state;
+        false
+    }
+    #[cfg(feature = "mcp")]
+    {
+        match state.client_mcp {
+            ClientMcpPolicy::Refused => false,
+            ClientMcpPolicy::Trusted => state.cli.mcp_is_eligible(&state.cfg),
+            ClientMcpPolicy::Sandboxed => {
+                let backend = state.cli.resolve_sandbox_backend(&state.cfg);
+                backend != "zerobox"
+                    && matches!(
+                        crate::sandbox::Sandbox::new(true, &backend).policy(),
+                        crate::sandbox::SandboxPolicy::RequiredAndAvailable
+                    )
+                    && state.cli.mcp_is_eligible(&state.cfg)
+            }
+        }
+    }
+}
+
 /// Validate the MCP servers a client supplied in `session/new`.
 ///
 /// ACP requires every agent to accept stdio servers. The server list comes
@@ -2738,7 +2767,7 @@ fn client_mcp_policy(is_tcp: bool, trusted_by_operator: bool) -> ClientMcpPolicy
 /// refused at session creation rather than after a prompt begins.
 /// `MINI_AGENT_ACP_TRUST_CLIENT_MCP=1` launches them unsandboxed instead.
 /// Anything this server cannot honour is refused explicitly rather than
-/// silently ignored: HTTP/SSE servers (not advertised), servers from a TCP
+/// silently ignored: SSE servers (not advertised), HTTP servers when the gate is closed, servers from a TCP
 /// peer (a network client must not launch local processes), servers when the
 /// sandbox is unavailable and not explicitly bypassed, and servers when MCP
 /// is disabled or not compiled in.
@@ -2763,6 +2792,17 @@ fn client_mcp_servers(
     #[cfg(feature = "mcp")]
     {
         use crate::extras::mcp::config::{McpServerConfig, McpStdioNetwork};
+        if servers
+            .iter()
+            .any(|server| matches!(server, McpServer::Http(_)))
+            && !client_mcp_http_available(state)
+        {
+            return refuse(
+                "only stdio MCP servers are supported; HTTP and SSE servers are not \
+                 advertised by this agent"
+                    .into(),
+            );
+        }
         let max_servers = state
             .cfg
             .acp_max_client_mcp_servers
@@ -2810,12 +2850,61 @@ fn client_mcp_servers(
         }
         let mut accepted = ClientMcpServers::new();
         for server in servers {
-            let McpServer::Stdio(stdio) = server else {
-                return refuse(
-                    "only stdio MCP servers are supported; HTTP and SSE servers are not \
-                     advertised by this agent"
-                        .into(),
-                );
+            let stdio = match server {
+                McpServer::Stdio(stdio) => stdio,
+                // Remote servers need no launch authority, but share the stdio
+                // gate (checked above); headers are used as given and the
+                // entry lives only for this session.
+                McpServer::Http(http) => {
+                    let url = match reqwest::Url::parse(&http.url) {
+                        Ok(url) => url,
+                        Err(_) => {
+                            return refuse(format!(
+                                "MCP server '{}' URL is not a valid URL",
+                                http.name
+                            ));
+                        }
+                    };
+                    let loopback = matches!(
+                        url.host_str(),
+                        Some("localhost" | "127.0.0.1" | "[::1]" | "::1")
+                    );
+                    if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
+                        return refuse(format!(
+                            "MCP server '{}' must use https (plain http only for loopback)",
+                            http.name
+                        ));
+                    }
+                    if !crate::extras::mcp::config::is_valid_server_name(&http.name) {
+                        return refuse(format!("invalid MCP server name '{}'", http.name));
+                    }
+                    if accepted.contains_key(&http.name) {
+                        return refuse(format!("duplicate MCP server name '{}'", http.name));
+                    }
+                    accepted.insert(
+                        http.name.clone(),
+                        McpServerConfig::Url {
+                            options: Default::default(),
+                            url: http.url.clone(),
+                            defer: Default::default(),
+                            allow_local: url.scheme() == "http",
+                            headers: http
+                                .headers
+                                .iter()
+                                .map(|header| (header.name.clone(), header.value.clone()))
+                                .collect(),
+                            oauth: None,
+                        },
+                    );
+                    continue;
+                }
+                _ => {
+                    return refuse(
+                        "only stdio and HTTP MCP servers are supported; SSE servers are not \
+                         advertised by this agent"
+                            .into(),
+                    );
+                }
             };
             if !stdio.command.is_absolute() {
                 return refuse(format!(
@@ -13832,14 +13921,16 @@ mod protocol_tests {
                 .map(|e| e.to_string())
         };
 
-        assert!(
-            refused(
-                &state,
-                McpServer::Http(McpServerHttp::new("remote", "https://example.com/mcp"))
-            )
-            .is_some(),
-            "HTTP servers are not advertised"
-        );
+        let fixture: PromptFixture = Arc::new(|_, _| Box::pin(async { Ok(Vec::new()) }));
+        let mut closed = fixture_state(fixture);
+        Arc::get_mut(&mut closed).unwrap().client_mcp = ClientMcpPolicy::Refused;
+        assert!(!client_mcp_http_available(&closed));
+        let message = refused(
+            &closed,
+            McpServer::Http(McpServerHttp::new("remote", "https://example.com/mcp")),
+        )
+        .expect("HTTP servers are refused while the gate is closed");
+        assert!(message.contains("not advertised"), "{message}");
         #[cfg(feature = "mcp")]
         {
             assert!(
@@ -13871,6 +13962,49 @@ mod protocol_tests {
             .is_some()
         );
         assert!(client_mcp_servers(&state, &[]).is_ok());
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn http_client_mcp_servers_become_session_only_url_entries_when_the_gate_is_open() {
+        let fixture: PromptFixture = Arc::new(|_, _| Box::pin(async { Ok(Vec::new()) }));
+        let mut open = fixture_state(fixture);
+        Arc::get_mut(&mut open).unwrap().client_mcp = ClientMcpPolicy::Trusted;
+        if !client_mcp_http_available(&open) {
+            return; // MCP disabled for this fixture configuration
+        }
+        let remote = McpServerHttp::new("remote", "https://example.com/mcp")
+            .headers(vec![HttpHeader::new("Authorization", "Bearer t")]);
+        let accepted = client_mcp_servers(&open, &[McpServer::Http(remote)]).unwrap();
+        let crate::extras::mcp::config::McpServerConfig::Url {
+            url,
+            headers,
+            allow_local,
+            oauth,
+            ..
+        } = &accepted["remote"]
+        else {
+            panic!("HTTP server must map to a URL entry")
+        };
+        assert_eq!(url, "https://example.com/mcp");
+        assert_eq!(headers["Authorization"], "Bearer t");
+        assert!(!allow_local && oauth.is_none());
+        let loopback = McpServerHttp::new("local", "http://127.0.0.1:9/mcp");
+        let accepted = client_mcp_servers(&open, &[McpServer::Http(loopback)]).unwrap();
+        assert!(matches!(
+            accepted["local"],
+            crate::extras::mcp::config::McpServerConfig::Url {
+                allow_local: true,
+                ..
+            }
+        ));
+        for bad in [
+            McpServerHttp::new("plain", "http://example.com/mcp"),
+            McpServerHttp::new("bad name", "https://example.com/mcp"),
+            McpServerHttp::new("junk", "not a url"),
+        ] {
+            assert!(client_mcp_servers(&open, &[McpServer::Http(bad)]).is_err());
+        }
     }
 
     #[tokio::test]

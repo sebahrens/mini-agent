@@ -8,14 +8,20 @@
 //! (never a re-read configuration), up to [`MAX_RECONNECT_ATTEMPTS`] times with
 //! a doubling backoff starting at [`RECONNECT_BASE_DELAY`]. While it runs the
 //! server shows as `pending` (`/mcp`, `/doctor`); after the last failed attempt
-//! it is marked `failed` until the user reconnects it by hand. Stdio servers
-//! have no link and stay manual.
+//! it is marked `failed` with the last attempt's reason. A failed link is not
+//! terminal: once a cool-down (2, 5, then 15 minutes) has passed, the next call
+//! runs one new attempt cycle, so unattended sessions heal without `/mcp
+//! reconnect`. A 401/403 failure stops its cycle after one attempt (more
+//! attempts cannot help until the credential changes). A call rejected with
+//! 401 on a `headersHelper` server retires the connection and runs one cycle
+//! (which re-runs the helper) before the error is reported. Stdio servers have
+//! no link and stay manual.
 //!
 //! A call that was already in flight when the connection dropped is never
 //! replayed: it fails, and only the next call reconnects, so a non-idempotent
 //! tool is not executed twice. The link never outlives the handle it belongs
 //! to: dropping the handle retires the link and closes any replacement.
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -30,6 +36,15 @@ use super::health::{AttemptKind, AttemptOutcome, Health};
 pub(crate) const MAX_RECONNECT_ATTEMPTS: usize = 5;
 /// Delay before the first attempt; each later attempt doubles it.
 pub(crate) const RECONNECT_BASE_DELAY: Duration = Duration::from_secs(1);
+/// Cool-down after a failed cycle before the next call may try again: the
+/// n-th consecutive failed cycle waits `COOLDOWNS[min(n, len) - 1]`.
+const COOLDOWNS: [Duration; 3] = [
+    Duration::from_secs(120),
+    Duration::from_secs(300),
+    Duration::from_secs(900),
+];
+/// Least gap between two reconnects triggered by a 401 on a live link.
+const REAUTH_MIN_GAP: Duration = Duration::from_secs(30);
 
 /// The live pieces of one connection generation.
 #[derive(Clone)]
@@ -65,6 +80,22 @@ pub(crate) struct ServerLink {
     connector: Connector,
     base_delay: Duration,
     health: Mutex<Option<Health>>,
+    /// When the link last became `Failed`, how many cycles failed in a row,
+    /// the last attempt's bounded reason and whether it needs a login.
+    failed: Mutex<Option<FailedCycle>>,
+    failed_cycles: AtomicU32,
+    /// A `headersHelper` server: a 401 retires the connection and reconnects.
+    reauth: AtomicBool,
+    /// Bumped each time a replacement connection is installed.
+    generation: AtomicU32,
+    last_reauth: Mutex<Option<tokio::time::Instant>>,
+}
+
+struct FailedCycle {
+    at: tokio::time::Instant,
+    attempts: usize,
+    reason: Option<String>,
+    needs_login: bool,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -88,7 +119,47 @@ impl ServerLink {
             connector,
             base_delay,
             health: Mutex::new(None),
+            failed: Mutex::new(None),
+            failed_cycles: AtomicU32::new(0),
+            reauth: AtomicBool::new(false),
+            generation: AtomicU32::new(0),
+            last_reauth: Mutex::new(None),
         })
+    }
+
+    /// Re-run the connector (and so the `headersHelper`) when a call is
+    /// rejected with 401 on a healthy transport.
+    pub(crate) fn enable_reauth(&self) {
+        self.reauth.store(true, Ordering::Release);
+    }
+
+    /// A call on this link failed with 401. On a `headersHelper` link this
+    /// retires the current connection and runs one reconnect cycle before the
+    /// caller reports the error; the failed call is never replayed. `true`
+    /// when a fresh connection is now installed.
+    pub(crate) async fn reauthenticate(&self) -> bool {
+        if !self.reauth.load(Ordering::Acquire) || self.retired.load(Ordering::Acquire) {
+            return false;
+        }
+        {
+            let mut last = lock(&self.last_reauth);
+            let now = tokio::time::Instant::now();
+            if last.is_some_and(|at| now.duration_since(at) < REAUTH_MIN_GAP) {
+                return false;
+            }
+            *last = Some(now);
+        }
+        self.force_reconnect().await.is_ok()
+    }
+
+    async fn force_reconnect(&self) -> Result<Conn, String> {
+        let observed = self.generation.load(Ordering::Acquire);
+        let _serial = self.serialise.lock().await;
+        // Another caller already replaced the connection this one saw.
+        if self.generation.load(Ordering::Acquire) != observed {
+            return Ok(self.conn());
+        }
+        self.reconnect_locked(self.conn()).await
     }
 
     pub(crate) fn bind_health(&self, health: Health) {
@@ -99,12 +170,35 @@ impl ServerLink {
         *lock(&self.state)
     }
 
-    /// Bounded, credential-free reason shown for a failed server.
+    /// Bounded, credential-free reason shown for a failed server: the last
+    /// attempt's classified error and when the link will try again.
     pub(crate) fn failure_message(&self) -> String {
-        format!(
-            "connection dropped; {MAX_RECONNECT_ATTEMPTS} reconnect attempts failed (run /mcp reconnect {})",
-            self.name
-        )
+        let failed = lock(&self.failed);
+        let (attempts, reason, needs_login) = failed
+            .as_ref()
+            .map_or((MAX_RECONNECT_ATTEMPTS, None, false), |failed| {
+                (failed.attempts, failed.reason.clone(), failed.needs_login)
+            });
+        let attempts_text = if attempts == 1 {
+            "1 reconnect attempt".to_owned()
+        } else {
+            format!("{attempts} reconnect attempts")
+        };
+        let mut text = format!("connection dropped; {attempts_text} failed");
+        if let Some(reason) = reason {
+            text.push_str(&format!(": {reason}"));
+        }
+        let cooldown = cooldown(self.failed_cycles.load(Ordering::Acquire));
+        if needs_login {
+            text.push_str(&format!(" (run mini-agent mcp login {}", self.name));
+        } else {
+            text.push_str(&format!(" (run /mcp reconnect {}", self.name));
+        }
+        text.push_str(&format!(
+            "; retries automatically after {} min)",
+            cooldown.as_secs() / 60
+        ));
+        text
     }
 
     pub(crate) fn conn(&self) -> Conn {
@@ -120,31 +214,45 @@ impl ServerLink {
     /// The live connection, reconnecting first when the transport closed.
     pub(crate) async fn ensure_connected(&self) -> Result<Conn, String> {
         let _serial = self.serialise.lock().await;
-        let retired = || {
-            format!(
-                "MCP connection retired; server '{0}' was replaced or removed, ask the user to run /mcp reconnect {0}",
-                self.name
-            )
-        };
         if self.retired.load(Ordering::Acquire) {
-            return Err(retired());
+            return Err(self.retired_message());
         }
         let conn = self.conn();
         if !conn.peer.is_transport_closed() {
             return Ok(conn);
         }
         if self.state() == LinkState::Failed {
-            return Err(format!(
-                "MCP server '{}' {}",
-                self.name,
-                self.failure_message()
-            ));
+            let due = lock(&self.failed).as_ref().is_some_and(|failed| {
+                failed.at.elapsed() >= cooldown(self.failed_cycles.load(Ordering::Acquire))
+            });
+            if !due {
+                return Err(format!(
+                    "MCP server '{}' {}",
+                    self.name,
+                    self.failure_message()
+                ));
+            }
         }
+        self.reconnect_locked(conn).await
+    }
+
+    fn retired_message(&self) -> String {
+        format!(
+            "MCP connection retired; server '{0}' was replaced or removed, ask the user to run /mcp reconnect {0}",
+            self.name
+        )
+    }
+
+    /// One reconnect cycle; the caller holds `serialise`.
+    async fn reconnect_locked(&self, conn: Conn) -> Result<Conn, String> {
+        let retired = || self.retired_message();
         *lock(&self.state) = LinkState::Reconnecting;
         let attempt = lock(&self.health)
             .clone()
             .map(|health| health.begin(&self.name, AttemptKind::Connection));
         let mut delay = self.base_delay;
+        let mut last_error: Option<(String, bool)> = None;
+        let mut attempts_made = 0;
         for number in 1..=MAX_RECONNECT_ATTEMPTS {
             let waited = tokio::select! {
                 biased;
@@ -153,7 +261,11 @@ impl ServerLink {
             };
             delay = delay.saturating_mul(2);
             if !waited || self.retired.load(Ordering::Acquire) {
-                *lock(&self.state) = LinkState::Connected;
+                *lock(&self.state) = if lock(&self.failed).is_some() {
+                    LinkState::Failed
+                } else {
+                    LinkState::Connected
+                };
                 if let Some(attempt) = attempt {
                     attempt.finish(AttemptOutcome::Cancelled);
                 }
@@ -163,6 +275,7 @@ impl ServerLink {
                 "MCP reconnecting dropped server '{}' (attempt {number}/{MAX_RECONNECT_ATTEMPTS})",
                 self.name
             );
+            attempts_made = number;
             let connected = tokio::select! {
                 biased;
                 _ = crate::agent::runner::current_work_scope_cancelled() => None,
@@ -170,7 +283,11 @@ impl ServerLink {
             };
             match connected {
                 None => {
-                    *lock(&self.state) = LinkState::Connected;
+                    *lock(&self.state) = if lock(&self.failed).is_some() {
+                        LinkState::Failed
+                    } else {
+                        LinkState::Connected
+                    };
                     if let Some(attempt) = attempt {
                         attempt.finish(AttemptOutcome::Cancelled);
                     }
@@ -195,25 +312,98 @@ impl ServerLink {
                     let previous = lock(&self.replacement).replace(handle);
                     drop(previous);
                     *lock(&self.current) = fresh.clone();
+                    self.generation.fetch_add(1, Ordering::AcqRel);
+                    *lock(&self.failed) = None;
+                    self.failed_cycles.store(0, Ordering::Release);
                     *lock(&self.state) = LinkState::Connected;
                     if let Some(attempt) = attempt {
                         attempt.finish(AttemptOutcome::Succeeded);
                     }
                     return Ok(fresh);
                 }
-                Some(Err(_)) => {}
+                Some(Err(error)) => {
+                    let (reason, auth) = classify(&error);
+                    last_error = Some((reason, auth));
+                    // A rejected credential cannot be fixed by retrying.
+                    if matches!(last_error, Some((_, true))) {
+                        break;
+                    }
+                }
             }
         }
+        let (reason, needs_login) = last_error.unzip();
+        let reason = reason.map(|reason| super::health::bound_detail(&reason));
+        self.failed_cycles.fetch_add(1, Ordering::AcqRel);
+        *lock(&self.failed) = Some(FailedCycle {
+            at: tokio::time::Instant::now(),
+            attempts: attempts_made.max(1),
+            reason: reason.clone(),
+            needs_login: needs_login.unwrap_or(false),
+        });
         *lock(&self.state) = LinkState::Failed;
+        let message = format!("MCP server '{}' {}", self.name, self.failure_message());
         if let Some(attempt) = attempt {
-            attempt.finish(AttemptOutcome::Failed);
+            match &reason {
+                Some(reason) => attempt.finish_with(AttemptOutcome::Failed, reason),
+                None => attempt.finish(AttemptOutcome::Failed),
+            }
         }
-        Err(format!(
-            "MCP server '{}' {}",
-            self.name,
-            self.failure_message()
-        ))
+        Err(message)
     }
+}
+
+/// Cool-down before the next cycle after `cycles` consecutive failed ones.
+fn cooldown(cycles: u32) -> Duration {
+    let index = (cycles.max(1) as usize - 1).min(COOLDOWNS.len() - 1);
+    COOLDOWNS[index]
+}
+
+/// A bounded, credential-free reason for a failed attempt and whether it was
+/// an authentication failure (no use retrying within the cycle). Host-written
+/// failure text is kept; anything that came off the wire is reduced to a
+/// fixed class so no URL or header value can reach the health row.
+fn classify(error: &anyhow::Error) -> (String, bool) {
+    use super::client::ConnectFailureKind as Kind;
+    if let Some((kind, detail)) = super::client::connect_failure_of(error) {
+        return match kind {
+            Kind::AuthRequired => (format!("authentication required: {detail}"), true),
+            Kind::InitTimedOut => ("initialization timed out".to_owned(), false),
+            Kind::Cancelled => ("cancelled".to_owned(), false),
+            Kind::Local => (detail, false),
+        };
+    }
+    let text = format!("{error:#}").to_ascii_lowercase();
+    let has_status = |wanted: &dyn Fn(&str) -> bool| {
+        text.split(|c: char| !c.is_ascii_digit())
+            .any(|token| token.len() == 3 && wanted(token))
+    };
+    let class = if text.contains("unauthorized")
+        || text.contains("auth required")
+        || text.contains("forbidden")
+        || has_status(&|code| code == "401" || code == "403")
+    {
+        return (
+            "authentication required (401/403): the credential was rejected".to_owned(),
+            true,
+        );
+    } else if text.contains("timed out") || text.contains("timeout") {
+        "request timed out"
+    } else if has_status(&|code| code.starts_with('5')) {
+        "server error (5xx)"
+    } else if text.contains("dns")
+        || text.contains("resolve")
+        || text.contains("lookup")
+        || text.contains("name or service")
+    {
+        "DNS lookup failed"
+    } else if text.contains("refused") || text.contains("connect") || text.contains("unreachable") {
+        "connection refused or unreachable"
+    } else if text.contains("source changed") {
+        "the server definition changed"
+    } else {
+        "connection failed"
+    };
+    (class.to_owned(), false)
 }
 
 fn retired_or_cancelled(retired: bool) -> String {
@@ -420,9 +610,17 @@ mod tests {
         let original = connect(&url).await.unwrap();
         let attempts = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&attempts);
+        let recovered = Arc::new(AtomicBool::new(false));
+        let back = Arc::clone(&recovered);
+        let revived = Arc::new(Mutex::new(Some(connect(&url).await.unwrap())));
         let connector: Connector = Arc::new(move || {
             counter.fetch_add(1, Ordering::SeqCst);
-            async { Err(anyhow::anyhow!("down")) }.boxed()
+            let handle = back
+                .load(Ordering::SeqCst)
+                .then(|| revived.lock().unwrap().take())
+                .flatten();
+            async move { handle.ok_or_else(|| anyhow::anyhow!("HTTP 503 Service Unavailable")) }
+                .boxed()
         });
         let link = ServerLink::new(
             "t".into(),
@@ -448,9 +646,84 @@ mod tests {
             health.snapshot().servers["t"].connection.unwrap().outcome,
             AttemptOutcome::Failed
         );
-        // Failed is sticky: no further attempts until a manual reconnect.
+        // The last attempt's class is recorded and shown (never raw text).
+        assert!(error.contains("server error (5xx)"), "{error}");
+        let detail = health.snapshot().servers["t"]
+            .connection_detail
+            .clone()
+            .unwrap();
+        assert!(detail.contains("server error"), "{detail}");
+        // Failed is held during the cool-down: no further attempts.
         assert!(link.ensure_connected().await.is_err());
         assert_eq!(attempts.load(Ordering::SeqCst), MAX_RECONNECT_ATTEMPTS);
+        // Once the cool-down has passed one new cycle runs, and it heals the
+        // link when the server is back.
+        recovered.store(true, Ordering::SeqCst);
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(119)).await;
+        assert!(link.ensure_connected().await.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), MAX_RECONNECT_ATTEMPTS);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let healed = link.ensure_connected().await.unwrap();
+        assert!(!healed.peer.is_transport_closed());
+        assert_eq!(attempts.load(Ordering::SeqCst), MAX_RECONNECT_ATTEMPTS + 1);
+        assert_eq!(link.state(), LinkState::Connected);
+    }
+
+    #[test]
+    fn cooldown_grows_and_caps() {
+        assert_eq!(cooldown(1), Duration::from_secs(120));
+        assert_eq!(cooldown(2), Duration::from_secs(300));
+        assert_eq!(cooldown(3), Duration::from_secs(900));
+        assert_eq!(cooldown(40), Duration::from_secs(900));
+    }
+
+    #[test]
+    fn failure_classes_never_carry_raw_transport_text() {
+        let (reason, auth) = classify(&anyhow::anyhow!(
+            "HTTP 401 for https://u:pw@host/x?k=SECRET"
+        ));
+        assert!(
+            auth && !reason.contains("SECRET") && !reason.contains("pw"),
+            "{reason}"
+        );
+        let (reason, auth) = classify(&anyhow::anyhow!("error sending request: dns error"));
+        assert!(!auth && reason == "DNS lookup failed", "{reason}");
+        let (reason, _) = classify(&anyhow::anyhow!("weird token=SECRET"));
+        assert_eq!(reason, "connection failed");
+    }
+
+    #[tokio::test]
+    async fn a_rejected_credential_on_a_live_link_reruns_the_connector_once() {
+        let Some((url, _)) = serve(0, "200 OK").await else {
+            return;
+        };
+        let original = connect(&url).await.unwrap();
+        let spare = Arc::new(Mutex::new(Some(connect(&url).await.unwrap())));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let (counter, spare_for_connector) = (Arc::clone(&runs), Arc::clone(&spare));
+        let connector: Connector = Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let handle = spare_for_connector.lock().unwrap().take();
+            async move { handle.ok_or_else(|| anyhow::anyhow!("down")) }.boxed()
+        });
+        let link = ServerLink::new(
+            "t".into(),
+            conn_of(&original),
+            connector,
+            Duration::from_millis(1),
+        );
+        // Not a `headersHelper` link: a 401 changes nothing.
+        assert!(!link.reauthenticate().await);
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        link.enable_reauth();
+        assert!(!original.peer().is_transport_closed());
+        assert!(link.reauthenticate().await, "the healthy link reconnects");
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert_eq!(link.state(), LinkState::Connected);
+        // A burst of 401s cannot loop reconnects.
+        assert!(!link.reauthenticate().await);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
