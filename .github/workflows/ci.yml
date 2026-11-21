@@ -448,7 +448,6 @@ jobs:
           - "--no-default-features --features memory"
           - "--no-default-features --features js"
           - "--no-default-features --features sandbox"
-          - "--no-default-features --features skills"
           - "--no-default-features --features js,sandbox"
           - "--no-default-features --features mcp"
           - "--no-default-features --features acp"
@@ -524,14 +523,16 @@ jobs:
         # The documented supported feature combinations. Isolated memory and
         # sandbox rows catch missing cfg gates that default features can mask.
         # `skills` implies `js`, so a skills-without-JS state is unselectable by
-        # construction.
+        # construction. For the same reason `--features skills` resolves to the
+        # identical feature set as the `js,skills` row below, so only the latter
+        # is listed (mini-agent-nvnkx.8): a second row would recompile and rerun
+        # the same suite.
         features:
           - ""
           - "--no-default-features"
           - "--no-default-features --features memory"
           - "--no-default-features --features js"
           - "--no-default-features --features sandbox"
-          - "--no-default-features --features skills"
           - "--no-default-features --features js,sandbox"
           - "--no-default-features --features mcp"
           - "--no-default-features --features acp"
@@ -555,8 +556,6 @@ jobs:
             features: "--no-default-features"
           - os: macos-latest
             features: "--no-default-features --features memory"
-          - os: macos-latest
-            features: "--no-default-features --features skills"
           - os: macos-latest
             features: "--no-default-features --features mcp"
           - os: macos-latest
