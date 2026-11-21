@@ -967,3 +967,33 @@ fn import_limits_cover_every_persistable_session() {
     assert_eq!(MAX_SESSION_IMPORT_MESSAGES, 100_000);
     const { assert!(MAX_SESSION_IMPORT_BYTES >= crate::session::storage::MAX_SESSION_BYTES) };
 }
+
+#[test]
+fn a_failed_tool_result_persists_its_error_flag_and_old_records_still_load() {
+    use crate::session::PersistedToolMessage;
+    let mut session = Session::new("p", "m", 1000, "");
+    session.add_tool_result_flagged("a", "shell", "npm ERR! boom", Vec::new(), true);
+    session.add_tool_result_flagged("b", "list_dir", "errors.rs", Vec::new(), false);
+    let json = serde_json::to_value(&session.messages[0].tool).unwrap();
+    assert_eq!(json["is_error"], true);
+    let ok = serde_json::to_value(&session.messages[1].tool).unwrap();
+    assert!(ok.get("is_error").is_none(), "false is not written");
+    let old: PersistedToolMessage =
+        serde_json::from_str(r#"{"kind":"result","output":"x"}"#).unwrap();
+    assert!(matches!(old, PersistedToolMessage::Result { is_error: false, .. }));
+    let back: PersistedToolMessage = serde_json::from_value(json).unwrap();
+    assert!(matches!(back, PersistedToolMessage::Result { is_error: true, .. }));
+}
+
+#[cfg(feature = "export")]
+#[test]
+fn exports_mark_an_unpriced_cost_instead_of_printing_zero_dollars() {
+    let mut session = Session::new("p", "unpriced-model", 1000, "");
+    session.set_input_output_prices(None);
+    assert_eq!(session.cost_display(), "price unknown");
+    let html = crate::extras::export::session_to_html(&session);
+    assert!(html.contains("price unknown"));
+    assert!(!html.contains("$0.0000"));
+    let markdown = crate::extras::export::session_to_markdown(&session);
+    assert!(markdown.contains("\"cost_incomplete\":true") || markdown.contains("\"cost_incomplete\": true"));
+}

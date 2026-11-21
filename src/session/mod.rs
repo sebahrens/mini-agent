@@ -536,6 +536,10 @@ pub enum PersistedToolMessage {
         /// recovery path without parsing marker-like text from the tool.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         artifact_path: Option<CompactString>,
+        /// The tool reported failure. Absent in older sessions (replay then
+        /// guesses from the text).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        is_error: bool,
     },
 }
 
@@ -2012,6 +2016,18 @@ impl Session {
         output: &str,
         images: Vec<tool_image::PersistedToolImage>,
     ) -> (String, Option<std::path::PathBuf>) {
+        self.add_tool_result_flagged(id, name, output, images, false)
+    }
+
+    /// [`Self::add_tool_result_with_images`] recording whether the tool failed.
+    pub(crate) fn add_tool_result_flagged(
+        &mut self,
+        id: &str,
+        name: &str,
+        output: &str,
+        images: Vec<tool_image::PersistedToolImage>,
+        is_error: bool,
+    ) -> (String, Option<std::path::PathBuf>) {
         let (content, replay_output, artifact) = self.tool_result_content(id, name, output);
         let artifact_path = artifact
             .as_ref()
@@ -2024,6 +2040,7 @@ impl Session {
                 output: CompactString::new(replay_output),
                 images,
                 artifact_path,
+                is_error,
             }),
         );
         (content, artifact)

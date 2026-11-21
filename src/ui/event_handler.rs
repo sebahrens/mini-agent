@@ -348,7 +348,7 @@ pub async fn handle_agent_event(
             renderer.feed_mut().clear_anchor_progress(&id);
             let (_, artifact) = ui
                 .session
-                .add_tool_result_with_images(&id, &name, &output, images);
+                .add_tool_result_flagged(&id, &name, &output, images, is_error);
             if let (Some(pending), Some(path)) = (run.pending_turn.as_mut(), artifact) {
                 pending.record_tool_output(path);
             }

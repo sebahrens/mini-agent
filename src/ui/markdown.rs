@@ -305,6 +305,7 @@ fn push_code_rows(
                         range: span.range.start.max(range.start) - range.start
                             ..span.range.end.min(range.end) - range.start,
                         color: span.color,
+                        attrs: span.attrs,
                     })
                     .collect();
                 Some(clipped.into()).filter(|c: &std::sync::Arc<[_]>| !c.is_empty())
@@ -415,8 +416,12 @@ pub(crate) fn markdown_with_code_state(
     let mut lists = ListCtx::default();
     let mut pending_links: Vec<String> = Vec::new();
     // Byte range of the link text in `acc`, to colour a paragraph that is one link.
-    let mut link_start = 0usize;
-    let mut link_span: Option<(usize, usize)> = None;
+    // Whether the current paragraph holds link text and text outside a link,
+    // to colour a paragraph that is only a link as a whole row.
+    let mut para_link = false;
+    let mut para_other = false;
+    let mut in_link = false;
+    let mut heading_level: Option<pulldown_cmark::HeadingLevel> = None;
     let mut table_rows: Vec<Vec<String>> = Vec::new();
     let mut table_row: Vec<String> = Vec::new();
     let mut table_cell = String::new();
@@ -428,11 +433,25 @@ pub(crate) fn markdown_with_code_state(
         match event {
             Event::Start(tag) => match tag {
                 Tag::Paragraph => {}
-                Tag::Heading { .. } => {
+                Tag::Heading { level, .. } => {
                     flush_text(&acc, Color::White, max_width, &mut lists, &mut result);
                     acc.clear();
                     in_heading = true;
+                    // Heading levels differ by attribute: h1 bold and
+                    // underlined, h2 bold, the rest italic.
+                    match level {
+                        pulldown_cmark::HeadingLevel::H1 => {
+                            acc.push(BOLD_ON);
+                            acc.push(UNDER_ON);
+                        }
+                        pulldown_cmark::HeadingLevel::H2 => acc.push(BOLD_ON),
+                        _ => acc.push(ITAL_ON),
+                    }
+                    heading_level = Some(level);
                 }
+                Tag::Emphasis if !in_table_cell => acc.push(ITAL_ON),
+                Tag::Strong if !in_table_cell => acc.push(BOLD_ON),
+                Tag::Strikethrough if !in_table_cell => acc.push(STRIKE_ON),
                 Tag::CodeBlock(kind) => {
                     flush_text(&acc, Color::White, max_width, &mut lists, &mut result);
                     acc.clear();
@@ -496,21 +515,18 @@ pub(crate) fn markdown_with_code_state(
                     table_cell.clear();
                     in_table_cell = true;
                 }
-                Tag::Link {
-                    link_type: _,
-                    dest_url,
-                    title: _,
-                    id: _,
-                }
-                | Tag::Image {
-                    link_type: _,
-                    dest_url,
-                    title: _,
-                    id: _,
-                } => {
+                Tag::Link { dest_url, .. } => {
                     link_url.clear();
                     link_url.push_str(&dest_url);
-                    link_start = acc.len();
+                    if !in_table_cell {
+                        acc.push(LINK_ON);
+                        in_link = true;
+                        para_link = true;
+                    }
+                }
+                Tag::Image { dest_url, .. } => {
+                    link_url.clear();
+                    link_url.push_str(&dest_url);
                 }
                 _ => {}
             },
@@ -518,20 +534,30 @@ pub(crate) fn markdown_with_code_state(
                 TagEnd::Paragraph => {
                     let color = if in_blockquote {
                         Color::DarkGrey
-                    } else if lists.frames.is_empty() && link_span == Some((0, acc.len())) {
+                    } else if lists.frames.is_empty() && para_link && !para_other {
                         Color::DarkCyan
                     } else {
                         Color::White
                     };
-                    link_span = None;
+                    para_link = false;
+                    para_other = false;
                     flush_text(&acc, color, max_width, &mut lists, &mut result);
                     acc.clear();
                     flush_links(&mut pending_links, max_width, &mut result);
                 }
                 TagEnd::Heading(_) => {
+                    match heading_level.take() {
+                        Some(pulldown_cmark::HeadingLevel::H1) => {
+                            acc.push(UNDER_OFF);
+                            acc.push(BOLD_OFF);
+                        }
+                        Some(pulldown_cmark::HeadingLevel::H2) => acc.push(BOLD_OFF),
+                        _ => acc.push(ITAL_OFF),
+                    }
                     flush_acc(&acc, Color::Cyan, max_width, &mut result);
                     acc.clear();
-                    link_span = None;
+                    para_link = false;
+                    para_other = false;
                     flush_links(&mut pending_links, max_width, &mut result);
                     in_heading = false;
                     result.push(LineEntry {
@@ -629,7 +655,8 @@ pub(crate) fn markdown_with_code_state(
                     };
                     flush_text(&acc, color, max_width, &mut lists, &mut result);
                     acc.clear();
-                    link_span = None;
+                    para_link = false;
+                    para_other = false;
                     flush_links(&mut pending_links, max_width, &mut result);
                     lists.marker = None;
                 }
@@ -641,14 +668,20 @@ pub(crate) fn markdown_with_code_state(
                         result.push(blank_row(Color::White));
                     }
                 }
+                TagEnd::Emphasis if !in_table_cell => acc.push(ITAL_OFF),
+                TagEnd::Strong if !in_table_cell => acc.push(BOLD_OFF),
+                TagEnd::Strikethrough if !in_table_cell => acc.push(STRIKE_OFF),
                 TagEnd::Link | TagEnd::Image => {
+                    if in_link && matches!(tag_end, TagEnd::Link) {
+                        acc.push(LINK_OFF);
+                        in_link = false;
+                    }
                     if !link_url.is_empty() {
                         if in_table_cell {
                             table_cell.push_str(" (");
                             table_cell.push_str(&link_url);
                             table_cell.push(')');
                         } else {
-                            link_span = Some((link_start, acc.len()));
                             pending_links.push(link_url.clone());
                         }
                     }
@@ -692,10 +725,22 @@ pub(crate) fn markdown_with_code_state(
                 if in_table_cell {
                     table_cell.push_str(&t);
                 } else {
-                    acc.push_str(&t);
+                    if !in_link {
+                        para_other = true;
+                    }
+                    // Layout marks are private to this module: never let
+                    // model text forge one.
+                    if t.chars().any(is_mark) {
+                        acc.extend(t.chars().filter(|c| !is_mark(*c)));
+                    } else {
+                        acc.push_str(&t);
+                    }
                 }
             }
             Event::Code(t) => {
+                if !in_link {
+                    para_other = true;
+                }
                 let target = if in_table_cell {
                     &mut table_cell
                 } else {
@@ -774,9 +819,94 @@ pub(crate) fn markdown_with_code_state(
         flush_acc(&acc, color, max_width, &mut result);
     }
 
+    apply_marks(&mut result, palette);
     StyledMarkdown {
         lines: result,
         code_state: last_code_state,
+    }
+}
+
+// Zero-width layout marks carried inside `acc` through wrapping, then turned
+// into attribute spans by `apply_marks`. They are zero columns wide, so
+// wrapping measures the visible text only.
+const BOLD_ON: char = '\u{2061}';
+const BOLD_OFF: char = '\u{2062}';
+const ITAL_ON: char = '\u{2063}';
+const ITAL_OFF: char = '\u{2064}';
+const STRIKE_ON: char = '\u{206A}';
+const STRIKE_OFF: char = '\u{206B}';
+const LINK_ON: char = '\u{206C}';
+const LINK_OFF: char = '\u{206D}';
+const UNDER_ON: char = '\u{206E}';
+const UNDER_OFF: char = '\u{206F}';
+
+fn is_mark(c: char) -> bool {
+    matches!(c, '\u{2061}'..='\u{2064}' | '\u{206A}'..='\u{206F}')
+}
+
+/// Replace layout marks in `rows` with attribute spans (bold, italic,
+/// strikethrough, underline and link colour), carrying the open state across
+/// wrapped rows.
+fn apply_marks(rows: &mut [LineEntry], palette: super::feed::ForegroundPalette) {
+    use super::highlight::{ATTR_BOLD, ATTR_ITALIC, ATTR_STRIKE, ATTR_UNDERLINE, TokenSpan};
+    // bold, italic, strike, underline, link
+    let mut open = [0i32; 5];
+    for row in rows {
+        let active = open.iter().any(|count| *count > 0);
+        if !active && (!row.text.bytes().any(|b| b == 0xE2) || !row.text.chars().any(is_mark)) {
+            continue;
+        }
+        let state = |open: &[i32; 5]| {
+            let mut attrs = 0u8;
+            for (count, bit) in open[..4]
+                .iter()
+                .zip([ATTR_BOLD, ATTR_ITALIC, ATTR_STRIKE, ATTR_UNDERLINE])
+            {
+                if *count > 0 {
+                    attrs |= bit;
+                }
+            }
+            (attrs, open[4] > 0)
+        };
+        let mut clean = String::with_capacity(row.text.len());
+        let mut spans: Vec<TokenSpan> = Vec::new();
+        let mut seg_start = 0;
+        let mut current = state(&open);
+        let close = |spans: &mut Vec<TokenSpan>, start: usize, end: usize, cur: (u8, bool)| {
+            if (cur.0 != 0 || cur.1) && end > start {
+                spans.push(TokenSpan {
+                    range: start..end,
+                    color: if cur.1 { palette.link } else { Color::Reset },
+                    attrs: cur.0,
+                });
+            }
+        };
+        for c in row.text.chars() {
+            if is_mark(c) {
+                close(&mut spans, seg_start, clean.len(), current);
+                match c {
+                    BOLD_ON => open[0] += 1,
+                    BOLD_OFF => open[0] = (open[0] - 1).max(0),
+                    ITAL_ON => open[1] += 1,
+                    ITAL_OFF => open[1] = (open[1] - 1).max(0),
+                    STRIKE_ON => open[2] += 1,
+                    STRIKE_OFF => open[2] = (open[2] - 1).max(0),
+                    UNDER_ON => open[3] += 1,
+                    UNDER_OFF => open[3] = (open[3] - 1).max(0),
+                    LINK_ON => open[4] += 1,
+                    _ => open[4] = (open[4] - 1).max(0),
+                }
+                seg_start = clean.len();
+                current = state(&open);
+            } else {
+                clean.push(c);
+            }
+        }
+        close(&mut spans, seg_start, clean.len(), current);
+        row.text = CompactString::from(clean);
+        if row.syntax_spans.is_none() && !spans.is_empty() {
+            row.syntax_spans = Some(spans.into());
+        }
     }
 }
 

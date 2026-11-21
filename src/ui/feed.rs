@@ -181,7 +181,12 @@ pub struct Block {
 struct Fold {
     alternate: String,
     expanded: bool,
+    /// Whether the collapsed form's summary line carries [`FOLD_HINT`].
+    hinted: bool,
 }
+
+/// Appended to the newest folded tool-result summary only.
+const FOLD_HINT: &str = " (Ctrl+T)";
 
 /// Per-block state only agent (markdown) layouts use.
 #[derive(Clone, Debug, Default)]
@@ -348,6 +353,7 @@ impl Block {
         block.fold = Some(Box::new(Fold {
             alternate,
             expanded: start_expanded,
+            hinted: false,
         }));
         block
     }
@@ -355,6 +361,36 @@ impl Block {
     /// Bytes retained by the block, both forms of a foldable block included.
     fn retained_bytes(&self) -> usize {
         self.text.len() + self.fold.as_ref().map_or(0, |fold| fold.alternate.len())
+    }
+
+    /// Add or remove the [`FOLD_HINT`] on the collapsed form's summary line.
+    fn set_hint(&mut self, on: bool) {
+        let Some(fold) = self.fold.as_mut() else {
+            return;
+        };
+        if fold.hinted == on {
+            return;
+        }
+        let expanded = fold.expanded;
+        let collapsed = if expanded {
+            &mut fold.alternate
+        } else {
+            &mut self.text
+        };
+        let end = collapsed.find('\n').unwrap_or(collapsed.len());
+        if on {
+            collapsed.insert_str(end, FOLD_HINT);
+        } else if collapsed[..end].ends_with(FOLD_HINT) {
+            collapsed.replace_range(end - FOLD_HINT.len()..end, "");
+        }
+        fold.hinted = on;
+        if !expanded {
+            self.revision = self.revision.wrapping_add(1);
+            *self.plain_cache.borrow_mut() = None;
+            self.clear_md_cache();
+            self.clear_syntax_cache();
+            *self.render_cache.borrow_mut() = None;
+        }
     }
 
     /// Swap a foldable block to `expanded`. Returns whether it changed.
@@ -835,6 +871,70 @@ impl Feed {
             .iter()
             .filter(|block| block.fold.is_some())
             .count()
+    }
+
+    /// Show the Ctrl+T hint on the newest foldable block only.
+    pub fn refresh_fold_hint(&mut self) {
+        let latest = self.nth_fold_index(1);
+        let mut touched = None;
+        for (index, block) in self.blocks.iter_mut().enumerate() {
+            if block.fold.is_none() {
+                continue;
+            }
+            let was = block.fold.as_ref().is_some_and(|fold| fold.hinted);
+            let want = Some(index) == latest;
+            if was != want {
+                block.set_hint(want);
+                touched = Some(touched.map_or(index, |first: usize| first.min(index)));
+            }
+        }
+        if let Some(index) = touched {
+            self.touch(index);
+        }
+    }
+
+    /// Row spans `(block index, first row, row count)` of every block at `width`.
+    fn block_row_spans(&self, width: usize) -> Vec<(usize, usize, usize)> {
+        let mut row = if self.pruned_blocks > 0 {
+            self.omitted_header_lines(width).len()
+        } else {
+            0
+        };
+        let mut spans = Vec::with_capacity(self.blocks.len());
+        for (index, block) in self.blocks.iter().enumerate() {
+            let len = block_segments(self, block, width)
+                .iter()
+                .map(|segment| segment.len())
+                .sum::<usize>();
+            spans.push((index, row, len));
+            row += len;
+        }
+        spans
+    }
+
+    /// The block containing laid-out row `line` and the row's offset inside it.
+    pub fn block_containing_line(&self, width: usize, line: usize) -> Option<(usize, usize)> {
+        self.block_row_spans(width)
+            .into_iter()
+            .find(|&(_, start, len)| line >= start && line < start + len)
+            .map(|(index, start, _)| (index, line - start))
+    }
+
+    /// First row and row count of block `index` at `width`.
+    pub fn block_span(&self, width: usize, index: usize) -> Option<(usize, usize)> {
+        self.block_row_spans(width)
+            .into_iter()
+            .find(|&(i, _, _)| i == index)
+            .map(|(_, start, len)| (start, len))
+    }
+
+    /// Summary rows of the foldable blocks, oldest first.
+    pub fn fold_summary_lines(&self, width: usize) -> Vec<usize> {
+        self.block_row_spans(width)
+            .into_iter()
+            .filter(|&(index, _, _)| self.blocks[index].fold.is_some())
+            .map(|(_, start, _)| start)
+            .collect()
     }
 
     /// Index of the `nth` most recent foldable block (1 = latest).

@@ -636,6 +636,70 @@ mod dirty {
         assert_eq!(r.selected_text().as_deref(), Some(words.trim_end()));
     }
 
+    fn scrolled_renderer_with_fold() -> (Renderer, usize) {
+        let mut r = Renderer::new().unwrap();
+        for i in 0..40 {
+            r.feed_mut().push_line(BlockStyle::Plain, format!("p{i}"));
+        }
+        let expanded = (0..30).map(|i| format!("e{i}")).collect::<Vec<_>>().join("\n");
+        r.feed_mut().place_block_after_anchor("", crate::ui::feed::Block::foldable(
+            BlockStyle::ToolResult,
+            "summary",
+            expanded,
+            false,
+        ));
+        for i in 0..40 {
+            r.feed_mut().push_line(BlockStyle::Plain, format!("q{i}"));
+        }
+        let summary = 40;
+        let visible = r.visible_lines() as u16;
+        for _ in 0..200 {
+            if (0..visible).any(|row| r.buffer_line_at_row(row) == Some(summary)) {
+                break;
+            }
+            r.scroll_line_up();
+        }
+        (r, summary)
+    }
+
+    #[test]
+    fn unfolding_while_scrolled_keeps_the_clicked_summary_under_the_pointer() {
+        let (mut r, summary) = scrolled_renderer_with_fold();
+        let visible = r.visible_lines() as u16;
+        let row = (0..visible)
+            .find(|row| r.buffer_line_at_row(*row) == Some(summary))
+            .unwrap();
+        assert_eq!(r.toggle_tool_output_at_line(summary), Some(true));
+        assert_eq!(r.buffer_line_at_row(row), Some(summary));
+        assert_eq!(r.toggle_tool_output_at_line(summary), Some(false));
+        assert_eq!(r.buffer_line_at_row(row), Some(summary));
+        // `/expand` keeps the viewport too.
+        assert_eq!(r.set_tool_output_fold(1, Some(true)), Some(true));
+        assert_eq!(r.buffer_line_at_row(row), Some(summary));
+    }
+
+    #[test]
+    fn ctrl_t_prefers_a_result_in_view_and_only_the_newest_shows_the_hint() {
+        let (mut r, summary) = scrolled_renderer_with_fold();
+        for _ in 0..3 {
+            r.scroll_line_up();
+        }
+        assert_eq!(r.ctrl_t_fold_target(), 1);
+        // A newer result below the viewport: Ctrl+T still picks the visible one.
+        r.feed_mut().place_block_after_anchor("", crate::ui::feed::Block::foldable(
+            BlockStyle::ToolResult,
+            "newer",
+            "x\ny",
+            false,
+        ));
+        assert_eq!(r.ctrl_t_fold_target(), 2);
+        r.feed_mut().refresh_fold_hint();
+        let w = r.line_width();
+        let lines = r.feed().lines(w);
+        assert!(!lines[summary].text.contains("(Ctrl+T)"));
+        assert!(lines[lines.len() - 1].text.contains("(Ctrl+T)"));
+    }
+
     #[test]
     fn trailing_punctuation_is_not_part_of_a_url() {
         use crate::ui::renderer::trim_url;

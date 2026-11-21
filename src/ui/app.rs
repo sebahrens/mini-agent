@@ -868,6 +868,31 @@ pub(crate) fn clipboard_shortcut(
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Links `App::open_link` was asked to open in tests (nothing is spawned).
+    static OPENED_LINKS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl App<'_> {
+    /// Open `url` in the browser without blocking the event loop.
+    fn open_link(&self, url: String) {
+        #[cfg(test)]
+        {
+            OPENED_LINKS.with(|opened| opened.borrow_mut().push(url));
+        }
+        #[cfg(not(test))]
+        {
+            let tx = self.user_tx.clone();
+            tokio::spawn(async move {
+                if let Err(error) = renderer_mod::open_url(&url).await {
+                    let _ = tx.send(UserEvent::LinkOpenFailed(error.to_string())).await;
+                }
+            });
+        }
+    }
+}
+
 /// Whether releasing the left button should copy the transcript selection.
 /// Only a real drag copies; a plain click (no movement, one line) does not.
 fn mouse_up_copies<P: PartialEq>(dragged: bool, start: Option<P>, end: Option<P>) -> bool {
@@ -1770,6 +1795,69 @@ mod startup_work_tests {
 mod reasoning_display_tests {
     use super::*;
     use crate::config::ReasoningDisplay;
+
+    #[tokio::test]
+    async fn a_url_opens_on_a_plain_click_release_and_never_on_a_drag() {
+        let root = crate::tests::OwnedTestDirectory::new("link-click-controls");
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            ("MINI_AGENT_CONFIG_DIR", Some(root.path().join("config").into_os_string())),
+            ("MINI_AGENT_DATA_DIR", Some(root.path().join("data").into_os_string())),
+            ("MINI_AGENT_STATE_DIR", Some(root.path().join("state").into_os_string())),
+            ("MINI_AGENT_CACHE_DIR", Some(root.path().join("cache").into_os_string())),
+        ]);
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let cfg = crate::config::Config::default();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session =
+            crate::session::Session::new("openrouter", "unused-test-model", 128_000, "");
+        let client = crate::provider::create_client(
+            "openrouter",
+            Some("unused-test-key"),
+            cfg.custom_providers_map(),
+            cfg.api_keys.as_ref(),
+        )
+        .unwrap();
+        let ui = UiContext::new(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+            client,
+            None,
+            None,
+            crate::sandbox::Sandbox::new(false, "none"),
+            None,
+        );
+        let mut app = test_support::fixture_app(ui);
+        app.renderer
+            .feed_mut()
+            .push_line(crate::ui::feed::BlockStyle::Plain, "see https://example.com/x ok");
+        let row = (0..app.renderer.visible_lines() as u16)
+            .find(|row| app.renderer.buffer_line_at_row(*row) == Some(0))
+            .unwrap();
+        let col = 8u16;
+        let opened = || OPENED_LINKS.with(|o| o.borrow().len());
+        let before = opened();
+        let _ = app.handle_user_event(UserEvent::MouseDown { row, col }).await.unwrap();
+        assert_eq!(opened(), before, "button-down alone opens nothing");
+        let _ = app.handle_user_event(UserEvent::MouseUp { row, col }).await.unwrap();
+        assert_eq!(opened(), before + 1);
+        // A drag across the URL selects and never opens.
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        let _ = app.handle_user_event(UserEvent::MouseDown { row, col: 6 }).await.unwrap();
+        assert!(app.renderer.selection_active);
+        let _ = app.handle_user_event(UserEvent::MouseDrag { row, col: 14 }).await.unwrap();
+        let _ = app.handle_user_event(UserEvent::MouseUp { row, col: 14 }).await.unwrap();
+        assert_eq!(opened(), before + 1, "a drag over a URL selects, never opens");
+        OPENED_LINKS.with(|o| assert_eq!(o.borrow().last().unwrap(), "https://example.com/x"));
+    }
 
     #[tokio::test]
     async fn actual_reasoning_controls_preserve_the_turn_and_persist_every_cycle() {
@@ -3838,13 +3926,7 @@ impl<'a> App<'a> {
                         if let Some(url) = url {
                             self.renderer
                                 .show_notice(&format!("opening {url}"), C_AGENT);
-                            let tx = self.user_tx.clone();
-                            tokio::spawn(async move {
-                                if let Err(error) = renderer_mod::open_url(&url).await {
-                                    let _ =
-                                        tx.send(UserEvent::LinkOpenFailed(error.to_string())).await;
-                                }
-                            });
+                            self.open_link(url);
                         } else if let Some(line) = clicked {
                             self.renderer.toggle_tool_output_at_line(line);
                         }
@@ -4277,7 +4359,10 @@ impl<'a> App<'a> {
 
         // Ctrl+T is unbound by default; a user binding for it wins.
         if action.is_none() && is_tool_output_key(key) {
-            if self.renderer.set_tool_output_fold(1, None).is_none() {
+            if self
+                .renderer
+                .set_tool_output_fold(self.renderer.ctrl_t_fold_target(), None)
+                .is_none() {
                 self.renderer
                     .show_notice("no tool output to expand yet", Color::DarkGrey);
             }
