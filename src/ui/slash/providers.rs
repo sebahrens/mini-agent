@@ -184,7 +184,8 @@ struct CachedListing {
 static MODEL_CACHE: LazyLock<Mutex<HashMap<ListingKey, CachedListing>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static MODEL_CACHE_GENERATION: AtomicU64 = AtomicU64::new(0);
-static LISTING_FAILURES: LazyLock<Mutex<HashMap<ListingKey, Instant>>> =
+/// Last listing failure per route: when, and its (secret-free) message.
+static LISTING_FAILURES: LazyLock<Mutex<HashMap<ListingKey, (Instant, String)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static WARMING: LazyLock<Mutex<HashSet<ListingKey>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 static TICKETS: LazyLock<Mutex<HashMap<ListingKey, u64>>> =
@@ -241,7 +242,14 @@ fn recently_failed(key: &ListingKey, now: Instant) -> bool {
         .lock()
         .unwrap()
         .get(key)
-        .is_some_and(|failed| now.saturating_duration_since(*failed) < LISTING_FAILURE_TTL)
+        .is_some_and(|(failed, _)| now.saturating_duration_since(*failed) < LISTING_FAILURE_TTL)
+}
+fn last_failure_message(key: &ListingKey) -> Option<String> {
+    LISTING_FAILURES
+        .lock()
+        .unwrap()
+        .get(key)
+        .map(|(_, message)| message.clone())
 }
 fn cached_or_baked(provider: &str, is_custom: bool, key: &ListingKey) -> Option<Arc<[ModelEntry]>> {
     if let Some(hit) = MODEL_CACHE.lock().unwrap().get(key) {
@@ -282,7 +290,10 @@ pub(crate) async fn fetch_models_cached(
             return Ok(hit);
         }
         if recently_failed(&key, Instant::now()) {
-            anyhow::bail!("model listing failed recently; run /models refresh to retry");
+            let cause = last_failure_message(&key)
+                .map(|message| format!(" ({message})"))
+                .unwrap_or_default();
+            anyhow::bail!("model listing failed recently{cause}; run /models refresh to retry");
         }
     }
     fetch_and_cache(provider, client, key).await
@@ -327,12 +338,12 @@ async fn fetch_and_cache(
         Ok(models)
     }
     .await;
-    if result.is_err() {
+    if let Err(error) = &result {
         // A stale failure cannot suppress the latest successful route revision.
         if TICKETS.lock().unwrap().get(&key) == Some(&ticket) {
             let mut failures = LISTING_FAILURES.lock().unwrap();
             failures.retain(|key, _| key.is_live());
-            failures.insert(key, Instant::now());
+            failures.insert(key, (Instant::now(), error.to_string()));
         }
     }
     result
@@ -943,7 +954,7 @@ async fn handle_models(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
             } else if is_custom {
                 write_result(
                     ctx.renderer,
-                    "  (live model list unavailable; type the model id directly)",
+                    format!("  (live model list unavailable: {e}; type the model id directly)"),
                 );
             }
         }
@@ -1284,7 +1295,7 @@ mod model_cache_tests {
         LISTING_FAILURES
             .lock()
             .unwrap()
-            .insert(key.clone(), Instant::now());
+            .insert(key.clone(), (Instant::now(), "test".into()));
         warm_model_cache(&provider, true, &client);
         assert!(!WARMING.lock().unwrap().contains(&key));
         let native = AnyClient::Anthropic(

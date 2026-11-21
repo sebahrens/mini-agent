@@ -48,6 +48,31 @@ pub(crate) struct SaveNoticeState {
     pending: Vec<String>,
 }
 
+/// A decode failure that keeps the serde location and, for a missing or
+/// unknown field, the field name; never any file content (a type error's
+/// message can quote a value, so it is reduced to its position).
+fn decode_failure(error: serde_json::Error) -> anyhow::Error {
+    let message = error.to_string();
+    let field = ["unknown field `", "missing field `"]
+        .iter()
+        .find_map(|prefix| {
+            let rest = message.strip_prefix(prefix)?;
+            let name = rest.split('`').next()?;
+            let kind = if prefix.starts_with("unknown") {
+                "unknown"
+            } else {
+                "missing"
+            };
+            (name.len() <= 64).then(|| format!(", {kind} field `{name}`"))
+        })
+        .unwrap_or_default();
+    anyhow::anyhow!(
+        "invalid persisted session JSON (line {}, column {}{field})",
+        error.line(),
+        error.column()
+    )
+}
+
 /// Decode only bounded data. Provider/workspace compatibility and fresh runtime
 /// grants belong to the host's import controller, never saved labels.
 pub(crate) fn decode_session_json(json: &str) -> anyhow::Result<Session> {
@@ -55,8 +80,7 @@ pub(crate) fn decode_session_json(json: &str) -> anyhow::Result<Session> {
         json.len() <= MAX_SESSION_BYTES,
         "persisted session exceeds the byte limit"
     );
-    let session: Session = serde_json::from_str(json)
-        .map_err(|_| anyhow::anyhow!("invalid persisted session JSON"))?;
+    let session: Session = serde_json::from_str(json).map_err(decode_failure)?;
     anyhow::ensure!(
         session.messages.len() <= MAX_SESSION_MESSAGES,
         "persisted session exceeds the message limit"
@@ -409,15 +433,31 @@ pub(crate) fn save_session_recovering(
 /// removing undo would invalidate their canonical replay/publication digest.
 pub(crate) fn prepare_save_recovering(
     session: &mut Session,
+    notice: impl FnMut(&str),
+) -> anyhow::Result<PreparedSave> {
+    prepare_save_recovering_with(session, notice, true)
+}
+
+/// `measure_native` encodes a native session once just to learn its size. The
+/// deferred turn-end path passes false: the writer thread encodes the session
+/// anyway and the last sealed encoding's size is already in
+/// `save_notice_state.encoded_bytes`, so the UI task skips a whole-session
+/// encode (mini-agent-sskdu.4).
+fn prepare_save_recovering_with(
+    session: &mut Session,
     mut notice: impl FnMut(&str),
+    measure_native: bool,
 ) -> anyhow::Result<PreparedSave> {
     report_pending_save_notices(session, &mut notice);
     let native = super::native_publication::is_native_bearing(session);
+    let last_native_size = session.save_notice_state.encoded_bytes;
     let prepare = |session: &Session| -> anyhow::Result<(PreparedSave, Option<usize>)> {
         // Native publication uses canonical bytes; ordinary files use their
         // compact storage representation. Never change either digest domain.
-        let native_size = if native {
+        let native_size = if native && measure_native {
             Some(serialize_bounded_session(session)?.len())
+        } else if native {
+            last_native_size
         } else {
             None
         };
@@ -489,7 +529,7 @@ pub(crate) fn save_session_deferred_recovering(
     let Some(runtime) = deferred::runtime() else {
         return save_session_recovering(session, notice);
     };
-    let prepared = prepare_save_recovering(session, &mut notice)?;
+    let prepared = prepare_save_recovering_with(session, &mut notice, false)?;
     let result = match prepared {
         PreparedSave::Legacy { id, json } => {
             deferred::queue(&runtime, &id, deferred::Snapshot::Legacy(json.into_bytes()))
@@ -1174,6 +1214,21 @@ const MAX_DISCOVERY_DIAGNOSTICS: usize = 5;
 struct SkippedEntries {
     reported: usize,
     total: usize,
+    first: Vec<SkippedSession>,
+}
+
+/// One session file that discovery could not use: its id (file stem) and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedSession {
+    pub id: String,
+    pub reason: String,
+}
+
+/// The unusable files a discovery call passed over, newest first.
+#[derive(Debug, Default, Clone)]
+pub struct DiscoverySkips {
+    pub total: usize,
+    pub first: Vec<SkippedSession>,
 }
 
 impl SkippedEntries {
@@ -1182,6 +1237,21 @@ impl SkippedEntries {
         if self.reported < MAX_DISCOVERY_DIAGNOSTICS {
             self.reported += 1;
             tracing::warn!("session discovery skipped {}: {}", path.display(), error);
+            self.first.push(SkippedSession {
+                id: path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("?")
+                    .to_owned(),
+                reason: error.to_string(),
+            });
+        }
+    }
+
+    fn report(&self) -> DiscoverySkips {
+        DiscoverySkips {
+            total: self.total,
+            first: self.first.clone(),
         }
     }
 
@@ -1269,11 +1339,19 @@ fn peek_session_name(path: &Path) -> Option<String> {
 }
 
 pub fn find_sessions_by_prefix(prefix: &str) -> anyhow::Result<Vec<Session>> {
+    find_sessions_by_prefix_reporting(prefix).map(|(sessions, _)| sessions)
+}
+
+/// [`find_sessions_by_prefix`] plus the files it could not read, so a caller
+/// can say why a session that exists on disk was not found.
+pub fn find_sessions_by_prefix_reporting(
+    prefix: &str,
+) -> anyhow::Result<(Vec<Session>, DiscoverySkips)> {
     if disabled("sessions") {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), DiscoverySkips::default()));
     }
     let Some(dir) = existing_session_dir()? else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), DiscoverySkips::default()));
     };
     let lower = prefix.to_lowercase();
     let mut sessions: Vec<Session> = Vec::new();
@@ -1314,7 +1392,7 @@ pub fn find_sessions_by_prefix(prefix: &str) -> anyhow::Result<Vec<Session>> {
         prefix,
         sessions.len(),
     );
-    Ok(sessions)
+    Ok((sessions, skipped.report()))
 }
 
 /// Load one private session by its complete portable identifier. This exact
@@ -1477,10 +1555,21 @@ pub fn find_recent_sessions(limit: usize) -> anyhow::Result<Vec<Session>> {
 /// Files are visited newest first, and only a file whose `working_dir`
 /// matches is fully decoded, so `--continue` stops at the first match instead
 /// of deserializing every saved session (mini-agent-5s9me).
+#[cfg(test)]
 pub fn find_recent_sessions_for_workspace(
     limit: usize,
     workspace: &Path,
 ) -> anyhow::Result<Vec<Session>> {
+    find_recent_sessions_for_workspace_reporting(limit, workspace).map(|(found, _)| found)
+}
+
+/// [`find_recent_sessions_for_workspace`] plus the files passed over. Because
+/// files are visited newest first, every reported skip is newer than the
+/// sessions returned.
+pub fn find_recent_sessions_for_workspace_reporting(
+    limit: usize,
+    workspace: &Path,
+) -> anyhow::Result<(Vec<Session>, DiscoverySkips)> {
     #[derive(serde::Deserialize)]
     struct WorkspacePeek {
         #[serde(default)]
@@ -1490,10 +1579,10 @@ pub fn find_recent_sessions_for_workspace(
     let workspace = std::fs::canonicalize(workspace)?;
     let mut matches = Vec::new();
     if limit == 0 || disabled("sessions") {
-        return Ok(matches);
+        return Ok((matches, DiscoverySkips::default()));
     }
     let Some(dir) = existing_session_dir()? else {
-        return Ok(matches);
+        return Ok((matches, DiscoverySkips::default()));
     };
     let mut skipped = SkippedEntries::default();
     let mut canonical_matches = std::collections::HashMap::<String, bool>::new();
@@ -1562,7 +1651,7 @@ pub fn find_recent_sessions_for_workspace(
         }
     }
     skipped.finish("workspace sessions");
-    Ok(matches)
+    Ok((matches, skipped.report()))
 }
 
 pub fn agents_path() -> PathBuf {
@@ -1822,12 +1911,15 @@ mod readonly_import_tests {
                 .to_string()
                 .contains("byte limit")
         );
-        assert_eq!(
-            decode_session_json("{\"messages\": [\"opaque-secret\"]}")
-                .unwrap_err()
-                .to_string(),
-            "invalid persisted session JSON"
+        // Position only (mini-agent-sskdu.5): never any file content.
+        let decode_error = decode_session_json("{\"messages\": [\"opaque-secret\"]}")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            decode_error.starts_with("invalid persisted session JSON (line 1, column"),
+            "{decode_error}"
         );
+        assert!(!decode_error.contains("opaque-secret"));
         invalid_projection.id = session.id.clone();
         assert!(save_session(&invalid_projection).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), previous);

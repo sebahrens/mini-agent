@@ -146,6 +146,7 @@ impl AnyClient {
         let mut used = 0_usize;
         let mut entries = 0_usize;
         let mut all = Vec::new();
+        let mut skipped = 0_usize;
         for _ in 0..MAX_PAGES {
             let (request, backend) = self.listing_request(&path(protocol, cursor.as_deref()))?;
             let body = backend
@@ -165,11 +166,20 @@ impl AnyClient {
             entries = entries.saturating_add(array.len());
             anyhow::ensure!(entries <= MAX_ENTRIES, "model listing entry limit exceeded");
             for value in array {
-                if let Some(model) = decode(protocol, value)? {
-                    anyhow::ensure!(ids.insert(model.id.clone()), "duplicate model listing id");
-                    if crate::provider::is_agent_model(&model) {
-                        all.push(model);
+                // One odd row (empty name, repeated id) must not discard the
+                // whole list; a malformed envelope above still fails hard.
+                match decode(protocol, value) {
+                    Ok(Some(model)) => {
+                        if !ids.insert(model.id.clone()) {
+                            skipped = skipped.saturating_add(1);
+                            continue;
+                        }
+                        if crate::provider::is_agent_model(&model) {
+                            all.push(model);
+                        }
                     }
+                    Ok(None) => {}
+                    Err(_) => skipped = skipped.saturating_add(1),
                 }
             }
             anyhow::ensure!(
@@ -178,7 +188,14 @@ impl AnyClient {
             );
             cursor = next_cursor(protocol, &value)?;
             match &cursor {
-                None => return Ok(all),
+                None => {
+                    if skipped > 0 {
+                        tracing::warn!(
+                            "model listing skipped {skipped} undecodable or duplicate entries"
+                        );
+                    }
+                    return Ok(all);
+                }
                 Some(cursor) => anyhow::ensure!(
                     cursors.insert(cursor.clone()),
                     "model listing cursor repeated"
@@ -340,6 +357,22 @@ fn decode(protocol: Protocol, value: &Value) -> anyhow::Result<Option<ModelEntry
         };
         model.input_price = rate("prompt");
         model.output_price = rate("completion");
+        // Typed output modalities decide chat versus image/audio models; ids
+        // are only a fallback for listings that carry no such field.
+        if let Some(modalities) = value
+            .get("architecture")
+            .and_then(|a| a.get("output_modalities"))
+            .and_then(Value::as_array)
+        {
+            let names: Vec<&str> = modalities.iter().filter_map(Value::as_str).collect();
+            if !names.is_empty() {
+                model.kind = Some(if names.contains(&"text") {
+                    "text".into()
+                } else {
+                    names.join(",")
+                });
+            }
+        }
     }
     Ok(Some(model))
 }
@@ -391,5 +424,42 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(free.input_price.zip(free.output_price), Some((0.0, 0.0)));
+    }
+
+    #[test]
+    fn openrouter_output_modalities_decide_chat_versus_image_models() {
+        let image = decode(
+            Protocol::OpenRouter,
+            &serde_json::json!({"id":"vendor/pixel-preview","architecture":{"output_modalities":["image"]}}),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!crate::provider::is_agent_model(&image));
+        let chat = decode(
+            Protocol::OpenRouter,
+            &serde_json::json!({"id":"vendor/veo-chat","architecture":{"output_modalities":["text","image"]}}),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            crate::provider::is_agent_model(&chat),
+            "typed text output wins over the id deny-list"
+        );
+    }
+
+    #[test]
+    fn listing_failure_messages_are_closed_and_actionable() {
+        assert!(
+            crate::provider_http::listing_status_message(401).contains("API key"),
+            "401 hints at the key"
+        );
+        assert!(
+            crate::provider_http::listing_transport_message("dns error: failed to lookup")
+                .contains("resolved")
+        );
+        assert!(
+            crate::provider_http::listing_transport_message("invalid peer certificate")
+                .contains("TLS")
+        );
     }
 }

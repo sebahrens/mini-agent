@@ -118,11 +118,13 @@ impl ProviderHttpClient {
     pub(crate) fn is_chatgpt(&self) -> bool {
         self.0.chatgpt.is_some()
     }
+    /// The service label of a private-auth backend whose error bodies are never
+    /// echoed (see `private_error_text`).
     fn private_error_message(&self) -> Option<&'static str> {
         if self.is_chatgpt() {
-            Some("ChatGPT request was rejected; check your account access and plan limits")
+            Some("ChatGPT")
         } else if self.0.copilot.is_some() {
-            Some("Copilot request was rejected; check your account access and plan limits")
+            Some("Copilot")
         } else {
             None
         }
@@ -270,16 +272,16 @@ impl ProviderHttpClient {
             request.method() == http::Method::GET,
             "invalid model listing request"
         );
+        // Same path as completions, so command-issued credentials are renewed
+        // after a 401 here too.
         let mut response = self
-            .prepare_request(request.map(Bytes::from))
-            .await?
-            .send()
+            .send_with_credentials(request.map(Bytes::from))
             .await
-            .map_err(|_| anyhow::anyhow!("model listing transport failed"))?;
+            .map_err(|error| anyhow::anyhow!(listing_transport_message(&error.to_string())))?;
         anyhow::ensure!(
             response.status().is_success(),
-            "model listing HTTP status {}",
-            response.status().as_u16()
+            "{}",
+            listing_status_message(response.status().as_u16())
         );
         anyhow::ensure!(
             response.content_length().is_none_or(|n| n <= limit as u64),
@@ -302,6 +304,33 @@ impl ProviderHttpClient {
         } else {
             Ok(body)
         }
+    }
+}
+
+/// A closed, secret-free description of a listing transport failure, so DNS,
+/// TLS, refusal and timeout are distinguishable.
+pub(crate) fn listing_transport_message(error: &str) -> &'static str {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("dns") || lower.contains("lookup") || lower.contains("resolve") {
+        "model listing failed: host name could not be resolved (check base_url)"
+    } else if lower.contains("certificate") || lower.contains("tls") || lower.contains("ssl") {
+        "model listing failed: TLS handshake or certificate error"
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        "model listing failed: request timed out"
+    } else if lower.contains("refused") || lower.contains("connect") {
+        "model listing failed: connection refused or unreachable (check base_url)"
+    } else {
+        "model listing transport failed"
+    }
+}
+
+pub(crate) fn listing_status_message(status: u16) -> String {
+    match status {
+        401 | 403 => format!("model listing HTTP status {status} (check the API key)"),
+        404 => format!(
+            "model listing HTTP status {status} (this endpoint has no model list; check base_url)"
+        ),
+        _ => format!("model listing HTTP status {status}"),
     }
 }
 
@@ -393,14 +422,70 @@ async fn read_error_body(mut response: reqwest::Response) -> String {
     text
 }
 
+/// Closed set of provider error codes that may be lifted out of a private-auth
+/// error body. Only these literals ever reach the message, never body text.
+const PRIVATE_ERROR_CODES: [&str; 4] = [
+    "model_max_prompt_tokens_exceeded",
+    "usage_limit_reached",
+    "context_length_exceeded",
+    "rate_limit_exceeded",
+];
+
+/// Bytes and time spent looking for a code in a private-auth error body.
+const PRIVATE_ERROR_PEEK_BYTES: usize = 16 * 1024;
+const PRIVATE_ERROR_PEEK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(750);
+
+fn closed_error_code(body: &[u8]) -> Option<&'static str> {
+    let lower = String::from_utf8_lossy(body).to_ascii_lowercase();
+    PRIVATE_ERROR_CODES
+        .into_iter()
+        .find(|code| lower.contains(code))
+}
+
+/// Reads a bounded, time-limited prefix of the body and returns only a code
+/// from the closed set; the response is dropped (retired) afterwards.
+async fn peek_private_error_code(mut response: reqwest::Response) -> Option<&'static str> {
+    let read = async {
+        let mut body = Vec::new();
+        while body.len() < PRIVATE_ERROR_PEEK_BYTES {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    let room = PRIVATE_ERROR_PEEK_BYTES - body.len();
+                    body.extend_from_slice(&chunk[..chunk.len().min(room)]);
+                }
+                _ => break,
+            }
+        }
+        body
+    };
+    let body = tokio::time::timeout(PRIVATE_ERROR_PEEK_TIMEOUT, read)
+        .await
+        .unwrap_or_default();
+    closed_error_code(&body)
+}
+
+/// The no-echo message for a private-auth failure, derived from the status and
+/// at most one closed-set error code. 5xx and 429 are not blamed on the account.
+fn private_error_text(label: &str, status: http::StatusCode, code: Option<&str>) -> String {
+    if let Some(code) = code {
+        return format!("{label} request was rejected: {code}");
+    }
+    match status.as_u16() {
+        429 => format!("{label} rate limit reached; the service asked to slow down"),
+        500..=599 => format!("{label} service error (HTTP {})", status.as_u16()),
+        _ => format!("{label} request was rejected; check your account access and plan limits"),
+    }
+}
+
 async fn response_error(
     response: reqwest::Response,
     private_auth: Option<&'static str>,
 ) -> http_client::Error {
     let status = response.status();
     let hint_headers = retry_hint_headers(response.headers());
-    let body = if let Some(message) = private_auth {
-        message.to_owned()
+    let body = if let Some(label) = private_auth {
+        let code = peek_private_error_code(response).await;
+        private_error_text(label, status, code)
     } else {
         read_error_body(response).await
     };
@@ -574,6 +659,29 @@ pub(crate) mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+
+    #[test]
+    fn private_error_text_lifts_only_closed_codes_and_blames_the_right_cause() {
+        let code = closed_error_code(
+            br#"{"error":{"code":"model_max_prompt_tokens_exceeded","message":"secret echo"}}"#,
+        );
+        let overflow = private_error_text("Copilot", http::StatusCode::BAD_REQUEST, code);
+        assert!(crate::retry::is_context_length_error_message(&overflow));
+        assert!(!overflow.contains("secret echo"));
+
+        let code = closed_error_code(b"{\"type\":\"usage_limit_reached\"}");
+        let quota = private_error_text("ChatGPT", http::StatusCode::TOO_MANY_REQUESTS, code);
+        let error = http_client::Error::InvalidStatusCodeWithMessage(
+            http::StatusCode::TOO_MANY_REQUESTS,
+            quota,
+        );
+        assert!(!crate::retry::is_retryable(&error));
+
+        let unavailable =
+            private_error_text("Copilot", http::StatusCode::SERVICE_UNAVAILABLE, None);
+        assert!(!unavailable.contains("account access"), "{unavailable}");
+        assert!(closed_error_code(b"free text only").is_none());
+    }
 
     async fn read_request(socket: &mut TcpStream) -> String {
         read_request_parts(socket).await.0
