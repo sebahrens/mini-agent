@@ -568,6 +568,92 @@ pub fn project_slug(path: &Path) -> String {
     crate::paths::opaque_name("memory-project", &[encoding, identity.as_slice()])
 }
 
+/// The path whose bytes identify the project: the main worktree of the Git
+/// repository containing `workspace`, so linked worktrees and subdirectories
+/// of one repository share their project memory. Outside a repository, or when
+/// the Git metadata cannot be read, the workspace path itself. Only small
+/// pointer files are read; no Git process runs.
+pub fn repository_identity_root(workspace: &Path) -> PathBuf {
+    for dir in workspace.ancestors() {
+        let dot_git = dir.join(".git");
+        let Ok(metadata) = fs::symlink_metadata(&dot_git) else {
+            continue;
+        };
+        if metadata.is_dir() {
+            return dir.to_path_buf();
+        }
+        if !metadata.is_file() {
+            return workspace.to_path_buf();
+        }
+        let git_dir = read_git_pointer(&dot_git, Some("gitdir:")).map(|target| dir.join(target));
+        let Some(git_dir) = git_dir else {
+            return workspace.to_path_buf();
+        };
+        let common = read_git_pointer(&git_dir.join("commondir"), None)
+            .map(|target| git_dir.join(target))
+            .unwrap_or(git_dir);
+        let mut lexical = PathBuf::new();
+        for component in common.components() {
+            match component {
+                std::path::Component::ParentDir => {
+                    lexical.pop();
+                }
+                std::path::Component::CurDir => {}
+                other => lexical.push(other),
+            }
+        }
+        let common = lexical;
+        // `<main>/.git` is the common directory of a normal repository; a bare
+        // repository is its own identity.
+        return match (common.file_name(), common.parent()) {
+            (Some(name), Some(parent)) if name == ".git" => parent.to_path_buf(),
+            _ => common,
+        };
+    }
+    workspace.to_path_buf()
+}
+
+fn read_git_pointer(path: &Path, prefix: Option<&str>) -> Option<PathBuf> {
+    use std::io::Read;
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let mut contents = String::new();
+    fs::File::open(path)
+        .ok()?
+        .take(4096)
+        .read_to_string(&mut contents)
+        .ok()?;
+    let line = contents.lines().next()?;
+    let value = match prefix {
+        Some(prefix) => line.strip_prefix(prefix)?.trim(),
+        None => line.trim(),
+    };
+    (!value.is_empty()).then(|| PathBuf::from(value))
+}
+
+/// One project directory under the memory store, as `/memory projects` lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectInfo {
+    pub slug: String,
+    /// Workspace path recorded the last time notes were written, if any.
+    pub path: Option<String>,
+    pub name: Option<String>,
+    /// This process's project.
+    pub current: bool,
+    /// The recorded path still exists on disk.
+    pub path_exists: bool,
+}
+
+fn is_project_slug(slug: &str) -> bool {
+    !slug.is_empty()
+        && slug.len() <= 128
+        && slug
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 #[cfg(unix)]
 fn project_path_identity(path: &Path) -> (&'static [u8], Vec<u8>) {
     use std::os::unix::ffi::OsStrExt;
@@ -670,7 +756,7 @@ impl Mem {
             .as_deref()
             .and_then(Path::parent)
             .expect("startup workspace must have a project path");
-        let project = project_slug(project_root);
+        let project = project_slug(&repository_identity_root(project_root));
         let today = jiff::ZonedDateTime::now().strftime("%Y-%m-%d").to_string();
         tracing::debug!("memory open: root={}, project={}", root.display(), project);
         Mem {
@@ -678,6 +764,116 @@ impl Mem {
             project,
             today,
         }
+    }
+
+    fn project_marker(&self) -> PathBuf {
+        self.project_dir().join("project.json")
+    }
+
+    /// Records which workspace this project's notes belong to (best effort), so
+    /// `/memory projects` can name them and `/memory adopt` can re-attach them
+    /// after the checkout moved. Only the current process's own project is
+    /// described.
+    fn write_project_marker(&self) {
+        let Ok(paths) = crate::paths::process_paths_ref() else {
+            return;
+        };
+        let Some(workspace) = paths.project_dir.as_deref().and_then(Path::parent) else {
+            return;
+        };
+        let identity = repository_identity_root(workspace);
+        if project_slug(&identity) != self.project {
+            return;
+        }
+        let marker = serde_json::json!({
+            "slug": self.project,
+            "path": workspace.display().to_string(),
+            "repository": identity.display().to_string(),
+            "name": identity.file_name().map(|name| name.to_string_lossy().into_owned()),
+        });
+        let Ok(text) = serde_json::to_string_pretty(&marker) else {
+            return;
+        };
+        let path = self.project_marker();
+        if fs::read_to_string(&path).is_ok_and(|current| current == text) {
+            return;
+        }
+        let _ = atomic_write(&path, &text);
+    }
+
+    /// Every project directory in the store, newest-named first by slug order.
+    pub fn list_projects(&self) -> Vec<ProjectInfo> {
+        let Ok(entries) = fs::read_dir(self.root.join("projects")) else {
+            return Vec::new();
+        };
+        let mut projects = Vec::new();
+        for entry in entries.flatten() {
+            let Some(slug) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if !entry.path().is_dir() || !is_project_slug(&slug) {
+                continue;
+            }
+            let marker = fs::read_to_string(entry.path().join("project.json"))
+                .ok()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+            let field = |key: &str| {
+                marker
+                    .as_ref()
+                    .and_then(|value| value.get(key))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
+            };
+            let path = field("repository").or_else(|| field("path"));
+            projects.push(ProjectInfo {
+                current: slug == self.project,
+                path_exists: path.as_deref().is_some_and(|path| Path::new(path).exists()),
+                name: field("name"),
+                path,
+                slug,
+            });
+        }
+        projects.sort_by(|a, b| a.slug.cmp(&b.slug));
+        projects
+    }
+
+    /// Moves another project's notes (scratchpad, daily logs, notes) into this
+    /// project, for a checkout that was moved or renamed. Refused when this
+    /// project already holds notes, so nothing is ever merged or overwritten.
+    pub fn adopt_project(&self, from: &str) -> std::io::Result<String> {
+        let invalid = |message: &str| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, message.to_owned())
+        };
+        if !is_project_slug(from) {
+            return Err(invalid("invalid project name"));
+        }
+        if from == self.project {
+            return Err(invalid("that is already the current project"));
+        }
+        let _store_lock = self.lock_store()?;
+        let source = self.root.join("projects").join(from);
+        if !fs::symlink_metadata(&source).is_ok_and(|m| m.is_dir()) {
+            return Err(invalid("no such project (see /memory projects)"));
+        }
+        let destination = self.project_dir();
+        if let Ok(entries) = fs::read_dir(&destination) {
+            let occupied = entries
+                .flatten()
+                .any(|entry| entry.file_name() != "project.json");
+            if occupied {
+                return Err(invalid(
+                    "the current project already has notes; adopting would overwrite or merge them",
+                ));
+            }
+            fs::remove_dir_all(&destination)?;
+        }
+        fs::create_dir_all(self.root.join("projects"))?;
+        fs::rename(&source, &destination)?;
+        self.write_project_marker();
+        Ok(format!(
+            "adopted project {from} into the current project ({})",
+            self.project
+        ))
     }
 
     pub(crate) fn memory_md(&self) -> PathBuf {
@@ -987,6 +1183,9 @@ continue with offset={end}, or tail=true for the newest entries]",
         };
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
+        }
+        if !matches!(target, WriteTarget::LongTerm) {
+            self.write_project_marker();
         }
         // Message state: `appended_len` is the byte count reported as written
         // (content bytes for overwrite, surviving bytes for a deduped append);
@@ -2529,5 +2728,80 @@ mod cache_placement_tests {
             effective_session_reserve(100, Some("raw memory 雪"), &session),
             effective_reserve(100, Some("raw memory 雪"))
         );
+    }
+}
+
+#[cfg(test)]
+mod repository_identity_tests {
+    use super::*;
+
+    /// mini-agent-nvnkx.53: linked worktrees and subdirectories share the main
+    /// checkout's project; a moved checkout's notes can be adopted.
+    #[test]
+    fn nvnkx53_linked_worktrees_share_the_main_checkout_project() {
+        let root = crate::tests::OwnedTestDirectory::new("nvnkx53-identity");
+        let main = root.path().join("main");
+        let linked = root.path().join("linked");
+        let admin = main.join(".git").join("worktrees").join("linked");
+        fs::create_dir_all(&admin).unwrap();
+        fs::create_dir_all(main.join("pkg/sub")).unwrap();
+        fs::create_dir_all(&linked).unwrap();
+        fs::write(
+            linked.join(".git"),
+            format!("gitdir: {}\n", admin.display()),
+        )
+        .unwrap();
+        fs::write(admin.join("commondir"), "../..\n").unwrap();
+        let expected = project_slug(&main);
+        assert_eq!(repository_identity_root(&main), main);
+        assert_eq!(
+            project_slug(&repository_identity_root(&main.join("pkg/sub"))),
+            expected
+        );
+        let resolved = repository_identity_root(&linked);
+        assert_eq!(
+            fs::canonicalize(&resolved).unwrap(),
+            fs::canonicalize(&main).unwrap()
+        );
+        // Outside any repository the workspace path is the identity.
+        let plain = root.path().join("plain");
+        fs::create_dir_all(&plain).unwrap();
+        assert_eq!(repository_identity_root(&plain), plain);
+    }
+
+    #[test]
+    fn nvnkx53_projects_are_listed_and_adopted_after_a_move() {
+        let root = crate::tests::OwnedTestDirectory::new("nvnkx53-adopt");
+        let store = root.path().join("memory");
+        let old = "a".repeat(64);
+        let new = "b".repeat(64);
+        let mem = Mem {
+            root: store.clone(),
+            project: new.clone(),
+            today: "2026-01-01".into(),
+        };
+        let old_dir = store.join("projects").join(&old);
+        fs::create_dir_all(&old_dir).unwrap();
+        fs::write(old_dir.join("SCRATCHPAD.md"), "- [ ] carry on\n").unwrap();
+        fs::write(
+            old_dir.join("project.json"),
+            r#"{"slug":"x","repository":"/definitely/not/here","name":"proj"}"#,
+        )
+        .unwrap();
+        let projects = mem.list_projects();
+        assert_eq!(projects.len(), 1);
+        assert!(!projects[0].path_exists && !projects[0].current);
+        assert_eq!(projects[0].name.as_deref(), Some("proj"));
+        assert!(mem.adopt_project("../escape").is_err());
+        assert!(mem.adopt_project(&new).is_err());
+        mem.adopt_project(&old).unwrap();
+        assert_eq!(
+            fs::read_to_string(mem.scratchpad()).unwrap(),
+            "- [ ] carry on\n"
+        );
+        assert!(!old_dir.exists());
+        // A second adoption would merge into existing notes: refused.
+        fs::create_dir_all(store.join("projects").join(&old)).unwrap();
+        assert!(mem.adopt_project(&old).is_err());
     }
 }

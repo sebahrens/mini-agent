@@ -321,7 +321,9 @@ pub(crate) fn argument_picker_spec(
         "/editsys" => Some((&["similarity", "hashedit"], "/editsys ")),
         "/toggle" => Some((&["todo on", "todo off"], "/toggle ")),
         "/memory" => Some((
-            &["status", "search", "read", "write", "editor", "clear"],
+            &[
+                "status", "search", "read", "write", "editor", "clear", "projects", "adopt",
+            ],
             "/memory ",
         )),
         "/init" => Some((&["force"], "/init ")),
