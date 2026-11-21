@@ -945,6 +945,7 @@ fn shared_compaction_commit_drains_only_the_summarized_prefix() {
 /// Cut invariants for every compaction gate: whatever the keep-recent budget,
 /// a cut never lands inside a parallel tool batch (between a call and any of
 /// its results) and never splits a result from the assistant turn before it.
+#[cfg(feature = "acp")]
 #[test]
 fn compaction_cut_never_splits_a_parallel_tool_batch() {
     let mut session = Session::new("openai", "gpt-4", 128_000, "");
