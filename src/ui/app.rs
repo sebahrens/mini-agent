@@ -1254,7 +1254,7 @@ impl<'a> App<'a> {
         }
 
         if auto_trigger_msg.is_some() {
-            ui.join_native_startup().await?;
+            ui.join_native_startup(&mut run).await?;
         }
         if let Some(ref trigger_msg) = auto_trigger_msg {
             echo_submission(&mut renderer, trigger_msg)?;
@@ -1424,7 +1424,7 @@ impl<'a> App<'a> {
         #[cfg(not(feature = "hooks"))]
         let session_start_task: Option<SessionStartTask> = None;
         if session_start_task.is_none() {
-            ui.join_native_startup().await?;
+            ui.join_native_startup(&mut run).await?;
         }
 
         let (btw_tx, btw_rx) = mpsc::channel::<BtwEvent>(32);
@@ -1523,7 +1523,7 @@ impl<'a> App<'a> {
             let result = task.await;
             self.adopt_session_start_result(result)?;
         }
-        self.ui.join_native_startup().await
+        self.ui.join_native_startup(&mut self.run).await
     }
 
     fn adopt_session_start_result(
@@ -1607,6 +1607,10 @@ impl<'a> App<'a> {
 
     #[cfg(feature = "hooks")]
     pub(super) async fn finish_session_end(&mut self) -> anyhow::Result<()> {
+        // A session switch leaves the previous session's owner behind.
+        if let Err(error) = super::rebind_native_session(&mut self.run, &mut self.ui).await {
+            tracing::warn!("native session owner could not be rebound at exit: {error:#}");
+        }
         if let Some(owner) = self.run.native_session_end.take() {
             owner.run(self.ui.session).await
         } else if !self.ui.cli.no_session
@@ -1635,6 +1639,10 @@ impl<'a> App<'a> {
 
     #[cfg(all(feature = "subagents", not(feature = "hooks")))]
     pub(super) async fn finish_session_end(&mut self) -> anyhow::Result<()> {
+        // A session switch leaves the previous session's owner behind.
+        if let Err(error) = super::rebind_native_session(&mut self.run, &mut self.ui).await {
+            tracing::warn!("native session owner could not be rebound at exit: {error:#}");
+        }
         if let Some(owner) = self.run.native_session_end.take() {
             owner.run(self.ui.session).await
         } else {
@@ -1806,7 +1814,7 @@ impl<'a> App<'a> {
                 Some(result) = async { Some(self.session_start_task.as_mut()?.await) } => {
                     self.session_start_task = None;
                     self.adopt_session_start_result(result)?;
-                    self.ui.join_native_startup().await?;
+                    self.ui.join_native_startup(&mut self.run).await?;
                     self.refresh()?;
                 }
                 Some(refresh) = self.git_status_rx.recv() => {

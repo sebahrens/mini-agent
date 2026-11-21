@@ -8844,6 +8844,19 @@ pub(crate) struct NativeSessionEndOwner {
     host: Option<NativeHostGuard>,
 }
 impl NativeSessionEndOwner {
+    /// An idle session's owner: its startup (or fork, or session switch) was
+    /// retired to a healthy checkpoint without any model work. There is no host
+    /// guard to revalidate until a turn binds one.
+    pub(crate) fn from_idle(
+        permit: crate::session::native_publication::RetiredSessionEndPermit,
+    ) -> Self {
+        Self { permit, host: None }
+    }
+    /// Whether this owner belongs to `session`'s own writer lease, not to a
+    /// session that was left behind by a switch.
+    pub(crate) fn belongs_to(&self, session: &crate::session::Session) -> bool {
+        self.permit.belongs_to(session)
+    }
     #[cfg(test)]
     pub(crate) fn fail_next_control_publication(&mut self) {
         self.permit.fail_next_control_publication();

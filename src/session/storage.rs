@@ -440,6 +440,12 @@ pub(crate) fn adopt_native_encoding(session: &mut Session, encoding: SaveEncodin
     session.save_notice_state.pending.extend(pending);
 }
 
+/// Queue a one-line notice the next save report shows (a native chain restart
+/// that happened inside a save or a turn start).
+pub(crate) fn queue_session_notice(session: &mut Session, notice: &str) {
+    session.save_notice_state.pending.push(notice.to_owned());
+}
+
 pub(crate) fn queue_native_save_failure(session: &mut Session, error: &anyhow::Error) {
     let mut pending = Vec::new();
     report_save_failure(session, error, |notice| pending.push(notice.to_owned()));
@@ -485,6 +491,27 @@ fn prepare_save_recovering_with(
 ) -> anyhow::Result<PreparedSave> {
     report_pending_save_notices(session, &mut notice);
     flush_precompact(session, &mut notice);
+    // An idle native session whose metadata changed after its last publication
+    // (title, name, permissions, schedules, usage charges) or whose failed
+    // publication left no live actor is republished as a new revision under
+    // its own owner. The strict digest check below would otherwise refuse
+    // every later save and turn until a restart (mini-agent-nvnkx.262/.266).
+    if super::native_publication::idle_republish_needed(session) {
+        deferred::supersede(&session.id);
+        match super::native_publication::republish_idle_sync(session) {
+            Ok(cause) => {
+                if let Some(cause) = cause {
+                    notice(cause.notice());
+                }
+                report_pending_save_notices(session, &mut notice);
+                return Ok(PreparedSave::Published);
+            }
+            Err(error) => {
+                report_save_failure(session, &error, notice);
+                return Err(error);
+            }
+        }
+    }
     let native = super::native_publication::is_native_bearing(session);
     let last_native_size = session.save_notice_state.encoded_bytes;
     let prepare = |session: &Session| -> anyhow::Result<(PreparedSave, Option<usize>)> {
@@ -501,7 +528,7 @@ fn prepare_save_recovering_with(
         let size = match &prepared {
             PreparedSave::Legacy { json, .. } => Some(json.len()),
             PreparedSave::Native(_) => native_size,
-            PreparedSave::Disabled { .. } => None,
+            PreparedSave::Disabled { .. } | PreparedSave::Published => None,
         };
         Ok((prepared, size))
     };
@@ -578,7 +605,7 @@ pub(crate) fn save_session_deferred_recovering(
                 deferred::Snapshot::Native(snapshot),
             )
         }
-        disabled @ PreparedSave::Disabled { .. } => disabled.commit(),
+        done @ (PreparedSave::Disabled { .. } | PreparedSave::Published) => done.commit(),
     };
     result?;
     report_save_success(session, notice);
@@ -591,8 +618,15 @@ pub(crate) fn save_session_deferred_recovering(
 /// `Session`, so it keeps an owned clone (mini-agent-twon3).
 pub(crate) enum PreparedSave {
     Native(Box<Session>),
-    Legacy { id: String, json: String },
-    Disabled { id: String },
+    Legacy {
+        id: String,
+        json: String,
+    },
+    Disabled {
+        id: String,
+    },
+    /// An idle republish already wrote the session; nothing is left to commit.
+    Published,
 }
 
 /// Validate and capture `session` without the optional-state recovery in
@@ -634,6 +668,7 @@ impl PreparedSave {
                 deferred::supersede(&id);
                 Ok(())
             }
+            Self::Published => Ok(()),
         }
     }
 }

@@ -281,6 +281,16 @@ impl NativeWriterLease {
             && self.frontier.identity().matches(&session.native_frontier)
     }
 
+    /// Live writer guards (tickets, actor pairs, cleanup owners). Zero means no
+    /// actor can still publish through this lease.
+    pub(super) fn live_writers(&self) -> usize {
+        self.held
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .publishers
+    }
+
     pub(super) fn begin_write(&self) -> anyhow::Result<NativeWriterGuard> {
         self.held.validate_namespace()?;
         let mut state = self

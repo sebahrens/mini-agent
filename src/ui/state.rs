@@ -73,9 +73,34 @@ impl<'a> UiContext<'a> {
     }
 
     /// App calls this after awaiting the exact configured SessionStart task.
-    pub(crate) async fn join_native_startup(&mut self) -> anyhow::Result<()> {
+    ///
+    /// Nothing has asked the model anything yet, so the idle startup ticket is
+    /// retired back to a healthy checkpoint at once: the session then idles
+    /// exactly like one between two turns (an owner that can republish title,
+    /// name, permission and effort changes, and no in-flight file when the user
+    /// quits before the first prompt). A failed write leaves the publication
+    /// failed; the next save or prompt recovers it from the transcript.
+    pub(crate) async fn join_native_startup(
+        &mut self,
+        run: &mut AgentRunState,
+    ) -> anyhow::Result<()> {
         if let Some(owner) = self.native_startup.take() {
-            self.native_ticket = Some(owner.into_model_ticket(self.session).await?);
+            let ticket = owner.into_model_ticket(self.session).await?;
+            if self.cli.no_session {
+                self.native_ticket = Some(ticket);
+                return Ok(());
+            }
+            match crate::session::native_publication::retire_idle_startup(self.session, ticket)
+                .await
+            {
+                Ok(permit) => {
+                    run.native_session_end =
+                        Some(crate::provider::NativeSessionEndOwner::from_idle(permit));
+                }
+                Err(error) => {
+                    tracing::warn!("idle native startup could not be published: {error:#}");
+                }
+            }
         }
         Ok(())
     }

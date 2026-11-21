@@ -23,6 +23,11 @@ struct PublicationState {
     revision: u64,
     digest: [u8; 32],
     phase: Phase,
+    /// Generation of the actor authority (a ticket or a retired-session permit).
+    /// It advances when an actor begins or retires, never for an idle republish
+    /// of metadata under the same owner, so a permit survives a title, a
+    /// `/rename` or a permission save while a stale one still cannot act.
+    authority: u64,
 }
 
 /// This cell belongs to the existing frontier, not a path or id registry.
@@ -34,7 +39,7 @@ pub(super) struct PublicationCell {
 }
 
 impl PublicationCell {
-    fn is_claimed(&self) -> bool {
+    pub(super) fn is_claimed(&self) -> bool {
         self.state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -72,6 +77,8 @@ pub(crate) struct NativePublicationTicket {
     writer: super::lock::NativeWriterGuard,
     paired: bool,
     actor_pair: Option<std::sync::Weak<ActorPairInner>>,
+    /// An idle control republish: it leaves the permit generation unchanged.
+    idle: bool,
     #[cfg(test)]
     fail_final_before_replace: bool,
 }
@@ -306,21 +313,39 @@ impl NativeStartupPublication {
     /// such a session resumes instead of being refused; the one-line notice
     /// goes to stderr.
     pub(crate) async fn begin(session: &mut Session) -> anyhow::Result<Self> {
+        let (startup, cause) = Self::begin_with_cause(session).await?;
+        if let Some(cause) = cause {
+            eprintln!("{}", cause.notice());
+        }
+        Ok(startup)
+    }
+
+    /// [`begin`](Self::begin) for a caller that must not write to stderr (a
+    /// running TUI): the restart notice is returned instead.
+    pub(crate) async fn begin_with_cause(
+        session: &mut Session,
+    ) -> anyhow::Result<(Self, Option<super::native_replay::NativeRestartCause>)> {
         let scope = crate::agent::runner::AgentWorkScope::new();
         let cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(Arc::clone(&scope));
-        let restart = session.native_restart_cause();
-        if restart.is_some() {
+        let unfinished = session.native_unfinished_cause();
+        let restart = session.native_restart_cause().or(unfinished);
+        if unfinished.is_some() {
+            // A fresh process that claims the session's lock below is proof the
+            // writer that left the in-flight denial is gone. If the claim fails
+            // (another live process), startup aborts before anything persists.
+            session.restart_unfinished_native_chain()?;
+        } else if restart.is_some() {
             session.restart_native_chain()?;
         }
         let ticket = begin_owned_with(session, &scope, restart.is_some()).await?;
-        if let Some(cause) = restart {
-            eprintln!("{}", cause.notice());
-        }
-        Ok(Self {
-            scope,
-            cleanup: Some(cleanup),
-            ticket: Some(ticket),
-        })
+        Ok((
+            Self {
+                scope,
+                cleanup: Some(cleanup),
+                ticket: Some(ticket),
+            },
+            restart,
+        ))
     }
 
     /// Construct the hook task while this exact scope is installed. Its whole
@@ -656,6 +681,7 @@ fn write_encoded_projection(session: &Session, json: &str) -> anyhow::Result<()>
 fn begin_blocking(
     mut snapshot: Session,
     restarted: bool,
+    idle: bool,
 ) -> anyhow::Result<(NativePublication, NativePublicationTicket)> {
     anyhow::ensure!(
         snapshot.native_frontier.ready(),
@@ -690,6 +716,19 @@ fn begin_blocking(
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         match &snapshot.native_publication {
+            // A failed publication leaves no live actor once every writer guard
+            // is gone. The exact lease holder may then start a new epoch from
+            // the transcript; the failed value is never replayed.
+            Some(previous)
+                if restarted
+                    && state.phase == Phase::Failed
+                    && previous.owner.lease.live_writers() == 0 =>
+            {
+                anyhow::ensure!(
+                    Arc::ptr_eq(&previous.owner, &owner),
+                    "unfinished native context belongs to another session owner"
+                );
+            }
             Some(previous) => {
                 validate_revision(previous, &state)?;
                 anyhow::ensure!(
@@ -705,6 +744,9 @@ fn begin_blocking(
         state.revision = state.revision.checked_add(1).ok_or(RestartReason::Limit)?;
         state.digest = current_digest;
         state.phase = Phase::Staging;
+        if !idle {
+            state.authority = state.authority.wrapping_add(1);
+        }
         NativePublication {
             owner: Arc::clone(&owner),
             revision: state.revision,
@@ -744,6 +786,7 @@ fn begin_blocking(
             writer,
             paired: false,
             actor_pair: None,
+            idle,
             #[cfg(test)]
             fail_final_before_replace: false,
         },
@@ -759,16 +802,60 @@ pub(crate) async fn begin_owned(
     begin_owned_with(session, scope, false).await
 }
 
+/// [`begin_owned`] for a frontend that has no idle owner of its own (ACP): a
+/// chain that cannot be replayed, or a failed publication, is dropped and a
+/// new epoch starts from the transcript, as the TUI and headless frontends
+/// do. Returns the restart cause for the user-facing notice.
+pub(crate) async fn begin_owned_reconciled(
+    session: &mut Session,
+    scope: &Arc<crate::agent::runner::AgentWorkScope>,
+) -> anyhow::Result<(
+    NativePublicationTicket,
+    Option<super::native_replay::NativeRestartCause>,
+)> {
+    let unfinished = session.native_unfinished_cause();
+    let failed = session.native_publication.as_ref().is_some_and(|p| {
+        p.owner
+            .cell
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .phase
+            == Phase::Failed
+            && p.owner.lease.live_writers() == 0
+    });
+    let cause = session
+        .native_restart_cause()
+        .or(unfinished)
+        .or_else(|| failed.then_some(super::native_replay::NativeRestartCause::WriteFailed));
+    if unfinished.is_some() {
+        session.restart_unfinished_native_chain()?;
+    } else if cause.is_some() {
+        session.restart_native_chain()?;
+    }
+    let ticket = begin_owned_with(session, scope, cause.is_some()).await?;
+    Ok((ticket, cause))
+}
+
 async fn begin_owned_with(
     session: &mut Session,
     scope: &Arc<crate::agent::runner::AgentWorkScope>,
     restarted: bool,
 ) -> anyhow::Result<NativePublicationTicket> {
+    if !restarted && idle_republish_needed(session) {
+        // Idle metadata changed since the last publication; publish it as its
+        // own revision instead of refusing the turn.
+        if let Some(cause) = republish_idle_sync(session)? {
+            super::storage::queue_session_notice(session, cause.notice());
+        }
+    }
     let snapshot = session.clone();
     let (publication, ticket) = scope
         .run(async move {
-            crate::agent::runner::spawn_blocking_scoped(move || begin_blocking(snapshot, restarted))
-                .await
+            crate::agent::runner::spawn_blocking_scoped(move || {
+                begin_blocking(snapshot, restarted, false)
+            })
+            .await
         })
         .await
         .map_err(anyhow::Error::from)
@@ -777,6 +864,176 @@ async fn begin_owned_with(
     super::storage::adopt_native_encoding(session, publication.encoding);
     session.native_publication = Some(publication);
     Ok(ticket)
+}
+
+/// The retirement outcome that matches a session's saved replay boundary: a
+/// chain-less transcript and a completed turn are `Completed`.
+fn boundary_outcome(session: &Session) -> anyhow::Result<RetiredNativeOutcome> {
+    Ok(match session.native_history_snapshot() {
+        Some(history) => match history.saved_boundary()? {
+            super::native_replay::ReplayBoundary::CompletedTurn => RetiredNativeOutcome::Completed,
+            super::native_replay::ReplayBoundary::LiveToolReply => {
+                RetiredNativeOutcome::LiveToolReply
+            }
+        },
+        None => RetiredNativeOutcome::Completed,
+    })
+}
+
+/// Retire the idle startup ticket of an interactive session back to a healthy
+/// checkpoint. No model request was admitted, so nothing is unfinished: the
+/// resumed (or restarted-from-transcript) value is published as it stands and
+/// the session is then an ordinary idle native session. This is what keeps a
+/// quit before the first prompt from leaving an in-flight file behind.
+pub(crate) async fn retire_idle_startup(
+    session: &mut Session,
+    ticket: NativePublicationTicket,
+) -> anyhow::Result<RetiredSessionEndPermit> {
+    anyhow::ensure!(
+        !ticket.paired,
+        "native context retirement requires the idle startup owner"
+    );
+    ensure_actor_value(session, &ticket)?;
+    let outcome = boundary_outcome(session)?;
+    let scope = crate::agent::runner::AgentWorkScope::new();
+    let cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(scope.clone());
+    let result = retire_owned(session, ticket, outcome, &scope).await;
+    cleanup.settle().await;
+    result?;
+    RetiredSessionEndPermit::from_idle_retirement(session)
+}
+
+/// Open native ownership of a new or freshly loaded idle session and publish it
+/// as a healthy checkpoint at once (no model work is involved): a forked
+/// session, or one entered through `/sessions`. A chain the transcript no
+/// longer matches is dropped as the startup path does. Returns the restart
+/// cause when it was.
+pub(crate) async fn publish_new_session(
+    session: &mut Session,
+) -> anyhow::Result<Option<super::native_replay::NativeRestartCause>> {
+    let (startup, cause) = NativeStartupPublication::begin_with_cause(session).await?;
+    let ticket = startup.into_model_ticket(session).await?;
+    retire_idle_startup(session, ticket).await?;
+    Ok(cause)
+}
+
+/// Whether this session is currently idle under a retired native publication
+/// whose owner is this process, so a [`RetiredSessionEndPermit`] can be minted.
+pub(crate) fn idle_permit(session: &Session) -> anyhow::Result<RetiredSessionEndPermit> {
+    RetiredSessionEndPermit::from_idle_retirement(session)
+}
+
+/// Republish an idle session that changed after its last publication, or whose
+/// failed publication left no live actor. `(false, None)` when nothing was
+/// needed; otherwise whether a republish ran and the restart cause when the
+/// chain was dropped.
+pub(crate) fn recover_idle(
+    session: &mut Session,
+) -> anyhow::Result<(bool, Option<super::native_replay::NativeRestartCause>)> {
+    if !idle_republish_needed(session) {
+        return Ok((false, None));
+    }
+    Ok((true, republish_idle_sync(session)?))
+}
+
+impl NativePublicationTicket {
+    /// Whether this ticket belongs to the session's own writer lease, not to a
+    /// session that was left behind by a switch.
+    pub(crate) fn belongs_to(&self, session: &Session) -> bool {
+        self.publication.owner.lease.matches(session)
+    }
+}
+
+impl RetiredSessionEndPermit {
+    pub(crate) fn belongs_to(&self, session: &Session) -> bool {
+        self.publication.owner.lease.matches(session)
+    }
+}
+
+/// Whether an idle, native-bearing session needs a new revision before it can
+/// be saved or start a turn: its metadata changed after the last publication
+/// (title, name, permissions, schedules, usage charges), or a failed
+/// publication left no live actor. Anything else (an active turn, a stale clone
+/// or a session this process does not own) is left to the strict paths.
+pub(super) fn idle_republish_needed(session: &Session) -> bool {
+    let Some(publication) = session.native_publication.as_ref() else {
+        return false;
+    };
+    if !publication.owner.lease.matches(session)
+        || !Arc::ptr_eq(
+            &publication.owner.cell,
+            &session.native_frontier.publication_cell(),
+        )
+    {
+        return false;
+    }
+    let (phase, current) = {
+        let state = publication
+            .owner
+            .cell
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        (
+            state.phase,
+            publication.revision == state.revision && publication.digest == state.digest,
+        )
+    };
+    match phase {
+        Phase::Retired => current && digest(session).is_ok_and(|now| now != publication.digest),
+        Phase::Failed => publication.owner.lease.live_writers() == 0,
+        _ => false,
+    }
+}
+
+/// Publish the changed idle `session` as a new revision under its own owner.
+/// A chain the new transcript no longer matches (or one a failed publication
+/// left unreliable) is dropped first and replaced by a new epoch; the previous
+/// value is denied on disk before the healthy payload replaces it, so an
+/// interrupted republish never leaves a stale chain replayable. The actor
+/// authority generation is unchanged. Returns the restart cause when the chain
+/// was dropped.
+pub(super) fn republish_idle_sync(
+    session: &mut Session,
+) -> anyhow::Result<Option<super::native_replay::NativeRestartCause>> {
+    let failed = session.native_publication.as_ref().is_some_and(|p| {
+        p.owner
+            .cell
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .phase
+            == Phase::Failed
+    });
+    let cause = session
+        .native_restart_cause()
+        .or_else(|| failed.then_some(super::native_replay::NativeRestartCause::WriteFailed));
+    if cause.is_some() {
+        session.restart_native_chain()?;
+    }
+    let result = (|| -> anyhow::Result<()> {
+        let (publication, ticket) = begin_blocking(session.clone(), true, true)?;
+        super::storage::adopt_native_encoding(session, publication.encoding);
+        session.native_publication = Some(publication);
+        let outcome = boundary_outcome(session)?;
+        let publication = retire_blocking(session.clone(), ticket, outcome)?;
+        super::storage::adopt_native_encoding(session, publication.encoding);
+        session.native_publication = Some(publication);
+        Ok(())
+    })();
+    if let Err(error) = result {
+        if cause.is_some() {
+            // The in-memory chain is gone but its replacement was not
+            // acknowledged: stay conservative instead of replaying a stale one.
+            let _ = session.native_frontier.refuse_expected(
+                session.native_frontier.current(),
+                RestartReason::IncompleteTurn,
+            );
+        }
+        super::storage::queue_native_save_failure(session, &error);
+        return Err(error);
+    }
+    Ok(cause)
 }
 
 /// Drop the native chain under a retained idle ticket (a startup ticket that
@@ -1161,6 +1418,7 @@ pub(crate) async fn publish_refused_owned(
         state.revision = state.revision.checked_add(1).ok_or(RestartReason::Limit)?;
         state.digest = digest;
         state.phase = Phase::Staging;
+        state.authority = state.authority.wrapping_add(1);
         NativePublication {
             owner: Arc::clone(&owner),
             revision: state.revision,
@@ -1354,6 +1612,9 @@ fn retire_blocking_using(
         state.revision = state.revision.checked_add(1).ok_or(RestartReason::Limit)?;
         state.digest = next_digest;
         state.phase = Phase::Staging;
+        if !ticket.idle {
+            state.authority = state.authority.wrapping_add(1);
+        }
         NativePublication {
             owner: Arc::clone(owner),
             revision: state.revision,
@@ -1461,7 +1722,7 @@ pub(crate) async fn retire_owned(
 /// role can run SessionEnd without inventing another model completion.
 pub(crate) struct RetiredSessionEndPermit {
     publication: NativePublication,
-    epoch: u64,
+    authority: u64,
     outcome: RetiredNativeOutcome,
     #[cfg(test)]
     fail_next_control_publication: bool,
@@ -1504,8 +1765,68 @@ impl RetiredSessionEndPermit {
         actor.session_end_issued = true;
         Ok(Self {
             publication: publication.clone(),
-            epoch: session.native_frontier.current(),
+            authority: state.authority,
             outcome: acknowledged.outcome,
+            #[cfg(test)]
+            fail_next_control_publication: false,
+        })
+    }
+
+    /// The permit's actor authority is still the current one for `publication`
+    /// (the session's own, already digest-checked, publication). An idle
+    /// republish of metadata keeps the generation; any actor begin or
+    /// retirement advances it, so an older permit cannot act.
+    fn verify(&self, publication: &NativePublication) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            Arc::ptr_eq(&publication.owner, &self.publication.owner),
+            "finish or recover the current native context before continuing"
+        );
+        let state = publication
+            .owner
+            .cell
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        anyhow::ensure!(
+            state.authority == self.authority,
+            "finish or recover the current native context before continuing"
+        );
+        validate_revision(publication, &state)
+    }
+
+    /// Adopt the publication this permit's own control just wrote.
+    fn rebind(&mut self, publication: NativePublication) {
+        self.authority = publication
+            .owner
+            .cell
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .authority;
+        self.publication = publication;
+    }
+
+    /// A permit for a session whose idle startup ticket was retired back to a
+    /// healthy checkpoint without any model work (a resumed session, or a
+    /// quit before the first prompt). It carries the same SessionEnd, effort
+    /// and restart authority a retired model actor would.
+    pub(crate) fn from_idle_retirement(session: &Session) -> anyhow::Result<Self> {
+        let publication = checked_retired_publication(session)?;
+        let state = publication
+            .owner
+            .cell
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        validate_revision(publication, &state)?;
+        anyhow::ensure!(
+            state.phase == Phase::Retired,
+            "idle native startup was not retired"
+        );
+        Ok(Self {
+            publication: publication.clone(),
+            authority: state.authority,
+            outcome: boundary_outcome(session)?,
             #[cfg(test)]
             fail_next_control_publication: false,
         })
@@ -1526,15 +1847,12 @@ impl RetiredSessionEndPermit {
         next: crate::provider::effort::SessionReasoning,
     ) -> anyhow::Result<()> {
         let publication = checked_retired_publication(session)?;
+        self.verify(publication)?;
         anyhow::ensure!(
-            Arc::ptr_eq(&publication.owner, &self.publication.owner)
-                && publication.revision == self.publication.revision
-                && publication.digest == self.publication.digest
-                && session.native_frontier.current() == self.epoch
-                && session.native_frontier.ready()
-                && self.outcome == RetiredNativeOutcome::Completed,
+            session.native_frontier.ready() && self.outcome == RetiredNativeOutcome::Completed,
             "finish or recover the current native context before changing effort"
         );
+        let published = publication.clone();
         let history = session
             .native_history_snapshot()
             .ok_or(RestartReason::UnavailableSource)?;
@@ -1562,7 +1880,7 @@ impl RetiredSessionEndPermit {
             let mut check = session.clone();
             check.reasoning_controls = previous;
             anyhow::ensure!(
-                unchanged_retired_body(&check, &self.publication)?,
+                unchanged_retired_body(&check, &published)?,
                 "session context changed while updating effort"
             );
             progress_owned(session, &mut ticket, &scope).await?;
@@ -1589,7 +1907,7 @@ impl RetiredSessionEndPermit {
                 })
                 .await??;
             session.native_publication = Some(publication.clone());
-            self.publication = publication;
+            self.rebind(publication);
             Ok(())
         }
         .await;
@@ -1604,12 +1922,7 @@ impl RetiredSessionEndPermit {
     /// restart never leaves a healthy chain behind.
     pub(crate) async fn restart_chain(&mut self, session: &mut Session) -> anyhow::Result<()> {
         let publication = checked_publication_owner(session)?;
-        anyhow::ensure!(
-            Arc::ptr_eq(&publication.owner, &self.publication.owner)
-                && publication.revision == self.publication.revision
-                && session.native_frontier.current() == self.epoch,
-            "finish or recover the current native context before restarting it"
-        );
+        self.verify(publication)?;
         session.restart_native_chain()?;
         let scope = crate::agent::runner::AgentWorkScope::new();
         let mut cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(scope.clone());
@@ -1629,11 +1942,11 @@ impl RetiredSessionEndPermit {
             );
             return Err(error);
         }
-        self.publication = session
+        let republished = session
             .native_publication
             .clone()
             .ok_or_else(|| anyhow::anyhow!("native restart was not published"))?;
-        self.epoch = session.native_frontier.current();
+        self.rebind(republished);
         self.outcome = RetiredNativeOutcome::Completed;
         Ok(())
     }
@@ -1645,13 +1958,10 @@ impl RetiredSessionEndPermit {
         host: Option<&crate::provider::NativeHostGuard>,
     ) -> anyhow::Result<()> {
         let publication = checked_retired_publication(session)?;
-        anyhow::ensure!(
-            Arc::ptr_eq(&publication.owner, &self.publication.owner)
-                && publication.revision == self.publication.revision
-                && publication.digest == self.publication.digest
-                && session.native_frontier.current() == self.epoch,
-            "session cleanup context changed after its model retired"
-        );
+        self.verify(publication).map_err(|_| {
+            anyhow::anyhow!("session cleanup context changed after its model retired")
+        })?;
+        let baseline = publication.clone();
         {
             let state = publication
                 .owner
@@ -1687,13 +1997,14 @@ impl RetiredSessionEndPermit {
         // The hook scope is closed. Its exact model boundary is unchanged;
         // all final IO is owned separately, just as in model publication.
         let mut ticket = ticket.lock().unwrap_or_else(|e| e.into_inner()).take();
-        let unchanged = unchanged_retired_body(session, &self.publication)?;
+        let unchanged = unchanged_retired_body(session, &baseline)?;
         let valid_host = host.map_or(Ok(()), |host| host.validate());
         if !unchanged || valid_host.is_err() {
             if session.native_frontier.ready() {
-                let _ = session
-                    .native_frontier
-                    .refuse_expected(self.epoch, RestartReason::ChangedPrefix);
+                let _ = session.native_frontier.refuse_expected(
+                    session.native_frontier.current(),
+                    RestartReason::ChangedPrefix,
+                );
             }
             anyhow::bail!(
                 "session context changed during cleanup; start a fresh context to continue"
@@ -3725,6 +4036,200 @@ mod tests {
                 imported(&session).native_frontier.refusal(),
                 Some(RestartReason::InFlight)
             );
+        });
+    }
+
+    /// Opens startup ownership and retires the idle ticket, as the TUI does.
+    async fn idle_owned(session: &mut Session) -> RetiredSessionEndPermit {
+        let owner = NativeStartupPublication::begin(session).await.unwrap();
+        let ticket = owner.into_model_ticket(session).await.unwrap();
+        retire_idle_startup(session, ticket).await.unwrap()
+    }
+
+    #[test]
+    fn idle_startup_retires_to_a_healthy_checkpoint() {
+        let roots = crate::tests::OwnedTestDirectory::new("native-idle-retire");
+        let _environment = environment(&roots);
+        let mut session = Session::new("anthropic", "fixture", 32_000, "");
+        let _release = Release(session.id.to_string());
+        runtime().block_on(async {
+            let _permit = idle_owned(&mut session).await;
+            // Quitting here leaves a healthy file, not an in-flight one.
+            assert_eq!(imported(&session).native_frontier.refusal(), None);
+        });
+    }
+
+    #[test]
+    fn idle_metadata_change_republishes_and_the_next_turn_begins() {
+        // mini-agent-nvnkx.262: an idle title or /rename change must not break
+        // the next save or prompt.
+        let roots = crate::tests::OwnedTestDirectory::new("native-idle-metadata");
+        let _environment = environment(&roots);
+        let mut session = Session::new("anthropic", "fixture", 32_000, "");
+        let _release = Release(session.id.to_string());
+        runtime().block_on(async {
+            let mut permit = idle_owned(&mut session).await;
+            session.generated_title = Some("An idle title".into());
+            session.total_input_tokens += 7;
+            super::super::storage::save_session_recovering(&mut session, |_| {}).unwrap();
+            let saved = imported(&session);
+            assert_eq!(saved.generated_title.as_deref(), Some("An idle title"));
+            assert_eq!(saved.native_frontier.refusal(), None);
+            session.name = "renamed".into();
+            super::super::storage::save_session_recovering(&mut session, |_| {}).unwrap();
+            assert_eq!(imported(&session).name, "renamed");
+            // The retired owner survives idle republication.
+            permit.restart_chain(&mut session).await.unwrap();
+            assert_eq!(imported(&session).native_frontier.refusal(), None);
+            // A change that was never saved is published when the turn begins.
+            session.name = "renamed again".into();
+            let scope = crate::agent::runner::AgentWorkScope::new();
+            let ticket = begin_owned(&mut session, &scope).await.unwrap();
+            assert_eq!(
+                imported(&session).native_frontier.refusal(),
+                Some(RestartReason::InFlight)
+            );
+            assert_eq!(imported(&session).name, "renamed again");
+            // The turn's actor supersedes the old owner.
+            assert!(permit.restart_chain(&mut session).await.is_err());
+            drop(ticket);
+        });
+    }
+
+    #[test]
+    fn stale_clone_cannot_use_idle_republication() {
+        let roots = crate::tests::OwnedTestDirectory::new("native-idle-stale");
+        let _environment = environment(&roots);
+        let mut session = Session::new("anthropic", "fixture", 32_000, "");
+        let _release = Release(session.id.to_string());
+        runtime().block_on(async {
+            let _permit = idle_owned(&mut session).await;
+            let mut stale = session.clone();
+            session.name = "newer".into();
+            super::super::storage::save_session_recovering(&mut session, |_| {}).unwrap();
+            stale.name = "stale".into();
+            assert!(super::super::storage::save_session_recovering(&mut stale, |_| {}).is_err());
+            assert_eq!(imported(&session).name, "newer");
+        });
+    }
+
+    #[test]
+    fn in_flight_file_of_a_dead_writer_restarts_on_resume() {
+        // mini-agent-nvnkx.209: a file left in flight by a process that was
+        // killed (or quit before its first prompt) must not strand the session.
+        let roots = crate::tests::OwnedTestDirectory::new("native-in-flight-resume");
+        let _environment = environment(&roots);
+        let mut session = Session::new("anthropic", "fixture", 32_000, "");
+        let id = session.id.to_string();
+        let _release = Release(id.clone());
+        session.add_message(super::super::MessageRole::User, "kept transcript row");
+        runtime().block_on(async {
+            let owner = NativeStartupPublication::begin(&mut session).await.unwrap();
+            drop(owner);
+        });
+        assert_eq!(
+            imported(&session).native_frontier.refusal(),
+            Some(RestartReason::InFlight)
+        );
+        // The first process is gone: its lock is released.
+        super::super::lock::release_session(&id);
+        let mut resumed = imported(&session);
+        assert_eq!(
+            resumed.native_frontier.refusal(),
+            Some(RestartReason::InFlight)
+        );
+        let before_epoch = resumed.native_frontier.current();
+        runtime().block_on(async {
+            let (owner, cause) = NativeStartupPublication::begin_with_cause(&mut resumed)
+                .await
+                .unwrap();
+            assert_eq!(
+                cause,
+                Some(super::super::native_replay::NativeRestartCause::Unfinished)
+            );
+            let ticket = owner.into_model_ticket(&resumed).await.unwrap();
+            retire_idle_startup(&mut resumed, ticket).await.unwrap();
+        });
+        assert!(resumed.native_frontier.current() > before_epoch);
+        let healthy = imported(&resumed);
+        assert_eq!(healthy.native_frontier.refusal(), None);
+        assert_eq!(healthy.messages.len(), 1);
+        assert_eq!(healthy.messages[0].content, "kept transcript row");
+    }
+
+    #[test]
+    fn in_flight_file_owned_by_another_process_still_refuses() {
+        let roots = crate::tests::OwnedTestDirectory::new("native-in-flight-held");
+        let _environment = environment(&roots);
+        let mut session = Session::new("anthropic", "fixture", 32_000, "");
+        let id = session.id.to_string();
+        let _release = Release(id.clone());
+        runtime().block_on(async {
+            drop(NativeStartupPublication::begin(&mut session).await.unwrap());
+        });
+        // This process still holds the lock (the "live writer"): a loaded copy
+        // is not a fresh claim, so the live cell keeps refusing replacement.
+        let mut other = imported(&session);
+        runtime().block_on(async {
+            let result = NativeStartupPublication::begin(&mut other).await;
+            // The same process owning the lock cannot be a second owner.
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn failed_final_publication_recovers_on_the_next_save() {
+        // mini-agent-nvnkx.266
+        let roots = crate::tests::OwnedTestDirectory::new("native-failed-recover");
+        let _environment = environment(&roots);
+        let mut session = Session::new("anthropic", "fixture", 32_000, "");
+        let _release = Release(session.id.to_string());
+        session.add_message(super::super::MessageRole::User, "hello");
+        runtime().block_on(async {
+            let mut owner = NativeStartupPublication::begin(&mut session).await.unwrap();
+            owner.fail_final_before_replace();
+            let ticket = owner.into_model_ticket(&session).await.unwrap();
+            assert!(retire_idle_startup(&mut session, ticket).await.is_err());
+            assert_eq!(
+                imported(&session).native_frontier.refusal(),
+                Some(RestartReason::InFlight)
+            );
+            // Nothing can save while the cell is failed, until recovery.
+            assert!(idle_republish_needed(&session));
+            super::super::storage::save_session_recovering(&mut session, |_| {}).unwrap();
+            let saved = imported(&session);
+            assert_eq!(saved.native_frontier.refusal(), None);
+            assert_eq!(saved.messages.len(), 1);
+            // The recovered owner can start a turn.
+            let scope = crate::agent::runner::AgentWorkScope::new();
+            drop(begin_owned(&mut session, &scope).await.unwrap());
+        });
+    }
+
+    #[test]
+    fn fork_of_a_native_session_is_published_through_its_own_owner() {
+        // mini-agent-nvnkx.267
+        let roots = crate::tests::OwnedTestDirectory::new("native-fork-publish");
+        let _environment = environment(&roots);
+        let mut session = Session::new("anthropic", "fixture", 32_000, "");
+        let _release = Release(session.id.to_string());
+        session.add_message(super::super::MessageRole::User, "first");
+        session.add_message(super::super::MessageRole::Assistant, "answer");
+        runtime().block_on(async {
+            let _permit = idle_owned(&mut session).await;
+            let mut fork = super::super::lock::fork_at_turn(&session, Some(1)).unwrap();
+            let _fork_release = Release(fork.id.to_string());
+            assert!(is_native_bearing(&fork));
+            // The ordinary save has no owner for the copy.
+            assert!(super::super::storage::save_session_recovering(&mut fork, |_| {}).is_err());
+            publish_new_session(&mut fork).await.unwrap();
+            let saved = imported(&fork);
+            assert_eq!(saved.messages.len(), 1);
+            assert_eq!(saved.native_frontier.refusal(), None);
+            // And the fork then behaves like any idle owned session.
+            fork.name = "fork renamed".into();
+            super::super::storage::save_session_recovering(&mut fork, |_| {}).unwrap();
+            assert_eq!(imported(&fork).name, "fork renamed");
         });
     }
 }

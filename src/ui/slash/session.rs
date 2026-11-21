@@ -698,9 +698,25 @@ async fn handle_fork(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
         }
     };
     let id = fork.id.clone();
-    if let Err(error) = persist_session_unless_ephemeral(ctx.cli.no_session, &mut fork, |notice| {
-        write_error(ctx.renderer, format!("warning: {notice}"))
-    }) {
+    // A fork that carries a native thinking chain has no owner yet: it is
+    // published through its own startup publication (the same sequence as
+    // `--fork-session`), which drops a chain the truncated transcript no longer
+    // matches. Anything else takes the ordinary save.
+    let saved =
+        if !ctx.cli.no_session && crate::session::native_publication::is_native_bearing(&fork) {
+            crate::session::native_publication::publish_new_session(&mut fork)
+                .await
+                .map(|cause| {
+                    if let Some(cause) = cause {
+                        write_result(ctx.renderer, cause.notice());
+                    }
+                })
+        } else {
+            persist_session_unless_ephemeral(ctx.cli.no_session, &mut fork, |notice| {
+                write_error(ctx.renderer, format!("warning: {notice}"))
+            })
+        };
+    if let Err(error) = saved {
         crate::session::lock::release_session(&id);
         write_error(ctx.renderer, format!("could not save fork: {error}"));
         return Ok(());
@@ -714,8 +730,6 @@ async fn handle_fork(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
 }
 
 async fn handle_clear(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
-    #[cfg(feature = "subagents")]
-    ctx.session.reset_background_tasks().await;
     match mutate_and_persist_session(
         ctx.session,
         clear_session_mutation,
@@ -742,6 +756,10 @@ async fn handle_clear(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
             return Ok(());
         }
     }
+    // Background tasks are reset only once the cleared session is saved, so a
+    // refused clear leaves the live tasks running.
+    #[cfg(feature = "subagents")]
+    ctx.session.reset_background_tasks().await;
     #[cfg(feature = "hooks")]
     crate::extras::hooks::dispatch_session_end("clear").await;
     ctx.context.chain_declined.clear();

@@ -68,6 +68,14 @@ pub(crate) enum NativeRestartCause {
     TranscriptChanged,
     /// A saved refusal made the chain unreplayable.
     Refused(RestartReason),
+    /// The previous run ended mid-turn (killed, crashed or quit before its
+    /// first prompt), or a failed checkpoint write left the live context
+    /// unreliable. The process owning the session's lock proves no writer is
+    /// left, so the transcript is the authority.
+    Unfinished,
+    /// A checkpoint write failed in this process; the live context is
+    /// unreliable, so a new epoch starts from the transcript.
+    WriteFailed,
 }
 
 impl NativeRestartCause {
@@ -85,6 +93,12 @@ impl NativeRestartCause {
             }
             Self::Refused(_) => {
                 "native thinking context could not be replayed: started a new context from the transcript (earlier thinking blocks dropped)"
+            }
+            Self::Unfinished => {
+                "previous run ended mid-turn; thinking context restarted from the transcript"
+            }
+            Self::WriteFailed => {
+                "a session checkpoint could not be written; thinking context restarted from the transcript"
             }
         }
     }
@@ -236,6 +250,26 @@ impl NativeFrontier {
         }
         if let Some(reason) = saved.refusal
             && !reason.restartable()
+        {
+            return Err(reason);
+        }
+        saved.refusal = None;
+        saved.epoch = saved.epoch.checked_add(1).ok_or(RestartReason::Limit)?;
+        Ok(saved.epoch)
+    }
+
+    /// [`restart`](Self::restart) that also accepts the `InFlight` denial a
+    /// dead writer left on disk. Only a process that has just claimed the
+    /// session's lock on a freshly loaded value may call this: the claim proves
+    /// the previous writer (and any paid request it opened) is gone.
+    pub(crate) fn restart_unfinished(&self) -> Result<u64, RestartReason> {
+        let mut saved = self.checkpoint();
+        if saved.retiring {
+            return Err(RestartReason::InFlight);
+        }
+        if let Some(reason) = saved.refusal
+            && !reason.restartable()
+            && reason != RestartReason::InFlight
         {
             return Err(reason);
         }

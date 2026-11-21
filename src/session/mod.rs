@@ -1432,6 +1432,27 @@ impl Session {
         Ok(())
     }
 
+    /// The restart cause for a freshly loaded session whose file still carries
+    /// the `InFlight` denial of a writer that is gone (nothing in this process
+    /// owns it: no publication and an unclaimed cell). `None` otherwise.
+    pub(crate) fn native_unfinished_cause(&self) -> Option<native_replay::NativeRestartCause> {
+        (self.native_publication.is_none()
+            && self.native_frontier.refusal() == Some(native_replay::RestartReason::InFlight)
+            && !self.native_frontier.publication_cell().is_claimed())
+        .then_some(native_replay::NativeRestartCause::Unfinished)
+    }
+
+    /// [`restart_native_chain`](Self::restart_native_chain) for the cause
+    /// [`native_unfinished_cause`](Self::native_unfinished_cause) reports.
+    pub(crate) fn restart_unfinished_native_chain(
+        &mut self,
+    ) -> Result<(), native_replay::RestartReason> {
+        self.native_frontier.restart_unfinished()?;
+        self.native_history = None;
+        self.retired_native_history.clear();
+        Ok(())
+    }
+
     pub(crate) fn validate_native_persistence(&self) -> Result<(), native_replay::RestartReason> {
         if let Some(history) = &self.native_history {
             history.validate_saved()?;

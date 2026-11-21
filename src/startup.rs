@@ -2126,13 +2126,22 @@ impl Startup {
                 || !crate::session::native_publication::is_native_bearing(&session),
             "this saved native context requires the headless print frontend or interactive frontend; automatic-round replay is not available yet"
         );
+        // A brand-new interactive session has no chain, transcript or file to
+        // protect before its first prompt. Its first publication happens when
+        // that prompt is admitted, so a launch closed without typing leaves no
+        // zero-message file for `--continue` to pick (mini-agent-nvnkx.210).
+        let fresh_idle_interactive = !cli.print
+            && session.messages.is_empty()
+            && !crate::session::native_publication::is_native_bearing(&session);
         let mut native_startup = if !editor_session
             && adopted_native_frontend
             && crate::session::native_publication::startup_requires_publication(
                 &session,
                 matches!(&client, AnyClient::Anthropic(_)),
                 cli.no_session,
-            )? {
+            )?
+            && !fresh_idle_interactive
+        {
             Some(
                 crate::session::native_publication::NativeStartupPublication::begin(&mut session)
                     .await?,
@@ -4391,6 +4400,21 @@ async fn run_bound_headless_segment(
     let native = agent.history_protocol() == HistoryProtocol::AnthropicMessages
         || session.native_history_snapshot().is_some();
     if !native {
+        // A non-native model (for example --resume-provider) continues a
+        // native-bearing session on the plain transcript path. The idle startup
+        // ticket has no model work to guard, so it is retired back to a healthy
+        // checkpoint first; the turn-end save then republishes under the same
+        // owner instead of leaving the file in flight (mini-agent-nvnkx.264).
+        if !cli.no_session
+            && let Some(ticket) = native_ticket.take()
+            && let Err(error) =
+                crate::session::native_publication::retire_idle_startup(session, ticket).await
+        {
+            return (
+                crate::agent::runner::HeadlessTurn::failed_before_start(error),
+                false,
+            );
+        }
         let turn = heap_future(|| {
             let agent = agent.clone();
             #[cfg(feature = "agent-skills")]
