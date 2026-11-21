@@ -5,11 +5,10 @@ use crate::agent::tools::{
 };
 use crate::extras::truncate::head_tail_lines;
 use crate::sandbox::{
-    BackgroundJobOutput, CommandLimits, CommandOutput, CommandOutputLimit, CommandProgress,
-    CommandStatus, DEFAULT_BACKGROUND_COMMAND_TIMEOUT, DEFAULT_COMMAND_LIMITS,
-    MAX_BACKGROUND_JOB_WAIT_MILLIS, OutputChannel, OutputLog, OutputTranscript, OutputWindow,
-    SHELL_HARD_OUTPUT_BYTES, Sandbox, ShellOutputCapture, SpoolPolicy, TranscriptPart,
-    write_private_log,
+    BackgroundJobOutput, CommandLimits, CommandOutputLimit, CommandProgress, CommandStatus,
+    DEFAULT_BACKGROUND_COMMAND_TIMEOUT, DEFAULT_COMMAND_LIMITS, MAX_BACKGROUND_JOB_WAIT_MILLIS,
+    OutputChannel, OutputLog, OutputTranscript, OutputWindow, SHELL_HARD_OUTPUT_BYTES, Sandbox,
+    ShellOutputCapture, SpoolPolicy, TranscriptPart, write_private_log,
 };
 use compact_str::CompactString;
 
