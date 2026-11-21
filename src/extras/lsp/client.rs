@@ -610,11 +610,11 @@ impl LspClient {
         initialize_timeout: Duration,
     ) -> Option<Arc<Self>> {
         let root = canonical_workspace_root(root)
-            .map_err(|error| tracing::debug!("lsp[{name}]: invalid root: {error}"))
+            .map_err(|error| tracing::info!("lsp[{name}]: invalid root: {error}"))
             .ok()?;
         let mut command = lsp_command(cfg, &root)
             .map_err(|error| {
-                tracing::debug!("lsp[{name}]: launch denied: {error}");
+                tracing::info!("lsp[{name}]: launch denied: {error}");
             })
             .ok()?;
         let use_descriptor_root = workspace.is_some();
@@ -629,17 +629,17 @@ impl LspClient {
             None
         };
         let server_root = bind_workspace_handle(&mut command, workspace_handle, &root)
-            .map_err(|error| tracing::debug!("lsp[{name}]: workspace bind failed: {error}"))
+            .map_err(|error| tracing::info!("lsp[{name}]: workspace bind failed: {error}"))
             .ok()?;
         let root_uri = file_uri(&server_root)
             .ok_or_else(|| {
-                tracing::debug!("lsp[{name}]: root '{}' is not a valid uri", root.display());
+                tracing::info!("lsp[{name}]: root '{}' is not a valid uri", root.display());
             })
             .ok()?;
         let mut child = owned_workspace_service_tree(command)
             .spawn_guarded()
             .map_err(|error| {
-                tracing::debug!("lsp[{name}]: spawn failed: {error}");
+                tracing::info!("lsp[{name}]: spawn failed: {error}");
             })
             .ok()?;
         let process_group = child.id();
@@ -942,6 +942,9 @@ impl LspClient {
             .and_then(|response| response.get("result"))
             .and_then(Value::as_object)
         else {
+            tracing::info!(
+                "lsp[{name}]: initialize failed or timed out after {initialize_timeout:?}"
+            );
             client.shutdown().await;
             return None;
         };

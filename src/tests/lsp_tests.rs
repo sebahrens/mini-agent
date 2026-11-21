@@ -3379,3 +3379,72 @@ async fn navigate_edit_arguments_are_validated() {
         );
     }
 }
+
+fn manager_with_server(
+    root: &TempDir,
+    command: &str,
+    args: &[&str],
+    ext: &str,
+) -> (LspManager, PathBuf) {
+    let mut server = custom(command, &[ext]);
+    server.args = args.iter().map(|arg| CompactString::from(*arg)).collect();
+    let file = root.path().join(format!("sample{ext}"));
+    std::fs::write(&file, "content").unwrap();
+    let manager = LspManager::new(
+        &LspConfig {
+            enabled: true.into(),
+            servers: HashMap::from([("slowfix".to_string(), server)]),
+            ..Default::default()
+        },
+        root.path().to_path_buf(),
+    );
+    let file = std::fs::canonicalize(file).unwrap();
+    (manager, file)
+}
+
+#[tokio::test]
+async fn first_edit_does_not_wait_for_a_slow_handshake() {
+    let root = TempDir::new("lsp-start");
+    // Reads nothing and never answers `initialize`.
+    let (manager, file) = manager_with_server(&root, "sh", &["-c", "sleep 30"], ".slowx");
+    let started = Instant::now();
+    assert!(manager.notify_changed(&file).await.is_none());
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the first edit waited {:?}",
+        started.elapsed()
+    );
+    let note = manager
+        .diagnostics_block_for_relative_edit(Path::new("sample.slowx"), None)
+        .await
+        .expect("a starting note");
+    assert!(note.contains("starting"), "{note}");
+    // The note is shown once per spawn.
+    assert!(
+        manager
+            .diagnostics_block_for_relative_edit(Path::new("sample.slowx"), None)
+            .await
+            .is_none()
+    );
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_server_that_fails_to_start_is_reported_once_per_streak() {
+    let root = TempDir::new("lsp-fail");
+    let (manager, file) = manager_with_server(&root, "sh", &["-c", "exit 1"], ".failx");
+    assert!(manager.notify_changed(&file).await.is_none());
+    let note = manager
+        .diagnostics_block_for_relative_edit(Path::new("sample.failx"), None)
+        .await
+        .expect("a failure marker");
+    assert!(note.contains("server is not running"), "{note}");
+    // A later edit inside the cooldown does not repeat the marker.
+    assert!(manager.notify_changed(&file).await.is_none());
+    assert!(
+        manager
+            .diagnostics_block_for_relative_edit(Path::new("sample.failx"), None)
+            .await
+            .is_none()
+    );
+}

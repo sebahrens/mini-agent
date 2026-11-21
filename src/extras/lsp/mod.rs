@@ -138,6 +138,12 @@ struct Inner {
     /// Consecutive startup/crash failures. A broken server is not relaunched
     /// for every edit; successful initialization clears its entry.
     failures: Mutex<HashMap<String, ServerFailureState>>,
+    /// Failure streak length already reported to the model per server, so the
+    /// "not running" marker appears once per streak.
+    reported_failures: Mutex<HashMap<String, u32>>,
+    /// server name → spawn in flight. Concurrent edits join it; the handshake
+    /// never runs under the `clients` lock.
+    starting: Mutex<HashMap<String, StartingServer>>,
     diags: DiagStore,
     diag_notify: Arc<Notify>,
     /// server name → whether its last edit wait missed the publish.
@@ -151,6 +157,19 @@ struct Inner {
     #[cfg(test)]
     test_synced_documents: Arc<std::sync::Mutex<HashMap<String, client::SyncedDocument>>>,
 }
+
+/// A language-server spawn running in the background; cloning joins it.
+#[derive(Clone)]
+struct StartingServer {
+    done: futures::future::Shared<futures::future::BoxFuture<'static, Option<Arc<LspClient>>>>,
+    /// The "starting" note was already shown for this spawn.
+    noted: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// How long the first edit of a language waits for the server's handshake
+/// before returning without diagnostics. The spawn continues in the
+/// background and the next edit uses the ready client.
+const FIRST_EDIT_START_GRACE: Duration = Duration::from_millis(1000);
 
 /// Adaptive state for the post-edit `publishDiagnostics` wait of one server.
 #[derive(Debug, Default, Clone)]
@@ -561,6 +580,8 @@ impl LspManager {
             withheld,
             clients: tokio::sync::Mutex::new(HashMap::new()),
             failures: Mutex::new(HashMap::new()),
+            reported_failures: Mutex::new(HashMap::new()),
+            starting: Mutex::new(HashMap::new()),
             diags: DiagStore::default(),
             diag_notify: Arc::new(Notify::new()),
             publish_waits: Mutex::new(HashMap::new()),
@@ -613,55 +634,160 @@ impl LspManager {
             return None;
         }
         let (name, cfg) = registry::server_for_path(&self.inner.servers, path)?;
-        let mut clients = self.inner.clients.lock().await;
-        if self.inner.workspace.validate().is_err()
-            || !path.starts_with(self.inner.workspace.root())
-        {
-            return None;
-        }
-        if let Some(cached) = clients.get(name)
-            && cached.is_usable()
-        {
-            // Touch under the clients lock: the idle watcher rechecks under
-            // the same lock, so a client handed out here is never retired
-            // out from under its caller.
-            cached.touch();
-            return Some(cached.clone());
-        }
-        if let Some(old) = clients.remove(name) {
-            old.shutdown().await;
-            self.record_server_failure(name);
-            self.inner
-                .diags
+        let starting = {
+            let mut clients = self.inner.clients.lock().await;
+            if self.inner.workspace.validate().is_err()
+                || !path.starts_with(self.inner.workspace.root())
+            {
+                return None;
+            }
+            if let Some(cached) = clients.get(name)
+                && cached.is_usable()
+            {
+                // Touch under the clients lock: the idle watcher rechecks under
+                // the same lock, so a client handed out here is never retired
+                // out from under its caller.
+                cached.touch();
+                return Some(cached.clone());
+            }
+            if let Some(old) = clients.remove(name) {
+                old.shutdown().await;
+                self.record_server_failure(name);
+                self.inner
+                    .diags
+                    .lock()
+                    .unwrap()
+                    .retain(|_, diagnostics| diagnostics.server != name.as_str());
+            }
+            if self.server_is_cooling_down(name) {
+                tracing::debug!("lsp[{name}]: restart suppressed during failure cooldown");
+                return None;
+            }
+            let mut starting = self
+                .inner
+                .starting
                 .lock()
-                .unwrap()
-                .retain(|_, diagnostics| diagnostics.server != name.as_str());
-        }
-        if self.server_is_cooling_down(name) {
-            tracing::debug!("lsp[{name}]: restart suppressed during failure cooldown");
-            return None;
-        }
-        let spawned = LspClient::spawn(
-            name,
-            cfg,
-            self.inner.workspace.root(),
-            Some(self.inner.workspace.clone()),
-            self.inner.diags.clone(),
-            self.inner.diag_notify.clone(),
-        )
-        .await;
-        let Some(spawned) = spawned else {
-            self.record_server_failure(name);
-            return None;
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            starting
+                .entry(name.clone())
+                .or_insert_with(|| self.start_in_background(name, cfg))
+                .clone()
         };
-        self.inner
+        // The clients lock is released: another language's edit is not held
+        // behind this handshake.
+        match tokio::time::timeout(FIRST_EDIT_START_GRACE, starting.done).await {
+            Ok(client) => client,
+            Err(_) => {
+                tracing::info!("lsp[{name}]: still starting; diagnostics from the next edit");
+                None
+            }
+        }
+    }
+
+    /// Spawns `name` on a background task that installs the client when its
+    /// handshake completes (or records the failure). Called with the
+    /// `clients` lock held, which the task needs to finish, so a caller can
+    /// register the returned handle before the task can complete.
+    fn start_in_background(
+        &self,
+        name: &str,
+        cfg: &crate::config::types::LspServerConfig,
+    ) -> StartingServer {
+        let manager = self.clone();
+        let name = name.to_string();
+        let cfg = cfg.clone();
+        let task = tokio::spawn(async move {
+            let spawned = LspClient::spawn(
+                &name,
+                &cfg,
+                manager.inner.workspace.root(),
+                Some(manager.inner.workspace.clone()),
+                manager.inner.diags.clone(),
+                manager.inner.diag_notify.clone(),
+            )
+            .await;
+            let mut clients = manager.inner.clients.lock().await;
+            let result = match spawned {
+                Some(spawned) => {
+                    manager
+                        .inner
+                        .failures
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&name);
+                    manager
+                        .inner
+                        .reported_failures
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&name);
+                    clients.insert(name.clone(), spawned.clone());
+                    manager.watch_idle(&name, &spawned);
+                    Some(spawned)
+                }
+                None => {
+                    manager.record_server_failure(&name);
+                    None
+                }
+            };
+            manager
+                .inner
+                .starting
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&name);
+            result
+        });
+        let done: futures::future::BoxFuture<'static, Option<Arc<LspClient>>> =
+            Box::pin(async move { task.await.ok().flatten() });
+        StartingServer {
+            done: futures::future::FutureExt::shared(done),
+            noted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// One-line status for a server that has no client during an edit: still
+    /// starting (shown once per spawn) or failing to start (once per streak).
+    fn unavailable_note(&self, server: &str) -> Option<String> {
+        if let Some(starting) = self
+            .inner
+            .starting
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(server)
+        {
+            return (!starting
+                .noted
+                .swap(true, std::sync::atomic::Ordering::Relaxed))
+            .then(|| {
+                format!(
+                    "\n\nLSP ({server}): starting; diagnostics from the next edit of this language."
+                )
+            });
+        }
+        let failure = *self
+            .inner
             .failures
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(name);
-        clients.insert(name.clone(), spawned.clone());
-        self.watch_idle(name, &spawned);
-        Some(spawned)
+            .get(server)?;
+        let mut reported = self
+            .inner
+            .reported_failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if reported.contains_key(server) {
+            return None;
+        }
+        reported.insert(server.to_string(), failure.consecutive);
+        let retry = failure
+            .retry_after
+            .saturating_duration_since(Instant::now())
+            .as_secs();
+        Some(format!(
+            "\n\nLSP ({server}): server is not running (start failed {} time(s); next retry in {retry}s); diagnostics unavailable.",
+            failure.consecutive
+        ))
     }
 
     /// Retires `client` once it has been unused for the idle timeout: removes
@@ -916,6 +1042,29 @@ impl LspManager {
     /// within the last full window, and returns to the full window as soon as
     /// the server is seen publishing again.
     async fn diagnostics_block_adaptive(
+        &self,
+        path: &Path,
+        baseline: Option<u64>,
+    ) -> Option<String> {
+        let output = self.diagnostics_block_adaptive_inner(path, baseline).await;
+        if baseline.is_some() {
+            return output;
+        }
+        // Nothing was synchronized: the server is starting, or not running.
+        // Say so instead of looking like a clean edit.
+        let server = registry::server_for_path(&self.inner.servers, path)?
+            .0
+            .clone();
+        match self.unavailable_note(&server) {
+            Some(note) => Some(match output {
+                Some(block) => format!("{block}{note}"),
+                None => note.trim_start().to_string(),
+            }),
+            None => output,
+        }
+    }
+
+    async fn diagnostics_block_adaptive_inner(
         &self,
         path: &Path,
         baseline: Option<u64>,
