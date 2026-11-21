@@ -400,6 +400,7 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Fixed: inputs queued while a run ends in an interrupt or error are returned to the editor (or the history and kill ring) instead of being dropped (mini-agent-nvnkx.291).
 - Fixed: a refused file rewind no longer cancels background tasks and saves the session (mini-agent-nvnkx.293).
 - Fixed: `/share` records its abort handle before the upload task can clear it (mini-agent-nvnkx.261).
+- Headless `-p` runs no longer start the default models.dev catalog refresh (or print its notice) unless `models_catalog_refresh_days` is set, and wait at most 250 ms for a provider model-listing context-window probe instead of 5 s.
 
 ### Added
 

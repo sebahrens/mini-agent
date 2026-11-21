@@ -1155,7 +1155,12 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
 
     // Started only once every one-shot command has returned: a network task
     // would otherwise be spawned and dropped by `--mcp-login`, `--setup`, etc.
-    models_catalog::spawn_refresh_if_stale(cfg.models_catalog_refresh_days);
+    // The unset default is a convenience for interactive use only: a
+    // headless run must not open a network connection or print a notice on
+    // stderr the caller never asked for; an explicit day count still applies.
+    if is_interactive || cfg.models_catalog_refresh_days.is_some() {
+        models_catalog::spawn_refresh_if_stale(cfg.models_catalog_refresh_days);
+    }
     provider_http::pin::set_enabled(cfg.openrouter_pin_provider.unwrap_or(true));
 
     // Overlap the host sandbox backend probe (a process spawn) with the

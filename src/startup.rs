@@ -852,6 +852,9 @@ type OpenRouterPricingMap = std::collections::HashMap<String, provider::OpenRout
 const OPENROUTER_PRICING_INTERACTIVE_WAIT: std::time::Duration =
     std::time::Duration::from_millis(1500);
 const OPENROUTER_PRICING_HEADLESS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// A headless run probing only a context window (no price needed for a USD
+/// cap) must not stall its first request on a slow or hung gateway listing.
+const CONTEXT_PROBE_HEADLESS_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 const OPENROUTER_PRICING_ABORT_JOIN_GRACE: std::time::Duration =
     std::time::Duration::from_millis(100);
 #[cfg(test)]
@@ -2537,8 +2540,10 @@ impl Startup {
         // (mini-agent-nvnkx.150).
         let wait = if self.is_interactive {
             OPENROUTER_PRICING_INTERACTIVE_WAIT
-        } else {
+        } else if refresh.need_pricing {
             OPENROUTER_PRICING_HEADLESS_WAIT
+        } else {
+            CONTEXT_PROBE_HEADLESS_WAIT
         };
         let result = refresh.finish_within(wait).await;
         apply_openrouter_pricing_refresh_result(&mut self.session, &refresh, result);
