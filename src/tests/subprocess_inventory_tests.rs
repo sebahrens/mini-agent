@@ -1061,7 +1061,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         "TEST-ONLY",
     ),
     (
-        "src/ui/app.rs",
+        "src/ui/app_tests/plan_approval_tests.rs",
         r#"std::thread::Builder::new().name("instruction61-app-one-mib".into()).stack_size(1024 * 1024).spawn(|| {"#,
         1,
         "NON-PROCESS",
@@ -1104,7 +1104,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     (
-        "src/ui/app.rs",
+        "src/ui/app_tests/plan_approval_tests.rs",
         r#"std::thread::Builder::new().name("model48-app-one-mib".into()).stack_size(1024*1024).spawn(|| {"#,
         1,
         "NON-PROCESS",
@@ -1207,15 +1207,37 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     // Owned fixed-stack App picker/Git/plan/compaction tests use std::thread.
-    ("src/ui/app.rs", ".spawn(|| {", 7, "NON-PROCESS"),
+    ("src/ui/app.rs", ".spawn(|| {", 1, "NON-PROCESS"),
     (
-        "src/ui/app.rs",
+        "src/ui/app_tests/plan_approval_tests.rs",
+        ".spawn(|| {",
+        4,
+        "NON-PROCESS",
+    ),
+    (
+        "src/ui/app_tests/workspace_session_picker_tests.rs",
+        ".spawn(|| {",
+        2,
+        "NON-PROCESS",
+    ),
+    (
+        "src/ui/app_tests/config_editor68_tests.rs",
         r#"std::thread::Builder::new().name("config68-app".into()).stack_size(1024*1024).spawn(||{"#,
         1,
         "NON-PROCESS",
     ),
-    ("src/ui/app.rs", "task.spawn(async move {", 1, "NON-PROCESS"),
-    ("src/ui/app.rs", ".spawn(move || {", 1, "NON-PROCESS"),
+    (
+        "src/ui/app_tests/plan_approval_tests.rs",
+        "task.spawn(async move {",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/ui/app_tests/workspace_session_picker_tests.rs",
+        ".spawn(move || {",
+        1,
+        "NON-PROCESS",
+    ),
     // Adopts an already-spawned trusted Windows hook into a Job (mini-agent-8cxmy).
     (
         "src/sandbox.rs",
@@ -2748,7 +2770,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     (
-        "src/ui/app.rs",
+        "src/ui/app_tests/plan_approval_tests.rs",
         r#"std::thread::Builder::new().name("instruction61-app-one-mib".into()).stack_size(1024 * 1024).spawn(|| {"#,
         1,
         "NON-PROCESS",
@@ -2821,7 +2843,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     (
-        "src/ui/app.rs",
+        "src/ui/app_tests/plan_approval_tests.rs",
         r#"std::thread::Builder::new().name("model48-app-one-mib".into()).stack_size(1024*1024).spawn(|| {"#,
         1,
         "NON-PROCESS",
@@ -3087,15 +3109,37 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     // Owned fixed-stack App picker/Git/plan/compaction tests use std::thread.
-    ("src/ui/app.rs", ".spawn(|| {", 7, "NON-PROCESS"),
+    ("src/ui/app.rs", ".spawn(|| {", 1, "NON-PROCESS"),
     (
-        "src/ui/app.rs",
+        "src/ui/app_tests/plan_approval_tests.rs",
+        ".spawn(|| {",
+        4,
+        "NON-PROCESS",
+    ),
+    (
+        "src/ui/app_tests/workspace_session_picker_tests.rs",
+        ".spawn(|| {",
+        2,
+        "NON-PROCESS",
+    ),
+    (
+        "src/ui/app_tests/config_editor68_tests.rs",
         r#"std::thread::Builder::new().name("config68-app".into()).stack_size(1024*1024).spawn(||{"#,
         1,
         "NON-PROCESS",
     ),
-    ("src/ui/app.rs", "task.spawn(async move {", 1, "NON-PROCESS"),
-    ("src/ui/app.rs", ".spawn(move || {", 1, "NON-PROCESS"),
+    (
+        "src/ui/app_tests/plan_approval_tests.rs",
+        "task.spawn(async move {",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/ui/app_tests/workspace_session_picker_tests.rs",
+        ".spawn(move || {",
+        1,
+        "NON-PROCESS",
+    ),
     // Adopts an already-spawned trusted Windows hook into a Job (mini-agent-8cxmy).
     (
         "src/sandbox.rs",
