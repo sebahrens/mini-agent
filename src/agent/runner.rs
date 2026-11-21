@@ -905,9 +905,11 @@ pub const HEADLESS_INTERRUPTED: &str = "headless agent interrupted";
 /// done rather than as new instructions.
 pub(crate) const HEADLESS_CONTEXT_RELIEF_PROMPT: &str = "[Earlier context was compacted to save \
 space. Your earlier work is condensed in the \"[Recap of my prior work in this conversation]\" \
-message above, and the most recent messages are kept verbatim. Details not in the recap are \
-gone; re-read files when you need them.]\n\nContinue with the user's original task. Do not \
-redo work already completed per the recap; focus on what remains. Context was tight, so prefer \
+message above: a summary, then any restored file windows (as read earlier, possibly stale) and \
+the live todo list and goal. The most recent messages after it are kept verbatim. Anything not \
+in the recap is gone; re-read files before relying on or editing them.]\n\nContinue the user's \
+task from the recap's Next Step, honouring the user's requests and constraints quoted under Task. \
+Do not redo work the recap reports as done; focus on what remains. Context was tight, so prefer \
 narrower follow-up tool calls over wide ones until pressure subsides.";
 
 /// The label `convert_history_uncached` puts on the replayed compaction summary.
