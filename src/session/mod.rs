@@ -13,6 +13,7 @@ pub(crate) mod native_replay;
 pub mod storage;
 pub mod title;
 pub(crate) mod tool_image;
+pub(crate) mod turn_journal;
 pub(crate) mod user;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};

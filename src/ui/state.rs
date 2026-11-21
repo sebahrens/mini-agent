@@ -429,6 +429,12 @@ impl PendingMainTurn {
             }
     }
 
+    /// Message count of the session before this turn's user message: the
+    /// length of the settled snapshot on disk.
+    pub(crate) fn base_message_len(&self) -> usize {
+        self.session_before.messages_len
+    }
+
     pub(crate) fn has_recorded_turn_messages(&self, session: &Session) -> bool {
         session.messages.len()
             > self

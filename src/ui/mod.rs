@@ -2165,7 +2165,16 @@ pub(crate) fn persist_session_if_settled(
     mut notice: impl FnMut(&str),
 ) -> anyhow::Result<bool> {
     crate::session::storage::report_pending_save_notices(session, &mut notice);
-    if !persistence_enabled || run.pending_turn.is_some() {
+    if !persistence_enabled {
+        return Ok(false);
+    }
+    if let Some(turn) = run.pending_turn.as_ref() {
+        // The snapshot stays at the pre-turn state, but a crash must not lose
+        // the turn's tool calls: append them to the turn journal
+        // (mini-agent-nvnkx.46). Native sessions have their own checkpoint.
+        if run.native_owner.is_none() && session.native_history_snapshot().is_none() {
+            crate::session::turn_journal::append(session, turn.base_message_len());
+        }
         return Ok(false);
     }
     // Turn-end snapshots are serialized here and written off the UI task;
@@ -2488,7 +2497,73 @@ pub async fn run_interactive(
     #[cfg(feature = "subagents")]
     let result = result.and(app.persist_background_state());
     app.shutdown_services().await;
+    // Leaving the alternate screen takes the conversation with it, so tell the
+    // user, on the restored primary screen, how to come back to it.
+    let summary = app.exit_summary();
+    drop(app);
+    if let Some(summary) = summary {
+        use std::io::IsTerminal;
+        if io::stdout().is_terminal() && io::stderr().is_terminal() {
+            eprintln!("{summary}");
+        }
+    }
     result
+}
+
+/// Plain text printed to the normal screen when the TUI exits: the session and
+/// the exact command that resumes it, with the usage totals the status line
+/// tracks. `None` for a session that was not saved or has no turn yet.
+pub(crate) fn exit_summary(session: &Session, no_session: bool) -> Option<String> {
+    let turns = session
+        .messages
+        .iter()
+        .filter(|message| message.role == MessageRole::User)
+        .count();
+    if no_session || turns == 0 {
+        return None;
+    }
+    let title = if !session.name.is_empty() {
+        Some(session.name.to_string())
+    } else {
+        session.generated_title.as_ref().map(ToString::to_string)
+    };
+    let title = title
+        .map(|title| format!(" \"{}\"", crate::ui::events::sanitize_output(&title)))
+        .unwrap_or_default();
+    let mut usage = format!(
+        "{turns} turn{}, {} in / {} out tokens",
+        if turns == 1 { "" } else { "s" },
+        session.total_input_tokens,
+        session.total_output_tokens
+    );
+    let cost = session.recorded_total_cost();
+    if cost > 0.0 {
+        let marker = if session.cost_is_incomplete() { "+?" } else { "" };
+        usage.push_str(&format!(", ${cost:.4}{marker}"));
+    }
+    Some(format!(
+        "Session {}{title}: {usage}\nResume it with: mini-agent --session {}   (or: mini-agent -c for the most recent)",
+        session.id.chars().take(8).collect::<String>(),
+        session.id
+    ))
+}
+
+#[cfg(test)]
+mod exit_summary_tests {
+    use super::*;
+
+    #[test]
+    fn a_saved_session_with_a_turn_prints_the_resume_command_and_totals() {
+        let mut session = Session::new("p", "m", 1000, "my session");
+        assert!(exit_summary(&session, false).is_none(), "no turn yet");
+        session.add_message(MessageRole::User, "hi");
+        session.total_input_tokens = 1200;
+        session.total_output_tokens = 300;
+        let text = exit_summary(&session, false).unwrap();
+        assert!(text.contains(&format!("mini-agent --session {}", session.id)), "{text}");
+        assert!(text.contains("\"my session\"") && text.contains("1 turn, 1200 in / 300 out"), "{text}");
+        assert!(exit_summary(&session, true).is_none(), "unsaved sessions cannot be resumed");
+    }
 }
 
 #[cfg(feature = "advisor")]

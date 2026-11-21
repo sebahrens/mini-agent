@@ -459,6 +459,77 @@ impl FileCheckpoints {
             if paths.len() > 5 { ", …" } else { "" }
         )
     }
+    /// The inventory entries created from turn index `from_turn` on, with the
+    /// blob sizes they reference, for the turn journal
+    /// (`session::turn_journal`). Small: records name preimages by digest.
+    pub(crate) fn journal_delta(&self, from_turn: usize) -> serde_json::Value {
+        let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let data = &state.data;
+        let records: Vec<&Record> = data
+            .records
+            .iter()
+            .filter(|record| record.turn >= from_turn && !record.retired)
+            .collect();
+        let mut blobs = BTreeMap::new();
+        for record in &records {
+            for digest in record.before.iter().chain(std::iter::once(&record.after)) {
+                if let Some(size) = data.blobs.get(digest) {
+                    blobs.insert(digest.clone(), *size);
+                }
+            }
+        }
+        let skipped: BTreeMap<usize, usize> = data
+            .skipped
+            .iter()
+            .filter(|(turn, _)| **turn >= from_turn)
+            .map(|(turn, count)| (*turn, *count))
+            .collect();
+        serde_json::json!({
+            "records": records,
+            "blobs": blobs,
+            "skipped": skipped,
+            "mutations": data.mutations,
+            "skip_reason": data.skip_reason,
+        })
+    }
+    /// Merge a [`FileCheckpoints::journal_delta`] into this inventory after a
+    /// crash. The merged inventory must pass the same validation as a loaded
+    /// one, otherwise nothing changes.
+    pub(crate) fn apply_journal_delta(&self, delta: &serde_json::Value) -> anyhow::Result<()> {
+        #[derive(Deserialize)]
+        struct Delta {
+            records: Vec<Record>,
+            blobs: BTreeMap<String, usize>,
+            #[serde(default)]
+            skipped: BTreeMap<usize, usize>,
+            #[serde(default)]
+            mutations: u64,
+            #[serde(default)]
+            skip_reason: Option<String>,
+        }
+        let delta: Delta = serde_json::from_value(delta.clone())?;
+        let mut merged = self
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .data
+            .clone();
+        for record in delta.records {
+            if !merged.records.contains(&record) {
+                merged.records.push(record);
+            }
+        }
+        merged.blobs.extend(delta.blobs);
+        merged.skipped.extend(delta.skipped);
+        merged.mutations = merged.mutations.max(delta.mutations);
+        if delta.skip_reason.is_some() {
+            merged.skip_reason = delta.skip_reason;
+        }
+        // Validation only: the same checks a saved inventory passes on load.
+        serde_json::from_value::<FileCheckpoints>(serde_json::to_value(&merged)?)?;
+        self.edit().data = merged;
+        Ok(())
+    }
     pub(crate) fn retire_from(&self, index: usize) {
         let mut state = self.edit();
         for r in &mut state.data.records {
@@ -1976,5 +2047,63 @@ mod retired_checkpoint_reason_tests {
             !summary.contains("12345-byte"),
             "the only surviving unavailable edit was READ-denied, but the summary names a retired size failure: {summary}"
         );
+    }
+}
+
+#[cfg(test)]
+mod journal_delta_tests {
+    use super::*;
+
+    fn digest_of(text: &str) -> String {
+        digest(text.as_bytes())
+    }
+
+    #[test]
+    fn a_journaled_turn_delta_merges_into_the_older_snapshot_inventory() {
+        let before = digest_of("old");
+        let after = digest_of("new");
+        let mut data = Data::default();
+        data.blobs.insert(before.clone(), 3);
+        data.blobs.insert(after.clone(), 3);
+        data.records.push(Record {
+            session: "s".into(),
+            turn: 4,
+            workspace: [7; 32],
+            path: "src/a.rs".into(),
+            before: Some(before),
+            after,
+            retired: false,
+        });
+        data.mutations = 3;
+        let live = FileCheckpoints(Arc::new(Mutex::new(State {
+            data,
+            trusted: true,
+            memory: BTreeMap::new(),
+            scanned: None,
+            notice: UncapturedNotice::None,
+            #[cfg(test)]
+            limits: None,
+            #[cfg(test)]
+            scans: 0,
+            #[cfg(feature = "subagents")]
+            observation: Default::default(),
+        })));
+        // An older turn's record is outside the delta.
+        let delta = live.journal_delta(4);
+        assert_eq!(delta["records"].as_array().unwrap().len(), 1);
+        assert_eq!(live.journal_delta(5)["records"].as_array().unwrap().len(), 0);
+        // The snapshot on disk predates the turn: its inventory is empty.
+        let snapshot = FileCheckpoints::default();
+        assert!(snapshot.is_empty());
+        snapshot.apply_journal_delta(&delta).unwrap();
+        assert!(!snapshot.is_empty());
+        assert_eq!(snapshot.revision(), 3);
+        // Replaying twice adds nothing; a corrupt delta changes nothing.
+        snapshot.apply_journal_delta(&delta).unwrap();
+        assert_eq!(snapshot.journal_delta(0)["records"].as_array().unwrap().len(), 1);
+        let mut bad = delta.clone();
+        bad["records"][0]["after"] = "not-a-digest".into();
+        assert!(snapshot.apply_journal_delta(&bad).is_err());
+        assert_eq!(snapshot.journal_delta(0)["records"].as_array().unwrap().len(), 1);
     }
 }

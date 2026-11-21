@@ -914,6 +914,14 @@ fn snapshot_digest(json: &[u8]) -> [u8; 32] {
 }
 
 fn write_legacy_snapshot(session_id: &str, json: &[u8]) -> anyhow::Result<()> {
+    write_legacy_snapshot_inner(session_id, json)?;
+    // The snapshot now holds everything the turn journal recorded
+    // (mini-agent-nvnkx.46); only a published snapshot makes it obsolete.
+    super::turn_journal::discard(session_id);
+    Ok(())
+}
+
+fn write_legacy_snapshot_inner(session_id: &str, json: &[u8]) -> anyhow::Result<()> {
     let dir = session_dir();
     crate::paths::ensure_private_directory(&dir)?;
     let path = session_path(session_id)?;
@@ -1228,6 +1236,13 @@ pub(crate) fn precompact_path(session_id: &str, number: usize) -> anyhow::Result
     Ok(session_dir().join(format!("{session_id}.precompact-{number}.jsonl")))
 }
 
+/// `<id>.turn.jsonl`: the append-only journal of the turn in progress (see
+/// `session::turn_journal`), in the private session directory.
+pub(crate) fn turn_journal_path(session_id: &str) -> anyhow::Result<PathBuf> {
+    crate::paths::validate_portable_component(session_id)?;
+    Ok(session_dir().join(format!("{session_id}.turn.jsonl")))
+}
+
 /// The messages compaction number `number` replaced, read back from its
 /// sidecar (mini-agent-sskdu.244). Bounded by the session size limit; a line
 /// that does not parse refuses the whole file rather than restoring a part.
@@ -1310,6 +1325,7 @@ fn delete_session_files(id: &str) -> anyhow::Result<()> {
     }
     // The catalogue's metadata sidecar goes with its session.
     let _ = std::fs::remove_file(dir.join(format!("{id}.index")));
+    let _ = std::fs::remove_file(dir.join(format!("{id}.turn.jsonl")));
     if let Ok(entries) = std::fs::read_dir(&dir) {
         let prefix = format!("{id}.precompact-");
         for entry in entries.flatten() {
@@ -1565,8 +1581,9 @@ fn read_discovered_session(path: &Path, skipped: &mut SkippedEntries) -> Option<
         }
     };
     match decode_session_json(&json) {
-        Ok(session) => {
+        Ok(mut session) => {
             if path.file_stem().and_then(|stem| stem.to_str()) == Some(session.id.as_str()) {
+                super::turn_journal::recover(&mut session);
                 session.file_checkpoints.trust_owned_load();
             }
             Some(session)
@@ -1704,6 +1721,8 @@ pub fn load_session_exact(id: &str) -> anyhow::Result<Option<Session>> {
                 "persisted session ID mismatch: requested {id}, found {}",
                 session.id
             );
+            let mut session = session;
+            super::turn_journal::recover(&mut session);
             session.file_checkpoints.trust_owned_load();
             Ok(Some(session))
         }

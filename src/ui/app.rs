@@ -2086,6 +2086,12 @@ impl<'a> App<'a> {
         }
     }
 
+    /// What to print on the normal screen after the TUI exits (see
+    /// [`super::exit_summary`]).
+    pub(super) fn exit_summary(&self) -> Option<String> {
+        super::exit_summary(self.ui.session, self.ui.cli.no_session)
+    }
+
     pub(super) async fn shutdown_services(&mut self) {
         #[cfg(feature = "lsp")]
         crate::extras::lsp::shutdown_live_managers().await;
