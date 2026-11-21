@@ -12,8 +12,7 @@
 //! answers are handed to the session through [`Hub`] channels and take the
 //! same steering queue and permission prompt as local input.
 
-// The TUI is not wired to this server yet (see docs/development/remote-control.md).
-#![allow(dead_code)]
+pub mod bridge;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -76,6 +75,7 @@ impl Hub {
     }
 }
 
+#[derive(Debug)]
 pub struct RemoteOptions {
     pub host: IpAddr,
     pub port: u16,
@@ -105,10 +105,6 @@ impl RemoteServer {
     /// URL carrying the token, to open on the other device.
     pub fn url(&self) -> String {
         format!("http://{}/?token={}", self.addr, self.token)
-    }
-
-    pub fn shutdown(&self) {
-        self.task.abort();
     }
 }
 

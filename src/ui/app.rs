@@ -783,6 +783,33 @@ impl Drop for SessionTitleWork {
     }
 }
 
+#[cfg(feature = "remote")]
+type RemoteLinkSlot = crate::extras::remote::bridge::RemoteLink;
+#[cfg(feature = "remote")]
+type RemoteCommandIn = crate::extras::remote::RemoteCommand;
+#[cfg(not(feature = "remote"))]
+type RemoteLinkSlot = std::convert::Infallible;
+#[cfg(not(feature = "remote"))]
+type RemoteCommandIn = std::convert::Infallible;
+
+/// The next browser command of the running remote view; pends when none runs.
+async fn next_remote_command(remote: &mut Option<RemoteLinkSlot>) -> Option<RemoteCommandIn> {
+    #[cfg(feature = "remote")]
+    if let Some(link) = remote.as_mut() {
+        return Some(link.recv().await);
+    }
+    #[cfg(not(feature = "remote"))]
+    let _ = remote;
+    std::future::pending().await
+}
+
+#[cfg(not(feature = "remote"))]
+impl App<'_> {
+    async fn apply_remote_command(&mut self, command: RemoteCommandIn) -> anyhow::Result<()> {
+        match command {}
+    }
+}
+
 pub(crate) struct App<'a> {
     ui: UiContext<'a>,
     run: AgentRunState,
@@ -816,6 +843,8 @@ pub(crate) struct App<'a> {
     ask_rx: Option<mpsc::Receiver<crate::permission::ask::UserRequest>>,
     permission_prompt: Option<PermissionState>,
     question_prompt: Option<QuestionState>,
+    /// The `/remote on` browser view, while one is running.
+    remote: Option<RemoteLinkSlot>,
     #[cfg(feature = "advisor")]
     handoff_rx: Option<crate::extras::advisor::HandoffReceiver>,
 
@@ -1487,6 +1516,7 @@ impl<'a> App<'a> {
             ask_rx,
             permission_prompt: None,
             question_prompt: None,
+            remote: None,
             #[cfg(feature = "advisor")]
             handoff_rx,
             btw_tx,
@@ -1748,6 +1778,8 @@ impl<'a> App<'a> {
                 self.loop_state.last_source_revalidation = Some(std::time::Instant::now());
             }
             self.expire_abandoned_prompts(revalidate)?;
+            #[cfg(feature = "remote")]
+            self.sync_remote_ask();
             #[cfg(feature = "subagents")]
             if self.permission_prompt.is_none()
                 && self.question_prompt.is_none()
@@ -1816,6 +1848,7 @@ impl<'a> App<'a> {
             let job_wake = self.job_wake_armed();
             let job_queue = self.ui.sandbox.job_notice_queue().clone();
 
+            let remote_armed = self.remote_armed();
             #[cfg(feature = "subagents")]
             let background_pool = self.ui.session.background_pool.clone();
             tokio::select! {
@@ -1926,6 +1959,9 @@ impl<'a> App<'a> {
                             crate::startup::heap_future(|| self.handle_agent_stream_closed()).await?;
                         }
                     }
+                }
+                Some(command) = next_remote_command(&mut self.remote), if remote_armed => {
+                    crate::startup::heap_future(|| self.apply_remote_command(command)).await?;
                 }
                 Some(ask_req) = async { self.ask_rx.as_mut()?.recv().await }, if (self.permission_prompt.is_none() && self.question_prompt.is_none()) => {
                     self.begin_user_request(ask_req)?;
@@ -3916,6 +3952,13 @@ impl<'a> App<'a> {
                 return Ok(());
             }
 
+            #[cfg(feature = "remote")]
+            if let Some(args) = crate::extras::remote::bridge::command_args(&text) {
+                echo_submission(&mut self.renderer, text.trim_start())?;
+                self.run_remote_command(args).await?;
+                return Ok(());
+            }
+
             // Bypass-slot handlers: /queue and /btw
             {
                 let t = text.trim_start();
@@ -3995,6 +4038,10 @@ impl<'a> App<'a> {
     }
 
     async fn handle_agent_event(&mut self, event: AgentEvent) -> anyhow::Result<()> {
+        #[cfg(feature = "remote")]
+        if let Some(remote) = self.remote.as_mut() {
+            remote.observe(&event);
+        }
         if self.reactive_context_relief_applies(&event)
             && let AgentEvent::Error { interactions, .. } = &event
         {
@@ -5720,6 +5767,152 @@ impl<'a> App<'a> {
                 C_TOOL,
             )?;
         }
+        Ok(())
+    }
+
+    fn remote_armed(&self) -> bool {
+        #[cfg(feature = "remote")]
+        return self.remote.is_some();
+        #[cfg(not(feature = "remote"))]
+        false
+    }
+
+    /// `/remote on|off|status`: starts, stops or describes the browser view.
+    #[cfg(feature = "remote")]
+    async fn run_remote_command(&mut self, args: &str) -> anyhow::Result<()> {
+        use crate::extras::remote::bridge::{self, RemoteLink, RemoteRequest};
+        match bridge::parse_request(args) {
+            Err(message) => self.renderer.write_line(&message, C_ERROR)?,
+            Ok(RemoteRequest::Status) => {
+                let line = match &self.remote {
+                    Some(link) => {
+                        format!("remote control: on, listening on http://{}", link.addr())
+                    }
+                    None => "remote control: off (start it with /remote on)".to_string(),
+                };
+                self.renderer.write_line(&line, C_TOOL)?;
+            }
+            Ok(RemoteRequest::Off) => {
+                let line = if self.remote.take().is_some() {
+                    "remote control: off"
+                } else {
+                    "remote control is not running"
+                };
+                self.renderer.write_line(line, C_TOOL)?;
+            }
+            Ok(RemoteRequest::On(options)) => {
+                if self.remote.is_some() {
+                    self.renderer.write_line(
+                        "remote control is already on; /remote off first to get a new URL",
+                        C_ERROR,
+                    )?;
+                } else {
+                    match RemoteLink::start(options).await {
+                        Ok(link) => {
+                            if let Some(warning) = bridge::non_loopback_warning(link.addr()) {
+                                self.renderer.write_line(&warning, C_ERROR)?;
+                            }
+                            self.renderer.write_line(
+                                "remote control on. Open this URL (it carries the access token; it is shown once):",
+                                C_TOOL,
+                            )?;
+                            self.renderer.write_line(&link.url(), C_TOOL)?;
+                            self.renderer
+                                .write_line("stop it with /remote off", C_TOOL)?;
+                            self.remote = Some(link);
+                        }
+                        Err(error) => self
+                            .renderer
+                            .write_line(&format!("remote control not started: {error}"), C_ERROR)?,
+                    }
+                }
+            }
+        }
+        self.refresh()?;
+        Ok(())
+    }
+
+    /// Keeps the browser's permission ask equal to the prompt on the terminal.
+    #[cfg(feature = "remote")]
+    fn sync_remote_ask(&mut self) {
+        if let Some(remote) = self.remote.as_mut() {
+            remote.sync_ask(
+                self.permission_prompt
+                    .as_ref()
+                    .and_then(|p| p.remote_view()),
+            );
+        }
+    }
+
+    /// Routes one browser command into the paths local input uses: the
+    /// steering queue, the permission prompt (first answer wins) and the
+    /// interrupt path.
+    #[cfg(feature = "remote")]
+    async fn apply_remote_command(
+        &mut self,
+        command: crate::extras::remote::RemoteCommand,
+    ) -> anyhow::Result<()> {
+        use crate::extras::remote::RemoteCommand;
+        match command {
+            RemoteCommand::Steer(text) => {
+                let result = if self.run.is_running {
+                    self.run
+                        .steering
+                        .as_ref()
+                        .ok_or("this run does not accept steering")
+                        .and_then(|steering| steering.submit(&text))
+                } else {
+                    Err("no turn is running to steer")
+                };
+                match result {
+                    Ok(()) => self.renderer.write_line(
+                        &format!("steering pending (remote): {}", sanitize_output(&text)),
+                        C_TOOL,
+                    )?,
+                    Err(reason) => {
+                        if let Some(remote) = &self.remote {
+                            remote.notice("error", reason);
+                        }
+                        self.renderer
+                            .write_line(&format!("remote steer refused: {reason}"), C_ERROR)?;
+                    }
+                }
+            }
+            RemoteCommand::Permission { id, allow } => {
+                let key = self.remote.as_ref().and_then(|remote| remote.ask_key(&id));
+                let on_screen = self
+                    .permission_prompt
+                    .as_ref()
+                    .and_then(|prompt| prompt.remote_view())
+                    .map(|view| view.key);
+                if key.is_some()
+                    && key == on_screen
+                    && let Some(mut prompt) = self.permission_prompt.take()
+                {
+                    let answered = prompt.answer_remote(allow, &mut self.renderer)?;
+                    drop(prompt);
+                    if answered {
+                        self.resume_permission_clock();
+                    }
+                }
+            }
+            RemoteCommand::Cancel => {
+                if matches!(
+                    interrupt_target(
+                        self.btw_inflight,
+                        self.run.validation_active(),
+                        self.run.is_running,
+                    ),
+                    InterruptTarget::Validation | InterruptTarget::MainRun
+                ) {
+                    self.abort_main_run().await?;
+                    if let Some(remote) = &self.remote {
+                        remote.notice("interrupted", "run cancelled from the remote view");
+                    }
+                }
+            }
+        }
+        self.refresh()?;
         Ok(())
     }
 

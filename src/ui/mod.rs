@@ -1104,6 +1104,18 @@ pub(crate) fn allowed_while_running(text: &str) -> bool {
         || goal_control_while_running(t)
         || loop_control_while_running(t)
         || cron_control_while_running(t)
+        || remote_control_while_running(t)
+}
+
+/// `/remote` only starts or stops the browser view; it never touches the run.
+#[cfg(feature = "remote")]
+fn remote_control_while_running(text: &str) -> bool {
+    crate::extras::remote::bridge::command_args(text).is_some()
+}
+
+#[cfg(not(feature = "remote"))]
+fn remote_control_while_running(_text: &str) -> bool {
+    false
 }
 
 /// Every `/cron` verb passes while running: arming, listing, stopping and

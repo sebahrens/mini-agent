@@ -161,6 +161,9 @@ fn build_available_commands() -> Vec<&'static str> {
     #[cfg(feature = "mcp")]
     cmds.push("/mcp");
 
+    #[cfg(feature = "remote")]
+    cmds.push("/remote");
+
     #[cfg(feature = "subagents")]
     {
         cmds.push("/subagent-model");
@@ -193,6 +196,7 @@ pub(crate) fn reserved_command(name: &str) -> bool {
             "/hooks",
             "/loop",
             "/mcp",
+            "/remote",
             "/subagent-model",
             "/subagent-models",
             "/tasks",
