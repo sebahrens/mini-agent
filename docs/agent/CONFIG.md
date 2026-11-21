@@ -1148,7 +1148,7 @@ layer. A missing file means no managed policy.
 [permissions]
 deny = { shell = ["rm -rf *"], write = ["/etc/**"] }  # appended to permission-deny; wins over allow rules
 # a deny on write, edit or notebook_edit applies to all three (and js/write_file)
-# in a shell deny, `*` crosses `/` (it is widened to `**`), so "rm -rf *" denies `rm -rf build/out`
+# in a shell deny or ask rule (managed or not), `*` crosses `/` (it is widened to `**`), so "rm -rf *" denies `rm -rf build/out`
 allowed_modes = ["standard", "guarded", "readonly"]   # security modes users may select (default: all)
 disable_yolo = true                                   # shorthand: remove `yolo` from the modes
 require_permission_checks = true                      # refuse --dangerously-skip-permissions (implied by deny, allowed_modes, disable_yolo)
@@ -2565,7 +2565,14 @@ permission tool keys are `shell` (`bash` is a compatibility alias), `js/fetch` (
 `git/show`, `git/stage`, `git/unstage`, `git/commit`, `git/amend`, `git/branch`, `git/switch`, `git/stash`,
 `git/tag`, `git/restore`, and `mcp_tool`.
 MCP-backed calls use `mcp_tool` as the tool key and
-`mcp_tool:{server_name}:{tool_name}` as the matched input. Use `"*"` for the
+`mcp_tool:{server_name}:{tool_name}` as the matched input. In every `mcp_tool` glob
+rule (allow, ask, deny; user and managed) `*` also crosses `/`, because MCP operations
+(`resources/read`, `prompts/get`) and server-chosen tool names may contain `/`: a deny of
+`mcp_tool:github:*` covers `mcp_tool:github:resources/read` and `mcp_tool:github:ns/tool`.
+Server names are limited to 1-64 letters, digits, `.`, `_` and `-` (a server with any
+other name, such as `a:b` or `*`, is not connected and a notice names it), and `:` and `%`
+in a tool name are percent-encoded in the key (`%3A`, `%25`) so the server and tool
+components are never ambiguous. Use `"*"` for the
 default action applied when no rule for a tool matches. In `standard` mode an
 unmatched `write`, `edit`, or JS `write_file` inside the workspace follows that
 default (so `"*": ask` asks before workspace modifications), except that an
@@ -2821,6 +2828,27 @@ When a rule resolves to `ask`, the TUI shows the request and these keys:
 
 Session grants never override a `deny` rule (see below). ACP clients keep
 their own approval choices.
+
+### Shell rules and read-only scripts
+
+- In shell `deny` and `ask` globs (config, `--deny`, managed) `*` crosses `/`, so
+  `curl *` matches `curl https://example.com/x` and `git push *` matches
+  `git push origin feature/login`. Shell `allow` rules stay exact-script.
+- The built-in convenience allows (`cargo test`, `pwd`, ...) are replaced only by a
+  configured allow or ask rule for `shell`; a deny rule alone keeps them. `guarded`
+  withholds the ones that write or run workspace code (`cargo fmt/build/test/check/clippy`).
+- A script the read-only classifier proves read-only (`ls`, `git log`, `rg foo src`) is
+  allowed without a prompt in `standard` and `guarded`, and in `readonly`/`planwrite`
+  when the sandbox is enforced (otherwise those modes still deny shell). The classifier
+  lexes POSIX syntax only: when the session shell is `cmd.exe` or PowerShell it never
+  auto-allows and every unmatched script asks.
+- `(x)` prefix grants are cleared when the session is replaced (`/resume`), are not
+  offered when the second word is an option (`rm -rf`, `git -C`) or the script is
+  destructive, and in `yolo` a script allowed only by a prefix grant still asks when it is
+  destructive (`git push --force`). The destructive recognizer also knows the cmd.exe and
+  PowerShell forms (`del /s`, `rd /s`, `Remove-Item -Recurse -Force`, `format`, ...).
+- Exact-URL `web_fetch`/`web_search`/`fetch` allow and ask rules also match the bare URL
+  of a live fetch (the part before ` destinations=[...]`).
 
 ### Rule precedence
 

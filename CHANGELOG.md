@@ -98,6 +98,15 @@ Notable changes to mini-agent are documented in this file. The format follows
   caps concurrent relays at 256 (mini-agent-y42nd). `update` and `install.sh` treat a `gh` whose
   `attestation verify --help` lacks the pin flags as unavailable (upgrade gh), not a failed
   verification (mini-agent-0cshc).
+- The read-only shell auto-allow is dialect-aware: with a cmd.exe or PowerShell session shell it never auto-allows (POSIX parsing proves nothing there), so `grep 'x & del y & rem ' f` and `cat -Path:.env` ask (mini-agent-nvnkx.358).
+- `*` in every `mcp_tool` glob rule now crosses `/`, so `mcp_tool:srv:*` covers `resources/read` and slash-named tools; MCP server names are limited to letters, digits, `.`, `_`, `-` (max 64) and `:`/`%` in tool names are percent-encoded in the permission key (mini-agent-nvnkx.190, .191).
+- `*` in user-level shell `deny` and `ask` globs crosses `/` like the managed layer, so `curl *` denies `curl https://example.com/x`; the managed special case was removed (mini-agent-nvnkx.61).
+- A shell `deny` rule no longer removes the built-in `cargo test`/`pwd` allows; only a configured allow or ask rule does (mini-agent-nvnkx.63).
+- Replacing the session (`/resume`) clears session shell-prefix grants, and loading one twice leaves one prefix (mini-agent-nvnkx.59).
+- The `(x)` prefix offer is withheld for an option second word or a destructive script, and a prefix grant no longer skips the yolo destructive-command ask (mini-agent-nvnkx.72).
+- Exact-URL `web_fetch`/`web_search`/`fetch` allow and ask rules match the bare URL of a live fetch (mini-agent-nvnkx.66).
+- The destructive-command recognizer (yolo ask) knows cmd.exe and PowerShell forms such as `del /s /q`, `rd /s /q`, `Remove-Item -Recurse -Force`, and strips `cmd /c`, `call`, `start` and `powershell -Command` wrappers (mini-agent-nvnkx.362).
+- `guarded` auto-allows scripts proven read-only and withholds the built-in `cargo fmt/build/test/check/clippy` allows; `readonly` and `planwrite` allow proven read-only scripts when the sandbox is enforced (mini-agent-nvnkx.64).
 
 ### Added
 

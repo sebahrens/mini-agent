@@ -568,6 +568,7 @@ pub(crate) fn build_interactive_permission_with_cli_at(
     let result = build_interactive_permission_at(cfg, authority, working_dir)?;
     if let Some(permission) = &result.0 {
         let mut checker = permission.lock().unwrap_or_else(|error| error.into_inner());
+        checker.set_shell_dialect(shell_dialect_for_name(&cli.resolve_shell(cfg)));
         checker.apply_ephemeral_cli_rules(&seeds)?;
         grant_add_dir_access(&mut checker, cli, cfg);
     }
@@ -608,10 +609,39 @@ pub(crate) fn build_noninteractive_permission_with_cli(
     let result = build_noninteractive_permission(cfg, authority)?;
     if let Some(permission) = &result.0 {
         let mut checker = permission.lock().unwrap_or_else(|error| error.into_inner());
+        checker.set_shell_dialect(shell_dialect_for_name(&cli.resolve_shell(cfg)));
         checker.apply_ephemeral_cli_rules(&seeds)?;
         grant_add_dir_access(&mut checker, cli, cfg);
     }
     Ok(result)
+}
+
+/// Shell dialect implied by a shell name or path. Unknown names are POSIX off
+/// Windows and fail closed (cmd) on Windows.
+pub(crate) fn shell_dialect_for_name(shell: &str) -> crate::sandbox::ShellDialect {
+    use crate::sandbox::ShellDialect;
+    let name = shell
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(shell)
+        .to_ascii_lowercase();
+    match name.as_str() {
+        "bash" | "bash.exe" | "sh" | "sh.exe" => ShellDialect::Posix,
+        "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe" => ShellDialect::PowerShell,
+        "cmd" | "cmd.exe" => ShellDialect::Cmd,
+        _ => default_shell_dialect(),
+    }
+}
+
+/// Dialect assumed when none was stated: the platform default shell.
+pub(crate) fn default_shell_dialect() -> crate::sandbox::ShellDialect {
+    // Unit tests that do not state a dialect exercise the POSIX policy on
+    // every host.
+    if cfg!(windows) && !cfg!(test) {
+        crate::sandbox::ShellDialect::Cmd
+    } else {
+        crate::sandbox::ShellDialect::Posix
+    }
 }
 
 fn build_permission_checker_at(
@@ -629,6 +659,10 @@ fn build_permission_checker_at(
         cfg.permission_modes.clone(),
         authority.sandbox,
     )?;
+    let mut checker = checker;
+    if let Some(shell) = &cfg.shell {
+        checker.set_shell_dialect(shell_dialect_for_name(shell));
+    }
 
     if !authority.tools_enabled || !authority.permission_checks_enabled {
         return Ok(None);
@@ -865,6 +899,32 @@ pub(crate) fn is_destructive_shell_script(script: &str) -> bool {
         ))
         .expect("trusted destructive-command regex must compile")
     });
+    // cmd.exe and PowerShell equivalents, matched case-insensitively. This is
+    // a guard rail, so both sets apply on every platform (over-asking is
+    // acceptable; mini-agent-nvnkx.362).
+    static WINDOWS_DESTRUCTIVE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| {
+            regex::Regex::new(concat!(
+                r"(?i)^(?:",
+                r"(?:del|erase)\s+(?:\S+\s+)*(?:/[sqf]\b|\S*\*)",
+                r"|(?:rd|rmdir)\s+(?:\S+\s+)*/s\b",
+                r"|(?:remove-item|ri|rm|del|erase|rd|rmdir)\s+(?:\S+\s+)*-(?:recurse|force|r|fo)\b",
+                r"|format(?:\.com)?\s+[a-z]:",
+                r"|(?:diskpart|clear-disk|clear-content|format-volume|remove-partition)\b",
+                r")"
+            ))
+            .expect("trusted Windows destructive-command regex must compile")
+        });
+    // Windows launcher prefixes that only wrap the real command.
+    static WINDOWS_WRAPPER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(concat!(
+            r"(?i)^(?:cmd(?:\.exe)?\s+(?:/\w+\s+)*?/[ck]\s+",
+            r"|call\s+",
+            r"|start\s+(?:/\w+\s+)*",
+            r"|(?:powershell|pwsh)(?:\.exe)?\s+(?:-\w+\s+)*?-c(?:ommand)?\s+)"
+        ))
+        .expect("trusted Windows wrapper regex must compile")
+    });
     script
         .split(['\n', ';', '&', '|'])
         .map(|command| {
@@ -872,15 +932,57 @@ pub(crate) fn is_destructive_shell_script(script: &str) -> bool {
             loop {
                 let stripped = ["sudo ", "env ", "command ", "exec ", "nohup ", "time "]
                     .iter()
-                    .find_map(|wrapper| command.strip_prefix(wrapper));
+                    .find_map(|wrapper| command.strip_prefix(wrapper))
+                    .or_else(|| {
+                        WINDOWS_WRAPPER
+                            .find(command)
+                            .map(|found| &command[found.end()..])
+                    });
                 match stripped {
-                    Some(rest) => command = rest.trim_start(),
+                    Some(rest) => {
+                        command = rest.trim_start().trim_start_matches(['"', '\'', '(', '{'])
+                    }
                     None => break,
                 }
             }
             command
         })
-        .any(|command| DESTRUCTIVE.is_match(command))
+        .any(|command| DESTRUCTIVE.is_match(command) || WINDOWS_DESTRUCTIVE.is_match(command))
+}
+
+#[cfg(test)]
+mod windows_destructive_tests {
+    use super::is_destructive_shell_script as d;
+
+    #[test]
+    fn windows_forms_are_destructive_and_listings_are_not() {
+        for script in [
+            "del /s /q build",
+            "rd /s /q .",
+            "Remove-Item -Recurse -Force src",
+            "cmd /c rmdir /s /q node_modules",
+            "CMD.EXE /D /S /C \"rmdir /s /q x\"",
+            "powershell -NoProfile -Command Remove-Item -Recurse x",
+            "call del *.log",
+            "start /b rd /s /q out",
+            "ri -Recurse x",
+            "format c:",
+            "diskpart",
+            "Clear-Content a.txt",
+            "echo hi & erase /f /q a.txt",
+        ] {
+            assert!(d(script), "{script}");
+        }
+        for script in [
+            "dir /s",
+            "Get-ChildItem -Recurse",
+            "cmd /c dir /s",
+            "del notes.txt",
+            "type a.txt",
+        ] {
+            assert!(!d(script), "{script}");
+        }
+    }
 }
 
 pub fn default_deny_regex_rules() -> Vec<(/* tool */ &'static str, /* regex */ &'static str)> {

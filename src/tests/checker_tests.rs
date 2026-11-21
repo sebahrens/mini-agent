@@ -60,8 +60,11 @@ fn readonly_denies_write_bash_and_edit() {
         checker.check("edit", "src/main.rs"),
         CheckResult::Denied(_)
     ));
+    // A script proven read-only is a read when the sandbox is enforced
+    // (mini-agent-nvnkx.64); anything that writes stays denied.
+    assert!(matches!(checker.check("bash", "ls"), CheckResult::Allowed));
     assert!(matches!(
-        checker.check("bash", "ls"),
+        checker.check("bash", "touch notes.txt"),
         CheckResult::Denied(_)
     ));
     assert!(matches!(
@@ -179,8 +182,11 @@ fn guarded_asks_for_write_and_bash() {
         checker.check("bash", "touch notes.txt"),
         CheckResult::Ask
     ));
-    // Read-only auto-allow is Standard-mode only; Guarded still asks.
-    assert!(matches!(checker.check("bash", "ls -la"), CheckResult::Ask));
+    // A verified read-only script is a read in Guarded too (nvnkx.64).
+    assert!(matches!(
+        checker.check("bash", "ls -la"),
+        CheckResult::Allowed
+    ));
     assert!(matches!(checker.check("bash", "ls **"), CheckResult::Ask));
     assert!(matches!(checker.check("bash", "pwd"), CheckResult::Allowed));
 }

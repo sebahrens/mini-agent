@@ -660,8 +660,8 @@ fn raw_definitions(content: &str) -> Result<BTreeMap<String, Value>, &'static st
     }
     let mut result = BTreeMap::new();
     for (name, value) in servers {
-        if name.is_empty() || name.len() > 256 || name.chars().any(char::is_control) {
-            return Err("project MCP server name is invalid");
+        if !super::config::is_valid_server_name(name) {
+            return Err("project MCP server name is invalid (use 1-64 letters, digits, . _ -)");
         }
         result.insert(name.clone(), value.clone());
     }
@@ -1181,6 +1181,16 @@ mod tests {
         assert!(!text.contains("HELPER_SECRET") && !text.contains("ENV_SECRET"));
         assert!(text.contains("NODE_OPTIONS=\"--require ./.hidden/evil.js\""));
     }
+    #[test]
+    fn server_names_with_key_separators_or_globs_are_rejected() {
+        for name in ["github:x", "*", "a/b", "a?b", "a b", ""] {
+            let text = serde_json::json!({"mcpServers": {name: {"command": "x"}}}).to_string();
+            assert!(definitions(&text).is_err(), "{name:?}");
+        }
+        let ok = serde_json::json!({"mcpServers": {"git-hub_1.x": {"command": "x"}}}).to_string();
+        assert!(definitions(&ok).is_ok());
+    }
+
     #[test]
     fn raw_definitions_are_bounded_and_never_manufacture_builtin_trust() {
         let defs=definitions(r#"{"mcpServers":{"雪":{"command":"runner","args":["a b",""],"env":{"KEY":"${SECRET}"}},"local":{"url":"http://localhost:3000/mcp","allow_local":true}}}"#).unwrap();
