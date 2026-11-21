@@ -114,7 +114,16 @@ impl fmt::Display for McpNotice {
 struct ToolNoticeState {
     pending: Vec<McpNotice>,
     last_info: Option<CompactString>,
+    /// Error notices already queued, so a permanent catalogue condition is
+    /// reported once instead of after every agent rebuild. Bounded.
+    delivered: std::collections::BTreeSet<String>,
+    /// Address of each server's last-seen cached listing; a new listing
+    /// makes its notices reportable again.
+    listing_seen: HashMap<String, usize>,
 }
+
+/// Most distinct catalogue notices remembered per manager.
+const MAX_DELIVERED_TOOL_NOTICES: usize = 256;
 
 pub struct McpClientManager {
     pub handles: Vec<client::McpClientHandle>,
@@ -413,11 +422,33 @@ impl McpClientManager {
     pub(crate) fn push_tool_notice(&self, notice: String) {
         // Info lands in the log file, never on stderr, so the TUI stays clean.
         tracing::info!("{notice}");
-        self.tool_notices
+        let mut state = self
+            .tool_notices
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .pending
-            .push(McpNotice::error(notice));
+            .unwrap_or_else(|error| error.into_inner());
+        if state.delivered.contains(&notice) {
+            return;
+        }
+        if state.delivered.len() >= MAX_DELIVERED_TOOL_NOTICES {
+            state.delivered.clear();
+        }
+        state.delivered.insert(notice.clone());
+        state.pending.push(McpNotice::error(notice));
+    }
+
+    /// Records the cached listing a collection used for `server`. When it is a
+    /// different listing than last time (relisted after `list_changed` or a
+    /// reconnect), the server's earlier notices are reportable again.
+    fn note_listing(&self, server: &str, listing: &Arc<client::ListedTools>) {
+        let address = Arc::as_ptr(listing) as usize;
+        let mut state = self
+            .tool_notices
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.listing_seen.insert(server.to_owned(), address) != Some(address) {
+            let marker = format!("'{server}'");
+            state.delivered.retain(|notice| !notice.contains(&marker));
+        }
     }
 
     /// Queue an informational catalog notice once for this manager. Agent
@@ -722,22 +753,42 @@ impl McpClientManager {
                 let client_is_live: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
                     liveness.upgrade().is_some() && (reconnects || !live_peer.is_transport_closed())
                 });
+                // A server that did not advertise the tools capability has no
+                // `tools/list` to answer; asking it only produces an error.
+                let tools_unsupported = peer
+                    .peer_info()
+                    .is_some_and(|info| info.capabilities.tools.is_none());
                 let attempt = self
                     .health
                     .begin(&server_name, health::AttemptKind::Catalogue);
                 async move {
                     let _permit = sem.acquire_owned().await;
-                    let cached = listed
-                        .get_or_list(|| {
-                            client::list_bounded_tools(&peer, list_timeout, &options, defer)
+                    // The failure of the previous collection was already
+                    // reported; do not ask (and wait) again within the backoff.
+                    let repeat_failure = !tools_unsupported && listed.recent_failure();
+                    let cached = if tools_unsupported {
+                        Ok(client::CachedListing {
+                            listed: Arc::new(client::bound_listed_tools(Vec::new())),
+                            kept_previous: None,
                         })
-                        .await;
+                    } else if repeat_failure {
+                        Err(rmcp::ServiceError::Timeout {
+                            timeout: Duration::ZERO,
+                        })
+                    } else {
+                        listed
+                            .get_or_list(|| {
+                                client::list_bounded_tools(&peer, list_timeout, &options, defer)
+                            })
+                            .await
+                    };
                     let (result, kept_previous) = match cached {
                         Ok(cached) => (Ok(cached.listed), cached.kept_previous),
                         Err(error) => (Err(error), None),
                     };
                     let outcome = match &result {
                         Ok(_) => health::AttemptOutcome::Succeeded,
+                        Err(_) if repeat_failure => health::AttemptOutcome::Failed,
                         Err(rmcp::ServiceError::Timeout { .. }) => health::AttemptOutcome::TimedOut,
                         Err(_) => health::AttemptOutcome::Failed,
                     };
@@ -753,6 +804,7 @@ impl McpClientManager {
                         result,
                         (list_timeout, call_timeout),
                         kept_previous,
+                        repeat_failure,
                     )
                 }
             })
@@ -772,6 +824,7 @@ impl McpClientManager {
             result,
             (list_timeout, call_timeout),
             kept_previous,
+            repeat_failure,
         ) in results
         {
             if let Some(error) = &kept_previous {
@@ -785,6 +838,7 @@ impl McpClientManager {
             }
             match result {
                 Ok(tools) => {
+                    self.note_listing(&server_name, &tools);
                     tracing::debug!(
                         "MCP server '{}': {} tools listed",
                         server_name,
@@ -888,6 +942,7 @@ impl McpClientManager {
                         ));
                     }
                 }
+                Err(_) if repeat_failure => {}
                 Err(rmcp::ServiceError::Timeout { .. }) => {
                     tracing::debug!(
                         "MCP server '{}': tools/list timed out after {} ms",
@@ -1381,6 +1436,25 @@ mod tests {
         assert_eq!(notices[0].level(), McpNoticeLevel::Error);
         assert_eq!(notices[0].message(), "first");
         assert!(manager.take_notices().is_empty());
+    }
+
+    #[test]
+    fn repeated_catalogue_errors_are_reported_once_until_the_server_is_relisted() {
+        let mut manager = McpClientManager::from_handles(Vec::new());
+        let listing = Arc::new(client::bound_listed_tools(Vec::new()));
+        manager.note_listing("big", &listing);
+        let notice = "MCP server 'big' tool catalog is limited to 128 tools".to_string();
+        manager.push_tool_notice(notice.clone());
+        manager.push_tool_notice(notice.clone());
+        assert_eq!(manager.take_notices().len(), 1);
+        // The same cached listing on the next rebuild stays quiet.
+        manager.note_listing("big", &listing);
+        manager.push_tool_notice(notice.clone());
+        assert!(manager.take_notices().is_empty());
+        // A relisted catalogue reports again.
+        manager.note_listing("big", &Arc::new(client::bound_listed_tools(Vec::new())));
+        manager.push_tool_notice(notice);
+        assert_eq!(manager.take_notices().len(), 1);
     }
 
     #[test]

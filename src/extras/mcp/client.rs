@@ -336,7 +336,16 @@ pub(crate) struct ToolListCache {
     /// `tools/list_changed` flag of a reconnect replacement connection; read
     /// and consumed together with `changed`.
     adopted: Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>,
+    /// When the last first listing failed. Within [`MCP_LIST_FAILURE_BACKOFF`]
+    /// the next collection does not ask the server again, so a server that
+    /// never answers `tools/list` costs its timeout once, not on every agent
+    /// build.
+    failed_at: Mutex<Option<std::time::Instant>>,
 }
+
+/// How long a failed `tools/list` is not retried unless the server announces
+/// a changed list or the connection is replaced.
+pub(crate) const MCP_LIST_FAILURE_BACKOFF: Duration = Duration::from_secs(60);
 
 /// Outcome of a cached listing; `kept_previous` is set when a relist after
 /// `list_changed` failed and the previous successful set was retained.
@@ -351,7 +360,23 @@ impl ToolListCache {
             cell: Mutex::default(),
             changed,
             adopted: Mutex::default(),
+            failed_at: Mutex::default(),
         }
+    }
+
+    /// Whether the last first listing failed recently enough not to retry.
+    pub(crate) fn recent_failure(&self) -> bool {
+        !self.is_stale()
+            && self
+                .failed_at
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some_and(|at| at.elapsed() < MCP_LIST_FAILURE_BACKOFF)
+    }
+
+    fn set_failed(&self, failed: bool) {
+        *self.failed_at.lock().unwrap_or_else(|e| e.into_inner()) =
+            failed.then(std::time::Instant::now);
     }
 
     /// After a reconnect: marks the cached listing stale (the next collection
@@ -361,6 +386,7 @@ impl ToolListCache {
         *self.adopted.lock().unwrap_or_else(|e| e.into_inner()) = Some(flag);
         self.changed
             .store(true, std::sync::atomic::Ordering::Release);
+        self.set_failed(false);
     }
 
     fn current(&self) -> Arc<tokio::sync::OnceCell<Arc<ListedTools>>> {
@@ -415,10 +441,13 @@ impl ToolListCache {
         }
         let cell = self.current();
         match cell.get_or_try_init(list).await {
-            Ok(listed) => Ok(CachedListing {
-                listed: listed.clone(),
-                kept_previous: None,
-            }),
+            Ok(listed) => {
+                self.set_failed(false);
+                Ok(CachedListing {
+                    listed: listed.clone(),
+                    kept_previous: None,
+                })
+            }
             Err(error) => match previous {
                 Some(previous) => {
                     let _ = cell.set(previous.clone());
@@ -427,7 +456,10 @@ impl ToolListCache {
                         kept_previous: Some(error),
                     })
                 }
-                None => Err(error),
+                None => {
+                    self.set_failed(true);
+                    Err(error)
+                }
             },
         }
     }
