@@ -3751,7 +3751,7 @@ impl Startup {
                         );
                     }
                     if interrupted {
-                        failure = Some(anyhow::anyhow!(crate::agent::runner::HEADLESS_INTERRUPTED));
+                        failure = Some(crate::agent::runner::HeadlessInterrupted.into());
                     }
                     let saved = if let Some(owner) = &mut self.native_headless {
                         let result = owner.progress(session).await;
@@ -5207,7 +5207,6 @@ async fn run_headless_goal_rounds_inner(
             let transcript =
                 crate::extras::goal::judge::transcript_for_round(session, &turn.interactions);
             let client_for_judge = client.clone();
-            let cfg_for_judge = cfg.clone();
             // An interrupt during verification ends the goal rather than
             // feeding a cancelled command back to the agent as a failure it
             // should fix. The flag survives the closure so the loop can stop.
@@ -5230,133 +5229,38 @@ async fn run_headless_goal_rounds_inner(
             let outcome =
                 driver::settle_round(&session.goal_store, summary, move |request| async move {
                     // An operator who interrupts must not wait for a check;
-                    // a check can run as long as a test suite does. One
-                    // interrupt covers every tier, so a signal landing between
-                    // the checks and the judge is not lost.
-                    let interrupt = crate::print::headless_interrupt();
-                    tokio::pin!(interrupt);
-                    let (checks, interrupted) = crate::spend::run::scope(
-                        Some(spend.clone()),
-                        crate::extras::goal::checks::run_with_interrupt(
-                            &goal_for_checks,
-                            &request,
-                            &sandbox_for_checks,
-                            &cfg_for_checks,
-                            interrupt.as_mut(),
-                        ),
+                    // one interrupt covers every tier.
+                    let tiers = driver::run_tiers(
+                        driver::TierContext {
+                            goal: &goal_for_checks,
+                            request: &request,
+                            sandbox: &sandbox_for_checks,
+                            cfg: &cfg_for_checks,
+                            judge,
+                            transcript: &transcript,
+                            spend: Some(spend),
+                            prices: Some((session_prices, session_cache_prices)),
+                        },
+                        |_| Ok(client_for_judge.clone()),
+                        crate::print::headless_interrupt(),
                     )
                     .await;
-                    if interrupted {
+                    *judge_charge_out
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = tiers.judge_charge;
+                    if tiers.verification.interrupted {
                         interrupt_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                        // Say what was stopped. The diagnostic used to reach
-                        // the operator only because the cancelled check was
-                        // fed back to the agent as a failure, which is exactly
-                        // what must not happen: nothing was proved either way,
-                        // so the round settles as interrupted and the reason
-                        // is reported here instead.
-                        if let Some(tail) = checks.as_ref().and_then(|o| o.failure_tail.as_deref())
-                        {
+                        // Say what was stopped. The cancelled check is not fed
+                        // back to the agent as a failure (nothing was proved
+                        // either way), so the reason is reported here instead.
+                        if let Some(tail) = tiers.interrupted_check_tail {
                             check_notices
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .push(format!("{tail}\n"));
                         }
-                        return driver::Verification {
-                            interrupted: true,
-                            checks,
-                            ..driver::Verification::default()
-                        };
                     }
-                    // A failing check already decides the claim, and the
-                    // gate returns before it looks at the judge. Asking
-                    // anyway would spend a model call on an answer nobody
-                    // reads, and a transport failure there would count
-                    // against the judge's own failure ladder.
-                    let checks_rejected = checks.as_ref().is_some_and(|o| !o.all_passed);
-                    let judged = match judge {
-                        Some(resolved) if request.run_judge && !checks_rejected => {
-                            // A judge call can wait on its provider for as long
-                            // as the retry policy allows. An interrupt drops it:
-                            // a verdict arriving after the operator stopped the
-                            // run must not decide the goal.
-                            let observed = crate::spend::run::UsageObserver::with_run(
-                                spend.for_judge(
-                                    &resolved,
-                                    &cfg_for_judge,
-                                    resolved
-                                        .same_provider_as_session
-                                        .then(|| {
-                                            client_for_judge.listing_key(&resolved.provider).ok()
-                                        })
-                                        .flatten()
-                                        .as_ref(),
-                                ),
-                            );
-                            let verdict = driver::unless_interrupted(
-                                crate::extras::goal::judge::ask_with_transcript_observed(
-                                    &goal_for_checks,
-                                    &request,
-                                    &resolved,
-                                    &client_for_judge,
-                                    &transcript,
-                                    &cfg_for_judge,
-                                    checks.as_ref(),
-                                    observed.clone(),
-                                ),
-                                interrupt.as_mut(),
-                            )
-                            .await;
-                            let Some(verdict) = verdict else {
-                                let cancelled_call =
-                                    crate::extras::goal::judge::JudgeCall::interrupted_with_usage(
-                                        &cfg_for_judge,
-                                        &resolved.provider,
-                                        &observed,
-                                    );
-                                *judge_charge_out
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                    cancelled_call.charge(
-                                        &resolved,
-                                        &cfg_for_judge,
-                                        crate::extras::goal::judge::judge_prices_with_cache_prices(
-                                            &resolved,
-                                            &cfg_for_judge,
-                                            session_prices,
-                                            session_cache_prices,
-                                        ),
-                                        session_cache_prices,
-                                    );
-                                interrupt_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                                return driver::Verification {
-                                    interrupted: true,
-                                    ..driver::Verification::default()
-                                };
-                            };
-                            *judge_charge_out
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner) = verdict
-                                .charge(
-                                    &resolved,
-                                    &cfg_for_judge,
-                                    crate::extras::goal::judge::judge_prices_with_cache_prices(
-                                        &resolved,
-                                        &cfg_for_judge,
-                                        session_prices,
-                                        session_cache_prices,
-                                    ),
-                                    session_cache_prices,
-                                );
-                            Some(verdict)
-                        }
-                        _ => None,
-                    };
-                    driver::Verification {
-                        checks,
-                        judge_tokens: judged.as_ref().map_or(0, |call| call.tokens),
-                        judge: judged.map(|call| call.outcome),
-                        ..driver::Verification::default()
-                    }
+                    tiers.verification
                 })
                 .await;
 
@@ -5775,8 +5679,8 @@ async fn relieve_headless_turn(
             relief_usage,
         };
         if crate::print::headless_force_stopped() {
-            let failure = failure
-                .or_else(|| Some(anyhow::anyhow!(crate::agent::runner::HEADLESS_INTERRUPTED)));
+            let failure =
+                failure.or_else(|| Some(crate::agent::runner::HeadlessInterrupted.into()));
             return surfaced(
                 failure,
                 prompt,

@@ -5917,79 +5917,32 @@ async fn settle_acp_goal_round(
     // signal rather than through `TurnControl::cancel`'s success.
     control.begin_verification();
     let outcome = driver::settle_round(store, summary, |request| async move {
-        let (checks, mut interrupted) =
-            crate::extras::goal::checks::run_with_interrupt(&goal, &request, sandbox, cfg, async {
-                control.verification_cancelled().await;
-                Ok(())
-            })
-            .await;
-        // A failing check already decides the claim, so the judge is not asked
-        // for an answer the gate will not read.
-        let checks_rejected = checks.as_ref().is_some_and(|o| !o.all_passed);
-        let judged = match judge {
-            Some(resolved) if request.run_judge && !checks_rejected && !interrupted => {
-                match state
+        // ACP has no interrupt signal of its own and does not charge the judge
+        // to a session: the call is accounted to the turn's run only.
+        driver::run_tiers(
+            driver::TierContext {
+                goal: &goal,
+                request: &request,
+                sandbox,
+                cfg,
+                judge,
+                transcript: &transcript,
+                spend: crate::spend::run::Run::current(),
+                prices: None,
+            },
+            |resolved| {
+                state
                     .provider_clients
                     .get(&state.cli, cfg, &resolved.provider)
-                {
-                    Ok(client) => {
-                        let call = crate::extras::goal::driver::unless_interrupted(
-                            crate::extras::goal::judge::ask_with_transcript_observed(
-                                &goal,
-                                &request,
-                                &resolved,
-                                &client,
-                                &transcript,
-                                cfg,
-                                checks.as_ref(),
-                                crate::spend::run::Run::current().map_or_else(
-                                    Default::default,
-                                    |run| {
-                                        crate::spend::run::UsageObserver::with_run(
-                                            run.for_judge(
-                                                &resolved,
-                                                cfg,
-                                                resolved
-                                                    .same_provider_as_session
-                                                    .then(|| {
-                                                        client.listing_key(&resolved.provider).ok()
-                                                    })
-                                                    .flatten()
-                                                    .as_ref(),
-                                            ),
-                                        )
-                                    },
-                                ),
-                            ),
-                            async {
-                                control.verification_cancelled().await;
-                                Ok(())
-                            },
-                        )
-                        .await;
-                        if call.is_none() {
-                            interrupted = true;
-                        }
-                        call
-                    }
-                    // Fail open, like every other judge failure: an editor
-                    // without a reachable judge still gets its checks.
-                    Err(error) => Some(crate::extras::goal::judge::JudgeCall::unmetered(
-                        crate::extras::goal::gate::JudgeOutcome::Unavailable {
-                            reason: error.to_string(),
-                        },
-                    )),
-                }
-            }
-            _ => None,
-        };
-        driver::Verification {
-            checks,
-            judge_tokens: judged.as_ref().map_or(0, |call| call.tokens),
-            judge: judged.map(|call| call.outcome),
-            interrupted,
-            ..driver::Verification::default()
-        }
+                    .map_err(|error| error.to_string())
+            },
+            async {
+                control.verification_cancelled().await;
+                Ok(())
+            },
+        )
+        .await
+        .verification
     })
     .await;
     control.end_verification();

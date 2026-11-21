@@ -956,90 +956,37 @@ async fn start_goal_verification(
         let cancelled = futures::FutureExt::shared(async move {
             let _ = cancelled.await;
         });
-        let (checks, mut interrupted) = crate::spend::run::scope(
-            Some(spend.clone()),
-            crate::extras::goal::checks::run_with_interrupt(&goal, &request, &sandbox, &cfg, {
-                let cancelled = cancelled.clone();
-                async move {
-                    cancelled.await;
-                    Ok(())
-                }
-            }),
+        // The judge is cancelled like a check: an interrupt or a `/goal pause`
+        // while it waits on its provider abandons the request rather than
+        // letting it run to an ignored verdict (mini-agent-4teup).
+        let tiers = crate::extras::goal::driver::run_tiers(
+            crate::extras::goal::driver::TierContext {
+                goal: &goal,
+                request: &request,
+                sandbox: &sandbox,
+                cfg: &cfg,
+                judge,
+                transcript: &transcript,
+                spend: Some(spend),
+                prices: Some((session_prices, session_cache_prices)),
+            },
+            |_| Ok(client.clone()),
+            async move {
+                cancelled.await;
+                Ok(())
+            },
         )
         .await;
-        // A failing check already decides the claim, and the gate returns
-        // before it looks at the judge: asking anyway spends a model call on
-        // an answer nobody reads.
-        let checks_rejected = checks.as_ref().is_some_and(|o| !o.all_passed);
-        let mut judge_charge = None;
-        let judged = match judge {
-            Some(resolved) if request.run_judge && !checks_rejected && !interrupted => {
-                // The judge is cancelled like a check: an interrupt or a
-                // `/goal pause` while it waits on its provider abandons the
-                // request rather than letting it run to an ignored verdict
-                // (mini-agent-4teup).
-                let observed = crate::spend::run::UsageObserver::with_run(
-                    spend.for_judge(
-                        &resolved,
-                        &cfg,
-                        resolved
-                            .same_provider_as_session
-                            .then(|| client.listing_key(&resolved.provider).ok())
-                            .flatten()
-                            .as_ref(),
-                    ),
-                );
-                let verdict = crate::extras::goal::driver::unless_interrupted(
-                    crate::extras::goal::judge::ask_with_transcript_observed(
-                        &goal,
-                        &request,
-                        &resolved,
-                        &client,
-                        &transcript,
-                        &cfg,
-                        checks.as_ref(),
-                        observed.clone(),
-                    ),
-                    async move {
-                        cancelled.await;
-                        Ok(())
-                    },
-                )
-                .await;
-                interrupted = verdict.is_none();
-                let verdict = Some(verdict.unwrap_or_else(|| {
-                    crate::extras::goal::judge::JudgeCall::interrupted_with_usage(
-                        &cfg,
-                        &resolved.provider,
-                        &observed,
-                    )
-                }));
-                judge_charge = verdict.as_ref().and_then(|call| {
-                    call.charge(
-                        &resolved,
-                        &cfg,
-                        crate::extras::goal::judge::judge_prices_with_cache_prices(
-                            &resolved,
-                            &cfg,
-                            session_prices,
-                            session_cache_prices,
-                        ),
-                        session_cache_prices,
-                    )
-                });
-                verdict
-            }
-            _ => None,
-        };
+        let verification = tiers.verification;
         let _ = tx
             .send(UserEvent::GoalVerificationDone(Box::new(
                 crate::event::GoalVerificationEvent {
                     operation_id,
-                    checks,
-                    judge_tokens: judged.as_ref().map_or(0, |call| call.tokens),
-                    judge_charge,
-                    judge: judged.map(|call| call.outcome),
-                    interrupted,
+                    checks: verification.checks,
+                    judge_tokens: verification.judge_tokens,
+                    judge_charge: tiers.judge_charge,
+                    judge: verification.judge,
+                    interrupted: verification.interrupted,
                 },
             )))
             .await;

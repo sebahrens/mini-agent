@@ -1487,7 +1487,7 @@ async fn write_owned_output(
         || parent.as_ref().is_some_and(|cancel| cancel.is_cancelled())
     {
         sink.closed().store(true, Ordering::Relaxed);
-        anyhow::bail!(crate::agent::runner::HEADLESS_INTERRUPTED);
+        return Err(crate::agent::runner::HeadlessInterrupted.into());
     }
     struct AdmissionGuard {
         joined: bool,
@@ -1521,7 +1521,7 @@ async fn write_owned_output(
     let completed = match parent.as_ref() {
         Some(parent) => tokio::select! {
             biased;
-            () = parent.cancelled() => Err(anyhow::anyhow!(crate::agent::runner::HEADLESS_INTERRUPTED)),
+            () = parent.cancelled() => Err(crate::agent::runner::HeadlessInterrupted.into()),
             completed = work => completed,
         },
         None => work.await,
@@ -1550,7 +1550,7 @@ async fn write_owned_output(
             .is_some_and(|cancel| cancel.is_cancelled())
     {
         sink.closed().store(true, Ordering::Relaxed);
-        anyhow::bail!(crate::agent::runner::HEADLESS_INTERRUPTED);
+        return Err(crate::agent::runner::HeadlessInterrupted.into());
     }
     Ok(())
 }

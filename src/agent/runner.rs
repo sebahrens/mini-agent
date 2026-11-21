@@ -946,6 +946,28 @@ fn goal_hook_info() -> Option<crate::extras::hooks::GoalHookInfo> {
 /// comparison against a message someone later rewords.
 pub const HEADLESS_INTERRUPTED: &str = "headless agent interrupted";
 
+/// The typed form of [`HEADLESS_INTERRUPTED`]: build the failure with
+/// `anyhow::Error::from(HeadlessInterrupted)` and recognise it with
+/// [`is_headless_interrupt`], which survives `.context(..)` wrapping.
+#[derive(Debug, Clone, Copy)]
+pub struct HeadlessInterrupted;
+
+impl std::fmt::Display for HeadlessInterrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(HEADLESS_INTERRUPTED)
+    }
+}
+
+impl std::error::Error for HeadlessInterrupted {}
+
+/// Whether `error` is an operator interrupt. Typed errors are found anywhere in
+/// the chain; the message is still accepted for a failure that crossed a text
+/// boundary (a rendered or re-wrapped error) before reaching the caller.
+pub fn is_headless_interrupt(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<HeadlessInterrupted>())
+        || error.to_string().contains(HEADLESS_INTERRUPTED)
+}
+
 /// Continuation prompt after headless context relief (a compaction inside a
 /// turn). Like the TUI's mid-turn prompt it frames the summary as work already
 /// done rather than as new instructions.
@@ -2125,7 +2147,7 @@ pub(crate) async fn await_headless_work<F: std::future::Future>(
 ) -> anyhow::Result<F::Output> {
     tokio::select! {
         biased;
-        _ = current_work_scope_cancelled() => Err(anyhow::anyhow!(HEADLESS_INTERRUPTED)),
+        _ = current_work_scope_cancelled() => Err(HeadlessInterrupted.into()),
         result = work => Ok(result),
     }
 }
