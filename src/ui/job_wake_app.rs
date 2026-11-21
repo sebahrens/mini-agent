@@ -136,7 +136,7 @@ fn task_wake_prompt(headlines: &[String]) -> String {
 }
 
 #[cfg(all(test, feature = "subagents"))]
-mod tests {
+mod task_wake_tests {
     #[test]
     fn task_wake_prompt_names_only_harness_fields() {
         let prompt = super::task_wake_prompt(&["audit the parser completed".into()]);

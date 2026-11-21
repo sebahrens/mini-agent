@@ -2159,6 +2159,7 @@ editing in a known location, grepping for a literal you will act on immediately.
             let authorization = authorization.clone();
             let lane_workspace = lane_workspace.clone();
             let isolation = isolation.clone();
+            #[cfg(feature = "mcp")]
             let isolated_child = isolation.is_some();
             #[cfg(feature = "skills")]
             let skill_services = skill_services
