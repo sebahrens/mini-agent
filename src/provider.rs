@@ -420,6 +420,81 @@ pub enum AnyClient {
     Ollama(ollama::Client<ProviderHttpClient>),
 }
 
+/// Applies one expression to the typed agent inside an [`AnyAgentInner`], with
+/// the same body for every provider arm: `with_inner!(self.inner, |a| a.preamble)`.
+/// `$inner` may be a value, `&x` or `&mut x`; the body is instantiated once per
+/// concrete agent type, so it may call generic functions. Use an explicit
+/// `match` only where a provider intentionally differs.
+macro_rules! with_inner {
+    ($inner:expr, |$a:ident| $body:expr) => {
+        match $inner {
+            AnyAgentInner::OpenRouter($a) => $body,
+            AnyAgentInner::OpenAI(OpenAiAgent::Responses($a)) => $body,
+            AnyAgentInner::OpenAI(OpenAiAgent::Completions($a)) => $body,
+            AnyAgentInner::Anthropic($a) => $body,
+            AnyAgentInner::Gemini($a) => $body,
+            AnyAgentInner::Ollama($a) => $body,
+            AnyAgentInner::Copilot($a) => $body,
+        }
+    };
+}
+
+/// Like [`with_inner!`] but rebuilds the same variant around the body's result:
+/// `map_inner!(&self.inner, |a| prepare(a))`.
+#[cfg(feature = "agent-skills")]
+macro_rules! map_inner {
+    ($inner:expr, |$a:ident| $body:expr) => {
+        match $inner {
+            AnyAgentInner::OpenRouter($a) => AnyAgentInner::OpenRouter($body),
+            AnyAgentInner::OpenAI(OpenAiAgent::Responses($a)) => {
+                AnyAgentInner::OpenAI(OpenAiAgent::Responses($body))
+            }
+            AnyAgentInner::OpenAI(OpenAiAgent::Completions($a)) => {
+                AnyAgentInner::OpenAI(OpenAiAgent::Completions($body))
+            }
+            AnyAgentInner::Anthropic($a) => AnyAgentInner::Anthropic($body),
+            AnyAgentInner::Gemini($a) => AnyAgentInner::Gemini($body),
+            AnyAgentInner::Ollama($a) => AnyAgentInner::Ollama($body),
+            AnyAgentInner::Copilot($a) => AnyAgentInner::Copilot($body),
+        }
+    };
+}
+
+/// [`with_inner!`] for an [`AnyModel`]: the body sees the bare completion model.
+macro_rules! with_model {
+    ($model:expr, |$m:ident| $body:expr) => {
+        match $model {
+            AnyModel::OpenRouter($m, _) => $body,
+            AnyModel::OpenAI(OpenAiModel::Responses($m)) => $body,
+            AnyModel::OpenAI(OpenAiModel::Completions($m)) => $body,
+            AnyModel::Anthropic($m) => $body,
+            AnyModel::Gemini($m) => $body,
+            AnyModel::Ollama($m) => $body,
+            AnyModel::Copilot($m) => $body,
+        }
+    };
+}
+
+/// Builds the [`AnyAgentInner`] variant matching an [`AnyModel`] from the bare
+/// completion model: `map_model!(model, |m| build(m))`.
+macro_rules! map_model {
+    ($model:expr, |$m:ident| $body:expr) => {
+        match $model {
+            AnyModel::OpenRouter($m, _) => AnyAgentInner::OpenRouter($body),
+            AnyModel::OpenAI(OpenAiModel::Responses($m)) => {
+                AnyAgentInner::OpenAI(OpenAiAgent::Responses($body))
+            }
+            AnyModel::OpenAI(OpenAiModel::Completions($m)) => {
+                AnyAgentInner::OpenAI(OpenAiAgent::Completions($body))
+            }
+            AnyModel::Anthropic($m) => AnyAgentInner::Anthropic($body),
+            AnyModel::Gemini($m) => AnyAgentInner::Gemini($body),
+            AnyModel::Ollama($m) => AnyAgentInner::Ollama($body),
+            AnyModel::Copilot($m) => AnyAgentInner::Copilot($body),
+        }
+    };
+}
+
 /// Extra OpenRouter request body params that pin a Claude model to the
 /// Anthropic direct route and enable automatic conversation-tail caching, or
 /// `None` for any non-Claude model.
@@ -1127,29 +1202,16 @@ impl AnyClient {
             session_id,
             GIT_PROPOSAL_MAX_TOKENS,
         )?;
-        macro_rules! complete {
-            ($model:expr) => {
-                git_proposal_with_model(
-                    $model,
-                    prompt,
-                    preamble,
-                    extras,
-                    cfg.temperature,
-                    &cfg.retry,
-                    usage,
-                )
-                .await
-            };
-        }
-        match model {
-            AnyModel::OpenRouter(model, _) => complete!(model),
-            AnyModel::OpenAI(OpenAiModel::Responses(model)) => complete!(model),
-            AnyModel::OpenAI(OpenAiModel::Completions(model)) => complete!(model),
-            AnyModel::Anthropic(model) => complete!(model),
-            AnyModel::Gemini(model) => complete!(model),
-            AnyModel::Ollama(model) => complete!(model),
-            AnyModel::Copilot(model) => complete!(model),
-        }
+        with_model!(model, |model| git_proposal_with_model(
+            model,
+            prompt,
+            preamble,
+            extras,
+            cfg.temperature,
+            &cfg.retry,
+            usage,
+        )
+        .await)
     }
 
     pub fn provider_name(&self) -> &'static str {
@@ -1203,29 +1265,7 @@ impl AnyClient {
             passive_provider_request_params(&model, cfg, extra_body, session_id, max_tokens)?,
             native_format,
         );
-        let inner = match model {
-            AnyModel::OpenRouter(model, _) => {
-                AnyAgentInner::OpenRouter(build(model, max_tokens, temperature, params))
-            }
-            AnyModel::OpenAI(OpenAiModel::Responses(model)) => AnyAgentInner::OpenAI(
-                OpenAiAgent::Responses(build(model, max_tokens, temperature, params)),
-            ),
-            AnyModel::OpenAI(OpenAiModel::Completions(model)) => AnyAgentInner::OpenAI(
-                OpenAiAgent::Completions(build(model, max_tokens, temperature, params)),
-            ),
-            AnyModel::Anthropic(model) => {
-                AnyAgentInner::Anthropic(build(model, max_tokens, temperature, params))
-            }
-            AnyModel::Gemini(model) => {
-                AnyAgentInner::Gemini(build(model, max_tokens, temperature, params))
-            }
-            AnyModel::Ollama(model) => {
-                AnyAgentInner::Ollama(build(model, max_tokens, temperature, params))
-            }
-            AnyModel::Copilot(model) => {
-                AnyAgentInner::Copilot(build(model, max_tokens, temperature, params))
-            }
-        };
+        let inner = map_model!(model, |model| build(model, max_tokens, temperature, params));
         Ok(AnyAgent::without_skills(inner).with_turn_token_budget(budget))
     }
 
@@ -1511,29 +1551,16 @@ impl AnyClient {
         let prompt = request.prompt.clone();
         let preamble = crate::session::title::preamble();
         let retry = &cfg.retry;
-        macro_rules! complete {
-            ($model:expr) => {
-                run_title_completion(
-                    $model,
-                    prompt,
-                    preamble,
-                    max_output_tokens,
-                    retry,
-                    ledger,
-                    options,
-                )
-                .await
-            };
-        }
-        match model {
-            AnyModel::OpenRouter(model, _) => complete!(model),
-            AnyModel::OpenAI(OpenAiModel::Responses(model)) => complete!(model),
-            AnyModel::OpenAI(OpenAiModel::Completions(model)) => complete!(model),
-            AnyModel::Anthropic(model) => complete!(model),
-            AnyModel::Gemini(model) => complete!(model),
-            AnyModel::Ollama(model) => complete!(model),
-            AnyModel::Copilot(model) => complete!(model),
-        }
+        with_model!(model, |model| run_title_completion(
+            model,
+            prompt,
+            preamble,
+            max_output_tokens,
+            retry,
+            ledger,
+            options,
+        )
+        .await)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3033,40 +3060,21 @@ pub enum AnyAgentInner {
 impl AnyAgentInner {
     /// The model id this agent sends.
     pub(crate) fn model_id(&self) -> String {
-        match self {
-            AnyAgentInner::OpenRouter(a) => a.model.model.clone(),
-            AnyAgentInner::OpenAI(OpenAiAgent::Responses(a)) => a.model.model.clone(),
-            AnyAgentInner::OpenAI(OpenAiAgent::Completions(a)) => a.model.model.clone(),
-            AnyAgentInner::Anthropic(a) => a.model.model.clone(),
-            AnyAgentInner::Gemini(a) => a.model.model.clone(),
-            AnyAgentInner::Copilot(a) => a.model.model.clone(),
-            AnyAgentInner::Ollama(a) => a.model.model.clone(),
-        }
+        with_inner!(self, |a| a.model.model.clone())
     }
 
     /// The same agent (tools, preamble, hooks, parameters) sending `model`
     /// instead, with its response cap clamped to that model's ceiling.
     pub(crate) fn with_model_id(&self, provider: &str, model: &str) -> AnyAgentInner {
         let mut inner = self.clone();
-        macro_rules! swap {
-            ($agent:expr) => {{
-                let mut completion = (*$agent.model).clone();
-                completion.model = model.to_string();
-                $agent.model = std::sync::Arc::new(completion);
-                $agent.max_tokens = $agent.max_tokens.map(|tokens| {
-                    crate::cli::resolve_response_max_tokens(Some(tokens), provider, model)
-                });
-            }};
-        }
-        match &mut inner {
-            AnyAgentInner::OpenRouter(a) => swap!(a),
-            AnyAgentInner::OpenAI(OpenAiAgent::Responses(a)) => swap!(a),
-            AnyAgentInner::OpenAI(OpenAiAgent::Completions(a)) => swap!(a),
-            AnyAgentInner::Anthropic(a) => swap!(a),
-            AnyAgentInner::Gemini(a) => swap!(a),
-            AnyAgentInner::Copilot(a) => swap!(a),
-            AnyAgentInner::Ollama(a) => swap!(a),
-        }
+        with_inner!(&mut inner, |a| {
+            let mut completion = (*a.model).clone();
+            completion.model = model.to_string();
+            a.model = std::sync::Arc::new(completion);
+            a.max_tokens = a.max_tokens.map(|tokens| {
+                crate::cli::resolve_response_max_tokens(Some(tokens), provider, model)
+            });
+        });
         inner
     }
 }
@@ -4472,15 +4480,7 @@ impl AnyAgent {
         let Some(snapshot) = &mut self.context_snapshot else {
             return self;
         };
-        let preamble = match &mut self.inner {
-            AnyAgentInner::OpenRouter(agent) => &mut agent.preamble,
-            AnyAgentInner::OpenAI(OpenAiAgent::Responses(agent)) => &mut agent.preamble,
-            AnyAgentInner::OpenAI(OpenAiAgent::Completions(agent)) => &mut agent.preamble,
-            AnyAgentInner::Anthropic(agent) => &mut agent.preamble,
-            AnyAgentInner::Gemini(agent) => &mut agent.preamble,
-            AnyAgentInner::Ollama(agent) => &mut agent.preamble,
-            AnyAgentInner::Copilot(agent) => &mut agent.preamble,
-        };
+        let preamble = with_inner!(&mut self.inner, |agent| &mut agent.preamble);
         self.memory_context = Some(match preamble {
             Some(preamble) => snapshot.detach_memory(preamble).map(std::sync::Arc::from),
             None => Err("the captured memory preamble is unavailable"),
@@ -4517,15 +4517,7 @@ impl AnyAgent {
         }
     }
     fn reasoning_params(&mut self) -> &mut Option<serde_json::Value> {
-        match &mut self.inner {
-            AnyAgentInner::Anthropic(a) => &mut a.additional_params,
-            AnyAgentInner::OpenRouter(a) => &mut a.additional_params,
-            AnyAgentInner::OpenAI(OpenAiAgent::Responses(a)) => &mut a.additional_params,
-            AnyAgentInner::OpenAI(OpenAiAgent::Completions(a)) => &mut a.additional_params,
-            AnyAgentInner::Gemini(a) => &mut a.additional_params,
-            AnyAgentInner::Ollama(a) => &mut a.additional_params,
-            AnyAgentInner::Copilot(a) => &mut a.additional_params,
-        }
+        with_inner!(&mut self.inner, |a| &mut a.additional_params)
     }
     /// Recompute from the original configured parameters, never from an earlier
     /// session override. Clones keep their already-captured invocation policy.
@@ -4717,16 +4709,7 @@ impl AnyAgent {
 
     #[cfg(test)]
     pub(crate) fn context_preamble_for_test(&self) -> &str {
-        match &self.inner {
-            AnyAgentInner::OpenRouter(a) => a.preamble.as_deref(),
-            AnyAgentInner::OpenAI(OpenAiAgent::Responses(a)) => a.preamble.as_deref(),
-            AnyAgentInner::OpenAI(OpenAiAgent::Completions(a)) => a.preamble.as_deref(),
-            AnyAgentInner::Anthropic(a) => a.preamble.as_deref(),
-            AnyAgentInner::Gemini(a) => a.preamble.as_deref(),
-            AnyAgentInner::Ollama(a) => a.preamble.as_deref(),
-            AnyAgentInner::Copilot(a) => a.preamble.as_deref(),
-        }
-        .unwrap_or("")
+        with_inner!(&self.inner, |a| a.preamble.as_deref()).unwrap_or("")
     }
 
     #[cfg(feature = "agent-skills")]
@@ -4768,15 +4751,7 @@ impl AnyAgent {
                 .hooks
                 .push(crate::extras::subagents::builder::ReportRepairGuard);
         }
-        match &mut self.inner {
-            AnyAgentInner::OpenRouter(agent) => guard(agent, max_tokens),
-            AnyAgentInner::OpenAI(OpenAiAgent::Responses(agent)) => guard(agent, max_tokens),
-            AnyAgentInner::OpenAI(OpenAiAgent::Completions(agent)) => guard(agent, max_tokens),
-            AnyAgentInner::Anthropic(agent) => guard(agent, max_tokens),
-            AnyAgentInner::Gemini(agent) => guard(agent, max_tokens),
-            AnyAgentInner::Ollama(agent) => guard(agent, max_tokens),
-            AnyAgentInner::Copilot(agent) => guard(agent, max_tokens),
-        }
+        with_inner!(&mut self.inner, |agent| guard(agent, max_tokens));
         self
     }
 
@@ -4804,15 +4779,7 @@ impl AnyAgent {
                     None,
                 ));
         }
-        match &mut self.inner {
-            AnyAgentInner::OpenRouter(a) => add(a, turn, query, protocol),
-            AnyAgentInner::OpenAI(OpenAiAgent::Responses(a)) => add(a, turn, query, protocol),
-            AnyAgentInner::OpenAI(OpenAiAgent::Completions(a)) => add(a, turn, query, protocol),
-            AnyAgentInner::Anthropic(a) => add(a, turn, query, protocol),
-            AnyAgentInner::Gemini(a) => add(a, turn, query, protocol),
-            AnyAgentInner::Ollama(a) => add(a, turn, query, protocol),
-            AnyAgentInner::Copilot(a) => add(a, turn, query, protocol),
-        }
+        with_inner!(&mut self.inner, |a| add(a, turn, query, protocol));
         self
     }
 
@@ -4842,15 +4809,7 @@ impl AnyAgent {
                 kind == rig::agent::StepEventKind::ToolResult
             }
         }
-        match &mut self.inner {
-            AnyAgentInner::OpenRouter(a) => a.hooks.push(Rewrite(text)),
-            AnyAgentInner::OpenAI(OpenAiAgent::Responses(a)) => a.hooks.push(Rewrite(text)),
-            AnyAgentInner::OpenAI(OpenAiAgent::Completions(a)) => a.hooks.push(Rewrite(text)),
-            AnyAgentInner::Anthropic(a) => a.hooks.push(Rewrite(text)),
-            AnyAgentInner::Gemini(a) => a.hooks.push(Rewrite(text)),
-            AnyAgentInner::Ollama(a) => a.hooks.push(Rewrite(text)),
-            AnyAgentInner::Copilot(a) => a.hooks.push(Rewrite(text)),
-        }
+        with_inner!(&mut self.inner, |a| a.hooks.push(Rewrite(text)));
         self
     }
 
@@ -4870,15 +4829,7 @@ impl AnyAgent {
     }
     #[cfg(feature = "agent-skills")]
     fn instruction_transcript_overridden(&self) -> bool {
-        let params = match &self.inner {
-            AnyAgentInner::OpenRouter(a) => &a.additional_params,
-            AnyAgentInner::OpenAI(OpenAiAgent::Responses(a)) => &a.additional_params,
-            AnyAgentInner::OpenAI(OpenAiAgent::Completions(a)) => &a.additional_params,
-            AnyAgentInner::Anthropic(a) => &a.additional_params,
-            AnyAgentInner::Gemini(a) => &a.additional_params,
-            AnyAgentInner::Ollama(a) => &a.additional_params,
-            AnyAgentInner::Copilot(a) => &a.additional_params,
-        };
+        let params = with_inner!(&self.inner, |a| &a.additional_params);
         self.instruction_protocol()
             .extra_body_overrides(params.as_ref())
     }
@@ -4956,30 +4907,13 @@ impl AnyAgent {
                 ));
             agent
         }
-        macro_rules! prepared {
-            ($agent:expr) => {
-                add(
-                    $agent,
-                    turn,
-                    self.instruction_protocol(),
-                    #[cfg(feature = "skills")]
-                    self.skills.clone(),
-                )
-            };
-        }
-        Ok(match &self.inner {
-            AnyAgentInner::OpenRouter(a) => AnyAgentInner::OpenRouter(prepared!(a)),
-            AnyAgentInner::OpenAI(OpenAiAgent::Responses(a)) => {
-                AnyAgentInner::OpenAI(OpenAiAgent::Responses(prepared!(a)))
-            }
-            AnyAgentInner::OpenAI(OpenAiAgent::Completions(a)) => {
-                AnyAgentInner::OpenAI(OpenAiAgent::Completions(prepared!(a)))
-            }
-            AnyAgentInner::Anthropic(a) => AnyAgentInner::Anthropic(prepared!(a)),
-            AnyAgentInner::Gemini(a) => AnyAgentInner::Gemini(prepared!(a)),
-            AnyAgentInner::Ollama(a) => AnyAgentInner::Ollama(prepared!(a)),
-            AnyAgentInner::Copilot(a) => AnyAgentInner::Copilot(prepared!(a)),
-        })
+        Ok(map_inner!(&self.inner, |a| add(
+            a,
+            turn,
+            self.instruction_protocol(),
+            #[cfg(feature = "skills")]
+            self.skills.clone(),
+        )))
     }
 
     /// Metadata already registered in this agent. `None` never selects
@@ -5001,15 +4935,7 @@ impl AnyAgent {
     /// The tool server every clone and per-turn preparation of this agent
     /// shares, so a registration here is visible to the next request.
     fn tool_server(&self) -> &rig::tool::server::ToolServerHandle {
-        match &self.inner {
-            AnyAgentInner::OpenRouter(a) => &a.tool_server_handle,
-            AnyAgentInner::OpenAI(OpenAiAgent::Responses(a)) => &a.tool_server_handle,
-            AnyAgentInner::OpenAI(OpenAiAgent::Completions(a)) => &a.tool_server_handle,
-            AnyAgentInner::Anthropic(a) => &a.tool_server_handle,
-            AnyAgentInner::Gemini(a) => &a.tool_server_handle,
-            AnyAgentInner::Ollama(a) => &a.tool_server_handle,
-            AnyAgentInner::Copilot(a) => &a.tool_server_handle,
-        }
+        with_inner!(&self.inner, |a| &a.tool_server_handle)
     }
 
     #[cfg(feature = "agent-skills")]
@@ -5150,19 +5076,8 @@ impl AnyAgent {
     pub fn with_max_agent_turns(&self, max_turns: u32) -> Self {
         let mut capped = self.clone();
         let turns = usize::try_from(max_turns).unwrap_or(usize::MAX).max(1);
-        match &mut capped.inner {
-            AnyAgentInner::OpenRouter(agent) => agent.default_max_turns = Some(turns),
-            AnyAgentInner::OpenAI(OpenAiAgent::Responses(agent)) => {
-                agent.default_max_turns = Some(turns)
-            }
-            AnyAgentInner::OpenAI(OpenAiAgent::Completions(agent)) => {
-                agent.default_max_turns = Some(turns)
-            }
-            AnyAgentInner::Anthropic(agent) => agent.default_max_turns = Some(turns),
-            AnyAgentInner::Gemini(agent) => agent.default_max_turns = Some(turns),
-            AnyAgentInner::Ollama(agent) => agent.default_max_turns = Some(turns),
-            AnyAgentInner::Copilot(agent) => agent.default_max_turns = Some(turns),
-        }
+        with_inner!(&mut capped.inner, |agent| agent.default_max_turns =
+            Some(turns));
         capped
     }
 
@@ -5328,130 +5243,33 @@ impl AnyAgent {
             // configured, the fallback model (mini-agent-5gc2c).
             macro_rules! dispatch {
                 ($inner:expr, $prompt:expr, $history:expr) => {
-                    match $inner {
-                        AnyAgentInner::OpenRouter(a) => {
-                            crate::startup::heap_future(|| {
-                                runner::run_print_with_output_and_verification(
-                                    a,
-                                    &$prompt,
-                                    output,
-                                    retry_config,
-                                    self.turn_token_budget,
-                                    $history,
-                                    self.completion_verification.clone(),
-                                    crate::agent::native_capture::NativeCaptureHook::default(),
-                                    #[cfg(feature = "hooks")]
-                                    loop_info,
+                    with_inner!($inner, |a| {
+                        // Only the Anthropic route records native replay capture.
+                        let capture = match $inner {
+                            AnyAgentInner::Anthropic(a) => {
+                                crate::agent::native_capture::NativeCaptureHook::for_native(
+                                    self.native_capture.clone(),
+                                    &a.model.model,
                                 )
-                            })
-                            .await
-                        }
-                        AnyAgentInner::OpenAI(a) => {
-                            match a {
-                                OpenAiAgent::Responses(a) => crate::startup::heap_future(|| {
-                                    runner::run_print_with_output_and_verification(
-                                        a,
-                                        &$prompt,
-                                        output,
-                                        retry_config,
-                                        self.turn_token_budget,
-                                        $history,
-                                        self.completion_verification.clone(),
-                                        crate::agent::native_capture::NativeCaptureHook::default(),
-                                        #[cfg(feature = "hooks")]
-                                        loop_info,
-                                    )
-                                })
-                                .await,
-                                OpenAiAgent::Completions(a) => crate::startup::heap_future(|| {
-                                    runner::run_print_with_output_and_verification(
-                                        a,
-                                        &$prompt,
-                                        output,
-                                        retry_config,
-                                        self.turn_token_budget,
-                                        $history,
-                                        self.completion_verification.clone(),
-                                        crate::agent::native_capture::NativeCaptureHook::default(),
-                                        #[cfg(feature = "hooks")]
-                                        loop_info,
-                                    )
-                                })
-                                .await,
                             }
-                        }
-                        AnyAgentInner::Anthropic(a) => {
-                            crate::startup::heap_future(|| {
-                                runner::run_print_with_output_and_verification(
-                                    a,
-                                    &$prompt,
-                                    output,
-                                    retry_config,
-                                    self.turn_token_budget,
-                                    $history,
-                                    self.completion_verification.clone(),
-                                    crate::agent::native_capture::NativeCaptureHook::for_native(
-                                        self.native_capture.clone(),
-                                        &a.model.model,
-                                    ),
-                                    #[cfg(feature = "hooks")]
-                                    loop_info,
-                                )
-                            })
-                            .await
-                        }
-                        AnyAgentInner::Gemini(a) => {
-                            crate::startup::heap_future(|| {
-                                runner::run_print_with_output_and_verification(
-                                    a,
-                                    &$prompt,
-                                    output,
-                                    retry_config,
-                                    self.turn_token_budget,
-                                    $history,
-                                    self.completion_verification.clone(),
-                                    crate::agent::native_capture::NativeCaptureHook::default(),
-                                    #[cfg(feature = "hooks")]
-                                    loop_info,
-                                )
-                            })
-                            .await
-                        }
-                        AnyAgentInner::Ollama(a) => {
-                            crate::startup::heap_future(|| {
-                                runner::run_print_with_output_and_verification(
-                                    a,
-                                    &$prompt,
-                                    output,
-                                    retry_config,
-                                    self.turn_token_budget,
-                                    $history,
-                                    self.completion_verification.clone(),
-                                    crate::agent::native_capture::NativeCaptureHook::default(),
-                                    #[cfg(feature = "hooks")]
-                                    loop_info,
-                                )
-                            })
-                            .await
-                        }
-                        AnyAgentInner::Copilot(a) => {
-                            crate::startup::heap_future(|| {
-                                runner::run_print_with_output_and_verification(
-                                    a,
-                                    &$prompt,
-                                    output,
-                                    retry_config,
-                                    self.turn_token_budget,
-                                    $history,
-                                    self.completion_verification.clone(),
-                                    crate::agent::native_capture::NativeCaptureHook::default(),
-                                    #[cfg(feature = "hooks")]
-                                    loop_info,
-                                )
-                            })
-                            .await
-                        }
-                    }
+                            _ => crate::agent::native_capture::NativeCaptureHook::default(),
+                        };
+                        crate::startup::heap_future(|| {
+                            runner::run_print_with_output_and_verification(
+                                a,
+                                &$prompt,
+                                output,
+                                retry_config,
+                                self.turn_token_budget,
+                                $history,
+                                self.completion_verification.clone(),
+                                capture,
+                                #[cfg(feature = "hooks")]
+                                loop_info,
+                            )
+                        })
+                        .await
+                    })
                 };
             }
             let fallback_input = self
@@ -5591,101 +5409,19 @@ impl AnyAgent {
             let prompt = prompt.to_string();
             #[cfg(not(feature = "agent-skills"))]
             let inner = &self.inner;
-            match &inner {
-                AnyAgentInner::OpenRouter(a) => {
-                    runner::run_subagent_with_history(
-                        a,
-                        &prompt,
-                        history,
-                        max_turns,
-                        event_tx,
-                        retry_config,
-                        usage_ledger,
-                        token_budget,
-                    )
-                    .await
-                }
-                AnyAgentInner::OpenAI(a) => match a {
-                    OpenAiAgent::Responses(a) => {
-                        runner::run_subagent_with_history(
-                            a,
-                            &prompt,
-                            history,
-                            max_turns,
-                            event_tx,
-                            retry_config,
-                            usage_ledger,
-                            token_budget,
-                        )
-                        .await
-                    }
-                    OpenAiAgent::Completions(a) => {
-                        runner::run_subagent_with_history(
-                            a,
-                            &prompt,
-                            history,
-                            max_turns,
-                            event_tx,
-                            retry_config,
-                            usage_ledger,
-                            token_budget,
-                        )
-                        .await
-                    }
-                },
-                AnyAgentInner::Anthropic(a) => {
-                    runner::run_subagent_with_history(
-                        a,
-                        &prompt,
-                        history,
-                        max_turns,
-                        event_tx,
-                        retry_config,
-                        usage_ledger,
-                        token_budget,
-                    )
-                    .await
-                }
-                AnyAgentInner::Gemini(a) => {
-                    runner::run_subagent_with_history(
-                        a,
-                        &prompt,
-                        history,
-                        max_turns,
-                        event_tx,
-                        retry_config,
-                        usage_ledger,
-                        token_budget,
-                    )
-                    .await
-                }
-                AnyAgentInner::Ollama(a) => {
-                    runner::run_subagent_with_history(
-                        a,
-                        &prompt,
-                        history,
-                        max_turns,
-                        event_tx,
-                        retry_config,
-                        usage_ledger,
-                        token_budget,
-                    )
-                    .await
-                }
-                AnyAgentInner::Copilot(a) => {
-                    runner::run_subagent_with_history(
-                        a,
-                        &prompt,
-                        history,
-                        max_turns,
-                        event_tx,
-                        retry_config,
-                        usage_ledger,
-                        token_budget,
-                    )
-                    .await
-                }
-            }
+            with_inner!(&inner, |a| {
+                runner::run_subagent_with_history(
+                    a,
+                    &prompt,
+                    history,
+                    max_turns,
+                    event_tx,
+                    retry_config,
+                    usage_ledger,
+                    token_budget,
+                )
+                .await
+            })
         });
         let future = crate::spend::run::scope(
             self.spend.clone().or_else(crate::spend::run::Run::current),
@@ -5926,126 +5662,32 @@ impl AnyAgent {
                     }
                     _ => prompt,
                 };
-                let paused = match inner {
-                    AnyAgentInner::OpenRouter(a) => {
-                        runner::spawn_agent_paused_input_in_scope_with_native_capture(
-                            a,
-                            prompt,
-                            history,
-                            retry_config,
-                            turn_token_budget,
-                            #[cfg(feature = "skills")]
-                            turn_guard,
-                            #[cfg(feature = "hooks")]
-                            loop_info,
-                            completion_verification.clone(),
-                            work_scope,
-                            crate::agent::native_capture::NativeCaptureHook::default(),
-                        )
-                    }
-                    AnyAgentInner::OpenAI(a) => match a {
-                        OpenAiAgent::Responses(a) => {
-                            runner::spawn_agent_paused_input_in_scope_with_native_capture(
-                                a,
-                                prompt,
-                                history,
-                                retry_config,
-                                turn_token_budget,
-                                #[cfg(feature = "skills")]
-                                turn_guard,
-                                #[cfg(feature = "hooks")]
-                                loop_info,
-                                completion_verification.clone(),
-                                work_scope,
-                                crate::agent::native_capture::NativeCaptureHook::default(),
-                            )
-                        }
-                        OpenAiAgent::Completions(a) => {
-                            runner::spawn_agent_paused_input_in_scope_with_native_capture(
-                                a,
-                                prompt,
-                                history,
-                                retry_config,
-                                turn_token_budget,
-                                #[cfg(feature = "skills")]
-                                turn_guard,
-                                #[cfg(feature = "hooks")]
-                                loop_info,
-                                completion_verification.clone(),
-                                work_scope,
-                                crate::agent::native_capture::NativeCaptureHook::default(),
-                            )
-                        }
-                    },
+                // Only the Anthropic route records native replay capture.
+                let capture = match &inner {
                     AnyAgentInner::Anthropic(a) => {
-                        let capture = crate::agent::native_capture::NativeCaptureHook::for_native(
+                        crate::agent::native_capture::NativeCaptureHook::for_native(
                             native_capture,
                             &a.model.model,
-                        );
-                        runner::spawn_agent_paused_input_in_scope_with_native_capture(
-                            a,
-                            prompt,
-                            history,
-                            retry_config,
-                            turn_token_budget,
-                            #[cfg(feature = "skills")]
-                            turn_guard,
-                            #[cfg(feature = "hooks")]
-                            loop_info,
-                            completion_verification.clone(),
-                            work_scope,
-                            capture,
                         )
                     }
-                    AnyAgentInner::Gemini(a) => {
-                        runner::spawn_agent_paused_input_in_scope_with_native_capture(
-                            a,
-                            prompt,
-                            history,
-                            retry_config,
-                            turn_token_budget,
-                            #[cfg(feature = "skills")]
-                            turn_guard,
-                            #[cfg(feature = "hooks")]
-                            loop_info,
-                            completion_verification.clone(),
-                            work_scope,
-                            crate::agent::native_capture::NativeCaptureHook::default(),
-                        )
-                    }
-                    AnyAgentInner::Ollama(a) => {
-                        runner::spawn_agent_paused_input_in_scope_with_native_capture(
-                            a,
-                            prompt,
-                            history,
-                            retry_config,
-                            turn_token_budget,
-                            #[cfg(feature = "skills")]
-                            turn_guard,
-                            #[cfg(feature = "hooks")]
-                            loop_info,
-                            completion_verification,
-                            work_scope,
-                            crate::agent::native_capture::NativeCaptureHook::default(),
-                        )
-                    }
-                    AnyAgentInner::Copilot(a) => {
-                        runner::spawn_agent_paused_input_in_scope_with_native_capture(
-                            a,
-                            prompt,
-                            history,
-                            retry_config,
-                            turn_token_budget,
-                            #[cfg(feature = "skills")]
-                            turn_guard,
-                            #[cfg(feature = "hooks")]
-                            loop_info,
-                            completion_verification,
-                            work_scope,
-                            crate::agent::native_capture::NativeCaptureHook::default(),
-                        )
-                    }
+                    _ => crate::agent::native_capture::NativeCaptureHook::default(),
                 };
+                let paused = with_inner!(inner, |a| {
+                    runner::spawn_agent_paused_input_in_scope_with_native_capture(
+                        a,
+                        prompt,
+                        history,
+                        retry_config,
+                        turn_token_budget,
+                        #[cfg(feature = "skills")]
+                        turn_guard,
+                        #[cfg(feature = "hooks")]
+                        loop_info,
+                        completion_verification.clone(),
+                        work_scope,
+                        capture,
+                    )
+                });
                 #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
                 let paused = paused.with_hook_context(context_notices);
                 #[cfg(feature = "subagents")]
@@ -6083,30 +5725,15 @@ impl AnyAgent {
         let hook_bindings = self_.hook_bindings();
         let spawn = || {
             crate::question::scope_sync(None, || {
-                crate::spend::run::scope_sync(self_.spend.clone(), || match self_.inner {
-                    AnyAgentInner::OpenRouter(a) => {
-                        runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
-                    }
-                    AnyAgentInner::OpenAI(a) => match a {
-                        OpenAiAgent::Responses(a) => {
-                            runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
-                        }
-                        OpenAiAgent::Completions(a) => {
-                            runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
-                        }
-                    },
-                    AnyAgentInner::Anthropic(a) => {
-                        runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
-                    }
-                    AnyAgentInner::Gemini(a) => {
-                        runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
-                    }
-                    AnyAgentInner::Ollama(a) => {
-                        runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
-                    }
-                    AnyAgentInner::Copilot(a) => {
-                        runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
-                    }
+                crate::spend::run::scope_sync(self_.spend.clone(), || {
+                    with_inner!(self_.inner, |a| runner::spawn_btw(
+                        a,
+                        prompt,
+                        history,
+                        event_tx,
+                        id,
+                        retry_config
+                    ))
                 })
             })
         };
