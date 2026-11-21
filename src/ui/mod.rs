@@ -1684,14 +1684,7 @@ pub(crate) async fn start_main_run_with_directive(
         adopt_runner_hook_context(&mut paused, pending_turn.as_mut(), ui.session);
         paused.start_interactive()
     };
-    run.steering = Some(runner.steering);
-    run.compaction_decision_tx = runner.compaction_decision_tx;
-    run.agent_rx = Some(runner.event_rx);
-    run.main_abort = Some(runner.abort_handle);
-    run.is_running = true;
-    if let Some(ss) = ui.status_signals.as_ref() {
-        ss.send_start();
-    }
+    adopt_started_runner(run, ui.status_signals.as_ref(), runner);
     if let Some(pending_turn) = pending_turn {
         if record_chat_history {
             record_started_main_turn(pending_turn, run, ui);
@@ -1805,6 +1798,67 @@ pub(crate) fn record_goal_round_boundary(
     };
     mark_main_turn_started(session, run, PendingMainTurn::capture(session, next_prompt));
     Ok(settled)
+}
+
+/// Records a freshly started interactive runner on the run state: its steering
+/// handle, compaction-decision channel, event receiver and abort handle, then
+/// marks the run live and signals the status integration. Every TUI path that
+/// starts a main-agent run (typed turn, `/init`, the first `/loop` round, goal
+/// rounds, mid-turn continuation) goes through this so a run's capabilities
+/// never depend on which site started it.
+pub(crate) fn adopt_started_runner(
+    run: &mut AgentRunState,
+    status_signals: Option<&crate::extras::status_signals::StatusSignals>,
+    runner: crate::agent::runner::AgentRunner,
+) {
+    run.steering = Some(runner.steering);
+    run.compaction_decision_tx = runner.compaction_decision_tx;
+    run.agent_rx = Some(runner.event_rx);
+    run.main_abort = Some(runner.abort_handle);
+    run.is_running = true;
+    if let Some(ss) = status_signals {
+        ss.send_start();
+    }
+}
+
+/// Builds the paused runner for a main-agent turn that starts from a prompt
+/// string (`/init`, the first `/loop` round, goal rounds). The caller has
+/// already prepared the run's question and instruction turns; this attaches
+/// them, the session-bound agent settings, spend ledger, file-checkpoint
+/// recorder (`checkpoint_index` is the message index the turn's edits are
+/// recorded against) and a fresh budget carry.
+pub(crate) async fn build_paused_main_runner(
+    ui: &mut UiContext<'_>,
+    run: &mut AgentRunState,
+    agent: crate::provider::AnyAgent,
+    prompt: String,
+    history: std::sync::Arc<[rig::completion::Message]>,
+    checkpoint_index: usize,
+) -> crate::agent::runner::PausedAgentRunner {
+    #[cfg(feature = "agent-skills")]
+    let agent = agent.with_instruction_turn(run.instruction_turn.clone());
+    let budget_carry = run.fresh_budget_carry();
+    let question_turn = run.question_turn.clone();
+    crate::startup::heap_future(|| {
+        agent
+            .with_main_session(ui.cfg, ui.session)
+            .with_spend_for_session(ui.session, ui.cfg, crate::spend::RequestKind::Turn)
+            .with_file_checkpoints(ui.session.file_checkpoints.recorder(
+                &ui.session.id,
+                checkpoint_index,
+                ui.cli.no_session,
+            ))
+            .with_question_turn(question_turn)
+            .with_budget_carry(budget_carry)
+            .spawn_runner_paused(
+                prompt,
+                history,
+                ui.cfg.retry.clone(),
+                #[cfg(feature = "hooks")]
+                None,
+            )
+    })
+    .await
 }
 
 #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
@@ -2117,16 +2171,9 @@ async fn compact_and_respawn(
             .map_err(anyhow::Error::msg)?;
     }
     let runner = paused.start_interactive();
-    run.steering = Some(runner.steering);
+    adopt_started_runner(run, ui.status_signals.as_ref(), runner);
     if let Some(previous) = previous_steering {
         previous.take_pending();
-    }
-    run.compaction_decision_tx = runner.compaction_decision_tx;
-    run.agent_rx = Some(runner.event_rx);
-    run.main_abort = Some(runner.abort_handle);
-    run.is_running = true;
-    if let Some(ss) = ui.status_signals.as_ref() {
-        ss.send_start();
     }
     Ok(())
 }
