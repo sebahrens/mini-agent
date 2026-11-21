@@ -2722,7 +2722,6 @@ editing in a known location, grepping for a literal you will act on immediately.
                         let _ = event_tx
                             .send(crate::event::AgentEvent::SubagentUsage {
                                 usage: total.into(),
-                                outer: crate::agent::tools::bash::current_tool_call_id(),
                             })
                             .await;
                     }

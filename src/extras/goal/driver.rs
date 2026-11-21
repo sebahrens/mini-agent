@@ -883,7 +883,6 @@ mod tests {
                 output_tokens: 400,
                 ..crate::event::UsageDelta::default()
             },
-            outer: None,
         });
         let summary = collector.finish(&goal(), RoundEnd::Done, 0);
         assert_eq!(summary.tokens_used, 3_520);

@@ -183,8 +183,6 @@ pub enum AgentEvent {
     #[cfg(feature = "subagents")]
     SubagentUsage {
         usage: UsageDelta,
-        /// Internal id of the outer `task` call, when known.
-        outer: Option<CompactString>,
     },
     #[cfg(feature = "subagents")]
     SubagentStarted {
