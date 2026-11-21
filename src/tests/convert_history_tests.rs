@@ -710,3 +710,26 @@ fn fork_prefix_recaps_only_the_summary_prose() {
         )
     );
 }
+
+#[test]
+fn replayed_tool_results_carry_the_persisted_is_error_flag() {
+    let mut session = sample_session();
+    session.add_tool_call_with_id("bad", "read", &serde_json::json!({"path": "x"}));
+    session.add_tool_result_flagged("bad", "read", "File not found: x", Vec::new(), true);
+    session.add_tool_call_with_id("ok", "read", &serde_json::json!({"path": "y"}));
+    session.add_tool_result_flagged("ok", "read", "contents", Vec::new(), false);
+    let flags = convert_history(&session)
+        .iter()
+        .flat_map(|message| match message {
+            Message::User { content } => content
+                .iter()
+                .filter_map(|item| match item {
+                    rig::message::UserContent::ToolResult(result) => Some(result.is_error),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(flags, vec![Some(true), None]);
+}

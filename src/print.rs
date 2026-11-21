@@ -2706,7 +2706,13 @@ pub(crate) fn persist_headless_turn_input(
                         .join("\n");
                     let images = crate::agent::runner::tool_result_images(name, result)
                         .map_err(anyhow::Error::msg)?;
-                    session.add_tool_result_with_images(&identifier, name, &output, images);
+                    session.add_tool_result_flagged(
+                        &identifier,
+                        name,
+                        &output,
+                        images,
+                        result.is_error == Some(true),
+                    );
                 }
                 persist_user_delta_blocks(session, user_blocks)?;
             }

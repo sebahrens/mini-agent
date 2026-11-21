@@ -564,6 +564,8 @@ impl<M: CompletionModel> AgentHook<M> for ToolLoopGuard {
             } => {
                 if outcome.is_error() || outcome.is_denied() {
                     record_tool_failure(internal_call_id);
+                } else {
+                    record_accepted_goal_report(tool_name, internal_call_id);
                 }
                 record_settled_result(internal_call_id, result);
                 show_settled_call(internal_call_id, outcome, result);
@@ -2006,6 +2008,53 @@ fn take_effective_args(internal_call_id: &str) -> Option<String> {
     let mut entries = EFFECTIVE_ARGS.lock().unwrap_or_else(|e| e.into_inner());
     let position = entries.iter().position(|(id, _)| id == internal_call_id)?;
     entries.remove(position).map(|(_, args)| args)
+}
+
+/// Internal ids of `goal_report` calls that succeeded. A rejected report
+/// returns an error (no running goal, invalid fields), so success of this tool
+/// is the typed acceptance signal; the result text is never inspected
+/// (mini-agent-sskdu.226). Process-wide rather than work-scoped so it also
+/// holds when a loop such as `run_print` runs outside a work scope.
+#[cfg(feature = "goal")]
+static ACCEPTED_GOAL_REPORTS: std::sync::Mutex<VecDeque<String>> =
+    std::sync::Mutex::new(VecDeque::new());
+#[cfg(feature = "goal")]
+const ACCEPTED_GOAL_REPORTS_MAX: usize = 128;
+
+fn record_accepted_goal_report(tool_name: &str, internal_call_id: &str) {
+    #[cfg(feature = "goal")]
+    if tool_name == <crate::extras::goal::report_tool::GoalReport as rig::tool::Tool>::NAME {
+        let mut ids = ACCEPTED_GOAL_REPORTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ids.retain(|id| id != internal_call_id);
+        ids.push_back(internal_call_id.to_owned());
+        while ids.len() > ACCEPTED_GOAL_REPORTS_MAX {
+            ids.pop_front();
+        }
+    }
+    #[cfg(not(feature = "goal"))]
+    let _ = (tool_name, internal_call_id);
+}
+
+/// Whether the call with this internal id was an accepted `goal_report`.
+/// Consumes the record.
+fn take_accepted_goal_report(internal_call_id: &str) -> bool {
+    #[cfg(feature = "goal")]
+    {
+        let mut ids = ACCEPTED_GOAL_REPORTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ids.iter()
+            .position(|id| id == internal_call_id)
+            .and_then(|position| ids.remove(position))
+            .is_some()
+    }
+    #[cfg(not(feature = "goal"))]
+    {
+        let _ = internal_call_id;
+        false
+    }
 }
 
 /// The result a call produced before its batch settled, consuming it.
@@ -3521,24 +3570,6 @@ fn append_tool_call(interactions: &mut Vec<Message>, tool_call: &ToolCall) {
     }
 }
 
-/// Whether a tool result is a `goal_report` the goal accepted.
-///
-/// Such a report is the round's account of itself, so the turn that filed it
-/// is complete even when the model adds no closing text. A rejected report (no
-/// running goal) does not count.
-fn is_accepted_goal_report(tool_name: &str, output: &str) -> bool {
-    #[cfg(feature = "goal")]
-    {
-        tool_name == <crate::extras::goal::report_tool::GoalReport as rig::tool::Tool>::NAME
-            && crate::extras::goal::report_tool::is_accepted_report_output(output)
-    }
-    #[cfg(not(feature = "goal"))]
-    {
-        let _ = (tool_name, output);
-        false
-    }
-}
-
 fn reconcile_terminal_response(response: &mut String, stream_start: usize, terminal: &str) {
     if response.len() > stream_start {
         return;
@@ -4166,9 +4197,16 @@ fn convert_history_uncached(
             }
             MessageRole::ToolResult => {
                 let structured = match (&msg.tool_call_id, &msg.tool) {
-                    (Some(id), Some(PersistedToolMessage::Result { output, images, .. }))
-                        if open_call_ids.contains(id.as_str())
-                            && !completed_call_ids.contains(id.as_str()) =>
+                    (
+                        Some(id),
+                        Some(PersistedToolMessage::Result {
+                            output,
+                            images,
+                            is_error,
+                            ..
+                        }),
+                    ) if open_call_ids.contains(id.as_str())
+                        && !completed_call_ids.contains(id.as_str()) =>
                     {
                         completed_call_ids.insert(id.to_string());
                         let identity =
@@ -4194,7 +4232,7 @@ fn convert_history_uncached(
                                 ),
                             )
                             .expect("text result is nonempty"),
-                            is_error: None,
+                            is_error: is_error.then_some(true),
                         }))
                     }
                     _ => None,
@@ -5254,7 +5292,7 @@ where
                         );
                         #[cfg(feature = "acp")]
                         crate::permission::ask::finish_tool_call(&tool_name, &internal_call_id);
-                        goal_report_accepted |= is_accepted_goal_report(&tool_name, &output);
+                        goal_report_accepted |= take_accepted_goal_report(&internal_call_id);
                         let loop_notice = take_tool_loop_notice(&internal_call_id);
                         let is_error = take_tool_failure(&internal_call_id);
                         // Delivered normally: the interrupt fallback is not needed.
@@ -6338,7 +6376,7 @@ where
                         native_capture.tool_result(&internal_call_id, &tool_result);
                         #[cfg(feature = "acp")]
                         crate::permission::ask::finish_tool_call(&name, &internal_call_id);
-                        goal_report_accepted |= is_accepted_goal_report(&name, &output);
+                        goal_report_accepted |= take_accepted_goal_report(&internal_call_id);
                         // A `read` image that cannot be decoded ends the turn here, as
                         // it does interactively, instead of failing at persistence.
                         if let Err(error) = tool_result_images(&name, &tool_result) {
@@ -15124,6 +15162,7 @@ mod tests {
         let model = MockCompletionModel::from_stream_turns(turns);
         let agent = AgentBuilder::new(model.clone())
             .tool(crate::extras::goal::report_tool::GoalReport::new(store))
+            .add_hook(super::ToolLoopGuard)
             .default_max_turns(4)
             .build();
         (model, agent)
@@ -15225,6 +15264,7 @@ mod tests {
             .tool(crate::extras::goal::report_tool::GoalReport::new(
                 crate::extras::goal::GoalStore::default(),
             ))
+            .add_hook(super::ToolLoopGuard)
             .default_max_turns(4)
             .build();
 
