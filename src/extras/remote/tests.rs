@@ -10,10 +10,7 @@ async fn http(addr: SocketAddr, request: String) -> String {
 
 fn get(server: &RemoteServer, path: &str, auth: Option<&str>) -> String {
     let auth = auth.map_or(String::new(), |t| format!("Authorization: Bearer {t}\r\n"));
-    format!(
-        "GET {path} HTTP/1.1\r\nHost: {}\r\n{auth}\r\n",
-        server.addr
-    )
+    format!("GET {path} HTTP/1.1\r\nHost: {}\r\n{auth}\r\n", server.addr)
 }
 
 fn post(server: &RemoteServer, path: &str, body: &str, auth: Option<&str>) -> String {
@@ -46,13 +43,23 @@ async fn unauthenticated_and_wrong_token_requests_are_refused() {
     assert!(none.starts_with("HTTP/1.1 401"), "{none}");
     let wrong = http(server.addr, get(&server, "/", Some("nope"))).await;
     assert!(wrong.starts_with("HTTP/1.1 401"), "{wrong}");
-    let steer = http(server.addr, post(&server, "/steer", r#"{"text":"x"}"#, None)).await;
+    let steer = http(
+        server.addr,
+        post(&server, "/steer", r#"{"text":"x"}"#, None),
+    )
+    .await;
     assert!(steer.starts_with("HTTP/1.1 401"), "{steer}");
     let ok = http(server.addr, get(&server, "/", Some(&server.token))).await;
-    assert!(ok.starts_with("HTTP/1.1 200") && ok.contains("mini-agent remote"), "{ok}");
+    assert!(
+        ok.starts_with("HTTP/1.1 200") && ok.contains("mini-agent remote"),
+        "{ok}"
+    );
     let query = http(
         server.addr,
-        format!("GET /?token={} HTTP/1.1\r\nHost: {}\r\n\r\n", server.token, server.addr),
+        format!(
+            "GET /?token={} HTTP/1.1\r\nHost: {}\r\n\r\n",
+            server.token, server.addr
+        ),
     )
     .await;
     assert!(query.starts_with("HTTP/1.1 200"), "{query}");
@@ -72,29 +79,67 @@ async fn foreign_host_header_is_refused_even_with_the_token() {
 async fn steering_and_permission_answers_reach_the_session_once() {
     let mut server = start(RemoteOptions::default()).await.unwrap();
     let t = server.token.clone();
-    let resp = http(server.addr, post(&server, "/steer", r#"{"text":"use tabs"}"#, Some(&t))).await;
+    let resp = http(
+        server.addr,
+        post(&server, "/steer", r#"{"text":"use tabs"}"#, Some(&t)),
+    )
+    .await;
     assert!(resp.starts_with("HTTP/1.1 202"), "{resp}");
     assert_eq!(
         server.commands.recv().await.unwrap(),
         RemoteCommand::Steer("use tabs".into())
     );
-    let blank = http(server.addr, post(&server, "/steer", r#"{"text":"  "}"#, Some(&t))).await;
+    let blank = http(
+        server.addr,
+        post(&server, "/steer", r#"{"text":"  "}"#, Some(&t)),
+    )
+    .await;
     assert!(blank.starts_with("HTTP/1.1 400"), "{blank}");
 
     // An unknown ask is rejected; a published one is answered exactly once.
-    let unknown = http(server.addr, post(&server, "/permission", r#"{"id":"p1","allow":true}"#, Some(&t))).await;
+    let unknown = http(
+        server.addr,
+        post(
+            &server,
+            "/permission",
+            r#"{"id":"p1","allow":true}"#,
+            Some(&t),
+        ),
+    )
+    .await;
     assert!(unknown.starts_with("HTTP/1.1 404"), "{unknown}");
     server.hub.publish_permission("p1", "shell: ls");
-    let answer = post(&server, "/permission", r#"{"id":"p1","allow":true}"#, Some(&t));
-    assert!(http(server.addr, answer.clone()).await.starts_with("HTTP/1.1 202"));
+    let answer = post(
+        &server,
+        "/permission",
+        r#"{"id":"p1","allow":true}"#,
+        Some(&t),
+    );
+    assert!(
+        http(server.addr, answer.clone())
+            .await
+            .starts_with("HTTP/1.1 202")
+    );
     assert_eq!(
         server.commands.recv().await.unwrap(),
-        RemoteCommand::Permission { id: "p1".into(), allow: true }
+        RemoteCommand::Permission {
+            id: "p1".into(),
+            allow: true
+        }
     );
     assert!(http(server.addr, answer).await.starts_with("HTTP/1.1 404"));
     server.hub.publish_permission("p2", "edit");
     server.hub.withdraw_permission("p2");
-    let late = http(server.addr, post(&server, "/permission", r#"{"id":"p2","allow":true}"#, Some(&t))).await;
+    let late = http(
+        server.addr,
+        post(
+            &server,
+            "/permission",
+            r#"{"id":"p2","allow":true}"#,
+            Some(&t),
+        ),
+    )
+    .await;
     assert!(late.starts_with("HTTP/1.1 404"));
 
     let cancel = http(server.addr, post(&server, "/cancel", "{}", Some(&t))).await;
@@ -117,7 +162,9 @@ async fn events_stream_to_an_authenticated_client() {
         let n = stream.read(&mut buf).await.unwrap();
         got.push_str(&String::from_utf8_lossy(&buf[..n]));
     }
-    server.hub.publish(&serde_json::json!({"type":"text","text":"hello"}));
+    server
+        .hub
+        .publish(&serde_json::json!({"type":"text","text":"hello"}));
     while !got.contains("hello") {
         let n = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buf))
             .await
@@ -125,7 +172,11 @@ async fn events_stream_to_an_authenticated_client() {
             .unwrap();
         got.push_str(&String::from_utf8_lossy(&buf[..n]));
     }
-    assert!(got.contains("text/event-stream") && got.contains("data: {\"text\":\"hello\",\"type\":\"text\"}"), "{got}");
+    assert!(
+        got.contains("text/event-stream")
+            && got.contains("data: {\"text\":\"hello\",\"type\":\"text\"}"),
+        "{got}"
+    );
 }
 
 #[test]

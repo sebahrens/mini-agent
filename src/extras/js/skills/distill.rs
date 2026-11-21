@@ -864,6 +864,87 @@ fn default_output_path(paths: &AppPaths, tool_call_id: &str) -> PathBuf {
         .join(format!("{stem}.json"))
 }
 
+/// A successful `js` call of a session, as `--distill-learned-skill <session> list` shows it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct JsCall {
+    pub(crate) tool_call_id: String,
+    pub(crate) preview: String,
+}
+
+/// Successful `js` tool calls in session order: the call record is a `js` call
+/// and its result record did not report an error.
+pub(crate) fn successful_js_calls(messages: &[SessionMessage]) -> Vec<JsCall> {
+    let failed_or_missing = |id: &str| {
+        !messages.iter().any(|message| {
+            message.role == MessageRole::ToolResult
+                && message.tool_call_id.as_deref() == Some(id)
+                && matches!(
+                    message.tool.as_ref(),
+                    Some(PersistedToolMessage::Result {
+                        is_error: false,
+                        ..
+                    })
+                )
+        })
+    };
+    messages
+        .iter()
+        .filter(|message| message.role == MessageRole::ToolCall)
+        .filter_map(|message| {
+            let id = message.tool_call_id.as_deref()?;
+            let Some(PersistedToolMessage::Call { name, arguments }) = message.tool.as_ref() else {
+                return None;
+            };
+            if name.as_str() != JS_TOOL_NAME || failed_or_missing(id) {
+                return None;
+            }
+            let code = arguments.get(JS_CODE_FIELD)?.as_str()?;
+            let preview: String = code
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())?
+                .chars()
+                .take(80)
+                .collect();
+            Some(JsCall {
+                tool_call_id: id.to_string(),
+                preview,
+            })
+        })
+        .collect()
+}
+
+/// Resolves what the operator typed for the tool call: `last` is the most
+/// recent successful `js` call, otherwise an unambiguous id prefix of one, or
+/// the id itself (so the existing exact-id errors still apply).
+pub(crate) fn resolve_tool_call_id(
+    messages: &[SessionMessage],
+    requested: &str,
+) -> anyhow::Result<String> {
+    let calls = successful_js_calls(messages);
+    if requested == "last" {
+        return calls
+            .last()
+            .map(|call| call.tool_call_id.clone())
+            .context("the session holds no successful js call to distil");
+    }
+    if calls.iter().any(|call| call.tool_call_id == requested) {
+        return Ok(requested.to_string());
+    }
+    let matches: Vec<&JsCall> = calls
+        .iter()
+        .filter(|call| !requested.is_empty() && call.tool_call_id.starts_with(requested))
+        .collect();
+    match matches.as_slice() {
+        [] => Ok(requested.to_string()),
+        [only] => Ok(only.tool_call_id.clone()),
+        many => anyhow::bail!(
+            "tool call prefix {requested} is ambiguous ({} successful js calls start with it); use more characters",
+            many.len()
+        ),
+    }
+}
+
 /// Read the session, distil the named tool call, write the package, and report.
 pub(crate) async fn run(
     cli: &Cli,
@@ -875,6 +956,17 @@ pub(crate) async fn run(
     let session = crate::session::storage::load_session_exact(session_id)
         .with_context(|| format!("failed to load session {session_id}"))?
         .with_context(|| format!("no stored session {session_id}"))?;
+    if tool_call_id == "list" {
+        println!("tool_call_id\tcode");
+        let calls = successful_js_calls(&session.messages);
+        for call in &calls {
+            println!("{}\t{}", call.tool_call_id, call.preview);
+        }
+        println!("total\t{}", calls.len());
+        return Ok(());
+    }
+    let tool_call_id = resolve_tool_call_id(&session.messages, tool_call_id)?;
+    let tool_call_id = tool_call_id.as_str();
     let recorded = locate_javascript(&session.messages, session_id, tool_call_id)?.to_string();
 
     let distillation = distil(cli, cfg, &recorded, session_id, tool_call_id).await?;
@@ -1048,6 +1140,78 @@ mod tests {
             name: CompactString::new("js"),
             arguments: serde_json::json!({ "code": code }),
         }
+    }
+
+    fn ok_result(id: &str, is_error: bool) -> SessionMessage {
+        message(
+            MessageRole::ToolResult,
+            Some(id),
+            Some(PersistedToolMessage::Result {
+                output: CompactString::new("ok"),
+                images: Vec::new(),
+                artifact_path: None,
+                is_error,
+                diff: None,
+            }),
+        )
+    }
+
+    // mini-agent-nvnkx.121: the session lists its successful js calls and
+    // names one by `last` or an unambiguous id prefix, without raw ids.
+    #[test]
+    fn successful_js_calls_are_listed_and_resolved_by_last_or_prefix() {
+        let messages = vec![
+            message(
+                MessageRole::ToolCall,
+                Some("abc111-one"),
+                Some(js_call("\n  const a = 1;\n")),
+            ),
+            ok_result("abc111-one", false),
+            message(
+                MessageRole::ToolCall,
+                Some("abc222-two"),
+                Some(js_call("failing()")),
+            ),
+            ok_result("abc222-two", true),
+            message(
+                MessageRole::ToolCall,
+                Some("def333-three"),
+                Some(js_call("done()")),
+            ),
+            ok_result("def333-three", false),
+            message(
+                MessageRole::ToolCall,
+                Some("def444-pending"),
+                Some(js_call("no result yet")),
+            ),
+        ];
+        let calls = successful_js_calls(&messages);
+        let ids: Vec<_> = calls.iter().map(|c| c.tool_call_id.as_str()).collect();
+        assert_eq!(ids, ["abc111-one", "def333-three"]);
+        assert_eq!(calls[0].preview, "const a = 1;");
+        assert_eq!(
+            resolve_tool_call_id(&messages, "last").unwrap(),
+            "def333-three"
+        );
+        assert_eq!(
+            resolve_tool_call_id(&messages, "abc").unwrap(),
+            "abc111-one"
+        );
+        assert_eq!(
+            resolve_tool_call_id(&messages, "def3").unwrap(),
+            "def333-three"
+        );
+        // Unknown ids fall through to the exact-id errors.
+        assert_eq!(resolve_tool_call_id(&messages, "zzz").unwrap(), "zzz");
+        let both = vec![
+            message(MessageRole::ToolCall, Some("same-1"), Some(js_call("a()"))),
+            ok_result("same-1", false),
+            message(MessageRole::ToolCall, Some("same-2"), Some(js_call("b()"))),
+            ok_result("same-2", false),
+        ];
+        let error = resolve_tool_call_id(&both, "same").unwrap_err().to_string();
+        assert!(error.contains("ambiguous"), "{error}");
+        assert!(resolve_tool_call_id(&[], "last").is_err());
     }
 
     fn transcript() -> Vec<SessionMessage> {

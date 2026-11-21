@@ -727,15 +727,33 @@ fn run_library_operation(
     paths: &AppPaths,
     embedding: Option<&EmbeddingConfig>,
 ) -> anyhow::Result<()> {
+    // An unambiguous id prefix names the full 64-hex id; ambiguity is refused
+    // before any lifecycle transaction opens.
+    let resolve = |column: &str, id: &str| -> anyhow::Result<String> {
+        if id.len() >= 64 {
+            return Ok(id.to_string());
+        }
+        let store = SkillStore::open_at(paths).context("failed to open learned-skill store")?;
+        let candidates = stored_ids(&store, column)?;
+        resolve_unique_prefix(column, id, &candidates)
+    };
     match operation {
         LibraryOperation::Import(path) => import_path(path, paths, embedding),
         LibraryOperation::InstallSeeds => install_seeds(paths, embedding),
-        LibraryOperation::Approve(id) => review_proposal(id, true, paths, embedding),
-        LibraryOperation::Reject(id) => review_proposal(id, false, paths, embedding),
-        LibraryOperation::Activate(id) => activate_skill(id, paths, embedding),
-        LibraryOperation::Promote(id) => promote_replacement_skill(id, paths, embedding),
-        LibraryOperation::Retire(id) => retire_skill(id, paths, embedding),
-        LibraryOperation::Reevaluate(id) => reevaluate_skill(id, paths),
+        LibraryOperation::Approve(id) => {
+            review_proposal(&resolve("proposal_id", id)?, true, paths, embedding)
+        }
+        LibraryOperation::Reject(id) => {
+            review_proposal(&resolve("proposal_id", id)?, false, paths, embedding)
+        }
+        LibraryOperation::Activate(id) => {
+            activate_skill(&resolve("skill_id", id)?, paths, embedding)
+        }
+        LibraryOperation::Promote(id) => {
+            promote_replacement_skill(&resolve("skill_id", id)?, paths, embedding)
+        }
+        LibraryOperation::Retire(id) => retire_skill(&resolve("skill_id", id)?, paths, embedding),
+        LibraryOperation::Reevaluate(id) => reevaluate_skill(&resolve("skill_id", id)?, paths),
         LibraryOperation::ListSuites => {
             let store = SkillStore::open_at(paths)?;
             suite_listing_report(&store)?.emit();
@@ -752,6 +770,55 @@ fn run_library_operation(
                 .emit();
             Ok(())
         }
+    }
+}
+
+/// Every id of `column` (`proposal_id` or `skill_id`) in the proposal table.
+fn stored_ids(store: &SkillStore, column: &str) -> anyhow::Result<Vec<String>> {
+    let sql = match column {
+        "proposal_id" => "SELECT DISTINCT proposal_id FROM skill_proposals ORDER BY 1",
+        "skill_id" => "SELECT DISTINCT skill_id FROM skill_proposals ORDER BY 1",
+        other => anyhow::bail!("unsupported id column {other}"),
+    };
+    let mut statement = store.connection().prepare(sql)?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// Resolves `input` to the one candidate it prefixes. Needs at least 6 hex
+/// characters; an exact match wins; no match leaves `input` for the caller's
+/// own not-found error; several matches are refused with the first few listed.
+pub(crate) fn resolve_unique_prefix(
+    kind: &str,
+    input: &str,
+    candidates: &[String],
+) -> anyhow::Result<String> {
+    if candidates.iter().any(|candidate| candidate == input) {
+        return Ok(input.to_string());
+    }
+    let hex = !input.is_empty()
+        && input
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
+    if !hex || input.len() < 6 {
+        return Ok(input.to_string());
+    }
+    let matches: Vec<&String> = candidates
+        .iter()
+        .filter(|candidate| candidate.starts_with(input))
+        .collect();
+    match matches.as_slice() {
+        [] => Ok(input.to_string()),
+        [only] => Ok((*only).clone()),
+        many => anyhow::bail!(
+            "{kind} prefix {input} is ambiguous: {} candidates ({}); use more characters",
+            many.len(),
+            many.iter()
+                .take(5)
+                .map(|id| &id[..id.len().min(12)])
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }
 
@@ -4454,5 +4521,61 @@ mod tests {
         assert_rejection_preserves_approved_state(&paths, &skill_id);
         activate_skill(&skill_id, &paths, None).unwrap();
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod prefix_tests {
+    use super::resolve_unique_prefix;
+
+    fn ids() -> Vec<String> {
+        vec![
+            format!("ab12cd{}", "0".repeat(58)),
+            format!("ab12ef{}", "0".repeat(58)),
+            format!("ff00aa{}", "0".repeat(58)),
+        ]
+    }
+
+    #[test]
+    fn unique_prefix_resolves_to_the_full_id() {
+        let ids = ids();
+        assert_eq!(
+            resolve_unique_prefix("skill_id", "ff00aa", &ids).unwrap(),
+            ids[2]
+        );
+        assert_eq!(
+            resolve_unique_prefix("skill_id", "ab12cd", &ids).unwrap(),
+            ids[0]
+        );
+        assert_eq!(
+            resolve_unique_prefix("skill_id", &ids[1], &ids).unwrap(),
+            ids[1]
+        );
+    }
+
+    #[test]
+    fn ambiguous_prefix_is_refused_and_short_or_unknown_input_passes_through() {
+        let ids = ids();
+        let error = resolve_unique_prefix(
+            "skill_id",
+            "ab12cd",
+            &[ids[0].clone(), format!("ab12cd{}", "1".repeat(58))],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("ambiguous"), "{error}");
+        // Below six characters or not hex: left for the caller's own error.
+        assert_eq!(
+            resolve_unique_prefix("skill_id", "ab12", &ids).unwrap(),
+            "ab12"
+        );
+        assert_eq!(
+            resolve_unique_prefix("skill_id", "zzzzzzzz", &ids).unwrap(),
+            "zzzzzzzz"
+        );
+        assert_eq!(
+            resolve_unique_prefix("skill_id", "123456", &ids).unwrap(),
+            "123456"
+        );
     }
 }

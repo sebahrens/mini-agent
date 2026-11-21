@@ -12,6 +12,9 @@
 //! answers are handed to the session through [`Hub`] channels and take the
 //! same steering queue and permission prompt as local input.
 
+// The TUI is not wired to this server yet (see docs/development/remote-control.md).
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -34,7 +37,10 @@ pub enum RemoteCommand {
     /// Text for the steering queue of the running turn.
     Steer(String),
     /// Answer to a permission ask previously published by id.
-    Permission { id: String, allow: bool },
+    Permission {
+        id: String,
+        allow: bool,
+    },
     Cancel,
 }
 
@@ -273,8 +279,12 @@ fn host_is_bound_address(host: &str, addr: SocketAddr) -> bool {
     let port = addr.port();
     host == addr.to_string()
         || (addr.ip().is_loopback()
-            && [format!("localhost:{port}"), format!("127.0.0.1:{port}"), format!("[::1]:{port}")]
-                .contains(&host))
+            && [
+                format!("localhost:{port}"),
+                format!("127.0.0.1:{port}"),
+                format!("[::1]:{port}"),
+            ]
+            .contains(&host))
 }
 
 async fn handle(mut stream: TcpStream, shared: &Shared) -> anyhow::Result<()> {
@@ -299,7 +309,13 @@ async fn handle(mut stream: TcpStream, shared: &Shared) -> anyhow::Result<()> {
         .or(request.query_token.as_deref())
         .unwrap_or_default();
     if !constant_time_eq(supplied.as_bytes(), shared.token.as_bytes()) {
-        respond(&mut stream, "401 Unauthorized", "text/plain", "unauthorized").await?;
+        respond(
+            &mut stream,
+            "401 Unauthorized",
+            "text/plain",
+            "unauthorized",
+        )
+        .await?;
         return Ok(());
     }
     match (request.method.as_str(), request.path.as_str()) {
@@ -312,7 +328,15 @@ async fn handle(mut stream: TcpStream, shared: &Shared) -> anyhow::Result<()> {
                 Some(text) => {
                     command(&mut stream, shared, RemoteCommand::Steer(text)).await?;
                 }
-                None => respond(&mut stream, "400 Bad Request", "text/plain", "text required").await?,
+                None => {
+                    respond(
+                        &mut stream,
+                        "400 Bad Request",
+                        "text/plain",
+                        "text required",
+                    )
+                    .await?
+                }
             }
         }
         ("POST", "/permission") => {
@@ -321,7 +345,13 @@ async fn handle(mut stream: TcpStream, shared: &Shared) -> anyhow::Result<()> {
             let id = value.get("id").and_then(|v| v.as_str()).map(str::to_string);
             let allow = value.get("allow").and_then(|v| v.as_bool());
             let (Some(id), Some(allow)) = (id, allow) else {
-                respond(&mut stream, "400 Bad Request", "text/plain", "id and allow required").await?;
+                respond(
+                    &mut stream,
+                    "400 Bad Request",
+                    "text/plain",
+                    "id and allow required",
+                )
+                .await?;
                 return Ok(());
             };
             // An answer is accepted once, for an ask that is still pending.
@@ -335,7 +365,13 @@ async fn handle(mut stream: TcpStream, shared: &Shared) -> anyhow::Result<()> {
             if known {
                 command(&mut stream, shared, RemoteCommand::Permission { id, allow }).await?;
             } else {
-                respond(&mut stream, "404 Not Found", "text/plain", "no such pending ask").await?;
+                respond(
+                    &mut stream,
+                    "404 Not Found",
+                    "text/plain",
+                    "no such pending ask",
+                )
+                .await?;
             }
         }
         ("POST", "/cancel") => command(&mut stream, shared, RemoteCommand::Cancel).await?,
