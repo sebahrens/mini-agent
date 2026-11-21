@@ -107,6 +107,21 @@ fn main() -> anyhow::Result<ExitCode> {
         }
         None => {}
     }
+    match setup::import::parse_invocation(&argv) {
+        Some(setup::import::Invocation::Run(import)) => {
+            let code = setup::import::run(import);
+            return Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)));
+        }
+        Some(setup::import::Invocation::Help) => {
+            println!("{}", setup::import::USAGE);
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some(setup::import::Invocation::Invalid(message)) => {
+            eprintln!("error: {message}\n\n{}", setup::import::USAGE);
+            return Ok(ExitCode::from(2));
+        }
+        None => {}
+    }
     let cli = cli::Cli::parse_command_line();
     if let Some(shell) = cli.completions {
         match cli::write_completions(shell, &mut std::io::stdout().lock()) {
@@ -1080,6 +1095,11 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
             }
             setup::SetupOutcome::Launch => {
                 // fall through to launch
+                if let Some(note) = dirs::home_dir()
+                    .and_then(|home| setup::import::detection_note(&home))
+                {
+                    eprintln!("{note}");
+                }
             }
         }
     }

@@ -10,6 +10,8 @@ use crossterm::terminal::{self, Clear, ClearType};
 
 use crate::config::{Config, CustomProviderConfig, QuickModelConfig};
 
+pub(crate) mod import;
+
 #[derive(Debug, Clone)]
 pub enum SetupOutcome {
     Launch,

@@ -192,11 +192,6 @@ pub(crate) fn input_json(
 }
 
 #[cfg(test)]
-pub(crate) fn clear_for_test() {
-    with_store(HashMap::clear);
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
