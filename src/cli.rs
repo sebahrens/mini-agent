@@ -1605,6 +1605,9 @@ impl Cli {
             .tools
             .iter()
             .map(String::as_str)
+            // `--tools ""` is the long-standing spelling of an empty allowlist
+            // (no tools), not a misspelt tool name.
+            .filter(|name| !name.is_empty())
             .filter(|name| !crate::agent::builder::is_reserved_builtin_tool_name(name))
             .collect();
         if unknown.is_empty() || self.resolve_no_tools(cfg) {
@@ -2150,6 +2153,7 @@ mod tests {
                 .validate_tool_allowlist(&cfg)
                 .is_ok()
         );
+        assert!(parse("").validate_tool_allowlist(&cfg).is_ok());
         let all_unknown = parse("reed,greb")
             .validate_tool_allowlist(&cfg)
             .unwrap_err();
