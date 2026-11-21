@@ -813,6 +813,15 @@ pub fn load_with_paths(paths: &AppPaths, interactive: bool) -> (Config, bool) {
     )
 }
 
+static CREATE_DEFAULT_CONFIG: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Whether a missing global config file is created with the defaults on load.
+/// Off for `--print-config`, which only reports state.
+pub fn set_create_default_config(create: bool) {
+    CREATE_DEFAULT_CONFIG.store(create, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Configuration discovery is separate from the captured execution workspace.
 pub(crate) fn load_in_workspace(
     paths: &AppPaths,
@@ -1528,6 +1537,7 @@ fn load_from_path_with_sources(
             error,
         ))
     });
+    let mut nested_unknown = Vec::new();
     #[allow(unused_mut)]
     let mut cfg: Config = if is_first_startup {
         tracing::info!(
@@ -1535,7 +1545,8 @@ fn load_from_path_with_sources(
             path.display()
         );
         let default = rich_default_config();
-        if path.extension().and_then(|e| e.to_str()) == Some("toml")
+        if CREATE_DEFAULT_CONFIG.load(std::sync::atomic::Ordering::Relaxed)
+            && path.extension().and_then(|e| e.to_str()) == Some("toml")
             && let Ok(content) = toml::to_string(&default)
         {
             atomic_config_write(&path, &content).unwrap_or_else(|error| {
@@ -1557,19 +1568,30 @@ fn load_from_path_with_sources(
                 error,
             ))
         });
-        parse_config_content(&path, &content).unwrap_or_else(|error| {
+        let parsed = parse_config_content(&path, &content).unwrap_or_else(|error| {
             fatal_config_load(format!(
                 "error: {} is not a valid config: {}\n\
                  Fix the file or remove it to use defaults.",
                 path.display(),
                 error,
             ))
-        })
+        });
+        if path.extension().and_then(|e| e.to_str()) == Some("toml")
+            && let Ok(table) = toml::from_str::<toml::Table>(&content)
+        {
+            nested_unknown = keys::unknown_nested_key_warnings(
+                &format!("global config {}", path.display()),
+                &table,
+            );
+        }
+        parsed
     };
     if is_first_startup {
         cfg.provenance.global_file = Some(path.clone());
         cfg.provenance.global_status = Some(
-            if path.extension().and_then(|e| e.to_str()) == Some("toml") {
+            if path.extension().and_then(|e| e.to_str()) == Some("toml")
+                && CREATE_DEFAULT_CONFIG.load(std::sync::atomic::Ordering::Relaxed)
+            {
                 "initialized from compiled defaults"
             } else {
                 "missing; compiled defaults shown"
@@ -1592,6 +1614,7 @@ fn load_from_path_with_sources(
             cfg.preserved.keys(),
         ),
     );
+    emit_config_warnings(&mut warnings, nested_unknown);
     let clamped = cfg.retry.clamp_to_limits();
     emit_config_warnings(
         &mut warnings,
@@ -1644,11 +1667,7 @@ fn load_from_path_with_sources(
                 &confirm_project_config_trust,
                 true,
             )
-            .unwrap_or_else(|_| {
-                fatal_config_load(
-                    "error: selected project config is invalid or changed (values omitted)".into(),
-                )
-            });
+            .unwrap_or_else(|message| fatal_config_load(project_config_failure(path, &message)));
             if matches!(
                 outcome,
                 ProjectConfigTrustOutcome::SkippedHeadless
@@ -2598,13 +2617,19 @@ fn apply_captured_override(
         sensitive_keys.insert("model".into());
     }
     let local = parse_project_toml(&content)?;
-    let unknown = keys::unknown_key_warnings(
-        "project config",
+    let mut unknown = keys::unknown_key_warnings(
+        &format!("project config {}", path.display()),
         local
             .as_table()
             .into_iter()
             .flat_map(|table| table.keys().map(String::as_str)),
     );
+    if let Some(table) = local.as_table() {
+        unknown.extend(keys::unknown_nested_key_warnings(
+            &format!("project config {}", path.display()),
+            table,
+        ));
+    }
     if repair {
         cfg.load_warnings.extend(unknown);
     } else {
@@ -3044,6 +3069,13 @@ pub fn merge_config_override(base: &Config, local_toml: &str) -> Result<Config, 
 /// Parse a project-local TOML config with its top-level keys rewritten to
 /// their canonical spellings, so trust classification and merging see
 /// `permission_deny` exactly as they see `permission-deny`.
+/// The fatal message for a project config layer that failed to load: the file
+/// path plus the loader's own value-free reason (which carries line and column
+/// for a TOML syntax error).
+fn project_config_failure(path: &Path, message: &str) -> String {
+    format!("error: project config {}: {message}", path.display())
+}
+
 pub(crate) fn parse_project_toml(local_toml: &str) -> Result<toml::Value, String> {
     super::layers::validate_toml_bounds_diagnostic(local_toml, MAX_PROJECT_CONFIG_BYTES)?;
     let mut local: toml::Value = toml::from_str(local_toml).map_err(|error:toml::de::Error| {
@@ -6053,6 +6085,18 @@ pub(super) fn approve_editor_project_config(
 #[cfg(test)]
 mod config691_tests {
     use super::*;
+    #[test]
+    fn project_config_failure_names_the_file_line_and_column() {
+        let error = parse_project_toml("model='x'\nretry=1\narray=[\n").unwrap_err();
+        let message = project_config_failure(Path::new("/repo/.mini-agent/config.toml"), &error);
+        assert!(
+            message.contains("/repo/.mini-agent/config.toml"),
+            "{message}"
+        );
+        assert!(message.contains("line 3"), "{message}");
+        assert!(!message.contains("'x'"));
+    }
+
     #[test]
     fn config691_static_locations_and_existing_default_identity_are_preserved() {
         for (text, line) in [

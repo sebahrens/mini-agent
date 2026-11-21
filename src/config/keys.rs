@@ -351,6 +351,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     gated("acp", "acp_servers").shaped(ConfigShape::Object),
     gated("acp", "acp_host").shaped(ConfigShape::String),
     gated("acp", "acp_port").shaped(ConfigShape::Integer),
+    gated("acp", "acp_accept_timeout_secs").described("Seconds to wait for the first authenticated ACP TCP peer before exiting (default 300; 0 waits indefinitely).").shaped(ConfigShape::Integer),
     key("edit_system").shaped(ConfigShape::Enum(&["similarity", "hashedit"])),
     gated("subagents", "subagent_context_window").described("Independent child context estimate cap, including reserved response. Default: known child capacity up to 1048576; unknown models 131072; main context_window stays independent. Applies to the next delegation.").live().shaped(ConfigShape::Integer),
     gated("subagents", "subagent_max_tokens").described("Per-response child output tokens (default 32000), subject to explicit parent response ceilings and provider limits. Applies to the next delegation.").live().shaped(ConfigShape::Integer),
@@ -507,6 +508,103 @@ pub(crate) fn nearest_known_key(spelling: &str) -> Option<&'static str> {
         .map(|(name, _)| name)
 }
 
+const RETRY_FIELDS: &[&str] = &[
+    "max_attempts",
+    "initial_backoff_ms",
+    "max_backoff_ms",
+    "max_retry_after_ms",
+];
+const QUICK_MODEL_FIELDS: &[&str] = &[
+    "provider",
+    "model",
+    "input_token_cost",
+    "output_token_cost",
+    "cache_read_token_cost",
+    "cache_write_token_cost",
+    "cache_write_1h_token_cost",
+    "reserve_tokens",
+    "temperature",
+    "extra_body",
+    "context_window",
+];
+const CUSTOM_PROVIDER_FIELDS: &[&str] = &[
+    "provider_type",
+    "base_url",
+    "api_key_env",
+    "inherit_builtin_key",
+    "danger_accept_invalid_certs",
+    "api_style",
+    "headers",
+    "timeout_secs",
+    "connect_timeout_secs",
+    "stream_idle_timeout_secs",
+    "model",
+    "prompt_caching",
+    "model_prices",
+];
+const ADVISOR_FIELDS: &[&str] = &[
+    "enabled",
+    "model",
+    "max_uses",
+    "human_handoff",
+    "advisor_kilobytes_limit",
+];
+
+/// Warnings for misspelled keys inside the typed config tables (`[retry]`,
+/// `[advisor]`, `[quick_models.*]`, `[custom_providers.*]`), which serde
+/// otherwise drops silently. Key names are shown (never values), each with the
+/// nearest field as a hint.
+pub(crate) fn unknown_nested_key_warnings(source: &str, root: &toml::Table) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (top, value) in root {
+        let Some(table) = value.as_table() else {
+            continue;
+        };
+        let canonical = lookup(top).map_or(top.as_str(), |key| key.name);
+        let (fields, per_entry): (&[&str], bool) = match canonical {
+            "retry" => (RETRY_FIELDS, false),
+            "advisor" => (ADVISOR_FIELDS, false),
+            "quick_models" => (QUICK_MODEL_FIELDS, true),
+            "custom_providers" => (CUSTOM_PROVIDER_FIELDS, true),
+            _ => continue,
+        };
+        let mut check = |prefix: String, table: &toml::Table| {
+            for spelling in table.keys() {
+                if fields.contains(&spelling.as_str()) {
+                    continue;
+                }
+                let hint = nearest_field(spelling, fields)
+                    .map(|field| format!(" (did you mean `{field}`?)"))
+                    .unwrap_or_default();
+                warnings.push(format!(
+                    "{source}: unknown key `{prefix}{spelling}` is ignored{hint}"
+                ));
+            }
+        };
+        if per_entry {
+            for (name, entry) in table {
+                if let Some(entry) = entry.as_table() {
+                    check(format!("{canonical}.{name}."), entry);
+                }
+            }
+        } else {
+            check(format!("{canonical}."), table);
+        }
+    }
+    warnings
+}
+
+pub(crate) fn nearest_field(spelling: &str, fields: &[&'static str]) -> Option<&'static str> {
+    let wanted = normalize(spelling);
+    let limit = (wanted.chars().count() / 4).max(2);
+    fields
+        .iter()
+        .map(|field| (*field, edit_distance(&wanted, field)))
+        .filter(|(_, distance)| *distance <= limit)
+        .min_by_key(|(_, distance)| *distance)
+        .map(|(field, _)| field)
+}
+
 fn normalize(spelling: &str) -> String {
     spelling.to_ascii_lowercase().replace('-', "_")
 }
@@ -615,6 +713,29 @@ mod tests {
         assert_eq!(nearest_known_key("permision_deny"), Some("permission-deny"));
         assert_eq!(nearest_known_key("accept-all"), Some("accept_all"));
         assert_eq!(nearest_known_key("completely_unrelated_thing"), None);
+    }
+
+    #[test]
+    fn nested_unknown_keys_get_a_warning_with_a_hint() {
+        let root: toml::Table = toml::from_str(
+            "[retry]\nmax_attemps = 2\nmax_attempts = 3\n\
+             [quick_models.fast]\nprovider = 'p'\nmodel = 'm'\ncontxt_window = 5\n\
+             [custom_providers.gw]\napi_key_evn = 'SECRET'\n\
+             [advisor]\nmodle = 'x'\n",
+        )
+        .unwrap();
+        let warnings = unknown_nested_key_warnings("global config c.toml", &root);
+        let text = warnings.join("\n");
+        for expected in [
+            "unknown key `retry.max_attemps` is ignored (did you mean `max_attempts`?)",
+            "`quick_models.fast.contxt_window` is ignored (did you mean `context_window`?)",
+            "`custom_providers.gw.api_key_evn` is ignored (did you mean `api_key_env`?)",
+            "`advisor.modle` is ignored (did you mean `model`?)",
+        ] {
+            assert!(text.contains(expected), "{expected}\n{text}");
+        }
+        assert_eq!(warnings.len(), 4, "{text}");
+        assert!(!text.contains("SECRET"));
     }
 
     #[test]

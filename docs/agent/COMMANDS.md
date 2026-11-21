@@ -551,9 +551,9 @@ and stopping only edit the schedule.
 - **Saved disarmed.** Schedules are saved with the session (id, interval,
   prompt, fires so far and the wall-clock time the next fire was expected),
   updated whenever one is armed, stopped, fired or retired. They only fire in
-  the process that armed them: quitting, `/resume`, `/new`, `/clear` or any
+  the process that armed them: quitting, `/sessions`, `/new`, `/clear` or any
   other session switch stops them. Resuming a session with saved schedules
-  (`/resume`, `--continue`) never re-arms them on its own, to avoid surprise
+  (`/sessions`, `--continue`) never re-arms them on its own, to avoid surprise
   spend; it shows one notice such as `this session had 2 /cron schedules (c1
   every 5m: ...); /cron resume to re-arm`. Until then `/cron list` shows them
   as `disarmed`, `/cron stop` removes them, and new schedules take ids after
@@ -678,8 +678,8 @@ provider request, with the error naming the valid personas on stderr (and in the
 [SUBAGENTS.md](SUBAGENTS.md#referencing-a-specialist-with-agent).
 
 At startup, mini-agent resolves the configured shell once against the canonical
-workspace and captured `PATH`. Supported Windows contracts are PowerShell/pwsh
-with `-Command` and Bash/sh with `-c`; Unix uses Bash/sh with `-c`. The resolved
+workspace and captured `PATH`. Supported Windows contracts are Command Prompt
+(`cmd.exe`, the default), PowerShell/pwsh with `-Command` and Bash/sh with `-c`; Unix uses Bash/sh with `-c`. The resolved
 executable identity and argument contract are retained across agent rebuilds.
 If the executable is missing or unsupported, the model-visible compatibility
 tool named `shell` and its prompt guidance are omitted, and shell execution fails

@@ -1137,6 +1137,31 @@ struct TcpTransport {
     api_key: String,
     tls: Option<Arc<tls::AcpTlsConfig>>,
     idle: Arc<idle::Idle>,
+    accept_timeout: Option<std::time::Duration>,
+}
+
+/// Default seconds to wait for the first authenticated ACP TCP peer.
+const DEFAULT_ACCEPT_TIMEOUT_SECS: u64 = 300;
+
+/// Bound the first-peer accept: `None` waits indefinitely.
+async fn within_accept_deadline<T>(
+    timeout: Option<std::time::Duration>,
+    accept: impl std::future::Future<Output = std::io::Result<T>>,
+) -> std::io::Result<T> {
+    match timeout {
+        None => accept.await,
+        Some(limit) => tokio::time::timeout(limit, accept)
+            .await
+            .unwrap_or_else(|_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "no authenticated ACP peer within {} s (see --acp-accept-timeout-secs)",
+                        limit.as_secs()
+                    ),
+                ))
+            }),
+    }
 }
 
 impl<Counterpart: Role> ConnectTo<Counterpart> for TcpTransport {
@@ -1156,12 +1181,15 @@ impl<Counterpart: Role> ConnectTo<Counterpart> for TcpTransport {
 
         if let Some(tls) = self.tls {
             tracing::info!("ACP TCP listening on {} (TLS)", local_addr);
-            let (stream, peer_addr) = tls::accept_tls_peer_with_idle(
-                listener,
-                self.api_key,
-                tls,
-                MAX_PENDING_AUTHENTICATIONS,
-                self.idle,
+            let (stream, peer_addr) = within_accept_deadline(
+                self.accept_timeout,
+                tls::accept_tls_peer_with_idle(
+                    listener,
+                    self.api_key,
+                    tls,
+                    MAX_PENDING_AUTHENTICATIONS,
+                    self.idle,
+                ),
             )
             .await
             .map_err(|e| {
@@ -1183,11 +1211,14 @@ impl<Counterpart: Role> ConnectTo<Counterpart> for TcpTransport {
         let accept_error =
             |e| agent_client_protocol::util::internal_error(format!("TCP accept: {}", e));
         let listener = accept::tokio_listener(listener).map_err(accept_error)?;
-        let (stream, peer_addr) = accept_authenticated_peer_with_idle(
-            listener,
-            self.api_key,
-            MAX_PENDING_AUTHENTICATIONS,
-            self.idle,
+        let (stream, peer_addr) = within_accept_deadline(
+            self.accept_timeout,
+            accept_authenticated_peer_with_idle(
+                listener,
+                self.api_key,
+                MAX_PENDING_AUTHENTICATIONS,
+                self.idle,
+            ),
         )
         .await
         .map_err(accept_error)?;
@@ -1319,6 +1350,7 @@ struct TcpServerSettings {
     port: u16,
     api_key: String,
     tls: Option<Arc<tls::AcpTlsConfig>>,
+    accept_timeout: Option<std::time::Duration>,
 }
 
 /// Opt-in for a non-loopback plaintext ACP TCP bind. Without TLS the TCP
@@ -1409,6 +1441,13 @@ fn resolve_tcp_settings_with_key(
         port,
         api_key,
         tls: None,
+        accept_timeout: Some(
+            cli.acp_accept_timeout_secs
+                .or(cfg.acp_accept_timeout_secs)
+                .unwrap_or(DEFAULT_ACCEPT_TIMEOUT_SECS),
+        )
+        .filter(|secs| *secs > 0)
+        .map(std::time::Duration::from_secs),
     }))
 }
 
@@ -1614,6 +1653,7 @@ pub async fn serve(cli: Cli, mut cfg: Config, context: ContextFiles) -> anyhow::
                 api_key: settings.api_key,
                 tls: settings.tls,
                 idle,
+                accept_timeout: settings.accept_timeout,
             },
         )
         .await
@@ -7146,6 +7186,18 @@ mod history_tests {
             }
         }
         panic!("fake ACP turn ended without a terminal event")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_peer_accept_gives_up_after_the_configured_deadline() {
+        let silent = std::future::pending::<std::io::Result<()>>();
+        let error = within_accept_deadline(Some(std::time::Duration::from_secs(30)), silent)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("within 30 s"), "{error}");
+        let ready = within_accept_deadline(None, async { Ok::<_, std::io::Error>(7) }).await;
+        assert_eq!(ready.unwrap(), 7);
     }
 
     #[tokio::test]

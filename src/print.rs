@@ -3019,6 +3019,24 @@ fn sandbox_toolchain_roots_entry(
     )
 }
 
+/// The permission mode the run will use, from the same resolver startup calls
+/// (CLI flags before config keys, managed policy applied). A resolution
+/// failure is shown in place of a mode, as startup would refuse to run.
+fn print_config_permission_mode(cli: &cli::Cli, cfg: &config::Config) -> String {
+    if cli.dangerously_skip_permissions {
+        return "dangerously-skip-permissions".to_owned();
+    }
+    match crate::permission::resolve_execution_authority(
+        cli,
+        cfg,
+        crate::sandbox::SandboxPolicy::Disabled,
+        "disabled",
+    ) {
+        Ok(authority) => authority.mode.as_str().to_owned(),
+        Err(error) => format!("error: {error}"),
+    }
+}
+
 pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<()> {
     let rules_cfg =
         crate::permission::cli_rules::report_config(cli, cfg).map_err(io::Error::other)?;
@@ -3030,8 +3048,8 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
     let config_file = config::config_file_path();
     let mut output = String::new();
 
-    let model = cli.resolve_model(cfg);
-    let provider = cli.resolve_provider(cfg);
+    cli.validate_quick_model(cfg).map_err(io::Error::other)?;
+    let (provider, model) = cli.resolve_provider_and_model(cfg);
     let qm_map = config::quick_models_map(cfg);
     let max_tokens = cli.resolve_max_tokens(cfg);
     let max_agent_turns = cli.resolve_max_agent_turns(cfg);
@@ -3079,21 +3097,8 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
     let edit_system = cli.resolve_edit_system(cfg);
     let compact = cfg.resolve_compact_enabled();
 
-    let mode = if cli.dangerously_skip_permissions {
-        "dangerously-skip-permissions"
-    } else if cli.yolo || cfg.yolo.unwrap_or(false) {
-        "yolo"
-    } else if cli.accept_all || cfg.accept_all.unwrap_or(false) {
-        "standard"
-    } else if cli.read_only {
-        "readonly"
-    } else if cli.guarded {
-        "guarded"
-    } else if cli.restrictive || cfg.restrictive.unwrap_or(false) {
-        "restrictive"
-    } else {
-        cfg.default_permission_mode.as_deref().unwrap_or("standard")
-    };
+    let mode = print_config_permission_mode(cli, cfg);
+    let mode = mode.as_str();
 
     append_section(
         &mut output,
@@ -3375,6 +3380,9 @@ fn config_source_entries(cli: &cli::Cli, cfg: &config::Config) -> Vec<(&'static 
         }
         if cli.acp_port.is_some() {
             explicit.insert("acp_port");
+        }
+        if cli.acp_accept_timeout_secs.is_some() {
+            explicit.insert("acp_accept_timeout_secs");
         }
     }
     #[cfg(feature = "advisor")]
@@ -3769,6 +3777,46 @@ mod tests {
             assert!(text.contains(required), "{text}");
         }
         assert_eq!(cfg.permission_allow.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn print_config_mode_follows_the_startup_resolver() {
+        let cfg: crate::config::Config = toml::from_str("yolo = true").unwrap();
+        let read_only = crate::cli::Cli {
+            read_only: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            super::print_config_permission_mode(&read_only, &cfg),
+            "readonly"
+        );
+        assert_eq!(
+            super::print_config_permission_mode(&crate::cli::Cli::default(), &cfg),
+            "yolo"
+        );
+        let bad: crate::config::Config =
+            toml::from_str("default_permission_mode = \"nope\"").unwrap();
+        assert!(
+            super::print_config_permission_mode(&crate::cli::Cli::default(), &bad)
+                .starts_with("error: ")
+        );
+    }
+
+    #[test]
+    fn print_config_uses_the_quick_model_provider_and_model() {
+        let cfg: crate::config::Config = toml::from_str(
+            "provider = \"openai\"\nmodel = \"base\"\n[quick_models.fast]\nprovider = \"anthropic\"\nmodel = \"quick-one\"\n",
+        )
+        .unwrap();
+        let cli = crate::cli::Cli {
+            quick_model: Some("fast".into()),
+            ..Default::default()
+        };
+        let (provider, model) = cli.resolve_provider_and_model(&cfg);
+        assert_eq!(
+            (provider.as_str(), model.as_str()),
+            ("anthropic", "quick-one")
+        );
     }
 
     #[test]
