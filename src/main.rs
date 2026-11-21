@@ -107,6 +107,21 @@ fn main() -> anyhow::Result<ExitCode> {
         }
         None => {}
     }
+    match extras::schedule::parse_invocation(&argv) {
+        Some(extras::schedule::Invocation::Run(command)) => {
+            let code = extras::schedule::run(command);
+            return Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)));
+        }
+        Some(extras::schedule::Invocation::Help) => {
+            println!("{}", extras::schedule::USAGE);
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some(extras::schedule::Invocation::Invalid(message)) => {
+            eprintln!("error: {message}\n\n{}", extras::schedule::USAGE);
+            return Ok(ExitCode::from(2));
+        }
+        None => {}
+    }
     match setup::import::parse_invocation(&argv) {
         Some(setup::import::Invocation::Run(import)) => {
             let code = setup::import::run(import);

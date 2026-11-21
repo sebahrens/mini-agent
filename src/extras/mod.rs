@@ -50,3 +50,5 @@ pub mod lsp;
 pub mod js;
 pub mod skills;
 pub(crate) mod truncate;
+
+pub(crate) mod schedule;
