@@ -188,18 +188,32 @@ async fn grep_per_call_limit_restricts_source_context_and_compact_results() {
         .await
         .unwrap();
     assert!(context.starts_with("2 results"), "{context}");
-    assert!(context.contains("hits.txt:1- before"), "{context}");
+    assert!(context.contains("hits.txt:1-before"), "{context}");
     assert!(!context.contains("hits.txt:3"), "{context}");
-    for cap in [0, 6, u64::MAX] {
-        let error = tool
+    let error = tool
+        .call(search_args(
+            root.path(),
+            serde_json::json!({"max_results":0}),
+        ))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("at least 1"), "{error}");
+    // Above the cap: served at the cap, with a note.
+    for cap in [6, u64::MAX] {
+        let output = tool
             .call(search_args(
                 root.path(),
                 serde_json::json!({"max_results":cap}),
             ))
             .await
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("configured cap 5"), "{error}");
+            .unwrap();
+        assert!(
+            output.contains(&format!(
+                "max_results {cap} exceeds the cap 5; showing up to 5"
+            )),
+            "{output}"
+        );
     }
     std::fs::write(root.path().join("other.txt"), "needle").unwrap();
     for mode in ["files_only", "count"] {
@@ -294,8 +308,8 @@ async fn grep_multiline_matches_whole_files_and_projects_numbered_unicode_crlf_l
         .await
         .unwrap();
     assert!(context.starts_with("6 results"), "{context}");
-    assert!(context.contains("hits.txt:1- before"), "{context}");
-    assert!(context.contains("hits.txt:3: end β"), "{context}");
+    assert!(context.contains("hits.txt:1-before"), "{context}");
+    assert!(context.contains("hits.txt:3:end β"), "{context}");
 }
 
 #[tokio::test]
@@ -492,7 +506,7 @@ async fn grep_offset_pages_lines_files_only_and_count_without_overlap() {
         ))
         .await
         .unwrap();
-    assert!(context.contains("hits.txt:3: needle 3"), "{context}");
+    assert!(context.contains("hits.txt:3:needle 3"), "{context}");
     assert!(!context.contains("\n--\n"), "{context}");
 
     for name in ["a.txt", "b.txt", "c.txt"] {

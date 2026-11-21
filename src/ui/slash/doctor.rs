@@ -3,7 +3,7 @@ use super::SlashCtx;
 
 pub(crate) fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     if parts.len() != 1 {
-        super::write_error(ctx.renderer, "usage: /doctor");
+        super::write_usage(ctx.renderer, "usage: /doctor");
         return Ok(());
     }
     let Ok(paths) = crate::paths::process_paths_ref() else {

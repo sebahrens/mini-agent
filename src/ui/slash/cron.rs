@@ -15,6 +15,7 @@
 use super::{write_error, write_ok, write_result};
 use crate::ui::cron::{self, ArmError, CronStore};
 use crate::ui::renderer::Renderer;
+use crate::ui::slash::write_usage;
 use tokio::time::Instant;
 
 const USAGE: &str = "usage: /cron <interval> <prompt>  |  /cron <prompt>  |  /cron list  |  /cron stop <id>|all  |  /cron run <id>  |  /cron resume";
@@ -114,9 +115,22 @@ pub(crate) fn handle(
             now,
         ),
         ["/cron", interval] if cron::is_interval_token(interval) => {
-            write_error(renderer, "usage: /cron <interval> <prompt>");
+            write_usage(renderer, "usage: /cron <interval> <prompt>");
         }
-        ["/cron", "list" | "stop" | "run", ..] => write_error(renderer, USAGE),
+        ["/cron", "list" | "stop" | "run", ..] => write_usage(renderer, USAGE),
+        // A lone word that is a verb of a sibling command (/goal, /loop,
+        // /queue, /tasks) is a typo, not a prompt worth a paid model turn.
+        [
+            "/cron",
+            word @ ("status" | "clear" | "pause" | "help" | "delete" | "cancel" | "remove"),
+        ] => {
+            write_error(
+                renderer,
+                format!(
+                    "cron: '{word}' is not a /cron command; did you mean /cron list or /cron stop <id>? (a schedule is /cron <interval> <prompt>)"
+                ),
+            );
+        }
         ["/cron", first, rest @ ..] => {
             let prompt = std::iter::once(*first)
                 .chain(rest.iter().copied())
@@ -124,7 +138,7 @@ pub(crate) fn handle(
                 .join(" ");
             arm_dynamic(&prompt, store, renderer, max_fires, budget_capped, now);
         }
-        _ => write_error(renderer, USAGE),
+        _ => write_usage(renderer, USAGE),
     }
 }
 
@@ -580,6 +594,15 @@ mod tests {
             );
         }
         assert_eq!(store.len(), 2);
+        // A lone sibling-command verb is refused instead of arming a paid turn.
+        for word in ["status", "clear", "pause", "help"] {
+            let lines = run(&format!("/cron {word}"), &mut store, true, now);
+            assert!(lines[0].contains("did you mean /cron list"), "{lines:?}");
+        }
+        assert_eq!(store.len(), 2);
+        // Several words are still a prompt.
+        run("/cron status page returns 500", &mut store, true, now);
+        assert_eq!(store.len(), 3);
     }
 
     #[test]

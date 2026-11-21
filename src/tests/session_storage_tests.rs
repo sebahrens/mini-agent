@@ -159,6 +159,39 @@ fn recent_session_lookup_is_scoped_to_the_captured_workspace() {
     assert_eq!(found[0].id, first_session.id);
 }
 
+// mini-agent-sskdu.5: a corrupt newest file is reported (id and reason, no
+// content), and the older valid session is still returned.
+#[test]
+fn recent_workspace_lookup_reports_the_skipped_newer_file() {
+    let env = setup_test_env();
+    let here = std::fs::canonicalize(&env.dir).unwrap();
+    let mut older = Session::new("openai", "gpt-4", 128_000, "older");
+    older.working_dir = here.to_string_lossy().into_owned().into();
+    save_session(&older).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let bad = serde_json::json!({
+        "working_dir": here.to_string_lossy(),
+        "messages": "secret-content",
+    });
+    atomic_write(
+        &env.dir.join("sessions").join("newer-bad.json"),
+        &bad.to_string(),
+    )
+    .unwrap();
+
+    let (found, skips) =
+        crate::session::storage::find_recent_sessions_for_workspace_reporting(1, &here).unwrap();
+    assert_eq!(found[0].id, older.id);
+    assert_eq!(skips.total, 1);
+    assert_eq!(skips.first[0].id, "newer-bad");
+    assert!(
+        skips.first[0].reason.contains("line 1, column"),
+        "{:?}",
+        skips.first[0]
+    );
+    assert!(!skips.first[0].reason.contains("secret-content"));
+}
+
 // mini-agent-5s9me: `--continue` decodes only the sessions of its own
 // workspace. A session elsewhere whose body no longer decodes as a Session
 // does not get in the way, and the newest match is returned.

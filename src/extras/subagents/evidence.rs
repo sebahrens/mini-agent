@@ -502,20 +502,7 @@ fn path_checks(
 
 /// Collapse `.` and `..` without touching the filesystem.
 fn lexical_normalize(path: &Path) -> PathBuf {
-    use std::path::Component;
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !out.pop() {
-                    out.push(component);
-                }
-            }
-            other => out.push(other),
-        }
-    }
-    out
+    crate::fs::lexical_normalize(path)
 }
 
 /// Validate a literal base64 image part the same way history retention does.

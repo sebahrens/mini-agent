@@ -404,6 +404,23 @@ pub fn simple_jitter(range_ms: u64) -> Duration {
 }
 
 pub fn is_retryable(error: &(dyn std::error::Error + 'static)) -> bool {
+    // Local, deterministic loop failures. Their text embeds tool lists and
+    // other names, which the substring fallbacks below would otherwise match
+    // ("dns_lookup", "timeout_ms"), turning a model mistake into a "transient
+    // provider error".
+    for candidate in error_sources(error) {
+        if matches!(
+            candidate.downcast_ref::<rig::completion::PromptError>(),
+            Some(
+                rig::completion::PromptError::UnknownToolCall { .. }
+                    | rig::completion::PromptError::PromptCancelled { .. }
+                    | rig::completion::PromptError::MaxTurnsError { .. }
+            )
+        ) {
+            return false;
+        }
+    }
+
     // Context overflow cannot recover without changing the request. Check the
     // entire source chain before provider status or message fallbacks so token
     // counts such as 213500 never masquerade as HTTP 500.
@@ -589,6 +606,15 @@ pub fn is_context_length_error_message(message: &str) -> bool {
 /// The user-facing text of a terminal provider error: the message plus
 /// recovery guidance for context overflow or a provider deadline.
 pub fn with_provider_error_hint(error: &(dyn std::error::Error + 'static)) -> String {
+    with_provider_error_hint_for(error, None)
+}
+
+/// [`with_provider_error_hint`] naming `provider` and the environment variable
+/// it reads its key from in the 401/403 hint.
+pub fn with_provider_error_hint_for(
+    error: &(dyn std::error::Error + 'static),
+    provider: Option<&str>,
+) -> String {
     let message = with_context_length_hint(&error.to_string());
     if is_quota_exhausted_error(error) {
         return format!("{message}\n{QUOTA_EXHAUSTED_HINT}");
@@ -596,12 +622,81 @@ pub fn with_provider_error_hint(error: &(dyn std::error::Error + 'static)) -> St
     if is_provider_timeout(error) {
         return format!("{message}\n{PROVIDER_TIMEOUT_HINT}");
     }
+    if let Some(hint) = status_hint(error, &message) {
+        if hint == AUTH_FAILURE_HINT
+            && let Some(provider) = provider
+        {
+            let env = crate::auth::ProviderKind::from_name(provider)
+                .map(|kind| format!("`{}`", kind.env_var_name()))
+                .unwrap_or_else(|| "its configured key".into());
+            return format!(
+                "{message}\nCheck the API key for provider `{provider}`: environment variable {env}, an `api_keys` entry in the config, or run /login (or `mini-agent setup`)."
+            );
+        }
+        return format!("{message}\n{hint}");
+    }
     match provider_retry_hint(error, SystemTime::now()) {
         Some(wait) if !wait.is_zero() => format!(
             "{message}\nThe provider's rate limit resets in about {}s.",
             wait.as_secs().max(1)
         ),
         _ => message,
+    }
+}
+
+/// A terminal provider failure flattened to its user-facing text, with the
+/// retry classification taken from the typed error before it was flattened.
+/// Without it a 400 whose body mentions "timeout" would look transient once the
+/// status is gone (mini-agent-sskdu.8).
+#[derive(Debug)]
+pub struct ClassifiedProviderError {
+    message: String,
+    retryable: bool,
+}
+
+impl ClassifiedProviderError {
+    pub fn from_error(error: &(dyn std::error::Error + 'static)) -> Self {
+        Self {
+            message: with_provider_error_hint(error),
+            retryable: is_retryable(error),
+        }
+    }
+}
+
+impl std::fmt::Display for ClassifiedProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ClassifiedProviderError {}
+
+/// Whether `error` may be retried: the verdict computed from the typed error
+/// when it was flattened, otherwise the ordinary classification.
+pub fn is_retryable_flattened(error: &anyhow::Error) -> bool {
+    match error.downcast_ref::<ClassifiedProviderError>() {
+        Some(classified) => classified.retryable,
+        None => is_retryable(error.as_ref()),
+    }
+}
+
+/// Guidance appended to a rejected or expired credential (HTTP 401/403).
+pub const AUTH_FAILURE_HINT: &str = "Check the API key for this provider: the environment variable it reads, an `api_keys` entry in the config, or run /login (or `mini-agent setup`).";
+
+/// Guidance appended to an unknown model id (HTTP 404 or a not-found body).
+pub const MODEL_NOT_FOUND_HINT: &str =
+    "The model id was not found for this provider; run /models to list valid ids.";
+
+/// Recovery guidance for the common first-run failures, chosen from the typed
+/// status (and `model_not_found` bodies), never from free text alone.
+fn status_hint(error: &(dyn std::error::Error + 'static), message: &str) -> Option<&'static str> {
+    let lower = message.to_ascii_lowercase();
+    let not_found_body = lower.contains("model_not_found") || lower.contains("not_found_error");
+    match provider_response_status(error).map(|status| status.as_u16()) {
+        Some(401 | 403) => Some(AUTH_FAILURE_HINT),
+        Some(404) => Some(MODEL_NOT_FOUND_HINT),
+        Some(400) if not_found_body => Some(MODEL_NOT_FOUND_HINT),
+        _ => None,
     }
 }
 
@@ -652,6 +747,37 @@ pub struct RetryNotice {
     pub max_attempts: usize,
     pub delay: Duration,
     pub error: String,
+    /// Short classified cause for display (see `retry_reason`).
+    pub reason: String,
+}
+
+/// A short user-facing cause for a retryable failure, from the typed status
+/// first and the transport second; empty when nothing is known.
+pub fn retry_reason(error: &(dyn std::error::Error + 'static)) -> String {
+    match provider_response_status(error).map(|status| status.as_u16()) {
+        Some(429) => return "rate limited".into(),
+        Some(529) => return "provider overloaded".into(),
+        Some(code) if (500..=599).contains(&code) => return format!("server error {code}"),
+        Some(code) => return format!("HTTP {code}"),
+        None => {}
+    }
+    let lower = error.to_string().to_ascii_lowercase();
+    if lower.contains("overloaded") {
+        "provider overloaded".into()
+    } else if lower.contains("rate limit") || lower.contains("too many requests") {
+        "rate limited".into()
+    } else if is_provider_timeout(error) || lower.contains("timed out") || lower.contains("timeout")
+    {
+        "request timed out".into()
+    } else if lower.contains("connection")
+        || lower.contains("stream ended")
+        || lower.contains("error sending request")
+        || lower.contains("dns")
+    {
+        "network error".into()
+    } else {
+        String::new()
+    }
 }
 
 pub async fn retry_stream_chat_with<T, E, Fut, S, C, CFut>(
@@ -725,6 +851,7 @@ where
                     max_attempts: config.max_attempts,
                     delay,
                     error: e.to_string(),
+                    reason: retry_reason(&e),
                 })
                 .await;
                 tokio::time::sleep(delay).await;
@@ -737,6 +864,41 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn terminal_auth_and_model_errors_get_a_next_step() {
+        let unauthorized = crate::provider_http::ProviderRetryAfterError::for_test(
+            401,
+            &[],
+            "authentication_error: invalid x-api-key",
+        );
+        let hint = with_provider_error_hint(&unauthorized);
+        assert!(
+            hint.contains("/login") && hint.contains("api_keys"),
+            "{hint}"
+        );
+        let named = with_provider_error_hint_for(&unauthorized, Some("anthropic"));
+        assert!(
+            named.contains("`anthropic`") && named.contains("ANTHROPIC_API_KEY"),
+            "{named}"
+        );
+        let missing = crate::provider_http::ProviderRetryAfterError::for_test(
+            404,
+            &[],
+            "not_found_error: model: nope",
+        );
+        assert!(with_provider_error_hint(&missing).contains("/models"));
+        let bad_request = crate::provider_http::ProviderRetryAfterError::for_test(
+            400,
+            &[],
+            "timeout must be <= 600",
+        );
+        let plain = with_provider_error_hint(&bad_request);
+        assert!(
+            !plain.contains("/models") && !plain.contains("/login"),
+            "{plain}"
+        );
+    }
+
     use super::*;
     use std::io;
     use std::sync::{Arc, Mutex};
@@ -941,13 +1103,17 @@ mod tests {
     #[test]
     fn retry_notice_text_names_the_actual_wait() {
         assert_eq!(
-            crate::event::retry_notice_text(1, 3, 45_000),
-            "retrying in 45s... (1/3)"
+            crate::event::retry_notice_text(1, 3, 45_000, ""),
+            "retrying in 45s... (1/3), Esc to cancel"
         );
         assert_eq!(
-            crate::event::retry_notice_text(2, 3, 1_250),
-            "retrying in 1.2s... (2/3)"
+            crate::event::retry_notice_text(2, 3, 1_250, "rate limited"),
+            "rate limited; retrying in 1.2s... (2/3)"
         );
+        let throttled = crate::provider_http::ProviderRetryAfterError::for_test(429, &[], "x");
+        assert_eq!(retry_reason(&throttled), "rate limited");
+        let down = crate::provider_http::ProviderRetryAfterError::for_test(503, &[], "x");
+        assert_eq!(retry_reason(&down), "server error 503");
     }
 
     #[test]
@@ -1142,6 +1308,24 @@ mod tests {
         assert_eq!(cfg.max_backoff_ms, 30_000);
         assert!(cfg.max_attempts <= MAX_RETRY_ATTEMPTS);
         assert_eq!(cfg.max_retry_after_ms, DEFAULT_MAX_RETRY_AFTER_MS);
+    }
+
+    #[test]
+    fn local_loop_errors_are_not_classified_by_tool_names_in_their_text() {
+        use rig::completion::PromptError;
+        let unknown = PromptError::UnknownToolCall {
+            tool_name: "bash".into(),
+            available_tools: vec!["dns_lookup".into(), "shell".into()],
+            allowed_tools: vec!["dns_lookup".into(), "shell".into()],
+            chat_history: Box::default(),
+        };
+        assert!(unknown.to_string().contains("dns"));
+        assert!(!is_retryable(&unknown));
+        let cancelled = PromptError::PromptCancelled {
+            chat_history: Vec::new(),
+            reason: "timeout while waiting for the user".into(),
+        };
+        assert!(!is_retryable(&cancelled));
     }
 
     #[test]

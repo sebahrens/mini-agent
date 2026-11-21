@@ -16,6 +16,10 @@ fn is_claude_model_family_matches_prefixes_and_segments_not_bare_substrings() {
         "~bedrock.anthropic.claude-sonnet-5-5",
         "anthropic/claude-3.5-sonnet",
         "openrouter/anthropic/claude-3.5-sonnet",
+        "anthropic.claude-opus-4-8-v1:0",
+        "us.anthropic.claude-sonnet-5-v1:0",
+        "bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0",
+        "claude-sonnet-4-5@20250929",
     ] {
         assert!(
             is_claude_model_family(model_id),

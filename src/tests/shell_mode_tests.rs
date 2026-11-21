@@ -229,7 +229,7 @@ async fn explicit_shell_requested_unavailable_backend_fails_closed_and_reports_i
             backend: "definitely-not-a-real-backend".to_string(),
         }
     );
-    assert_eq!(run.output.status, CommandStatus::Failed);
+    assert_eq!(run.output.status, CommandStatus::NotStarted);
     assert!(
         run.rendered_output()
             .contains("refusing to run unsandboxed")

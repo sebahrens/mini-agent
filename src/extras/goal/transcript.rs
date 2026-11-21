@@ -21,7 +21,11 @@ const FIELD_CHARS: usize = 4_000;
 
 #[derive(Serialize)]
 struct RoundRecord<'a> {
+    /// The round this evaluation was for, which is not the goal's counter when
+    /// the evaluation was an interrupt that counted nothing.
     round: u32,
+    /// Which evaluation of that round, from 1.
+    attempt: u32,
     timestamp: String,
     goal_id: &'a str,
     /// Digest rather than text: the instruction restates the objective, which
@@ -65,12 +69,22 @@ fn clip(text: &str) -> String {
     text.chars().take(FIELD_CHARS).collect::<String>() + "…"
 }
 
+/// Which evaluation a record describes: the round it was for and the attempt,
+/// as [`Goal::push_history`] numbers them. An interrupted evaluation counts no
+/// round, so the goal's counter alone cannot name its record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Evaluation {
+    pub round: u32,
+    pub attempt: u32,
+}
+
 /// Write the record for one gate evaluation.
 ///
 /// A failure here is reported and dropped: losing an audit line must never turn
 /// a decided round into a failed one.
 pub fn save_round(
     goal: &Goal,
+    evaluation: Evaluation,
     summary: &RoundSummary,
     decision: &GateDecision,
     instruction: &str,
@@ -84,10 +98,18 @@ pub fn save_round(
         return;
     };
 
-    let record = build_record(goal, summary, decision, instruction, checks, judge);
+    let record = build_record(
+        goal,
+        evaluation,
+        summary,
+        decision,
+        instruction,
+        checks,
+        judge,
+    );
     write_record(
         &paths.goals_dir().join(goal.id.as_str()),
-        goal.progress.rounds,
+        evaluation,
         &record,
     );
 }
@@ -97,12 +119,21 @@ pub fn save_round(
 /// Split from path resolution so the write itself is testable: the directory
 /// a goal's transcripts live in is decided once, and everything after it is
 /// the same few filesystem calls wherever that directory is.
-fn write_record(dir: &std::path::Path, round: u32, record: &RoundRecord<'_>) {
+fn write_record(dir: &std::path::Path, evaluation: Evaluation, record: &RoundRecord<'_>) {
     if let Err(error) = std::fs::create_dir_all(dir) {
         tracing::warn!(%error, "goal: could not create the transcript directory");
         return;
     }
-    let path = dir.join(format!("round-{round:04}.json"));
+    // The first evaluation of a round keeps the plain name; a repeat (a round
+    // evaluated again after an interrupt) must not replace it.
+    let path = if evaluation.attempt <= 1 {
+        dir.join(format!("round-{:04}.json", evaluation.round))
+    } else {
+        dir.join(format!(
+            "round-{:04}-a{}.json",
+            evaluation.round, evaluation.attempt
+        ))
+    };
     match serde_json::to_vec_pretty(record) {
         Ok(bytes) => {
             if let Err(error) = crate::fs::private_atomic_write_sync(&path, &bytes) {
@@ -120,6 +151,7 @@ fn write_record(dir: &std::path::Path, round: u32, record: &RoundRecord<'_>) {
 /// written rather than a second one built to match.
 fn build_record<'a>(
     goal: &'a Goal,
+    evaluation: Evaluation,
     summary: &'a RoundSummary,
     decision: &GateDecision,
     instruction: &str,
@@ -127,7 +159,8 @@ fn build_record<'a>(
     judge: Option<&JudgeOutcome>,
 ) -> RoundRecord<'a> {
     RoundRecord {
-        round: goal.progress.rounds,
+        round: evaluation.round,
+        attempt: evaluation.attempt,
         timestamp: super::now_rfc3339_string(),
         goal_id: goal.id.as_str(),
         instruction_sha256: crate::hex::encode_lower(Sha256::digest(instruction.as_bytes())),
@@ -239,7 +272,18 @@ mod tests {
             source: VerdictSource::Checks,
             evidence: vec![VerificationKind::SelfReport, VerificationKind::Checks],
         };
-        let record = build_record(goal, &summary, &decision, "instruction", checks, judge);
+        let record = build_record(
+            goal,
+            Evaluation {
+                round: 3,
+                attempt: 1,
+            },
+            &summary,
+            &decision,
+            "instruction",
+            checks,
+            judge,
+        );
         serde_json::to_string_pretty(&record).unwrap()
     }
 
@@ -258,10 +302,28 @@ mod tests {
             source: VerdictSource::Checks,
             evidence: vec![VerificationKind::SelfReport, VerificationKind::Checks],
         };
-        let record = build_record(&goal, &summary, &decision, "instruction", None, None);
+        let record = build_record(
+            &goal,
+            Evaluation {
+                round: 3,
+                attempt: 1,
+            },
+            &summary,
+            &decision,
+            "instruction",
+            None,
+            None,
+        );
 
         let dir = root.join(goal.id.as_str());
-        write_record(&dir, goal.progress.rounds, &record);
+        write_record(
+            &dir,
+            Evaluation {
+                round: 3,
+                attempt: 1,
+            },
+            &record,
+        );
         let written: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(dir.join("round-0003.json")).expect("a record was written"),
         )
@@ -274,7 +336,14 @@ mod tests {
         // an audit line must never lose the round it describes.
         let blocked = root.join("blocked");
         std::fs::write(&blocked, b"not a directory").expect("block the path");
-        write_record(&blocked.join("goal"), 1, &record);
+        write_record(
+            &blocked.join("goal"),
+            Evaluation {
+                round: 1,
+                attempt: 1,
+            },
+            &record,
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -284,6 +353,7 @@ mod tests {
         let json = render(
             &goal(),
             Some(&CheckOutcome {
+                failure_kind: Default::default(),
                 all_passed: true,
                 failure_tail: None,
                 verified: vec![VerificationKind::Checks],
@@ -326,6 +396,39 @@ mod tests {
         );
         assert!(json.contains("\"outcome\": \"unavailable\""));
         assert!(json.contains("connection refused"));
+    }
+
+    /// An interrupted evaluation counts no round, so it is the same round's
+    /// next attempt: it must not replace the record of the round that completed
+    /// (mini-agent-sskdu.218).
+    #[test]
+    fn a_repeated_evaluation_does_not_overwrite_the_earlier_record() {
+        let root = std::env::temp_dir().join(format!("goal-transcript-{}", uuid::Uuid::new_v4()));
+        let goal = goal();
+        let summary = summary();
+        let decision = GateDecision::Stop {
+            status: GoalStatus::Met,
+            reason: "done".into(),
+            paused_reason: None,
+            source: VerdictSource::Checks,
+            evidence: Vec::new(),
+        };
+        let first = Evaluation {
+            round: 2,
+            attempt: 1,
+        };
+        let second = Evaluation {
+            round: 2,
+            attempt: 2,
+        };
+        let dir = root.join(goal.id.as_str());
+        for evaluation in [first, second] {
+            let record = build_record(&goal, evaluation, &summary, &decision, "i", None, None);
+            write_record(&dir, evaluation, &record);
+        }
+        assert!(dir.join("round-0002.json").exists());
+        assert!(dir.join("round-0002-a2.json").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -342,7 +342,6 @@ pub(crate) fn search_root_allow_scope(root: &str) -> (String, String) {
 /// The human-readable form of an AllowAlways pattern, for showing the user
 /// exactly what a grant covers. Generated literal scopes are decoded (they
 /// are opaque hex on the wire); any other pattern is returned verbatim.
-#[cfg_attr(not(feature = "acp"), allow(dead_code))]
 pub(crate) fn describe_allow_pattern(pattern: &str) -> String {
     if let Some(scope) = Pattern::new_generated_web_origin_scope(pattern) {
         let origin = decode_hex_path(

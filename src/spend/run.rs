@@ -1,6 +1,6 @@
 //! Explicit per-run accounting profile and effect admission. The profile is
 //! copied into SDK extensions; task-local scope is never assumed to cross spawn.
-use super::{Account, Ledger, PriceSnapshot, Receipt, RequestKind};
+use super::{Account, BudgetRefusal, Ledger, PriceSnapshot, Receipt, RequestKind};
 use crate::{config::Config, event::UsageDelta, session::Session};
 use rig::agent::{AgentHook, Flow, HookContext, StepEvent};
 use rig::completion::CompletionModel;
@@ -408,6 +408,9 @@ impl Run {
     }
     /// The accounting kind every request of this run records.
     #[cfg_attr(not(any(feature = "hooks", feature = "acp")), allow(dead_code))]
+    pub(crate) fn provider_name(&self) -> &str {
+        &self.provider
+    }
     pub(crate) fn kind(&self) -> RequestKind {
         self.kind
     }
@@ -430,16 +433,29 @@ impl Run {
             _ => BudgetStopped.into(),
         }
     }
+    /// The `BudgetStopped` marker for `reason`. A USD exhaustion keeps the
+    /// plain budget text; any other cause names its own limit and keeps
+    /// `BUDGET_STOP` out of the message, since it would name the wrong one.
+    fn stopped_for(&self, reason: BudgetRefusal) -> anyhow::Error {
+        match reason {
+            BudgetRefusal::UsdExhausted | BudgetRefusal::TrackingIncomplete => self.stopped(),
+            // A pending write caused by a failed ledger keeps the ledger detail.
+            BudgetRefusal::LedgerPending if self.account.snapshot().tracking_error => {
+                self.stopped()
+            }
+            other => anyhow::Error::from(BudgetStopped).context(other.to_string()),
+        }
+    }
     pub(crate) fn admit(&self) -> anyhow::Result<()> {
         if self.cap_required && self.setup_error.is_some() {
             self.refused
                 .store(true, std::sync::atomic::Ordering::Release);
             return Err(BudgetStopped.into());
         }
-        self.account.admit(self.prices).map_err(|_| {
+        self.account.admit_reason(self.prices).map_err(|reason| {
             self.refused
                 .store(true, std::sync::atomic::Ordering::Release);
-            self.stopped()
+            self.stopped_for(reason)
         })
     }
     pub(crate) fn admit_effect(&self) -> anyhow::Result<()> {
@@ -448,10 +464,10 @@ impl Run {
                 .store(true, std::sync::atomic::Ordering::Release);
             return Err(BudgetStopped.into());
         }
-        self.account.admit_effect().map_err(|_| {
+        self.account.admit_effect_reason().map_err(|reason| {
             self.refused
                 .store(true, std::sync::atomic::Ordering::Release);
-            self.stopped()
+            self.stopped_for(reason)
         })
     }
     pub(crate) async fn admit_effect_ready(&self) -> anyhow::Result<()> {

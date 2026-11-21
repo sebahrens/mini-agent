@@ -89,10 +89,21 @@ fn main() -> anyhow::Result<ExitCode> {
     // `mini-agent update` is handled before clap so that only its exact forms
     // are a subcommand; `mini-agent update the docs` stays an ordinary prompt.
     let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    if let Some(update) = self_update::parse_update_args(&argv) {
-        let runtime = normal_runtime().context("failed to initialize the async runtime")?;
-        let code = runtime.block_on(self_update::run(update));
-        return Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)));
+    match self_update::parse_update_invocation(&argv) {
+        Some(self_update::UpdateInvocation::Run(update)) => {
+            let runtime = normal_runtime().context("failed to initialize the async runtime")?;
+            let code = runtime.block_on(self_update::run(update));
+            return Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)));
+        }
+        Some(self_update::UpdateInvocation::Help) => {
+            println!("{}", self_update::UPDATE_USAGE);
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some(self_update::UpdateInvocation::Invalid(message)) => {
+            eprintln!("error: {message}\n\n{}", self_update::UPDATE_USAGE);
+            return Ok(ExitCode::from(2));
+        }
+        None => {}
     }
     let cli = cli::Cli::parse_command_line();
     if let Some(shell) = cli.completions {
@@ -120,7 +131,24 @@ fn run_on_runtime(cli: cli::Cli, runtime_headless: bool) -> anyhow::Result<ExitC
     // own stack frames before polling it.
     #[cfg(feature = "mcp")]
     let mcp_server = cli.mcp_server;
+    // A `-p` run with machine output always ends with one result record, even
+    // when startup fails before any turn runs (no credential, bad session).
+    let machine_output_cli =
+        (cli.print && cli.output_format() != cli::OutputFormat::Text).then(|| cli.clone());
     let result = runtime.block_on(Box::pin(run(cli)));
+    if let (Err(error), Some(cli)) = (&result, &machine_output_cli)
+        && !print::headless_result_emitted()
+        && !error.is::<question::QuestionRequired>()
+        && !is_goal_exit(error)
+    {
+        let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let _ = runtime.block_on(Box::pin(print::emit_headless_failure(
+            cli,
+            &root,
+            &format!("{error:#}"),
+            None,
+        )));
+    }
     #[cfg(feature = "mcp")]
     if mcp_server {
         // serve() has retired its owned runs. Tokio's standard-I/O adapters
@@ -170,6 +198,18 @@ fn run_on_runtime(cli: cli::Cli, runtime_headless: bool) -> anyhow::Result<ExitC
         },
         #[cfg(not(feature = "goal"))]
         Err(error) => finish_runtime_error(&runtime, error, runtime_headless),
+    }
+}
+
+fn is_goal_exit(error: &anyhow::Error) -> bool {
+    #[cfg(feature = "goal")]
+    {
+        error.is::<print::HeadlessGoalExit>()
+    }
+    #[cfg(not(feature = "goal"))]
+    {
+        let _ = error;
+        false
     }
 }
 
@@ -241,8 +281,8 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
         std::io::stdout().lock().write_all(b"\n")?;
         return Ok(());
     }
-    let config_overrides =
-        config::layers::parse_overrides(&cli.config_overrides).map_err(anyhow::Error::msg)?;
+    let config_overrides = config::layers::parse_cli_overrides(&cli.config_overrides)
+        .map_err(|message| anyhow::Error::new(startup::HeadlessUsageError(message)))?;
     if let Err(error) = output_schema::prepare(&mut cli) {
         print::emit_headless_preflight_failure(&cli, std::path::Path::new("."), &error.to_string())
             .await?;
@@ -435,15 +475,19 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
     #[cfg(feature = "mcp")]
     if cli.mcp_server {
         #[cfg(feature = "acp")]
-        anyhow::ensure!(
-            !cli.acp_enabled,
-            "--mcp-server cannot be combined with --acp"
-        );
+        if cli.acp_enabled {
+            return Err(startup::HeadlessUsageError(
+                "--mcp-server cannot be combined with --acp".to_owned(),
+            )
+            .into());
+        }
         #[cfg(feature = "loop")]
-        anyhow::ensure!(
-            !cli.loop_mode,
-            "--mcp-server cannot be combined with --loop"
-        );
+        if cli.loop_mode {
+            return Err(startup::HeadlessUsageError(
+                "--mcp-server cannot be combined with --loop".to_owned(),
+            )
+            .into());
+        }
         return extras::mcp::server::serve_stdio().await;
     }
 
@@ -454,12 +498,27 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
     #[cfg(feature = "loop")]
     let is_interactive = is_interactive && !cli.loop_mode;
 
+    if cli.tutor && !cli.setup {
+        // Static text: no configuration, trust prompt or default file needed.
+        return docs::show_get_started();
+    }
+    anyhow::ensure!(
+        !cli.setup || (std::io::stdin().is_terminal() && std::io::stdout().is_terminal()),
+        "--setup needs an interactive terminal; edit {} or set the provider's API key environment variable instead",
+        config::config_file_path().display()
+    );
     paths::converge_legacy_artifacts(&app_paths, is_interactive)?;
     logging::install_panic_hook();
     logging::init(&cli, is_interactive);
 
-    let (mut cfg, is_first_startup) =
-        config::load_in_workspace(&app_paths, &workspace, is_interactive);
+    // Commands that only report state never ask for project trust, and
+    // `--print-config` never creates the default config file.
+    config::set_create_default_config(!cli.print_config);
+    let (mut cfg, is_first_startup) = config::load_in_workspace(
+        &app_paths,
+        &workspace,
+        is_interactive && !cli.is_informational_command(),
+    );
     context::agents::set_claude_project_agents(cfg.resolve_claude_project_agents());
     context::agents::set_claude_user_agents(cfg.resolve_claude_user_agents());
 
@@ -788,7 +847,9 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
             let tool_input: serde_json::Value = cli
                 .hooks_test_input
                 .as_deref()
-                .map(|s| serde_json::from_str(s).unwrap_or(serde_json::Value::Null))
+                .map(serde_json::from_str)
+                .transpose()
+                .context("--hooks-test-input is not valid JSON")?
                 .unwrap_or_else(|| serde_json::json!({}));
             println!(
                 "{}",

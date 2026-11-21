@@ -64,9 +64,11 @@ fn doctor_cli_is_read_only_with_missing_invalid_and_configured_credentials_and_n
 
     // Seed through the ordinary private writer, including the native Windows
     // ACL; doctor itself must never create or repair this file.
+    // `--print-config` only reports, so it no longer creates the default file;
+    // an empty `-p` prompt fails after the global config has been loaded.
     let mut seed = root.command();
-    seed.args(["--print-config", "--no-tools"]);
-    assert!(bounded_output(seed).status.success());
+    seed.args(["-p", "--no-tools", ""]);
+    assert_eq!(bounded_output(seed).status.code(), Some(2));
     let config = root.0.join("config.toml");
     std::fs::write(&config, format!(
         "provider = 'doctor-local'\nmodel = 'test'\n[custom_providers.doctor-local]\nprovider_type = 'openai'\napi_style = 'completions'\nbase_url = 'http://{}/v1'\napi_key_env = 'DOCTOR_GATEWAY_KEY'\n[api_keys]\ndoctor-local = 'DOCTOR_PRIVATE_CONFIG_VALUE'\n",
@@ -1153,16 +1155,49 @@ fn startup_errors_keep_provider_guidance_without_mislabeling_other_failures() {
         let output = bounded_output(command);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(!output.status.success(), "{args:?}: {stderr}");
-        assert!(
-            output.stdout.is_empty(),
-            "startup failure has no turn result"
-        );
+        // A startup failure still ends machine output with one failure record.
+        let stdout = String::from_utf8(output.stdout.clone()).unwrap();
+        assert_eq!(stdout.lines().count(), 1, "{args:?}: {stdout}");
+        let record: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+        assert_eq!(record["is_error"], true, "{args:?}: {stdout}");
+        assert_eq!(record["stop_reason"], "failed", "{args:?}: {stdout}");
         assert!(stderr.contains(detail), "{args:?}: {stderr}");
         assert_eq!(
             stderr.contains("mini-agent --setup"),
             setup_hint,
             "{args:?}: {stderr}"
         );
+    }
+}
+
+#[test]
+fn usage_errors_found_after_parsing_exit_two_not_one() {
+    for (args, detail) in [
+        (&["--config", "model=gpt-5"][..], "--config #1"),
+        (
+            &["--resume-provider", "openai"][..],
+            "--resume-provider/--resume-model require",
+        ),
+        (
+            &["--session", "missing-session"][..],
+            "no session matching 'missing-session'",
+        ),
+    ] {
+        let root = TempRoot::new();
+        let mut command = root.command();
+        command
+            .args([
+                "--no-sandbox",
+                "--no-context-files",
+                "--no-tools",
+                "-p",
+                "q",
+            ])
+            .args(args);
+        let output = bounded_output(command);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {stderr}");
+        assert!(stderr.contains(detail), "{args:?}: {stderr}");
     }
 }
 
@@ -1197,7 +1232,7 @@ fn explicit_print_json_reports_command_outcomes_in_one_value() {
             "headless-json-smoke",
             false,
         ),
-        ("!", false, "", "empty command after '!'", false),
+        ("!", false, "failed", "empty command after '!'", false),
         ("", false, "failed", "no prompt given", false),
         ("   ", false, "failed", "no prompt given", false),
     ] {
@@ -1295,6 +1330,11 @@ fn explicit_print_json_reports_command_outcomes_in_one_value() {
                 "{recorded}"
             );
             assert!(recorded.contains(result.trim_end()), "{recorded}");
+        } else if message == "!" {
+            assert!(
+                !root.0.join("sessions").exists(),
+                "an empty ! command saved a session"
+            );
         } else {
             assert!(
                 root.0.join("sessions").is_file(),

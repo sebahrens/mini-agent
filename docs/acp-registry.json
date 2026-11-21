@@ -7,24 +7,43 @@
     "homepage": "https://github.com/sebahrens/mini-agent",
     "protocol": {
       "name": "agent-client-protocol",
-      "version": "1.3.0",
-      "schema_version": "1.5.0",
-      "transports": ["stdio", "tcp"]
+      "version": "2.0.0",
+      "schema_version": "v1",
+      "transports": ["stdio", "tcp", "tcp+tls"]
     },
     "capabilities": {
       "sessions": {
         "max_concurrent": 64,
-        "close": true
+        "close": true,
+        "load": true,
+        "list": true
+      },
+      "prompt": {
+        "image": true,
+        "embedded_context": true
       },
       "permissions": {
         "interactive": true,
         "request_permission": true
       },
+      "slash_commands": [
+        "compact",
+        "undo",
+        "rename",
+        "cost",
+        "model",
+        "effort",
+        "cron",
+        "tasks",
+        "goal"
+      ],
       "tools": [
         "shell",
+        "job_status",
         "read",
         "write",
         "edit",
+        "notebook_edit",
         "grep",
         "find_files",
         "list_dir",
@@ -33,6 +52,14 @@
         "git",
         "js",
         "task",
+        "task_send",
+        "web_fetch",
+        "web_search",
+        "lsp_diagnostics",
+        "lsp_navigate",
+        "ask_user_question",
+        "list_mcp_resources",
+        "read_mcp_resource",
         "memory_write",
         "memory_edit",
         "memory_read",
@@ -47,7 +74,7 @@
       "tcp": {
         "command": "mini-agent",
         "args": ["--acp-port", "${port}"],
-        "notes": "TCP authentication uses api_key under [acp_servers.<name>] in the mini-agent config (the --api-key flag is the model-provider key, not ACP auth). See docs/vscode-acp-setup.md."
+        "notes": "TCP authentication uses api_key under [acp_servers.<name>] in the mini-agent config (the --api-key flag is the model-provider key, not ACP auth). Set MINI_AGENT_ACP_TLS_CERT and MINI_AGENT_ACP_TLS_KEY to serve TLS. See docs/vscode-acp-setup.md."
       }
     }
   }

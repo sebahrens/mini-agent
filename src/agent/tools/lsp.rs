@@ -29,10 +29,16 @@ pub struct LspArgs {
     pub path: Option<String>,
     /// Diagnostics to skip (page with the offset the previous truncation
     /// footer names).
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::agent::tools::lenient::offset_usize"
+    )]
     pub offset: Option<usize>,
     /// Most diagnostics to return (default 200, at most 1000).
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::agent::tools::lenient::limit_usize"
+    )]
     pub limit: Option<usize>,
     /// Only `error` or only `warning` diagnostics.
     #[serde(default)]
@@ -43,7 +49,10 @@ pub struct LspArgs {
     pub directory: Option<String>,
     /// Per-file query only: milliseconds to wait for the server to publish
     /// (default 3000, or the server's `wait_ms`; at most 60000).
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::agent::tools::lenient::wait_ms_u64"
+    )]
     pub wait_ms: Option<u64>,
 }
 
@@ -84,7 +93,7 @@ impl Tool for LspTool {
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "File to inspect (optional; omit for all files)" },
-                "offset": { "type": "integer", "minimum": 0, "description": "Diagnostics to skip; pass the offset named by the previous truncation line" },
+                "offset": { "type": "integer", "minimum": 0, "description": "Diagnostics to skip (0-based count); pass the offset named by the previous truncation line" },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Most diagnostics to return (default 200)" },
                 "severity": { "type": "string", "enum": ["error", "warning"], "description": "Only diagnostics of this severity" },
                 "directory": { "type": "string", "description": "Project-wide listing only: workspace-relative directory to restrict to" },
@@ -373,8 +382,10 @@ pub struct LspNavigateArgs {
     /// language whose server should be asked).
     pub path: String,
     /// 1-based line of the symbol (position ops).
+    #[serde(default, deserialize_with = "crate::agent::tools::lenient::line_u32")]
     pub line: Option<u32>,
     /// 1-based column of the symbol (position ops); UTF-16 code units.
+    #[serde(default, deserialize_with = "crate::agent::tools::lenient::column_u32")]
     pub column: Option<u32>,
     /// Symbol name filter for workspace_symbols.
     pub query: Option<String>,
@@ -382,32 +393,50 @@ pub struct LspNavigateArgs {
     #[serde(default)]
     pub new_name: Option<String>,
     /// code_actions: 1-based end line of the range (default `line`).
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::agent::tools::lenient::end_line_u32"
+    )]
     pub end_line: Option<u32>,
     /// code_actions: 1-based end column of the range (default `column`).
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::agent::tools::lenient::end_column_u32"
+    )]
     pub end_column: Option<u32>,
     /// code_actions: 1-based number of an action whose edit to preview.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::agent::tools::lenient::action_u32")]
     pub action: Option<u32>,
     /// Results (or, for rename and a code action's edit, edits) to skip; pass
     /// the `next_offset` named by the previous truncation line.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::agent::tools::lenient::offset_usize"
+    )]
     pub offset: Option<usize>,
     /// Most results or edits to return (default 100 results, 200 edits; at
     /// most 1000).
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::agent::tools::lenient::limit_usize"
+    )]
     pub limit: Option<usize>,
     /// rename / a code action's edit: show the complete replacement text of
     /// the edit with this 1-based number from the listing.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::agent::tools::lenient::edit_usize")]
     pub edit: Option<usize>,
     /// rename / a code action's edit: show every replacement in full (a page
     /// ends early at a byte budget and names the `next_offset`).
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::agent::tools::lenient::full_text_flag"
+    )]
     pub full_text: Option<bool>,
     /// With `edit`: byte offset into that edit's replacement text.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::agent::tools::lenient::text_offset_usize"
+    )]
     pub text_offset: Option<usize>,
 }
 
@@ -457,7 +486,7 @@ impl Tool for LspNavigateTool {
                 "end_line": { "type": "integer", "minimum": 1, "description": "code_actions: 1-based end line of the range" },
                 "end_column": { "type": "integer", "minimum": 1, "description": "code_actions: 1-based end column of the range" },
                 "action": { "type": "integer", "minimum": 1, "description": "code_actions: preview the edit of this action number" },
-                "offset": { "type": "integer", "minimum": 0, "description": "Results (rename / action previews: edits) to skip; pass the next_offset of the previous page" },
+                "offset": { "type": "integer", "minimum": 0, "description": "Results (rename / action previews: edits) to skip (0-based count); pass the next_offset of the previous page" },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Most results or edits per page (default 100 results, 200 edits)" },
                 "edit": { "type": "integer", "minimum": 1, "description": "rename / code action edit: complete replacement text of the edit with this number from the listing" },
                 "full_text": { "type": "boolean", "description": "rename / code action edit: show every replacement in full (pages end early at a byte budget; continue with next_offset)" },

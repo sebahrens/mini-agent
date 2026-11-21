@@ -1,5 +1,6 @@
 use crate::context;
 use crate::session::storage;
+use crate::ui::slash::write_usage;
 use crate::ui::slash::{SlashCtx, write_error, write_ok, write_result};
 use crate::ui::{PromptModeOutcome, apply_main_agent, apply_prompt_mode};
 
@@ -38,7 +39,7 @@ async fn handle_agent(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<
                 ctx.context.agent_definitions[&name].list_entry(&name),
             );
         }
-        write_result(ctx.renderer, "usage: /agent <name>  |  /agent default");
+        write_usage(ctx.renderer, "usage: /agent <name>  |  /agent default");
         return Ok(());
     }
 
@@ -166,27 +167,59 @@ async fn handle_prompt(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
             for name in &sorted {
                 write_result(ctx.renderer, format!("  {}", name));
             }
-            write_result(ctx.renderer, "usage: /prompt <name>  |  /prompt default");
+            write_usage(ctx.renderer, "usage: /prompt <name>  |  /prompt default");
         }
     } else if parts[1] == "default" {
         if ctx.context.current_prompt.is_none() {
             write_ok(ctx.renderer, "no active prompt to clear");
         } else {
+            let cleared_name = ctx.context.current_prompt_name.take();
             ctx.context.current_prompt = None;
-            ctx.context.current_prompt_name = None;
-            // Revert to the config default model
-            let default_model = ctx.cli.resolve_model(ctx.cfg);
-            let default_provider = ctx.cli.resolve_provider(ctx.cfg);
-            let provider_changed = default_provider != ctx.session.provider;
-            match provider_changed.then(|| ctx.switch_client(&default_provider)) {
-                Some(Err(e)) => {
-                    // Keep the current provider with its own model.
-                    write_error(ctx.renderer, format!("failed to revert provider: {}", e));
+            // A prompt's `%%mode=` and `%%grant=` die with it.
+            let mode_note = ctx.permission.as_ref().map(|perm| {
+                let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
+                guard.restore_user_mode();
+                guard.set_prompt_grant_offer(None);
+                guard.mode().to_string()
+            });
+            // Only a prompt routed through `[prompt_to_model]` changed the
+            // model; otherwise keep whatever the user picked with /model.
+            let routed = cleared_name
+                .as_deref()
+                .is_some_and(|name| super::mapped_prompt_route(ctx.cfg, name).is_some());
+            let mut reverted = false;
+            if routed {
+                let default_model = ctx.cli.resolve_model(ctx.cfg);
+                let default_provider = ctx.cli.resolve_provider(ctx.cfg);
+                let provider_changed = default_provider != ctx.session.provider;
+                match provider_changed.then(|| ctx.switch_client(&default_provider)) {
+                    Some(Err(e)) => {
+                        // Keep the current provider with its own model.
+                        write_error(ctx.renderer, format!("failed to revert provider: {}", e));
+                    }
+                    Some(Ok(())) | None => {
+                        // Same prices, cache prices and context window as /model.
+                        super::providers::apply_model(ctx, &default_model, None).await;
+                        reverted = true;
+                    }
                 }
-                Some(Ok(())) | None => ctx.session.model = default_model,
             }
-            ctx.rebuild_agent().await;
-            write_ok(ctx.renderer, "prompt cleared (back to default)");
+            if !reverted {
+                ctx.rebuild_agent().await;
+            }
+            write_ok(
+                ctx.renderer,
+                match mode_note {
+                    Some(mode) => format!(
+                        "prompt cleared (back to default); model: {}, security mode: {mode}",
+                        ctx.session.model
+                    ),
+                    None => format!(
+                        "prompt cleared (back to default); model: {}",
+                        ctx.session.model
+                    ),
+                },
+            );
         }
     } else {
         let name = parts[1].trim();
@@ -254,7 +287,7 @@ async fn handle_theme(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<
             for name in &sorted {
                 write_result(ctx.renderer, format!("  {}", name));
             }
-            write_result(ctx.renderer, "usage: /theme <name>  |  /theme default");
+            write_usage(ctx.renderer, "usage: /theme <name>  |  /theme default");
         }
     } else if parts[1] == "default" {
         if ctx.context.current_theme_name.is_none() && storage::load_theme_name().is_none() {
@@ -519,6 +552,169 @@ mod theme_selection_tests {
             storage::load_theme_name(),
             None,
             "default can clear a rejected saved choice"
+        );
+    }
+}
+
+#[cfg(test)]
+mod prompt_default_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    struct Cleared {
+        model: String,
+        mode: crate::permission::SecurityMode,
+        context_window: u64,
+        input_cost: f64,
+        transcript: Vec<String>,
+    }
+
+    async fn clear_prompt(cfg: crate::config::Config) -> Cleared {
+        let root = crate::tests::OwnedTestDirectory::new("prompt-default-clear");
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            (
+                "MINI_AGENT_CONFIG_DIR",
+                Some(root.path().join("config").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_DATA_DIR",
+                Some(root.path().join("data").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_STATE_DIR",
+                Some(root.path().join("state").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_CACHE_DIR",
+                Some(root.path().join("cache").into_os_string()),
+            ),
+        ]);
+        let cli = crate::cli::Cli::default();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = context::load(true).for_workspace_binding(true, &workspace);
+        context.current_prompt = Some("body".into());
+        context.current_prompt_name = Some("plan".into());
+        let mut renderer = crate::ui::renderer::Renderer::new().unwrap();
+        let mut session = crate::session::Session::new("anthropic", "picked-model", 777, "");
+        session.set_input_output_prices(Some((9.0, 9.0)));
+        let mut client = crate::provider::create_client(
+            "anthropic",
+            Some("unused-test-key"),
+            cfg.custom_providers_map(),
+            cfg.api_keys.as_ref(),
+        )
+        .unwrap();
+        let mut agent = None;
+        let mut input = crate::ui::input::InputEditor::new();
+        let invalidated = AtomicBool::new(false);
+        let mut show_reasoning = false;
+        let mut reasoning_enabled = false;
+        let mut is_running = false;
+        let mut todo_tools_enabled = false;
+        let mut sandbox = crate::sandbox::Sandbox::new(false, "none");
+        let mut terminal_guard = crate::ui::terminal::TerminalGuard::detached_for_test();
+        #[cfg(feature = "skills")]
+        let skill_services = Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new());
+        let permission = Some(Arc::new(std::sync::Mutex::new(
+            crate::permission::checker::PermissionChecker::new(
+                &Default::default(),
+                crate::permission::SecurityMode::Standard,
+                Some(root.path().to_path_buf()),
+                None,
+            )
+            .unwrap(),
+        )));
+        assert!(
+            permission
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .set_prompt_mode(crate::permission::SecurityMode::ReadOnly)
+        );
+        let mut ctx = SlashCtx {
+            prebuild_invalidated: &invalidated,
+            agent: &mut agent,
+            client: &mut client,
+            renderer: &mut renderer,
+            session: &mut session,
+            cli: &cli,
+            cfg: &cfg,
+            context: &mut context,
+            workspace: &workspace,
+            custom_commands: &mut Default::default(),
+            show_reasoning: &mut show_reasoning,
+            reasoning_enabled: &mut reasoning_enabled,
+            is_running: &mut is_running,
+            input: &mut input,
+            permission: &permission,
+            ask_tx: &None,
+            todo_tools_enabled: &mut todo_tools_enabled,
+            sandbox: &mut sandbox,
+            terminal_guard: &mut terminal_guard,
+            #[cfg(feature = "skills")]
+            skill_services: &skill_services,
+            #[cfg(feature = "mcp")]
+            mcp_manager: None,
+        };
+        handle_prompt(&["/prompt", "default"], &mut ctx)
+            .await
+            .unwrap();
+        let model = ctx.session.model.to_string();
+        let context_window = ctx.session.context_window;
+        let input_cost = ctx.session.input_token_cost;
+        assert!(ctx.context.current_prompt.is_none());
+        let feed = ctx.renderer.feed();
+        let transcript = (0..feed.block_count())
+            .filter_map(|index| feed.block_text(index).map(str::to_owned))
+            .collect();
+        Cleared {
+            model,
+            mode: permission.as_ref().unwrap().lock().unwrap().mode(),
+            context_window,
+            input_cost,
+            transcript,
+        }
+    }
+
+    /// `/prompt default` keeps a model the user picked when the prompt was
+    /// never routed to one, drops the prompt's security mode and grant offer,
+    /// and says which model and mode are now active.
+    #[tokio::test]
+    async fn clearing_a_prompt_keeps_the_model_and_restores_the_user_mode() {
+        let cleared = clear_prompt(crate::config::Config::default()).await;
+        assert_eq!(cleared.model, "picked-model");
+        assert_eq!(cleared.mode, crate::permission::SecurityMode::Standard);
+        assert_eq!(
+            cleared.context_window, 777,
+            "an unrouted prompt leaves capacity alone"
+        );
+        assert!(
+            cleared
+                .transcript
+                .iter()
+                .any(|line| line.contains("model: picked-model, security mode: standard")),
+            "{:?}",
+            cleared.transcript
+        );
+    }
+
+    /// A prompt routed through `[prompt_to_model]` reverts to the default
+    /// model, and prices and context window follow it like any `/model` switch.
+    #[tokio::test]
+    async fn clearing_a_routed_prompt_reprices_and_resizes_for_the_default_model() {
+        let cfg: crate::config::Config = toml::from_str(
+            "context_window = 64000\n[quick_models.cheap]\nprovider = \"anthropic\"\nmodel = \"cheap-model\"\n[prompt_to_model]\nplan = \"cheap\"\n",
+        )
+        .unwrap();
+        let default_model = crate::cli::Cli::default().resolve_model(&cfg);
+        let cleared = clear_prompt(cfg).await;
+        assert_eq!(cleared.model, default_model.to_string());
+        assert_eq!(cleared.context_window, 64_000);
+        assert_ne!(
+            cleared.input_cost, 9.0,
+            "the previous model's price is gone"
         );
     }
 }

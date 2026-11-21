@@ -164,6 +164,9 @@ pub struct GrepTool {
     pub ask_tx: Option<AskSender>,
     pub max_results: u64,
     workspace: Option<std::sync::Arc<crate::paths::WorkspaceBinding>>,
+    /// Append the "use `task`" hint to broad results; set only when the
+    /// owning agent registers a `task` tool.
+    task_hint: bool,
 }
 
 impl GrepTool {
@@ -174,7 +177,13 @@ impl GrepTool {
             // A zero cap would report "No matches found." for a matching tree.
             max_results: max_results.max(1),
             workspace: None,
+            task_hint: false,
         }
+    }
+
+    pub(crate) fn with_task_hint(mut self, enabled: bool) -> Self {
+        self.task_hint = enabled;
+        self
     }
 
     pub(crate) fn with_workspace_binding(
@@ -598,7 +607,7 @@ impl GrepSearch {
                     let matched = match_ranges.get(&index).cloned();
                     let displayed = truncate_output_line(lines[index], matched);
                     self.results.push(format!(
-                        "{}:{}{} {}",
+                        "{}:{}{}{}",
                         path_str,
                         index + 1,
                         separator,
@@ -777,8 +786,9 @@ impl Tool for GrepTool {
     type Output = String;
 
     fn description(&self) -> String {
+        let skip_dirs = crate::agent::tools::skip_dirs_phrase();
         format!(
-            "Search file contents using a regex pattern (Rust regex syntax). Returns at most {} result lines and truncates each displayed source line to {} characters around its match. A call may lower the configured result cap; multiline enables whole-file matching with dot matching newlines. Files larger than 10 MiB and binary files are skipped: a directory search appends a `[skipped N files not searched: ...]` line counting them, and naming such a file as `path` returns an error naming the limit instead of an empty result. A call visits at most {} directory entries, depth {} and {} MiB of file bytes; a partial result names the first unsearched path. Respects .gitignore by default (the result counts ignored entries it skipped; pass no_ignore=true to search them too). Skips VCS metadata, node_modules and target directories beside a build manifest (Cargo.toml, pom.xml, build.gradle, build.sbt), naming skipped ones in a notice; pass such a directory as path to search it. `path` may name a single file to search only that file.",
+            "Search file contents using a regex pattern (Rust regex syntax). Returns at most {} result lines and truncates each displayed source line to {} characters around its match. A call may lower the configured result cap; multiline enables whole-file matching with dot matching newlines. Files larger than 10 MiB and binary files are skipped: a directory search appends a `[skipped N files not searched: ...]` line counting them, and naming such a file as `path` returns an error naming the limit instead of an empty result. A call visits at most {} directory entries, depth {} and {} MiB of file bytes; a partial result names the first unsearched path. Respects .gitignore by default (the result counts ignored entries it skipped; pass no_ignore=true to search them too). Skips VCS metadata, {skip_dirs}, naming skipped ones in a notice; pass such a directory as path to search it. `path` may name a single file to search only that file.",
             self.max_results,
             MAX_OUTPUT_LINE_CHARS,
             super::limits::current().search_max_entries,
@@ -833,7 +843,7 @@ impl Tool for GrepTool {
                 "no_ignore": {
                     "type": "boolean",
                     "default": false,
-                    "description": "Also search files hidden by .gitignore/.ignore (generated output, .env.local, vendored copies). Default false; a result that skipped ignored entries says how many. Permission deny rules, VCS metadata and dependency/build directories still apply"
+                    "description": "Also search files hidden by .gitignore/.ignore (default false)"
                 },
                 "offset": {
                     "type": "integer",
@@ -852,28 +862,38 @@ impl Tool for GrepTool {
             args.path.as_deref().unwrap_or("."),
             args.include,
         );
-        let coaching = check_perm(&self.permission, &self.ask_tx, "grep", &args.pattern).await?;
-
         if args.files_only && args.count {
             return Err(ToolError::Msg(
                 "grep files_only and count modes are mutually exclusive".to_string(),
             ));
         }
-        let max_results = args.max_results.unwrap_or(self.max_results);
-        if args
-            .max_results
-            .is_some_and(|limit| limit == 0 || limit > self.max_results)
-        {
-            return Err(ToolError::Msg(format!(
-                "grep max_results must be between 1 and the configured cap {}",
-                self.max_results
-            )));
+        if args.max_results == Some(0) {
+            return Err(ToolError::Msg(
+                "grep max_results must be at least 1. Example: {\"pattern\":\"TODO\",\"max_results\":50}"
+                    .to_string(),
+            ));
         }
+        // A request above the configured cap is served at the cap and says so.
+        let cap_note = args
+            .max_results
+            .filter(|limit| *limit > self.max_results)
+            .map(|limit| {
+                format!(
+                    "[max_results {limit} exceeds the cap {}; showing up to {}]",
+                    self.max_results, self.max_results
+                )
+            });
+        let max_results = args
+            .max_results
+            .map_or(self.max_results, |limit| limit.min(self.max_results));
         let re = RegexBuilder::new(&args.pattern)
             .case_insensitive(args.case_insensitive)
             .dot_matches_new_line(args.multiline)
             .build()
             .map_err(|e| ToolError::Msg(format!("Invalid regex pattern: {}", e)))?;
+        // Arguments are validated before any permission effect, so a prompt is
+        // never raised for a call that fails on its own arguments.
+        let coaching = check_perm(&self.permission, &self.ask_tx, "grep", &args.pattern).await?;
 
         let requested_path = args.path.as_deref().unwrap_or(".");
         if requested_path.is_empty() {
@@ -916,8 +936,11 @@ impl Tool for GrepTool {
                     SearchTarget::File(bound_regular_file(&logical, file)?)
                 }
                 Err(error) => {
-                    return Err(crate::agent::tools::bound_open_error(
-                        workspace, relative, error,
+                    return Err(crate::agent::tools::bound_open_error_for(
+                        Some("grep"),
+                        workspace,
+                        relative,
+                        error,
                     ));
                 }
             };
@@ -926,7 +949,11 @@ impl Tool for GrepTool {
                     .await?;
             (target, coaching)
         } else {
-            let traversal_root = tokio::fs::canonicalize(&search_path).await?;
+            let traversal_root = tokio::fs::canonicalize(&search_path)
+                .await
+                .map_err(|error| {
+                    crate::agent::tools::missing_path_error("grep", &search_path, error)
+                })?;
             let authorized_metadata = crate::fs::stable_path_metadata(&traversal_root).await?;
             let hidden = crate::agent::tools::walk_deny_filter(&self.permission, "grep", None);
             let target = if authorized_metadata.is_file() {
@@ -958,7 +985,7 @@ impl Tool for GrepTool {
             .await?;
             (target, coaching)
         };
-        let coaching = combine_coaching(coaching, path_coaching);
+        let coaching = combine_coaching(combine_coaching(coaching, path_coaching), cap_note);
         let context = args.context_lines.unwrap_or(0);
 
         let include_re = args
@@ -1094,7 +1121,8 @@ impl Tool for GrepTool {
         // its next action, which is the highest-leverage point in the loop.
         // Suppressed when truncated, since the truncation hint already steers
         // the agent toward narrowing or task.
-        let result = if !args.files_only
+        let result = if self.task_hint
+            && !args.files_only
             && !args.count
             && !truncated
             && total >= 10
@@ -1135,6 +1163,34 @@ mod tests {
     use crate::permission::{Action, PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm};
 
     use crate::tests::support::temp::TempDir;
+
+    // mini-agent-sskdu.91: the "use task" hint only appears when the owning
+    // agent registers a task tool.
+    #[tokio::test]
+    async fn task_hint_appears_only_when_enabled() {
+        let temp = TempDir::new("grep-task-hint");
+        for file in ["a.txt", "b.txt"] {
+            std::fs::write(temp.path().join(file), "needle\n".repeat(6)).unwrap();
+        }
+        let args = || -> GrepArgs {
+            serde_json::from_value(serde_json::json!({ "pattern": "needle" })).unwrap()
+        };
+        let plain = GrepTool::new(None, None, 100).with_workspace(temp.path());
+        let output = plain.call(args()).await.unwrap();
+        assert!(
+            output.contains("12 matches") || output.contains("needle"),
+            "{output}"
+        );
+        assert!(!output.contains("`task`"), "{output}");
+        let hinted = GrepTool::new(None, None, 100)
+            .with_task_hint(true)
+            .with_workspace(temp.path());
+        let output = hinted.call(args()).await.unwrap();
+        assert!(
+            output.contains("`task` returns a verified summary"),
+            "{output}"
+        );
+    }
 
     fn restrictive_permission_allowing_pattern() -> PermCheck {
         let config = PermissionConfig {
@@ -1547,7 +1603,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(ToolError::Msg(ref msg)) if msg == "Permission denied: Blocked by deny rule"
+            Err(ToolError::Msg(ref msg)) if msg.starts_with("Permission denied: Blocked by deny rule")
         ));
     }
 
@@ -2238,19 +2294,19 @@ mod tests {
         assert!(
             output
                 .lines()
-                .any(|line| line.contains("context.txt:1- before")),
+                .any(|line| line.contains("context.txt:1-before")),
             "{output}"
         );
         assert!(
             output
                 .lines()
-                .any(|line| line.contains("context.txt:2: needle")),
+                .any(|line| line.contains("context.txt:2:needle")),
             "{output}"
         );
         assert!(
             output
                 .lines()
-                .any(|line| line.contains("context.txt:3- after")),
+                .any(|line| line.contains("context.txt:3-after")),
             "{output}"
         );
         assert!(output.starts_with("3 results"), "{output}");
@@ -2398,7 +2454,7 @@ mod tests {
         assert_eq!(
             tool.call(context).await.unwrap(),
             format!(
-                "3 results (searched 1 files):\n{expected_path}:1- target\n{expected_path}:2: .beads/\n{expected_path}:3- beads.log"
+                "3 results (searched 1 files):\n{expected_path}:1-target\n{expected_path}:2:.beads/\n{expected_path}:3-beads.log"
             )
         );
 

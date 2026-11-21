@@ -71,6 +71,42 @@ pub fn parse_tool_arguments(arguments: &str) -> serde_json::Result<serde_json::V
     serde_json::from_str(arguments)
 }
 
+/// Key under which a tool call whose argument text was not valid JSON carries
+/// that text (bounded) instead of being dropped.
+pub const INVALID_TOOL_ARGUMENTS_KEY: &str = "__invalid_json";
+/// Key carrying the parse error for [`INVALID_TOOL_ARGUMENTS_KEY`].
+pub const INVALID_TOOL_ARGUMENTS_ERROR_KEY: &str = "__invalid_json_error";
+const INVALID_TOOL_ARGUMENTS_MAX_BYTES: usize = 2048;
+
+/// The arguments object a tool call gets when its streamed argument text could
+/// not be parsed. Silently dropping the call leaves the model with an empty
+/// turn and no way to learn it sent malformed JSON; the host short-circuits
+/// calls carrying this marker with a corrective result.
+pub fn invalid_tool_arguments(raw: &str, error: &serde_json::Error) -> serde_json::Value {
+    let mut end = raw.len().min(INVALID_TOOL_ARGUMENTS_MAX_BYTES);
+    while !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut map = serde_json::Map::new();
+    map.insert(
+        INVALID_TOOL_ARGUMENTS_KEY.to_owned(),
+        serde_json::Value::String(raw[..end].to_owned()),
+    );
+    map.insert(
+        INVALID_TOOL_ARGUMENTS_ERROR_KEY.to_owned(),
+        serde_json::Value::String(error.to_string()),
+    );
+    serde_json::Value::Object(map)
+}
+
+/// The parse error when `arguments` is the marker built by
+/// [`invalid_tool_arguments`].
+pub fn invalid_tool_arguments_error(arguments: &serde_json::Value) -> Option<&str> {
+    let map = arguments.as_object()?;
+    map.get(INVALID_TOOL_ARGUMENTS_KEY)?;
+    map.get(INVALID_TOOL_ARGUMENTS_ERROR_KEY)?.as_str()
+}
+
 /// This module is helpful in cases where raw json objects are serialized and deserialized as
 ///  strings such as `"{\"key\": \"value\"}"`. This might seem odd but it's actually how some
 ///  some providers such as OpenAI return function arguments (for some reason).

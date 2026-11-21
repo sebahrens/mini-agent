@@ -2225,7 +2225,13 @@ mod tests {
 
             let _defer = super::super::storage::defer_saves_for_test();
             let before = crate::fs::DURABLE_SYNCS.with(std::cell::Cell::get);
-            super::super::storage::save_session_deferred(&session).unwrap();
+            let encodes = super::super::storage::SERIALIZE_BOUNDED_CALLS.with(std::cell::Cell::get);
+            super::super::storage::save_session_deferred_recovering(&mut session, |_| {}).unwrap();
+            assert_eq!(
+                super::super::storage::SERIALIZE_BOUNDED_CALLS.with(std::cell::Cell::get),
+                encodes,
+                "the calling thread performs no whole-session encode"
+            );
             assert_eq!(
                 crate::fs::DURABLE_SYNCS.with(std::cell::Cell::get),
                 before,

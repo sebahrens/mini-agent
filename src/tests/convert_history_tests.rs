@@ -612,3 +612,97 @@ fn empty_assistant_records_are_not_replayed() {
     );
     assert_eq!(history.last(), Some(&Message::user("next")));
 }
+
+#[test]
+fn continuation_prompt_names_the_recap_label_the_replay_uses() {
+    // mini-agent-sskdu.186: the prompt must point at the message the model
+    // actually sees, not at a "system summary".
+    let prompt = crate::agent::runner::HEADLESS_CONTEXT_RELIEF_PROMPT;
+    assert!(prompt.contains(crate::agent::runner::COMPACTION_RECAP_LABEL));
+    assert!(!prompt.contains("full prior history"));
+    assert!(!prompt.contains("system summary"));
+
+    let mut session = sample_session();
+    session.add_message(MessageRole::User, "q");
+    session.add_message(MessageRole::Assistant, "a");
+    session.compress("did some prior work".into(), 2, 0);
+    let history = convert_history(&session);
+    let Message::Assistant { content, .. } = &history[0] else {
+        panic!("recap must be an assistant message");
+    };
+    let text = content
+        .iter()
+        .filter_map(|item| match item {
+            AssistantContent::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert!(text.starts_with(crate::agent::runner::COMPACTION_RECAP_LABEL));
+}
+
+#[test]
+fn recap_renders_live_todos_not_a_frozen_snapshot() {
+    // mini-agent-sskdu.236
+    use crate::agent::tools::todo::TodoItem;
+    let mut session = sample_session();
+    session.add_message(MessageRole::User, "q");
+    session.add_message(MessageRole::Assistant, "a");
+    session.todos.replace(vec![TodoItem {
+        content: "ship the parser fix".into(),
+        status: "pending".into(),
+        priority: "high".into(),
+    }]);
+    session.compress("did some prior work".into(), 2, 0);
+    let text = |session: &Session| {
+        let history = convert_history(session);
+        let Message::Assistant { content, .. } = &history[0] else {
+            panic!("recap");
+        };
+        content
+            .iter()
+            .filter_map(|item| match item {
+                AssistantContent::Text(text) => Some(text.text.clone()),
+                _ => None,
+            })
+            .collect::<String>()
+    };
+    assert!(text(&session).contains("ship the parser fix"));
+    assert!(
+        !session.compactions[0]
+            .summary
+            .contains("ship the parser fix")
+    );
+    session.todos.replace(Vec::new());
+    assert!(!text(&session).contains("ship the parser fix"));
+}
+
+#[test]
+fn fork_prefix_recaps_only_the_summary_prose() {
+    // mini-agent-sskdu.235
+    let mut session = sample_session();
+    session.add_message(MessageRole::User, "look");
+    session.add_tool_call_with_id("r1", "read", &serde_json::json!({"path": "src/a.rs"}));
+    session.add_tool_result_with_id("r1", "read", "1: fn a() {}");
+    session.add_message(MessageRole::Assistant, "done");
+    session.add_message(MessageRole::User, "next");
+    session.compress("MODEL PROSE".into(), 4, 0);
+    assert!(session.compactions[0].summary.len() > "MODEL PROSE".len());
+    let prefix = crate::agent::runner::convert_history_prefix(&session, session.messages.len(), 4);
+    let Message::Assistant { content, .. } = &prefix[0] else {
+        panic!("recap");
+    };
+    let text: String = content
+        .iter()
+        .filter_map(|item| match item {
+            AssistantContent::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        text,
+        format!(
+            "{}\nMODEL PROSE",
+            crate::agent::runner::COMPACTION_RECAP_LABEL
+        )
+    );
+}

@@ -5,6 +5,8 @@ use agent_client_protocol::schema::v1::*;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Command {
     Compact,
+    /// `/compact show`: print the active summary.
+    CompactShow,
     Undo,
     Rename(String),
     /// `/model [alias|default]`: show or select the session's model.
@@ -43,6 +45,7 @@ pub(super) fn classify(
                 Command::Effort(arguments.to_owned())
             })
         }
+        "/compact" if arguments == "show" => Some(Command::CompactShow),
         "/compact" | "/undo" | "/cost" => {
             if !arguments.is_empty() {
                 return Err(agent_client_protocol::Error::new(
@@ -85,6 +88,18 @@ pub(super) fn cron_arguments(blocks: &[ContentBlock]) -> Option<String> {
     let text = text.text.trim();
     let (name, arguments) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
     (name == "/cron").then(|| arguments.trim().to_owned())
+}
+
+/// The arguments of a `/tasks` command in the original sole text block (see
+/// [`cron_arguments`] for why it stays out of [`Command`]).
+#[cfg(feature = "subagents")]
+pub(super) fn tasks_arguments(blocks: &[ContentBlock]) -> Option<String> {
+    let [ContentBlock::Text(text)] = blocks else {
+        return None;
+    };
+    let text = text.text.trim();
+    let (name, arguments) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
+    (name == "/tasks").then(|| arguments.trim().to_owned())
 }
 
 /// Name and arguments of a `/name args` invocation in the original sole text
@@ -186,6 +201,11 @@ pub(super) async fn announce(
             "Repeat a prompt on an interval while this session is idle: /cron <interval> <prompt>, /cron list, /cron stop <id>|all",
         ),
     ];
+    #[cfg(feature = "subagents")]
+    commands.push(AvailableCommand::new(
+        "tasks",
+        "List background tasks, or read or stop one: /tasks, /tasks result <id>, /tasks cancel <id>",
+    ));
     #[cfg(feature = "goal")]
     commands.push(AvailableCommand::new(
         "goal",
@@ -216,6 +236,36 @@ pub(super) async fn announce(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "subagents")]
+    #[test]
+    fn tasks_is_recognised_only_in_the_sole_text_block() {
+        let text = |value: &str| vec![ContentBlock::Text(TextContent::new(value))];
+        assert_eq!(tasks_arguments(&text("/tasks")), Some(String::new()));
+        assert_eq!(
+            tasks_arguments(&text("/tasks cancel abc")),
+            Some("cancel abc".into())
+        );
+        assert_eq!(tasks_arguments(&text("/tasksx")), None);
+        assert_eq!(
+            tasks_arguments(&[
+                ContentBlock::Text(TextContent::new("/tasks")),
+                ContentBlock::Text(TextContent::new("data")),
+            ]),
+            None
+        );
+        assert_eq!(classify(&text("/tasks")).unwrap(), None);
+    }
+
+    #[test]
+    fn compact_show_is_a_local_command_and_other_arguments_are_refused() {
+        // mini-agent-sskdu.243
+        assert_eq!(
+            classify(&[ContentBlock::Text(TextContent::new("/compact show"))]).unwrap(),
+            Some(Command::CompactShow)
+        );
+        assert!(classify(&[ContentBlock::Text(TextContent::new("/compact now"))]).is_err());
+    }
+
     #[test]
     fn acp53_local_commands_require_the_original_sole_text_block() {
         assert_eq!(

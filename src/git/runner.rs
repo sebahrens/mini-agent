@@ -2257,7 +2257,7 @@ pub(crate) fn command_result(
         CommandStatus::Completed if output.exit_status.is_some_and(|status| status.success()) => {
             Ok(output)
         }
-        CommandStatus::Completed | CommandStatus::Failed => {
+        CommandStatus::Completed | CommandStatus::Failed | CommandStatus::NotStarted => {
             Err(command_failure(operation, &output))
         }
         CommandStatus::TimedOut => Err(GitRunError::TimedOut {

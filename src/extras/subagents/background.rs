@@ -255,7 +255,7 @@ pub(crate) const COMPACTION_CANCEL_REASON: &str =
 const REQUEST_CANCEL_REASON: &str = "cancelled on request";
 
 impl SavedTask {
-    fn new(id: String) -> Self {
+    pub(crate) fn new(id: String) -> Self {
         Self {
             id,
             status: Status::Running,

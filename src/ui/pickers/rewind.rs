@@ -96,24 +96,30 @@ pub struct RewindPicker {
     /// Message index of each rewind-able user turn, in order. The list shows
     /// the previews, so `list.selected` indexes straight into this.
     targets: Vec<usize>,
-    /// The previews, parked here while the confirm step replaces the list.
+    /// Every turn's preview; the list shows the newest matches of `query`.
     previews: Vec<String>,
+    /// Indexes into `targets`/`previews` of the rows the list shows, oldest
+    /// first, so `list.selected` indexes straight into this.
+    visible: Vec<usize>,
+    /// Typed filter (case-insensitive substring of the preview).
+    query: String,
     chosen: Option<usize>,
     outcome: Option<RewindOutcome>,
 }
 
 impl RewindPicker {
     pub(crate) fn new(targets: Vec<(usize, String)>, binding: RewindBinding) -> Self {
-        let mut list = ListPicker::new();
+        let list = ListPicker::new();
         let (targets, previews): (Vec<usize>, Vec<String>) = targets.into_iter().unzip();
-        list.set_items(previews);
         RewindPicker {
             active: false,
             binding,
             stage: Stage::PickMessage,
             list,
             targets,
-            previews: Vec::new(),
+            previews,
+            visible: Vec::new(),
+            query: String::new(),
             chosen: None,
             outcome: None,
         }
@@ -130,7 +136,36 @@ impl RewindPicker {
     pub fn activate(&mut self) {
         self.active = true;
         self.stage = Stage::PickMessage;
+        self.query.clear();
+        self.refresh_list();
+    }
+
+    /// Show the newest `ROWS` turns matching the typed filter, with the
+    /// newest highlighted: rewinding is almost always "undo the last turn".
+    fn refresh_list(&mut self) {
+        const ROWS: usize = 50;
+        let query = self.query.to_lowercase();
+        let matching: Vec<usize> = (0..self.previews.len())
+            .filter(|&index| {
+                query.is_empty() || self.previews[index].to_lowercase().contains(&query)
+            })
+            .collect();
+        self.visible = matching[matching.len().saturating_sub(ROWS)..].to_vec();
+        self.list.set_items(
+            self.visible
+                .iter()
+                .map(|&index| self.previews[index].clone())
+                .collect(),
+        );
         self.list.activate();
+        self.list.selected = self.visible.len().saturating_sub(1);
+    }
+
+    fn move_selection(&mut self, to: impl FnOnce(usize, usize) -> usize) {
+        let len = self.list.len();
+        if len > 0 {
+            self.list.selected = to(self.list.selected, len - 1).min(len - 1);
+        }
     }
 
     pub fn active(&self) -> bool {
@@ -147,7 +182,13 @@ impl RewindPicker {
         cols: u16,
         floor_row: u16,
     ) -> std::io::Result<()> {
-        self.list.draw(out, cols, None, floor_row)
+        let empty = matches!(self.stage, Stage::PickMessage).then(|| {
+            format!(
+                "no turn matches '{}' (Backspace edits the filter)",
+                self.query
+            )
+        });
+        self.list.draw(out, cols, empty.as_deref(), floor_row)
     }
 
     /// Handle a key while the picker is open. Always returns `true`: the picker
@@ -164,6 +205,23 @@ impl RewindPicker {
                 }
             }
             KeyCode::BackTab => self.list.select_prev(),
+            KeyCode::PageUp => self.move_selection(|at, _| at.saturating_sub(10)),
+            KeyCode::PageDown => self.move_selection(|at, _| at + 10),
+            KeyCode::Home => self.move_selection(|_, _| 0),
+            KeyCode::End => self.move_selection(|_, last| last),
+            KeyCode::Char(c)
+                if matches!(self.stage, Stage::PickMessage)
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.query.push(c);
+                self.refresh_list();
+            }
+            KeyCode::Backspace if matches!(self.stage, Stage::PickMessage) => {
+                self.query.pop();
+                self.refresh_list();
+            }
             KeyCode::Enter => self.confirm(),
             KeyCode::Esc => self.back_or_cancel(),
             _ => {}
@@ -174,10 +232,13 @@ impl RewindPicker {
     fn confirm(&mut self) {
         match self.stage {
             Stage::PickMessage => {
-                if let Some(&idx) = self.targets.get(self.list.selected) {
+                if let Some(&idx) = self
+                    .visible
+                    .get(self.list.selected)
+                    .and_then(|&row| self.targets.get(row))
+                {
                     self.chosen = Some(idx);
                     self.stage = Stage::Confirm;
-                    self.previews = self.list.take_items();
                     self.list.set_items(vec![
                         CONFIRM_REWIND.to_string(),
                         format!(
@@ -218,12 +279,12 @@ impl RewindPicker {
             // bailing out entirely, so a mis-step is cheap to correct.
             Stage::Confirm => {
                 self.stage = Stage::PickMessage;
-                self.list.set_items(std::mem::take(&mut self.previews));
-                self.list.activate();
-                if let Some(pos) = self
-                    .chosen
-                    .and_then(|idx| self.targets.iter().position(|i| *i == idx))
-                {
+                self.refresh_list();
+                if let Some(pos) = self.chosen.and_then(|idx| {
+                    self.visible
+                        .iter()
+                        .position(|&row| self.targets.get(row) == Some(&idx))
+                }) {
                     self.list.selected = pos;
                 }
             }
@@ -286,7 +347,7 @@ mod tests {
     #[test]
     fn enter_then_confirm_yields_the_chosen_message_index() {
         let mut p = picker();
-        p.handle(key(KeyCode::Down)); // select second target (message index 3)
+        // The newest turn (message index 3) starts highlighted.
         p.handle(key(KeyCode::Enter)); // open confirm step
         assert!(matches!(p.stage, Stage::Confirm));
         p.handle(key(KeyCode::Enter)); // confirm "Rewind and start from here"
@@ -300,7 +361,7 @@ mod tests {
     #[test]
     fn confirm_step_cancel_option_backs_out() {
         let mut p = picker();
-        p.handle(key(KeyCode::Enter)); // confirm step for first target
+        p.handle(key(KeyCode::Enter)); // confirm step for the newest target
         for _ in 0..3 {
             p.handle(key(KeyCode::Down));
         } // move to "Cancel"
@@ -325,5 +386,45 @@ mod tests {
         p.handle(key(KeyCode::Esc));
         assert!(matches!(p.take_outcome(), Some(RewindOutcome::Cancelled)));
         assert!(!p.active());
+    }
+
+    #[test]
+    fn opens_on_the_newest_turn_and_filters_and_pages() {
+        let mut p = picker();
+        assert_eq!(p.list.selected, 1, "newest turn is highlighted");
+        p.handle(key(KeyCode::Home));
+        assert_eq!(p.list.selected, 0);
+        p.handle(key(KeyCode::End));
+        assert_eq!(p.list.selected, 1);
+        for c in "fir".chars() {
+            p.handle(key(KeyCode::Char(c)));
+        }
+        assert_eq!(p.list.len(), 1);
+        p.handle(key(KeyCode::Enter));
+        p.handle(key(KeyCode::Enter));
+        assert!(matches!(
+            p.take_outcome(),
+            Some(RewindOutcome::Confirmed(1, RewindMode::Conversation, _))
+        ));
+    }
+
+    #[test]
+    fn a_long_session_keeps_its_newest_turns_reachable() {
+        let targets: Vec<(usize, String)> =
+            (0..120).map(|n| (n * 2, format!("turn {n}"))).collect();
+        let mut p = RewindPicker::new(
+            targets,
+            RewindBinding {
+                session: "test".into(),
+                history: [0; 32],
+                checkpoints: [0; 32],
+                source: Default::default(),
+                workspace: [0; 32],
+            },
+        );
+        p.activate();
+        assert_eq!(p.list.selected_name(), Some("turn 119"));
+        p.handle(key(KeyCode::PageUp));
+        assert_eq!(p.list.selected_name(), Some("turn 109"));
     }
 }

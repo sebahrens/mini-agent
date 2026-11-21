@@ -1418,6 +1418,13 @@ editing in a known location, grepping for a literal you will act on immediately.
             background_timeout_secs: default_background_timeout,
             resume_children: default_resume_children,
         } = defaults;
+        let allow_write = with_config(|cfg| {
+            cfg.config
+                .subagents
+                .as_ref()
+                .is_some_and(|policy| policy.allow_write)
+        })
+        .unwrap_or(false);
         let (specialist_entries, listing_note) =
             crate::context::agents::available_schema_entries_for_workspace(
                 self.workspace.as_deref(),
@@ -1435,7 +1442,12 @@ editing in a known location, grepping for a literal you will act on immediately.
             Some(note) => format!("{specialist_descriptions}\n[{note}]"),
             None => specialist_descriptions,
         };
-        serde_json::json!({
+        let write_note = if allow_write {
+            "Specialists are read-only by default. A trusted persona with mode: write requires [subagents] allow_write = true and inherits only eligible parent tools, permissions and sandbox; write children run one at a time, unless the persona sets isolation: worktree, which runs each child in its own git worktree and branch (parallel; the parent workspace is never written; the branch is returned for an explicit merge). The child model and write mode come from the persona definition (frontmatter model: and mode: write); add or edit a persona to change them. "
+        } else {
+            "Specialists are read-only by default ([subagents] allow_write = true enables mode: write personas). "
+        };
+        let mut schema = serde_json::json!({
             "type": "object",
             "description": "Provide exactly one of prompts or briefs. mini-agent validates this constraint when the tool call is decoded.",
             "properties": {
@@ -1485,15 +1497,6 @@ editing in a known location, grepping for a literal you will act on immediately.
                     "maximum": timeout_ceiling,
                     "description": format!("Optional whole-call deadline in seconds (default: the persona's timeout_secs, else task_timeout_secs {default_timeout} in the foreground or task_background_timeout_secs {default_background_timeout} in the background). Values above the configured ceiling ({timeout_ceiling}, [subagents] task_timeout_ceiling_secs) are rejected.")
                 },
-                "isolation": {
-                    "type": "string",
-                    "enum": ["none", "worktree"],
-                    "description": "Optional. \"worktree\" runs each child of a mode: write persona in its own git worktree and branch (parallel; the parent workspace is never written; branches are returned for an explicit merge), as the persona frontmatter isolation: worktree does. Rejected for read-only children."
-                },
-                "base_ref": {
-                    "type": "string",
-                    "description": "Optional commit-ish (branch, tag or commit id) that worktree-isolated children branch from instead of the parent's HEAD. Requires isolation. Uncommitted parent changes are never visible to the child."
-                },
                 "model": {
                     "type": "string",
                     "description": "Optional name of a configured [quick_models] alias for this call's children (used by context: fork skills). Raw model ids and unknown aliases are rejected; a persona that pins its own model: cannot be overridden."
@@ -1510,7 +1513,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                 "agent_type": {
                     "type": "string",
                     "enum": specialist_names,
-                    "description": format!("Optional specialist agent type resolved from the installed global and active-workspace agent definitions. Omit for general codebase exploration. Specialists are read-only by default. A trusted persona with mode: write requires [subagents] allow_write = true and inherits only eligible parent tools, permissions and sandbox; write children run one at a time, unless the persona sets isolation: worktree, which runs each child in its own git worktree and branch (parallel; the parent workspace is never written; the branch is returned for an explicit merge). The child model and write mode come from the persona definition (frontmatter model: and mode: write); add or edit a persona to change them. Available specialists:\n{specialist_descriptions}")
+                    "description": format!("Optional specialist agent type resolved from the installed global and active-workspace agent definitions. Omit for general codebase exploration. {write_note}Available specialists:\n{specialist_descriptions}")
                 }
             },
             // Exclusivity is stated in the descriptions and enforced by
@@ -1519,7 +1522,27 @@ editing in a known location, grepping for a literal you will act on immediately.
             // non-strict OpenAI-compatible gateways ignore them, and strict
             // schema sanitizers rewrite them into an unsatisfiable shape.
             "additionalProperties": false
-        })
+        });
+        // Worktree isolation applies to write personas only; with writes off
+        // the fields would be dead schema text.
+        if allow_write && let Some(properties) = schema["properties"].as_object_mut() {
+            properties.insert(
+                "isolation".into(),
+                serde_json::json!({
+                    "type": "string",
+                    "enum": ["none", "worktree"],
+                    "description": "Optional. \"worktree\" runs each child of a mode: write persona in its own git worktree and branch (parallel; the parent workspace is never written; branches are returned for an explicit merge), as the persona frontmatter isolation: worktree does. Rejected for read-only children."
+                }),
+            );
+            properties.insert(
+                "base_ref".into(),
+                serde_json::json!({
+                    "type": "string",
+                    "description": "Optional commit-ish (branch, tag or commit id) that worktree-isolated children branch from instead of the parent's HEAD. Requires isolation. Uncommitted parent changes are never visible to the child."
+                }),
+            );
+        }
+        schema
     }
 
     async fn call(&self, mut args: TaskArgs) -> Result<String, ToolError> {

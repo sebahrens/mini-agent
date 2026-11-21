@@ -54,6 +54,9 @@ pub struct StatusContext<'a> {
     pub goal_label: Option<&'a str>,
     /// Session `/cron` schedules (see [`cron_label`]); `None` hides the item.
     pub cron_label: Option<&'a str>,
+    /// Live countdown for a long provider retry wait (see [`retry_wait_label`]).
+    /// Shown on the first line whether or not the layout places it.
+    pub retry_label: Option<&'a str>,
     pub prompt_name: Option<&'a str>,
     /// Configured `[reasoning] effort` (wire spelling), if any.
     pub reasoning_effort: Option<&'a str>,
@@ -104,6 +107,39 @@ pub(crate) fn cron_label(summary: crate::ui::cron::CronSummary, waiting: bool) -
         }
     };
     Some(format!("\u{27f3} {} {state}", summary.armed))
+}
+
+/// `retry in 37s (rate limited)` while a provider retry wait is pending.
+pub(crate) fn retry_wait_label(
+    deadline: std::time::Instant,
+    reason: &str,
+    now: std::time::Instant,
+) -> Option<String> {
+    let left = deadline
+        .checked_duration_since(now)
+        .filter(|d| !d.is_zero())?;
+    let secs = left.as_secs() + u64::from(left.subsec_nanos() > 0);
+    Some(if reason.is_empty() {
+        format!("retry in {secs}s")
+    } else {
+        format!("retry in {secs}s ({reason})")
+    })
+}
+
+/// How long until [`retry_wait_label`] changes (the next whole-second step).
+pub(crate) fn retry_wait_repaint_in(
+    deadline: std::time::Instant,
+    now: std::time::Instant,
+) -> Option<std::time::Duration> {
+    let left = deadline
+        .checked_duration_since(now)
+        .filter(|d| !d.is_zero())?;
+    let shown = left.as_secs() + u64::from(left.subsec_nanos() > 0);
+    let boundary = std::time::Duration::from_secs(shown - 1);
+    Some(
+        left.saturating_sub(boundary)
+            .max(std::time::Duration::from_millis(50)),
+    )
 }
 
 /// How long until [`cron_label`]'s countdown text changes on its own, so an
@@ -282,6 +318,7 @@ pub fn cache_key(session: &Session, ctx: &StatusContext) -> u64 {
     // The label already carries the next fire bucketed to the minute, so a
     // countdown rebuilds the spans once a minute, not every frame.
     ctx.cron_label.hash(&mut state);
+    ctx.retry_label.hash(&mut state);
     ctx.prompt_name.hash(&mut state);
     ctx.reasoning_effort.hash(&mut state);
     ctx.perm_mode.hash(&mut state);
@@ -351,6 +388,29 @@ pub fn build_lines(
             bg: None,
             layout: SpanLayout::Item {
                 priority: 255,
+                plain: single_line_safe(label),
+                compact: None,
+                dynamic_color: true,
+            },
+        });
+    }
+    if let Some(label) = ctx.retry_label
+        && let Some(first) = lines.first_mut()
+    {
+        if !first.is_empty() {
+            first.push(StatusSpan::Text {
+                text: " ".to_string(),
+                fg: None,
+                bg: None,
+                layout: SpanLayout::Separator,
+            });
+        }
+        first.push(StatusSpan::Text {
+            text: single_line_safe(label),
+            fg: Some(Color::Yellow),
+            bg: None,
+            layout: SpanLayout::Item {
+                priority: 250,
                 plain: single_line_safe(label),
                 compact: None,
                 dynamic_color: true,
