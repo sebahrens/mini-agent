@@ -1015,6 +1015,55 @@ mod permission_prompt_layout_tests {
     const OPTIONS: &str = "  (y) allow once  (n) deny";
 
     #[test]
+    fn question_options_keep_the_answer_draft_and_key_hint_on_a_short_terminal() {
+        let mut options: Vec<String> = (1..=6)
+            .map(|n| format!("  ({n}) option {n} — {}", "description ".repeat(12)))
+            .collect();
+        options.push("Answer: my typed answer".into());
+        options.push("[Enter] submit answer  [Esc] back".into());
+        let rows =
+            permission_prompt_rows("[question 1/1] Which?", &options.join("\n"), 80, 12, true);
+        assert!(rows.len() <= expanded_prompt_max_rows(12), "{rows:?}");
+        assert!(rows.iter().all(|row| display_width(row) <= 80), "{rows:?}");
+        assert!(
+            rows.iter().any(|r| r.contains("Answer: my typed answer")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.last().unwrap().contains("[Enter] submit answer"),
+            "{rows:?}"
+        );
+        assert!(rows.iter().any(|r| r.contains("option 1")), "{rows:?}");
+        // Roomy terminals show every option in full, one per row group.
+        let roomy =
+            permission_prompt_rows("[question 1/1] Which?", &options.join("\n"), 80, 60, true);
+        assert!(roomy.iter().any(|r| r.contains("option 6")), "{roomy:?}");
+    }
+
+    #[test]
+    fn deny_note_stays_visible_under_a_long_multiline_request() {
+        let header = format!(
+            "[permission] bash: {}",
+            (0..20)
+                .map(|n| format!("line {n}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let options = "note for the model: do it differently\n[Enter] deny and send the note  [Esc] back to the prompt";
+        let rows = permission_prompt_rows(&header, options, 80, 24, false);
+        assert!(rows.len() <= prompt_max_rows(24), "{rows:?}");
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("note for the model: do it differently")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.last().unwrap().contains("[Enter] deny and send"),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
     fn a_long_path_wraps_instead_of_being_clipped() {
         let header = "[permission] edit: /home/user/projects/app/src/components/forms/Input.tsx";
         let rows = prompt_block_rows(header, OPTIONS, 30, 6);

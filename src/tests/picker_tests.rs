@@ -1293,6 +1293,21 @@ mod slash_picker_contract {
         }
     }
 
+    /// mini-agent-sskdu.46: Tab after the canonical name lists the quick models.
+    #[test]
+    fn subagent_models_tab_completion_lists_quick_models_for_both_spellings() {
+        for command in ["/subagent-models ", "/models-subagent "] {
+            let mut input = InputEditor::new();
+            input.set_quick_model_names(vec!["fast".into(), "smart".into()]);
+            input.load_text(command);
+            press(&mut input, KeyCode::Tab, KeyModifiers::NONE);
+            assert!(
+                input.picker.as_ref().is_some_and(Picker::active),
+                "{command}"
+            );
+        }
+    }
+
     #[test]
     fn argument_tab_completion_still_waits_for_enter_to_submit() {
         let mut input = InputEditor::new();

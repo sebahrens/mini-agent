@@ -70,5 +70,5 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
     }
     write_ok(ctx.renderer, format!("review: {}", msg));
 
-    Err(anyhow::anyhow!("DEFER_REVIEW:{}", msg))
+    Err(super::DeferredSlash::Review(msg.to_string()).into())
 }

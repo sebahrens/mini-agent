@@ -1,13 +1,14 @@
 use crate::agent::tools;
 use crate::config::types::EditSystem;
 use crate::permission::SecurityMode;
+use crate::ui::slash::write_usage;
 use crate::ui::slash::{SlashCtx, write_error, write_ok, write_result};
 
 pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     match parts[0] {
         "/keys" => {
             if parts.len() != 1 {
-                write_error(ctx.renderer, "usage: /keys");
+                write_usage(ctx.renderer, "usage: /keys");
                 return Ok(());
             }
             write_ok(
@@ -39,7 +40,7 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
                 ["/vim", "on"] => true,
                 ["/vim", "off"] => false,
                 _ => {
-                    write_error(ctx.renderer, "usage: /vim [on|off]");
+                    write_usage(ctx.renderer, "usage: /vim [on|off]");
                     return Ok(());
                 }
             };
@@ -55,7 +56,7 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
         }
         "/cost" => {
             if parts.len() != 1 {
-                write_error(ctx.renderer, "usage: /cost");
+                write_usage(ctx.renderer, "usage: /cost");
                 return Ok(());
             }
             let result = match crate::paths::process_paths_ref() {
@@ -99,10 +100,7 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
             }
             #[cfg(not(feature = "advisor"))]
             {
-                write_error(
-                    ctx.renderer,
-                    "Advisor support not enabled (build with --features advisor)",
-                );
+                write_error(ctx.renderer, super::feature_missing("/advisor", "advisor"));
                 Ok(())
             }
         }
@@ -110,10 +108,7 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
         "/mcp" => handle_mcp(parts, ctx).await,
         #[cfg(not(feature = "mcp"))]
         "/mcp" => {
-            write_error(
-                ctx.renderer,
-                "MCP support not enabled (build with --features mcp)",
-            );
+            write_error(ctx.renderer, super::feature_missing("/mcp", "mcp"));
             Ok(())
         }
         _ => Ok(()),
@@ -274,7 +269,7 @@ async fn handle_advisor(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resul
                 ctx.rebuild_agent().await;
                 write_ok(ctx.renderer, format!("advisor model: {selected}"));
             } else {
-                write_error(ctx.renderer, "usage: /advisor model <name>");
+                write_usage(ctx.renderer, "usage: /advisor model <name>");
             }
         }
         "max-uses" => {
@@ -288,7 +283,7 @@ async fn handle_advisor(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resul
                 advisor::init_config(cfg);
                 write_ok(ctx.renderer, format!("advisor max uses: {}", label));
             } else {
-                write_error(
+                write_usage(
                     ctx.renderer,
                     "usage: /advisor max-uses <number|0=unlimited>",
                 );
@@ -309,7 +304,7 @@ async fn handle_advisor(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resul
                     ),
                 );
             } else {
-                write_error(ctx.renderer, "usage: /advisor context-limit <kilobytes>");
+                write_usage(ctx.renderer, "usage: /advisor context-limit <kilobytes>");
             }
         }
         _ => {
@@ -353,7 +348,7 @@ async fn handle_sandbox(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resul
         return Ok(());
     }
     if parts.len() != 2 {
-        write_error(
+        write_usage(
             ctx.renderer,
             "usage: /sandbox [workspace|host-read|host-full]",
         );
@@ -444,10 +439,19 @@ async fn handle_mode(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
 
 /// Present the permission policies using approval-oriented names while keeping
 /// `/mode` as the complete low-level security-mode interface.
+/// Shared by `/permissions` and `/mode` when no permission checker exists.
+const PERMISSION_SYSTEM_DISABLED: &str =
+    "permission system disabled at startup; restart without --dangerously-skip-permissions";
+
 async fn handle_permissions(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     if parts.len() < 2 {
-        ctx.input
-            .start_argument_picker("/permissions ", ["yolo", "auto", "manual", "rules"]);
+        // One list for this picker and for Tab/slash completion.
+        if let Some((items, prefix)) =
+            crate::ui::pickers::handlers::argument_picker_spec("/permissions")
+        {
+            ctx.input
+                .start_argument_picker(prefix, items.iter().copied());
+        }
         return Ok(());
     }
 
@@ -467,7 +471,7 @@ async fn handle_permissions(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::R
         None => write_error(
             ctx.renderer,
             format!(
-                "unknown permissions mode: {} (use yolo, auto, or manual)",
+                "unknown permissions argument: {} (use yolo, auto, manual, rules, or forget)",
                 parts[1]
             ),
         ),
@@ -548,10 +552,7 @@ fn set_permission_mode(ctx: &mut SlashCtx<'_>, mode: SecurityMode, label: &str) 
             .set_mode(mode);
         write_ok(ctx.renderer, format!("permissions: {label}"));
     } else {
-        write_error(
-            ctx.renderer,
-            "permission system disabled at startup; restart without --dangerously-skip-permissions",
-        );
+        write_error(ctx.renderer, PERMISSION_SYSTEM_DISABLED);
     }
 }
 
@@ -589,13 +590,13 @@ async fn set_mode(ctx: &mut SlashCtx<'_>, mode: SecurityMode) {
         p.lock().unwrap_or_else(|e| e.into_inner()).set_mode(mode);
         write_ok(ctx.renderer, format!("security mode: {mode}"));
     } else {
-        write_error(ctx.renderer, "permission system not active");
+        write_error(ctx.renderer, PERMISSION_SYSTEM_DISABLED);
     }
 }
 
 async fn handle_toggle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     if parts.len() < 2 {
-        write_ok(ctx.renderer, "usage: /toggle <feature> [on|off]");
+        write_usage(ctx.renderer, "usage: /toggle <feature> [on|off]");
         write_ok(ctx.renderer, "features:");
         write_result(
             ctx.renderer,
@@ -793,12 +794,6 @@ async fn handle_editsys(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resul
     Ok(())
 }
 
-/// Prefix understood by the caller in `ui::mod` to start the interactive OAuth
-/// login for a server. The login (browser wait) runs there as a background task
-/// so the TUI stays responsive; on success the server is reconnected.
-#[cfg(feature = "mcp")]
-pub(crate) const DEFER_MCP_LOGIN: &str = "DEFER_MCP_LOGIN:";
-
 #[cfg(feature = "mcp")]
 async fn handle_mcp(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     if parts.len() >= 2 && parts[1] == "login" {
@@ -936,7 +931,7 @@ fn resolve_oauth_server(
 #[cfg(feature = "mcp")]
 async fn handle_mcp_login(name: Option<&str>, ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     let Some(name) = name.filter(|n| !n.is_empty()) else {
-        write_error(ctx.renderer, "usage: /mcp login <server>");
+        write_usage(ctx.renderer, "usage: /mcp login <server>");
         return Ok(());
     };
     // Validate config here so errors get friendly messages. The actual login
@@ -946,13 +941,13 @@ async fn handle_mcp_login(name: Option<&str>, ctx: &mut SlashCtx<'_>) -> anyhow:
         write_error(ctx.renderer, e);
         return Ok(());
     }
-    Err(anyhow::anyhow!("{}{}", DEFER_MCP_LOGIN, name))
+    Err(super::DeferredSlash::McpLogin(name.to_string()).into())
 }
 
 #[cfg(feature = "mcp")]
 fn handle_mcp_logout(name: Option<&str>, ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     let Some(name) = name.filter(|n| !n.is_empty()) else {
-        write_error(ctx.renderer, "usage: /mcp logout <server>");
+        write_usage(ctx.renderer, "usage: /mcp logout <server>");
         return Ok(());
     };
     let (url, settings) = match resolve_oauth_server(ctx, name) {
