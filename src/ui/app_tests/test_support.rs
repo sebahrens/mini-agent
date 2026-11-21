@@ -5,6 +5,7 @@ pub(super) fn fixture_app(ui: UiContext<'_>) -> App<'_> {
     input.keybindings = KeyBindings::from_overrides(ui.cfg.keys.as_ref()).unwrap();
     input.set_vim_enabled(ui.cfg.vim_mode.unwrap_or(false));
     let (git_status_tx, git_status_rx) = mpsc::channel(1);
+    let (command_segment_tx, command_segment_rx) = mpsc::channel(1);
     let (btw_tx, btw_rx) = mpsc::channel(1);
     let (title_tx, title_rx) = mpsc::channel(1);
     let (user_tx, user_rx) = mpsc::channel(1);
@@ -30,6 +31,8 @@ pub(super) fn fixture_app(ui: UiContext<'_>) -> App<'_> {
         transcript_search: None,
         git_status_tx,
         git_status_rx,
+        command_segment_tx,
+        command_segment_rx,
         git_status_in_flight: false,
         ask_rx: None,
         permission_prompt: None,

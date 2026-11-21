@@ -135,6 +135,11 @@ pub(crate) struct CommandCredential {
     state: Mutex<State>,
     /// Serializes command runs (blocking and async alike).
     gate: tokio::sync::Mutex<()>,
+    /// Bytes written to the command's stdin (status-bar segments); `None`
+    /// leaves stdin closed.
+    input: Option<Vec<u8>>,
+    /// Turns raw stdout into the result; credentials require one clean line.
+    parse: fn(&[u8]) -> Result<String, &'static str>,
 }
 
 impl std::fmt::Debug for CommandCredential {
@@ -154,6 +159,8 @@ impl CommandCredential {
             spec,
             state: Mutex::new(State::default()),
             gate: tokio::sync::Mutex::new(()),
+            input: None,
+            parse: credential_from_output,
         })
     }
 
@@ -534,7 +541,11 @@ async fn run_async(credential: &CommandCredential) -> Result<String, String> {
     let mut command = tokio::process::Command::new(&spec.command[0]);
     command
         .args(&spec.command[1..])
-        .stdin(std::process::Stdio::null())
+        .stdin(if credential.input.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
@@ -545,6 +556,14 @@ async fn run_async(credential: &CommandCredential) -> Result<String, String> {
         .map_err(|error| credential.failure(&format!("could not start ({:?})", error.kind())))?;
     // Dropping this (timeout, cancellation, or normal return) kills the group.
     let group = GroupKill::new(child.id());
+    if let (Some(input), Some(mut stdin)) = (credential.input.clone(), child.stdin.take()) {
+        use tokio::io::AsyncWriteExt as _;
+        // Bounded by the run's own timeout; a command that never reads is
+        // killed with the group, and the handle closes when the task ends.
+        tokio::spawn(async move {
+            let _ = stdin.write_all(&input).await;
+        });
+    }
     let mut stdout = child.stdout.take().expect("piped stdout");
     let run = async {
         let mut output = Vec::new();
@@ -577,7 +596,45 @@ async fn run_async(credential: &CommandCredential) -> Result<String, String> {
     if !status.success() {
         return Err(credential.failure(&exit_reason(status)));
     }
-    credential_from_output(&output).map_err(|reason| credential.failure(reason))
+    (credential.parse)(&output).map_err(|reason| credential.failure(reason))
+}
+
+/// Runs one credential command once, uncached, and returns its single-line
+/// output (used for `gh auth token`). Same launcher, timeout and output rules
+/// as `api_key_commands`; failures name the program, never its output.
+#[cfg_attr(not(feature = "export"), allow(dead_code))]
+pub(crate) async fn run_once(
+    label: &str,
+    command: Vec<String>,
+    timeout_secs: u64,
+) -> Result<String, String> {
+    run_with(label, command, timeout_secs, None, credential_from_output).await
+}
+
+/// [`run_once`] with bytes for the command's stdin and a caller-chosen output
+/// parser (the command-backed status-bar segment). The launcher, process
+/// group, timeout and 16 KiB output cap are the same.
+pub(crate) async fn run_with(
+    label: &str,
+    command: Vec<String>,
+    timeout_secs: u64,
+    input: Option<Vec<u8>>,
+    parse: fn(&[u8]) -> Result<String, &'static str>,
+) -> Result<String, String> {
+    let mut credential = CommandCredential::new(
+        label,
+        ApiKeyCommandSpec {
+            command,
+            ttl_secs: Some(0),
+            timeout_secs: Some(timeout_secs),
+        },
+    );
+    {
+        let inner = Arc::get_mut(&mut credential).expect("freshly created credential");
+        inner.input = input;
+        inner.parse = parse;
+    }
+    run_async(&credential).await
 }
 
 static REGISTRY: RwLock<Option<HashMap<String, Arc<CommandCredential>>>> = RwLock::new(None);

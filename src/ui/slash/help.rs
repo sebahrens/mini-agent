@@ -179,6 +179,18 @@ pub(crate) fn help_lines(
     );
     emit(
         false,
+        "  /plugins               list installed plugins (manage with `mini-agent plugin`)",
+    );
+    emit(
+        false,
+        "  /feedback [text]       draft a redacted issue (--open opens the prefilled form)",
+    );
+    emit(
+        false,
+        "  /release-notes         show what changed in this version",
+    );
+    emit(
+        false,
         "  /model [alias|id]      show or switch model (quick alias, else raw id)",
     );
     emit(
@@ -214,6 +226,10 @@ pub(crate) fn help_lines(
         emit(
             false,
             "  /share                 share session as a secret GitHub gist (asks to confirm)",
+        );
+        emit(
+            false,
+            "  /unshare               delete the session's shared gist",
         );
     }
     emit(
@@ -328,7 +344,7 @@ pub(crate) fn help_lines(
     );
     emit(
         false,
-        "  /review [msg]          review code (auto message if omitted)",
+        "  /review [target] [msg] review code: --base <ref>, --commit <sha>, --uncommitted, --pr <n>, --post, --security",
     );
     for (command, description) in [
         ("/diff [path|turn]", "show a contained Git diff"),

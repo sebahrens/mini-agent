@@ -1164,24 +1164,201 @@ pub(crate) fn gist_client() -> Result<reqwest::Client> {
         .context("failed to build the GitHub API client")
 }
 
-/// Upload `content` as a secret gist and return its URL. Requires
-/// `GITHUB_TOKEN` or `GH_TOKEN` in the environment. A secret gist is unlisted,
-/// not private: anyone with the link can read it.
-pub async fn share_gist(filename: &str, content: &str, description: &str) -> Result<String> {
-    let token = std::env::var("GITHUB_TOKEN")
-        .or_else(|_| std::env::var("GH_TOKEN"))
-        .context("set GITHUB_TOKEN or GH_TOKEN to share sessions as gists")?;
-    upload_gist(
+/// Where a GitHub token came from; shown to the user, never the token itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TokenSource {
+    GithubToken,
+    GhToken,
+    GhCli,
+}
+
+impl TokenSource {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::GithubToken => "GITHUB_TOKEN",
+            Self::GhToken => "GH_TOKEN",
+            Self::GhCli => "`gh auth token`",
+        }
+    }
+}
+
+/// `GITHUB_TOKEN`, then `GH_TOKEN`, then the gh CLI's stored credential
+/// (`gh auth token`, run through the credential-helper launcher with its
+/// timeout and output cap). `lookup` is the environment, injectable for tests.
+fn env_token(lookup: impl Fn(&str) -> Option<String>) -> Option<(String, TokenSource)> {
+    let usable = |name: &str| {
+        lookup(name)
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty())
+    };
+    usable("GITHUB_TOKEN")
+        .map(|t| (t, TokenSource::GithubToken))
+        .or_else(|| usable("GH_TOKEN").map(|t| (t, TokenSource::GhToken)))
+}
+
+pub(crate) async fn resolve_github_token() -> Result<(String, TokenSource)> {
+    if let Some(found) = env_token(|name| std::env::var(name).ok()) {
+        return Ok(found);
+    }
+    match crate::key_command::run_once("gh", vec!["gh".into(), "auth".into(), "token".into()], 10)
+        .await
+    {
+        Ok(token) => Ok((token, TokenSource::GhCli)),
+        Err(_) => anyhow::bail!(
+            "no GitHub credential: set GITHUB_TOKEN or GH_TOKEN, or sign in with `gh auth login`"
+        ),
+    }
+}
+
+/// A finished share: the gist's URL and id, and how it was authorised.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GistShare {
+    pub url: String,
+    pub id: String,
+    /// True when an existing gist was updated instead of a new one created.
+    pub updated: bool,
+    pub source: TokenSource,
+}
+
+/// Upload `content` as a secret gist, or update `existing` when given and
+/// still present, and return where it lives. A secret gist is unlisted, not
+/// private: anyone with the link can read it.
+pub async fn share_gist(
+    filename: &str,
+    content: &str,
+    description: &str,
+    existing: Option<&str>,
+) -> Result<GistShare> {
+    let (token, source) = resolve_github_token().await?;
+    let mut share = publish_gist(
         &gist_client()?,
         GIST_API_URL,
         &token,
         filename,
         content,
         description,
+        existing,
     )
-    .await
+    .await?;
+    share.source = source;
+    Ok(share)
 }
 
+/// Delete a shared gist (`/unshare`). A gist that is already gone counts as
+/// removed. Returns the credential source used.
+pub async fn unshare_gist(id: &str) -> Result<TokenSource> {
+    let (token, source) = resolve_github_token().await?;
+    delete_gist(&gist_client()?, GIST_API_URL, &token, id).await?;
+    Ok(source)
+}
+
+fn gist_headers(request: reqwest::RequestBuilder, token: &str) -> reqwest::RequestBuilder {
+    request
+        .header(reqwest::header::USER_AGENT, crate::product::PUBLIC_NAME)
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", token))
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+}
+
+fn valid_gist_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// Send one gist request. A non-success answer is an error naming the status,
+/// except that a missing gist (404) is `None` when `tolerate_missing`.
+async fn send_gist(
+    request: reqwest::RequestBuilder,
+    tolerate_missing: bool,
+) -> Result<Option<reqwest::Response>> {
+    let response = request
+        .send()
+        .await
+        .context("failed to reach the GitHub API")?;
+    if !response.status().is_success() {
+        let status = response.status();
+        if tolerate_missing && status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let text = response.text().await.unwrap_or_default();
+        anyhow::bail!("GitHub API returned {}: {}", status, text.trim());
+    }
+    Ok(Some(response))
+}
+
+pub(crate) async fn delete_gist(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    id: &str,
+) -> Result<()> {
+    anyhow::ensure!(valid_gist_id(id), "the recorded gist id is not valid");
+    // A gist that is already gone counts as removed.
+    send_gist(
+        gist_headers(client.delete(format!("{base_url}/{id}")), token),
+        true,
+    )
+    .await?;
+    Ok(())
+}
+
+pub(crate) async fn publish_gist(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    filename: &str,
+    content: &str,
+    description: &str,
+    existing: Option<&str>,
+) -> Result<GistShare> {
+    let body = serde_json::json!({
+        "description": description,
+        "public": false,
+        "files": { filename: { "content": content } },
+    });
+    let mut updated = false;
+    let mut response = None;
+    if let Some(id) = existing.filter(|id| valid_gist_id(id)) {
+        // A gist deleted behind our back (404) is created afresh below.
+        response = send_gist(
+            gist_headers(client.patch(format!("{base_url}/{id}")), token).json(&body),
+            true,
+        )
+        .await?;
+        updated = response.is_some();
+    }
+    let response = match response {
+        Some(response) => response,
+        None => send_gist(
+            gist_headers(client.post(base_url), token).json(&body),
+            false,
+        )
+        .await?
+        .context("GitHub API returned no response")?,
+    };
+    let json: serde_json::Value = response
+        .json()
+        .await
+        .context("invalid GitHub API response")?;
+    let url = json
+        .get("html_url")
+        .and_then(|u| u.as_str())
+        .map(str::to_string)
+        .context("GitHub API response did not include html_url")?;
+    let id = json
+        .get("id")
+        .and_then(|u| u.as_str())
+        .filter(|id| valid_gist_id(id))
+        .map(str::to_string)
+        .context("GitHub API response did not include a gist id")?;
+    Ok(GistShare {
+        url,
+        id,
+        updated,
+        source: TokenSource::GithubToken,
+    })
+}
+
+/// Create-only upload used by tests of the transport: returns the gist URL.
+#[cfg(test)]
 pub(crate) async fn upload_gist(
     client: &reqwest::Client,
     url: &str,
@@ -1190,33 +1367,123 @@ pub(crate) async fn upload_gist(
     content: &str,
     description: &str,
 ) -> Result<String> {
-    let body = serde_json::json!({
-        "description": description,
-        "public": false,
-        "files": { filename: { "content": content } },
-    });
-    let response = client
-        .post(url)
-        .header(reqwest::header::USER_AGENT, crate::product::PUBLIC_NAME)
-        .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", token))
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .json(&body)
-        .send()
+    publish_gist(client, url, token, filename, content, description, None)
         .await
-        .context("failed to reach the GitHub API")?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        anyhow::bail!("GitHub API returned {}: {}", status, text.trim());
+        .map(|share| share.url)
+}
+
+#[cfg(test)]
+mod gist_tests {
+    use super::*;
+
+    #[test]
+    fn env_tokens_prefer_github_token_and_skip_blanks() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| (*v).to_owned())
+            }
+        };
+        let both = env_token(env(&[("GITHUB_TOKEN", "a"), ("GH_TOKEN", "b")])).unwrap();
+        assert_eq!(both, ("a".into(), TokenSource::GithubToken));
+        let blank = env_token(env(&[("GITHUB_TOKEN", "  "), ("GH_TOKEN", "b")])).unwrap();
+        assert_eq!(blank, ("b".into(), TokenSource::GhToken));
+        assert!(env_token(env(&[])).is_none());
     }
-    let json: serde_json::Value = response
-        .json()
+
+    /// One request per connection: records "METHOD path" and answers `reply`.
+    async fn serve(
+        replies: Vec<(u16, &'static str)>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/gists", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            for (status, body) in replies {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 65536];
+                let n = socket.read(&mut buf).await.unwrap();
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                let line = head.lines().next().unwrap_or("").to_owned();
+                let mut parts = line.split(' ');
+                seen.push(format!(
+                    "{} {}",
+                    parts.next().unwrap_or(""),
+                    parts.next().unwrap_or("")
+                ));
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            seen
+        });
+        (base, task)
+    }
+
+    #[tokio::test]
+    async fn share_share_again_updates_and_unshare_deletes() {
+        let created = r#"{"id":"abc123","html_url":"https://gist.github.com/u/abc123"}"#;
+        let (base, server) =
+            serve(vec![(201, created), (200, created), (204, ""), (404, "{}")]).await;
+        let client = reqwest::Client::new();
+        let first = publish_gist(&client, &base, "t", "s.html", "<p>", "d", None)
+            .await
+            .unwrap();
+        assert_eq!((first.id.as_str(), first.updated), ("abc123", false));
+        let second = publish_gist(&client, &base, "t", "s.html", "<p>2", "d", Some(&first.id))
+            .await
+            .unwrap();
+        assert!(second.updated);
+        delete_gist(&client, &base, "t", &first.id).await.unwrap();
+        // Deleting a gist that is already gone is not an error.
+        delete_gist(&client, &base, "t", &first.id).await.unwrap();
+        let seen = server.await.unwrap();
+        assert_eq!(
+            seen,
+            [
+                "POST /gists",
+                "PATCH /gists/abc123",
+                "DELETE /gists/abc123",
+                "DELETE /gists/abc123"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gist_deleted_elsewhere_is_recreated() {
+        let created = r#"{"id":"new1","html_url":"https://gist.github.com/u/new1"}"#;
+        let (base, server) = serve(vec![(404, "{}"), (201, created)]).await;
+        let share = publish_gist(
+            &reqwest::Client::new(),
+            &base,
+            "t",
+            "s.html",
+            "x",
+            "d",
+            Some("gone"),
+        )
         .await
-        .context("invalid GitHub API response")?;
-    json.get("html_url")
-        .and_then(|u| u.as_str())
-        .map(str::to_string)
-        .context("GitHub API response did not include html_url")
+        .unwrap();
+        assert_eq!((share.id.as_str(), share.updated), ("new1", false));
+        assert_eq!(server.await.unwrap(), ["PATCH /gists/gone", "POST /gists"]);
+    }
+
+    #[tokio::test]
+    async fn a_hostile_recorded_id_never_reaches_the_url() {
+        let result = delete_gist(
+            &reqwest::Client::new(),
+            "http://127.0.0.1:9/gists",
+            "t",
+            "../x",
+        )
+        .await;
+        assert!(result.is_err());
+    }
 }
 
 #[cfg(test)]

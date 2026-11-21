@@ -2110,6 +2110,18 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         "TC-LIFECYCLE-HELPER",
     ),
     (
+        "src/extras/schedule/mod.rs",
+        ".spawn()",
+        1,
+        "TC-SUPPORT-UTILITY",
+    ),
+    (
+        "src/extras/schedule/mod.rs",
+        "let mut command = Command::new(program);",
+        1,
+        "TC-SUPPORT-UTILITY",
+    ),
+    (
         "src/self_update.rs",
         "let mut child = command.spawn()?;",
         1,
@@ -3702,6 +3714,7 @@ const SINGLE_CLASS_FAMILIES: &[(&str, &str)] = &[
     ("src/extras/lsp/client.rs", "TC-LSP-SERVICE"),
     ("src/extras/mcp/client.rs", "TC-MCP-STDIO"),
     ("src/extras/mcp/server.rs", "TC-SUPPORT-UTILITY"),
+    ("src/extras/schedule/mod.rs", "TC-SUPPORT-UTILITY"),
     ("src/ui/input/mod.rs", "TC-SUPPORT-UTILITY"),
     ("src/ui/renderer.rs", "TC-SUPPORT-UTILITY"),
     ("src/ui/clipboard_image.rs", "TC-SUPPORT-UTILITY"),

@@ -6,6 +6,7 @@ pub(crate) mod context;
 pub(crate) mod cron;
 mod doctor;
 mod features;
+mod feedback;
 #[cfg(feature = "git-worktree")]
 pub(crate) mod git;
 mod help;
@@ -14,6 +15,7 @@ mod hooks;
 pub(crate) mod init;
 mod jobs;
 mod memory;
+mod plugins;
 #[cfg(feature = "subagents")]
 mod tasks;
 #[cfg(feature = "memory")]
@@ -1494,9 +1496,20 @@ pub(crate) async fn handle_slash(
             crate::startup::heap_future(|| session::handle(&path_parts, &mut ctx)).await
         }
         #[cfg(feature = "export")]
-        "/share" => crate::startup::heap_future(|| session::handle(&parts, &mut ctx)).await,
+        "/share" | "/unshare" => {
+            crate::startup::heap_future(|| session::handle(&parts, &mut ctx)).await
+        }
         "/context" => crate::startup::heap_future(|| context::handle(&parts, &mut ctx)).await,
         "/doctor" => in_one_frame(&mut ctx, |ctx| doctor::handle(&parts, ctx))?,
+        "/plugins" => {
+            in_one_frame(&mut ctx, |ctx| plugins::handle(&parts, ctx))?;
+            Ok(())
+        }
+        "/feedback" => feedback::handle_feedback(&parts, &mut ctx).await,
+        "/release-notes" => in_one_frame(&mut ctx, |ctx| {
+            feedback::handle_release_notes(&parts, ctx);
+            Ok(())
+        })?,
         "/jobs" => in_one_frame(&mut ctx, |ctx| jobs::handle(&parts, ctx))?,
         "/notices" => in_one_frame(&mut ctx, |ctx| {
             let notices = ctx.renderer.recent_notices();

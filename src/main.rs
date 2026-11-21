@@ -108,6 +108,51 @@ fn main() -> anyhow::Result<ExitCode> {
         }
         None => {}
     }
+    match extras::plugins::parse_invocation(&argv) {
+        Some(extras::plugins::Invocation::Run(command)) => {
+            let code = extras::plugins::run(command);
+            return Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)));
+        }
+        Some(extras::plugins::Invocation::Help) => {
+            println!("{}", extras::plugins::USAGE);
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some(extras::plugins::Invocation::Invalid(message)) => {
+            eprintln!("error: {message}\n\n{}", extras::plugins::USAGE);
+            return Ok(ExitCode::from(2));
+        }
+        None => {}
+    }
+    match extras::schedule::parse_invocation(&argv) {
+        Some(extras::schedule::Invocation::Run(command)) => {
+            let code = extras::schedule::run(command);
+            return Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)));
+        }
+        Some(extras::schedule::Invocation::Help) => {
+            println!("{}", extras::schedule::USAGE);
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some(extras::schedule::Invocation::Invalid(message)) => {
+            eprintln!("error: {message}\n\n{}", extras::schedule::USAGE);
+            return Ok(ExitCode::from(2));
+        }
+        None => {}
+    }
+    match setup::import::parse_invocation(&argv) {
+        Some(setup::import::Invocation::Run(import)) => {
+            let code = setup::import::run(import);
+            return Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)));
+        }
+        Some(setup::import::Invocation::Help) => {
+            println!("{}", setup::import::USAGE);
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some(setup::import::Invocation::Invalid(message)) => {
+            eprintln!("error: {message}\n\n{}", setup::import::USAGE);
+            return Ok(ExitCode::from(2));
+        }
+        None => {}
+    }
     let cli = cli::Cli::parse_command_line();
     if let Some(shell) = cli.completions {
         match cli::write_completions(shell, &mut std::io::stdout().lock()) {
@@ -1081,6 +1126,11 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
             }
             setup::SetupOutcome::Launch => {
                 // fall through to launch
+                if let Some(note) =
+                    dirs::home_dir().and_then(|home| setup::import::detection_note(&home))
+                {
+                    eprintln!("{note}");
+                }
             }
         }
     }
@@ -1144,10 +1194,13 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
                 .chain(&cli.add_workspace_dir)
                 .map(|dir| (dir.to_string_lossy().into_owned(), launch.clone())),
         );
-        for note in extras::skills::session::configure_extra_roots(
-            add_dirs,
-            entries("skills_plugin_dirs", &cfg.skills_plugin_dirs),
-        ) {
+        let mut plugin_dirs = entries("skills_plugin_dirs", &cfg.skills_plugin_dirs);
+        plugin_dirs.extend(
+            extras::plugins::installed_skill_dirs(&app_paths.data_dir.join("plugins"))
+                .into_iter()
+                .map(|dir| (dir.to_string_lossy().into_owned(), launch.clone())),
+        );
+        for note in extras::skills::session::configure_extra_roots(add_dirs, plugin_dirs) {
             eprintln!("warning: {note}");
         }
         let home = paths::process_home_dir();

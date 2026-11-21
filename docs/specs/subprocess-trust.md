@@ -657,7 +657,7 @@ The audit currently resolves as follows:
 | `TC-MCP-STDIO` | Tokio process import/types and the guarded `CommandWrap` spawn in `src/extras/mcp/client.rs`, and the guarded `CommandWrap` spawn of the `headersHelper` command in `src/extras/mcp/headers_helper.rs`. |
 | `TC-LSP-SERVICE` | Tokio child/stdin types (including the transport guard's owned stdin lock and writer accessor), constructor, and terminal spawn in `src/extras/lsp/client.rs`. |
 | `TC-INTERNAL-GIT` | The Tokio constructor/import in `src/extras/git_worktree/mod.rs` and the shared hardened runner in `src/git/runner.rs`, used by the background session-status refresh, the headless change baseline, and the explicit-workspace `/undo stash` helper in `src/ui/mod.rs`. |
-| `TC-SUPPORT-UTILITY` | Direct-argv sites: pager in `src/docs.rs`, lazygit in `src/ui/app.rs`, opener/clipboard constructors in `src/ui/renderer.rs`, fixed image-clipboard constructors in `src/ui/clipboard_image.rs`, the fixed macOS version probe in `src/sandbox/worker/macos.rs`, the `gh attestation verify` check and staged-binary `--version` probe in `src/self_update.rs`, and the opt-in `--mcp-server` relaunch in `src/extras/mcp/server.rs` (this executable, the operator's own flags, then `-p -- <prompt>` with the MCP client's prompt as one literal argv element; the child applies its ordinary headless sandbox and permission policy). Opaque editor-shell sites: `src/ui/input/mod.rs` and `src/ui/slash/memory.rs`. The Windows `ShellExecuteW` URL opener in `src/ui/renderer.rs` is `NON-PROCESS` and has no command-interpreter fallback. |
+| `TC-SUPPORT-UTILITY` | Direct-argv sites: pager in `src/docs.rs`, lazygit in `src/ui/app.rs`, opener/clipboard constructors in `src/ui/renderer.rs`, fixed image-clipboard constructors in `src/ui/clipboard_image.rs`, the fixed macOS version probe in `src/sandbox/worker/macos.rs`, the `gh attestation verify` check and staged-binary `--version` probe in `src/self_update.rs`, the fixed-grammar `mini-agent schedule` launcher in `src/extras/schedule/mod.rs` (`launchctl`, `systemctl --user`, `schtasks` with generated argv, `git clone` for `mini-agent plugin install`, and the scheduled `mini-agent -p ... -- <prompt>` self-relaunch run by `schedule run`; one direct-argv site with null stdin, stdout/stderr to a log file or null, its own process group, a deadline that kills the group, no shell), and the opt-in `--mcp-server` relaunch in `src/extras/mcp/server.rs` (this executable, the operator's own flags, then `-p -- <prompt>` with the MCP client's prompt as one literal argv element; the child applies its ordinary headless sandbox and permission policy). Opaque editor-shell sites: `src/ui/input/mod.rs` and `src/ui/slash/memory.rs`. The Windows `ShellExecuteW` URL opener in `src/ui/renderer.rs` is `NON-PROCESS` and has no command-interpreter fallback. |
 | `TC-INTERNAL-VERIFICATION` | Fixed Windows AppContainer runtime probe constructors/terminals in `src/sandbox/windows.rs`. |
 | `TC-LIFECYCLE-HELPER` | Shared bounded captured-process terminal and in-process Unix process-group signalling in `src/sandbox.rs`, and the forwarder's final `exec` of the already-selected contained command in `src/sandbox/net_forwarder.rs`. Caller trust remains the caller's class; this helper grants no authority itself. |
 | `TC-CREDENTIAL-HELPER` | The user-configured credential command constructors and guarded spawns in `src/key_command.rs`. |
@@ -672,6 +672,25 @@ thread and one `task.spawn(async move {` actor on a test-only Tokio `JoinSet`
 for its bounded loopback HTTP server. Both exact occurrences are classified
 `NON-PROCESS` in both owning tables; the actor owns no subprocess and is
 joined on normal completion or aborted by its retained JoinSet on unwind.
+
+## Feature-ux launch additions (mini-agent-nvnkx.126, .134, .138, .55)
+
+* `src/extras/schedule/mod.rs::launch_process_with_env` is the only new production launch site. It is
+  `TC-SUPPORT-UTILITY` (direct argv, no shell, null stdin, output to a private log file or null, own
+  Unix process group killed at the deadline, creation guarded by `spawn_guarded`). Callers: OS
+  scheduler tools with a fixed grammar, `git clone --depth 1` with `protocol.ext.allow=never`,
+  `protocol.file.allow=never` and `GIT_TERMINAL_PROMPT=0` for plugin installs (https/ssh locations
+  only), and the scheduled headless turn, which relaunches this executable with the stored prompt as
+  one literal argv element after `--`. A schedule entry and its prompt are written by the user's own
+  `schedule add`; installing a plugin never launches anything it contains.
+* The command-backed status-bar segment (`.134`) and `gh auth token` (`.55`) reuse the existing
+  `TC-CREDENTIAL-HELPER` launcher in `src/key_command.rs` (`run_with`/`run_once`) and add no site.
+  Segment commands come only from the global configuration.
+* Plugin hooks and MCP servers add no launch path: they are written into the user's global
+  `settings.json`/`config.toml` only after `plugin trust` shows them and the user confirms, and then
+  run under the existing hook and MCP classes.
+* `/review --pr` and `--post` run `gh` only through the model's ordinary shell tool, behind the
+  shell permission prompt; `/feedback --open` uses the existing URL opener.
 
 ## Review and change rules
 

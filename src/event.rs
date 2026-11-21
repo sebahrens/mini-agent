@@ -403,9 +403,9 @@ pub enum UserEvent {
     /// A line for the user from a background component (a panicked task, a
     /// failed formatter): shown in the feed without touching the run state.
     Notice(String),
-    /// A background `/share confirm` upload finished: the gist URL or the error.
+    /// A background `/share confirm` upload finished: the gist or the error.
     #[cfg(feature = "export")]
-    ShareDone(Result<String, String>),
+    ShareDone(Result<crate::extras::export::GistShare, String>),
     /// Boxed: this variant carries a whole verification result, and
     /// `UserEvent` is held in the interactive future the startup path builds on
     /// the stack. A regression test runs the binary under the 1 MiB Windows

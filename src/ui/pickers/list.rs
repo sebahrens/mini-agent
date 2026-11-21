@@ -28,6 +28,7 @@ const BASE_COMMANDS: &[&str] = &[
     "/editsys",
     "/effort",
     "/expand",
+    "/feedback",
     "/find",
     "/fork",
     "/help",
@@ -45,6 +46,7 @@ const BASE_COMMANDS: &[&str] = &[
     "/new",
     "/notices",
     "/permissions",
+    "/plugins",
     "/prompt",
     "/provider",
     "/queue",
@@ -54,6 +56,7 @@ const BASE_COMMANDS: &[&str] = &[
     "/regen-prompts",
     "/reload",
     "/regen-themes",
+    "/release-notes",
     "/rename",
     "/retry",
     "/review",
@@ -132,6 +135,7 @@ fn build_available_commands() -> Vec<&'static str> {
         cmds.push("/export");
         cmds.push("/import");
         cmds.push("/share");
+        cmds.push("/unshare");
     }
 
     #[cfg(feature = "goal")]
@@ -180,6 +184,7 @@ pub(crate) fn reserved_command(name: &str) -> bool {
             "/export",
             "/import",
             "/share",
+            "/unshare",
             "/goal",
             "/worktree",
             "/wt-exit",
