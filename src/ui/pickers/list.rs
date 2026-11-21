@@ -45,6 +45,7 @@ const BASE_COMMANDS: &[&str] = &[
     "/new",
     "/notices",
     "/permissions",
+    "/plugins",
     "/prompt",
     "/provider",
     "/queue",

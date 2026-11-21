@@ -52,3 +52,4 @@ pub mod skills;
 pub(crate) mod truncate;
 
 pub(crate) mod schedule;
+pub(crate) mod plugins;

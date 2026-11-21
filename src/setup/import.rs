@@ -132,7 +132,7 @@ fn valid_server_name(name: &str) -> bool {
 }
 
 /// One `mcpServers` entry in Claude Code / `.mcp.json` shape.
-fn claude_server(name: &str, entry: &Json, plan: &mut Plan) {
+pub(crate) fn claude_server(name: &str, entry: &Json, plan: &mut Plan) {
     let Some(object) = entry.as_object() else {
         plan.unsupported.push(format!("MCP server '{name}': not an object"));
         return;

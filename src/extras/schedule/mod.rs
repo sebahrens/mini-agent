@@ -422,11 +422,14 @@ pub(crate) struct RunRecord {
 }
 
 /// The headless argv for one run: `mini-agent -p --session sched-<id> ... -- <prompt>`.
-pub(crate) fn turn_argv(exe: &Path, entry: &Entry) -> Vec<String> {
+///
+/// The first run creates the named session (`--name`); later runs, once one
+/// has succeeded, resume it (`--session`), so a schedule keeps its context.
+pub(crate) fn turn_argv(exe: &Path, entry: &Entry, resume: bool) -> Vec<String> {
     let mut argv = vec![
         exe.to_string_lossy().into_owned(),
         "-p".into(),
-        "--session".into(),
+        if resume { "--session" } else { "--name" }.into(),
         entry.session_name(),
     ];
     if let Some(mode) = &entry.permission_mode {
@@ -453,8 +456,12 @@ pub(crate) fn run_entry(
 ) -> Result<RunRecord, String> {
     let entry = store.load(id)?;
     let started = crate::session::rfc3339_utc(jiff::Timestamp::now());
+    let resume = std::fs::read_to_string(store.last_path(id))
+        .ok()
+        .and_then(|text| serde_json::from_str::<RunRecord>(&text).ok())
+        .is_some_and(|record| record.exit_code == Some(0));
     let outcome = launch(
-        &turn_argv(exe, &entry),
+        &turn_argv(exe, &entry, resume),
         Path::new(&entry.workspace),
         &store.log_path(id),
         Duration::from_secs(entry.timeout_secs),
@@ -485,11 +492,23 @@ pub(crate) fn launch_process(
     log: Option<&Path>,
     timeout: Duration,
 ) -> Result<(Option<i32>, bool), String> {
+    launch_process_with_env(argv, cwd, log, timeout, &[])
+}
+
+/// [`launch_process`] with extra environment variables for the child.
+pub(crate) fn launch_process_with_env(
+    argv: &[String],
+    cwd: Option<&Path>,
+    log: Option<&Path>,
+    timeout: Duration,
+    env: &[(&str, &str)],
+) -> Result<(Option<i32>, bool), String> {
     use crate::process_creation::StdCommandCreationExt as _;
     use std::process::{Command, Stdio};
     let (program, args) = argv.split_first().ok_or("empty command")?;
     let mut command = Command::new(program);
     command.args(args).stdin(Stdio::null());
+    command.envs(env.iter().copied());
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
@@ -804,8 +823,9 @@ mod tests {
         let (root, store, host) = fixture();
         let new = parse_add(&["--daily", "07:30", "--prompt", "-rf the thing", "--workspace", "ws", "--permission-mode", "guarded", "--max-budget-usd", "3"]).unwrap();
         let entry = add(&store, &host, &mut Recording::default(), new, &root).unwrap();
-        let argv = turn_argv(Path::new("/x/mini-agent"), &entry);
-        assert_eq!(argv[..4], ["/x/mini-agent", "-p", "--session", &format!("sched-{}", entry.id)]);
+        let argv = turn_argv(Path::new("/x/mini-agent"), &entry, false);
+        assert_eq!(argv[..4], ["/x/mini-agent", "-p", "--name", &format!("sched-{}", entry.id)]);
+        assert_eq!(turn_argv(Path::new("/x"), &entry, true)[2], "--session");
         assert!(argv.windows(2).any(|w| w == ["--permission-mode", "guarded"]));
         assert!(argv.windows(2).any(|w| w == ["--max-budget-usd", "3"]));
         assert_eq!(argv[argv.len() - 2..], ["--", "-rf the thing"]);
@@ -830,6 +850,15 @@ mod tests {
         assert!(argv.contains(&"-p".to_owned()));
         let saved: RunRecord = serde_json::from_str(&std::fs::read_to_string(store.last_path(&entry.id)).unwrap()).unwrap();
         assert_eq!(saved, record);
+        assert!(argv.contains(&"--name".to_owned()));
+        // After a successful run the named session is resumed.
+        let mut second = Vec::new();
+        run_entry(&store, Path::new("/x"), &entry.id, &mut |argv, _, _, _| {
+            second = argv.to_vec();
+            Ok((Some(0), false))
+        })
+        .unwrap();
+        assert!(second.contains(&"--session".to_owned()));
         assert!(last_summary(&store, &entry.id).contains("exit 0"));
         let failed = run_entry(&store, Path::new("/x"), &entry.id, &mut |_, _, _, _| Err("could not start".into())).unwrap();
         assert!(failed.error.is_some() && failed.exit_code.is_none());

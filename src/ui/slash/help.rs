@@ -179,6 +179,10 @@ pub(crate) fn help_lines(
     );
     emit(
         false,
+        "  /plugins               list installed plugins (manage with `mini-agent plugin`)",
+    );
+    emit(
+        false,
         "  /feedback [text]       draft a redacted issue (--open opens the prefilled form)",
     );
     emit(

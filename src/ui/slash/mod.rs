@@ -6,6 +6,7 @@ pub(crate) mod context;
 pub(crate) mod cron;
 mod doctor;
 mod feedback;
+mod plugins;
 mod features;
 #[cfg(feature = "git-worktree")]
 pub(crate) mod git;
@@ -1508,6 +1509,10 @@ pub(crate) async fn handle_slash(
         }
         "/context" => crate::startup::heap_future(|| context::handle(&parts, &mut ctx)).await,
         "/doctor" => in_one_frame(&mut ctx, |ctx| doctor::handle(&parts, ctx))?,
+        "/plugins" => {
+            in_one_frame(&mut ctx, |ctx| plugins::handle(&parts, ctx))?;
+            Ok(())
+        }
         "/feedback" => feedback::handle_feedback(&parts, &mut ctx).await,
         "/release-notes" => in_one_frame(&mut ctx, |ctx| {
             feedback::handle_release_notes(&parts, ctx);
