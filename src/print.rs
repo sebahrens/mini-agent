@@ -2558,6 +2558,42 @@ pub(crate) fn persist_headless_turn_input(
     response: &str,
     interactions: &[Message],
 ) -> anyhow::Result<()> {
+    persist_headless_turn_rows(session, prompt, false, response, interactions)
+}
+
+/// Like [`persist_headless_turn`] for a turn the host started (an output
+/// schema repair): `note` is stored as a System row, never as a user prompt,
+/// so a resumed session does not read it as the user's words.
+pub(crate) fn persist_headless_host_turn(
+    session: &mut Session,
+    note: &str,
+    response: &str,
+    interactions: &[Message],
+) {
+    let start = session.messages.len();
+    if let Err(error) = persist_headless_turn_rows(
+        session,
+        &crate::agent::input::PromptInput::text(note.to_owned()),
+        true,
+        response,
+        interactions,
+    ) {
+        tracing::warn!(%error, "canonical user-content projection was incomplete");
+        session.truncate_to(start);
+        session.add_message(MessageRole::System, note);
+        if !response.is_empty() {
+            session.add_message(MessageRole::Assistant, response);
+        }
+    }
+}
+
+fn persist_headless_turn_rows(
+    session: &mut Session,
+    prompt: &crate::agent::input::PromptInput,
+    host_note: bool,
+    response: &str,
+    interactions: &[Message],
+) -> anyhow::Result<()> {
     // Only host gates produce leading System notices in an observed turn.
     // Persist their append-only transcript representation before the exact
     // initial User so reload/native feed order matches the actual request.
@@ -2571,7 +2607,9 @@ pub(crate) fn persist_headless_turn_input(
         }
     }
     let interactions = &interactions[notices..];
-    if let Some(user) = prompt.persisted_user() {
+    if host_note {
+        session.add_message(MessageRole::System, prompt.literal_text());
+    } else if let Some(user) = prompt.persisted_user() {
         session.add_user_message(user.clone());
     } else {
         session.add_message(MessageRole::User, prompt.literal_text());
@@ -3680,6 +3718,37 @@ mod headless_goal_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_schema_repair_turn_is_a_system_note_not_a_user_prompt() {
+        // mini-agent-sskdu.193
+        let mut session = super::Session::new("anthropic", "claude-sonnet-5-5", 200_000, "test");
+        super::persist_headless_turn(&mut session, "answer the question", "\"wrong\"", &[]);
+        super::persist_headless_host_turn(
+            &mut session,
+            "JSON repair 1: expected integer",
+            "42",
+            &[],
+        );
+        let rows: Vec<(super::MessageRole, String)> = session
+            .messages
+            .iter()
+            .map(|message| (message.role.clone(), message.content.to_string()))
+            .collect();
+        assert_eq!(
+            rows.iter()
+                .filter(|(role, _)| *role == super::MessageRole::User)
+                .count(),
+            1,
+            "{rows:?}"
+        );
+        assert!(rows.contains(&(
+            super::MessageRole::System,
+            "JSON repair 1: expected integer".to_string()
+        )));
+        assert_eq!(rows.last().unwrap().1, "42");
+        assert!(rows.iter().all(|(_, text)| !text.contains("Schema:")));
+    }
+
     #[test]
     fn compactions_are_reported_once_and_only_when_they_happened() {
         // mini-agent-sskdu.243

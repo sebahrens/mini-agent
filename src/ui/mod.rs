@@ -1284,6 +1284,7 @@ pub(crate) async fn git_stash_in_workspace(
             crate::git::runner::LOCAL_MUTATION_LIMITS,
         )
         .await
+        .map_err(String::from)
 }
 
 /// Result of a background agent prebuild.

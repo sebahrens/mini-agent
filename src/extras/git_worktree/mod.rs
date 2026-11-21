@@ -314,9 +314,9 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    worktree_runner()
+    Ok(worktree_runner()
         .run(repo_path, operation, args, QUERY_LIMITS)
-        .await
+        .await?)
 }
 
 async fn run_local<I, S>(
@@ -328,9 +328,9 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    worktree_runner()
+    Ok(worktree_runner()
         .run(repo_path, operation, args, LOCAL_MUTATION_LIMITS)
-        .await
+        .await?)
 }
 
 async fn run_network<I, S>(
@@ -342,9 +342,9 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    worktree_runner()
+    Ok(worktree_runner()
         .run_network(repo_path, operation, args, NETWORK_LIMITS)
-        .await
+        .await?)
 }
 
 async fn current_branch_at(repo_path: &Path) -> Result<Option<String>, String> {
@@ -359,7 +359,7 @@ async fn current_branch_at(repo_path: &Path) -> Result<Option<String>, String> {
     match output.exit_status.and_then(|status| status.code()) {
         Some(0) => {}
         Some(1) => return Ok(None),
-        _ => return Err(command_failure("current-branch", &output)),
+        _ => return Err(command_failure("current-branch", &output).into()),
     }
     let branch = String::from_utf8_lossy(trim_line(&output.stdout)).into_owned();
     Ok(Some(branch))
@@ -380,7 +380,7 @@ async fn target_has_pull_configuration(repo_path: &Path, target: &str) -> Result
     match output.exit_status.and_then(|status| status.code()) {
         Some(0) => Ok(true),
         Some(1) => Ok(false),
-        _ => Err(command_failure("target-upstream", &output)),
+        _ => Err(command_failure("target-upstream", &output).into()),
     }
 }
 
@@ -892,17 +892,18 @@ async fn supervise_create(
     }
 }
 
-async fn await_create_step<T, F>(
+async fn await_create_step<T, E, F>(
     response_tx: &mut oneshot::Sender<CreateResponse>,
     future: F,
 ) -> Result<T, CreateStepError>
 where
-    F: Future<Output = Result<T, String>>,
+    E: Into<String>,
+    F: Future<Output = Result<T, E>>,
 {
     tokio::select! {
         biased;
         _ = response_tx.closed() => Err(CreateStepError::CallerDropped),
-        result = future => result.map_err(CreateStepError::Command),
+        result = future => result.map_err(|error| CreateStepError::Command(error.into())),
     }
 }
 
@@ -918,21 +919,28 @@ async fn create_transaction(
         state.expected_branch_oid, state.ownership_ref, state.expected_branch_oid
     )
     .into_bytes();
-    match await_create_step(
-        response_tx,
-        worktree_runner().run_with_input(
-            &state.repo_path,
-            "create-branch-ref",
-            ["update-ref", "--stdin"],
-            reservation,
-            ref_limits,
-        ),
-    )
+    let mut reservation_failure = None;
+    match await_create_step(response_tx, async {
+        worktree_runner()
+            .run_with_input(
+                &state.repo_path,
+                "create-branch-ref",
+                ["update-ref", "--stdin"],
+                reservation,
+                ref_limits,
+            )
+            .await
+            .map_err(|error| {
+                reservation_failure = Some(error.kind());
+                error
+            })
+    })
     .await
     {
         Ok(_) => state.branch_reservation_owned = true,
         Err(CreateStepError::Command(error)) => {
-            state.branch_reservation_uncertain = reservation_error_is_uncertain(&error);
+            state.branch_reservation_uncertain =
+                reservation_failure.is_some_and(reservation_error_is_uncertain);
             return Err(CreateStepError::Command(error));
         }
         Err(CreateStepError::CallerDropped) => {
@@ -1008,9 +1016,8 @@ async fn create_transaction(
 
 /// Whether a failed branch reservation may still have created the branch: the
 /// command was cut off or could not be observed, as opposed to refused by Git.
-fn reservation_error_is_uncertain(error: &str) -> bool {
-    use crate::git::runner::GitRunError;
-    GitRunError::kind_is_uncertain(GitRunError::classify(error))
+fn reservation_error_is_uncertain(kind: crate::git::runner::GitRunErrorKind) -> bool {
+    crate::git::runner::GitRunError::kind_is_uncertain(kind)
 }
 
 async fn delete_owned_ref(
@@ -1019,14 +1026,14 @@ async fn delete_owned_ref(
     expected_oid: &str,
     operation: &'static str,
 ) -> Result<CommandOutput, String> {
-    worktree_runner()
+    Ok(worktree_runner()
         .run(
             repo_path,
             operation,
             ["update-ref", "--no-deref", "-d", reference, expected_oid],
             LOCAL_MUTATION_LIMITS,
         )
-        .await
+        .await?)
 }
 
 async fn rollback_failed_create(state: &CreateState, error: String) -> String {
@@ -1201,6 +1208,7 @@ async fn delete_create_refs(
         )
         .await
         .map(|_| ())
+        .map_err(String::from)
 }
 
 struct WorktreeRegistration {
@@ -1303,17 +1311,18 @@ async fn supervise_merge(
     }
 }
 
-async fn await_merge_step<T, F>(
+async fn await_merge_step<T, E, F>(
     response_tx: &mut oneshot::Sender<MergeResponse>,
     future: F,
 ) -> Result<T, MergeStepError>
 where
-    F: Future<Output = Result<T, String>>,
+    E: Into<String>,
+    F: Future<Output = Result<T, E>>,
 {
     tokio::select! {
         biased;
         _ = response_tx.closed() => Err(MergeStepError::CallerDropped),
-        result = future => result.map_err(MergeStepError::Command),
+        result = future => result.map_err(|error| MergeStepError::Command(error.into())),
     }
 }
 
@@ -1827,7 +1836,7 @@ async fn squash_and_commit(
         }
         Err(MergeStepError::Command(error)) => {
             let conflict = match await_merge_step(response_tx, async {
-                Ok(has_merge_conflict_at(main_repo_path).await)
+                Ok::<_, String>(has_merge_conflict_at(main_repo_path).await)
             })
             .await
             {
@@ -1839,7 +1848,7 @@ async fn squash_and_commit(
             };
             if conflict {
                 let files = match await_merge_step(response_tx, async {
-                    Ok(conflicted_files_at(main_repo_path).await)
+                    Ok::<_, String>(conflicted_files_at(main_repo_path).await)
                 })
                 .await
                 {
@@ -2063,6 +2072,7 @@ async fn compare_and_set_direct_ref(
         )
         .await
         .map(|_| ())
+        .map_err(String::from)
 }
 
 /// Create the stash commit without publishing it, then publish that exact OID
@@ -2587,6 +2597,7 @@ async fn verify_target_and_delete_source(
         )
         .await
         .map(|_| ())
+        .map_err(String::from)
 }
 
 #[cfg(test)]
@@ -2981,6 +2992,7 @@ pub(crate) async fn run_git_with_limits_for_test(
     worktree_runner()
         .run(&repo_path, "test", args, limits)
         .await
+        .map_err(String::from)
 }
 
 #[cfg(test)]
@@ -2994,6 +3006,7 @@ pub(crate) async fn run_locked_git_with_limits_for_test(
     worktree_runner()
         .run(&repo_path, "locked-test", args, limits)
         .await
+        .map_err(String::from)
 }
 
 #[cfg(test)]

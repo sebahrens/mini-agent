@@ -5,7 +5,7 @@ use rig::tool::Tool;
 use serde::Deserialize;
 
 use crate::agent::tools::{ToolError, check_perm, check_perm_bound_path};
-use crate::git::runner::{GitRunner, LOCAL_MUTATION_LIMITS, QUERY_LIMITS, command_result};
+use crate::git::runner::{GitRunError, GitRunner, LOCAL_MUTATION_LIMITS, QUERY_LIMITS, command_result};
 use crate::permission::ask::AskSender;
 use crate::permission::checker::PermCheck;
 use crate::sandbox::{CommandOutput, CommandStatus, Sandbox};
@@ -269,17 +269,18 @@ fn side_of_range(error: ToolError, side: &str) -> ToolError {
 }
 
 /// Adds the retry guidance to a timeout error.
-fn timeout_guidance(error: ToolError) -> ToolError {
+fn timeout_guidance(error: GitRunError) -> ToolError {
     match error {
-        ToolError::Msg(message)
-            if super::runner::GitRunError::classify(&message)
-                == super::runner::GitRunErrorKind::TimedOut =>
-        {
-            ToolError::Msg(format!(
-                "{message}; retry with a larger timeout_secs (at most {QUERY_TIMEOUT_MAX_SECS}) or narrow the query (revision range, paths, skip)"
-            ))
-        }
-        other => other,
+        GitRunError::TimedOut { .. } => ToolError::Msg(format!(
+            "{error}; retry with a larger timeout_secs (at most {QUERY_TIMEOUT_MAX_SECS}) or narrow the query (revision range, paths, skip)"
+        )),
+        other => other.into(),
+    }
+}
+
+impl From<GitRunError> for ToolError {
+    fn from(error: GitRunError) -> Self {
+        ToolError::Msg(error.to_string())
     }
 }
 
@@ -487,7 +488,7 @@ impl GitTool {
         args: Vec<String>,
         limits: crate::sandbox::CommandLimits,
         allow_nonzero_or_truncated: bool,
-    ) -> Result<CommandOutput, ToolError> {
+    ) -> Result<CommandOutput, GitRunError> {
         #[cfg(test)]
         if self.test_uncontained {
             let result = if allow_nonzero_or_truncated {
@@ -523,7 +524,7 @@ impl GitTool {
                     )
                     .await
             };
-            return result.map_err(ToolError::Msg);
+            return result;
         }
         self.runner
             .run_contained(
@@ -535,7 +536,6 @@ impl GitTool {
                 allow_nonzero_or_truncated,
             )
             .await
-            .map_err(ToolError::Msg)
     }
 
     async fn permission(
@@ -571,7 +571,7 @@ impl GitTool {
             .runner
             .run_contained_observed(&self.workspace, &self.sandbox, operation, args, limits)
             .await;
-        let output = output.map_err(ToolError::Msg)?;
+        let output = output.map_err(ToolError::from)?;
         match output.status {
             CommandStatus::TimedOut | CommandStatus::OutputLimitExceeded(_) => Ok(output),
             CommandStatus::Completed
@@ -581,7 +581,7 @@ impl GitTool {
                 Ok(output)
             }
             _ => {
-                command_result(operation, limits, output).map_err(ToolError::Msg)?;
+                command_result(operation, limits, output).map_err(ToolError::from)?;
                 Err(ToolError::Msg(format!("git {operation} failed")))
             }
         }
@@ -603,7 +603,7 @@ impl GitTool {
                     LOCAL_MUTATION_LIMITS,
                 )
                 .await
-                .map_err(ToolError::Msg);
+                .map_err(ToolError::from);
         }
         self.runner
             .run_contained_observed(
@@ -614,7 +614,7 @@ impl GitTool {
                 LOCAL_MUTATION_LIMITS,
             )
             .await
-            .map_err(ToolError::Msg)
+            .map_err(ToolError::from)
     }
 
     async fn run_with_input(
@@ -636,7 +636,7 @@ impl GitTool {
                     limits,
                 )
                 .await
-                .map_err(ToolError::Msg);
+                .map_err(ToolError::from);
         }
         self.runner
             .run_contained_with_input_observed(
@@ -648,7 +648,7 @@ impl GitTool {
                 limits,
             )
             .await
-            .map_err(ToolError::Msg)
+            .map_err(ToolError::from)
     }
 
     async fn validate_revision(&self, revision: &str) -> Result<(), ToolError> {
@@ -680,17 +680,15 @@ impl GitTool {
             // `rev-parse --verify --quiet` exits non-zero without a message
             // only for a name that does not resolve; any other failure
             // (not a repository, timeout, launch failure) is passed through.
-            ToolError::Msg(message)
-                if super::runner::GitRunError::classify(&message)
-                    == super::runner::GitRunErrorKind::Failed
-                    && message == "git validate-revision failed" =>
+            GitRunError::Failed { operation, stderr }
+                if operation == "validate-revision" && stderr.is_empty() =>
             {
                 ToolError::Msg(format!(
                     "unknown Git revision {}: it does not name a commit, tag, branch or other object here",
                     shown_revision(revision)
                 ))
             }
-            other => other,
+            other => other.into(),
         })
     }
 
@@ -809,7 +807,7 @@ impl GitTool {
         let output = if truncated {
             output
         } else {
-            command_result("status", STATUS_LIMITS, output).map_err(ToolError::Msg)?
+            command_result("status", STATUS_LIMITS, output).map_err(ToolError::from)?
         };
         let (records, changed_count, untracked_count) =
             parse_status_records(&output.stdout, truncated);
@@ -1016,7 +1014,7 @@ impl GitTool {
             )
             .await?;
         let output = command_result("check-filter-attributes", FILTER_PROBE_LIMITS, output)
-            .map_err(ToolError::Msg)?;
+            .map_err(ToolError::from)?;
         let fields = output.stdout.split(|byte| *byte == 0).collect::<Vec<_>>();
         // Every record is `path NUL attribute NUL value NUL`, so the split
         // leaves one empty trailing field.
@@ -1061,7 +1059,7 @@ impl GitTool {
             )
             .await?;
         let output = command_result("check-attributes", PAGED_TEXT_LIMITS, output)
-            .map_err(ToolError::Msg)?;
+            .map_err(ToolError::from)?;
         let fields = output
             .stdout
             .split(|byte| *byte == 0)
@@ -1103,16 +1101,13 @@ impl GitTool {
             .map_err(|error| match error {
                 // Only an output overflow is fixed by staging less at once; a
                 // timeout, cancellation or repository error is not.
-                ToolError::Msg(message)
-                    if super::runner::GitRunError::classify(&message)
-                        == super::runner::GitRunErrorKind::OutputLimit =>
-                {
+                GitRunError::OutputLimit { .. } => {
                     ToolError::Msg(format!(
-                        "{message}; the selection is too large to stage at once. Stage a narrower \
+                        "{error}; the selection is too large to stage at once. Stage a narrower \
                          set of subdirectories in separate calls."
                     ))
                 }
-                other => other,
+                other => other.into(),
             })?;
         Ok(output
             .stdout
@@ -3707,31 +3702,27 @@ mod tests {
     }
 
     #[test]
-    fn only_output_overflow_gets_the_narrower_selection_advice() {
-        use super::super::runner::{GitRunError, GitRunErrorKind};
-        let overflow = GitRunError::OutputLimit {
-            operation: "expand-stage-paths".into(),
-            limit: "Stdout".into(),
-        }
-        .to_string();
+    fn only_timeouts_get_the_retry_guidance() {
+        use super::{GitRunError, timeout_guidance};
         let timeout = GitRunError::TimedOut {
-            operation: "expand-stage-paths".into(),
+            operation: "log".into(),
             millis: 5,
-        }
-        .to_string();
-        assert_eq!(
-            GitRunError::classify(&overflow),
-            GitRunErrorKind::OutputLimit
-        );
-        assert_eq!(GitRunError::classify(&timeout), GitRunErrorKind::TimedOut);
-        // The timeout guidance matches on the kind, not on its wording.
-        use super::{ToolError, timeout_guidance};
-        let guided = timeout_guidance(ToolError::Msg(timeout.clone())).to_string();
+        };
+        let guided = timeout_guidance(timeout).to_string();
         assert!(guided.contains("timeout_secs"), "{guided}");
-        assert_eq!(
-            timeout_guidance(ToolError::Msg(overflow.clone())).to_string(),
-            overflow
-        );
+        let overflow = GitRunError::OutputLimit {
+            operation: "log".into(),
+            limit: "Stdout".into(),
+        };
+        let plain = overflow.to_string();
+        assert_eq!(timeout_guidance(overflow).to_string(), plain);
+        // Git's own stderr that mentions a timeout is not a timed-out command.
+        let refused = GitRunError::Failed {
+            operation: "log".into(),
+            stderr: "fatal: timed out after waiting".into(),
+        };
+        let plain = refused.to_string();
+        assert_eq!(timeout_guidance(refused).to_string(), plain);
     }
 
     #[tokio::test]
