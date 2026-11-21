@@ -50,6 +50,15 @@ impl PromptInput {
         self.turn_directive = directive.and_then(bounded_turn_directive);
         self
     }
+    /// Like [`Self::with_turn_directive`] for host-owned text that is already
+    /// bounded by its producer (the `--output-schema` contract, at most 64 KiB):
+    /// blank is dropped, the 1 KiB routing budget does not apply.
+    pub(crate) fn with_host_turn_directive(mut self, directive: Option<String>) -> Self {
+        self.turn_directive = directive
+            .map(|directive| directive.trim().to_owned())
+            .filter(|directive| !directive.is_empty());
+        self
+    }
     /// Mark (or, with `None`, unmark) this turn so its first model request
     /// forces `tool`. See [`PromptInput::first_request_tool`].
     #[cfg(feature = "subagents")]
@@ -234,6 +243,21 @@ mod tests {
         assert_eq!(
             prompt.with_turn_directive(None).to_message(),
             plain.to_message()
+        );
+    }
+
+    #[test]
+    fn host_directive_is_unbounded_but_stays_out_of_the_literal_text() {
+        let long = "s".repeat(TURN_DIRECTIVE_MAX_BYTES * 4);
+        let prompt = PromptInput::text("question".into())
+            .with_host_turn_directive(Some(format!("  {long}  ")));
+        assert_eq!(prompt.turn_directive(), Some(long.as_str()));
+        assert_eq!(prompt.literal_text(), "question");
+        assert!(
+            PromptInput::text("x".into())
+                .with_host_turn_directive(Some("  ".into()))
+                .turn_directive()
+                .is_none()
         );
     }
 

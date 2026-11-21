@@ -54,18 +54,16 @@ You are an expert coding assistant operating non-interactively. Use only the too
 - Do not end with a question: no reply can arrive during this run. Report any blocker, the assumption or missing authority, and the work already verified.
 - Be concise but provide the complete final report: outcome, material changes, verification evidence, and remaining risk. Omit generic preambles.";
 
+/// Routing only: the runtime contract (strict script, fresh runtime, top-level
+/// `await`, result encoding) lives in the `js` tool description.
 pub const JS_TOOL_PROMPT: &str = "\n\n## JavaScript execution\n\
 When available, use file tools for direct file lookup and process tools for repository toolchains, \
 builds, and tests. Use **js** for computation, parsing, data transformation, control \
 flow, or portable multi-step automation. Prefer JavaScript over shell-hosted Python. Use Python only when the user requests \
 Python, the task specifically depends on its ecosystem, or JavaScript cannot satisfy the task. \
 When retrieved skill guidance names a JavaScript export, reuse that callable global instead of reimplementing it. \
-JavaScript runs in strict mode in a fresh runtime on every call and supports top-level `await`; \
-its host globals are synchronous, so awaiting them is optional. No JavaScript state persists \
-between calls. When several known files must be read and aggregated, do the bounded reads and \
-computation together in one `js` call. End the script with an expression that evaluates to a string or plain JSON-compatible value; explicitly \
-use `JSON.stringify(value)` for Date, Map, Set, class instances, or objects containing \
-`undefined`, NaN/Infinity, holes, or accessors.";
+When several known files must be read and aggregated, do the bounded reads and \
+computation together in one `js` call.";
 
 pub const READ_TOOL_PROMPT: &str = "\n\
 - **read** reads file contents. Repeated reads of the same path/offset/limit are blocked until the \
@@ -163,14 +161,11 @@ mod tests {
     fn system_prompt_prefers_javascript_and_limits_python_fallback() {
         assert!(JS_TOOL_PROMPT.contains("for computation"));
         assert!(JS_TOOL_PROMPT.contains("Use Python only when the user requests"));
-        assert!(JS_TOOL_PROMPT.contains("supports top-level `await`"));
-        assert!(JS_TOOL_PROMPT.contains("strict mode in a fresh runtime"));
-        assert!(JS_TOOL_PROMPT.contains("No JavaScript state persists"));
         assert!(JS_TOOL_PROMPT.contains("several known files"));
-        assert!(JS_TOOL_PROMPT.contains("plain JSON-compatible value"));
-        assert!(!JS_TOOL_PROMPT.contains("Return a"));
         assert!(!JS_TOOL_PROMPT.contains("version-control"));
-        assert!(JS_TOOL_PROMPT.contains("`JSON.stringify(value)`"));
+        // The contract is stated once, in the tool description.
+        assert!(!JS_TOOL_PROMPT.contains("strict mode"));
+        assert!(!JS_TOOL_PROMPT.contains("Return a"));
         assert!(!SYSTEM_PROMPT.contains("**js**"));
         assert!(!SYSTEM_PROMPT.contains("**read**"));
     }

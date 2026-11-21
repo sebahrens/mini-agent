@@ -1282,12 +1282,12 @@ pub(crate) async fn start_main_run(
 /// Register the turn-scoped `schedule_wakeup` tool when the scheduler armed
 /// [`AgentRunState::cron_wakeup`] for this turn; a no-op otherwise.
 async fn register_cron_wakeup(run: &mut AgentRunState) -> anyhow::Result<()> {
-    if let Some(slot) = run.cron_wakeup.as_ref()
+    if let Some(cell) = run.cron_wakeup_cell.as_ref()
         && let Some(agent) = run.agent.as_ref()
     {
         agent
             .add_turn_tool(crate::agent::tools::schedule_wakeup::ScheduleWakeup::new(
-                slot.clone(),
+                cell.clone(),
             ))
             .await?;
     }
@@ -1421,9 +1421,9 @@ pub(crate) async fn start_main_run_with_directive(
     ensure_agent(&mut run.agent, ui, slash.reasoning_enabled).await;
     // A self-paced `/cron` fire offers `schedule_wakeup` on the exact agent
     // this turn runs (after any rebuild above), before its first request.
-    if matches!(question_origin, crate::question::QuestionOrigin::Scheduled) {
-        register_cron_wakeup(run).await?;
-    }
+    // Every turn re-registers it (idempotent) while a self-paced entry exists,
+    // so a rebuilt agent keeps the same tool list as the one it replaced.
+    register_cron_wakeup(run).await?;
     run.request_tool_results_cleared = ui
         .session
         .tool_results_cleared_for_retention(ui.cfg.resolve_keep_recent_tool_results());

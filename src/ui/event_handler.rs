@@ -353,8 +353,8 @@ pub async fn handle_agent_event(
                 pending.record_tool_output(path);
             }
             save_session_if_settled(ui.session, ui.cli, run, renderer)?;
-            if crate::agent::runner::is_tool_loop_notice(&output) {
-                // The following ToolLoop event renders the diagnostic with a
+            if std::mem::take(&mut run.loop_guard_result_pending) {
+                // The preceding ToolLoop event renders the diagnostic with a
                 // dedicated style; keep this event for canonical persistence.
             } else if name == "todo_write" {
                 renderer.write_line_after(&id, &sanitize_output(&output), C_TOOL)?;
@@ -369,6 +369,7 @@ pub async fn handle_agent_event(
         }
         AgentEvent::ToolLoop { name, message } => {
             run.was_reasoning = false;
+            run.loop_guard_result_pending = true;
             finalize_response_segment(renderer, run)?;
             if run.agent_line_started {
                 renderer.write_line("", Color::White)?;

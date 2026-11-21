@@ -511,6 +511,9 @@ impl PendingMainTurn {
 /// stream and abort handle, queued user input, and streaming-response scratch.
 #[derive(Default)]
 pub(crate) struct AgentRunState {
+    /// A `ToolLoop` notice arrived for the result that follows; that result
+    /// is persisted but not rendered (the notice is the diagnostic).
+    pub(crate) loop_guard_result_pending: bool,
     pub(crate) native_checkpointed: bool,
     pub(crate) native_session_end: Option<crate::provider::NativeSessionEndOwner>,
     /// Current native actor's exact writer and prepared-history binding.
@@ -543,6 +546,10 @@ pub(crate) struct AgentRunState {
     /// turn-scoped `schedule_wakeup` tool bound to this slot on the agent it
     /// runs, and the scheduler removes the tool when that turn ends.
     pub(crate) cron_wakeup: Option<crate::agent::tools::schedule_wakeup::WakeupSlot>,
+    /// Present while a self-paced `/cron` entry exists: the tool stays
+    /// registered on the agent (every turn, rebuilds included) so the request's
+    /// tool list is stable; only the cell's armed slot changes per fire.
+    pub(crate) cron_wakeup_cell: Option<crate::agent::tools::schedule_wakeup::WakeupCell>,
     /// Typed marker armed with `next_turn_directive` for an `@agent` mention
     /// turn when `agent_mention_tool_choice = "force"`: the tool the turn's
     /// first model request must call. Taken by the same start attempt.

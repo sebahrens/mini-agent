@@ -1390,14 +1390,14 @@ impl Tool for JobStatusTool {
                 "input": {
                     "type": "string",
                     "maxLength": 16384,
-                    "description": "Only with action=input: text written to the job's terminal as typed, at most 16384 bytes; include \\n to press Enter. The text is permission-checked like a shell command, together with any unterminated line already typed. C0 control characters other than newline and carriage return (Tab, Ctrl-U, Ctrl-C, backspace, ESC, DEL) are refused because a terminal would act on them (completion, line editing, signals); so are history expansions (`!` followed by text, a line starting with `^`). Use keys for Ctrl-C, Ctrl-D, Esc and arrows. Writing gives up after 5 seconds if the program is not reading; the result shows the output produced until it goes quiet (at most 3 seconds)."
+                    "description": "Only with action=input: text typed into the pty=true job's terminal (at most 16384 bytes; include \\n to press Enter), permission-checked like a shell command. Control characters other than newline and carriage return, and history expansions, are refused; use keys for Ctrl-C, Ctrl-D, Esc and arrows. Writing gives up after 5 seconds if the program is not reading; the result shows the output produced until it goes quiet (at most 3 seconds)."
                 },
                 "keys": {
                     "type": "array",
                     "minItems": 1,
                     "maxItems": MAX_JOB_KEYS,
                     "items": {"type": "string", "enum": JobKey::NAMES},
-                    "description": "Only with action=input, instead of input: named keys pressed in order (ctrl_c interrupts the foreground program, ctrl_d sends EOF, ctrl_z suspends it, ctrl_l redraws the screen, plus esc, arrows, page_up, page_down, home, end, delete, shift_tab, f1..f12, tab, enter, backspace for pagers, TUIs and REPLs). The tool renders the bytes. ctrl_c and ctrl_d are always allowed; enter judges the typed line like input; cursor, history, function and esc keys make the line unknowable so the next enter is judged as an opaque edited line (use ctrl_c to clear it); tab on a partly typed line is refused."
+                    "description": "Only with action=input, instead of input: named keys pressed in order, for pagers, TUIs and REPLs. ctrl_c and ctrl_d are always allowed; enter is judged like input; cursor, history, function and esc keys make the line unknowable so the next enter is judged as an opaque edited line (ctrl_c clears it); tab on a partly typed line is refused."
                 },
                 "timeout_ms": {
                     "type": "integer",

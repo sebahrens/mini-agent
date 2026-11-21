@@ -255,9 +255,35 @@ impl PreambleSnapshot {
 struct PreambleComposition {
     text: String,
     parts: Vec<(&'static str, std::ops::Range<usize>)>,
+    /// Byte offset where the user-owned tail (active goal, `SUFFIX.md`) begins.
+    /// Built-in sections added later are inserted here so the suffix stays the
+    /// very end of the prompt.
+    tail_start: usize,
 }
 
 impl PreambleComposition {
+    /// Insert a built-in section before the goal/suffix tail, keeping the
+    /// recorded part ranges consistent.
+    fn insert_before_tail(&mut self, label: &'static str, section: &str) {
+        if section.is_empty() {
+            return;
+        }
+        let at = self.tail_start;
+        let len = section.len();
+        self.text.insert_str(at, section);
+        let index = self
+            .parts
+            .iter()
+            .position(|(_, range)| range.start >= at)
+            .unwrap_or(self.parts.len());
+        for (_, range) in &mut self.parts[index..] {
+            range.start += len;
+            range.end += len;
+        }
+        self.parts.insert(index, (label, at..at + len));
+        self.tail_start += len;
+    }
+
     fn snapshot(&self) -> PreambleSnapshot {
         PreambleSnapshot {
             tokens: crate::session::Session::estimate_tokens(&self.text),
@@ -469,6 +495,9 @@ fn compose_preamble(
         preamble.push_str(appended);
     }
     record_part(&mut parts, &preamble, "Appended system prompt");
+    // Unconditional: skill context can be injected per turn even when
+    // `skills_search` is not offered, and native (signed-prefix) sessions
+    // require this static policy in the captured system prompt.
     #[cfg(feature = "agent-skills")]
     {
         preamble.push_str(crate::extras::skills::selection::POLICY);
@@ -479,6 +508,7 @@ fn compose_preamble(
         crate::extras::memory::append_memory_block(&mut preamble, context.memory.as_deref());
     }
     record_part(&mut parts, &preamble, "Memory");
+    let tail_start = preamble.len();
     // The active objective. Static for the goal's life so the cached prompt
     // prefix does not move between rounds.
     if let Some(block) = goal_block {
@@ -494,6 +524,7 @@ fn compose_preamble(
     PreambleComposition {
         text: preamble,
         parts,
+        tail_start,
     }
 }
 
@@ -622,12 +653,13 @@ fn compose_registered_preamble(
             sections.push_str(crate::agent::prompt::LSP_MUTATION_PROMPT);
         }
     }
+    let mut guidance = String::new();
     if !bullets.is_empty() {
-        composition.text.push_str("\n\n## Tools");
-        composition.text.push_str(&bullets);
+        guidance.push_str("\n\n## Tools");
+        guidance.push_str(&bullets);
     }
-    composition.text.push_str(&sections);
-    record_part(&mut composition.parts, &composition.text, "Tool guidance");
+    guidance.push_str(&sections);
+    composition.insert_before_tail("Tool guidance", &guidance);
     composition
 }
 
@@ -1742,26 +1774,13 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
     );
     #[cfg(feature = "mcp")]
     if !discovery_index.is_empty() {
-        composition.text.push_str(&discovery_index);
-        record_part(
-            &mut composition.parts,
-            &composition.text,
-            "Deferred MCP tool index",
-        );
+        composition.insert_before_tail("Deferred MCP tool index", &discovery_index);
     }
     #[cfg(feature = "mcp")]
     if cli.tools.is_empty()
         && let Some(manager) = mcp_manager
     {
-        let section = manager.instructions_section();
-        if !section.is_empty() {
-            composition.text.push_str(&section);
-            record_part(
-                &mut composition.parts,
-                &composition.text,
-                "MCP server instructions",
-            );
-        }
+        composition.insert_before_tail("MCP server instructions", &manager.instructions_section());
     }
     if let Some(instructions) = &instructions {
         let overlay = instructions.initial_overlay();
@@ -1770,23 +1789,12 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
                 .iter()
                 .any(|name| registered_tools.contains(name))
         {
-            composition
-                .text
-                .push_str(crate::context::instructions::POLICY);
-            record_part(
-                &mut composition.parts,
-                &composition.text,
+            composition.insert_before_tail(
                 "Workspace instruction policy",
+                crate::context::instructions::POLICY,
             );
         }
-        if !overlay.is_empty() {
-            composition.text.push_str(&overlay);
-            record_part(
-                &mut composition.parts,
-                &composition.text,
-                "Root instruction includes",
-            );
-        }
+        composition.insert_before_tail("Root instruction includes", &overlay);
     }
     let mut snapshot = composition.snapshot();
     snapshot.instruction_sources = instructions.clone();
@@ -3054,6 +3062,66 @@ mod js_tests {
         let tools = preamble.find("## Tools").unwrap();
         assert!(preamble.find("- **write**").unwrap() > tools);
         assert!(preamble.find("- **shell**").unwrap() > tools);
+    }
+
+    /// Built-in tool definitions have a size budget like MCP tools do: a
+    /// definition is paid for in every request. Tools above the default budget
+    /// are listed with their own ceiling; raising one needs a reason here.
+    #[tokio::test]
+    async fn built_in_tool_definitions_stay_within_their_size_budgets() {
+        const DEFAULT_BUDGET: usize = 4096;
+        let workspace = workspace_binding();
+        let sandbox = shell_sandbox();
+        let cli = crate::cli::Cli::default();
+        let agent = test_main_agent(&cli, sandbox, workspace).await;
+        let definitions = agent.tool_server_handle.get_tool_defs(None).await.unwrap();
+        for definition in &definitions {
+            let size = definition.description.len() + definition.parameters.to_string().len();
+            let budget = match definition.name.as_str() {
+                "js" => 11_000,
+                "task" => 9_000,
+                "git" => 7_000,
+                "shell" | "read" | "job_status" | "lsp_navigate" | "grep" | "find_files" => 6_500,
+                _ => DEFAULT_BUDGET,
+            };
+            assert!(
+                size <= budget,
+                "{} is {size} bytes (budget {budget})",
+                definition.name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn built_in_sections_precede_the_user_tail() {
+        let workspace = workspace_binding();
+        let sandbox = shell_sandbox();
+        let compose = |tools: &[&str]| {
+            super::compose_registered_preamble(
+                &empty_context(),
+                false,
+                workspace.root(),
+                &sandbox,
+                tools,
+                &crate::cli::Cli::default(),
+                Some("GOAL_TAIL"),
+            )
+        };
+        let mut composition = compose(&["write", "shell"]);
+        composition.insert_before_tail("Test section", "\n\nEXTRA_SECTION");
+        assert!(composition.text.ends_with("GOAL_TAIL"));
+        assert!(composition.text.find("EXTRA_SECTION") < composition.text.find("GOAL_TAIL"));
+        assert!(composition.text.find("## Tools") < composition.text.find("GOAL_TAIL"));
+        for (label, range) in &composition.parts {
+            assert!(range.end <= composition.text.len(), "{label}");
+        }
+        #[cfg(feature = "agent-skills")]
+        {
+            let policy = crate::extras::skills::selection::POLICY;
+            // Part of the static base, and before the user tail.
+            assert!(composition.text.contains(policy));
+            assert!(composition.text.find(policy) < composition.text.find("GOAL_TAIL"));
+        }
     }
 
     #[tokio::test]

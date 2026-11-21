@@ -2870,14 +2870,13 @@ impl Startup {
     }
 
     async fn dispatch_print_inner(&mut self) -> anyhow::Result<()> {
-        let mut msg = self.cli.message.join(" ").trim().to_string();
+        let msg = self.cli.message.join(" ").trim().to_string();
         #[cfg_attr(not(feature = "multimodal"), allow(unused_variables))]
         let media = self.take_headless_media(msg.starts_with('!'))?;
         let schema = self.cli.loaded_output_schema.clone();
-        if let Some(schema) = &schema {
-            msg.push_str("\n\n");
-            msg.push_str(&schema.instructions());
-        }
+        // The schema contract is host text for this request only: a directive
+        // keeps it out of the saved prompt, hooks, title and chat history.
+        let schema_directive = schema.as_ref().map(|schema| schema.instructions());
         let output = crate::print::HeadlessOutputPolicy::from_cli(&self.cli);
         let json_output = output.format != OutputFormat::Text;
         let identity = (self.session.id.to_string(), self.session.name.to_string());
@@ -3141,7 +3140,15 @@ impl Startup {
             // state it did when it was taken before MCP connect.
             let change_baseline = join_change_baseline(baseline_task).await;
             #[cfg(feature = "subagents")]
-            let agent = agent.with_headless_turn_directive(self.headless_agent_directive.take());
+            let agent_directive = self.headless_agent_directive.take();
+            #[cfg(not(feature = "subagents"))]
+            let agent_directive: Option<String> = None;
+            let agent = agent.with_headless_turn_directive(
+                match (agent_directive, schema_directive.clone()) {
+                    (Some(first), Some(second)) => Some(format!("{first}\n\n{second}")),
+                    (first, second) => first.or(second),
+                },
+            );
             #[cfg(all(feature = "hooks", feature = "mcp"))]
             if let Some(scope) = crate::agent::runner::current_hook_work_scope() {
                 scope.set_hook_mcp_peers(

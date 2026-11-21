@@ -643,15 +643,18 @@ held-out skill tests) keep the strict 64 KiB contract and fail with
 ## Turn-scoped cron tool
 
 `schedule_wakeup` (`src/agent/tools/schedule_wakeup.rs`) is the one tool that
-is registered per turn rather than at agent build. When a self-paced `/cron`
-schedule fires, the TUI arms `AgentRunState::cron_wakeup`, and the
-`QuestionOrigin::Scheduled` start (`start_main_run_with_directive`) adds the
-tool to the agent's shared tool server (`AnyAgent::add_turn_tool`) after the
-agent is resolved and before the first request; a mid-turn context-relief
-respawn adds it again. `App::settle_dynamic_cron_turn` removes it
-(`AnyAgent::remove_turn_tool`) when that turn ends, is interrupted, or fails to
-start, before any queued input can start the next turn. Ordinary turns, interval
-fires, subagents and side questions (their own tool servers), headless `-p` and
+is registered at run time rather than at agent build. When a self-paced `/cron`
+schedule first fires, the TUI creates `AgentRunState::cron_wakeup_cell` and
+`start_main_run_with_directive` adds the tool to the agent's shared tool server
+(`AnyAgent::add_turn_tool`, idempotent) at the start of every turn while that
+cell exists, so a rebuilt agent keeps the same tool list. The tool list is part
+of the provider's cached prompt prefix, so it stays unchanged between cron and
+ordinary turns. The per-fire slot is armed in the cell for the fire's turn and
+disarmed by `App::settle_dynamic_cron_turn`; a call while no cron turn is armed
+returns "only valid in a turn started by a self-paced /cron schedule". The tool
+is removed (`AnyAgent::remove_turn_tool`) when the last self-paced entry ends at
+a turn settlement. Sessions with no self-paced entry,
+subagents and side questions (their own tool servers), headless `-p` and
 ACP never register it; the name is reserved against MCP shadowing and counts
 as non-mutating. Its parameters are `delay_secs` (integer, clamped to
 60..=3600), `reason` (string, kept as one line of at most 200 characters) and
