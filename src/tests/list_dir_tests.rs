@@ -1,24 +1,24 @@
-use crate::agent::tools::list_dir::format_size;
 use crate::agent::tools::{ListDirArgs, ListDirTool};
+use crate::byte_text::format_bytes;
 use rig::tool::Tool;
 
 #[test]
-fn format_size_preserves_unit_boundaries_and_fractional_units() {
+fn format_bytes_preserves_unit_boundaries_and_fractional_units() {
     for (bytes, expected) in [
         (0, "0 B"),
         (1, "1 B"),
         (512, "512 B"),
         (1023, "1023 B"),
-        (1024, "1.0 KB"),
-        (1536, "1.5 KB"),
-        (2048, "2.0 KB"),
-        (2560, "2.5 KB"),
-        (1_047_552, "1023.0 KB"),
-        (1_048_576, "1.0 MB"),
-        (1_073_741_824, "1.0 GB"),
-        (2_199_023_255_552, "2048.0 GB"),
+        (1024, "1.0 KiB"),
+        (1536, "1.5 KiB"),
+        (2048, "2.0 KiB"),
+        (2560, "2.5 KiB"),
+        (1_047_552, "1023.0 KiB"),
+        (1_048_576, "1.0 MiB"),
+        (1_073_741_824, "1.0 GiB"),
+        (2_199_023_255_552, "2048.0 GiB"),
     ] {
-        assert_eq!(format_size(bytes), expected, "bytes={bytes}");
+        assert_eq!(format_bytes(bytes), expected, "bytes={bytes}");
     }
 }
 

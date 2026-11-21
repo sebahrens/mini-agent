@@ -266,17 +266,9 @@ fn strip_schema(schema: &mut serde_json::Value, level: StripLevel) {
 }
 
 fn truncate_utf8_bytes(text: &str, max_bytes: usize, marker: &str) -> (String, bool) {
-    if text.len() <= max_bytes {
-        return (text.to_string(), false);
-    }
-    let prefix_budget = max_bytes.saturating_sub(marker.len());
-    let mut end = prefix_budget.min(text.len());
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    let mut bounded = text[..end].to_string();
-    bounded.push_str(marker);
-    (bounded, true)
+    let bounded = crate::byte_text::clip_with_marker(text, max_bytes, marker);
+    let truncated = matches!(bounded, std::borrow::Cow::Owned(_));
+    (bounded.into_owned(), truncated)
 }
 
 fn parse_arguments(args: &str) -> Result<Option<JsonObject>, McpToolError> {

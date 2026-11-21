@@ -529,7 +529,9 @@ fn package_from_generation(
         "generalized source exceeds the {MAX_SOURCE_BYTES}-byte proposal limit"
     );
     let description =
-        truncate_on_char_boundary(generated.description.trim(), MAX_DESCRIPTION_BYTES);
+        crate::byte_text::clip_to_bytes(generated.description.trim(), MAX_DESCRIPTION_BYTES)
+            .0
+            .to_string();
 
     assemble(
         source,
@@ -568,17 +570,6 @@ fn bounded_assertions(
         );
     }
     Ok(kept)
-}
-
-fn truncate_on_char_boundary(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
-        return text.to_string();
-    }
-    let mut end = limit;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text[..end].to_string()
 }
 
 /// Build the fallback package: the recorded source wrapped in an export, with

@@ -3128,10 +3128,7 @@ fn usage_nonnegative_difference(
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "shared API is intentionally dormant before its frontend consumer lands"
-)]
+#[cfg(test)]
 fn completed_stream_delta(
     messages: Option<Vec<Message>>,
     current_prompt: &str,
@@ -3908,10 +3905,6 @@ fn replay_call_identity(
 /// Canonical ACP projection retains actual empty assistant boundaries and
 /// optional non-Responses IDs; legacy/Responses identity safety stays intact.
 #[cfg(feature = "acp")]
-#[allow(
-    dead_code,
-    reason = "shared canonical adapter precedes its ACP session consumer"
-)]
 pub(crate) fn convert_canonical_history_with_tool_result_retention(
     session: &Session,
     keep_recent_tool_results: usize,
@@ -4551,11 +4544,8 @@ where
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-#[allow(
-    dead_code,
-    reason = "shared API is intentionally dormant before its frontend consumer lands"
-)]
 pub(crate) fn spawn_agent_paused_in_scope<M>(
     agent: Agent<M>,
     prompt: String,
@@ -4587,11 +4577,8 @@ where
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-#[allow(
-    dead_code,
-    reason = "shared API is intentionally dormant before its frontend consumer lands"
-)]
 pub(crate) fn spawn_agent_paused_in_scope_with_native_capture<M>(
     agent: Agent<M>,
     prompt: String,

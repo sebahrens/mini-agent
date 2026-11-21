@@ -54,7 +54,7 @@ impl App<'_> {
         self.renderer.write_line(
             &format!(
                 "uploading {} to gist.github.com… (Esc cancels)",
-                crate::agent::tools::list_dir::format_size(html.len() as u64)
+                crate::byte_text::format_bytes(html.len() as u64)
             ),
             C_AGENT,
         )?;

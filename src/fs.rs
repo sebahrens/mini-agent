@@ -563,10 +563,6 @@ impl std::ops::Deref for CheckedMetadata {
 impl CheckedMetadata {
     /// Fixed-size compatibility data from the retained physical identity.
     /// This digest is not a file capability and cannot reopen or authorize it.
-    #[allow(
-        dead_code,
-        reason = "shared API is intentionally dormant before its frontend consumer lands"
-    )]
     pub(crate) fn identity_fingerprint(&self) -> [u8; 32] {
         self.identity.fingerprint()
     }

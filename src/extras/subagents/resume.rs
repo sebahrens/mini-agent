@@ -87,20 +87,10 @@ pub(crate) fn insert_note(outcome: &Insert, limits: ResumeLimits) -> Option<Stri
         Insert::TooLarge { bytes, limit } => Some(format!(
             "[host note: child not resumable: conversation exceeds {} ({} serialized); \
              raise [subagents] task_resume_max_bytes or start a new task]\n",
-            human_mib(*limit),
-            human_mib(*bytes)
+            crate::byte_text::format_bytes(*limit as u64),
+            crate::byte_text::format_bytes(*bytes as u64)
         )),
         _ => None,
-    }
-}
-
-fn human_mib(bytes: usize) -> String {
-    if bytes >= 1024 * 1024 && bytes.is_multiple_of(1024 * 1024) {
-        format!("{} MiB", bytes / (1024 * 1024))
-    } else if bytes >= 1024 * 1024 {
-        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
-    } else {
-        format!("{} KiB", bytes.div_ceil(1024))
     }
 }
 
@@ -406,7 +396,7 @@ mod tests {
         assert!(bytes > 4096 && limit == 2048);
         let note = insert_note(&outcome, small).unwrap();
         assert!(
-            note.contains("child not resumable: conversation exceeds 2 KiB"),
+            note.contains("child not resumable: conversation exceeds 2.0 KiB"),
             "{note}"
         );
         assert!(note.contains("task_resume_max_bytes"), "{note}");

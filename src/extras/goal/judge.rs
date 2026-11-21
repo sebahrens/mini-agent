@@ -812,32 +812,6 @@ pub(crate) fn judge_prices_with_cache_prices(
 /// Failures fail open: the caller receives [`JudgeOutcome::Unavailable`] and the
 /// gate keeps working rather than completing or ending the goal on a model that
 /// could not answer.
-#[allow(
-    dead_code,
-    reason = "Compatibility wrapper for callers without owned usage observers"
-)]
-pub async fn ask_with_transcript(
-    goal: &Goal,
-    request: &VerifyRequest,
-    resolved: &ResolvedJudge,
-    session_client: &crate::provider::AnyClient,
-    transcript: &str,
-    cfg: &crate::config::Config,
-    checks: Option<&CheckOutcome>,
-) -> JudgeCall {
-    ask_with_transcript_observed(
-        goal,
-        request,
-        resolved,
-        session_client,
-        transcript,
-        cfg,
-        checks,
-        Default::default(),
-    )
-    .await
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn ask_with_transcript_observed(
     goal: &Goal,

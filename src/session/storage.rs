@@ -173,7 +173,16 @@ pub(super) fn serialize_bounded_session(session: &Session) -> anyhow::Result<Str
 #[derive(Debug)]
 pub(crate) enum ExactLoadRefusal {
     /// The session was saved for a different workspace (the saved label).
-    WorkspaceMismatch { saved: String },
+    WorkspaceMismatch {
+        #[cfg_attr(
+            not(feature = "acp"),
+            allow(
+                dead_code,
+                reason = "only the ACP load-failure mapping reads the saved label"
+            )
+        )]
+        saved: String,
+    },
     /// The file is not a session this build can read.
     Incompatible,
     /// The file holds a different session than the requested id.
@@ -199,10 +208,6 @@ impl std::error::Error for ExactLoadRefusal {}
 /// Exact, noncreating and nonrepairing import. Both retained directories are
 /// supplied by the host; stored working_dir is compared as text, never opened.
 #[cfg(any(feature = "acp", test))]
-#[allow(
-    dead_code,
-    reason = "shared API is intentionally dormant before its frontend consumer lands"
-)]
 pub(crate) fn load_session_exact_read_only(
     sessions_root: &crate::paths::WorkspaceBinding,
     requested_id: &str,
