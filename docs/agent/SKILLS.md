@@ -821,3 +821,11 @@ search stages its callable and instruction selections until the exact captured t
 host result commits them once. A rewritten or spilled result leaves live callable lookup, routing
 and attribution unchanged; cancellation or a later user turn rejects stale candidates. Existing
 learned ABI, lease, scope and admission checks remain in force.
+
+### Finding the tool call without reading session files
+
+`--distill-learned-skill <session-id> list` prints the session's successful `js` calls (id and first
+line of code), `last` distils the most recent one and any unambiguous prefix of a listed id works. The
+`--approve-`, `--reject-`, `--activate-`, `--promote-`, `--retire-` and `--reevaluate-learned-skill`
+flags accept an unambiguous id prefix of at least six lowercase hex characters; an ambiguous prefix is
+refused before any lifecycle change. Every human gate is unchanged.

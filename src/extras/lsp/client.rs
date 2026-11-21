@@ -344,13 +344,46 @@ pub struct DiagStoreState {
     /// it so a waiter holding a pre-eviction baseline still sees progress.
     version_floor: AtomicU64,
     dropped: Mutex<DroppedFiles>,
+    /// `(server, ".ext")` pairs where the server is not the first claimant of
+    /// the extension. Their diagnostics are stored under a composite key so a
+    /// second server for a file type adds to, never replaces, the first.
+    secondary: Mutex<std::collections::HashSet<(String, String)>>,
 }
+
+/// Separator between a file URI and a secondary server's name in a store key.
+const SECONDARY_KEY_SEPARATOR: char = '\u{1}';
 
 impl DiagStoreState {
     pub fn lock(
         &self,
     ) -> std::sync::LockResult<std::sync::MutexGuard<'_, HashMap<String, FileDiags>>> {
         self.map.lock()
+    }
+
+    /// Marks `server` as a secondary claimant of `extension` (with its dot).
+    pub fn register_secondary(&self, server: &str, extension: &str) {
+        self.secondary
+            .lock()
+            .unwrap()
+            .insert((server.to_string(), extension.to_ascii_lowercase()));
+    }
+
+    /// Store key for `server`'s diagnostics of `uri`: the URI itself for a
+    /// primary server, a composite for a secondary one.
+    pub fn key_for(&self, uri: &str, server: &str) -> String {
+        let secondary = self.secondary.lock().unwrap();
+        if secondary.is_empty() {
+            return uri.to_string();
+        }
+        let ext = uri
+            .rsplit_once('.')
+            .map(|(_, ext)| format!(".{}", ext.to_ascii_lowercase()))
+            .unwrap_or_default();
+        if secondary.contains(&(server.to_string(), ext)) {
+            format!("{uri}{SECONDARY_KEY_SEPARATOR}{server}")
+        } else {
+            uri.to_string()
+        }
     }
 
     /// Files whose diagnostics were lost to a full cache and not republished.
@@ -2125,6 +2158,7 @@ pub(crate) fn commit_diagnostics(
     identity: Option<crate::fs::CheckedMetadata>,
     content: Option<crate::fs::ContentDigest>,
 ) -> bool {
+    let uri = diags.key_for(&uri, server);
     let (diagnostics, omitted) = sanitize_diagnostics(diagnostics);
     let cached_bytes = retained_diagnostic_bytes(&uri, server, &diagnostics);
     // An incoming clean publication may only displace clean entries: it must

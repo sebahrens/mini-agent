@@ -4603,9 +4603,21 @@ rust-analyzer, gopls, typescript-language-server, pyright-langserver,
 clangd, bash-language-server, lua-language-server, jdtls (`.java`),
 csharp-ls (`.cs`), ruby-lsp (`.rb`, `.rake`, `.gemspec`), intelephense
 (`.php`), kotlin-language-server (`.kt`, `.kts`), sourcekit-lsp (`.swift`) and
-zls (`.zig`). Each is skipped silently when its binary is not on PATH; the
-built-in names `java`, `csharp`, `ruby`, `php`, `kotlin`, `swift` and `zig` can
-be overridden or set `disabled = true` like the others.
+zls (`.zig`), vue-language-server (`.vue`), svelteserver (`.svelte`), astro-ls (`.astro`),
+elixir-ls (`.ex`, `.exs`, `.heex`, `.eex`), `dart language-server` (`.dart`),
+yaml-language-server (`.yaml`, `.yml`), terraform-ls (`.tf`, `.tfvars`, `.tofu`) and metals
+(`.scala`, `.sc`). Each is skipped silently when its binary is not on PATH (a server that
+fails to start names its install source in the startup notice; nothing is installed
+automatically); the built-in names `java`, `csharp`, `ruby`, `php`, `kotlin`, `swift`, `zig`,
+`vue`, `svelte`, `astro`, `elixir`, `dart`, `yaml`, `terraform` and `scala` can be overridden or
+set `disabled = true` like the others.
+
+**Several servers per extension.** Every configured server that claims a file's extension is
+started and synchronized with it. The first (user-defined servers precede built-ins, ordered by
+name) answers navigation queries; every server's diagnostics appear after an edit, each block
+labelled with its server. A linter such as `[lsp.servers.eslint]` with `extensions = [".ts"]`
+therefore runs next to `typescript-language-server` instead of replacing it; use the built-in's
+name (`typescript`) to replace it.
 
 **Trade-off for the build-evaluating built-ins.** `jdtls`, `csharp-ls`, `ruby-lsp`,
 `kotlin-language-server`, `sourcekit-lsp` and `zls` load the repository's build definitions
@@ -4614,8 +4626,10 @@ be overridden or set `disabled = true` like the others.
 executes the interpreter a repository's `pyrightconfig.json`/virtualenv selects;
 `typescript-language-server` loads `tsconfig.json` plugins and a workspace TypeScript; `gopls`
 runs the Go toolchain a repository's `go.mod` selects. All of this is repository code running in
-the server process outside the shell sandbox. The built-in entries for these ten (the names `java`,
-`csharp`, `ruby`, `kotlin`, `swift`, `zig`, `rust`, `python`, `typescript`, `go`) therefore start
+the server process outside the shell sandbox. `vue-language-server`, `svelteserver`, `astro-ls`, `elixir-ls`,
+`dart` and `metals` load the project's TypeScript, Mix, pub or sbt build the same way. The built-in
+entries for these sixteen (the names `java`, `csharp`, `ruby`, `kotlin`, `swift`, `zig`, `rust`, `python`,
+`typescript`, `go`, `vue`, `svelte`, `astro`, `elixir`, `dart`, `scala`) therefore start
 **only when the workspace's `.mini-agent/config.toml` is trusted** (the same content-bound
 project-config trust as other project settings, read without prompting). In an untrusted
 workspace, one without a project config, or when the trust store is unavailable they are not

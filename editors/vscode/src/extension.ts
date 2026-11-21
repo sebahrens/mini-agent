@@ -12,7 +12,9 @@ import {
 import { AgentSession } from './session';
 import { describeServerCommands } from './commandList';
 import { buildPromptBlocks } from './references';
-import { collectReferences } from './vscodeReferences';
+import { collectEditorContext, collectReferences } from './vscodeReferences';
+import { ChatViewController, renderChatHtml } from './chatView';
+import { PROPOSED_SCHEME, ProposedContent, firstOpenableDiff } from './diffView';
 import { log, setLogLevel, showOutput } from './log';
 import { assertExecutableScope, gatedFolderPick } from './trust';
 
@@ -43,6 +45,10 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     log.channel,
     registerChatParticipant(context),
+    registerChatView(context),
+    vscode.workspace.registerTextDocumentContentProvider(PROPOSED_SCHEME, {
+      provideTextDocumentContent: uri => proposedContent.get(uri.toString()),
+    }),
     vscode.commands.registerCommand('mini-agent.start', () => cmdStart(context)),
     vscode.commands.registerCommand('mini-agent.stop', () => cmdStop()),
     vscode.commands.registerCommand('mini-agent.restart', () => cmdRestart(context)),
@@ -184,7 +190,10 @@ function registerChatParticipant(context: vscode.ExtensionContext): vscode.ChatP
           promptText = checked;
         }
         response.progress('Connecting to Mini Agent…');
-        const references = await collectReferences(request, request.command === 'selection');
+        const references = [
+          ...await collectReferences(request, request.command === 'selection'),
+          ...collectEditorContext(request.command === 'selection'),
+        ];
         const built = await buildPromptBlocks({
           text: promptText,
           references,
@@ -214,6 +223,45 @@ function registerChatParticipant(context: vscode.ExtensionContext): vscode.ChatP
   );
   participant.iconPath = new vscode.ThemeIcon('sparkle');
   return participant;
+}
+
+const proposedContent = new ProposedContent();
+
+/** The Mini Agent activity-bar view: the same session as the chat participant, without Copilot Chat. */
+function registerChatView(context: vscode.ExtensionContext): vscode.Disposable {
+  const provider: vscode.WebviewViewProvider = {
+    resolveWebviewView(view) {
+      view.webview.options = { enableScripts: true };
+      const controller = new ChatViewController({
+        post: state => { void view.webview.postMessage({ type: 'state', state }); },
+        openPath: target => {
+          const folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+          // Only files inside the workspace folder are opened from model-supplied paths.
+          if (folder && (target === folder || target.startsWith(`${folder}/`) || target.startsWith(`${folder}\\`))) {
+            void vscode.window.showTextDocument(vscode.Uri.file(target));
+          }
+        },
+        runPrompt: async (text, onUpdate, signal) => {
+          const active = await ensureSession(context);
+          if (!active) { throw new Error('Mini Agent requires a trusted local workspace folder.'); }
+          const built = await buildPromptBlocks({
+            text,
+            references: collectEditorContext(false),
+            workspaceRoot: active.workspaceFolder.uri.fsPath,
+            trusted: vscode.workspace.isTrusted,
+            embeddedContext: active.acceptsEmbeddedContext,
+            image: active.acceptsImages,
+            realpath,
+          });
+          return active.prompt(built.blocks, onUpdate, signal);
+        },
+      });
+      const nonce = Array.from({ length: 16 }, () => Math.floor(Math.random() * 36).toString(36)).join('');
+      view.webview.html = renderChatHtml(nonce, view.webview.cspSource);
+      view.webview.onDidReceiveMessage(message => controller.handle(message));
+    },
+  };
+  return vscode.window.registerWebviewViewProvider('mini-agent.chatView', provider);
 }
 
 async function describeCommands(active: AgentSession, pageArgument: string): Promise<string> {
@@ -285,6 +333,18 @@ export async function requestPermission(
   // not just the tool name, so the allow-always option never grants an unseen rule.
   // It goes in a modal `detail`, which wraps and keeps multi-line commands intact;
   // a QuickPick placeHolder is a one-line input hint that clips and vanishes on typing.
+  // An edit that carries the whole old and new text opens in the native diff editor
+  // first, so it is reviewed side by side before the modal asks. Truncated previews
+  // keep the text summary only.
+  const sides = firstOpenableDiff(request.toolCall.content);
+  if (sides) {
+    const before = proposedContent.add('before', sides.path, sides.before);
+    const after = proposedContent.add('after', sides.path, sides.after);
+    void vscode.commands.executeCommand(
+      'vscode.diff', vscode.Uri.parse(before), vscode.Uri.parse(after), `Proposed edit: ${sides.path}`,
+      { preview: true, preserveFocus: true },
+    );
+  }
   const optionTitles = request.options.map(option => permissionOptionTitle(request, option));
   // A clipped input gets an extra non-approving button that shows all of it.
   const clipped = permissionOmittedChars(request) > 0;

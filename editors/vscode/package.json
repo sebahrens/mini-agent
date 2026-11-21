@@ -41,6 +41,16 @@
         ]
       }
     ],
+    "viewsContainers": {
+      "activitybar": [
+        { "id": "mini-agent", "title": "Mini Agent", "icon": "$(sparkle)" }
+      ]
+    },
+    "views": {
+      "mini-agent": [
+        { "type": "webview", "id": "mini-agent.chatView", "name": "Chat" }
+      ]
+    },
     "commands": [
       {
         "command": "mini-agent.start",
@@ -101,6 +111,18 @@
           "default": false,
           "description": "Let the Mini Agent server read and write workspace files through the editor (unsaved buffers, undo stack) using ACP fs/read_text_file and fs/write_text_file. Paths are confined to the trusted workspace folder.",
           "scope": "machine"
+        },
+        "mini-agent.attachActiveEditor": {
+          "type": "boolean",
+          "default": true,
+          "description": "Attach the active file, or its selection, to every prompt as a bounded reference.",
+          "scope": "window"
+        },
+        "mini-agent.attachDiagnostics": {
+          "type": "boolean",
+          "default": false,
+          "description": "Attach the errors and warnings of open files (the Problems panel) to every prompt.",
+          "scope": "window"
         },
         "mini-agent.showThoughts": {
           "type": "boolean",

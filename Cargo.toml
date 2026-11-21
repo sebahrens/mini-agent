@@ -35,6 +35,12 @@ required-features = ["git-worktree", "sandbox"]
 [features]
 default = ['loop', 'goal', 'git-worktree', 'mcp', 'acp', 'subagents', 'archmd', 'status-signals', 'multithread', 'export', 'js', 'sandbox', 'memory', 'agent-skills', 'lsp', 'hooks', 'multimodal', 'bedrock', 'vertex']
 status-signals = []
+# Opt-in OpenTelemetry export (OTLP/HTTP JSON) of usage metrics and turn/tool
+# spans. Adds no dependency; inactive unless OTEL_EXPORTER_OTLP_* is set.
+otel = []
+# Opt-in loopback web view that watches and steers a running session. No
+# extra dependencies; started only by an explicit runtime request.
+remote = []
 # `--loop` is a goal preset: it sets a goal and the goal driver runs its
 # rounds, so the loop feature cannot be built without it.
 loop = ["goal"]

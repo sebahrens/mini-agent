@@ -934,6 +934,15 @@ pub struct Config {
     /// finishes. Default: false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_prompt_marks: Option<bool>,
+    /// Screen-reader friendly TUI: no mouse capture, no title updates, no
+    /// animation and monochrome output. `--screen-reader` also enables it.
+    /// Default: false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub screen_reader: Option<bool>,
+    /// Turn spinner animation off while keeping everything else. Implied by
+    /// `screen_reader`. Default: false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reduce_motion: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_prompt: Option<CompactString>,
     #[cfg(feature = "git-worktree")]
@@ -1568,6 +1577,16 @@ impl Config {
 
     pub fn resolve_terminal_notify_min_secs(&self) -> u64 {
         self.terminal_notify_min_secs.unwrap_or(10)
+    }
+
+    /// Whether the screen-reader mode is on (`--screen-reader` or config).
+    pub fn resolve_screen_reader(&self, flag: bool) -> bool {
+        flag || self.screen_reader.unwrap_or(false)
+    }
+
+    /// Whether animation is off: `reduce_motion`, or implied by screen-reader mode.
+    pub fn resolve_reduce_motion(&self, screen_reader: bool) -> bool {
+        screen_reader || self.reduce_motion.unwrap_or(false)
     }
 
     pub fn resolve_terminal_prompt_marks(&self) -> bool {
@@ -2880,6 +2899,20 @@ brainstorm = ""
     fn resolve_prompt_model_returns_none_for_empty_map() {
         let cfg = make_config(HashMap::new());
         assert_eq!(cfg.resolve_prompt_model("plan"), None);
+    }
+
+    #[test]
+    fn accessibility_keys_default_off_and_screen_reader_implies_reduced_motion() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(!cfg.resolve_screen_reader(false));
+        assert!(!cfg.resolve_reduce_motion(false));
+        assert!(cfg.resolve_screen_reader(true));
+        let cfg: Config = toml::from_str("reduce_motion = true\n").unwrap();
+        assert!(!cfg.resolve_screen_reader(false));
+        assert!(cfg.resolve_reduce_motion(false));
+        let cfg: Config = toml::from_str("screen_reader = true\n").unwrap();
+        assert!(cfg.resolve_screen_reader(false));
+        assert!(cfg.resolve_reduce_motion(true));
     }
 
     #[test]

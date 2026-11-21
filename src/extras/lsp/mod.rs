@@ -141,6 +141,8 @@ struct Inner {
     /// Failure streak length already reported to the model per server, so the
     /// "not running" marker appears once per streak.
     reported_failures: Mutex<HashMap<String, u32>>,
+    /// Store key of a secondary server's entry → version seen at the last sync.
+    secondary_baselines: Mutex<HashMap<String, u64>>,
     /// server name → spawn in flight. Concurrent edits join it; the handshake
     /// never runs under the `clients` lock.
     starting: Mutex<HashMap<String, StartingServer>>,
@@ -596,6 +598,7 @@ impl LspManager {
             clients: tokio::sync::Mutex::new(HashMap::new()),
             failures: Mutex::new(HashMap::new()),
             reported_failures: Mutex::new(HashMap::new()),
+            secondary_baselines: Mutex::new(HashMap::new()),
             starting: Mutex::new(HashMap::new()),
             diags: DiagStore::default(),
             diag_notify: Arc::new(Notify::new()),
@@ -610,6 +613,17 @@ impl LspManager {
             #[cfg(test)]
             test_synced_documents: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
+        // A server that is not the first claimant of an extension reports into
+        // a composite cache key, so servers sharing a file type all contribute.
+        let mut claimed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (name, cfg) in &inner.servers {
+            for ext in &cfg.extensions {
+                let ext = ext.to_ascii_lowercase().to_string();
+                if !claimed.insert(ext.clone()) {
+                    inner.diags.register_secondary(name, &ext);
+                }
+            }
+        }
         register_live_manager(&inner);
         Self { inner }
     }
@@ -649,6 +663,21 @@ impl LspManager {
             return None;
         }
         let (name, cfg) = registry::server_for_path(&self.inner.servers, path)?;
+        self.client_for_server(path, name, cfg).await
+    }
+
+    /// [`Self::client_for`] for one named server that claims `path`.
+    async fn client_for_server(
+        &self,
+        path: &Path,
+        name: &String,
+        cfg: &crate::config::types::LspServerConfig,
+    ) -> Option<Arc<LspClient>> {
+        if self.inner.workspace.validate().is_err()
+            || !path.starts_with(self.inner.workspace.root())
+        {
+            return None;
+        }
         let starting = {
             let mut clients = self.inner.clients.lock().await;
             if self.inner.workspace.validate().is_err()
@@ -780,7 +809,10 @@ impl LspManager {
                 None => {
                     if !had_failed {
                         push_user_notice(format!(
-                            "LSP ({name}): server failed to start; edits will not report diagnostics (see /doctor)"
+                            "LSP ({name}): server failed to start; edits will not report diagnostics (see /doctor){}",
+                            registry::install_hint(cfg.command.as_str())
+                                .map(|hint| format!(". To install `{}`: {hint}", cfg.command))
+                                .unwrap_or_default()
                         ));
                     }
                     manager.record_server_failure(&name);
@@ -942,10 +974,109 @@ impl LspManager {
         let document = client::read_document(tokio::fs::File::from_std(file))
             .await
             .ok()?;
-        self.client_for(&lookup)
+        let version = self
+            .client_for(&lookup)
             .await?
             .sync_document(&lookup, document)
+            .await;
+        self.sync_secondaries(relative, &lookup).await;
+        version
+    }
+
+    /// Synchronizes `lookup` with every further server claiming its extension
+    /// and records each one's baseline for the edit-time wait.
+    async fn sync_secondaries(&self, relative: &Path, lookup: &Path) {
+        let all = registry::servers_for_path(&self.inner.servers, lookup);
+        if all.len() < 2 {
+            return;
+        }
+        let Some(uri) = client::file_uri(lookup) else {
+            return;
+        };
+        for (name, cfg) in all.into_iter().skip(1) {
+            let Ok(file) = self.inner.workspace.open_relative(relative) else {
+                return;
+            };
+            let Ok(document) = client::read_document(tokio::fs::File::from_std(file)).await else {
+                return;
+            };
+            let Some(client) = self.client_for_server(lookup, name, cfg).await else {
+                continue;
+            };
+            if let Some(baseline) = client.sync_document(lookup, document).await {
+                let key = self.inner.diags.key_for(&uri, name);
+                self.inner
+                    .secondary_baselines
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(key, baseline);
+            }
+        }
+    }
+
+    /// Diagnostics blocks of the secondary servers for `path`, each waiting
+    /// at most that server's edit window for its own publish.
+    async fn secondary_blocks(&self, path: &Path) -> Option<String> {
+        let all = registry::servers_for_path(&self.inner.servers, path);
+        if all.len() < 2 {
+            return None;
+        }
+        let uri = client::file_uri(path)?;
+        let mut blocks = Vec::new();
+        for (name, cfg) in all.into_iter().skip(1) {
+            let key = self.inner.diags.key_for(&uri, name);
+            let Some(baseline) = self
+                .inner
+                .secondary_baselines
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&key)
+                .copied()
+            else {
+                continue;
+            };
+            let deadline = tokio::time::Instant::now() + cfg.edit_wait();
+            loop {
+                let notified = self.inner.diag_notify.notified();
+                tokio::pin!(notified);
+                let current = self
+                    .inner
+                    .diags
+                    .lock()
+                    .unwrap()
+                    .get(&key)
+                    .map_or(0, |entry| entry.version);
+                if current > baseline {
+                    break;
+                }
+                if tokio::time::timeout_at(deadline, &mut notified)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            let Some(file) = self.inner.diags.lock().unwrap().get(&key).cloned() else {
+                continue;
+            };
+            let uri = uri.clone();
+            let block = crate::agent::runner::spawn_blocking_scoped(move || {
+                if !diagnostic_identity_is_current(&uri, &file) {
+                    return None;
+                }
+                format_file_diags(
+                    &file.server,
+                    &file.diagnostics,
+                    file.omitted,
+                    DiagPage::EDIT,
+                )
+            })
             .await
+            .ok()
+            .flatten();
+            blocks.extend(block);
+        }
+        (!blocks.is_empty()).then(|| blocks.join("\n"))
     }
 
     /// Stops and reaps every language-server process currently owned by this
@@ -1105,7 +1236,13 @@ impl LspManager {
     ) -> Option<String> {
         let output = self.diagnostics_block_adaptive_inner(path, baseline).await;
         if baseline.is_some() {
-            return output;
+            return match self.secondary_blocks(path).await {
+                Some(extra) => Some(match output {
+                    Some(block) => format!("{block}\n{extra}"),
+                    None => extra,
+                }),
+                None => output,
+            };
         }
         // Nothing was synchronized: the server is starting, or not running.
         // Say so instead of looking like a clean edit.
@@ -1572,6 +1709,16 @@ impl LspManager {
             self.inner.diag_notify.notify_waiters();
         }
         stored
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_secondary_baseline_for_test(&self, uri: &str, server: &str, baseline: u64) {
+        let key = self.inner.diags.key_for(uri, server);
+        self.inner
+            .secondary_baselines
+            .lock()
+            .unwrap()
+            .insert(key, baseline);
     }
 
     #[cfg(test)]

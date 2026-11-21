@@ -833,7 +833,7 @@ pub struct Cli {
             "reevaluate_learned_skill"
         ],
         help = "Distil the JavaScript of one persisted tool call into a learned-skill proposal \
-                package for --import-learned-skill: reads the session's `js` tool call, asks the \
+                package for --import-learned-skill: reads the session's `js` tool call (the id may be an unambiguous prefix, `last` for the most recent successful call, or `list` to print them), asks the \
                 configured provider once to generalize it, and writes the package. Nothing is \
                 imported, verified or approved"
     )]
@@ -1061,6 +1061,12 @@ pub struct Cli {
 
     #[arg(long = "no-color", help = "Disable colored TUI output")]
     pub no_color: bool,
+
+    #[arg(
+        long = "screen-reader",
+        help = "Screen-reader friendly TUI: monochrome, no spinner animation, no mouse capture, no title updates (see ACCESSIBILITY.md)"
+    )]
+    pub screen_reader: bool,
 
     #[cfg(feature = "hooks")]
     #[arg(long = "no-hooks", help = "Disable all hooks")]

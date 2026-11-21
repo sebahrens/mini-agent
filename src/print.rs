@@ -845,6 +845,10 @@ impl HeadlessOutputPolicy {
         name: &str,
         args: &serde_json::Value,
     ) -> anyhow::Result<()> {
+        #[cfg(feature = "otel")]
+        if let Some(collector) = crate::extras::otel::global() {
+            collector.tool_call(id, name);
+        }
         let (args, args_truncated) = bounded_json_value(args, progress_bytes());
         let (provider_id, id_truncated) = bounded_progress(provider_id, 512);
         let (event_name, name_truncated) = bounded_progress(name, 256);
@@ -871,6 +875,10 @@ impl HeadlessOutputPolicy {
         is_error: bool,
     ) -> anyhow::Result<()> {
         begin_api_span();
+        #[cfg(feature = "otel")]
+        if let Some(collector) = crate::extras::otel::global() {
+            collector.tool_result(id, is_error);
+        }
         let (bounded, output_truncated) = bounded_progress(output, progress_bytes());
         let (event_name, name_truncated) = bounded_progress(name, 256);
         let truncated = output_truncated || name_truncated;
@@ -910,6 +918,10 @@ impl HeadlessOutputPolicy {
     ) -> anyhow::Result<()> {
         COMPLETIONS_FINISHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         end_api_span();
+        #[cfg(feature = "otel")]
+        if let Some(collector) = crate::extras::otel::global() {
+            collector.usage(&delta);
+        }
         if delta.has_values() {
             let delta: Usage = delta.into();
             self.emit_event(
@@ -1401,6 +1413,12 @@ pub(crate) async fn emit_headless_result(
     value["session_name"] = session.map_or(serde_json::Value::Null, |(_, name)| name.into());
     value["session_persisted"] = persisted.into();
     value["duration_ms"] = take_run_duration_ms().into();
+    #[cfg(feature = "otel")]
+    if let Some(collector) = crate::extras::otel::global() {
+        collector
+            .end_turn(value.get("is_error").and_then(serde_json::Value::as_bool) == Some(true));
+        collector.flush().await;
+    }
     if let Some(compactions) = take_headless_compactions() {
         value["compactions"] = compactions;
     }
