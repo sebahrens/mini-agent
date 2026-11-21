@@ -2575,6 +2575,21 @@ impl<'a> App<'a> {
 
         // Saved `/cron` schedules are held disarmed until `/cron resume`.
         let cron = super::cron::CronStore::from_saved(&ui.session.cron_schedule);
+        // The ARCHITECTURE.md offer rides the update-notice slot; it never
+        // blocks startup on stdin.
+        let update_notice = crate::update::take_startup_notice().or_else(|| {
+            #[cfg(feature = "archmd")]
+            {
+                let offer = interactive_arch_offer_allowed(&ui)
+                    .then(|| crate::extras::archmd::startup_offer(ui.workspace.root()))
+                    .flatten()?;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let _ = tx.send(offer);
+                Some(rx)
+            }
+            #[cfg(not(feature = "archmd"))]
+            None
+        });
         let mut app = Self {
             ui,
             run,
@@ -2624,7 +2639,7 @@ impl<'a> App<'a> {
             ctrl_c_exit_armed: false,
             session_start_task,
             skill_commands,
-            update_notice: crate::update::take_startup_notice(),
+            update_notice,
         };
         app.request_git_status_refresh();
         Ok(app)
@@ -20543,4 +20558,11 @@ mod rejected_skill_tests {
         );
         assert_eq!(rejected_skill_reason(&diagnostics, "absent"), None);
     }
+}
+
+/// Whether the interactive start may show the ARCHITECTURE.md offer: context
+/// files are enabled and `architecture_prompt` was not turned off.
+#[cfg(feature = "archmd")]
+fn interactive_arch_offer_allowed(ui: &UiContext<'_>) -> bool {
+    !ui.cli.resolve_no_context_files(ui.cfg) && ui.cfg.resolve_architecture_prompt()
 }

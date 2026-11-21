@@ -73,34 +73,21 @@ pub(crate) fn should_ask_with_path(dir: &Path, asked_path: &Path) -> bool {
     arch_path.symlink_metadata().is_err() && !has_been_asked_with_path(dir, asked_path)
 }
 
-pub fn ask_and_create(dir: &Path) -> anyhow::Result<bool> {
+/// The one-line TUI notice offering an `ARCHITECTURE.md`, or `None` when the
+/// directory is not a project, already has one, or was offered before. Asking
+/// is recorded here, so each directory is offered once. Nothing reads stdin:
+/// the notice points at `/init`.
+pub fn startup_offer(dir: &Path) -> Option<String> {
     if !should_ask(dir) {
-        return Ok(false);
+        return None;
     }
-
-    eprint!(
-        "No ARCHITECTURE.md found in {} (documents high-level codebase architecture for AI agents). Create an empty template? [y/N] ",
-        dir.display()
-    );
-    std::io::stderr().flush()?;
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-    let input = input.trim().to_lowercase();
-
     if let Err(e) = record_asked_dir(dir) {
         tracing::warn!("Failed to record asked directory: {e}");
     }
-
-    if input == "y" || input == "yes" {
-        create_architecture_template(dir)?;
-        eprintln!(
-            "Created {}/ARCHITECTURE.md — edit it to describe the codebase architecture.",
-            dir.display()
-        );
-        Ok(true)
-    } else {
-        Ok(false)
-    }
+    Some(format!(
+        "No ARCHITECTURE.md in {} (it documents the codebase for AI agents). Run /init to create a template; this is shown once per directory (architecture_prompt = false turns it off).",
+        dir.display()
+    ))
 }
 
 // ---------------------------------------------------------------------------

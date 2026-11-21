@@ -624,10 +624,11 @@ pub(crate) fn discover(
             })();
             if let Err(reason) = attempt {
                 result.diagnostics.push(format!(
-                    "{} skill '{}' rejected: {}",
+                    "{} skill '{}' rejected: {} (in {})",
                     source.origin,
                     name,
-                    sanitize_reason(&reason)
+                    sanitize_reason(&reason),
+                    source.directory.join(&name).join("SKILL.md").display()
                 ));
             }
         }

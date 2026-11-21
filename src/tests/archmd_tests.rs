@@ -229,8 +229,7 @@ fn dangling_symlink_is_neither_asked_about_nor_written_through() {
 fn ask_and_create_false_when_arch_exists() {
     let dir = temp_dir("ask_arch_exists");
     fs::write(dir.join("ARCHITECTURE.md"), "# test").unwrap();
-    // No interactive prompt — should_ask returns false immediately
-    assert!(!archmd::ask_and_create(&dir).unwrap());
+    assert!(archmd::startup_offer(&dir).is_none());
 }
 
 #[test]

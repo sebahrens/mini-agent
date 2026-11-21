@@ -558,7 +558,7 @@ pub(crate) async fn run_advisor_completion(
     model_name: &str,
     cfg: &crate::config::Config,
 ) -> anyhow::Result<String> {
-    let conversation = format_conversation(messages, kilobytes_limit);
+    let conversation = format_conversation_with(messages, kilobytes_limit, true);
     let prompt = build_advisor_prompt(&conversation, question);
     // The advisor receives the whole transcript, so it must carry the same
     // provider parameters (store=false/ZDR, reasoning, OpenRouter routing,
@@ -588,15 +588,30 @@ pub(crate) async fn run_advisor_completion(
 /// content inside it cannot end the block early.
 fn build_advisor_prompt(conversation: &str, question: &str) -> String {
     let conversation = conversation.replace("</conversation>", "<\\/conversation>");
+    let cwd = std::env::current_dir()
+        .map(|dir| dir.display().to_string())
+        .unwrap_or_else(|_| "unknown".into());
     format!(
-        "## Conversation\n\n<conversation>\n{conversation}\n</conversation>\n\n## Assistant's question\n\n{question}"
+        "## Project context\n\nWorking directory: {cwd}\nPlatform: {}\n\n## Conversation\n\n<conversation>\n{conversation}\n</conversation>\n\n## Assistant's question\n\n{question}",
+        std::env::consts::OS
     )
 }
 
+#[cfg(test)]
 pub(crate) fn format_conversation(msgs: &[SessionMessage], kilobytes_limit: u32) -> String {
+    format_conversation_with(msgs, kilobytes_limit, false)
+}
+
+/// `indexed` prefixes each entry with its position (`[#12 ToolResult]:`) so a
+/// role label inside content is visibly nested, not a structural entry.
+pub(crate) fn format_conversation_with(
+    msgs: &[SessionMessage],
+    kilobytes_limit: u32,
+    indexed: bool,
+) -> String {
     let per_side = (kilobytes_limit as usize * 1024) / 2;
 
-    fn format_line(msg: &SessionMessage) -> String {
+    fn format_line(index: usize, indexed: bool, msg: &SessionMessage) -> String {
         let role = match msg.role {
             MessageRole::User => "User",
             MessageRole::Assistant => "Assistant",
@@ -605,7 +620,11 @@ pub(crate) fn format_conversation(msgs: &[SessionMessage], kilobytes_limit: u32)
             MessageRole::ToolResult => "ToolResult",
             MessageRole::SubagentToolCall => "SubagentToolCall",
         };
-        format!("[{role}]: {}", msg.content)
+        if indexed {
+            format!("[#{index} {role}]: {}", msg.content)
+        } else {
+            format!("[{role}]: {}", msg.content)
+        }
     }
 
     // Collect head (oldest messages). The oldest message is the task origin;
@@ -617,7 +636,7 @@ pub(crate) fn format_conversation(msgs: &[SessionMessage], kilobytes_limit: u32)
     // Each kept line is formatted once here and reused when assembling.
     let mut head_lines: Vec<String> = Vec::new();
     for (i, msg) in msgs.iter().enumerate() {
-        let line = format_line(msg);
+        let line = format_line(i, indexed, msg);
         let needed = if head_chars > 0 {
             line.len() + 2
         } else {
@@ -645,7 +664,7 @@ pub(crate) fn format_conversation(msgs: &[SessionMessage], kilobytes_limit: u32)
     // Newest first: `tail_lines[k]` is message `msgs.len() - 1 - k`.
     let mut tail_lines: Vec<String> = Vec::new();
     for (i, msg) in msgs.iter().enumerate().rev() {
-        let line = format_line(msg);
+        let line = format_line(i, indexed, msg);
         let needed = if tail_chars > 0 {
             line.len() + 2
         } else {

@@ -403,6 +403,10 @@ pub struct Config {
         alias = "auto_update_themes"
     )]
     pub auto_update_themes: Option<bool>,
+    /// Offer to create `ARCHITECTURE.md` (once per project directory) at an
+    /// interactive start. Default `true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub architecture_prompt: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_providers: Option<HashMap<String, types::CustomProviderConfig>>,
     /// Embedding backend for the skill library. Absent means the built-in
@@ -2026,6 +2030,10 @@ impl Config {
 
     pub fn resolve_auto_update_prompts(&self) -> Option<bool> {
         self.auto_update_prompts
+    }
+
+    pub fn resolve_architecture_prompt(&self) -> bool {
+        self.architecture_prompt.unwrap_or(true)
     }
 
     pub fn resolve_auto_update_themes(&self) -> Option<bool> {

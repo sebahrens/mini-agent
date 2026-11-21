@@ -499,6 +499,29 @@ impl InstructionServices {
             .clone()
     }
 
+    /// Headless runs have no `/skills`: print each rejected package once to
+    /// stderr so a skill that did not load is not silently absent.
+    pub(crate) async fn report_rejections_once(self: &Arc<Self>) {
+        static REPORTED: std::sync::Once = std::sync::Once::new();
+        let Ok(snapshot) = self.refresh(false).await else {
+            return;
+        };
+        let rejected: Vec<&String> = snapshot
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.contains(" rejected: "))
+            .collect();
+        if rejected.is_empty() {
+            return;
+        }
+        REPORTED.call_once(|| {
+            for diagnostic in rejected {
+                let line: String = diagnostic.chars().filter(|c| !c.is_control()).collect();
+                eprintln!("skill not loaded: {line}");
+            }
+        });
+    }
+
     pub(crate) async fn refresh(
         self: &Arc<Self>,
         explicit: bool,
