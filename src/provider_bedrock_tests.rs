@@ -473,3 +473,58 @@ async fn bedrock_profile_files_are_parsed_once_until_they_or_the_selecting_env_c
     );
     assert_eq!(PROFILE_CHECKS.with(std::cell::Cell::get), 2);
 }
+
+#[test]
+fn bedrock_region_falls_back_to_the_selected_profile_and_names_both_sources() {
+    use aws_credential_types::provider::error::CredentialsError as E;
+    let temp = crate::tests::OwnedTestDirectory::new("bedrock-region-profile");
+    let config = temp.path().join("config");
+    std::fs::write(
+        &config,
+        "# comment\n[default]\nregion = eu-central-1\n\n[profile work]\nsso_session = x\nregion=ap-southeast-2\n",
+    )
+    .unwrap();
+    let file = config.to_string_lossy().into_owned();
+    let env_with = |profile: Option<&'static str>| {
+        let file = file.clone();
+        move |name: &str| match name {
+            "AWS_CONFIG_FILE" => Ok(file.clone()),
+            "AWS_PROFILE" => profile.map(String::from).ok_or(VarError::NotPresent),
+            _ => Err(VarError::NotPresent),
+        }
+    };
+    assert_eq!(region(&env_with(None)).unwrap(), "eu-central-1");
+    assert_eq!(region(&env_with(Some("work"))).unwrap(), "ap-southeast-2");
+    let missing = region(&env_with(Some("absent"))).unwrap_err().to_string();
+    assert!(
+        missing.contains("AWS_REGION") && missing.contains("`absent` profile"),
+        "{missing}"
+    );
+    // An explicit variable still wins over the profile.
+    let both = |name: &str| match name {
+        "AWS_REGION" => Ok("us-west-2".to_owned()),
+        other => env_with(None)(other),
+    };
+    assert_eq!(region(&both).unwrap(), "us-west-2");
+    assert!(region(&|_: &str| Err(VarError::NotPresent)).is_err());
+
+    // The credential failure keeps its class and never the SDK's text.
+    let not_loaded = credentials_failure(&E::not_loaded("PRIVATE_DETAIL"), None);
+    let timed_out = credentials_failure(&E::provider_timed_out(Duration::from_secs(1)), None);
+    let provider = credentials_failure(&E::provider_error("PRIVATE_DETAIL"), None);
+    let sso = credentials_failure(
+        &E::provider_error("the SSO token for session has expired"),
+        Some("work"),
+    );
+    assert!(not_loaded.contains("no credentials found"), "{not_loaded}");
+    assert!(timed_out.contains("timed out"), "{timed_out}");
+    assert!(provider.contains("provider failed"), "{provider}");
+    assert!(sso.contains("aws sso login --profile work"), "{sso}");
+    let all = [&not_loaded, &timed_out, &provider, &sso];
+    assert!(all.iter().all(|m| !m.contains("PRIVATE_DETAIL")));
+    for (i, a) in all.iter().enumerate() {
+        for b in &all[i + 1..] {
+            assert_ne!(a, b);
+        }
+    }
+}

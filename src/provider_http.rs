@@ -177,14 +177,15 @@ impl ProviderHttpClient {
             *again.headers_mut() = headers;
             Ok(again)
         };
-        let original_headers = parts.headers.clone();
+        let mut original_headers = parts.headers.clone();
         let (builder, applied) = self
             .prepare_request_applied(rebuild(original_headers.clone())?)
             .await?;
         let response = builder.send().await.map_err(transport_error)?;
         if response.status() != http::StatusCode::UNAUTHORIZED
-            || applied.is_empty()
-            || !crate::key_command::renew_after_unauthorized(&applied).await
+            || !self
+                .renew_after_unauthorized(&applied, &mut original_headers)
+                .await
         {
             return Ok(response);
         }
@@ -193,6 +194,27 @@ impl ProviderHttpClient {
             .send()
             .await
             .map_err(transport_error)
+    }
+
+    /// Renews the credential a `401` rejected so the request can be resent
+    /// once: a command-issued key (`api_key_commands`), or the cached ChatGPT
+    /// access token / Copilot model token, which are otherwise reused until
+    /// their local expiry even after the provider invalidated them.
+    async fn renew_after_unauthorized(
+        &self,
+        applied: &[crate::key_command::Applied],
+        headers: &mut http::HeaderMap,
+    ) -> bool {
+        if !applied.is_empty() {
+            return crate::key_command::renew_after_unauthorized(applied).await;
+        }
+        if let Some(registration) = &self.0.chatgpt {
+            return registration.invalidate().await.is_ok();
+        }
+        match &self.0.copilot {
+            Some(auth) => auth.renew_after_unauthorized(headers).await,
+            None => false,
+        }
     }
 
     async fn prepare_request_applied(
@@ -230,8 +252,14 @@ impl ProviderHttpClient {
                 Ok::<(), anyhow::Error>(())
             }
             .await;
-            prepare.map_err(|error| http_client::Error::Instance(error.into()))?;
+            prepare.map_err(|error| match error.downcast::<crate::auth::AuthFailure>() {
+                // Keep the typed failure on the chain so the retry policy can
+                // tell a transient refresh error from a revoked grant.
+                Ok(failure) => http_client::Error::Instance(Box::new(failure)),
+                Err(error) => http_client::Error::Instance(error.into()),
+            })?;
         }
+        strip_empty_bearer(request.headers_mut());
         let (parts, body) = request.into_parts();
         let destination = parts.uri.to_string();
         #[cfg(test)]
@@ -303,6 +331,23 @@ impl ProviderHttpClient {
         } else {
             Ok(body)
         }
+    }
+}
+
+/// Removes an `Authorization: Bearer ` header with no token. A keyless local
+/// server (LM Studio, llama.cpp, vLLM) is built with an empty key, which the
+/// SDK would otherwise send as an empty bearer (mini-agent-nvnkx.41).
+fn strip_empty_bearer(headers: &mut http::HeaderMap) {
+    if headers
+        .get(http::header::AUTHORIZATION)
+        .is_some_and(|value| {
+            value
+                .as_bytes()
+                .trim_ascii()
+                .eq_ignore_ascii_case(b"bearer")
+        })
+    {
+        headers.remove(http::header::AUTHORIZATION);
     }
 }
 
@@ -425,11 +470,22 @@ async fn read_error_body(mut response: reqwest::Response) -> String {
 
 /// Closed set of provider error codes that may be lifted out of a private-auth
 /// error body. Only these literals ever reach the message, never body text.
-const PRIVATE_ERROR_CODES: [&str; 4] = [
+const PRIVATE_ERROR_CODES: [&str; 8] = [
     "model_max_prompt_tokens_exceeded",
     "usage_limit_reached",
     "context_length_exceeded",
     "rate_limit_exceeded",
+    "model_not_supported",
+    "model_not_found",
+    "unsupported_api_for_model",
+    "content_filter",
+];
+
+/// Codes that mean the selected model is not available to this account.
+const MODEL_AVAILABILITY_CODES: [&str; 3] = [
+    "model_not_supported",
+    "model_not_found",
+    "unsupported_api_for_model",
 ];
 
 /// Bytes and time spent looking for a code in a private-auth error body.
@@ -469,6 +525,14 @@ async fn peek_private_error_code(mut response: reqwest::Response) -> Option<&'st
 /// at most one closed-set error code. 5xx and 429 are not blamed on the account.
 fn private_error_text(label: &str, status: http::StatusCode, code: Option<&str>) -> String {
     if let Some(code) = code {
+        if MODEL_AVAILABILITY_CODES.contains(&code) {
+            return format!(
+                "{label} request was rejected: this model is not available on your plan or not enabled for your account; run /models to pick another"
+            );
+        }
+        if code == "content_filter" {
+            return format!("{label} request was rejected: the content filter blocked the request");
+        }
         return format!("{label} request was rejected: {code}");
     }
     let code = status.as_u16();
@@ -683,6 +747,31 @@ pub(crate) mod tests {
             private_error_text("Copilot", http::StatusCode::SERVICE_UNAVAILABLE, None);
         assert!(!unavailable.contains("account access"), "{unavailable}");
         assert!(closed_error_code(b"free text only").is_none());
+
+        let code = closed_error_code(
+            br#"{"error":{"code":"model_not_supported","message":"secret echo gpt-9"}}"#,
+        );
+        let model = private_error_text("Copilot", http::StatusCode::BAD_REQUEST, code);
+        assert!(model.contains("model is not available"), "{model}");
+        assert!(model.contains("/models"), "{model}");
+        assert!(!model.contains("secret echo") && !model.contains("model_not_supported"));
+        let filtered = private_error_text(
+            "ChatGPT",
+            http::StatusCode::BAD_REQUEST,
+            closed_error_code(b"{\"code\":\"content_filter\"}"),
+        );
+        assert!(filtered.contains("content filter"), "{filtered}");
+    }
+
+    #[test]
+    fn empty_bearer_is_stripped_and_real_credentials_are_kept() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::AUTHORIZATION, "Bearer ".parse().unwrap());
+        strip_empty_bearer(&mut headers);
+        assert!(headers.get(http::header::AUTHORIZATION).is_none());
+        headers.insert(http::header::AUTHORIZATION, "Bearer abc".parse().unwrap());
+        strip_empty_bearer(&mut headers);
+        assert!(headers.get(http::header::AUTHORIZATION).is_some());
     }
 
     async fn read_request(socket: &mut TcpStream) -> String {

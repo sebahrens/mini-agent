@@ -42,18 +42,39 @@ Inside the TUI, use `/login openai`; `/login openai new` registers another
 account or workspace, and `/login openai <number>` reauthorizes a registration
 listed by `/provider`. The CLI equivalents are `--login-account new` or
 `--login-account <number>`. The browser asks for consent. Ctrl-C cancels while
-waiting for the callback; the bounded token exchange then finishes under its
+waiting for the callback (up to 10 minutes); the bounded token exchange then finishes under its
 owned cleanup scope. Identity and grant validation finish before the active account can change.
 
 The selected saved login takes precedence over environment/config API keys on
 the built-in `openai` route. An explicit `--api-key` still overrides it. Custom
 providers and alternate base URLs never inherit subscription credentials.
+Over SSH or in a container the browser runs on another machine, so the
+`127.0.0.1` redirect cannot arrive. With `mini-agent --login openai`, open the
+printed URL locally, let the redirect fail, and paste the full failed address
+(`http://127.0.0.1:PORT/auth/callback?...`) back into the terminal; it goes
+through the same state/client/code validation as the redirect itself. To avoid
+the paste, export `MINI_AGENT_LOGIN_PORT=PORT` (1024-65535) on the host and
+forward it first (`ssh -L PORT:127.0.0.1:PORT host`). Pasting works only for
+the one-shot `--login`; `/login` inside the TUI owns the terminal, so use the
+fixed port there.
+
+If the provider answers a request with HTTP 401 (a token invalidated early, or a
+clock that runs behind), the cached ChatGPT/Copilot token is dropped, a fresh
+one is acquired and the request is resent once; a second 401 is reported.
+A network error or 5xx while renewing a token is retried like a model-request
+error and never tells you to sign in again; only a refused grant
+(`invalid_grant`, 401/403) does.
+
 Changing accounts replaces the client on the next explicit provider/login
 operation; an already captured subscription client cannot borrow another
 registration's tokens. `/logout openai` (or `--logout openai`) attempts to
 revoke the renewable session and clears local tokens. If remote revocation
-cannot be confirmed, the message points to ChatGPT Settings. API-key fallback
-is available after explicit logout if a key is configured.
+cannot be confirmed, the message points to ChatGPT Settings. `/logout openai`
+clears only the active account and says how many others stay signed in;
+`/logout openai all` (or `--logout openai --login-account all`) revokes and
+clears every saved account under one lock and reports how many were revoked
+remotely versus cleared locally only, and `/logout openai N` clears account N.
+API-key fallback is available after explicit logout if a key is configured.
 
 `src/auth/oauth.rs` implements OpenAI's [public-client registration](https://developers.openai.com/siwc/token-sharing-open-source/sign-in),
 with fresh state, nonce and PKCE, a stable opaque host UUID, and an issued
@@ -194,13 +215,22 @@ explains deployment names and Entra token scope.
 
 ## AWS Bedrock Claude Messages
 
-Select `provider = "bedrock"`, set `AWS_REGION` (or `AWS_DEFAULT_REGION`), and
-configure the exact Bedrock Claude model or inference-profile ID:
+Select `provider = "bedrock"`, set `AWS_REGION` (or `AWS_DEFAULT_REGION`; when
+neither is set the `region` of the selected `AWS_PROFILE`/`default` profile in
+`~/.aws/config` or `AWS_CONFIG_FILE` is used), and configure the exact Bedrock Claude model or inference-profile ID:
 
 ```toml
 provider = "bedrock"
 model = "us.anthropic.claude-sonnet-5"
 ```
+
+Not yet verified live (needs an AWS account): that `/anthropic/v1/messages`
+streams plain SSE for a real region, and whether a Bedrock API key is accepted as
+`x-api-key` (as sent today) or must be `Authorization: Bearer`. Request shape is
+pinned by `provider_bedrock_tests.rs`; if a live run refuses either, change the
+route/header there. A failed credential chain now names its class (no
+credentials, timeout, provider error) and an expired SSO session says to run
+`aws sso login --profile NAME`.
 
 This backend uses the current native Anthropic Messages endpoint,
 `https://bedrock-runtime.REGION.amazonaws.com/anthropic/v1/messages`, with
@@ -349,6 +379,11 @@ The API key is resolved in this priority order:
    default env var for the provider kind
 4. **Config file** `api_keys` map — keyed by provider slug or custom provider name
 5. **Ollama** — returns an empty string (no key required)
+6. **Local OpenAI-compatible servers** — a custom provider whose `base_url` is a
+   loopback address (LM Studio, llama.cpp `llama-server`, vLLM, Jan) needs no key
+   when none of the sources above is configured, and no `Authorization` header
+   is sent. A remote server that needs none can declare it with
+   `api_keys.<name> = "none"`.
 
 For native Anthropic, `ANTHROPIC_AUTH_TOKEN` is a typed bearer alternative after
 `--api-key` and the designated API-key environment variable, before config keys.
@@ -632,7 +667,16 @@ GitHub documents [independent OAuth apps](https://docs.github.com/en/copilot/how
 and [GHE.com service routing](https://docs.github.com/en/copilot/reference/copilot-allowlist-reference).
 
 
-Configure your own GitHub OAuth app with device flow enabled, then authorize it:
+Configure your own GitHub OAuth app with device flow enabled, then authorize it.
+The sign-in exchanges the GitHub user token at `/copilot_internal/v2/token`, an
+internal GitHub endpoint that may issue Copilot tokens only to GitHub-approved
+editor integrations. If GitHub refuses it (HTTP 403/404) sign-in stops with a
+message saying so, and the supported fallbacks are `GITHUB_COPILOT_API_TOKEN` or
+`COPILOT_GITHUB_TOKEN`. This has not been verified against github.com with a
+fresh OAuth app (it needs a Copilot account); record the observed status here
+once checked. A model the plan or organization policy does not enable is reported
+as "this model is not available on your plan or not enabled for your account;
+run /models"; error bodies are never echoed.
 
 ```sh
 export COPILOT_CLIENT_ID=YOUR_APP_CLIENT_ID

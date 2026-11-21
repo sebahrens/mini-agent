@@ -468,7 +468,7 @@ async fn run_one_shot(
                 );
             } else {
                 startup::heap_future(|| {
-                    auth::oauth::sign_in(provider, cli.login_account.as_deref())
+                    auth::oauth::sign_in(provider, cli.login_account.as_deref(), true)
                 })
                 .await?;
                 println!(
@@ -480,13 +480,17 @@ async fn run_one_shot(
         OneShot::Logout => {
             let provider = cli.logout.as_deref().expect("classified from --logout");
             let message = if provider.eq_ignore_ascii_case("copilot") {
+                anyhow::ensure!(
+                    cli.login_account.is_none(),
+                    "Copilot stores one account per GitHub host; omit --login-account"
+                );
                 auth::copilot::logout().await?
             } else {
                 anyhow::ensure!(
                     provider.eq_ignore_ascii_case("openai"),
                     "Supported provider logins: openai, copilot"
                 );
-                auth::oauth::logout().await?
+                auth::oauth::logout(cli.login_account.as_deref()).await?
             };
             println!("{message}");
             Ok(())

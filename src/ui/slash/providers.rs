@@ -89,23 +89,23 @@ async fn handle_login(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<
         );
         return Ok(());
     }
-    if parts.len() > if parts[0] == "/login" { 3 } else { 2 } {
+    if parts.len() > 3 {
         write_usage(
             ctx.renderer,
-            "usage: /login openai [new|account-number] | copilot, /logout openai | copilot",
+            "usage: /login openai [new|account-number] | copilot, /logout openai [all|account-number] | copilot",
         );
         return Ok(());
     }
     let result = if parts[0] == "/login" {
         ctx.terminal_guard.suspend()?;
         let result = crate::startup::heap_future(|| {
-            crate::auth::oauth::sign_in(provider, parts.get(2).copied())
+            crate::auth::oauth::sign_in(provider, parts.get(2).copied(), false)
         })
         .await;
         ctx.terminal_guard.resume()?;
         result.map(|()| "ChatGPT sign-in saved".to_owned())
     } else {
-        crate::auth::oauth::logout().await
+        crate::auth::oauth::logout(parts.get(2).copied()).await
     };
     match result {
         Ok(message) => {

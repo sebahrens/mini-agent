@@ -174,6 +174,7 @@ pub enum InputFormat {
     about = "Minimal coding agent",
     after_help = "Commands:\n  mini-agent update    Update mini-agent in place (see `mini-agent update --help`)")]
 #[command(group(clap::ArgGroup::new("permission_mode_flags").args(["restrictive", "read_only", "guarded", "accept_all", "yolo", "dangerously_skip_permissions"]).multiple(false)))]
+#[command(group(clap::ArgGroup::new("provider_account_action").args(["login", "logout"]).multiple(true)))]
 #[command(group(clap::ArgGroup::new("fork_resume_source").args(["continue_session", "session", "resume"]).multiple(true)))]
 #[cfg_attr(all(feature = "acp", feature = "loop"), command(group(clap::ArgGroup::new("idle_server_mode").args(["acp_enabled", "loop_mode"]).multiple(true))))]
 #[cfg_attr(all(feature = "acp", not(feature = "loop")), command(group(clap::ArgGroup::new("idle_server_mode").args(["acp_enabled"]))))]
@@ -190,8 +191,8 @@ pub struct Cli {
     #[arg(
         long,
         value_name = "NEW_OR_NUMBER",
-        requires = "login",
-        help = "Choose a saved ChatGPT registration, or new (OpenAI only)"
+        requires = "provider_account_action",
+        help = "Choose a saved ChatGPT registration: new or a number with --login; all or a number with --logout (OpenAI only)"
     )]
     pub login_account: Option<String>,
     #[arg(

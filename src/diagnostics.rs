@@ -122,6 +122,7 @@ where
         .with_config_keys(cfg.api_keys.as_ref())
         .with_custom_provider_name(Some(name))
         .with_credential_isolation(route.credential_isolation)
+        .with_local_base_url(route.base_url.as_deref())
         .credential_source_with_env(&get_env);
     match source {
         Ok(CredentialSource::CopilotLogin) => {

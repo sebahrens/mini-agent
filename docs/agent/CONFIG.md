@@ -1991,6 +1991,24 @@ resolves keys like its `provider_type` built-in, whatever its name: its
 `api_key_env` if set, otherwise the vendor variable, then `api_keys` under the
 vendor slot (`openai`, `gemini`, ...) or under the entry's own name.
 
+### Local OpenAI-compatible servers (LM Studio, llama.cpp, vLLM)
+
+A custom provider whose `base_url` is a loopback address needs no API key and
+sends no `Authorization` header; no placeholder is required:
+
+```toml
+[custom_providers.lmstudio]
+provider_type = "openai"
+base_url = "http://127.0.0.1:1234/v1"   # llama.cpp: http://127.0.0.1:8080/v1, vLLM: http://127.0.0.1:8000/v1
+api_style = "completions"
+model = "qwen2.5-coder-7b-instruct"
+```
+
+Run `mini-agent --provider lmstudio`. A non-loopback server that needs no key
+declares it with `api_keys.<name> = "none"`; otherwise a custom provider without
+a key still fails closed. Configured keys, `api_key_env` and credential commands
+take precedence over the loopback default.
+
 ## OpenAI API styles and custom headers
 
 The `openai` provider (and any custom provider with `"provider_type": "openai"`)

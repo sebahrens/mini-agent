@@ -88,6 +88,31 @@ impl CopilotAuth {
             logical,
         })
     }
+    /// The provider answered 401: drop the model token this route used and
+    /// install a fresh bearer in `headers` for the one resend. False when
+    /// nothing can be renewed (an explicit token) or renewal failed
+    /// (mini-agent-nvnkx.198).
+    pub(crate) async fn renew_after_unauthorized(&self, headers: &mut http::HeaderMap) -> bool {
+        match &self.source {
+            Source::Direct(_) => return false,
+            Source::Login(registration) => {
+                if registration.invalidate().await.is_err() {
+                    return false;
+                }
+            }
+            Source::GitHub { token, .. } => token.lock().await.invalidate(),
+        }
+        let Ok(context) = self.context().await else {
+            return false;
+        };
+        let Ok(mut value) = http::HeaderValue::from_str(&format!("Bearer {}", context.api_key))
+        else {
+            return false;
+        };
+        value.set_sensitive(true);
+        headers.insert(http::header::AUTHORIZATION, value);
+        true
+    }
     pub(crate) fn is_login(&self) -> bool {
         matches!(self.source, Source::Login(_))
     }
@@ -221,6 +246,18 @@ impl CopilotAuth {
         Ok(())
     }
 }
+/// The sentence a failed credential acquisition becomes. A typed transient
+/// failure keeps its retryable text; a refused grant names the re-login; only
+/// an untyped (local) failure gets the generic check-your-token sentence.
+fn auth_failure_text(error: &anyhow::Error) -> String {
+    match crate::auth::AuthFailure::of(error) {
+        Some(failure) => failure.message.clone(),
+        None => {
+            "Copilot authentication failed; check the configured token or run /login copilot".into()
+        }
+    }
+}
+
 pub(crate) fn build_client(
     credential: ResolvedCredential,
     endpoint: Option<&str>,
@@ -232,9 +269,12 @@ pub(crate) fn build_client(
     let callback = sdk::ExternalAuthenticator::new(move || {
         let auth = provider.clone();
         async move {
-            tokio::time::timeout(Duration::from_secs(30),auth.context()).await
-                .map_err(|_|sdk::AuthError::Message("Copilot credential acquisition timed out".into()))?
-                .map_err(|_|sdk::AuthError::Message("Copilot authentication failed; check the configured token or run /login copilot".into()))
+            tokio::time::timeout(Duration::from_secs(30), auth.context())
+                .await
+                .map_err(|_| {
+                    sdk::AuthError::Message("Copilot credential acquisition timed out".into())
+                })?
+                .map_err(|error| sdk::AuthError::Message(auth_failure_text(&error)))
         }
     });
     let mut builder = ClientBuilder::<sdk::CopilotBuilder>::default()

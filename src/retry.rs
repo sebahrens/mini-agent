@@ -361,6 +361,10 @@ fn parse_go_duration(value: &str) -> Option<Duration> {
 /// balance or a hard billing limit. They often arrive as HTTP 429, which
 /// would otherwise be retried until the budget is spent.
 pub fn is_quota_exhausted_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    // 402 Payment Required (OpenRouter, DeepSeek: insufficient credits).
+    if provider_response_status(error).is_some_and(|status| status.as_u16() == 402) {
+        return true;
+    }
     error_sources(error).any(|candidate| is_quota_exhausted_message(&candidate.to_string()))
 }
 
@@ -440,6 +444,15 @@ pub fn is_retryable(error: &(dyn std::error::Error + 'static)) -> bool {
         ) {
             return false;
         }
+    }
+
+    // A typed credential-renewal failure decides on its own: a flaky network
+    // at renewal time is retried like the model request would be, a refused
+    // grant never is (mini-agent-nvnkx.199).
+    if let Some(failure) = error_sources(error)
+        .find_map(|candidate| candidate.downcast_ref::<crate::auth::AuthFailure>())
+    {
+        return failure.kind == crate::auth::AuthFailureKind::Transient;
     }
 
     // Context overflow cannot recover without changing the request. Check the
@@ -707,13 +720,35 @@ pub const AUTH_FAILURE_HINT: &str = "Check the API key for this provider: the en
 pub const MODEL_NOT_FOUND_HINT: &str =
     "The model id was not found for this provider; run /models to list valid ids.";
 
+/// Guidance for a model (or its routed endpoints) that cannot call tools.
+pub const TOOLS_UNSUPPORTED_HINT: &str = "This model or its available endpoints cannot call tools; pick another model (/models) or relax provider routing.";
+
+/// Guidance for an OpenRouter data-policy / privacy-routing mismatch.
+pub const DATA_POLICY_HINT: &str = "No endpoint satisfies your account's data-policy or privacy settings for this model; relax them in the provider's privacy settings or pick another model.";
+
+/// Guidance for a 404 whose body does not name a missing model: the route
+/// itself is probably wrong.
+pub const ENDPOINT_NOT_FOUND_HINT: &str = "The endpoint answered 404 without naming a missing model; if the model id is valid, check the provider's base_url path (for example it may need a /v1 suffix).";
+
 /// Recovery guidance for the common first-run failures, chosen from the typed
 /// status (and `model_not_found` bodies), never from free text alone.
 fn status_hint(error: &(dyn std::error::Error + 'static), message: &str) -> Option<&'static str> {
     let lower = message.to_ascii_lowercase();
     let not_found_body = lower.contains("model_not_found") || lower.contains("not_found_error");
-    match provider_response_status(error).map(|status| status.as_u16()) {
+    let status = provider_response_status(error).map(|status| status.as_u16());
+    // The model id is valid in these cases, so "run /models" would mislead.
+    if matches!(status, Some(400 | 404))
+        && (lower.contains("support tool") || lower.contains("does not support tools"))
+    {
+        return Some(TOOLS_UNSUPPORTED_HINT);
+    }
+    if status == Some(404) && lower.contains("data policy") {
+        return Some(DATA_POLICY_HINT);
+    }
+    match status {
         Some(401 | 403) => Some(AUTH_FAILURE_HINT),
+        Some(404) if !not_found_body && lower.contains("model") => Some(MODEL_NOT_FOUND_HINT),
+        Some(404) if !not_found_body => Some(ENDPOINT_NOT_FOUND_HINT),
         Some(404) => Some(MODEL_NOT_FOUND_HINT),
         Some(400) if not_found_body => Some(MODEL_NOT_FOUND_HINT),
         _ => None,
@@ -922,6 +957,35 @@ mod tests {
     use super::*;
     use std::io;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn tools_credit_and_endpoint_failures_do_not_blame_the_model_id() {
+        use crate::provider_http::ProviderRetryAfterError as E;
+        let routing = E::for_test(404, &[], "No endpoints found that support tool use");
+        let hint = with_provider_error_hint(&routing);
+        assert!(hint.contains(TOOLS_UNSUPPORTED_HINT), "{hint}");
+        assert!(!hint.contains(MODEL_NOT_FOUND_HINT), "{hint}");
+        let ollama = E::for_test(
+            400,
+            &[],
+            "registry.ollama.ai/library/gemma3 does not support tools",
+        );
+        let hint = with_provider_error_hint(&ollama);
+        assert!(hint.contains(TOOLS_UNSUPPORTED_HINT), "{hint}");
+        let policy = E::for_test(404, &[], "No endpoints available matching your data policy");
+        let hint = with_provider_error_hint(&policy);
+        assert!(hint.contains(DATA_POLICY_HINT), "{hint}");
+        assert!(!hint.contains(MODEL_NOT_FOUND_HINT), "{hint}");
+        let wrong_path = E::for_test(404, &[], "404 page not found");
+        let hint = with_provider_error_hint(&wrong_path);
+        assert!(hint.contains(ENDPOINT_NOT_FOUND_HINT), "{hint}");
+        assert!(!hint.contains(MODEL_NOT_FOUND_HINT), "{hint}");
+        let named = E::for_test(404, &[], "The model `gpt-9` does not exist");
+        assert!(with_provider_error_hint(&named).contains(MODEL_NOT_FOUND_HINT));
+        let credits = E::for_test(402, &[], "Insufficient credits");
+        assert!(with_provider_error_hint(&credits).contains(QUOTA_EXHAUSTED_HINT));
+        assert!(!is_retryable(&credits));
+    }
 
     #[tokio::test]
     async fn many_image_rejection_tightens_the_budget_and_retries_once_without_a_delay() {

@@ -1227,3 +1227,392 @@ async fn oauth_refresh_wait_is_bounded_cancellable_and_rechecks_logout() {
             .contains("account changed")
     );
 }
+
+use crate::tests::support::loopback_http::asynchronous::read_request_or_empty as read_request;
+
+fn signed_in(root: &std::path::Path, ids: &[&str], expires: u64) {
+    let mut store = LockedStore::open(root.to_path_buf(), true)
+        .unwrap()
+        .unwrap();
+    for id in ids {
+        store.data.accounts.push(Account {
+            client_id: (*id).into(),
+            subject: "subject".into(),
+            email: None,
+            tokens: Some(Tokens {
+                access: "owned-access".into(),
+                refresh: format!("refresh-{id}"),
+                id: "unused-id".into(),
+                scopes: SCOPES.into(),
+                expires,
+            }),
+        });
+    }
+    store.data.active = ids.first().map(|id| (*id).to_owned());
+    store.save().unwrap();
+}
+
+#[tokio::test]
+async fn oauth198_a_401_renews_the_token_and_resends_once_then_surfaces_a_second_401() {
+    use tokio::io::AsyncWriteExt;
+    for persistent in [false, true] {
+        let roots = crate::tests::OwnedTestDirectory::new("oauth198-401");
+        let root = roots.path().join("credentials");
+        signed_in(&root, &["oaiapp_fixture"], now().unwrap() + 3600);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let registration = Registration {
+            root: root.clone(),
+            client_id: "oaiapp_fixture".into(),
+            endpoints: Some(AuthEndpoints {
+                token: format!("{origin}/token"),
+                jwks: format!("{origin}/jwks"),
+            }),
+        };
+        let backend = crate::provider_http::ProviderHttpClient::chatgpt_test_wire(
+            registration,
+            origin.parse().unwrap(),
+        );
+        let server = async {
+            let mut log = Vec::new();
+            for _ in 0..4 {
+                let (mut socket, request) = {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let request = read_request(&mut socket).await;
+                    (socket, request)
+                };
+                let line = request.head.lines().next().unwrap().to_owned();
+                let (status, content_type, body) = if line.starts_with("GET /v1/models") {
+                    let fresh = request.headers.contains("bearer fresh-access");
+                    log.push(format!("models fresh={fresh}"));
+                    if fresh && !persistent {
+                        (
+                            "200 OK",
+                            "application/json",
+                            r#"{"models":[{"slug":"gpt-x","display_name":"X","visibility":"list"}]}"#
+                                .to_owned(),
+                        )
+                    } else {
+                        ("401 Unauthorized", "application/json", "{}".to_owned())
+                    }
+                } else if line.starts_with("POST /token") {
+                    log.push("token".into());
+                    let body = String::from_utf8(request.body.clone()).unwrap();
+                    assert!(body.contains("grant_type=refresh_token"), "{body}");
+                    (
+                        "200 OK",
+                        "application/json",
+                        serde_json::json!({"access_token":"fresh-access","refresh_token":"refresh-new","id_token":signed_id("oaiapp_fixture","n","subject",now().unwrap()+3600),"token_type":"Bearer","expires_in":3600,"scope":SCOPES}).to_string(),
+                    )
+                } else {
+                    log.push("jwks".into());
+                    (
+                        "200 OK",
+                        "application/json",
+                        String::from_utf8(include_bytes!("fixtures/test-only-jwks.json").to_vec())
+                            .unwrap(),
+                    )
+                };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(head.as_bytes()).await.unwrap();
+            }
+            log
+        };
+        let operation = async {
+            backend
+                .listing_get(
+                    http::Request::builder()
+                        .uri("https://api.openai.com/v1/models")
+                        .body(Vec::new())
+                        .unwrap(),
+                    64 * 1024,
+                )
+                .await
+        };
+        let (log, result) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(server, operation)
+        })
+        .await
+        .unwrap();
+        let expected = ["models fresh=false", "token", "jwks", "models fresh=true"];
+        assert_eq!(log, expected);
+        if persistent {
+            // 401, renew, resend, 401 again: surfaced after exactly one retry.
+            assert!(result.unwrap_err().to_string().contains("401"));
+        } else {
+            assert!(result.is_ok(), "{result:?}");
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err(),
+            "no further resend"
+        );
+    }
+}
+
+#[tokio::test]
+async fn oauth199_transient_refresh_errors_are_retryable_and_invalid_grant_keeps_the_hint() {
+    use tokio::io::AsyncWriteExt;
+    let roots = crate::tests::OwnedTestDirectory::new("oauth199-transient");
+    let root = roots.path().join("credentials");
+    signed_in(&root, &["oaiapp_fixture"], 0);
+    // A refused connection to the token endpoint.
+    let closed = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        format!("http://{}", listener.local_addr().unwrap())
+    };
+    let registration = |token: String| Registration {
+        root: root.clone(),
+        client_id: "oaiapp_fixture".into(),
+        endpoints: Some(AuthEndpoints {
+            token: token.clone(),
+            jwks: token,
+        }),
+    };
+    let error = registration(closed).access_token().await.unwrap_err();
+    assert_eq!(
+        crate::auth::AuthFailure::of(&error).map(|f| f.kind),
+        Some(crate::auth::AuthFailureKind::Transient)
+    );
+    assert!(!error.to_string().contains("sign in"), "{error}");
+    assert!(!error.to_string().contains("/login"), "{error}");
+    let wrapped = rig::http_client::Error::Instance(error.into());
+    assert!(crate::retry::is_retryable(&wrapped));
+    // Still signed in: a transient failure never clears the grant.
+    assert!(
+        LockedStore::open(root.clone(), false)
+            .unwrap()
+            .unwrap()
+            .data
+            .accounts[0]
+            .tokens
+            .is_some()
+    );
+    // A 503 from the token endpoint is transient too; invalid_grant is not.
+    for (status, body, transient) in [
+        ("503 Service Unavailable", "{}", true),
+        ("400 Bad Request", r#"{"error":"invalid_grant"}"#, false),
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = read_request(&mut socket).await;
+            socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        };
+        let subject = registration(endpoint);
+        let (_, error) = tokio::join!(server, subject.access_token());
+        let error = error.unwrap_err();
+        let wrapped = rig::http_client::Error::Instance(error.into());
+        assert_eq!(crate::retry::is_retryable(&wrapped), transient, "{status}");
+        if !transient {
+            assert!(wrapped.to_string().contains("/login openai"), "{wrapped}");
+        }
+    }
+}
+
+#[test]
+fn oauth200_selection_and_status_read_without_waiting_for_the_credential_lock() {
+    let roots = crate::tests::OwnedTestDirectory::new("oauth200-lock");
+    let credentials = roots.path().join("credentials");
+    let root = credentials.join("provider-oauth");
+    signed_in(&root, &["oaiapp_a", "oaiapp_b"], now().unwrap() + 3600);
+    // Another process holds session.lock across a refresh.
+    let held = LockedStore::open(root.clone(), false).unwrap().unwrap();
+    assert!(LockedStore::open(root.clone(), false).is_err());
+    let registration = selected_at(&credentials).unwrap().expect("registration");
+    assert_eq!(registration.client_id, "oaiapp_a");
+    let lines = status_at(&credentials).unwrap();
+    assert!(lines.iter().any(|l| l.contains("[active]")), "{lines:?}");
+    assert_eq!(lines.len(), 3);
+    drop(held);
+    // No record at all: signed out, nothing created.
+    let empty = crate::tests::OwnedTestDirectory::new("oauth200-empty");
+    assert!(selected_at(empty.path()).unwrap().is_none());
+    assert_eq!(status_at(empty.path()).unwrap(), ["ChatGPT: not signed in"]);
+}
+
+#[tokio::test]
+async fn oauth201_pasted_callback_is_validated_like_the_loopback_redirect() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let roots = crate::tests::OwnedTestDirectory::new("oauth201-paste");
+    let root = roots.path().join("credentials");
+    let mut store = LockedStore::open(root.clone(), true).unwrap().unwrap();
+    store.save().unwrap();
+    let (host, revision) = (store.data.host.clone(), store.data.revision);
+    drop(store);
+    let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", server.local_addr().unwrap());
+    let endpoints = AuthEndpoints {
+        token: format!("{origin}/token"),
+        jwks: format!("{origin}/jwks"),
+    };
+    let login = Login {
+        listener: tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        root: root.clone(),
+        host,
+        revision,
+        selected: None,
+        state: "state".into(),
+        nonce: "nonce".into(),
+        verifier: "verifier".into(),
+        redirect: "http://127.0.0.1:1/auth/callback".into(),
+        url: "unused".into(),
+        endpoints: Some(endpoints),
+    };
+    // Wrong state, wrong host and a non-URL are refused; the right one is not.
+    for bad in [
+        "http://127.0.0.1:9/auth/callback?state=other&code=c&client_id=oaiapp_own",
+        "http://evil.example/auth/callback?state=state&code=c&client_id=oaiapp_own",
+        "http://127.0.0.1:9/elsewhere?state=state&code=c&client_id=oaiapp_own",
+        "just a code",
+    ] {
+        assert!(login.callback_from_paste(bad).is_err(), "{bad}");
+    }
+    let (code, client) = login
+        .callback_from_paste("http://127.0.0.1:41234/auth/callback?code=fixture_code&state=state&client_id=oaiapp_own")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (code.as_str(), client.as_str()),
+        ("fixture_code", "oaiapp_own")
+    );
+    assert!(
+        login
+            .callback_from_paste("http://127.0.0.1:9/auth/callback?state=state&error=access_denied")
+            .unwrap()
+            .is_none()
+    );
+    // End to end: a wrong-state line is ignored, the right one exchanges.
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    sender
+        .send("http://127.0.0.1:9/auth/callback?state=wrong&code=nope&client_id=oaiapp_own".into())
+        .unwrap();
+    sender
+        .send(
+            "http://127.0.0.1:9/auth/callback?state=state&code=fixture_code&client_id=oaiapp_own"
+                .into(),
+        )
+        .unwrap();
+    let token_server = async {
+        for index in 0..2 {
+            let (mut socket, _) = server.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            if index == 0 {
+                let form = String::from_utf8(request.body).unwrap();
+                assert!(
+                    form.contains("code=fixture_code") && !form.contains("nope"),
+                    "{form}"
+                );
+            }
+            let body = if index == 0 {
+                serde_json::to_vec(&serde_json::json!({"access_token":"pasted-access","refresh_token":"pasted-refresh","id_token":signed_id("oaiapp_own","nonce","subject",now().unwrap()+3600),"token_type":"Bearer","expires_in":3600,"scope":SCOPES})).unwrap()
+            } else {
+                include_bytes!("fixtures/test-only-jwks.json").to_vec()
+            };
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).as_bytes()).await.unwrap();
+            socket.write_all(&body).await.unwrap();
+            let mut rest = Vec::new();
+            let _ = socket.read_to_end(&mut rest).await;
+        }
+    };
+    let mut paste = Some(receiver);
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(login.complete_with_paste(&mut paste), token_server)
+    })
+    .await
+    .unwrap();
+    result.unwrap();
+    let store = LockedStore::open(root, false).unwrap().unwrap();
+    assert_eq!(store.data.active.as_deref(), Some("oaiapp_own"));
+    assert_eq!(
+        store.data.accounts[0].tokens.as_ref().unwrap().access,
+        "pasted-access"
+    );
+}
+
+#[test]
+fn oauth206_logout_all_revokes_every_account_and_plain_logout_mentions_the_rest() {
+    use std::io::{Read, Write};
+    let serve = |count: usize| {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/revoke", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let mut bodies = Vec::new();
+            for _ in 0..count {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut buffer = vec![0u8; 4096];
+                let mut read = 0;
+                loop {
+                    let n = socket.read(&mut buffer[read..]).unwrap();
+                    read += n;
+                    let text = String::from_utf8_lossy(&buffer[..read]).to_string();
+                    if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                        let length = head
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if body.len() >= length {
+                            bodies.push(body.to_owned());
+                            break;
+                        }
+                    }
+                    assert!(n > 0);
+                }
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+            }
+            bodies
+        });
+        (url, handle)
+    };
+    let roots = crate::tests::OwnedTestDirectory::new("oauth206-all");
+    let root = roots.path().join("provider-oauth");
+    signed_in(&root, &["oaiapp_a", "oaiapp_b"], now().unwrap() + 3600);
+    // Plain logout: only the active account, and the message names the other.
+    let (url, handle) = serve(1);
+    let message = logout_scoped(root.clone(), &url, LogoutScope::Active).unwrap();
+    assert!(message.contains("revoked"), "{message}");
+    assert!(
+        message.contains("1 other ChatGPT account(s) remain signed in"),
+        "{message}"
+    );
+    assert_eq!(handle.join().unwrap().len(), 1);
+    // All: the rest is revoked under one lock and no tokens remain.
+    let (url, handle) = serve(1);
+    let message = logout_scoped(root.clone(), &url, LogoutScope::All).unwrap();
+    assert!(
+        message.contains("1 revoked remotely, 0 cleared locally only"),
+        "{message}"
+    );
+    assert!(!message.contains("remain signed in"), "{message}");
+    assert!(handle.join().unwrap()[0].contains("token=refresh-oaiapp_b"));
+    let store = LockedStore::open(root.clone(), false).unwrap().unwrap();
+    assert!(store.data.accounts.iter().all(|a| a.tokens.is_none()));
+    assert!(store.data.active.is_none());
+    drop(store);
+    // Two signed-in accounts, `all`: two revocations posted.
+    let roots = crate::tests::OwnedTestDirectory::new("oauth206-all-two");
+    let root = roots.path().join("provider-oauth");
+    signed_in(&root, &["oaiapp_a", "oaiapp_b"], now().unwrap() + 3600);
+    let (url, handle) = serve(2);
+    let message = logout_scoped(root.clone(), &url, LogoutScope::All).unwrap();
+    assert!(message.contains("2 revoked remotely"), "{message}");
+    let bodies = handle.join().unwrap();
+    assert!(bodies.iter().any(|b| b.contains("refresh-oaiapp_a")));
+    assert!(bodies.iter().any(|b| b.contains("refresh-oaiapp_b")));
+    assert!(LogoutScope::parse(Some("0")).is_err());
+    assert_eq!(
+        LogoutScope::parse(Some("2")).unwrap(),
+        LogoutScope::Number(2)
+    );
+}
