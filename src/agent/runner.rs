@@ -1386,6 +1386,184 @@ impl std::error::Error for NativeContextFull {}
 /// bounded event channel, so this can never fill and block the UI.
 const COMPACTION_DECISION_CAPACITY: usize = 64;
 
+/// State a start-failure fallback proxy shares with every runner it may spawn
+/// (mini-agent-nvnkx.43): the steering slot, compaction flag and pressure
+/// gate belong to the user-visible run, not to the model attempt, so the
+/// fallback runner reuses the primary's. `start_failure_retryable` is set by a
+/// runner whose very first request failed after exhausting retries with an
+/// error that retrying could have fixed (no progress was made).
+#[derive(Clone)]
+pub(crate) struct RunnerLink {
+    steering: crate::agent::steering::Steering,
+    compaction: Arc<CompactionShared>,
+    compaction_enabled: Arc<AtomicBool>,
+    start_failure_retryable: Arc<AtomicBool>,
+    /// True until the proxy has taken (or declined) the fallback: the primary
+    /// run then leaves its work scope uncancelled when it settles, because
+    /// the fallback runs in the same scope the frontend holds.
+    fallback_pending: Arc<AtomicBool>,
+}
+
+impl RunnerLink {
+    pub(crate) fn new() -> Self {
+        Self {
+            steering: Default::default(),
+            compaction: CompactionShared::new(),
+            compaction_enabled: Arc::new(AtomicBool::new(false)),
+            start_failure_retryable: Arc::new(AtomicBool::new(false)),
+            fallback_pending: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// Spawn runners created inside `operation` on this link.
+    pub(crate) fn scope_sync<T>(&self, operation: impl FnOnce() -> T) -> T {
+        RUNNER_LINK.sync_scope(self.clone(), operation)
+    }
+}
+
+tokio::task_local! {
+    static RUNNER_LINK: RunnerLink;
+}
+
+/// Given the failure message, spawns the started fallback runner and the
+/// one-line notice to show, or `None` when the fallback cannot run.
+pub(crate) type FallbackSpawn = Box<
+    dyn FnOnce(
+            String,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Option<(AgentRunner, String)>> + Send>,
+        > + Send,
+>;
+
+/// Aborts whichever runner currently drives the turn when the proxy task is
+/// aborted or dropped.
+struct AbortActive(Arc<std::sync::Mutex<tokio::task::AbortHandle>>);
+
+impl Drop for AbortActive {
+    fn drop(&mut self) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).abort();
+    }
+}
+
+impl AgentRunner {
+    /// Wrap `primary` so a first-request failure that retrying could have
+    /// fixed (no event other than `Retrying` yet) is replaced by the runner
+    /// `spawn` produces. Everything the UI holds (steering, compaction gate,
+    /// abort handle, decision channel) keeps addressing the active runner.
+    fn with_start_fallback(
+        primary: AgentRunner,
+        link: RunnerLink,
+        scope: AgentWorkCancellation,
+        spawn: FallbackSpawn,
+    ) -> Self {
+        let AgentRunner {
+            steering,
+            mut event_rx,
+            abort_handle,
+            compaction_decision_tx,
+            compaction_enabled,
+        } = primary;
+        let (event_tx, proxy_rx) = mpsc::channel::<AgentEvent>(run_event_capacity());
+        let (decision_tx, mut decision_rx) =
+            mpsc::channel::<CompactionBoundaryDecision>(COMPACTION_DECISION_CAPACITY);
+        let shared = Arc::clone(&link.compaction);
+        let mut target = compaction_decision_tx.map(|c| c.tx);
+        let active = Arc::new(std::sync::Mutex::new(abort_handle));
+        let guard = AbortActive(Arc::clone(&active));
+        let mut spawn = Some(spawn);
+        let join = tokio::spawn(async move {
+            let _guard = guard;
+            let mut progressed = false;
+            let mut decisions_open = true;
+            let mut terminal_seen = false;
+            loop {
+                tokio::select! {
+                    decision = decision_rx.recv(), if decisions_open => {
+                        match decision {
+                            Some(decision) => {
+                                if let Some(target) = &target {
+                                    let _ = target.send(decision).await;
+                                }
+                            }
+                            None => decisions_open = false,
+                        }
+                    }
+                    event = event_rx.recv() => {
+                        let Some(event) = event else {
+                            if progressed && !terminal_seen {
+                                let _ = event_tx
+                                    .send(AgentEvent::error_with(
+                                        "The fallback model run ended without a result.",
+                                        Vec::new(),
+                                    ))
+                                    .await;
+                            }
+                            break;
+                        };
+                        if matches!(
+                            event,
+                            AgentEvent::Done { .. }
+                                | AgentEvent::Error { .. }
+                                | AgentEvent::AwaitingUser { .. }
+                        ) {
+                            terminal_seen = true;
+                        }
+                        if let AgentEvent::Error { message, .. } = &event
+                            && !progressed
+                            && link.start_failure_retryable.load(Ordering::Acquire)
+                            && let Some(spawn) = spawn.take()
+                        {
+                            let reason = message.to_string();
+                            // The primary run settles before its channel
+                            // closes; only then may the fallback reuse its
+                            // (uncancelled) work scope.
+                            while event_rx.recv().await.is_some() {}
+                            link.fallback_pending.store(false, Ordering::Release);
+                            match spawn(reason).await {
+                                Some((runner, notice)) => {
+                                    let _ = event_tx
+                                        .send(AgentEvent::OutputTruncated {
+                                            message: CompactString::from(notice),
+                                        })
+                                        .await;
+                                    progressed = true;
+                                    terminal_seen = false;
+                                    event_rx = runner.event_rx;
+                                    target = runner.compaction_decision_tx.map(|c| c.tx);
+                                    *active.lock().unwrap_or_else(|e| e.into_inner()) =
+                                        runner.abort_handle;
+                                    continue;
+                                }
+                                None => {
+                                    scope.cancel();
+                                    let _ = event_tx.send(event).await;
+                                    break;
+                                }
+                            }
+                        }
+                        if !matches!(event, AgentEvent::Retrying { .. }) {
+                            progressed = true;
+                        }
+                        if event_tx.send(event).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        AgentRunner {
+            steering,
+            event_rx: proxy_rx,
+            abort_handle: join.abort_handle(),
+            compaction_decision_tx: Some(CompactionDecisionTx {
+                tx: decision_tx,
+                shared,
+            }),
+            compaction_enabled,
+        }
+    }
+}
+
 tokio::task_local! {
     static AGENT_WORK_SCOPE: Arc<AgentWorkScope>;
 }
@@ -1708,6 +1886,9 @@ pub(crate) struct AgentRunCleanupGuard {
     armed: bool,
     /// Runtime-only ownership carried until all registered children retire.
     retained: Option<Box<dyn Send>>,
+    /// `(start failure retryable, fallback pending)` of a start-failure
+    /// fallback link: when both hold, settling leaves the scope uncancelled.
+    keep_for_fallback: Option<(Arc<AtomicBool>, Arc<AtomicBool>)>,
 }
 
 impl AgentRunCleanupGuard {
@@ -1718,7 +1899,16 @@ impl AgentRunCleanupGuard {
             runtime: tokio::runtime::Handle::current(),
             armed: true,
             retained: None,
+            keep_for_fallback: None,
         }
+    }
+
+    fn keep_scope_for_fallback(mut self, link: &RunnerLink) -> Self {
+        self.keep_for_fallback = Some((
+            Arc::clone(&link.start_failure_retryable),
+            Arc::clone(&link.fallback_pending),
+        ));
+        self
     }
 
     /// Auxiliary work has the same retirement owner without a model event channel.
@@ -1729,6 +1919,7 @@ impl AgentRunCleanupGuard {
             runtime: tokio::runtime::Handle::current(),
             armed: true,
             retained: None,
+            keep_for_fallback: None,
         }
     }
 
@@ -1757,8 +1948,17 @@ impl AgentRunCleanupGuard {
     }
 
     pub(crate) async fn settle(mut self) {
-        self.scope.cancellation_handle().cancel();
-        self.scope.wait_idle().await;
+        let keep = self
+            .keep_for_fallback
+            .as_ref()
+            .is_some_and(|(failed, pending)| {
+                failed.load(Ordering::Acquire) && pending.load(Ordering::Acquire)
+            });
+        // A start failure ran no tool, so there is no child to wait for.
+        if !keep {
+            self.scope.cancellation_handle().cancel();
+            self.scope.wait_idle().await;
+        }
         self.lifecycle_tx.take();
         self.armed = false;
     }
@@ -2309,6 +2509,20 @@ impl PausedAgentRunner {
         notice: Option<crate::extras::subagents::background::NoticeLease>,
     ) -> Self {
         self.background_notice = notice;
+        self
+    }
+
+    /// Replace a start failure that retrying could have fixed with the runner
+    /// `spawn` builds (mini-agent-nvnkx.43). Only the first request of the
+    /// turn can fall back: once any other event was delivered the turn has
+    /// made progress and the failure ends it as before.
+    pub(crate) fn with_start_fallback(
+        mut self,
+        link: RunnerLink,
+        scope: AgentWorkCancellation,
+        spawn: FallbackSpawn,
+    ) -> Self {
+        self.runner = AgentRunner::with_start_fallback(self.runner, link, scope, spawn);
         self
     }
 
@@ -4937,21 +5151,33 @@ where
     let question_turn = crate::question::QuestionTurn::current();
     let retry_config = retry_config.bounded();
     let (event_tx, event_rx) = mpsc::channel::<AgentEvent>(run_event_capacity());
-    let steering = crate::agent::steering::Steering::default();
+    let link = RUNNER_LINK.try_with(Clone::clone).ok();
+    let steering = link
+        .as_ref()
+        .map(|link| link.steering.clone())
+        .unwrap_or_default();
     let steering_hook = crate::agent::steering::SteeringHook {
         steering: steering.clone(),
         events: event_tx.clone(),
     };
     let (compaction_decision_raw_tx, mut compaction_decision_rx) =
         mpsc::channel::<CompactionBoundaryDecision>(COMPACTION_DECISION_CAPACITY);
-    let compaction_shared = CompactionShared::new();
+    let compaction_shared = link
+        .as_ref()
+        .map_or_else(CompactionShared::new, |link| Arc::clone(&link.compaction));
     let runner_compaction_shared = Arc::clone(&compaction_shared);
     let compaction_decision_tx = CompactionDecisionTx {
         tx: compaction_decision_raw_tx,
         shared: compaction_shared,
     };
-    let compaction_enabled = Arc::new(AtomicBool::new(false));
+    let compaction_enabled = link.as_ref().map_or_else(
+        || Arc::new(AtomicBool::new(false)),
+        |link| Arc::clone(&link.compaction_enabled),
+    );
     let runner_compaction_enabled = Arc::clone(&compaction_enabled);
+    let start_failure_retryable = link
+        .as_ref()
+        .map(|link| Arc::clone(&link.start_failure_retryable));
     let runner_lifecycle_tx = event_tx.clone();
     let native_pair = native_capture.actor_pair();
     let mutation_events = event_tx.clone();
@@ -5171,6 +5397,9 @@ where
                 Err(error) => {
                     park_question!();
                     tracing::error!("agent stream start failed after retries: {error}");
+                    if let Some(flag) = &start_failure_retryable {
+                        flag.store(crate::retry::is_retryable(&error), Ordering::Release);
+                    }
                     let error = retry::with_provider_error_hint_for(
                         &error,
                         crate::spend::run::Run::current()
@@ -5820,6 +6049,10 @@ where
     // guard and transfers cleanup ownership.
     let setup_error_tx = runner_lifecycle_tx.clone();
     let cleanup = AgentRunCleanupGuard::new(Arc::clone(&task_scope), runner_lifecycle_tx);
+    let cleanup = match &link {
+        Some(link) => cleanup.keep_scope_for_fallback(link),
+        None => cleanup,
+    };
     let agent_future = async move {
         if let Some(pair) = native_pair {
             let model = crate::startup::heap_future(|| async move {

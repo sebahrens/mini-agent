@@ -603,3 +603,6 @@ pub(crate) fn build_client(
 #[cfg(test)]
 #[path = "provider_bedrock_tests.rs"]
 mod tests;
+
+#[path = "provider_bedrock_converse.rs"]
+pub(crate) mod converse;

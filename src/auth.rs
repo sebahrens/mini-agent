@@ -188,6 +188,9 @@ pub enum ProviderKind {
     Azure,
     Bedrock,
     Vertex,
+    /// Gemini models served by Vertex AI (`generateContent` under the
+    /// `google` publisher) with the same ADC / access-token credentials.
+    VertexGemini,
     Copilot,
     Anthropic,
     Gemini,
@@ -202,6 +205,7 @@ impl ProviderKind {
             "azure" | "azure-openai" | "azure_openai" => Some(Self::Azure),
             "bedrock" | "aws-bedrock" => Some(Self::Bedrock),
             "vertex" | "vertex-ai" => Some(Self::Vertex),
+            "vertex-gemini" | "vertex-ai-gemini" => Some(Self::VertexGemini),
             "copilot" | "github-copilot" => Some(Self::Copilot),
             "anthropic" => Some(Self::Anthropic),
             "gemini" | "google" => Some(Self::Gemini),
@@ -619,8 +623,10 @@ impl AuthResolver {
             ));
         }
 
-        if self.provider_kind == ProviderKind::Vertex
-            && custom.is_none()
+        if matches!(
+            self.provider_kind,
+            ProviderKind::Vertex | ProviderKind::VertexGemini
+        ) && custom.is_none()
             && self.api_key_env_override.is_none()
         {
             return Ok((ResolvedCredential::GoogleAdc, CredentialSource::GoogleAdc));
@@ -695,7 +701,10 @@ impl AuthResolver {
     }
 
     fn explicit_credential(&self, value: String) -> ResolvedCredential {
-        if self.provider_kind == ProviderKind::Vertex {
+        if matches!(
+            self.provider_kind,
+            ProviderKind::Vertex | ProviderKind::VertexGemini
+        ) {
             ResolvedCredential::Bearer(value)
         } else {
             ResolvedCredential::ApiKey(value)
@@ -724,7 +733,7 @@ impl ProviderKind {
             ProviderKind::OpenAI => "OPENAI_API_KEY",
             ProviderKind::Azure => "AZURE_OPENAI_API_KEY",
             ProviderKind::Bedrock => "AWS_BEARER_TOKEN_BEDROCK",
-            ProviderKind::Vertex => "VERTEX_ACCESS_TOKEN",
+            ProviderKind::Vertex | ProviderKind::VertexGemini => "VERTEX_ACCESS_TOKEN",
             ProviderKind::Copilot => "GITHUB_COPILOT_API_TOKEN",
             ProviderKind::Anthropic => "ANTHROPIC_API_KEY",
             ProviderKind::Gemini => "GEMINI_API_KEY",
@@ -744,6 +753,7 @@ impl ProviderKind {
             ProviderKind::Azure
             | ProviderKind::Bedrock
             | ProviderKind::Vertex
+            | ProviderKind::VertexGemini
             | ProviderKind::Copilot => "",
             ProviderKind::Anthropic => "https://api.anthropic.com",
             ProviderKind::Gemini => "https://generativelanguage.googleapis.com",
@@ -772,6 +782,7 @@ impl ProviderKind {
             ProviderKind::Azure => "azure",
             ProviderKind::Bedrock => "bedrock",
             ProviderKind::Vertex => "vertex",
+            ProviderKind::VertexGemini => "vertex-gemini",
             ProviderKind::Copilot => "copilot",
             ProviderKind::Anthropic => "anthropic",
             ProviderKind::Gemini => "gemini",

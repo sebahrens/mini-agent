@@ -104,6 +104,15 @@ pub(crate) mod vertex {
     ) -> anyhow::Result<AnyClient> {
         unavailable()
     }
+
+    pub(crate) fn build_gemini_client(
+        _credential: crate::auth::ResolvedCredential,
+        _endpoint: &str,
+        _route: VertexRoute,
+        _http: reqwest::Client,
+    ) -> anyhow::Result<AnyClient> {
+        unavailable()
+    }
 }
 
 #[cfg(all(test, not(any(feature = "bedrock", feature = "vertex"))))]
@@ -3422,6 +3431,9 @@ pub(crate) struct FallbackRoute {
     pub(crate) alias: Option<String>,
     pub(crate) cfg: std::sync::Arc<Config>,
     pub(crate) controls: effort::SessionReasoning,
+    /// The route names another provider than the session's: it runs on the
+    /// agent attached with [`AnyAgent::with_cross_provider_fallback`].
+    pub(crate) cross_provider: bool,
 }
 
 impl FallbackRoute {
@@ -3431,11 +3443,19 @@ impl FallbackRoute {
             .as_ref()
             .map(|error| error.to_string())
             .unwrap_or_default();
+        self.notice_for(primary, &reason)
+    }
+
+    fn notice_for(&self, primary: &str, reason: &str) -> String {
         let reason = reason.lines().next().unwrap_or_default();
         let reason: String = reason.chars().take(200).collect();
+        let target = if self.cross_provider {
+            format!("{}/{}", self.provider, self.model)
+        } else {
+            self.model.clone()
+        };
         format!(
-            "notice: model {primary} failed after retries ({reason}); falling back to {} for this turn",
-            self.model
+            "notice: model {primary} failed after retries ({reason}); falling back to {target} for this turn"
         )
     }
 }
@@ -3462,13 +3482,33 @@ pub(crate) fn resolve_fallback_route(
         .unwrap_or_else(|error| error.into_inner())
         .clone();
     let name = cli.or_else(|| cfg.fallback_model.as_ref().map(|name| name.to_string()))?;
-    resolve_fallback_route_named(cfg, session, &name)
+    resolve_fallback_route_named(cfg, session, &name, false)
+}
+
+/// The quick-model alias `fallback_model` / `--fallback-model` names when it
+/// belongs to a provider other than `provider`: the frontend that builds the
+/// agent must also build an agent for that provider
+/// (mini-agent-nvnkx.43).
+pub(crate) fn cross_provider_fallback_alias(
+    cfg: &Config,
+    provider: &str,
+) -> Option<crate::config::QuickModelConfig> {
+    let name = CLI_FALLBACK_MODEL
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone()
+        .or_else(|| cfg.fallback_model.as_ref().map(|name| name.to_string()))?;
+    crate::config::quick_models_map(cfg)
+        .get(name.trim())
+        .filter(|quick| quick.provider.as_str() != provider)
+        .cloned()
 }
 
 fn resolve_fallback_route_named(
     cfg: &Config,
     session: &crate::session::Session,
     name: &str,
+    allow_cross_provider: bool,
 ) -> Option<std::sync::Arc<FallbackRoute>> {
     let name = name.trim();
     if name.is_empty() {
@@ -3482,7 +3522,8 @@ fn resolve_fallback_route_named(
         ),
         None => (session.provider.to_string(), name.to_string(), None),
     };
-    if provider != session.provider.as_str() {
+    let cross_provider = provider != session.provider.as_str();
+    if cross_provider && !allow_cross_provider {
         tracing::warn!(
             fallback = name,
             provider,
@@ -3491,7 +3532,7 @@ fn resolve_fallback_route_named(
         );
         return None;
     }
-    if model == session.model.as_str() {
+    if !cross_provider && model == session.model.as_str() {
         return None;
     }
     Some(std::sync::Arc::new(FallbackRoute {
@@ -3500,6 +3541,7 @@ fn resolve_fallback_route_named(
         alias,
         cfg: std::sync::Arc::new(cfg.clone()),
         controls: session.reasoning_controls,
+        cross_provider,
     }))
 }
 
@@ -3524,6 +3566,122 @@ pub(crate) fn fallback_eligible(turn: &runner::HeadlessTurn) -> bool {
         return false;
     }
     crate::retry::is_retryable_flattened(error)
+}
+
+/// Per-turn scopes the interactive fallback runner must be spawned under, so
+/// it spends, asks questions and checkpoints exactly like the primary.
+struct InteractiveFallbackCtx {
+    primary_model: String,
+    spend: Option<crate::spend::run::Run>,
+    question_turn: Option<crate::question::QuestionTurn>,
+    file_checkpoints: Option<crate::session::file_checkpoints::Recorder>,
+    budget_carry: Option<std::sync::Arc<runner::HeadlessBudgetCarry>>,
+    #[cfg(feature = "hooks")]
+    hook_bindings: runner::HookBindings,
+    #[cfg(feature = "skills")]
+    turn_gate: Option<std::sync::Arc<tokio::sync::Mutex<()>>>,
+}
+
+struct InteractiveFallback {
+    link: runner::RunnerLink,
+    route: std::sync::Arc<FallbackRoute>,
+    inner: AnyAgentInner,
+    reason: String,
+    prompt: crate::agent::input::PromptInput,
+    history: std::sync::Arc<[Message]>,
+    retry_config: RetryConfig,
+    turn_token_budget: Option<u64>,
+    completion_verification: Option<runner::CompletionVerification>,
+    capture_source: Option<crate::agent::native_capture::NativeCapture>,
+    work_scope: std::sync::Arc<runner::AgentWorkScope>,
+    #[cfg(feature = "hooks")]
+    loop_info: Option<LoopInfo>,
+    ctx: InteractiveFallbackCtx,
+}
+
+/// Start the fallback runner for a turn whose primary failed before any
+/// progress, under the same spend/question/checkpoint/hook scopes as the
+/// primary but with spend recorded against the fallback model. The history is
+/// the provider-neutral transcript the primary was given; native Anthropic
+/// replay capture is only attached when the fallback itself is native.
+async fn spawn_interactive_fallback(
+    input: InteractiveFallback,
+) -> Option<(runner::AgentRunner, String)> {
+    let InteractiveFallback {
+        link,
+        route,
+        inner,
+        reason,
+        prompt,
+        history,
+        retry_config,
+        turn_token_budget,
+        completion_verification,
+        capture_source,
+        work_scope,
+        #[cfg(feature = "hooks")]
+        loop_info,
+        ctx,
+    } = input;
+    let notice = route.notice_for(&ctx.primary_model, &reason);
+    tracing::warn!("{notice}");
+    let spend = ctx.spend.as_ref().map(|run| {
+        run.for_model(
+            &route.provider,
+            &route.model,
+            &route.cfg,
+            route.alias.as_deref(),
+            None,
+            run.kind(),
+        )
+    });
+    #[cfg(feature = "skills")]
+    let turn_guard = match ctx.turn_gate {
+        Some(gate) => Some(gate.lock_owned().await),
+        None => None,
+    };
+    let body = async move {
+        let capture = match &inner {
+            AnyAgentInner::Anthropic(a) => {
+                crate::agent::native_capture::NativeCaptureHook::for_native(
+                    capture_source,
+                    &a.model.model,
+                )
+            }
+            _ => crate::agent::native_capture::NativeCaptureHook::default(),
+        };
+        let paused = link.scope_sync(|| {
+            with_inner!(inner, |a| {
+                runner::spawn_agent_paused_input_in_scope_with_native_capture(
+                    a,
+                    prompt,
+                    history,
+                    retry_config,
+                    turn_token_budget,
+                    #[cfg(feature = "skills")]
+                    turn_guard,
+                    #[cfg(feature = "hooks")]
+                    loop_info,
+                    completion_verification,
+                    work_scope,
+                    capture,
+                )
+            })
+        });
+        paused.start()
+    };
+    let future = crate::spend::run::scope(spend, body);
+    #[cfg(feature = "hooks")]
+    let future = ctx.hook_bindings.run(future);
+    let runner = crate::question::scope(
+        ctx.question_turn,
+        crate::session::file_checkpoints::scope(
+            ctx.file_checkpoints,
+            runner::with_interactive_budget_carry(ctx.budget_carry, future),
+        ),
+    )
+    .await;
+    Some((runner, notice))
 }
 
 #[derive(Clone)]
@@ -3567,6 +3725,11 @@ pub struct AnyAgent {
     /// Same-provider model used for the rest of a headless turn whose
     /// primary request failed with retries exhausted (mini-agent-5gc2c).
     fallback: Option<std::sync::Arc<FallbackRoute>>,
+    /// Opt-in (`fallback_interactive`): TUI and ACP turns also fall back.
+    interactive_fallback: bool,
+    /// A fully built agent for a fallback on another provider, supplied by
+    /// the frontend that owns the tool context (mini-agent-nvnkx.43).
+    cross_fallback: Option<std::sync::Arc<AnyAgent>>,
     #[cfg(feature = "memory")]
     memory_context: Option<Result<std::sync::Arc<str>, &'static str>>,
     context_snapshot: Option<builder::PreambleSnapshot>,
@@ -4374,6 +4537,8 @@ impl AnyAgent {
             completion_verification: None,
             reasoning_controls: None,
             fallback: None,
+            interactive_fallback: false,
+            cross_fallback: None,
             #[cfg(feature = "memory")]
             memory_context: None,
             context_snapshot: None,
@@ -4396,8 +4561,16 @@ impl AnyAgent {
     /// fallback cannot honour the session's reasoning controls.
     fn fallback_agent(&self, inner: &AnyAgentInner, route: &FallbackRoute) -> Option<AnyAgent> {
         let mut agent = self.clone();
-        agent.inner = inner.with_model_id(&route.provider, &route.model);
+        agent.inner = if route.cross_provider {
+            self.cross_fallback
+                .as_ref()?
+                .inner
+                .with_model_id(&route.provider, &route.model)
+        } else {
+            inner.with_model_id(&route.provider, &route.model)
+        };
         agent.fallback = None;
+        agent.cross_fallback = None;
         let agent = agent.with_reasoning_controls(&route.cfg, route.controls);
         if let Some(error) = agent.reasoning_error() {
             tracing::warn!(
@@ -4455,13 +4628,31 @@ impl AnyAgent {
         }
     }
 
+    /// Attach the agent a fallback on another provider runs on; it is built
+    /// by the frontend with that provider's client and the session's tools.
+    pub(crate) fn with_cross_provider_fallback(mut self, agent: AnyAgent) -> Self {
+        self.cross_fallback = Some(std::sync::Arc::new(agent));
+        self
+    }
+
     /// Capture main-session data before restoring a binding or starting work.
     /// Independently built auxiliary agents retain their own context policy.
     pub(crate) fn with_main_session(self, cfg: &Config, session: &crate::session::Session) -> Self {
         let mut agent = self
             .with_reasoning_controls(cfg, session.reasoning_controls)
             .with_ollama_context_window(session.context_window);
-        agent.fallback = resolve_fallback_route(cfg, session);
+        agent.interactive_fallback = cfg.fallback_interactive == Some(true);
+        agent.fallback = match CLI_FALLBACK_MODEL
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .or_else(|| cfg.fallback_model.as_ref().map(|name| name.to_string()))
+        {
+            Some(name) => {
+                resolve_fallback_route_named(cfg, session, &name, agent.cross_fallback.is_some())
+            }
+            None => None,
+        };
         #[cfg(feature = "hooks")]
         {
             let root = agent
@@ -5062,6 +5253,8 @@ impl AnyAgent {
             completion_verification: None,
             reasoning_controls: None,
             fallback: None,
+            interactive_fallback: false,
+            cross_fallback: None,
             #[cfg(feature = "memory")]
             memory_context: None,
             context_snapshot: None,
@@ -5684,6 +5877,36 @@ impl AnyAgent {
                     Ok(inner) => inner,
                     Err(error) => return spawn_blocked_runner(error, work_scope),
                 };
+                // Opt-in fallback for an interactive/ACP turn whose first
+                // request fails after retries (mini-agent-nvnkx.43). The
+                // fallback agent is prepared before `self` is taken apart.
+                let fallback_plan = if self.interactive_fallback {
+                    self.fallback.clone()
+                } else {
+                    None
+                }
+                .and_then(|route| {
+                    #[cfg(feature = "agent-skills")]
+                    let primary: &AnyAgentInner = &inner;
+                    #[cfg(not(feature = "agent-skills"))]
+                    let primary: &AnyAgentInner = &self.inner;
+                    self.fallback_agent(primary, &route)
+                        .map(|agent| (route, agent.inner))
+                });
+                let fallback_ctx = fallback_plan.is_some().then(|| InteractiveFallbackCtx {
+                    primary_model: self.inner.model_id(),
+                    spend: crate::spend::run::Run::current(),
+                    question_turn: self.question_turn.clone(),
+                    file_checkpoints: self.file_checkpoints.clone(),
+                    budget_carry: self.budget_carry.clone(),
+                    #[cfg(feature = "hooks")]
+                    hook_bindings: self.hook_bindings(),
+                    #[cfg(feature = "skills")]
+                    turn_gate: self
+                        .skills
+                        .is_some()
+                        .then(|| std::sync::Arc::clone(&self.turn_gate)),
+                });
                 let turn_token_budget = self.turn_token_budget;
                 let completion_verification = self.completion_verification;
                 let native_capture = self.native_capture;
@@ -5709,6 +5932,7 @@ impl AnyAgent {
                     _ => prompt,
                 };
                 // Only the Anthropic route records native replay capture.
+                let capture_source = native_capture.clone();
                 let capture = match &inner {
                     AnyAgentInner::Anthropic(a) => {
                         crate::agent::native_capture::NativeCaptureHook::for_native(
@@ -5718,22 +5942,69 @@ impl AnyAgent {
                     }
                     _ => crate::agent::native_capture::NativeCaptureHook::default(),
                 };
-                let paused = with_inner!(inner, |a| {
-                    runner::spawn_agent_paused_input_in_scope_with_native_capture(
-                        a,
-                        prompt,
-                        history,
-                        retry_config,
-                        turn_token_budget,
-                        #[cfg(feature = "skills")]
-                        turn_guard,
-                        #[cfg(feature = "hooks")]
-                        loop_info,
-                        completion_verification.clone(),
-                        work_scope,
-                        capture,
+                let link = fallback_plan.as_ref().map(|_| runner::RunnerLink::new());
+                let scope_cancel = work_scope.cancellation_handle();
+                let fallback_input = fallback_plan.as_ref().map(|_| {
+                    (
+                        prompt.clone(),
+                        history.clone(),
+                        retry_config.clone(),
+                        capture_source,
+                        work_scope.clone(),
                     )
                 });
+                let spawn_primary = || {
+                    with_inner!(inner, |a| {
+                        runner::spawn_agent_paused_input_in_scope_with_native_capture(
+                            a,
+                            prompt,
+                            history,
+                            retry_config,
+                            turn_token_budget,
+                            #[cfg(feature = "skills")]
+                            turn_guard,
+                            #[cfg(feature = "hooks")]
+                            loop_info,
+                            completion_verification.clone(),
+                            work_scope,
+                            capture,
+                        )
+                    })
+                };
+                let paused = match &link {
+                    Some(link) => link.scope_sync(spawn_primary),
+                    None => spawn_primary(),
+                };
+                let paused = match (link, fallback_plan, fallback_input, fallback_ctx) {
+                    (
+                        Some(link),
+                        Some((route, fallback_inner)),
+                        Some((prompt, history, retry_config, capture_source, work_scope)),
+                        Some(ctx),
+                    ) => {
+                        let spawn_link = link.clone();
+                        let spawn: runner::FallbackSpawn = Box::new(move |reason: String| {
+                            Box::pin(spawn_interactive_fallback(InteractiveFallback {
+                                link: spawn_link,
+                                route,
+                                inner: fallback_inner,
+                                reason,
+                                prompt,
+                                history,
+                                retry_config,
+                                turn_token_budget,
+                                completion_verification,
+                                capture_source,
+                                work_scope,
+                                #[cfg(feature = "hooks")]
+                                loop_info,
+                                ctx,
+                            }))
+                        });
+                        paused.with_start_fallback(link, scope_cancel, spawn)
+                    }
+                    _ => paused,
+                };
                 #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
                 let paused = paused.with_hook_context(context_notices);
                 #[cfg(feature = "subagents")]
@@ -6135,7 +6406,10 @@ pub fn check_client_credentials(
     }
     let get_env = |name: &str| std::env::var(name);
     let config = resolve_provider_config(provider_name, custom_providers)?;
-    if config.kind == ProviderKind::Vertex {
+    if matches!(
+        config.kind,
+        ProviderKind::Vertex | ProviderKind::VertexGemini
+    ) {
         vertex::route(&get_env)?;
     }
     if config.kind == ProviderKind::Bedrock {
@@ -6225,7 +6499,10 @@ where
 {
     let config = resolve_provider_config(provider_name, custom_providers)?;
     let base_url = resolve_base_url_with_env(&config, &get_env);
-    let vertex_route = if config.kind == ProviderKind::Vertex {
+    let vertex_route = if matches!(
+        config.kind,
+        ProviderKind::Vertex | ProviderKind::VertexGemini
+    ) {
         Some(vertex::route(&get_env)?)
     } else {
         None
@@ -6240,7 +6517,10 @@ where
             base_url.as_deref(),
             bedrock_region.as_deref().expect("Bedrock region validated"),
         )?)
-    } else if config.kind == ProviderKind::Vertex {
+    } else if matches!(
+        config.kind,
+        ProviderKind::Vertex | ProviderKind::VertexGemini
+    ) {
         Some(vertex::endpoint(
             base_url.as_deref(),
             vertex_route.as_ref().expect("Vertex route validated"),
@@ -6273,6 +6553,7 @@ where
                 ProviderKind::Azure
                     | ProviderKind::Bedrock
                     | ProviderKind::Vertex
+                    | ProviderKind::VertexGemini
                     | ProviderKind::Copilot
             ) || matches!(&credential, ResolvedCredential::Bearer(_))
         })
@@ -6284,6 +6565,7 @@ where
                     ProviderKind::Azure
                         | ProviderKind::Bedrock
                         | ProviderKind::Vertex
+                        | ProviderKind::VertexGemini
                         | ProviderKind::Copilot
                 ) {
                     !matches!(
@@ -6309,7 +6591,10 @@ where
         config.danger_accept_invalid_certs,
         http_custom,
         base_url.as_deref(),
-        matches!(config.kind, ProviderKind::Vertex | ProviderKind::Copilot),
+        matches!(
+            config.kind,
+            ProviderKind::Vertex | ProviderKind::VertexGemini | ProviderKind::Copilot
+        ),
     )?;
     match config.kind {
         ProviderKind::Copilot => copilot::build_client(
@@ -6318,6 +6603,12 @@ where
             crate::auth::copilot::Profile::for_host(
                 &get_env("COPILOT_GITHUB_HOST").unwrap_or_else(|_| "github.com".into()),
             )?,
+            http_client,
+        ),
+        ProviderKind::VertexGemini => vertex::build_gemini_client(
+            credential,
+            base_url.as_deref().expect("Vertex endpoint validated"),
+            vertex_route.expect("Vertex route validated"),
             http_client,
         ),
         ProviderKind::Vertex => vertex::build_client(
@@ -9341,6 +9632,7 @@ mod fallback_notice_tests {
             alias: None,
             cfg: std::sync::Arc::new(crate::config::Config::default()),
             controls: Default::default(),
+            cross_provider: false,
         };
         let mut turn = super::runner::HeadlessTurn::failed_before_start(anyhow::anyhow!(
             "HTTP 529 overloaded\nbody"

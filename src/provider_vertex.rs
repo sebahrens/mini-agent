@@ -55,6 +55,8 @@ fn auth_error(message: &'static str) -> http_client::Error {
 pub(crate) struct VertexAuth {
     endpoint: reqwest::Url,
     route: VertexRoute,
+    /// Gemini (`generateContent`, publisher `google`) instead of Claude.
+    gemini: bool,
     bearer: Option<http::HeaderValue>,
     adc: tokio::sync::OnceCell<Credentials>,
 }
@@ -69,6 +71,14 @@ impl VertexAuth {
         endpoint: &str,
         route: VertexRoute,
     ) -> anyhow::Result<Self> {
+        Self::with_publisher(credential, endpoint, route, false)
+    }
+    fn with_publisher(
+        credential: ResolvedCredential,
+        endpoint: &str,
+        route: VertexRoute,
+        gemini: bool,
+    ) -> anyhow::Result<Self> {
         let bearer = match credential {
             ResolvedCredential::Bearer(value) => {
                 let mut value = http::HeaderValue::from_str(&format!("Bearer {value}"))?;
@@ -81,6 +91,7 @@ impl VertexAuth {
         Ok(Self {
             endpoint: reqwest::Url::parse(endpoint)?,
             route,
+            gemini,
             bearer,
             adc: tokio::sync::OnceCell::new(),
         })
@@ -89,6 +100,10 @@ impl VertexAuth {
         &self,
         request: &mut http::Request<Bytes>,
     ) -> http_client::Result<()> {
+        if self.gemini {
+            self.rewrite_gemini(request)?;
+            return self.attach_credentials(request).await;
+        }
         let url = reqwest::Url::parse(&request.uri().to_string())
             .map_err(|_| auth_error("invalid Vertex request URL"))?;
         let path = url.path();
@@ -113,10 +128,63 @@ impl VertexAuth {
         {
             return Err(auth_error("Vertex request changed credential destination"));
         }
+        self.attach_credentials(request).await
+    }
+
+    /// Map the AI Studio shaped request rig's Gemini client builds
+    /// (`/v1beta/models/{m}:[stream]generateContent[?alt=sse&key=..]`) onto the
+    /// one Vertex publisher path this client is pinned to. Anything else, and
+    /// any destination change, is refused before a token is acquired.
+    fn rewrite_gemini(&self, request: &mut http::Request<Bytes>) -> http_client::Result<()> {
+        let url = reqwest::Url::parse(&request.uri().to_string())
+            .map_err(|_| auth_error("invalid Vertex request URL"))?;
+        let model_action = url
+            .path()
+            .strip_prefix("/v1beta/models/")
+            .ok_or_else(|| auth_error("unsupported Vertex Gemini request path"))?;
+        let (model, streaming) =
+            if let Some(model) = model_action.strip_suffix(":streamGenerateContent") {
+                (model, true)
+            } else if let Some(model) = model_action.strip_suffix(":generateContent") {
+                (model, false)
+            } else {
+                return Err(auth_error("unsupported Vertex Gemini request path"));
+            };
+        if request.method() != http::Method::POST
+            || url.origin() != self.endpoint.origin()
+            || url.fragment().is_some()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query_pairs().any(|(key, value)| match key.as_ref() {
+                "key" => false,
+                "alt" => value != "sse",
+                _ => true,
+            })
+        {
+            return Err(auth_error("Vertex request changed credential destination"));
+        }
+        let path = gemini_path(&self.route, model, streaming)?;
+        let uri = format!(
+            "{}{}{}",
+            self.endpoint.as_str().trim_end_matches('/'),
+            path,
+            if streaming { "?alt=sse" } else { "" }
+        );
+        *request.uri_mut() = uri
+            .parse()
+            .map_err(|_| auth_error("invalid Vertex request URL"))?;
+        Ok(())
+    }
+
+    async fn attach_credentials(
+        &self,
+        request: &mut http::Request<Bytes>,
+    ) -> http_client::Result<()> {
         for name in [
             "authorization",
             "api-key",
             "x-api-key",
+            "x-goog-api-key",
             "x-goog-user-project",
             "anthropic-version",
             "anthropic-beta",
@@ -161,6 +229,28 @@ impl VertexAuth {
     }
 }
 
+/// `/v1/projects/{p}/locations/{l}/publishers/google/models/{m}:{action}`
+/// for the route's project and location.
+pub(crate) fn gemini_path(
+    route: &VertexRoute,
+    model: &str,
+    streaming: bool,
+) -> http_client::Result<String> {
+    // The route owns validation of project and location; derive them from its
+    // Claude path so no second copy of the segments exists.
+    let claude = route.path(model, false)?;
+    let parts: Vec<&str> = claude.split('/').collect();
+    let (project, location) = (parts[3], parts[5]);
+    Ok(format!(
+        "/v1/projects/{project}/locations/{location}/publishers/google/models/{model}:{}",
+        if streaming {
+            "streamGenerateContent"
+        } else {
+            "generateContent"
+        }
+    ))
+}
+
 #[derive(Clone, Default)]
 struct VertexBuilder;
 struct NoAuth;
@@ -197,6 +287,27 @@ pub(crate) fn build_client(
         .build()?
         .with_ext(AnthropicExt::vertex(route));
     Ok(AnyClient::Anthropic(client))
+}
+
+/// Gemini on Vertex: rig's Gemini client with the AI Studio key replaced by
+/// the pinned Vertex path rewrite and ADC / access-token authorization.
+pub(crate) fn build_gemini_client(
+    credential: ResolvedCredential,
+    endpoint: &str,
+    route: VertexRoute,
+    http: reqwest::Client,
+) -> anyhow::Result<AnyClient> {
+    let auth = Arc::new(VertexAuth::with_publisher(
+        credential, endpoint, route, true,
+    )?);
+    let client = rig::providers::gemini::Client::builder()
+        // The key is never sent: `rewrite_gemini` strips it and the request
+        // is authorized with a bearer token instead.
+        .api_key("vertex-adc")
+        .base_url(endpoint)
+        .http_client(ProviderHttpClient::with_vertex(http, auth))
+        .build()?;
+    Ok(AnyClient::Gemini(client))
 }
 
 #[cfg(test)]

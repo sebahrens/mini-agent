@@ -69,6 +69,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Large pastes (more than 10 lines or 1,000 characters) become an atomic `[Pasted text #N +M lines]` chip in the prompt that the cursor steps over and Backspace removes whole; submit, history and the external editor use the full text (mini-agent-nvnkx.88).
 - `/vim` Normal mode: operators `d`/`c`/`y` with counts, motions (`w e b 0 ^ $ gg G f F t T`, `iw`/`aw`), `x X D C p P o O r ~` and `.` repeat of the last change (mini-agent-nvnkx.89).
 - Pasting or dragging an image file path into the prompt attaches the image as `/add <path>` would, when the permission policy allows reading it (mini-agent-nvnkx.256).
+- Built-in provider presets for OpenAI-compatible vendors (`xai`, `groq`, `mistral`, `deepseek`, `together`, `fireworks`, `cerebras`, keyless loopback `lmstudio`): `--provider groq`, `/provider` and `--setup` work without a hand-written `custom_providers` table; presets are credential-isolated, a same-named user entry wins, and `--print-config` shows the expanded entry (mini-agent-nvnkx.130).
+- Opt-in `fallback_interactive = true`: TUI and ACP turns whose first request fails after retries (overload, rate limit, 5xx, transport) switch to `fallback_model` for that turn only, with a one-line notice and spend recorded against the fallback; in the TUI the fallback alias may belong to another provider (mini-agent-nvnkx.43).
+- `vertex-gemini` provider: Gemini models on Vertex AI (`generateContent` under the `google` publisher, ADC or access token, pinned project/location path); catalog lookups resolve Gemini and other non-Claude ids on Vertex and Bedrock to their own entries. Bedrock Converse/ConverseStream wire layer (request encoding, SigV4 signing, event-stream decoding) is in place but not yet attached to a model route (mini-agent-nvnkx.44).
 
 ### Fixed
 
