@@ -1503,8 +1503,12 @@ impl OpenRouterPricingRefresh {
     ) -> Option<anyhow::Result<OpenRouterPricingMap>> {
         if let Some(handle) = self.handle.as_mut()
             && !handle.is_finished()
+            // A handle that completes inside the wait has been polled to completion:
+            // return its result here, because awaiting it again panics.
+            && let Ok(joined) = tokio::time::timeout(wait, &mut *handle).await
         {
-            let _ = tokio::time::timeout(wait, &mut *handle).await;
+            self.handle = None;
+            return joined.ok();
         }
         self.finish_without_wait().await
     }
@@ -8091,6 +8095,22 @@ mod tests {
             ACTIVE_OPENROUTER_PRICING_REAPERS.load(std::sync::atomic::Ordering::Acquire),
             before
         );
+    }
+
+    #[tokio::test]
+    async fn pricing_refresh_finishing_inside_the_wait_returns_its_result_once() {
+        let mut refresh = OpenRouterPricingRefresh::start(
+            "test/model".into(),
+            true,
+            true,
+            128_000,
+            async { Ok(std::collections::HashMap::new()) },
+        );
+        // The handle completes while `finish_within` polls it; awaiting it a second
+        // time used to panic with "JoinHandle polled after completion".
+        let result = refresh.finish_within(std::time::Duration::from_secs(5)).await;
+        assert!(matches!(result, Some(Ok(_))));
+        assert!(refresh.finish_without_wait().await.is_none());
     }
 
     #[cfg(feature = "multithread")]
