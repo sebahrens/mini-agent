@@ -3296,6 +3296,21 @@ fn token_budget_exhaustion_message(used: u64, budget: u64) -> String {
     )
 }
 
+/// The failure for a segment that begins with the tokens already carried over
+/// from earlier relief segments at or over the per-prompt budget. Shared by
+/// the interactive and headless turn loops.
+fn carried_token_budget_exhausted(prior_tokens: u64, budget: Option<u64>) -> Option<String> {
+    let budget = budget?;
+    (prior_tokens >= budget).then(|| token_budget_exhaustion_message(prior_tokens, budget))
+}
+
+/// The terminal message for a budget crossed during the turn. Both turn loops
+/// use it for the check at each tool item after a completion crossed the
+/// budget, and for the check before a continuation.
+fn token_budget_stop_message(exhausted: Option<(u64, u64)>) -> Option<String> {
+    exhausted.map(|(used, budget)| token_budget_exhaustion_message(used, budget))
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error(
     "Agent stream ended without a terminal response; provider attempt budget exhausted ({attempts}/{limit})."
@@ -4799,6 +4814,25 @@ where
                 }
             };
         }
+        // A completion crossed the token budget: no later tool item may start
+        // or deliver work. Shared by the `ToolCall`, `ToolExecutionStart` and
+        // `ToolResult` arms.
+        macro_rules! stop_if_budget_exhausted {
+            () => {
+                if let Some(message) = token_budget_stop_message(exhausted_budget_after_completion)
+                {
+                    finalize_interactive_tool_calls(&mut tool_calls, &mut interactions, &event_tx)
+                        .await;
+                    let _ = event_tx
+                        .send(AgentEvent::error_with(
+                            CompactString::from(message),
+                            completed_so_far!(),
+                        ))
+                        .await;
+                    return;
+                }
+            };
+        }
         // `None` means the initial prompt. Continuations install only their
         // small replacement instruction instead of cloning the initial prompt.
         let mut stream_prompt: Option<String> = None;
@@ -4814,16 +4848,10 @@ where
             .as_ref()
             .map_or((0, 0), |carry| carry.begin_segment());
         let max_turns = max_turns_total.saturating_sub(prior_turns);
-        if let Some(budget) = turn_token_budget
-            && prior_tokens >= budget
-        {
+        if let Some(message) = carried_token_budget_exhausted(prior_tokens, turn_token_budget) {
             let _ = event_tx
                 .send(AgentEvent::error_with(
-                    CompactString::from(format!(
-                        "Agent exhausted its cumulative token budget ({prior_tokens}/{budget}) \
-                         before completing. Compact the session or raise turn_token_budget \
-                         before retrying."
-                    )),
+                    CompactString::from(message),
                     Vec::new(),
                 ))
                 .await;
@@ -5016,23 +5044,7 @@ where
                                 tool_call,
                                 internal_call_id,
                             } => {
-                                if let Some((used, budget)) = exhausted_budget_after_completion {
-                                    finalize_interactive_tool_calls(
-                                        &mut tool_calls,
-                                        &mut interactions,
-                                        &event_tx,
-                                    )
-                                    .await;
-                                    let _ = event_tx
-                                        .send(AgentEvent::error_with(
-                                            CompactString::from(token_budget_exhaustion_message(
-                                                used, budget,
-                                            )),
-                                            completed_so_far!(),
-                                        ))
-                                        .await;
-                                    return;
-                                }
+                                stop_if_budget_exhausted!();
                                 let tool_name = &tool_call.function.name;
                                 workspace_may_have_changed |= tool_may_mutate_workspace(tool_name);
                                 tracing::debug!(
@@ -5102,23 +5114,7 @@ where
                         tool_call,
                         internal_call_id,
                     }) => {
-                        if let Some((used, budget)) = exhausted_budget_after_completion {
-                            finalize_interactive_tool_calls(
-                                &mut tool_calls,
-                                &mut interactions,
-                                &event_tx,
-                            )
-                            .await;
-                            let _ = event_tx
-                                .send(AgentEvent::error_with(
-                                    CompactString::from(token_budget_exhaustion_message(
-                                        used, budget,
-                                    )),
-                                    completed_so_far!(),
-                                ))
-                                .await;
-                            return;
-                        }
+                        stop_if_budget_exhausted!();
                         tracing::debug!(
                             tool_name = %tool_call.function.name,
                             internal_call_id,
@@ -5129,23 +5125,7 @@ where
                         tool_result,
                         internal_call_id,
                     })) => {
-                        if let Some((used, budget)) = exhausted_budget_after_completion {
-                            finalize_interactive_tool_calls(
-                                &mut tool_calls,
-                                &mut interactions,
-                                &event_tx,
-                            )
-                            .await;
-                            let _ = event_tx
-                                .send(AgentEvent::error_with(
-                                    CompactString::from(token_budget_exhaustion_message(
-                                        used, budget,
-                                    )),
-                                    completed_so_far!(),
-                                ))
-                                .await;
-                            return;
-                        }
+                        stop_if_budget_exhausted!();
                         let Some((tool_name, output)) = append_attributed_tool_result(
                             &mut tool_calls,
                             &mut interactions,
@@ -5651,18 +5631,14 @@ where
                     .await;
                 return;
             }
-            if let Some((used, budget)) =
-                exhausted_token_budget(usage_ledger.total, turn_token_budget)
-            {
-                tracing::warn!(
-                    "agent: cumulative token budget exhausted before continuation ({used}/{budget})"
-                );
+            if let Some(message) = token_budget_stop_message(exhausted_token_budget(
+                usage_ledger.total,
+                turn_token_budget,
+            )) {
+                tracing::warn!("agent: cumulative token budget exhausted before continuation");
                 let _ = event_tx
                     .send(AgentEvent::error_with(
-                        CompactString::from(format!(
-                            "Agent exhausted its cumulative token budget ({used}/{budget}) before \
-                             completing. Compact the session or raise turn_token_budget before retrying."
-                        )),
+                        CompactString::from(message),
                         completed_so_far!(),
                     ))
                     .await;
@@ -6030,13 +6006,8 @@ where
             crate::cli::MAX_AGENT_TURNS_HINT
         ));
     }
-    if let Some(budget) = turn_token_budget
-        && prior_tokens >= budget
-    {
-        return HeadlessTurn::failed_before_start(anyhow::anyhow!(
-            "Agent exhausted its cumulative token budget ({prior_tokens}/{budget}) before \
-             completing. Compact the session or raise turn_token_budget before retrying."
-        ));
+    if let Some(message) = carried_token_budget_exhausted(prior_tokens, turn_token_budget) {
+        return HeadlessTurn::failed_before_start(anyhow::anyhow!(message));
     }
     let turn_token_budget = turn_token_budget.map(|budget| budget.saturating_sub(prior_tokens));
 
@@ -6127,6 +6098,14 @@ where
     macro_rules! fail_turn {
         ($($arg:tt)*) => {{ return turn_failure!($($arg)*); }};
     }
+    macro_rules! stop_if_budget_exhausted {
+        () => {
+            if let Some(message) = token_budget_stop_message(exhausted_budget_after_completion) {
+                tool_calls.finalize_unresolved(&mut interactions);
+                fail_turn!(message);
+            }
+        };
+    }
     macro_rules! park_question {
         () => {
             if let Some(question) = crate::question::required() {
@@ -6214,10 +6193,7 @@ where
                             internal_call_id,
                         },
                     )) => {
-                        if let Some((used, budget)) = exhausted_budget_after_completion {
-                            tool_calls.finalize_unresolved(&mut interactions);
-                            fail_turn!(token_budget_exhaustion_message(used, budget));
-                        }
+                        stop_if_budget_exhausted!();
                         let name = &tool_call.function.name;
                         workspace_may_have_changed |= tool_may_mutate_workspace(name);
                         if let Err(error) = tool_calls.record(&internal_call_id, &tool_call) {
@@ -6246,19 +6222,13 @@ where
                         crate::permission::ask::record_tool_call(name, &internal_call_id);
                     }
                     Ok(MultiTurnStreamItem::ToolExecutionStart { .. }) => {
-                        if let Some((used, budget)) = exhausted_budget_after_completion {
-                            tool_calls.finalize_unresolved(&mut interactions);
-                            fail_turn!(token_budget_exhaustion_message(used, budget));
-                        }
+                        stop_if_budget_exhausted!();
                     }
                     Ok(MultiTurnStreamItem::StreamUserItem(StreamedUserContent::ToolResult {
                         tool_result,
                         internal_call_id,
                     })) => {
-                        if let Some((used, budget)) = exhausted_budget_after_completion {
-                            tool_calls.finalize_unresolved(&mut interactions);
-                            fail_turn!(token_budget_exhaustion_message(used, budget));
-                        }
+                        stop_if_budget_exhausted!();
                         let Some((name, output)) = append_attributed_tool_result(
                             &mut tool_calls,
                             &mut interactions,
@@ -6537,13 +6507,11 @@ where
                     crate::cli::MAX_AGENT_TURNS_HINT
                 );
             }
-            if let Some((used, budget)) =
-                exhausted_token_budget(usage_ledger.total, turn_token_budget)
-            {
-                fail_turn!(
-                    "Agent exhausted its cumulative token budget ({used}/{budget}) before \
-                     completing. Compact the session or raise turn_token_budget before retrying."
-                );
+            if let Some(message) = token_budget_stop_message(exhausted_token_budget(
+                usage_ledger.total,
+                turn_token_budget,
+            )) {
+                fail_turn!(message);
             }
             let continuation_instruction = next_instruction
                 .take()
@@ -13966,6 +13934,26 @@ mod tests {
         ledger.record(second);
         assert!(!ledger.reconcile_terminal(second).has_values());
         assert_eq!(ledger.total, first + second);
+    }
+
+    #[test]
+    fn shared_token_budget_messages_agree_for_every_turn_loop() {
+        let expected = super::token_budget_exhaustion_message(7, 5);
+        assert_eq!(
+            super::carried_token_budget_exhausted(7, Some(5)).as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            super::carried_token_budget_exhausted(5, Some(5)).as_deref(),
+            Some(super::token_budget_exhaustion_message(5, 5).as_str())
+        );
+        assert_eq!(super::carried_token_budget_exhausted(4, Some(5)), None);
+        assert_eq!(super::carried_token_budget_exhausted(u64::MAX, None), None);
+        assert_eq!(
+            super::token_budget_stop_message(Some((7, 5))).as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(super::token_budget_stop_message(None), None);
     }
 
     #[test]
