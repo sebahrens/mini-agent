@@ -1661,135 +1661,22 @@ fn sync_directory(_path: &Path, _failure: Option<AuditFailurePoint>) -> Result<(
     Err(AuditError::SyncFailed)
 }
 
-#[cfg(unix)]
-#[allow(unsafe_code)]
+/// Take the writer's exclusive advisory lock without blocking. `File::try_lock`
+/// maps to `flock` on Unix and `LockFileEx` on Windows and retries `EINTR`.
 fn try_lock_exclusive(file: &File) -> Result<(), AuditError> {
-    use std::os::fd::AsRawFd;
-    unsafe extern "C" {
-        fn flock(fd: std::os::raw::c_int, operation: std::os::raw::c_int) -> std::os::raw::c_int;
-    }
-    loop {
-        // SAFETY: the descriptor is valid and remains owned by `file` for the call.
-        if unsafe { flock(file.as_raw_fd(), 2 | 4) } == 0 {
-            return Ok(());
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() == std::io::ErrorKind::Interrupted {
-            continue;
-        }
-        report_open_io_stage("flock", &error);
-        return if error.kind() == std::io::ErrorKind::WouldBlock {
-            Err(AuditError::WriterLocked)
-        } else {
-            Err(AuditError::PathUnavailable)
-        };
-    }
-}
-
-#[cfg(unix)]
-#[allow(unsafe_code)]
-fn unlock(file: &File) {
-    use std::os::fd::AsRawFd;
-    unsafe extern "C" {
-        fn flock(fd: std::os::raw::c_int, operation: std::os::raw::c_int) -> std::os::raw::c_int;
-    }
-    // SAFETY: the descriptor remains valid while its advisory lock is released.
-    let _ = unsafe { flock(file.as_raw_fd(), 8) };
-}
-
-#[cfg(windows)]
-#[allow(unsafe_code)]
-fn try_lock_exclusive(file: &File) -> Result<(), AuditError> {
-    use std::ffi::c_void;
-    use std::os::windows::io::AsRawHandle;
-    #[repr(C)]
-    struct Overlapped {
-        internal: usize,
-        internal_high: usize,
-        offset: u32,
-        offset_high: u32,
-        event: *mut c_void,
-    }
-    unsafe extern "system" {
-        fn LockFileEx(
-            file: *mut c_void,
-            flags: u32,
-            reserved: u32,
-            low: u32,
-            high: u32,
-            overlapped: *mut Overlapped,
-        ) -> i32;
-    }
-    let mut overlapped = Overlapped {
-        internal: 0,
-        internal_high: 0,
-        offset: 0,
-        offset_high: 0,
-        event: std::ptr::null_mut(),
-    };
-    // SAFETY: the handle remains valid and `overlapped` lives for the synchronous call.
-    if unsafe {
-        LockFileEx(
-            file.as_raw_handle(),
-            0x2 | 0x1,
-            0,
-            u32::MAX,
-            u32::MAX,
-            &mut overlapped,
-        )
-    } != 0
-    {
-        Ok(())
-    } else {
-        let error = std::io::Error::last_os_error();
-        if matches!(error.raw_os_error(), Some(33 | 158)) {
-            Err(AuditError::WriterLocked)
-        } else {
+    match file.try_lock() {
+        Ok(()) => Ok(()),
+        Err(std::fs::TryLockError::WouldBlock) => Err(AuditError::WriterLocked),
+        Err(std::fs::TryLockError::Error(error)) => {
+            report_open_io_stage("flock", &error);
             Err(AuditError::PathUnavailable)
         }
     }
 }
 
-#[cfg(windows)]
-#[allow(unsafe_code)]
 fn unlock(file: &File) {
-    use std::ffi::c_void;
-    use std::os::windows::io::AsRawHandle;
-    #[repr(C)]
-    struct Overlapped {
-        internal: usize,
-        internal_high: usize,
-        offset: u32,
-        offset_high: u32,
-        event: *mut c_void,
-    }
-    unsafe extern "system" {
-        fn UnlockFileEx(
-            file: *mut c_void,
-            reserved: u32,
-            low: u32,
-            high: u32,
-            overlapped: *mut Overlapped,
-        ) -> i32;
-    }
-    let mut overlapped = Overlapped {
-        internal: 0,
-        internal_high: 0,
-        offset: 0,
-        offset_high: 0,
-        event: std::ptr::null_mut(),
-    };
-    // SAFETY: the handle and `overlapped` remain valid for the synchronous unlock call.
-    let _ = unsafe { UnlockFileEx(file.as_raw_handle(), 0, u32::MAX, u32::MAX, &mut overlapped) };
+    let _ = file.unlock();
 }
-
-#[cfg(not(any(unix, windows)))]
-fn try_lock_exclusive(_file: &File) -> Result<(), AuditError> {
-    Err(AuditError::PathUnavailable)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn unlock(_file: &File) {}
 
 fn sha256_hex(bytes: &[u8]) -> String {
     crate::hex::encode_lower(Sha256::digest(bytes))
