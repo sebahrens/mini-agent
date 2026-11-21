@@ -4826,7 +4826,14 @@ where
                         };
                         completed_interactions.extend(completed_delta);
                         // Tell the user when older images were left out of a request.
-                        for notice in crate::agent::image_budget::take_notices() {
+                        #[cfg(feature = "hooks")]
+                        let hook_notices = crate::extras::hooks::take_hook_problem_notices();
+                        #[cfg(not(feature = "hooks"))]
+                        let hook_notices: Vec<String> = Vec::new();
+                        for notice in crate::agent::image_budget::take_notices()
+                            .into_iter()
+                            .chain(hook_notices)
+                        {
                             tracing::warn!("{notice}");
                             let _ = event_tx
                                 .send(AgentEvent::OutputTruncated {

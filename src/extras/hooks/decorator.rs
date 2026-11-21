@@ -108,8 +108,14 @@ impl HookedTool {
                         .unwrap_or_else(|e| e.into_inner())
                         .record_blocked(&tool_name, &call_args);
                 }
+                // A hook that could not run is not a policy decision.
+                let message = if reason.starts_with(super::dispatcher::HOOK_FAILURE_PREFIX) {
+                    reason
+                } else {
+                    format!("Blocked by guard rail: {reason}")
+                };
                 return Err(ToolError::ToolCallError(Box::new(LocalToolError::Msg(
-                    format!("Blocked by guard rail: {reason}"),
+                    message,
                 ))));
             }
             // An `ask` must be enforced before the tool runs. Wrapped
