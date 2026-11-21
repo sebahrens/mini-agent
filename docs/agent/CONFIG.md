@@ -2561,14 +2561,30 @@ allow them anyway.
 In `standard` mode a script whose every command is a read-only allowlisted
 command (`ls`, `cat`, `head`, `tail` without `-f`, `wc`, `grep`, `rg` without
 `--pre`/`-z`, `find` without `-exec`/`-delete`/`-fprint*`, `sed -n 'ADDRp'`, and
-`git log|show|diff|status|blame|rev-parse|ls-files`) runs without a prompt when
-paths stay inside the working directory. Redirections, `$`/backtick expansion,
+`git log|show|diff|status|blame|rev-parse|ls-files`, plus the pure filters `pwd`,
+`true`, `sort` (without `-o`/`-T`/`--compress-program`/`--files0-from`), `uniq` (one
+operand at most), `cut`, `tr`, `nl`, `basename`, `dirname`, `stat`, `du` and `file`
+(without `-C`/`-m`/`-f`)) runs without a prompt when paths stay inside the working
+directory. The first operand of `grep`/`rg` is the search pattern and is not treated
+as a path unless an option such as `-e`/`-f` could supply it, and `\` in double quotes
+is literal unless it precedes `$`, a backtick, `"`, `\` or a newline. The fixed
+redirections `2>/dev/null`, `2>&1`, `>/dev/null` and `&>/dev/null` (as whole tokens)
+are accepted; `#` and `@` are only special at the start of a word. Any other
+redirection, `$`/backtick expansion,
 subshells, `tee`, `xargs`, env assignments, `&`, unquoted glob characters
 (`*`, `?`, `[`: the shell would expand them to paths the checker never saw; quote
 them to keep a literal) and any other command still ask. Recursive `grep -r`,
 `rg` and `find` also ask whenever any `read`/`grep` deny rule (or `external_directory`
 deny) exists, because the traversal could surface denied files below the named directory.
 Git is withheld in the unsandboxed fallback. See `src/permission/readonly_shell.rs`.
+The approval prompt names what `(a)` (and `(p)`, when project approvals are on) will
+grant, for example `edit on anything under /repo/src/ui/` or `this exact command`.
+For a literal two-word shell command such as `cargo test foo`, `(x)` offers
+`commands starting with "cargo test"` for this session (restored on resume; deny
+rules and mode checks still apply, and scripts with operators or expansions never
+match). Escalation prompts offer no reusable grant, and network host prompts offer
+only a session grant held by the proxy. Denials tell the model which mode or deny
+rule (`<tool> = "<pattern>"`) fired.
 On Linux, procfs process secrets are denied by a built-in baseline in every
 mode that no rule or session grant can lift (only
 `--dangerously-skip-permissions` bypasses permission checks): `/proc/<pid>|self|thread-self/{environ,cmdline,mem}` (and the

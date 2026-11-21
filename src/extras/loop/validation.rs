@@ -123,7 +123,7 @@ impl ValidationResult {
             CommandStatus::OutputLimitExceeded(limit) => {
                 ValidationStatus::OutputLimitExceeded(limit)
             }
-            CommandStatus::Failed => ValidationStatus::Failed,
+            CommandStatus::Failed | CommandStatus::NotStarted => ValidationStatus::Failed,
         };
         let (stdout, stderr, diagnostic_truncated) =
             bound_captured_streams(output.stdout, output.stderr, limits);

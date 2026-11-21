@@ -623,7 +623,9 @@ fn lsp_diagnostics_inherits_read_rules_and_path_semantics() {
             "{tool}"
         );
         assert_eq!(
-            checker.check_path(tool, &workspace_path("src/secret.rs")),
+            checker
+                .check_path(tool, &workspace_path("src/secret.rs"))
+                .rule_denied(),
             CheckResult::Denied("Blocked by deny rule".to_string()),
             "{tool}"
         );

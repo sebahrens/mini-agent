@@ -832,6 +832,15 @@ impl ShellTool {
             }
             result.push_str(&termination);
         }
+        let failed = output.exit_status.is_some_and(|status| !status.success());
+        if let Some(note) =
+            sandbox_failure_note(&self.sandbox, self.allow_escalation, failed, &result)
+        {
+            if !result.is_empty() && !result.ends_with('\n') {
+                result.push('\n');
+            }
+            result.push_str(&note);
+        }
 
         let transcript = self.spill_line_capped_output(transcript, &result);
         let mut result = bound_output_lines(result, self.max_output_lines, &transcript);
@@ -987,6 +996,15 @@ impl ShellTool {
                 result.push('\n');
             }
             result.push_str(&ended);
+        }
+        let failed = snapshot.exit_code.is_some_and(|code| code != 0) || snapshot.signal.is_some();
+        if let Some(note) =
+            sandbox_failure_note(&self.sandbox, self.allow_escalation, failed, &result)
+        {
+            if !result.is_empty() && !result.ends_with('\n') {
+                result.push('\n');
+            }
+            result.push_str(&note);
         }
         let transcript = self.spill_line_capped_output(transcript, &result);
         let mut result = bound_output_lines(result, self.max_output_lines, &transcript);
@@ -2202,12 +2220,69 @@ fn bound_output_lines_with_hint(text: String, max_output_lines: Option<u64>, hin
     .unwrap_or(text)
 }
 
+/// Output fragments that a sandbox denial produces and that an unrelated
+/// failure rarely does. Matched case-insensitively against the retained output.
+const SANDBOX_FAILURE_MARKERS: [&str; 6] = [
+    "operation not permitted",
+    "read-only file system",
+    "could not resolve host",
+    "network is unreachable",
+    "sandbox-exec",
+    "bwrap:",
+];
+
+/// One bracketed line telling the model (and user) that a failed command may
+/// have been stopped by the sandbox rather than by its own logic
+/// (mini-agent-sskdu.143). `None` unless containment was requested, the
+/// command failed and the output carries a known sandbox marker.
+fn sandbox_failure_note(
+    sandbox: &Sandbox,
+    allow_escalation: bool,
+    failed: bool,
+    output: &str,
+) -> Option<String> {
+    if !failed || !sandbox.containment_requested() {
+        return None;
+    }
+    let lowered = output.to_ascii_lowercase();
+    if !SANDBOX_FAILURE_MARKERS
+        .iter()
+        .any(|marker| lowered.contains(marker))
+    {
+        return None;
+    }
+    let mut note = format!(
+        "[sandbox: profile {}, network {}. This failure may be the sandbox, not the command.",
+        sandbox.profile().name(),
+        sandbox.network().name()
+    );
+    if sandbox.profile() != crate::sandbox::SandboxProfile::HostFull {
+        note.push_str(" Writes are limited to the workspace.");
+    }
+    note.push_str(" See /sandbox");
+    if allow_escalation {
+        note.push_str("; escalate=true runs one command unsandboxed after user approval");
+    }
+    note.push(']');
+    Some(note)
+}
+
 fn resource_limit_error(
     status: CommandStatus,
     transcript: &OutputTranscript,
     limits: CommandLimits,
     max_output_lines: Option<u64>,
 ) -> ToolError {
+    if status == CommandStatus::NotStarted {
+        // The captured text is this program's own explanation (a refused or
+        // failed launch), not partial output of the command.
+        let reason = String::from_utf8_lossy(&transcript.channel_bytes(OutputChannel::Stderr))
+            .trim()
+            .to_string();
+        return ToolError::Msg(format!(
+            "[status: not_started; the command was not run] {reason}"
+        ));
+    }
     let metadata = match status {
         CommandStatus::TimedOut => format!(
             "[status: timed_out; timeout_ms: {}]",
@@ -2225,6 +2300,7 @@ fn resource_limit_error(
             )
         }
         CommandStatus::Failed => "[status: failed]".to_string(),
+        CommandStatus::NotStarted => unreachable!("handled above"),
         CommandStatus::Completed => unreachable!("completed output is handled before this helper"),
     };
     let mut partial =
@@ -3226,6 +3302,65 @@ mod tests {
         );
         assert_eq!(output.stdout.len(), limits.stdout_bytes);
         assert!(output.stderr.is_empty());
+    }
+
+    #[test]
+    fn sandbox_failure_note_needs_containment_a_failure_and_a_known_marker() {
+        let on = Sandbox::new(true, "bwrap");
+        let off = Sandbox::new(false, "bwrap");
+        for output in [
+            "touch: /Users/x/.cache/foo: Operation not permitted",
+            "rm: x: Read-only file system",
+            "curl: (6) Could not resolve host: example.com",
+            "connect: Network is unreachable",
+            "sandbox-exec: sandbox_apply: denied",
+            "bwrap: Can't mount proc",
+        ] {
+            let note = sandbox_failure_note(&on, false, true, output)
+                .unwrap_or_else(|| panic!("no note for {output}"));
+            assert!(
+                note.starts_with("[sandbox: profile workspace, network deny."),
+                "{note}"
+            );
+            assert!(
+                note.contains("may be the sandbox, not the command"),
+                "{note}"
+            );
+            assert!(note.contains("/sandbox"), "{note}");
+            assert!(!note.contains("escalate"), "{note}");
+            assert_eq!(sandbox_failure_note(&off, false, true, output), None);
+            assert_eq!(sandbox_failure_note(&on, false, false, output), None);
+        }
+        assert_eq!(
+            sandbox_failure_note(&on, false, true, "grep: no match"),
+            None
+        );
+        assert!(
+            sandbox_failure_note(&on, true, true, "Operation not permitted")
+                .unwrap()
+                .contains("escalate=true")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refused_launch_is_reported_as_not_started_not_as_partial_output() {
+        let tool = ShellTool::new(None, None, Sandbox::new(true, "no-such-backend"), None);
+        let error = tool
+            .call(BashArgs {
+                command: "echo hi".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with("[status: not_started; the command was not run] "),
+            "{error}"
+        );
+        assert!(!error.contains("partial"), "{error}");
+        assert!(!error.contains("[stderr]"), "{error}");
+        assert!(!error.contains("[status: failed]"), "{error}");
     }
 
     #[cfg(unix)]

@@ -3732,7 +3732,7 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/sandbox.rs",
-        "assert_eq!(output.status, CommandStatus::Failed);",
+        "assert_eq!(output.status, CommandStatus::NotStarted);",
         3,
         "NON-PROCESS",
     ),
@@ -5297,10 +5297,6 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
             (
                 "77288e0715e2e881aa2f70d0c79e2dc255ad6bb1cb187ddef46359df73a23762",
                 1,
-            ),
-            (
-                "4e84ceaa1caa195958b88ed22d26b6d1e789ca8417fe59629074614a4e7100b8",
-                3,
             ),
             (
                 "5940f63c8bdc3c394d8e54c7b6deba8e8529d0a5b921c897cf45a23f4d94f94b",

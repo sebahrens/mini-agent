@@ -323,10 +323,7 @@ async fn handle_advisor(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resul
 async fn handle_sandbox(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     use crate::sandbox::SandboxProfile;
     if parts.len() == 1 {
-        write_ok(
-            ctx.renderer,
-            format!("sandbox profile: {}", ctx.sandbox.profile()),
-        );
+        write_ok(ctx.renderer, ctx.sandbox.status_line());
         write_result(ctx.renderer, shell_network_line(ctx.sandbox));
         write_result(
             ctx.renderer,
@@ -358,6 +355,10 @@ async fn handle_sandbox(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resul
         write_error(ctx.renderer, "expected workspace, host-read or host-full");
         return Ok(());
     };
+    if let Some(refusal) = profile_switch_refusal(ctx.sandbox) {
+        write_error(ctx.renderer, refusal);
+        return Ok(());
+    }
     #[cfg(feature = "subagents")]
     let background_active = ctx.session.background_task_counts().0 != 0;
     #[cfg(not(feature = "subagents"))]
@@ -381,6 +382,12 @@ async fn handle_sandbox(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resul
         ),
     );
     Ok(())
+}
+
+/// A profile switch changes nothing while the sandbox is off (or fell back to
+/// unsandboxed), so it is refused rather than reported as applied.
+fn profile_switch_refusal(sandbox: &crate::sandbox::Sandbox) -> Option<&'static str> {
+    (!sandbox.containment_requested()).then_some("sandbox is off; the profile has no effect")
 }
 
 /// `/sandbox` line describing the `sandbox-network` setting and whether it
@@ -1332,12 +1339,14 @@ mod profile100_tests {
         assert!(!invalidated.load(Ordering::Relaxed));
         *ctx.is_running = false;
         handle(&["/sandbox", "host-full"], &mut ctx).await.unwrap();
+        // mini-agent-sskdu.151: with the sandbox off the switch is refused, not
+        // reported as applied; nothing is rebuilt.
         assert_eq!(
             ctx.sandbox.profile(),
-            crate::sandbox::SandboxProfile::HostFull
+            crate::sandbox::SandboxProfile::Workspace
         );
-        assert!(invalidated.load(Ordering::Relaxed));
-        assert!(ctx.agent.is_some());
+        assert!(!invalidated.load(Ordering::Relaxed));
+        assert!(ctx.agent.is_none());
         assert_eq!(
             ctx.sandbox.policy(),
             crate::sandbox::SandboxPolicy::Disabled,
@@ -1381,5 +1390,26 @@ mod i7aog4_tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+}
+
+#[cfg(test)]
+mod sskdu151_tests {
+    use super::profile_switch_refusal;
+    use crate::sandbox::Sandbox;
+
+    #[test]
+    fn profile_switches_are_refused_while_the_sandbox_is_off() {
+        assert_eq!(
+            profile_switch_refusal(&Sandbox::new(false, "bwrap")),
+            Some("sandbox is off; the profile has no effect")
+        );
+        assert_eq!(
+            profile_switch_refusal(
+                &Sandbox::new(false, "bwrap").with_unavailable_default_fallback()
+            ),
+            Some("sandbox is off; the profile has no effect")
+        );
+        assert_eq!(profile_switch_refusal(&Sandbox::new(true, "bwrap")), None);
     }
 }

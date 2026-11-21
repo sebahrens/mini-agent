@@ -527,6 +527,12 @@ impl PermissionBridgeOwner {
         self.bridge.clone()
     }
 
+    /// Replace the deadline every later permission request carries
+    /// (`js-step-timeout-secs`); bridges handed out earlier keep their value.
+    pub(crate) fn set_timeout(&mut self, timeout: Duration) {
+        self.bridge.timeout = timeout;
+    }
+
     pub(crate) fn shutdown(&self) {
         self.bridge.shutdown.cancel();
         self.task.abort();
@@ -852,6 +858,9 @@ impl JsTool {
             super::types::MIN_STEP_TIMEOUT_SECS,
             super::types::MAX_STEP_TIMEOUT_SECS,
         ));
+        // Permission prompts raised by brokered effects (and the initial `js`
+        // check) must wait as long as the step itself may run.
+        self.permission_bridge.set_timeout(self.step_timeout);
         self
     }
 
@@ -1360,19 +1369,7 @@ impl Tool for JsTool {
 
 impl JsTool {
     async fn call_collecting(&self, args: JsArgs, diffs: &DiffSink) -> Result<String, ToolError> {
-        let rendered = self.call_with_deadline(args, diffs).await?;
-        if self.step_timeout == STEP_TIMEOUT {
-            return Ok(rendered);
-        }
-        // Name the configured deadline instead of the built-in 30 s.
-        Ok(rendered.replacen(
-            "(30s limit exceeded)",
-            &format!(
-                "({}s js-step-timeout-secs limit exceeded)",
-                self.step_timeout.as_secs()
-            ),
-            1,
-        ))
+        self.call_with_deadline(args, diffs).await
     }
 }
 
@@ -1566,6 +1563,7 @@ impl JsTool {
                 return render_worker_execution_error(
                     error,
                     invocation_state.permission_prompt_blocked_deadline(),
+                    self.step_timeout,
                 );
             }
         };
@@ -1578,7 +1576,7 @@ impl JsTool {
                 StepOutcome::Error(_) | StepOutcome::Timeout
             )
         {
-            return Ok(PERMISSION_PROMPT_TIMEOUT_MESSAGE.to_string());
+            return Ok(permission_prompt_timeout_message(self.step_timeout));
         }
 
         // mini-agent-pff43: a read-only child runs without a telemetry dispatcher by design
@@ -1600,7 +1598,7 @@ impl JsTool {
             );
         }
 
-        let mut output = render_step_result(&response);
+        let mut output = render_step_result_for(&response, self.step_timeout);
         if let Some(notice) = crate::session::file_checkpoints::take_uncaptured_notice() {
             output.push_str(&notice);
         }
@@ -1875,18 +1873,37 @@ fn worker_tool_error(error: WorkerError) -> ToolError {
     ToolError::Msg(error.to_string())
 }
 
-const PERMISSION_PROMPT_TIMEOUT_MESSAGE: &str = "JS error: permission prompt not answered within the 30s budget; do not retry without a new user decision";
+fn permission_prompt_timeout_message(budget: Duration) -> String {
+    format!(
+        "JS error: permission prompt not answered within the {}s budget; do not retry without a new user decision",
+        budget.as_secs()
+    )
+}
+
+/// The model-visible headline for a step that ran past `budget`. The default
+/// keeps its historical wording; a configured deadline names its key.
+fn step_timeout_headline(budget: Duration) -> String {
+    if budget == STEP_TIMEOUT {
+        "JS error: execution timed out (30s limit exceeded)".to_string()
+    } else {
+        format!(
+            "JS error: execution timed out ({}s js-step-timeout-secs limit exceeded)",
+            budget.as_secs()
+        )
+    }
+}
 
 fn render_worker_execution_error(
     error: WorkerError,
     permission_prompt_blocked_deadline: bool,
+    budget: Duration,
 ) -> Result<String, ToolError> {
     match error {
-        WorkerError::PermissionPromptTimedOut => Ok(PERMISSION_PROMPT_TIMEOUT_MESSAGE.to_string()),
+        WorkerError::PermissionPromptTimedOut => Ok(permission_prompt_timeout_message(budget)),
         WorkerError::TimedOut if permission_prompt_blocked_deadline => {
-            Ok(PERMISSION_PROMPT_TIMEOUT_MESSAGE.to_string())
+            Ok(permission_prompt_timeout_message(budget))
         }
-        WorkerError::TimedOut => Ok("JS error: execution timed out (30s limit exceeded)".into()),
+        WorkerError::TimedOut => Ok(step_timeout_headline(budget)),
         error => Err(worker_tool_error(error)),
     }
 }
@@ -2074,7 +2091,12 @@ fn validate_step_diagnostic(result: &StepResult, model_source: &str) -> Result<(
 /// Renders the model-visible text for a bounded step result: console records
 /// in emission order (level-prefixed), the returned value, and on failure the
 /// stable diagnostic stage / script role.
+#[cfg(test)]
 fn render_step_result(result: &StepResult) -> String {
+    render_step_result_for(result, STEP_TIMEOUT)
+}
+
+fn render_step_result_for(result: &StepResult, budget: Duration) -> String {
     match &result.outcome {
         StepOutcome::Value(value) => {
             let mut text = String::with_capacity(value.len());
@@ -2102,9 +2124,7 @@ fn render_step_result(result: &StepResult) -> String {
             &js_error_headline(*code, result.diagnostic.as_ref()),
             result,
         ),
-        StepOutcome::Timeout => {
-            render_failure("JS error: execution timed out (30s limit exceeded)", result)
-        }
+        StepOutcome::Timeout => render_failure(&step_timeout_headline(budget), result),
         StepOutcome::OutOfMemory => {
             render_failure("JS error: out of memory (64 MiB limit exceeded)", result)
         }
@@ -4672,22 +4692,64 @@ mod step_result_rendering {
 
     #[test]
     fn permission_wait_timeout_is_distinct_and_tells_the_model_not_to_retry() {
-        let rendered = render_worker_execution_error(WorkerError::PermissionPromptTimedOut, false)
-            .expect("permission timeout is a closed model-visible result");
+        let rendered = render_worker_execution_error(
+            WorkerError::PermissionPromptTimedOut,
+            false,
+            STEP_TIMEOUT,
+        )
+        .expect("permission timeout is a closed model-visible result");
 
-        assert_eq!(rendered, PERMISSION_PROMPT_TIMEOUT_MESSAGE);
+        assert_eq!(rendered, permission_prompt_timeout_message(STEP_TIMEOUT));
+        assert!(rendered.contains("within the 30s budget"));
         assert!(rendered.contains("permission prompt"));
         assert!(rendered.contains("do not retry"));
         assert!(!rendered.contains("execution timed out"));
         assert_eq!(
-            render_worker_execution_error(WorkerError::TimedOut, true)
+            render_worker_execution_error(WorkerError::TimedOut, true, STEP_TIMEOUT)
                 .expect("sticky prompt attribution must survive the effect boundary"),
-            PERMISSION_PROMPT_TIMEOUT_MESSAGE
+            permission_prompt_timeout_message(STEP_TIMEOUT)
         );
         assert_eq!(
-            render_worker_execution_error(WorkerError::TimedOut, false)
+            render_worker_execution_error(WorkerError::TimedOut, false, STEP_TIMEOUT)
                 .expect("ordinary execution timeout stays model-visible"),
             "JS error: execution timed out (30s limit exceeded)"
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_bridge_deadline_follows_the_configured_step_timeout() {
+        let mut owner = PermissionBridgeOwner::new(None, None, STEP_TIMEOUT);
+        assert_eq!(owner.bridge().timeout, STEP_TIMEOUT);
+        owner.set_timeout(Duration::from_secs(60));
+        assert_eq!(owner.bridge().timeout, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn configured_step_timeout_is_named_by_the_producers_not_patched_in() {
+        let budget = Duration::from_secs(60);
+        assert_eq!(
+            render_worker_execution_error(WorkerError::TimedOut, false, budget).unwrap(),
+            "JS error: execution timed out (60s js-step-timeout-secs limit exceeded)"
+        );
+        assert!(
+            render_worker_execution_error(WorkerError::PermissionPromptTimedOut, false, budget)
+                .unwrap()
+                .contains("within the 60s budget")
+        );
+        // A successful result that merely contains the default wording is untouched.
+        let echoed = step(
+            StepOutcome::Value("(30s limit exceeded)".into()),
+            Vec::new(),
+            None,
+        );
+        assert_eq!(
+            render_step_result_for(&echoed, budget),
+            "(30s limit exceeded)"
+        );
+        let timeout = step(StepOutcome::Timeout, Vec::new(), None);
+        assert_eq!(
+            render_step_result_for(&timeout, budget),
+            "JS error: execution timed out (60s js-step-timeout-secs limit exceeded)"
         );
     }
 

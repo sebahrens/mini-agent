@@ -119,8 +119,11 @@ sudo dnf install bubblewrap      # Fedora
 sudo pacman -S bubblewrap        # Arch
 ```
 
-The general-process sandbox also requires both `--bind-fd` and `--ro-bind-fd`;
-an older build lacking either refuses workspace commands. Spelling aliases inside
+The general-process sandbox also requires both `--bind-fd` and `--ro-bind-fd`
+(bubblewrap 0.8.0 or later). The startup preflight checks for them: an older
+build is reported as an unavailable sandbox backend with an upgrade hint, so
+`--sandbox` refuses to start and the default session announces the fallback
+instead of starting with a shell that refuses every command. Spelling aliases inside
 readonly runtime directories require bubblewrap's idempotent `--symlink` behavior.
 
 Ubuntu 23.10 and later (including 24.04) set `kernel.apparmor_restrict_unprivileged_userns=1`,
