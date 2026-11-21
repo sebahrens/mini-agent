@@ -175,6 +175,25 @@ pub fn build_prompt(
             "Work is ongoing and its checks have just run. Answer `not_yet` and say what remains."
         }
     });
+    if !goal.reports.is_empty() {
+        out.push_str("\n\n## Reports the agent filed (its own account)\n");
+        for report in goal.reports.iter().rev().take(4).rev() {
+            let text = match report.status {
+                super::ReportStatus::Progress | super::ReportStatus::Met => {
+                    report.evidence.as_deref()
+                }
+                super::ReportStatus::Blocked => report.blocker.as_deref(),
+                super::ReportStatus::Impossible => report.reason.as_deref(),
+                super::ReportStatus::NeedsUser => report.question.as_deref(),
+            };
+            out.push_str(&format!(
+                "- round {} {:?}: {}\n",
+                report.round,
+                report.status,
+                clip(text.unwrap_or(""), 600).replace('\n', " ")
+            ));
+        }
+    }
     if let Some(checks) = checks {
         out.push_str("\n\n## Checks\n<checks untrusted=\"true\">\n");
         out.push_str(&fence_checks(&render_checks(goal, checks, verify_command)));
@@ -264,7 +283,53 @@ fn fence_body(transcript: &str) -> String {
 /// a transcript, and the judge needs to see that a command ran and roughly what
 /// it said, not its entire output.
 pub fn transcript_tail(session: &crate::session::Session) -> String {
-    assemble_tail(session_blocks(session))
+    with_changed_files(session, assemble_tail(session_blocks(session)))
+}
+
+/// Most files named in the harness-built changed-files section.
+const CHANGED_FILES_LISTED: usize = 40;
+
+/// Prefix `tail` with the files the session's mutating tool calls named.
+///
+/// Built by the harness from the recorded calls rather than from anything the
+/// model wrote about its work, so the judge can see what was touched even when
+/// the tail's budget has only the last few messages.
+fn with_changed_files(session: &crate::session::Session, tail: String) -> String {
+    let mut files: Vec<String> = Vec::new();
+    for message in &session.messages {
+        let Some(crate::session::PersistedToolMessage::Call { name, arguments }) =
+            message.tool.as_ref()
+        else {
+            continue;
+        };
+        if name.as_str() == "bash" || !crate::agent::runner::tool_may_mutate_workspace(name) {
+            continue;
+        }
+        let path = ["path", "file_path", "filePath"]
+            .iter()
+            .find_map(|key| arguments.get(key).and_then(|v| v.as_str()));
+        if let Some(path) = path
+            && !files.iter().any(|known| known == path)
+        {
+            files.push(clip(path, 200));
+        }
+    }
+    if files.is_empty() {
+        return tail;
+    }
+    let more = files.len().saturating_sub(CHANGED_FILES_LISTED);
+    files.truncate(CHANGED_FILES_LISTED);
+    let mut section = format!(
+        "files changed by tool calls this session ({}):\n",
+        files.len() + more
+    );
+    for file in &files {
+        section.push_str(&format!("- {file}\n"));
+    }
+    if more > 0 {
+        section.push_str(&format!("- …and {more} more\n"));
+    }
+    format!("{section}\n{tail}")
 }
 
 /// The tail the judge should read when adjudicating a round.
@@ -280,7 +345,7 @@ pub fn transcript_for_round(
 ) -> String {
     let mut blocks = interaction_blocks(interactions);
     blocks.extend(session_blocks(session));
-    assemble_tail(blocks)
+    with_changed_files(session, assemble_tail(blocks))
 }
 
 /// Blocks from the session's own history, newest first.
@@ -572,6 +637,22 @@ fn text_reason(text: &str) -> String {
         .collect()
 }
 
+/// Ask once with the verdict cap and, when the reply was empty (on a reasoning
+/// model hidden reasoning usually consumed the cap), once more with room for it,
+/// before a judge failure is counted.
+async fn complete_with_empty_retry<F, Fut>(
+    mut ask: F,
+) -> anyhow::Result<(String, rig::completion::Usage)>
+where
+    F: FnMut(u64) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<(String, rig::completion::Usage)>>,
+{
+    match ask(VERDICT_MAX_TOKENS).await {
+        Err(error) if is_empty_reply(&error.to_string()) => ask(VERDICT_RETRY_MAX_TOKENS).await,
+        other => other,
+    }
+}
+
 /// A judge request failure in the judge's own words. The request rides the
 /// summarizer path, whose errors are worded for compaction; the user reading
 /// "Compression failed" during a goal would look at the wrong feature.
@@ -809,32 +890,17 @@ pub(crate) async fn ask_with_transcript_observed(
         checks,
         cfg.verify_command.as_deref(),
     );
-    let mut reply = client
-        .judge_completion_observed(
+    let reply = complete_with_empty_retry(|max_tokens| {
+        client.judge_completion_observed(
             &resolved.model,
             prompt.clone(),
             preamble(),
-            VERDICT_MAX_TOKENS,
+            max_tokens,
             &cfg.retry,
             observed.clone(),
         )
-        .await;
-    // An empty reply usually means hidden reasoning consumed the cap; ask once
-    // more with room for it before counting a judge failure.
-    if let Err(error) = &reply
-        && is_empty_reply(&error.to_string())
-    {
-        reply = client
-            .judge_completion_observed(
-                &resolved.model,
-                prompt,
-                preamble(),
-                VERDICT_RETRY_MAX_TOKENS,
-                &cfg.retry,
-                observed.clone(),
-            )
-            .await;
-    }
+    })
+    .await;
     match reply {
         Ok((raw, usage)) => {
             // Priced and counted in one shape whatever the judge's provider.
@@ -1166,6 +1232,31 @@ mod tests {
     }
 
     #[test]
+    fn the_judge_sees_files_changed_and_the_reports_filed() {
+        use crate::session::Session;
+        let mut session = Session::new("openrouter", "model", 200_000, "");
+        session.add_tool_call_with_id("1", "edit", &serde_json::json!({"path": "src/lib.rs"}));
+        session.add_tool_call_with_id("2", "bash", &serde_json::json!({"command": "ls"}));
+        session.add_message(crate::session::MessageRole::Assistant, "done");
+        let tail = transcript_tail(&session);
+        assert!(tail.contains("src/lib.rs"), "{tail}");
+        assert!(tail.contains("files changed by tool calls"));
+
+        let mut goal = Goal::new("ship it", Vec::new()).unwrap();
+        goal.push_report(crate::extras::goal::Report {
+            status: crate::extras::goal::ReportStatus::Progress,
+            evidence: Some("ported the parser".into()),
+            blocker: None,
+            reason: None,
+            question: None,
+            round: 1,
+            at: compact_str::CompactString::new("now"),
+        });
+        let prompt = build_prompt(&goal, "", VerifyCause::MetClaim, None, None);
+        assert!(prompt.contains("ported the parser"), "{prompt}");
+    }
+
+    #[test]
     fn the_goal_report_claim_is_shown_beyond_the_tool_call_clip() {
         assert_eq!(tool_call_bytes("goal_report"), MESSAGE_BYTES);
         assert_eq!(tool_call_bytes("bash"), TOOL_CALL_BYTES);
@@ -1186,6 +1277,46 @@ mod tests {
         let (_, wrapped) =
             parse_verdict("VERDICT: not_yet\nREASON: the build\nstill fails.").unwrap();
         assert_eq!(wrapped, "the build\nstill fails.");
+    }
+
+    #[tokio::test]
+    async fn an_empty_reply_is_retried_once_with_a_larger_cap() {
+        let caps = std::sync::Mutex::new(Vec::new());
+        let reply = complete_with_empty_retry(|max_tokens| {
+            caps.lock().unwrap().push(max_tokens);
+            async move {
+                if max_tokens == VERDICT_MAX_TOKENS {
+                    Err(anyhow::anyhow!("Compression returned empty response"))
+                } else {
+                    Ok(("VERDICT: met".to_string(), Default::default()))
+                }
+            }
+        })
+        .await
+        .expect("the retry answers");
+        assert_eq!(reply.0, "VERDICT: met");
+        assert_eq!(
+            *caps.lock().unwrap(),
+            vec![VERDICT_MAX_TOKENS, VERDICT_RETRY_MAX_TOKENS]
+        );
+
+        // Any other failure is not retried; a second empty reply is final.
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let failed = complete_with_empty_retry(|_| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Err(anyhow::anyhow!("Compression failed: 503")) }
+        })
+        .await;
+        assert!(failed.is_err());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let twice = std::sync::atomic::AtomicU32::new(0);
+        let empty = complete_with_empty_retry(|_| {
+            twice.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Err(anyhow::anyhow!("Compression returned empty response")) }
+        })
+        .await;
+        assert!(empty.is_err());
+        assert_eq!(twice.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]

@@ -15,6 +15,52 @@
 //! Owning specification: `docs/specs/goals.md` (Record).
 
 pub mod checks;
+
+/// What a `/goal ...` command line means, shared by every surface that accepts
+/// one (the terminal and the editor) so they cannot disagree on it.
+///
+/// A verb that takes no argument is a verb only when it stands alone: `/goal
+/// clear the cache` is an objective, not a deletion. Any other single word is
+/// not an objective either: it is almost certainly a mistyped verb, and
+/// silently setting a goal called "pasue" is worse than saying so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalCommand<'a> {
+    Status,
+    Clear,
+    Pause,
+    Resume,
+    Reopen,
+    /// `bounds`, with whatever followed it.
+    Bounds(&'a str),
+    /// `check`, with whatever followed it.
+    Check(&'a str),
+    /// Two or more words: a new objective (with any `done when:` lines).
+    Objective,
+    /// One word that is no verb.
+    UnknownWord(&'a str),
+}
+
+/// Classify the text after `/goal`.
+pub fn parse_goal_command(body: &str) -> GoalCommand<'_> {
+    let body = body.trim();
+    let mut words = body.split_whitespace();
+    let Some(first) = words.next() else {
+        return GoalCommand::Status;
+    };
+    let alone = words.next().is_none();
+    let rest = body[first.len()..].trim();
+    match (first, alone) {
+        ("status", true) => GoalCommand::Status,
+        ("clear", true) => GoalCommand::Clear,
+        ("pause", true) => GoalCommand::Pause,
+        ("resume", true) => GoalCommand::Resume,
+        ("reopen", true) => GoalCommand::Reopen,
+        ("bounds", _) => GoalCommand::Bounds(rest),
+        ("check", _) => GoalCommand::Check(rest),
+        (word, true) => GoalCommand::UnknownWord(word),
+        _ => GoalCommand::Objective,
+    }
+}
 pub mod driver;
 pub mod gate;
 pub mod judge;
@@ -662,6 +708,10 @@ pub struct Goal {
     /// preamble for the same reason: the preamble is the cached prefix.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_file: Option<std::path::PathBuf>,
+    /// The first round starts by itself, without the user typing a message.
+    /// Set only by `/loop`; an ordinary `/goal` waits for the user.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub autostart: bool,
     #[serde(default)]
     pub bounds: GoalBounds,
     #[serde(default)]
@@ -767,6 +817,7 @@ impl Goal {
             resolved_judge: None,
             continuation: ContinuationMode::default(),
             context_file: None,
+            autostart: false,
             bounds: GoalBounds::default(),
             progress: GoalProgress::default(),
             reports: VecDeque::new(),
@@ -821,6 +872,15 @@ impl Goal {
             self.history.pop_front();
         }
         attempt
+    }
+
+    /// Whether the newest evaluation of the round now due was an interrupt, so
+    /// that a further interrupt with no round settled between is the user
+    /// insisting on a stop.
+    pub fn last_evaluation_was_interrupt(&self) -> bool {
+        self.history.back().is_some_and(|entry| {
+            entry.round == self.progress.current_round() && entry.summary.starts_with("interrupted")
+        })
     }
 
     /// Append a model report, discarding the oldest beyond [`MAX_REPORTS`].
@@ -1042,7 +1102,15 @@ impl GoalStore {
     /// budget-stopped goal is visible at a glance. Formatted under the lock
     /// from three scalars; the painter runs this every frame and must not
     /// deep-clone the goal record the way [`GoalStore::snapshot`] does.
+    #[cfg(test)]
     pub fn status_label(&self) -> Option<String> {
+        self.status_label_with(true)
+    }
+
+    /// As [`GoalStore::status_label`], but an active goal with no run in
+    /// flight (after an interrupt, say) is marked `idle`: it is armed, and the
+    /// next message continues it.
+    pub fn status_label_with(&self, busy: bool) -> Option<String> {
         let slot = self.lock();
         let goal = slot.as_ref().filter(|goal| !goal.status.is_terminal())?;
         // The wrap-up round runs after the bound is reached, so say so rather
@@ -1058,7 +1126,11 @@ impl GoalStore {
             goal.bounds.max_rounds
         );
         Some(if goal.status == GoalStatus::Active {
-            progress
+            if busy {
+                progress
+            } else {
+                format!("{progress} idle")
+            }
         } else {
             format!("{progress} {}", goal.status.label())
         })
@@ -1190,6 +1262,8 @@ struct StoredGoal {
     #[serde(default)]
     context_file: Option<std::path::PathBuf>,
     #[serde(default)]
+    autostart: bool,
+    #[serde(default)]
     bounds: GoalBounds,
     #[serde(default)]
     progress: GoalProgress,
@@ -1237,6 +1311,7 @@ impl StoredGoal {
             resolved_judge: self.resolved_judge,
             continuation: self.continuation,
             context_file: self.context_file,
+            autostart: self.autostart,
             bounds: self.bounds,
             progress: self.progress,
             // One report this build cannot read is one line of history lost,
@@ -1314,6 +1389,23 @@ mod tests {
     }
 
     #[test]
+    fn a_second_interrupt_with_no_round_between_is_recognised() {
+        let mut g = goal();
+        assert!(!g.last_evaluation_was_interrupt());
+        g.push_history(
+            1,
+            "interrupted — still active; your next message continues it",
+        );
+        assert!(g.last_evaluation_was_interrupt());
+        g.push_history(1, "not yet (round 1) — keep going");
+        assert!(!g.last_evaluation_was_interrupt());
+        // A settled round moves the counter on; the old interrupt is stale.
+        g.push_history(2, "interrupted");
+        g.progress.rounds = 2;
+        assert!(!g.last_evaluation_was_interrupt());
+    }
+
+    #[test]
     fn the_statusline_label_is_built_without_cloning_the_goal() {
         let store = GoalStore::default();
         assert_eq!(store.status_label(), None);
@@ -1325,6 +1417,17 @@ mod tests {
         assert_eq!(store.status_label().as_deref(), Some("goal 3/7"));
         store.with_mut(|g| g.status = GoalStatus::Paused);
         assert_eq!(store.status_label().as_deref(), Some("goal 3/7 paused"));
+        assert_eq!(
+            store.status_label_with(false).as_deref(),
+            Some("goal 3/7 paused"),
+            "only an active goal gets the idle marker"
+        );
+        store.with_mut(|g| g.status = GoalStatus::Active);
+        assert_eq!(
+            store.status_label_with(false).as_deref(),
+            Some("goal 3/7 idle")
+        );
+        store.with_mut(|g| g.status = GoalStatus::Paused);
         // The wrap-up round runs after the bound; the counter never passes it.
         store.with_mut(|g| {
             g.progress.rounds = 8;

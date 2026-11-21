@@ -4906,18 +4906,18 @@ async fn run_prompt(
             }
             #[cfg(feature = "goal")]
             commands::Command::Goal(arguments) => {
+                use crate::extras::goal::GoalCommand;
                 let arguments = arguments.trim();
-                let verb = arguments.split_whitespace().next().unwrap_or("");
-                let rest = arguments[verb.len()..].trim();
-                if arguments.is_empty() || arguments == "status" {
+                let command = crate::extras::goal::parse_goal_command(arguments);
+                if command == GoalCommand::Status {
                     Some(goal_store.snapshot().map_or_else(
                         || "No goal is set.".into(),
                         |goal| crate::ui::slash::goal::render_status(&goal),
                     ))
-                } else if arguments == "clear" {
+                } else if command == GoalCommand::Clear {
                     goal_store.clear();
                     Some("Goal cleared.".into())
-                } else if arguments == "pause" {
+                } else if command == GoalCommand::Pause {
                     Some(
                         goal_store
                             .with_mut(|goal| {
@@ -4934,8 +4934,8 @@ async fn run_prompt(
                             })
                             .unwrap_or_else(|| "No goal to pause.".into()),
                     )
-                } else if arguments == "resume" || arguments == "reopen" {
-                    let reopen = arguments == "reopen";
+                } else if matches!(command, GoalCommand::Resume | GoalCommand::Reopen) {
+                    let reopen = command == GoalCommand::Reopen;
                     Some(
                         goal_store
                             .with_mut(|goal| {
@@ -4951,7 +4951,7 @@ async fn run_prompt(
                             })
                             .unwrap_or_else(|| "No goal to resume.".into()),
                     )
-                } else if verb == "bounds" {
+                } else if let GoalCommand::Bounds(rest) = command {
                     Some(
                         goal_store
                             .with_mut(|goal| {
@@ -4975,8 +4975,10 @@ async fn run_prompt(
                             })
                             .unwrap_or_else(|| "No goal to configure.".into()),
                     )
-                } else if verb == "check" && !rest.is_empty() {
-                    Some(
+                } else if let GoalCommand::Check(rest) = command {
+                    Some(if rest.is_empty() {
+                        "usage: /goal check <command>  |  /goal check clear".to_string()
+                    } else {
                         goal_store
                             .with_mut(|goal| {
                                 if rest == "clear" {
@@ -4987,8 +4989,12 @@ async fn run_prompt(
                                     format!("Check added: {rest}")
                                 }
                             })
-                            .unwrap_or_else(|| "No goal to add a check to.".into()),
-                    )
+                            .unwrap_or_else(|| "No goal to add a check to.".into())
+                    })
+                } else if let GoalCommand::UnknownWord(word) = command {
+                    Some(format!(
+                        "Unknown /goal command {word:?}; a new objective needs at least two words."
+                    ))
                 } else {
                     let goal = match crate::extras::goal::Goal::configured(
                         arguments.to_string(),
@@ -11657,6 +11663,212 @@ mod protocol_tests {
                 .expect("a new generation must start after cancellation")?;
                 assert_eq!(next.stop_reason, StopReason::EndTurn);
                 assert_eq!(next_started.load(Ordering::Acquire), 1);
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "goal")]
+    fn instant_fixture() -> PromptFixture {
+        Arc::new(|prompt, _history| {
+            Box::pin(async move {
+                Ok(vec![done(
+                    &prompt,
+                    vec![Message::assistant(prompt.clone())],
+                )])
+            })
+        })
+    }
+
+    #[cfg(feature = "goal")]
+    fn met_report(round: u32) -> crate::extras::goal::Report {
+        crate::extras::goal::Report {
+            status: crate::extras::goal::ReportStatus::Met,
+            evidence: Some("did it".into()),
+            blocker: None,
+            reason: None,
+            question: None,
+            round,
+            at: compact_str::CompactString::new("now"),
+        }
+    }
+
+    /// `/goal` knows the same verbs as in the terminal, and a mistyped single
+    /// word is refused rather than becoming an objective (mini-agent-sskdu.214).
+    #[cfg(feature = "goal")]
+    #[tokio::test]
+    async fn acp_goal_verbs_match_the_terminal_and_unknown_words_are_not_objectives() {
+        let state = fixture_state(instant_fixture());
+        let observed = state.clone();
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+        let lines = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let sink = lines.clone();
+        Client
+            .builder()
+            .on_receive_notification(
+                async move |notification: SessionNotification, _cx| {
+                    if let SessionUpdate::AgentMessageChunk(chunk) = notification.update
+                        && let ContentBlock::Text(text) = chunk.content
+                    {
+                        lock_unpoisoned(&sink).push(text.text);
+                    }
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session = cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?
+                    .session_id;
+                let status = || async {
+                    observed
+                        .sessions
+                        .lock()
+                        .await
+                        .get(&session)
+                        .and_then(|s| s.goal_store.snapshot())
+                        .map(|goal| (goal.status, goal.objective.clone()))
+                };
+                for command in ["/goal keep the suite green", "/goal pause", "/goal pasue"] {
+                    cx.send_request(prompt(session.clone(), command))
+                        .block_task()
+                        .await?;
+                }
+                assert_eq!(
+                    status().await,
+                    Some((
+                        crate::extras::goal::GoalStatus::Paused,
+                        "keep the suite green".to_string()
+                    )),
+                    "pause parks the goal and a mistyped verb creates nothing"
+                );
+                cx.send_request(prompt(session.clone(), "/goal resume"))
+                    .block_task()
+                    .await?;
+                assert_eq!(
+                    status().await.map(|(status, _)| status),
+                    Some(crate::extras::goal::GoalStatus::Active)
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let lines = lock_unpoisoned(&lines).join("\n");
+        assert!(lines.contains("Unknown /goal command"), "{lines}");
+    }
+
+    /// The gate's instruction survives to the next prompt: after a rejected
+    /// claim the failing check is what the next turn is told, and the editor
+    /// user is not the only one who sees it (mini-agent-sskdu.215).
+    #[cfg(feature = "goal")]
+    #[tokio::test]
+    async fn acp_carries_a_rejected_claims_instruction_to_the_next_prompt() {
+        let mut state = fixture_state(instant_fixture());
+        Arc::get_mut(&mut state).unwrap().cfg.goal_checks = Some(vec!["false".into()]);
+        let observed = state.clone();
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+        Client
+            .builder()
+            .on_receive_notification(
+                async |_notification: SessionNotification, _cx| Ok(()),
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session = cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?
+                    .session_id;
+                cx.send_request(prompt(session.clone(), "/goal keep the suite green"))
+                    .block_task()
+                    .await?;
+                let (store, history) = {
+                    let sessions = observed.sessions.lock().await;
+                    let entry = &sessions[&session];
+                    (entry.goal_store.clone(), entry.history.clone())
+                };
+                // Round 1: the agent claims completion; the check rejects it.
+                store.append_report(met_report(1));
+                cx.send_request(prompt(session.clone(), "all done"))
+                    .block_task()
+                    .await?;
+                let pending = history.lock().await.pending_goal_instruction.clone();
+                let pending = pending.expect("the gate's instruction is carried");
+                assert!(pending.contains("Verification failed"), "{pending}");
+                assert!(
+                    store
+                        .snapshot()
+                        .and_then(|goal| goal.last_verdict)
+                        .is_some_and(|verdict| verdict.reason.contains("Verification failed"))
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    /// A `session/cancel` during goal verification stops the running check
+    /// instead of waiting out `verify_timeout_secs` (mini-agent-sskdu.216).
+    #[cfg(all(feature = "goal", unix))]
+    #[tokio::test]
+    async fn acp_cancel_stops_a_running_goal_check() {
+        let mut state = fixture_state(instant_fixture());
+        Arc::get_mut(&mut state).unwrap().cfg.goal_checks = Some(vec!["sleep 60".into()]);
+        let observed = state.clone();
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+        Client
+            .builder()
+            .on_receive_notification(
+                async |_notification: SessionNotification, _cx| Ok(()),
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session = cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?
+                    .session_id;
+                cx.send_request(prompt(session.clone(), "/goal keep the suite green"))
+                    .block_task()
+                    .await?;
+                let store = observed.sessions.lock().await[&session].goal_store.clone();
+                store.append_report(met_report(1));
+                let claim_cx = cx.clone();
+                let claim_session = session.clone();
+                let claim = tokio::spawn(async move {
+                    claim_cx
+                        .send_request(prompt(claim_session, "all done"))
+                        .block_task()
+                        .await
+                });
+                // The turn itself is instant; by now the check is running.
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                cx.send_notification(CancelNotification::new(session))?;
+                tokio::time::timeout(Duration::from_secs(15), claim)
+                    .await
+                    .expect("cancel must stop the check, not wait out its sleep")
+                    .unwrap()?;
+                let goal = store.snapshot().unwrap();
+                assert_eq!(
+                    goal.progress.rounds, 0,
+                    "an interrupted round counts nothing"
+                );
+                assert!(goal.status.is_running());
                 Ok(())
             })
             .await

@@ -270,7 +270,10 @@ fn draw_main_frame(
     // `round/max`, plus the status word whenever the goal is not simply
     // running (see `GoalStore::status_label`).
     #[cfg(feature = "goal")]
-    let goal_label = ui.session.goal_store.status_label();
+    let goal_label = ui
+        .session
+        .goal_store
+        .status_label_with(run.is_running || run.pending_goal_gate.is_some());
     let retry_label =
         run.retry_wait
             .as_ref()
@@ -1037,6 +1040,21 @@ fn loop_control_while_running(_text: &str) -> bool {
     false
 }
 
+/// Why a native (direct Anthropic) session cannot start a turn while a goal is
+/// running. Shown inline by the TUI; the headless path reports it as an error.
+#[cfg(feature = "goal")]
+pub(crate) const NATIVE_GOAL_NOTICE: &str = "a goal is running, and the direct Anthropic route cannot drive automatic goal rounds; \
+     the input is retained. Run /goal pause or /goal clear, or switch to a non-native \
+     provider route";
+
+/// Whether starting a turn now would hit [`NATIVE_GOAL_NOTICE`].
+#[cfg(feature = "goal")]
+pub(crate) fn native_goal_blocks_start(ui: &UiContext<'_>) -> bool {
+    let native = matches!(&ui.client, crate::provider::AnyClient::Anthropic(_))
+        || ui.session.native_history_snapshot().is_some();
+    native && ui.session.goal_store.is_active()
+}
+
 /// `/goal status`, `pause`, `bounds` and `check`: the verbs that only read or
 /// edit the goal record. `resume`, `reopen`, `clear` and a new objective wait.
 #[cfg(feature = "goal")]
@@ -1441,10 +1459,8 @@ pub(crate) async fn start_main_run_with_directive(
         || ui.session.native_history_snapshot().is_some();
     #[cfg(feature = "goal")]
     anyhow::ensure!(
-        !native || !ui.session.goal_store.is_active(),
-        "a goal is running, and the direct Anthropic route cannot drive automatic goal rounds; \
-         the input is retained. Run /goal pause or /goal clear, or switch to a non-native \
-         provider route"
+        !(native && ui.session.goal_store.is_active()),
+        NATIVE_GOAL_NOTICE
     );
     let mut native_owner = if native {
         let scope = crate::agent::runner::AgentWorkScope::new();
