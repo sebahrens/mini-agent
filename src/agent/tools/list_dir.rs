@@ -192,7 +192,7 @@ impl Tool for ListDirTool {
                 "no_ignore": {
                     "type": "boolean",
                     "default": false,
-                    "description": "Also list entries hidden by .gitignore/.ignore (generated output, .env.local, vendored copies). Default false; a listing that hid ignored entries says how many. Permission deny rules, VCS metadata and dependency/build directories still apply"
+                    "description": "Also list entries hidden by .gitignore/.ignore (default false)"
                 },
                 "depth": {
                     "type": "integer",

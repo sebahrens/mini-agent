@@ -1199,8 +1199,8 @@ impl Tool for JsTool {
                  string}}[], truncated: boolean, skipped: {{large: number, binary: number, \
                  non_utf8: number, unreadable: number}}}}`, plus `splitLines`, `json_exact`, and \
                  `read_lines`. {} `console.log` is available for bounded diagnostics. {} Writer, network, process, session-state, proposal, batch-read, and \
-                 glob globals are absent. Return a string, finite number, boolean, or \
-                 accessor-free plain JSON value. Limits per call: {} s total, {} MiB JavaScript \
+                 glob globals are absent. End the script with an expression that evaluates to a string, finite number, \
+                 boolean, or accessor-free plain JSON value. Limits per call: {} s total, {} MiB JavaScript \
                  heap, {} KiB JavaScript stack, {} KiB result (excess is cut with a size \
                  note), and {} read effects.",
                 helper_globals_doc().join(" "),
@@ -1259,7 +1259,7 @@ impl Tool for JsTool {
         }
         if self.sandbox.owns_complete_process_tree() {
             globals.push(format!(
-                "`spawn(program: string, args: string[]): {{stdout: string, stderr: string, code: number, timed_out: boolean, stdout_truncated: boolean, stderr_truncated: boolean}}` (synchronous; stdout and stderr max {} MiB each; program binary max {} MiB and at most {} arguments, otherwise too_large (use the shell tool); `args` must be an array and no shell parsing occurs). Example: `const p = spawn('git', ['status', '--short']); console.log(p.code, p.stdout);`",
+                "`spawn(program: string, args: string[]): {{stdout: string, stderr: string, code: number, timed_out: boolean, stdout_truncated: boolean, stderr_truncated: boolean}}` (synchronous; stdout and stderr max {} MiB each; program binary max {} MiB and at most {} arguments, otherwise too_large (use a command tool instead); `args` must be an array and no shell parsing occurs). Example: `const p = spawn('git', ['status', '--short']); console.log(p.code, p.stdout);`",
                 SPAWN_STDOUT_MAX_BYTES.min(SPAWN_STDERR_MAX_BYTES) / (1024 * 1024),
                 crate::extras::js::broker::MAX_SPAWN_EXECUTABLE_BYTES / (1024 * 1024),
                 crate::extras::js::types::SPAWN_ARGUMENT_MAX_COUNT
@@ -1298,8 +1298,8 @@ impl Tool for JsTool {
         format!(
             "Execute JavaScript code. Prefer this tool for computation, parsing, data \
              transformation, control flow, and cross-platform automation instead of invoking \
-             Python through a shell. Use read/grep for direct lookup and shell for builds, tests, \
-             version control, or commands that need shell semantics. Code runs as a strict script \
+             Python through a shell. Use file tools for direct lookup and command \
+             tools for builds, tests, version control, or shell semantics. Code runs as a strict script \
              in a fresh runtime for every call, with top-level `await` supported; no variables or \
              other JavaScript state persist between calls. Host globals are synchronous, \
              so awaiting them is optional. Available global contracts and examples: {} Worked \
@@ -1307,7 +1307,7 @@ impl Tool for JsTool {
              text) => n + text.length, 0); total`. Strings, finite numbers, booleans, and \
              accessor-free plain JSON objects/arrays are valid results. For values containing \
              `undefined`, NaN/Infinity, holes, accessors, Date, Map, Set, or class instances, end \
-             with `JSON.stringify(value)` or return a string explicitly. Use `result(value)` for \
+             the script with `JSON.stringify(value)` or an explicit string. Use `result(value)` for \
              a validated structured result and `scratch_put`/`scratch_get` for JSON values that \
              must survive the next fresh-runtime call. {} \
              Limits per call: {} s total, {} MiB JavaScript heap, {} KiB JavaScript stack, {} KiB \

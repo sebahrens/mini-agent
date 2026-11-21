@@ -81,14 +81,32 @@ pub(crate) struct ScheduleWakeupArgs {
     pub noop: bool,
 }
 
-/// The turn-scoped `schedule_wakeup` tool.
+/// The slot of the self-paced turn that is currently running, if any. The tool
+/// stays registered for as long as a self-paced entry exists, so the request's
+/// tool list (part of the cached prompt prefix) does not change per turn; a
+/// call while no cron turn is armed fails instead.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct WakeupCell(Arc<Mutex<Option<WakeupSlot>>>);
+
+impl WakeupCell {
+    /// Arm (or, with `None`, disarm) the cell for the turn about to run.
+    pub(crate) fn set(&self, slot: Option<WakeupSlot>) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = slot;
+    }
+
+    fn current(&self) -> Option<WakeupSlot> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+/// The `schedule_wakeup` tool, registered while a self-paced `/cron` entry exists.
 pub(crate) struct ScheduleWakeup {
-    slot: WakeupSlot,
+    cell: WakeupCell,
 }
 
 impl ScheduleWakeup {
-    pub(crate) fn new(slot: WakeupSlot) -> Self {
-        Self { slot }
+    pub(crate) fn new(cell: WakeupCell) -> Self {
+        Self { cell }
     }
 }
 
@@ -101,8 +119,8 @@ impl Tool for ScheduleWakeup {
 
     fn description(&self) -> String {
         format!(
-            "This turn was started by a self-paced /cron schedule. Call this once before \
-             ending the turn to choose when the schedule fires next. delay_secs is clamped \
+            "Only for turns started by a self-paced /cron schedule (a call in any other turn \
+             fails). Call this once before ending such a turn to choose when the schedule fires next. delay_secs is clamped \
              to {WAKEUP_MIN_SECS}..{WAKEUP_MAX_SECS}. Set noop to true when nothing changed \
              since the previous check. If you do not call it, the schedule stops."
         )
@@ -133,13 +151,19 @@ impl Tool for ScheduleWakeup {
     }
 
     async fn call(&self, args: ScheduleWakeupArgs) -> Result<String, ToolError> {
+        let Some(slot) = self.cell.current() else {
+            return Err(ToolError::Msg(
+                "schedule_wakeup is only valid in a turn started by a self-paced /cron schedule"
+                    .into(),
+            ));
+        };
         let delay = clamp_delay_secs(args.delay_secs);
         let wakeup = Wakeup {
             delay,
             noop: args.noop,
             reason: single_line_reason(&args.reason),
         };
-        self.slot.set(wakeup);
+        slot.set(wakeup);
         let requested = u64::try_from(args.delay_secs).ok();
         let clamped = if requested == Some(delay.as_secs()) {
             String::new()
@@ -171,9 +195,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_call_outside_an_armed_cron_turn_is_refused() {
+        let cell = WakeupCell::default();
+        let tool = ScheduleWakeup::new(cell.clone());
+        let error = ToolDyn::call(
+            &tool,
+            r#"{"delay_secs":60,"reason":"x","noop":false}"#.into(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("only valid in a turn started by"), "{error}");
+        let slot = WakeupSlot::default();
+        cell.set(Some(slot.clone()));
+        ToolDyn::call(
+            &tool,
+            r#"{"delay_secs":60,"reason":"x","noop":false}"#.into(),
+        )
+        .await
+        .unwrap();
+        assert!(slot.take().is_some());
+        cell.set(None);
+        assert!(
+            ToolDyn::call(
+                &tool,
+                r#"{"delay_secs":60,"reason":"x","noop":false}"#.into()
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn wire_call_records_the_clamped_request_in_the_slot() {
         let slot = WakeupSlot::default();
-        let tool = ScheduleWakeup::new(slot.clone());
+        let cell = WakeupCell::default();
+        cell.set(Some(slot.clone()));
+        let tool = ScheduleWakeup::new(cell);
         let output = ToolDyn::call(
             &tool,
             r#"{"delay_secs":5,"reason":"build\nstill running","noop":false}"#.into(),
@@ -212,7 +270,9 @@ mod tests {
     #[tokio::test]
     async fn wire_call_clamps_the_upper_bound_and_refuses_malformed_arguments() {
         let slot = WakeupSlot::default();
-        let tool = ScheduleWakeup::new(slot.clone());
+        let cell = WakeupCell::default();
+        cell.set(Some(slot.clone()));
+        let tool = ScheduleWakeup::new(cell);
         let output = ToolDyn::call(
             &tool,
             r#"{"delay_secs":99999,"reason":"idle","noop":true}"#.into(),

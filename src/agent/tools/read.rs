@@ -219,10 +219,21 @@ impl Tool for ReadTool {
                 self.max_lines, self.max_text_file_size
             ),
         };
+        // Image and PDF-document delivery exists only in multimodal builds.
+        #[cfg(feature = "multimodal")]
+        let image_note = "PNG, JPEG, GIF and WebP images are returned as image blocks when the captured model/transport supports them (images over 5 MiB or 8000 px per side are downscaled to at most 2000 px and re-encoded; the summary names the new size); line offset/limit do not apply and an image read never authorizes a text overwrite. ";
+        #[cfg(not(feature = "multimodal"))]
+        let image_note = "";
+        #[cfg(feature = "multimodal")]
+        let pdf_media_note = "pages without a text layer that paint images (scans) come back as image blocks, at most 4 per call and only when the captured model accepts images (the result maps image N to its page and names the pages to continue with); otherwise they are reported as scanned. When the captured transport and model take PDF documents (Anthropic, OpenAI Responses, Gemini; catalogued vision models only) all pages without a text layer, scans and vector figures alike, come back instead as one PDF document block holding only those pages, with the text mapping document pages to source pages (documents over 6 MiB, encrypted files or failed extraction fall back to page images).";
+        #[cfg(not(feature = "multimodal"))]
+        let pdf_media_note = "pages without a text layer are reported as scanned.";
         format!(
-            "{text} One result is bounded by a {} character budget; a longer line-mode read stops early and names the next offset. Lines longer than {} characters are clipped with a marker naming the character_offset that continues them (hashedit tags still cover the full line). For very long lines or tool-output spills, use character_offset/character_limit (1-indexed Unicode characters, not bytes or lines); do not combine with line offset/limit. PNG, JPEG, GIF and WebP images are returned as image blocks when the captured model/transport supports them (images over 5 MiB or 8000 px per side are downscaled to at most 2000 px and re-encoded; the summary names the new size); line offset/limit do not apply and an image read never authorizes a text overwrite. .ipynb files default to bounded virtual cell views showing source, stream text, text/plain results and error tracebacks (outputs at most 4 KiB per output cell and the whole view at most 64 KiB, so choose offset/limit to reach later cells; image and other rich outputs are labelled by mime type); offset/limit then address virtual lines. Set raw_notebook:true for raw JSON, raw CRC tags or full-overwrite authorization. PDF files return their extracted text layer with page markers; select pages with pages (at most 20 per call, required above 20 pages); pages without a text layer that paint images (scans) come back as image blocks, at most 4 per call and only when the captured model accepts images (the result maps image N to its page and names the pages to continue with); otherwise they are reported as scanned. When the captured transport and model take PDF documents (Anthropic, OpenAI Responses, Gemini; catalogued vision models only) all pages without a text layer, scans and vector figures alike, come back instead as one PDF document block holding only those pages, with the text mapping document pages to source pages (documents over 6 MiB, encrypted files or failed extraction fall back to page images).",
+            "{text} One result is bounded by a {} character budget; a longer line-mode read stops early and names the next offset. Lines longer than {} characters are clipped with a marker naming the character_offset that continues them (hashedit tags still cover the full line). For very long lines or tool-output spills, use character_offset/character_limit (1-indexed Unicode characters, not bytes or lines); do not combine with line offset/limit. {}.ipynb files default to bounded virtual cell views showing source, stream text, text/plain results and error tracebacks (outputs at most 4 KiB per output cell and the whole view at most 64 KiB, so choose offset/limit to reach later cells; image and other rich outputs are labelled by mime type); offset/limit then address virtual lines. Set raw_notebook:true for raw JSON, raw CRC tags or full-overwrite authorization. PDF files return their extracted text layer with page markers; select pages with pages (at most 20 per call, required above 20 pages); {}",
             super::limits::current().max_result_chars,
-            super::limits::current().max_read_line_chars
+            super::limits::current().max_read_line_chars,
+            image_note,
+            pdf_media_note
         )
     }
 

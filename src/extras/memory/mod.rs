@@ -306,27 +306,111 @@ pub fn append_memory_block(preamble: &mut String, memory: Option<&str>) {
 /// it does not supply instructions, grants, or a signed top-level system field.
 const CONTEXT_NOTICE: &str = "Persistent memory snapshot (user-maintained context; newer snapshots supersede earlier snapshots):\n";
 
+/// A patch to the memory reconstructed from the earlier notices: keep the first
+/// `prefix` bytes and the last `suffix` bytes, replace what lies between.
+const CONTEXT_UPDATE_NOTICE: &str = "Persistent memory update (user-maintained context; a patch against the latest earlier memory snapshot: keep its first `prefix` bytes and last `suffix` bytes, replace everything between with the text below; the result supersedes earlier snapshots):\n";
+
+/// Patches since the last full snapshot are bounded so the replayed chain
+/// stays short.
+const MAX_CHAINED_UPDATES: usize = 8;
+
+/// Patch fixed overhead plus a margin: a patch must be this much smaller than
+/// the full block to be worth sending.
+const PATCH_MARGIN_BYTES: usize = 400;
+
+/// The memory text the history currently describes, and how many patches were
+/// applied on top of its last full snapshot. `None` when there is no (valid)
+/// snapshot in the history.
+fn reconstruct_memory(history: &[rig::completion::Message]) -> Option<(String, usize)> {
+    let mut current: Option<(String, usize)> = None;
+    for message in history {
+        let rig::completion::Message::Assistant { content, .. } = message else {
+            continue;
+        };
+        for part in content.iter() {
+            let rig::completion::AssistantContent::Text(text) = part else {
+                continue;
+            };
+            let text = text.text.as_str();
+            if let Some(rest) = text.strip_prefix(CONTEXT_NOTICE) {
+                current = rest
+                    .split_once('\n')
+                    .map(|(_, memory)| (memory.to_owned(), 0));
+            } else if let Some(rest) = text.strip_prefix(CONTEXT_UPDATE_NOTICE) {
+                current = current
+                    .take()
+                    .and_then(|(base, count)| apply_patch(&base, rest).map(|m| (m, count + 1)));
+            }
+        }
+    }
+    current
+}
+
+fn apply_patch(base: &str, patch: &str) -> Option<String> {
+    let (line, middle) = patch.split_once('\n')?;
+    let mut prefix = None;
+    let mut suffix = None;
+    for field in line.split_whitespace() {
+        match field.split_once('=')? {
+            ("prefix", value) => prefix = value.parse::<usize>().ok(),
+            ("suffix", value) => suffix = value.parse::<usize>().ok(),
+            _ => {}
+        }
+    }
+    let (prefix, suffix) = (prefix?, suffix?);
+    let tail_start = base.len().checked_sub(suffix)?;
+    if prefix > tail_start || !base.is_char_boundary(prefix) || !base.is_char_boundary(tail_start) {
+        return None;
+    }
+    Some(format!(
+        "{}{middle}{}",
+        &base[..prefix],
+        &base[tail_start..]
+    ))
+}
+
 pub(crate) fn context_notice(memory: &str, history: &[rig::completion::Message]) -> Option<String> {
-    let previous = history.iter().rev().find_map(|message| match message {
-        rig::completion::Message::Assistant { content, .. } => content
-            .iter()
-            .filter_map(|part| {
-                if let rig::completion::AssistantContent::Text(text) = part {
-                    text.text
-                        .starts_with(CONTEXT_NOTICE)
-                        .then_some(text.text.as_str())
-                } else {
-                    None
-                }
-            })
-            .last(),
-        _ => None,
-    });
+    let previous = reconstruct_memory(history);
     if memory.is_empty() && previous.is_none() {
         return None;
     }
-    let notice = format!("{CONTEXT_NOTICE}bytes={}\n{memory}", memory.len());
-    (previous != Some(notice.as_str())).then_some(notice)
+    if previous.as_ref().is_some_and(|(text, _)| text == memory) {
+        return None;
+    }
+    if let Some((base, updates)) = &previous
+        && !memory.is_empty()
+        && *updates < MAX_CHAINED_UPDATES
+    {
+        let mut prefix = base
+            .bytes()
+            .zip(memory.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        while !base.is_char_boundary(prefix) || !memory.is_char_boundary(prefix) {
+            prefix -= 1;
+        }
+        let max_suffix = base.len().min(memory.len()) - prefix;
+        let mut suffix = base
+            .bytes()
+            .rev()
+            .zip(memory.bytes().rev())
+            .take(max_suffix)
+            .take_while(|(a, b)| a == b)
+            .count();
+        while !base.is_char_boundary(base.len() - suffix)
+            || !memory.is_char_boundary(memory.len() - suffix)
+        {
+            suffix -= 1;
+        }
+        let middle = &memory[prefix..memory.len() - suffix];
+        if middle.len() + PATCH_MARGIN_BYTES < memory.len() {
+            return Some(format!(
+                "{CONTEXT_UPDATE_NOTICE}prefix={prefix} suffix={suffix} bytes={}\n{middle}",
+                memory.len()
+            ));
+        }
+    }
+    Some(format!("{CONTEXT_NOTICE}bytes={}\n{memory}", memory.len()))
 }
 
 /// Opaque, collision-resistant identity for a project path.
@@ -1869,17 +1953,16 @@ impl Tool for MemoryWrite {
     type Output = String;
 
     fn description(&self) -> String {
-        "Persist durable memory to disk. target=long_term writes curated facts/\
-preferences/decisions to MEMORY.md (always loaded next session), one fact per line; long_term \
+        "Persist durable memory to disk. target=long_term writes curated user preferences and cross-project facts to \
+MEMORY.md (always loaded next session), one fact per line; long_term \
 appends are deduplicated (whitespace-insensitive) so a line already present is skipped. \
 target=scratchpad maintains a \
 per-project checklist (use `- [ ]` items; open ones are auto-injected, mode=overwrite to rewrite the list). \
 target=daily appends to today's running log. target=note saves reference material to \
-notes/<name>.md; a bounded name/first-line index is loaded next turn. Use append_facts for \
-verified decisions and bug root causes, one fact per line (the same dedup as long_term). \
+notes/<name>.md; a bounded name/first-line index is loaded next turn. Project decisions and verified bug root \
+causes go to target=note with mode=append_facts, one fact per line (the same dedup as long_term). \
 Use ordinary append/overwrite for Markdown/code references to preserve their structure. \
-Find existing facts with memory_search and edit stale ones rather than saving contradictions. \
-Prefer long_term for things that should always be remembered."
+Find existing facts with memory_search and edit stale ones rather than saving contradictions."
             .to_string()
     }
 
@@ -1887,9 +1970,9 @@ Prefer long_term for things that should always be remembered."
         serde_json::json!({
             "type": "object",
             "properties": {
-                "target":  { "type": "string", "description": "long_term, scratchpad, daily, or note" },
+                "target":  { "type": "string", "enum": ["long_term", "scratchpad", "daily", "note"], "description": "where to write" },
                 "content": { "type": "string", "description": "Markdown content to store (max 64KB; longer is truncated with a warning)" },
-                "mode":    { "type": "string", "description": "append (default), append_facts (note-only normalized fact dedup), or overwrite" },
+                "mode":    { "type": "string", "enum": ["append", "append_facts", "overwrite"], "description": "append (default), append_facts (note-only normalized fact dedup), or overwrite" },
                 "name":    { "type": "string", "description": "filename stem, required for note" }
             },
             "required": ["target", "content"]
@@ -1978,12 +2061,12 @@ append or overwrite; use this to surgically fix or remove existing content."
         serde_json::json!({
             "type": "object",
             "properties": {
-                "target":  { "type": "string", "description": "long_term, scratchpad, daily, or note" },
+                "target":  { "type": "string", "enum": ["long_term", "scratchpad", "daily", "note"], "description": "which memory file to edit" },
                 "name":    { "type": "string", "description": "note stem, required for note" },
-                "old_str": { "type": "string", "description": "substring to replace; must occur exactly once. Omit to delete the whole note (target=note only)" },
+                "old_str": { "type": "string", "description": "substring to replace; must occur exactly once. Omit to delete the whole note (target=note only; new_str may then be omitted)" },
                 "new_str": { "type": "string", "description": "replacement text; empty string deletes the matched substring" }
             },
-            "required": ["target", "new_str"]
+            "required": ["target"]
         })
     }
 
@@ -2179,6 +2262,31 @@ up with memory_read. Use to recall older context that is not auto-injected. If a
 #[cfg(test)]
 mod cache_placement_tests {
     use super::*;
+    #[test]
+    fn small_memory_changes_are_sent_as_patches_that_reconstruct_exactly() {
+        use rig::completion::Message;
+        let base = format!(
+            "## Long term\n{}\n## Daily\nstart 雪\n",
+            "fact\n".repeat(2000)
+        );
+        let first = context_notice(&base, &[]).unwrap();
+        let mut history = vec![Message::assistant(first.clone())];
+        let mut current = base.clone();
+        let mut total = first.len();
+        for round in 0..3 {
+            current = format!("{current}note {round} 雪\n");
+            let notice = context_notice(&current, &history).unwrap();
+            assert!(notice.starts_with(CONTEXT_UPDATE_NOTICE), "round {round}");
+            total += notice.len();
+            history.push(Message::assistant(notice));
+            assert_eq!(reconstruct_memory(&history).unwrap().0, current);
+            assert!(context_notice(&current, &history).is_none());
+        }
+        assert!(total < first.len() * 2, "{total} vs {}", first.len());
+        let cleared = context_notice("", &history).unwrap();
+        assert!(cleared.starts_with(CONTEXT_NOTICE));
+    }
+
     #[test]
     fn cache71_memory_notices_dedupe_clear_and_preserve_literal_bytes() {
         use rig::completion::Message;

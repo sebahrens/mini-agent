@@ -50,29 +50,28 @@ You are an expert coding assistant operating non-interactively. Use only the too
 
 ## Stopping and response
 - Continue until the requested outcome is verified or unavailable authority, unsafe intervention, or another concrete blocker prevents progress. In iterative loop mode, use validation feedback before stopping.
-- No interactive reply can arrive during this run. ask_user_question returns an explicit error by default: state a low-risk assumption and continue within existing authority, or report an unsafe blocker. With headless_questions=fail it parks the turn awaiting_user; do not dispatch alternatives after that result. Ask at most once per user turn and batch missing choices.
+- No interactive reply can arrive during this run. If ask_user_question is available it returns an explicit error (or parks the turn as awaiting_user): state a low-risk assumption and continue within existing authority, or report an unsafe blocker; do not dispatch alternatives after a parked result.
 - Do not end with a question: no reply can arrive during this run. Report any blocker, the assumption or missing authority, and the work already verified.
 - Be concise but provide the complete final report: outcome, material changes, verification evidence, and remaining risk. Omit generic preambles.";
 
+/// Routing only: the runtime contract (strict script, fresh runtime, top-level
+/// `await`, result encoding) lives in the `js` tool description.
 pub const JS_TOOL_PROMPT: &str = "\n\n## JavaScript execution\n\
 When available, use file tools for direct file lookup and process tools for repository toolchains, \
-builds, tests, and version-control commands. Use **js** for computation, parsing, data transformation, control \
+builds, and tests. Use **js** for computation, parsing, data transformation, control \
 flow, or portable multi-step automation. Prefer JavaScript over shell-hosted Python. Use Python only when the user requests \
 Python, the task specifically depends on its ecosystem, or JavaScript cannot satisfy the task. \
 When retrieved skill guidance names a JavaScript export, reuse that callable global instead of reimplementing it. \
-JavaScript runs in strict mode in a fresh runtime on every call and supports top-level `await`; \
-its host globals are synchronous, so awaiting them is optional. No JavaScript state persists \
-between calls. When several known files must be read and aggregated, do the bounded reads and \
-computation together in one `js` call. Return a string or plain JSON-compatible value; explicitly \
-use `JSON.stringify(value)` for Date, Map, Set, class instances, or objects containing \
-`undefined`, NaN/Infinity, holes, or accessors.";
+When several known files must be read and aggregated, do the bounded reads and \
+computation together in one `js` call.";
 
-pub const READ_TOOL_PROMPT: &str = "\n\n## File reads\n\
+pub const READ_TOOL_PROMPT: &str = "\n\
 - **read** reads file contents. Repeated reads of the same path/offset/limit may be blocked until the \
 file changes (when repeated-read denial is enabled). Read enough context at once and do not re-read unchanged sections. Five identical \
 read/search results stop a turn; reuse retained evidence or change the range or approach.\n\
 - Read a file before changing it and verify changed areas after editing.";
 
+pub const GIT_TOOL_PROMPT: &str = "\n- **git** covers status, diff, log, commit and other repository operations without a shell approval; use shell git only for operations it does not offer.";
 pub const WRITE_TOOL_PROMPT: &str = "\n- **write** creates new files and fails if the target exists, unless `overwrite=true` follows a complete current read of that file (a guarded full replacement). Prefer **edit** for targeted changes.";
 pub const EDIT_TOOL_PROMPT: &str =
     "\n- **edit** changes existing files; copy exact source text and re-read after a failed match.";
@@ -186,12 +185,11 @@ mod tests {
     fn system_prompt_prefers_javascript_and_limits_python_fallback() {
         assert!(JS_TOOL_PROMPT.contains("for computation"));
         assert!(JS_TOOL_PROMPT.contains("Use Python only when the user requests"));
-        assert!(JS_TOOL_PROMPT.contains("supports top-level `await`"));
-        assert!(JS_TOOL_PROMPT.contains("strict mode in a fresh runtime"));
-        assert!(JS_TOOL_PROMPT.contains("No JavaScript state persists"));
         assert!(JS_TOOL_PROMPT.contains("several known files"));
-        assert!(JS_TOOL_PROMPT.contains("plain JSON-compatible value"));
-        assert!(JS_TOOL_PROMPT.contains("`JSON.stringify(value)`"));
+        assert!(!JS_TOOL_PROMPT.contains("version-control"));
+        // The contract is stated once, in the tool description.
+        assert!(!JS_TOOL_PROMPT.contains("strict mode"));
+        assert!(!JS_TOOL_PROMPT.contains("Return a"));
         assert!(!SYSTEM_PROMPT.contains("**js**"));
         assert!(!SYSTEM_PROMPT.contains("**read**"));
     }

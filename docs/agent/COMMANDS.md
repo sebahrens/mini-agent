@@ -495,8 +495,8 @@ and stopping only edit the schedule.
   command or argument form) stays refused, so a schedule can never re-arm
   itself or steer a turn.
 - **Self-paced schedules.** A `/cron <prompt>` schedule has no interval.
-  Only during the turn of one of its fires, the model is offered the
-  `schedule_wakeup` tool (`delay_secs` integer, `reason` string, `noop`
+  While a self-paced entry exists, the model is offered the
+  `schedule_wakeup` tool (it only succeeds in a fire's turn) (`delay_secs` integer, `reason` string, `noop`
   boolean; see [TOOL_RUNTIME.md](TOOL_RUNTIME.md#turn-scoped-cron-tool)). The
   delay is clamped to `60..=3600` seconds (`5` becomes 60, `99999` becomes
   3600) and the next fire is set that long after the turn ends; the last call

@@ -6,6 +6,10 @@ use rig::tool::Tool;
 use serde::Deserialize;
 use std::sync::Arc;
 
+/// Parameter text next to where the model writes the value: the index is lexical.
+pub(crate) const QUERY_PARAMETER_TEXT: &str =
+    "Concrete nouns expected in the skill's name or description (lexical match on a default build)";
+
 pub(crate) struct SkillsSearchTool {
     services: Arc<InstructionServices>,
 }
@@ -28,7 +32,7 @@ impl Tool for SkillsSearchTool {
         "Search currently authorized instruction skills by concrete words. Returns bounded name, description and digest metadata. Resources stay inert; this tool cannot grant permissions, execute scripts, approve or activate learned skills.".into()
     }
     fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({"type":"object","properties":{"query":{"type":"string","minLength":1,"maxLength":8192}},"required":["query"],"additionalProperties":false})
+        serde_json::json!({"type":"object","properties":{"query":{"type":"string","minLength":1,"maxLength":8192,"description":QUERY_PARAMETER_TEXT}},"required":["query"],"additionalProperties":false})
     }
     async fn call_structured(
         &self,
@@ -154,5 +158,13 @@ mod encode_tests {
             serde_json::from_str(&encode_selected(&selected).unwrap()).unwrap();
         assert!(value.get("omitted").is_none());
         assert_eq!(value["agent_skills"].as_array().unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod parameter_text_tests {
+    #[test]
+    fn query_parameter_asks_for_nouns_not_a_paraphrase() {
+        assert!(super::QUERY_PARAMETER_TEXT.contains("nouns"));
     }
 }

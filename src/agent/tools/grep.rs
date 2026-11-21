@@ -843,7 +843,7 @@ impl Tool for GrepTool {
                 "no_ignore": {
                     "type": "boolean",
                     "default": false,
-                    "description": "Also search files hidden by .gitignore/.ignore (generated output, .env.local, vendored copies). Default false; a result that skipped ignored entries says how many. Permission deny rules, VCS metadata and dependency/build directories still apply"
+                    "description": "Also search files hidden by .gitignore/.ignore (default false)"
                 },
                 "offset": {
                     "type": "integer",

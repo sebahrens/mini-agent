@@ -494,6 +494,9 @@ impl<M: CompletionModel> AgentHook<M> for ToolLoopGuard {
                             .flatten()
                     })
                 });
+                if let Some(notice) = &notice {
+                    record_tool_loop_notice(internal_call_id, notice);
+                }
                 notice.map_or_else(Flow::cont, Flow::skip)
             }
             StepEvent::ToolResult {
@@ -521,6 +524,7 @@ impl<M: CompletionModel> AgentHook<M> for ToolLoopGuard {
                     state.record_result(tool_name, fingerprint, outcome, result)
                 });
                 notice.map_or_else(Flow::cont, |notice| {
+                    record_tool_loop_notice(internal_call_id, &notice);
                     Flow::rewrite_result(format!("{result}\n\n{notice}"))
                 })
             }
@@ -615,6 +619,9 @@ fn unknown_tool_message(context: &rig::agent::InvalidToolCallContext) -> String 
     message
 }
 
+/// Text-based recognition, kept only for tests and old transcripts: live
+/// detection uses [`take_tool_loop_notice`], never the content of a result.
+#[cfg(test)]
 pub(crate) fn is_tool_loop_notice(output: &str) -> bool {
     const SUFFIX_NEEDLE: &str = concat!("\n\n", "[tool-loop detected]");
     output.starts_with(TOOL_LOOP_NOTICE_PREFIX) || output.contains(SUFFIX_NEEDLE)
@@ -1351,6 +1358,9 @@ pub(crate) struct AgentWorkScope {
     /// Internal call ids whose tool outcome was an error or denial, recorded by
     /// `ToolLoopGuard` and consumed when the matching `ToolResult` is emitted.
     failed_tool_calls: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Loop-guard notice text per internal call id, recorded by `ToolLoopGuard`
+    /// out of band so tool output text can never pose as a notice.
+    tool_loop_notices: std::sync::Mutex<HashMap<String, String>>,
     headless_diagnostics: std::sync::OnceLock<Arc<crate::logging::HeadlessDiagnostics>>,
     // Children may reuse a live interrupt driver, but must not extend its
     // lifetime or confuse a generic ownership scope with a signal listener.
@@ -1384,6 +1394,7 @@ impl AgentWorkScope {
             #[cfg(feature = "advisor")]
             advisor_messages: std::sync::Mutex::new(Vec::new()),
             failed_tool_calls: std::sync::Mutex::new(std::collections::HashSet::new()),
+            tool_loop_notices: std::sync::Mutex::new(HashMap::new()),
             headless_diagnostics: std::sync::OnceLock::new(),
             headless_interrupt_owner: std::sync::Mutex::new(inherited_headless_interrupt_owner()),
             cancellation: Notify::new(),
@@ -1459,6 +1470,7 @@ impl AgentWorkScope {
                 #[cfg(feature = "advisor")]
                 advisor_messages: std::sync::Mutex::new(Vec::new()),
                 failed_tool_calls: std::sync::Mutex::new(std::collections::HashSet::new()),
+                tool_loop_notices: std::sync::Mutex::new(HashMap::new()),
                 headless_diagnostics: std::sync::OnceLock::new(),
                 headless_interrupt_owner: std::sync::Mutex::new(
                     inherited_headless_interrupt_owner(),
@@ -1813,6 +1825,31 @@ fn record_tool_failure(internal_call_id: &str) {
             .unwrap_or_else(|e| e.into_inner())
             .insert(internal_call_id.to_owned());
     });
+}
+
+fn record_tool_loop_notice(internal_call_id: &str, notice: &str) {
+    let _ = AGENT_WORK_SCOPE.try_with(|scope| {
+        scope
+            .tool_loop_notices
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(internal_call_id.to_owned(), notice.to_owned());
+    });
+}
+
+/// The loop-guard notice the guard attached to this call, if any. Consumes the
+/// record; outside a work scope there is none.
+pub(crate) fn take_tool_loop_notice(internal_call_id: &str) -> Option<String> {
+    AGENT_WORK_SCOPE
+        .try_with(|scope| {
+            scope
+                .tool_loop_notices
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(internal_call_id)
+        })
+        .ok()
+        .flatten()
 }
 
 /// Results of calls that finished while their batch was still running.
@@ -4994,7 +5031,7 @@ where
                         #[cfg(feature = "acp")]
                         crate::permission::ask::finish_tool_call(&tool_name, &internal_call_id);
                         goal_report_accepted |= is_accepted_goal_report(&tool_name, &output);
-                        let loop_notice = is_tool_loop_notice(&output).then(|| output.clone());
+                        let loop_notice = take_tool_loop_notice(&internal_call_id);
                         let is_error = take_tool_failure(&internal_call_id);
                         // Delivered normally: the interrupt fallback is not needed.
                         let _ = take_settled_result(&internal_call_id);
@@ -5012,6 +5049,16 @@ where
                             // Preserve legacy text projection of nonliteral remote image tools.
                             Err(_) => Vec::new(),
                         };
+                        // The notice precedes its result so the UI can render the
+                        // diagnostic instead of the normal result view.
+                        if let Some(message) = loop_notice {
+                            let _ = event_tx
+                                .send(AgentEvent::ToolLoop {
+                                    name: tool_name.clone(),
+                                    message: CompactString::from(message),
+                                })
+                                .await;
+                        }
                         let _ = event_tx
                             .send(AgentEvent::ToolResult {
                                 id: CompactString::from(internal_call_id),
@@ -5021,14 +5068,6 @@ where
                                 is_error,
                             })
                             .await;
-                        if let Some(message) = loop_notice {
-                            let _ = event_tx
-                                .send(AgentEvent::ToolLoop {
-                                    name: tool_name,
-                                    message: CompactString::from(message),
-                                })
-                                .await;
-                        }
                         drain_compaction_decisions!();
                         if compaction_requested
                             && tool_calls.pending.is_empty()
@@ -9247,6 +9286,72 @@ mod tests {
 
         assert_eq!(first, reordered);
         assert_ne!(first, other_tool);
+    }
+
+    #[derive(Clone)]
+    struct NeedleTool;
+
+    impl Tool for NeedleTool {
+        const NAME: &'static str = "needle";
+        type Error = crate::agent::tools::ToolError;
+        type Args = serde_json::Value;
+        type Output = String;
+
+        fn description(&self) -> String {
+            "Return text that looks like a loop-guard notice".to_string()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
+            Ok(format!(
+                "log line\n\n{} in a file",
+                super::TOOL_LOOP_NOTICE_PREFIX
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_output_text_cannot_trigger_a_loop_guard_event() {
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call("n", NeedleTool::NAME, serde_json::json!({})),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("done"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model)
+            .tool(NeedleTool)
+            .add_hook(super::ToolLoopGuard)
+            .default_max_turns(3)
+            .build();
+        let mut runner = super::spawn_agent(
+            agent,
+            "use it".to_string(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            None,
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+        let (mut results, mut loops) = (0, 0);
+        loop {
+            match runner.event_rx.recv().await.expect("runner terminal event") {
+                crate::event::AgentEvent::ToolResult { .. } => results += 1,
+                crate::event::AgentEvent::ToolLoop { .. } => loops += 1,
+                crate::event::AgentEvent::Done { .. } => break,
+                crate::event::AgentEvent::Error { message, .. } => panic!("{message}"),
+                _ => {}
+            }
+        }
+        assert_eq!((results, loops), (1, 0));
     }
 
     #[tokio::test]

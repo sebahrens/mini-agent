@@ -226,6 +226,10 @@ impl App<'_> {
         if fire.dynamic {
             let slot = WakeupSlot::default();
             self.run.cron_wakeup = Some(slot.clone());
+            self.run
+                .cron_wakeup_cell
+                .get_or_insert_with(Default::default)
+                .set(Some(slot.clone()));
             self.cron_dynamic = Some(DynamicCronTurn {
                 id: fire.id.clone(),
                 slot,
@@ -289,14 +293,34 @@ impl App<'_> {
         Ok(())
     }
 
-    /// End a self-paced fire's turn: remove `schedule_wakeup` from the agent,
-    /// then apply the turn's last call (or retire the entry without one). A
-    /// no-op when no self-paced turn is running.
+    /// End a self-paced fire's turn: disarm `schedule_wakeup` (it stays
+    /// registered while any self-paced entry exists and is removed with the
+    /// last one), then apply the turn's last call (or retire the entry without
+    /// one). A no-op when no self-paced turn is running.
     pub(super) async fn settle_dynamic_cron_turn(&mut self) -> anyhow::Result<()> {
         let Some(turn) = self.cron_dynamic.take() else {
             return Ok(());
         };
         self.run.cron_wakeup = None;
+        if let Some(cell) = &self.run.cron_wakeup_cell {
+            // Disarm: a call outside a cron turn now fails, but the tool stays
+            // advertised so the request's tool list does not change.
+            cell.set(None);
+        }
+        let wakeup = turn.slot.take();
+        let result = self.finish_dynamic_cron_turn(turn, wakeup);
+        self.retire_cron_tool_if_unused().await;
+        result
+    }
+
+    /// Remove `schedule_wakeup` once the last self-paced entry is gone.
+    async fn retire_cron_tool_if_unused(&mut self) {
+        if self.cron.entries().iter().any(|entry| entry.dynamic) {
+            return;
+        }
+        if self.run.cron_wakeup_cell.take().is_none() {
+            return;
+        }
         if let Some(agent) = self.run.agent.as_ref()
             && let Err(error) = agent
                 .remove_turn_tool(<ScheduleWakeup as rig::tool::Tool>::NAME)
@@ -304,7 +328,13 @@ impl App<'_> {
         {
             tracing::warn!(%error, "cron: failed to remove schedule_wakeup");
         }
-        let wakeup = turn.slot.take();
+    }
+
+    fn finish_dynamic_cron_turn(
+        &mut self,
+        turn: DynamicCronTurn,
+        wakeup: Option<Wakeup>,
+    ) -> anyhow::Result<()> {
         if self.cron.get(&turn.id).is_none() {
             // Stopped, or retired at cron_max_fires, while the turn ran.
             self.cron_noop = None;

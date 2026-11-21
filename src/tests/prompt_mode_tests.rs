@@ -438,3 +438,28 @@ fn pipeline_designer_persona_activates_design_prompt_and_opus_model() {
     // Other prompts are unmapped, so only `design` moves the main model.
     assert_eq!(config.resolve_prompt_model("code"), None);
 }
+
+/// Bundled mode prompts name tools that are registered: `todo` is not one
+/// (the tools are `todo_write`/`todo_read`), and ask mode must not both forbid
+/// and prescribe the shell.
+#[test]
+fn bundled_prompts_name_only_real_tools() {
+    for (name, text) in [
+        (
+            "orchestrator",
+            include_str!("../../data/prompts/orchestrator.md"),
+        ),
+        (
+            "autoconfig",
+            include_str!("../../data/prompts/autoconfig.md"),
+        ),
+        ("ask", include_str!("../../data/prompts/ask.md")),
+    ] {
+        assert!(
+            !text.contains("`todo`"),
+            "{name} names a phantom `todo` tool"
+        );
+    }
+    let ask = include_str!("../../data/prompts/ask.md");
+    assert!(!ask.contains("use the shell tool directly"));
+}
