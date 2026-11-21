@@ -3055,6 +3055,18 @@ fn turn_budget_writeup_prompt(
          You cannot call tools any more and must not try. Using only what your earlier tool \
          results in this conversation established, write your final report now"
     );
+    writeup_prompt_with_lead(&lead, max_report_bytes, free_form)
+}
+
+/// Final prompt for a child that finished its tool work without writing a report.
+fn empty_final_writeup_prompt(max_report_bytes: usize, free_form: bool) -> String {
+    let lead = "Your last response contained no text, so no report reached the parent. \
+         You cannot call tools any more and must not try. Using only what your earlier tool \
+         results in this conversation established, write your final report now";
+    writeup_prompt_with_lead(lead, max_report_bytes, free_form)
+}
+
+fn writeup_prompt_with_lead(lead: &str, max_report_bytes: usize, free_form: bool) -> String {
     if free_form {
         return format!(
             "{lead}, in plain text. Lead with caveats and missing evidence, and say what you did \
@@ -3198,6 +3210,24 @@ where
             "{}\n{narration}",
             turn_budget_header(run.turns, run.tool_calls, written_up)
         ));
+    }
+
+    // A child that did its tool work and then wrote nothing gets the same
+    // tool-free write-up on its own conversation (mini-agent-nvnkx.14).
+    if run.empty_final && run.response.is_err() && !run.history.is_empty() && !budget_exhausted() {
+        let writeup = continue_tool_free(
+            Continuation::WriteUp,
+            empty_final_writeup_prompt(max_report_bytes, policy.free_form),
+            run.history.clone(),
+        )
+        .await;
+        run.usage = usage_saturating_add(run.usage, writeup.usage);
+        if let Ok(text) = writeup.response
+            && !text.trim().is_empty()
+        {
+            run.response = Ok(text);
+            run.history = writeup.history;
+        }
     }
 
     let mut known_violations = None;
@@ -9617,6 +9647,39 @@ mod child_continuation_tests {
             Some(Vec::new()),
             "valid write-up needs no repair"
         );
+    }
+
+    // mini-agent-nvnkx.14: a child that did tool work and then wrote nothing
+    // gets the same tool-free write-up instead of a bare error.
+    #[tokio::test]
+    async fn an_empty_final_gets_a_tool_free_writeup_over_the_history() {
+        let mut turns = child_turns(1, None);
+        turns.push(vec![MockStreamEvent::final_response_with_default_usage()]);
+        let child = MockCompletionModel::from_stream_turns(turns);
+        let run = run_child(child, 3).await;
+        assert!(run.empty_final);
+        assert_eq!(run.tool_calls, 1);
+        assert!(run.response.is_err());
+
+        let writeup = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::text(CONTRACT),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let finished = finish_child_run(
+            run,
+            || false,
+            4096,
+            None,
+            continuation(writeup.clone(), Arc::default()),
+        )
+        .await;
+        let requests = writeup.requests();
+        assert_eq!(requests.len(), 1, "write-up is exactly one model turn");
+        let seen: Vec<Message> = requests[0].chat_history.iter().cloned().collect();
+        assert!(history_has_tool_result(&seen, "EVIDENCE: src/lib.rs:7"));
+        let response = finished.response.expect("the write-up replaces the error");
+        assert!(response.contains("src/lib.rs:7"), "{response}");
+        assert_eq!(finished.details.tool_calls, 1);
     }
 
     #[tokio::test]

@@ -1671,9 +1671,16 @@ fn headless_interrupt_preserves_progress_and_settles_owned_work() {
                 None,
                 "parent must finish cooperative cleanup"
             );
+            // An interrupted run exits 128 plus the signal (mini-agent-nvnkx.158);
+            // an explicit shell command keeps the generic failure status.
             assert_eq!(
                 status.code(),
-                Some(if mode == "validation" { 0 } else { 1 }),
+                Some(match (mode, signal) {
+                    ("validation", _) => 0,
+                    ("explicit", _) => 1,
+                    (_, Signal::SIGINT) => 130,
+                    _ => 143,
+                }),
                 "{mode}: {stderr}"
             );
             if mode == "explicit" {
@@ -1747,8 +1754,17 @@ fn headless_interrupt_preserves_progress_and_settles_owned_work() {
             if !mode.starts_with("loop_") && mode != "validation" {
                 let json: serde_json::Value = serde_json::from_slice(&output.stdout)
                     .expect("one JSON result for interrupted turn");
-                assert_eq!(json["stop_reason"], "failed");
-                assert_eq!(json["result"], response);
+                // An operator interrupt is its own stop reason, and the text
+                // produced so far is kept with a marker (mini-agent-nvnkx.158).
+                assert_eq!(json["stop_reason"], "interrupted");
+                assert_eq!(json["is_error"], true);
+                let marker = "[interrupted: the run was cut short]";
+                let expected = if response.is_empty() {
+                    marker.to_string()
+                } else {
+                    format!("{response}\n{marker}")
+                };
+                assert_eq!(json["result"], expected);
                 assert_eq!(json["usage"]["total_tokens"], completions * 120);
                 assert_eq!(
                     json["tool_calls"]["total"],
@@ -3416,7 +3432,7 @@ fn stream_json_control_interrupts_a_running_tool() {
     let result = driver.until("the interrupted turn's result", |row| {
         row["type"] == "result"
     });
-    assert_eq!(result["stop_reason"], "failed");
+    assert_eq!(result["stop_reason"], "interrupted");
     let pid: i32 = std::fs::read_to_string(&marker)
         .unwrap()
         .trim()
@@ -3781,7 +3797,7 @@ fn streaming_events_arrive_before_completion_and_cancellation_or_closed_stdout_p
             let rows = reader.join().unwrap();
             let last = rows.last().unwrap();
             assert_eq!(last["type"], "result");
-            assert_eq!(last["stop_reason"], "failed");
+            assert_eq!(last["stop_reason"], "interrupted");
             assert_eq!(last["session_persisted"], true);
             assert_eq!(last["session_id"], saved["id"]);
             assert_eq!(last["usage"]["total_tokens"], 120);
@@ -4310,11 +4326,7 @@ fn stalled_open_stdout_has_bounded_signal_cleanup_and_preserves_accounting_witho
             );
             std::thread::sleep(Duration::from_millis(10));
         };
-        assert_eq!(
-            status.code(),
-            Some(if mode == "resume-active" { 1 } else { 130 }),
-            "{mode}"
-        );
+        assert_eq!(status.code(), Some(130), "{mode}");
         assert_eq!(
             unsafe {
                 libc::fcntl(
@@ -4721,17 +4733,7 @@ fn stalled_stderr_progress_and_runtime_reports_and_both_sinks_settle_owned_work_
             );
             std::thread::sleep(Duration::from_millis(10));
         };
-        assert_eq!(
-            status.code(),
-            Some(
-                if matches!(mode, "reasoning-resumed" | "retry-log-resumed") {
-                    1
-                } else {
-                    130
-                }
-            ),
-            "{mode}"
-        );
+        assert_eq!(status.code(), Some(130), "{mode}");
         #[cfg(target_os = "macos")]
         let kernel_written = 0x00010000;
         #[cfg(not(target_os = "macos"))]
@@ -4828,7 +4830,8 @@ fn stalled_stderr_progress_and_runtime_reports_and_both_sinks_settle_owned_work_
                 .collect();
             let final_row = rows.last().unwrap();
             assert_eq!(final_row["type"], "result");
-            assert_eq!(final_row["stop_reason"], "failed");
+            // An interrupt is its own stop reason (mini-agent-nvnkx.158).
+            assert_eq!(final_row["stop_reason"], "interrupted");
             assert_eq!(final_row["session_persisted"], true);
             assert_eq!(final_row["usage"]["total_tokens"], 120);
         } else if mode == "ordinary-report" {
@@ -5511,7 +5514,8 @@ fn output_schema_cancel_during_repair_keeps_original_effect_and_saved_usage() {
     let _ = owned.err.take().unwrap().join().unwrap();
     owned.server.finish();
     let result: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(result["stop_reason"], "failed");
+    // Interrupted (mini-agent-nvnkx.158), not failed.
+    assert_eq!(result["stop_reason"], "interrupted");
     assert_eq!(result["usage"]["input_tokens"], 200);
     assert_eq!(root.saved_session()["total_input_tokens"], 200);
     assert_eq!(

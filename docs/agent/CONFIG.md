@@ -846,7 +846,7 @@ Accepted top-level keys:
 | `claude_user_commands`    | boolean | Read the user's `~/.claude/commands/*.md` as custom slash commands, below mini-agent's own `<config_dir>/commands` in priority. Default: `true`; `false` opts out. Restart required. |
 | `repo_root_instruction_files` | boolean | Also read `AGENTS.md` and `CLAUDE.md` from the enclosing git repository root and each directory down to the launch directory (outermost first, inert text under the context-file budget). Executable assets (`.mcp.json`, hooks, config, agents, skills) are never read from ancestors. Default: `true`; a project config needs trust to set it. `/reload` re-reads instruction files after an edit. |
 | `claude_user_agents`      | boolean | Read the user's `~/.claude/agents/*.md` as specialist definitions (Claude Code compatibility), with the same validation as the user-global layer and lower priority than mini-agent's own user directory. Default: `false` (opt-in). Project config needs trust to set it. Restart required. |
-| `mid_turn_compact_threshold` | number | Mid-turn compaction. Fraction of the context window (`0.0`–`1.0`) of real provider prompt pressure at which to compact *during* a turn, not just between turns. Default when unset: `0.9`; `0` disables mid-turn compaction. Honored only when `compact_enabled` is `true`. See Mid-turn compaction below. With `0`, byte pressure from `compact_size_fraction` still compacts at tool-batch boundaries in the TUI, headless and ACP runs.            |
+| `mid_turn_compact_threshold` | number | Mid-turn compaction. Fraction of the context window (`0.0`–`1.0`) of real provider prompt pressure at which to compact *during* a turn, not just between turns. Default when unset: `0.9`; `0` disables mid-turn compaction. Pressure counts the completion's reported prompt plus its output; headless runs also add the estimated size of the tool results just appended and test at the tool-batch boundary, and headless and TUI runs test a provider that reports no usage on the session's estimate. Honored only when `compact_enabled` is `true`. See Mid-turn compaction below. With `0`, byte pressure from `compact_size_fraction` still compacts at tool-batch boundaries in the TUI, headless and ACP runs.            |
 | `compact_size_fraction`      | number | Byte-pressure compaction. Fraction (`0.0`–`1.0`) of the 32 MiB persisted-session ceiling at which automatic compaction starts (between turns and at tool-batch boundaries), so image-heavy sessions compact before saving stops. Default when unset: `0.75`; `0` disables. Honored only when `compact_enabled` is `true`. |
 | `compaction_timeout_secs` | integer | Seconds one compaction summarizer request may run (clamped to `1`–`7200`). The limit is per request, not for the whole compaction. Default when unset: 300 s plus 1 s per 2,000 tokens of summarizer input, at most 1800 s. A timeout error names this key. Mid-stream provider errors during a summary request are retried within `retry` (only that request restarts). |
 | `compaction_model`        | string  | A `quick_models` entry name whose model runs compaction summaries instead of the session model (faster or cheaper). It must use the session's provider; otherwise a warning is logged and the session model is used. Summarizer input and response budgets come from the compaction model's own resolved context window (capped by the session's), so a smaller-window model is sent smaller requests rather than failing. The entry's prices are used for the compaction receipts. Project config needs trust to set it. |
@@ -3569,7 +3569,13 @@ command or duplicate name, when MCP is disabled or not compiled in, or when it
 arrives over ACP TCP: a network peer must not launch local processes, so TCP
 deployments configure MCP on the agent host.
 
-A turn that fails internally (provider or runner error, unusable workspace,
+A turn that exhausts `max_agent_turns` answers `session/prompt` with the
+`max_turn_requests` stop reason (the explanation arrives as a thought chunk), a turn that
+spends `turn_token_budget` or whose final answer the provider cut off at its output limit
+(after the automatic continuations) answers `max_tokens`, and a cancelled turn that already
+ran tools keeps its prompt, the completed tool calls and results (calls without a result
+closed as unknown) and an interruption marker in the session history. A turn that fails
+internally (provider or runner error, unusable workspace,
 missing credentials) answers `session/prompt` with a JSON-RPC error (`-32603`)
 carrying the failure message, rather than a `refusal` stop reason; any tool
 work the turn completed is still committed to the session history. With the
@@ -5061,7 +5067,7 @@ serialized into the worker protocol.
 `running_input = "queue"` (default) queues ordinary Enter submissions while an
 interactive turn runs. Use `"steer"` to deliver them at the next settled tool
 boundary instead. `/steer <message>` explicitly steers regardless of this setting.
-Only one steer may wait at a time; a second remains in the input draft.
+Several steers may wait (up to 64 KiB in total); the next settled tool batch delivers them in order, each as its own message.
 
 The `background_tasks` status-line item (with `subagents`) shows the current
 session’s active Task jobs and completed reports awaiting next-turn notice.

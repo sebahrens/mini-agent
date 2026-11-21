@@ -6808,7 +6808,9 @@ impl AcpMidTurn {
             delta.cached_input_tokens,
             delta.cache_creation_input_tokens,
         );
-        real_input_tokens as f64 / self.window as f64 > self.threshold
+        // The completion's output joins the next request (mini-agent-nvnkx.164).
+        real_input_tokens.saturating_add(delta.output_tokens) as f64 / self.window as f64
+            > self.threshold
     }
 }
 
@@ -8580,6 +8582,8 @@ async fn relay_prompt_events(
     let mut usage = rig::completion::Usage::default();
     let mut pending_text = PendingText::default();
     let mut calls = OpenCalls::default();
+    // The typed reason the turn ends short; set just before `Done`/`Error`.
+    let mut stop_cause: Option<crate::event::StopCause> = None;
     #[cfg(feature = "subagents")]
     let mut task_activity = TaskActivity::default();
     loop {
@@ -8814,6 +8818,14 @@ async fn relay_prompt_events(
                     usage,
                 };
             }
+            // Host-instruction rows are an interactive-history concern.
+            AgentEvent::HostInstruction { .. } => {}
+            AgentEvent::StopCause(cause) => stop_cause = Some(cause),
+            AgentEvent::Interrupted { interactions } => {
+                while rx.recv().await.is_some() {}
+                relay_plan_if_changed(&session_id, &cx, &plan_store, &mut last_plan);
+                return PromptOutcome::cancelled(Some(interactions));
+            }
             AgentEvent::SteerConsumed { .. }
             | AgentEvent::SteerRejected { .. }
             | AgentEvent::CompactionBoundary { .. } => {
@@ -8853,7 +8865,11 @@ async fn relay_prompt_events(
                 calls.close_unfinished(&session_id, &cx);
                 relay_plan_if_changed(&session_id, &cx, &plan_store, &mut last_plan);
                 return PromptOutcome {
-                    reason: StopReason::EndTurn,
+                    // A final answer the provider cut off at its output limit.
+                    reason: match stop_cause {
+                        Some(crate::event::StopCause::OutputTruncated) => StopReason::MaxTokens,
+                        _ => StopReason::EndTurn,
+                    },
                     question: None,
                     progress: Some(interactions),
                     error: None,
@@ -8869,11 +8885,28 @@ async fn relay_prompt_events(
                 while rx.recv().await.is_some() {}
                 calls.close_unfinished(&session_id, &cx);
                 relay_plan_if_changed(&session_id, &cx, &plan_store, &mut last_plan);
+                // A spent turn cap or budget is a protocol stop reason, not an
+                // internal failure (mini-agent-nvnkx.273).
+                let typed = stop_cause.map(|cause| match cause {
+                    crate::event::StopCause::TurnLimit => StopReason::MaxTurnRequests,
+                    crate::event::StopCause::TokenBudget
+                    | crate::event::StopCause::OutputTruncated => StopReason::MaxTokens,
+                });
+                if typed.is_some() {
+                    // The client shows the stop reason; keep the explanation.
+                    let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(
+                        message.to_string(),
+                    )));
+                    let _ = cx.send_notification(SessionNotification::new(
+                        session_id.clone(),
+                        SessionUpdate::AgentThoughtChunk(chunk),
+                    ));
+                }
                 return PromptOutcome {
-                    reason: StopReason::Refusal,
+                    reason: typed.unwrap_or(StopReason::Refusal),
                     question: None,
                     progress: Some(interactions),
-                    error: Some(message.to_string()),
+                    error: typed.is_none().then(|| message.to_string()),
                     compaction_boundary: false,
                     #[cfg(feature = "goal")]
                     usage,
@@ -8924,6 +8957,7 @@ async fn cancelled_after_runner(
             } => calls.result(session_id, cx, id.to_string(), &output, is_error),
             AgentEvent::Done { interactions, .. }
             | AgentEvent::Error { interactions, .. }
+            | AgentEvent::Interrupted { interactions }
             | AgentEvent::AwaitingUser { interactions, .. }
                 if !interactions.is_empty() =>
             {
@@ -14738,6 +14772,102 @@ mod protocol_tests {
             ),
             "Cancelled must not return while the configured hook process is live"
         );
+    }
+
+    // mini-agent-nvnkx.272/.273: a cancelled run that already did work keeps
+    // its prompt and effects in history, and a spent turn cap or a cut-off
+    // answer is a protocol stop reason, not a JSON-RPC internal error.
+    #[tokio::test]
+    async fn in_memory_protocol_keeps_interrupted_progress_and_maps_typed_stops() {
+        let observed = Arc::new(StdMutex::new(Vec::<(String, Vec<Message>)>::new()));
+        let fixture: PromptFixture = {
+            let observed = observed.clone();
+            Arc::new(move |prompt, history| {
+                let observed = observed.clone();
+                Box::pin(async move {
+                    observed.lock().unwrap().push((prompt.clone(), history));
+                    Ok(match prompt.as_str() {
+                        "interrupted" => vec![AgentEvent::Interrupted {
+                            interactions: vec![Message::assistant("edit applied")],
+                        }],
+                        "turn-cap" => vec![
+                            AgentEvent::StopCause(crate::event::StopCause::TurnLimit),
+                            AgentEvent::Error {
+                                message: "Agent exhausted its maximum turn budget (3)".into(),
+                                interactions: vec![Message::assistant("partial work")],
+                            },
+                        ],
+                        "truncated" => vec![
+                            AgentEvent::StopCause(crate::event::StopCause::OutputTruncated),
+                            done("truncated", vec![Message::assistant("cut off")]),
+                        ],
+                        "provider-error" => vec![AgentEvent::Error {
+                            message: "provider returned 400".into(),
+                            interactions: Vec::new(),
+                        }],
+                        other => vec![done(other, vec![Message::assistant(other)])],
+                    })
+                })
+            })
+        };
+        let state = fixture_state(fixture);
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+        Client
+            .builder()
+            .on_receive_notification(
+                async |_notification: SessionNotification, _cx| Ok(()),
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session = cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?
+                    .session_id;
+                let interrupted = cx
+                    .send_request(prompt(session.clone(), "interrupted"))
+                    .block_task()
+                    .await?;
+                assert_eq!(interrupted.stop_reason, StopReason::Cancelled);
+                let capped = cx
+                    .send_request(prompt(session.clone(), "turn-cap"))
+                    .block_task()
+                    .await?;
+                assert_eq!(capped.stop_reason, StopReason::MaxTurnRequests);
+                let cut = cx
+                    .send_request(prompt(session.clone(), "truncated"))
+                    .block_task()
+                    .await?;
+                assert_eq!(cut.stop_reason, StopReason::MaxTokens);
+                let failed = cx
+                    .send_request(prompt(session.clone(), "provider-error"))
+                    .block_task()
+                    .await;
+                assert!(failed.is_err(), "a real failure stays a JSON-RPC error");
+                let next = cx
+                    .send_request(prompt(session, "next"))
+                    .block_task()
+                    .await?;
+                assert_eq!(next.stop_reason, StopReason::EndTurn);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let observed = observed.lock().unwrap();
+        let (_, history) = observed.last().expect("the last prompt was observed");
+        assert_eq!(
+            &history[..2],
+            [
+                Message::user("interrupted"),
+                Message::assistant("edit applied")
+            ],
+            "the interrupted turn keeps its prompt and effects"
+        );
+        assert!(history.contains(&Message::assistant("partial work")));
     }
 
     #[tokio::test]

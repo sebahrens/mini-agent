@@ -710,11 +710,14 @@ async fn steering_enter_mode_and_explicit_command_use_one_pending_slot() {
         };
         user(&mut app, UserEvent::Paste("/steer second pending".into())).await;
         key(&mut app, KeyCode::Enter).await;
-        assert_eq!(app.input.buffer.as_str(), "second pending");
+        // Steering is a queue (mini-agent-nvnkx.18): the second message is
+        // accepted and both reach the next request.
+        assert_eq!(app.input.buffer.as_str(), "");
         assert!(app.run.pending_inputs.is_empty());
         assert!(finish_turn(&mut app).await);
         assert_eq!(provider.calls().len(), 2);
         assert!(provider.calls()[1].to_string().contains(selected));
+        assert!(provider.calls()[1].to_string().contains("second pending"));
         assert!(!provider.calls()[0].to_string().contains(selected));
         assert_eq!(
             app.ui

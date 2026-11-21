@@ -3999,6 +3999,14 @@ impl<'a> App<'a> {
                 usage.cached_input_tokens,
                 usage.cache_creation_input_tokens,
             );
+            // The completion's own output joins the next request, and a provider
+            // that reports no usage still gets protection from the session's
+            // estimate (mini-agent-nvnkx.164).
+            let real_input_tokens = if real_input_tokens == 0 {
+                self.ui.session.effective_context_tokens()
+            } else {
+                real_input_tokens.saturating_add(usage.output_tokens)
+            };
             let pressure = real_input_tokens as f64 / self.ui.session.context_window as f64;
             Some((real_input_tokens, threshold, pressure))
         } else {

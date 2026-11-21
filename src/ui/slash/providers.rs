@@ -611,6 +611,22 @@ pub(super) async fn apply_model(
         ));
 
     write_ok(ctx.renderer, format!("switched to model: {}", new_model));
+    // Image evidence kept across a compaction cannot be sent to a model with
+    // no image input; the replay swaps each image for its identity line.
+    #[cfg(feature = "multimodal")]
+    if ctx
+        .session
+        .compactions
+        .last()
+        .is_some_and(|record| !record.images.is_empty())
+        && crate::models_catalog::model_image_input(&ctx.session.provider, &new_model)
+            == Some(false)
+    {
+        ctx.renderer.show_notice(
+            "this model has no image input: images kept across compaction are sent as identity lines only",
+            crossterm::style::Color::Yellow,
+        );
+    }
 }
 
 async fn handle_provider(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {

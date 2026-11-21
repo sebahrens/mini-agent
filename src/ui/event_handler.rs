@@ -420,6 +420,8 @@ pub async fn handle_agent_event(
             if let (Some(pending), Some(path)) = (run.pending_turn.as_mut(), artifact) {
                 pending.record_tool_output(path);
             }
+            // Recorded: the interrupt fallback for this call is not needed.
+            let _ = crate::agent::runner::take_settled_result(&id);
             save_session_if_settled(ui.session, ui.cli, run, renderer)?;
             if std::mem::take(&mut run.loop_guard_result_pending) {
                 // The preceding ToolLoop event renders the diagnostic with a
@@ -533,6 +535,26 @@ pub async fn handle_agent_event(
             renderer.write_line(&message, Color::Yellow)?;
         }
         AgentEvent::CompactionBoundary { .. } => {}
+        // The UI cancels by finalizing its own rows; the runner's mirror is for
+        // clients that have none.
+        AgentEvent::Interrupted { .. } | AgentEvent::StopCause(_) => {}
+        AgentEvent::HostInstruction { text, flush_response } => {
+            // Stored where it happened, so the transcript reads answer, host
+            // row, the work it caused, final answer (mini-agent-nvnkx.11).
+            if flush_response {
+                finalize_response_segment(renderer, run)?;
+                if run.agent_line_started {
+                    renderer.write_line("", Color::White)?;
+                    run.agent_line_started = false;
+                }
+                run.response_start_block = None;
+            }
+            let pending = if flush_response { run.response_buf.as_str() } else { "" };
+            record_host_instruction(ui.session, pending, &text);
+            if flush_response {
+                run.response_buf.clear();
+            }
+        }
         AgentEvent::AwaitingUser { question, interactions } => {
             ui.session.adopt_provider_tool_identity(&interactions);
             let notice=question.notice();
@@ -679,29 +701,17 @@ pub(crate) fn commit_turn_response(
         adopted_provider_identities = adopted,
         "committing turn response; tool records were persisted live"
     );
-    persist_host_instructions(session, interactions);
     session.add_message(MessageRole::Assistant, response);
 }
 
-/// Host continuation instructions (verification failure, Stop-hook reason,
-/// truncation or retry notice) are not streamed as events, so they exist only
-/// in the turn's batch. Store them as host rows, as headless `-p` does, so a
-/// later turn or resume shows why the extra work happened and never attributes
-/// the text to the user (mini-agent-sskdu.187).
-fn persist_host_instructions(session: &mut Session, interactions: &[Message]) {
-    for message in interactions {
-        let Message::User { content } = message else {
-            continue;
-        };
-        for item in content.iter() {
-            if let rig::message::UserContent::Text(text) = item
-                && crate::agent::input::is_host_instruction(&text.text)
-                && !crate::agent::input::is_host_context_message(&text.text)
-            {
-                session.add_message(MessageRole::System, &text.text);
-            }
-        }
+/// Store a host continuation instruction where it happened: the answer it
+/// followed (when that answer was complete), then the host row
+/// (mini-agent-nvnkx.11).
+pub(crate) fn record_host_instruction(session: &mut Session, answer: &str, instruction: &str) {
+    if !answer.is_empty() {
+        session.add_message(MessageRole::Assistant, answer);
     }
+    session.add_message(MessageRole::System, instruction);
 }
 
 async fn handle_agent_done(

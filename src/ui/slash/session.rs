@@ -1760,6 +1760,7 @@ mod session_persistence_tests {
                             text: "checked".into(),
                         }],
                     }],
+                    ..Default::default()
                 },
             );
         }

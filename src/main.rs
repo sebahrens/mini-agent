@@ -233,6 +233,11 @@ fn finish_runtime_error(
     if print::headless_force_stopped() {
         print::exit_force_stopped();
     }
+    // An operator interrupt is not a provider or tool failure: exit with the
+    // conventional 128 + signal (mini-agent-nvnkx.158).
+    if agent::runner::is_headless_interrupt(&error) {
+        return Ok(ExitCode::from(print::headless_interrupt_exit_code() as u8));
+    }
     Ok(ExitCode::from(code))
 }
 

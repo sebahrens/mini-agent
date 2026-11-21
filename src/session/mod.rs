@@ -607,6 +607,18 @@ impl PersistedReasoning {
         self.id.is_none() && self.blocks.is_empty()
     }
 
+    /// Whether the item carries ciphertext that only its producing model can
+    /// read back (encrypted or redacted blocks).
+    fn is_opaque(&self) -> bool {
+        self.blocks.iter().any(|block| {
+            matches!(
+                block,
+                PersistedReasoningBlock::Encrypted { .. }
+                    | PersistedReasoningBlock::Redacted { .. }
+            )
+        })
+    }
+
     /// True when the item can be replayed as a stored provider reasoning item.
     fn is_replayable(&self) -> bool {
         self.id.is_some() && !self.blocks.is_empty()
@@ -704,9 +716,37 @@ pub struct PersistedCallProvenance {
     /// Reasoning items emitted before the call, in provider order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasoning: Vec<PersistedReasoning>,
+    /// The provider route that produced these ids and items. Item ids and
+    /// reasoning blocks are only valid on the route that issued them, so a
+    /// session moved to another provider replays the rewritten identity
+    /// instead (mini-agent-nvnkx.161). `None` for records written before this
+    /// was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_provider: Option<CompactString>,
+    /// The producing model; encrypted reasoning only replays on the same one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_model: Option<CompactString>,
 }
 
 impl PersistedCallProvenance {
+    /// Whether the provider's own ids and reasoning may be replayed on the
+    /// session's current route. A recorded route must match the provider (and
+    /// the model when the reasoning is encrypted). A record without a route
+    /// keeps its old behaviour only on OpenAI Responses providers.
+    pub(crate) fn replayable_on(&self, provider: &str, model: &str) -> bool {
+        match &self.route_provider {
+            Some(recorded) => {
+                recorded.as_str() == provider
+                    && (self.route_model.as_deref() == Some(model)
+                        || !self.reasoning.iter().any(PersistedReasoning::is_opaque))
+            }
+            None => matches!(
+                crate::auth::ProviderKind::from_name(provider),
+                Some(crate::auth::ProviderKind::OpenAI | crate::auth::ProviderKind::Azure)
+            ),
+        }
+    }
+
     /// True when this call can be replayed with the provider's own item ids:
     /// both identities are known and at least one reasoning item can be
     /// replayed with them. The Responses API rejects a native `function_call`
@@ -765,6 +805,8 @@ pub(crate) fn provider_tool_calls(
                                 provider_item_id: Some(CompactString::new(call.id.as_str())),
                                 provider_call_id: call.call_id.as_deref().map(CompactString::new),
                                 reasoning: std::mem::take(&mut pending),
+                                route_provider: None,
+                                route_model: None,
                             },
                         }),
                         AssistantContent::Text(_) | AssistantContent::Image(_) => {}
@@ -828,6 +870,9 @@ struct CachedHistoryConversion {
     /// history revision.
     live_blocks: String,
     keep_recent_tool_results: usize,
+    /// The provider and model the replay was built for: provider item ids,
+    /// reasoning and image evidence depend on them (mini-agent-nvnkx.161/.297).
+    route: (CompactString, CompactString),
     messages: std::sync::Arc<[rig::completion::Message]>,
 }
 
@@ -1597,6 +1642,8 @@ impl Session {
                 cache.as_ref().and_then(|entry| {
                     (entry.revision == self.history_revision
                         && entry.live_blocks == self.live_recap_blocks()
+                        && entry.route.0 == self.provider
+                        && entry.route.1 == self.model
                         && entry.keep_recent_tool_results == keep_recent_tool_results)
                         .then(|| std::sync::Arc::clone(&entry.messages))
                 })
@@ -1613,6 +1660,7 @@ impl Session {
                 revision: self.history_revision,
                 live_blocks: self.live_recap_blocks(),
                 keep_recent_tool_results,
+                route: (self.provider.clone(), self.model.clone()),
                 messages,
             });
         }
@@ -1927,10 +1975,14 @@ impl Session {
     pub(crate) fn record_tool_call_provenance(
         &mut self,
         tool_call_id: &str,
-        provenance: PersistedCallProvenance,
+        mut provenance: PersistedCallProvenance,
     ) {
         if tool_call_id.is_empty() || provenance == PersistedCallProvenance::default() {
             return;
+        }
+        if provenance.route_provider.is_none() {
+            provenance.route_provider = Some(self.provider.clone());
+            provenance.route_model = Some(self.model.clone());
         }
         self.tool_call_provenance
             .insert(CompactString::new(tool_call_id), provenance);

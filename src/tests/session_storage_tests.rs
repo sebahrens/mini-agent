@@ -1435,6 +1435,7 @@ fn saved_session_round_trips_reasoning_and_both_provider_tool_ids() {
                 },
             ],
         }],
+        ..Default::default()
     };
     session.record_tool_call_provenance("call_abc123", provenance.clone());
     save_session(&session).unwrap();
@@ -1442,10 +1443,16 @@ fn saved_session_round_trips_reasoning_and_both_provider_tool_ids() {
     let loaded = load_session_exact(&session.id)
         .unwrap()
         .expect("saved session must load");
+    // Recording stamps the producing route (mini-agent-nvnkx.161).
+    let stamped = PersistedCallProvenance {
+        route_provider: Some(session.provider.clone()),
+        route_model: Some(session.model.clone()),
+        ..provenance.clone()
+    };
     assert_eq!(
         loaded.tool_call_provenance.get("call_abc123"),
-        Some(&provenance),
-        "the reasoning item and both provider ids must survive save/load"
+        Some(&stamped),
+        "the reasoning item, both provider ids and the route must survive save/load"
     );
     assert_eq!(
         loaded.messages[1].tool_call_id.as_deref(),
@@ -1493,6 +1500,7 @@ fn old_format_session_without_provenance_still_loads_and_replays_rewritten() {
                     text: "thinking".into(),
                 }],
             }],
+            ..Default::default()
         },
     );
     save_session(&session).unwrap();

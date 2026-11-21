@@ -74,6 +74,11 @@ Notable changes to mini-agent are documented in this file. The format follows
 - MCP server `notifications/message` log lines are kept in a bounded per-server ring, shown by `/mcp <server>` and appended (fenced as untrusted) to a failed tool call's error; subscribed resources the server reports updated are re-read with a note (mini-agent-nvnkx.80; argument completion not implemented).
 - ACP advertises `mcpCapabilities.http` and accepts client-supplied HTTP MCP servers (https, or loopback http) for the session when the same gate as client stdio servers is open; headers are used as given and never persisted (mini-agent-nvnkx.108).
 - `mcp_search` replies list further matches by name (`more`) without schemas (mini-agent-nvnkx.183).
+- Added: steering keeps a bounded queue (64 KiB in total) instead of one pending message; every queued message is delivered at the next settled tool batch as its own user message, in order (mini-agent-nvnkx.18).
+- Added: a headless turn announces a provider retry as a stderr line (text mode) or a `retry` stream-json event with the attempt, limit, delay and reason (mini-agent-nvnkx.17).
+- Added: an interrupted headless run (SIGINT, SIGTERM or a control-channel interrupt) reports `stop_reason: "interrupted"` with `is_error: true`, the text produced so far plus a cut-short marker in `result`, and exits 130 (SIGINT) or 143 (SIGTERM) (mini-agent-nvnkx.158).
+- Added: a job id from an earlier process of the session answers that the job started in an earlier process and is no longer running, and names its output log when it still exists (mini-agent-nvnkx.315).
+- Added: ACP answers `max_turn_requests` for a spent turn cap and `max_tokens` for a spent token budget or a final answer cut off at the output limit, instead of a JSON-RPC internal error or `end_turn`; the explanation arrives as a thought chunk (mini-agent-nvnkx.273).
 
 ### Fixed
 
@@ -297,6 +302,19 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Ctrl+V with no clipboard image pastes the clipboard text (`pbpaste`, `wl-paste`, `xclip`) or says there is nothing to paste, instead of reporting an unavailable platform; a missing Linux image target is "no image" (mini-agent-nvnkx.255).
 - macOS and Windows clipboard image helpers accept PNGs up to the 24 MiB raw bound so large Retina screenshots reach the downscaler (mini-agent-nvnkx.249).
 - Copying selected text over SSH or inside tmux uses OSC 52 or `tmux load-buffer -w` instead of the remote machine's clipboard helpers, names the route in the notice, refuses payloads too large for OSC 52, and `MINI_AGENT_CLIPBOARD=auto|osc52|helper|tmux` overrides the choice (mini-agent-nvnkx.285).
+- Fixed: a cancelled ACP turn that already ran tools keeps the prompt, the completed calls and results (calls without a result closed as unknown) and an interruption marker in history; the runner reports them before it stops (mini-agent-nvnkx.272).
+- Fixed: stored OpenAI provider item ids and reasoning replay only on the provider (and, for encrypted blocks, the model) that issued them, so `/model` to another provider no longer sends `rs_`/`fc_` items to it; the history cache is keyed by provider and model (mini-agent-nvnkx.161).
+- Fixed: context-length errors from llama.cpp (`exceed_context_size_error`), LM Studio and xAI (`maximum prompt length`) are recognised, so they get the `/compress` hint, are not retried and trigger compaction (mini-agent-nvnkx.37).
+- Fixed: a resumed subagent keeps its whole conversation (the returned history starts with the history it was given), so a second resume and a `SubagentStop` continuation see the earlier tool results (mini-agent-nvnkx.10).
+- Fixed: a subagent that fails on a stream error, or finishes with no final text after tool work, keeps its history, tool log and turns; the empty-final case gets the tool-free write-up used for an exhausted turn budget (mini-agent-nvnkx.15, .14).
+- Fixed: images kept across a compaction are sent as identity lines to a model the catalog marks as having no image input, and `/model` says so once (mini-agent-nvnkx.297).
+- Fixed: headless mid-turn pressure counts the completion's output and the estimated results just appended, and falls back to the session estimate when the provider reports no usage; the TUI and ACP count the completion's output (mini-agent-nvnkx.164).
+- Fixed: a turn whose tool work is done but whose final text is empty gets one nudge and then ends normally with `(no closing message)` instead of failing; the empty-response counter resets on text or a tool call (mini-agent-nvnkx.13).
+- Fixed: a verification retry or blocking `Stop` hook starts the response over, so the turn's result is the last answer, not two answers glued together; headless text mode separates them with a newline (mini-agent-nvnkx.12).
+- Fixed: output-truncation continuation instructions are host rows; the TUI stores a host instruction when it happens (after the answer it followed, before the work it caused) and headless runs persist verification, hook and truncation instructions between the two answers (mini-agent-nvnkx.11).
+- Fixed: the steering checkpoint failure reports the messages of every stream of the turn, not just the current one (mini-agent-nvnkx.16).
+- Fixed: a call that completed and was reported is no longer recorded as "outcome unknown" when the user interrupts before the UI read its result event (mini-agent-nvnkx.166).
+- Fixed: the loop guard lets an identical failing call run again after a `job_status` poll or eight other tool results, so polling for a port, CI run or lock is not blocked for the rest of the turn (mini-agent-nvnkx.19).
 
 ### Added
 

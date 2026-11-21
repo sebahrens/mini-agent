@@ -36,7 +36,7 @@ pub(crate) struct Images {
 }
 
 impl Images {
-    pub(super) fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty() && self.omitted == 0
     }
 
@@ -185,7 +185,15 @@ impl Images {
             .fold(1024, u64::saturating_add)
     }
 
+    #[cfg(test)]
     pub(crate) fn to_message(&self) -> Option<rig::message::Message> {
+        self.to_message_for(true)
+    }
+
+    /// As [`Self::to_message`]; with `accepts_images` false every retained
+    /// image becomes its identity line, because a model without image input
+    /// would fail every request that carried the pixels (mini-agent-nvnkx.297).
+    pub(crate) fn to_message_for(&self, accepts_images: bool) -> Option<rig::message::Message> {
         if self.is_empty() {
             return None;
         }
@@ -204,7 +212,14 @@ impl Images {
                     },
                     entry.identity
                 )));
-                parts.push(UserContent::Image(image.to_rig()));
+                if accepts_images {
+                    parts.push(UserContent::Image(image.to_rig()));
+                } else {
+                    parts.push(UserContent::text(format!(
+                        "[Historical image sha256={} not sent: model has no image input]",
+                        entry.identity
+                    )));
+                }
             } else {
                 parts.push(UserContent::text(format!("[Historical image sha256={} has no retained pixels in this saved history record; obtain the original evidence if needed.]", entry.identity)));
             }
@@ -521,6 +536,28 @@ mod tests {
             rendered.contains("no retained pixels")
                 && rendered.contains(expected.evidence_identity().as_str())
         );
+    }
+
+    // mini-agent-nvnkx.297: a model without image input gets the identity line
+    // instead of the pixels.
+    #[test]
+    fn evidence_for_a_text_only_model_carries_identities_not_pixels() {
+        let mut session = Session::new("test", "test", 128_000, "");
+        let expected = image(None);
+        session.add_tool_call_with_id("old", "read", &serde_json::json!({"path":"old.png"}));
+        session.add_tool_result_with_images("old", "read", "old pixels", vec![expected.clone()]);
+        session.compress("old summary".into(), session.messages.len(), 0);
+        let images = &session.compactions.last().unwrap().images;
+        let with_pixels = images.to_message_for(true).unwrap();
+        assert_eq!(pixels(std::slice::from_ref(&with_pixels)).len(), 1);
+        let text_only = images.to_message_for(false).unwrap();
+        assert!(pixels(std::slice::from_ref(&text_only)).is_empty());
+        let rendered = serde_json::to_string(&text_only).unwrap();
+        assert!(
+            rendered.contains("not sent: model has no image input"),
+            "{rendered}"
+        );
+        assert!(rendered.contains(expected.evidence_identity().as_str()));
     }
 
     #[test]

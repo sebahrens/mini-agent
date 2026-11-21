@@ -48,6 +48,7 @@ fn session_with_native_call_and_reasoning() -> Session {
             provider_item_id: Some("fc_abc123".into()),
             provider_call_id: Some("call_abc123".into()),
             reasoning: vec![reasoning_item("rs_abc123")],
+            ..Default::default()
         },
     );
     session
@@ -439,6 +440,7 @@ fn provenance_without_a_reasoning_item_keeps_the_rewritten_identity() {
                     text: "thinking".into(),
                 }],
             }],
+            ..Default::default()
         },
     );
 
@@ -504,6 +506,72 @@ fn persisted_reasoning_replays_immediately_before_its_native_function_call() {
     };
     assert_eq!(result.id, "fc_abc123");
     assert_eq!(result.call_id.as_deref(), Some("call_abc123"));
+}
+
+/// mini-agent-nvnkx.161: the provider's own `fc_`/`rs_` items are valid only on
+/// the route that issued them. After `/model` moves the session elsewhere the
+/// call replays with the rewritten identity and no reasoning item.
+#[test]
+fn native_reasoning_and_ids_are_not_replayed_on_another_provider() {
+    fn replayed_call(session: &Session) -> (bool, rig::message::ToolCall) {
+        let history = convert_history(session);
+        let Message::Assistant { content, .. } = &history[1] else {
+            panic!("tool call must replay as an assistant message")
+        };
+        let has_reasoning = content
+            .iter()
+            .any(|item| matches!(item, AssistantContent::Reasoning(_)));
+        let call = content
+            .iter()
+            .find_map(|item| match item {
+                AssistantContent::ToolCall(call) => Some(call.clone()),
+                _ => None,
+            })
+            .expect("the call replays");
+        (has_reasoning, call)
+    }
+
+    let mut session = session_with_native_call_and_reasoning();
+    let (has_reasoning, call) = replayed_call(&session);
+    assert!(has_reasoning, "unchanged on the original route");
+    assert_eq!(call.id, "fc_abc123");
+
+    // Same provider, another model: the encrypted block is bound to its model.
+    session.model = "claude-other".into();
+    let (has_reasoning, call) = replayed_call(&session);
+    assert!(!has_reasoning, "encrypted reasoning needs the same model");
+    assert_eq!(call.id, "call_abc123");
+
+    // Another provider altogether.
+    session.model = "claude-test".into();
+    session.provider = "openrouter".into();
+    let (has_reasoning, call) = replayed_call(&session);
+    assert!(!has_reasoning);
+    assert!(!call.id.starts_with("fc_"), "{}", call.id);
+    assert_eq!(call.call_id.as_deref(), Some("call_abc123"));
+
+    // Back on the original route the cached history is not served stale.
+    session.provider = "anthropic".into();
+    assert!(replayed_call(&session).0);
+}
+
+/// A record written before the route was stored keeps its native replay only on
+/// OpenAI Responses providers.
+#[test]
+fn a_record_without_a_route_replays_natively_only_on_openai() {
+    let mut session = session_with_native_call_and_reasoning();
+    for provenance in session.tool_call_provenance.values_mut() {
+        provenance.route_provider = None;
+        provenance.route_model = None;
+    }
+    session.provider = "openai".into();
+    let history = convert_history(&session);
+    assert!(matches!(&history[1], Message::Assistant { content, .. }
+            if content.iter().any(|item| matches!(item, AssistantContent::Reasoning(_)))));
+    session.provider = "anthropic".into();
+    let history = convert_history(&session);
+    assert!(matches!(&history[1], Message::Assistant { content, .. }
+            if !content.iter().any(|item| matches!(item, AssistantContent::Reasoning(_)))));
 }
 
 /// The same end-to-end guard as the rewritten path: rig's Responses request

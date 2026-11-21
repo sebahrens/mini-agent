@@ -29,6 +29,11 @@ use crate::session::{MessageRole, PersistedToolMessage, Session};
 
 const VERIFICATION_DIAGNOSTIC_CHARS: usize = 12_000;
 const IDENTICAL_TOOL_FAILURE_LIMIT: u32 = 3;
+/// Other tool results after which a blocked identical failing call may run
+/// again; a `wait` or `job_status` result lifts the block at once. A call whose
+/// outcome depends on time (a port opening, a CI run, a lock) fails identically
+/// until the condition holds (mini-agent-nvnkx.19).
+const IDENTICAL_FAILURE_BLOCK_EXPIRY: u64 = 8;
 const ALTERNATING_EDIT_HISTORY: usize = 5;
 pub(crate) const TOOL_LOOP_NOTICE_PREFIX: &str = "[tool-loop detected]";
 
@@ -344,6 +349,11 @@ fn hash_canonical_json(digest: &mut Sha256, value: &serde_json::Value) {
 struct ToolLoopState {
     successful_reads: super::read_loop::ReadLoopState,
     failures: HashMap<ToolCallFingerprint, u32>,
+    /// Tool results recorded so far, and how many were `wait`/`job_status`.
+    results_seen: u64,
+    poll_results: u64,
+    /// `(results_seen, poll_results)` when each fingerprint last failed.
+    failed_at: HashMap<ToolCallFingerprint, (u64, u64)>,
     recent_successful_edits: VecDeque<ToolCallFingerprint>,
     blocked_edit_pair: Option<[ToolCallFingerprint; 2]>,
     /// Fingerprints computed at `ToolCall`, keyed by the call's internal id and
@@ -362,11 +372,20 @@ fn raw_args_hash(args: &str) -> u64 {
 impl ToolLoopState {
     fn exact_failure_notice(&self, fingerprint: ToolCallFingerprint) -> Option<String> {
         let failures = self.failures.get(&fingerprint).copied().unwrap_or(0);
-        (failures >= IDENTICAL_TOOL_FAILURE_LIMIT).then(|| {
-            format!(
-                "{TOOL_LOOP_NOTICE_PREFIX} This exact call has failed {failures} times and was not executed again. Change the arguments or approach; ask the user only when an interactive decision is genuinely required."
-            )
-        })
+        if failures < IDENTICAL_TOOL_FAILURE_LIMIT {
+            return None;
+        }
+        // A wait/job_status result, or enough other work, lets the call run
+        // again: its outcome may depend on time rather than on the workspace.
+        if let Some(&(results, polls)) = self.failed_at.get(&fingerprint)
+            && (self.poll_results > polls
+                || self.results_seen.saturating_sub(results) >= IDENTICAL_FAILURE_BLOCK_EXPIRY)
+        {
+            return None;
+        }
+        Some(format!(
+            "{TOOL_LOOP_NOTICE_PREFIX} This exact call has failed {failures} times and was not executed again. Change the arguments or approach; ask the user only when an interactive decision is genuinely required. It may run again after a `wait` or `job_status` call, or after {IDENTICAL_FAILURE_BLOCK_EXPIRY} other tool results."
+        ))
     }
 
     fn alternating_edit_notice(&mut self, fingerprint: ToolCallFingerprint) -> Option<String> {
@@ -406,8 +425,10 @@ impl ToolLoopState {
         outcome: &rig::tool::ToolOutcome,
         result: &str,
     ) -> Option<String> {
+        self.results_seen = self.results_seen.saturating_add(1);
         if super::read_loop::resets_read_loop(tool_name) {
             self.successful_reads.clear_after_mutation();
+            self.poll_results = self.poll_results.saturating_add(1);
         }
         if super::read_loop::invalidates_evidence(tool_name) {
             self.successful_reads.clear_after_mutation();
@@ -417,10 +438,12 @@ impl ToolLoopState {
             // anything. A failed mutation changes nothing the model can rely on.
             if outcome.is_success() {
                 self.failures.clear();
+                self.failed_at.clear();
             }
         }
         if outcome.is_success() {
             self.failures.remove(&fingerprint);
+            self.failed_at.remove(&fingerprint);
             if super::read_loop::is_evidence_read(tool_name) {
                 self.successful_reads.observe(fingerprint.0, result);
                 // Keep successful typed payloads and canonical operator input untouched.
@@ -439,6 +462,8 @@ impl ToolLoopState {
             return None;
         }
 
+        self.failed_at
+            .insert(fingerprint, (self.results_seen, self.poll_results));
         let failures = self.failures.entry(fingerprint).or_default();
         *failures = failures.saturating_add(1);
         (*failures == IDENTICAL_TOOL_FAILURE_LIMIT).then(|| {
@@ -977,7 +1002,6 @@ impl std::error::Error for HeadlessInterrupted {}
 /// Whether `error` is an operator interrupt. Typed errors are found anywhere in
 /// the chain; the message is still accepted for a failure that crossed a text
 /// boundary (a rendered or re-wrapped error) before reaching the caller.
-#[cfg(feature = "goal")]
 pub fn is_headless_interrupt(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<HeadlessInterrupted>())
         || error.to_string().contains(HEADLESS_INTERRUPTED)
@@ -1074,7 +1098,12 @@ impl CompactionPressureGate {
                     delta.cached_input_tokens,
                     delta.cache_creation_input_tokens,
                 );
-                window == 0 || real_input_tokens as f64 / window as f64 > threshold
+                // No reported prompt size: the UI falls back to its estimate, so
+                // it may act. The completion's output joins the next request.
+                window == 0
+                    || real_input_tokens == 0
+                    || real_input_tokens.saturating_add(delta.output_tokens) as f64 / window as f64
+                        > threshold
             }
         }
     }
@@ -1212,15 +1241,18 @@ pub(crate) struct HeadlessMidTurnPolicy {
     pub(crate) window: u64,
     pub(crate) threshold: f64,
     pub(crate) anthropic_native: bool,
+    /// The session's estimated context (overhead, history and the prompt)
+    /// when the segment starts: the fallback for a provider that reports no
+    /// usage, so a long tool-driven turn still gets in-turn protection
+    /// (mini-agent-nvnkx.164).
+    pub(crate) baseline_estimate: u64,
 }
 
 impl HeadlessMidTurnPolicy {
-    /// Real prompt pressure of a completion as a fraction of the window, when
-    /// it crosses the threshold.
-    fn crossed(self, usage: &rig::completion::Usage) -> Option<f64> {
-        if self.window == 0 {
-            return None;
-        }
+    /// What the next request carries according to a completion's own usage:
+    /// its prompt plus the output it appended. `None` when the provider
+    /// reported no prompt size.
+    fn reported_next_request_tokens(self, usage: &rig::completion::Usage) -> Option<u64> {
         let real_input_tokens = crate::session::Session::real_input_tokens(
             self.anthropic_native,
             usage.input_tokens,
@@ -1229,7 +1261,16 @@ impl HeadlessMidTurnPolicy {
             usage.cached_input_tokens,
             usage.cache_creation_input_tokens,
         );
-        let pressure = real_input_tokens as f64 / self.window as f64;
+        (real_input_tokens > 0).then(|| real_input_tokens.saturating_add(usage.output_tokens))
+    }
+
+    /// Projected prompt pressure of the next request as a fraction of the
+    /// window, when it crosses the threshold.
+    fn crossed(self, projected_tokens: u64) -> Option<f64> {
+        if self.window == 0 {
+            return None;
+        }
+        let pressure = projected_tokens as f64 / self.window as f64;
         (pressure > self.threshold).then_some(pressure)
     }
 }
@@ -1696,6 +1737,127 @@ impl AgentWorkCancellation {
 
 pub(crate) struct AgentWorkGuard {
     scope: Arc<AgentWorkScope>,
+}
+
+/// The completed work of a running interactive turn, readable after the
+/// runner's future is dropped by cancellation. The runner owns its transcript
+/// in locals that a dropped future takes with it, so it mirrors them here at
+/// every tool call, tool result and stream boundary; on cancellation the
+/// runner publishes [`AgentEvent::Interrupted`] from this mirror so a client
+/// can keep the prompt and the effects that already happened
+/// (mini-agent-nvnkx.272).
+#[derive(Clone, Default)]
+pub(crate) struct RunProgress(Arc<std::sync::Mutex<RunProgressState>>);
+
+#[derive(Default)]
+struct RunProgressState {
+    completed: Vec<Message>,
+    stream: Vec<Message>,
+    last_text_sync: Option<std::time::Instant>,
+}
+
+impl RunProgress {
+    /// Mirror the grouped transcript of every finished stream; the current
+    /// stream's messages are part of it now.
+    fn sync_completed(&self, completed: &[Message]) {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if completed.len() >= state.completed.len() {
+            let from = state.completed.len();
+            state.completed.extend_from_slice(&completed[from..]);
+        } else {
+            state.completed = completed.to_vec();
+        }
+        state.stream.clear();
+    }
+
+    /// Mirror the current stream's transcript. Only its last message can have
+    /// changed since the previous mirror (text and calls append to it).
+    fn sync_stream(&self, interactions: &[Message]) {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let from = state.stream.len().min(interactions.len()).saturating_sub(1);
+        state.stream.truncate(from);
+        state.stream.extend_from_slice(&interactions[from..]);
+        state.last_text_sync = Some(std::time::Instant::now());
+    }
+
+    /// As [`Self::sync_stream`], at most every 250 ms: streamed text arrives
+    /// per token and the last message grows with it.
+    fn sync_stream_throttled(&self, interactions: &[Message]) {
+        let due = {
+            let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            state
+                .last_text_sync
+                .is_none_or(|at| at.elapsed() >= std::time::Duration::from_millis(250))
+        };
+        if due {
+            self.sync_stream(interactions);
+        }
+    }
+
+    /// The interrupted turn's transcript: everything mirrored so far, calls
+    /// without a result closed as unknown, and a host marker saying why the
+    /// turn stopped. Empty when no model output or tool effect happened.
+    pub(crate) fn interrupted_transcript(&self) -> Vec<Message> {
+        let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut messages: Vec<Message> = state
+            .completed
+            .iter()
+            .chain(state.stream.iter())
+            .cloned()
+            .collect();
+        drop(state);
+        if messages.is_empty() {
+            return messages;
+        }
+        let mut open: Vec<(String, Option<String>)> = Vec::new();
+        for message in &messages {
+            match message {
+                Message::Assistant { content, .. } => {
+                    for item in content.iter() {
+                        if let AssistantContent::ToolCall(call) = item {
+                            open.push((call.id.clone(), call.call_id.clone()));
+                        }
+                    }
+                }
+                Message::User { content } => {
+                    for item in content.iter() {
+                        if let rig::message::UserContent::ToolResult(result) = item {
+                            open.retain(|(id, _)| *id != result.id);
+                        }
+                    }
+                }
+                Message::System { .. } => {}
+            }
+        }
+        for (id, call_id) in open {
+            messages.push(
+                ToolResult {
+                    id,
+                    call_id,
+                    content: OneOrMany::one(ToolResultContent::text(UNKNOWN_TOOL_OUTCOME)),
+                    is_error: None,
+                }
+                .into(),
+            );
+        }
+        messages.push(Message::user(crate::agent::input::host_instruction(
+            "turn interrupted",
+            "The user cancelled the previous turn before it finished. Tool calls above \
+             that show an unknown outcome may or may not have taken effect; check the \
+             current state before repeating work.",
+        )));
+        messages
+    }
+}
+
+/// Tell the client what a cancelled turn had already done. Never blocks the
+/// cancellation: a full channel drops the report and the client falls back to
+/// rolling the turn back.
+fn publish_interrupted(progress: &RunProgress, tx: &mpsc::Sender<AgentEvent>) {
+    let interactions = progress.interrupted_transcript();
+    if !interactions.is_empty() {
+        let _ = tx.try_send(AgentEvent::Interrupted { interactions });
+    }
 }
 
 /// Keeps the runner event channel open through hard task abortion. Dropping
@@ -2398,6 +2560,14 @@ pub(crate) const UNKNOWN_TOOL_OUTCOME: &str = "[Tool execution outcome is unknow
 const UNRESOLVED_TOOL_CALLS_ERROR: &str =
     "Agent stream ended with unresolved tool calls; execution outcome is unknown.";
 const TRANSIENT_PROVIDER_CONTINUATION: &str = "[Host: transient provider error; not written by the user]\nA transient provider error interrupted the previous completion call. Continue from the preserved transcript without repeating completed tool calls.";
+/// Whether a continuation instruction tells the model something worth storing
+/// in the transcript (verification output, a hook reason, a truncation
+/// notice). The empty-response nudge and the transient-retry note carry no
+/// information and stay out of history (mini-agent-nvnkx.11).
+fn informative_host_instruction(instruction: &str) -> bool {
+    instruction != DEFAULT_CONTINUATION && instruction != TRANSIENT_PROVIDER_CONTINUATION
+}
+
 /// The continuation used when nothing more specific applies (an empty response).
 const DEFAULT_CONTINUATION: &str =
     "[Host: empty response; not written by the user]\nPlease continue.";
@@ -4017,12 +4187,20 @@ struct ReplayToolIdentity {
 /// reasoning item stored without its `rs_...` id — keeps the rewritten identity
 /// that needs no stored provider item, which is what every session did before
 /// reasoning could be persisted at all.
+///
+/// The provider's ids and reasoning are valid only on the route that issued
+/// them; after `/model` moves the session to another provider the rewritten
+/// identity is replayed instead, as for a provenance-free session
+/// (mini-agent-nvnkx.161).
 fn replay_call_identity(
     provenance: Option<&crate::session::PersistedCallProvenance>,
     persisted_id: &str,
+    provider: &str,
+    model: &str,
 ) -> (ReplayToolIdentity, Vec<AssistantContent>) {
-    if let Some((item_id, call_id, reasoning)) =
-        provenance.and_then(|provenance| provenance.replayable_reasoning())
+    if let Some((item_id, call_id, reasoning)) = provenance
+        .filter(|provenance| provenance.replayable_on(provider, model))
+        .and_then(|provenance| provenance.replayable_reasoning())
     {
         return (
             ReplayToolIdentity {
@@ -4053,6 +4231,20 @@ pub(crate) fn convert_canonical_history_with_tool_result_retention(
     keep_recent_tool_results: usize,
 ) -> Vec<Message> {
     convert_history_uncached(session, keep_recent_tool_results, true)
+}
+
+/// Whether the session's current model takes image input. Only an explicit
+/// catalog "no" withholds pixels; an unknown model keeps them.
+fn model_accepts_images(provider: &str, model: &str) -> bool {
+    #[cfg(feature = "multimodal")]
+    {
+        crate::models_catalog::model_image_input(provider, model) != Some(false)
+    }
+    #[cfg(not(feature = "multimodal"))]
+    {
+        let _ = (provider, model);
+        true
+    }
 }
 
 fn convert_history_uncached(
@@ -4086,11 +4278,11 @@ fn convert_history_uncached(
             format!("{COMPACTION_RECAP_LABEL}\n{summary}\n\n{live}")
         };
         messages.push(Message::assistant(recap));
-        if let Some(evidence) = session
-            .compactions
-            .last()
-            .and_then(|record| record.images.to_message())
-        {
+        if let Some(evidence) = session.compactions.last().and_then(|record| {
+            record
+                .images
+                .to_message_for(model_accepts_images(&session.provider, &session.model))
+        }) {
             messages.push(evidence);
         }
     }
@@ -4216,6 +4408,8 @@ fn convert_history_uncached(
                         let (identity, mut items) = replay_call_identity(
                             session.provenance_for_tool_call(id.as_str()),
                             id.as_str(),
+                            session.provider.as_str(),
+                            session.model.as_str(),
                         );
                         // Reasoning first: the Responses API requires the
                         // `reasoning` item to precede the `function_call` it
@@ -4971,6 +5165,9 @@ where
     // tool-call scopes, `tokio::spawn`) would each reserve a full copy, which
     // overflowed a 2 MiB test thread with `acp,hooks` (mini-agent-ood0d).
     let interactive_carry = INTERACTIVE_BUDGET_CARRY.try_with(Arc::clone).ok();
+    let run_progress = RunProgress::default();
+    let progress = run_progress.clone();
+    let interrupted_tx = event_tx.clone();
     let agent_future = crate::startup::heap_future(|| async move {
         if let Some(start_rx) = start_rx
             && start_rx.await.is_err()
@@ -5047,6 +5244,9 @@ where
                         &event_tx,
                     )
                     .await;
+                    let _ = event_tx
+                        .send(AgentEvent::StopCause(crate::event::StopCause::TokenBudget))
+                        .await;
                     let _ = event_tx
                         .send(AgentEvent::error_with(
                             CompactString::from(message),
@@ -5195,7 +5395,7 @@ where
             while let Some(item) = stream.next().await {
                 match item {
                     Ok(MultiTurnStreamItem::InputInjected(messages)) => {
-                        steering_hook.steering.take_pending();
+                        steering_hook.steering.consume_delivered();
                         turn.response.clear();
                         turn.response_len_at_stream_start = 0;
                         turn.interactions.extend(messages.iter().cloned());
@@ -5219,7 +5419,7 @@ where
                             let _ = event_tx
                                 .send(AgentEvent::error_with(
                                     "Steering checkpoint handoff was not accepted",
-                                    turn.interactions.clone(),
+                                    completed_so_far!(),
                                 ))
                                 .await;
                             return;
@@ -5241,6 +5441,7 @@ where
                         match content {
                             StreamedAssistantContent::Text(text) => {
                                 turn.on_text(&text.text);
+                                progress.sync_stream_throttled(&turn.interactions);
                                 let _ = event_tx
                                     .send(AgentEvent::Token(CompactString::from(text.text)))
                                     .await;
@@ -5257,8 +5458,12 @@ where
                                     internal_call_id,
                                     tool_call.function.arguments.to_string().len(),
                                 );
-                                if let Err(error) = turn.on_tool_call(&internal_call_id, &tool_call)
-                                {
+                                let call_recorded =
+                                    turn.on_tool_call(&internal_call_id, &tool_call);
+                                if call_recorded.is_ok() {
+                                    progress.sync_stream(&turn.interactions);
+                                }
+                                if let Err(error) = call_recorded {
                                     finalize_interactive_tool_calls(
                                         &mut turn.tool_calls,
                                         &mut turn.interactions,
@@ -5332,6 +5537,7 @@ where
                         else {
                             continue;
                         };
+                        progress.sync_stream(&turn.interactions);
                         native_capture.tool_result(&internal_call_id, &tool_result);
                         tracing::debug!(
                             "agent tool result: name={}, output_len={}",
@@ -5342,8 +5548,10 @@ where
                         crate::permission::ask::finish_tool_call(&tool_name, &internal_call_id);
                         let loop_notice = take_tool_loop_notice(&internal_call_id);
                         let is_error = take_tool_failure(&internal_call_id);
-                        // Delivered normally: the interrupt fallback is not needed.
-                        let _ = take_settled_result(&internal_call_id);
+                        // The settled entry stays until the UI has recorded the
+                        // result row: an interrupt handled while this event is
+                        // still queued must find the real output, not "outcome
+                        // unknown" (mini-agent-nvnkx.166). Bounded either way.
                         let images = match tool_result_images(&tool_name, &tool_result) {
                             Ok(images) => images,
                             Err(error) => {
@@ -5413,6 +5621,7 @@ where
                             }
                         };
                         completed_interactions.extend(completed_delta);
+                        progress.sync_completed(&completed_interactions);
                         // Tell the user when older images were left out of a request.
                         for notice in take_round_user_notices() {
                             tracing::warn!("{notice}");
@@ -5488,11 +5697,34 @@ where
 
                         // An accepted `goal_report` completes a round even when
                         // no closing text follows it (mini-agent-64qyf).
-                        if terminal_was_streamed
+                        let mut completes = terminal_was_streamed
                             || !response_text.is_empty()
                             || turn.goal_report_accepted
-                            || native_capture.completes_without_visible_text()
-                        {
+                            || native_capture.completes_without_visible_text();
+                        if !completes {
+                            match turn.on_empty_final() {
+                                turn_state::EmptyFinal::Abort => {
+                                    let _ = event_tx
+                                        .send(AgentEvent::error_with(
+                                            CompactString::from(
+                                                "Agent returned empty response too many times, aborting.",
+                                            ),
+                                            completed_so_far!(),
+                                        ))
+                                        .await;
+                                    return;
+                                }
+                                turn_state::EmptyFinal::Continue => {}
+                                // Tool work is done and the model stayed silent
+                                // after one nudge: finish normally with a host
+                                // note (mini-agent-nvnkx.13).
+                                turn_state::EmptyFinal::Complete => {
+                                    turn.response.push_str(turn_state::NO_CLOSING_MESSAGE);
+                                    completes = true;
+                                }
+                            }
+                        }
+                        if completes {
                             let verification_ran =
                                 turn.verification_applies(completion_verification.as_ref());
                             if verification_ran
@@ -5564,6 +5796,13 @@ where
                                 interactions = completed_interactions.len(),
                                 "agent model completion ready for terminal event delivery"
                             );
+                            if turn.output_cut_off {
+                                let _ = event_tx
+                                    .send(AgentEvent::StopCause(
+                                        crate::event::StopCause::OutputTruncated,
+                                    ))
+                                    .await;
+                            }
                             if event_tx
                                 .send(AgentEvent::Done {
                                     response: CompactString::from(turn.response.clone()),
@@ -5576,17 +5815,6 @@ where
                                     "agent terminal event delivery failed because the UI receiver closed"
                                 );
                             }
-                            return;
-                        }
-                        if matches!(turn.on_empty_final(), turn_state::EmptyFinal::Abort) {
-                            let _ = event_tx
-                                .send(AgentEvent::error_with(
-                                    CompactString::from(
-                                        "Agent returned empty response too many times, aborting.",
-                                    ),
-                                    completed_so_far!(),
-                                ))
-                                .await;
                             return;
                         }
                         break;
@@ -5687,6 +5915,9 @@ where
                                     "agent: maximum turn budget ({max_turns_total}) exhausted"
                                 );
                                 let _ = event_tx
+                                    .send(AgentEvent::StopCause(crate::event::StopCause::TurnLimit))
+                                    .await;
+                                let _ = event_tx
                                     .send(AgentEvent::error_with(
                                         CompactString::from(max_turns_exhausted_message(
                                             max_turns_total,
@@ -5709,6 +5940,11 @@ where
                                     retrying_interrupted_completion = true;
                                     break;
                                 }
+                                let _ = event_tx
+                                    .send(AgentEvent::StopCause(
+                                        crate::event::StopCause::OutputTruncated,
+                                    ))
+                                    .await;
                                 let _ = event_tx
                                     .send(AgentEvent::error_with(
                                         CompactString::from(notice),
@@ -5771,6 +6007,9 @@ where
             ) {
                 Ok(continuation) => continuation,
                 Err(stop) => {
+                    if let Some(cause) = stop.cause() {
+                        let _ = event_tx.send(AgentEvent::StopCause(cause)).await;
+                    }
                     let _ = event_tx
                         .send(AgentEvent::error_with(
                             CompactString::from(stop.message()),
@@ -5795,6 +6034,15 @@ where
                 uncommitted_interactions,
                 &continuation_instruction,
             );
+            progress.sync_completed(&completed_interactions);
+            if informative_host_instruction(&continuation_instruction) {
+                let _ = event_tx
+                    .send(AgentEvent::HostInstruction {
+                        text: CompactString::from(continuation_instruction.as_str()),
+                        flush_response: turn.restart_pending(),
+                    })
+                    .await;
+            }
             stream_prompt = Some(continuation_instruction.clone());
             stream = stream_policy.apply(
                 continue_prompt_message_injector(
@@ -5828,7 +6076,9 @@ where
                     .run(async move {
                         tokio::select! {
                             biased;
-                            _ = cancellation_scope.cancelled() => {}
+                            _ = cancellation_scope.cancelled() => {
+                                publish_interrupted(&run_progress, &interrupted_tx);
+                            }
                             _ = agent_future => {}
                         }
                     })
@@ -5856,7 +6106,9 @@ where
                 .run(async move {
                     tokio::select! {
                         biased;
-                        _ = cancellation_scope.cancelled() => {}
+                        _ = cancellation_scope.cancelled() => {
+                            publish_interrupted(&run_progress, &interrupted_tx);
+                        }
                         _ = agent_future => {}
                     }
                 })
@@ -6143,28 +6395,41 @@ where
     let retry_config = &retry_config.bounded();
     let mut first_attempt_history = Some(history.to_vec());
     let stream = await_headless_work(crate::startup::heap_future(|| {
-        retry::retry_stream_chat(retry_config, || {
-            let p = prompt.to_message();
-            let h = first_attempt_history
-                .take()
-                .unwrap_or_else(|| history.to_vec());
-            let capture = native_capture.clone();
-            crate::startup::heap_future(|| async move {
-                agent
-                    .stream_chat(p, h)
-                    .max_turns(max_turns)
-                    .tool_concurrency(crate::agent::tools::concurrency::tool_concurrency())
-                    .add_hook(capture)
-                    .add_hook(crate::spend::run::AdmissionHook(
-                        crate::spend::run::Run::current(),
-                    ))
-                    .add_hook(crate::question::QuestionGuard)
-                    .tool_extensions(crate::question::extend_current(
-                        crate::spend::run::current_extensions(),
-                    ))
-                    .await
-            })
-        })
+        retry::retry_stream_chat_with(
+            retry_config,
+            || {
+                let p = prompt.to_message();
+                let h = first_attempt_history
+                    .take()
+                    .unwrap_or_else(|| history.to_vec());
+                let capture = native_capture.clone();
+                crate::startup::heap_future(|| async move {
+                    agent
+                        .stream_chat(p, h)
+                        .max_turns(max_turns)
+                        .tool_concurrency(crate::agent::tools::concurrency::tool_concurrency())
+                        .add_hook(capture)
+                        .add_hook(crate::spend::run::AdmissionHook(
+                            crate::spend::run::Run::current(),
+                        ))
+                        .add_hook(crate::question::QuestionGuard)
+                        .tool_extensions(crate::question::extend_current(
+                            crate::spend::run::current_extensions(),
+                        ))
+                        .await
+                })
+            },
+            move |notice: retry::RetryNotice| async move {
+                let _ = output_policy
+                    .retry_notice(
+                        notice.attempt,
+                        notice.max_attempts,
+                        notice.delay,
+                        &notice.reason,
+                    )
+                    .await;
+            },
+        )
     }))
     .await;
     let stream = match stream {
@@ -6243,7 +6508,12 @@ where
     let mid_turn_policy = HEADLESS_MID_TURN.try_with(|policy| *policy).ok();
     // Pressure of the latest completion that crossed the mid-turn threshold;
     // honored at the next correlated tool result once the batch is complete.
-    let mut mid_turn_pressure: Option<f64> = None;
+    // The next request's projected size is the last completion's reported
+    // prompt plus its output plus the results appended since; with no reported
+    // usage it is the policy's baseline estimate plus every result of the turn.
+    let mut mid_turn_reported: Option<u64> = None;
+    let mut mid_turn_since_completion: u64 = 0;
+    let mut mid_turn_turn_estimate: u64 = 0;
 
     while continue_turn {
         continue_turn = false;
@@ -6363,18 +6633,32 @@ where
                         {
                             fail_turn!(error);
                         }
-                        if let Some(pressure) = mid_turn_pressure
-                            && turn.tool_calls.pending.is_empty()
-                            && crate::question::required().is_none()
-                        {
-                            fail_turn!(MidTurnCompactionBoundary { pressure });
+                        if let Some(policy) = mid_turn_policy {
+                            let estimate = crate::session::Session::estimate_tokens(&output);
+                            mid_turn_since_completion =
+                                mid_turn_since_completion.saturating_add(estimate);
+                            mid_turn_turn_estimate = mid_turn_turn_estimate.saturating_add(estimate);
+                            if turn.tool_calls.pending.is_empty()
+                                && crate::question::required().is_none()
+                            {
+                                let projected = match mid_turn_reported {
+                                    Some(reported) => {
+                                        reported.saturating_add(mid_turn_since_completion)
+                                    }
+                                    None => policy
+                                        .baseline_estimate
+                                        .saturating_add(mid_turn_turn_estimate),
+                                };
+                                if let Some(pressure) = policy.crossed(projected) {
+                                    fail_turn!(MidTurnCompactionBoundary { pressure });
+                                }
+                            }
                         }
                     }
                     Ok(MultiTurnStreamItem::CompletionCall(call)) => {
-                        if let Some(pressure) =
-                            mid_turn_policy.and_then(|policy| policy.crossed(&call.usage))
-                        {
-                            mid_turn_pressure = Some(pressure);
+                        if let Some(policy) = mid_turn_policy {
+                            mid_turn_reported = policy.reported_next_request_tokens(&call.usage);
+                            mid_turn_since_completion = 0;
                         }
                         let delta = turn.on_completion_call(&call, retry_config);
                         if let Err(error) = output_policy
@@ -6448,11 +6732,29 @@ where
                             && !turn.goal_report_accepted
                             && !native_capture.completes_without_visible_text()
                         {
-                            if matches!(turn.on_empty_final(), turn_state::EmptyFinal::Abort) {
-                                fail_turn!("Agent returned empty response too many times, aborting.");
+                            match turn.on_empty_final() {
+                                turn_state::EmptyFinal::Abort => {
+                                    fail_turn!(
+                                        "Agent returned empty response too many times, aborting."
+                                    );
+                                }
+                                turn_state::EmptyFinal::Continue => {
+                                    continue_turn = true;
+                                    return Ok(false);
+                                }
+                                // Tool work is done and the model stayed silent
+                                // after one nudge: finish normally with a host
+                                // note (mini-agent-nvnkx.13).
+                                turn_state::EmptyFinal::Complete => {
+                                    turn.response.push_str(turn_state::NO_CLOSING_MESSAGE);
+                                    if let Err(error) = output_policy
+                                        .assistant_text(turn_state::NO_CLOSING_MESSAGE)
+                                        .await
+                                    {
+                                        fail_turn!(error);
+                                    }
+                                }
                             }
-                            continue_turn = true;
-                            return Ok(false);
                         }
                         let verification_ran =
                             turn.verification_applies(completion_verification.as_ref());
@@ -6543,7 +6845,18 @@ where
                                 continue_turn = true;
                                 return Ok(false);
                             }
-                            turn_state::StreamErrorAction::Retry { delay, .. } => {
+                            turn_state::StreamErrorAction::Retry { attempt, delay } => {
+                                if let Err(error) = output_policy
+                                    .retry_notice(
+                                        attempt,
+                                        retry_config.max_attempts,
+                                        delay,
+                                        &retry::retry_reason(&e),
+                                    )
+                                    .await
+                                {
+                                    fail_turn!(error);
+                                }
                                 await_turn!(tokio::time::sleep(delay));
                                 retrying_interrupted_completion = true;
                                 continue_turn = true;
@@ -6583,6 +6896,11 @@ where
                 Err(stop) => fail_turn!(stop.into_error()),
             };
             committed_interactions.extend(new_interactions.iter().cloned());
+            // Persist the instruction too, so a resumed session shows why the
+            // extra work happened between the two answers (mini-agent-nvnkx.11).
+            if informative_host_instruction(&continuation_instruction) {
+                committed_interactions.push(Message::user(continuation_instruction.clone()));
+            }
             continuation_bridge = normalized_continuation_bridge(
                 std::mem::take(&mut continuation_bridge),
                 &new_interactions,
@@ -6600,7 +6918,14 @@ where
                 remaining_turns,
                 native_capture.clone(),
             )));
-            turn.stream_started();
+            // A continuation after a complete answer starts the result over;
+            // keep the two answers apart on a streamed stdout.
+            if turn.stream_started()
+                && output_policy.streams_text()
+                && let Err(error) = crate::print::headless_stdout_async("\n".into()).await
+            {
+                fail_turn!(error);
+            }
             continue_turn = true;
         }
     }
@@ -6676,6 +7001,10 @@ pub(crate) struct SubagentRunOutput {
     pub tool_log: Vec<crate::extras::subagents::background::ToolLogEntry>,
     /// The run ended because its model-turn budget was exhausted.
     pub turn_budget_exhausted: bool,
+    /// The child finished its tool work and then wrote no final text; the
+    /// task tool asks for a tool-free write-up on its conversation
+    /// (mini-agent-nvnkx.14).
+    pub empty_final: bool,
     /// The child's next request would exceed its context window
     /// ([`CHILD_CONTEXT_REFUSAL`]); `history` is the conversation so far.
     pub context_exhausted: bool,
@@ -6696,10 +7025,28 @@ impl SubagentRunOutput {
             tool_calls: 0,
             tool_log: Vec::new(),
             turn_budget_exhausted: false,
+            empty_final: false,
             context_exhausted: false,
             compacted_histories: Vec::new(),
         }
     }
+}
+
+/// The child's conversation so far: the history it was given, the prompt, the
+/// bridge of earlier streams, and the current stream's transcript. Shared by
+/// the transient-retry arm and every exit that has no Rig-provided history.
+#[cfg(feature = "subagents")]
+fn subagent_history_so_far(
+    history: &[Message],
+    prompt: &str,
+    bridge: &[Message],
+    interactions: &[Message],
+) -> Vec<Message> {
+    let mut all = history.to_vec();
+    all.push(Message::user(prompt.to_string()));
+    all.extend_from_slice(bridge);
+    all.extend_from_slice(interactions);
+    all
 }
 
 /// Why a child request was refused locally: its estimate exceeds the child
@@ -6908,6 +7255,7 @@ where
                 tool_calls,
                 tool_log,
                 turn_budget_exhausted,
+                empty_final: false,
                 context_exhausted: false,
                 compacted_histories: Vec::new(),
             }
@@ -6970,8 +7318,13 @@ where
             Ok(MultiTurnStreamItem::FinalResponse(res)) => {
                 usage_ledger.reconcile_terminal(res.usage());
                 turn.response = res.output.to_string();
-                child_history = resumed_prefix
-                    .drain(..)
+                // `res.messages()` holds only this stream's new messages, so the
+                // returned history is the input history, the resumed prefix and
+                // then those (mini-agent-nvnkx.10).
+                child_history = history
+                    .iter()
+                    .cloned()
+                    .chain(resumed_prefix.drain(..))
                     .chain(res.messages().map(<[Message]>::to_vec).unwrap_or_default())
                     .collect();
                 // A report cut off at the output-token limit must not reach the
@@ -7096,16 +7449,29 @@ where
                 }
                 // Keep what the child did (calls, results, turns) and the text
                 // it had written; a bare error discards the whole investigation.
+                turn.tool_calls.finalize_unresolved(&mut turn.interactions);
+                child_history =
+                    subagent_history_so_far(&history, prompt, &bridge, &turn.interactions);
                 return finish!(Err(subagent_stream_error(&e.to_string(), &turn.response)));
             }
         }
     }
 
+    // Exits that stop the stream themselves (truncation, budget) carry no Rig
+    // history; assemble it from what was streamed.
+    if child_history.is_empty() {
+        turn.tool_calls.finalize_unresolved(&mut turn.interactions);
+        child_history = subagent_history_so_far(&history, prompt, &bridge, &turn.interactions);
+    }
+    debug_assert!(
+        child_history.starts_with(&history),
+        "a subagent's returned history starts with the history it was given"
+    );
+
     if turn.response.is_empty() {
-        return SubagentRunOutput::bare(
-            Err("subagent returned empty response".to_string()),
-            usage_ledger.total(),
-        );
+        let mut out = finish!(Err("subagent returned empty response".to_string()));
+        out.empty_final = true;
+        return out;
     }
 
     finish!(Ok(turn.response.clone()))
@@ -7346,6 +7712,7 @@ mod tests {
             window: 1000,
             threshold: 0.9,
             anthropic_native: false,
+            baseline_estimate: 0,
         }))
         .await;
         let boundary = turn
@@ -7370,6 +7737,119 @@ mod tests {
             "tool results are retained: {:?}",
             turn.interactions
         );
+    }
+
+    #[derive(Clone)]
+    struct BigResultTool;
+
+    impl Tool for BigResultTool {
+        const NAME: &'static str = "big_result";
+        type Error = MockToolError;
+        type Args = serde_json::Value;
+        type Output = String;
+
+        fn description(&self) -> String {
+            "Return a large result".to_string()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
+            Ok("x".repeat(500))
+        }
+    }
+
+    async fn big_result_mid_turn(
+        policy: super::HeadlessMidTurnPolicy,
+        completion_usage: Usage,
+    ) -> (super::HeadlessTurn, usize) {
+        #[cfg(feature = "hooks")]
+        let _dispatcher_guard = crate::tests::fake_model::dispatcher_guard::acquire();
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call("big-1", BigResultTool::NAME, serde_json::json!({})),
+                MockStreamEvent::final_response(completion_usage),
+            ],
+            vec![
+                MockStreamEvent::text("finished"),
+                MockStreamEvent::final_response(usage(10, 1, 0, 0)),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .tool(BigResultTool)
+            .default_max_turns(3)
+            .build();
+        let turn = super::with_headless_mid_turn(
+            Some(policy),
+            super::run_print_with_stream_policy_and_verification(
+                &agent,
+                &crate::agent::input::PromptInput::text("work".to_owned()),
+                crate::print::HeadlessOutputPolicy::legacy(false, true),
+                None,
+                &crate::retry::RetryConfig::default(),
+                None,
+                Arc::from(Vec::new()),
+                super::RunnerStreamPolicy::default(),
+                None,
+                crate::agent::native_capture::NativeCaptureHook::default(),
+                #[cfg(feature = "hooks")]
+                None,
+            ),
+        )
+        .await;
+        (turn, model.requests().len())
+    }
+
+    // mini-agent-nvnkx.164: a completion at 80% followed by a result worth
+    // ~15% ends the segment at the batch boundary: the projected next request
+    // is over the window threshold although no completion reported it.
+    #[tokio::test]
+    async fn headless_mid_turn_counts_output_and_pending_tool_results() {
+        let (turn, requests) = big_result_mid_turn(
+            super::HeadlessMidTurnPolicy {
+                window: 1000,
+                threshold: 0.9,
+                anthropic_native: false,
+                baseline_estimate: 0,
+            },
+            usage(800, 8, 0, 0),
+        )
+        .await;
+        assert!(
+            turn.failure
+                .as_ref()
+                .is_some_and(|e| e.is::<super::MidTurnCompactionBoundary>()),
+            "{:?}",
+            turn.failure
+        );
+        assert_eq!(requests, 1, "no request after the boundary");
+    }
+
+    // A provider that reports no usage still gets protection from the
+    // session's estimate (mini-agent-nvnkx.164).
+    #[tokio::test]
+    async fn headless_mid_turn_uses_the_estimate_when_usage_is_absent() {
+        let policy = |baseline_estimate| super::HeadlessMidTurnPolicy {
+            window: 1000,
+            threshold: 0.9,
+            anthropic_native: false,
+            baseline_estimate,
+        };
+        let (turn, requests) = big_result_mid_turn(policy(780), usage(0, 0, 0, 0)).await;
+        assert!(
+            turn.failure
+                .as_ref()
+                .is_some_and(|e| e.is::<super::MidTurnCompactionBoundary>()),
+            "{:?}",
+            turn.failure
+        );
+        assert_eq!(requests, 1);
+        // A small transcript with the same silent provider carries on.
+        let (turn, requests) = big_result_mid_turn(policy(100), usage(0, 0, 0, 0)).await;
+        assert!(turn.failure.is_none(), "{:?}", turn.failure);
+        assert_eq!(requests, 2);
     }
 
     // mini-agent-djjua: a relief segment continues the same prompt, so the
@@ -7438,6 +7918,7 @@ mod tests {
             window: 1000,
             threshold: 0.9,
             anthropic_native: false,
+            baseline_estimate: 0,
         });
         let first = run(policy, None).await;
         assert!(
@@ -7509,6 +7990,7 @@ mod tests {
                 window: 1000,
                 threshold: 0.99,
                 anthropic_native: false,
+                baseline_estimate: 0,
             }),
         ] {
             let (turn, model, calls) = headless_mid_turn_probe(policy).await;
@@ -8091,6 +8573,30 @@ mod tests {
         assert!(state.exact_failure_notice(read).is_some());
         state.record_result("edit", edit, &rig::tool::ToolOutcome::Success, "ok");
         assert!(state.exact_failure_notice(read).is_none());
+    }
+
+    #[test]
+    fn a_blocked_failing_call_runs_again_after_a_poll_or_enough_other_results() {
+        let mut state = super::ToolLoopState::default();
+        let call = super::tool_call_fingerprint("shell", r#"{"command":"nc -z localhost 80"}"#);
+        let failed = rig::tool::ToolOutcome::Denied;
+        for _ in 0..super::IDENTICAL_TOOL_FAILURE_LIMIT {
+            state.record_result("shell", call, &failed, "refused");
+        }
+        assert!(state.exact_failure_notice(call).is_some());
+        // `job_status` is read-only, so unlike a successful mutating tool (and
+        // `wait`, which is classed as one) it did not clear the counters.
+        let poll = super::tool_call_fingerprint("job_status", "{}");
+        state.record_result("job_status", poll, &rig::tool::ToolOutcome::Success, "done");
+        assert!(state.exact_failure_notice(call).is_none());
+        // It fails again, so it is blocked again until the next poll.
+        state.record_result("shell", call, &failed, "refused");
+        assert!(state.exact_failure_notice(call).is_some());
+        for i in 0..super::IDENTICAL_FAILURE_BLOCK_EXPIRY {
+            let other = super::tool_call_fingerprint("list_dir", &format!(r#"{{"n":{i}}}"#));
+            state.record_result("list_dir", other, &rig::tool::ToolOutcome::Success, "ok");
+        }
+        assert!(state.exact_failure_notice(call).is_none());
     }
 
     #[cfg(feature = "hooks")]
@@ -10364,8 +10870,13 @@ mod tests {
         .0;
 
         let mut verification_events = Vec::new();
+        let mut host_instructions = Vec::new();
         let response = loop {
             match runner.event_rx.recv().await.expect("runner terminal event") {
+                crate::event::AgentEvent::HostInstruction {
+                    text,
+                    flush_response,
+                } => host_instructions.push((text.to_string(), flush_response)),
                 crate::event::AgentEvent::Verification {
                     attempt,
                     max,
@@ -10381,7 +10892,14 @@ mod tests {
         };
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(response, "candidatefixed");
+        // The retry's answer replaces the rejected one instead of being glued to
+        // it, and the instruction is announced where it happened with the
+        // rejected answer flushed first (mini-agent-nvnkx.11/.12).
+        assert_eq!(response, "fixed");
+        assert_eq!(host_instructions.len(), 1);
+        assert!(host_instructions[0].0.starts_with("[Host: "));
+        assert!(host_instructions[0].0.contains("first failure"));
+        assert!(host_instructions[0].1, "the rejected answer was complete");
         assert_eq!(verification_events.len(), 2);
         assert_eq!((verification_events[0].0, verification_events[0].1), (1, 3));
         assert!(!verification_events[0].2);
@@ -10529,7 +11047,7 @@ mod tests {
             .default_max_turns(3)
             .build();
 
-        let (response, _, _) = super::run_print_with_verification(
+        let (response, _, interactions) = super::run_print_with_verification(
             &agent,
             "change the workspace",
             false,
@@ -10545,7 +11063,22 @@ mod tests {
         .into_result()
         .expect("headless verification retry should recover");
 
-        assert_eq!(response, "candidatefixed");
+        assert_eq!(response, "fixed");
+        // The persisted transcript keeps the verification output between the
+        // two answers (mini-agent-nvnkx.11).
+        let host_rows: Vec<usize> = interactions
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| {
+                matches!(message, Message::User { content }
+                    if content.iter().any(|item| matches!(item, UserContent::Text(text)
+                        if crate::agent::input::is_host_instruction(&text.text)
+                            && text.text.contains("headless failure"))))
+            })
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(host_rows.len(), 1, "{interactions:?}");
+        assert!(host_rows[0] > 0 && host_rows[0] + 1 < interactions.len());
         assert_eq!(model.requests().len(), 3);
         assert!(matches!(
             model.requests()[2].chat_history.last_ref(),
@@ -10556,6 +11089,114 @@ mod tests {
                 ))
         ));
         let _ = std::fs::remove_file(marker);
+    }
+
+    // mini-agent-nvnkx.10: the returned conversation is the whole one.
+    #[cfg(feature = "subagents")]
+    #[tokio::test]
+    async fn subagent_history_starts_with_the_history_it_was_given() {
+        let model = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::text("second answer"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let agent = AgentBuilder::new(model).default_max_turns(2).build();
+        let earlier = vec![
+            Message::user("first task"),
+            Message::assistant("first answer"),
+        ];
+        let run = super::run_subagent_with_history(
+            &agent,
+            "follow up",
+            earlier.clone(),
+            2,
+            None,
+            &crate::retry::RetryConfig::default(),
+            super::SharedUsageLedger::default(),
+            None,
+        )
+        .await;
+        assert_eq!(run.response.as_deref(), Ok("second answer"));
+        assert_eq!(&run.history[..2], earlier.as_slice());
+        assert_eq!(run.history[2], Message::user("follow up"));
+        assert_eq!(
+            run.history.last(),
+            Some(&Message::assistant("second answer"))
+        );
+    }
+
+    // mini-agent-nvnkx.15: a non-retryable stream error after tool work keeps
+    // the child's conversation.
+    #[cfg(feature = "subagents")]
+    #[tokio::test]
+    async fn subagent_stream_error_keeps_the_conversation_and_tool_results() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call("child-1", CountingTool::NAME, serde_json::json!({})),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![MockStreamEvent::error(
+                "prompt is too long: 213500 tokens > 200000 maximum context length",
+            )],
+        ]);
+        let agent = AgentBuilder::new(model)
+            .tool(CountingTool(calls.clone()))
+            .default_max_turns(4)
+            .build();
+        let run = super::run_subagent_with_history(
+            &agent,
+            "investigate",
+            Vec::new(),
+            4,
+            None,
+            &crate::retry::RetryConfig::default(),
+            super::SharedUsageLedger::default(),
+            None,
+        )
+        .await;
+        assert!(run.response.is_err());
+        assert_eq!(run.tool_calls, 1);
+        let kept = format!("{:?}", run.history);
+        assert!(kept.contains("counted"), "the tool result is kept: {kept}");
+        assert_eq!(run.history[0], Message::user("investigate"));
+    }
+
+    // mini-agent-nvnkx.14: tool work followed by an empty final keeps the
+    // child's evidence and is marked for the tool-free write-up.
+    #[cfg(feature = "subagents")]
+    #[tokio::test]
+    async fn subagent_empty_final_keeps_its_work_and_is_marked() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call("child-2", CountingTool::NAME, serde_json::json!({})),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![MockStreamEvent::final_response_with_default_usage()],
+        ]);
+        let agent = AgentBuilder::new(model)
+            .tool(CountingTool(calls.clone()))
+            .default_max_turns(4)
+            .build();
+        let run = super::run_subagent_with_history(
+            &agent,
+            "investigate",
+            Vec::new(),
+            4,
+            None,
+            &crate::retry::RetryConfig::default(),
+            super::SharedUsageLedger::default(),
+            None,
+        )
+        .await;
+        assert_eq!(
+            run.response.as_ref().unwrap_err(),
+            "subagent returned empty response"
+        );
+        assert!(run.empty_final);
+        assert_eq!(run.tool_calls, 1);
+        assert!(!run.history.is_empty());
+        assert!(run.turns >= 2);
     }
 
     #[cfg(feature = "subagents")]
@@ -14987,6 +15628,217 @@ mod tests {
             error.to_string(),
             "Agent returned empty response too many times, aborting."
         );
+    }
+
+    #[derive(Clone)]
+    struct PendingTool;
+
+    impl Tool for PendingTool {
+        const NAME: &'static str = "block";
+        type Error = MockToolError;
+        type Args = serde_json::Value;
+        type Output = String;
+
+        fn description(&self) -> String {
+            "Never returns".to_string()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
+            std::future::pending().await
+        }
+    }
+
+    // mini-agent-nvnkx.13: a model that finished its tool work and then stays
+    // silent ends the turn normally after one nudge, in both loops.
+    #[tokio::test]
+    async fn interactive_silence_after_tool_work_completes_the_turn() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call("quiet-1", CountingTool::NAME, serde_json::json!({})),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![MockStreamEvent::final_response_with_default_usage()],
+            vec![MockStreamEvent::final_response_with_default_usage()],
+            vec![MockStreamEvent::final_response_with_default_usage()],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .tool(CountingTool(calls.clone()))
+            .default_max_turns(5)
+            .build();
+        let mut runner = super::spawn_agent(
+            agent,
+            "do it".to_string(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            None,
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+        let response = loop {
+            match runner.event_rx.recv().await.expect("runner terminal event") {
+                crate::event::AgentEvent::Done { response, .. } => break response.to_string(),
+                crate::event::AgentEvent::Error { message, .. } => {
+                    panic!("tool work was done, the turn must not fail: {message}")
+                }
+                _ => {}
+            }
+        };
+        assert_eq!(response, "(no closing message)");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(model.requests().len(), 3, "one nudge, then done");
+    }
+
+    #[tokio::test]
+    async fn headless_silence_after_tool_work_completes_the_turn() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call("quiet-2", CountingTool::NAME, serde_json::json!({})),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![MockStreamEvent::final_response_with_default_usage()],
+            vec![MockStreamEvent::final_response_with_default_usage()],
+            vec![MockStreamEvent::final_response_with_default_usage()],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .tool(CountingTool(calls.clone()))
+            .default_max_turns(5)
+            .build();
+        let (response, _, _) = super::run_print(
+            &agent,
+            "do it",
+            false,
+            &crate::retry::RetryConfig::default(),
+            None,
+            Vec::new(),
+            #[cfg(feature = "hooks")]
+            None,
+        )
+        .await
+        .expect("silence after tool work is not a failure");
+        assert_eq!(response, "(no closing message)");
+        assert_eq!(model.requests().len(), 3);
+    }
+
+    // mini-agent-nvnkx.272: a cancelled run tells its client what already
+    // happened: the completed call with its result, the call that never
+    // returned closed as unknown, and a host marker.
+    #[tokio::test]
+    async fn cancelling_a_run_reports_completed_tool_work() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call("done-1", CountingTool::NAME, serde_json::json!({})),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::tool_call("stuck-1", PendingTool::NAME, serde_json::json!({})),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model)
+            .tool(CountingTool(calls.clone()))
+            .tool(PendingTool)
+            .default_max_turns(5)
+            .build();
+        let scope = super::AgentWorkScope::new();
+        let mut runner = super::spawn_agent_with_start_mode(
+            agent,
+            crate::agent::input::PromptInput::text("work".to_string()),
+            Vec::new().into(),
+            crate::retry::RetryConfig::default(),
+            None,
+            RunnerStreamPolicy::default(),
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+            None,
+            false,
+            Arc::clone(&scope),
+            crate::agent::native_capture::NativeCaptureHook::default(),
+        )
+        .0;
+        let mut interrupted = None;
+        loop {
+            let Some(event) = runner.event_rx.recv().await else {
+                break;
+            };
+            match event {
+                crate::event::AgentEvent::ToolCall { name, .. } if name == PendingTool::NAME => {
+                    scope.cancellation_handle().cancel();
+                }
+                crate::event::AgentEvent::Interrupted { interactions } => {
+                    interrupted = Some(interactions);
+                }
+                crate::event::AgentEvent::Done { .. } | crate::event::AgentEvent::Error { .. } => {
+                    panic!("a cancelled run has no terminal answer")
+                }
+                _ => {}
+            }
+        }
+        let interactions = interrupted.expect("cancellation reports the completed work");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let results: Vec<String> = interactions
+            .iter()
+            .filter_map(|message| match message {
+                Message::User { content } => Some(content.iter().filter_map(|item| match item {
+                    UserContent::ToolResult(result) => Some(format!("{:?}", result.content)),
+                    _ => None,
+                })),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(results.len(), 2, "{interactions:?}");
+        assert!(results[0].contains("counted"), "{results:?}");
+        assert!(results[1].contains(UNKNOWN_TOOL_OUTCOME), "{results:?}");
+        assert!(
+            matches!(interactions.last(), Some(Message::User { content })
+            if content.iter().any(|item| matches!(item, UserContent::Text(text)
+                if crate::agent::input::is_host_instruction(&text.text))))
+        );
+    }
+
+    // mini-agent-nvnkx.273: a spent turn cap is announced as a typed cause.
+    #[tokio::test]
+    async fn a_spent_turn_cap_is_announced_as_a_typed_cause() {
+        let model = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::tool_call("cap-1", CountingTool::NAME, serde_json::json!({})),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let agent = AgentBuilder::new(model)
+            .tool(CountingTool(Arc::new(AtomicUsize::new(0))))
+            .default_max_turns(1)
+            .build();
+        let mut runner = super::spawn_agent(
+            agent,
+            "loop".to_string(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            None,
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+        let mut cause = None;
+        loop {
+            match runner.event_rx.recv().await.expect("runner terminal event") {
+                crate::event::AgentEvent::StopCause(found) => cause = Some(found),
+                crate::event::AgentEvent::Error { .. } => break,
+                crate::event::AgentEvent::Done { .. } => panic!("the cap must end the turn"),
+                _ => {}
+            }
+        }
+        assert_eq!(cause, Some(crate::event::StopCause::TurnLimit));
     }
 
     // mini-agent-knwk1: the headless response is the final completion's text,
