@@ -113,7 +113,15 @@ impl PriceSnapshot {
                 .map(|input| cache.effective_at(input))
                 .unwrap_or(cache)
         } else {
-            crate::pricing::CachePrices::default()
+            // Non-native routes keep only the tier rates they know; unknown
+            // tiers stay unknown (billed at the base rate) rather than
+            // inheriting Anthropic's default multipliers (nvnkx.32).
+            crate::pricing::CachePrices {
+                read: cache.read,
+                write: cache.write,
+                write_1h: None,
+                split_required: false,
+            }
         };
         Self {
             input,
@@ -193,6 +201,12 @@ impl PriceSnapshot {
     }
     /// Token cost plus the per-request fee of provider-hosted web searches.
     pub(crate) fn cost(self, usage: UsageDelta) -> Option<f64> {
+        // The provider's own billed amount (OpenRouter `usage.cost`) beats the
+        // price table: it reflects the real upstream host, cache discounts and
+        // BYOK (mini-agent-nvnkx.203).
+        if let Some(reported) = usage.reported_cost() {
+            return Some(reported);
+        }
         let tokens = self.token_cost(usage)?;
         let fee = crate::pricing::hosted_search_fee_at(
             usage.hosted_search_requests,
@@ -424,6 +438,7 @@ impl From<LegacyUsage> for UsageDelta {
             cache_creation: None,
             tool_use_prompt_tokens: usage.tool_use_prompt_tokens,
             hosted_search_requests: 0,
+            reported_cost_nano_usd: 0,
             reasoning_tokens: usage.reasoning_tokens,
         }
     }
@@ -575,6 +590,10 @@ struct State {
     observed_cost: f64,
     unpriced_tokens: u64,
     tracking_error: bool,
+    /// The only cause of `tracking_error` so far was a failed ledger write
+    /// (memory-only: a restored account stays latched). Cleared by any other
+    /// failure; lets a later successful flush repair it (nvnkx.159).
+    ledger_write_failed: bool,
     pending: BTreeMap<Uuid, Arc<Row>>,
     // Only pending receipts survive here; retries can have reached an archive
     // after a failed append/sync or a concurrent writer rotation.
@@ -604,7 +623,9 @@ pub(crate) enum BudgetRefusal {
         "cost cap requires known model pricing; add model_prices for this model or switch model"
     )]
     UnknownPricing,
-    #[error("cost cap cannot continue while usage tracking is incomplete")]
+    #[error(
+        "cost cap cannot continue while usage tracking is incomplete; start a new session with /new, or restart without a USD cap"
+    )]
     TrackingIncomplete,
     #[error("usage ledger persistence is pending")]
     LedgerPending,
@@ -1175,7 +1196,25 @@ impl Account {
     pub(crate) fn tracking_failed(&self) {
         let mut state = self.edit();
         state.tracking_error = true;
+        state.ledger_write_failed = false;
         state.call_history_complete = false;
+    }
+    /// A ledger append failed; a later complete flush may clear it.
+    pub(crate) fn ledger_write_failed(&self) {
+        let mut state = self.edit();
+        let was_clean = !state.tracking_error;
+        state.tracking_error = true;
+        state.ledger_write_failed = was_clean || state.ledger_write_failed;
+        state.call_history_complete = false;
+    }
+    /// Clears a tracking error that only a failed ledger write caused, once
+    /// every pending receipt has reached the ledger.
+    pub(crate) fn ledger_write_recovered(&self) {
+        let mut state = self.edit();
+        if state.ledger_write_failed && state.pending.is_empty() {
+            state.ledger_write_failed = false;
+            state.tracking_error = false;
+        }
     }
 }
 
@@ -1236,6 +1275,7 @@ mod tests {
             output_tokens: 2,
             total_tokens: 12,
             hosted_search_requests: 3,
+            reported_cost_nano_usd: 0,
             ..Default::default()
         };
         let tokens = 10.0 * 2.0 / 1e6 + 2.0 * 2.0 / 1e6;

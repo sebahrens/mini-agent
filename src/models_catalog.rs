@@ -232,6 +232,82 @@ pub(crate) fn is_claude_family(model: &str) -> bool {
     native_claude_id(segment).starts_with("claude-")
 }
 
+/// `claude-<family>-<major>[-<minor>][-YYYYMMDD]` split into
+/// (family, major, minor, dated).
+fn parse_claude_version(id: &str) -> Option<(&str, u32, u32, bool)> {
+    let rest = id.strip_prefix("claude-")?;
+    let (family, version) = rest.split_once('-')?;
+    if family.is_empty() || !family.bytes().all(|b| b.is_ascii_lowercase()) {
+        return None;
+    }
+    let mut parts = version.split('-');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let (mut minor, mut dated) = (0_u32, false);
+    for (index, part) in parts.enumerate() {
+        let digits = part.bytes().all(|b| b.is_ascii_digit());
+        match (index, part.len()) {
+            (0, 1..=2) if digits => minor = part.parse().ok()?,
+            (_, 8) if digits => dated = true,
+            _ => return None,
+        }
+    }
+    Some((family, major, minor, dated))
+}
+
+/// For an official-looking Claude id the catalog does not list yet
+/// (`claude-fable-5-2`), the nearest same-family entry: the newest listed
+/// version not above it. Its context window, output
+/// ceiling and prices are inherited so the new model is not unpriced or left
+/// on the 128k fallback (mini-agent-nvnkx.36). Exact entries never come here.
+fn nearest_claude_entry(model: &str) -> Option<&'static str> {
+    let (family, major, minor, _) = parse_claude_version(model)?;
+    let anthropic = CATALOG.entries.get("anthropic")?;
+    let mut below: Option<(&'static str, (u32, u32, bool))> = None;
+    for entry in anthropic {
+        let Some((fam, ma, mi, dated)) = parse_claude_version(&entry.id) else {
+            continue;
+        };
+        if fam != family {
+            continue;
+        }
+        // Undated entries rank above dated ones at the same version.
+        let rank = (ma, mi, !dated);
+        if (ma, mi) <= (major, minor) && below.is_none_or(|(_, best)| rank > best) {
+            below = Some((entry.id.as_str(), rank));
+        }
+    }
+    // Only a model newer than a listed sibling inherits; an older unlisted
+    // id is never guessed from a newer sibling's (different) prices.
+    below.map(|(id, _)| id)
+}
+
+/// The listed entry whose limits and prices an unlisted official-looking
+/// Claude id inherits, when it does (for the startup notice).
+pub(crate) fn inherited_catalog_entry(provider: &str, model: &str) -> Option<&'static str> {
+    let native = if provider == "anthropic" || claude_route(provider) {
+        native_claude_id(model)
+    } else {
+        return None;
+    };
+    if CATALOG
+        .entries
+        .get("anthropic")?
+        .iter()
+        .any(|entry| entry.id == native)
+    {
+        return None;
+    }
+    nearest_claude_entry(&native)
+}
+
+/// One-line notice that `provider/model` runs on a sibling's limits/prices.
+pub(crate) fn inheritance_notice(provider: &str, model: &str) -> Option<String> {
+    let from = inherited_catalog_entry(provider, model)?;
+    Some(format!(
+        "notice: {model} is not in the model catalog yet; using the context window, output limit and prices of {from} (refresh with /models catalog-refresh)"
+    ))
+}
+
 /// The catalog key for `provider/model`: the exact entry, or for Bedrock and
 /// Vertex the native Anthropic id (with or without its date suffix).
 fn catalog_key(provider: &str, model: &str) -> Option<(&'static str, String)> {
@@ -243,7 +319,7 @@ fn catalog_key(provider: &str, model: &str) -> Option<(&'static str, String)> {
     {
         return Some((provider_key.as_str(), model.to_string()));
     }
-    if !claude_route(provider) {
+    if provider != "anthropic" && !claude_route(provider) {
         return None;
     }
     let native = native_claude_id(model);
@@ -252,10 +328,11 @@ fn catalog_key(provider: &str, model: &str) -> Option<(&'static str, String)> {
         .rsplit_once('-')
         .filter(|(_, date)| date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit()))
         .map(|(base, _)| base.to_string());
-    [Some(native), undated]
+    [Some(native.clone()), undated]
         .into_iter()
         .flatten()
         .find(|id| anthropic.iter().any(|entry| &entry.id == id))
+        .or_else(|| nearest_claude_entry(&native).map(str::to_string))
         .map(|id| ("anthropic", id))
 }
 
@@ -627,18 +704,31 @@ fn refresh_due(path: &std::path::Path, days: u64, now: jiff::Timestamp) -> bool 
     !fresh
 }
 
-/// The opt-in `models_catalog_refresh_days` startup refresh: when the cache
-/// is missing or older than `days`, refresh it in the background. Network
-/// failures only log; the embedded snapshot stays in use.
+/// Default `models_catalog_refresh_days` when the key is unset
+/// (mini-agent-nvnkx.36). `models_catalog_refresh_days = 0` opts out.
+pub(crate) const DEFAULT_REFRESH_DAYS: u64 = 7;
+
+/// The `models_catalog_refresh_days` startup refresh (default every 7 days,
+/// `0` disables): when the cache is missing or older than that, refresh it in
+/// the background. The first default fetch is announced once, when the cache
+/// does not exist yet. Network failures only log; the embedded snapshot stays
+/// in use.
 pub(crate) fn spawn_refresh_if_stale(days: Option<u64>) {
-    let Some(days) = days.filter(|&days| days > 0) else {
+    let announce = days.is_none();
+    let days = days.unwrap_or(DEFAULT_REFRESH_DAYS);
+    if days == 0 {
         return;
-    };
+    }
     let Some(path) = cache_path() else {
         return;
     };
     if !refresh_due(&path, days, jiff::Timestamp::now()) {
         return;
+    }
+    if announce && !path.exists() {
+        eprintln!(
+            "notice: fetching the public model catalog (models.dev) in the background to keep model limits and prices current; set models_catalog_refresh_days = 0 to disable"
+        );
     }
     tokio::spawn(async {
         match refresh_cache().await {
@@ -883,5 +973,48 @@ mod tests {
         assert_eq!(parsed["anthropic"][0].cache_write_price, None);
         assert_eq!(parsed["anthropic"][1].cache_read_price, Some(0.0));
         assert_eq!(parsed["anthropic"][1].cache_write_price, Some(5.0));
+    }
+
+    #[test]
+    fn built_in_provider_defaults_exist_in_the_catalog() {
+        let cfg = crate::config::Config::default();
+        for provider in ["anthropic", "openai", "gemini"] {
+            let (model, _) = crate::provider::default_model_for_provider(provider, &cfg)
+                .unwrap_or_else(|| panic!("no default for {provider}"));
+            assert!(
+                super::catalog_entry(provider, &model).is_some(),
+                "{provider} default {model} is missing from data/models.json"
+            );
+        }
+        // No newer flash model than the Gemini default is listed.
+        let flash = |id: &str| -> Option<(u32, u32)> {
+            let rest = id.strip_prefix("gemini-")?.strip_suffix("-flash")?;
+            let (major, minor) = rest.split_once('.').unwrap_or((rest, "0"));
+            Some((major.parse().ok()?, minor.parse().ok()?))
+        };
+        let (gemini, _) = crate::provider::default_model_for_provider("gemini", &cfg).unwrap();
+        let newest = super::catalog_entries("gemini")
+            .unwrap()
+            .iter()
+            .filter_map(|entry| flash(&entry.id))
+            .max()
+            .unwrap();
+        assert_eq!(flash(&gemini), Some(newest));
+    }
+
+    #[test]
+    fn unlisted_newer_claude_ids_inherit_the_family_entry() {
+        let listed = super::catalog_entry("anthropic", "claude-fable-5-1").unwrap();
+        let inherited = super::catalog_entry("anthropic", "claude-fable-5-2").unwrap();
+        assert_eq!(inherited.id, listed.id);
+        assert_eq!(inherited.context_length, listed.context_length);
+        assert_eq!(inherited.input_price, listed.input_price);
+        let notice = super::inheritance_notice("anthropic", "claude-fable-5-2").unwrap();
+        assert!(notice.contains("claude-fable-5-1"), "{notice}");
+        assert!(super::inheritance_notice("anthropic", "claude-fable-5-1").is_none());
+        // Aliases and older unlisted ids are never guessed.
+        assert!(super::catalog_entry("anthropic", "claude-custom-alias").is_none());
+        assert!(super::catalog_entry("anthropic", "claude-3-7-sonnet").is_none());
+        assert!(super::catalog_entry("anthropic", "claude-fable-4-1").is_none());
     }
 }

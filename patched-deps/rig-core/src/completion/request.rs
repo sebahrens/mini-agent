@@ -712,6 +712,11 @@ pub struct Usage {
     /// The number of tokens spent on internal reasoning / "thoughts" by reasoning-capable
     /// models (e.g. Gemini thinking, Anthropic extended thinking, OpenAI o-series).
     pub reasoning_tokens: u64,
+    /// Cost the provider itself billed for this response, in nano-USD
+    /// (OpenRouter `usage.cost`); 0 when unreported. (mini-agent patch,
+    /// nvnkx.203)
+    #[serde(default)]
+    pub reported_cost_nano_usd: u64,
 }
 
 impl Usage {
@@ -726,6 +731,7 @@ impl Usage {
             cache_creation: None,
             tool_use_prompt_tokens: 0,
             hosted_search_requests: 0,
+            reported_cost_nano_usd: 0,
             reasoning_tokens: 0,
         }
     }
@@ -744,6 +750,7 @@ impl Usage {
             self.tool_use_prompt_tokens,
             self.hosted_search_requests,
             self.reasoning_tokens,
+            self.reported_cost_nano_usd,
         ]
         .into_iter()
         .any(|count| count != 0)
@@ -776,6 +783,9 @@ impl Add for Usage {
             tool_use_prompt_tokens: self.tool_use_prompt_tokens + other.tool_use_prompt_tokens,
             hosted_search_requests: self.hosted_search_requests + other.hosted_search_requests,
             reasoning_tokens: self.reasoning_tokens + other.reasoning_tokens,
+            reported_cost_nano_usd: self
+                .reported_cost_nano_usd
+                .saturating_add(other.reported_cost_nano_usd),
         }
     }
 }
@@ -796,6 +806,9 @@ impl AddAssign for Usage {
         self.tool_use_prompt_tokens += other.tool_use_prompt_tokens;
         self.hosted_search_requests += other.hosted_search_requests;
         self.reasoning_tokens += other.reasoning_tokens;
+        self.reported_cost_nano_usd = self
+            .reported_cost_nano_usd
+            .saturating_add(other.reported_cost_nano_usd);
     }
 }
 

@@ -284,6 +284,28 @@ fn context(value: &Value, key: &str) -> Option<u32> {
         .and_then(|v| u32::try_from(v).ok())
         .filter(|v| *v > 0)
 }
+/// Context window of an OpenAI-compatible listing row. The protocol has no
+/// standard field, so probe the keys real gateways use, first valid wins:
+/// Together/OpenRouter-style `context_length`, Groq `context_window`, Mistral
+/// `max_context_length`, vLLM `max_model_len`, llama.cpp `meta.n_ctx_train`
+/// and Copilot `capabilities.limits.max_context_window_tokens`
+/// (mini-agent-nvnkx.38).
+fn openai_compatible_context(value: &Value) -> Option<u32> {
+    const PATHS: [&[&str]; 6] = [
+        &["context_length"],
+        &["context_window"],
+        &["max_context_length"],
+        &["max_model_len"],
+        &["meta", "n_ctx_train"],
+        &["capabilities", "limits", "max_context_window_tokens"],
+    ];
+    PATHS.iter().find_map(|path| {
+        let leaf = path.iter().try_fold(value, |node, key| node.get(*key))?;
+        leaf.as_u64()
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|v| *v > 0)
+    })
+}
 fn decode(protocol: Protocol, value: &Value) -> anyhow::Result<Option<ModelEntry>> {
     if protocol == Protocol::Gemini
         && !value
@@ -347,7 +369,8 @@ fn decode(protocol: Protocol, value: &Value) -> anyhow::Result<Option<ModelEntry
             Protocol::Anthropic => context(value, "max_input_tokens"),
             Protocol::Gemini => context(value, "inputTokenLimit"),
             Protocol::OpenRouter => context(value, "context_length"),
-            Protocol::OpenAI | Protocol::Ollama => None,
+            Protocol::OpenAI => openai_compatible_context(value),
+            Protocol::Ollama => None,
         },
         kind: None,
         input_price: None,
@@ -367,6 +390,8 @@ fn decode(protocol: Protocol, value: &Value) -> anyhow::Result<Option<ModelEntry
         };
         model.input_price = rate("prompt");
         model.output_price = rate("completion");
+        model.cache_read_price = rate("input_cache_read");
+        model.cache_write_price = rate("input_cache_write");
         // Typed output modalities decide chat versus image/audio models; ids
         // are only a fallback for listings that carry no such field.
         if let Some(modalities) = value
@@ -437,10 +462,15 @@ mod tests {
             .to_string()
             .contains("display limit")
         );
-        let openai=decode(Protocol::OpenAI,&serde_json::json!({"id":"new-model","context_length":1000000,"max_input_tokens":1000000})).unwrap().unwrap();
+        let openai = decode(
+            Protocol::OpenAI,
+            &serde_json::json!({"id":"new-model","max_input_tokens":1000000}),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             openai.context_length, None,
-            "unstandardized OpenAI fields are not native capacity authority"
+            "unprobed OpenAI fields are not capacity authority"
         );
 
         let gemini = decode(Protocol::Gemini,&serde_json::json!({"name":"models/gemini-precise-001","baseModelId":"gemini-base","inputTokenLimit":1000000,"supportedGenerationMethods":["generateContent"]})).unwrap().unwrap();
@@ -465,6 +495,62 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(free.input_price.zip(free.output_price), Some((0.0, 0.0)));
+    }
+
+    #[test]
+    fn openai_compatible_rows_report_context_from_known_gateway_keys() {
+        let ctx = |row: serde_json::Value| {
+            decode(Protocol::OpenAI, &row)
+                .unwrap()
+                .unwrap()
+                .context_length
+        };
+        assert_eq!(
+            ctx(
+                serde_json::json!({"id":"gpt-x","capabilities":{"limits":{"max_context_window_tokens":264000,"max_prompt_tokens":200000}}})
+            ),
+            Some(264000),
+            "Copilot"
+        );
+        assert_eq!(
+            ctx(serde_json::json!({"id":"llama","meta":{"n_ctx_train":131072}})),
+            Some(131072)
+        );
+        assert_eq!(
+            ctx(serde_json::json!({"id":"vllm","max_model_len":32768})),
+            Some(32768)
+        );
+        assert_eq!(
+            ctx(serde_json::json!({"id":"groq","context_window":8192})),
+            Some(8192)
+        );
+        assert_eq!(
+            ctx(serde_json::json!({"id":"mistral","max_context_length":32000})),
+            Some(32000)
+        );
+        assert_eq!(
+            ctx(serde_json::json!({"id":"zero","context_length":0})),
+            None
+        );
+        assert_eq!(
+            ctx(serde_json::json!({"id":"huge","context_length":99999999999u64})),
+            None
+        );
+    }
+
+    #[test]
+    fn openrouter_cache_prices_come_from_the_live_listing() {
+        let row = decode(
+            Protocol::OpenRouter,
+            &serde_json::json!({"id":"a/b","pricing":{"prompt":"0.000001","completion":"0.000002","input_cache_read":"0.0000001","input_cache_write":"0.00000125"}}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            row.cache_read_price.map(|p| (p * 1e6).round()),
+            Some(100000.0)
+        );
+        assert!(row.cache_write_price.is_some());
     }
 
     #[test]

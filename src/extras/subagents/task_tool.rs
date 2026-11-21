@@ -2414,6 +2414,7 @@ impl ChildPlan {
         let cancellation_repair_usage = repair_usage.clone();
         let cancellation_writeup_usage = writeup_usage.clone();
         let report_pool = pool_weak.clone();
+        let report_name = child_name.clone();
         let report_ledgers = [
             initial_usage.clone(),
             retry_usage.clone(),
@@ -2942,7 +2943,7 @@ impl ChildPlan {
                     usage_saturating_add(sum, ledger.total())
                 });
                 if total.has_values() {
-                    super::record_child_usage(pool.session_id(), total.into());
+                    super::record_child_usage(pool.session_id(), &report_name, total.into());
                 }
             }
             ChildExecution {
@@ -8950,6 +8951,7 @@ fn main() {
             cache_creation_input_tokens: u64::MAX - 1,
             tool_use_prompt_tokens: u64::MAX - 1,
             hosted_search_requests: 0,
+            reported_cost_nano_usd: 0,
             reasoning_tokens: u64::MAX - 1,
         };
         let increment = Usage {
@@ -8961,6 +8963,7 @@ fn main() {
             cache_creation_input_tokens: 10,
             tool_use_prompt_tokens: 10,
             hosted_search_requests: 0,
+            reported_cost_nano_usd: 0,
             reasoning_tokens: 10,
         };
         let merged = merge_forced_continuation_run(

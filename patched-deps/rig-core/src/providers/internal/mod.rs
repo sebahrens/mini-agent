@@ -18,6 +18,7 @@ pub(crate) fn completion_usage(
         cache_creation: None,
         tool_use_prompt_tokens: 0,
         hosted_search_requests: 0,
+        reported_cost_nano_usd: 0,
         reasoning_tokens: 0,
     }
 }

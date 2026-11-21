@@ -2798,7 +2798,7 @@ output_token_cost = 0.0
         );
         assert_eq!(
             resolved(DEFAULT_LIKE_CONFIG, &["--provider", "openai"], None),
-            ("openai".into(), "gpt-5.5".into())
+            ("openai".into(), "gpt-6.1-sol".into())
         );
         // An explicit model always wins.
         assert_eq!(

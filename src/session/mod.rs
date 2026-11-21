@@ -2375,12 +2375,9 @@ impl Session {
                     usage.cached_input_tokens,
                     usage.cache_creation_input_tokens,
                 ));
-        self.total_cost += cache_prices.estimate_cost(
-            anthropic_native,
-            usage,
-            input_token_cost,
-            output_token_cost,
-        );
+        self.total_cost += usage.reported_cost().unwrap_or_else(|| {
+            cache_prices.estimate_cost(anthropic_native, usage, input_token_cost, output_token_cost)
+        });
     }
 
     #[cfg(test)]
@@ -2564,6 +2561,38 @@ impl Session {
             .filter(|message| message.role == MessageRole::ToolResult)
             .count();
         self.calibrated_tool_results_cleared = cleared_tool_results.min(live_results);
+    }
+
+    /// Anchor the context estimate on a finished turn's reported usage when
+    /// no per-call snapshot exists (headless and ACP; the TUI calibrates per
+    /// call). `usage` aggregates `calls` provider requests, so the per-call
+    /// mean is used: it never exceeds the final call's real prompt size and
+    /// so corrects the cold estimate without overshooting
+    /// (mini-agent-nvnkx.163).
+    pub(crate) fn calibrate_from_turn_usage(
+        &mut self,
+        usage: crate::event::UsageDelta,
+        anthropic_native: bool,
+        calls: u64,
+    ) {
+        let calls = calls.max(1);
+        let input = Self::real_input_tokens(
+            anthropic_native,
+            usage.input_tokens,
+            usage.total_tokens,
+            usage.output_tokens,
+            usage.cached_input_tokens,
+            usage.cache_creation_input_tokens,
+        );
+        let real = (input / calls).saturating_add(usage.output_tokens / calls);
+        if real > self.total_estimated_tokens {
+            self.total_estimated_tokens = real;
+        }
+        self.set_calibration_with_cleared_tool_results(
+            input / calls,
+            usage.output_tokens / calls,
+            0,
+        );
     }
 
     /// Mark messages appended after the most recent provider usage event as
@@ -3563,6 +3592,32 @@ pub(crate) fn format_truncated_tool_output(
 /// Preserve the live context bound even when artifact persistence fails. The
 /// head and tail remain useful, while the notice makes the loss explicit.
 #[cfg(test)]
+mod turn_calibration_tests {
+    use super::*;
+
+    #[test]
+    fn turn_usage_anchors_the_context_estimate_for_headless_and_acp() {
+        let mut session = Session::new("openai", "gpt-5.5", 128_000, "");
+        session.add_message(MessageRole::User, "hello");
+        assert_eq!(session.calibrated_tokens, 0);
+        let usage = crate::event::UsageDelta {
+            input_tokens: 50_000,
+            output_tokens: 200,
+            total_tokens: 50_200,
+            ..Default::default()
+        };
+        session.calibrate_from_turn_usage(usage, false, 1);
+        assert_eq!(session.calibrated_tokens, 50_200);
+        // A multi-call turn uses the per-call mean, never the summed input.
+        let mut multi = Session::new("openai", "gpt-5.5", 128_000, "");
+        multi.add_message(MessageRole::User, "hello");
+        multi.calibrate_from_turn_usage(usage, false, 5);
+        assert_eq!(multi.calibrated_tokens, 10_040);
+        assert!(session.effective_context_tokens() >= 50_200);
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn format_unpersisted_truncated_tool_output(
     output: &str,
     output_chars: usize,
@@ -3938,8 +3993,11 @@ mod preflight_tests {
             session.charge_usage_delta(usage, true);
             assert_eq!(session.total_cost, expected);
         }
+        // Without a known cache price a non-native cached subset is never a
+        // separate charge; with one it is billed at that rate (nvnkx.32).
         session.total_cost = 0.0;
         session.output_token_cost = 3.0;
+        session.set_cache_prices(crate::pricing::CachePrices::default());
         session.charge_usage_delta(usage, false);
         assert_eq!(
             session.total_cost, 3.0,

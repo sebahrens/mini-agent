@@ -452,3 +452,10 @@ short-circuits a marked call with a corrective tool result.
   Anthropic, Chat Completions and Gemini final responses through `CompletionCall.stop_reason`.
 - `openai::completion::CompletionModel::base_url()` exposes the endpoint for route-gated request
   defaults.
+
+## OpenRouter reported cost (mini-agent-nvnkx.203)
+
+`completion::Usage` gained `reported_cost_nano_usd` (serde-default 0). The OpenRouter
+`usage.cost` (USD per response) is converted by `openrouter::client::cost_to_nano_usd`
+for both blocking and streamed responses; other providers leave it 0. `Add`/`AddAssign`
+sum it and `has_values` counts it.

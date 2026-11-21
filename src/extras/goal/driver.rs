@@ -878,8 +878,8 @@ mod tests {
             output_tokens: 400,
             ..crate::event::UsageDelta::default()
         };
-        crate::extras::subagents::record_child_usage("goal-child-usage-a", usage);
-        crate::extras::subagents::record_child_usage("goal-child-usage-a", usage);
+        crate::extras::subagents::record_child_usage("goal-child-usage-a", "explore", usage);
+        crate::extras::subagents::record_child_usage("goal-child-usage-a", "explore", usage);
         assert_eq!(
             crate::extras::subagents::take_child_usage("goal-child-usage-b").input_tokens,
             0

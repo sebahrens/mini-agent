@@ -51,9 +51,9 @@ fn current_direct_provider_defaults_are_catalogued_and_priced() {
     let cfg = crate::config::Config::default();
     for (provider, expected) in [
         ("anthropic", "claude-sonnet-5-5"),
-        ("openai", "gpt-5.5"),
-        ("gemini", "gemini-3.7-flash"),
-        ("google", "gemini-3.7-flash"),
+        ("openai", "gpt-6.1-sol"),
+        ("gemini", "gemini-3.8-flash"),
+        ("google", "gemini-3.8-flash"),
     ] {
         let (model, _) = crate::provider::default_model_for_provider(provider, &cfg).unwrap();
         assert_eq!(model, expected);

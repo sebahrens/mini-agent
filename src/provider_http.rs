@@ -418,15 +418,215 @@ impl ProviderRetryAfterError {
 pub(crate) fn is_retry_hint_header(name: &http::HeaderName) -> bool {
     let name = name.as_str();
     matches!(name, "retry-after" | "retry-after-ms" | "x-should-retry")
-        || (name.starts_with("anthropic-ratelimit-") && name.ends_with("-reset"))
+        || (name.starts_with("anthropic-ratelimit-")
+            && (name.ends_with("-reset") || name.ends_with("-remaining")))
         || name.starts_with("x-ratelimit-reset")
+        // The sibling `*-remaining` header is what lets `rate_limit_reset`
+        // wait only for the exhausted bucket (mini-agent-nvnkx.39).
+        || name.starts_with("x-ratelimit-remaining")
+}
+
+/// Upstream-host pinning for OpenRouter sessions (mini-agent-nvnkx.202).
+///
+/// OpenRouter may route each call of one session to a different upstream
+/// host, and implicit prompt caches are per host. The first successful
+/// response names the host that served it (`"provider":"Moonshot AI"` in the
+/// stream); later requests for the same model carry
+/// `provider: {order: [host], allow_fallbacks: true}` unless the request
+/// already has a `provider` object (the Claude route's `Anthropic` order or
+/// the user's own `extra_body`). `openrouter_pin_provider = false` turns it
+/// off. The pin lives for the process (keyed by model), so a resume re-learns it.
+pub(crate) mod pin {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static ENABLED: AtomicBool = AtomicBool::new(true);
+    static PINS: std::sync::LazyLock<Mutex<HashMap<String, String>>> =
+        std::sync::LazyLock::new(Default::default);
+    #[cfg(test)]
+    pub(crate) static TEST_ANY_HOST: AtomicBool = AtomicBool::new(false);
+    const MAX_PINS: usize = 64;
+    const MAX_SNIFF_BYTES: usize = 16 * 1024;
+
+    pub(crate) fn set_enabled(enabled: bool) {
+        ENABLED.store(enabled, Ordering::Relaxed);
+    }
+
+    pub(crate) fn applies_to(uri: &http::Uri) -> bool {
+        if !ENABLED.load(Ordering::Relaxed) || !uri.path().ends_with("/chat/completions") {
+            return false;
+        }
+        #[cfg(test)]
+        if TEST_ANY_HOST.load(Ordering::Relaxed) {
+            return true;
+        }
+        uri.host()
+            .is_some_and(|host| host == "openrouter.ai" || host.ends_with(".openrouter.ai"))
+    }
+
+    pub(crate) fn current(model: &str) -> Option<String> {
+        PINS.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(model)
+            .cloned()
+    }
+
+    pub(crate) fn remember(model: &str, host: &str) {
+        let mut pins = PINS.lock().unwrap_or_else(|e| e.into_inner());
+        if pins.len() < MAX_PINS || pins.contains_key(model) {
+            pins.entry(model.to_string())
+                .or_insert_with(|| host.to_string());
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_for_test() {
+        PINS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    /// Adds the pinned provider object to a request body, returning the model
+    /// name to learn a pin for when none is known yet.
+    pub(crate) fn shape(body: &bytes::Bytes) -> (Option<bytes::Bytes>, Option<String>) {
+        let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
+            return (None, None);
+        };
+        let Some(object) = value.as_object_mut() else {
+            return (None, None);
+        };
+        let Some(model) = object
+            .get("model")
+            .and_then(|m| m.as_str())
+            .map(str::to_owned)
+        else {
+            return (None, None);
+        };
+        if object.contains_key("provider") {
+            return (None, None);
+        }
+        match current(&model) {
+            Some(host) => {
+                object.insert(
+                    "provider".into(),
+                    serde_json::json!({"order": [host], "allow_fallbacks": true}),
+                );
+                match serde_json::to_vec(&value) {
+                    Ok(bytes) => (Some(bytes::Bytes::from(bytes)), None),
+                    Err(_) => (None, None),
+                }
+            }
+            None => (None, Some(model)),
+        }
+    }
+
+    /// Learns the serving host from the first bytes of a response stream.
+    pub(crate) struct Sniffer {
+        model: String,
+        seen: Vec<u8>,
+        done: bool,
+    }
+
+    impl Sniffer {
+        pub(crate) fn new(model: String) -> Self {
+            Self {
+                model,
+                seen: Vec::new(),
+                done: false,
+            }
+        }
+
+        pub(crate) fn feed(&mut self, chunk: &[u8]) {
+            if self.done {
+                return;
+            }
+            let room = MAX_SNIFF_BYTES.saturating_sub(self.seen.len());
+            self.seen.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            let text = String::from_utf8_lossy(&self.seen);
+            const KEY: &str = "\"provider\":\"";
+            if let Some(start) = text.find(KEY) {
+                let rest = &text[start + KEY.len()..];
+                if let Some(end) = rest.find('"') {
+                    let host = &rest[..end];
+                    if !host.is_empty()
+                        && host.len() <= 64
+                        && !host.contains('\\')
+                        && !host.chars().any(char::is_control)
+                    {
+                        remember(&self.model, host);
+                    }
+                    self.finish();
+                }
+            } else if self.seen.len() >= MAX_SNIFF_BYTES {
+                self.finish();
+            }
+        }
+
+        fn finish(&mut self) {
+            self.done = true;
+            self.seen = Vec::new();
+        }
+    }
+}
+
+/// Records the rate-limit headers of a successful response (nvnkx.45).
+fn record_rate_limits(response: &reqwest::Response) {
+    let host = response.url().host_str().unwrap_or("provider");
+    crate::rate_limits::record(host, response.headers());
+}
+
+/// A conservative usage bound for a request that is dropped before its final
+/// usage report (mini-agent-nvnkx.159): one prompt token per three body bytes
+/// plus the request's output cap (`max_tokens` and its provider spellings,
+/// else a fixed allowance). Over-estimating keeps a USD cap safe; the session
+/// still continues.
+pub(crate) fn request_usage_bound(body: &[u8]) -> crate::event::UsageDelta {
+    const DEFAULT_OUTPUT_ALLOWANCE: u64 = 16_384;
+    let output = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            [
+                "/max_tokens",
+                "/max_completion_tokens",
+                "/max_output_tokens",
+                "/generationConfig/maxOutputTokens",
+                "/options/num_predict",
+            ]
+            .into_iter()
+            .find_map(|pointer| value.pointer(pointer).and_then(serde_json::Value::as_u64))
+        })
+        .unwrap_or(DEFAULT_OUTPUT_ALLOWANCE);
+    let input = (body.len() as u64).div_ceil(3);
+    crate::event::UsageDelta {
+        input_tokens: input,
+        output_tokens: output,
+        total_tokens: input.saturating_add(output),
+        ..Default::default()
+    }
+}
+
+/// Applies the learned OpenRouter upstream pin to `request` and returns a
+/// sniffer when the host should be learned from this request's response.
+fn pin_openrouter_host(request: Request<Bytes>) -> (Request<Bytes>, Option<pin::Sniffer>) {
+    if !pin::applies_to(request.uri()) {
+        return (request, None);
+    }
+    let (shaped, learn) = pin::shape(request.body());
+    let request = match shaped {
+        Some(body) => {
+            let (mut parts, _) = request.into_parts();
+            parts.headers.remove(http::header::CONTENT_LENGTH);
+            Request::from_parts(parts, body)
+        }
+        None => request,
+    };
+    (request, learn.map(pin::Sniffer::new))
 }
 
 fn retry_hint_headers(headers: &http::HeaderMap) -> http::HeaderMap {
     headers
         .iter()
         .filter(|(name, _)| is_retry_hint_header(name))
-        .take(32)
+        .take(64)
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect()
 }
@@ -606,6 +806,7 @@ impl HttpClientExt for ProviderHttpClient {
             if !response.status().is_success() {
                 return Err(response_error(response, this.private_error_message()).await);
             }
+            record_rate_limits(&response);
             if this.is_chatgpt() {
                 let mut bytes = Vec::new();
                 while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
@@ -679,7 +880,11 @@ impl HttpClientExt for ProviderHttpClient {
     {
         let client = self.clone();
         let request = request.map(Into::into);
+        let (request, mut sniffer) = pin_openrouter_host(request);
         let budget_guard = crate::spend::run::Run::current().and_then(|run| run.sdk_stream_guard());
+        if let Some(guard) = &budget_guard {
+            guard.set_estimate(request_usage_bound(request.body()));
+        }
         async move {
             let response = match client.send_with_credentials(request).await {
                 Ok(response) => response,
@@ -699,6 +904,7 @@ impl HttpClientExt for ProviderHttpClient {
             if let Some(guard) = budget_guard {
                 guard.opened();
             }
+            record_rate_limits(&response);
             let mut builder = Response::builder()
                 .status(response.status())
                 .version(response.version());
@@ -706,11 +912,13 @@ impl HttpClientExt for ProviderHttpClient {
                 *headers = response.headers().clone();
             }
             use futures::StreamExt;
-            let body: http_client::sse::BoxedStream = Box::pin(
-                response
-                    .bytes_stream()
-                    .map(|chunk| chunk.map_err(transport_error)),
-            );
+            let body: http_client::sse::BoxedStream =
+                Box::pin(response.bytes_stream().map(move |chunk| {
+                    if let (Some(sniffer), Ok(bytes)) = (sniffer.as_mut(), chunk.as_ref()) {
+                        sniffer.feed(bytes);
+                    }
+                    chunk.map_err(transport_error)
+                }));
             builder.body(body).map_err(http_client::Error::Protocol)
         }
     }
@@ -1296,5 +1504,177 @@ pub(crate) mod tests {
             .await
             .unwrap();
         }
+    }
+
+    /// Serves one canned response with arbitrary extra headers.
+    async fn serve_with_headers(
+        listener: &TcpListener,
+        status: u16,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_request(&mut socket).await;
+        let extra: String = headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect();
+        let content_type = if status == 200 {
+            "text/event-stream"
+        } else {
+            "application/json"
+        };
+        let response = format!(
+            "HTTP/1.1 {status} fixture\r\nContent-Type: {content_type}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+        socket.shutdown().await.unwrap();
+    }
+
+    fn loopback_agent(
+        listener: &TcpListener,
+    ) -> rig::agent::Agent<rig::providers::openrouter::CompletionModel<ProviderHttpClient>> {
+        let client = rig::providers::openrouter::Client::builder()
+            .api_key("unused-test-key")
+            .base_url(format!("http://{}", listener.local_addr().unwrap()))
+            .http_client(ProviderHttpClient::default())
+            .build()
+            .unwrap();
+        rig::agent::AgentBuilder::new(client.completion_model("test/model"))
+            .max_tokens(16)
+            .build()
+    }
+
+    #[tokio::test]
+    async fn remaining_headers_survive_so_only_the_exhausted_bucket_sets_the_wait() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let agent = loopback_agent(&listener);
+        let server = serve_with_headers(
+            &listener,
+            429,
+            &[
+                ("x-ratelimit-remaining-requests", "400"),
+                ("x-ratelimit-reset-requests", "6m0s"),
+                ("x-ratelimit-remaining-tokens", "0"),
+                ("x-ratelimit-reset-tokens", "2s"),
+            ],
+            r#"{"error":{"message":"slow down"}}"#,
+        );
+        let request = async {
+            let mut stream = agent
+                .stream_chat("hello", Vec::<rig::completion::Message>::new())
+                .max_turns(1)
+                .await;
+            while let Some(item) = stream.next().await {
+                if let Err(error) = item {
+                    return error;
+                }
+            }
+            panic!("429 did not surface");
+        };
+        let (_, error) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(server, request)
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::retry::provider_retry_hint(&error, std::time::SystemTime::now()),
+            Some(Duration::from_secs(2)),
+            "only the exhausted token bucket sets the wait, not the 6m request reset"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_streams_update_the_rate_limit_snapshot() {
+        crate::rate_limits::clear_for_test();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let agent = loopback_agent(&listener);
+        let server = serve_with_headers(
+            &listener,
+            200,
+            &[
+                ("x-ratelimit-limit-tokens", "1000"),
+                ("x-ratelimit-remaining-tokens", "40"),
+                ("x-ratelimit-reset-tokens", "3s"),
+            ],
+            "data: [DONE]\n\n",
+        );
+        let request = async {
+            let mut stream = agent
+                .stream_chat("hello", Vec::<rig::completion::Message>::new())
+                .max_turns(1)
+                .await;
+            while stream.next().await.is_some() {}
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(server, request);
+        })
+        .await
+        .unwrap();
+        let snapshots = crate::rate_limits::snapshots();
+        let tokens = snapshots
+            .iter()
+            .flat_map(|s| &s.buckets)
+            .find(|b| b.name == "tokens")
+            .expect("tokens bucket recorded");
+        assert_eq!(tokens.remaining, Some(40.0));
+        assert!(crate::rate_limits::warning(&snapshots).is_some());
+    }
+
+    #[tokio::test]
+    async fn second_request_pins_the_upstream_host_the_first_response_named() {
+        use std::sync::atomic::Ordering;
+        pin::clear_for_test();
+        pin::TEST_ANY_HOST.store(true, Ordering::Relaxed);
+        const FIRST: &str = concat!(
+            "data: {\"id\":\"pin\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"pin/model\",\"provider\":\"Moonshot AI\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"pin\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"pin/model\",\"provider\":\"Moonshot AI\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2,\"cost\":0.0123}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = rig::providers::openrouter::Client::builder()
+            .api_key("unused-test-key")
+            .base_url(format!("http://{}", listener.local_addr().unwrap()))
+            .http_client(ProviderHttpClient::default())
+            .build()
+            .unwrap();
+        let agent = rig::agent::AgentBuilder::new(client.completion_model("pin/model"))
+            .max_tokens(16)
+            .build();
+        let server = async {
+            let mut bodies = Vec::new();
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let (_, body) = read_request_parts(&mut socket).await;
+                bodies.push(serde_json::from_slice::<serde_json::Value>(&body).unwrap());
+                respond(&mut socket, 200, None, FIRST).await;
+            }
+            bodies
+        };
+        let requests = async {
+            for _ in 0..2 {
+                let mut stream = agent
+                    .stream_chat("hello", Vec::<rig::completion::Message>::new())
+                    .max_turns(1)
+                    .await;
+                while stream.next().await.is_some() {}
+            }
+        };
+        let (bodies, _) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(server, requests)
+        })
+        .await
+        .unwrap();
+        pin::TEST_ANY_HOST.store(false, Ordering::Relaxed);
+        assert!(bodies[0].get("provider").is_none(), "{}", bodies[0]);
+        assert_eq!(
+            bodies[1]["provider"],
+            serde_json::json!({"order": ["Moonshot AI"], "allow_fallbacks": true})
+        );
+        // A request that already carries a provider object is left alone.
+        pin::remember("pin/other", "Host A");
+        let own = Bytes::from(r#"{"model":"pin/other","provider":{"order":["Mine"]}}"#);
+        assert!(pin::shape(&own).0.is_none());
     }
 }

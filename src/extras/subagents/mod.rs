@@ -750,12 +750,68 @@ static UNCOUNTED_CHILD_USAGE: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, crate::event::UsageDelta>>,
 > = std::sync::LazyLock::new(Default::default);
 
-pub(crate) fn record_child_usage(session_id: &str, usage: crate::event::UsageDelta) {
+/// Every finished child's usage, by session id and agent type, for the
+/// headless result's `subagent_usage` breakdown (mini-agent-nvnkx.151).
+/// Unlike `UNCOUNTED_CHILD_USAGE` it is never consumed by goal rounds.
+type ChildUsageRows = Vec<(String, crate::event::UsageDelta)>;
+static CHILD_USAGE_REPORT: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, ChildUsageRows>>,
+> = std::sync::LazyLock::new(Default::default);
+/// Bound on distinct children listed per session.
+const MAX_REPORTED_CHILDREN: usize = 256;
+
+/// The children's usage recorded for `session_id`: the sum and one
+/// `(agent type, usage)` row per finished child.
+pub(crate) fn child_usage_report(
+    session_id: &str,
+) -> (
+    crate::event::UsageDelta,
+    Vec<(String, crate::event::UsageDelta)>,
+) {
+    let map = CHILD_USAGE_REPORT.lock().unwrap_or_else(|e| e.into_inner());
+    let rows = map.get(session_id).cloned().unwrap_or_default();
+    let total = rows
+        .iter()
+        .fold(crate::event::UsageDelta::default(), |sum, (_, usage)| {
+            sum.saturating_add(*usage)
+        });
+    (total, rows)
+}
+
+pub(crate) fn record_child_usage(session_id: &str, agent: &str, usage: crate::event::UsageDelta) {
+    {
+        let mut report = CHILD_USAGE_REPORT.lock().unwrap_or_else(|e| e.into_inner());
+        let rows = report.entry(session_id.to_owned()).or_default();
+        if rows.len() < MAX_REPORTED_CHILDREN {
+            rows.push((agent.to_owned(), usage));
+        }
+    }
     let mut map = UNCOUNTED_CHILD_USAGE
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let slot = map.entry(session_id.to_owned()).or_default();
     *slot = slot.saturating_add(usage);
+}
+
+#[cfg(test)]
+mod child_usage_report_tests {
+    #[test]
+    fn finished_children_are_reported_per_agent_and_summed() {
+        let usage = |input| crate::event::UsageDelta {
+            input_tokens: input,
+            output_tokens: 5,
+            ..Default::default()
+        };
+        super::record_child_usage("report-test-session", "explore", usage(100));
+        super::record_child_usage("report-test-session", "plan", usage(50));
+        let (total, rows) = super::child_usage_report("report-test-session");
+        assert_eq!(total.input_tokens, 150);
+        assert_eq!(rows.len(), 2);
+        let json = crate::print::subagent_usage_json(&rows);
+        assert_eq!(json[0]["agent"], "explore");
+        assert_eq!(json[1]["input_tokens"], 50);
+        assert!(super::child_usage_report("other-session").1.is_empty());
+    }
 }
 
 /// Takes (and clears) the child usage recorded for `session_id`.

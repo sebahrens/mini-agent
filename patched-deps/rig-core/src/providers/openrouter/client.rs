@@ -144,6 +144,16 @@ impl std::fmt::Display for Usage {
     }
 }
 
+/// OpenRouter's reported per-request `cost` (USD) as whole nano-USD; zero for
+/// absent, negative or non-finite values. (mini-agent patch, nvnkx.203)
+pub fn cost_to_nano_usd(cost: f64) -> u64 {
+    if cost.is_finite() && cost > 0.0 {
+        (cost * 1e9).round().min(u64::MAX as f64) as u64
+    } else {
+        0
+    }
+}
+
 impl GetTokenUsage for Usage {
     fn token_usage(&self) -> crate::completion::Usage {
         let (cached_input, cache_creation) = self
@@ -165,6 +175,7 @@ impl GetTokenUsage for Usage {
                 .as_ref()
                 .map(|d| d.reasoning_tokens as u64)
                 .unwrap_or(0),
+            reported_cost_nano_usd: cost_to_nano_usd(self.cost),
         }
     }
 }

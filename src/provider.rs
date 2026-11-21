@@ -339,8 +339,8 @@ pub(crate) fn default_model_for_provider(
     }
     let m = match provider {
         "anthropic" => "claude-sonnet-5-5",
-        "openai" => "gpt-5.5",
-        "gemini" | "google" => "gemini-3.7-flash",
+        "openai" => "gpt-6.1-sol",
+        "gemini" | "google" => "gemini-3.8-flash",
         "openrouter" => "deepseek/deepseek-v4-pro",
         "ollama" => "llama3.1",
         _ => return None,
@@ -1040,7 +1040,7 @@ pub(crate) fn provider_request_params(
     let reasoning = cfg.reasoning.as_ref();
     match model {
         AnyModel::OpenRouter(m, routing) => merge_extra_body(
-            openrouter_reasoning_default(routing.clone(), &m.model, reasoning),
+            openrouter_default_params(routing.clone(), &m.model, reasoning),
             provider_extra_body,
         ),
         AnyModel::OpenAI(OpenAiModel::Responses(_)) => {
@@ -1067,6 +1067,18 @@ pub(crate) fn provider_request_params(
 /// at its default depth whatever the user set. `extra_body` keeps precedence
 /// (it is merged over this). `max` has no OpenRouter wire value and is not
 /// sent. (mini-agent-nvnkx.156)
+/// The generated OpenRouter defaults: the reasoning default plus
+/// `usage: {include: true}`, so the response carries the billed `cost`
+/// (mini-agent-nvnkx.203). The user's `extra_body` still wins per key.
+pub(crate) fn openrouter_default_params(
+    base: Option<serde_json::Value>,
+    model_id: &str,
+    reasoning: Option<&ReasoningConfig>,
+) -> Option<serde_json::Value> {
+    let base = openrouter_reasoning_default(base, model_id, reasoning);
+    merge_extra_body(Some(serde_json::json!({"usage": {"include": true}})), base)
+}
+
 pub(crate) fn openrouter_reasoning_default(
     base: Option<serde_json::Value>,
     model_id: &str,
@@ -1372,7 +1384,7 @@ impl AnyClient {
             AnyModel::OpenAI(OpenAiModel::Responses(_)) => effort::Protocol::OpenAiResponses,
             AnyModel::OpenAI(OpenAiModel::Completions(_)) => effort::Protocol::OpenAiCompletions,
             AnyModel::Gemini(_) => effort::Protocol::Gemini,
-            _ => effort::Protocol::Other,
+            AnyModel::Ollama(_) => effort::Protocol::Ollama,
         };
         let raw = crate::config::resolve_extra_body(cfg, &session.model);
         let params = provider_request_params(&model, cfg, raw.clone(), &session.id);
@@ -2200,6 +2212,9 @@ pub struct OpenRouterModelInfo {
     /// None permits only a positive legacy estimate. Decoded live metadata
     /// always sets Some, distinguishing explicit free rates from absence.
     pub prices_known: Option<bool>,
+    /// Live cache-tier rates (USD per million tokens), when listed.
+    pub cache_read: Option<f64>,
+    pub cache_write: Option<f64>,
 }
 impl OpenRouterModelInfo {
     pub(crate) fn known_prices(self) -> Option<(f64, f64)> {
@@ -2311,6 +2326,8 @@ pub async fn fetch_openrouter_pricing(
                     output_cost: output.unwrap_or(0.0),
                     context_length,
                     prices_known: Some(known),
+                    cache_read: rate("input_cache_read"),
+                    cache_write: rate("input_cache_write"),
                 },
             );
         }
@@ -4541,7 +4558,7 @@ impl AnyAgent {
                 (P::OpenAiCompletions, &a.model.model)
             }
             AnyAgentInner::Gemini(a) => (P::Gemini, &a.model.model),
-            AnyAgentInner::Ollama(a) => (P::Other, &a.model.model),
+            AnyAgentInner::Ollama(a) => (P::Ollama, &a.model.model),
             AnyAgentInner::Copilot(a) => (copilot::reasoning_protocol(&a.model), &a.model.model),
         }
     }
@@ -6808,7 +6825,7 @@ async fn build_agent_with_probe_snapshot(
     // as the unified `reasoning.effort` request field (mini-agent-nvnkx.156).
     let model = match model {
         AnyModel::OpenRouter(m, routing) => {
-            let routing = openrouter_reasoning_default(routing, &m.model, cfg.reasoning.as_ref());
+            let routing = openrouter_default_params(routing, &m.model, cfg.reasoning.as_ref());
             AnyModel::OpenRouter(m, routing)
         }
         other => other,
@@ -7485,7 +7502,7 @@ pub async fn build_btw_agent(
     // as the unified `reasoning.effort` request field (mini-agent-nvnkx.156).
     let model = match model {
         AnyModel::OpenRouter(m, routing) => {
-            let routing = openrouter_reasoning_default(routing, &m.model, cfg.reasoning.as_ref());
+            let routing = openrouter_default_params(routing, &m.model, cfg.reasoning.as_ref());
             AnyModel::OpenRouter(m, routing)
         }
         other => other,

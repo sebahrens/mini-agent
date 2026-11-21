@@ -173,6 +173,7 @@ mod tests {
             cache_creation: None,
             tool_use_prompt_tokens: 12,
             hosted_search_requests: 0,
+            reported_cost_nano_usd: 0,
             reasoning_tokens: 5,
         });
 

@@ -37,6 +37,13 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Bedrock resolves its region from the selected AWS profile in `~/.aws/config` when `AWS_REGION`/`AWS_DEFAULT_REGION` are unset (mini-agent-nvnkx.313).
 - `read` with `visual:true` attaches the selected PDF pages as page images or a native document block even when they have a text layer, and text pages that also paint images now say so with the exact `visual:true` call to see them (mini-agent-nvnkx.236).
 - `read` returns PNG and JPEG outputs of notebook cells in the selected window as image blocks (at most 4, mapped by `image N = cell C output O`) when the model accepts images; other outputs and text-only models keep the mime label (mini-agent-nvnkx.240).
+- `/cost` prints a `Rate limits` section from the latest successful responses (`anthropic-ratelimit-*`, `x-ratelimit-*`, `x-codex-*` plan windows) and warns when a bucket drops below 10% (mini-agent-nvnkx.45).
+- Headless results report delegated `task` children: their usage is included in `usage` and `total_cost_usd`, and a `subagent_usage` array lists one row per child (children are priced at the session model's rates) (mini-agent-nvnkx.151).
+- OpenRouter: the cost OpenRouter bills per response (`usage.cost`, requested with `usage.include`) is used for spend, `/cost` and headless `total_cost_usd` ahead of the price table, with no catalog needed (mini-agent-nvnkx.203).
+- OpenRouter non-Claude models are pinned to the upstream host that served their first response (`provider.order`, fallbacks allowed) so implicit prompt caches survive; `openrouter_pin_provider = false` turns it off (mini-agent-nvnkx.202).
+- `/effort` and `/reasoning` map to OpenRouter's unified `reasoning` object for every non-Claude model, to Ollama's `think`, and to `reasoning_effort` for Claude and Gemini ids on Copilot (mini-agent-nvnkx.34).
+- Unlisted official-looking Claude ids newer than a listed sibling (for example `claude-fable-5-2`) inherit that sibling's context window, output limit and prices, with a startup notice (mini-agent-nvnkx.36).
+- `scripts/check_catalog_age.py` fails a release when `data/models.generated` is older than 45 days (mini-agent-nvnkx.36).
 
 ### Fixed
 
@@ -206,6 +213,16 @@ Notable changes to mini-agent are documented in this file. The format follows
 - `notebook_edit` results name the affected index, the new cell's id and the cell count when the preimage may be disclosed, and `replace` accepts `cell_type` to convert a cell (outputs and `execution_count` are dropped when leaving code and added when entering it) (mini-agent-nvnkx.241).
 - `read` downscales images that are within the 5 MiB / 8000 px limits but exceed 2000 px on the long edge or 1 MiB (GIFs only for pixels), keeping the `resized from` note; small images stay byte-identical and `full_resolution:true` keeps the original pixels (mini-agent-nvnkx.242).
 - `task` calls that name a read-only persona (`explore` or any persona that is not `mode: write` and has no memory, hooks or MCP servers) share the tool lane like an argument-free call, so a model that writes `"agent_type":"explore"` still overlaps with other readers (mini-agent-nvnkx.243).
+- Cached input is priced at the cache-read rate on OpenAI, Gemini, OpenRouter and Copilot routes (and cache writes at the write rate when known), so budgets and `/cost` match provider invoices; OpenRouter live listings now supply `input_cache_read`/`input_cache_write` (mini-agent-nvnkx.32).
+- The model catalog refreshes from models.dev every 7 days by default (`models_catalog_refresh_days = 0` opts out; announced once), the weekly refresh workflow is live in-repo, and the OpenAI and Gemini default models follow the catalog (`gpt-6.1-sol`, `gemini-3.8-flash`) (mini-agent-nvnkx.36).
+- Context windows come from OpenAI-compatible and Copilot model listings (`context_length`, `context_window`, `max_context_length`, `max_model_len`, `meta.n_ctx_train`, `capabilities.limits.max_context_window_tokens`), and a session on the 128k fallback adopts the listed window instead of printing the fallback notice (mini-agent-nvnkx.38).
+- Retry hints keep `anthropic-ratelimit-*-remaining` and `x-ratelimit-remaining-*`, so a 429 waits only for the exhausted bucket (mini-agent-nvnkx.39).
+- Gemini thinking controls follow the model's major version (3 and later, `gemini-4-*`, and the `-latest` aliases use `thinkingLevel`) instead of the `gemini-3`/`gemini-2.5` name prefixes (mini-agent-nvnkx.40).
+- A capped session survives an interrupted or dropped stream: the unfinished request is settled as an upper-bound receipt (prompt bytes/3 plus the output cap) and a later successful ledger flush clears a failed-write latch (mini-agent-nvnkx.159).
+- `/cost` totals report `uncached input / cached / cache write / output` per each row's provider rule, and an uncapped unpriced session is told which tokens are unpriced instead of that requests are blocked (mini-agent-nvnkx.289, .290).
+- The OpenRouter price list is awaited for a bounded time (5 s headless, 1.5 s interactive) instead of being discarded, and a capped OpenRouter run with no price warns that the cap cannot be enforced (mini-agent-nvnkx.150).
+- Rolling-compaction summarizer usage is charged at the `compaction_model`'s prices in the session total (mini-agent-nvnkx.165).
+- Headless and ACP sessions calibrate the context estimate from the turn's provider usage and take the built preamble's size as prompt overhead, so the compaction gate fires where the TUI's does (mini-agent-nvnkx.163).
 
 ### Added
 

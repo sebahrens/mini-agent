@@ -306,6 +306,10 @@ pub(crate) fn reasoning_protocol(
         || model.model.starts_with("o1")
         || model.model.starts_with("o3")
         || model.model.starts_with("o4")
+        // Claude and Gemini on Copilot take the chat-completions
+        // `reasoning_effort` control (mini-agent-nvnkx.34).
+        || model.model.starts_with("claude-")
+        || model.model.starts_with("gemini-")
     {
         Protocol::OpenAiCompletions
     } else {

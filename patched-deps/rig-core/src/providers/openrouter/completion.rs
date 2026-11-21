@@ -730,6 +730,7 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
                         .as_ref()
                         .map(|d| d.reasoning_tokens as u64)
                         .unwrap_or(0),
+                    reported_cost_nano_usd: super::client::cost_to_nano_usd(usage.cost),
                 }
             })
             .unwrap_or_default();
@@ -1852,6 +1853,18 @@ mod tests {
         let response: CompletionResponse = serde_json::from_value(json).unwrap();
         let converted = completion::CompletionResponse::try_from(response).unwrap();
         assert_eq!(converted.usage.output_tokens, 10);
+    }
+
+    #[test]
+    fn usage_cost_maps_to_reported_nano_usd() {
+        use crate::completion::GetTokenUsage;
+        let usage: crate::providers::openrouter::Usage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12, "cost": 0.0123
+        }))
+        .unwrap();
+        assert_eq!(usage.token_usage().reported_cost_nano_usd, 12_300_000);
+        assert_eq!(super::super::client::cost_to_nano_usd(-1.0), 0);
+        assert_eq!(super::super::client::cost_to_nano_usd(f64::NAN), 0);
     }
 
     #[test]

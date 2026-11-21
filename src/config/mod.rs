@@ -232,6 +232,10 @@ pub struct Config {
     /// when it is older than this many days (network access; default off).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models_catalog_refresh_days: Option<u64>,
+    /// Pin non-Claude OpenRouter models to the upstream host that served the
+    /// first response so implicit prompt caches survive (default on).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openrouter_pin_provider: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_tools: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
