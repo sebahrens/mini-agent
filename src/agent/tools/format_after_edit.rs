@@ -1981,6 +1981,7 @@ mod tests {
                         question: "Choose the next step".into(),
                         options: Vec::new(),
                         allow_free_text: true,
+                        multi_select: false,
                     },
                 ]));
                 assert!(turn.required().is_some());

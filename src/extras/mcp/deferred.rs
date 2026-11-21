@@ -833,6 +833,7 @@ mod tests {
                                 question: "Owned clarification parks this invocation".into(),
                                 options: Vec::new(),
                                 allow_free_text: true,
+                                multi_select: false,
                             },
                         ]));
                         release.release();

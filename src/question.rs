@@ -29,6 +29,9 @@ pub(crate) struct Question {
     pub options: Vec<QuestionOption>,
     #[serde(default = "default_free_text")]
     pub allow_free_text: bool,
+    /// The user may pick several options (answered as `Answer::Options`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub multi_select: bool,
 }
 
 pub(crate) fn default_free_text() -> bool {
@@ -65,6 +68,9 @@ impl QuestionBatch {
             {
                 return Err("Provide at most eight options or allow a free-text answer");
             }
+            if question.multi_select && question.options.len() < 2 {
+                return Err("A multi-select question needs at least two options");
+            }
             let mut labels = std::collections::HashSet::new();
             for option in &question.options {
                 bounded_text(&option.label, MAX_LABEL_BYTES, false)?;
@@ -87,6 +93,28 @@ impl QuestionBatch {
         }
         let mut values = Vec::with_capacity(answers.len());
         for (question, answer) in self.0.iter().zip(answers) {
+            if let Answer::Options(indices) = answer {
+                if !question.multi_select {
+                    return Err("This question does not accept several options");
+                }
+                let mut seen = std::collections::BTreeSet::new();
+                let mut labels = Vec::with_capacity(indices.len());
+                for index in indices {
+                    let option = question
+                        .options
+                        .get(*index)
+                        .ok_or("Question answer selected an unknown option")?;
+                    if !seen.insert(*index) {
+                        return Err("Question answer repeats an option");
+                    }
+                    labels.push(option.label.as_str());
+                }
+                if labels.is_empty() {
+                    return Err("Choose at least one option");
+                }
+                values.push(serde_json::json!({"question": question.question, "answer": labels}));
+                continue;
+            }
             let text = match answer {
                 Answer::Option(index) => question
                     .options
@@ -94,6 +122,7 @@ impl QuestionBatch {
                     .ok_or("Question answer selected an unknown option")?
                     .label
                     .as_str(),
+                Answer::Options(_) => unreachable!("handled above"),
                 Answer::Text(text) => {
                     if !question.allow_free_text {
                         return Err("This question does not accept free text");
@@ -117,6 +146,8 @@ impl QuestionBatch {
 )]
 pub(crate) enum Answer {
     Option(usize),
+    /// Several options of a multi-select question, in the order chosen.
+    Options(Vec<usize>),
     Text(String),
 }
 
@@ -414,6 +445,7 @@ mod tests {
                 description: "Current branch".into(),
             }],
             allow_free_text: true,
+            multi_select: false,
         }])
     }
 

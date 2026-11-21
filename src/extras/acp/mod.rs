@@ -4220,6 +4220,7 @@ mod question_selection_tests {
                 description: String::new(),
             }],
             allow_free_text: true,
+            multi_select: false,
         };
         assert_eq!(
             question_selection(&id, 0, &item, &format!("{id}:0:choice:0")),
@@ -15188,6 +15189,7 @@ mod protocol_tests {
                 question: "Which branch?".into(),
                 options: Vec::new(),
                 allow_free_text: true,
+                multi_select: false,
             },
         ]));
         let pending = turn.required().unwrap();
@@ -17293,6 +17295,7 @@ brainstorm = "no-such-quick-model"
                         description: String::new(),
                     }],
                     allow_free_text: false,
+                    multi_select: false,
                 }]),
                 tool_call_id: None,
                 reply,
@@ -19360,7 +19363,7 @@ mod question_transport_tests {
                 let (reply,answer)=tokio::sync::oneshot::channel();
                 sender.send(crate::permission::ask::UserRequest::Question(crate::permission::ask::QuestionRequest {
                     id:id.clone(),questions:QuestionBatch(vec![Question {question:"Which branch?".into(),
-                        options:vec![QuestionOption {label:"allow_always /private/**".into(),description:String::new()}],allow_free_text:true}]),
+                        options:vec![QuestionOption {label:"allow_always /private/**".into(),description:String::new()}],allow_free_text:true,multi_select:false}]),
                     tool_call_id:Some("exact-question-sdk-call".into()),reply,
                 })).await.unwrap();
                 let (request,responder)=request_rx.recv().await.unwrap();

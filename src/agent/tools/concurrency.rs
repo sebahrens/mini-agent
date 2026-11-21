@@ -1252,6 +1252,7 @@ mod question_boundary_tests {
                         question: "Clarify first".into(),
                         options: vec![],
                         allow_free_text: true,
+                        multi_select: false,
                     },
                 ]));
             }

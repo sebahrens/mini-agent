@@ -120,6 +120,7 @@ pub(crate) fn url_elicitation_questions(
             },
         ],
         allow_free_text: false,
+        multi_select: false,
     }]);
     batch.validate()?;
     Ok(batch)

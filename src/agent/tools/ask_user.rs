@@ -14,6 +14,7 @@ pub(crate) struct AskUserArgs {
     pub question: Option<String>,
     pub options: Option<Vec<QuestionOption>>,
     pub allow_free_text: Option<bool>,
+    pub multi_select: Option<bool>,
     pub questions: Option<Vec<Question>>,
 }
 
@@ -24,8 +25,13 @@ impl AskUserArgs {
                 question,
                 options: self.options.unwrap_or_default(),
                 allow_free_text: self.allow_free_text.unwrap_or(true),
+                multi_select: self.multi_select.unwrap_or(false),
             }]),
-            (None, Some(questions)) if self.options.is_none() && self.allow_free_text.is_none() => {
+            (None, Some(questions))
+                if self.options.is_none()
+                    && self.allow_free_text.is_none()
+                    && self.multi_select.is_none() =>
+            {
                 QuestionBatch(questions)
             }
             _ => {
@@ -71,7 +77,8 @@ impl Tool for AskUserTool {
         let properties = serde_json::json!({
             "question":{"type":"string","maxLength":2048,"description":"The question to ask. Use this field for a single question, or `questions` for several, never both"},
             "options":{"type":"array","maxItems":8,"items":option,"description":"Suggested answers (at most 8); each has a short label and an optional description"},
-            "allow_free_text":{"type":"boolean","default":true,"description":"Whether the user may type an answer instead of choosing an option (default true)"}
+            "allow_free_text":{"type":"boolean","default":true,"description":"Whether the user may type an answer instead of choosing an option (default true)"},
+            "multi_select":{"type":"boolean","default":false,"description":"Let the user pick several of the options (needs at least two); the answer is then a list of labels (default false)"}
         });
         serde_json::json!({
             "type":"object", "additionalProperties":false,
@@ -79,6 +86,7 @@ impl Tool for AskUserTool {
                 "question":properties["question"],
                 "options":properties["options"],
                 "allow_free_text":properties["allow_free_text"],
+                "multi_select":properties["multi_select"],
                 "questions":{"type":"array","minItems":1,"maxItems":4,"description":"Several questions in one call (1 to 4); use instead of `question`, never together with it","items":{
                     "type":"object","additionalProperties":false,"properties":properties,"required":["question"]
                 }}

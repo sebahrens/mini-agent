@@ -919,6 +919,7 @@ async fn actual_app_question_overlay_refuses_mcp_edit_without_answering_or_grant
             question: "Which target should the held turn use?".into(),
             options: vec![],
             allow_free_text: true,
+            multi_select: false,
         }]),
         #[cfg(feature = "acp")]
         tool_call_id: Some("held-question".into()),

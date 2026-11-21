@@ -4183,6 +4183,7 @@ async fn ask_user_actual_app_cancel_retires_exact_reply_and_rejects_stale_questi
             question: "STALE".into(),
             options: vec![],
             allow_free_text: true,
+            multi_select: false,
         }]),
         #[cfg(feature = "acp")]
         tool_call_id: Some("stale-call".into()),

@@ -741,6 +741,7 @@ impl Form {
                 ),
                 options,
                 allow_free_text: field.schema["type"] != "boolean",
+                multi_select: false,
             });
         }
         let batch = QuestionBatch(rows);
@@ -762,6 +763,7 @@ impl Form {
                 Answer::Option(index) if !field.required && *index == choices.len() => continue,
                 Answer::Option(index) => choices.get(*index).ok_or("choice invalid")?.clone(),
                 Answer::Text(text) => text.clone(),
+                Answer::Options(_) => return Err("choice invalid"),
             };
             let value = if field.schema["type"] == "string" {
                 Value::String(text)
