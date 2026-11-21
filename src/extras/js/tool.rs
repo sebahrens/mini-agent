@@ -1399,6 +1399,15 @@ impl JsTool {
             .ok_or_else(|| ToolError::Msg("JS tool deadline unavailable".into()))?;
 
         let cancellation = PermCancellation::new();
+        // Phase 6 timing rule: time spent awaiting a user approval is excluded from the step
+        // budget, but at most one permission-prompt timeout (the step timeout, see
+        // `with_step_timeout_secs`) in total. The parent supervisor enforces the resulting hard
+        // overall bound (`hard_deadline`); the worker only receives credit from the parent.
+        let approval_allowance = self.step_timeout;
+        cancellation.set_approval_allowance(approval_allowance);
+        let hard_deadline = call_deadline
+            .checked_add(approval_allowance)
+            .ok_or_else(|| ToolError::Msg("JS tool deadline unavailable".into()))?;
         let mut cancel_on_drop = CancelOnDrop::new(cancellation.clone());
         #[cfg(feature = "skills")]
         let skill_bundle = self.skill_turn_context.snapshot();
@@ -1425,7 +1434,7 @@ impl JsTool {
         #[cfg(feature = "skills")]
         let prepared_skill_manifests =
             prepare_skill_manifests(&skill_bundle, call_deadline, cancellation.clone()).await?;
-        let grant_expires_at = call_deadline;
+        let grant_expires_at = hard_deadline;
         let model_capabilities = self.model_capabilities();
         let grant = InvocationGrant::issue(
             invocation_id.clone(),
@@ -1471,8 +1480,9 @@ impl JsTool {
             .permission_bridge
             .bridge()
             .for_invocation(cancellation.clone());
-        // Compute remaining time from the absolute call_deadline for all effect services
-        let remaining_deadline = call_deadline.saturating_duration_since(Instant::now());
+        // Effect services bound a whole effect, including its permission prompt, so they get
+        // the hard overall bound; the supervisor enforces the (pause-extended) step deadline.
+        let remaining_deadline = hard_deadline.saturating_duration_since(Instant::now());
         let service = ParentHostEffectService::new(
             FileEffectService::new(
                 bridge.clone(),

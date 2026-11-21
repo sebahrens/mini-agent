@@ -1707,7 +1707,7 @@ fn compile_trusted_bootstrap_bytecode() -> rquickjs::Result<Vec<u8>> {
     let runtime = Runtime::new()?;
     runtime.set_max_stack_size(STACK_LIMIT);
     let deadline = Instant::now() + STEP_TIMEOUT;
-    runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
+    runtime.set_interrupt_handler(Some(Box::new(move || deadline_passed(deadline))));
     let context = Context::full(&runtime)?;
     context.with(|ctx| {
         Module::declare(
@@ -1785,7 +1785,7 @@ mod trusted_bootstrap_bytecode_tests {
         let runtime = Runtime::new()?;
         runtime.set_max_stack_size(STACK_LIMIT);
         let deadline = Instant::now() + STEP_TIMEOUT;
-        runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
+        runtime.set_interrupt_handler(Some(Box::new(move || deadline_passed(deadline))));
         let context = Context::full(&runtime)?;
         Ok((runtime, context))
     }
@@ -1881,7 +1881,7 @@ mod trusted_bootstrap_bytecode_tests {
             let runtime = Runtime::new().expect("create fresh runtime");
             runtime.set_max_stack_size(STACK_LIMIT);
             let deadline = Instant::now() + STEP_TIMEOUT;
-            runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
+            runtime.set_interrupt_handler(Some(Box::new(move || deadline_passed(deadline))));
             let context = Context::full(&runtime).expect("create fresh context");
             let functions =
                 load_trusted_bootstrap_functions(&context, &bytecode).expect("load bytecode");
@@ -1988,6 +1988,41 @@ mod trusted_bootstrap_bytecode_tests {
             percentile_microseconds(&bytecode_samples, 95),
         );
     }
+}
+
+/// Milliseconds of parent-measured user-approval wait credited to the current step.
+///
+/// The parent owns the clock: it reports this only on an effect response, for time it spent
+/// awaiting an approval it initiated, and it enforces the hard overall bound by killing the
+/// worker regardless of what this process believes. The worker never computes or extends the
+/// value on its own. Reset at the start of every step so it cannot carry across requests.
+static APPROVAL_CREDIT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Cap on the credit this process will accept in total, a sanity bound independent of the
+/// parent's own (authoritative) cap.
+const MAX_APPROVAL_CREDIT_MS: u64 = super::types::MAX_STEP_TIMEOUT_SECS * 1000;
+
+fn reset_approval_credit() {
+    APPROVAL_CREDIT_MS.store(0, Ordering::Release);
+}
+
+fn credit_approval_wait(milliseconds: u64) {
+    if milliseconds == 0 {
+        return;
+    }
+    let _ = APPROVAL_CREDIT_MS.fetch_update(Ordering::AcqRel, Ordering::Acquire, |credited| {
+        Some(
+            credited
+                .saturating_add(milliseconds)
+                .min(MAX_APPROVAL_CREDIT_MS),
+        )
+    });
+}
+
+/// Whether `deadline`, extended by any parent-credited approval wait, has passed.
+fn deadline_passed(deadline: Instant) -> bool {
+    let credit = Duration::from_millis(APPROVAL_CREDIT_MS.load(Ordering::Acquire));
+    Instant::now() >= deadline.checked_add(credit).unwrap_or(deadline)
 }
 
 #[derive(Clone, Copy)]
@@ -2232,7 +2267,7 @@ fn classify_thrown_exception<'js>(
         return ClosedFailure::out_of_memory(stage, role);
     }
     let inspected = diagnostics.inspect(ctx, thrown);
-    if interrupted.load(Ordering::Relaxed) || Instant::now() >= deadline {
+    if interrupted.load(Ordering::Relaxed) || deadline_passed(deadline) {
         ClosedFailure::timeout(stage, role)
     } else {
         ClosedFailure::javascript_exception(inspected, stage, role)
@@ -2656,6 +2691,7 @@ fn execute_brokered_run_step<R: std::io::Read + Send + 'static, W: Write + Send 
 ) -> Result<(StepResult, u64), ()> {
     let model_grant_id = request.model_grant_id.clone();
     let limits = step_limits(limits, request.timeout_ms)?;
+    reset_approval_credit();
     let ordinal = Arc::new(std::sync::atomic::AtomicU32::new(0));
     #[cfg(feature = "skills")]
     let skill_request_ordinal = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -2886,7 +2922,11 @@ impl<R: std::io::Read, W: Write> WorkerTransport<R, W> {
             ParentFrame::EffectResponse(EffectResponse {
                 effect_ordinal,
                 result,
-            }) if effect_ordinal == request_ordinal => Ok(result),
+                approval_wait_ms,
+            }) if effect_ordinal == request_ordinal => {
+                credit_approval_wait(approval_wait_ms);
+                Ok(result)
+            }
             _ => Err(()),
         }
     }
@@ -3380,7 +3420,7 @@ fn execute_fresh_step(
         let interrupt_flag = interrupted.clone();
         let terminal_interrupt = terminal_requested.clone();
         runtime.set_interrupt_handler(Some(Box::new(move || {
-            let expired = Instant::now() >= deadline;
+            let expired = deadline_passed(deadline);
             if expired {
                 interrupt_flag.store(true, Ordering::Relaxed);
             }
@@ -3674,7 +3714,7 @@ fn drain_jobs(
                 role,
             ));
         }
-        if interrupted.load(Ordering::Relaxed) || Instant::now() >= deadline {
+        if interrupted.load(Ordering::Relaxed) || deadline_passed(deadline) {
             return Err(ClosedFailure::timeout(DiagnosticStage::JobDrain, role));
         }
         if *remaining_jobs == 0 {
@@ -3694,7 +3734,7 @@ fn drain_jobs(
             Err(exception) => {
                 let allocation_failed = runtime.allocation_failed();
                 return Err(exception.0.with(|ctx| {
-                    if interrupted.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                    if interrupted.load(Ordering::Relaxed) || deadline_passed(deadline) {
                         let _ = ctx.catch();
                         ClosedFailure::timeout(DiagnosticStage::JobDrain, role)
                     } else if allocation_failed {
@@ -3751,7 +3791,7 @@ fn settle_and_convert(
         let mut promise_unwraps = 0_usize;
         loop {
             if let Some(promise) = value.as_promise() {
-                if interrupted.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                if interrupted.load(Ordering::Relaxed) || deadline_passed(deadline) {
                     return Err(ClosedFailure::timeout(
                         DiagnosticStage::ResultConversion,
                         role,
@@ -3833,7 +3873,7 @@ fn settle_and_convert(
                     if matches!(error, Error::Exception) {
                         let _ = ctx.catch();
                     }
-                    if interrupted.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                    if interrupted.load(Ordering::Relaxed) || deadline_passed(deadline) {
                         ClosedFailure::timeout(DiagnosticStage::ResultConversion, role)
                     } else if runtime.allocation_failed() {
                         ClosedFailure::out_of_memory(DiagnosticStage::ResultConversion, role)
@@ -4035,7 +4075,7 @@ fn classify_ctx_error(
         }
         return ClosedFailure::out_of_memory(stage, role);
     }
-    if interrupted.load(Ordering::Relaxed) || Instant::now() >= deadline {
+    if interrupted.load(Ordering::Relaxed) || deadline_passed(deadline) {
         if matches!(error, Error::Exception) {
             let _ = ctx.catch();
         }
@@ -4082,7 +4122,7 @@ fn execute_verification(request: VerifyArtifact, limits: ExecutionLimits) -> Ver
     let interrupted = Arc::new(AtomicBool::new(false));
     let interrupt_flag = interrupted.clone();
     runtime.set_interrupt_handler(Some(Box::new(move || {
-        let expired = Instant::now() >= deadline;
+        let expired = deadline_passed(deadline);
         if expired {
             interrupt_flag.store(true, Ordering::Relaxed);
         }
@@ -4808,7 +4848,7 @@ fn execute_verification(request: VerifyArtifact, limits: ExecutionLimits) -> Ver
     let interrupted = Arc::new(AtomicBool::new(false));
     let interrupt_flag = interrupted.clone();
     runtime.set_interrupt_handler(Some(Box::new(move || {
-        let expired = Instant::now() >= deadline;
+        let expired = deadline_passed(deadline);
         if expired {
             interrupt_flag.store(true, Ordering::Relaxed);
         }

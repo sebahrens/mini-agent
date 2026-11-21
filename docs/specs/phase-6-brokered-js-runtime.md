@@ -37,7 +37,7 @@ This is the single canonical checklist for Phase 6 containment. Agent instructio
 1. One parent-created, contained worker process is the native-code containment unit. The parent lazily keeps at most one worker live and reuses its process-wide supervisor across `JsTool` and agent rebuilds. No supported production or verification path executes QuickJS in the parent or launches an uncontained worker.
 2. `JsTool` and every parent-owned field are `Send + Sync`; no QuickJS `Runtime`, `Context`, value, or derived handle exists in the production parent process.
 3. One `RunStep` or whole `VerifyArtifact` request is the complete QuickJS `Runtime` lifetime. The worker drops and recreates the runtime for every request, including after success, failure, timeout, cancellation, or OOM.
-4. Every runtime receives the 64 MiB heap limit, 512 KiB JavaScript stack limit, and interrupt deadline before evaluation. Pending-job draining is bounded.
+4. Every runtime receives the 64 MiB heap limit, 512 KiB JavaScript stack limit, and interrupt deadline before evaluation. Pending-job draining is bounded. The parent owns the clock: time spent awaiting a user approval that a parent-brokered effect itself initiated is excluded from the step budget, in total at most one permission-prompt timeout (`js-step-timeout-secs`); the hard overall bound is therefore step budget plus that allowance and is always enforced by the parent. A worker cannot extend its own deadline: it only applies credit the parent reports on an effect response for approval wait the parent measured.
 5. All JavaScript effects are typed requests executed by the parent capability broker under parent-created, invocation-bound grants and target narrowing. A brokered `spawn()` creates its general command through `Sandbox::wrap_command`; the worker itself uses only the separate broker-only, fail-closed launcher and never the workspace-readable general-process profile.
 6. Worker stdout is protocol-only. Production results, logs, and diagnostics expose only closed error classes/codes and validated source-free stage/script-role metadata—never arbitrary exception messages, stacks, thrown values, source snippets, effect results, prompts, contents, or secrets.
 7. Stored-skill source initialization has no effects and no writer API. Parent policy remains authoritative even when every worker-supplied identity or attribution field is malicious.
@@ -1708,3 +1708,38 @@ exit immediately — runs on one stable, named, long-lived thread.
 ignored, real-backend regression, gated like `linux_js_worker_containment`, that launches through
 the real production path from a transient thread which then exits, waits past the race window, and
 asserts the worker is still alive, repeated 20 times.
+
+## Delivered corrections (2026-11-21 approval wait and the step deadline)
+
+`mini-agent-sskdu.267`: a `js` step whose effect needed a user approval used to be charged the
+approval time against the step deadline (`js-step-timeout-secs`, default 30 s; the permission
+prompt timeout equals the step timeout), so a user who looked away lost the call. Invariant 4's
+timing rule is now: approval wait is excluded from the step budget, capped cumulatively at one
+permission-prompt timeout, and the parent enforces the hard overall bound (step budget plus that
+allowance, at most 2x the step timeout).
+
+Mechanism (smallest change, parent-owned):
+
+- `PermCancellation` keeps a parent-side pause clock that runs while at least one
+  `PermissionPromptGuard` is live (a guard exists only while `resolve_permission` waits on the
+  user). `JsTool::call` sets an approval allowance equal to the step timeout; every other caller
+  (verification, tests) leaves it at zero, which excludes nothing.
+- `run_invocation` derives its effective deadline as `base_deadline + approval_pause()`, re-read on
+  every protocol read/write and inside the effect wait, so the supervisor, effect cancellation and
+  worker kill all follow it. Grant expiry and the effect-service timeouts use the hard bound
+  (`call_deadline + allowance`); they are defense in depth behind the supervisor.
+- `EffectResponse` gained `approval_wait_ms` (parent to worker only, omitted when zero). The parent
+  fills it with the newly accrued pause since the previous response; the worker adds it to its
+  interrupt clock (`deadline_passed`), clamps the total to the configurable maximum and resets it
+  at every step. No worker-to-parent frame carries it, so a worker cannot request or raise it, and
+  a worker that ignores or inflates it is still killed by the parent at the effective deadline.
+- Behavior note: a brokered effect that is not waiting on an approval (for example a long
+  `spawn`) now ends at the supervisor's step deadline instead of at the slightly earlier
+  effect-service timeout; it surfaces as the step timeout rather than a `timed_out` spawn result.
+
+No invariant is weakened: the worker stays bounded and interruptible, native CPU ceilings are
+unchanged (approval wait is not CPU time), and the parent remains the only clock authority.
+Coverage: `approval_pause_is_parent_clocked_scoped_and_capped` (types),
+`worker_approval_pause` (contained worker: slow approval within the bound succeeds, the overall
+bound still ends an unanswered approval, effect wait without an approval earns no credit, no
+allowance excludes nothing) and the worst-case frame-size tests in `host.rs`.
