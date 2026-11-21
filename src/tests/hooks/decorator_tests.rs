@@ -219,7 +219,9 @@ async fn broken_pre_tool_hook_fails_closed() {
         .call("{}".to_string())
         .await
         .expect_err("a failed guard must deny the tool call");
-    assert!(error.to_string().contains("PreToolUse hook failed"));
+    let text = error.to_string();
+    assert!(text.contains("Hook failure: PreToolUse hook 'sh' exited 7"));
+    assert!(!text.contains("Blocked by guard rail"));
     assert!(!error.to_string().contains("fixture-secret"));
     assert!(!error.to_string().contains('\x1b'));
 }

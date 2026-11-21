@@ -1141,6 +1141,10 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         *diagnostic_lsp = lsp_manager.clone();
     }
 
+    // Servers with at least one admitted tool: only their instructions are
+    // sent to the model.
+    #[cfg(feature = "mcp")]
+    let mut admitted_mcp_servers = std::collections::BTreeSet::<String>::new();
     let all_tools = if !tools_enabled {
         #[cfg(feature = "mcp")]
         context.mcp_discovery.retire(tool_output_session_id);
@@ -1218,16 +1222,17 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
             )));
         }
 
-        base_tools.push(Box::new(
-            tools::ReadTool::new_with_tracker(
-                permission.clone(),
-                ask_tx.clone(),
-                max_text_file_size,
-                max_read_lines,
-                read_tracker.clone(),
-            )
-            .with_workspace_binding(workspace.clone()),
-        ));
+        let read_tool = tools::ReadTool::new_with_tracker(
+            permission.clone(),
+            ask_tx.clone(),
+            max_text_file_size,
+            max_read_lines,
+            read_tracker.clone(),
+        )
+        .with_workspace_binding(workspace.clone());
+        #[cfg(feature = "lsp")]
+        let read_tool = read_tool.with_lsp(lsp_manager.clone());
+        base_tools.push(Box::new(read_tool));
         base_tools.push(Box::new(write_tool));
         base_tools.push(Box::new(edit_tool));
         base_tools.push(Box::new(tools::ask_user::AskUserTool::new(
@@ -1521,6 +1526,7 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
             let total = mcp_tools.len();
             let mut native_eager_fallback = false;
             for t in mcp_tools {
+                admitted_mcp_servers.insert(t.server_name.to_string());
                 let name = rig::tool::ToolDyn::name(&t);
                 let definition = rig::completion::ToolDefinition {
                     name: name.clone(),
@@ -1794,10 +1800,11 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         composition.insert_before_tail("Deferred MCP tool index", &discovery_index);
     }
     #[cfg(feature = "mcp")]
-    if cli.tools.is_empty()
-        && let Some(manager) = mcp_manager
-    {
-        composition.insert_before_tail("MCP server instructions", &manager.instructions_section());
+    if let Some(manager) = mcp_manager {
+        composition.insert_before_tail(
+            "MCP server instructions",
+            &manager.instructions_section_for(&admitted_mcp_servers),
+        );
     }
     if let Some(instructions) = &instructions {
         let overlay = instructions.initial_overlay();

@@ -341,6 +341,7 @@ accessible via `/memory read` and `memory_search`.
 | `/mcp add <name> <command|url> [args…] [--project] [--allow-local]` | Save a named definition and reconnect. Project JSON requires explicit whole-file trust review. Arguments are literal, not shell expressions. |
 | `/mcp remove <name> [--project]` | Remove the selected owning definition and close its retained peer. |
 | `/mcp <server>` | List tools of a specific MCP server. |
+| `/mcp reconnect <server>` | Reconnect a configured server from its current definition: revives a stdio server that exited or a remote server whose automatic reconnection gave up. `/mcp` shows such servers as `disconnected` or `failed`. |
 | `/mcp login <server>` | Run the OAuth 2.0 login flow for a URL server, then reconnect it. Outside the TUI use `mini-agent --mcp-login <server>`. |
 | `/mcp logout <server>` | Remove a server's stored OAuth token. |
 | `/mcp:<server>:<prompt> [JSON arguments]` | Expand a cached server prompt as literal user-turn data, then use ordinary model admission. |

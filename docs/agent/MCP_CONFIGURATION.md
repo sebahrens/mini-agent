@@ -234,7 +234,8 @@ clamped to 1..=3600). Built-in registrations use the defaults.
 ## Connection retry and automatic reconnection
 
 Remote (URL and built-in HTTP) servers only; stdio servers are never retried or
-reconnected automatically (use the `/mcp` reconnect action).
+reconnected automatically: when one exits, `/mcp` shows it as `disconnected` and
+`/mcp reconnect <server>` starts it again.
 
 - **First connection.** A transient failure (connection refused or reset, HTTP 5xx, 408 or 429)
   is retried up to 3 times with a doubling backoff (0.5 s, 1 s, 2 s; a numeric `Retry-After`
@@ -246,8 +247,8 @@ reconnected automatically (use the `/mcp` reconnect action).
   network drop, expired session), the next tool call to it reconnects first, from the exact
   definition and source that connected: up to 5 attempts, waiting 1 s, 2 s, 4 s, 8 s, 16 s
   before them. While this runs the server shows as `pending`; after the last failed attempt it
-  shows as `failed` ("reconnect from /mcp") and further calls fail fast until you reconnect it by
-  hand. A call that was already in flight when the connection dropped is never replayed (it
+  shows as `failed` ("run /mcp reconnect <server>") and further calls fail fast until you run
+  `/mcp reconnect <server>`. A call that was already in flight when the connection dropped is never replayed (it
   reports the drop; the following call reconnects), so a non-idempotent tool does not run twice.
   A changed or revoked source, or a retired connection, never reconnects.
 - **What reconnects.** The first of any of these after a drop reconnects: a tool call, a

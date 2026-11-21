@@ -2598,33 +2598,6 @@ impl Startup {
             });
         }
 
-        // ARCHITECTURE.md prompt. It reads a line from stdin, so like the
-        // version prompts it is only offered when a person is at the terminal:
-        // a `-p`, `--goal` or `--loop` run would otherwise stop on it, consume
-        // piped input meant for the run, or record the directory as asked
-        // without anyone having answered.
-        #[cfg(feature = "archmd")]
-        let arch_created = if self.is_interactive && !self.cli.resolve_no_context_files(&self.cfg) {
-            let workspace = self.workspace.root();
-            if workspace.exists() {
-                crate::extras::archmd::ask_and_create(workspace).unwrap_or_else(|e| {
-                    tracing::warn!("Architecture.md prompt failed: {e}");
-                    false
-                })
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-
-        // Reload context after potential ARCHITECTURE.md creation
-        #[cfg(feature = "archmd")]
-        if arch_created {
-            self.context.architecture =
-                crate::context::load_architecture_from(self.workspace.root());
-        }
-
         // Default prompt resolution (after prompts may have been regenerated)
         {
             let default_prompt = self.cfg.resolve_default_prompt().to_string();
@@ -4911,6 +4884,10 @@ async fn run_headless_goal_rounds(
         let instruction_turn = agent.instruction_services().map(|services| {
             crate::extras::skills::session::InstructionTurn::new(services.clone(), None)
         });
+        #[cfg(feature = "agent-skills")]
+        if let Some(services) = agent.instruction_services() {
+            services.report_rejections_once().await;
+        }
         let output = if cli.is_loop_mode() && !cli.print {
             crate::print::HeadlessOutputPolicy::legacy(cli.pure_stdout, !json_output)
         } else {
@@ -5032,6 +5009,10 @@ async fn run_headless_goal_rounds_inner(
     let instruction_turn = agent.instruction_services().map(|services| {
         crate::extras::skills::session::InstructionTurn::new(services.clone(), None)
     });
+    #[cfg(feature = "agent-skills")]
+    if let Some(services) = agent.instruction_services() {
+        services.report_rejections_once().await;
+    }
     session.pending_question = None;
     let output = if cli.is_loop_mode() && !cli.print {
         crate::print::HeadlessOutputPolicy::legacy(cli.pure_stdout, !json_output)

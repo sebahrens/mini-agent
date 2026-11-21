@@ -66,23 +66,16 @@ Files from all levels are concatenated, with source-path headers indicating
 where each block came from. This lets you define organization-wide conventions
 in the global file while having project-specific architecture in each repo.
 
-At an interactive startup, if no `ARCHITECTURE.md` is found anywhere in the
-directory tree, mini-agent offers to create one. Headless runs (`-p`, `--goal`
-with `-p`, `--loop`, `--acp`) never ask, so they cannot stop on the question or
-consume piped input:
-
-```
-No ARCHITECTURE.md found in /home/you/project. Create an empty template? [y/N]
-```
-
-If you answer yes, a template is written to the project root. The template
-includes sections for directory layout, key types/traits, control flow, data
-flow, design decisions, dependencies, and entry points.
-
-Accepting this prompt only creates and loads the empty template. It does not
-start an agent turn, contact the model provider, or launch subagents. The
-interactive composer remains idle until you enter an instruction. An explicit
-positional CLI prompt still starts normally.
+At an interactive startup inside a version-controlled project (the directory or
+an ancestor holds `.git`, `.hg`, `.jj` or `.svn`), if no `ARCHITECTURE.md` is
+found, mini-agent shows a one-line notice in the TUI pointing at `/init`, which
+writes a template to the project root. The notice appears once per directory,
+never blocks startup (there is no stdin prompt), and is not shown for other
+directories (a home folder, a scratch directory), headless runs (`-p`, `--goal`,
+`--loop`, `--acp`) or with `--no-context-files`. Set `architecture_prompt = false`
+to turn it off. The template includes sections for directory layout, key
+types/traits, control flow, data flow, design decisions, dependencies, and entry
+points.
 
 ### Template Contents
 

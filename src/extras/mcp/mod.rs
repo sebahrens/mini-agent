@@ -110,11 +110,68 @@ impl fmt::Display for McpNotice {
     }
 }
 
+/// Health outcome of a failed connection attempt: a handshake timeout and a
+/// cancellation keep their own rows instead of collapsing into `Failed`.
+fn connect_failure_outcome(error: &anyhow::Error) -> health::AttemptOutcome {
+    match client::connect_failure_of(error) {
+        Some((client::ConnectFailureKind::InitTimedOut, _)) => health::AttemptOutcome::TimedOut,
+        Some((client::ConnectFailureKind::Cancelled, _)) => health::AttemptOutcome::Cancelled,
+        _ => health::AttemptOutcome::Failed,
+    }
+}
+
+/// Most characters of a server's own stderr quoted in a notice; the rest goes
+/// to the log file.
+const CONNECT_DETAIL_NOTICE_CHARS: usize = 600;
+
+/// The text following "not connected" for a failed connection. Only text this
+/// process generated (a typed failure: command lookup, spawn, crash stderr,
+/// handshake timeout, missing login) or a refused redirect is shown; any
+/// other error may carry an expanded URL or header credential and is
+/// reduced to "(credential values omitted)". The full detail of a typed
+/// failure is logged at info (log file only), never to stderr.
+pub(crate) fn connect_failure_detail(server: &str, error: &anyhow::Error) -> String {
+    if let Some(refusal) = bounded_http::redirect_refusal(error) {
+        return format!(": {refusal}");
+    }
+    let Some((kind, detail)) = client::connect_failure_of(error) else {
+        return " (credential values omitted)".to_string();
+    };
+    tracing::info!("MCP server '{server}' connection failed: {detail}");
+    let single_line: String = detail
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let mut shown: String = single_line
+        .chars()
+        .take(CONNECT_DETAIL_NOTICE_CHARS)
+        .collect();
+    if single_line.chars().count() > CONNECT_DETAIL_NOTICE_CHARS {
+        shown.push_str("...");
+    }
+    let hint = match kind {
+        client::ConnectFailureKind::InitTimedOut => {
+            format!("; raise startup_timeout_sec for '{server}' if it needs longer to start")
+        }
+        _ => String::new(),
+    };
+    format!(": {shown}{hint}")
+}
+
 #[derive(Default)]
 struct ToolNoticeState {
     pending: Vec<McpNotice>,
     last_info: Option<CompactString>,
+    /// Error notices already queued, so a permanent catalogue condition is
+    /// reported once instead of after every agent rebuild. Bounded.
+    delivered: std::collections::BTreeSet<String>,
+    /// Address of each server's last-seen cached listing; a new listing
+    /// makes its notices reportable again.
+    listing_seen: HashMap<String, usize>,
 }
+
+/// Most distinct catalogue notices remembered per manager.
+const MAX_DELIVERED_TOOL_NOTICES: usize = 256;
 
 pub struct McpClientManager {
     pub handles: Vec<client::McpClientHandle>,
@@ -242,8 +299,19 @@ impl McpClientManager {
                     .find(|handle| handle.server_name.as_str() == name.as_str())
                     .and_then(|handle| handle.link.as_ref());
                 let link_state = link.map(|link| link.state());
+                // A stdio server has no reconnect link: a closed transport
+                // means the process exited and only a manual reconnect helps.
+                let transport_closed = self
+                    .handles
+                    .iter()
+                    .find(|handle| handle.server_name.as_str() == name.as_str())
+                    .is_some_and(|handle| {
+                        handle.link.is_none() && handle.live_peer().is_transport_closed()
+                    });
                 let status = if !enabled {
                     "disabled"
+                } else if connected && transport_closed {
+                    "disconnected"
                 } else if connected && link_state == Some(reconnect::LinkState::Reconnecting) {
                     "pending"
                 } else if connected && link_state == Some(reconnect::LinkState::Failed) {
@@ -265,11 +333,19 @@ impl McpClientManager {
                     status,
                     error: (status != "connected")
                         .then(|| {
-                            self.connect_errors.get(name).cloned().or_else(|| {
-                                (link_state == Some(reconnect::LinkState::Failed))
-                                    .then(|| link.map(|link| link.failure_message()))
-                                    .flatten()
-                            })
+                            self.connect_errors
+                                .get(name)
+                                .cloned()
+                                .or_else(|| {
+                                    (link_state == Some(reconnect::LinkState::Failed))
+                                        .then(|| link.map(|link| link.failure_message()))
+                                        .flatten()
+                                })
+                                .or_else(|| {
+                                    transport_closed.then(|| {
+                                        format!("connection closed; run /mcp reconnect {name}")
+                                    })
+                                })
                         })
                         .flatten(),
                 }
@@ -413,11 +489,33 @@ impl McpClientManager {
     pub(crate) fn push_tool_notice(&self, notice: String) {
         // Info lands in the log file, never on stderr, so the TUI stays clean.
         tracing::info!("{notice}");
-        self.tool_notices
+        let mut state = self
+            .tool_notices
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .pending
-            .push(McpNotice::error(notice));
+            .unwrap_or_else(|error| error.into_inner());
+        if state.delivered.contains(&notice) {
+            return;
+        }
+        if state.delivered.len() >= MAX_DELIVERED_TOOL_NOTICES {
+            state.delivered.clear();
+        }
+        state.delivered.insert(notice.clone());
+        state.pending.push(McpNotice::error(notice));
+    }
+
+    /// Records the cached listing a collection used for `server`. When it is a
+    /// different listing than last time (relisted after `list_changed` or a
+    /// reconnect), the server's earlier notices are reportable again.
+    fn note_listing(&self, server: &str, listing: &Arc<client::ListedTools>) {
+        let address = Arc::as_ptr(listing) as usize;
+        let mut state = self
+            .tool_notices
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.listing_seen.insert(server.to_owned(), address) != Some(address) {
+            let marker = format!("'{server}'");
+            state.delivered.retain(|notice| !notice.contains(&marker));
+        }
     }
 
     /// Queue an informational catalog notice once for this manager. Agent
@@ -545,8 +643,15 @@ impl McpClientManager {
                     };
                     match &result {
                         Ok(_) => attempt.finish(health::AttemptOutcome::Succeeded),
-                        Err(error) => attempt
-                            .finish_with(health::AttemptOutcome::Failed, &format!("{error:#}")),
+                        Err(error) => {
+                            // One credential-safe reason, shared with the
+                            // startup notice.
+                            let reason = connect_failure_detail(&name, error);
+                            attempt.finish_with(
+                                connect_failure_outcome(error),
+                                reason.trim_start_matches(": ").trim(),
+                            );
+                        }
                     }
                     (name, result)
                 }
@@ -572,10 +677,7 @@ impl McpClientManager {
                     // credential. Health retains the typed outcome separately.
                     // A refused redirect is the exception: its bounded,
                     // generated text names only the target origin and path.
-                    tracing::debug!("Failed to connect to MCP server '{}'", name);
-                    let detail = bounded_http::redirect_refusal(&error)
-                        .map(|refusal| format!(": {refusal}"))
-                        .unwrap_or_else(|| " (credential values omitted)".to_string());
+                    let detail = connect_failure_detail(&name, &error);
                     connect_errors.insert(name.clone(), format!("not connected{detail}"));
                     notices.push(McpNotice::error(format!(
                         "MCP server '{name}' not connected{detail}"
@@ -613,10 +715,28 @@ impl McpClientManager {
     /// [`INSTRUCTIONS_TOTAL_BYTES`] overall (with a visible notice), stripped
     /// of control characters, and fenced so it cannot close its own block or
     /// claim system authority. Empty when no server sent any.
+    #[cfg(test)]
     pub(crate) fn instructions_section(&self) -> String {
+        self.instructions_section_filtered(None)
+    }
+
+    /// As [`Self::instructions_section`], limited to servers with at least
+    /// one tool in the final tool set (eager or deferred).
+    pub(crate) fn instructions_section_for(
+        &self,
+        admitted: &std::collections::BTreeSet<String>,
+    ) -> String {
+        self.instructions_section_filtered(Some(admitted))
+    }
+
+    fn instructions_section_filtered(
+        &self,
+        admitted: Option<&std::collections::BTreeSet<String>>,
+    ) -> String {
         let mut servers: Vec<(String, String)> = self
             .handles
             .iter()
+            .filter(|handle| admitted.is_none_or(|set| set.contains(handle.server_name.as_str())))
             .filter_map(|handle| {
                 let info = handle.peer().peer_info()?;
                 let text = info.instructions.as_deref()?;
@@ -705,22 +825,42 @@ impl McpClientManager {
                 let client_is_live: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
                     liveness.upgrade().is_some() && (reconnects || !live_peer.is_transport_closed())
                 });
+                // A server that did not advertise the tools capability has no
+                // `tools/list` to answer; asking it only produces an error.
+                let tools_unsupported = peer
+                    .peer_info()
+                    .is_some_and(|info| info.capabilities.tools.is_none());
                 let attempt = self
                     .health
                     .begin(&server_name, health::AttemptKind::Catalogue);
                 async move {
                     let _permit = sem.acquire_owned().await;
-                    let cached = listed
-                        .get_or_list(|| {
-                            client::list_bounded_tools(&peer, list_timeout, &options, defer)
+                    // The failure of the previous collection was already
+                    // reported; do not ask (and wait) again within the backoff.
+                    let repeat_failure = !tools_unsupported && listed.recent_failure();
+                    let cached = if tools_unsupported {
+                        Ok(client::CachedListing {
+                            listed: Arc::new(client::bound_listed_tools(Vec::new())),
+                            kept_previous: None,
                         })
-                        .await;
+                    } else if repeat_failure {
+                        Err(rmcp::ServiceError::Timeout {
+                            timeout: Duration::ZERO,
+                        })
+                    } else {
+                        listed
+                            .get_or_list(|| {
+                                client::list_bounded_tools(&peer, list_timeout, &options, defer)
+                            })
+                            .await
+                    };
                     let (result, kept_previous) = match cached {
                         Ok(cached) => (Ok(cached.listed), cached.kept_previous),
                         Err(error) => (Err(error), None),
                     };
                     let outcome = match &result {
                         Ok(_) => health::AttemptOutcome::Succeeded,
+                        Err(_) if repeat_failure => health::AttemptOutcome::Failed,
                         Err(rmcp::ServiceError::Timeout { .. }) => health::AttemptOutcome::TimedOut,
                         Err(_) => health::AttemptOutcome::Failed,
                     };
@@ -736,6 +876,7 @@ impl McpClientManager {
                         result,
                         (list_timeout, call_timeout),
                         kept_previous,
+                        repeat_failure,
                     )
                 }
             })
@@ -755,6 +896,7 @@ impl McpClientManager {
             result,
             (list_timeout, call_timeout),
             kept_previous,
+            repeat_failure,
         ) in results
         {
             if let Some(error) = &kept_previous {
@@ -768,6 +910,7 @@ impl McpClientManager {
             }
             match result {
                 Ok(tools) => {
+                    self.note_listing(&server_name, &tools);
                     tracing::debug!(
                         "MCP server '{}': {} tools listed",
                         server_name,
@@ -776,6 +919,7 @@ impl McpClientManager {
                     let reached_tool_cap = tools.reached_tool_cap;
                     let mut truncated_descriptions = 0usize;
                     let mut rejected_schemas = 0usize;
+                    let mut flattened_schemas = 0usize;
                     let mut reduced_schemas = 0usize;
                     let mut replaced_schemas = 0usize;
                     for listed in &tools.entries {
@@ -785,6 +929,7 @@ impl McpClientManager {
                         };
                         match bounded.schema_fit {
                             tool::SchemaFit::Verbatim => {}
+                            tool::SchemaFit::Flattened => flattened_schemas += 1,
                             tool::SchemaFit::Reduced { .. } => reduced_schemas += 1,
                             tool::SchemaFit::Replaced { .. } => replaced_schemas += 1,
                         }
@@ -839,6 +984,11 @@ impl McpClientManager {
                         );
                         self.push_tool_notice(notice);
                     }
+                    if flattened_schemas > 0 {
+                        self.push_tool_notice(format!(
+                            "MCP server '{server_name}' had {flattened_schemas} tool input schema(s) with a top-level oneOf/anyOf/allOf/not/enum or a non-object root; each is sent as a permissive object and the server validates arguments",
+                        ));
+                    }
                     if reduced_schemas > 0 {
                         self.push_tool_notice(format!(
                             "MCP server '{server_name}' had {reduced_schemas} tool input schema(s) over {} bytes reduced (examples/descriptions removed)",
@@ -864,6 +1014,7 @@ impl McpClientManager {
                         ));
                     }
                 }
+                Err(_) if repeat_failure => {}
                 Err(rmcp::ServiceError::Timeout { .. }) => {
                     tracing::debug!(
                         "MCP server '{}': tools/list timed out after {} ms",
@@ -1304,6 +1455,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_missing_command_notice_names_the_command() {
+        let mut config = failing_config();
+        if let McpServerConfig::Command { command, .. } = &mut config {
+            *command = "definitely-not-an-installed-mcp-binary".to_string();
+        }
+        let configs = HashMap::from([("ghost".to_string(), config)]);
+        let workspace = std::env::current_dir().unwrap();
+        let manager = McpClientManager::connect_all_in(&configs, &workspace).await;
+        let message = manager.notices[0].message().to_string();
+        assert!(
+            message.contains("definitely-not-an-installed-mcp-binary"),
+            "{message}"
+        );
+        assert!(!message.contains("credential values omitted"), "{message}");
+        assert_eq!(manager.server_statuses(&configs)[0].status, "failed");
+    }
+
+    #[test]
+    fn typed_connect_failures_show_their_cause_and_others_stay_redacted() {
+        let timeout = client::ConnectFailure::error(
+            client::ConnectFailureKind::InitTimedOut,
+            "initialization timed out after 10000 ms",
+            "MCP connection failed for 'x': initialization timed out after 10000 ms",
+        );
+        let text = connect_failure_detail("x", &timeout);
+        assert!(text.contains("timed out after 10000 ms"), "{text}");
+        assert!(text.contains("startup_timeout_sec"), "{text}");
+        assert_eq!(
+            connect_failure_outcome(&timeout),
+            health::AttemptOutcome::TimedOut
+        );
+        let login = client::ConnectFailure::error(
+            client::ConnectFailureKind::AuthRequired,
+            "no OAuth token stored; run `/mcp login x`",
+            "no OAuth token stored; run `/mcp login x`",
+        );
+        assert!(connect_failure_detail("x", &login).contains("/mcp login x"));
+        let other = anyhow::anyhow!("https://host/?token=SECRET");
+        assert_eq!(
+            connect_failure_detail("x", &other),
+            " (credential values omitted)"
+        );
+        assert_eq!(
+            connect_failure_outcome(&other),
+            health::AttemptOutcome::Failed
+        );
+    }
+
+    #[tokio::test]
     async fn connect_all_in_stable_notice_order_independent_of_map_iteration() {
         // Insert keys in a non-alphabetical order to confirm HashMap iteration
         // order does not leak through to the output.
@@ -1357,6 +1557,25 @@ mod tests {
         assert_eq!(notices[0].level(), McpNoticeLevel::Error);
         assert_eq!(notices[0].message(), "first");
         assert!(manager.take_notices().is_empty());
+    }
+
+    #[test]
+    fn repeated_catalogue_errors_are_reported_once_until_the_server_is_relisted() {
+        let mut manager = McpClientManager::from_handles(Vec::new());
+        let listing = Arc::new(client::bound_listed_tools(Vec::new()));
+        manager.note_listing("big", &listing);
+        let notice = "MCP server 'big' tool catalog is limited to 128 tools".to_string();
+        manager.push_tool_notice(notice.clone());
+        manager.push_tool_notice(notice.clone());
+        assert_eq!(manager.take_notices().len(), 1);
+        // The same cached listing on the next rebuild stays quiet.
+        manager.note_listing("big", &listing);
+        manager.push_tool_notice(notice.clone());
+        assert!(manager.take_notices().is_empty());
+        // A relisted catalogue reports again.
+        manager.note_listing("big", &Arc::new(client::bound_listed_tools(Vec::new())));
+        manager.push_tool_notice(notice);
+        assert_eq!(manager.take_notices().len(), 1);
     }
 
     #[test]

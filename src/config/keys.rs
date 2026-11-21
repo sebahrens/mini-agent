@@ -222,6 +222,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     key("always_show_welcome").shaped(ConfigShape::Bool),
     aliased("auto-update-prompts", &["auto_update_prompts"]).shaped(ConfigShape::Bool),
     aliased("auto-update-themes", &["auto_update_themes"]).shaped(ConfigShape::Bool),
+    key("architecture_prompt").shaped(ConfigShape::Bool),
     key("custom_providers").shaped(ConfigShape::Object),
     key("embedding").described("Embedding backend for the skill library. Absent means the built-in offline deterministic backend.").shaped(ConfigShape::Object),
     key("enable_skill_proposals").described("Allow model-authored JavaScript steps to submit bounded learned-skill proposals.").shaped(ConfigShape::Bool),

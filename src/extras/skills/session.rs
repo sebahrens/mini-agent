@@ -65,6 +65,8 @@ const MAX_CACHED_DOCUMENT_EMBEDDINGS: usize = 4096;
 
 struct CachedDiscovery {
     signature: [u8; 32],
+    /// Per-root authorization verdicts the discovery was built under.
+    authorized: Vec<bool>,
     discovery: Arc<Discovery>,
 }
 
@@ -497,6 +499,29 @@ impl InstructionServices {
             .clone()
     }
 
+    /// Headless runs have no `/skills`: print each rejected package once to
+    /// stderr so a skill that did not load is not silently absent.
+    pub(crate) async fn report_rejections_once(self: &Arc<Self>) {
+        static REPORTED: std::sync::Once = std::sync::Once::new();
+        let Ok(snapshot) = self.refresh(false).await else {
+            return;
+        };
+        let rejected: Vec<&String> = snapshot
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.contains(" rejected: "))
+            .collect();
+        if rejected.is_empty() {
+            return;
+        }
+        REPORTED.call_once(|| {
+            for diagnostic in rejected {
+                let line: String = diagnostic.chars().filter(|c| !c.is_control()).collect();
+                eprintln!("skill not loaded: {line}");
+            }
+        });
+    }
+
     pub(crate) async fn refresh(
         self: &Arc<Self>,
         explicit: bool,
@@ -532,8 +557,8 @@ impl InstructionServices {
 
     /// Check cheaply, redo only on change: the previous clean discovery is
     /// reused when no source file or directory changed (stat signature), the
-    /// imported catalogue is unchanged, and every existing root still holds its
-    /// trust and read authority. Anything else runs the full pass.
+    /// imported catalogue is unchanged, and every root still has the trust and
+    /// read verdict it was discovered under. Anything else runs the full pass.
     fn discover_or_reuse(&self, roots: &[SourceRoot], force: bool) -> Arc<Discovery> {
         let mut cache = self
             .discovery_cache
@@ -550,7 +575,8 @@ impl InstructionServices {
                 .catalogues
                 .first()
                 .is_some_and(|imported| imported.lexical_is_current())
-            && super::discovery::roots_still_authorized(roots, &self.paths, &self.permission)
+            && super::discovery::root_authorizations(roots, &self.paths, &self.permission)
+                .is_some_and(|verdicts| verdicts == cached.authorized)
         {
             return Arc::clone(&cached.discovery);
         }
@@ -560,10 +586,16 @@ impl InstructionServices {
             roots,
             &self.permission,
         ));
+        // Diagnostics are a function of the same inputs as the packages, so a
+        // result carrying them is cached too; only an incomplete scan is not.
+        let authorized =
+            super::discovery::root_authorizations(roots, &self.paths, &self.permission);
         *cache = signature
-            .filter(|_| discovery.diagnostics.is_empty())
-            .map(|signature| CachedDiscovery {
+            .filter(|_| !discovery.scan_incomplete)
+            .zip(authorized)
+            .map(|(signature, authorized)| CachedDiscovery {
                 signature,
+                authorized,
                 discovery: Arc::clone(&discovery),
             });
         discovery
@@ -2440,6 +2472,21 @@ mod discovery_tests {
         // An explicit pin always runs the full pass.
         fixture.services.pin("writer").await.unwrap();
         assert_eq!(fixture.services.discover_runs.load(Ordering::Relaxed), 4);
+    }
+
+    #[tokio::test]
+    async fn an_untrusted_root_does_not_defeat_the_discovery_cache() {
+        let fixture = Fixture::new(false);
+        fixture.skill(".claude/skills", "reviewer", "code review", "project");
+        std::fs::remove_file(fixture.services.paths.project_config_trust_file()).unwrap();
+        let first = fixture.services.refresh(false).await.unwrap();
+        assert!(
+            !first.diagnostics.is_empty(),
+            "the untrusted root is reported"
+        );
+        let second = fixture.services.refresh(false).await.unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(fixture.services.discover_runs.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

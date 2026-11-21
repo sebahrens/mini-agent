@@ -74,3 +74,20 @@ async fn exit_two_also_forces_continuation() {
         StopGate::Release => panic!("expected Continue"),
     }
 }
+
+#[tokio::test]
+async fn failing_stop_hook_releases_but_leaves_a_notice() {
+    let dispatcher = dispatcher_with(vec![handler("exit 41")]);
+    let gate = gate_stop(&dispatcher, &ctx(), false, None, None, None).await;
+    assert!(matches!(gate, StopGate::Release));
+    let notices = crate::extras::hooks::take_hook_problem_notices();
+    assert!(
+        notices
+            .iter()
+            .any(|notice| notice == "hook 'sh' (Stop) exited 41; ignored (exit 2 blocks)"),
+        "{notices:?}"
+    );
+    // The same problem is reported once per process.
+    let _ = gate_stop(&dispatcher, &ctx(), false, None, None, None).await;
+    assert!(crate::extras::hooks::take_hook_problem_notices().is_empty());
+}

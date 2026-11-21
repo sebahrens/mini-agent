@@ -2,6 +2,7 @@ pub(crate) mod backend;
 pub(crate) mod channel;
 pub(crate) mod decorator;
 pub(crate) mod dispatcher;
+pub(crate) use dispatcher::take_hook_problem_notices;
 pub(crate) mod envelope;
 pub(crate) mod normalize;
 pub(crate) mod pins;

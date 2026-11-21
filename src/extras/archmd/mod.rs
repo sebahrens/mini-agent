@@ -35,7 +35,7 @@ them on every exploration.
 When you discover new architectural information about this
 codebase, add it to this file so future explorations start
 with the full picture. Keep the document under ~300 lines
-    of code total. Keep entries concise and link to specific source files.
+of code total. Keep entries concise and link to specific source files.
 ";
 
 // ---------------------------------------------------------------------------
@@ -53,7 +53,18 @@ pub fn should_ask(dir: &Path) -> bool {
     if crate::paths::artifact_disabled("architecture prompt state") {
         return false;
     }
-    should_ask_with_path(dir, &dirs_asked_path())
+    // Only offer inside a project: `~`, scratch directories and doc folders
+    // are not worth a blocking question before the UI appears.
+    is_in_vcs_project(dir) && should_ask_with_path(dir, &dirs_asked_path())
+}
+
+/// Whether `dir` or an ancestor carries a version-control marker.
+pub(crate) fn is_in_vcs_project(dir: &Path) -> bool {
+    dir.ancestors().any(|ancestor| {
+        [".git", ".hg", ".jj", ".svn"]
+            .iter()
+            .any(|marker| ancestor.join(marker).symlink_metadata().is_ok())
+    })
 }
 
 pub(crate) fn should_ask_with_path(dir: &Path, asked_path: &Path) -> bool {
@@ -62,34 +73,21 @@ pub(crate) fn should_ask_with_path(dir: &Path, asked_path: &Path) -> bool {
     arch_path.symlink_metadata().is_err() && !has_been_asked_with_path(dir, asked_path)
 }
 
-pub fn ask_and_create(dir: &Path) -> anyhow::Result<bool> {
+/// The one-line TUI notice offering an `ARCHITECTURE.md`, or `None` when the
+/// directory is not a project, already has one, or was offered before. Asking
+/// is recorded here, so each directory is offered once. Nothing reads stdin:
+/// the notice points at `/init`.
+pub fn startup_offer(dir: &Path) -> Option<String> {
     if !should_ask(dir) {
-        return Ok(false);
+        return None;
     }
-
-    eprint!(
-        "No ARCHITECTURE.md found in {} (documents high-level codebase architecture for AI agents). Create an empty template? [y/N] ",
-        dir.display()
-    );
-    std::io::stdout().flush()?;
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-    let input = input.trim().to_lowercase();
-
     if let Err(e) = record_asked_dir(dir) {
         tracing::warn!("Failed to record asked directory: {e}");
     }
-
-    if input == "y" || input == "yes" {
-        create_architecture_template(dir)?;
-        eprintln!(
-            "Created {}/ARCHITECTURE.md — edit it to describe the codebase architecture.",
-            dir.display()
-        );
-        Ok(true)
-    } else {
-        Ok(false)
-    }
+    Some(format!(
+        "No ARCHITECTURE.md in {} (it documents the codebase for AI agents). Run /init to create a template; this is shown once per directory (architecture_prompt = false turns it off).",
+        dir.display()
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -121,6 +119,9 @@ pub(crate) fn record_asked_dir_with_path(dir: &Path, asked_path: &Path) -> anyho
     let mut content = String::new();
     if asked_path.exists() {
         content = std::fs::read_to_string(asked_path).unwrap_or_default();
+    }
+    if content.lines().any(|line| line == dir_str) {
+        return Ok(());
     }
     if !content.ends_with('\n') && !content.is_empty() {
         content.push('\n');

@@ -145,9 +145,19 @@ pub struct ReadTool {
     pub max_lines: u64,
     workspace: Option<std::sync::Arc<crate::paths::WorkspaceBinding>>,
     read_tracker: ReadTracker,
+    #[cfg(feature = "lsp")]
+    lsp: Option<crate::extras::lsp::LspManager>,
 }
 
 impl ReadTool {
+    /// Start the language server for files this tool reads, so the first edit
+    /// does not pay for its handshake.
+    #[cfg(feature = "lsp")]
+    pub(crate) fn with_lsp(mut self, lsp: Option<crate::extras::lsp::LspManager>) -> Self {
+        self.lsp = lsp;
+        self
+    }
+
     #[cfg(test)]
     pub fn new(
         permission: Option<PermCheck>,
@@ -178,6 +188,8 @@ impl ReadTool {
             max_lines,
             workspace: None,
             read_tracker,
+            #[cfg(feature = "lsp")]
+            lsp: None,
         }
     }
 
@@ -272,6 +284,8 @@ impl Tool for ReadTool {
         let mut notice = None;
         #[cfg(feature = "multimodal")]
         let mut image = None;
+        #[cfg(feature = "lsp")]
+        let prewarm_path = args.path.clone();
         let output = self
             .read_inner(
                 args,
@@ -281,6 +295,10 @@ impl Tool for ReadTool {
                 &mut image,
             )
             .await?;
+        #[cfg(feature = "lsp")]
+        if let (Some(lsp), Some(workspace)) = (&self.lsp, &self.workspace) {
+            lsp.prewarm(&workspace.root().join(&prewarm_path)).await;
+        }
         #[cfg(feature = "multimodal")]
         let notice = notice.map(|notice| {
             if image.is_some() {

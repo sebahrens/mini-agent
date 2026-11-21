@@ -632,10 +632,12 @@ impl HookDispatcher {
         // Construct the handler aggregate outside this retained lifecycle poll
         // frame; configured hooks otherwise reserve its large debug temporary
         // on the interactive request's existing stack.
-        let outputs = crate::startup::heap_future(|| {
-            self.run_handlers(event, &handlers, &envelope, &ctx.cwd, &execution_root)
+        let labeled = crate::startup::heap_future(|| {
+            self.run_handlers_labeled(event, &handlers, &envelope, &ctx.cwd, &execution_root)
         })
         .await;
+        report_hook_problems(event, &labeled);
+        let outputs: Vec<HookOutput> = labeled.into_iter().map(|(_, output)| output).collect();
         merge_decisions(event, &outputs)
     }
 
@@ -701,7 +703,7 @@ impl HookDispatcher {
             mcp,
         );
         let outputs = self
-            .run_handlers(
+            .run_handlers_labeled(
                 "PreToolUse",
                 &handlers,
                 &envelope,
@@ -709,7 +711,10 @@ impl HookDispatcher {
                 &execution_root,
             )
             .await;
-        let parts: Vec<PreDecisionPart> = outputs.iter().map(parse_pre_decision_part).collect();
+        let parts: Vec<PreDecisionPart> = outputs
+            .iter()
+            .map(|(label, output)| parse_pre_decision_part(label, output))
+            .collect();
         merge_pre_decisions(&tool_input, &parts)
     }
 
@@ -886,13 +891,30 @@ impl HookDispatcher {
         project_dir: &str,
         execution_root: &HookExecutionRootLease,
     ) -> Vec<HookOutput> {
+        self.run_handlers_labeled(event, handlers, envelope, project_dir, execution_root)
+            .await
+            .into_iter()
+            .map(|(_, output)| output)
+            .collect()
+    }
+
+    /// As `run_handlers`, pairing each output with a bounded label naming its
+    /// handler (see `handler_label`).
+    async fn run_handlers_labeled(
+        &self,
+        event: &str,
+        handlers: &[&HookHandler],
+        envelope: &serde_json::Value,
+        project_dir: &str,
+        execution_root: &HookExecutionRootLease,
+    ) -> Vec<(String, HookOutput)> {
         let stdin: Arc<[u8]> = serde_json::to_vec(envelope).unwrap_or_default().into();
         // One canonicalize of the project directory per event, shared by all
         // handlers; the next event resolves it afresh.
         let dir_memo = Arc::new(ProjectDirMemo::default());
-        let mut futures: Vec<
-            std::pin::Pin<Box<dyn std::future::Future<Output = HookOutput> + Send>>,
-        > = Vec::new();
+        type LabeledRun =
+            std::pin::Pin<Box<dyn std::future::Future<Output = (String, HookOutput)> + Send>>;
+        let mut futures: Vec<LabeledRun> = Vec::new();
         for handler in handlers {
             let Some(command) = handler.command.clone() else {
                 continue;
@@ -929,10 +951,11 @@ impl HookDispatcher {
                 let is_async = handler.is_async;
                 let handler = (*handler).clone();
                 let body = stdin.clone();
+                let label = handler_label(&handler.kind, &command);
                 let request = async move {
                     let output = super::backend::run_backend_hook(&handler, &body, timeout).await;
                     once_reservation.consume_if_started(&output);
-                    output
+                    (label, output)
                 };
                 if is_async {
                     std::mem::drop(crate::agent::runner::spawn_async_scoped(async move {
@@ -965,10 +988,11 @@ impl HookDispatcher {
                 );
                 let headers = handler.env.clone();
                 let body = stdin.clone();
+                let label = handler_label(&handler.kind, &command);
                 let request = async move {
                     let output = run_http_hook(&command, &headers, &body, timeout).await;
                     once_reservation.consume_if_started(&output);
-                    output
+                    (label, output)
                 };
                 if handler.is_async {
                     std::mem::drop(crate::agent::runner::spawn_async_scoped(async move {
@@ -1146,6 +1170,7 @@ impl HookDispatcher {
                 network = diagnostics.network,
                 "hooks: applying subprocess policy"
             );
+            let label = handler_label(&handler.kind, &command);
             futures.push(Box::pin(async move {
                 let output = run_hook_with_policy_at_root(
                     &command,
@@ -1159,7 +1184,7 @@ impl HookDispatcher {
                 .await;
                 once_reservation.consume_if_started(&output);
                 audit_hook_outcome(&audit_event, &command, "handler", trust, &output);
-                output
+                (label, output)
             }));
         }
         futures::future::join_all(futures).await
@@ -1307,13 +1332,80 @@ fn audit_hook_outcome(
     );
 }
 
+/// Prefix of a model-visible reason that says a hook could not run, as
+/// opposed to a hook that decided to block ("Blocked by guard rail: ...").
+pub(crate) const HOOK_FAILURE_PREFIX: &str = "Hook failure:";
+
+const MAX_HOOK_LABEL_CHARS: usize = 48;
+
+/// A short, credential-free name for a handler: the command's first word (file name), or
+/// `http <host>` / `mcp_tool <name>` for the in-process kinds.
+fn handler_label(kind: &str, command: &str) -> String {
+    let bounded = |text: &str| text.chars().take(MAX_HOOK_LABEL_CHARS).collect::<String>();
+    match kind {
+        "http" => {
+            let host = reqwest::Url::parse(command)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_owned))
+                .unwrap_or_else(|| "?".to_owned());
+            format!("http {}", bounded(&host))
+        }
+        "mcp_tool" | "prompt" | "agent" => format!("{kind} {}", bounded(command)),
+        _ => {
+            // The command may be opaque shell text: only its first word is
+            // named, never arguments.
+            let first = command.split_whitespace().next().unwrap_or(command);
+            let name = std::path::Path::new(first)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(command);
+            bounded(name)
+        }
+    }
+}
+
+static HOOK_PROBLEMS: std::sync::Mutex<(Vec<String>, std::collections::BTreeSet<String>)> =
+    std::sync::Mutex::new((Vec::new(), std::collections::BTreeSet::new()));
+
+/// One-line notices about hooks that failed or timed out on an event that
+/// fails open, queued since the last call. Each (event, handler, problem) is
+/// reported once per process.
+pub(crate) fn take_hook_problem_notices() -> Vec<String> {
+    std::mem::take(&mut HOOK_PROBLEMS.lock().unwrap_or_else(|e| e.into_inner()).0)
+}
+
+/// Records a user-visible notice for every handler whose infrastructure
+/// failed. Fail-open stays the policy (only exit 2 blocks); the failure must
+/// not be silent.
+fn report_hook_problems(event: &str, outputs: &[(String, HookOutput)]) {
+    for (label, output) in outputs {
+        let problem = match interpret_hook_output(output) {
+            ChannelResult::Error { exit_code } => match exit_code {
+                Some(code) if output.started => {
+                    format!("exited {code}; ignored (exit 2 blocks)")
+                }
+                _ => "could not be started; ignored".to_owned(),
+            },
+            ChannelResult::TimedOut => "timed out; ignored".to_owned(),
+            ChannelResult::OutputLimitExceeded => "exceeded its output limit; ignored".to_owned(),
+            _ => continue,
+        };
+        tracing::warn!(hook = label.as_str(), event, "hooks: hook {problem}");
+        let notice = format!("hook '{label}' ({event}) {problem}");
+        let mut state = HOOK_PROBLEMS.lock().unwrap_or_else(|e| e.into_inner());
+        if state.1.len() < 256 && state.1.insert(notice.clone()) {
+            state.0.push(notice);
+        }
+    }
+}
+
 struct PreDecisionPart {
     verdict: Verdict,
     reason: Option<String>,
     updated_input: Option<serde_json::Value>,
 }
 
-fn parse_pre_decision_part(output: &HookOutput) -> PreDecisionPart {
+fn parse_pre_decision_part(label: &str, output: &HookOutput) -> PreDecisionPart {
     match interpret_hook_output(output) {
         ChannelResult::Block { stderr } => PreDecisionPart {
             verdict: Verdict::Deny,
@@ -1346,28 +1438,46 @@ fn parse_pre_decision_part(output: &HookOutput) -> PreDecisionPart {
         ChannelResult::Error { exit_code } => {
             // Hook stderr is untrusted and may contain credentials or input
             // data. Decision and audit payloads carry only the closed outcome.
-            tracing::warn!("hooks: PreToolUse hook exited {exit_code:?}; denying tool call");
+            tracing::warn!(
+                hook = label,
+                "hooks: PreToolUse hook exited {exit_code:?}; denying tool call"
+            );
+            let what = match exit_code {
+                Some(code) if output.started => format!("exited {code}"),
+                _ if output.started => "was terminated before exiting".to_string(),
+                _ => "could not be started".to_string(),
+            };
             PreDecisionPart {
                 verdict: Verdict::Deny,
-                reason: Some("PreToolUse hook failed; tool call denied".to_string()),
+                reason: Some(format!(
+                    "{HOOK_FAILURE_PREFIX} PreToolUse hook '{label}' {what}; tool call denied"
+                )),
                 updated_input: None,
             }
         }
         ChannelResult::TimedOut => {
-            tracing::warn!("hooks: PreToolUse hook timed out; denying tool call");
+            tracing::warn!(
+                hook = label,
+                "hooks: PreToolUse hook timed out; denying tool call"
+            );
             PreDecisionPart {
                 verdict: Verdict::Deny,
-                reason: Some("PreToolUse hook timed out; tool call denied".to_string()),
+                reason: Some(format!(
+                    "{HOOK_FAILURE_PREFIX} PreToolUse hook '{label}' timed out; tool call denied"
+                )),
                 updated_input: None,
             }
         }
         ChannelResult::OutputLimitExceeded => {
-            tracing::warn!("hooks: PreToolUse hook exceeded its output limit; denying tool call");
+            tracing::warn!(
+                hook = label,
+                "hooks: PreToolUse hook exceeded its output limit; denying tool call"
+            );
             PreDecisionPart {
                 verdict: Verdict::Deny,
-                reason: Some(
-                    "PreToolUse hook output exceeded its limit; tool call denied".to_string(),
-                ),
+                reason: Some(format!(
+                    "{HOOK_FAILURE_PREFIX} PreToolUse hook '{label}' output exceeded its limit; tool call denied"
+                )),
                 updated_input: None,
             }
         }

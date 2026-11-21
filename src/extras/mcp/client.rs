@@ -58,8 +58,114 @@ const MCP_CONNECT_RETRY_BASE: Duration = Duration::from_millis(500);
 /// Whether a failed first connection is worth retrying: a timeout, a refused
 /// or reset connection, or an HTTP 5xx. Authentication problems, other 4xx
 /// responses, refused redirects and cancellation are final.
+/// Why a connection attempt failed, for the failures whose text this process
+/// generated and may therefore be shown to the user. Transport errors can
+/// carry an expanded URL or header credential and are never shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConnectFailureKind {
+    /// Bounded local text (command lookup, spawn, a crash with stderr).
+    Local,
+    InitTimedOut,
+    Cancelled,
+    AuthRequired,
+}
+
+/// A connection failure with credential-free, bounded text. `detail` is the
+/// message without the server-name prefix.
+#[derive(Debug)]
+pub(crate) struct ConnectFailure {
+    pub(crate) kind: ConnectFailureKind,
+    pub(crate) detail: String,
+    display: String,
+}
+
+impl ConnectFailure {
+    pub(crate) fn error(
+        kind: ConnectFailureKind,
+        detail: impl Into<String>,
+        display: impl Into<String>,
+    ) -> anyhow::Error {
+        anyhow::Error::new(Self {
+            kind,
+            detail: detail.into(),
+            display: display.into(),
+        })
+    }
+}
+
+impl std::fmt::Display for ConnectFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.display)
+    }
+}
+
+impl std::error::Error for ConnectFailure {}
+
+/// The typed, displayable part of a connection error, if it has one.
+pub(crate) fn connect_failure_of(error: &anyhow::Error) -> Option<(ConnectFailureKind, String)> {
+    error.chain().find_map(|cause| {
+        if let Some(failure) = cause.downcast_ref::<ConnectFailure>() {
+            return Some((failure.kind, failure.detail.clone()));
+        }
+        cause
+            .downcast_ref::<NamedConnectError>()
+            .filter(|named| named.timed_out)
+            .map(|named| (ConnectFailureKind::InitTimedOut, named.detail.clone()))
+    })
+}
+
+/// An HTTP connection failure that keeps the user's server name apart from
+/// the transport's own text, so retry classification reads only the latter: a
+/// server named `disabled-tests` must not look like a disabled server.
+#[derive(Debug)]
+pub(crate) struct NamedConnectError {
+    server: String,
+    detail: String,
+    /// The detail is this process's own "initialization timed out" text.
+    timed_out: bool,
+}
+
+impl NamedConnectError {
+    fn error(server: &str, detail: impl std::fmt::Display) -> anyhow::Error {
+        anyhow::Error::new(Self {
+            server: server.to_owned(),
+            detail: detail.to_string(),
+            timed_out: false,
+        })
+    }
+
+    fn timed_out(server: &str, timeout: Duration) -> anyhow::Error {
+        anyhow::Error::new(Self {
+            server: server.to_owned(),
+            detail: format!("initialization timed out after {} ms", timeout.as_millis()),
+            timed_out: true,
+        })
+    }
+}
+
+impl std::fmt::Display for NamedConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "MCP HTTP connection failed for '{}': {}",
+            self.server, self.detail
+        )
+    }
+}
+
+impl std::error::Error for NamedConnectError {}
+
+/// The text retry decisions read: the transport detail without the server
+/// name when the error is a [`NamedConnectError`], else the full rendering.
+fn classifiable_text(error: &anyhow::Error) -> String {
+    match error.downcast_ref::<NamedConnectError>() {
+        Some(named) => named.detail.clone(),
+        None => format!("{error:#}"),
+    }
+}
+
 pub(crate) fn is_transient_connect_error(error: &anyhow::Error) -> bool {
-    let text = format!("{error:#}");
+    let text = classifiable_text(error);
     let lower = text.to_ascii_lowercase();
     const FINAL: [&str; 7] = [
         "cancelled",
@@ -100,7 +206,7 @@ pub(crate) fn is_transient_connect_error(error: &anyhow::Error) -> bool {
 /// Server-requested wait (`Retry-After` seconds) recorded in an HTTP error
 /// message as `[retry-after: N]`.
 fn retry_after_hint(error: &anyhow::Error) -> Option<Duration> {
-    let text = format!("{error:#}");
+    let text = classifiable_text(error);
     let rest = text.split_once("[retry-after: ")?.1;
     let seconds = rest.split_once(']')?.0.trim().parse::<u64>().ok()?;
     Some(Duration::from_secs(seconds))
@@ -297,7 +403,16 @@ pub(crate) struct ToolListCache {
     /// `tools/list_changed` flag of a reconnect replacement connection; read
     /// and consumed together with `changed`.
     adopted: Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>,
+    /// When the last first listing failed. Within [`MCP_LIST_FAILURE_BACKOFF`]
+    /// the next collection does not ask the server again, so a server that
+    /// never answers `tools/list` costs its timeout once, not on every agent
+    /// build.
+    failed_at: Mutex<Option<std::time::Instant>>,
 }
+
+/// How long a failed `tools/list` is not retried unless the server announces
+/// a changed list or the connection is replaced.
+pub(crate) const MCP_LIST_FAILURE_BACKOFF: Duration = Duration::from_secs(60);
 
 /// Outcome of a cached listing; `kept_previous` is set when a relist after
 /// `list_changed` failed and the previous successful set was retained.
@@ -319,7 +434,23 @@ impl ToolListCache {
             cell: Mutex::default(),
             changed,
             adopted: Mutex::default(),
+            failed_at: Mutex::default(),
         }
+    }
+
+    /// Whether the last first listing failed recently enough not to retry.
+    pub(crate) fn recent_failure(&self) -> bool {
+        !self.is_stale()
+            && self
+                .failed_at
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some_and(|at| at.elapsed() < MCP_LIST_FAILURE_BACKOFF)
+    }
+
+    fn set_failed(&self, failed: bool) {
+        *self.failed_at.lock().unwrap_or_else(|e| e.into_inner()) =
+            failed.then(std::time::Instant::now);
     }
 
     /// After a reconnect: marks the cached listing stale (the next collection
@@ -329,6 +460,7 @@ impl ToolListCache {
         *self.adopted.lock().unwrap_or_else(|e| e.into_inner()) = Some(flag);
         self.changed
             .store(true, std::sync::atomic::Ordering::Release);
+        self.set_failed(false);
     }
 
     fn current(&self) -> Arc<tokio::sync::OnceCell<Arc<ListedTools>>> {
@@ -383,10 +515,13 @@ impl ToolListCache {
         }
         let cell = self.current();
         match cell.get_or_try_init(list).await {
-            Ok(listed) => Ok(CachedListing {
-                listed: listed.clone(),
-                kept_previous: None,
-            }),
+            Ok(listed) => {
+                self.set_failed(false);
+                Ok(CachedListing {
+                    listed: listed.clone(),
+                    kept_previous: None,
+                })
+            }
             Err(error) => match previous {
                 Some(previous) => {
                     let _ = cell.set(previous.clone());
@@ -395,7 +530,10 @@ impl ToolListCache {
                         kept_previous: Some(error),
                     })
                 }
-                None => Err(error),
+                None => {
+                    self.set_failed(true);
+                    Err(error)
+                }
             },
         }
     }
@@ -775,7 +913,11 @@ impl McpClientHandle {
         };
         validate()?;
         if crate::agent::runner::current_work_scope_is_cancelled() {
-            anyhow::bail!("MCP connection cancelled");
+            return Err(ConnectFailure::error(
+                ConnectFailureKind::Cancelled,
+                "cancelled",
+                "MCP connection cancelled",
+            ));
         }
         crate::config::managed::check_mcp_server(&server_name, config)
             .map_err(anyhow::Error::msg)?;
@@ -911,7 +1053,7 @@ impl McpClientHandle {
             } => {
                 let endpoint = tokio::select! {
                     biased;
-                    _ = crate::agent::runner::current_work_scope_cancelled() => anyhow::bail!("MCP connection cancelled"),
+                    _ = crate::agent::runner::current_work_scope_cancelled() => return Err(ConnectFailure::error(ConnectFailureKind::Cancelled, "cancelled", "MCP connection cancelled")),
                     result = validate_mcp_server_url_policy_cidrs(url, *allow_local, &options.allowed_cidrs) => result?,
                 };
                 validate()?;
@@ -921,7 +1063,7 @@ impl McpClientHandle {
                 let headers = if let Some(helper) = &options.headers_helper {
                     merged = tokio::select! {
                         biased;
-                        _ = crate::agent::runner::current_work_scope_cancelled() => anyhow::bail!("MCP connection cancelled"),
+                        _ = crate::agent::runner::current_work_scope_cancelled() => return Err(ConnectFailure::error(ConnectFailureKind::Cancelled, "cancelled", "MCP connection cancelled")),
                         result = super::headers_helper::merged_headers(
                             &server_name,
                             helper,
@@ -1052,30 +1194,28 @@ impl McpClientHandle {
                 let transport = AuthHttpClient::with_client(auth_client, cfg);
                 serve_client(elicitation.clone(), transport)
                     .await
-                    .map_err(|e| {
-                        anyhow::anyhow!("MCP HTTP connection failed for '{server_name}': {e}")
-                    })
+                    .map_err(|e| NamedConnectError::error(&server_name, e))
             } else {
                 type HttpClient = rmcp::transport::StreamableHttpClientTransport<BoundedHttpClient>;
                 let transport = HttpClient::with_client(http_client, cfg);
                 serve_client(elicitation.clone(), transport)
                     .await
-                    .map_err(|e| {
-                        anyhow::anyhow!("MCP HTTP connection failed for '{server_name}': {e}")
-                    })
+                    .map_err(|e| NamedConnectError::error(&server_name, e))
             }
         };
         let initialized = tokio::select! {
             biased;
-            _ = crate::agent::runner::current_work_scope_cancelled() => anyhow::bail!("MCP HTTP connection cancelled"),
+            _ = crate::agent::runner::current_work_scope_cancelled() => return Err(ConnectFailure::error(ConnectFailureKind::Cancelled, "cancelled", "MCP HTTP connection cancelled")),
             result = tokio::time::timeout(initialize_timeout, connect) => result,
         };
         let running_service = match initialized {
             Ok(result) => result?,
-            Err(_) => anyhow::bail!(
-                "MCP HTTP connection failed for '{server_name}': initialization timed out after {} ms",
-                initialize_timeout.as_millis()
-            ),
+            Err(_) => {
+                return Err(NamedConnectError::timed_out(
+                    &server_name,
+                    initialize_timeout,
+                ));
+            }
         };
         Ok(Self {
             server_name,
@@ -1537,12 +1677,23 @@ async fn stdio_connect_error(
 fn bounded_stdio_error(server_name: &str, reason: &str, diagnostic: &str) -> anyhow::Error {
     let server_name = bounded_utf8(server_name.trim(), 256);
     let reason = bounded_utf8(reason.trim(), 512);
-    let mut rendered = format!("MCP connection failed for '{server_name}': {reason}");
+    let prefix = format!("MCP connection failed for '{server_name}': ");
+    let mut rendered = format!("{prefix}{reason}");
     if !diagnostic.is_empty() && rendered.len() < MCP_STDERR_LIMIT {
         append_bounded(&mut rendered, "; stderr: ", MCP_STDERR_LIMIT);
         append_bounded(&mut rendered, diagnostic, MCP_STDERR_LIMIT);
     }
-    anyhow::anyhow!(rendered)
+    // Every part is generated here or is the server's own bounded stderr, so
+    // the user may be shown it (the stderr is also logged by the caller).
+    let kind = if reason.starts_with("initialization timed out") {
+        ConnectFailureKind::InitTimedOut
+    } else if reason.starts_with("initialization cancelled") {
+        ConnectFailureKind::Cancelled
+    } else {
+        ConnectFailureKind::Local
+    };
+    let detail = rendered[prefix.len()..].to_owned();
+    ConnectFailure::error(kind, detail, rendered)
 }
 
 fn bounded_lossy_diagnostic(bytes: &[u8]) -> String {
@@ -2602,5 +2753,30 @@ mod local_policy_tests {
                 .await
                 .is_ok()
         );
+    }
+}
+
+#[cfg(test)]
+mod connect_classification_tests {
+    use super::*;
+
+    #[test]
+    fn server_names_do_not_steer_retry_classification() {
+        for name in ["disabled-tests", "forbidden-zone", "unauthorized-proxy"] {
+            let refused =
+                NamedConnectError::error(name, "error sending request: connection refused");
+            assert!(is_transient_connect_error(&refused), "{name}");
+            let auth = NamedConnectError::error(name, "HTTP 401 unauthorized");
+            assert!(!is_transient_connect_error(&auth), "{name}");
+        }
+        // A name that looks like a status code is not read as one.
+        let named = NamedConnectError::error("HTTP 404 service", "connection reset by peer");
+        assert!(is_transient_connect_error(&named));
+        let hinted = NamedConnectError::error("x [retry-after: 9]", "HTTP 503 [retry-after: 2]");
+        assert_eq!(retry_after_hint(&hinted), Some(Duration::from_secs(2)));
+        // Errors from elsewhere keep full-text classification.
+        assert!(!is_transient_connect_error(&anyhow::anyhow!(
+            "MCP server disabled by policy"
+        )));
     }
 }
