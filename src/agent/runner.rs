@@ -406,6 +406,9 @@ impl ToolLoopState {
         outcome: &rig::tool::ToolOutcome,
         result: &str,
     ) -> Option<String> {
+        if super::read_loop::resets_read_loop(tool_name) {
+            self.successful_reads.clear_after_mutation();
+        }
         if super::read_loop::invalidates_evidence(tool_name) {
             self.successful_reads.clear_after_mutation();
             // A completed mutation changes what an identical call would now
@@ -502,14 +505,6 @@ pub(crate) struct ToolLoopGuard;
 impl<M: CompletionModel> AgentHook<M> for ToolLoopGuard {
     async fn on_event(&self, ctx: &HookContext, event: StepEvent<'_, M>) -> Flow {
         match event {
-            StepEvent::CompletionCall { .. } => {
-                let stop = update_loop_state(ctx, |state| state.successful_reads.stop_requested());
-                if stop {
-                    Flow::terminate(super::read_loop::STOP_REASON)
-                } else {
-                    Flow::cont()
-                }
-            }
             StepEvent::ToolCall {
                 tool_name,
                 args,
@@ -533,11 +528,26 @@ impl<M: CompletionModel> AgentHook<M> for ToolLoopGuard {
                     state
                         .pending
                         .insert(internal_call_id.to_owned(), (raw, fingerprint));
-                    state.exact_failure_notice(fingerprint).or_else(|| {
-                        (tool_name == "edit")
-                            .then(|| state.alternating_edit_notice(fingerprint))
-                            .flatten()
-                    })
+                    state
+                        .exact_failure_notice(fingerprint)
+                        .or_else(|| {
+                            (tool_name == "edit")
+                                .then(|| state.alternating_edit_notice(fingerprint))
+                                .flatten()
+                        })
+                        .or_else(|| {
+                            // The read would only return the same unchanged
+                            // evidence again: answer it with a notice the
+                            // model sees instead of ending the run.
+                            (super::read_loop::is_evidence_read(tool_name)
+                                && state.successful_reads.is_stuck(&fingerprint.0))
+                            .then(|| {
+                                format!(
+                                    "{TOOL_LOOP_NOTICE_PREFIX} {}",
+                                    super::read_loop::UNCHANGED_READ_NOTICE
+                                )
+                            })
+                        })
                 });
                 if let Some(notice) = &notice {
                     record_tool_loop_notice(internal_call_id, notice);
@@ -4394,13 +4404,35 @@ where
         .await
 }
 
+/// Whether `message` is an assistant message made only of reasoning blocks.
+fn is_thinking_only_assistant(message: &Message) -> bool {
+    match message {
+        Message::Assistant { content, .. } => content
+            .iter()
+            .all(|block| matches!(block, AssistantContent::Reasoning(_))),
+        _ => false,
+    }
+}
+
+/// A stream that died while a large tool call was still streaming leaves an
+/// assistant message whose only block is the completed thinking block.
+/// Anthropic-style APIs reject a replayed assistant turn that ends in thinking
+/// (and the thinking belongs to the abandoned attempt), so the continuation
+/// bridge drops such a trailing message (mini-agent-sskdu.261).
+fn without_thinking_only_tail(interactions: &[Message]) -> &[Message] {
+    match interactions.split_last() {
+        Some((last, rest)) if is_thinking_only_assistant(last) => rest,
+        _ => interactions,
+    }
+}
+
 fn normalized_continuation_bridge(
     completed_interactions: Vec<Message>,
     uncommitted_interactions: &[Message],
     continuation_instruction: &str,
 ) -> Vec<Message> {
     let mut bridge = completed_interactions;
-    bridge.extend_from_slice(uncommitted_interactions);
+    bridge.extend_from_slice(without_thinking_only_tail(uncommitted_interactions));
     // The continuation instruction stays its own trailing user message: the
     // OpenAI-family converters (chat completions, Responses, OpenRouter) drop
     // text parts that share a user message with tool results, so folding it into
@@ -9885,8 +9917,55 @@ mod tests {
         turns
     }
 
+    /// The sixth identical unchanged read is answered with a notice the model
+    /// sees; the run continues to its answer instead of ending in an error.
     #[tokio::test]
-    async fn unchanged_successful_reads_preserve_last_result_then_stop_before_sixth_request() {
+    async fn sixth_unchanged_read_is_skipped_with_a_notice_and_the_run_continues() {
+        let model = MockCompletionModel::from_stream_turns(evidence_turns(6));
+        let executions = Arc::new(AtomicUsize::new(0));
+        let agent = AgentBuilder::new(model.clone())
+            .tool(ReadEvidenceProbe {
+                executions: executions.clone(),
+                outputs: vec!["retained fact"],
+            })
+            .add_hook(super::ToolLoopGuard)
+            .default_max_turns(8)
+            .build();
+        let (response, _, interactions) = super::run_print(
+            &agent,
+            "inspect evidence",
+            false,
+            &crate::retry::RetryConfig::default(),
+            None,
+            Vec::new(),
+            #[cfg(feature = "hooks")]
+            None,
+        )
+        .await
+        .expect("an unchanged-read loop must not end the run");
+        assert_eq!(response, "done");
+        assert_eq!(executions.load(Ordering::SeqCst), 5);
+        let results = tool_result_texts(&interactions);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|text| **text == "retained fact")
+                .count(),
+            5
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|text| text.contains(super::super::read_loop::UNCHANGED_READ_NOTICE))
+                .count(),
+            1
+        );
+    }
+
+    /// `job_status` polling between reads restarts the counters: the job may
+    /// have changed what the same read returns.
+    #[tokio::test]
+    async fn job_status_polling_resets_the_unchanged_read_counters() {
         let mut turns = evidence_turns(6);
         for (index, turn) in turns.iter_mut().take(6).enumerate() {
             turn.insert(
@@ -9901,7 +9980,7 @@ mod tests {
         let model = MockCompletionModel::from_stream_turns(turns);
         let executions = Arc::new(AtomicUsize::new(0));
         let polls = Arc::new(AtomicUsize::new(0));
-        let agent = AgentBuilder::new(model.clone())
+        let agent = AgentBuilder::new(model)
             .tool(PollingProbe(polls.clone()))
             .tool(ReadEvidenceProbe {
                 executions: executions.clone(),
@@ -9910,66 +9989,53 @@ mod tests {
             .add_hook(super::ToolLoopGuard)
             .default_max_turns(8)
             .build();
-        let mut runner = super::spawn_agent(
-            agent,
-            "inspect evidence".into(),
+        let (response, _, interactions) = super::run_print(
+            &agent,
+            "inspect evidence",
+            false,
+            &crate::retry::RetryConfig::default(),
+            None,
             Vec::new(),
-            crate::retry::RetryConfig::default(),
-            None,
-            #[cfg(feature = "skills")]
-            None,
             #[cfg(feature = "hooks")]
             None,
-        );
-        let mut outputs = Vec::new();
-        let mut stopped = false;
-        while let Some(event) = runner.event_rx.recv().await {
-            match event {
-                crate::event::AgentEvent::ToolResult {
-                    name,
-                    output,
-                    is_error,
-                    ..
-                } if name == ReadEvidenceProbe::NAME => {
-                    assert!(!is_error);
-                    outputs.push(output.to_string());
-                }
-                crate::event::AgentEvent::Error {
-                    message,
-                    interactions,
-                } => {
-                    assert_eq!(
-                        tool_result_texts(&interactions)
-                            .into_iter()
-                            .filter(|text| *text == "retained fact")
-                            .count(),
-                        5
-                    );
-                    assert!(
-                        message.contains(super::super::read_loop::STOP_REASON),
-                        "{message}"
-                    );
-                    stopped = true;
-                    break;
-                }
-                crate::event::AgentEvent::Retrying { .. } => {
-                    panic!("read-loop stops must never retry the provider")
-                }
-                crate::event::AgentEvent::Done { .. } => panic!("unchanged read loop must stop"),
-                _ => {}
-            }
-        }
-        assert!(stopped);
-        assert_eq!(executions.load(Ordering::SeqCst), 5);
-        assert_eq!(model.requests().len(), 5);
-        assert_eq!(outputs.len(), 5);
-        assert_eq!(polls.load(Ordering::SeqCst), 5);
+        )
+        .await
+        .unwrap();
+        assert_eq!(response, "done");
+        assert_eq!(executions.load(Ordering::SeqCst), 6);
         assert!(
-            outputs
+            tool_result_texts(&interactions)
                 .iter()
-                .all(|output| output.contains("retained fact"))
+                .all(|text| !text.contains(super::super::read_loop::UNCHANGED_READ_NOTICE))
         );
-        assert!(outputs.iter().all(|output| output == "retained fact"));
+    }
+
+    #[test]
+    fn continuation_bridge_drops_a_trailing_thinking_only_assistant_message() {
+        let thinking = Message::Assistant {
+            id: None,
+            content: OneOrMany::one(AssistantContent::Reasoning(rig::message::Reasoning::new(
+                "thought",
+            ))),
+        };
+        let bridge = super::normalized_continuation_bridge(
+            vec![Message::user("kept")],
+            &[Message::user("tool result stand-in"), thinking.clone()],
+            "continue",
+        );
+        assert_eq!(bridge.len(), 3);
+        assert!(!bridge.iter().any(super::is_thinking_only_assistant));
+        // Thinking followed by real content is a normal assistant turn.
+        let mixed = Message::Assistant {
+            id: None,
+            content: OneOrMany::many(vec![
+                AssistantContent::Reasoning(rig::message::Reasoning::new("thought")),
+                AssistantContent::text("answer"),
+            ])
+            .unwrap(),
+        };
+        let bridge = super::normalized_continuation_bridge(Vec::new(), &[mixed], "continue");
+        assert_eq!(bridge.len(), 2);
     }
 
     #[tokio::test]
