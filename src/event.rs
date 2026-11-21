@@ -366,6 +366,9 @@ pub enum UserEvent {
     // Sent only from the non-test opener; tests construct it directly.
     #[cfg_attr(test, allow(dead_code))]
     LinkOpenFailed(String),
+    /// A line for the user from a background component (a panicked task, a
+    /// failed formatter): shown in the feed without touching the run state.
+    Notice(String),
     /// A background `/share confirm` upload finished: the gist URL or the error.
     #[cfg(feature = "export")]
     ShareDone(Result<String, String>),

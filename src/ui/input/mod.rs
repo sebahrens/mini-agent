@@ -1979,6 +1979,26 @@ impl InputEditor {
         }
     }
 
+    /// Hand back inputs queued during a run that ended without running them:
+    /// joined into the draft when the editor is empty (returns `true`),
+    /// otherwise pushed to the kill ring and input history (returns `false`).
+    pub(crate) fn recover_queued_inputs(&mut self, texts: &[String]) -> bool {
+        if self.buffer.is_empty() && self.pastes.is_empty() {
+            self.load_text(&texts.join("\n"));
+            return true;
+        }
+        for text in texts {
+            if text.trim().is_empty() {
+                continue;
+            }
+            self.push_kill(CompactString::from(text.as_str()));
+            if !crate::ui::slash::config::is_command(text) {
+                self.history.push(CompactString::from(text.as_str()));
+            }
+        }
+        false
+    }
+
     fn push_kill(&mut self, text: CompactString) {
         if text.is_empty() {
             return;
@@ -2443,6 +2463,20 @@ mod settings_history_tests {
         assert!(input.handle_picker_key(KeyCode::Enter.into()));
         assert_eq!(input.buffer, "/config --project sandbox true");
         assert!(!input.picker.as_ref().unwrap().active());
+    }
+
+    #[test]
+    fn queued_inputs_return_to_an_empty_editor_or_to_history() {
+        let texts = vec!["first".to_string(), "second".to_string()];
+        let mut empty = InputEditor::new();
+        assert!(empty.recover_queued_inputs(&texts));
+        assert_eq!(empty.buffer, "first\nsecond");
+        let mut busy = InputEditor::new();
+        busy.load_text("draft");
+        assert!(!busy.recover_queued_inputs(&texts));
+        assert_eq!(busy.buffer, "draft");
+        assert_eq!(busy.history.len(), 2);
+        assert_eq!(busy.kill_ring.first().map(|t| t.as_str()), Some("second"));
     }
 
     #[test]

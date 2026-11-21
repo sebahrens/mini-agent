@@ -1296,6 +1296,10 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
                 )
             })
             .flatten();
+        if let Some(formatter) = &formatter {
+            // Formatter failures reach the user's notice area, never the model.
+            formatter.set_notice_sink(crate::ui::notice_sink());
+        }
         let write_tool = tools::WriteTool::new_with_tracker(
             permission.clone(),
             ask_tx.clone(),

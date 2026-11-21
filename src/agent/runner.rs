@@ -4181,7 +4181,7 @@ fn convert_history_uncached(
             // An empty assistant record (a round that ended in its accepted
             // `goal_report` with no closing text) carries nothing to replay,
             // and providers reject an empty text block.
-            MessageRole::Assistant if msg.content.is_empty() && !canonical => {}
+            MessageRole::Assistant if msg.content.trim().is_empty() && !canonical => {}
             MessageRole::Assistant => {
                 messages.push(Message::assistant(msg.content.to_string()));
                 replay_kind = ReplayKind::Assistant;

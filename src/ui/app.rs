@@ -1321,6 +1321,7 @@ impl<'a> App<'a> {
         }
 
         let (user_tx, user_rx) = mpsc::channel::<UserEvent>(64);
+        super::register_notice_sender(user_tx.clone());
         let running = Arc::new(AtomicBool::new(true));
         let event_handle = Some(super::spawn_event_thread_with_events(
             user_tx.clone(),
@@ -3043,6 +3044,9 @@ impl<'a> App<'a> {
                 self.renderer
                     .write_line(&format!("cannot open link: {error}"), C_ERROR)?;
             }
+            UserEvent::Notice(line) => {
+                self.renderer.write_line(&sanitize_output(&line), C_ERROR)?;
+            }
             UserEvent::Paste(data) => {
                 self.ctrl_c_exit_armed = false;
                 #[cfg(feature = "multimodal")]
@@ -3518,8 +3522,9 @@ impl<'a> App<'a> {
                         .write_line("rewind selection is stale; open /rewind again", C_ERROR)?;
                     return Ok(());
                 }
-                #[cfg(feature = "subagents")]
-                self.ui.session.reset_background_tasks().await;
+                // Background tasks are cancelled only once something is really
+                // rewound: a refused or no-op restore leaves them running, as
+                // /undo does (mini-agent-nvnkx.293).
                 if mode != RewindMode::Conversation {
                     // Like session publication, this bounded native operation stays
                     // owned by the foreground key handler through completion.
@@ -3534,6 +3539,8 @@ impl<'a> App<'a> {
                                 self.ui.session.read_tracker.clear();
                                 self.ui.invalidate_prebuild();
                                 self.run.agent = None;
+                                #[cfg(feature = "subagents")]
+                                self.ui.session.reset_background_tasks().await;
                             }
                             self.renderer
                                 .write_line(&format!("restored {count} files"), Color::Green)?;
@@ -3552,6 +3559,8 @@ impl<'a> App<'a> {
                                 ),
                                 C_ERROR,
                             )?;
+                            // Some files may have changed before the refusal.
+                            self.save_session()?;
                             return Ok(());
                         }
                     }
@@ -3560,6 +3569,8 @@ impl<'a> App<'a> {
                     && crate::ui::slash::rewind_selected_turn(self.ui.session, &mut self.input, idx)
                         > 0
                 {
+                    #[cfg(feature = "subagents")]
+                    self.ui.session.reset_background_tasks().await;
                     self.save_session()?;
                     render_session(
                         &mut self.renderer,
@@ -4376,10 +4387,9 @@ impl<'a> App<'a> {
         self.chain.plan = Default::default();
         self.renderer.feed_mut().finish_reasoning();
         self.cancel_pending_permissions();
-        let preserve_progress = preserve_pending_main_turn_progress(&mut self.run, self.ui.session);
-        if preserve_progress {
-            super::record_interrupted_turn_notice(self.ui.session);
-        }
+        // Whether the turn made progress is decided now; the unresolved calls
+        // are closed only after the task is gone and its command guards ran.
+        let has_progress = super::pending_main_turn_has_progress(&self.run, self.ui.session);
         #[cfg(feature = "loop")]
         self.run.cancel_validation();
         if let Some(handle) = self.run.main_abort.take() {
@@ -4389,6 +4399,11 @@ impl<'a> App<'a> {
         self.run.is_running = false;
         if let Err(error) = self.run.retire(Duration::from_secs(5)).await {
             tracing::warn!(%error, "TUI failed-run cleanup failed");
+        }
+        let preserve_progress =
+            super::commit_pending_main_turn_progress(&mut self.run, self.ui.session, has_progress);
+        if preserve_progress {
+            super::record_interrupted_turn_notice(self.ui.session);
         }
         if let Err(error) = super::settle_native_main_turn(
             &mut self.run,
@@ -4442,10 +4457,7 @@ impl<'a> App<'a> {
             self.renderer.chain_but_mode = false;
         }
         self.cancel_pending_permissions();
-        let preserve_progress = preserve_pending_main_turn_progress(&mut self.run, self.ui.session);
-        if preserve_progress {
-            super::record_interrupted_turn_notice(self.ui.session);
-        }
+        let has_progress = super::pending_main_turn_has_progress(&self.run, self.ui.session);
         let validation_active = self.run.cancel_validation();
 
         if !validation_active {
@@ -4460,6 +4472,14 @@ impl<'a> App<'a> {
         }
         if let Err(error) = self.run.retire(Duration::from_secs(5)).await {
             tracing::warn!(%error, "TUI interrupted-run cleanup failed");
+        }
+        // Closing unresolved calls only now lets an interrupted foreground
+        // command's partial output (registered when its future dropped) reach
+        // the transcript instead of "outcome unknown".
+        let preserve_progress =
+            super::commit_pending_main_turn_progress(&mut self.run, self.ui.session, has_progress);
+        if preserve_progress {
+            super::record_interrupted_turn_notice(self.ui.session);
         }
         if let Err(error) = super::settle_native_main_turn(
             &mut self.run,
@@ -4590,13 +4610,25 @@ impl<'a> App<'a> {
 
     /// Queued prompts must not restart the agent after an interrupt. Make the
     /// discard visible; failure cleanup remains safe if presentation also fails.
+    ///
+    /// The texts are handed back rather than lost: into the editor when it is
+    /// empty, otherwise into the kill ring and input history (mini-agent-nvnkx.291).
     fn discard_interrupted_queue(&mut self) {
         let count = self.run.pending_inputs.len();
-        self.run.pending_inputs.clear();
-        if count > 0
-            && let Err(error) = self
-                .renderer
-                .write_line(&format!("dropped {count} queued inputs"), C_TOOL)
+        let texts: Vec<String> = self.run.pending_inputs.drain(..).collect();
+        if count == 0 {
+            return;
+        }
+        let in_editor = self.input.recover_queued_inputs(&texts);
+        let noun = if count == 1 { "input" } else { "inputs" };
+        let place = if in_editor {
+            "to the editor, not sent"
+        } else {
+            "to history (Up recalls them), not sent"
+        };
+        if let Err(error) = self
+            .renderer
+            .write_line(&format!("{count} queued {noun} returned {place}"), C_TOOL)
         {
             tracing::warn!(%error, count, "interrupted-run queue discard could not be displayed");
         }
@@ -9104,7 +9136,7 @@ mod git_command_consumer_tests {
         assert!(
             app.renderer
                 .captured_output()
-                .contains("dropped 2 queued inputs")
+                .contains("2 queued inputs returned")
         );
         assert_eq!(repo.git(&["rev-parse", "HEAD"]).await, before);
         assert!(

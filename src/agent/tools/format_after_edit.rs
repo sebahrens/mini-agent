@@ -154,7 +154,6 @@ impl FormatAfterEdit {
 
     /// Routes formatter failure explanations (exit status and a stderr tail)
     /// to the user. They never enter a tool result, which the model reads.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn set_notice_sink(&self, sink: NoticeSink) {
         let _ = self.notice_sink.set(sink);
     }

@@ -362,7 +362,7 @@ async fn actual_provider_error_restores_draft_without_starting_queued_requests()
             .feed()
             .selected_text(4096, 0, lines - 1)
             .unwrap();
-        assert!(shown.contains("dropped 2 queued inputs"), "{shown}");
+        assert!(shown.contains("2 queued inputs returned"), "{shown}");
         assert!(shown.contains("queue is empty"), "{shown}");
         if progress {
             assert_eq!(app.input.buffer, "follow-up after provider failure");
@@ -539,7 +539,7 @@ async fn actual_context_exhaustion_preserves_followup_draft_usage_and_drops_queu
             shown.contains("not enough context to continue this turn"),
             "{shown}"
         );
-        assert!(shown.contains("dropped 2 queued inputs"), "{shown}");
+        assert!(shown.contains("2 queued inputs returned"), "{shown}");
         assert!(shown.contains("queue is empty"), "{shown}");
         if progress {
             assert_eq!(
@@ -782,7 +782,7 @@ async fn actual_abort_and_failure_preserve_drafts_and_report_discarded_queue() {
                 .feed()
                 .selected_text(4096, 0, lines - 1)
                 .unwrap();
-            assert!(shown.contains("dropped 2 queued inputs"), "{shown}");
+            assert!(shown.contains("2 queued inputs returned"), "{shown}");
             assert!(shown.contains("queue is empty"), "{shown}");
             if progress {
                 assert_eq!(app.input.buffer, "follow-up draft héllo");
@@ -804,4 +804,116 @@ async fn actual_abort_and_failure_preserve_drafts_and_report_discarded_queue() {
             }
         }
     }
+}
+
+/// Registers what a foreground command printed when its future is dropped, as
+/// the shell tool's guard does.
+struct DropRegisters(&'static str, &'static str);
+impl Drop for DropRegisters {
+    fn drop(&mut self) {
+        crate::agent::runner::record_settled_result(self.0, self.1);
+    }
+}
+
+#[tokio::test]
+async fn interrupt_keeps_the_partial_output_of_a_running_shell_call() {
+    let root = crate::tests::OwnedTestDirectory::new("app-interrupt-shell-output");
+    let _environment = crate::tests::ScopedProcessEnv::set(&[
+        (
+            "MINI_AGENT_CONFIG_DIR",
+            Some(root.path().join("config").into_os_string()),
+        ),
+        (
+            "MINI_AGENT_DATA_DIR",
+            Some(root.path().join("data").into_os_string()),
+        ),
+        (
+            "MINI_AGENT_STATE_DIR",
+            Some(root.path().join("state").into_os_string()),
+        ),
+        (
+            "MINI_AGENT_CACHE_DIR",
+            Some(root.path().join("cache").into_os_string()),
+        ),
+    ]);
+    let cli = crate::cli::Cli {
+        no_session: true,
+        no_tools: true,
+        no_sandbox: true,
+        ..Default::default()
+    };
+    let cfg = crate::config::Config::default();
+    let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+    let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+    let mut session = Session::new("openrouter", "test-model", 128_000, "");
+    session.add_message(MessageRole::User, "earlier prompt");
+    session.add_message(MessageRole::Assistant, "earlier answer");
+    let ui = UiContext {
+        native_startup: None,
+        native_ticket: None,
+        #[cfg(feature = "hooks")]
+        pending_session_start_context: None,
+        cli: &cli,
+        cfg: &cfg,
+        session: &mut session,
+        context: &mut context,
+        workspace,
+        client: crate::provider::create_client(
+            "openrouter",
+            Some("unused-test-key"),
+            cfg.custom_providers_map(),
+            cfg.api_keys.as_ref(),
+        )
+        .unwrap(),
+        permission: None,
+        ask_tx: None,
+        sandbox: crate::sandbox::Sandbox::new(false, "none"),
+        prebuild_invalidated: Arc::new(AtomicBool::new(false)),
+        status_signals: None,
+        #[cfg(feature = "skills")]
+        skill_services: Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new()),
+        #[cfg(feature = "mcp")]
+        mcp_manager: None,
+    };
+    let mut app = fixture_app(ui);
+    let pending = PendingMainTurn::capture(app.ui.session, "run the ticker");
+    crate::ui::mark_main_turn_started(app.ui.session, &mut app.run, pending);
+    app.ui.session.add_tool_call_with_id(
+        "interrupt-shell-call",
+        "shell",
+        &serde_json::json!({"command": "for i in 1 2 3; do echo tick $i; sleep 5; done"}),
+    );
+    // The running turn: a task that owns the event channel (so retiring waits
+    // for it to be dropped) and a command guard that registers its output
+    // only when that task's future is dropped.
+    let (tx, rx) = mpsc::channel(1);
+    app.run.agent_rx = Some(rx);
+    let task = tokio::spawn(async move {
+        let _events = tx;
+        let _guard = DropRegisters(
+            "interrupt-shell-call",
+            "[Interrupted by the user before the command finished] tick 1\ntick 2",
+        );
+        std::future::pending::<()>().await;
+    });
+    app.run.main_abort = Some(task.abort_handle());
+    app.run.is_running = true;
+    tokio::task::yield_now().await;
+    app.abort_main_run().await.unwrap();
+    let result = app
+        .ui
+        .session
+        .messages
+        .iter()
+        .find(|m| {
+            m.role == MessageRole::ToolResult
+                && m.tool_call_id.as_deref() == Some("interrupt-shell-call")
+        })
+        .expect("the interrupted call is closed");
+    assert!(
+        result.content.contains("Interrupted by the user") && result.content.contains("tick 2"),
+        "{}",
+        result.content
+    );
+    assert!(!result.content.contains("outcome is unknown"));
 }

@@ -10,8 +10,33 @@ use std::sync::Mutex;
 /// while one is active is refused.
 static ACTIVE: Mutex<Option<tokio::task::AbortHandle>> = Mutex::new(None);
 
+type Slot = Mutex<Option<tokio::task::AbortHandle>>;
+
+fn lock(slot: &'static Slot) -> std::sync::MutexGuard<'static, Option<tokio::task::AbortHandle>> {
+    slot.lock().unwrap_or_else(|error| error.into_inner())
+}
+
 fn active() -> std::sync::MutexGuard<'static, Option<tokio::task::AbortHandle>> {
-    ACTIVE.lock().unwrap_or_else(|error| error.into_inner())
+    lock(&ACTIVE)
+}
+
+/// Spawn `work` and record its abort handle in `slot`, which the task clears
+/// when it finishes. The slot stays locked from before the spawn until the
+/// handle is stored, so a task that finishes without suspending cannot clear
+/// the slot first and leave a finished task's handle behind for good
+/// (mini-agent-nvnkx.261).
+fn spawn_tracked<F>(slot: &'static Slot, work: F) -> tokio::task::JoinHandle<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let mut guard = lock(slot);
+    let task = tokio::spawn(async move {
+        work.await;
+        *lock(slot) = None;
+    });
+    *guard = Some(task.abort_handle());
+    drop(guard);
+    task
 }
 
 /// Whether the submitted text is the confirming form of `/share`.
@@ -59,14 +84,15 @@ impl App<'_> {
             C_AGENT,
         )?;
         let tx = self.user_tx.clone();
-        let task = tokio::spawn(async move {
+        spawn_tracked(&ACTIVE, async move {
             let result = crate::extras::export::share_gist(&filename, &html, &description)
                 .await
                 .map_err(|error| error.to_string());
+            // Cleared before the event is sent, so a later `/share confirm`
+            // never sees the finished upload.
             *active() = None;
             let _ = tx.send(UserEvent::ShareDone(result)).await;
         });
-        *active() = Some(task.abort_handle());
         Ok(())
     }
 
@@ -105,5 +131,16 @@ mod tests {
         assert!(cancel_active());
         assert!(task.await.unwrap_err().is_cancelled());
         assert!(!cancel_active());
+    }
+
+    static RACE_SLOT: Slot = Mutex::new(None);
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_task_that_finishes_at_once_never_leaves_its_handle_behind() {
+        for _ in 0..3000 {
+            let task = spawn_tracked(&RACE_SLOT, async {});
+            task.await.unwrap();
+            assert!(lock(&RACE_SLOT).is_none(), "finished task kept its handle");
+        }
     }
 }

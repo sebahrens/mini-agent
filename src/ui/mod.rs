@@ -604,6 +604,41 @@ impl ReaderErrors {
     }
 }
 
+/// Where background components (panic hook, formatter) send user-facing lines
+/// while the interactive TUI runs.
+static NOTICE_SENDER: std::sync::Mutex<Option<mpsc::Sender<UserEvent>>> =
+    std::sync::Mutex::new(None);
+
+pub(crate) fn register_notice_sender(tx: mpsc::Sender<UserEvent>) {
+    *NOTICE_SENDER
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(tx);
+}
+
+/// Queue a one-line notice for the interactive feed. Never blocks; returns
+/// whether it was queued (false without a running TUI or when it is closed).
+pub(crate) fn post_notice(line: String) -> bool {
+    post_notice_to(&NOTICE_SENDER, line)
+}
+
+fn post_notice_to(slot: &std::sync::Mutex<Option<mpsc::Sender<UserEvent>>>, line: String) -> bool {
+    let sender = slot
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    sender.is_some_and(|tx| tx.try_send(UserEvent::Notice(line)).is_ok())
+}
+
+/// A sink for [`FormatAfterEdit::set_notice_sink`] that shows formatter
+/// failures in the TUI notice area (they are always logged as well).
+///
+/// [`FormatAfterEdit::set_notice_sink`]: crate::agent::tools::format_after_edit::FormatAfterEdit::set_notice_sink
+pub(crate) fn notice_sink() -> crate::agent::tools::format_after_edit::NoticeSink {
+    Arc::new(|line: &str| {
+        let _ = post_notice(line.to_string());
+    })
+}
+
 /// Turn termination requests into an orderly [`UserEvent::Quit`] so the run is
 /// stopped, the session saved and the terminal restored (raw mode, mouse,
 /// bracketed paste, keyboard protocol, cursor) instead of the process dying
@@ -2062,7 +2097,21 @@ pub(crate) fn preserve_pending_main_turn_progress(
     run: &mut AgentRunState,
     session: &mut Session,
 ) -> bool {
-    if !pending_main_turn_has_progress(run, session) {
+    let has_progress = pending_main_turn_has_progress(run, session);
+    commit_pending_main_turn_progress(run, session, has_progress)
+}
+
+/// The second half of [`preserve_pending_main_turn_progress`], for callers that
+/// decided `has_progress` before they aborted the run. An interrupt must abort
+/// the task, kill its commands and retire the run first: a foreground command's
+/// guard registers what it printed only when its future is dropped, and the
+/// unresolved calls are closed from that text here (mini-agent-nvnkx.160).
+pub(crate) fn commit_pending_main_turn_progress(
+    run: &mut AgentRunState,
+    session: &mut Session,
+    has_progress: bool,
+) -> bool {
+    if !has_progress {
         return false;
     }
 
@@ -2994,5 +3043,25 @@ mod compaction_cancel_tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), cancel.cancelled())
             .await
             .expect("a notified compaction wakes");
+    }
+}
+
+#[cfg(test)]
+mod notice_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn notices_reach_the_channel_without_blocking() {
+        let slot = std::sync::Mutex::new(None);
+        assert!(!post_notice_to(&slot, "nobody listens".into()));
+        let (tx, mut rx) = mpsc::channel::<UserEvent>(1);
+        *slot.lock().unwrap() = Some(tx);
+        assert!(post_notice_to(&slot, "internal task panicked".into()));
+        assert!(
+            matches!(rx.recv().await, Some(UserEvent::Notice(line)) if line.contains("panicked"))
+        );
+        // A full channel drops the line instead of blocking the panicking thread.
+        assert!(post_notice_to(&slot, "a".into()));
+        assert!(!post_notice_to(&slot, "b".into()));
     }
 }

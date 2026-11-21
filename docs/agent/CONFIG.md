@@ -4756,7 +4756,10 @@ mini-agent -v
 Enables full trace-level logging to a timestamped log file below the state
 root's `logs/` directory (`MINI_AGENT_STATE_DIR` overrides the state root). The log
 file is named `mini-agent-YYYY-MM-DD_HH-MM-SS_<pid>.log`. A new file is created
-per instance — previous runs are never overwritten.
+per instance — previous runs are never overwritten. At startup the 20 newest
+auto-named logs (and crash reports in the crash directory) are kept and older
+ones, or any older than 14 days, are removed; other file names and symlinks are
+never touched. Log files contain no ANSI colour escapes.
 
 With `-v`, visible diagnostic output stays at the default `warn` level. The
 log file captures everything at `trace` level for all mini-agent
@@ -4769,7 +4772,8 @@ mini-agent --log-file /tmp/debug.log
 ```
 
 Writes full trace-level logs to the specified path instead of the default
-location. Implies `-v` for the file output. Can be combined with `-v` (no
+location. The file is appended to, never truncated, and each run writes a
+`--- mini-agent run started ... ---` marker first. Implies `-v` for the file output. Can be combined with `-v` (no
 effect on the path, since `--log-file` takes precedence).
 
 ### Custom stderr log level (`--log-level`)

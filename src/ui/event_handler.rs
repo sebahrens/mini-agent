@@ -322,7 +322,9 @@ pub async fn handle_agent_event(
                 renderer.write_line("", Color::White)?;
                 run.agent_line_started = false;
             }
-            if !run.response_buf.is_empty() {
+            // Whitespace-only text (a lone newline before a tool call) is
+            // absent: providers reject whitespace-only text blocks.
+            if !run.response_buf.trim().is_empty() {
                 ui.session
                     .add_message(MessageRole::Assistant, &run.response_buf);
             }
@@ -680,7 +682,10 @@ pub(crate) fn commit_turn_response(
         "committing turn response; tool records were persisted live"
     );
     persist_host_instructions(session, interactions);
-    session.add_message(MessageRole::Assistant, response);
+    // A whitespace-only closing text is not a reply (mini-agent-nvnkx.162).
+    if response.is_empty() || !response.trim().is_empty() {
+        session.add_message(MessageRole::Assistant, response);
+    }
 }
 
 /// Host continuation instructions (verification failure, Stop-hook reason,
