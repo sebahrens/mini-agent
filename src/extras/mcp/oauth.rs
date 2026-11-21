@@ -1495,9 +1495,14 @@ pub(crate) async fn build_auth_client(
         .await
         .map_err(|e| anyhow::anyhow!("OAuth restore failed: {e}"))?;
     if !restored {
-        anyhow::bail!(
+        let message = format!(
             "no OAuth token stored; run `/mcp login {server_name}` or `mini-agent --mcp-login {server_name}`"
         );
+        return Err(super::client::ConnectFailure::error(
+            super::client::ConnectFailureKind::AuthRequired,
+            message.clone(),
+            message,
+        ));
     }
     // Restoring knows only the stored client id; a confidential pre-registered
     // client also needs its secret to refresh the token.

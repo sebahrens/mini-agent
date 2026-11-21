@@ -58,6 +58,62 @@ const MCP_CONNECT_RETRY_BASE: Duration = Duration::from_millis(500);
 /// Whether a failed first connection is worth retrying: a timeout, a refused
 /// or reset connection, or an HTTP 5xx. Authentication problems, other 4xx
 /// responses, refused redirects and cancellation are final.
+/// Why a connection attempt failed, for the failures whose text this process
+/// generated and may therefore be shown to the user. Transport errors can
+/// carry an expanded URL or header credential and are never shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConnectFailureKind {
+    /// Bounded local text (command lookup, spawn, a crash with stderr).
+    Local,
+    InitTimedOut,
+    Cancelled,
+    AuthRequired,
+}
+
+/// A connection failure with credential-free, bounded text. `detail` is the
+/// message without the server-name prefix.
+#[derive(Debug)]
+pub(crate) struct ConnectFailure {
+    pub(crate) kind: ConnectFailureKind,
+    pub(crate) detail: String,
+    display: String,
+}
+
+impl ConnectFailure {
+    pub(crate) fn error(
+        kind: ConnectFailureKind,
+        detail: impl Into<String>,
+        display: impl Into<String>,
+    ) -> anyhow::Error {
+        anyhow::Error::new(Self {
+            kind,
+            detail: detail.into(),
+            display: display.into(),
+        })
+    }
+}
+
+impl std::fmt::Display for ConnectFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.display)
+    }
+}
+
+impl std::error::Error for ConnectFailure {}
+
+/// The typed, displayable part of a connection error, if it has one.
+pub(crate) fn connect_failure_of(error: &anyhow::Error) -> Option<(ConnectFailureKind, String)> {
+    error.chain().find_map(|cause| {
+        if let Some(failure) = cause.downcast_ref::<ConnectFailure>() {
+            return Some((failure.kind, failure.detail.clone()));
+        }
+        cause
+            .downcast_ref::<NamedConnectError>()
+            .filter(|named| named.timed_out)
+            .map(|named| (ConnectFailureKind::InitTimedOut, named.detail.clone()))
+    })
+}
+
 /// An HTTP connection failure that keeps the user's server name apart from
 /// the transport's own text, so retry classification reads only the latter: a
 /// server named `disabled-tests` must not look like a disabled server.
@@ -65,6 +121,8 @@ const MCP_CONNECT_RETRY_BASE: Duration = Duration::from_millis(500);
 pub(crate) struct NamedConnectError {
     server: String,
     detail: String,
+    /// The detail is this process's own "initialization timed out" text.
+    timed_out: bool,
 }
 
 impl NamedConnectError {
@@ -72,6 +130,15 @@ impl NamedConnectError {
         anyhow::Error::new(Self {
             server: server.to_owned(),
             detail: detail.to_string(),
+            timed_out: false,
+        })
+    }
+
+    fn timed_out(server: &str, timeout: Duration) -> anyhow::Error {
+        anyhow::Error::new(Self {
+            server: server.to_owned(),
+            detail: format!("initialization timed out after {} ms", timeout.as_millis()),
+            timed_out: true,
         })
     }
 }
@@ -839,7 +906,11 @@ impl McpClientHandle {
         };
         validate()?;
         if crate::agent::runner::current_work_scope_is_cancelled() {
-            anyhow::bail!("MCP connection cancelled");
+            return Err(ConnectFailure::error(
+                ConnectFailureKind::Cancelled,
+                "cancelled",
+                "MCP connection cancelled",
+            ));
         }
         crate::config::managed::check_mcp_server(&server_name, config)
             .map_err(anyhow::Error::msg)?;
@@ -975,7 +1046,7 @@ impl McpClientHandle {
             } => {
                 let endpoint = tokio::select! {
                     biased;
-                    _ = crate::agent::runner::current_work_scope_cancelled() => anyhow::bail!("MCP connection cancelled"),
+                    _ = crate::agent::runner::current_work_scope_cancelled() => return Err(ConnectFailure::error(ConnectFailureKind::Cancelled, "cancelled", "MCP connection cancelled")),
                     result = validate_mcp_server_url_policy_cidrs(url, *allow_local, &options.allowed_cidrs) => result?,
                 };
                 validate()?;
@@ -985,7 +1056,7 @@ impl McpClientHandle {
                 let headers = if let Some(helper) = &options.headers_helper {
                     merged = tokio::select! {
                         biased;
-                        _ = crate::agent::runner::current_work_scope_cancelled() => anyhow::bail!("MCP connection cancelled"),
+                        _ = crate::agent::runner::current_work_scope_cancelled() => return Err(ConnectFailure::error(ConnectFailureKind::Cancelled, "cancelled", "MCP connection cancelled")),
                         result = super::headers_helper::merged_headers(
                             &server_name,
                             helper,
@@ -1127,18 +1198,15 @@ impl McpClientHandle {
         };
         let initialized = tokio::select! {
             biased;
-            _ = crate::agent::runner::current_work_scope_cancelled() => anyhow::bail!("MCP HTTP connection cancelled"),
+            _ = crate::agent::runner::current_work_scope_cancelled() => return Err(ConnectFailure::error(ConnectFailureKind::Cancelled, "cancelled", "MCP HTTP connection cancelled")),
             result = tokio::time::timeout(initialize_timeout, connect) => result,
         };
         let running_service = match initialized {
             Ok(result) => result?,
             Err(_) => {
-                return Err(NamedConnectError::new(
+                return Err(NamedConnectError::timed_out(
                     &server_name,
-                    format!(
-                        "initialization timed out after {} ms",
-                        initialize_timeout.as_millis()
-                    ),
+                    initialize_timeout,
                 ));
             }
         };
@@ -1602,12 +1670,23 @@ async fn stdio_connect_error(
 fn bounded_stdio_error(server_name: &str, reason: &str, diagnostic: &str) -> anyhow::Error {
     let server_name = bounded_utf8(server_name.trim(), 256);
     let reason = bounded_utf8(reason.trim(), 512);
-    let mut rendered = format!("MCP connection failed for '{server_name}': {reason}");
+    let prefix = format!("MCP connection failed for '{server_name}': ");
+    let mut rendered = format!("{prefix}{reason}");
     if !diagnostic.is_empty() && rendered.len() < MCP_STDERR_LIMIT {
         append_bounded(&mut rendered, "; stderr: ", MCP_STDERR_LIMIT);
         append_bounded(&mut rendered, diagnostic, MCP_STDERR_LIMIT);
     }
-    anyhow::anyhow!(rendered)
+    // Every part is generated here or is the server's own bounded stderr, so
+    // the user may be shown it (the stderr is also logged by the caller).
+    let kind = if reason.starts_with("initialization timed out") {
+        ConnectFailureKind::InitTimedOut
+    } else if reason.starts_with("initialization cancelled") {
+        ConnectFailureKind::Cancelled
+    } else {
+        ConnectFailureKind::Local
+    };
+    let detail = rendered[prefix.len()..].to_owned();
+    ConnectFailure::error(kind, detail, rendered)
 }
 
 fn bounded_lossy_diagnostic(bytes: &[u8]) -> String {

@@ -110,6 +110,54 @@ impl fmt::Display for McpNotice {
     }
 }
 
+/// Health outcome of a failed connection attempt: a handshake timeout and a
+/// cancellation keep their own rows instead of collapsing into `Failed`.
+fn connect_failure_outcome(error: &anyhow::Error) -> health::AttemptOutcome {
+    match client::connect_failure_of(error) {
+        Some((client::ConnectFailureKind::InitTimedOut, _)) => health::AttemptOutcome::TimedOut,
+        Some((client::ConnectFailureKind::Cancelled, _)) => health::AttemptOutcome::Cancelled,
+        _ => health::AttemptOutcome::Failed,
+    }
+}
+
+/// Most characters of a server's own stderr quoted in a notice; the rest goes
+/// to the log file.
+const CONNECT_DETAIL_NOTICE_CHARS: usize = 600;
+
+/// The text following "not connected" for a failed connection. Only text this
+/// process generated (a typed failure: command lookup, spawn, crash stderr,
+/// handshake timeout, missing login) or a refused redirect is shown; any
+/// other error may carry an expanded URL or header credential and is
+/// reduced to "(credential values omitted)". The full detail of a typed
+/// failure is logged at info (log file only), never to stderr.
+fn connect_failure_detail(server: &str, error: &anyhow::Error) -> String {
+    if let Some(refusal) = bounded_http::redirect_refusal(error) {
+        return format!(": {refusal}");
+    }
+    let Some((kind, detail)) = client::connect_failure_of(error) else {
+        return " (credential values omitted)".to_string();
+    };
+    tracing::info!("MCP server '{server}' connection failed: {detail}");
+    let single_line: String = detail
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let mut shown: String = single_line
+        .chars()
+        .take(CONNECT_DETAIL_NOTICE_CHARS)
+        .collect();
+    if single_line.chars().count() > CONNECT_DETAIL_NOTICE_CHARS {
+        shown.push_str("...");
+    }
+    let hint = match kind {
+        client::ConnectFailureKind::InitTimedOut => {
+            format!("; raise startup_timeout_sec for '{server}' if it needs longer to start")
+        }
+        _ => String::new(),
+    };
+    format!(": {shown}{hint}")
+}
+
 #[derive(Default)]
 struct ToolNoticeState {
     pending: Vec<McpNotice>,
@@ -574,10 +622,9 @@ impl McpClientManager {
                         })
                         .await
                     };
-                    attempt.finish(if result.is_ok() {
-                        health::AttemptOutcome::Succeeded
-                    } else {
-                        health::AttemptOutcome::Failed
+                    attempt.finish(match &result {
+                        Ok(_) => health::AttemptOutcome::Succeeded,
+                        Err(error) => connect_failure_outcome(error),
                     });
                     (name, result)
                 }
@@ -603,10 +650,7 @@ impl McpClientManager {
                     // credential. Health retains the typed outcome separately.
                     // A refused redirect is the exception: its bounded,
                     // generated text names only the target origin and path.
-                    tracing::debug!("Failed to connect to MCP server '{}'", name);
-                    let detail = bounded_http::redirect_refusal(&error)
-                        .map(|refusal| format!(": {refusal}"))
-                        .unwrap_or_else(|| " (credential values omitted)".to_string());
+                    let detail = connect_failure_detail(&name, &error);
                     connect_errors.insert(name.clone(), format!("not connected{detail}"));
                     notices.push(McpNotice::error(format!(
                         "MCP server '{name}' not connected{detail}"
@@ -1379,6 +1423,55 @@ mod tests {
         assert!(
             manager.notices[1].message().contains("beta"),
             "second notice should name beta"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_command_notice_names_the_command() {
+        let mut config = failing_config();
+        if let McpServerConfig::Command { command, .. } = &mut config {
+            *command = "definitely-not-an-installed-mcp-binary".to_string();
+        }
+        let configs = HashMap::from([("ghost".to_string(), config)]);
+        let workspace = std::env::current_dir().unwrap();
+        let manager = McpClientManager::connect_all_in(&configs, &workspace).await;
+        let message = manager.notices[0].message().to_string();
+        assert!(
+            message.contains("definitely-not-an-installed-mcp-binary"),
+            "{message}"
+        );
+        assert!(!message.contains("credential values omitted"), "{message}");
+        assert_eq!(manager.server_statuses(&configs)[0].status, "failed");
+    }
+
+    #[test]
+    fn typed_connect_failures_show_their_cause_and_others_stay_redacted() {
+        let timeout = client::ConnectFailure::error(
+            client::ConnectFailureKind::InitTimedOut,
+            "initialization timed out after 10000 ms",
+            "MCP connection failed for 'x': initialization timed out after 10000 ms",
+        );
+        let text = connect_failure_detail("x", &timeout);
+        assert!(text.contains("timed out after 10000 ms"), "{text}");
+        assert!(text.contains("startup_timeout_sec"), "{text}");
+        assert_eq!(
+            connect_failure_outcome(&timeout),
+            health::AttemptOutcome::TimedOut
+        );
+        let login = client::ConnectFailure::error(
+            client::ConnectFailureKind::AuthRequired,
+            "no OAuth token stored; run `/mcp login x`",
+            "no OAuth token stored; run `/mcp login x`",
+        );
+        assert!(connect_failure_detail("x", &login).contains("/mcp login x"));
+        let other = anyhow::anyhow!("https://host/?token=SECRET");
+        assert_eq!(
+            connect_failure_detail("x", &other),
+            " (credential values omitted)"
+        );
+        assert_eq!(
+            connect_failure_outcome(&other),
+            health::AttemptOutcome::Failed
         );
     }
 
