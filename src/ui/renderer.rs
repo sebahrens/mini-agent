@@ -141,6 +141,8 @@ fn wrap_urls_osc8(text: &str) -> String {
             last = run;
         }
     }
+    // Match offsets are relative to where the scan began, not to `last`, which
+    // advances as URLs are emitted.
     let base = last;
     for m in URL_RE.find_iter(&text[base..]) {
         let (mstart, mend) = (base + m.start(), base + m.end());

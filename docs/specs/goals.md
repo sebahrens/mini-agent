@@ -207,7 +207,7 @@ Enforced in code, never in prompt text.
 | `no_progress_rounds` | 3 | `paused{no_progress}` |
 | `blocked_rounds` | 3 | `blocked` |
 | `wrap_up_max_agent_turns` | 4 | round ends; zero makes the bound exact |
-| `reinject_every` | 6 provider calls | mid-round reminder |
+| `reinject_every` | 6 provider calls | mid-round reminder (on the first tool result after every 6th provider call) |
 | `judge_every` | 5 rounds | drift check |
 
 Active time excludes any stretch spent waiting on a permission prompt: a goal's budget measures how
@@ -224,6 +224,9 @@ way) for the call that returned an answer, parseable or not, on whichever provid
 that failed, was interrupted, or was retried away before a final response reported nothing and adds
 nothing. Tokens, not cost, are what the bound measures, so a judge on a cheaper model counts the
 same per token.
+
+Tokens spent by subagents (`task` children) are not on the parent's event stream and so are not
+counted by `max_tokens` or the `tokens:` line; `max_rounds` and `max_active_secs` still bound the work they do.
 
 The terminal and headless surfaces also charge each judge call to the session's token and cost
 counters, at the judge model's own prices: the session's prices when the judge is the session

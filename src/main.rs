@@ -3,6 +3,7 @@
 mod acp_auth;
 mod agent;
 mod auth;
+mod byte_text;
 mod cli;
 mod config;
 mod context;
@@ -274,6 +275,203 @@ async fn run(cli: cli::Cli) -> anyhow::Result<()> {
     result
 }
 
+/// Run the verification-only `--*-check` flags that need nothing but the
+/// process paths. Returns whether one ran, so the caller exits.
+async fn run_self_check(cli: &cli::Cli, app_paths: &paths::AppPaths) -> anyhow::Result<bool> {
+    if cli.config_preservation_check {
+        config::verify_config_preservation(app_paths)?;
+        println!("config preservation check: PASS");
+        return Ok(true);
+    }
+
+    if cli.project_config_trust_check {
+        config::verify_project_config_trust()?;
+        println!("project config trust check: PASS");
+        return Ok(true);
+    }
+
+    #[cfg(unix)]
+    if cli.memory_editor_preservation_check {
+        ui::slash::verify_memory_editor_preservation()?;
+        println!("memory editor preservation check: PASS");
+        return Ok(true);
+    }
+
+    if cli.resume_provider_safety_check {
+        startup::verify_resume_provider_safety()?;
+        println!("session resume provider safety check: PASS");
+        return Ok(true);
+    }
+
+    if cli.acp_authentication_check {
+        acp_auth::verify_tcp_authentication()?;
+        println!("ACP TCP authentication check: PASS");
+        return Ok(true);
+    }
+
+    if cli.acp_permission_policy_check {
+        startup::heap_future(permission::verify_acp_permission_policy).await?;
+        println!("ACP headless permission policy check: PASS");
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+/// Run the learned-skill operator commands (store-only, plus distillation,
+/// the only one that reaches a provider). Returns whether one ran.
+#[cfg(feature = "skills")]
+async fn run_learned_skill_command(
+    cli: &cli::Cli,
+    cfg: &config::Config,
+    app_paths: &paths::AppPaths,
+) -> anyhow::Result<bool> {
+    // Learned-skill operator commands may launch contained workers.
+    git::global_snapshot::wait_initialized().await;
+    extras::js::skills::operations::set_json_output(cli.learned_skill_json);
+
+    if cli.learned_skill_stats {
+        extras::js::skills::operations::print_skill_stats(app_paths)?;
+        return Ok(true);
+    }
+
+    if cli.list_learned_skill_proposals {
+        extras::js::skills::operations::print_proposal_queue(app_paths)?;
+        return Ok(true);
+    }
+
+    if let Some(proposal_id) = cli.learned_skill_proposal.as_deref() {
+        extras::js::skills::operations::print_proposal(app_paths, proposal_id)?;
+        return Ok(true);
+    }
+
+    if cli.learned_skill_feedback_record.is_some()
+        || cli.list_learned_skill_feedback.is_some()
+        || cli.correct_learned_skill_feedback.is_some()
+    {
+        extras::js::skills::operations::run_feedback_management(
+            cli.learned_skill_feedback_record.as_deref(),
+            cli.list_learned_skill_feedback.as_deref(),
+            cli.learned_skill_feedback_after.as_deref(),
+            cli.correct_learned_skill_feedback.as_deref(),
+            app_paths,
+        )?;
+        return Ok(true);
+    }
+
+    // Distillation is the only learned-skill command that reaches a provider,
+    // so it sits apart from the store-only operator funnel below. It still
+    // writes nothing to the library: its output is a package file the operator
+    // reviews and then hands to `--import-learned-skill`.
+    if let Some(target) = cli.distill_learned_skill.as_deref() {
+        let [session_id, tool_call_id] = target else {
+            anyhow::bail!("--distill-learned-skill takes exactly a session id and a tool call id");
+        };
+        startup::heap_future(|| {
+            extras::js::skills::distill::run(cli, cfg, app_paths, session_id, tool_call_id)
+        })
+        .await?;
+        return Ok(true);
+    }
+
+    if cli.purge_learned_skill.is_some()
+        || cli.compact_learned_skill_events
+        || cli.learned_skill_feedback.is_some()
+        || cli.import_learned_skill.is_some()
+        || cli.install_learned_skill_seeds
+        || cli.approve_learned_skill.is_some()
+        || cli.reject_learned_skill.is_some()
+        || cli.activate_learned_skill.is_some()
+        || cli.promote_learned_skill.is_some()
+        || cli.retire_learned_skill.is_some()
+        || cli.reevaluate_learned_skill.is_some()
+        || cli.list_learned_skill_suites
+        || cli.disable_learned_skill_suite.is_some()
+    {
+        let feedback = cli.learned_skill_feedback.as_deref().map(|skill_id| {
+            extras::js::skills::operations::FeedbackOperation {
+                skill_id,
+                invocation_id: cli.learned_skill_feedback_invocation.as_deref(),
+                kind: cli
+                    .learned_skill_feedback_kind
+                    .as_deref()
+                    .expect("clap requires feedback kind"),
+                reason_code: cli
+                    .learned_skill_feedback_reason
+                    .as_deref()
+                    .expect("clap requires feedback reason"),
+                idempotency_key: cli
+                    .learned_skill_feedback_key
+                    .as_deref()
+                    .expect("clap requires feedback key"),
+            }
+        });
+        let library = cli
+            .import_learned_skill
+            .as_deref()
+            .map(extras::js::skills::operations::LibraryOperation::Import)
+            .or_else(|| {
+                cli.install_learned_skill_seeds
+                    .then_some(extras::js::skills::operations::LibraryOperation::InstallSeeds)
+            })
+            .or_else(|| {
+                cli.approve_learned_skill
+                    .as_deref()
+                    .map(extras::js::skills::operations::LibraryOperation::Approve)
+            })
+            .or_else(|| {
+                cli.reject_learned_skill
+                    .as_deref()
+                    .map(extras::js::skills::operations::LibraryOperation::Reject)
+            })
+            .or_else(|| {
+                cli.activate_learned_skill
+                    .as_deref()
+                    .map(extras::js::skills::operations::LibraryOperation::Activate)
+            })
+            .or_else(|| {
+                cli.promote_learned_skill
+                    .as_deref()
+                    .map(extras::js::skills::operations::LibraryOperation::Promote)
+            })
+            .or_else(|| {
+                cli.retire_learned_skill
+                    .as_deref()
+                    .map(extras::js::skills::operations::LibraryOperation::Retire)
+            })
+            .or_else(|| {
+                cli.reevaluate_learned_skill
+                    .as_deref()
+                    .map(extras::js::skills::operations::LibraryOperation::Reevaluate)
+            })
+            .or_else(|| {
+                cli.list_learned_skill_suites
+                    .then_some(extras::js::skills::operations::LibraryOperation::ListSuites)
+            })
+            .or_else(|| {
+                cli.disable_learned_skill_suite
+                    .as_deref()
+                    .map(extras::js::skills::operations::LibraryOperation::DisableSuite)
+            });
+        let purge = cli.purge_learned_skill.as_deref().map(|skill_id| {
+            extras::js::skills::operations::PurgeOperation {
+                skill_id,
+                force: cli.purge_learned_skill_force,
+            }
+        });
+        extras::js::skills::operations::run(
+            purge,
+            cli.compact_learned_skill_events,
+            feedback,
+            library,
+            app_paths,
+            cfg.embedding.as_ref(),
+        )?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
     if cli.config_schema {
         use std::io::Write as _;
@@ -441,40 +639,7 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    if cli.config_preservation_check {
-        config::verify_config_preservation(&app_paths)?;
-        println!("config preservation check: PASS");
-        return Ok(());
-    }
-
-    if cli.project_config_trust_check {
-        config::verify_project_config_trust()?;
-        println!("project config trust check: PASS");
-        return Ok(());
-    }
-
-    #[cfg(unix)]
-    if cli.memory_editor_preservation_check {
-        ui::slash::verify_memory_editor_preservation()?;
-        println!("memory editor preservation check: PASS");
-        return Ok(());
-    }
-
-    if cli.resume_provider_safety_check {
-        startup::verify_resume_provider_safety()?;
-        println!("session resume provider safety check: PASS");
-        return Ok(());
-    }
-
-    if cli.acp_authentication_check {
-        acp_auth::verify_tcp_authentication()?;
-        println!("ACP TCP authentication check: PASS");
-        return Ok(());
-    }
-
-    if cli.acp_permission_policy_check {
-        startup::heap_future(permission::verify_acp_permission_policy).await?;
-        println!("ACP headless permission policy check: PASS");
+    if run_self_check(&cli, &app_paths).await? {
         return Ok(());
     }
 
@@ -545,7 +710,6 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
     context::agents::set_claude_user_agents(cfg.resolve_claude_user_agents());
     provider::set_provider_timeouts(cfg.provider_timeouts);
     provider::set_cli_fallback_model(cli.fallback_model.clone());
-    models_catalog::spawn_refresh_if_stale(cfg.models_catalog_refresh_days);
     for warning in &cfg.load_warnings[loaded_warning_count..] {
         eprintln!("warning: {warning}");
     }
@@ -586,155 +750,8 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Learned-skill operator commands may launch contained workers.
     #[cfg(feature = "skills")]
-    git::global_snapshot::wait_initialized().await;
-    #[cfg(feature = "skills")]
-    extras::js::skills::operations::set_json_output(cli.learned_skill_json);
-
-    #[cfg(feature = "skills")]
-    if cli.learned_skill_stats {
-        extras::js::skills::operations::print_skill_stats(&app_paths)?;
-        return Ok(());
-    }
-
-    #[cfg(feature = "skills")]
-    if cli.list_learned_skill_proposals {
-        extras::js::skills::operations::print_proposal_queue(&app_paths)?;
-        return Ok(());
-    }
-
-    #[cfg(feature = "skills")]
-    if let Some(proposal_id) = cli.learned_skill_proposal.as_deref() {
-        extras::js::skills::operations::print_proposal(&app_paths, proposal_id)?;
-        return Ok(());
-    }
-
-    #[cfg(feature = "skills")]
-    if cli.learned_skill_feedback_record.is_some()
-        || cli.list_learned_skill_feedback.is_some()
-        || cli.correct_learned_skill_feedback.is_some()
-    {
-        extras::js::skills::operations::run_feedback_management(
-            cli.learned_skill_feedback_record.as_deref(),
-            cli.list_learned_skill_feedback.as_deref(),
-            cli.learned_skill_feedback_after.as_deref(),
-            cli.correct_learned_skill_feedback.as_deref(),
-            &app_paths,
-        )?;
-        return Ok(());
-    }
-
-    // Distillation is the only learned-skill command that reaches a provider,
-    // so it sits apart from the store-only operator funnel below. It still
-    // writes nothing to the library: its output is a package file the operator
-    // reviews and then hands to `--import-learned-skill`.
-    #[cfg(feature = "skills")]
-    if let Some(target) = cli.distill_learned_skill.as_deref() {
-        let [session_id, tool_call_id] = target else {
-            anyhow::bail!("--distill-learned-skill takes exactly a session id and a tool call id");
-        };
-        startup::heap_future(|| {
-            extras::js::skills::distill::run(&cli, &cfg, &app_paths, session_id, tool_call_id)
-        })
-        .await?;
-        return Ok(());
-    }
-
-    #[cfg(feature = "skills")]
-    if cli.purge_learned_skill.is_some()
-        || cli.compact_learned_skill_events
-        || cli.learned_skill_feedback.is_some()
-        || cli.import_learned_skill.is_some()
-        || cli.install_learned_skill_seeds
-        || cli.approve_learned_skill.is_some()
-        || cli.reject_learned_skill.is_some()
-        || cli.activate_learned_skill.is_some()
-        || cli.promote_learned_skill.is_some()
-        || cli.retire_learned_skill.is_some()
-        || cli.reevaluate_learned_skill.is_some()
-        || cli.list_learned_skill_suites
-        || cli.disable_learned_skill_suite.is_some()
-    {
-        let feedback = cli.learned_skill_feedback.as_deref().map(|skill_id| {
-            extras::js::skills::operations::FeedbackOperation {
-                skill_id,
-                invocation_id: cli.learned_skill_feedback_invocation.as_deref(),
-                kind: cli
-                    .learned_skill_feedback_kind
-                    .as_deref()
-                    .expect("clap requires feedback kind"),
-                reason_code: cli
-                    .learned_skill_feedback_reason
-                    .as_deref()
-                    .expect("clap requires feedback reason"),
-                idempotency_key: cli
-                    .learned_skill_feedback_key
-                    .as_deref()
-                    .expect("clap requires feedback key"),
-            }
-        });
-        let library = cli
-            .import_learned_skill
-            .as_deref()
-            .map(extras::js::skills::operations::LibraryOperation::Import)
-            .or_else(|| {
-                cli.install_learned_skill_seeds
-                    .then_some(extras::js::skills::operations::LibraryOperation::InstallSeeds)
-            })
-            .or_else(|| {
-                cli.approve_learned_skill
-                    .as_deref()
-                    .map(extras::js::skills::operations::LibraryOperation::Approve)
-            })
-            .or_else(|| {
-                cli.reject_learned_skill
-                    .as_deref()
-                    .map(extras::js::skills::operations::LibraryOperation::Reject)
-            })
-            .or_else(|| {
-                cli.activate_learned_skill
-                    .as_deref()
-                    .map(extras::js::skills::operations::LibraryOperation::Activate)
-            })
-            .or_else(|| {
-                cli.promote_learned_skill
-                    .as_deref()
-                    .map(extras::js::skills::operations::LibraryOperation::Promote)
-            })
-            .or_else(|| {
-                cli.retire_learned_skill
-                    .as_deref()
-                    .map(extras::js::skills::operations::LibraryOperation::Retire)
-            })
-            .or_else(|| {
-                cli.reevaluate_learned_skill
-                    .as_deref()
-                    .map(extras::js::skills::operations::LibraryOperation::Reevaluate)
-            })
-            .or_else(|| {
-                cli.list_learned_skill_suites
-                    .then_some(extras::js::skills::operations::LibraryOperation::ListSuites)
-            })
-            .or_else(|| {
-                cli.disable_learned_skill_suite
-                    .as_deref()
-                    .map(extras::js::skills::operations::LibraryOperation::DisableSuite)
-            });
-        let purge = cli.purge_learned_skill.as_deref().map(|skill_id| {
-            extras::js::skills::operations::PurgeOperation {
-                skill_id,
-                force: cli.purge_learned_skill_force,
-            }
-        });
-        extras::js::skills::operations::run(
-            purge,
-            cli.compact_learned_skill_events,
-            feedback,
-            library,
-            &app_paths,
-            cfg.embedding.as_ref(),
-        )?;
+    if run_learned_skill_command(&cli, &cfg, &app_paths).await? {
         return Ok(());
     }
 
@@ -772,6 +789,10 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
             return Ok(());
         }
     }
+
+    // Started only once every one-shot command has returned: a network task
+    // would otherwise be spawned and dropped by `--mcp-login`, `--setup`, etc.
+    models_catalog::spawn_refresh_if_stale(cfg.models_catalog_refresh_days);
 
     // Overlap the host sandbox backend probe (a process spawn) with the
     // remaining startup; the later availability check joins its result.

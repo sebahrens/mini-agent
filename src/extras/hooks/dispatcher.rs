@@ -365,6 +365,7 @@ impl HookDispatcher {
         approved_pins: HashMap<HookHandler, HookContentPins>,
     ) -> Result<Self, String> {
         let mut events = HashMap::new();
+        let mut matcher_problems = Vec::new();
         for (event, groups) in config {
             let mut entries = Vec::with_capacity(groups.len());
             for group in groups {
@@ -372,6 +373,11 @@ impl HookDispatcher {
                     Ok(matcher) => matcher,
                     Err(error) => {
                         tracing::warn!("{error}; skipping only this hook matcher group");
+                        // A silent drop would leave the operator believing a
+                        // guard hook runs, so it is also shown at startup.
+                        matcher_problems.push(format!(
+                            "{event}: {error}; that hook matcher group is skipped"
+                        ));
                         continue;
                     }
                 };
@@ -421,7 +427,7 @@ impl HookDispatcher {
             content_pins,
             pinned_normalized,
             fail_closed: None,
-            startup_notices: Vec::new(),
+            startup_notices: matcher_problems,
         })
     }
 
@@ -433,7 +439,7 @@ impl HookDispatcher {
         notices: Vec<String>,
     ) -> Self {
         self.fail_closed = fail_closed;
-        self.startup_notices = notices;
+        self.startup_notices.extend(notices);
         self
     }
 
@@ -912,8 +918,9 @@ impl HookDispatcher {
         // One canonicalize of the project directory per event, shared by all
         // handlers; the next event resolves it afresh.
         let dir_memo = Arc::new(ProjectDirMemo::default());
-        type LabeledRun =
-            std::pin::Pin<Box<dyn std::future::Future<Output = (String, HookOutput)> + Send>>;
+        type LabeledRun = std::pin::Pin<
+            Box<dyn std::future::Future<Output = Option<(String, HookOutput)>> + Send>,
+        >;
         let mut futures: Vec<LabeledRun> = Vec::new();
         for handler in handlers {
             let Some(command) = handler.command.clone() else {
@@ -955,7 +962,7 @@ impl HookDispatcher {
                 let request = async move {
                     let output = super::backend::run_backend_hook(&handler, &body, timeout).await;
                     once_reservation.consume_if_started(&output);
-                    (label, output)
+                    Some((label, output))
                 };
                 if is_async {
                     std::mem::drop(crate::agent::runner::spawn_async_scoped(async move {
@@ -992,7 +999,7 @@ impl HookDispatcher {
                 let request = async move {
                     let output = run_http_hook(&command, &headers, &body, timeout).await;
                     once_reservation.consume_if_started(&output);
-                    (label, output)
+                    Some((label, output))
                 };
                 if handler.is_async {
                     std::mem::drop(crate::agent::runner::spawn_async_scoped(async move {
@@ -1098,80 +1105,77 @@ impl HookDispatcher {
             let policy = HookPolicy::new(handler.trust, &self.sandbox_backend, handler.env.clone())
                 .with_content_pins(self.content_pins_for(handler))
                 .with_project_dir_memo(Arc::clone(&dir_memo));
-            if let Some(condition) = &handler.condition {
-                let cond_timeout = std::time::Duration::from_secs(
-                    handler.timeout.unwrap_or(default_timeout_secs(event)),
-                );
-                let cond_output = crate::startup::heap_future(|| {
-                    run_shell_condition_at_root(
-                        condition,
-                        &stdin,
-                        cond_timeout,
-                        project_dir,
-                        &policy,
-                        execution_root,
-                    )
-                })
-                .await;
-                audit_hook_outcome(event, &command, "condition", handler.trust, &cond_output);
-                match cond_output.status {
-                    HookStatus::TimedOut => {
-                        tracing::warn!(
-                            "hooks: `if` condition for {command:?} timed out; failing closed (running the handler)"
-                        );
-                    }
-                    HookStatus::OutputLimitExceeded(limit) => {
-                        tracing::warn!(
-                            "hooks: `if` condition for {command:?} exceeded its {limit:?} output limit; failing closed (running the handler)"
-                        );
-                    }
-                    HookStatus::Completed | HookStatus::Failed | HookStatus::PolicyDenied => {
-                        match cond_output.exit_code {
-                            Some(0) => {}
-                            Some(_) => continue,
-                            None => {
-                                tracing::warn!(
-                                    "hooks: `if` condition for {command:?} could not be completed; failing closed (running the handler)"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-
-            // A false condition never consumes `once`. Reserve immediately
-            // before launch so concurrent dispatches cannot run the binding
-            // twice, then release only if no child/wrapper was started.
-            let once_key = handler
-                .once
-                .then(|| (event.to_string(), (*handler).clone()));
-            let Some(mut once_reservation) =
-                OnceReservation::reserve(Arc::clone(&self.once_ran), once_key)
-            else {
-                continue;
-            };
-
+            // The `if` condition runs inside the handler's own future, so
+            // conditions and handlers of one event overlap instead of each
+            // condition waiting out its timeout before the next one starts.
+            let condition = handler.condition.clone();
             let timeout = std::time::Duration::from_secs(
                 handler.timeout.unwrap_or(default_timeout_secs(event)),
             );
+            let once_key = handler
+                .once
+                .then(|| (event.to_string(), (*handler).clone()));
+            let once_ran = Arc::clone(&self.once_ran);
             let stdin = stdin.clone();
             let project_dir = project_dir.to_string();
             let execution_root = execution_root.clone();
             let args = handler.args.clone();
-            let diagnostics = policy.diagnostics();
             let trust = handler.trust;
             let audit_event = event.to_string();
-            tracing::info!(
-                event,
-                command = command.as_str(),
-                trust = ?handler.trust,
-                containment = diagnostics.containment,
-                filesystem = diagnostics.filesystem,
-                network = diagnostics.network,
-                "hooks: applying subprocess policy"
-            );
             let label = handler_label(&handler.kind, &command);
             futures.push(Box::pin(async move {
+                if let Some(condition) = &condition {
+                    let cond_output = crate::startup::heap_future(|| {
+                        run_shell_condition_at_root(
+                            condition,
+                            &stdin,
+                            timeout,
+                            &project_dir,
+                            &policy,
+                            &execution_root,
+                        )
+                    })
+                    .await;
+                    audit_hook_outcome(&audit_event, &command, "condition", trust, &cond_output);
+                    match cond_output.status {
+                        HookStatus::TimedOut => {
+                            tracing::warn!(
+                                "hooks: `if` condition for {command:?} timed out; failing closed (running the handler)"
+                            );
+                        }
+                        HookStatus::OutputLimitExceeded(limit) => {
+                            tracing::warn!(
+                                "hooks: `if` condition for {command:?} exceeded its {limit:?} output limit; failing closed (running the handler)"
+                            );
+                        }
+                        HookStatus::Completed | HookStatus::Failed | HookStatus::PolicyDenied => {
+                            match cond_output.exit_code {
+                                Some(0) => {}
+                                Some(_) => return None,
+                                None => {
+                                    tracing::warn!(
+                                        "hooks: `if` condition for {command:?} could not be completed; failing closed (running the handler)"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // A false condition never consumes `once`. Reserve immediately
+                // before launch so concurrent dispatches cannot run the binding
+                // twice, then release only if no child/wrapper was started.
+                let mut once_reservation = OnceReservation::reserve(once_ran, once_key)?;
+                let diagnostics = policy.diagnostics();
+                tracing::info!(
+                    event = audit_event.as_str(),
+                    command = command.as_str(),
+                    trust = ?trust,
+                    containment = diagnostics.containment,
+                    filesystem = diagnostics.filesystem,
+                    network = diagnostics.network,
+                    "hooks: applying subprocess policy"
+                );
                 let output = run_hook_with_policy_at_root(
                     &command,
                     args.as_deref(),
@@ -1184,10 +1188,14 @@ impl HookDispatcher {
                 .await;
                 once_reservation.consume_if_started(&output);
                 audit_hook_outcome(&audit_event, &command, "handler", trust, &output);
-                (label, output)
+                Some((label, output))
             }));
         }
-        futures::future::join_all(futures).await
+        futures::future::join_all(futures)
+            .await
+            .into_iter()
+            .flatten()
+            .collect()
     }
 }
 
@@ -2119,6 +2127,17 @@ mod tests {
         assert!(
             matches!(super::merge_decisions("UserPromptSubmit", &[nested(), output(serde_json::json!({"decision":"block","reason":"blocked"})), flat()]), super::Decision::Block { reason } if reason == "blocked")
         );
+    }
+
+    #[test]
+    fn an_invalid_matcher_regex_is_reported_as_a_startup_notice() {
+        let config: crate::extras::hooks::settings::HooksConfig = serde_json::from_value(
+            serde_json::json!({"PreToolUse": [{"matcher": "(", "hooks": [{"type": "command", "command": "x"}]}]})
+        ).unwrap();
+        let dispatcher = super::HookDispatcher::from_config(&config).unwrap();
+        let notices = dispatcher.startup_notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("invalid matcher regex"), "{notices:?}");
     }
 
     #[test]

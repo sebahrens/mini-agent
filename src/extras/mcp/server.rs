@@ -558,15 +558,7 @@ impl Drop for GroupKillOnDrop {
 }
 
 fn truncate_utf8(text: &mut String, cap: usize) -> bool {
-    if text.len() <= cap {
-        return false;
-    }
-    let mut end = cap;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text.truncate(end);
-    true
+    crate::byte_text::truncate_to_bytes(text, cap)
 }
 
 /// Split the child's `--output json` envelope into answer text and session.

@@ -192,6 +192,9 @@ fn permission_restrictive() -> Option<crate::permission::checker::PermCheck> {
     )))
 }
 
+/// Appended to a result when a PreToolUse hook rewrote the call's input.
+const REWRITE_NOTE: &str = "\n\n[note: a PreToolUse hook rewrote this call's input before it ran]";
+
 #[tokio::test]
 async fn deny_blocks_the_call_with_guard_rail_message() {
     let dispatcher = dispatcher_with("PreToolUse", vec![handler("exit 2")]);
@@ -277,7 +280,10 @@ async fn pre_tool_use_updated_input_is_applied_before_the_inner_call() {
         .call(r#"{"command":"original"}"#.to_string())
         .await
         .unwrap();
-    assert_eq!(result, r#"{"command":"rewritten"}"#);
+    assert_eq!(
+        result,
+        format!(r#"{{"command":"rewritten"}}{REWRITE_NOTE}"#)
+    );
 }
 
 #[tokio::test]
@@ -325,7 +331,10 @@ async fn hook_approval_describes_the_rewritten_call_and_runs_only_when_approved(
                 .unwrap();
             let result = call.await;
             if approve {
-                assert_eq!(result.unwrap(), r#"{"command":"echo rewritten"}"#);
+                assert_eq!(
+                    result.unwrap(),
+                    format!(r#"{{"command":"echo rewritten"}}{REWRITE_NOTE}"#)
+                );
             } else {
                 assert!(
                     result
@@ -804,7 +813,10 @@ async fn a_post_hook_observes_the_arguments_that_actually_ran() {
         .call(r#"{"path":"original-target"}"#.to_string())
         .await
         .unwrap();
-    assert_eq!(result, r#"{"path":"actual-target"}"#);
+    assert_eq!(
+        result,
+        format!(r#"{{"path":"actual-target"}}{REWRITE_NOTE}"#)
+    );
 
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while !marker.exists() {

@@ -96,10 +96,6 @@ impl WorkspaceBinding {
     /// Bounded compatibility data, never a persisted workspace capability.
     /// Check the path size before canonicalization or any owned encoding, and
     /// validate the binding after folding in the already-retained identity.
-    #[allow(
-        dead_code,
-        reason = "shared API is intentionally dormant before its frontend consumer lands"
-    )]
     pub(crate) fn compatibility_fingerprint(&self) -> Result<[u8; 32], String> {
         use sha2::{Digest, Sha256};
         const MAX_ROOT_ENCODING_BYTES: usize = 4 * 1024 * 1024;

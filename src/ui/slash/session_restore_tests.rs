@@ -734,9 +734,7 @@ async fn share_requires_confirmation_before_uploading() {
     );
     assert!(shown.contains("1 tool output,"), "{shown}");
     assert!(
-        shown.contains(&crate::agent::tools::list_dir::format_size(
-            html_bytes as u64
-        )),
+        shown.contains(&crate::byte_text::format_bytes(html_bytes as u64)),
         "{shown}"
     );
     assert!(shown.contains("/share confirm"), "{shown}");

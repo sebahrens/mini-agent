@@ -514,7 +514,13 @@ cyclic provenance fails closed rather than inheriting a local-type exemption. As
 function-item references and raw terminal identifiers are inventoried even when a later indirect
 call has another name. Terminal method identifiers in macro inputs and locally defined
 `macro_rules!` expansion bodies are treated as process terminals unless an exact inventory
-identity classifies the site as non-process. That identity binds the source path, occurrence, and
+identity classifies the site as non-process. The one structural exemption is a *bare* terminal
+spelling (a variable, pattern or field such as `matches!(status.as_u16(), ..)` or
+`assert_eq!(output, ..)`) inside the closed set of std/tokio/tracing argument-evaluating macros
+(`SPLICE_FREE_MACROS` in `src/tests/subprocess_inventory_tests.rs`), because those macros cannot
+splice an identifier into a method position. Qualified calls (`.spawn(`, `Command::status(`) inside
+them stay flagged; a macro nested inside one is judged by its own name; `macro_rules!` bodies are
+never exempt; and a guard test fails if the crate defines or aliases a macro with a listed name. That identity binds the source path, occurrence, and
 SHA-256 of the unambiguously framed full macro-context chain. Each invocation structurally encodes
 the exact path tokens (including root qualification and raw identifier spelling), punctuation
 character and spacing, token-tree kind, nested delimiter, and literal spelling; it never relies on a

@@ -355,7 +355,7 @@ pub(crate) fn share_confirmation(session: &crate::session::Session, html_bytes: 
         "/share uploads this session's full transcript ({}, {} tool output{}, which may include \
          file contents and secrets) as a secret GitHub gist, readable by anyone with the link.\n\
          Run /share confirm to upload it.",
-        crate::agent::tools::list_dir::format_size(html_bytes as u64),
+        crate::byte_text::format_bytes(html_bytes as u64),
         tool_outputs,
         if tool_outputs == 1 { "" } else { "s" },
     )
@@ -389,7 +389,7 @@ async fn handle_share(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<
         ctx.renderer,
         format!(
             "uploading {} to gist.github.com…",
-            crate::agent::tools::list_dir::format_size(html.len() as u64)
+            crate::byte_text::format_bytes(html.len() as u64)
         ),
     );
     match crate::extras::export::share_gist(&filename, &html, &description).await {
@@ -516,6 +516,18 @@ async fn show_busy_sessions(ctx: &mut SlashCtx<'_>, all: bool) -> anyhow::Result
     Ok(())
 }
 
+/// Fewest id characters `/sessions delete` accepts as a prefix.
+const MIN_DELETE_ID_PREFIX: usize = 8;
+
+/// Deleting has no undo, so a unique but vague match (a substring of the name
+/// or a short id prefix) is not enough: the query must be the exact id, the
+/// exact name (case-insensitive) or a long enough id prefix.
+fn delete_query_is_specific(query: &str, session: &crate::session::Session) -> bool {
+    session.id == query
+        || (!session.name.is_empty() && session.name.eq_ignore_ascii_case(query))
+        || (query.len() >= MIN_DELETE_ID_PREFIX && session.id.starts_with(query))
+}
+
 async fn handle_sessions(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     if parts.len() < 2 || parts[1] == "--all" {
         let all = parts.get(1) == Some(&"--all");
@@ -534,6 +546,17 @@ async fn handle_sessions(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
         match crate::session::storage::select_session(prefix, sessions) {
             crate::session::storage::SessionSelection::NoMatch => {
                 write_error(ctx.renderer, format!("no session matching '{}'", prefix));
+            }
+            crate::session::storage::SessionSelection::One(s)
+                if !delete_query_is_specific(prefix, &s) =>
+            {
+                write_error(
+                    ctx.renderer,
+                    format!(
+                        "'{prefix}' is too short to delete a session by; give the exact name or at least {MIN_DELETE_ID_PREFIX} characters of the id"
+                    ),
+                );
+                write_result(ctx.renderer, format_session_line(&s));
             }
             crate::session::storage::SessionSelection::One(s) => {
                 if s.id == ctx.session.id {
@@ -1504,7 +1527,19 @@ mod import_tests {
 
 #[cfg(test)]
 mod session_id_tests {
-    use super::{short_id, validate_imported_session_id};
+    use super::{delete_query_is_specific, short_id, validate_imported_session_id};
+
+    #[test]
+    fn delete_needs_an_exact_name_or_a_long_id_prefix() {
+        let mut session = crate::session::Session::new("p", "m", 1, "");
+        session.id = "123e4567-e89b-12d3-a456-426614174000".into();
+        session.name = "Work".into();
+        assert!(delete_query_is_specific(&session.id, &session));
+        assert!(delete_query_is_specific("work", &session));
+        assert!(delete_query_is_specific("123e4567-e", &session));
+        assert!(!delete_query_is_specific("123", &session));
+        assert!(!delete_query_is_specific("wor", &session));
+    }
 
     #[test]
     fn short_id_is_char_safe_for_short_and_non_ascii_ids() {

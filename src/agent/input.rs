@@ -76,11 +76,7 @@ impl PromptInput {
     pub(crate) fn turn_directive(&self) -> Option<&str> {
         self.turn_directive.as_deref()
     }
-    #[cfg(any(feature = "acp", feature = "multimodal", test))]
-    #[allow(
-        dead_code,
-        reason = "shared API is intentionally dormant before its frontend consumer lands"
-    )]
+    #[cfg(any(feature = "multimodal", test))]
     pub(crate) fn user(user: crate::session::user::PersistedUserMessage) -> Self {
         Self {
             text: user.literal_text(),

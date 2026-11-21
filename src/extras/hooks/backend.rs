@@ -565,7 +565,11 @@ async fn run_model_with_runner(
             .await;
         let reply = match reply {
             Ok((reply, _usage)) => reply,
-            Err(error) => return failed(format!("{kind} hook: model call failed: {error}")),
+            Err(error) => {
+                return failed(format!(
+                    "{kind} hook: model call failed (model `{model}` on provider `{provider}`; a model that is not a quick_models alias is sent as a raw model id): {error}"
+                ));
+            }
         };
         let Some(binding) = binding.as_ref() else {
             return verdict_output(kind, &reply);

@@ -632,14 +632,9 @@ impl SessionHistory {
             // Honour the summarizer's window-scaled byte budget instead of the
             // fixed 16 KiB clamp, and record the tokens removed
             // (mini-agent-sskdu.230, partial).
-            let removed: u64 = self.session.messages[..completed_cut]
-                .iter()
-                .map(|message| message.estimated_tokens)
-                .sum();
-            self.session.compress_with_budget_restoring(
+            self.session.commit_compaction_prefix(
                 output.summary,
                 completed_cut,
-                removed,
                 output.summary_byte_budget,
                 self.limits.restore_read_tokens,
             );
@@ -4820,6 +4815,279 @@ fn native_command_refusal(command: &commands::Command) -> String {
     )
 }
 
+/// The reply to `/goal ...` over ACP and the goal it changed; `Err` is a
+/// terminal error text (the turn is refused, nothing is sent as a message).
+#[cfg(feature = "goal")]
+fn goal_command_line(
+    state: &AcpState,
+    session: &crate::session::Session,
+    goal_store: &crate::extras::goal::GoalStore,
+    arguments: &str,
+) -> Result<Option<String>, &'static str> {
+    use crate::extras::goal::GoalCommand;
+    let arguments = arguments.trim();
+    let command = crate::extras::goal::parse_goal_command(arguments);
+    Ok(if command == GoalCommand::Status {
+        Some(goal_store.snapshot().map_or_else(
+            || "No goal is set.".into(),
+            |goal| crate::ui::slash::goal::render_status(&goal),
+        ))
+    } else if command == GoalCommand::Clear {
+        goal_store.clear();
+        Some("Goal cleared.".into())
+    } else if command == GoalCommand::Pause {
+        Some(
+            goal_store
+                .with_mut(|goal| {
+                    if goal.status.is_running()
+                        && goal.set_status(
+                            crate::extras::goal::GoalStatus::Paused,
+                            Some(crate::extras::goal::PauseReason::UserRequested),
+                        )
+                    {
+                        "Goal paused.".to_string()
+                    } else {
+                        format!("The goal is already {}.", goal.status.label())
+                    }
+                })
+                .unwrap_or_else(|| "No goal to pause.".into()),
+        )
+    } else if matches!(command, GoalCommand::Resume | GoalCommand::Reopen) {
+        let reopen = command == GoalCommand::Reopen;
+        Some(
+            goal_store
+                .with_mut(|goal| {
+                    let done = if reopen { goal.reopen() } else { goal.resume() };
+                    if done {
+                        "Goal active again; send a prompt to continue.".to_string()
+                    } else if reopen {
+                        "Only a goal marked impossible can reopen.".to_string()
+                    } else {
+                        "The goal is final; set a new one with /goal <objective>.".to_string()
+                    }
+                })
+                .unwrap_or_else(|| "No goal to resume.".into()),
+        )
+    } else if let GoalCommand::Bounds(rest) = command {
+        Some(
+            goal_store
+                .with_mut(|goal| {
+                    if rest.is_empty() {
+                        return crate::ui::slash::goal::render_bounds(goal);
+                    }
+                    let mut lines = Vec::new();
+                    for assignment in rest.split_whitespace() {
+                        lines.push(
+                            crate::ui::slash::goal::parse_bound(goal, assignment)
+                                .unwrap_or_else(|error| error),
+                        );
+                    }
+                    // Raising a bound is how a budget stop is answered.
+                    if goal.status == crate::extras::goal::GoalStatus::BudgetLimited
+                        && goal.resume()
+                    {
+                        lines.push("goal active again".into());
+                    }
+                    lines.join("\n")
+                })
+                .unwrap_or_else(|| "No goal to configure.".into()),
+        )
+    } else if let GoalCommand::Check(rest) = command {
+        Some(if rest.is_empty() {
+            "usage: /goal check <command>  |  /goal check clear".to_string()
+        } else {
+            goal_store
+                .with_mut(|goal| {
+                    if rest == "clear" {
+                        goal.checks.clear();
+                        "Checks cleared.".to_string()
+                    } else {
+                        goal.checks.push(crate::extras::goal::GoalCheck::new(rest));
+                        format!("Check added: {rest}")
+                    }
+                })
+                .unwrap_or_else(|| "No goal to add a check to.".into())
+        })
+    } else if let GoalCommand::UnknownWord(word) = command {
+        Some(format!(
+            "Unknown /goal command {word:?}; a new objective needs at least two words."
+        ))
+    } else {
+        let goal = match crate::extras::goal::Goal::configured(
+            arguments.to_string(),
+            Vec::new(),
+            crate::extras::goal::GoalDefaults {
+                cfg: &state.cfg,
+                provider: &session.provider,
+                model: &session.model,
+            },
+        ) {
+            Ok(goal) => goal,
+            Err(_) => {
+                return Err("invalid ACP goal");
+            }
+        };
+        if goal_store.set(goal, false).is_err() {
+            return Err("an unfinished ACP goal already exists");
+        }
+        Some("Goal created.".into())
+    })
+}
+
+/// What a slash command did to the prompt.
+enum CommandFlow {
+    /// The command answered the prompt; return this result.
+    Respond(Result<(), agent_client_protocol::Error>),
+    /// Nothing to answer (`/compact` only arms compaction): run the turn.
+    Continue(PromptReply),
+}
+
+/// Run an ACP slash command against the session. Commands that produce a
+/// reply line answer the prompt themselves; `/compact` falls through to the
+/// turn with the compaction flag armed.
+#[allow(clippy::too_many_arguments)]
+async fn run_command(
+    state: &AcpState,
+    command: &commands::Command,
+    session_id: &SessionId,
+    history: &mut tokio::sync::OwnedMutexGuard<SessionHistory>,
+    #[cfg(feature = "goal")] goal_store: &crate::extras::goal::GoalStore,
+    responder: PromptReply,
+    cx: &ConnectionTo<Client>,
+    registration: &TurnRegistration,
+) -> CommandFlow {
+    let mutates_native_context = match command {
+        commands::Command::Undo | commands::Command::Compact | commands::Command::Rename(_) => true,
+        commands::Command::CompactShow
+        | commands::Command::Model(_)
+        | commands::Command::Effort(_)
+        | commands::Command::Cost => false,
+        #[cfg(feature = "goal")]
+        commands::Command::Goal(arguments) => !arguments.is_empty() && arguments != "status",
+    };
+    if crate::session::native_publication::is_native_bearing(&history.session)
+        && mutates_native_context
+    {
+        return CommandFlow::Respond(respond_terminal_error(
+            registration,
+            responder,
+            native_command_refusal(command),
+        ));
+    }
+    let line = match command {
+        commands::Command::Undo => {
+            let removed = crate::ui::slash::undo_last(&mut history.session);
+            Some(format!(
+                "Removed {removed} conversation records; files and billed usage remain unchanged."
+            ))
+        }
+        commands::Command::Rename(name) => {
+            history.session.name = name.as_str().into();
+            Some(format!("Session renamed to {name}."))
+        }
+        commands::Command::Cost => Some(cost_summary(state, history)),
+        commands::Command::Model(_) | commands::Command::Effort(_) => {
+            let (config_id, argument) = match command {
+                commands::Command::Model(argument) => (model_options::MODEL_CONFIG_ID, argument),
+                commands::Command::Effort(argument) => (model_options::EFFORT_CONFIG_ID, argument),
+                _ => unreachable!("matched above"),
+            };
+            let native = crate::session::native_publication::is_native_bearing(&history.session);
+            let line = if argument.is_empty() {
+                selection_summary(state, session_id, config_id).await
+            } else {
+                let command_value = if config_id == model_options::MODEL_CONFIG_ID {
+                    model_options::command_model_value(argument)
+                } else {
+                    argument.to_owned()
+                };
+                match set_model_override(state, session_id, config_id, &command_value, native).await
+                {
+                    Ok(line) => {
+                        let options = persona_config_options(state, session_id).await;
+                        let _ = cx.send_notification(SessionNotification::new(
+                            session_id.clone(),
+                            SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options)),
+                        ));
+                        line
+                    }
+                    Err(error) => format!("{}: {}", config_id, error.message),
+                }
+            };
+            Some(line)
+        }
+        #[cfg(feature = "goal")]
+        commands::Command::Goal(arguments) => {
+            match goal_command_line(state, &history.session, goal_store, arguments) {
+                Ok(line) => line,
+                Err(message) => {
+                    return CommandFlow::Respond(respond_terminal_error(
+                        registration,
+                        responder,
+                        message.into(),
+                    ));
+                }
+            }
+        }
+        commands::Command::Compact => {
+            history.manual_compact = true;
+            None
+        }
+        commands::Command::CompactShow => Some(compaction_show_text(&history.session)),
+    };
+    if let Some(line) = line {
+        if !registration.control.complete() {
+            return CommandFlow::Respond(respond_terminal(
+                registration,
+                responder,
+                StopReason::Cancelled,
+            ));
+        }
+        if !state.cli.no_session
+            && sessions::checkpoint(history, |notice| {
+                let _ = cx.send_notification(SessionNotification::new(
+                    session_id.clone(),
+                    SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
+                        TextContent::new(format!("warning: {notice}")),
+                    ))),
+                ));
+            })
+            .await
+            .is_err()
+        {
+            return CommandFlow::Respond(respond_terminal_error(
+                registration,
+                responder,
+                "ACP command checkpoint failed; observed progress remains in memory".into(),
+            ));
+        }
+        // `/rename` and `/undo` change what the client shows (title,
+        // context meter): push both now rather than at the next prompt
+        // (mini-agent-8x75g).
+        if matches!(
+            command,
+            commands::Command::Undo | commands::Command::Rename(_)
+        ) {
+            send_usage_update(state, history, session_id, cx);
+            send_session_info(history, session_id, cx);
+        }
+        if let Err(error) = cx.send_notification(SessionNotification::new(
+            session_id.clone(),
+            SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                TextContent::new(line),
+            ))),
+        )) {
+            return CommandFlow::Respond(Err(error));
+        }
+        return CommandFlow::Respond(respond_terminal(
+            registration,
+            responder,
+            StopReason::EndTurn,
+        ));
+    }
+    CommandFlow::Continue(responder)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_prompt(
     state: &AcpState,
@@ -4843,242 +5111,26 @@ async fn run_prompt(
     registration: &TurnRegistration,
 ) -> Result<(), agent_client_protocol::Error> {
     let native_at_start = crate::session::native_publication::is_native_bearing(&history.session);
-    if let Some(command) = command.as_ref() {
-        let mutates_native_context = match command {
-            commands::Command::Undo | commands::Command::Compact | commands::Command::Rename(_) => {
-                true
-            }
-            commands::Command::CompactShow
-            | commands::Command::Model(_)
-            | commands::Command::Effort(_)
-            | commands::Command::Cost => false,
+    let responder = if let Some(command) = command.as_ref() {
+        match run_command(
+            state,
+            command,
+            &session_id,
+            &mut history,
             #[cfg(feature = "goal")]
-            commands::Command::Goal(arguments) => !arguments.is_empty() && arguments != "status",
-        };
-        if crate::session::native_publication::is_native_bearing(&history.session)
-            && mutates_native_context
+            &goal_store,
+            responder,
+            &cx,
+            registration,
+        )
+        .await
         {
-            return respond_terminal_error(
-                registration,
-                responder,
-                native_command_refusal(command),
-            );
+            CommandFlow::Respond(result) => return result,
+            CommandFlow::Continue(responder) => responder,
         }
-        let line = match command {
-            commands::Command::Undo => {
-                let removed = crate::ui::slash::undo_last(&mut history.session);
-                Some(format!(
-                    "Removed {removed} conversation records; files and billed usage remain unchanged."
-                ))
-            }
-            commands::Command::Rename(name) => {
-                history.session.name = name.as_str().into();
-                Some(format!("Session renamed to {name}."))
-            }
-            commands::Command::Cost => Some(cost_summary(state, &history)),
-            commands::Command::Model(_) | commands::Command::Effort(_) => {
-                let (config_id, argument) = match command {
-                    commands::Command::Model(argument) => {
-                        (model_options::MODEL_CONFIG_ID, argument)
-                    }
-                    commands::Command::Effort(argument) => {
-                        (model_options::EFFORT_CONFIG_ID, argument)
-                    }
-                    _ => unreachable!("matched above"),
-                };
-                let native =
-                    crate::session::native_publication::is_native_bearing(&history.session);
-                let line = if argument.is_empty() {
-                    selection_summary(state, &session_id, config_id).await
-                } else {
-                    let command_value = if config_id == model_options::MODEL_CONFIG_ID {
-                        model_options::command_model_value(argument)
-                    } else {
-                        argument.to_owned()
-                    };
-                    match set_model_override(state, &session_id, config_id, &command_value, native)
-                        .await
-                    {
-                        Ok(line) => {
-                            let options = persona_config_options(state, &session_id).await;
-                            let _ = cx.send_notification(SessionNotification::new(
-                                session_id.clone(),
-                                SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options)),
-                            ));
-                            line
-                        }
-                        Err(error) => format!("{}: {}", config_id, error.message),
-                    }
-                };
-                Some(line)
-            }
-            #[cfg(feature = "goal")]
-            commands::Command::Goal(arguments) => {
-                use crate::extras::goal::GoalCommand;
-                let arguments = arguments.trim();
-                let command = crate::extras::goal::parse_goal_command(arguments);
-                if command == GoalCommand::Status {
-                    Some(goal_store.snapshot().map_or_else(
-                        || "No goal is set.".into(),
-                        |goal| crate::ui::slash::goal::render_status(&goal),
-                    ))
-                } else if command == GoalCommand::Clear {
-                    goal_store.clear();
-                    Some("Goal cleared.".into())
-                } else if command == GoalCommand::Pause {
-                    Some(
-                        goal_store
-                            .with_mut(|goal| {
-                                if goal.status.is_running()
-                                    && goal.set_status(
-                                        crate::extras::goal::GoalStatus::Paused,
-                                        Some(crate::extras::goal::PauseReason::UserRequested),
-                                    )
-                                {
-                                    "Goal paused.".to_string()
-                                } else {
-                                    format!("The goal is already {}.", goal.status.label())
-                                }
-                            })
-                            .unwrap_or_else(|| "No goal to pause.".into()),
-                    )
-                } else if matches!(command, GoalCommand::Resume | GoalCommand::Reopen) {
-                    let reopen = command == GoalCommand::Reopen;
-                    Some(
-                        goal_store
-                            .with_mut(|goal| {
-                                let done = if reopen { goal.reopen() } else { goal.resume() };
-                                if done {
-                                    "Goal active again; send a prompt to continue.".to_string()
-                                } else if reopen {
-                                    "Only a goal marked impossible can reopen.".to_string()
-                                } else {
-                                    "The goal is final; set a new one with /goal <objective>."
-                                        .to_string()
-                                }
-                            })
-                            .unwrap_or_else(|| "No goal to resume.".into()),
-                    )
-                } else if let GoalCommand::Bounds(rest) = command {
-                    Some(
-                        goal_store
-                            .with_mut(|goal| {
-                                if rest.is_empty() {
-                                    return crate::ui::slash::goal::render_bounds(goal);
-                                }
-                                let mut lines = Vec::new();
-                                for assignment in rest.split_whitespace() {
-                                    lines.push(
-                                        crate::ui::slash::goal::parse_bound(goal, assignment)
-                                            .unwrap_or_else(|error| error),
-                                    );
-                                }
-                                // Raising a bound is how a budget stop is answered.
-                                if goal.status == crate::extras::goal::GoalStatus::BudgetLimited
-                                    && goal.resume()
-                                {
-                                    lines.push("goal active again".into());
-                                }
-                                lines.join("\n")
-                            })
-                            .unwrap_or_else(|| "No goal to configure.".into()),
-                    )
-                } else if let GoalCommand::Check(rest) = command {
-                    Some(if rest.is_empty() {
-                        "usage: /goal check <command>  |  /goal check clear".to_string()
-                    } else {
-                        goal_store
-                            .with_mut(|goal| {
-                                if rest == "clear" {
-                                    goal.checks.clear();
-                                    "Checks cleared.".to_string()
-                                } else {
-                                    goal.checks.push(crate::extras::goal::GoalCheck::new(rest));
-                                    format!("Check added: {rest}")
-                                }
-                            })
-                            .unwrap_or_else(|| "No goal to add a check to.".into())
-                    })
-                } else if let GoalCommand::UnknownWord(word) = command {
-                    Some(format!(
-                        "Unknown /goal command {word:?}; a new objective needs at least two words."
-                    ))
-                } else {
-                    let goal = match crate::extras::goal::Goal::configured(
-                        arguments.to_string(),
-                        Vec::new(),
-                        crate::extras::goal::GoalDefaults {
-                            cfg: &state.cfg,
-                            provider: &history.session.provider,
-                            model: &history.session.model,
-                        },
-                    ) {
-                        Ok(goal) => goal,
-                        Err(_) => {
-                            return respond_terminal_error(
-                                registration,
-                                responder,
-                                "invalid ACP goal".into(),
-                            );
-                        }
-                    };
-                    if goal_store.set(goal, false).is_err() {
-                        return respond_terminal_error(
-                            registration,
-                            responder,
-                            "an unfinished ACP goal already exists".into(),
-                        );
-                    }
-                    Some("Goal created.".into())
-                }
-            }
-            commands::Command::Compact => {
-                history.manual_compact = true;
-                None
-            }
-            commands::Command::CompactShow => Some(compaction_show_text(&history.session)),
-        };
-        if let Some(line) = line {
-            if !registration.control.complete() {
-                return respond_terminal(registration, responder, StopReason::Cancelled);
-            }
-            if !state.cli.no_session
-                && sessions::checkpoint(&mut history, |notice| {
-                    let _ = cx.send_notification(SessionNotification::new(
-                        session_id.clone(),
-                        SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
-                            TextContent::new(format!("warning: {notice}")),
-                        ))),
-                    ));
-                })
-                .await
-                .is_err()
-            {
-                return respond_terminal_error(
-                    registration,
-                    responder,
-                    "ACP command checkpoint failed; observed progress remains in memory".into(),
-                );
-            }
-            // `/rename` and `/undo` change what the client shows (title,
-            // context meter): push both now rather than at the next prompt
-            // (mini-agent-8x75g).
-            if matches!(
-                command,
-                commands::Command::Undo | commands::Command::Rename(_)
-            ) {
-                send_usage_update(state, &history, &session_id, &cx);
-                send_session_info(&mut history, &session_id, &cx);
-            }
-            cx.send_notification(SessionNotification::new(
-                session_id,
-                SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
-                    TextContent::new(line),
-                ))),
-            ))?;
-            return respond_terminal(registration, responder, StopReason::EndTurn);
-        }
-    }
+    } else {
+        responder
+    };
     #[cfg(all(not(test), feature = "mcp"))]
     let mut mcp_manager: Option<PromptMcp> = None;
     #[cfg(all(test, feature = "mcp"))]
@@ -5757,35 +5809,41 @@ async fn generate_session_title(
     if matches!(client, crate::provider::AnyClient::Anthropic(_)) {
         return;
     }
-    let (mut history, applied) = title_without_history_lock(history, &state.cfg, &client, |job| {
-        crate::startup::heap_future(|| job.run(&state.cfg, false))
-    })
-    .await;
-    if !applied {
+    let (mut history, applied, charged) =
+        title_without_history_lock(history, &state.cfg, &client, |job| {
+            crate::startup::heap_future(|| job.run(&state.cfg, false))
+        })
+        .await;
+    if !charged {
         return;
     }
+    // A failed title still spent tokens that `finish` charged, so persist and
+    // report them; only a stored title changes the session info.
     let _ = sessions::checkpoint(&mut history, |_| {}).await;
-    send_session_info(&mut history, session_id, cx);
+    if applied {
+        send_session_info(&mut history, session_id, cx);
+    }
     send_usage_update(state, &history, session_id, cx);
 }
 
 /// Snapshot the title request under `history`, release the lock while `run`
 /// makes the model call, then re-take it to charge the spend (once) and store
 /// the title if nothing named the session meanwhile. Returns the re-taken
-/// guard and whether a title was stored. Nothing is stored when no title is due.
+/// guard, whether a title was stored, and whether a request ran (and so was
+/// charged). Nothing is stored when no title is due.
 async fn title_without_history_lock<F, Fut>(
     mut history: tokio::sync::OwnedMutexGuard<SessionHistory>,
     cfg: &Config,
     client: &crate::provider::AnyClient,
     run: F,
-) -> (tokio::sync::OwnedMutexGuard<SessionHistory>, bool)
+) -> (tokio::sync::OwnedMutexGuard<SessionHistory>, bool, bool)
 where
     F: FnOnce(crate::session::title::TitleJob) -> Fut,
     Fut: std::future::Future<Output = crate::session::title::TitleOutcome>,
 {
     let Some(job) = crate::session::title::TitleJob::prepare(&mut history.session, cfg, client)
     else {
-        return (history, false);
+        return (history, false, false);
     };
     history.title_in_flight = true;
     let mutex = tokio::sync::OwnedMutexGuard::mutex(&history).clone();
@@ -5794,7 +5852,7 @@ where
     let mut history = mutex.lock_owned().await;
     history.title_in_flight = false;
     let (_, _, applied) = outcome.finish(&mut history.session);
-    (history, applied)
+    (history, applied, true)
 }
 
 /// Judge the goal round this ACP prompt turn was.
@@ -5859,79 +5917,32 @@ async fn settle_acp_goal_round(
     // signal rather than through `TurnControl::cancel`'s success.
     control.begin_verification();
     let outcome = driver::settle_round(store, summary, |request| async move {
-        let (checks, mut interrupted) =
-            crate::extras::goal::checks::run_with_interrupt(&goal, &request, sandbox, cfg, async {
-                control.verification_cancelled().await;
-                Ok(())
-            })
-            .await;
-        // A failing check already decides the claim, so the judge is not asked
-        // for an answer the gate will not read.
-        let checks_rejected = checks.as_ref().is_some_and(|o| !o.all_passed);
-        let judged = match judge {
-            Some(resolved) if request.run_judge && !checks_rejected && !interrupted => {
-                match state
+        // ACP has no interrupt signal of its own and does not charge the judge
+        // to a session: the call is accounted to the turn's run only.
+        driver::run_tiers(
+            driver::TierContext {
+                goal: &goal,
+                request: &request,
+                sandbox,
+                cfg,
+                judge,
+                transcript: &transcript,
+                spend: crate::spend::run::Run::current(),
+                prices: None,
+            },
+            |resolved| {
+                state
                     .provider_clients
                     .get(&state.cli, cfg, &resolved.provider)
-                {
-                    Ok(client) => {
-                        let call = crate::extras::goal::driver::unless_interrupted(
-                            crate::extras::goal::judge::ask_with_transcript_observed(
-                                &goal,
-                                &request,
-                                &resolved,
-                                &client,
-                                &transcript,
-                                cfg,
-                                checks.as_ref(),
-                                crate::spend::run::Run::current().map_or_else(
-                                    Default::default,
-                                    |run| {
-                                        crate::spend::run::UsageObserver::with_run(
-                                            run.for_judge(
-                                                &resolved,
-                                                cfg,
-                                                resolved
-                                                    .same_provider_as_session
-                                                    .then(|| {
-                                                        client.listing_key(&resolved.provider).ok()
-                                                    })
-                                                    .flatten()
-                                                    .as_ref(),
-                                            ),
-                                        )
-                                    },
-                                ),
-                            ),
-                            async {
-                                control.verification_cancelled().await;
-                                Ok(())
-                            },
-                        )
-                        .await;
-                        if call.is_none() {
-                            interrupted = true;
-                        }
-                        call
-                    }
-                    // Fail open, like every other judge failure: an editor
-                    // without a reachable judge still gets its checks.
-                    Err(error) => Some(crate::extras::goal::judge::JudgeCall::unmetered(
-                        crate::extras::goal::gate::JudgeOutcome::Unavailable {
-                            reason: error.to_string(),
-                        },
-                    )),
-                }
-            }
-            _ => None,
-        };
-        driver::Verification {
-            checks,
-            judge_tokens: judged.as_ref().map_or(0, |call| call.tokens),
-            judge: judged.map(|call| call.outcome),
-            interrupted,
-            ..driver::Verification::default()
-        }
+                    .map_err(|error| error.to_string())
+            },
+            async {
+                control.verification_cancelled().await;
+                Ok(())
+            },
+        )
+        .await
+        .verification
     })
     .await;
     control.end_verification();
@@ -6056,6 +6067,85 @@ impl PromptOutcome {
     }
 }
 
+/// The route, session overrides and spend run one ACP turn is admitted on.
+struct TurnSelection {
+    route: persona::TurnRoute,
+    overrides: model_options::Overrides,
+    run: Option<crate::spend::run::Run>,
+}
+
+/// Resolve the turn's model route and admit its run. `Err` is the turn's
+/// failed outcome (an unusable route, a refused image, an exhausted budget).
+async fn select_turn_route(
+    state: &AcpState,
+    session_id: &SessionId,
+    history: &mut SessionHistory,
+    context: &ContextFiles,
+    // The run this turn's requests are accounted to once its route is known.
+    routed_run: &mut Option<crate::spend::run::Run>,
+) -> Result<TurnSelection, PromptOutcome> {
+    // The session prompt's `[prompt_to_model]` route, or the startup
+    // selection when it is unmapped. A route that cannot be initialized
+    // refuses the turn: no other provider is substituted for it.
+    // The session's `model` selection (config option, `/model`) replaces the
+    // prompt's route; `effort` is applied to the agent below.
+    let overrides = state
+        .sessions
+        .lock()
+        .await
+        .get(session_id)
+        .map(|session| session.model_overrides.clone())
+        .unwrap_or_default();
+    let route = match overrides.model.as_deref() {
+        Some(alias) => {
+            if crate::session::native_publication::is_native_bearing(&history.session) {
+                return Err(PromptOutcome::failed(native_model_refusal()));
+            }
+            model_options::route_for(&state.cfg, alias)
+        }
+        None => persona::resolve_route(&state.cli, &state.cfg, context),
+    };
+    let route = match route {
+        Ok(route) => route,
+        Err(error) => return Err(PromptOutcome::failed(error)),
+    };
+    if let Err(error) = persona::check_route(&state.cli, &state.cfg, &route) {
+        return Err(PromptOutcome::failed(error));
+    }
+    history.context_window = state.cfg.resolve_context_window(
+        &route.provider,
+        &route.model,
+        crate::config::quick_models_map(&state.cfg),
+    );
+    // Admission, the ledger receipts, compaction and the cost estimate all use
+    // the model this turn is routed to, not the session's startup model
+    // (mini-agent-1ly5i). The startup route keeps the session's own profile.
+    let rerouted = overrides.model.is_some() || route.mapped.is_some();
+    let run = crate::spend::run::Run::current().map(|run| {
+        if !rerouted {
+            return run;
+        }
+        let selected = overrides
+            .model
+            .as_deref()
+            .or_else(|| route.mapped.as_ref().map(|(_, alias)| alias.as_str()));
+        run.for_routed_turn(&route.provider, &route.model, &state.cfg, selected)
+    });
+    if let Some(run) = &run
+        && run.admit().is_err()
+    {
+        return Err(PromptOutcome::failed(crate::spend::run::BUDGET_STOP.into()));
+    }
+    if rerouted {
+        *routed_run = run.clone();
+    }
+    Ok(TurnSelection {
+        route,
+        overrides,
+        run,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_prompt(
     state: &AcpState,
@@ -6090,61 +6180,14 @@ async fn execute_prompt(
     if let Err(error) = workspace.validate() {
         return Ok(PromptOutcome::failed(error.to_string()));
     }
-    // The session prompt's `[prompt_to_model]` route, or the startup
-    // selection when it is unmapped. A route that cannot be initialized
-    // refuses the turn: no other provider is substituted for it.
-    // The session's `model` selection (config option, `/model`) replaces the
-    // prompt's route; `effort` is applied to the agent below.
-    let overrides = state
-        .sessions
-        .lock()
-        .await
-        .get(&session_id)
-        .map(|session| session.model_overrides.clone())
-        .unwrap_or_default();
-    let route = match overrides.model.as_deref() {
-        Some(alias) => {
-            if crate::session::native_publication::is_native_bearing(&history.session) {
-                return Ok(PromptOutcome::failed(native_model_refusal()));
-            }
-            model_options::route_for(&state.cfg, alias)
-        }
-        None => persona::resolve_route(&state.cli, &state.cfg, &context),
+    let TurnSelection {
+        route,
+        overrides,
+        run,
+    } = match select_turn_route(state, &session_id, history, &context, routed_run).await {
+        Ok(selection) => selection,
+        Err(outcome) => return Ok(outcome),
     };
-    let route = match route {
-        Ok(route) => route,
-        Err(error) => return Ok(PromptOutcome::failed(error)),
-    };
-    if let Err(error) = persona::check_route(&state.cli, &state.cfg, &route) {
-        return Ok(PromptOutcome::failed(error));
-    }
-    history.context_window = state.cfg.resolve_context_window(
-        &route.provider,
-        &route.model,
-        crate::config::quick_models_map(&state.cfg),
-    );
-    // Admission, the ledger receipts, compaction and the cost estimate all use
-    // the model this turn is routed to, not the session's startup model
-    // (mini-agent-1ly5i). The startup route keeps the session's own profile.
-    let rerouted = overrides.model.is_some() || route.mapped.is_some();
-    let run = crate::spend::run::Run::current().map(|run| {
-        if !rerouted {
-            return run;
-        }
-        let selected = overrides
-            .model
-            .as_deref()
-            .or_else(|| route.mapped.as_ref().map(|(_, alias)| alias.as_str()));
-        run.for_routed_turn(&route.provider, &route.model, &state.cfg, selected)
-    });
-    if let Some(run) = &run
-        && run.admit().is_err()
-    {
-        return Ok(PromptOutcome::failed(crate::spend::run::BUDGET_STOP.into()));
-    }
-    if rerouted {
-        *routed_run = run.clone();
-    }
     #[cfg(test)]
     lock_unpoisoned(&state.turn_routes).push(route.clone());
     if let Some(refusal) = image_route_refusal(prompt_input, &route.provider, &route.model) {
@@ -8983,7 +9026,7 @@ mod protocol_tests {
         let guard = history.clone().lock_owned().await;
         let parked = release.clone();
         let task = tokio::spawn(async move {
-            let (guard, applied) =
+            let (guard, applied, _) =
                 title_without_history_lock(guard, &Config::default(), &client, |job| async move {
                     let _ = started_tx.send(());
                     parked.notified().await;

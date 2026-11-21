@@ -30,14 +30,7 @@ const MAX_RECENT_FOREGROUND: usize = 8;
 
 /// Cut `text` to at most `cap` bytes on a char boundary, marking the cut.
 pub(crate) fn clip_bytes(text: &str, cap: usize) -> String {
-    if text.len() <= cap {
-        return text.to_owned();
-    }
-    let mut end = cap.saturating_sub(3);
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}...", &text[..end])
+    crate::byte_text::clip_with_marker(text, cap, "...").into_owned()
 }
 
 /// One child tool call: bounded, display-only.
@@ -2150,7 +2143,6 @@ mod tests {
                 2,
                 4000,
                 1000,
-                0,
                 move |_, _, _, _, _| async move {
                     assert!(
                         inspected.exists(),

@@ -1340,10 +1340,6 @@ impl Session {
         false
     }
 
-    #[allow(
-        dead_code,
-        reason = "shared API is intentionally dormant before its frontend consumer lands"
-    )]
     pub(crate) fn native_js_context(&self) -> crate::provider::NativeJsContext {
         self.native_history
             .as_ref()
@@ -1358,10 +1354,6 @@ impl Session {
         self.native_history.as_ref()
     }
 
-    #[allow(
-        dead_code,
-        reason = "shared API is intentionally dormant before its frontend consumer lands"
-    )]
     pub(crate) fn native_restore_history(
         &self,
         target: native_replay::HistoryProtocol,
@@ -1381,10 +1373,6 @@ impl Session {
     /// The caller owns exact retired-turn settlement. Validate a candidate
     /// snapshot before mutation; importing this data cannot recreate runtime
     /// authority or establish a ready native request on its own.
-    #[allow(
-        dead_code,
-        reason = "shared API is intentionally dormant before its frontend consumer lands"
-    )]
     pub(crate) fn store_native_history(
         &mut self,
         mut history: native_replay::NativeHistory,
@@ -2278,6 +2266,24 @@ impl Session {
         }
     }
 
+    #[cfg(feature = "goal")]
+    /// Count a judge call's tokens as unpriced, including cached and
+    /// cache-creation input for an Anthropic-native judge, the same way for a
+    /// judge with no price and one whose price cannot cost this usage.
+    fn add_unpriced_judge_tokens(&mut self, charge: &crate::extras::goal::judge::JudgeCharge) {
+        self.unpriced_judge_tokens = self
+            .unpriced_judge_tokens
+            .saturating_add(Self::real_input_tokens(
+                charge.anthropic_native,
+                charge.usage.input_tokens,
+                charge.usage.total_tokens,
+                charge.usage.output_tokens,
+                charge.usage.cached_input_tokens,
+                charge.usage.cache_creation_input_tokens,
+            ))
+            .saturating_add(charge.usage.output_tokens);
+    }
+
     /// Charge a goal completion-judge call at the judge model's own prices
     /// (mini-agent-kfsup). Its tokens always join the session totals; with no
     /// known price they add no cost and are counted in
@@ -2303,17 +2309,7 @@ impl Session {
                     )
                     .is_some();
                 if !priced {
-                    self.unpriced_judge_tokens = self
-                        .unpriced_judge_tokens
-                        .saturating_add(Self::real_input_tokens(
-                            charge.anthropic_native,
-                            charge.usage.input_tokens,
-                            charge.usage.total_tokens,
-                            charge.usage.output_tokens,
-                            charge.usage.cached_input_tokens,
-                            charge.usage.cache_creation_input_tokens,
-                        ))
-                        .saturating_add(charge.usage.output_tokens);
+                    self.add_unpriced_judge_tokens(charge);
                 }
                 priced
             }
@@ -2325,12 +2321,7 @@ impl Session {
                     0.0,
                     crate::pricing::CachePrices::default(),
                 );
-                self.unpriced_judge_tokens = self.unpriced_judge_tokens.saturating_add(
-                    charge
-                        .usage
-                        .input_tokens
-                        .saturating_add(charge.usage.output_tokens),
-                );
+                self.add_unpriced_judge_tokens(charge);
                 false
             }
         }
@@ -2795,14 +2786,32 @@ impl Session {
     /// estimator applies the per-message delta in either direction so clearing
     /// an unusually short result cannot make the gate undercount the request.
     pub fn effective_context_tokens_after_tool_result_pruning(&self, keep_recent: usize) -> u64 {
+        self.context_tokens_after_pruning(keep_recent, true)
+    }
+
+    /// As [`Self::effective_context_tokens_after_tool_result_pruning`] but
+    /// ignoring provider calibration, i.e. the figure a calibration reset
+    /// would report. Compare it with a post-reset figure (compaction resets
+    /// calibration) so a before/after "freed" check never mixes a calibrated
+    /// number with a cold estimate.
+    pub fn cold_context_tokens_after_tool_result_pruning(&self, keep_recent: usize) -> u64 {
+        self.context_tokens_after_pruning(keep_recent, false)
+    }
+
+    fn context_tokens_after_pruning(&self, keep_recent: usize, calibrated: bool) -> u64 {
+        let calibrated_tokens = if calibrated {
+            self.calibrated_tokens
+        } else {
+            0
+        };
         let (_, first_live) = self.compacted_context();
         let current_clear = self.live_tool_result_clear_count(first_live, keep_recent);
         let anchor = self.calibrated_msg_count.min(self.messages.len());
-        let mut effective = if self.calibrated_tokens == 0 {
+        let mut effective = if calibrated_tokens == 0 {
             self.overhead_tokens
                 .saturating_add(self.compacted_image_token_estimate())
         } else {
-            self.calibrated_tokens
+            calibrated_tokens
         };
         let mut result_ordinal = 0usize;
 
@@ -2820,7 +2829,7 @@ impl Session {
                 message.estimated_tokens
             };
 
-            if self.calibrated_tokens == 0 || index >= anchor {
+            if calibrated_tokens == 0 || index >= anchor {
                 effective = effective.saturating_add(current_tokens);
             } else if old_pruned != current_pruned {
                 let old_tokens = if old_pruned {
@@ -3342,7 +3351,7 @@ impl Session {
 
     /// Number of leading messages to drain after a compaction whose summarizer
     /// reported `messages_included` summarized messages for a cut of
-    /// `cut_idx`. The summarizer contract (`provider::compress_messages`)
+    /// `cut_idx`. The summarizer contract (`provider::AnyClient::compress_messages_observed_with_timeout`)
     /// counts an oldest prefix of the cut slice, so with full coverage this is
     /// `cut_idx`; a partial count drains only the summarized prefix and leaves
     /// the unsummarized remainder for a later pass. Zero is an error because
@@ -3364,11 +3373,7 @@ impl Session {
             .map(|c| c.prose.as_ref().unwrap_or(&c.summary).to_string())
     }
 
-    pub fn compaction_input(
-        &self,
-        cut_idx: usize,
-        _keep_recent_tool_results: usize,
-    ) -> (usize, Vec<SessionMessage>) {
+    pub fn compaction_input(&self, cut_idx: usize) -> (usize, Vec<SessionMessage>) {
         let skipped = match self.compacted_context() {
             (Some(_), 1) if cut_idx > 1 => 1,
             _ => 0,
@@ -3386,6 +3391,63 @@ impl Session {
             anyhow::bail!("compaction summarized no messages; nothing to drain");
         }
         Ok(drain)
+    }
+
+    /// Replaces `messages[..first_kept_index]` with `summary`, re-attaching
+    /// recent file windows within `restore_read_tokens`, and returns the
+    /// estimated tokens the replaced prefix held. The one commit step shared
+    /// by the TUI, headless and ACP compaction drivers.
+    pub(crate) fn commit_compaction_prefix(
+        &mut self,
+        summary: String,
+        first_kept_index: usize,
+        summary_byte_budget: usize,
+        restore_read_tokens: u64,
+    ) -> u64 {
+        let tokens_before: u64 = self.messages[..first_kept_index]
+            .iter()
+            .map(|message| message.estimated_tokens)
+            .sum();
+        self.compress_with_budget_restoring(
+            summary,
+            first_kept_index,
+            tokens_before,
+            summary_byte_budget,
+            restore_read_tokens,
+        );
+        tokens_before
+    }
+
+    /// Commits a summarizer result for the cut `messages[..cut_idx]` whose
+    /// input began after `skipped` leading messages (see
+    /// [`compaction_input`](Self::compaction_input)). The summarizer's
+    /// `messages_included` is the length of the oldest prefix of the cut slice
+    /// it saw; exactly that prefix is drained, so unsummarized history is
+    /// never discarded and summarized history never lingers to re-trigger
+    /// compaction. `stage_summary` observes the summary and drain length
+    /// before the session is mutated. Returns the drain length and the
+    /// estimated tokens it removed.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_summarized_cut(
+        &mut self,
+        skipped: usize,
+        cut_idx: usize,
+        summary: String,
+        summary_byte_budget: usize,
+        messages_included: usize,
+        restore_read_tokens: u64,
+        stage_summary: impl FnOnce(&str, usize),
+    ) -> anyhow::Result<(usize, u64)> {
+        let first_kept_index =
+            skipped + Self::compaction_drain_len(cut_idx - skipped, messages_included)?;
+        stage_summary(&summary, first_kept_index);
+        let tokens_before = self.commit_compaction_prefix(
+            summary,
+            first_kept_index,
+            summary_byte_budget,
+            restore_read_tokens,
+        );
+        Ok((first_kept_index, tokens_before))
     }
 }
 
@@ -3664,6 +3726,41 @@ mod shell_interaction_tests {
 #[cfg(test)]
 mod preflight_tests {
     use super::*;
+
+    #[test]
+    fn cold_context_tokens_ignore_provider_calibration() {
+        let mut session = Session::new("openai", "big", 128_000, "");
+        session.add_message(MessageRole::User, "hello there");
+        let cold = session.cold_context_tokens_after_tool_result_pruning(3);
+        session.calibrated_tokens = 50_000;
+        session.calibrated_msg_count = session.messages.len();
+        assert_eq!(
+            session.cold_context_tokens_after_tool_result_pruning(3),
+            cold
+        );
+        assert!(session.effective_context_tokens_after_tool_result_pruning(3) >= 50_000);
+    }
+
+    #[cfg(feature = "goal")]
+    #[test]
+    fn unpriced_native_judge_tokens_include_cached_input() {
+        let mut session = Session::new("anthropic", "big", 128_000, "");
+        let charge = crate::extras::goal::judge::JudgeCharge {
+            usage: crate::event::UsageDelta {
+                input_tokens: 1_000,
+                output_tokens: 100,
+                total_tokens: 1_600,
+                cached_input_tokens: 500,
+                ..crate::event::UsageDelta::default()
+            },
+            anthropic_native: true,
+            prices: None,
+            cache_prices: crate::pricing::CachePrices::default(),
+            model: "anthropic/judge".into(),
+        };
+        assert!(!session.charge_judge_call(&charge));
+        assert_eq!(session.unpriced_judge_tokens, 1_600);
+    }
 
     /// Judge calls are charged at the judge model's prices; an unknown price
     /// records the tokens without cost and counts them (mini-agent-kfsup).

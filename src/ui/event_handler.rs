@@ -956,90 +956,37 @@ async fn start_goal_verification(
         let cancelled = futures::FutureExt::shared(async move {
             let _ = cancelled.await;
         });
-        let (checks, mut interrupted) = crate::spend::run::scope(
-            Some(spend.clone()),
-            crate::extras::goal::checks::run_with_interrupt(&goal, &request, &sandbox, &cfg, {
-                let cancelled = cancelled.clone();
-                async move {
-                    cancelled.await;
-                    Ok(())
-                }
-            }),
+        // The judge is cancelled like a check: an interrupt or a `/goal pause`
+        // while it waits on its provider abandons the request rather than
+        // letting it run to an ignored verdict (mini-agent-4teup).
+        let tiers = crate::extras::goal::driver::run_tiers(
+            crate::extras::goal::driver::TierContext {
+                goal: &goal,
+                request: &request,
+                sandbox: &sandbox,
+                cfg: &cfg,
+                judge,
+                transcript: &transcript,
+                spend: Some(spend),
+                prices: Some((session_prices, session_cache_prices)),
+            },
+            |_| Ok(client.clone()),
+            async move {
+                cancelled.await;
+                Ok(())
+            },
         )
         .await;
-        // A failing check already decides the claim, and the gate returns
-        // before it looks at the judge: asking anyway spends a model call on
-        // an answer nobody reads.
-        let checks_rejected = checks.as_ref().is_some_and(|o| !o.all_passed);
-        let mut judge_charge = None;
-        let judged = match judge {
-            Some(resolved) if request.run_judge && !checks_rejected && !interrupted => {
-                // The judge is cancelled like a check: an interrupt or a
-                // `/goal pause` while it waits on its provider abandons the
-                // request rather than letting it run to an ignored verdict
-                // (mini-agent-4teup).
-                let observed = crate::spend::run::UsageObserver::with_run(
-                    spend.for_judge(
-                        &resolved,
-                        &cfg,
-                        resolved
-                            .same_provider_as_session
-                            .then(|| client.listing_key(&resolved.provider).ok())
-                            .flatten()
-                            .as_ref(),
-                    ),
-                );
-                let verdict = crate::extras::goal::driver::unless_interrupted(
-                    crate::extras::goal::judge::ask_with_transcript_observed(
-                        &goal,
-                        &request,
-                        &resolved,
-                        &client,
-                        &transcript,
-                        &cfg,
-                        checks.as_ref(),
-                        observed.clone(),
-                    ),
-                    async move {
-                        cancelled.await;
-                        Ok(())
-                    },
-                )
-                .await;
-                interrupted = verdict.is_none();
-                let verdict = Some(verdict.unwrap_or_else(|| {
-                    crate::extras::goal::judge::JudgeCall::interrupted_with_usage(
-                        &cfg,
-                        &resolved.provider,
-                        &observed,
-                    )
-                }));
-                judge_charge = verdict.as_ref().and_then(|call| {
-                    call.charge(
-                        &resolved,
-                        &cfg,
-                        crate::extras::goal::judge::judge_prices_with_cache_prices(
-                            &resolved,
-                            &cfg,
-                            session_prices,
-                            session_cache_prices,
-                        ),
-                        session_cache_prices,
-                    )
-                });
-                verdict
-            }
-            _ => None,
-        };
+        let verification = tiers.verification;
         let _ = tx
             .send(UserEvent::GoalVerificationDone(Box::new(
                 crate::event::GoalVerificationEvent {
                     operation_id,
-                    checks,
-                    judge_tokens: judged.as_ref().map_or(0, |call| call.tokens),
-                    judge_charge,
-                    judge: judged.map(|call| call.outcome),
-                    interrupted,
+                    checks: verification.checks,
+                    judge_tokens: verification.judge_tokens,
+                    judge_charge: tiers.judge_charge,
+                    judge: verification.judge,
+                    interrupted: verification.interrupted,
                 },
             )))
             .await;
@@ -1281,40 +1228,23 @@ async fn finish_goal_round(
                 Some(max_turns) => rebuilt.with_max_agent_turns(max_turns),
                 None => rebuilt.clone(),
             };
-            #[cfg(feature = "agent-skills")]
-            let round_agent = round_agent.with_instruction_turn(run.instruction_turn.clone());
-            let budget_carry = run.fresh_budget_carry();
-            let paused = round_agent
-                .with_main_session(ui.cfg, ui.session)
-                .with_spend_for_session(ui.session, ui.cfg, crate::spend::RequestKind::Turn)
-                .with_file_checkpoints(ui.session.file_checkpoints.recorder(
-                    &ui.session.id,
-                    ui.session.messages.len(),
-                    ui.cli.no_session,
-                ))
-                .with_question_turn(run.question_turn.clone())
-                .with_budget_carry(budget_carry)
-                .spawn_runner_paused(
-                    relaunch.prompt,
-                    history,
-                    ui.cfg.retry.clone(),
-                    #[cfg(feature = "hooks")]
-                    None,
-                )
-                .await;
+            let checkpoint_index = ui.session.messages.len();
+            let paused = super::build_paused_main_runner(
+                ui,
+                run,
+                round_agent,
+                relaunch.prompt,
+                history,
+                checkpoint_index,
+            )
+            .await;
             #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
             let mut paused = paused;
             #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
             super::adopt_runner_hook_context(&mut paused, run.pending_turn.as_mut(), ui.session);
             let runner = paused.start_interactive();
-            run.compaction_decision_tx = runner.compaction_decision_tx;
-            run.agent_rx = Some(runner.event_rx);
-            run.main_abort = Some(runner.abort_handle);
-            run.is_running = true;
+            super::adopt_started_runner(run, ui.status_signals.as_ref(), runner);
             run.goal_round = Some(driver::RoundCollector::new());
-            if let Some(signals) = ui.status_signals.as_ref() {
-                signals.send_start();
-            }
             Ok(true)
         }
     }

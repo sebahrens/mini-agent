@@ -163,8 +163,13 @@ pub(crate) fn resolve_images(
                 .map_err(|error| format!("{name}: {error}"))?
             }
         };
-        crate::extras::multimodal::fit_image_attachment(&mut attachment)
-            .map_err(|error| format!("{name}: {error}"))?;
+        if let Some(note) = crate::extras::multimodal::fit_image_attachment(&mut attachment)
+            .map_err(|error| format!("{name}: {error}"))?
+        {
+            // The TUI shows the downscale note; a headless run says it on
+            // stderr so stdout stays machine-readable.
+            eprintln!("{name}: {note}");
+        }
         if let Attachment::Image { data, .. } = &attachment {
             total = total.saturating_add(data.len());
             if data.len() > MAX_USER_IMAGE_BYTES || total > MAX_USER_IMAGE_TOTAL {

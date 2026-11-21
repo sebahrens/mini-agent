@@ -36,6 +36,10 @@ pub(crate) const MCP_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bound on a complete `tools/list` enumeration for one server, including
 /// every paginated page.
 pub(crate) const MCP_LIST_TOOLS_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bound on one prompts/resources discovery pass. Deliberately short and fixed
+/// (not `startup_timeout_sec` / `list_timeout`): it runs off the connect path,
+/// and a slow catalogue only stays empty until the next refresh.
+pub(crate) const MCP_AUXILIARY_LIST_TIMEOUT: Duration = Duration::from_secs(3);
 /// Cap on `tools/list` pages so a server that keeps returning a cursor cannot
 /// spin the enumeration loop forever within the time budget.
 pub(crate) const MCP_LIST_TOOLS_MAX_PAGES: usize = 64;
@@ -1304,7 +1308,7 @@ impl McpClientHandle {
         self.auxiliary
             .ensure(
                 &super::catalogue::RpcClient::capture(self),
-                Duration::from_secs(3),
+                MCP_AUXILIARY_LIST_TIMEOUT,
             )
             .await;
     }
@@ -1322,7 +1326,7 @@ impl McpClientHandle {
         let cache = Arc::clone(&self.auxiliary);
         let client = super::catalogue::RpcClient::capture(self);
         tokio::spawn(async move {
-            cache.ensure(&client, Duration::from_secs(3)).await;
+            cache.ensure(&client, MCP_AUXILIARY_LIST_TIMEOUT).await;
         });
     }
 
@@ -1340,7 +1344,7 @@ impl McpClientHandle {
             self.auxiliary
                 .ensure(
                     &super::catalogue::RpcClient::capture(self),
-                    Duration::from_secs(3),
+                    MCP_AUXILIARY_LIST_TIMEOUT,
                 )
                 .await;
         }

@@ -493,6 +493,46 @@ fn validate_process_creation_raw_inventory_with_non_process(
     }
 }
 
+/// Macros that only evaluate or format their arguments. None of them can build
+/// a method call from an identifier argument (the way a local `macro_rules!`
+/// can with `$object.$method()`), so a bare `spawn` / `output` / `status` in
+/// their tokens is a variable, pattern or field name and not process authority.
+/// Qualified calls (`.spawn(`, `Command::status(`) inside them stay flagged, and
+/// a macro nested inside one of them is judged on its own name.
+/// `splice_free_macro_names_are_not_redefined_by_the_crate` fails closed if the
+/// crate ever defines a macro with one of these names.
+const SPLICE_FREE_MACROS: &[&str] = &[
+    "assert",
+    "assert_eq",
+    "assert_ne",
+    "debug_assert",
+    "debug_assert_eq",
+    "debug_assert_ne",
+    "matches",
+    "format",
+    "format_args",
+    "write",
+    "writeln",
+    "print",
+    "println",
+    "eprint",
+    "eprintln",
+    "panic",
+    "unreachable",
+    "todo",
+    "unimplemented",
+    "vec",
+    "dbg",
+    "select",
+    "join",
+    "try_join",
+    "trace",
+    "debug",
+    "info",
+    "warn",
+    "error",
+];
+
 fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
     fn normalized_ident(ident: &proc_macro2::Ident) -> String {
         let spelling = ident.to_string();
@@ -689,12 +729,46 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
                 && resolved.get(1).is_none_or(|segment| segment != "process"))
     }
 
+    /// Whether the macro whose `!` is at `bang_index` is a [`SPLICE_FREE_MACROS`]
+    /// member called by its bare name or through `std`/`core`/`tokio`/`tracing`.
+    /// Any other path (`$crate::`, a local module, a metavariable prefix) is not.
+    fn is_splice_free_invocation(tokens: &[TokenTree], bang_index: usize) -> bool {
+        let colon =
+            |token: &TokenTree| matches!(token, TokenTree::Punct(punct) if punct.as_char() == ':');
+        let Some(mut cursor) = bang_index.checked_sub(1) else {
+            return false;
+        };
+        let TokenTree::Ident(name) = &tokens[cursor] else {
+            return false;
+        };
+        if !SPLICE_FREE_MACROS.contains(&normalized_ident(name).as_str()) {
+            return false;
+        }
+        while cursor >= 3
+            && colon(&tokens[cursor - 1])
+            && colon(&tokens[cursor - 2])
+            && let TokenTree::Ident(segment) = &tokens[cursor - 3]
+        {
+            if !matches!(
+                normalized_ident(segment).as_str(),
+                "std" | "core" | "tokio" | "tracing"
+            ) {
+                return false;
+            }
+            cursor -= 3;
+        }
+        // A leading `::` is fine; `$` (a metavariable prefix) is not.
+        !(cursor >= 1
+            && matches!(&tokens[cursor - 1], TokenTree::Punct(punct) if punct.as_char() == '$'))
+    }
+
     fn scan(
         stream: TokenStream,
         provenance: &SourceProvenance,
         calls: &mut Vec<TerminalCall>,
         macro_context: Option<MacroContext>,
         macro_occurrences: &mut BTreeMap<String, usize>,
+        splice_free: bool,
     ) {
         fn is_macro_rules_body(tokens: &[TokenTree], index: usize) -> bool {
             matches!(index.checked_sub(3).and_then(|i| tokens.get(i)), Some(TokenTree::Ident(ident)) if normalized_ident(ident) == "macro_rules")
@@ -714,6 +788,13 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
                 let macro_rules_body = is_macro_rules_body(&tokens, index);
                 let begins_macro = matches!(macro_arguments, Some(TokenTree::Punct(punct)) if punct.as_char() == '!')
                     || macro_rules_body;
+                let group_splice_free = if macro_rules_body {
+                    false
+                } else if begins_macro {
+                    splice_free && is_splice_free_invocation(&tokens, index - 1)
+                } else {
+                    splice_free
+                };
                 let group_context = if begins_macro {
                     let digest = macro_digest(
                         &tokens,
@@ -737,6 +818,7 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
                     calls,
                     group_context,
                     macro_occurrences,
+                    group_splice_free,
                 );
             }
             let TokenTree::Ident(ident) = token else {
@@ -744,7 +826,8 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
             };
             let name = normalized_ident(ident);
             let qualified = is_method_or_ufcs(&tokens, index);
-            let macro_method_ident = macro_context.is_some() && !qualified;
+            // A bare identifier in a splice-free macro is data, not a method name.
+            let macro_method_ident = macro_context.is_some() && !qualified && !splice_free;
             if !is_terminal(&name) || (!qualified && !macro_method_ident) {
                 continue;
             }
@@ -780,7 +863,14 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
     let stream = TokenStream::from_str(source)
         .map_err(|error| format!("Rust source did not tokenize: {error}"))?;
     let mut calls = Vec::new();
-    scan(stream, &provenance, &mut calls, None, &mut BTreeMap::new());
+    scan(
+        stream,
+        &provenance,
+        &mut calls,
+        None,
+        &mut BTreeMap::new(),
+        true,
+    );
     calls.sort_by_key(|call| call.line);
     Ok(calls)
 }
@@ -791,60 +881,6 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
 /// the inventory to source line numbers.
 const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     // perf 2026-10-19: test assertions over returned tool output strings.
-    (
-        "src/extras/hooks/subprocess.rs",
-        "output.started,",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/hooks/subprocess.rs",
-        "String::from_utf8_lossy(&output.stderr)",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/session/mod.rs",
-        "format_truncated_tool_output_with_notice(&output, len, \"n\"),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/session/mod.rs",
-        "reference(&output, len, \"n\"),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/grep.rs",
-        "assert!(output.contains(expected), \"{pattern}: {output}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/grep.rs",
-        "assert!(!output.contains(\"b.txt\"), \"{pattern}: {output}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/read.rs",
-        "assert!(output.contains(\"line 19997 \"), \"{output}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/read.rs",
-        "assert!(output.contains(\"line 19998 \"), \"{output}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/read.rs",
-        "assert!(!output.contains(\"line 19996 \"), \"{output}\");",
-        1,
-        "NON-PROCESS",
-    ),
     // perf 2026-10-19: test-only kill/status, thread spawns and a signature type.
     ("src/extras/acp/mod.rs", ".status()", 1, "TEST-ONLY"),
     // perf 2026-10-19: test-only kill/status, thread spawns and a signature type.
@@ -1330,24 +1366,6 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/agent/tools/web_http.rs",
         "let status = response.status().as_u16();",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/js/host.rs",
-        "assert_eq!(output.status, CommandStatus::Completed);",
-        3,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/js/host.rs",
-        "assert_eq!(output.stdout, b\"approved\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/js/host.rs",
-        "assert_eq!(output.stdout, b\"elf-snapshot\");",
         1,
         "NON-PROCESS",
     ),
@@ -2101,73 +2119,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
 const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     // Native NTSTATUS conversion assertion: `status` is input data, never
     // a process method. The complete reviewed macro digest is pinned below.
-    (
-        "src/agent/tools/find_files.rs",
-        "assert_eq!(nt_error(status).kind(), std::io::ErrorKind::NotFound);",
-        1,
-        "NON-PROCESS",
-    ),
     // Exact capture/JSON data tokens within the reviewed full macro digests.
-    (
-        "src/extras/mcp/headers_helper.rs",
-        "status = child.inner_mut().wait() => {",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/mcp/headers_helper.rs",
-        "Ok((read, output)) => (read, output, Some(status)),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/mcp/headers_helper.rs",
-        "Err(_) => (Err(std::io::Error::other(\"MCP helper output did not retire\")), Vec::new(), Some(status)),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/mcp/headers_helper.rs",
-        "(read, output) = &mut read => {",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/mcp/headers_helper.rs",
-        "let status = if output.len() > MAX_OUTPUT_BYTES || read.is_err() { None } else { Some(child.inner_mut().wait().await) };",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/mcp/headers_helper.rs",
-        "(read, output, status)",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/mcp/server.rs",
-        "status = child.inner_mut().wait() => {",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/mcp/server.rs",
-        "Ok((stdout, stderr)) => (stdout, stderr, status),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/mcp/server.rs",
-        "let status = child.inner_mut().wait().await;",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/mcp/server.rs",
-        "(stdout, stderr, status)",
-        1,
-        "NON-PROCESS",
-    ),
     (
         "src/git/tool.rs",
         "\"path_records\": parse_status_paths(&output.stdout, truncated),",
@@ -2175,280 +2127,9 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     // Wakeup tool and App /cron assertions inspect returned or rendered strings.
-    (
-        "src/agent/tools/schedule_wakeup.rs",
-        "assert!(output.contains(\"in 60s (clamped from 5s)\"), \"{output}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/schedule_wakeup.rs",
-        "output.contains(\"in 3600s (clamped from 99999s)\"),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/ui/cron_app_tests.rs",
-        "output.contains(\"⟳ cron c2 (every 1m): check the deploy\"),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/ui/cron_app_tests.rs",
-        "assert!(!output.contains(\"> check the deploy\"), \"{output}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/ui/cron_app_tests.rs",
-        "output.matches(\"schedule(s) suspended and kept\").count(),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/ui/cron_app_tests.rs",
-        "assert!(output.contains(\"cron: USD budget reached; 2 schedule(s)\"));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/ui/cron_app_tests.rs",
-        "assert!(output.contains(\"⟳ cron c1 (self-paced): watch ci\"), \"{output}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/ui/cron_app_tests.rs",
-        "output.contains(\"⟳ cron c1: next wakeup in 1m · owned reason\"),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/ui/cron_app_tests.rs",
-        "assert!(output.contains(\"⟳ cron c1 (every 1m): /jobs\"), \"{output}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/ui/cron_app_tests.rs",
-        "output.contains(\"no background jobs in this session\"),",
-        1,
-        "NON-PROCESS",
-    ),
     // Exact native-result and compact-status assertion identifiers are data.
-    (
-        "src/sandbox/general_profile.rs",
-        "assert_eq!(output.status, CommandStatus::Completed);",
-        2,
-        "NON-PROCESS",
-    ),
-    (
-        "src/sandbox/general_profile.rs",
-        "output.exit_status.is_some_and(|status| status.success()),",
-        4,
-        "NON-PROCESS",
-    ),
-    (
-        "src/sandbox/general_profile.rs",
-        "output.exit_status,",
-        3,
-        "NON-PROCESS",
-    ),
-    (
-        "src/sandbox/general_profile.rs",
-        "String::from_utf8_lossy(&output.stderr)",
-        4,
-        "NON-PROCESS",
-    ),
-    (
-        "src/sandbox/general_profile.rs",
-        "assert_eq!(output.stdout, b\"PROFILE100_NATIVE_PASS\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/sandbox/general_profile.rs",
-        "assert_eq!(output.stdout, b\"HOME24W5S_WORKSPACE\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/sandbox/general_profile.rs",
-        "assert_eq!(output.stdout, b\"HOME24W5S_HOST_READ\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/subagents/task_tool.rs",
-        "assert!(status.len() <= budget);",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/subagents/task_tool.rs",
-        "assert!(status.ends_with(']') || status.ends_with(\"]\\n\"));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/subagents/task_tool.rs",
-        "assert_eq!(status, AGGREGATE_TRUNCATION_MARKER);",
-        1,
-        "NON-PROCESS",
-    ),
     // Native persisted-result CompactString payload, not process output.
-    (
-        "src/agent/tools/web_fetch.rs",
-        "assert_eq!(output.as_str(), page);",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/js/host.rs",
-        "assert_eq!(output.stdout, b\"/workspace is literal output, not a replacement token\\nNATIVE_REAL_PATH_PASSSNAPSHOT_IMAGE_PASS\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/js/host.rs",
-        "String::from_utf8_lossy(&output.stderr)",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/js/host.rs",
-        "output.exit_status.is_some_and(|status| status.success()),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/sandbox/linux_workspace_tests.rs",
-        "assert_eq!(output.status, CommandStatus::Cancelled);",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/sandbox/linux_workspace_tests.rs",
-        "assert_eq!(output.status, CommandStatus::Completed);",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/sandbox/linux_workspace_tests.rs",
-        "output.stdout,",
-        3,
-        "NON-PROCESS",
-    ),
-    (
-        "src/sandbox/linux_workspace_tests.rs",
-        "output.exit_status.is_some_and(|status| status.success()),",
-        2,
-        "NON-PROCESS",
-    ),
-    (
-        "src/sandbox/linux_workspace_tests.rs",
-        "String::from_utf8_lossy(&output.stderr)",
-        3,
-        "NON-PROCESS",
-    ),
-    (
-        "src/sandbox/linux_workspace_tests.rs",
-        "output.status,",
-        1,
-        "NON-PROCESS",
-    ),
     // Assertions inspect already-owned Git stdout/stderr/status; never launch methods.
-    (
-        "src/git/global_snapshot.rs",
-        "assert_eq!(output.stdout, b\"retained@example.invalid\\n\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/git/global_snapshot.rs",
-        "assert_eq!(output.stdout, b\"approved\\n\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/git/global_snapshot.rs",
-        "output.stdout, b\"local preference\\n\",",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/git/global_snapshot.rs",
-        "assert_eq!(output.stdout, b\"https://example.invalid/repo\\n\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/git/global_snapshot.rs",
-        "assert_eq!(output.stdout, b\"ordinary\\n\");",
-        1,
-        "NON-PROCESS",
-    ),
-    ("src/git/runner.rs", "output.status,", 1, "NON-PROCESS"),
-    (
-        "src/git/runner.rs",
-        "String::from_utf8_lossy(&output.stderr)",
-        2,
-        "NON-PROCESS",
-    ),
-    (
-        "src/git/runner.rs",
-        "output.exit_status.is_some_and(|status| status.success()),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/git/runner.rs",
-        "assert_eq!(output.status, CommandStatus::Completed);",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/git/runner.rs",
-        "assert!(output.exit_status.is_some_and(|status| !status.success()));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/git/runner.rs",
-        "assert!(output.exit_status.is_some_and(|status| status.success()));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/git/runner.rs",
-        "assert_eq!(output.stdout, b\"ordinary\\n\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/git/windows_runtime_tests.rs",
-        "assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), value);",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/subagents/task_tool.rs",
-        "output: Ok(\"old retired\".into()),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/subagents/task_tool.rs",
-        "output: Ok(\"next retired\".into()),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/auth/oauth.rs",
-        "if matches!(status.as_u16(), 400 | 401)",
-        1,
-        "NON-PROCESS",
-    ),
     (
         "src/auth/oauth.rs",
         "anyhow::bail!(\"Provider authentication HTTP status {}\", status.as_u16());",
@@ -2456,113 +2137,10 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     // TodoItem status data in the exact cancellation relay fixture below.
-    (
-        "src/extras/acp/mod.rs",
-        "status: \"in_progress\".into(), priority: \"high\".into(),",
-        1,
-        "NON-PROCESS",
-    ),
     // Reviewed local HookOutput fixture calls inside exact matches! contexts.
-    (
-        "src/extras/hooks/dispatcher.rs",
-        "&output(serde_json::json!({\"additionalContext\":\"x\".repeat(32769)}))",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/hooks/dispatcher.rs",
-        "matches!(super::merge_decisions(\"UserPromptSubmit\", &[nested(), output(serde_json::json!({\"decision\":\"block\",\"reason\":\"blocked\"})), flat()]), super::Decision::Block { reason } if reason == \"blocked\")",
-        1,
-        "NON-PROCESS",
-    ),
     // Numeric NTSTATUS arguments in the two test-only native diagnostics.
-    ("src/fs.rs", "status as u32", 2, "NON-PROCESS"),
-    (
-        "src/session/native_publication.rs",
-        "status.success(),",
-        1,
-        "NON-PROCESS",
-    ),
     // Literal formatter-result assertion data; exact full-token digests below.
-    (
-        "src/agent/tools/format_after_edit.rs",
-        "assert!(output.contains(\"Written 10 bytes\"));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/session/native_publication.rs",
-        "assert_eq!(status.code(), Some(130), \"{output}\\n{error}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/format_after_edit.rs",
-        "assert!(!output.contains(\"Formatted.\"), \"{case}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/format_after_edit.rs",
-        "assert!(output.contains(\"Formatted.\"), \"{output}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/format_after_edit.rs",
-        "output.contains(\"Formatter skipped: target changed after approval\"),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/session/native_publication.rs",
-        "assert!(output.contains(\"NATIVE_CHILD_PID=\"), \"{output}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/session/native_publication.rs",
-        "assert_eq!(status.code(), Some(130));",
-        1,
-        "NON-PROCESS",
-    ),
     // Exact captured model/text data assertions in context63 controls.
-    (
-        "src/context/instruction_wire_tests.rs",
-        "assert_eq!(output.output, \"settled\");",
-        5,
-        "NON-PROCESS",
-    ),
-    (
-        "src/context/instruction_wire_tests.rs",
-        "assert_eq!(output.usage.input_tokens, 30);",
-        3,
-        "NON-PROCESS",
-    ),
-    (
-        "src/context/instruction_wire_tests.rs",
-        "assert_eq!(output.usage.output_tokens, 6);",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/context/instruction_wire_tests.rs",
-        "assert_eq!(output.usage.input_tokens, 40);",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/ui/app.rs",
-        "assert!(output.contains(\"CLAUDE.local.md\"));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/ui/app.rs",
-        "assert!(!output.contains(\"PRIVATE_LOCAL_INSTRUCTION_BODY\"));",
-        1,
-        "NON-PROCESS",
-    ),
     // Exact async-only MCP HTTP fixture and HTTP response status tuple.
     (
         "src/ui/mcp_admin_app_tests.rs",
@@ -2570,37 +2148,7 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "NON-PROCESS",
     ),
-    (
-        "src/ui/mcp_admin_app_tests.rs",
-        "let (status, body) = if anthropic_request {",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/ui/mcp_admin_app_tests.rs",
-        "status.contains(\"attempt #\") && status.contains(\": failed\"),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/ui/mcp_admin_app_tests.rs",
-        "assert!(status.contains(\"reason:\"), \"{status}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/ui/mcp_admin_app_tests.rs",
-        "assert!(status.contains(\"tools: \"), \"{status}\");",
-        1,
-        "NON-PROCESS",
-    ),
     // Pressure continuation assertion inspects SDK ToolResult output text.
-    (
-        "src/ui/app.rs",
-        "assert!(output.contains(\"at most once\"));",
-        1,
-        "NON-PROCESS",
-    ),
     // Captured native SDK output text and child ExitStatus assertions are data.
     (
         "src/spend/request_tests.rs",
@@ -2608,405 +2156,24 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "NON-PROCESS",
     ),
-    (
-        "src/spend/request_tests.rs",
-        "status.code(),",
-        1,
-        "NON-PROCESS",
-    ),
     // Context diagnostics inspect captured renderer String values.
-    (
-        "src/ui/app.rs",
-        "assert!(output.contains(\"Context composition:\") && output.contains(\"agent not built\"));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/ui/app.rs",
-        "assert!(!output.contains(\"PRIVATE_USER_CONTENT\"));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/ui/app.rs",
-        "assert!(output.contains(\"actual built-agent preamble snapshot\"));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/ui/app.rs",
-        "assert!(output.contains(&format!(",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/ui/app.rs",
-        "assert!(!output.contains(\"CAPTURED_\") && !output.contains(\"PRIVATE_USER_CONTENT\"));",
-        2,
-        "NON-PROCESS",
-    ),
     // Doctor assertions inspect captured text; complete macro digests below
     // also bind these exact terminal-looking string methods.
-    (
-        "src/ui/app.rs",
-        "output.contains(\"price source: captured session rates\")",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/ui/app.rs",
-        "&& output.contains(\"Terminal attachment:\")",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/ui/app.rs",
-        "assert!(output.contains(\"Directories:\") && output.contains(\"Provider and model:\"));",
-        1,
-        "NON-PROCESS",
-    ),
     // Price-pair bindings inside assertion/rendering macros are numeric data.
-    (
-        "src/session/title.rs",
-        ".map(|(input, output)| input + output)",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/setup/mod.rs",
-        "|(input, output)| format!(\"${input:.4}/M in  ${output:.4}/M out\")",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/context/commands.rs",
-        "assert_eq!(output.status, crate::sandbox::CommandStatus::Completed);",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/context/commands.rs",
-        "output.exit_status.unwrap().success(),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/context/commands.rs",
-        "String::from_utf8_lossy(&output.stderr)",
-        1,
-        "NON-PROCESS",
-    ),
     // These inline shell tests inspect captured String output, not commands.
-    (
-        "src/agent/tools/bash.rs",
-        "assert!(output.contains(\"CONFIGURED_DEADLINE\"));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/bash.rs",
-        "output.contains(\"Status: completed\") && output.contains(\"JOB_FINISHED\"),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/bash.rs",
-        "output.contains(\"Status: running\") && output.contains(\"JOB_READY\"),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/runner.rs",
-        "assert_eq!(output.as_str(), third);",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/todo.rs",
-        "status: status.into(),",
-        3,
-        "NON-PROCESS",
-    ),
-    (
-        "src/cli.rs",
-        "assert_eq!(output.status, crate::sandbox::CommandStatus::Completed);",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/cli.rs",
-        "output.exit_status.unwrap().success(),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/cli.rs",
-        "String::from_utf8_lossy(&output.stderr)",
-        1,
-        "NON-PROCESS",
-    ),
-    ("src/pricing.rs", "output", 2, "NON-PROCESS"),
-    (
-        "src/ui/slash/session_restore_tests.rs",
-        "assert_eq!(output.as_str(), text);",
-        1,
-        "NON-PROCESS",
-    ),
     // Bounded read/replay and file-search regression outputs are strings.
-    (
-        "src/agent/runner.rs",
-        "assert!(output.chars().count() > crate::session::TOOL_RESULT_SAVE_THRESHOLD);",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/runner.rs",
-        "assert!(output.contains(line), \"missing complete line: {line}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/runner.rs",
-        "assert!(!output.contains(\"tool output truncated\"));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/runner.rs",
-        "assert_eq!(replay_output.as_str(), output);",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/find_files.rs",
-        "output.starts_with(\"No files found matching the pattern.\"),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/find_files.rs",
-        "assert!(output.contains(\"Interpreted as regex\"), \"{output}\");",
-        2,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/find_files.rs",
-        "output.starts_with(&format!(\"{} files found:\", expected.len())),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/find_files.rs",
-        "output.lines().any(|line| line",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/find_files.rs",
-        "assert!(output.starts_with(\"1 files found:\"), \"{output}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/find_files.rs",
-        "assert!(output.contains(\"test_a.rs\"), \"{output}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/find_files.rs",
-        "assert!(output.contains(expected), \"{pattern}: {output}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/session/mod.rs",
-        "assert_eq!(replay, output);",
-        1,
-        "NON-PROCESS",
-    ),
     // `status` in the goal module is a `GoalStatus`, not a process exit
     // status, and `report_tool`'s is a `ReportStatus`. The identifier scanner
     // cannot tell them apart inside a macro, so each site is classified here.
     // The goal module launches nothing: its only commands run through the
     // shared validation runner (`TC-GOAL-CHECK`).
-    (
-        "src/extras/goal/driver.rs",
-        "assert_eq!(status, GoalStatus::Met);",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/goal/driver.rs",
-        "RoundOutcome::Stopped { status, .. } => assert_eq!(status, GoalStatus::Active),",
-        2,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/goal/gate.rs",
-        "status: GoalStatus::Active,",
-        2,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/goal/gate.rs",
-        "status: GoalStatus::BudgetLimited,",
-        2,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/goal/gate.rs",
-        "assert_eq!(status, GoalStatus::Blocked);",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/goal/gate.rs",
-        "assert_eq!(*status, GoalStatus::AwaitingUser);",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/goal/gate.rs",
-        "assert_eq!(*status, GoalStatus::BudgetLimited);",
-        2,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/goal/gate.rs",
-        "assert_eq!(*status, GoalStatus::Blocked);",
-        3,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/goal/gate.rs",
-        "assert_eq!(*status, GoalStatus::Impossible);",
-        2,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/goal/gate.rs",
-        "assert_eq!(*status, GoalStatus::Paused);",
-        3,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/goal/gate.rs",
-        "status: GoalStatus::Impossible,",
-        4,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/goal/gate.rs",
-        "assert_eq!(*status, GoalStatus::Met);",
-        3,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/goal/gate.rs",
-        "status: GoalStatus::Met,",
-        4,
-        "NON-PROCESS",
-    ),
-    ("src/extras/goal/mod.rs", "status.label()", 1, "NON-PROCESS"),
-    (
-        "src/extras/goal/mod.rs",
-        "status = %self.status,",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/goal/mod.rs",
-        "assert!(status.is_terminal(), \"{status:?} must be terminal\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/goal/mod.rs",
-        "assert!(!status.is_terminal(), \"{status:?} must be resumable\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/goal/mod.rs",
-        "status: GoalStatus::Active",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/goal/mod.rs",
-        "assert_eq!(status, back, \"{status:?} must survive a round trip\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/goal/report_tool.rs",
-        "?status,",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/ui/slash/goal.rs",
-        "Some((true, status)) => write_ok(ctx.renderer, format!(\"goal {}\", status.label())),",
-        1,
-        "NON-PROCESS",
-    ),
-    ("src/ui/slash/goal.rs", "status.label()", 1, "NON-PROCESS"),
-    (
-        "src/extras/subagents/task_tool.rs",
-        "output: Ok(\"first result\".into()),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/subagents/task_tool.rs",
-        "output: Ok(\"must be cancelled or queued\".into()),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/startup.rs",
-        "assert_eq!(info.output_cost, output, \"{model} output\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/permission/ask.rs",
-        "Some(crate::event::AgentEvent::ToolResult { id, output, .. }) => {",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/permission/ask.rs",
-        "results.insert(id.to_string(), output.to_string());",
-        1,
-        "NON-PROCESS",
-    ),
     // Distiller test fixtures: `output` is a persisted tool-result field, not a
     // process output.
-    (
-        "src/extras/js/skills/distill.rs",
-        "output: CompactString::new(\"6\"),",
-        2,
-        "NON-PROCESS",
-    ),
     // Learned-skill operator commands: `status` here is a lifecycle status
     // rendered into a log field or an error message, never a process exit.
     (
         "src/extras/js/skills/operations.rs",
-        "status = %row.status,",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/js/skills/operations.rs",
         "status.as_deref().unwrap_or(\"absent\"),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/js/skills/operations.rs",
-        "Some(format!(\"ineligible_status:{}\", status.as_token())),",
         1,
         "NON-PROCESS",
     ),
@@ -3016,793 +2183,25 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "NON-PROCESS",
     ),
-    (
-        "src/sandbox.rs",
-        "assert_eq!(output.stdout, b\"MACOS_SEATBELT_BOUND_WORKSPACE_PASS\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/sandbox.rs",
-        "output.exit_status.and_then(|status| status.code()),",
-        2,
-        "NON-PROCESS",
-    ),
-    (
-        "src/sandbox.rs",
-        "assert_eq!(output.stdout, b\"MACOS_SEATBELT_SERVICE_WORKSPACE_PASS\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/sandbox.rs",
-        "assert!(output.exit_status.is_some_and(|status| status.success()));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/sandbox.rs",
-        "assert_eq!(output.stdout, b\"DECLARED_EXECUTABLE\\n\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/setup/mod.rs",
-        ".is_some_and(|status| status.contains(\"never saved\"))",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/ui/slash/memory.rs",
-        "assert!(output.contains(\"2026-05-15.md (daily):\"));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/ui/slash/memory.rs",
-        "assert!(output.contains(\"SPLIT DAILY CONTENT\"));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/sandbox/windows.rs",
-        "assert!(output.status.success());",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/sandbox/windows.rs",
-        "assert!(status.success(), \"fixture must create a real junction\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/runner.rs",
-        "assert_eq!(output, UNKNOWN_TOOL_OUTCOME);",
-        2,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/find_files.rs",
-        "assert!(output.contains(\"No files found\"));",
-        1,
-        "NON-PROCESS",
-    ),
     // Notebook parser/view assertions inspect owned String data, not processes.
-    (
-        "src/agent/tools/notebook.rs",
-        "Notebook::parse(output.as_bytes(), MAX_NOTEBOOK_BYTES)",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/notebook.rs",
-        "assert!(output.contains(&nested));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/notebook.rs",
-        "assert!(output.contains(\"output bytes omitted\"));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/notebook.rs",
-        "assert!(output.len() < MAX_VIEW_BYTES);",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/find_files.rs",
-        "assert!(!output.contains(\"must_not_be_returned.txt\"));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/grep.rs",
-        "assert!(output.contains(\"No matches found\"));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/grep.rs",
-        "assert!(!output.contains(&long_line));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/grep.rs",
-        "assert!(!output.contains(&context_line));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/grep.rs",
-        "assert!(output.contains(\"root.rs\"), \"{output}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/grep.rs",
-        "assert!(output.contains(\"src/lib.rs\"), \"{output}\");",
-        2,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/grep.rs",
-        "assert!(!output.contains(\"lib.txt\"), \"{output}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/grep.rs",
-        "assert!(!output.contains(\"root.rs\"), \"{output}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/grep.rs",
-        "assert_eq!(output.matches(\"two.txt\").count(), 1, \"{output}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/grep.rs",
-        "assert!(!output.contains(\"needle again\"), \"{output}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/grep.rs",
-        "output.lines().any(|line| line.ends_with(\"two.txt:2\")),",
-        1,
-        "NON-PROCESS",
-    ),
-    ("src/agent/tools/grep.rs", "output", 4, "NON-PROCESS"),
-    (
-        "src/agent/tools/grep.rs",
-        "assert!(output.starts_with(\"3 results\"), \"{output}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/read.rs",
-        "output.contains(\"requested offset 6 is past EOF at line 2\"),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/read.rs",
-        "assert!(!output.contains(\"lines 6-2\"), \"{output}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/read.rs",
-        "assert!(output.contains(\"two\"), \"{output}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/read.rs",
-        "assert!(output.contains(\"three\"), \"{output}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/read.rs",
-        "assert!(!output.contains(\"four\"), \"{output}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/read.rs",
-        "assert!(output.contains(\"more lines are available\"), \"{output}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/read.rs",
-        "assert!(output.contains(\"offset 5\"), \"{output}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    ("src/config/mod.rs", "output: 5.0,", 1, "NON-PROCESS"),
-    (
-        "src/extras/subagents/task_tool.rs",
-        "output: Ok(\"completed before deadline\".into()),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/subagents/task_tool.rs",
-        "output: Ok(\"too late\".into()),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/subagents/task_tool.rs",
-        "output: Ok(\"also too late\".into()),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/subagents/task_tool.rs",
-        "output: Ok(\"never started\".into()),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/grep.rs",
-        "assert!(!output.contains(\"must_not_be_returned\"));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/acp/mod.rs",
-        "output: \"b-result\".into(),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/acp/mod.rs",
-        "output: \"a-result\".into(),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/runner.rs",
-        "assert!(output.contains(\"cacheStatus\"));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/runner.rs",
-        "assert!(output.contains(\"unknown stream item variant\"));",
-        1,
-        "NON-PROCESS",
-    ),
-    ("src/agent/runner.rs", "output,", 3, "NON-PROCESS"),
-    ("src/agent/runner.rs", "output.len(),", 1, "NON-PROCESS"),
-    (
-        "src/agent/tools/bash.rs",
-        "assert!(output.stderr.is_empty());",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/bash.rs",
-        "assert!(output.stdout.is_empty());",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/bash.rs",
-        "assert_eq!(output, \"[stdout]\\nstdout\\n[stderr]\\nstderr\\nExit code: 7\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/bash.rs",
-        "assert!(output.ends_with(\"Exit code: 9\"), \"{output}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/bash.rs",
-        "render_termination(Some(status)).as_deref(),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/bash.rs",
-        "assert_eq!(output.stderr.len(), limits.stderr_bytes);",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/bash.rs",
-        "assert_eq!(output.stdout.len(), limits.stdout_bytes);",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/bash.rs",
-        "output.exit_status,",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/bash.rs",
-        "output.status,",
-        3,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/bash.rs",
-        "output.stdout.len() + output.stderr.len(),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/bash.rs",
-        "tracing::debug!(\"tool shell stopped before completion: {:?}\", output.status);",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/find_files.rs",
-        "assert!(!output.contains(\"[truncated\"));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/find_files.rs",
-        "assert!(!output.contains(\"swapped_marker.txt\"));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/find_files.rs",
-        "assert!(output.contains(\"authorized_marker.txt\"));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/find_files.rs",
-        "assert!(output.contains(\"truncated after 100 entries\"));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/find_files.rs",
-        "assert!(output.contains(\"1 additional entries\"));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/find_files.rs",
-        "output.contains(dir.path().join(\"root.rs\").to_string_lossy().as_ref()),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/find_files.rs",
-        "output.contains(",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/find_files.rs",
-        "assert!(!output.contains(\"child.txt\"), \"{output}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/find_files.rs",
-        "assert!(output.contains(\"a.txt\"), \"{output}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/find_files.rs",
-        "assert!(output.contains(\"b.txt\"), \"{output}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/find_files.rs",
-        "assert!(!output.contains(\"m.txt\"), \"{output}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/find_files.rs",
-        "assert!(!output.contains(\"z.txt\"), \"{output}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/find_files.rs",
-        "assert!(output.starts_with(\"4 files found (showing first 2):\"));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/find_files.rs",
-        "assert!(output.starts_with(\"100 files found:\\n\"));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/grep.rs",
-        "assert!(!output.contains(\"0 more matches\"));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/grep.rs",
-        "assert!(!output.contains(\"[truncated after\"));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/grep.rs",
-        "assert!(!output.contains(\"swapped_binding_marker\"));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/grep.rs",
-        "assert!(output.contains(\"authorized_binding_marker\"));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/grep.rs",
-        "assert!(output.contains(\"unknown number of additional matches\"));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/grep.rs",
-        "assert!(output.starts_with(\"2 results (searched 1 files):\"));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/grep.rs",
-        "assert_eq!(output, \"No matches found.\");",
-        2,
-        "NON-PROCESS",
-    ),
     (
         "src/extras/export.rs",
         "anyhow::bail!(\"GitHub API returned {}: {}\", status, text.trim());",
         1,
         "NON-PROCESS",
     ),
-    (
-        "src/sandbox/windows.rs",
-        "String::from_utf8_lossy(&output.stderr)",
-        1,
-        "NON-PROCESS",
-    ),
-    ("src/extras/js/host.rs", "output.status,", 2, "NON-PROCESS"),
-    ("src/agent/tools/web_http.rs", "status,", 4, "NON-PROCESS"),
-    ("src/extras/js/host.rs", "status: 200,", 7, "NON-PROCESS"),
-    ("src/extras/js/host.rs", "status: 204,", 1, "NON-PROCESS"),
-    ("src/extras/js/host.rs", "status: 304,", 1, "NON-PROCESS"),
-    (
-        "src/extras/js/skills/store.rs",
-        "Some((ref status, ref report_id, ref reason))",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/js/skills/store.rs",
-        "if status == \"rejected\"",
-        1,
-        "NON-PROCESS",
-    ),
     ("src/extras/js/skills/store.rs", "status,", 8, "NON-PROCESS"),
-    (
-        "src/extras/js/skills/store.rs",
-        "let revision_changed = if matches!(status.as_str(), \"verified\" | \"awaiting_approval\") {",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/js/skills/telemetry.rs",
-        "if !matches!(status, LifecycleStatus::Canary | LifecycleStatus::Active) {",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/js/skills/turn.rs",
-        "let _ = writeln!(output, \"  capability: {}\", skill.capability.tier);",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/js/skills/turn.rs",
-        "let _ = writeln!(output, \"  rank: {}\", skill.rank);",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/js/skills/turn.rs",
-        "let _ = writeln!(output, \"  score: {:.6}\", skill.score());",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/js/skills/turn.rs",
-        "let _ = writeln!(output, \"- id: {}\", skill.id);",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/js/skills/turn.rs",
-        "let _ = writeln!(output, \"<available_js_skills>\");",
-        1,
-        "NON-PROCESS",
-    ),
     // Authored native heading formats a String, never a process receiver.
-    (
-        "src/extras/skills/selection.rs",
-        "let _ = writeln!(output, \"BEGIN_{delimiter}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/skills/selection.rs",
-        "let _ = writeln!(output, \"BEGIN_{resource_delimiter} path={path}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/skills/selection.rs",
-        "let _ = writeln!(output, \"END_{delimiter}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/skills/selection.rs",
-        "let _ = writeln!(output, \"END_{resource_delimiter}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    ("src/extras/js/skills/turn.rs", "output,", 3, "NON-PROCESS"),
-    (
-        "src/extras/skills/selection.rs",
-        "output,",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/js/supervisor.rs",
-        "output = future => Ok(output),",
-        1,
-        "NON-PROCESS",
-    ),
     (
         "src/extras/loop/mod.rs",
         "status.success(),",
         1,
         "NON-PROCESS",
     ),
-    (
-        "src/extras/hooks/dispatcher.rs",
-        "status = ?output.status,",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/hooks/dispatcher.rs",
-        "containment = output.diagnostics.containment,",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/hooks/dispatcher.rs",
-        "environment = output.diagnostics.environment,",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/hooks/dispatcher.rs",
-        "filesystem = output.diagnostics.filesystem,",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/hooks/dispatcher.rs",
-        "network = output.diagnostics.network,",
-        1,
-        "NON-PROCESS",
-    ),
-    ("src/sandbox.rs", "status.success(),", 1, "NON-PROCESS"),
     // FakeStep response fields in the rendered-output budget regressions.
     // These vec! bodies contain no process receiver or terminal call.
-    (
-        "src/extras/subagents/task_tool.rs",
-        "output: Ok(\"x\\n\".repeat(160)),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/subagents/task_tool.rs",
-        "output: Ok(String::new()),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/subagents/task_tool.rs",
-        "output: Ok(response.into()),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/subagents/task_tool.rs",
-        "output: Err(\"second failed\".into()),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/subagents/task_tool.rs",
-        "output: Ok(\"first\".into()),",
-        2,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/subagents/task_tool.rs",
-        "output: Ok(\"must be cancelled\".into()),",
-        2,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/subagents/task_tool.rs",
-        "output: Ok(\"must not start\".into()),",
-        4,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/subagents/task_tool.rs",
-        "output: Ok(\"result one\".into()),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/subagents/task_tool.rs",
-        "output: Ok(\"result two\".into()),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/subagents/task_tool.rs",
-        "output: Ok(\"result zero\".into()),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/subagents/task_tool.rs",
-        "output: Ok(\"x\".repeat(2_000)),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/print.rs",
-        "writeln!(output).expect(\"writing configuration output to a String cannot fail\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/print.rs",
-        "writeln!(output, \"  {k:<width$}  {v}\")",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/print.rs",
-        "writeln!(output, \"{}:\", title).expect(\"writing configuration output to a String cannot fail\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/sandbox.rs",
-        "!output.exit_status.is_some_and(|status| status.success()),",
-        2,
-        "NON-PROCESS",
-    ),
-    (
-        "src/sandbox.rs",
-        "String::from_utf8_lossy(&output.stderr).contains(\"hardlink\"),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/sandbox.rs",
-        "String::from_utf8_lossy(&output.stderr).contains(\".git symlink\"),",
-        1,
-        "NON-PROCESS",
-    ),
     // Captured Sandbox command-result fields in native boundary tests; the
     // added Seatbelt assertions are data inspection, not process terminals.
-    (
-        "src/sandbox.rs",
-        "String::from_utf8_lossy(&output.stderr)",
-        11,
-        "NON-PROCESS",
-    ),
-    (
-        "src/sandbox.rs",
-        "assert_eq!(output.status, CommandStatus::NotStarted);",
-        3,
-        "NON-PROCESS",
-    ),
-    (
-        "src/sandbox.rs",
-        "assert_eq!(output.stdout, b\"LINUX_SANDBOX_POLICY_PASS\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/sandbox.rs",
-        "assert_eq!(output.stdout, b\"MACOS_SEATBELT_POLICY_PASS\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/sandbox.rs",
-        "output.exit_status.is_some_and(|status| status.success()),",
-        5,
-        "NON-PROCESS",
-    ),
-    ("src/sandbox.rs", "output.status,", 4, "NON-PROCESS"),
-    (
-        "src/sandbox.rs",
-        "output.stdout.is_empty(),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/ui/app.rs",
-        "outcome = ?output.status,",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/ui/app.rs",
-        "&format!(\"warning: lazygit ended with {:?}\", output.status),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/sandbox.rs",
-        "status = child.wait() => CommandTermination::Exited(status),",
-        2,
-        "NON-PROCESS",
-    ),
-    (
-        "src/ui/app.rs",
-        "crate::extras::truncate::truncate_cjk(output, 500, \"…\")",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/ui/renderer.rs",
-        "}) => matches!(result, Ok(Ok(status)) if status.success()),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/git/runner.rs",
-        "&& (matches!(output.status, CommandStatus::OutputLimitExceeded(_))",
-        1,
-        "NON-PROCESS",
-    ),
     (
         "src/git/tool.rs",
         "let output = Command::new(\"git\")",
@@ -3884,18 +2283,6 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     (
-        "src/agent/tools/client_fs_tests.rs",
-        "assert!(!output.contains(\"client claims\"), \"{name}: {output}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/client_fs_tests.rs",
-        "assert!(!output.contains(\"client claims\"), \"{output}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
         "src/extras/mcp/headers_helper.rs",
         "output.len() <= MAX_OUTPUT_BYTES,",
         1,
@@ -3907,38 +2294,7 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "NON-PROCESS",
     ),
-    (
-        "src/git/tool.rs",
-        "if matches!(output.status, CommandStatus::OutputLimitExceeded(_))",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/git/tool.rs",
-        "let truncated = matches!(output.status, CommandStatus::OutputLimitExceeded(_));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/git/tool.rs",
-        "let limit_hit = matches!(output.status, CommandStatus::OutputLimitExceeded(_));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/git/tool.rs",
-        "let output_limited = matches!(output.status, CommandStatus::OutputLimitExceeded(_));",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/key_command.rs",
-        "status = child.wait() => {",
-        1,
-        "NON-PROCESS",
-    ),
-    ("src/key_command.rs", "status", 1, "NON-PROCESS"),
-    ("src/provider.rs", "output,", 3, "NON-PROCESS"),
+    ("src/provider.rs", "output,", 9, "NON-PROCESS"),
     (
         "src/provider_effort_tests.rs",
         "Self::spawn(responses, \"/v1/messages\", true)",
@@ -3948,18 +2304,6 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/provider_effort_tests.rs",
         "Self::spawn(responses, path, false)",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/retry.rs",
-        ".filter(|status| matches!(status.as_u16(), 429 | 503))",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/sandbox/network_tests.rs",
-        "assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), \"200\");",
         1,
         "NON-PROCESS",
     ),
@@ -3978,1004 +2322,48 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
 /// approval in the same source file.
 const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     // perf 2026-10-19 tests: assertions over returned tool/hook output values.
-    (
-        "src/agent/tools/grep.rs",
-        &[
-            (
-                "2f9f965dec5fb094307cf349922d1f400621ae69c5bc375933ae58f259994b02",
-                1,
-            ),
-            (
-                "a595abe2b6179eb2bf8960002b0d42f9c6a849b7009eeab360a76729ce98cb07",
-                1,
-            ),
-        ],
-    ),
-    (
-        "src/agent/tools/read.rs",
-        &[
-            (
-                "b7a03b6534e677e6f87405ae5664c6b51fb8fe79d400c13a99cf9eea64f47925",
-                1,
-            ),
-            (
-                "cb0fdecd8826463da98c0644258d77a7429996d8129a227f7be8a629295e300f",
-                1,
-            ),
-            (
-                "3392d677f815baf3f1a8d1da8ff565125beb6807fb749545cb569b4fc4235bae",
-                1,
-            ),
-        ],
-    ),
-    (
-        "src/session/mod.rs",
-        &[(
-            "7e00ca274d7960ede3231461c848e2d25dade6062e6415c558d538cdc75410f4",
-            1,
-        )],
-    ),
-    (
-        "src/extras/hooks/subprocess.rs",
-        &[(
-            "43ff20d24f612ec32d6c6f3d05e4da9ec76b409dbb60ea69d872e47a6d2594a2",
-            1,
-        )],
-    ),
     // Wakeup tool and App /cron assertions inspect a returned tool-result
     // String or captured renderer output; no process is constructed.
-    (
-        "src/agent/tools/schedule_wakeup.rs",
-        &[
-            (
-                "8a00b380f75a6750685c58871c8d064e5b88b12996d737e027364a236e8b7920",
-                1,
-            ),
-            (
-                "a402f8fe5898ef7e0de64639f5b86a9fc7f91e1e879f1af8d0dbd54305f5aa4e",
-                1,
-            ),
-        ],
-    ),
-    (
-        "src/ui/cron_app_tests.rs",
-        &[
-            (
-                "758af48af924ad28a84b646c2433d075a0d65181ee21cadce1e0ff2955bbc3c9",
-                1,
-            ),
-            (
-                "89ba83d4c92446a819b58ff4eef0c727a54f876b162abcbeb55a600777f2b804",
-                1,
-            ),
-            (
-                "0b48e1286279a92a4905c350cf613b75864d0306aa006ba6b88cd760b7da9c54",
-                1,
-            ),
-            (
-                "042e0c05dc704e21e6a385254d81f90b42a6eaf1e3ab38fb10911a01709f8d23",
-                1,
-            ),
-            (
-                "de30b951c6508aa1812cbb3a503897d9ed3b8cf01663ca72ab6ad26536f091e3",
-                1,
-            ),
-            (
-                "a2d0a9ddd1879d8cf019a1fc514e624ff5dc6e683477e1d4339120cd40b78053",
-                1,
-            ),
-            (
-                "47312379504646023c28a2b95f17664e8eb6c0acd929a0aa99473b7b007b2328",
-                1,
-            ),
-            (
-                "f996bb0e5beb8471d050536b0bf5244b593ae3b5abf6bb1a5acf3da8366f710f",
-                1,
-            ),
-        ],
-    ),
     // Task cost weight assertions compare a struct whose field is named
     // `output`; the token tree constructs or executes no process.
-    (
-        "src/config/mod.rs",
-        &[(
-            "782910d94eb0c0ef2060f6be673146587c4524a418c2db104aee81d9fb6c3cb6",
-            1,
-        )],
-    ),
     // Compact partial marker assertions inspect a String, never a process.
-    (
-        "src/extras/subagents/task_tool.rs",
-        &[
-            (
-                "a4163283c1da7dcc08d8a7a5af29f52305ff73782ee4c997ad45dbaaec2b5abe",
-                1,
-            ),
-            (
-                "4488de2505a6c90970027484e9cf589ecdebbcab82ce6d5bdf4811931eb84c77",
-                1,
-            ),
-            (
-                "1e8507c7079c6b2cc8311975805893306588cccc2a5205257bfed643670ccf51",
-                1,
-            ),
-        ],
-    ),
     // Native profile fixtures inspect CommandOutput fields in exact assertions;
     // these token trees contain no process construction or execution call.
-    (
-        "src/sandbox/general_profile.rs",
-        &[
-            (
-                "2990b99216f07cf0bf799c8742347e406c9d3f08ec875af2101bfdf3182519c7",
-                2,
-            ),
-            (
-                "ee777ca22024364b409391190584f456071f7d4e5901eea682e855d543212017",
-                1,
-            ),
-            (
-                "0aadb10a43373eac2a37c716efa085d3fd9226d932993ab7e585c97d9cdd7aa9",
-                1,
-            ),
-            (
-                "7d05a44afe0aaa39594c07cde71339d327de9a611fb4b02841ee05baa078ca5a",
-                1,
-            ),
-            (
-                "a781cb34bac9aa98ce22ff1576f9747f9d69c6d3bc397d604b96c22fc5fdaae8",
-                1,
-            ),
-            (
-                "17ea34486aa6cfe26d922516674b3c269d41f3655cdc7dd42ce97a20bbcc329e",
-                1,
-            ),
-            (
-                "fc2f87349d1b149637c15e59d7e67bb6674a883b2940b8bb9dcc325afc429e08",
-                1,
-            ),
-            (
-                "78ba56e010a879238db1f067274c2c546b7c47cf0dedd133747351e9496c3eb4",
-                1,
-            ),
-        ],
-    ),
     // Native real-path tests inspect bounded CommandOutput data only.
-    (
-        "src/sandbox/linux_workspace_tests.rs",
-        &[
-            (
-                "8b1b2938a13a5c2c4409c8eb4a604d670a3d43f0a8f6a20bdd30288c927a78bb",
-                1,
-            ),
-            (
-                "7d05a44afe0aaa39594c07cde71339d327de9a611fb4b02841ee05baa078ca5a",
-                2,
-            ),
-            (
-                "50a8323724d9040f728c70e55be039dafab8ed4d3dec119f235b5166104199d3",
-                3,
-            ),
-            (
-                "2990b99216f07cf0bf799c8742347e406c9d3f08ec875af2101bfdf3182519c7",
-                1,
-            ),
-            (
-                "fe5b6e0cbd6641269701daf5ba28e00171b8e8e60fbd76d3ac873c4a35fabc6a",
-                1,
-            ),
-        ],
-    ),
     // Exact full assertion tokens for frozen-global and Windows service data.
     (
-        "src/git/global_snapshot.rs",
-        &[
-            (
-                "5398e26c5e66113bbdbb66079a5ec789a50e4984c0b098f141667a5ef9749703",
-                1,
-            ),
-            (
-                "46b14564c286f28a4d03f6ecfaa681e5f9888e03189053c370757335497aae63",
-                1,
-            ),
-            (
-                "9fb6e06551b42aa2b9cc40592d18182a87475df987b2fe43ac5ad1e310038ad7",
-                1,
-            ),
-            (
-                "5eaf28323eb12f1b2ce84d70659e79aedc8c95e796bf4c67b67bd65f442516b8",
-                1,
-            ),
-            (
-                "1f5cdcadf7b9660a47ba343bd823136ea5a67f15ce74a8f6a259d78e4d394bcf",
-                1,
-            ),
-        ],
-    ),
-    (
-        "src/git/windows_runtime_tests.rs",
+        "src/auth/oauth.rs",
         &[(
-            "96656c0351161e9f473d2e6eef4f3b34ad62971d96595e6d5b0ef2228f008b36",
+            "54ce06e836d9bacb3b577c577930f047fc5e11b66494159d86f4ec436fc1af30",
             1,
         )],
     ),
-    (
-        "src/auth/oauth.rs",
-        &[
-            (
-                "8ec5333edb019c40f0fe19338211f99ccc54bca434f77f4629228fc6afb3872e",
-                1,
-            ),
-            (
-                "54ce06e836d9bacb3b577c577930f047fc5e11b66494159d86f4ec436fc1af30",
-                1,
-            ),
-        ],
-    ),
     // Test-only diagnostic prints a numeric NTSTATUS, not a process status terminal.
-    (
-        "src/fs.rs",
-        &[
-            (
-                "71f031649abe23acf15013d8ff92f00a9ee847aa1d08401e79157aa8971a344d",
-                1,
-            ),
-            (
-                "de4d0f3f252e6baaec9e9c2c31e29440bfc9373d41e0c8ae5999e33cddddd83d",
-                1,
-            ),
-        ],
-    ),
-    (
-        "src/agent/tools/format_after_edit.rs",
-        &[
-            (
-                "1e5eaabec41b03e558c0e1864140eaa8d289afae2768fcdae7df42844ec0acdb",
-                1,
-            ),
-            (
-                "69224cb13021988e04ebb302f0c6f781ff9ecfb8bcf2b9e6f3aac24196f0181e",
-                1,
-            ),
-            (
-                "5cf9c9f2fb6b69af49aae4d8fc838e829258c4c610925d877aea766adf2adfc3",
-                1,
-            ),
-            (
-                "0cf3a48c5b66b4513dfff2198fb31a5a61196ff36497c315a8bcbae55d4a9ef2",
-                1,
-            ),
-        ],
-    ),
-    (
-        "src/session/native_publication.rs",
-        &[
-            (
-                "5b0d857a99f27e381df3b8fa7ad4564db345c35a6133d15025342b3a36fa35f6",
-                1,
-            ),
-            (
-                "4f7b79705e309204080afd875515dc605469abd02b79eb7b519589cd9f922600",
-                1,
-            ),
-            (
-                "769b44781b2cbe10926b6ca25b4af88f04d839b8d1d0b125e6e1905c10fb279e",
-                1,
-            ),
-            (
-                "0c736d64cd41631588d11786bd650f77583c3cf4befe75be91a3126a94206649",
-                1,
-            ),
-        ],
-    ),
     // Bounded listing response status is metadata, not a subprocess terminal.
     // Complete tokens of the exact context63 captured data macros above.
     (
-        "src/context/instruction_wire_tests.rs",
-        &[
-            (
-                "44642c1e0454c2b57a294a0b5bd0d9d87ebc97b2be6aebde3f3b10d19bd685ce",
-                5,
-            ),
-            (
-                "6b8e867d2f431f5da86fdfddf89759c0e0e802e7142a215f4d19a787bece77d1",
-                3,
-            ),
-            (
-                "d82ef98c4e099c2e164a0c13e9a5d9a9a30d7ef5f94fdfa6fc0b3b1b9f9a7431",
-                1,
-            ),
-            (
-                "fa87a3f6afc6fa92116daf109f77491f05c3e91f14e9ad807043e86a95f1e22b",
-                1,
-            ),
-        ],
-    ),
-    (
-        "src/ui/app.rs",
-        &[
-            (
-                "61dd8af08a9e7661a5207ba550156aed195fb2a47f14cb75add9e1c15c627697",
-                1,
-            ),
-            (
-                "43305cca706e54401a6a08040bbfb1d130e038a57445352dc83baf4ee2c13935",
-                1,
-            ),
-        ],
-    ),
-    (
         "src/ui/mcp_admin_app_tests.rs",
-        &[
-            (
-                "4693571b3b75e2cab6670639f5777643c31863db105e12066eb088960c52f191",
-                1,
-            ),
-            (
-                "4ca10e3645fe77ac257cc93a32633382fa445d7d71e74d8d1150e9273280e7b8",
-                1,
-            ),
-            (
-                "523c9c17d8bf92e6dfeeb73177d8ef9fd174d1406a081b1418ef1c825ff40a13",
-                1,
-            ),
-            (
-                "7d327890e257f7e9756aeb583bc18429718eb2fa5a7567646d1199456da73f1a",
-                1,
-            ),
-        ],
-    ),
-    (
-        "src/spend/request_tests.rs",
-        &[
-            (
-                "e9734110377c90391506e62dc9ed02c26ee2d870c7cac01670c869822ee8ddfe",
-                1,
-            ),
-            (
-                "191ab31a485b54bcd750b0c704dc914c2207449933cf7674f42d7d7bb348cb73",
-                1,
-            ),
-        ],
-    ),
-    (
-        "src/agent/tools/web_http.rs",
         &[(
-            "5190609317dbab79fde23dab3907dc07258c750dd05ff75ec44868499bf4bcff",
+            "523c9c17d8bf92e6dfeeb73177d8ef9fd174d1406a081b1418ef1c825ff40a13",
             1,
         )],
-    ),
-    (
-        "src/agent/tools/web_fetch.rs",
-        &[(
-            "181d820a4307815360b374def867fdc9f2362f7b96104d1452ae72aec2bbb0d5",
-            1,
-        )],
-    ),
-    (
-        "src/context/commands.rs",
-        &[
-            (
-                "5da17685a5478627a5d0018f0bb97c840787645dfa5b8b84ba358081a56e9437",
-                1,
-            ),
-            (
-                "70251d766c54234bccb37237bbe744c2708d4881514462d0453c064fdb069eb4",
-                1,
-            ),
-        ],
     ),
     // CLI executor output fields and todo labels are data. Full macro tokens
     // bind these exemptions; constructors remain TEST-ONLY, not exempted here.
-    (
-        "src/cli.rs",
-        &[
-            (
-                "5da17685a5478627a5d0018f0bb97c840787645dfa5b8b84ba358081a56e9437",
-                1,
-            ),
-            (
-                "70251d766c54234bccb37237bbe744c2708d4881514462d0453c064fdb069eb4",
-                1,
-            ),
-        ],
-    ),
-    (
-        "src/agent/tools/todo.rs",
-        &[
-            (
-                "398b11681b8c76f11f4f6ee603b985d2aa8dd4ede75987aa1ea6cc318ba8da5d",
-                1,
-            ),
-            (
-                "e339cb76312cee0928f4a6625b6d943dfa3bb4b4262fa0765e8fd449ce25ef9e",
-                1,
-            ),
-        ],
-    ),
     // These assertions compare mathematical output-token prices and a
     // persisted tool-result string. Their full macro identities are bound;
     // none of the receivers is a process builder or launches a command.
-    (
-        "src/pricing.rs",
-        &[
-            (
-                "3da7304e195dea8a708395cd9199725b7a4fc1475efb98d3b4c32caa595d770e",
-                1,
-            ),
-            (
-                "1374c30aaf4360bcbc3879e64ef7812293fefd8cdc85ddbbeefa5a39784561b5",
-                1,
-            ),
-        ],
-    ),
-    (
-        "src/ui/slash/session_restore_tests.rs",
-        &[(
-            "1d4fc664e3aae9cd30ae42c11543cc637c3e381962a3d6fba1aa27563788b516",
-            1,
-        )],
-    ),
-    (
-        "src/session/mod.rs",
-        &[(
-            "cf9e3c16def70e185eb6021ca4adfd0ecc0df8ae47679c47b267f44925835cdc",
-            1,
-        )],
-    ),
     // Goal records carry a `status` field, so `goal.status` and
     // `outcome.status` inside an assertion or a format string look like a
     // process `status()` terminal to the scanner. None of these launch
     // anything: the goal module builds no process and reaches commands only
     // through the shared validation runner (`TC-GOAL-CHECK`).
     (
-        "src/extras/goal/driver.rs",
-        &[
-            (
-                "4df5946458762c388a5a59bfba766e3867c1ac504ddf845f5bd60115dadfa9c8",
-                1,
-            ),
-            (
-                "9616cc3a86ba50ddf5ec520a82165e50da9f169a345f44e31d480d9f8600e411",
-                2,
-            ),
-        ],
-    ),
-    (
-        "src/extras/goal/gate.rs",
-        &[
-            (
-                "1c395765e43cd9b6cd43b9a473b7ceffb32e994c1223a3b582b653177a95a9fd",
-                2,
-            ),
-            (
-                "2d4dd6b0880b43f63964a9fafcc049782905712a4ac5a0ac7d070073cb11736c",
-                2,
-            ),
-            (
-                "30b402ca4a0e1f2324e2b9461d55e5847661e8e9a4cfa5eaf663529dab3f2a73",
-                1,
-            ),
-            (
-                "046648aa713ea8e8f3b4b14eebc5fa7b7d883f09a76ce51f529704f6a6085a80",
-                1,
-            ),
-            (
-                "e23523dc6191a1cd2f1f91d0b489f83772025167f3ca88cebc782d8f786fc83e",
-                1,
-            ),
-            (
-                "3dcff6b567562c9ae7bef19bfb158463c9a0901e0a0f34331ec808f10919f3d9",
-                1,
-            ),
-            (
-                "585ce007efc55b9749a5329bbe96b5f999e529f85875908cd99fae9259612f5d",
-                1,
-            ),
-            (
-                "2d2dd285053cc8bdefc39adfeed3addb47382f1675faeb806dbcc8a2dcb0fa63",
-                1,
-            ),
-            (
-                "8d75b0cb773e965bfd51463713ca3a6d85ef592e89b0d7de8d512d7076d993ae",
-                3,
-            ),
-            (
-                "8e683c287c05b02ec770d6282642cc2ca52a1a16f7c38fb8abf40adaf4031a8e",
-                3,
-            ),
-            (
-                "c532de8f1745797862d32e6fe009e5387d6fd988a9c36866da808b774d1ca804",
-                3,
-            ),
-            (
-                "d4b5d99d3ff7da25179c36899006e1dab75d5815da30cd759e890d30e33df324",
-                2,
-            ),
-            (
-                "eb05a85e94123023faa2184e3ec47592b9f93e8fa0494014122c0149fc3fc918",
-                1,
-            ),
-        ],
-    ),
-    (
-        "src/extras/goal/mod.rs",
-        &[
-            (
-                "07b82e86e9564e070c7ba9117e00c4a75354e3d28e0bba09d5b7e28c864d6f1f",
-                1,
-            ),
-            (
-                "2813a1eb6093b7aba65612133b0e22ead09f2f1f5d01e0a690c3120f25ec704b",
-                1,
-            ),
-            (
-                "28aca723af03db3ea27ec41743e0d06197ee0262e7da888f749863bd785ff761",
-                1,
-            ),
-            (
-                "381913f1df84f9d7a14aa0d5aac698f4a93db4e7bb1051130b2afe4a82b8a0a4",
-                1,
-            ),
-            (
-                "b00a299fed097df3e3098f8ce75ff61dc6b40b3b8acfcd3569dcd258473c9a96",
-                1,
-            ),
-            (
-                "e855b12cda5b2f7dc7de8757f985671c0333030e70b3d474380ecb23697ee1f7",
-                1,
-            ),
-        ],
-    ),
-    (
-        "src/extras/goal/report_tool.rs",
-        &[(
-            "33b815e68968fbbcbcc5152d1232028273f2482dda592282259257b1ab5826fe",
-            1,
-        )],
-    ),
-    (
-        "src/ui/slash/goal.rs",
-        &[
-            (
-                "9d89a11800afded3a584c81d94dc1d867961f62af82e5e1ad5019accf7e6cc48",
-                1,
-            ),
-            (
-                "d478ccc3c3b6804387a50239b4aaa9b27cd77e842bdfe3ff83d27ecaa182cc5d",
-                1,
-            ),
-        ],
-    ),
-    (
-        "src/startup.rs",
-        &[(
-            "bfb649801945731a3401da523cb736f42d1932c761cff088e24a3a1c15bfeea9",
-            1,
-        )],
-    ),
-    (
-        "src/permission/ask.rs",
-        &[
-            // Approval regression: select! matches ToolResult.output and
-            // records its text; it neither constructs nor launches a process.
-            (
-                "2a651fc8fe75c0ea45234d99f2df6ce44f16757d00e1e47552e415e404271e09",
-                1,
-            ),
-        ],
-    ),
-    (
-        "src/agent/runner.rs",
-        &[
-            (
-                "1a503801a8a3fd36c212382d3ef072cd3109dc3f4c6145e652f9f73a5657d5a6",
-                1,
-            ),
-            (
-                "dcb051101cba4c5c9e985c56a84b8932a34fc3f820b96b5d6d54433d53a731cb",
-                1,
-            ),
-            (
-                "0a0917e74a8b9a537ef30ef42f13c2d052f6d07e1f81805112593bfd69ac4111",
-                1,
-            ),
-            (
-                "381692062b911bb656a5d6addf0f0fbe24d8184a872fa7f21bd318b5cc747e56",
-                1,
-            ),
-            (
-                "8b4a02b427881148835e707cd0a76d14914217b024ae730e0f4bf77f074f1ca4",
-                1,
-            ),
-            (
-                "171453e5b2606177e62ffc589caee645490fd18305ae366b007a993e16b669db",
-                1,
-            ),
-            (
-                // assert_eq! compares the attributed image placeholder String;
-                // the third "output," fingerprint shares this exact macro tree.
-                "2e9d6fe2b541c8535dfabf335779690424c0bb5bb198ff7429dbaede8642b50f",
-                1,
-            ),
-            (
-                "a65ff78b30cd28567d54a354081c187246782a6f49f314a7d5ce6289ebdc97f3",
-                1,
-            ),
-            (
-                "c7984bb9ee969797484f192f11aa877a68f90f5b456d5d2ee40a2a7e7f834fbd",
-                1,
-            ),
-            (
-                "225002167cc20f4e6df35ecd65a6c50e007af4b1cfdcb530eb6a48de70d02689",
-                2,
-            ),
-        ],
-    ),
-    (
-        "src/agent/tools/bash.rs",
-        &[
-            // Full assert! token trees for configured deadline/job strings.
-            (
-                "793a3b50bb43dadca3a774dd894872be1b909dec7f1433ffeb83675180d47419",
-                1,
-            ),
-            (
-                "77648ada4ea01cfcd7468cc0851a96b2a1da7595c6e26d227c5661d8b40b8d0a",
-                1,
-            ),
-            (
-                "72029598af562279a2f55077ed2f8982a210ca6ac75f687ed0189688201b4489",
-                1,
-            ),
-            (
-                "11590494b23b272022bf8aa154b2fcfb865b05cc25efb8a449623f43dbd184c8",
-                1,
-            ),
-            (
-                "1a4d10559a457b95bab2fbea7dcd65fefebe980c444cd00e9de9a60d1ece599d",
-                1,
-            ),
-            (
-                "7340793918840ff0a06131325b389589d2873616472f19c449062b5be4bc1380",
-                1,
-            ),
-            (
-                "761e9d94916bbe3a5d5de4cbbb2d1ceb08208ec28b457cd8d41fbac9e1f8a6fe",
-                1,
-            ),
-            (
-                "ad2596fb4e92d03c6e11f4c1aa11829076d1156dd173cc7b094036343a52b445",
-                1,
-            ),
-            (
-                "d70f631d43aa86b91b591554981d4ba8cb2a723cd349bc1742f6a6a2e2f2fd54",
-                1,
-            ),
-            (
-                "dacb7feff2f8401db6fff30373bb92be0bc1bdfa88d247cabcef3edd4d93d16c",
-                1,
-            ),
-            (
-                "f67e03a1d8c8573ffae016bbaf134c13aa8d999566a8ed47610219e3e5507457",
-                1,
-            ),
-            (
-                "e601ac14d92758c7985acd681e935910e3c51caf457e448c436171c885728374",
-                1,
-            ),
-            (
-                "ddb27fae640c819d13689c66dfcac4db416d10dc75c58e505f8b8c4215719778",
-                1,
-            ),
-            (
-                "526130c218c3b072fc65d134de57cf71cc78267fb6194aa15fc9604a13f70066",
-                1,
-            ),
-            (
-                "211556a02c9cc9dc12d72aafac79816ad580db70ca45a597c1ffc6200e574e34",
-                1,
-            ),
-            (
-                "5d4508a51dba0c790ffef62f8414b6d39fa90438f85d1b8f85c76e0cf2b18238",
-                1,
-            ),
-        ],
-    ),
-    (
-        "src/agent/tools/find_files.rs",
-        &[
-            // Exact NTSTATUS-to-io::ErrorKind assertion above; no launch.
-            (
-                "655047f670f8e91bbcbec3df81a00e1406129981a29ecc548d059ddd0f0e2253",
-                1,
-            ),
-            (
-                "36a39cd2cd56c5eee3bdefba64b4371c8d56e3c0eb582c77bbd8f47f6b51e22e",
-                1,
-            ),
-            (
-                "efef1521aaa237b5ca763ad839ac1df713a4cd27e56f9a8edeef8aa8ea91d5e4",
-                2,
-            ),
-            (
-                "48458250bb5860a3c3f6058899f70ac05575cb8b812b1ca7c237d1f9802494a1",
-                1,
-            ),
-            (
-                "a66786897e20a7770563edd278c1c85ee70570b0f4bc3be162205586615020cb",
-                1,
-            ),
-            (
-                "97fbc7e25bcf8468b43664c6d4fd5e39c79fadb742399b1ad2b58be8e64c2b29",
-                1,
-            ),
-            (
-                "b20c238b4f2fe5fab3be47c20839a6cf0a2604c3d115c5b4a7d101c8bc1f73c7",
-                1,
-            ),
-            (
-                "2f9f965dec5fb094307cf349922d1f400621ae69c5bc375933ae58f259994b02",
-                1,
-            ),
-            (
-                "205b255efe38d50d4e3ffd4840977d3744af25b4be13bacd284867d626d6eea0",
-                1,
-            ),
-            (
-                "44b3168425ceb3c6808eea846f357f1369ebc7da14a5bddef0ed7090e353dafb",
-                1,
-            ),
-            (
-                "56e99f3288d12b12f3643fdb1a5a4e56eddec6c5ce068190a6056d9fd6e7412e",
-                1,
-            ),
-            (
-                "94179e11a3f89f5be978ecad4f61da60c1d2e431b78531090945f40b629d2541",
-                1,
-            ),
-            (
-                "f25fa463789bdff96f2ac1db892cb80aa2acf858cae6fce6207f6faa70bc85b8",
-                1,
-            ),
-            (
-                "bf75191f6049b49ba3066fe7c1afe9dff0a585c144d3231ac53532058b16f0a7",
-                1,
-            ),
-            (
-                "3462a253774a87b69c35808079213817cbb63784594c3b6c36e1cf0d433edd76",
-                1,
-            ),
-            (
-                "c6dfc12dd72d884545ffce046f3ff316401aa8864ab7ac426babce371076e0e1",
-                1,
-            ),
-            (
-                "0de524ec980ae25a2e89c050a7a176bdd8e0cd52f79156f09212a32885ba79e3",
-                1,
-            ),
-            (
-                "2acef44899035b4fe1ebe5cd51e6ac1bb258bf09bf04e6bbfac41750c0fa413f",
-                1,
-            ),
-            (
-                "6ed6b28463166006497c66c9247ea156068ac1b3331cd763aa86fb11e08f93bd",
-                1,
-            ),
-            (
-                "6598de95de2f8df009925a1dff68903fdd3a439e8ddf26f902bb1c207833535e",
-                1,
-            ),
-            (
-                "27dc418559b47c51f40c8b885af3a4c69b9772ab2c3a72bae4408ad8ae751f3f",
-                1,
-            ),
-            (
-                "b6db8c610fa3f1db24a5037afbf75e853908e2475b22500fe22b882990ed0555",
-                1,
-            ),
-            (
-                "77032623138c5140bbf56ea2124c216b497181cd48be0ac857f6e706156c4337",
-                1,
-            ),
-            (
-                "2a407b198400d179b7a2386736bc49d07e5bc4cb88a2d948eeec7ffbc31beaa7",
-                1,
-            ),
-        ],
-    ),
-    (
-        "src/agent/tools/grep.rs",
-        &[
-            (
-                "0a94ede10a0163a59731cf2f78ca877c9139de14b8b94e4daa8d72347ddaadd0",
-                1,
-            ),
-            (
-                "0acbebee88d292c8ec6ee41a10395563fb9ffe96c71dbc580dbdc484b64dcea6",
-                1,
-            ),
-            (
-                "174b3659662ea4f4bcc7d2f7de1f632e16b959c70fd2f7e186199bfe8474a639",
-                1,
-            ),
-            (
-                "21cc41b46381ab04832f9a6c9f3d598ed2fe4d747d481237f990b7158c52a58a",
-                1,
-            ),
-            (
-                "371266118d5513014528466d57966ed6c1909cb33bab1a9fd302e5c6256ad82b",
-                2,
-            ),
-            (
-                "99092c71e9e39b0963c34a3241c195133962a8db5ec43f09bb6cd66917665b9b",
-                1,
-            ),
-            (
-                "ddc400f7816d0659ba5fe6e89b565e7e22473e6551c6c5be7a2ee53dca51c0ab",
-                1,
-            ),
-            (
-                "41db4c0ce2690c675124ac22b2e8c8e42e31dc78f69918c069d5683fdb587955",
-                1,
-            ),
-            (
-                "f9bb10578ae06a1346990778eb26b16f15fbed1f8f35faef03215060ce6723e5",
-                1,
-            ),
-            (
-                "033a7ee1d169afb06684962734123560b7792bc0e4c5f7fb6da63084635b97c3",
-                1,
-            ),
-            (
-                "590aff96addd2539535fda11afb4bc10d0711c7497a7af93bab9910a7d9ec930",
-                1,
-            ),
-            (
-                "ff3b43196033b3cb4287ed716424d712c238f131a79e3e7994ef950a3ad2da71",
-                1,
-            ),
-            (
-                "12d39ec0d2f309c72aa23d4b2aea0c69683bac46292bc008819ea5a08668a100",
-                2,
-            ),
-            (
-                "b1dd47ca1808c93ffce820571bc616dd9bbab0ff00a6d30a036997aa5b7cd074",
-                1,
-            ),
-            (
-                "aacff8364b7c19920bb65dc2fee6777b3970b83c489120632dc29a7f75319f6a",
-                1,
-            ),
-            (
-                "d8bc746640594ad8677988f759e17acba24b7b65f84bddbe9ab0eb3c87fea94c",
-                1,
-            ),
-            (
-                "8c145fa86d2c2af2f6271fb1346753b3d2a26349f1910729d7deda388fa48fea",
-                1,
-            ),
-            (
-                "eb01710697adef617d3b9c5e6adffdafb27387e6f9314f65d69c3eec0916ec57",
-                1,
-            ),
-            (
-                "54ab2fb39f30fd9d5c739fc08f4baeeecf57a21e6a6fb8cc411b1457a835ae82",
-                1,
-            ),
-        ],
-    ),
-    (
-        "src/agent/tools/read.rs",
-        &[
-            (
-                "d644a582ab03230393d8aa9e710728df802952c882e3acd19fefccb68ef16bfe",
-                1,
-            ),
-            (
-                "8c5480aa4c05e0a79e3efb3aff15f396119c8f782131f0a63b4897af118f1455",
-                1,
-            ),
-            (
-                "4ad0b02fe087ed6b7e90581f16576153cc14c43368790acbfe70bcac2dc955df",
-                1,
-            ),
-            (
-                "67fe1eca2ff8a4b47915f814626f5cf7f0f96438e1d83be6dc8ed38caa2ed0d2",
-                1,
-            ),
-            (
-                "b6e695c20bf9ede9e3659632a9a667e3fa7498031117a6a9938ab61d39946487",
-                1,
-            ),
-            (
-                "9ac084e54227f3dcf8902a1744b06dfefc01910a1a1443ef6b65477a31ec972d",
-                1,
-            ),
-            (
-                "ff352e17dc49e58a4943cb8618000ddddfca2fb4e4b0e8e420a8e09c46f35001",
-                1,
-            ),
-        ],
-    ),
-    (
-        "src/extras/acp/mod.rs",
-        &[
-            // Full tokio::select! tree: actual TodoStore write and channel relay,
-            // with a TodoItem status field, no process construction or terminal.
-            (
-                "5e6b7deef53c9bbc937e9b5f2643396b1eb7a0dd176f3db52719403e9047f84e",
-                1,
-            ),
-        ],
-    ),
-    (
         "src/extras/export.rs",
         &[(
             "2642f045409085bb7c6fe9d020dad6e7a3f2915275c0c3686ac43710af88e0bc",
             1,
         )],
-    ),
-    (
-        "src/extras/js/host.rs",
-        &[
-            (
-                "04c86182a5a99a0f160452606423562347d2b4f8bb1aad73f1651fee6fdc98bf",
-                1,
-            ),
-            (
-                "0397b840693f6b293544b512fce5572f9d450833533087168f099b3af77a5cb9",
-                1,
-            ),
-            (
-                "1b71d7d643b2f7208bbb297fc64a33265b776a2b8c934c32441cc124083abcd4",
-                1,
-            ),
-            (
-                "2f073adf370dfed835a37ffd305529ca895486178a4033f395abb56386e6cb63",
-                1,
-            ),
-            (
-                "2af98358d4d0cc429b3ce4d3d0c3e5c8b100dd2d15a699dceef636c9092c420f",
-                1,
-            ),
-            (
-                "2990b99216f07cf0bf799c8742347e406c9d3f08ec875af2101bfdf3182519c7",
-                3,
-            ),
-            (
-                "4b4be55dac813da63579ff80d76a858484598b955c750180378e47acac2ec2b1",
-                1,
-            ),
-            (
-                "7517f2b69b6a018823611af16ad46cf509fd34b973baa82547d55ace719d28ca",
-                2,
-            ),
-            (
-                "8198bc7a5a750904ebdbef0a4b5a9371aaae8034a46471b5ce5a66e448c5b4e9",
-                1,
-            ),
-            (
-                "891a8bf5535d2f446d9d641b9d740ab7042ca41a7408f9ab36d76624b10cb05e",
-                1,
-            ),
-            (
-                "a2934036f2abb93e08faec85d7d7c126860a0fda0a8d26e879dd0f45ed38ac42",
-                1,
-            ),
-            (
-                "e44a0994c1278803b6647fefeb9a3c5bfeecf526b1c19fcc05d8fdb2a174d406",
-                1,
-            ),
-            (
-                "7d05a44afe0aaa39594c07cde71339d327de9a611fb4b02841ee05baa078ca5a",
-                1,
-            ),
-            (
-                "1555628fb189c32e86c4784f05d35633b042cf00398f75582580d5e20c4b5012",
-                1,
-            ),
-        ],
     ),
     (
         "src/extras/js/worker.rs",
@@ -4985,125 +2373,16 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         )],
     ),
     (
-        "src/extras/js/skills/distill.rs",
-        &[
-            (
-                "e29c4db61b300c9232bd5dac5648daf7847f57f2a335b79b8c063bc0f9df7ee6",
-                1,
-            ),
-            (
-                "a2a0b59efb88598321f470e499fff73689fb23ba54944b5548efe5bcb42bb28f",
-                1,
-            ),
-        ],
-    ),
-    (
         "src/extras/js/skills/operations.rs",
-        &[
-            (
-                "2727f66b793de5da9bf06afce532b6430db688e1627dd9de99a26d28241d6ca1",
-                1,
-            ),
-            (
-                "5e1cad9558bb44aff59cfceb758fa075425286c89e08b41cb0514efaca10eb05",
-                1,
-            ),
-            (
-                "7e2e1921ca489c8880183f827afffd928a982893eabe1ec6ead9228af5d99d36",
-                1,
-            ),
-        ],
-    ),
-    (
-        "src/extras/js/skills/store.rs",
-        &[
-            (
-                "24f6070b5204f83ee8d5fc7a6bd756f7991bbe7fca840e62752f54e090661491",
-                1,
-            ),
-            (
-                "37b1d55d03713d423bc79e2bdfc046830486adddb9997708182cbd6434852b94",
-                1,
-            ),
-            (
-                "77c64a52f67e32ce3f54a58973a20dd8c3c1c99797b07d43cf1fd780469e8f99",
-                1,
-            ),
-        ],
-    ),
-    (
-        "src/extras/js/skills/telemetry.rs",
         &[(
-            "060c076e1ddfc773151d0c424432a12ad46d0d66f893b7ef6c39b5070b3a73b5",
+            "7e2e1921ca489c8880183f827afffd928a982893eabe1ec6ead9228af5d99d36",
             1,
         )],
     ),
     (
-        "src/extras/js/skills/turn.rs",
-        &[
-            (
-                "28e6f4ffe8d995be8ac3f65f2da51fc77225808714039ef01a22669ad78e1143",
-                1,
-            ),
-            (
-                "512f23c6f08f33c0ac29a8dee50052a6e6095547c7cad697b269fe69e02bff5a",
-                1,
-            ),
-            (
-                "5eeb4ebba574fc8359881819f6b7d27f879be4b7a64a5993cc4b89429e7d5831",
-                1,
-            ),
-            (
-                "90ca522aa88240dba89634b772026c3cddd99b27e54673ff13874f2462c73f4d",
-                1,
-            ),
-            (
-                "a3ed78f809040e7856ccd224f3040f2a334937ea2702a6aef1f0584bba41d417",
-                1,
-            ),
-            (
-                "bc4fb0706aaa17dcb6d23c47773435403f4660ebf1230b57349ea16e489978c3",
-                1,
-            ),
-            (
-                "c9126084bcc36b3b03f6bcfb1a0fe17fc36b65edcb75386d9dcfefc20954df9d",
-                1,
-            ),
-            (
-                "dac84961f14ecf95f7c7977967ca0956483de20be39a59e3e535972c86df536d",
-                1,
-            ),
-        ],
-    ),
-    (
-        "src/extras/skills/selection.rs",
-        &[
-            (
-                "8154a2ee5820021bc90b621e03072ff7718a42229efd4d9367831262646d587d",
-                1,
-            ),
-            (
-                "e134a67930eed0c8e0c1a02bcac6efda89c87f216b2f1a438a90737d63907acb",
-                1,
-            ),
-            (
-                "53b45424ea372be94559be65c6f1ac40932431c7093e9cfe824d256dc55454ec",
-                1,
-            ),
-            (
-                "d4ee4a31960023c4dca62084241f8e7e0e63866d5367a3c02886b4c0a29bb428",
-                1,
-            ),
-            (
-                "f4faf0ed27164d65181a5963d363f1eaef80f3ed8d260e6e0aef509bfbbdbe31",
-                1,
-            ),
-        ],
-    ),
-    (
-        "src/extras/js/supervisor.rs",
+        "src/extras/js/skills/store.rs",
         &[(
-            "e30de734188566fa21d676314e3cff927ee853afaa7e694f5f33d20ecaa58413",
+            "37b1d55d03713d423bc79e2bdfc046830486adddb9997708182cbd6434852b94",
             1,
         )],
     ),
@@ -5121,100 +2400,7 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
             1,
         )],
     ),
-    (
-        "src/extras/subagents/task_tool.rs",
-        &[
-            (
-                "f6cbad0c5a42805120dccf0d39a9e20f819fec851a04f3e989ac7c7a754508e5",
-                1,
-            ),
-            (
-                "e56ebbde3b87e7449cf7d734dabaddf4963dbf3c2548ae0a7c393bf165a29b14",
-                1,
-            ),
-            (
-                "8736900ea9356e3180408c8a88e523bfb2e418de1adfd6255713e395822e6f41",
-                1,
-            ),
-            (
-                "a77ad0065bc0cc36c152ac342277fdeff0edce4ae455e44c3a686dab6c5bd3a3",
-                1,
-            ),
-            (
-                "6884bc264c3021e29f258708b6c9047a22a2d755048dd069b549824131e86d7a",
-                1,
-            ),
-            (
-                "7308fdc8eff948ba4a55b0e6e5bc4490cd09ba72db71d7553393f8ec71aa2da4",
-                1,
-            ),
-            (
-                "ed11a97886914baeefe43d2157c89851a90e5f5bb1af6d4d0d4545046d5c8fc9",
-                1,
-            ),
-            (
-                "b5b1fd8ecd14c3b459885cace1c89d97456db2d65fb24b23305042f2207f7d95",
-                1,
-            ),
-        ],
-    ),
     // Exact full-token contexts of those four notebook String assertions.
-    (
-        "src/agent/tools/notebook.rs",
-        &[
-            (
-                "b8a22ea3c44dfa022f99d414246e65b1f175ab4687fbda633be9246605ad946b",
-                1,
-            ),
-            (
-                "4969b09c8c9f35749df4497141b936749b60113dcb2157fa414e843e9df55dc8",
-                1,
-            ),
-            (
-                "7b1e5cde9d702c82371414edbf74788deb26b002323f724baa0c78855e282023",
-                1,
-            ),
-            (
-                "eb165b6c9b108e4be2dd9adf719be30b28d8595cf218016abed3be374e00db78",
-                1,
-            ),
-        ],
-    ),
-    (
-        "src/print.rs",
-        &[
-            (
-                "7754ad9d4a4920c203d43d087fc405e95102f7a4801855582533ab54e3a86b86",
-                1,
-            ),
-            (
-                "8a4d18f5eab2de9d10ef609d4c51cef612fd6652674c5ee503fb77a75a66cc1a",
-                1,
-            ),
-            (
-                "a9b0b5cf240a3b7a378fc6c6dedd61ea1555a7bd03bcd115629965b05dd8d7fc",
-                1,
-            ),
-        ],
-    ),
-    (
-        "src/extras/hooks/dispatcher.rs",
-        &[
-            (
-                "4455fff110b3f344a84e2da4538deb7323313eafb4e100e51a659498ebf49077",
-                1,
-            ),
-            // matches! predicates call the local fixture output(Value), not a process.
-            (
-                "b4a21a2e238f2b0b84865f9a46b5d4c192332a95e0f10d81b11f4d102386c534",
-                1,
-            ),
-            (
-                "2038cb9c54e834f60e215100c1c8e293c5277f833a78920ed77cb21d48ca1e19",
-                1,
-            ),
-        ],
-    ),
     (
         "src/extras/mcp/client.rs",
         &[(
@@ -5237,264 +2423,9 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         ],
     ),
     (
-        "src/sandbox.rs",
-        &[
-            (
-                "5aac039070f3564d9fbd695b02011940968a7ef00c1bc7dbb31f56a7ab5aa89f",
-                1,
-            ),
-            (
-                "be15ad15d5bdb6dd8980fa2cdad4e8ad377d08ab4b6efbf79303765ad5b4ab82",
-                1,
-            ),
-            // Exact macro contexts for the two new native Seatbelt tests.
-            // Native bwrap alias-refusal stderr predicates read CommandOutput data.
-            (
-                "180fa7b0696bd7ffa684772d8ce48c7481f258456b1aeadc03868a8f69e12c48",
-                1,
-            ),
-            (
-                "45c86e553982badc8ac01b7c4004735ebe00a3561fd23f3bcdbf1e3c2058f64e",
-                1,
-            ),
-            (
-                "05e3b16e731da032d3b458cb2ffa859da145b5a7adefa4806895742048a416b2",
-                1,
-            ),
-            (
-                "4dd1797249dccadd720d5239ab4cc1b711e50d34a29958f2a2f2b49b9b55cb3e",
-                1,
-            ),
-            (
-                "7d05a44afe0aaa39594c07cde71339d327de9a611fb4b02841ee05baa078ca5a",
-                1,
-            ),
-            (
-                "627b473d9f5eeeebcc106c10f05b0efd5737d4306d9842f566d3b999afe0b605",
-                1,
-            ),
-            (
-                "a1926db5b3e3f1231774fc4347154ba171e577143dc78940bf0596febca78bfa",
-                1,
-            ),
-            (
-                "b259679d1bae5bcc5274fa14b991897494f5fdf88a0b3ce6bcd601cbba5692be",
-                1,
-            ),
-            (
-                "c56e4e7b8f07cb0b1239fb75799362ad1a44fa0e8fbdf5b3b846761765108f74",
-                1,
-            ),
-            (
-                "d36edb6bb8fb94a81802d47d5595b1640211adceaaec11c4ac3bb4e5b0a06b92",
-                1,
-            ),
-            (
-                "d41de9f2559c59c3403416bf0fc72407b08c084cbe2d3086af0e0e4cf4e42c05",
-                1,
-            ),
-            (
-                "77288e0715e2e881aa2f70d0c79e2dc255ad6bb1cb187ddef46359df73a23762",
-                1,
-            ),
-            (
-                "5940f63c8bdc3c394d8e54c7b6deba8e8529d0a5b921c897cf45a23f4d94f94b",
-                1,
-            ),
-            (
-                "6e4cd00c8c8dced3ba1dfe6bfdf749624335b102a8b952c6bc33430cadd913df",
-                1,
-            ),
-            (
-                "7109de400e0c4f3dadd8116f47f0a2974119a18a8d7488093158d54d032b4798",
-                1,
-            ),
-            (
-                "87927df2c7d794eca3102771a06a4b3da45f0924beeb7715e6bd2fd0c917a654",
-                1,
-            ),
-            (
-                "8bf1360ab3a1b48ffbec38dcab906b7c7b5e8681952a391bf1323aca036db123",
-                2,
-            ),
-            (
-                "8de02a606709e72b294f7747449b50f5cd1b28d5ee73898fac28d59e83d6d77b",
-                1,
-            ),
-            (
-                "8f720ce431f239fd3832c71566aa0b9e7b4320c2183f6760d7385047da7fba0a",
-                1,
-            ),
-            (
-                "b27051c5dbe7a008d67062f63095b37014ef1b88f4f1f0180d289237271cab70",
-                1,
-            ),
-        ],
-    ),
-    (
-        "src/ui/app.rs",
-        &[
-            // Genuine pressure/question regression matches ToolResult.output
-            // inside its timeout future; this is event data, not process IO.
-            (
-                "3edad67d0872deca14b82de9ca22e3c54e8603ce632c80b8eaf55297b8a68d97",
-                1,
-            ),
-            // Context diagnostic assertions inspect captured renderer strings,
-            // never process builders; bind each complete macro invocation.
-            (
-                "27b4360381c77aa12e4fcf4c083cd1150bf4cf12dfc6914c7507d9ddaeb3aa49",
-                1,
-            ),
-            (
-                "2ec28ae5aeb94b904650c110aed46f8a6119bf282cb94103305353c2cd086655",
-                1,
-            ),
-            (
-                "43396f941f737accd9c4d4d101e440fe68fc3b52a834529227f028abb9e1c58f",
-                1,
-            ),
-            (
-                "7129b5cf6f964bbd2698b0f39b68c8552a420fc5594d81482b5fcce6512b6aba",
-                1,
-            ),
-            (
-                "039c1c846af0d5772694e02ae88965b6fec2b6260b55bd0f961fd55c057ae21f",
-                2,
-            ),
-            // Doctor rendering/privacy assertions on captured text only.
-            (
-                "2d2a09c6cb4d23527ecc393eb213bac6a3faf7ee00578202ae0a8c126edca8b6",
-                1,
-            ),
-            (
-                "2dae43810c104e80c5c03f6253a24be7e5560718dddc8a2764e87b9420292bec",
-                1,
-            ),
-            (
-                "6eb9f9893492e75602197e2c9cdc86fb779ac28b07c86dc8969eb75d55fad6fb",
-                1,
-            ),
-            (
-                "b7af79d5aa59730634d98c20d3fec794b65f77a4c75b6d6e476c8fbe491a0a8d",
-                1,
-            ),
-            (
-                "efbf1e616edc14fac2436cfd32c40c1a31fa90cb5f2516dad7ab725a76e5d4d4",
-                1,
-            ),
-        ],
-    ),
-    (
-        "src/ui/renderer.rs",
-        &[(
-            "99da3c2607b5ae5cbf0cf0a647827d0338e6fe9a07b83397ef5eee860a43fe20",
-            1,
-        )],
-    ),
-    (
-        "src/sandbox/windows.rs",
-        &[
-            (
-                "2d89694470e84019a3e88ae581007d1b2f626839a3d9ab1ad2950a4a3a8d7e6d",
-                1,
-            ),
-            (
-                "48b38d261851e6e3c7bb387f8fb5d093448cb69f8047816907f7b7dc699ca584",
-                1,
-            ),
-            (
-                "7731da00f43136911c6dc28ad641ac88c4af40639bd4738168ad235d98d9effb",
-                1,
-            ),
-        ],
-    ),
-    (
-        "src/git/runner.rs",
-        &[
-            (
-                "bb8b0f921bc2afe7c1a0fdd7d97dc264237bdbe93e6c7aff99554fb104933299",
-                1,
-            ),
-            (
-                "8b1b2938a13a5c2c4409c8eb4a604d670a3d43f0a8f6a20bdd30288c927a78bb",
-                1,
-            ),
-            (
-                "7d05a44afe0aaa39594c07cde71339d327de9a611fb4b02841ee05baa078ca5a",
-                1,
-            ),
-            (
-                "2990b99216f07cf0bf799c8742347e406c9d3f08ec875af2101bfdf3182519c7",
-                1,
-            ),
-            (
-                "a77bef71f18041ad560cfa5d7f941831db717c3ce841bb19085d4feda4390176",
-                1,
-            ),
-            (
-                "05e3b16e731da032d3b458cb2ffa859da145b5a7adefa4806895742048a416b2",
-                1,
-            ),
-            (
-                "1f5cdcadf7b9660a47ba343bd823136ea5a67f15ce74a8f6a259d78e4d394bcf",
-                1,
-            ),
-        ],
-    ),
-    (
         "src/docs.rs",
         &[(
             "eaf04cf21084dd8d714729cf31f39143471900f5d86a880cffc12bbfe31be9a0",
-            1,
-        )],
-    ),
-    (
-        "src/setup/mod.rs",
-        &[
-            (
-                "b945ed43b6634d640ac67926eb81d8a86cbeb71a124db0ee8a3c0d9fac65f891",
-                1,
-            ),
-            // Price-pair closure in the setup renderer's format!; no process call.
-            (
-                "3fe711d4827c7e1bce3abfabd2cd8e0007745ba1311752f25add29cfc450ef6a",
-                1,
-            ),
-        ],
-    ),
-    (
-        "src/session/title.rs",
-        // The assertion sums captured input/output prices; both identifiers are data.
-        &[(
-            "e9aa8d89774cc408a3aa61dd9ac2621f7b493c84046448e28d3db3767d648e86",
-            1,
-        )],
-    ),
-    (
-        "src/ui/slash/memory.rs",
-        &[
-            (
-                "31f0448d3ca88e815a10351301f97493f81877893b6a2540b221ff52d4a10a9e",
-                1,
-            ),
-            (
-                "a332259bdc29adc54732a3d79505caf3f2563d38417b9ea523d35e26a19e3a45",
-                1,
-            ),
-        ],
-    ),
-    (
-        "src/agent/tools/client_fs_tests.rs",
-        &[(
-            "c194291ac0ae72fc669bfb3f7b559222e88020ffeb12f5291b3b091c9171f12b",
-            1,
-        )],
-    ),
-    (
-        "src/agent/tools/client_fs_tests.rs",
-        &[(
-            "d0da8140489dd16ca649043fe075375777f240e3459395ce6628c9f6498d6960",
             1,
         )],
     ),
@@ -5520,30 +2451,9 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         )],
     ),
     (
-        "src/key_command.rs",
-        &[(
-            "f57825fbb17eff02fef2a1cd49c1cf7a35125d5fa1961b87863a18b6cdc58159",
-            1,
-        )],
-    ),
-    (
         "src/provider.rs",
         &[(
-            "0cdbbd4deccdcddfef5ad81a669b729b0a26d5d929bf1bb27bae6b4881cf4387",
-            1,
-        )],
-    ),
-    (
-        "src/retry.rs",
-        &[(
-            "67d9213dd8a4e10e89130deed01449bee3c0b852bdb5b3eb9c84de7bd6163978",
-            1,
-        )],
-    ),
-    (
-        "src/sandbox/network_tests.rs",
-        &[(
-            "6fc8e2858b0d0c2a80bfcd744f4bdd583bc0f23e515e66b4c70ecb8e86499d33",
+            "2544a43f58db98f7e0aa66a33286959c9587ce7dd8ee92935ac05d7f8b6a2484",
             1,
         )],
     ),
@@ -5555,42 +2465,14 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         )],
     ),
     (
-        "src/spend/request_tests.rs",
-        &[(
-            "18b8e284ef24da195128cd56be0b34177307739c1f57795638fc788c6a6750f7",
-            1,
-        )],
-    ),
-    (
         "src/update.rs",
         &[(
             "fd6a7fea2777cec3193c620b5076e42fc813fd793ca7f909ed003c722e72009a",
             1,
         )],
     ),
-    (
-        "src/git/tool.rs",
-        &[(
-            "bb8b0f921bc2afe7c1a0fdd7d97dc264237bdbe93e6c7aff99554fb104933299",
-            4,
-        )],
-    ),
     // Exact select bodies inspect captured I/O/status and JoinSet tasks;
     // actual child creation remains outside these macros and guarded.
-    (
-        "src/extras/mcp/headers_helper.rs",
-        &[(
-            "4c8b85e6eb6ef8da3e0680afc3ba5a877bbfe732b9150a963865f94a5e0dc7de",
-            1,
-        )],
-    ),
-    (
-        "src/extras/mcp/server.rs",
-        &[(
-            "5060a4fa982c2dc00234a99b857bcea723113ca93491f3804c117a2b99113a98",
-            1,
-        )],
-    ),
     // This status JSON reads captured CommandOutput.stdout; no launch occurs.
     (
         "src/git/tool.rs",
@@ -5703,60 +2585,6 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     ("src/extras/acp/mod.rs", ".status()", 1, "TEST-ONLY"),
     ("src/sandbox.rs", ".spawn(move || {", 2, "NON-PROCESS"),
     ("src/cli.rs", ".spawn(parse)", 1, "NON-PROCESS"),
-    (
-        "src/extras/hooks/subprocess.rs",
-        "output.started,",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/hooks/subprocess.rs",
-        "String::from_utf8_lossy(&output.stderr)",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/session/mod.rs",
-        "format_truncated_tool_output_with_notice(&output, len, \"n\"),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/session/mod.rs",
-        "reference(&output, len, \"n\"),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/grep.rs",
-        "assert!(output.contains(expected), \"{pattern}: {output}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/grep.rs",
-        "assert!(!output.contains(\"b.txt\"), \"{pattern}: {output}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/read.rs",
-        "assert!(output.contains(\"line 19997 \"), \"{output}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/read.rs",
-        "assert!(output.contains(\"line 19998 \"), \"{output}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/read.rs",
-        "assert!(!output.contains(\"line 19996 \"), \"{output}\");",
-        1,
-        "NON-PROCESS",
-    ),
     (
         "src/extras/acp/mod.rs",
         "std::process::Command::new(\"kill\")",
@@ -5871,12 +2699,6 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/acp/sessions.rs",
         ".status(ToolCallStatus::Completed)",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/acp/sessions.rs",
-        ".status(ToolCallStatus::Failed)",
         1,
         "NON-PROCESS",
     ),
@@ -6300,24 +3122,6 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     (
-        "src/extras/js/host.rs",
-        "assert_eq!(output.status, CommandStatus::Completed);",
-        3,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/js/host.rs",
-        "assert_eq!(output.stdout, b\"approved\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/js/host.rs",
-        "assert_eq!(output.stdout, b\"elf-snapshot\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
         "src/extras/js/worker.rs",
         "\"status\": status.as_str(),",
         1,
@@ -6349,12 +3153,6 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     ("src/extras/acp/mod.rs", "cx.spawn({", 1, "NON-PROCESS"),
-    (
-        "src/extras/acp/mod.rs",
-        "cx.spawn(tasks::watch(",
-        1,
-        "NON-PROCESS",
-    ),
     // The ACP /cron driver is a connection task on the ACP executor, not a process.
     (
         "src/extras/acp/cron.rs",
@@ -6788,6 +3586,19 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         "std::process::Command::new(&probe_clone).arg(\"--version\"),",
         1,
         "TC-SUPPORT-UTILITY",
+    ),
+    // ACP connection tasks and a builder method named `status`; no process is launched.
+    (
+        "src/extras/acp/mod.rs",
+        "cx.spawn(tasks::watch(",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/acp/sessions.rs",
+        ".status(ToolCallStatus::Failed)",
+        1,
+        "NON-PROCESS",
     ),
 ];
 
@@ -7348,9 +4159,19 @@ fn process_creation_raw_terminals_are_exact_and_guard_dominated() {
             "output_std_once|std::process::Command::output(command)".to_string(),
             1,
         ),
-        ("spawn_tokio_once|TokioCommand::spawn(command)".to_string(), 1),
-        ("spawn_guarded_until|TokioCommand::spawn(self)".to_string(), 1),
-        ("launch_tokio_with_creation_guard_until|let child = TokioCommand::spawn(command)?;".to_string(), 1),
+        (
+            "spawn_tokio_once|TokioCommand::spawn(command)".to_string(),
+            1,
+        ),
+        (
+            "spawn_guarded_until|TokioCommand::spawn(self)".to_string(),
+            1,
+        ),
+        (
+            "launch_tokio_with_creation_guard_until|let child = TokioCommand::spawn(command)?;"
+                .to_string(),
+            1,
+        ),
         (
             "spawn_wrap_once|process_wrap::tokio::CommandWrap::spawn(command)".to_string(),
             1,
@@ -7363,36 +4184,8 @@ fn process_creation_raw_terminals_are_exact_and_guard_dominated() {
             "spawn_guarded_until|std::process::Command::spawn(self)".to_string(),
             1,
         ),
-        (
-            "guarded_output_preserves_explicit_stdio_across_builder_reuse|assert!(output.status.success());"
-                .to_string(),
-            1,
-        ),
-        (
-            "guarded_output_preserves_explicit_stdio_across_builder_reuse|output.stderr.is_empty(),"
-                .to_string(),
-            1,
-        ),
-        (
-            "guarded_output_preserves_explicit_stdio_across_builder_reuse|output.stdout.is_empty(),"
-                .to_string(),
-            1,
-        ),
     ]);
-    let exact_non_process = BTreeSet::from([
-        (
-            "7731da00f43136911c6dc28ad641ac88c4af40639bd4738168ad235d98d9effb".to_string(),
-            1,
-        ),
-        (
-            "793b5bb0809fd91c3813d13713e2e3cf9cc19325c876bea759bc1631905cb673".to_string(),
-            1,
-        ),
-        (
-            "bfb1f62966ac90ca4e21d0f6749754af021b8f31716fb4396b11c1298ef735f4".to_string(),
-            1,
-        ),
-    ]);
+    let exact_non_process = BTreeSet::new();
 
     validate_process_creation_raw_inventory_with_non_process(
         &source,
@@ -7837,6 +4630,136 @@ fn launch(command: &mut std::process::Command) {
         ["spawn"]
     );
     assert!(calls.iter().all(|call| !call.guarded));
+}
+
+fn terminal_names(source: &str) -> Vec<String> {
+    terminal_calls(source)
+        .expect("fixture must tokenize")
+        .into_iter()
+        .map(|call| call.name)
+        .collect()
+}
+
+#[test]
+fn splice_free_macros_ignore_bare_identifiers_that_are_data() {
+    // Variable, pattern and field spellings that merely look like terminals.
+    let calls = terminal_names(
+        r#"
+fn inspect(status: Status, output: Output) {
+    let ok = matches!(status.as_u16(), 429 | 529);
+    assert_eq!(output, expected);
+    assert!(output.status.success(), "{status}");
+    let _ = format!("{}", status);
+    tracing::info!(status = status.as_u16(), output = ?output);
+    match (spawn, status) { (Some(spawn), status) if matches!(status, Ok(_)) => {} _ => {} }
+    std::println!("{}", output);
+}
+"#,
+    );
+    assert!(calls.is_empty(), "{calls:?}");
+}
+
+#[test]
+fn splice_free_macros_still_flag_real_process_calls() {
+    // Method and path calls stay flagged however deeply a std macro wraps them.
+    for fixture in [
+        "fn l(c: &mut std::process::Command) { assert!(c.spawn().is_ok()); }",
+        "fn l(c: &mut std::process::Command) { assert_eq!(c.status().unwrap().code(), Some(0)); }",
+        "fn l(c: &mut std::process::Command) { let _ = format!(\"{:?}\", c.output()); }",
+        "fn l(c: &mut std::process::Command) { matches!(c.status(), Ok(_)); }",
+        "fn l(c: &mut std::process::Command) { let _ = vec![c.spawn()]; }",
+        "async fn l(mut child: tokio::process::Child) { tokio::select! { r = child.status() => { drop(r); } } }",
+        "fn l(c: &mut std::process::Command) { assert!(std::process::Command::spawn(c).is_ok()); }",
+        "fn l(c: &mut std::process::Command) { assert!(matches!(c.spawn(), Ok(_))); }",
+    ] {
+        assert!(
+            !terminal_names(fixture).is_empty(),
+            "a real launch inside a splice-free macro was not flagged: {fixture}"
+        );
+    }
+}
+
+#[test]
+fn splice_free_macros_do_not_vouch_for_macros_nested_inside_them() {
+    // The nested macro is judged on its own name: an unknown or local macro can
+    // splice the identifier into a method position.
+    for fixture in [
+        "fn l(c: &mut std::process::Command) { assert!(terminal!(c, spawn).is_ok()); }",
+        "fn l(c: &mut std::process::Command) { matches!(run!(c, status), Ok(_)); }",
+        "fn l(c: &mut std::process::Command) { assert_eq!(crate::terminal!(c, output), 1); }",
+        "fn l(c: &mut std::process::Command) { assert_eq!(local::format!(c, spawn), 1); }",
+        "fn l(c: &mut std::process::Command) { assert_eq!($crate::format!(c, spawn), 1); }",
+    ] {
+        assert_eq!(
+            terminal_names(fixture).len(),
+            1,
+            "nested non-splice-free macro was exempted: {fixture}"
+        );
+    }
+}
+
+#[test]
+fn splice_free_exemption_never_applies_inside_macro_rules_bodies() {
+    let calls = terminal_names(
+        r#"
+macro_rules! launch {
+    ($command:ident, $method:ident) => {
+        assert!($command.$method().is_ok());
+        matches!($method, spawn)
+    };
+}
+"#,
+    );
+    assert!(!calls.is_empty());
+}
+
+#[test]
+fn splice_free_macro_names_are_not_redefined_by_the_crate() {
+    // The exemption is by macro name. If the crate ever defines a macro with one
+    // of these names (or re-exports one under it) the name no longer proves the
+    // macro cannot splice an identifier, so this fails until the list is revisited.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut offenders = Vec::new();
+    for source in rust_sources(&root.join("src")) {
+        let relative = source
+            .strip_prefix(root)
+            .expect("source must be below manifest root")
+            .to_string_lossy()
+            .replace('\\', "/");
+        if relative == "src/tests/subprocess_inventory_tests.rs" {
+            continue;
+        }
+        let contents = std::fs::read_to_string(&source).expect("Rust source must be UTF-8");
+        let Ok(stream) = TokenStream::from_str(&contents) else {
+            continue;
+        };
+        fn walk(stream: TokenStream, relative: &str, offenders: &mut Vec<String>) {
+            let tokens: Vec<_> = stream.into_iter().collect();
+            for (index, token) in tokens.iter().enumerate() {
+                if let TokenTree::Group(group) = token {
+                    walk(group.stream(), relative, offenders);
+                }
+                let TokenTree::Ident(ident) = token else {
+                    continue;
+                };
+                let name = ident.to_string();
+                let is_exempt_name = SPLICE_FREE_MACROS.contains(&name.as_str());
+                let defines = index >= 2
+                    && matches!(&tokens[index - 2], TokenTree::Ident(keyword) if keyword == "macro_rules")
+                    && matches!(&tokens[index - 1], TokenTree::Punct(punct) if punct.as_char() == '!');
+                let renames = index >= 1
+                    && matches!(&tokens[index - 1], TokenTree::Ident(keyword) if keyword == "as");
+                if is_exempt_name && (defines || renames) {
+                    offenders.push(format!("{relative}:{} {name}", ident.span().start().line));
+                }
+            }
+        }
+        walk(stream, &relative, &mut offenders);
+    }
+    assert!(
+        offenders.is_empty(),
+        "macro names on the subprocess inventory's splice-free list were redefined or aliased: {offenders:#?}"
+    );
 }
 
 #[test]

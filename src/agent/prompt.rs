@@ -101,7 +101,8 @@ diagnostic). Positions are 1-based line/column of the symbol.";
 
 #[cfg(feature = "lsp")]
 pub const LSP_MUTATION_PROMPT: &str = "\nFresh diagnostics are appended after supported file changes. Trust them and \
-fix what they report before moving on; no separate typecheck is needed just to confirm.";
+fix what they report before moving on. They cover only the edited file, so after a signature or \
+API change still run the build or tests to catch broken callers elsewhere.";
 
 /// The part of the summarizer contract both request shapes share: what to
 /// produce, the sections, and the replacement rule (mini-agent-sskdu.234,

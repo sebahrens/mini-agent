@@ -129,7 +129,9 @@ impl Redactor {
         for secret in &self.exact_secrets {
             value = value.replace(secret, "[REDACTED]");
         }
-        truncate_utf8(&value, self.max_bytes)
+        crate::byte_text::clip_to_bytes(&value, self.max_bytes)
+            .0
+            .to_string()
     }
 
     #[cfg(test)]
@@ -138,15 +140,4 @@ impl Redactor {
             .iter()
             .any(|secret| value.contains(secret))
     }
-}
-
-fn truncate_utf8(value: &str, max_bytes: usize) -> String {
-    if value.len() <= max_bytes {
-        return value.to_string();
-    }
-    let mut end = max_bytes;
-    while !value.is_char_boundary(end) {
-        end = end.saturating_sub(1);
-    }
-    value[..end].to_string()
 }

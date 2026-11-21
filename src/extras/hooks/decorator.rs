@@ -91,6 +91,7 @@ impl HookedTool {
         // Post hooks audit the operation that actually ran, so they receive
         // the effective arguments after any pre-hook rewrite rather than
         // the arguments the model originally proposed.
+        let input_rewritten = pre.updated_input.is_some();
         let executed_input: serde_json::Value = match &pre.updated_input {
             Some(rewritten) => rewritten.clone(),
             None => tool_input,
@@ -251,6 +252,19 @@ impl HookedTool {
                         .await;
                 }
             }
+        }
+
+        // The model asked for one input and ran another; say so, or it reasons
+        // about a call that never happened.
+        if input_rewritten
+            && let Ok(response) = &result
+            && inspect(response).0
+        {
+            let noted = format!(
+                "{}\n\n[note: a PreToolUse hook rewrote this call's input before it ran]",
+                inspect(response).1
+            );
+            return result.map(|original| rewrite(original, noted));
         }
 
         result
