@@ -20,6 +20,12 @@ Notable changes to mini-agent are documented in this file. The format follows
 - `$CLAUDE_PROJECT_DIR`/`$MINI_AGENT_PROJECT_DIR` prefixes in hook `command`/args are expanded at launch and `CLAUDE_PROJECT_DIR` is exported to hooks; a Claude-style command string with shell operators skips only that handler instead of the whole file (mini-agent-nvnkx.181).
 - `--trust-project-hooks` (env `MINI_AGENT_TRUST_PROJECT_HOOKS`) and `mini-agent hooks trust [--list|--yes]` let headless and CI runs approve project hooks; skipped bindings now raise a startup notice (mini-agent-nvnkx.179).
 - Brokered JS `writeFile`, `fetch` and `spawn` effects run PreToolUse hooks as `write`, `web_fetch` and `bash` (spawn also still as `js_spawn`), and PostToolUse/PostToolUseFailure after they settle (mini-agent-nvnkx.335).
+- `mini-agent trust [--list|--yes|--revoke <path>]` and `--trust-project-config` (env `MINI_AGENT_TRUST_PROJECT_CONFIG`) approve a project config for CI and containers; approvals bind to the sensitive keys only, so comment and benign edits keep them, and the ignored-key note and the stream-json init record name the keys (mini-agent-nvnkx.345).
+- `terminal_notify` accepts `bell` and `auto` (terminal-aware, tmux passthrough), stays quiet while the terminal reports focus, and `terminal_notify_min_secs` (default 10) suppresses short "turn finished" notices (mini-agent-nvnkx.93).
+- `--print-config` shows a `Managed policy` section and labels policy-decided keys `managed policy`; policy clamps are printed at startup (mini-agent-nvnkx.348, .349).
+- The TUI falls back to 256 or 16 colours unless `COLORTERM`/`TERM`/`TERM_PROGRAM` show truecolor; `/doctor` shows the detected depth (mini-agent-nvnkx.252).
+- Setup wizard: `D` cycles the default provider/model among providers with a key or login, `T` checks a typed key with a model listing, and first run selects the one provider that has a credential (mini-agent-nvnkx.223, .224).
+- Unknown-key warnings now cover `[goal]`, `[lsp]`, `[colors]`, `[chain]`, `[statusline]` and `[embedding]`, with field lists taken from the structs (mini-agent-nvnkx.99).
 
 ### Fixed
 
@@ -130,6 +136,14 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Hook content pinning binds only files a hook executes (program, interpreter script operand, executable `-c`/`if` tokens), so editing a config or lock file named in a hook's arguments no longer disables the hook or blocks the agent's write tools (mini-agent-nvnkx.338).
 - Hook `if` rules written as Claude Code permission rules (`Bash(git push *)`) are matched in process; a shell condition that cannot be evaluated (exit 2, 126, 127) runs the handler with a notice instead of disabling it (mini-agent-nvnkx.180).
 - `docs/agent/CONFIG.md` no longer says `.claude/settings.json` is not read; the project file is listed with its trust rule (mini-agent-nvnkx.355).
+- A project layer adds to, rather than replaces, `permission-deny` and `permission-ask` rules (mini-agent-nvnkx.344).
+- Global-only keys in a project config are dropped before the trust prompt with a warning naming the key (mini-agent-nvnkx.350).
+- Saving settings keeps `config.json` as JSON and keeps `config.toml` comments and key order; MCP add/remove and saved quick models edit the file in place (mini-agent-nvnkx.346, .347).
+- The project-config trust store is updated under a lock, so concurrent sessions keep each other's approvals (mini-agent-nvnkx.357).
+- The "root assets were not loaded" notice no longer lists `.mini-agent/config.toml`, which is loaded (mini-agent-nvnkx.354).
+- A symlinked or read-only global config loads (owner and mode checked, never chmod-ed) instead of exiting (mini-agent-nvnkx.192).
+- `managed-settings.json` and, on Windows, `managed-config.toml` must be administrator-owned; a planted file loads no hooks and fails closed (mini-agent-nvnkx.221).
+- Setup wizard: saving an existing custom provider keeps its headers, timeouts, model and prices; an empty key clears the stored key; keys are trimmed; unknown provider types are rejected (mini-agent-nvnkx.222).
 
 ### Added
 

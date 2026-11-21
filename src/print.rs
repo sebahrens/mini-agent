@@ -3313,6 +3313,17 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
     let mode = print_config_permission_mode(cli, cfg);
     let mode = mode.as_str();
 
+    if let Some(policy) = config::managed::active() {
+        append_section(
+            &mut output,
+            "Managed policy (wins over every other layer; values omitted)",
+            &[
+                ("file", policy.path().display().to_string()),
+                ("enforces", policy.summary()),
+            ],
+        );
+    }
+
     append_section(
         &mut output,
         "Directories",

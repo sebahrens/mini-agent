@@ -305,6 +305,7 @@ fn apply_limit_setting_at(
             crate::config::ConfigLayer::Project => 1,
             crate::config::ConfigLayer::Local => 2,
             crate::config::ConfigLayer::Cli => 3,
+            crate::config::ConfigLayer::Managed => 4,
         }
     }
     if config

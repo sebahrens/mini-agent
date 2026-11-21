@@ -51,9 +51,35 @@ directory that is already a repository root.
 
 Precedence is global config → selected `config.toml` → selected
 `config.local.toml` → repeated `--config key=value` → existing dedicated flags.
-Tables merge by key; scalars and arrays replace. Each project file has its own
-canonical path/SHA-256 approval; approval for `config.toml` does not activate
-sensitive local values. `.mini-agent/config.local.toml` is ignored by this repository.
+Tables merge by key; scalars and arrays replace, with two exceptions that only
+ever add: `permission-deny` and `permission-ask` rules (and `sandbox-home-masks`)
+from a project layer are appended to the inherited ones, so a repository file can
+never replace your own deny rules for a tool (allow lists and explicit `--config`
+overrides still replace). Each project file has its own canonical path approval,
+bound to the SHA-256 of its *sensitive* keys only (canonical TOML of the keys the
+trust prompt lists), so editing a comment or a benign key such as `max_tokens` keeps
+the approval; approval for `config.toml` does not activate sensitive local values.
+Keys only the global config may set (`max_budget_usd`, `max_session_input_tokens`,
+`max_session_total_tokens`, `cache_ttl`, `permission_mode_cycle`, `sandbox-required`,
+`permission-checks-required`, `shell-env-allow-secrets`) are dropped from a project
+file before the trust prompt, with a load warning naming the key.
+
+Headless, ACP and CI runs never prompt. A project config whose sensitive keys are not
+approved applies only its benign keys and prints a note naming the ignored keys (they
+also appear as `ignored_project_config_keys` in the stream-json `system`/`init` record).
+Approve it once with `mini-agent trust` (shows the settings and asks), `mini-agent trust
+--yes` (records without asking), or for one run only with `--trust-project-config` (env
+`MINI_AGENT_TRUST_PROJECT_CONFIG`; nothing is recorded). `mini-agent trust --list` prints the
+stored approvals and `mini-agent trust --revoke <project-or-config-path>` removes them.
+The trust store is updated under a lock file, so concurrent sessions never drop each
+other's approvals.
+
+A global config that is a symbolic link (GNU stow, home-manager, a mounted ConfigMap),
+sits in a linked directory, or lives on a read-only mount is read through its resolved
+target: the target must be a regular file owned by you or root and not group- or
+world-writable (nothing is chmod-ed). The program never rewrites a linked config; settings
+saved from the UI then fail with a message naming the target. Saving `config.toml` edits
+the file in place, so comments and key order survive, and `config.json` stays JSON. `.mini-agent/config.local.toml` is ignored by this repository.
 Existing global-only financial/cache and permission-cycle policy stays global-only.
 A project `model` alias that changes an implicitly selected provider needs project trust.
 Benign raw model IDs and same-provider aliases preserve the inherited provider; an
@@ -882,7 +908,8 @@ Accepted top-level keys:
 | `mouse_scroll_lines`      | integer | Transcript lines one plain mouse-wheel notch scrolls (1 to 20). `Shift+wheel`/`Ctrl+wheel` always scroll a page per notch. Unused when `mouse_capture = false`. Default: `3`. |
 | `mouse_capture`           | boolean | Capture mouse events in the TUI: wheel scrolling, click to place the input cursor, click to open links, drag to select and copy transcript text, and double-click to copy a word. Set `false` to leave the mouse to the terminal so its native text selection works (the in-app mouse features are then unavailable; use `PageUp`/`PageDown` to scroll). Inside a terminal multiplexer that offers its own selection and copy mode (tmux, zellij, herdr), `false` lets that selection work. Default: `true`. |
 | `terminal_title`          | boolean | Report agent activity in the terminal/window title (OSC 0): `mini-agent: working` while a run is active, `mini-agent: waiting for approval` while a permission prompt waits, and `mini-agent: idle` otherwise. Terminal multiplexers and tab bars that show pane or window titles (tmux `#{pane_title}`, zellij, herdr, terminal tabs) can surface it. The title is saved on start and restored on exit (XTWINOPS title stack; terminals without it fall back to their default title). The text is fixed, never model or tool output. Set `false` to leave the title alone. Default: `true`. |
-| `terminal_notify`         | string  | Desktop notification escape emitted when a turn finishes (`<name>: turn finished`) and when a permission prompt starts waiting (`<name>: waiting for approval`): `"osc9"` sends `OSC 9 ; <text> BEL` (iTerm2, WezTerm, Ghostty, kitty, foot), `"osc777"` sends `OSC 777 ; notify ; <name> ; <text> BEL` (rxvt-unicode, foot, Ghostty, WezTerm, patched VTE terminals), `"off"` sends nothing. Terminals interpret these differently (some treat unknown `OSC 9` payloads as progress or ignore them), so the default is `"off"`. The text is fixed, never model or tool output, and control characters and `;` are stripped from every payload. Inside tmux the sequences reach the outer terminal only with passthrough enabled (`set -g allow-passthrough on`). |
+| `terminal_notify`         | string  | Notification emitted when a turn finishes (`<name>: turn finished`) and when a permission prompt starts waiting (`<name>: waiting for approval`): `"osc9"` sends `OSC 9 ; <text> BEL` (iTerm2, WezTerm, Ghostty, kitty, foot), `"osc777"` sends `OSC 777 ; notify ; <name> ; <text> BEL` (rxvt-unicode, foot, Ghostty, WezTerm, patched VTE terminals), `"bell"` sends a plain BEL that every terminal and multiplexer maps to a bell, badge or urgency hint, `"auto"` picks osc9 (iTerm2, WezTerm, Ghostty, kitty), osc777 (foot, VTE) or a bell from `TERM`/`TERM_PROGRAM`/`VTE_VERSION` and wraps the OSC forms in tmux's DCS passthrough when `TMUX` is set, `"off"` sends nothing. When notifications are on the TUI asks the terminal for focus reports and stays quiet while the terminal says it has focus; a terminal without focus reporting keeps notifying. Terminals interpret the OSC forms differently (some treat unknown `OSC 9` payloads as progress or ignore them), so the default is `"off"`. The text is fixed, never model or tool output, and control characters and `;` are stripped from every payload. With an explicit `osc9`/`osc777` inside tmux the sequences reach the outer terminal only with passthrough enabled (`set -g allow-passthrough on`). |
+| `terminal_notify_min_secs` | integer | Seconds a turn must run before `terminal_notify` announces "turn finished" (default `10`); approval and question waits always notify (unless the terminal is focused). |
 | `terminal_prompt_marks`   | boolean | Emit OSC 133 semantic prompt marks: `A`/`B` (prompt, input) while the TUI waits for input or a permission answer, `C` when a run starts, and `D` when it finishes. Multiplexers and terminals that track shell prompts (herdr, WezTerm, kitty, Ghostty, iTerm2) can use them to tell a busy agent from one waiting for input. Which signal herdr reads is not confirmed, so this is opt-in alongside `terminal_title` and `terminal_notify`. Default: `false`. |
 | `default_prompt`          | string  | Prompt name to activate on startup and in every new ACP session. Default: `code`. If the prompt file has a `%%mode=<mode>` first-line directive, the security mode is set automatically (see Prompt directives below). |
 | `wt-auto-merge`           | boolean | Automatically merge a CLI-created worktree on exit; requires `git-worktree`. Default: `false`. |
@@ -1137,7 +1164,7 @@ An administrator can pin permissions, sandbox, MCP and providers with a root-own
 | -- | ---- |
 | Linux | `/etc/mini-agent/managed-config.toml` |
 | macOS | `/Library/Application Support/mini-agent/managed-config.toml` |
-| Windows (experimental) | `C:\ProgramData\mini-agent\managed-config.toml` (no ownership check) |
+| Windows (experimental) | `C:\ProgramData\mini-agent\managed-config.toml` (owner and every write ACE must be Administrators, SYSTEM or TrustedInstaller; a user-writable directory is refused) |
 
 On Unix the file and its directory must be owned by root and not group- or world-writable, and the
 file must be a regular file (not a symlink) of at most 256 KiB. A present file that is unreadable,
@@ -1207,7 +1234,15 @@ toolchain roots stay. `allowed_roots` needs `max_profile`. `allowed_hosts` also 
 pinned `*.github.com` covers `api.github.com`, an entry's port must fit the pinned one) and turns
 off run-time approval of unlisted hosts, so pinned hosts are the only ones a user can list;
 `forbid_home_mounts` clears `sandbox-home-mounts`. Each lowering adds a load warning naming the file.
-Managed hooks keep their own `managed-settings.json` (see Hooks).
+Managed hooks keep their own `managed-settings.json` (see Hooks); that file passes the same
+owner/permission gate as the policy (root-owned and not group/world-writable, in a root-owned
+directory on Unix; administrator-only ACL on Windows). A file that fails it loads no hook and
+fails closed: PreToolUse calls are denied until it is fixed.
+
+Every clamp or removal the policy makes (lowered `sandbox-profile`/`sandbox-network`, cleared home
+mounts, removed MCP servers) is printed as a `warning:` line at startup and listed once in
+`--print-config`, which also shows a `Managed policy` section (file and a values-free summary) and
+labels every key the policy decided as `managed policy` in `Config sources`.
 
 ## Hooks
 
@@ -3889,7 +3924,10 @@ warning that names the file, the key and the nearest known key, for example
 clamped `[retry]` values) in a `Warnings:` section. A key that belongs to a
 Cargo feature this build was compiled without (for example `mcp_servers` in a
 build without `mcp`) is kept in the file unused and does not warn. Keys nested
-inside tables are not checked by this pass.
+inside tables are checked only for the typed tables `retry`, `goal`, `lsp` (and its
+`servers.*`), `colors`, `chain`, `statusline` (lines and segments), `embedding`,
+`advisor`, `quick_models.*` and `custom_providers.*`; the field lists come from the
+structs themselves.
 
 A config that fails to parse reports the line and column of the error. The
 message never includes a source excerpt, and quoted values the parser echoes

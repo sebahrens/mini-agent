@@ -24,6 +24,22 @@ pub(crate) enum CredentialReport {
     InvalidRoute,
 }
 impl CredentialReport {
+    /// A key, command or saved login the user actually provided. Ambient
+    /// chains (AWS, ADC) and keyless providers do not count.
+    pub(crate) fn is_provided(&self) -> bool {
+        use crate::auth::LoginRecordState as S;
+        matches!(
+            self,
+            Self::Source(
+                CredentialSource::Cli
+                    | CredentialSource::Command(_)
+                    | CredentialSource::Environment(_)
+                    | CredentialSource::Config(_)
+            ) | Self::ChatGpt(S::Stored)
+                | Self::Copilot(S::Stored)
+        )
+    }
+
     pub(crate) fn setup_label(&self) -> &'static str {
         use crate::auth::LoginRecordState as S;
         match self {
@@ -242,6 +258,7 @@ impl DoctorReport {
             }
             None => report.row("managed policy", "none"),
         }
+        report.row("color depth", crate::context::themes::color_depth().label());
         report.row("load warnings", cfg.load_warnings.len().to_string());
         for (class, count) in warning_classes(&cfg.load_warnings) {
             report.row(

@@ -284,6 +284,19 @@ struct ProjectConfigTrustStore {
     /// any project config (mini-agent-83ioo).
     #[serde(default)]
     persona_bindings: Vec<PersonaTrustBinding>,
+    /// Approvals bound to the sensitive subset of a project config rather than
+    /// to the whole file, so a comment or benign-key edit keeps them
+    /// (mini-agent-nvnkx.345).
+    #[serde(default)]
+    sensitive_bindings: Vec<SensitiveTrustBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SensitiveTrustBinding {
+    canonical_project: String,
+    canonical_config: String,
+    /// SHA-256 of the canonical TOML of the sensitive keys only.
+    sensitive_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -312,6 +325,21 @@ enum ProjectConfigTrustOutcome {
 
 /// Write `content` to `path` atomically via temp-file + rename.
 pub(crate) fn atomic_config_write(path: &Path, content: &str) -> io::Result<()> {
+    // A linked config is read through its target but never replaced by the
+    // program: the rename would silently swap the link for a regular file.
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        let target = path
+            .canonicalize()
+            .map(|target| target.display().to_string())
+            .unwrap_or_else(|_| "its target".into());
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "config {} is a symbolic link; edit {target} directly (the program does not rewrite linked configs)",
+                path.display()
+            ),
+        ));
+    }
     crate::fs::private_atomic_write_sync(path, content.as_bytes()).map_err(|error| {
         if cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33)) {
             io::Error::new(
@@ -343,8 +371,93 @@ pub(crate) fn read_config_content(path: &Path) -> io::Result<String> {
             "config file must have a parent directory",
         )
     })?;
-    crate::fs::ensure_private_directory(parent)?;
-    read_private_content(path, MAX_PRIVATE_CONFIG_BYTES, false)
+    let linked = |candidate: &Path| {
+        std::fs::symlink_metadata(candidate)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+    };
+    // Not the current user's own private file (a root-provisioned config, a
+    // hard link)?
+    #[cfg(unix)]
+    let foreign = std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+        use std::os::unix::fs::MetadataExt;
+        metadata.is_file()
+            && (metadata.uid() != crate::fs::private_current_uid() || metadata.nlink() != 1)
+    });
+    #[cfg(not(unix))]
+    let foreign = false;
+    // The config is authored by the user, not written by the program: a linked
+    // file or directory (stow, home-manager, a mounted ConfigMap) or one owned
+    // by root is read through its resolved target (mini-agent-nvnkx.192).
+    if linked(path) || linked(parent) || foreign {
+        return read_authored_config(path);
+    }
+    match crate::fs::ensure_private_directory(parent)
+        .and_then(|()| read_private_content(path, MAX_PRIVATE_CONFIG_BYTES, false))
+    {
+        // A read-only mount (EROFS) or a file we may not chmod (EPERM) cannot
+        // be repaired to 0700/0600 but may still be safe to read. Authority
+        // and identity failures carry no OS error and stay refused.
+        Err(error) if matches!(error.raw_os_error(), Some(1 | 30)) => read_authored_config(path)
+            .map_err(|lenient| {
+                io::Error::new(
+                    lenient.kind(),
+                    format!("{lenient} (strict private read failed: {error})"),
+                )
+            }),
+        other => other,
+    }
+}
+
+/// Read a user-authored config through its resolved target. The final file
+/// must be regular, owned by the current user or root and not group- or
+/// world-writable; nothing is chmod-ed.
+fn read_authored_config(path: &Path) -> io::Result<String> {
+    use std::io::Read;
+    let resolved = path.canonicalize()?;
+    let file = std::fs::File::open(&resolved)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("config {} is not a regular file", resolved.display()),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let uid = metadata.uid();
+        if uid != crate::fs::private_current_uid() && uid != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "config {} is owned by uid {uid}, not you or root",
+                    resolved.display()
+                ),
+            ));
+        }
+        let mode = metadata.mode() & 0o7777;
+        if mode & 0o022 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "config {} has mode {mode:o}, which is writable by group or others; \
+                     chmod go-w it or point MINI_AGENT_CONFIG_DIR at a private copy",
+                    resolved.display()
+                ),
+            ));
+        }
+    }
+    if metadata.len() > MAX_PRIVATE_CONFIG_BYTES as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "config file exceeds the size limit",
+        ));
+    }
+    let mut content = String::new();
+    file.take(MAX_PRIVATE_CONFIG_BYTES as u64 + 1)
+        .read_to_string(&mut content)?;
+    Ok(content)
 }
 
 pub(crate) fn parse_config_content(path: &Path, content: &str) -> io::Result<Config> {
@@ -423,6 +536,13 @@ pub(crate) fn serialize_config_content(path: &Path, cfg: &Config) -> io::Result<
     cfg.validate_subagent_settings().map_err(io::Error::other)?;
     match path.extension().and_then(|extension| extension.to_str()) {
         Some("toml") => toml::to_string(cfg).map_err(io::Error::other),
+        // A JSON config stays JSON (mini-agent-nvnkx.347).
+        Some("json") => serde_json::to_string_pretty(cfg)
+            .map(|mut text| {
+                text.push('\n');
+                text
+            })
+            .map_err(io::Error::other),
         _ => serde_yaml_ng::to_string(cfg).map_err(io::Error::other),
     }
 }
@@ -583,11 +703,12 @@ pub fn save_quick_model(
     output_token_cost: Option<f64>,
 ) -> std::io::Result<()> {
     let path = resolve_config_path();
-    let mut cfg: Config = if path_entry_exists(&path)? {
+    let before: Config = if path_entry_exists(&path)? {
         parse_config_content(&path, &read_config_content(&path)?)?
     } else {
         Config::default()
     };
+    let mut cfg = before.clone();
 
     let quick_models = cfg.quick_models.get_or_insert_with(HashMap::new);
     quick_models.insert(
@@ -607,8 +728,48 @@ pub fn save_quick_model(
         },
     );
 
-    atomic_config_write(&path, &serialize_config_content(&path, &cfg)?)?;
-    Ok(())
+    // Structural delta on the existing file: comments, key order and unknown
+    // keys survive (mini-agent-nvnkx.346).
+    save_config_changes_at(&path, &before, &cfg)
+}
+
+/// Providers a first run may switch to, in the order they are preferred.
+const FIRST_RUN_PROVIDERS: &[&str] = &["anthropic", "openai", "gemini", "copilot"];
+
+/// The first-run defaults select openrouter. When no openrouter credential
+/// exists and exactly one other built-in provider has a key or saved login,
+/// select that provider (with its default model) so the first prompt works
+/// (mini-agent-nvnkx.223). With several candidates the defaults stay: the
+/// choice is the user's, made in `--setup` (D) or with `--provider`.
+pub(crate) fn credential_aware_default<F>(
+    mut cfg: Config,
+    credentials_dir: &Path,
+    get_env: F,
+) -> Config
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    let provided = |cfg: &Config, name: &str| {
+        crate::diagnostics::provider_credential_with_env(cfg, name, None, credentials_dir, &get_env)
+            .is_provided()
+    };
+    if provided(&cfg, "openrouter") {
+        return cfg;
+    }
+    let candidates: Vec<&str> = FIRST_RUN_PROVIDERS
+        .iter()
+        .copied()
+        .filter(|name| provided(&cfg, name))
+        .collect();
+    let [only] = candidates[..] else {
+        return cfg;
+    };
+    cfg.provider = Some(CompactString::new(only));
+    cfg.model = None;
+    if let Some((model, _)) = crate::provider::default_model_for_provider(only, &cfg) {
+        cfg.model = Some(CompactString::new(model));
+    }
+    cfg
 }
 
 pub(super) fn rich_default_config() -> Config {
@@ -850,7 +1011,14 @@ pub(crate) fn load_in_workspace(
     );
     let (mut cfg, first_startup) = result;
     if let Some(policy) = super::managed::active() {
+        let already = cfg.load_warnings.len();
         policy.apply(&mut cfg);
+        // The clamps are only worth anything if the user sees them: print the
+        // ones this application added (mini-agent-nvnkx.348).
+        for warning in &cfg.load_warnings[already..] {
+            tracing::warn!("config: {warning}");
+            eprintln!("warning: {warning}");
+        }
     }
     (cfg, first_startup)
 }
@@ -1545,7 +1713,12 @@ fn load_from_path_with_sources(
             "first startup, writing default config to {}",
             path.display()
         );
-        let default = rich_default_config();
+        let credentials_dir = crate::paths::process_paths_ref()
+            .map(|paths| paths.credentials_dir.clone())
+            .unwrap_or_default();
+        let default = credential_aware_default(rich_default_config(), &credentials_dir, |name| {
+            std::env::var(name)
+        });
         if CREATE_DEFAULT_CONFIG.load(std::sync::atomic::Ordering::Relaxed)
             && path.extension().and_then(|e| e.to_str()) == Some("toml")
             && let Ok(content) = toml::to_string(&default)
@@ -1675,10 +1848,7 @@ fn load_from_path_with_sources(
                     | ProjectConfigTrustOutcome::Declined
                     | ProjectConfigTrustOutcome::TrustUnavailable
             ) {
-                eprintln!(
-                    "note: project-local executable/security settings are inactive; benign settings were applied from {}",
-                    path.display()
-                );
+                eprintln!("{}", inactive_settings_note(&cfg, path, interactive));
             }
             sources
                 .source
@@ -1835,18 +2005,19 @@ pub(crate) fn record_persona_trust(
     let project = persona_project_key(workspace)
         .ok_or_else(|| "project path is not available (values omitted)".to_string())?;
     let trust_file = paths.project_config_trust_file();
-    let mut store = load_project_config_trust(&trust_file).map_err(|error| error.to_string())?;
-    store
-        .persona_bindings
-        .retain(|binding| binding.canonical_project != project);
-    store.persona_bindings.push(PersonaTrustBinding {
-        canonical_project: project,
-        personas_sha256: digest.to_string(),
-    });
     if let Some(parent) = trust_file.parent() {
         crate::fs::ensure_private_directory(parent).map_err(|error| error.to_string())?;
     }
-    save_project_config_trust(&trust_file, &store).map_err(|error| error.to_string())
+    update_project_config_trust(&trust_file, |store| {
+        store
+            .persona_bindings
+            .retain(|binding| binding.canonical_project != project);
+        store.persona_bindings.push(PersonaTrustBinding {
+            canonical_project: project.clone(),
+            personas_sha256: digest.to_string(),
+        });
+    })
+    .map_err(|error| error.to_string())
 }
 
 /// Interactive-only review of untrusted project persona files. Headless, ACP
@@ -2152,6 +2323,7 @@ fn load_project_config_trust_mode(
                 schema: PROJECT_CONFIG_TRUST_SCHEMA,
                 bindings: Vec::new(),
                 persona_bindings: Vec::new(),
+                sensitive_bindings: Vec::new(),
             });
         }
         Err(error) => return Err(error),
@@ -2163,9 +2335,83 @@ fn load_project_config_trust_mode(
             schema: PROJECT_CONFIG_TRUST_SCHEMA,
             bindings: Vec::new(),
             persona_bindings: Vec::new(),
+            sensitive_bindings: Vec::new(),
         });
     }
     Ok(store)
+}
+
+/// Replace any earlier approval of this project config with `binding` plus its
+/// sensitive-subset digest.
+fn record_project_config_binding(
+    store: &mut ProjectConfigTrustStore,
+    binding: &ProjectConfigTrustBinding,
+    sensitive_sha256: &str,
+) {
+    store.bindings.retain(|existing| {
+        existing.canonical_project != binding.canonical_project
+            || existing.canonical_config != binding.canonical_config
+    });
+    store.sensitive_bindings.retain(|existing| {
+        existing.canonical_project != binding.canonical_project
+            || existing.canonical_config != binding.canonical_config
+    });
+    store.bindings.push(binding.clone());
+    store.sensitive_bindings.push(SensitiveTrustBinding {
+        canonical_project: binding.canonical_project.clone(),
+        canonical_config: binding.canonical_config.clone(),
+        sensitive_sha256: sensitive_sha256.to_owned(),
+    });
+}
+
+/// Exclusive advisory lock on `<store>.lock`, held until the returned file is
+/// dropped. The lock file is never deleted: unlinking one another process has
+/// open would let two owners lock different inodes (mini-agent-nvnkx.357).
+pub(crate) fn lock_store_file(path: &Path) -> io::Result<std::fs::File> {
+    let mut name = path
+        .file_name()
+        .ok_or_else(|| io::Error::other("trust store path has no file name"))?
+        .to_os_string();
+    name.push(".lock");
+    let lock_path = path.with_file_name(name);
+    if let Some(parent) = lock_path.parent() {
+        crate::fs::ensure_private_directory(parent)?;
+    }
+    match crate::fs::private_atomic_create_sync(&lock_path, b"") {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    let file = crate::fs::open_private_file(&lock_path)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out waiting for another session's trust store lock",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+        }
+    }
+}
+
+/// Read-modify-write the trust store under its lock: re-read the file, apply
+/// only `change`, write. Two sessions approving different projects therefore
+/// never overwrite each other's approval.
+fn update_project_config_trust(
+    path: &Path,
+    change: impl FnOnce(&mut ProjectConfigTrustStore),
+) -> io::Result<()> {
+    let _lock = lock_store_file(path)?;
+    let mut store = load_project_config_trust(path)?;
+    change(&mut store);
+    save_project_config_trust(path, &store)
 }
 
 fn save_project_config_trust(path: &Path, store: &ProjectConfigTrustStore) -> std::io::Result<()> {
@@ -2199,6 +2445,251 @@ fn statusline_value_needs_git_status(value: &toml::Value) -> bool {
         .any(|item| crate::config::STATUSLINE_GIT_STATUS_ITEMS.contains(&item))
 }
 
+/// Keys only the global config (or the command line) may set. A project layer
+/// cannot lift financial caps, the permission-mode cycle or the required
+/// guards, whatever its trust.
+const GLOBAL_ONLY_PROJECT_KEYS: &[&str] = &[
+    "permission_mode_cycle",
+    "sandbox_required",
+    "permission_checks_required",
+    "shell_env_allow_secrets",
+    "max_budget_usd",
+    "max_session_input_tokens",
+    "max_session_total_tokens",
+    "cache_ttl",
+];
+
+fn is_global_only_key(key: &str) -> bool {
+    let normalized = key.replace('-', "_");
+    GLOBAL_ONLY_PROJECT_KEYS.contains(&normalized.as_str())
+}
+
+/// One load warning per global-only key a project file tries to set. Key names
+/// are catalogue names, never user-authored text.
+fn global_only_key_warnings(
+    table: &toml::map::Map<String, toml::Value>,
+    file: &Path,
+) -> Vec<String> {
+    table
+        .keys()
+        .filter(|key| is_global_only_key(key))
+        .map(|key| {
+            let flag = match key.replace('-', "_").as_str() {
+                "max_budget_usd" => " or pass --max-budget-usd",
+                _ => "",
+            };
+            format!(
+                "{key} in {} is global-only and was ignored; set it in the global config{flag}",
+                file.display()
+            )
+        })
+        .collect()
+}
+
+/// Digest of the sensitive subset of a project config: canonical TOML of only
+/// the keys the trust prompt covers. Comment and benign-key edits do not
+/// change it (mini-agent-nvnkx.345).
+fn sensitive_subset_digest(sensitive: &toml::Value) -> String {
+    let canonical = toml::to_string(sensitive).unwrap_or_default();
+    crate::hex::encode_lower(Sha256::digest(canonical.as_bytes()))
+}
+
+/// The stderr note for a project config whose sensitive keys stayed inactive.
+/// It names the ignored keys and how to approve them.
+fn inactive_settings_note(cfg: &Config, path: &Path, interactive: bool) -> String {
+    let keys = cfg
+        .provenance
+        .ignored_sensitive
+        .iter()
+        .find(|(file, _)| file == path)
+        .map(|(_, keys)| keys.join(", "))
+        .filter(|keys| !keys.is_empty());
+    let mut note = format!(
+        "note: project-local executable/security settings are inactive; benign settings were applied from {}",
+        path.display()
+    );
+    if let Some(keys) = keys {
+        note.push_str(&format!(" (ignored keys: {keys})"));
+    }
+    if !interactive {
+        note.push_str(". Run `mini-agent trust` once, or pass --trust-project-config for this run");
+    }
+    note
+}
+
+/// What `mini-agent trust` does (mini-agent-nvnkx.345).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigTrustMode {
+    /// Describe each untrusted project config and ask y/N.
+    Ask,
+    /// Print the stored approvals.
+    List,
+    /// Record trust without asking (the operator typed the command).
+    Yes,
+    /// Remove approvals for a project root or config path.
+    Revoke(String),
+}
+
+/// Review, list or revoke project-config approvals. Consent still comes from
+/// the operator: the repository cannot run this command.
+pub fn run_config_trust(
+    paths: &AppPaths,
+    workspace: &std::sync::Arc<crate::paths::WorkspaceBinding>,
+    mode: ConfigTrustMode,
+    confirm: &dyn Fn(&str) -> bool,
+) -> Result<String, String> {
+    let trust_file = paths.project_config_trust_file();
+    match mode {
+        ConfigTrustMode::List => {
+            let store = load_project_config_trust_mode(&trust_file, false)
+                .map_err(|error| format!("project config trust store unavailable: {error}"))?;
+            if store.bindings.is_empty() {
+                return Ok("No approved project configs.".into());
+            }
+            let mut out = String::from("Approved project configs:\n");
+            for binding in &store.bindings {
+                let scope = if store.sensitive_bindings.iter().any(|existing| {
+                    existing.canonical_project == binding.canonical_project
+                        && existing.canonical_config == binding.canonical_config
+                }) {
+                    "sensitive keys"
+                } else {
+                    "whole file"
+                };
+                out.push_str(&format!(
+                    "  {}  (bound to: {scope}, sha256 {})\n",
+                    binding.canonical_config,
+                    &binding.config_sha256[..binding.config_sha256.len().min(12)]
+                ));
+            }
+            Ok(out.trim_end().to_owned())
+        }
+        ConfigTrustMode::Revoke(target) => {
+            let wanted = Path::new(&target)
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from(&target));
+            let matches = |project: &str, config: &str| {
+                Path::new(project) == wanted || Path::new(config) == wanted
+            };
+            let mut removed = 0usize;
+            update_project_config_trust(&trust_file, |store| {
+                let before = store.bindings.len();
+                store.bindings.retain(|binding| {
+                    !matches(&binding.canonical_project, &binding.canonical_config)
+                });
+                removed = before - store.bindings.len();
+                store.sensitive_bindings.retain(|binding| {
+                    !matches(&binding.canonical_project, &binding.canonical_config)
+                });
+            })
+            .map_err(|error| format!("could not update the trust store: {error}"))?;
+            if removed == 0 {
+                Err(format!("no approval found for {target}"))
+            } else {
+                Ok(format!("Revoked {removed} approval(s) for {target}."))
+            }
+        }
+        mode @ (ConfigTrustMode::Ask | ConfigTrustMode::Yes) => {
+            let home = crate::paths::process_home_dir();
+            let sources = super::layers::discover(workspace, home.as_deref())
+                .map_err(|error| error.to_string())?;
+            let Some(sources) = sources else {
+                return Ok("No project config found.".into());
+            };
+            let mut report = Vec::new();
+            for path in [sources.project.as_deref(), sources.local.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                let relative = path
+                    .strip_prefix(sources.source.root())
+                    .map_err(|_| "config source path escaped its root".to_string())?;
+                let content = read_project_config_text_in_workspace(&sources.source, relative)
+                    .map_err(|_| "project config is unreadable (values omitted)".to_string())?;
+                let (_, sensitive, keys) = split_project_override(&content)?;
+                if keys.is_empty() {
+                    report.push(format!(
+                        "{}: no sensitive keys; nothing to approve",
+                        path.display()
+                    ));
+                    continue;
+                }
+                let binding = checked_project_config_binding(&sources.source, relative, &content)?;
+                let digest = sensitive_subset_digest(&sensitive);
+                let description = format!(
+                    "Project-local config requests executable or security-sensitive settings.\n\
+                     Project: {}\n\
+                     Config: {}\n\
+                     SHA-256: {}\n\
+                     Sensitive keys: {}\n\
+                     Sensitive settings (secret values redacted):\n{}",
+                    binding.canonical_project,
+                    binding.canonical_config,
+                    binding.config_sha256,
+                    keys.iter().cloned().collect::<Vec<_>>().join(", "),
+                    sensitive_settings_summary(&sensitive)
+                );
+                let approved = mode == ConfigTrustMode::Yes || { confirm(&description) };
+                if !approved {
+                    report.push(format!("{}: declined", path.display()));
+                    continue;
+                }
+                if read_project_config_text_in_workspace(&sources.source, relative)
+                    .ok()
+                    .as_deref()
+                    != Some(content.as_str())
+                {
+                    return Err("project config changed during approval (values omitted)".into());
+                }
+                update_project_config_trust(&trust_file, |store| {
+                    record_project_config_binding(store, &binding, &digest);
+                })
+                .map_err(|error| format!("could not update the trust store: {error}"))?;
+                report.push(format!(
+                    "{}: trusted (sensitive keys: {})",
+                    path.display(),
+                    keys.iter().cloned().collect::<Vec<_>>().join(", ")
+                ));
+            }
+            if report.is_empty() {
+                report.push("No project config found.".into());
+            }
+            Ok(report.join("\n"))
+        }
+    }
+}
+
+#[cfg(not(test))]
+static RUN_TRUST_PROJECT_CONFIG: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+thread_local! {
+    static RUN_TRUST_OVERRIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `--trust-project-config` / `MINI_AGENT_TRUST_PROJECT_CONFIG`: accept the
+/// current content of the project's config for this run only. Nothing is
+/// recorded, and a repository cannot set it (mini-agent-nvnkx.345).
+pub fn set_run_trust_project_config(enabled: bool) {
+    #[cfg(test)]
+    RUN_TRUST_OVERRIDE.with(|flag| flag.set(enabled));
+    #[cfg(not(test))]
+    RUN_TRUST_PROJECT_CONFIG.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn run_trust_project_config() -> bool {
+    #[cfg(test)]
+    {
+        // Per thread, so parallel tests cannot see each other's flag.
+        RUN_TRUST_OVERRIDE.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        RUN_TRUST_PROJECT_CONFIG.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 pub(super) fn split_project_override(
     local_toml: &str,
 ) -> Result<(toml::Value, toml::Value, BTreeSet<String>), String> {
@@ -2217,19 +2708,9 @@ fn split_project_override_with_sensitive_fields(
     let mut sensitive = toml::map::Map::new();
     let mut sensitive_keys = BTreeSet::new();
     for (key, value) in table {
-        if key == "permission_mode_cycle" {
-            tracing::warn!("project config: permission_mode_cycle is global-only and was ignored");
-            continue;
-        }
-        if matches!(
-            key.as_str(),
-            "sandbox-required"
-                | "sandbox_required"
-                | "permission-checks-required"
-                | "permission_checks_required"
-                | "shell-env-allow-secrets"
-                | "shell_env_allow_secrets"
-        ) {
+        if is_global_only_key(key) {
+            // Dropped before classification so it never reaches the trust
+            // prompt; `global_only_key_warnings` tells the user.
             tracing::warn!("project config: {key} is global-only and was ignored");
             continue;
         }
@@ -2273,6 +2754,26 @@ fn split_project_override_with_sensitive_fields(
 #[cfg(test)]
 fn merge_config_value(base: &Config, local: toml::Value) -> Result<Config, String> {
     merge_config_value_layer(base, local, ConfigLayer::Project)
+}
+
+/// Re-add the inherited rules to `merged`, keeping inherited entries first and
+/// dropping duplicates.
+fn union_permission_rules(
+    merged: &mut Option<HashMap<String, Vec<String>>>,
+    inherited: &Option<HashMap<String, Vec<String>>>,
+) {
+    let Some(inherited) = inherited else { return };
+    let target = merged.get_or_insert_with(Default::default);
+    for (tool, rules) in inherited {
+        let layer_rules = std::mem::take(target.entry(tool.clone()).or_default());
+        let mut combined = rules.clone();
+        for rule in layer_rules {
+            if !combined.contains(&rule) {
+                combined.push(rule);
+            }
+        }
+        target.insert(tool.clone(), combined);
+    }
 }
 
 pub(super) fn merge_config_value_layer(
@@ -2326,6 +2827,10 @@ pub(super) fn merge_config_value_layer(
             }
         }
         merged.sandbox_home_masks = masks;
+        // Deny and ask rules only ever accumulate across project layers: a
+        // repository file must not replace the user's own rules for a tool.
+        union_permission_rules(&mut merged.permission_deny, &base.permission_deny);
+        union_permission_rules(&mut merged.permission_ask, &base.permission_ask);
     }
     #[cfg(feature = "js")]
     if matches!(layer, ConfigLayer::Project | ConfigLayer::Local)
@@ -2618,6 +3123,10 @@ fn apply_captured_override(
         sensitive_keys.insert("model".into());
     }
     let local = parse_project_toml(&content)?;
+    if let Some(table) = local.as_table() {
+        cfg.load_warnings
+            .extend(global_only_key_warnings(table, path));
+    }
     let mut unknown = keys::unknown_key_warnings(
         &format!("project config {}", path.display()),
         local
@@ -2673,7 +3182,7 @@ fn apply_captured_override(
             return Ok(ProjectConfigTrustOutcome::TrustUnavailable);
         }
     };
-    let mut store = match load_project_config_trust_mode(trust_store_path, repair) {
+    let store = match load_project_config_trust_mode(trust_store_path, repair) {
         Ok(store) => store,
         Err(error) => {
             *cfg = benign_cfg;
@@ -2684,7 +3193,14 @@ fn apply_captured_override(
         }
     };
 
-    if store.bindings.contains(&binding) {
+    let sensitive_sha256 = sensitive_subset_digest(&sensitive);
+    let subset_trusted = store.sensitive_bindings.iter().any(|existing| {
+        existing.canonical_project == binding.canonical_project
+            && existing.canonical_config == binding.canonical_config
+            && existing.sensitive_sha256 == sensitive_sha256
+    });
+    let run_trusted = run_trust_project_config();
+    if store.bindings.contains(&binding) || subset_trusted || run_trusted {
         #[allow(unused_mut)]
         let mut trusted = merge_config_value_layer(&benign_cfg, sensitive.clone(), layer)?;
         #[cfg(feature = "mcp")]
@@ -2698,11 +3214,20 @@ fn apply_captured_override(
             trust_store_path,
         )?;
         *cfg = trusted;
-        set_layer_status(cfg, layer, path, "content-bound trusted");
+        let status = if run_trusted && !subset_trusted && !store.bindings.contains(&binding) {
+            "trusted for this run"
+        } else {
+            "content-bound trusted"
+        };
+        set_layer_status(cfg, layer, path, status);
         return Ok(ProjectConfigTrustOutcome::AlreadyTrusted);
     }
 
     if !interactive {
+        benign_cfg
+            .provenance
+            .ignored_sensitive
+            .push((path.to_path_buf(), sensitive_keys.iter().cloned().collect()));
         *cfg = benign_cfg;
         tracing::warn!(
             project = %binding.canonical_project,
@@ -2751,12 +3276,10 @@ fn apply_captured_override(
         true,
         trust_store_path,
     )?;
-    store.bindings.retain(|existing| {
-        existing.canonical_project != binding.canonical_project
-            || existing.canonical_config != binding.canonical_config
+    let persisted = update_project_config_trust(trust_store_path, |store| {
+        record_project_config_binding(store, &binding, &sensitive_sha256);
     });
-    store.bindings.push(binding);
-    if let Err(error) = save_project_config_trust(trust_store_path, &store) {
+    if let Err(error) = persisted {
         *cfg = benign_cfg;
         tracing::warn!(
             "project config: sensitive settings are inactive because trust could not be persisted privately: {error}"
@@ -3041,10 +3564,7 @@ fn apply_local_override(
                     | ProjectConfigTrustOutcome::Declined
                     | ProjectConfigTrustOutcome::TrustUnavailable
             ) {
-                eprintln!(
-                    "note: project-local executable/security settings are inactive; benign settings were applied from {}",
-                    path.display()
-                );
+                eprintln!("{}", inactive_settings_note(cfg, path, interactive));
             }
         }
         Err(error) => {
@@ -3404,8 +3924,10 @@ pub(super) fn save_config_changes_at(
 }
 
 fn save_toml_config_changes_at(path: &Path, before: &Config, after: &Config) -> io::Result<()> {
+    let mut original_content = String::new();
     let mut global = if path_entry_exists(path)? {
         let content = read_config_content(path)?;
+        original_content = content.clone();
         // Reject a concurrently corrupted config rather than publishing a
         // syntactically valid delta over values the application cannot load.
         parse_config_content(path, &content)?;
@@ -3438,9 +3960,102 @@ fn save_toml_config_changes_at(path: &Path, before: &Config, after: &Config) -> 
         .map_err(io::Error::other)?;
     #[cfg(not(feature = "subagents"))]
     let _ = candidate;
-    atomic_config_write(path, &toml::to_string(&global).map_err(io::Error::other)?)?;
+    let rendered = render_toml_with_delta(&original_content, &global, &before, &after)
+        .unwrap_or_else(|| {
+            toml::to_string(&global)
+                .map_err(io::Error::other)
+                .unwrap_or_default()
+        });
+    atomic_config_write(path, &rendered)?;
     tracing::debug!("config saved to {}", path.display());
     Ok(())
+}
+
+/// Turn a TOML value into an editable item, keeping tables as tables.
+fn toml_value_to_item(value: &toml::Value) -> Option<toml_edit::Item> {
+    let mut wrapper = toml::map::Map::new();
+    wrapper.insert("v".to_owned(), value.clone());
+    let text = toml::to_string(&toml::Value::Table(wrapper)).ok()?;
+    let mut document: toml_edit::DocumentMut = text.parse().ok()?;
+    document.remove("v")
+}
+
+/// Apply the structural `before -> after` change to a parsed document in
+/// place, so every untouched key keeps its comments, order and layout.
+fn apply_toml_edit_delta(
+    base: &mut toml_edit::Item,
+    before: &toml::Value,
+    after: &toml::Value,
+) -> Option<()> {
+    if before == after {
+        return Some(());
+    }
+    if let (Some(before), Some(after)) = (before.as_table(), after.as_table()) {
+        if base.as_table_like().is_none() {
+            *base = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        let table = base.as_table_like_mut()?;
+        let keys: BTreeSet<&String> = before.keys().chain(after.keys()).collect();
+        for key in keys {
+            match (before.get(key), after.get(key)) {
+                (Some(_), None) => {
+                    table.remove(key);
+                }
+                (None, Some(value)) => {
+                    table.insert(key, toml_value_to_item(value)?);
+                }
+                (Some(old), Some(new)) if old != new => {
+                    if table.get(key).is_none() {
+                        table.insert(key, toml_edit::Item::Table(toml_edit::Table::new()));
+                    }
+                    apply_toml_edit_delta(table.get_mut(key)?, old, new)?;
+                }
+                _ => {}
+            }
+        }
+        return Some(());
+    }
+    // A scalar or array: replace the value but keep the comments around it.
+    let decor = base.as_value().map(|value| value.decor().clone());
+    let mut item = toml_value_to_item(after)?;
+    if let (Some(decor), Some(value)) = (decor, item.as_value_mut()) {
+        *value.decor_mut() = decor;
+    }
+    *base = item;
+    Some(())
+}
+
+/// The new file text: the original document with only the delta applied.
+/// `expected` is the value the result must parse to; on any mismatch (or an
+/// unparsable original) the caller falls back to plain serialization.
+fn render_toml_with_delta(
+    original: &str,
+    expected: &toml::Value,
+    before: &toml::Value,
+    after: &toml::Value,
+) -> Option<String> {
+    if original.trim().is_empty() {
+        return None;
+    }
+    let mut document: toml_edit::DocumentMut = original.parse().ok()?;
+    // Rename alias spellings (`permission_deny`) to their canonical key, in
+    // place, so the delta never leaves both.
+    let renames: Vec<(String, String)> = document
+        .as_table()
+        .iter()
+        .filter_map(|(key, _)| {
+            let known = keys::lookup(key)?;
+            (known.name != key).then(|| (key.to_owned(), known.name.to_owned()))
+        })
+        .collect();
+    for (from, to) in renames {
+        let item = document.remove(&from)?;
+        document.insert(&to, item);
+    }
+    apply_toml_edit_delta(document.as_item_mut(), before, after)?;
+    let rendered = document.to_string();
+    let parsed: toml::Value = toml::from_str(&rendered).ok()?;
+    (parsed == *expected).then_some(rendered)
 }
 
 fn apply_toml_delta(base: &mut toml::Value, before: &toml::Value, after: &toml::Value) {
@@ -4678,7 +5293,7 @@ mod project_config_trust_tests {
         );
         let before_denial = std::fs::read(&trust_path).unwrap();
 
-        std::fs::write(&config_path, "yolo = true\n# changed\n").unwrap();
+        std::fs::write(&config_path, "yolo = true\nverify_command = 'changed'\n").unwrap();
         let mut changed = Config {
             yolo: Some(false),
             ..Default::default()
@@ -4763,6 +5378,7 @@ mod project_config_trust_tests {
                 schema: PROJECT_CONFIG_TRUST_SCHEMA + 1,
                 bindings: Vec::new(),
                 persona_bindings: Vec::new(),
+                sensitive_bindings: Vec::new(),
             },
         )
         .unwrap();
@@ -5790,14 +6406,14 @@ pub(crate) fn approve_project_mcp_at(
             "project MCP definitions changed during approval",
         ));
     }
-    let mut store = load_project_config_trust(trust_path)?;
-    store.bindings.retain(|old| {
-        old.canonical_project != binding.canonical_project
-            || old.canonical_config != binding.canonical_config
-    });
-    store.bindings.push(binding);
     workspace.validate().map_err(io::Error::other)?;
-    save_project_config_trust(trust_path, &store)
+    update_project_config_trust(trust_path, |store| {
+        store.bindings.retain(|old| {
+            old.canonical_project != binding.canonical_project
+                || old.canonical_config != binding.canonical_config
+        });
+        store.bindings.push(binding);
+    })
 }
 
 /// Persist one explicit MCP edit as a private structural file delta. Runtime
@@ -5825,33 +6441,38 @@ pub(crate) fn save_mcp_server_at(
         parse_config_content(path, &snapshot.content)?;
     }
     let changed = if path.extension().and_then(|ext| ext.to_str()) == Some("toml") {
-        let mut document: toml::Value = if snapshot.exists() {
-            toml::from_str(&snapshot.content).map_err(io::Error::other)?
+        // A document edit, not a re-serialization: comments and key order of
+        // the user's file survive (mini-agent-nvnkx.346).
+        let mut document: toml_edit::DocumentMut = if snapshot.exists() {
+            snapshot.content.parse().map_err(io::Error::other)?
         } else {
-            toml::Value::Table(Default::default())
+            toml_edit::DocumentMut::new()
         };
-        let object = document
-            .as_table_mut()
-            .ok_or_else(|| io::Error::other("global config is not a table"))?;
         // Parsing above validates aliases on a copy. A structural MCP edit
         // must retain every unrelated key's original spelling and value.
-        let servers = object
-            .entry("mcp_servers")
-            .or_insert_with(|| toml::Value::Table(Default::default()))
-            .as_table_mut()
+        if document.get("mcp_servers").is_none() {
+            document.insert(
+                "mcp_servers",
+                toml_edit::Item::Table(toml_edit::Table::new()),
+            );
+        }
+        let servers = document["mcp_servers"]
+            .as_table_like_mut()
             .ok_or_else(|| io::Error::other("mcp_servers is not a table"))?;
         if let Some(server) = server {
             if servers.contains_key(name) {
                 return Err(io::Error::other("MCP name already exists in global config"));
             }
+            let value = toml::Value::try_from(server).map_err(io::Error::other)?;
             servers.insert(
-                name.to_owned(),
-                toml::Value::try_from(server).map_err(io::Error::other)?,
+                name,
+                toml_value_to_item(&value)
+                    .ok_or_else(|| io::Error::other("MCP server cannot be encoded"))?,
             );
         } else if servers.remove(name).is_none() {
             return Err(io::Error::other("MCP name is not in global config"));
         }
-        toml::to_string(&document).map_err(io::Error::other)?
+        document.to_string()
     } else {
         let mut document: serde_yaml_ng::Value = if snapshot.exists() {
             serde_yaml_ng::from_str(&snapshot.content).map_err(io::Error::other)?
@@ -6070,17 +6691,17 @@ pub(super) fn approve_editor_project_config(
     if binding.config_sha256 != expected_sha {
         return Err(io::Error::other("project configuration changed"));
     }
-    let mut store = load_project_config_trust_mode(trust, true)?;
-    store.bindings.retain(|old| {
-        old.canonical_project != binding.canonical_project
-            || old.canonical_config != binding.canonical_config
-    });
-    store.bindings.push(binding);
     workspace.validate().map_err(io::Error::other)?;
     if read_project_config_text_in_workspace(workspace, relative)? != content {
         return Err(io::Error::other("project configuration changed"));
     }
-    save_project_config_trust(trust, &store)
+    update_project_config_trust(trust, |store| {
+        store.bindings.retain(|old| {
+            old.canonical_project != binding.canonical_project
+                || old.canonical_config != binding.canonical_config
+        });
+        store.bindings.push(binding);
+    })
 }
 
 #[cfg(test)]
@@ -6313,5 +6934,269 @@ model = "local-two"
         })
         .unwrap();
         assert_eq!(cli.resolve_provider(&cfg), "ollama");
+    }
+}
+
+#[cfg(test)]
+mod config_package_tests {
+    use super::*;
+
+    fn project(name: &str, text: &str) -> (crate::tests::OwnedTestDirectory, PathBuf, PathBuf) {
+        let root = crate::tests::OwnedTestDirectory::new(name);
+        let path = root.path().join("project/.mini-agent/config.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, text).unwrap();
+        let trust = root.path().join("state/trusted-project-configs.json");
+        (root, path, trust)
+    }
+
+    #[test]
+    fn project_deny_and_ask_rules_union_with_inherited_ones() {
+        let base = Config {
+            permission_deny: Some([("shell".to_owned(), vec!["a".to_owned()])].into()),
+            permission_ask: Some([("write".to_owned(), vec!["w".to_owned()])].into()),
+            ..Default::default()
+        };
+        let local: toml::Value = toml::from_str(
+            "permission-deny = { shell = ['b', 'a'], read = ['r'] }\npermission-ask = { write = ['x'] }\n",
+        )
+        .unwrap();
+        for layer in [ConfigLayer::Project, ConfigLayer::Local] {
+            let merged = merge_config_value_layer(&base, local.clone(), layer).unwrap();
+            let deny = merged.permission_deny.unwrap();
+            assert_eq!(deny["shell"], ["a", "b"], "{layer:?}");
+            assert_eq!(deny["read"], ["r"]);
+            assert_eq!(merged.permission_ask.unwrap()["write"], ["w", "x"]);
+        }
+    }
+
+    #[test]
+    fn global_only_project_keys_never_reach_the_trust_prompt_and_warn() {
+        let (_root, path, trust) = project(
+            "global-only-warn",
+            "max_budget_usd = 1\npermission_mode_cycle = ['readonly']\n",
+        );
+        let mut cfg = Config::default();
+        let outcome =
+            apply_local_override_with_confirmation(&mut cfg, &path, &trust, true, &|_| {
+                panic!("no prompt for global-only keys")
+            })
+            .unwrap();
+        assert_eq!(outcome, ProjectConfigTrustOutcome::NoSensitiveKeys);
+        let warnings = cfg.load_warnings.join("\n");
+        assert!(warnings.contains("max_budget_usd"), "{warnings}");
+        assert!(warnings.contains("permission_mode_cycle"), "{warnings}");
+        assert_eq!(cfg.max_budget_usd, None);
+    }
+
+    #[test]
+    fn headless_note_names_keys_and_run_flag_applies_without_recording() {
+        let (_root, path, trust) = project("run-trust", "yolo = true\nmax_tokens = 5\n");
+        let mut cfg = Config::default();
+        let outcome =
+            apply_local_override_with_confirmation(&mut cfg, &path, &trust, false, &|_| false)
+                .unwrap();
+        assert_eq!(outcome, ProjectConfigTrustOutcome::SkippedHeadless);
+        let note = inactive_settings_note(&cfg, &path, false);
+        assert!(
+            note.contains("yolo") && note.contains("--trust-project-config"),
+            "{note}"
+        );
+        assert_ne!(cfg.yolo, Some(true));
+
+        set_run_trust_project_config(true);
+        let mut cfg = Config::default();
+        let outcome =
+            apply_local_override_with_confirmation(&mut cfg, &path, &trust, false, &|_| false);
+        set_run_trust_project_config(false);
+        assert_eq!(outcome.unwrap(), ProjectConfigTrustOutcome::AlreadyTrusted);
+        assert_eq!(cfg.yolo, Some(true));
+        assert!(!trust.exists(), "a per-run trust must write nothing");
+    }
+
+    #[test]
+    fn comment_and_benign_edits_keep_an_approval_but_sensitive_edits_void_it() {
+        let (_root, path, trust) = project("subset-trust", "yolo = true\nmax_tokens = 5\n");
+        let mut cfg = Config::default();
+        apply_local_override_with_confirmation(&mut cfg, &path, &trust, true, &|_| true).unwrap();
+        assert_eq!(cfg.yolo, Some(true));
+        std::fs::write(&path, "# a comment\nyolo = true\nmax_tokens = 9\n").unwrap();
+        let mut cfg = Config::default();
+        let outcome =
+            apply_local_override_with_confirmation(&mut cfg, &path, &trust, false, &|_| false)
+                .unwrap();
+        assert_eq!(outcome, ProjectConfigTrustOutcome::AlreadyTrusted);
+        assert_eq!((cfg.yolo, cfg.max_tokens), (Some(true), Some(9)));
+        std::fs::write(&path, "yolo = true\nverify_command = 'make'\n").unwrap();
+        let mut cfg = Config::default();
+        let outcome =
+            apply_local_override_with_confirmation(&mut cfg, &path, &trust, false, &|_| false)
+                .unwrap();
+        assert_eq!(outcome, ProjectConfigTrustOutcome::SkippedHeadless);
+    }
+
+    #[test]
+    fn trust_command_lists_and_revokes_approvals() {
+        let (root, path, _) = project("trust-cmd", "yolo = true\n");
+        let paths = AppPaths {
+            config_dir: root.path().join("config"),
+            data_dir: root.path().join("data"),
+            local_data_dir: root.path().join("local"),
+            state_dir: root.path().join("state"),
+            cache_dir: root.path().join("cache"),
+            credentials_dir: root.path().join("credentials"),
+            project_dir: None,
+        };
+        let project_root = path.parent().unwrap().parent().unwrap();
+        let workspace =
+            std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(project_root).unwrap());
+        let list = |mode| run_config_trust(&paths, &workspace, mode, &|_| false).unwrap();
+        assert!(list(ConfigTrustMode::List).contains("No approved"));
+        let report = list(ConfigTrustMode::Yes);
+        assert!(
+            report.contains("trusted") && report.contains("yolo"),
+            "{report}"
+        );
+        assert!(list(ConfigTrustMode::List).contains("sensitive keys"));
+        let canonical = project_root.canonicalize().unwrap();
+        let revoked = list(ConfigTrustMode::Revoke(canonical.display().to_string()));
+        assert!(revoked.contains("Revoked 1"), "{revoked}");
+        assert!(list(ConfigTrustMode::List).contains("No approved"));
+        assert!(
+            run_config_trust(
+                &paths,
+                &workspace,
+                ConfigTrustMode::Revoke("/nowhere".into()),
+                &|_| false
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn concurrent_approvals_are_merged_under_the_lock() {
+        let root = crate::tests::OwnedTestDirectory::new("trust-lock");
+        let store = root.path().join("state/trusted-project-configs.json");
+        std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+        let binding = |name: &str| ProjectConfigTrustBinding {
+            canonical_project: format!("/{name}"),
+            canonical_config: format!("/{name}/.mini-agent/config.toml"),
+            config_sha256: "0".repeat(64),
+        };
+        // Session one read the (empty) store before session two approved X.
+        let stale = load_project_config_trust(&store).unwrap();
+        update_project_config_trust(&store, |s| {
+            record_project_config_binding(s, &binding("x"), "sx");
+        })
+        .unwrap();
+        assert!(stale.bindings.is_empty());
+        update_project_config_trust(&store, |s| {
+            record_project_config_binding(s, &binding("y"), "sy");
+        })
+        .unwrap();
+        let merged = load_project_config_trust(&store).unwrap();
+        let projects: Vec<_> = merged
+            .bindings
+            .iter()
+            .map(|b| b.canonical_project.as_str())
+            .collect();
+        assert_eq!(projects, ["/x", "/y"]);
+        assert_eq!(merged.sensitive_bindings.len(), 2);
+    }
+
+    #[test]
+    fn json_config_stays_json_and_toml_keeps_comments_and_order() {
+        let root = crate::tests::OwnedTestDirectory::new("save-fidelity");
+        let json = root.path().join("config.json");
+        std::fs::write(&json, r#"{"model":"m","vim_mode":false}"#).unwrap();
+        let before = parse_config_content(&json, &std::fs::read_to_string(&json).unwrap()).unwrap();
+        let mut after = before.clone();
+        after.vim_mode = Some(true);
+        save_config_changes_at(&json, &before, &after).unwrap();
+        let text = std::fs::read_to_string(&json).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["vim_mode"], true);
+
+        let toml_path = root.path().join("config.toml");
+        let original = "# my notes\nzeta_future = 1\nmodel = 'm' # keep this\n\n# editor\nvim_mode = false\nalpha_future = 2\n";
+        std::fs::write(&toml_path, original).unwrap();
+        let before =
+            parse_config_content(&toml_path, &std::fs::read_to_string(&toml_path).unwrap())
+                .unwrap();
+        let mut after = before.clone();
+        after.vim_mode = Some(true);
+        save_config_changes_at(&toml_path, &before, &after).unwrap();
+        let text = std::fs::read_to_string(&toml_path).unwrap();
+        for line in ["# my notes", "model = 'm' # keep this", "# editor"] {
+            assert!(text.contains(line), "{text}");
+        }
+        assert!(text.contains("vim_mode = true"), "{text}");
+        assert!(text.find("zeta_future").unwrap() < text.find("alpha_future").unwrap());
+        assert!(text.find("zeta_future").unwrap() < text.find("model").unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_and_read_only_global_configs_load_and_unsafe_ones_say_why() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::tests::OwnedTestDirectory::new("linked-config");
+        let real = root.path().join("real");
+        let cfg_dir = root.path().join("cfg");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let target = real.join("config.toml");
+        std::fs::write(&target, "model = 'x'\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = cfg_dir.join("config.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(read_config_content(&link).unwrap(), "model = 'x'\n");
+        assert!(atomic_config_write(&link, "model = 'y'\n").is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "model = 'x'\n");
+
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let error = read_config_content(&link).unwrap_err().to_string();
+        assert!(
+            error.contains("666") && error.contains("MINI_AGENT_CONFIG_DIR"),
+            "{error}"
+        );
+
+        let ro = root.path().join("ro");
+        std::fs::create_dir_all(&ro).unwrap();
+        let file = ro.join("config.toml");
+        std::fs::write(&file, "model = 'ro'\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let loaded = read_config_content(&file);
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(loaded.unwrap(), "model = 'ro'\n");
+    }
+
+    #[test]
+    fn first_run_picks_the_only_provider_with_a_credential() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                vars.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_owned())
+                    .ok_or(std::env::VarError::NotPresent)
+            }
+        };
+        let dir = Path::new("/nonexistent-credentials");
+        let anthropic = credential_aware_default(
+            rich_default_config(),
+            dir,
+            env(&[("ANTHROPIC_API_KEY", "k")]),
+        );
+        assert_eq!(anthropic.provider.as_deref(), Some("anthropic"));
+        assert_ne!(anthropic.model.as_deref(), Some("deepseek-v4-pro"));
+        for vars in [
+            &[("OPENROUTER_API_KEY", "k"), ("ANTHROPIC_API_KEY", "k")][..],
+            &[][..],
+            &[("ANTHROPIC_API_KEY", "k"), ("OPENAI_API_KEY", "k")][..],
+        ] {
+            let cfg = credential_aware_default(rich_default_config(), dir, env(vars));
+            assert_eq!(cfg.provider.as_deref(), Some("openrouter"), "{vars:?}");
+            assert_eq!(cfg.model.as_deref(), Some("deepseek-v4-pro"));
+        }
     }
 }

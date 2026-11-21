@@ -893,9 +893,10 @@ pub(crate) fn spawn_event_thread_with_events(
                 Ok(event::Event::Paste(data)) => {
                     let _ = user_tx.blocking_send(UserEvent::Paste(data));
                 }
+                Ok(event::Event::FocusGained) => terminal::set_terminal_focus(true),
+                Ok(event::Event::FocusLost) => terminal::set_terminal_focus(false),
                 Err(_) if !on_error(&mut errors) => break,
                 Err(_) => {}
-                _ => {}
             }
         }
     })

@@ -720,7 +720,12 @@ impl TerminalOperations for SystemTerminal {
                 discard_pending_input();
                 Ok(())
             }
-            TerminalAction::LeaveAlternate => stdout.execute(LeaveAlternateScreen).map(drop),
+            TerminalAction::LeaveAlternate => {
+                if FOCUS_REPORTING.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    let _ = stdout.write_all(b"\x1b[?1004l");
+                }
+                stdout.execute(LeaveAlternateScreen).map(drop)
+            }
             TerminalAction::ShowCursor => stdout.execute(Show).map(drop),
             TerminalAction::PopTitle => {
                 TITLE_PUSHED.store(false, Ordering::Release);
@@ -773,6 +778,39 @@ pub(crate) fn title_sequence(activity: AgentActivity) -> String {
 pub(crate) struct ActivitySignals {
     pub notify: crate::config::TerminalNotify,
     pub prompt_marks: bool,
+    /// A finished turn shorter than this is not announced.
+    pub min_turn_secs: u64,
+    /// Set per call by the renderer: the terminal reported that it has focus.
+    pub focused: bool,
+    /// Set per call by the renderer: how long the turn that just ended ran.
+    pub turn_elapsed: Option<std::time::Duration>,
+}
+
+const FOCUS_UNKNOWN: u8 = 0;
+const FOCUS_IN: u8 = 1;
+const FOCUS_OUT: u8 = 2;
+static FOCUS_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(FOCUS_UNKNOWN);
+static FOCUS_REPORTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record a focus report (`FocusGained` / `FocusLost`) from the input thread.
+pub(crate) fn set_terminal_focus(focused: bool) {
+    FOCUS_STATE.store(
+        if focused { FOCUS_IN } else { FOCUS_OUT },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Whether the terminal has said it is focused. Unknown counts as not focused,
+/// so a terminal without focus reporting keeps notifying.
+pub(crate) fn terminal_is_focused() -> bool {
+    FOCUS_STATE.load(std::sync::atomic::Ordering::Relaxed) == FOCUS_IN
+}
+
+/// Ask the terminal for focus reports (`CSI ? 1004 h`) and remember to turn
+/// them off when the alternate screen is left.
+pub(crate) fn enable_focus_reporting() -> &'static str {
+    FOCUS_REPORTING.store(true, std::sync::atomic::Ordering::Relaxed);
+    "\x1b[?1004h"
 }
 
 impl ActivitySignals {
@@ -793,13 +831,56 @@ fn osc_payload(text: &str) -> String {
 
 /// Desktop notification announcing `body` in the configured style.
 fn notification_sequence(style: crate::config::TerminalNotify, body: &str) -> String {
+    notification_sequence_with_env(style, body, &|name| std::env::var(name).ok())
+}
+
+/// `Auto` resolved from the terminal's identity: the concrete style and
+/// whether the sequence needs tmux's passthrough wrapper.
+fn resolve_auto_notify(
+    get: &dyn Fn(&str) -> Option<String>,
+) -> (crate::config::TerminalNotify, bool) {
     use crate::config::TerminalNotify;
+    let term = get("TERM").unwrap_or_default().to_ascii_lowercase();
+    let program = get("TERM_PROGRAM").unwrap_or_default();
+    let style = if matches!(program.as_str(), "iTerm.app" | "WezTerm" | "ghostty")
+        || ["kitty", "wezterm", "ghostty"]
+            .iter()
+            .any(|name| term.contains(name))
+    {
+        TerminalNotify::Osc9
+    } else if term.contains("foot") || get("VTE_VERSION").is_some_and(|v| !v.is_empty()) {
+        TerminalNotify::Osc777
+    } else {
+        TerminalNotify::Bell
+    };
+    let tmux = get("TMUX").is_some_and(|v| !v.is_empty());
+    (style, tmux)
+}
+
+fn notification_sequence_with_env(
+    style: crate::config::TerminalNotify,
+    body: &str,
+    get: &dyn Fn(&str) -> Option<String>,
+) -> String {
+    use crate::config::TerminalNotify;
+    let (style, tmux) = if style == TerminalNotify::Auto {
+        resolve_auto_notify(get)
+    } else {
+        (style, false)
+    };
     let title = osc_payload(crate::product::PUBLIC_NAME);
     let body = osc_payload(body);
-    match style {
-        TerminalNotify::Off => String::new(),
+    let sequence = match style {
+        TerminalNotify::Off => return String::new(),
         TerminalNotify::Osc9 => format!("\x1b]9;{title}: {body}\x07"),
         TerminalNotify::Osc777 => format!("\x1b]777;notify;{title};{body}\x07"),
+        TerminalNotify::Bell | TerminalNotify::Auto => return "\x07".to_owned(),
+    };
+    if tmux {
+        // tmux forwards a DCS passthrough with every ESC doubled.
+        format!("\x1bPtmux;{}\x1b\\", sequence.replace('\x1b', "\x1b\x1b"))
+    } else {
+        sequence
     }
 }
 
@@ -840,7 +921,15 @@ pub(crate) fn activity_sequences(
             }
         }
     }
+    // A focused terminal already shows the activity; a short turn is not
+    // worth an interruption. Waits for approval or an answer are not skipped
+    // for duration, only for focus.
+    let long_enough = signals
+        .turn_elapsed
+        .is_none_or(|elapsed| elapsed.as_secs() >= signals.min_turn_secs);
     let body = match (previous, next) {
+        _ if signals.focused => None,
+        (Some(_), AgentActivity::Idle) if !long_enough => None,
         (Some(_), AgentActivity::Idle) => Some("turn finished"),
         (Some(_), AgentActivity::WaitingForApproval) => Some("waiting for approval"),
         (Some(_), AgentActivity::WaitingForUserAnswer) => Some("waiting for your answer"),
@@ -1530,6 +1619,7 @@ mod tests {
         ActivitySignals {
             notify: style,
             prompt_marks: false,
+            ..Default::default()
         }
     }
 
@@ -1558,7 +1648,8 @@ mod tests {
                 AgentActivity::WaitingForUserAnswer,
                 ActivitySignals {
                     notify: TerminalNotify::Off,
-                    prompt_marks: true
+                    prompt_marks: true,
+                    ..Default::default()
                 }
             ),
             format!("{PROMPT_START}{INPUT_START}")
@@ -1610,6 +1701,7 @@ mod tests {
         let marks = ActivitySignals {
             notify: crate::config::TerminalNotify::Off,
             prompt_marks: true,
+            ..Default::default()
         };
         assert_eq!(
             activity_sequences(None, Idle, marks),
@@ -1786,5 +1878,105 @@ mod tests {
         drop(session);
         assert_eq!(unsafe { GetConsoleCP() }, original.input);
         assert_eq!(unsafe { GetConsoleOutputCP() }, original.output);
+    }
+}
+
+#[cfg(test)]
+mod notify_focus_tests {
+    use super::*;
+    use crate::config::TerminalNotify;
+    use std::time::Duration;
+
+    fn signals(style: TerminalNotify, focused: bool, secs: Option<u64>) -> ActivitySignals {
+        ActivitySignals {
+            notify: style,
+            min_turn_secs: 10,
+            focused,
+            turn_elapsed: secs.map(Duration::from_secs),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn focused_terminals_and_short_turns_stay_quiet() {
+        use AgentActivity::*;
+        let bell = TerminalNotify::Bell;
+        assert_eq!(
+            activity_sequences(Some(Working), Idle, signals(bell, true, Some(60))),
+            ""
+        );
+        assert_eq!(
+            activity_sequences(Some(Working), Idle, signals(bell, false, Some(60))),
+            "\x07"
+        );
+        assert_eq!(
+            activity_sequences(Some(Working), Idle, signals(bell, false, Some(2))),
+            ""
+        );
+        // Approval and question waits ignore the duration threshold.
+        assert_eq!(
+            activity_sequences(
+                Some(Working),
+                WaitingForApproval,
+                signals(bell, false, Some(1))
+            ),
+            "\x07"
+        );
+        assert_eq!(
+            activity_sequences(
+                Some(Working),
+                WaitingForApproval,
+                signals(bell, true, Some(99))
+            ),
+            ""
+        );
+    }
+
+    #[test]
+    fn auto_picks_the_terminal_style_and_wraps_for_tmux() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                vars.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_owned())
+            }
+        };
+        let name = crate::product::PUBLIC_NAME;
+        let osc9 = format!("\x1b]9;{name}: done\x07");
+        assert_eq!(
+            notification_sequence_with_env(
+                TerminalNotify::Auto,
+                "done",
+                &env(&[("TERM_PROGRAM", "WezTerm")])
+            ),
+            osc9
+        );
+        assert_eq!(
+            notification_sequence_with_env(TerminalNotify::Auto, "done", &env(&[("TERM", "foot")])),
+            format!("\x1b]777;notify;{name};done\x07")
+        );
+        assert_eq!(
+            notification_sequence_with_env(
+                TerminalNotify::Auto,
+                "done",
+                &env(&[("TERM", "xterm")])
+            ),
+            "\x07"
+        );
+        let wrapped = notification_sequence_with_env(
+            TerminalNotify::Auto,
+            "done",
+            &env(&[("TERM_PROGRAM", "WezTerm"), ("TMUX", "/tmp/tmux")]),
+        );
+        assert!(wrapped.starts_with("\x1bPtmux;\x1b\x1b]9;") && wrapped.ends_with("\x1b\\"));
+        // An explicit style is never rewritten.
+        assert_eq!(
+            notification_sequence_with_env(
+                TerminalNotify::Osc9,
+                "done",
+                &env(&[("TMUX", "/tmp/tmux")])
+            ),
+            osc9
+        );
     }
 }

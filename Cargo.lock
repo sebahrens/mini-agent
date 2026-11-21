@@ -3327,6 +3327,7 @@ dependencies = [
  "tokio",
  "tokio-native-tls",
  "toml",
+ "toml_edit",
  "tracing",
  "tracing-subscriber",
  "unicase",
@@ -5568,6 +5569,7 @@ dependencies = [
  "indexmap 2.14.1",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 

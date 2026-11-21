@@ -56,14 +56,128 @@ pub fn apply(
     Ok(())
 }
 
-fn resolve_foregrounds(colors: &ColorsConfig, mut palette: ForegroundPalette) -> ForegroundPalette {
+/// How many colours the terminal can show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ColorDepth {
+    TrueColor,
+    Ansi256,
+    Ansi16,
+}
+
+impl ColorDepth {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::TrueColor => "truecolor (24-bit)",
+            Self::Ansi256 => "256 colours",
+            Self::Ansi16 => "16 colours",
+        }
+    }
+}
+
+/// Decide the colour depth from the environment (`get` reads one variable).
+/// Truecolor needs a positive sign: `COLORTERM=truecolor|24bit`, a `direct`
+/// terminfo, a terminal known to support it, or Windows Terminal. Otherwise
+/// `256color` in `TERM` gives 256 colours and anything else 16.
+pub(crate) fn detect_color_depth(get: impl Fn(&str) -> Option<String>) -> ColorDepth {
+    let term = get("TERM").unwrap_or_default().to_ascii_lowercase();
+    let colorterm = get("COLORTERM").unwrap_or_default().to_ascii_lowercase();
+    let program = get("TERM_PROGRAM").unwrap_or_default();
+    let truecolor = matches!(colorterm.as_str(), "truecolor" | "24bit")
+        || term.contains("direct")
+        || ["kitty", "wezterm", "alacritty", "ghostty"]
+            .iter()
+            .any(|name| term.contains(name))
+        || matches!(program.as_str(), "iTerm.app" | "WezTerm" | "ghostty" | "vscode")
+        || get("WT_SESSION").is_some_and(|value| !value.is_empty())
+        // A Windows console without TERM is a modern conhost.
+        || (cfg!(windows) && term.is_empty());
+    if truecolor {
+        ColorDepth::TrueColor
+    } else if term.contains("256color") {
+        ColorDepth::Ansi256
+    } else {
+        ColorDepth::Ansi16
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static DEPTH_OVERRIDE: std::cell::Cell<Option<ColorDepth>> = const { std::cell::Cell::new(None) };
+}
+
+/// The detected depth. Unit tests see truecolor unless they override it.
+pub(crate) fn color_depth() -> ColorDepth {
+    #[cfg(test)]
+    {
+        DEPTH_OVERRIDE
+            .with(|depth| depth.get())
+            .unwrap_or(ColorDepth::TrueColor)
+    }
+    #[cfg(not(test))]
+    {
+        static DEPTH: std::sync::OnceLock<ColorDepth> = std::sync::OnceLock::new();
+        *DEPTH.get_or_init(|| detect_color_depth(|name| std::env::var(name).ok()))
+    }
+}
+
+/// Nearest of the 16 terminal colours.
+fn to_ansi_16(color: crossterm::style::Color) -> crossterm::style::Color {
+    use crossterm::style::Color;
+    const TABLE: [(u8, u8, u8, Color); 16] = [
+        (0, 0, 0, Color::Black),
+        (128, 0, 0, Color::DarkRed),
+        (0, 128, 0, Color::DarkGreen),
+        (128, 128, 0, Color::DarkYellow),
+        (0, 0, 128, Color::DarkBlue),
+        (128, 0, 128, Color::DarkMagenta),
+        (0, 128, 128, Color::DarkCyan),
+        (192, 192, 192, Color::Grey),
+        (128, 128, 128, Color::DarkGrey),
+        (255, 0, 0, Color::Red),
+        (0, 255, 0, Color::Green),
+        (255, 255, 0, Color::Yellow),
+        (0, 0, 255, Color::Blue),
+        (255, 0, 255, Color::Magenta),
+        (0, 255, 255, Color::Cyan),
+        (255, 255, 255, Color::White),
+    ];
+    let Color::Rgb { r, g, b } = color else {
+        return color;
+    };
+    let distance = |(tr, tg, tb): (u8, u8, u8)| {
+        let d = |a: u8, b: u8| (i32::from(a) - i32::from(b)).pow(2);
+        d(r, tr) + d(g, tg) + d(b, tb)
+    };
+    TABLE
+        .iter()
+        .min_by_key(|(tr, tg, tb, _)| distance((*tr, *tg, *tb)))
+        .map_or(color, |(_, _, _, named)| *named)
+}
+
+/// Bring `color` to what the terminal can show: untouched on truecolor, the
+/// nearest 256- or 16-colour value otherwise. A theme with
+/// `scheme_type = "ansi"` always uses 256 colours.
+fn downgrade(
+    color: crossterm::style::Color,
+    scheme: &SchemeType,
+    depth: ColorDepth,
+) -> crossterm::style::Color {
+    match depth {
+        ColorDepth::Ansi16 => to_ansi_16(color),
+        ColorDepth::Ansi256 => to_ansi_256(color),
+        ColorDepth::TrueColor if matches!(scheme, SchemeType::Ansi) => to_ansi_256(color),
+        ColorDepth::TrueColor => color,
+    }
+}
+
+fn resolve_foregrounds(
+    colors: &ColorsConfig,
+    mut palette: ForegroundPalette,
+    depth: ColorDepth,
+) -> ForegroundPalette {
     let resolve = |value: &Option<compact_str::CompactString>, fallback| {
         let color = value.as_deref().and_then(parse_color).unwrap_or(fallback);
-        if matches!(colors.scheme_type, SchemeType::Ansi) {
-            to_ansi_256(color)
-        } else {
-            color
-        }
+        downgrade(color, &colors.scheme_type, depth)
     };
     palette.user = resolve(&colors.user, palette.user);
     palette.agent = resolve(&colors.agent, palette.agent);
@@ -84,6 +198,15 @@ fn resolve_foregrounds(colors: &ColorsConfig, mut palette: ForegroundPalette) ->
 }
 
 pub fn apply_colors(colors: &ColorsConfig, renderer: &mut Renderer, input: &mut InputEditor) {
+    apply_colors_at_depth(colors, renderer, input, color_depth());
+}
+
+fn apply_colors_at_depth(
+    colors: &ColorsConfig,
+    renderer: &mut Renderer,
+    input: &mut InputEditor,
+    depth: ColorDepth,
+) {
     let light = colors
         .chat_background
         .as_deref()
@@ -107,18 +230,14 @@ pub fn apply_colors(colors: &ColorsConfig, renderer: &mut Renderer, input: &mut 
         include_str!("../../data/themes/default-dark.json")
     })
     .expect("embedded foreground palette must be valid");
-    let palette = resolve_foregrounds(&defaults, ForegroundPalette::default());
-    renderer.set_foreground_palette(resolve_foregrounds(colors, palette));
+    let palette = resolve_foregrounds(&defaults, ForegroundPalette::default(), depth);
+    renderer.set_foreground_palette(resolve_foregrounds(colors, palette, depth));
     let chat_bg = colors.chat_background.as_deref().and_then(parse_color);
     let input_bg = colors.input_background.as_deref().and_then(parse_color);
     let status_bg = colors.status_background.as_deref().and_then(parse_color);
     let accent = colors.accent.as_deref().and_then(parse_color);
     let convert = |color: Option<crossterm::style::Color>| {
-        if matches!(colors.scheme_type, SchemeType::Ansi) {
-            color.map(to_ansi_256)
-        } else {
-            color
-        }
+        color.map(|color| downgrade(color, &colors.scheme_type, depth))
     };
     renderer.set_background_colors(convert(chat_bg), convert(input_bg), convert(status_bg));
     // The theme accent recolours the welcome banner and picker highlights;
@@ -572,5 +691,75 @@ mod themes_tests {
             Color::Cyan,
             "unrelated cyan content must retain its semantic color"
         );
+    }
+}
+
+#[cfg(test)]
+mod color_depth_tests {
+    use super::*;
+    use crossterm::style::Color;
+
+    fn depth(vars: &[(&str, &str)]) -> ColorDepth {
+        detect_color_depth(|name| {
+            vars.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_owned())
+        })
+    }
+
+    #[test]
+    fn depth_detection_table() {
+        use ColorDepth::*;
+        assert_eq!(
+            depth(&[("COLORTERM", "truecolor"), ("TERM", "xterm")]),
+            TrueColor
+        );
+        assert_eq!(depth(&[("COLORTERM", "24bit")]), TrueColor);
+        assert_eq!(depth(&[("TERM", "xterm-direct")]), TrueColor);
+        assert_eq!(depth(&[("TERM", "xterm-kitty")]), TrueColor);
+        assert_eq!(
+            depth(&[("TERM", "xterm-256color"), ("TERM_PROGRAM", "iTerm.app")]),
+            TrueColor
+        );
+        assert_eq!(
+            depth(&[("TERM", "xterm-256color"), ("WT_SESSION", "x")]),
+            TrueColor
+        );
+        assert_eq!(depth(&[("TERM", "xterm-256color")]), Ansi256);
+        assert_eq!(
+            depth(&[("TERM", "screen-256color"), ("COLORTERM", "")]),
+            Ansi256
+        );
+        if !cfg!(windows) {
+            assert_eq!(depth(&[("TERM", "linux")]), Ansi16);
+            assert_eq!(depth(&[]), Ansi16);
+        }
+    }
+
+    #[test]
+    fn a_256_colour_terminal_gets_no_rgb_in_the_palette() {
+        for forced in [ColorDepth::Ansi256, ColorDepth::Ansi16] {
+            let mut renderer = Renderer::for_app_test().unwrap();
+            apply_colors_at_depth(
+                &ColorsConfig {
+                    chat_background: Some("#101010".into()),
+                    accent: Some("#ff8800".into()),
+                    ..Default::default()
+                },
+                &mut renderer,
+                &mut InputEditor::new(),
+                forced,
+            );
+            let palette = renderer.foreground_palette_for_test();
+            for color in [
+                palette.text,
+                palette.user,
+                palette.agent,
+                palette.error,
+                palette.link,
+            ] {
+                assert!(!matches!(color, Color::Rgb { .. }), "{forced:?}: {color:?}");
+            }
+        }
     }
 }
