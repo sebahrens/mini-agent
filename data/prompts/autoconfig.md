@@ -70,7 +70,7 @@ When a user provides a skill definition (from superpowers, claude-plugins, or a 
 
 - **API keys or env vars** the skill requires → `api_keys` object or document the `*_API_KEY` env var.
 - **External services/tools** the skill calls → `mcp_servers` if MCP-backed; `custom_providers` if it is a model provider.
-- **Tool permissions** the skill needs → `permission` rules for `allow`/`ask`/`deny` on `shell`, `read`, `write`, `edit`, `list_dir`, `js`, `todo`, `job_status`, `external_directory`, etc.
+- **Tool permissions** the skill needs → `permission` rules for `allow`/`ask`/`deny` on `shell`, `read`, `write`, `edit`, `list_dir`, `js`, `todo_write`, `job_status`, `external_directory`, etc.
 - **Model preferences** → `model` / `provider` / `quick_models` entries.
 - **Prompt activation** → `default_prompt` key or instruct the user on `/prompt <name>`.
 - **Subagent model** (if the skill triggers exploration) → `subagent_model` / `subagent_provider`.

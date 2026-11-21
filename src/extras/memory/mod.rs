@@ -1869,17 +1869,16 @@ impl Tool for MemoryWrite {
     type Output = String;
 
     fn description(&self) -> String {
-        "Persist durable memory to disk. target=long_term writes curated facts/\
-preferences/decisions to MEMORY.md (always loaded next session), one fact per line; long_term \
+        "Persist durable memory to disk. target=long_term writes curated user preferences and cross-project facts to \
+MEMORY.md (always loaded next session), one fact per line; long_term \
 appends are deduplicated (whitespace-insensitive) so a line already present is skipped. \
 target=scratchpad maintains a \
 per-project checklist (use `- [ ]` items; open ones are auto-injected, mode=overwrite to rewrite the list). \
 target=daily appends to today's running log. target=note saves reference material to \
-notes/<name>.md; a bounded name/first-line index is loaded next turn. Use append_facts for \
-verified decisions and bug root causes, one fact per line (the same dedup as long_term). \
+notes/<name>.md; a bounded name/first-line index is loaded next turn. Project decisions and verified bug root \
+causes go to target=note with mode=append_facts, one fact per line (the same dedup as long_term). \
 Use ordinary append/overwrite for Markdown/code references to preserve their structure. \
-Find existing facts with memory_search and edit stale ones rather than saving contradictions. \
-Prefer long_term for things that should always be remembered."
+Find existing facts with memory_search and edit stale ones rather than saving contradictions."
             .to_string()
     }
 
@@ -1887,9 +1886,9 @@ Prefer long_term for things that should always be remembered."
         serde_json::json!({
             "type": "object",
             "properties": {
-                "target":  { "type": "string", "description": "long_term, scratchpad, daily, or note" },
+                "target":  { "type": "string", "enum": ["long_term", "scratchpad", "daily", "note"], "description": "where to write" },
                 "content": { "type": "string", "description": "Markdown content to store (max 64KB; longer is truncated with a warning)" },
-                "mode":    { "type": "string", "description": "append (default), append_facts (note-only normalized fact dedup), or overwrite" },
+                "mode":    { "type": "string", "enum": ["append", "append_facts", "overwrite"], "description": "append (default), append_facts (note-only normalized fact dedup), or overwrite" },
                 "name":    { "type": "string", "description": "filename stem, required for note" }
             },
             "required": ["target", "content"]
@@ -1978,12 +1977,12 @@ append or overwrite; use this to surgically fix or remove existing content."
         serde_json::json!({
             "type": "object",
             "properties": {
-                "target":  { "type": "string", "description": "long_term, scratchpad, daily, or note" },
+                "target":  { "type": "string", "enum": ["long_term", "scratchpad", "daily", "note"], "description": "which memory file to edit" },
                 "name":    { "type": "string", "description": "note stem, required for note" },
-                "old_str": { "type": "string", "description": "substring to replace; must occur exactly once. Omit to delete the whole note (target=note only)" },
+                "old_str": { "type": "string", "description": "substring to replace; must occur exactly once. Omit to delete the whole note (target=note only; new_str may then be omitted)" },
                 "new_str": { "type": "string", "description": "replacement text; empty string deletes the matched substring" }
             },
-            "required": ["target", "new_str"]
+            "required": ["target"]
         })
     }
 

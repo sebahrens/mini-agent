@@ -2457,3 +2457,29 @@ fn a_write_to_a_file_with_invalid_utf8_does_not_rewrite_it_lossily() {
     assert_eq!(fs::read(memory_md(&m)).unwrap(), original);
     cleanup(&m);
 }
+
+#[test]
+fn memory_tool_schemas_declare_closed_sets_and_one_decision_rule() {
+    use crate::extras::memory::{MemoryEdit, MemoryWrite};
+    let write = rig::tool::Tool::parameters(&MemoryWrite::new(None, None));
+    let strings = |v: &serde_json::Value| -> Vec<String> {
+        v["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(
+        strings(&write["properties"]["target"]),
+        ["long_term", "scratchpad", "daily", "note"]
+    );
+    assert_eq!(
+        strings(&write["properties"]["mode"]),
+        ["append", "append_facts", "overwrite"]
+    );
+    let edit = rig::tool::Tool::parameters(&MemoryEdit::new(None, None));
+    assert_eq!(edit["required"], serde_json::json!(["target"]));
+    let description = rig::tool::Tool::description(&MemoryWrite::new(None, None));
+    assert!(!description.contains("Prefer long_term"));
+}

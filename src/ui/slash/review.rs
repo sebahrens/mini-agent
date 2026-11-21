@@ -32,7 +32,7 @@ fn build_default_review_message(session_empty: bool, in_worktree: bool) -> Strin
                           security."
             .to_string(),
         (false, true) => "Review the changes in this worktree session. Consider the diff from \
-                          main since the branch was created. Check for correctness, design, \
+                          the base branch this worktree was created from. Check for correctness, design, \
                           testing, and security."
             .to_string(),
         (false, false) => "Review the changes discussed in this session for correctness, \
@@ -71,4 +71,19 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
     write_ok(ctx.renderer, format!("review: {}", msg));
 
     Err(anyhow::anyhow!("DEFER_REVIEW:{}", msg))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_default_review_message;
+
+    #[test]
+    fn default_review_messages_never_hard_code_a_branch() {
+        for empty in [true, false] {
+            for worktree in [true, false] {
+                let message = build_default_review_message(empty, worktree);
+                assert!(!message.contains("main"), "{message}");
+            }
+        }
+    }
 }

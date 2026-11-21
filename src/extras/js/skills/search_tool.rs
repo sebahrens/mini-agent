@@ -58,7 +58,7 @@ impl Tool for SkillsSearchTool {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": MAX_SEARCH_QUERY_BYTES,
-                    "description": "A focused description of the capability needed now."
+                    "description": "Concrete nouns expected in the skill's name or description (lexical match on a default build)"
                 }
             },
             "required": ["query"],

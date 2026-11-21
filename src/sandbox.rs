@@ -721,7 +721,7 @@ impl ShellCapability {
 
     pub(crate) fn model_guidance(&self) -> String {
         format!(
-            "\n- **shell**: Run {} commands (timeout in ms). Use `background: true` for long builds, tests, or servers, then poll or stop the returned id with **job_status**. The legacy `bash` name is accepted only as a compatibility alias.",
+            "\n- **shell**: Run {} commands. Use `background: true` for long builds, tests, or servers, then poll or stop the returned id with **job_status**.",
             self.dialect.name()
         )
     }

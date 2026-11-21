@@ -445,6 +445,13 @@ fn compose_preamble(
     if !cwd.is_empty() {
         preamble.push_str("\n\nCurrent working directory: ");
         preamble.push_str(&cwd);
+        // Session-start facts only: the date is fixed when the agent is built
+        // so the cached prompt prefix does not change between turns.
+        preamble.push_str(&format!(
+            "\nToday's date (UTC): {}. Platform: {}.",
+            &jiff::Timestamp::now().to_string()[..10],
+            std::env::consts::OS
+        ));
         if let Some(alias) = shell_cwd_alias {
             preamble.push_str("\nSandboxed shell commands see this workspace at ");
             preamble.push_str(&alias.display().to_string());
@@ -550,76 +557,76 @@ fn compose_registered_preamble(
         sandbox.shell_cwd_alias().as_deref(),
     );
     let has = |name: &str| registered_tools.contains(&name);
+    // Bullets are collected under one "## Tools" heading so none attaches to
+    // user-authored text; self-contained sections follow them.
+    let mut bullets = String::new();
+    let mut sections = String::new();
     if has("js") {
-        composition.text.push_str(JS_TOOL_PROMPT);
+        sections.push_str(JS_TOOL_PROMPT);
     }
     if has("read") {
-        composition.text.push_str(READ_TOOL_PROMPT);
+        bullets.push_str(READ_TOOL_PROMPT);
     }
     if has("write") {
-        composition.text.push_str(WRITE_TOOL_PROMPT);
+        bullets.push_str(WRITE_TOOL_PROMPT);
     }
     if has("edit") {
-        composition.text.push_str(EDIT_TOOL_PROMPT);
+        bullets.push_str(EDIT_TOOL_PROMPT);
     }
     if has("grep") {
-        composition.text.push_str(GREP_TOOL_PROMPT);
+        bullets.push_str(GREP_TOOL_PROMPT);
     }
     if has("find_files") {
-        composition.text.push_str(FIND_FILES_TOOL_PROMPT);
+        bullets.push_str(FIND_FILES_TOOL_PROMPT);
     }
     if has("list_dir") {
-        composition.text.push_str(LIST_DIR_TOOL_PROMPT);
+        bullets.push_str(LIST_DIR_TOOL_PROMPT);
+    }
+    if has("git") {
+        bullets.push_str(crate::agent::prompt::GIT_TOOL_PROMPT);
     }
     if has("todo_write") || has("todo_read") {
-        composition.text.push_str(TODO_TOOL_PROMPT);
+        bullets.push_str(TODO_TOOL_PROMPT);
     }
     if has("task") {
-        composition.text.push_str(TASK_TOOL_PROMPT);
+        bullets.push_str(TASK_TOOL_PROMPT);
     }
     #[cfg(feature = "memory")]
     {
         if has("memory_write") {
-            composition
-                .text
-                .push_str(crate::agent::prompt::MEMORY_WRITE_TOOL_PROMPT);
+            bullets.push_str(crate::agent::prompt::MEMORY_WRITE_TOOL_PROMPT);
         }
         if has("memory_edit") {
-            composition
-                .text
-                .push_str(crate::agent::prompt::MEMORY_EDIT_TOOL_PROMPT);
+            bullets.push_str(crate::agent::prompt::MEMORY_EDIT_TOOL_PROMPT);
         }
         if has("memory_search") {
-            composition
-                .text
-                .push_str(crate::agent::prompt::MEMORY_SEARCH_TOOL_PROMPT);
+            bullets.push_str(crate::agent::prompt::MEMORY_SEARCH_TOOL_PROMPT);
         }
         if has("memory_read") {
-            composition
-                .text
-                .push_str(crate::agent::prompt::MEMORY_READ_TOOL_PROMPT);
-        }
-    }
-    #[cfg(feature = "lsp")]
-    if has("lsp_navigate") {
-        composition
-            .text
-            .push_str(crate::agent::prompt::LSP_NAVIGATE_PROMPT);
-    }
-    #[cfg(feature = "lsp")]
-    if has("lsp_diagnostics") {
-        composition.text.push_str(crate::agent::prompt::LSP_PROMPT);
-        if has("edit") || has("write") {
-            composition
-                .text
-                .push_str(crate::agent::prompt::LSP_MUTATION_PROMPT);
+            bullets.push_str(crate::agent::prompt::MEMORY_READ_TOOL_PROMPT);
         }
     }
     if has("shell")
         && let Some(capability) = sandbox.shell_capability()
     {
-        composition.text.push_str(&capability.model_guidance());
+        bullets.push_str(&capability.model_guidance());
     }
+    #[cfg(feature = "lsp")]
+    if has("lsp_navigate") {
+        sections.push_str(crate::agent::prompt::LSP_NAVIGATE_PROMPT);
+    }
+    #[cfg(feature = "lsp")]
+    if has("lsp_diagnostics") {
+        sections.push_str(crate::agent::prompt::LSP_PROMPT);
+        if has("edit") || has("write") {
+            sections.push_str(crate::agent::prompt::LSP_MUTATION_PROMPT);
+        }
+    }
+    if !bullets.is_empty() {
+        composition.text.push_str("\n\n## Tools");
+        composition.text.push_str(&bullets);
+    }
+    composition.text.push_str(&sections);
     record_part(&mut composition.parts, &composition.text, "Tool guidance");
     composition
 }
@@ -3023,6 +3030,30 @@ mod js_tests {
             None,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn tool_guidance_is_one_tools_section_and_routes_git_to_the_git_tool() {
+        let workspace = workspace_binding();
+        let sandbox = shell_sandbox();
+        let preamble = build_registered_preamble(
+            &empty_context(),
+            false,
+            workspace.root(),
+            &sandbox,
+            &["js", "git", "write", "shell"],
+            &crate::cli::Cli::default(),
+            None,
+        );
+        assert_eq!(preamble.matches("\n\n## Tools").count(), 1);
+        assert!(preamble.contains("- **git**"));
+        assert!(!preamble.contains("version-control"));
+        assert!(!preamble.contains("`bash` name"));
+        assert!(!preamble.contains("File reads"));
+        assert!(preamble.contains("Today's date (UTC): "));
+        let tools = preamble.find("## Tools").unwrap();
+        assert!(preamble.find("- **write**").unwrap() > tools);
+        assert!(preamble.find("- **shell**").unwrap() > tools);
     }
 
     #[tokio::test]
