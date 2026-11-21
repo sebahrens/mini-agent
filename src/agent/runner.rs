@@ -446,12 +446,54 @@ impl ToolLoopState {
     }
 }
 
+/// Marks a call as finished on its live row while the rest of its batch still
+/// runs. Rig delivers every result of a batch together, so without this a
+/// 20 ms `read` looks pending until the slowest sibling ends. Display only: the
+/// real `ToolResult` replaces it (mini-agent-sskdu.250).
+fn show_settled_call(internal_call_id: &str, outcome: &rig::tool::ToolOutcome, result: &str) {
+    let Some(events) = crate::agent::tools::mutation_diff::scoped_event_sender() else {
+        return;
+    };
+    let first_line: String = result
+        .lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(100)
+        .collect();
+    let text = if outcome.is_success() {
+        format!("✓ finished ({} bytes)", result.len())
+    } else {
+        format!("✗ failed: {first_line}")
+    };
+    let _ = events.try_send(AgentEvent::ToolProgress {
+        id: CompactString::from(internal_call_id),
+        text: CompactString::from(text),
+    });
+}
+
+/// Runs `f` on the loop guard's counters: the user turn's, kept on the work
+/// scope, so they survive forced continuations; outside a work scope (a bare
+/// stream) the per-stream scratchpad is used.
+fn update_loop_state<R>(ctx: &HookContext, f: impl FnOnce(&mut ToolLoopState) -> R) -> R {
+    let mut f = Some(f);
+    let scoped = AGENT_WORK_SCOPE.try_with(|scope| {
+        let mut state = scope.loop_state.lock().unwrap_or_else(|e| e.into_inner());
+        (f.take().expect("closure runs once"))(&mut state)
+    });
+    match scoped {
+        Ok(result) => result,
+        Err(_) => ctx
+            .scratchpad()
+            .update(f.take().expect("closure not consumed")),
+    }
+}
+
 /// Run-scoped guard against repeated failures, unchanged reads and edit/undo oscillation.
-/// Rig creates a fresh [`HookContext`] for every provider stream (`drive_agent`),
-/// so no state leaks between user turns or agents. A forced continuation inside
-/// one user turn (empty response, truncation, Stop-hook block, verification
-/// retry, transient retry) starts a new stream and therefore a fresh state:
-/// the counters are per stream, not per user turn (mini-agent-sskdu.258).
+/// The counters live on the turn's `AgentWorkScope`, so they span the forced
+/// continuations of one user turn (empty response, truncation, Stop-hook block,
+/// verification retry, transient retry) and never leak between turns or agents
+/// (mini-agent-sskdu.258). Without a work scope they are per Rig stream.
 ///
 /// It also answers a call to a tool that is not advertised: instead of the
 /// run-ending default, the model gets a corrective tool result.
@@ -461,9 +503,7 @@ impl<M: CompletionModel> AgentHook<M> for ToolLoopGuard {
     async fn on_event(&self, ctx: &HookContext, event: StepEvent<'_, M>) -> Flow {
         match event {
             StepEvent::CompletionCall { .. } => {
-                let stop = ctx
-                    .scratchpad()
-                    .update(|state: &mut ToolLoopState| state.successful_reads.stop_requested());
+                let stop = update_loop_state(ctx, |state| state.successful_reads.stop_requested());
                 if stop {
                     Flow::terminate(super::read_loop::STOP_REASON)
                 } else {
@@ -489,7 +529,7 @@ impl<M: CompletionModel> AgentHook<M> for ToolLoopGuard {
                 }
                 let fingerprint = tool_call_fingerprint(tool_name, args);
                 let raw = raw_args_hash(args);
-                let notice = ctx.scratchpad().update(|state: &mut ToolLoopState| {
+                let notice = update_loop_state(ctx, |state: &mut ToolLoopState| {
                     state
                         .pending
                         .insert(internal_call_id.to_owned(), (raw, fingerprint));
@@ -516,8 +556,9 @@ impl<M: CompletionModel> AgentHook<M> for ToolLoopGuard {
                     record_tool_failure(internal_call_id);
                 }
                 record_settled_result(internal_call_id, result);
+                show_settled_call(internal_call_id, outcome, result);
                 let raw = raw_args_hash(args);
-                let cached = ctx.scratchpad().update(|state: &mut ToolLoopState| {
+                let cached = update_loop_state(ctx, |state: &mut ToolLoopState| {
                     state
                         .pending
                         .remove(internal_call_id)
@@ -525,7 +566,7 @@ impl<M: CompletionModel> AgentHook<M> for ToolLoopGuard {
                         .map(|(_, fingerprint)| fingerprint)
                 });
                 let fingerprint = cached.unwrap_or_else(|| tool_call_fingerprint(tool_name, args));
-                let notice = ctx.scratchpad().update(|state: &mut ToolLoopState| {
+                let notice = update_loop_state(ctx, |state: &mut ToolLoopState| {
                     state.record_result(tool_name, fingerprint, outcome, result)
                 });
                 notice.map_or_else(Flow::cont, |notice| {
@@ -1368,6 +1409,11 @@ pub(crate) struct AgentWorkScope {
     /// Loop-guard notice text per internal call id, recorded by `ToolLoopGuard`
     /// out of band so tool output text can never pose as a notice.
     tool_loop_notices: std::sync::Mutex<HashMap<String, String>>,
+    /// The loop guard's counters for this user turn. A continuation inside the
+    /// turn (empty response, truncation, Stop-hook block, verification retry,
+    /// transient retry) starts a new Rig stream and so a new scratchpad; the
+    /// scope outlives them all (mini-agent-sskdu.258).
+    loop_state: std::sync::Mutex<ToolLoopState>,
     headless_diagnostics: std::sync::OnceLock<Arc<crate::logging::HeadlessDiagnostics>>,
     // Children may reuse a live interrupt driver, but must not extend its
     // lifetime or confuse a generic ownership scope with a signal listener.
@@ -1402,6 +1448,7 @@ impl AgentWorkScope {
             advisor_messages: std::sync::Mutex::new(Vec::new()),
             failed_tool_calls: std::sync::Mutex::new(std::collections::HashSet::new()),
             tool_loop_notices: std::sync::Mutex::new(HashMap::new()),
+            loop_state: std::sync::Mutex::new(ToolLoopState::default()),
             headless_diagnostics: std::sync::OnceLock::new(),
             headless_interrupt_owner: std::sync::Mutex::new(inherited_headless_interrupt_owner()),
             cancellation: Notify::new(),
@@ -1478,6 +1525,7 @@ impl AgentWorkScope {
                 advisor_messages: std::sync::Mutex::new(Vec::new()),
                 failed_tool_calls: std::sync::Mutex::new(std::collections::HashSet::new()),
                 tool_loop_notices: std::sync::Mutex::new(HashMap::new()),
+                loop_state: std::sync::Mutex::new(ToolLoopState::default()),
                 headless_diagnostics: std::sync::OnceLock::new(),
                 headless_interrupt_owner: std::sync::Mutex::new(
                     inherited_headless_interrupt_owner(),
@@ -1882,7 +1930,7 @@ static SETTLED_RESULTS: std::sync::Mutex<VecDeque<(String, String)>> =
 const SETTLED_RESULT_MAX_ENTRIES: usize = 128;
 const SETTLED_RESULT_MAX_BYTES: usize = 16 * 1024;
 
-fn record_settled_result(internal_call_id: &str, result: &str) {
+pub(crate) fn record_settled_result(internal_call_id: &str, result: &str) {
     let mut end = result.len().min(SETTLED_RESULT_MAX_BYTES);
     while !result.is_char_boundary(end) {
         end -= 1;
@@ -1899,11 +1947,6 @@ fn record_settled_result(internal_call_id: &str, result: &str) {
     while settled.len() > SETTLED_RESULT_MAX_ENTRIES {
         settled.pop_front();
     }
-}
-
-#[cfg(test)]
-pub(crate) fn record_settled_result_for_tests(internal_call_id: &str, result: &str) {
-    record_settled_result(internal_call_id, result);
 }
 
 /// The result a call produced before its batch settled, consuming it.
@@ -2408,6 +2451,7 @@ impl ToolCallTracker {
                 id: call.provider_id,
                 call_id: call.provider_call_id,
                 content: OneOrMany::one(ToolResultContent::text(UNKNOWN_TOOL_OUTCOME)),
+                is_error: None,
             };
             interactions.push(tool_result.clone().into());
             finalized.push(FinalizedToolCall {
@@ -2474,6 +2518,54 @@ fn attributed_tool_result(
     }
 
     Some((CompactString::new(call.name), output))
+}
+
+/// Turns Rig's tool-call deltas into throttled [`AgentEvent::ToolCallArgsStreaming`]
+/// events: one when the name arrives, then one per [`Self::STEP`] argument bytes.
+#[derive(Default)]
+struct ArgsStreaming {
+    calls: HashMap<String, (CompactString, usize, usize)>,
+}
+
+impl ArgsStreaming {
+    const STEP: usize = 4096;
+    const MAX_TRACKED: usize = 64;
+
+    fn observe(
+        &mut self,
+        internal_call_id: &str,
+        content: &rig::streaming::ToolCallDeltaContent,
+    ) -> Option<AgentEvent> {
+        use rig::streaming::ToolCallDeltaContent;
+        match content {
+            ToolCallDeltaContent::Name(name) => {
+                if self.calls.len() >= Self::MAX_TRACKED {
+                    self.calls.clear();
+                }
+                let name = CompactString::from(name.as_str());
+                self.calls
+                    .insert(internal_call_id.to_owned(), (name.clone(), 0, 0));
+                Some(AgentEvent::ToolCallArgsStreaming {
+                    id: CompactString::from(internal_call_id),
+                    name,
+                    bytes: 0,
+                })
+            }
+            ToolCallDeltaContent::Delta(fragment) => {
+                let (name, bytes, reported) = self.calls.get_mut(internal_call_id)?;
+                *bytes = bytes.saturating_add(fragment.len());
+                if *bytes - *reported < Self::STEP {
+                    return None;
+                }
+                *reported = *bytes;
+                Some(AgentEvent::ToolCallArgsStreaming {
+                    id: CompactString::from(internal_call_id),
+                    name: name.clone(),
+                    bytes: *bytes,
+                })
+            }
+        }
+    }
 }
 
 fn append_attributed_tool_result(
@@ -3922,6 +4014,14 @@ fn convert_history_uncached(
             }
             // A legacy mid-stream System record remains transcript prose. New
             // tool records take the structured branches below instead.
+            // A stored context notice (memory snapshot, hook context, job or
+            // task notice) replays as marked user-side text, the role it has live.
+            MessageRole::System if crate::agent::input::is_context_notice_row(&msg.content) => {
+                messages.push(Message::user(crate::agent::input::host_context_text(
+                    &msg.content,
+                )));
+                replay_kind = ReplayKind::Other;
+            }
             MessageRole::System if crate::agent::input::is_host_instruction(&msg.content) => {
                 // A host continuation instruction replays with the role it had
                 // live: a marked user-side message, not the model's own words.
@@ -4020,6 +4120,7 @@ fn convert_history_uncached(
                                 ),
                             )
                             .expect("text result is nonempty"),
+                            is_error: None,
                         }))
                     }
                     _ => None,
@@ -4129,6 +4230,7 @@ fn subagent_replay_messages(
                 id: identity.clone(),
                 call_id: Some(identity),
                 content: OneOrMany::one(ToolResultContent::text(SUBAGENT_TOOL_RESULT_PLACEHOLDER)),
+                is_error: None,
             })),
         },
     ]
@@ -4760,6 +4862,7 @@ where
         // default re-injected `retry_prompt`.
         let mut next_instruction: Option<String> = None;
         let mut output_truncation = OutputTruncation::default();
+        let mut args_streaming = ArgsStreaming::default();
         #[cfg(feature = "hooks")]
         let mut stop_hook_active = false;
         #[cfg(feature = "hooks")]
@@ -4977,8 +5080,20 @@ where
                                     StreamedAssistantContent::Unknown(value),
                                 ));
                             }
-                            StreamedAssistantContent::ToolCallDelta { .. }
-                            | StreamedAssistantContent::Reasoning(_)
+                            StreamedAssistantContent::ToolCallDelta {
+                                internal_call_id,
+                                content,
+                                ..
+                            } => {
+                                // The longest silent stretch of a turn is the model
+                                // writing a large call: show which tool is coming.
+                                if let Some(event) =
+                                    args_streaming.observe(&internal_call_id, &content)
+                                {
+                                    let _ = event_tx.send(event).await;
+                                }
+                            }
+                            StreamedAssistantContent::Reasoning(_)
                             | StreamedAssistantContent::ReasoningDelta { .. }
                             | StreamedAssistantContent::Final(_) => {}
                         }
@@ -6747,6 +6862,13 @@ where
     let mut logged: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut turn_budget_exhausted = false;
     let mut output_truncation = OutputTruncation::default();
+    // Mid-stream retry: what this stream produced so far, to resume from it.
+    let mut completion_retry = CompletionRetryState::new(retry_config);
+    let mut interactions: Vec<Message> = Vec::new();
+    let mut tracker = ToolCallTracker::default();
+    let mut bridge: Vec<Message> = Vec::new();
+    // Messages before the current stream's own (original prompt + bridge) once resumed.
+    let mut resumed_prefix: Vec<Message> = Vec::new();
     macro_rules! finish {
         ($response:expr) => {
             SubagentRunOutput {
@@ -6766,6 +6888,7 @@ where
         match item {
             Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text))) => {
                 full_response.push_str(&text.text);
+                append_streamed_text(&mut interactions, &text.text);
                 crate::extras::subagents::partial::record_text(&text.text);
             }
             Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall {
@@ -6773,6 +6896,8 @@ where
                 internal_call_id,
             })) => {
                 tool_calls = tool_calls.saturating_add(1);
+                let _ = tracker.record(&internal_call_id, &tool_call);
+                append_tool_call(&mut interactions, &tool_call);
                 crate::extras::subagents::partial::record_tool_call();
                 if tool_log.len() < MAX_TOOL_LOG_ENTRIES {
                     logged.insert(internal_call_id, tool_log.len());
@@ -6796,6 +6921,12 @@ where
                 internal_call_id,
             })) => {
                 let failed = take_tool_failure(&internal_call_id);
+                let _ = append_attributed_tool_result(
+                    &mut tracker,
+                    &mut interactions,
+                    &internal_call_id,
+                    &tool_result,
+                );
                 if let Some(entry) = logged
                     .remove(&internal_call_id)
                     .and_then(|row| tool_log.get_mut(row))
@@ -6816,7 +6947,10 @@ where
             Ok(MultiTurnStreamItem::FinalResponse(res)) => {
                 usage_ledger.reconcile_terminal(res.usage());
                 full_response = res.output.to_string();
-                child_history = res.messages().map(<[Message]>::to_vec).unwrap_or_default();
+                child_history = resumed_prefix
+                    .drain(..)
+                    .chain(res.messages().map(<[Message]>::to_vec).unwrap_or_default())
+                    .collect();
                 // A report cut off at the output-token limit must not reach the
                 // parent as complete findings (mini-agent-sskdu.86).
                 if output_truncation.final_response().is_some() {
@@ -6826,6 +6960,7 @@ where
             }
             Ok(MultiTurnStreamItem::CompletionCall(call)) => {
                 output_truncation.observe_call(&call);
+                completion_retry.reset(retry_config);
                 turns = turns.saturating_add(1);
                 usage_ledger.record_completion(call.usage);
                 if exhausted_token_budget(usage_ledger.total(), token_budget).is_some() {
@@ -6882,6 +7017,58 @@ where
                 if output_truncation.stream_error(&e.to_string()).is_some() {
                     full_response.push_str(SUBAGENT_OUTPUT_TRUNCATED_PARTIAL);
                     break;
+                }
+                // A transient error mid-stream: resume from what the child has
+                // accumulated instead of discarding the investigation.
+                let remaining = max_turns.saturating_sub(turns as usize);
+                if remaining > 0
+                    && let Some((_, delay)) =
+                        midstream_retry(&mut completion_retry, retry_config, &e)
+                {
+                    tokio::time::sleep(delay).await;
+                    tracker.finalize_unresolved(&mut interactions);
+                    let new_interactions = take_new_interactions(&mut interactions);
+                    bridge = normalized_continuation_bridge(
+                        std::mem::take(&mut bridge),
+                        &new_interactions,
+                        TRANSIENT_PROVIDER_CONTINUATION,
+                    );
+                    let (current, earlier) = bridge
+                        .split_last()
+                        .expect("a continuation bridge ends with its prompt");
+                    let mut resumed_history = history.clone();
+                    resumed_history.push(Message::user(prompt.to_string()));
+                    resumed_history.extend_from_slice(earlier);
+                    resumed_prefix = std::iter::once(Message::user(prompt.to_string()))
+                        .chain(earlier.iter().cloned())
+                        .collect();
+                    let current = current.clone();
+                    let resumed = crate::startup::heap_future(|| {
+                        retry::retry_stream_chat(retry_config, || {
+                            let current = current.clone();
+                            let history = resumed_history.clone();
+                            let admission = usage_ledger.clone();
+                            crate::startup::heap_future(|| async move {
+                                agent
+                                    .stream_chat(current, history)
+                                    .max_turns(remaining)
+                                    .add_hook(admission)
+                                    .tool_concurrency(
+                                        crate::agent::tools::concurrency::tool_concurrency(),
+                                    )
+                                    .add_hook(crate::spend::run::AdmissionHook(
+                                        crate::spend::run::Run::current(),
+                                    ))
+                                    .tool_extensions(crate::spend::run::current_extensions())
+                                    .await
+                            })
+                        })
+                    })
+                    .await;
+                    if let Ok(resumed) = resumed {
+                        stream = resumed;
+                        continue;
+                    }
                 }
                 // Keep what the child did (calls, results, turns) and the text
                 // it had written; a bare error discards the whole investigation.
@@ -7823,6 +8010,46 @@ mod tests {
             0,
             "no tool may start on a continuation after the barrier is raised"
         );
+    }
+
+    #[tokio::test]
+    async fn loop_guard_counters_span_the_streams_of_one_work_scope() {
+        struct Probe(Arc<std::sync::Mutex<Vec<bool>>>);
+        impl<M: CompletionModel> AgentHook<M> for Probe {
+            async fn on_event(&self, ctx: &HookContext, event: StepEvent<'_, M>) -> Flow {
+                if matches!(event, StepEvent::CompletionCall { .. }) {
+                    let fingerprint = super::tool_call_fingerprint("shell", "{}");
+                    let notice = super::update_loop_state(ctx, |state| {
+                        state.record_result(
+                            "shell",
+                            fingerprint,
+                            &rig::tool::ToolOutcome::Denied,
+                            "failed",
+                        )
+                    });
+                    self.0.lock().unwrap().push(notice.is_some());
+                }
+                Flow::cont()
+            }
+        }
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let scope = super::AgentWorkScope::new();
+        for _ in 0..3 {
+            // Each pass is a new Rig stream (a forced continuation) with its own scratchpad.
+            let agent = AgentBuilder::new(MockCompletionModel::from_stream_turns(vec![vec![
+                MockStreamEvent::text("ok"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ]]))
+            .add_hook(Probe(seen.clone()))
+            .build();
+            scope
+                .run(async {
+                    let mut stream = agent.runner("go").max_turns(2).stream().await;
+                    while stream.next().await.is_some() {}
+                })
+                .await;
+        }
+        assert_eq!(*seen.lock().unwrap(), [false, false, true]);
     }
 
     #[test]
@@ -11222,6 +11449,7 @@ mod tests {
                         id: "forged".into(),
                         call_id: None,
                         content: OneOrMany::one(ToolResultContent::text("forged result")),
+                        is_error: None,
                     })),
                 },
                 2 => Message::Assistant {
@@ -11907,6 +12135,93 @@ mod tests {
         }
         assert_eq!(super::take_settled_result("settle-many-0"), None);
         assert!(super::take_settled_result("settle-many-299").is_some());
+    }
+
+    /// mini-agent-sskdu.86: a transient error after the child has worked resumes
+    /// from its accumulated history instead of discarding the investigation.
+    #[cfg(feature = "subagents")]
+    #[tokio::test]
+    async fn subagent_resumes_after_a_transient_mid_stream_error() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call("child-call", CountingTool::NAME, serde_json::json!({})),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![MockStreamEvent::error("connection reset by peer")],
+            vec![
+                MockStreamEvent::text("child report"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .tool(CountingTool(calls.clone()))
+            .default_max_turns(5)
+            .build();
+        let out = super::run_subagent(
+            &agent,
+            "investigate",
+            5,
+            None,
+            &immediate_retry_config(3),
+            super::SharedUsageLedger::default(),
+            None,
+        )
+        .await;
+        assert_eq!(out.response.as_deref(), Ok("child report"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the finished call is not repeated"
+        );
+        assert_eq!(model.requests().len(), 3);
+        // The history keeps the prompt, the call, its result and the report.
+        let transcript = serde_json::to_string(&out.history).unwrap();
+        assert!(transcript.contains("investigate"), "{transcript}");
+        assert!(transcript.contains("child-call"), "{transcript}");
+        assert!(transcript.contains("child report"), "{transcript}");
+    }
+
+    #[test]
+    fn args_streaming_reports_the_name_then_every_4k() {
+        use rig::streaming::ToolCallDeltaContent as Delta;
+        let mut streaming = super::ArgsStreaming::default();
+        let first = streaming.observe("c1", &Delta::Name("write".into()));
+        assert!(matches!(
+            first,
+            Some(crate::event::AgentEvent::ToolCallArgsStreaming { bytes: 0, .. })
+        ));
+        assert!(
+            streaming
+                .observe("c1", &Delta::Delta("x".repeat(1000)))
+                .is_none()
+        );
+        let second = streaming.observe("c1", &Delta::Delta("x".repeat(4000)));
+        assert!(matches!(
+            second,
+            Some(crate::event::AgentEvent::ToolCallArgsStreaming { bytes: 5000, .. })
+        ));
+        assert!(
+            streaming
+                .observe("other", &Delta::Delta("x".repeat(9000)))
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_settled_call_is_marked_finished_on_its_row_before_the_batch_ends() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        crate::agent::tools::mutation_diff::scope_events(tx, async {
+            super::show_settled_call("fast-call", &rig::tool::ToolOutcome::Success, "ok");
+        })
+        .await;
+        match rx.recv().await {
+            Some(crate::event::AgentEvent::ToolProgress { id, text }) => {
+                assert_eq!(id, "fast-call");
+                assert!(text.starts_with("✓ finished"), "{text}");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -13207,6 +13522,7 @@ mod tests {
             id: "orphan-result".to_string(),
             call_id: None,
             content: OneOrMany::one(ToolResultContent::Text(Text::new("unexpected output"))),
+            is_error: None,
         };
         let mut tracker = ToolCallTracker::default();
 
@@ -13219,6 +13535,7 @@ mod tests {
             id: "image-result".to_string(),
             call_id: None,
             content: OneOrMany::one(ToolResultContent::Image(Image::default())),
+            is_error: None,
         };
         let mut tracker = ToolCallTracker::default();
         tracker
@@ -13258,6 +13575,7 @@ mod tests {
             id: id.to_string(),
             call_id: call_id.map(str::to_string),
             content: OneOrMany::one(ToolResultContent::Text(Text::new(output))),
+            is_error: None,
         }
     }
 

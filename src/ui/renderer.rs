@@ -2771,6 +2771,17 @@ impl Renderer {
         self.paint_written_line()
     }
 
+    /// Rewrite the text of an anchored line in place. Returns whether the line
+    /// was still retained.
+    pub fn replace_anchored_line(&mut self, anchor: &str, text: &str) -> io::Result<bool> {
+        let replaced = self.feed.replace_anchored_text(anchor, text);
+        if replaced {
+            self.chat_dirty = true;
+            self.render_viewport()?;
+        }
+        Ok(replaced)
+    }
+
     /// Place a line directly under the line written with `anchor` (a tool
     /// result under its own call), or at the end when that line is gone.
     pub fn write_line_after(&mut self, anchor: &str, text: &str, color: Color) -> io::Result<()> {

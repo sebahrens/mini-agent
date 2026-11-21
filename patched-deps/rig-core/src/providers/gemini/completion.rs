@@ -2222,7 +2222,7 @@ mod tests {
                 message::ToolResultContent::text("scanned"),
                 message::ToolResultContent::pdf_base64("JVBERg=="),
             ])
-            .unwrap(),
+            .unwrap(), is_error: None,
         });
         let part = Part::try_from(content).unwrap();
         let json = serde_json::to_value(&part).unwrap();
@@ -3040,7 +3040,7 @@ mod tests {
                     detail: None,
                     additional_params: None,
                 }),
-            ]).expect("Should create OneOrMany with multiple items"),
+            ]).expect("Should create OneOrMany with multiple items"), is_error: None,
         };
 
         let user_content = message::UserContent::ToolResult(tool_result);
@@ -3164,7 +3164,7 @@ mod tests {
                 media_type: Some(ImageMediaType::PNG),
                 detail: None,
                 additional_params: None,
-            })),
+            })), is_error: None,
         };
 
         let user_content = message::UserContent::ToolResult(tool_result);

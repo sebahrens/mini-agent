@@ -7276,6 +7276,8 @@ async fn relay_prompt_events(
                     send_tool_update(&session_id, &cx, update);
                 }
             }
+            // Display-only hint for the TUI; ACP clients get the call when it completes.
+            AgentEvent::ToolCallArgsStreaming { .. } => {}
             AgentEvent::ToolProgress { id, text } => {
                 // Throttled by the runner; one update on the same call, never
                 // a new tool call. The result update stays canonical.

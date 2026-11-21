@@ -121,6 +121,16 @@ pub enum AgentEvent {
         name: CompactString,
         args: serde_json::Value,
     },
+    /// The model is still writing the arguments of a tool call. `id` is the
+    /// call's internal id (the one its `ToolCall` later carries); `bytes` is the
+    /// argument text received so far. Emitted when the name arrives and then at
+    /// most once per 4 KiB. Display only: never persisted. Clients without a
+    /// live view ignore it.
+    ToolCallArgsStreaming {
+        id: CompactString,
+        name: CompactString,
+        bytes: usize,
+    },
     ToolResult {
         id: CompactString,
         name: CompactString,

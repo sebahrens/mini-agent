@@ -131,7 +131,10 @@ impl<M: CompletionModel> AgentHook<M> for SteeringHook {
         };
         #[cfg(not(feature = "hooks"))]
         let notices: Vec<String> = Vec::new();
-        let mut messages: Vec<Message> = notices.into_iter().map(Message::assistant).collect();
+        let mut messages: Vec<Message> = notices
+            .into_iter()
+            .map(|notice| Message::user(crate::agent::input::host_context_text(&notice)))
+            .collect();
         messages.push(Message::user(prompt));
         Flow::patch_request(RequestPatch::new().append_input(messages))
     }

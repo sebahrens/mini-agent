@@ -1244,7 +1244,7 @@ impl TryFrom<message::Message> for Message {
                         cache_control: None,
                     }),
                     message::UserContent::ToolResult(message::ToolResult {
-                        id, content, ..
+                        id, content, is_error: result_is_error, ..
                     }) => Ok(Content::ToolResult {
                         tool_use_id: id,
                         content: content.try_map(|content| match content {
@@ -1295,7 +1295,7 @@ impl TryFrom<message::Message> for Message {
                                 })
                             }
                         })?,
-                        is_error: None,
+                        is_error: result_is_error,
                         cache_control: None,
                     }),
                     message::UserContent::Image(message::Image {
@@ -2953,7 +2953,7 @@ mod tests {
             content: OneOrMany::one(message::UserContent::ToolResult(message::ToolResult {
                 id: "toolu_1".into(),
                 call_id: None,
-                content: OneOrMany::one(message::ToolResultContent::pdf_base64("JVBERg==")),
+                content: OneOrMany::one(message::ToolResultContent::pdf_base64("JVBERg==")), is_error: None,
             })),
         };
         let converted: Message = message.try_into().unwrap();

@@ -1388,6 +1388,7 @@ mod tests {
             content: rig::OneOrMany::one(rig::message::ToolResultContent::text(
                 "actual surfaced result",
             )),
+            is_error: None,
         });
         assert_eq!(
             history.require_completed_boundary(),

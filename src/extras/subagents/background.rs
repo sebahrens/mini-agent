@@ -3163,6 +3163,7 @@ mod evidence_tool_tests {
                     id: id.into(),
                     call_id: None,
                     content: OneOrMany::many(parts).unwrap(),
+                    is_error: None,
                 })),
             },
         ]

@@ -45,11 +45,13 @@ fn interactions() -> Vec<Message> {
                         ToolResultContent::Image(image()),
                     ])
                     .unwrap(),
+                    is_error: None,
                 }),
                 UserContent::ToolResult(ToolResult {
                     id: "text-call".into(),
                     call_id: None,
                     content: OneOrMany::one(ToolResultContent::text("notes remain text")),
+                    is_error: None,
                 }),
             ])
             .unwrap(),
@@ -1061,6 +1063,7 @@ fn image_read64_borrowed_batch_limits_precede_payload_decoding() {
         id: "image-call".into(),
         call_id: None,
         content: OneOrMany::many(images.into_iter().map(ToolResultContent::Image)).unwrap(),
+        is_error: None,
     };
     assert!(
         crate::session::tool_image::from_result(&result(vec![invalid.clone(); 9]))

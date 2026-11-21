@@ -265,6 +265,7 @@ async fn pdf_block_reaches_each_provider_wire_format() {
                 id: "toolu_1".into(),
                 call_id: Some("call_1".into()),
                 content,
+                is_error: None,
             },
         )),
     };
@@ -312,6 +313,7 @@ async fn pdf_block_in_history_costs_pages_not_base64_text() {
                 id: "t".into(),
                 call_id: None,
                 content: rig::message::ToolResultContent::from_tool_output(output),
+                is_error: None,
             },
         )),
     };

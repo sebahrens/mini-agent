@@ -528,6 +528,8 @@ pub(crate) struct AgentRunState {
     /// A `ToolLoop` notice arrived for the result that follows; that result
     /// is persisted but not rendered (the notice is the diagnostic).
     pub(crate) loop_guard_result_pending: bool,
+    /// Calls whose row was already written while their arguments streamed.
+    pub(crate) streaming_call_rows: std::collections::HashSet<compact_str::CompactString>,
     pub(crate) native_checkpointed: bool,
     pub(crate) native_session_end: Option<crate::provider::NativeSessionEndOwner>,
     /// Current native actor's exact writer and prepared-history binding.

@@ -1809,6 +1809,7 @@ pub mod interactions_api_types {
                     id,
                     call_id,
                     content,
+                    ..
                 }) => {
                     let Some(call_id) = call_id else {
                         return Err(message::MessageError::ConversionError(
@@ -2598,7 +2599,7 @@ mod tests {
         let content = message::UserContent::ToolResult(message::ToolResult {
             id: "get_weather".to_string(),
             call_id: None,
-            content: OneOrMany::one(message::ToolResultContent::text("ok")),
+            content: OneOrMany::one(message::ToolResultContent::text("ok")), is_error: None,
         });
 
         let err = Content::try_from(content).expect_err("should require call_id");

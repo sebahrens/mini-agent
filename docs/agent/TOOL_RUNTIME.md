@@ -1087,6 +1087,28 @@ mutations; anything else, including MCP tools, is treated as mutating. A complet
 resets the identical-failure counters of `ToolLoopGuard`, so a call that failed before an edit can run
 again after it.
 
+### Host messages, interrupts and live rows
+
+- Host context (memory snapshot, `UserPromptSubmit` hook context, background job and task notices) is
+  delivered as a user-role message whose text starts `[Host: context notice; not written by the user]`,
+  never as an assistant message. Stored System rows keep the raw notice; replay (`convert_history`) wraps
+  rows that look like context notices the same way, and the memory-snapshot dedupe reads both the marked
+  user form and the older assistant form. Continuation instructions (empty response, retry, Stop hook,
+  verification) use the same `[Host: ...]` marker and are stored as System rows by both frontends.
+- Rig commits a tool batch atomically. `ToolLoopGuard` notes each result as its call settles, so an
+  interrupt records the real result of calls that had finished (the unknown-outcome text only for calls
+  that did not), shows a `finished`/`failed` marker on the call's live row (`AgentEvent::ToolProgress`),
+  and a foreground `shell` call dropped mid-run saves its partial output to a `shell-interrupted-*` log in
+  the output directory and reports the last 40 lines with that path. An interrupt or failure also adds a
+  host row saying the turn was cut off.
+- `AgentEvent::ToolCallArgsStreaming { id, name, bytes }` is emitted when a tool name arrives and then
+  every 4 KiB of argument text, so the TUI shows `write (receiving arguments, 12.0 kB)` while the model
+  writes a large call; the row is completed in place by the `ToolCall` event. ACP ignores it.
+- `ToolResult.is_error` (Rig) is set for failed, denied and hook-skipped results and sent as Anthropic
+  `is_error`. It is not yet persisted in session rows.
+- Loop-guard counters live on the turn's `AgentWorkScope`, so they span forced continuations inside one
+  user turn. A subagent resumes after a transient mid-stream error from its accumulated history.
+
 ### Unknown tool arguments
 
 Every model-facing tool argument struct (`shell`, `job_status`, `read`, `write`, `edit` and its
