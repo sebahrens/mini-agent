@@ -1016,5 +1016,97 @@ fi
             self.assertEqual([], self.attestation_calls(root))
 
 
+    # ---- preflight, uninstall and truncation safety ----
+
+    def test_missing_curl_is_reported_before_any_download(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin = self.make_fixture(directory)
+            (stub_bin / "curl").unlink()
+
+            result = self.run_installer(
+                root, release, stub_bin, system_path=self.tools_without_bwrap(root)
+            )
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("curl is required", result.stderr)
+            self.assertNotIn("private", result.stderr)
+            self.assertFalse((root / "prefix").exists())
+
+    @unittest.skipIf(os.geteuid() == 0, "root can write anywhere")
+    def test_read_only_install_directory_fails_before_any_network_call(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin = self.make_fixture(directory)
+            locked = root / "locked"
+            locked.mkdir()
+            locked.chmod(0o555)
+            try:
+                result = self.run_installer(
+                    root,
+                    release,
+                    stub_bin,
+                    install_dir=str(locked / "bin"),
+                    extra_env={"INSTALL_TEST_CURL_LOG": str(root / "curl.log")},
+                )
+            finally:
+                locked.chmod(0o755)
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("cannot create or write", result.stderr)
+            self.assertIn("--dir", result.stderr)
+            self.assertFalse((root / "curl.log").exists())
+
+    def test_windows_shells_get_a_pointer_to_the_windows_install(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin = self.make_fixture(directory)
+            (stub_bin / "uname").write_text(
+                '#!/bin/sh\n[ "$1" = "-s" ] && echo MINGW64_NT-10.0 || echo x86_64\n'
+            )
+
+            result = self.run_installer(root, release, stub_bin)
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("WINDOWS_INSTALL.md", result.stderr)
+
+    def test_uninstall_removes_the_binary_and_the_document_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin = self.make_fixture(directory)
+            self.assertEqual(0, self.run_installer(root, release, stub_bin).returncode)
+            self.assertTrue((root / "prefix/bin/mini-agent").is_file())
+            self.assertTrue((root / "prefix/share/doc/mini-agent").is_dir())
+
+            result = subprocess.run(
+                ["bash", str(INSTALLER), "--uninstall", "--dir", str(root / "prefix/bin")],
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertFalse((root / "prefix/bin/mini-agent").exists())
+            self.assertFalse((root / "prefix/share/doc/mini-agent").exists())
+
+    def test_truncated_script_runs_nothing(self) -> None:
+        source = INSTALLER.read_text(encoding="utf-8")
+        self.assertTrue(source.rstrip().endswith('main "$@"'))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for fraction in (0.2, 0.5, 0.8, 0.95):
+                cut = source[: int(len(source) * fraction)]
+                result = subprocess.run(
+                    ["bash", "-s", "--", "--dir", str(root / "target")],
+                    input=cut,
+                    env={**os.environ, "HOME": str(root)},
+                    cwd=root,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(0, result.returncode, fraction)
+                self.assertEqual("", result.stdout, fraction)
+                self.assertEqual([], sorted(p.name for p in root.iterdir()), fraction)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -107,11 +107,8 @@ fn loop_script_invokes_configured_agent_as_a_quoted_array() {
     assert!(!loop_script.contains("| $AGENT_CMD"));
 }
 
-#[cfg(unix)]
 #[test]
-fn test_workflow_only_headless_relevance_check_executes_embedded_policy() {
-    crate::extras::r#loop::verify_workflow_only_headless_relevance().unwrap();
-
+fn ci_workflow_keeps_the_sandbox_filter_in_a_yaml_safe_block_scalar() {
     let workflow = include_str!("../../.github/workflows/ci.yml");
     assert!(
         workflow.contains("run: >-\n          cargo test --locked sandbox::"),

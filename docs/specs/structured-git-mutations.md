@@ -1,20 +1,25 @@
 # ADR: Structured Git mutations
 
 - **Document role**: normative cross-cutting decision
-- **Specification version**: 1.0.1
+- **Specification version**: 1.1.0
 - **Delivery status**: delivered
-- **Last reconciled**: 2026-09-06
+- **Last reconciled**: 2026-11-21
 - **Accepted**: 2026-08-14
 
 ## Decision
 
-The model-visible Git surface permits only `stage`, `unstage`, and `commit`.
-Each operation is a typed request against the captured `WorkspaceBinding`; raw
+The model-visible Git surface is the closed `GitOperation` set below. Read-only:
+`status`, `diff`, `log`, `show`, `blame`, `branches`, `stash_list`. Mutating: `stage`,
+`unstage`, `commit` (optionally `amend`), `branch_create`, `switch`, `stash_push`,
+`stash_pop`, `tag`, `restore`. Each operation is a typed request against the captured `WorkspaceBinding`; raw
 argv, shell text, remotes, and network operations are not part of the API.
-`status`, `diff`, `log`, and `show` remain read-only operations.
 
-Mutation calls require the exact permission verb (`git/stage`,
-`git/unstage`, or `git/commit`) and return before/after porcelain-v2 state,
+Permission keys: `git/status` (`status`, `branches`, `stash_list`), `git/diff`, `git/log`,
+`git/show` (`show`, `blame`), `git/stage`, `git/unstage`, `git/commit`, `git/amend` (a second
+check when `commit` sets `amend`), `git/branch` (`branch_create`), `git/switch`, `git/stash`
+(`stash_push`, `stash_pop`), `git/tag`, `git/restore`.
+
+Mutation calls require the exact permission verb for the operation and return before/after porcelain-v2 state,
 exit status, bounded output, and the requested operation. A failed command is
 never described as rolled back. A process-wide admission lock serializes
 structured mutations with internal worktree mutations; Git's own index lock is
@@ -42,8 +47,16 @@ worktree stdin/network entry points follow their `git-worktree` callers.
 Git can execute hooks, clean/smudge/process filters, signing programs,
 credential helpers, editors, pagers, external diff/textconv, submodule
 commands, and protocol helpers. The contract disables or rejects each surface.
-No fetch, pull, push, checkout, reset-hard, clean, merge, or rebase operation
-is exposed. Cancellation and output/timeout limits terminate the child and
+No fetch, pull, push, reset-hard, clean, merge, or rebase operation is exposed.
+`switch` and `restore` do rewrite the working tree, which can run checkout
+conversion (smudge/process filters, eol and `ident` attributes); they run with
+filters, hooks and helpers disabled and refuse paths or attributes that need an
+external transform, exactly as staging does. `stash_push` and `stash_pop` create
+commits and therefore need a committer identity; the identity is resolved by
+the host from the captured global Git configuration (never model-supplied,
+and `GIT_AUTHOR_*`/`GIT_COMMITTER_*` overrides from the parent environment are
+removed), and the operation fails when none is configured. `amend` only
+replaces a HEAD commit that is in no remote-tracking ref. Cancellation and output/timeout limits terminate the child and
 preserve the truthful post-operation snapshot.
 
 ## Alternatives rejected
@@ -59,7 +72,10 @@ hardened direct executable boundary is selected for this narrow local subset.
 Tests must cover Unix and Windows, linked worktrees, Unicode and option-like
 paths, symlinks and submodules, hostile hooks/attributes/signing/editor config,
 index lock contention, concurrent callers, cancellation, bounded output, and
-truthful partial staging. A platform where the executable or workspace cannot
+truthful partial staging. Every `GitOperation::name()` must appear in the operation list
+above (enforced by the `adr_lists_every_git_operation` test in `src/git/tool.rs`), and the
+working-tree-rewriting operations (`switch`, `restore`, `stash_pop`) need rows for checkout
+conversion refusal and stash identity. A platform where the executable or workspace cannot
 be verified is rejected before launch.
 
 The Unix worktree concurrency tests hold real Git aliases and pre-commit hooks

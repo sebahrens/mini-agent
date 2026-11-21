@@ -124,7 +124,15 @@ class SyncVersionTests(unittest.TestCase):
                 (root / "docs/acp-registry.json").read_text(encoding="utf-8")
             )
             self.assertEqual("9.8.7", registry["agent"]["version"])
-            self.assertEqual("1.3.0", registry["agent"]["protocol"]["version"])
+            # The sync script must not touch the protocol version: it stays
+            # whatever the checked-in registry fixture says.
+            original_registry = json.loads(
+                (REPOSITORY / "docs/acp-registry.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                original_registry["agent"]["protocol"]["version"],
+                registry["agent"]["protocol"]["version"],
+            )
 
             # The pinned source install follows the release tag, and nothing
             # else in the README changes.

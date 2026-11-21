@@ -172,9 +172,11 @@ ACLs; learned-skill process spawning remains disabled there until an immutable-e
 exists. If a required backend or live proof fails, that capability—or JavaScript itself—is
 unavailable instead of silently running with more authority.
 
-One deliberate exception remains: checked replacement of an existing workspace file fails closed on
-Windows because NT rename has no destination file-identity compare-and-swap operation. mini-agent
-does not trade away the raced-edit protection used by Linux and macOS merely to claim parity.
+One narrower residual race remains on Windows: replacing an existing workspace file re-verifies
+the target's identity and content digest immediately before a handle-relative, POSIX-semantics
+rename, but NT has no destination compare-and-swap, so the window is slightly wider than on Linux
+and macOS. Replacement requires a filesystem with 128-bit file IDs and POSIX rename support (NTFS
+or ReFS); FAT, exFAT and some network shares are refused.
 
 See [the architecture overview](ARCHITECTURE.md) and
 [brokered runtime specification](docs/specs/phase-6-brokered-js-runtime.md) for the exact threat
@@ -327,6 +329,10 @@ To install an exact release instead of the latest one, pass `--release`:
 ```bash
 curl -fsSL https://raw.githubusercontent.com/sebahrens/mini-agent/main/install.sh | bash -s -- --release X.Y.Z
 ```
+
+The installer writes the `mini-agent` binary to the install directory (default `~/.local/bin`) and
+the licence and source notices to `share/doc/mini-agent` beside it. `install.sh --uninstall --dir
+<path>` removes both.
 
 The installer refuses an archive that does not match the release's `SHA256SUMS`. That manifest is
 served from the same release as the archive, so it catches a damaged or truncated download but not a

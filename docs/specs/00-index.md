@@ -456,3 +456,10 @@ overall bound (step budget plus that allowance). The `EffectResponse` wire frame
 parent-to-worker `approval_wait_ms`. See "Delivered corrections (2026-11-21 approval wait and the
 step deadline)" in [`phase-6-brokered-js-runtime.md`](phase-6-brokered-js-runtime.md); canonical
 invariant 4 carries the changed timing rule.
+
+## Delivered corrections (2026-11-21 structured Git ADR)
+
+`mini-agent-nvnkx.51`: [`structured-git-mutations.md`](structured-git-mutations.md) is reconciled
+to version 1.1.0 with the full `GitOperation` list, the per-operation permission keys, and
+threat-model rows for checkout conversion and stash identity. A test pins the operation list to
+`GitOperation::name()`.

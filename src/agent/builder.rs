@@ -2430,8 +2430,10 @@ mod extra_file_tests {
             .position(|line| line.starts_with("Current working directory:"))
             .unwrap();
         assert_eq!(lines[cwd], "Current working directory: /dev/shm");
+        // Order is cwd, session facts (date/platform), sandbox notice.
+        assert!(lines[cwd + 1].starts_with("Today's date (UTC): "));
         assert_eq!(
-            lines[cwd + 1],
+            lines[cwd + 2],
             format!(
                 "Sandboxed shell commands see this workspace at {}; file tools keep the working-directory path above.",
                 alias.display()
@@ -2447,7 +2449,7 @@ mod extra_file_tests {
             .iter()
             .find(|(name, _)| *name == "Workspace path")
             .unwrap();
-        assert!(actual.text[workspace.1.clone()].ends_with(lines[cwd + 1]));
+        assert!(actual.text[workspace.1.clone()].ends_with(lines[cwd + 2]));
         assert_eq!(actual.parts.last().unwrap().1.end, actual.text.len());
     }
 
@@ -2479,10 +2481,19 @@ mod extra_file_tests {
             .iter()
             .find(|(name, _)| *name == "Workspace path")
             .unwrap();
+        let workspace_text = actual.text[workspace.1.clone()].trim();
         assert_eq!(
-            actual.text[workspace.1.clone()].trim(),
+            workspace_text.lines().next().unwrap(),
             format!("Current working directory: {}", spelled.display())
         );
+        assert!(
+            workspace_text
+                .lines()
+                .nth(1)
+                .unwrap()
+                .starts_with("Today's date (UTC): ")
+        );
+        assert_eq!(workspace_text.lines().count(), 2);
         assert!(
             !actual
                 .text
@@ -2490,6 +2501,39 @@ mod extra_file_tests {
         );
         assert_eq!(binding.root(), real);
         assert_eq!(sandbox.shell_cwd_alias(), None);
+    }
+
+    /// Platform-neutral pin of the "Workspace path" part order: working
+    /// directory, then the session-start date/platform line, nothing else
+    /// without a sandbox alias.
+    #[test]
+    fn workspace_part_orders_cwd_then_session_facts() {
+        let workspace =
+            crate::paths::WorkspaceBinding::capture(&std::env::current_dir().unwrap()).unwrap();
+        let sandbox = crate::sandbox::Sandbox::new(false, "none");
+        let actual = super::compose_registered_preamble(
+            &empty_ctx(),
+            false,
+            workspace.root(),
+            &sandbox,
+            &[],
+            &crate::cli::Cli::default(),
+            None,
+            crate::context::instructions::InstructionProtocol::Unverified,
+        );
+        let part = actual
+            .parts
+            .iter()
+            .find(|(name, _)| *name == "Workspace path")
+            .unwrap();
+        let text = actual.text[part.1.clone()].trim();
+        let lines: Vec<_> = text.lines().collect();
+        assert!(
+            lines[0].starts_with("Current working directory: "),
+            "{text}"
+        );
+        assert!(lines[1].starts_with("Today's date (UTC): "), "{text}");
+        assert!(lines[1].contains("Platform: "), "{text}");
     }
 
     #[test]

@@ -284,8 +284,6 @@ async fn run(cli: cli::Cli) -> anyhow::Result<()> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OneShot {
     ConfigSchema,
-    #[cfg(all(feature = "loop", unix))]
-    LoopPolicyCheck,
     Login,
     Logout,
     Doctor,
@@ -329,8 +327,6 @@ impl OneShot {
     fn needs(self) -> Needs {
         match self {
             Self::ConfigSchema => Needs::Nothing,
-            #[cfg(all(feature = "loop", unix))]
-            Self::LoopPolicyCheck => Needs::Arguments,
             Self::Login | Self::Logout | Self::Doctor => Needs::Paths,
             #[cfg(feature = "js")]
             Self::JsRuntimeCheck => Needs::Storage,
@@ -356,10 +352,6 @@ impl OneShot {
 fn one_shot_command(cli: &cli::Cli) -> Option<OneShot> {
     if cli.config_schema {
         return Some(OneShot::ConfigSchema);
-    }
-    #[cfg(all(feature = "loop", unix))]
-    if cli.loop_verification_policy_check {
-        return Some(OneShot::LoopPolicyCheck);
     }
     if cli.login.is_some() {
         return Some(OneShot::Login);
@@ -427,12 +419,6 @@ fn run_argument_one_shot(command: Option<OneShot>, stage: Needs) -> anyhow::Resu
             std::io::stdout().lock().write_all(b"\n")?;
             Ok(true)
         }
-        #[cfg(all(feature = "loop", unix))]
-        OneShot::LoopPolicyCheck => {
-            extras::r#loop::verify_workflow_only_headless_relevance()?;
-            println!("workflow-only headless loop verification check: PASS");
-            Ok(true)
-        }
         _ => Ok(false),
     }
 }
@@ -458,8 +444,6 @@ async fn run_one_shot(
     match command {
         // Run before any paths exist, by `run_argument_one_shot`.
         OneShot::ConfigSchema => unreachable!("handled before startup state exists"),
-        #[cfg(all(feature = "loop", unix))]
-        OneShot::LoopPolicyCheck => unreachable!("handled before startup state exists"),
         OneShot::Login => {
             let provider = cli.login.as_deref().expect("classified from --login");
             if provider.eq_ignore_ascii_case("copilot") {

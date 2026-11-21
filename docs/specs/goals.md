@@ -391,6 +391,7 @@ required check still runs. `Stop` hooks still receive `loop_iteration` and
 `loop_active`, derived from the round the goal is on.
 
 `LoopState` no longer exists. The loop module keeps only its plan handling, the
-bounded validation runner shared with goal checks, and the workflow-only
-headless verification that `--loop-verification-policy-check` exercises. The
+bounded validation runner shared with goal checks. The workflow-only
+headless verification policy is checked from `scripts/` by
+`scripts.tests.test_loop_lifecycle` in CI, not by a shipped flag. The
 `loop` Cargo feature therefore depends on `goal`.
