@@ -3403,6 +3403,24 @@ pub(crate) fn convert_history_prefix(
     keep_recent_tool_results: usize,
 ) -> Vec<Message> {
     let mut prefix = session.clone();
+    // The summarizer must recap the previous summary's prose, not the machine
+    // appendices (file list, restored windows) or live todo/goal state
+    // (mini-agent-sskdu.235).
+    if let (Some(prose), (Some(_), live)) = (
+        session.compactions.last().and_then(|c| c.prose.clone()),
+        session.compacted_context(),
+    ) && live >= 1
+    {
+        prefix.messages[live - 1].content = prose.clone();
+        if let Some(record) = prefix.compactions.last_mut() {
+            record.summary = prose;
+        }
+    }
+    prefix.todos = Default::default();
+    #[cfg(feature = "goal")]
+    {
+        prefix.goal_store = Default::default();
+    }
     prefix.messages.truncate(end);
     prefix.mark_history_changed();
     convert_history_uncached(&prefix, keep_recent_tool_results, false)
@@ -3540,10 +3558,13 @@ fn convert_history_uncached(
     // so the agent doesn't treat it as a fresh continuation of its own
     // voice.
     if let Some(summary) = summary {
-        messages.push(Message::assistant(format!(
-            "{}\n{}",
-            COMPACTION_RECAP_LABEL, summary
-        )));
+        let live = session.live_recap_blocks();
+        let recap = if live.is_empty() {
+            format!("{COMPACTION_RECAP_LABEL}\n{summary}")
+        } else {
+            format!("{COMPACTION_RECAP_LABEL}\n{summary}\n\n{live}")
+        };
+        messages.push(Message::assistant(recap));
         if let Some(evidence) = session
             .compactions
             .last()

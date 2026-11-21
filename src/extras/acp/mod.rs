@@ -125,6 +125,9 @@ struct SessionHistory {
     policy: policy::SessionPolicy,
     pending_question: Option<crate::question::QuestionRequired>,
     manual_compact: bool,
+    /// What the last compaction did or why it did not, for the client
+    /// (mini-agent-sskdu.229, .243). Drained after each compaction.
+    compaction_events: Vec<String>,
     /// Servers and managers that outlive a single prompt.
     reuse: SessionReuse,
     /// Compaction triggers, refreshed from config and the routed model's
@@ -293,6 +296,7 @@ impl Default for SessionHistory {
             policy: Default::default(),
             pending_question: None,
             manual_compact: false,
+            compaction_events: Vec::new(),
             reuse: Default::default(),
             limits: Default::default(),
             context_window: 0,
@@ -519,16 +523,22 @@ impl SessionHistory {
             let output = match result {
                 Ok(output) if output.messages_included > 0 => output,
                 failed => {
-                    match &failed {
-                        Err(error) => tracing::warn!(
-                            %error,
-                            "ACP summarizer failed; history compaction skipped"
-                        ),
-                        Ok(_) => tracing::warn!(
-                            "ACP summarizer included no messages; history compaction skipped"
-                        ),
-                    }
-                    self.fall_back_after_summary_failure();
+                    let reason = match &failed {
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                "ACP summarizer failed; history compaction skipped"
+                            );
+                            format!("{error:#}")
+                        }
+                        Ok(_) => {
+                            tracing::warn!(
+                                "ACP summarizer included no messages; history compaction skipped"
+                            );
+                            "the summarizer covered no messages".to_owned()
+                        }
+                    };
+                    self.fall_back_after_summary_failure(&reason);
                     return Some(usage);
                 }
             };
@@ -560,7 +570,7 @@ impl SessionHistory {
                 .max()
                 .or_else(|| (consumed == self.session.messages.len()).then_some(consumed));
             let Some(completed_cut) = completed_cut else {
-                self.fall_back_after_summary_failure();
+                self.fall_back_after_summary_failure("the summary did not cover a whole turn");
                 return Some(usage);
             };
             // Honour the summarizer's window-scaled byte budget instead of the
@@ -578,6 +588,14 @@ impl SessionHistory {
                 0,
             );
             self.manual_compact = false;
+            self.compaction_events.push(format!(
+                "compacted {} records into a summary (~{} tokens freed)",
+                completed_cut,
+                self.session
+                    .compactions
+                    .last()
+                    .map_or(0, |compaction| compaction.token_savings)
+            ));
             needs = self.needs_compaction();
         }
         Some(usage)
@@ -590,11 +608,17 @@ impl SessionHistory {
     /// byte guard or the turn cap) leaves no other way to proceed; plain token
     /// pressure keeps the transcript intact and lets the prompt run, since the
     /// reactive path still covers a real overflow (mini-agent-sskdu.229).
-    fn fall_back_after_summary_failure(&mut self) {
+    fn fall_back_after_summary_failure(&mut self, reason: &str) {
         if self.over_turn_cap() || self.exceeds_hard_bound() {
             self.emergency_compact();
+            self.compaction_events.push(format!(
+                "compaction failed ({reason}); older history was evicted to stay within the session limits"
+            ));
         } else {
             self.manual_compact = false;
+            self.compaction_events.push(format!(
+                "compaction failed ({reason}); the history was kept unchanged"
+            ));
         }
     }
     fn emergency_compact(&mut self) {
@@ -2123,6 +2147,7 @@ async fn install_session(
                 policy,
                 pending_question,
                 manual_compact: false,
+                compaction_events: Vec::new(),
                 reuse: Default::default(),
                 limits: Default::default(),
                 context_window: 0,
@@ -4053,6 +4078,23 @@ fn native_relief_stop(reliefs: usize, progress: &[Message], compacted: bool) -> 
     None
 }
 
+/// `/compact show`: the active compaction summary, bounded like the TUI's
+/// (mini-agent-sskdu.243).
+fn compaction_show_text(session: &crate::session::Session) -> String {
+    let Some(summary) = session.compacted_context().0 else {
+        return "no active compaction summary".to_owned();
+    };
+    let mut end = summary.len().min(64 * 1024);
+    while !summary.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "previous summary ({} lines):\n{}",
+        summary.lines().count(),
+        &summary[..end]
+    )
+}
+
 /// Text of the final assistant message of `progress`, if it ends with one.
 fn last_assistant_text(progress: &[Message]) -> String {
     match progress.last() {
@@ -4094,7 +4136,8 @@ async fn run_prompt(
             commands::Command::Undo | commands::Command::Compact | commands::Command::Rename(_) => {
                 true
             }
-            commands::Command::Model(_)
+            commands::Command::CompactShow
+            | commands::Command::Model(_)
             | commands::Command::Effort(_)
             | commands::Command::Cost => false,
             #[cfg(feature = "goal")]
@@ -4200,6 +4243,7 @@ async fn run_prompt(
                 history.manual_compact = true;
                 None
             }
+            commands::Command::CompactShow => Some(compaction_show_text(&history.session)),
         };
         if let Some(line) = line {
             if !registration.control.complete() {
@@ -5453,9 +5497,11 @@ async fn execute_prompt(
     if needs_compaction {
         #[cfg(feature = "hooks")]
         let compactions_before = history.session.compaction_count();
+        // `PreCompact` fires from the first summarizer request, so a relief
+        // that finds nothing to cut does not announce a compaction that never
+        // ran (mini-agent-sskdu.239).
         #[cfg(feature = "hooks")]
-        crate::startup::heap_future(|| crate::extras::hooks::dispatch_pre_compact(true, None))
-            .await;
+        let pre_compact_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let quick_models = crate::config::quick_models_map(&state.cfg);
         let context_window =
             state
@@ -5516,7 +5562,16 @@ async fn execute_prompt(
                 move |messages, previous_summary| {
                     let observed = observed.clone();
                     let provider_str = provider_str.clone();
+                    #[cfg(feature = "hooks")]
+                    let pre_compact_sent = pre_compact_sent.clone();
                     async move {
+                        #[cfg(feature = "hooks")]
+                        if !pre_compact_sent.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                            crate::startup::heap_future(|| {
+                                crate::extras::hooks::dispatch_pre_compact(true, None)
+                            })
+                            .await;
+                        }
                         let mut output = compaction_client
                             .compress_messages_observed_with_timeout(
                                 compaction_model,
@@ -5575,6 +5630,32 @@ async fn execute_prompt(
         }
         #[cfg(not(feature = "goal"))]
         let _ = usage;
+    }
+    // Tell the client what the compaction did, or why it did nothing; a
+    // `/compact` otherwise ends as an empty reply (mini-agent-sskdu.229, .243).
+    let events = std::mem::take(&mut history.compaction_events);
+    if compact_only {
+        let line = if events.is_empty() {
+            "Nothing to compact: the session has no history older than its current summary."
+                .to_owned()
+        } else {
+            events.join("\n")
+        };
+        let _ = cx.send_notification(SessionNotification::new(
+            session_id.clone(),
+            SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                TextContent::new(line),
+            ))),
+        ));
+    } else {
+        for event in events {
+            let _ = cx.send_notification(SessionNotification::new(
+                session_id.clone(),
+                SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
+                    TextContent::new(event),
+                ))),
+            ));
+        }
     }
     if compact_only {
         return Ok(PromptOutcome {
@@ -7231,6 +7312,45 @@ mod history_tests {
         assert!(result.is_some());
         assert_eq!(history.session.messages.len(), before);
         assert_eq!(history.session.compaction_count(), 0);
+        // The client is told why (mini-agent-sskdu.229).
+        assert!(
+            history
+                .compaction_events
+                .iter()
+                .any(|event| event.contains("429 after retries") && event.contains("kept")),
+            "{:?}",
+            history.compaction_events
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_compaction_records_a_client_event_and_show_text() {
+        // mini-agent-sskdu.243
+        let mut history = SessionHistory::default();
+        history.commit_completed_turn(
+            &"oversized".repeat(MAX_ACP_HISTORY_BYTES),
+            vec![Message::assistant("old answer")],
+        );
+        history
+            .compact_with(
+                &TurnControl::new(),
+                #[cfg(feature = "goal")]
+                None,
+                |messages, _| async move { Ok(compaction_output("the recap", messages.len())) },
+            )
+            .await
+            .unwrap();
+        assert!(
+            history
+                .compaction_events
+                .iter()
+                .any(|event| event.starts_with("compacted ") && event.contains("tokens freed"))
+        );
+        assert!(compaction_show_text(&history.session).contains("the recap"));
+        assert_eq!(
+            compaction_show_text(&crate::session::Session::new("", "", 1, "")),
+            "no active compaction summary"
+        );
     }
 
     /// mini-agent-p9oyv: the turn's memory block leaves out a daily-log copy
@@ -15442,14 +15562,11 @@ mod goal_acp_tests {
             })
             .await;
 
-        let summary = history
-            .session
-            .compacted_context()
-            .0
-            .expect("history was summarized");
+        assert!(history.session.compacted_context().0.is_some());
+        let recap = history.session.live_recap_blocks();
         assert!(
-            summary.contains("finish the migration"),
-            "the objective must survive ACP compaction: {summary}"
+            recap.contains("finish the migration"),
+            "the objective must survive ACP compaction: {recap}"
         );
     }
 

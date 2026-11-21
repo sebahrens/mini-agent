@@ -157,7 +157,7 @@ fn todo_store_round_trips_with_session_and_survives_compaction() {
     restored.add_message(MessageRole::User, "old context");
     restored.add_message(MessageRole::Assistant, "old response");
     restored.compress("Goal: continue".to_string(), 1, 1);
-    let summary = restored.compactions.last().unwrap().summary.as_str();
+    let summary = restored.live_recap_blocks();
     assert!(summary.contains("Critical Context"));
     assert!(summary.contains("Open work"));
     assert!(!summary.contains("Finished work"));

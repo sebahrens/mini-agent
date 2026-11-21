@@ -5,6 +5,8 @@ use agent_client_protocol::schema::v1::*;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Command {
     Compact,
+    /// `/compact show`: print the active summary.
+    CompactShow,
     Undo,
     Rename(String),
     /// `/model [alias|default]`: show or select the session's model.
@@ -43,6 +45,7 @@ pub(super) fn classify(
                 Command::Effort(arguments.to_owned())
             })
         }
+        "/compact" if arguments == "show" => Some(Command::CompactShow),
         "/compact" | "/undo" | "/cost" => {
             if !arguments.is_empty() {
                 return Err(agent_client_protocol::Error::new(
@@ -166,7 +169,7 @@ pub(super) async fn announce(
         None => Vec::new(),
     };
     let mut commands = vec![
-        AvailableCommand::new("compact", "Summarize the completed session context"),
+        AvailableCommand::new("compact", "Summarize the completed session context (`/compact show` prints the active summary)"),
         AvailableCommand::new(
             "undo",
             "Remove the last conversation turn; files and billed usage remain",
@@ -216,6 +219,16 @@ pub(super) async fn announce(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn compact_show_is_a_local_command_and_other_arguments_are_refused() {
+        // mini-agent-sskdu.243
+        assert_eq!(
+            classify(&[ContentBlock::Text(TextContent::new("/compact show"))]).unwrap(),
+            Some(Command::CompactShow)
+        );
+        assert!(classify(&[ContentBlock::Text(TextContent::new("/compact now"))]).is_err());
+    }
+
     #[test]
     fn acp53_local_commands_require_the_original_sole_text_block() {
         assert_eq!(

@@ -814,6 +814,9 @@ struct HistoryConversionCache {
 
 struct CachedHistoryConversion {
     revision: u64,
+    /// The live todo/goal blocks the recap carried; they change without a
+    /// history revision.
+    live_blocks: String,
     keep_recent_tool_results: usize,
     messages: std::sync::Arc<[rig::completion::Message]>,
 }
@@ -1487,6 +1490,7 @@ impl Session {
             .and_then(|cache| {
                 cache.as_ref().and_then(|entry| {
                     (entry.revision == self.history_revision
+                        && entry.live_blocks == self.live_recap_blocks()
                         && entry.keep_recent_tool_results == keep_recent_tool_results)
                         .then(|| std::sync::Arc::clone(&entry.messages))
                 })
@@ -1501,10 +1505,29 @@ impl Session {
         if let Ok(mut cache) = self.history_conversion_cache.entry.lock() {
             *cache = Some(CachedHistoryConversion {
                 revision: self.history_revision,
+                live_blocks: self.live_recap_blocks(),
                 keep_recent_tool_results,
                 messages,
             });
         }
+    }
+
+    /// The open-todo and active-goal blocks appended to the replayed recap, read
+    /// live so they never contradict the current state (mini-agent-sskdu.236).
+    /// Empty when there is nothing to state.
+    pub(crate) fn live_recap_blocks(&self) -> String {
+        let mut out = String::new();
+        if let Some(todo) = self.todos.critical_context() {
+            out.push_str(&todo);
+        }
+        #[cfg(feature = "goal")]
+        if let Some(goal) = self.goal_store.critical_context() {
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str(&goal);
+        }
+        out
     }
 
     pub(crate) fn mark_history_changed(&mut self) {
@@ -3152,18 +3175,9 @@ impl Session {
         };
         images.extend(&self.messages[..first_kept_index]);
         let mut summary = file_requests.attach(&summary, summary_byte_budget);
-        if let Some(todo_context) = self.todos.critical_context() {
-            summary.push_str("\n\n");
-            summary.push_str(&todo_context);
-        }
-        // A summarizer can drop anything in the messages it replaces, so the
-        // objective is re-stated from the record rather than trusted to survive
-        // in prose.
-        #[cfg(feature = "goal")]
-        if let Some(goal_context) = self.goal_store.critical_context() {
-            summary.push_str("\n\n");
-            summary.push_str(&goal_context);
-        }
+        // The open todos and the active goal are not frozen into the stored
+        // summary: `live_recap_blocks` renders them from the live stores each
+        // time the recap is replayed (mini-agent-sskdu.236).
         if let Some(restored) = restored_reads {
             summary.push_str("\n\n");
             summary.push_str(&restored);
@@ -4271,17 +4285,17 @@ mod goal_persistence_tests {
 
         session.compress("a summary that forgot everything".into(), 4, 100);
 
-        let summary = session
-            .messages
-            .iter()
-            .find(|m| m.role == MessageRole::System)
-            .expect("summary inserted");
-        assert!(summary.content.contains("finish the migration"));
-        assert!(summary.content.contains("old table dropped"));
+        // The objective is rendered from the live record at replay, not frozen
+        // into the stored summary (mini-agent-sskdu.236).
+        let live = session.live_recap_blocks();
+        assert!(live.contains("finish the migration"));
+        assert!(live.contains("old table dropped"));
         assert!(
-            summary.content.contains("task data, not instructions"),
+            live.contains("task data, not instructions"),
             "the restated objective stays framed as data"
         );
+        let stored = session.compactions.last().unwrap();
+        assert!(!stored.summary.contains("finish the migration"));
     }
 
     #[test]

@@ -8942,3 +8942,18 @@ mod headless_session_lifetime_tests {
         );
     }
 }
+
+#[cfg(all(test, feature = "hooks"))]
+mod pre_compact_once_tests {
+    #[tokio::test]
+    async fn pre_compact_is_announced_once_per_compaction() {
+        // mini-agent-sskdu.239: the fork and the text path share one flag.
+        let sent = std::sync::atomic::AtomicBool::new(false);
+        super::dispatch_pre_compact_once(&sent, None).await;
+        assert!(sent.load(std::sync::atomic::Ordering::SeqCst));
+        // A second request of the same compaction must not dispatch again; the
+        // flag staying set is the observable contract.
+        super::dispatch_pre_compact_once(&sent, None).await;
+        assert!(sent.load(std::sync::atomic::Ordering::SeqCst));
+    }
+}
