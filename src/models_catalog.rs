@@ -308,6 +308,58 @@ pub(crate) fn inheritance_notice(provider: &str, model: &str) -> Option<String> 
     ))
 }
 
+/// OpenRouter-style slug (`meta-llama/llama-3.1-70b-instruct`) for a Bedrock
+/// Converse model id (`us.meta.llama3-1-70b-instruct-v1:0`): the inference
+/// profile prefix and the `-vN:M` / `-N:M` revision suffix are dropped, the
+/// vendor segment is renamed, and `llamaX-Y` becomes `llama-X.Y`.
+fn bedrock_catalog_slug(id: &str) -> Option<String> {
+    let mut rest = id;
+    if let Some((prefix, tail)) = rest.split_once('.')
+        && prefix.len() <= 6
+        && tail.contains('.')
+    {
+        rest = tail;
+    }
+    let (vendor, name) = rest.split_once('.')?;
+    let vendor = match vendor {
+        "meta" => "meta-llama",
+        "mistral" => "mistralai",
+        other => other,
+    };
+    let name = match name.rsplit_once('-') {
+        Some((head, tail))
+            if tail.split_once(':').is_some_and(|(a, b)| {
+                a.trim_start_matches('v')
+                    .bytes()
+                    .all(|c| c.is_ascii_digit())
+                    && !a.trim_start_matches('v').is_empty()
+                    && b.bytes().all(|c| c.is_ascii_digit())
+            }) =>
+        {
+            head
+        }
+        _ => name,
+    };
+    let mut name = name.to_string();
+    if let Some(version) = name.strip_prefix("llama")
+        && version.as_bytes().first().is_some_and(u8::is_ascii_digit)
+    {
+        let (major, rest) = version.split_once('-').unwrap_or((version, ""));
+        let (minor, tail) = rest.split_once('-').unwrap_or((rest, ""));
+        name = if minor.bytes().all(|c| c.is_ascii_digit()) && !minor.is_empty() {
+            let tail = if tail.is_empty() {
+                String::new()
+            } else {
+                format!("-{tail}")
+            };
+            format!("llama-{major}.{minor}{tail}")
+        } else {
+            format!("llama-{version}")
+        };
+    }
+    Some(format!("{vendor}/{name}"))
+}
+
 /// The catalog key for `provider/model`: the exact entry, or for Bedrock and
 /// Vertex the native Anthropic id (with or without its date suffix).
 fn catalog_key(provider: &str, model: &str) -> Option<(&'static str, String)> {
@@ -321,6 +373,15 @@ fn catalog_key(provider: &str, model: &str) -> Option<(&'static str, String)> {
     };
     if claude_route(provider) && !is_claude_family(model) {
         let bare = model.rsplit('/').next().unwrap_or(model);
+        // A Bedrock Converse id (`meta.llama3-1-70b-instruct-v1:0`) maps to the
+        // OpenRouter slug of the same model when the catalog lists it.
+        if !provider.starts_with("vertex")
+            && let Some(slug) = bedrock_catalog_slug(bare)
+            && let Some((key, entries)) = CATALOG.entries.get_key_value("openrouter")
+            && entries.iter().any(|entry| entry.id == slug)
+        {
+            return Some((key.as_str(), slug));
+        }
         let wanted = if provider.starts_with("vertex") {
             ["gemini", "openrouter", "openai"]
         } else {
@@ -911,6 +972,28 @@ mod tests {
             );
         }
         assert!(super::catalog_entry("bedrock", "amazon.nova-pro-v1:0").is_none());
+        // Converse ids map onto the catalog's slug of the same model
+        // (mini-agent-nvnkx.44).
+        for (bedrock, slug) in [
+            (
+                "meta.llama3-1-70b-instruct-v1:0",
+                "meta-llama/llama-3.1-70b-instruct",
+            ),
+            (
+                "us.meta.llama3-3-70b-instruct-v1:0",
+                "meta-llama/llama-3.3-70b-instruct",
+            ),
+            (
+                "mistral.mistral-large-2407-v1:0",
+                "mistralai/mistral-large-2407",
+            ),
+            ("openai.gpt-oss-120b-1:0", "openai/gpt-oss-120b"),
+        ] {
+            assert_eq!(super::bedrock_catalog_slug(bedrock).as_deref(), Some(slug));
+            let entry = super::catalog_entry("bedrock", bedrock)
+                .unwrap_or_else(|| panic!("{bedrock} must resolve to {slug}"));
+            assert_eq!(entry.id, slug);
+        }
         assert!(super::catalog_entry("ollama", "claude-sonnet-4-5").is_none());
         assert_eq!(
             crate::config::Config::catalog_context_window("vertex", "claude-sonnet-4-5@20250929"),

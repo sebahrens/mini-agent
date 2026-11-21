@@ -581,6 +581,7 @@ pub(crate) async fn run_advisor_completion(
         AnyModel::Gemini(m) => advisor_call(m, prompt, params, retry).await,
         AnyModel::Ollama(m) => advisor_call(m, prompt, params, retry).await,
         AnyModel::Copilot(m) => advisor_call(m, prompt, params, retry).await,
+        AnyModel::BedrockConverse(m) => advisor_call(m, prompt, params, retry).await,
     }
 }
 

@@ -587,6 +587,7 @@ async fn image_read64_actual_provider_bodies_keep_image_bytes_and_batch_correlat
                 AnyModel::Gemini(model) => model.completion(request).await.map(|_| ()),
                 AnyModel::Ollama(model) => model.completion(request).await.map(|_| ()),
                 AnyModel::Copilot(model) => model.completion(request).await.map(|_| ()),
+                AnyModel::BedrockConverse(model) => model.completion(request).await.map(|_| ()),
             }
         };
         // Both futures are owned by this join; no detached fixture task or
@@ -787,6 +788,7 @@ async fn image_tool_results_on_copilot_azure_bedrock_vertex_routes() {
                     model.completion(request).await.map(|_| ())
                 }
                 AnyModel::Copilot(model) => model.completion(request).await.map(|_| ()),
+                AnyModel::BedrockConverse(model) => model.completion(request).await.map(|_| ()),
                 _ => panic!("{route}/{style}: unexpected converter"),
             }
         };

@@ -772,6 +772,9 @@ async fn generalize(
             AnyModel::Gemini(model) => complete_once(model, prompt, preamble, retry_config).await,
             AnyModel::Ollama(model) => complete_once(model, prompt, preamble, retry_config).await,
             AnyModel::Copilot(model) => complete_once(model, prompt, preamble, retry_config).await,
+            AnyModel::BedrockConverse(model) => {
+                complete_once(model, prompt, preamble, retry_config).await
+            }
         }
     })
     .await

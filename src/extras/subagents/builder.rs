@@ -1325,6 +1325,7 @@ fn child_context_window(model: &AnyModel, cfg: &crate::config::Config) -> u64 {
         AnyModel::Gemini(model) => ("gemini", model.model.as_str()),
         AnyModel::Ollama(model) => ("ollama", model.model.as_str()),
         AnyModel::Copilot(model) => ("copilot", model.model.as_str()),
+        AnyModel::BedrockConverse(model) => ("bedrock", model.model.as_str()),
     };
     cfg.resolve_subagent_context_window(provider, model, None)
 }
@@ -1646,6 +1647,33 @@ pub(crate) async fn build_explore_agent_with_suffix(
             #[cfg(feature = "skills")]
             skill_services.as_ref(),
         )),
+        AnyModel::BedrockConverse(m) => {
+            AnyAgentInner::BedrockConverse(build_explore_agent_inner_with_suffix(
+                m,
+                crate::context::instructions::InstructionProtocol::Chat,
+                max_turns,
+                max_tokens,
+                context_window,
+                max_text_file_size,
+                max_read_lines,
+                max_grep_results,
+                max_find_results,
+                max_list_dir_entries,
+                &authorization,
+                provider_params.clone(),
+                #[cfg(feature = "archmd")]
+                arch_ref,
+                spec_ref,
+                suffix,
+                &persona,
+                #[cfg(feature = "mcp")]
+                mcp_tools,
+                #[cfg(not(feature = "mcp"))]
+                Vec::new(),
+                #[cfg(feature = "skills")]
+                skill_services.as_ref(),
+            ))
+        }
         AnyModel::Copilot(m) => AnyAgentInner::Copilot(build_explore_agent_inner_with_suffix(
             m.clone(),
             crate::provider::copilot::instruction_protocol(&m),

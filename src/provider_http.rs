@@ -112,6 +112,13 @@ impl ProviderHttpClient {
             test_wire: None,
         }))
     }
+    /// The Bedrock Converse base URL when this transport carries Bedrock auth.
+    pub(crate) fn bedrock_converse_base(&self) -> Option<String> {
+        #[cfg(feature = "bedrock")]
+        return self.0.bedrock.as_ref().map(|auth| auth.converse_base());
+        #[cfg(not(feature = "bedrock"))]
+        None
+    }
     pub(crate) fn is_copilot_login(&self) -> bool {
         self.0.copilot.as_ref().is_some_and(|auth| auth.is_login())
     }
