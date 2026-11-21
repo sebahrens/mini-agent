@@ -181,7 +181,13 @@ pub(crate) struct ControlState {
     /// denied at once because no driver can answer them.
     closed: std::sync::atomic::AtomicBool,
     next_id: AtomicU64,
+    /// Interrupt permit: `notify_one` stores a permit, so an interrupt that
+    /// arrives before the turn first polls [`ControlState::interrupted`] is
+    /// not lost.
     interrupt: Notify,
+    /// User lines read from stdin whose turn has not finished (queued or
+    /// running). An interrupt with none is refused instead of acknowledged.
+    outstanding: AtomicU64,
     permission: Mutex<Option<PermCheck>>,
     output: HeadlessOutputPolicy,
     timeout: Duration,
@@ -214,6 +220,7 @@ impl ControlState {
             closed: std::sync::atomic::AtomicBool::new(false),
             next_id: AtomicU64::new(1),
             interrupt: Notify::new(),
+            outstanding: AtomicU64::new(0),
             permission: Mutex::new(permission),
             output,
             timeout,
@@ -320,7 +327,10 @@ impl ControlState {
         };
         match line {
             ControlLine::Interrupt { request_id } => {
-                self.interrupt.notify_waiters();
+                if self.outstanding.load(Ordering::SeqCst) == 0 {
+                    return ack(request_id, Err("no turn is running or queued".into()));
+                }
+                self.interrupt.notify_one();
                 ack(request_id, Ok(()))
             }
             ControlLine::SetPermissionMode { request_id, mode } => {
@@ -378,10 +388,55 @@ impl ControlState {
         }
     }
 
-    /// Resolves when a driver interrupt arrives after this call.
+    /// Resolves when a driver interrupt is pending for the current line,
+    /// including one that arrived before this call.
     pub(crate) async fn interrupted(&self) {
         self.interrupt.notified().await;
     }
+
+    /// The reader forwarded one user line to the turn queue.
+    pub(crate) fn line_queued(&self) {
+        self.outstanding.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The reader could not queue a line it had counted.
+    pub(crate) fn line_unqueued(&self) {
+        self.outstanding.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Guard for a line the turn loop took from the queue; dropping it ends
+    /// the line and discards an interrupt permit nobody consumed.
+    pub(crate) fn line_guard(&'static self) -> LineGuard {
+        LineGuard(self)
+    }
+
+    fn discard_stale_interrupt(&self) {
+        use futures::FutureExt;
+        let _ = self.interrupt.notified().now_or_never();
+    }
+}
+
+/// See [`ControlState::line_guard`].
+pub(crate) struct LineGuard(&'static ControlState);
+
+impl Drop for LineGuard {
+    fn drop(&mut self) {
+        self.0.outstanding.fetch_sub(1, Ordering::SeqCst);
+        self.0.discard_stale_interrupt();
+    }
+}
+
+/// Counts the argument prompt as a line of the control channel (no-op when the
+/// channel is off).
+pub(crate) fn begin_line() -> Option<LineGuard> {
+    let state = STATE.get()?;
+    state.line_queued();
+    Some(state.line_guard())
+}
+
+/// Guard for a line just taken from the reader's queue.
+pub(crate) fn claim_line() -> Option<LineGuard> {
+    STATE.get().map(ControlState::line_guard)
 }
 
 static STATE: OnceLock<ControlState> = OnceLock::new();
@@ -508,22 +563,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_interrupt_wakes_only_a_waiting_turn_and_is_acknowledged() {
-        let state = std::sync::Arc::new(state(Duration::from_secs(5)));
-        let ack = state
-            .handle(ControlLine::Interrupt {
-                request_id: Some("i1".into()),
-            })
-            .unwrap();
-        assert_eq!(ack["response"]["subtype"], "success");
-        assert_eq!(ack["response"]["request_id"], "i1");
-        // An interrupt with nothing running is not remembered for the next turn.
+    async fn an_interrupt_is_kept_for_a_queued_turn_and_refused_when_idle() {
+        let state: &'static ControlState = Box::leak(Box::new(state(Duration::from_secs(5))));
+        let interrupt = |id: &str| {
+            state
+                .handle(ControlLine::Interrupt {
+                    request_id: Some(id.into()),
+                })
+                .unwrap()
+        };
+        // Nothing queued or running: an error, and nothing is remembered.
+        let refused = interrupt("i0");
+        assert_eq!(refused["response"]["subtype"], "error");
         let idle = tokio::time::timeout(Duration::from_millis(50), state.interrupted()).await;
         assert!(idle.is_err());
-        let waiting = std::sync::Arc::clone(&state);
-        let turn = tokio::spawn(async move { waiting.interrupted().await });
+        // A line is queued and its interrupt arrives before the turn polls.
+        state.line_queued();
+        let guard = state.line_guard();
+        let ack = interrupt("i1");
+        assert_eq!(ack["response"]["subtype"], "success");
+        assert_eq!(ack["response"]["request_id"], "i1");
+        tokio::time::timeout(Duration::from_secs(2), state.interrupted())
+            .await
+            .expect("an interrupt sent before the turn listened still cancels it");
+        // An interrupt the turn never consumed does not leak into the next line.
+        interrupt("i2");
+        drop(guard);
+        state.line_queued();
+        let _next = state.line_guard();
+        let leaked = tokio::time::timeout(Duration::from_millis(50), state.interrupted()).await;
+        assert!(leaked.is_err());
+        // A waiting turn is woken too.
+        let turn = tokio::spawn(state.interrupted());
         tokio::time::sleep(Duration::from_millis(20)).await;
-        state.handle(ControlLine::Interrupt { request_id: None });
+        interrupt("i3");
         tokio::time::timeout(Duration::from_secs(2), turn)
             .await
             .expect("the waiting turn is interrupted")

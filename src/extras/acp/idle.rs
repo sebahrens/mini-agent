@@ -83,6 +83,14 @@ impl Idle {
         }))
     }
 
+    /// True once the idle timeout elapsed and the server is shutting down.
+    pub(super) fn is_retiring(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retiring
+    }
+
     pub(super) fn enabled(&self) -> bool {
         self.timeout.is_some()
     }

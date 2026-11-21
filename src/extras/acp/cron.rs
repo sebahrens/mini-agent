@@ -277,6 +277,11 @@ impl SessionCron {
         self.changed.notify_waiters();
     }
 
+    /// True while any `/cron` entry is scheduled.
+    pub(super) fn has_schedules(&self) -> bool {
+        !self.lock().store.is_empty()
+    }
+
     #[cfg(test)]
     pub(super) fn holds_lease(&self) -> bool {
         self.lock().lease.is_some()
@@ -349,6 +354,10 @@ impl CronOwner {
 
     pub(super) fn clear(&self) {
         self.0.clear();
+    }
+
+    pub(super) fn has_schedules(&self) -> bool {
+        self.0.has_schedules()
     }
 
     fn owns(&self, cron: &Arc<SessionCron>) -> bool {

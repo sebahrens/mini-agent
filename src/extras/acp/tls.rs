@@ -237,6 +237,7 @@ async fn authenticate_connection(
     api_key: Arc<str>,
     tls: Arc<AcpTlsConfig>,
 ) -> PeerOutcome {
+    super::liveness::enable_keepalive(&tcp);
     let result = tokio::time::timeout(TLS_AUTH_TIMEOUT, async {
         let mut stream = tls
             .acceptor

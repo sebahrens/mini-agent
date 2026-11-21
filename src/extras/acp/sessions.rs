@@ -241,9 +241,10 @@ pub(super) async fn handle_load(
             "additional ACP workspace directories are not supported",
         ));
     }
-    // Fresh runtime lease/policy; no permission choice, waiter, hidden redo or
-    // process-local skill/MCP authority can be adopted from saved data.
-    let lease = state.leases.reserve(req.session_id.clone())?;
+    // Fresh runtime lease/policy (reserved once the saved data has loaded, so
+    // a failed load never evicts a live session); no permission choice,
+    // waiter, hidden redo or process-local skill/MCP authority can be adopted
+    // from saved data.
     #[cfg(feature = "mcp")]
     let client_mcp_servers = super::client_mcp_servers(state, &req.mcp_servers)?;
     #[cfg(not(feature = "mcp"))]
@@ -301,6 +302,12 @@ pub(super) async fn handle_load(
         ));
     }
     let replay = replay_updates(&req.session_id, &session, workspace.root())?;
+    // An id this process still holds with nothing running is replaced by the
+    // saved copy, and at the session cap the least recently used idle session
+    // makes room; only busy sessions refuse the load.
+    let lease = super::reserve_lease(state, &req.session_id).await?;
+    let saved_selection = session.acp_selection.clone();
+    let native = crate::session::native_publication::is_native_bearing(&session);
     let modes = super::install_session(
         state,
         req.session_id.clone(),
@@ -322,6 +329,23 @@ pub(super) async fn handle_load(
             return Err(error);
         }
     }
+    // The model, effort and persona the thread ran on come back with it; what
+    // cannot be restored is named, never swapped silently.
+    let notices = match &saved_selection {
+        Some(saved) => {
+            super::restore_session_selection(state, &req.session_id, saved, native).await
+        }
+        None => Vec::new(),
+    };
+    for notice in notices {
+        let _ = cx.send_notification(SessionNotification::new(
+            req.session_id.clone(),
+            SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                TextContent::new(notice),
+            ))),
+        ));
+    }
+    super::announce_loaded_state(state, &req.session_id, &cx).await;
     let config_options = super::persona_config_options(state, &req.session_id).await;
     super::commands::announce(state, &req.session_id, &cx).await?;
     responder.respond(
@@ -378,11 +402,27 @@ fn replay_updates(
                     &message.tool,
                     Some(crate::session::PersistedToolMessage::Result { is_error: true, .. })
                 );
+                // The edit's stored diff leads the content like the live
+                // update, marked as a historical preview.
+                let mut content = Vec::new();
+                if let Some(crate::session::PersistedToolMessage::Result {
+                    diff: Some(diff), ..
+                }) = &message.tool
+                    && let Ok(mut stored) = serde_json::from_value::<ToolCallContent>(diff.clone())
+                {
+                    if let ToolCallContent::Diff(diff) = &mut stored {
+                        diff.meta
+                            .get_or_insert_with(Default::default)
+                            .insert("mini-agent-historical".to_owned(), true.into());
+                    }
+                    content.push(stored);
+                }
+                content.push(ToolCallContent::from(ContentBlock::Text(TextContent::new(
+                    message.content.to_string(),
+                ))));
                 let mut fields = ToolCallUpdateFields::new()
                     .status(ToolCallStatus::Completed)
-                    .content(vec![ToolCallContent::from(ContentBlock::Text(
-                        TextContent::new(message.content.to_string()),
-                    ))]);
+                    .content(content);
                 if failed {
                     fields.status = Some(ToolCallStatus::Failed);
                 }
@@ -472,8 +512,7 @@ mod canonical_tests {
         session.add_tool_call_with_id("done", "edit", &serde_json::json!({"path": "src/main.rs"}));
         session.add_tool_result_with_id("done", "edit", "ok");
         session.add_tool_call_with_id("bad", "shell", &serde_json::json!({"command": "false"}));
-        session.add_tool_result_with_id("bad", "shell", "exit 1");
-        session.mark_failed_tool_results(|output| output == "exit 1");
+        session.add_tool_result_flagged("bad", "shell", "exit 1", Vec::new(), true);
         session.add_tool_call_with_id(
             "lost",
             "shell",
@@ -505,6 +544,39 @@ mod canonical_tests {
         };
         assert_eq!(closed.tool_call_id.0.as_ref(), "lost");
         assert_eq!(closed.fields.status, Some(ToolCallStatus::Failed));
+    }
+
+    #[test]
+    fn replay_restores_the_edit_diff_a_checkpoint_stored_with_the_result() {
+        let mut session = crate::session::Session::new("logical", "model", 128_000, "");
+        session.add_tool_call_with_id("e", "edit", &serde_json::json!({"path": "src/main.rs"}));
+        session.add_tool_result_with_id("e", "edit", "edited src/main.rs");
+        let live = ToolCallContent::Diff(Diff::new("/work/src/main.rs", "new").old_text("old"));
+        super::super::toolcall::record_result(
+            session.id.as_ref(),
+            "edited src/main.rs",
+            false,
+            Some(&live),
+        );
+        super::super::toolcall::apply_failed_results(&mut session);
+        // The row survives a save and load.
+        let saved: crate::session::Session =
+            serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
+        let id = SessionId::new(saved.id.to_string());
+        let updates = replay_updates(&id, &saved, std::path::Path::new("/work")).unwrap();
+        let SessionUpdate::ToolCallUpdate(done) = &updates[1].update else {
+            panic!("expected a result update");
+        };
+        let content = done.fields.content.as_ref().unwrap();
+        let ToolCallContent::Diff(diff) = &content[0] else {
+            panic!("the diff leads the replayed result: {content:?}");
+        };
+        assert_eq!(diff.path, std::path::PathBuf::from("/work/src/main.rs"));
+        assert_eq!(diff.old_text.as_deref(), Some("old"));
+        assert_eq!(diff.new_text, "new");
+        assert_eq!(diff.meta.as_ref().unwrap()["mini-agent-historical"], true);
+        assert!(matches!(content[1], ToolCallContent::Content(_)));
+        super::super::toolcall::forget_session(session.id.as_ref());
     }
 
     #[test]

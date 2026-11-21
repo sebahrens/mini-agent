@@ -162,7 +162,13 @@ async fn control_reader_loop<F, Fut>(
             }
             continue;
         }
+        if let Some(state) = state {
+            state.line_queued();
+        }
         if tx.send(line).await.is_err() {
+            if let Some(state) = state {
+                state.line_unqueued();
+            }
             break;
         }
     }

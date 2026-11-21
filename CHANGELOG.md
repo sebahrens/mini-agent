@@ -98,6 +98,17 @@ Notable changes to mini-agent are documented in this file. The format follows
   caps concurrent relays at 256 (mini-agent-y42nd). `update` and `install.sh` treat a `gh` whose
   `attestation verify --help` lacks the pin flags as unavailable (upgrade gh), not a failed
   verification (mini-agent-0cshc).
+- Headless `--stream-json-control`: an `interrupt` that arrives right behind its user message (before the turn starts listening) now still cancels that turn instead of being acknowledged and lost, and an `interrupt` with no turn running or queued is answered with an `error` response (mini-agent-nvnkx.353).
+- ACP `ask_user` clarifications no longer offer the answers as `allow_once` permission options, so a client that auto-approves permission requests cannot answer the model's question unseen: the first allow option parks the turn (answer in a new message) and the choices are reject-kind options; a cancelled or declined synthetic Clarification call is now closed as failed (mini-agent-nvnkx.283, mini-agent-nvnkx.282).
+- ACP closes tool calls it announced but never got a result for (provider stream failure, turn error, cancellation) as failed with an "interrupted" note, and relays results that beat a cancellation (mini-agent-nvnkx.281).
+- ACP `session/load` of an id the process still holds replaces the idle in-memory session with the saved copy, and at the session cap the least recently used idle session (no turn, schedule, pending question or background task) is evicted instead of refusing every new session (mini-agent-nvnkx.279).
+- ACP `session/load` restores the session's model, effort and persona (saved with the session, re-validated on load; an unavailable one is named in an agent message and the session stays on its route), replays the stored edit/write diffs with the results, and sends the restored plan, context meter and title before the response (mini-agent-nvnkx.278, mini-agent-nvnkx.277, mini-agent-nvnkx.280).
+- The ACP TCP/TLS listener keeps accepting after the authenticated peer disconnects (its sessions stay dormant until reloaded with `session/load`; `--idle-exit-secs` bounds the wait), accepted connections enable TCP keepalive, and a write that makes no progress for 120 s (a client that stopped reading, over stdio, TCP or TLS) closes the connection so its turns are cancelled instead of queueing output without bound (mini-agent-nvnkx.275, mini-agent-nvnkx.276).
+- A panic inside one ACP turn answers that prompt with a `-32603` error and leaves the connection and every other session running (mini-agent-nvnkx.274).
+- ACP permission modes the managed policy forbids are no longer listed in the mode picker, `session/set_mode` refuses them with the managed message instead of confirming, and the initial mode is clamped (mini-agent-nvnkx.228).
+- ACP pending-call previews are bounded per session (one busy session cannot evict another's edit preview) and tool-result failure status is joined to stored rows in arrival order, so identical outputs with one failure replay with the right status (mini-agent-nvnkx.284).
+- ACP `/tasks` rows and completion notices show each task's label, persona and child count, and `/tasks result|cancel` accept an unambiguous id prefix (mini-agent-nvnkx.229).
+- The ACP `model` picker also lists baked catalogue models of providers with a usable credential (after the quick models, at most 128 entries; providers denied by the managed policy are left out) as `catalog:<provider>/<model>` (mini-agent-nvnkx.230).
 
 ### Added
 

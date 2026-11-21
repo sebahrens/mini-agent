@@ -56,8 +56,18 @@ pub(super) struct SessionPolicy(Arc<Mutex<State>>);
 
 impl SessionPolicy {
     pub(super) fn new(mode: SecurityMode, enabled: bool) -> Self {
+        Self::with_clamp(mode, enabled, crate::config::managed::clamp_mode)
+    }
+
+    /// The initial mode is lowered to one the managed policy permits, so the
+    /// advertised current mode is the one the checker will enforce.
+    fn with_clamp(
+        mode: SecurityMode,
+        enabled: bool,
+        clamp: impl Fn(SecurityMode) -> SecurityMode,
+    ) -> Self {
         Self(Arc::new(Mutex::new(State {
-            mode: Some(mode),
+            mode: Some(clamp(mode)),
             enabled,
             ..Default::default()
         })))
@@ -71,11 +81,21 @@ impl SessionPolicy {
     }
 
     pub(super) fn modes(&self) -> Option<SessionModeState> {
+        self.modes_permitting(|mode| crate::config::managed::mode_violation(mode).is_none())
+    }
+
+    /// The picker lists only modes the managed policy permits, so it never
+    /// offers a choice that could not take effect.
+    fn modes_permitting(
+        &self,
+        permitted: impl Fn(SecurityMode) -> bool,
+    ) -> Option<SessionModeState> {
         let state = self.0.lock().unwrap_or_else(|error| error.into_inner());
         state.enabled.then(|| {
             SessionModeState::new(
                 state.mode.expect("enabled policy has a mode").to_string(),
                 SecurityMode::all()
+                    .filter(|mode| permitted(*mode))
                     .map(|mode| {
                         SessionMode::new(mode.to_string(), mode.to_string())
                             .description(mode.description())
@@ -85,11 +105,24 @@ impl SessionPolicy {
         })
     }
 
-    pub(super) fn set_mode(&self, name: &str) -> Result<(), &'static str> {
+    pub(super) fn set_mode(&self, name: &str) -> Result<(), String> {
+        self.set_mode_checked(name, crate::config::managed::mode_violation)
+    }
+
+    /// Stores `name` unless the managed policy refuses it, so the stored mode,
+    /// the `CurrentModeUpdate` and the checker's effective mode agree.
+    fn set_mode_checked(
+        &self,
+        name: &str,
+        violation: impl Fn(SecurityMode) -> Option<String>,
+    ) -> Result<(), String> {
         let mode = SecurityMode::from_str(name).ok_or("unknown ACP permission mode")?;
+        if let Some(refusal) = violation(mode) {
+            return Err(refusal);
+        }
         let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
         if !state.enabled {
-            return Err("permission mode switching is disabled for this session");
+            return Err("permission mode switching is disabled for this session".into());
         }
         state.mode = Some(mode);
         Ok(())
@@ -269,5 +302,33 @@ mod tests {
         assert!(disabled.modes().is_none());
         assert!(disabled.set_mode("readonly").is_err());
         assert!(!disabled.can_record(&Choice::Deny("shell".into(), "x".into())));
+    }
+
+    #[test]
+    fn managed_policy_filters_the_mode_picker_and_refuses_forbidden_modes() {
+        let permitted = [SecurityMode::ReadOnly, SecurityMode::Standard];
+        let refuse = |mode: SecurityMode| {
+            (!permitted.contains(&mode)).then(|| format!("managed policy forbids {mode}"))
+        };
+        let clamp = |mode: SecurityMode| {
+            if permitted.contains(&mode) {
+                mode
+            } else {
+                SecurityMode::Standard
+            }
+        };
+        // The initial mode is clamped too.
+        let policy = SessionPolicy::with_clamp(SecurityMode::Yolo, true, clamp);
+        assert_eq!(policy.mode(), Some(SecurityMode::Standard));
+        let listed = policy
+            .modes_permitting(|mode| refuse(mode).is_none())
+            .unwrap();
+        assert_eq!(listed.available_modes.len(), 2);
+        assert_eq!(listed.current_mode_id.0.as_ref(), "standard");
+        let error = policy.set_mode_checked("yolo", refuse).unwrap_err();
+        assert!(error.contains("managed policy forbids"), "{error}");
+        assert_eq!(policy.mode(), Some(SecurityMode::Standard));
+        policy.set_mode_checked("readonly", refuse).unwrap();
+        assert_eq!(policy.mode(), Some(SecurityMode::ReadOnly));
     }
 }

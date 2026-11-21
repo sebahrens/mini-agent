@@ -19,8 +19,12 @@ const TITLE_MAX_CHARS: usize = 120;
 const TASK_PROMPT_CHARS: usize = 60;
 /// Edit blocks previewed in one permission request.
 const MAX_PREVIEW_BLOCKS: usize = 16;
-/// Pending edit/write argument sets kept for permission previews.
+/// Pending edit/write argument sets kept per session for permission previews.
+/// A session over this evicts only its own oldest entry.
 const MAX_PENDING: usize = 64;
+/// Pending calls kept across all sessions; over it the session holding the
+/// most entries gives up its oldest one.
+const MAX_PENDING_TOTAL: usize = 1024;
 
 pub(super) fn kind_for(tool: &str) -> ToolKind {
     match tool {
@@ -335,6 +339,7 @@ pub(super) fn mutation_diff_content(diff: &MutationDiff) -> Option<ToolCallConte
 /// One announced call kept until its result: the title shown to the user and,
 /// for `edit`/`write`, the arguments a permission preview is built from.
 struct PendingCall {
+    session: String,
     id: String,
     title: String,
     args: Option<Value>,
@@ -348,8 +353,10 @@ fn pending() -> &'static Mutex<VecDeque<PendingCall>> {
 /// Remember a call's title (every tool) and, for edit/write, its arguments
 /// until the result, so the permission bridge (a separate task) can keep the
 /// descriptive title and build a diff for the dialog. A relative `path` is
-/// made absolute with `root` so the diff header is a valid ACP path.
+/// made absolute with `root` so the diff header is a valid ACP path. Entries
+/// are bounded per session, so a busy session cannot evict another's preview.
 pub(super) fn remember_args(
+    session_id: &str,
     tool_call_id: &str,
     tool: &str,
     args: &Value,
@@ -366,11 +373,33 @@ pub(super) fn remember_args(
         args
     });
     let mut guard = pending().lock().unwrap_or_else(|e| e.into_inner());
-    guard.retain(|call| call.id != tool_call_id);
-    if guard.len() >= MAX_PENDING {
-        guard.pop_front();
+    guard.retain(|call| !(call.session == session_id && call.id == tool_call_id));
+    let own = guard
+        .iter()
+        .filter(|call| call.session == session_id)
+        .count();
+    if own >= MAX_PENDING
+        && let Some(position) = guard.iter().position(|call| call.session == session_id)
+    {
+        guard.remove(position);
+    }
+    if guard.len() >= MAX_PENDING_TOTAL {
+        let mut counts = std::collections::HashMap::<&str, usize>::new();
+        for call in guard.iter() {
+            *counts.entry(call.session.as_str()).or_default() += 1;
+        }
+        let heaviest = counts
+            .into_iter()
+            .max_by_key(|(_, count)| *count)
+            .map(|(session, _)| session.to_owned());
+        if let Some(heaviest) = heaviest
+            && let Some(position) = guard.iter().position(|call| call.session == heaviest)
+        {
+            guard.remove(position);
+        }
     }
     guard.push_back(PendingCall {
+        session: session_id.to_owned(),
         id: tool_call_id.to_owned(),
         title: title.to_owned(),
         args,
@@ -404,44 +433,124 @@ pub(super) fn forget_args(tool_call_id: &str) {
         .retain(|call| call.id != tool_call_id);
 }
 
-/// Outputs of failed tool results by session, until a checkpoint stamps them
-/// onto the stored rows. Rig interactions carry no error flag and the model's
-/// call ids differ from the lifecycle ids events use, so the output text is the
-/// join key. Bounded; display data only.
-const MAX_FAILED: usize = 128;
+/// Tool-result outcomes of one session, until a checkpoint stamps them onto
+/// the stored rows. Rig interactions carry no error flag and the model's call
+/// ids differ from the lifecycle ids events use, so the output text is the
+/// join key; recording every outcome (not only failures) and consuming them in
+/// arrival order keeps two identical outputs, one failed, apart. Bounded;
+/// display data only.
+const MAX_OUTCOMES: usize = 256;
 
-fn failed_results() -> &'static Mutex<VecDeque<(String, String)>> {
-    static FAILED: OnceLock<Mutex<VecDeque<(String, String)>>> = OnceLock::new();
-    FAILED.get_or_init(|| Mutex::new(VecDeque::new()))
+#[derive(Default)]
+struct Outcomes {
+    queue: VecDeque<(String, bool, Option<Value>)>,
+    /// Stored tool-result rows already matched at an earlier checkpoint.
+    stamped: usize,
 }
 
-pub(super) fn record_failed_result(session_id: &str, output: &str) {
-    let mut guard = failed_results().lock().unwrap_or_else(|e| e.into_inner());
-    if guard.len() >= MAX_FAILED {
-        guard.pop_front();
+fn outcomes() -> &'static Mutex<std::collections::HashMap<String, Outcomes>> {
+    static OUTCOMES: OnceLock<Mutex<std::collections::HashMap<String, Outcomes>>> = OnceLock::new();
+    OUTCOMES.get_or_init(Default::default)
+}
+
+fn result_rows(session: &crate::session::Session) -> usize {
+    session
+        .messages
+        .iter()
+        .filter(|message| {
+            matches!(
+                message.tool,
+                Some(crate::session::PersistedToolMessage::Result { .. })
+            )
+        })
+        .count()
+}
+
+/// A session was installed with its stored transcript: rows already there
+/// never match a later event.
+pub(super) fn adopt_session(session: &crate::session::Session) {
+    outcomes().lock().unwrap_or_else(|e| e.into_inner()).insert(
+        session.id.to_string(),
+        Outcomes {
+            queue: VecDeque::new(),
+            stamped: result_rows(session),
+        },
+    );
+}
+
+/// A session closed: its pending calls and outcomes are dropped.
+pub(super) fn forget_session(session_id: &str) {
+    pending()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|call| call.session != session_id);
+    outcomes()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(session_id);
+}
+
+/// Largest serialized diff persisted with a tool-result row.
+const MAX_PERSISTED_DIFF_BYTES: usize = 32 * 1024;
+
+/// `diff` is the finished edit's ACP diff content, kept for replay.
+pub(super) fn record_result(
+    session_id: &str,
+    output: &str,
+    is_error: bool,
+    diff: Option<&ToolCallContent>,
+) {
+    let diff = diff
+        .and_then(|content| serde_json::to_value(content).ok())
+        .filter(|value| value.to_string().len() <= MAX_PERSISTED_DIFF_BYTES);
+    let mut guard = outcomes().lock().unwrap_or_else(|e| e.into_inner());
+    let entry = guard.entry(session_id.to_owned()).or_default();
+    if entry.queue.len() >= MAX_OUTCOMES {
+        entry.queue.pop_front();
     }
-    guard.push_back((session_id.to_owned(), output.to_owned()));
+    entry.queue.push_back((output.to_owned(), is_error, diff));
 }
 
 /// Stamp recorded failures onto this session's stored tool results.
 pub(super) fn apply_failed_results(session: &mut crate::session::Session) {
-    let mut guard = failed_results().lock().unwrap_or_else(|e| e.into_inner());
-    if guard.is_empty() {
+    let mut guard = outcomes().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(entry) = guard.get_mut(session.id.as_str()) else {
         return;
+    };
+    let total = result_rows(session);
+    if total < entry.stamped {
+        // A compaction removed rows; positions no longer line up.
+        entry.stamped = 0;
     }
-    let id = session.id.to_string();
-    session.mark_failed_tool_results(|output| {
-        match guard
+    let skip = entry.stamped;
+    let rows = session
+        .messages
+        .iter_mut()
+        .filter_map(|message| match &mut message.tool {
+            Some(crate::session::PersistedToolMessage::Result {
+                output,
+                is_error,
+                diff,
+                ..
+            }) => Some((output, is_error, diff)),
+            _ => None,
+        });
+    for (output, is_error, diff) in rows.skip(skip) {
+        if let Some(position) = entry
+            .queue
             .iter()
-            .position(|(owner, text)| *owner == id && text == output)
+            .position(|(text, ..)| text.as_str() == output.as_str())
+            && let Some((_, failed, recorded)) = entry.queue.remove(position)
         {
-            Some(position) => {
-                guard.remove(position);
-                true
+            if failed {
+                *is_error = true;
             }
-            None => false,
+            if diff.is_none() {
+                *diff = recorded;
+            }
         }
-    });
+    }
+    entry.stamped = total;
 }
 
 #[cfg(test)]
@@ -475,6 +584,7 @@ mod tests {
         assert_eq!(locations_for("read", &args, Some(&root))[0].path, absolute);
 
         remember_args(
+            "s",
             "abs-1",
             "write",
             &json!({"path": "c.txt", "content": "x"}),
@@ -521,15 +631,8 @@ mod tests {
         assert_eq!(kind_for("memory_search"), ToolKind::Search);
     }
 
-    #[test]
-    fn failed_results_are_stamped_onto_matching_stored_rows_once() {
-        let mut session = crate::session::Session::new("p", "m", 1000, "");
-        session.add_tool_result_with_id("a", "shell", "boom");
-        session.add_tool_result_with_id("b", "shell", "fine");
-        record_failed_result(session.id.as_ref(), "boom");
-        record_failed_result("another-session", "fine");
-        apply_failed_results(&mut session);
-        let flags: Vec<bool> = session
+    fn flags(session: &crate::session::Session) -> Vec<bool> {
+        session
             .messages
             .iter()
             .filter_map(|m| match &m.tool {
@@ -538,13 +641,43 @@ mod tests {
                 }
                 _ => None,
             })
-            .collect();
-        assert_eq!(flags, vec![true, false]);
+            .collect()
+    }
+
+    #[test]
+    fn failed_results_are_stamped_onto_matching_stored_rows_once() {
+        let mut session = crate::session::Session::new("p", "m", 1000, "");
+        session.add_tool_result_with_id("a", "shell", "boom");
+        session.add_tool_result_with_id("b", "shell", "fine");
+        record_result(session.id.as_ref(), "boom", true, None);
+        record_result("another-session", "fine", true, None);
+        apply_failed_results(&mut session);
+        assert_eq!(flags(&session), vec![true, false]);
+        forget_session(session.id.as_ref());
+    }
+
+    #[test]
+    fn identical_outputs_keep_their_own_status_in_order() {
+        let mut session = crate::session::Session::new("p", "m", 1000, "");
+        session.add_tool_result_with_id("old", "shell", "same");
+        // The stored transcript is adopted: its rows never match later events.
+        adopt_session(&session);
+        session.add_tool_result_with_id("c", "shell", "same");
+        session.add_tool_result_with_id("d", "shell", "same");
+        record_result(session.id.as_ref(), "same", false, None);
+        record_result(session.id.as_ref(), "same", true, None);
+        apply_failed_results(&mut session);
+        assert_eq!(flags(&session), vec![false, false, true]);
+        // A later checkpoint does not re-match the settled rows.
+        apply_failed_results(&mut session);
+        assert_eq!(flags(&session), vec![false, false, true]);
+        forget_session(session.id.as_ref());
     }
 
     #[test]
     fn remembered_title_survives_for_every_tool() {
         remember_args(
+            "s",
             "title-1",
             "shell",
             &json!({"command": "cargo test"}),
@@ -673,6 +806,7 @@ mod tests {
     fn pending_args_are_bounded() {
         for index in 0..(MAX_PENDING + 10) {
             remember_args(
+                "s",
                 &format!("bound-{index}"),
                 "write",
                 &json!({"path": "a"}),
@@ -685,6 +819,7 @@ mod tests {
         forget_args(&format!("bound-{}", MAX_PENDING + 9));
         assert!(recall_args(&format!("bound-{}", MAX_PENDING + 9)).is_none());
         remember_args(
+            "s",
             "shell-1",
             "shell",
             &json!({"command": "x"}),
@@ -692,5 +827,33 @@ mod tests {
             None,
         );
         assert!(recall_args("shell-1").is_none());
+    }
+
+    #[test]
+    fn a_busy_session_does_not_evict_another_sessions_pending_edit() {
+        remember_args(
+            "quiet",
+            "quiet-edit",
+            "edit",
+            &json!({"path": "a.rs", "block": "x"}),
+            "edit a.rs",
+            None,
+        );
+        for index in 0..(MAX_PENDING + 1) {
+            remember_args(
+                "busy",
+                &format!("busy-{index}"),
+                "write",
+                &json!({"path": "b"}),
+                "write b",
+                None,
+            );
+        }
+        assert!(recall_args("quiet-edit").is_some());
+        assert!(recall_title("busy-0").is_none());
+        assert!(recall_title(&format!("busy-{MAX_PENDING}")).is_some());
+        forget_session("busy");
+        forget_session("quiet");
+        assert!(recall_args("quiet-edit").is_none());
     }
 }
