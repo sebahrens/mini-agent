@@ -221,6 +221,119 @@ pub(crate) fn copy_embedded_to(embedded: &Dir, dest: &Path) -> anyhow::Result<()
     Ok(())
 }
 
+/// Records which bundled files were installed into a user directory, so a
+/// later version can replace the copies the user never edited. Lives next to
+/// the files (no extension, so no loader reads it) and carries its own
+/// version, independent of the docs install marker.
+const BUNDLED_MANIFEST: &str = ".bundled-manifest";
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct BundledManifest {
+    version: String,
+    /// File name -> sha256 of the content last installed by mini-agent.
+    files: std::collections::BTreeMap<String, String>,
+}
+
+fn content_hash(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    crate::hex::encode_lower(Sha256::digest(bytes))
+}
+
+fn read_bundled_manifest(dest: &Path) -> Option<BundledManifest> {
+    let text = std::fs::read_to_string(dest.join(BUNDLED_MANIFEST)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// What [`sync_embedded_to`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct SyncReport {
+    /// Unedited installed copies replaced by the newer bundled text.
+    pub refreshed: Vec<String>,
+    /// Files that differ from the bundle and from what was installed (or have
+    /// no install record); left alone.
+    pub kept_edited: Vec<String>,
+}
+
+/// Brings an installed copy of `embedded` in `dest` up to date, once per
+/// version. Files whose on-disk hash still equals the recorded install hash
+/// were never edited and are replaced silently; edited files and files from
+/// before the manifest existed are kept. Missing files stay missing (the
+/// bundled layer still serves them). A no-op when the manifest already
+/// carries the running version.
+pub(crate) fn sync_embedded_to(embedded: &Dir, dest: &Path) -> anyhow::Result<SyncReport> {
+    let version = env!("CARGO_PKG_VERSION");
+    let manifest = read_bundled_manifest(dest);
+    if manifest.as_ref().is_some_and(|m| m.version == version) {
+        return Ok(SyncReport::default());
+    }
+    let recorded = manifest.map(|m| m.files).unwrap_or_default();
+    let mut report = SyncReport::default();
+    let mut files = std::collections::BTreeMap::new();
+    for file in embedded.files() {
+        let (Some(name), Some(content)) = (
+            file.path().file_name().and_then(|s| s.to_str()),
+            file.contents_utf8(),
+        ) else {
+            continue;
+        };
+        let Ok(existing) = std::fs::read(dest.join(name)) else {
+            continue;
+        };
+        let disk = content_hash(&existing);
+        let bundled = content_hash(content.as_bytes());
+        if disk == bundled {
+            files.insert(name.to_string(), bundled);
+        } else if recorded.get(name) == Some(&disk) {
+            std::fs::write(dest.join(name), content)?;
+            files.insert(name.to_string(), bundled);
+            report.refreshed.push(name.to_string());
+        } else {
+            if let Some(old) = recorded.get(name) {
+                files.insert(name.to_string(), old.clone());
+            }
+            report.kept_edited.push(name.to_string());
+        }
+    }
+    report.refreshed.sort();
+    report.kept_edited.sort();
+    write_bundled_manifest(dest, version, &files)?;
+    Ok(report)
+}
+
+fn write_bundled_manifest(
+    dest: &Path,
+    version: &str,
+    files: &std::collections::BTreeMap<String, String>,
+) -> anyhow::Result<()> {
+    let manifest = BundledManifest {
+        version: version.to_string(),
+        files: files.clone(),
+    };
+    std::fs::write(
+        dest.join(BUNDLED_MANIFEST),
+        serde_json::to_string_pretty(&manifest)?,
+    )?;
+    Ok(())
+}
+
+/// Records every file of `dest` that equals its bundled original as an
+/// unedited install, after a fresh copy or a regeneration.
+pub(crate) fn record_embedded_install(embedded: &Dir, dest: &Path) -> anyhow::Result<()> {
+    let mut files = std::collections::BTreeMap::new();
+    for file in embedded.files() {
+        let (Some(name), Some(content)) = (
+            file.path().file_name().and_then(|s| s.to_str()),
+            file.contents_utf8(),
+        ) else {
+            continue;
+        };
+        if std::fs::read(dest.join(name)).is_ok_and(|existing| existing == content.as_bytes()) {
+            files.insert(name.to_string(), content_hash(content.as_bytes()));
+        }
+    }
+    write_bundled_manifest(dest, env!("CARGO_PKG_VERSION"), &files)
+}
+
 /// Outcome of a regeneration: how many embedded files were written and which
 /// differing (user-edited or older-version) files were saved as `<name>.bak`
 /// before being replaced.
@@ -502,6 +615,34 @@ impl ContextFiles {
         context
     }
 
+    /// Re-read the root instruction files for `/reload`, leaving prompts,
+    /// personas, themes and memory untouched.
+    pub(crate) fn reload_instruction_files(
+        &mut self,
+        no_context_files: bool,
+        workspace: &crate::paths::WorkspaceBinding,
+    ) {
+        let (agents, architecture, instruction_roots) = if no_context_files {
+            (None, None, Vec::new())
+        } else {
+            walk_bound_context_files(workspace)
+        };
+        self.agents = agents;
+        self.instruction_roots = instruction_roots;
+        #[cfg(feature = "archmd")]
+        {
+            self.architecture = architecture;
+        }
+        #[cfg(not(feature = "archmd"))]
+        let _ = architecture;
+    }
+
+    /// One notice per changed instruction file: `AGENTS.md changed on disk`
+    /// and how to apply it. Each distinct change is reported once.
+    pub(crate) fn instruction_change_notices(&self) -> Vec<String> {
+        change_notices(&self.instruction_roots)
+    }
+
     #[cfg(feature = "git-worktree")]
     pub(crate) fn reload_from_binding(
         &mut self,
@@ -517,6 +658,28 @@ impl ContextFiles {
         }
         *self = rebound;
     }
+}
+
+fn change_notices(roots: &[instructions::InstructionRoot]) -> Vec<String> {
+    type Reported = HashSet<(PathBuf, Option<std::time::SystemTime>, u64)>;
+    static REPORTED: std::sync::Mutex<Option<Reported>> = std::sync::Mutex::new(None);
+    let mut reported = REPORTED.lock().unwrap_or_else(|e| e.into_inner());
+    let reported = reported.get_or_insert_with(HashSet::new);
+    let mut notices = Vec::new();
+    for root in roots {
+        if let Some((path, modified, len)) = root.changed_on_disk()
+            && reported.insert((path.clone(), modified, len))
+        {
+            notices.push(format!(
+                "{} changed on disk: /reload to apply (it rebuilds the system prompt, so the provider prompt cache and, on native Anthropic sessions, the thinking chain restart)",
+                path.file_name().map_or_else(
+                    || path.display().to_string(),
+                    |name| name.to_string_lossy().into_owned()
+                )
+            ));
+        }
+    }
+    notices
 }
 
 fn walk_bound_context_files(
@@ -598,6 +761,24 @@ fn walk_bound_context_files_in(
         && let Some(content) = budget.admit("global ARCHITECTURE.md", content, truncated)
     {
         arch_parts.push(format!("# Global ARCHITECTURE.md\n{content}"));
+    }
+    // Instruction files of the enclosing git repository, outermost first, as
+    // inert text under the same budget. Only AGENTS.md and CLAUDE.md are read:
+    // every executable asset stays bound to the launch directory.
+    for (directory, name, content, truncated) in ancestor_instruction_files(workspace.root()) {
+        let Some(content) = budget.admit(
+            &format!("{name} ({})", directory.display()),
+            content,
+            truncated,
+        ) else {
+            continue;
+        };
+        agent_parts.push(format!(
+            "# {} ({}; repository ancestor of the working directory)\n{}",
+            name,
+            directory.display(),
+            content
+        ));
     }
     // The retained root is the entire walk. Ambient parents are intentionally
     // excluded, including when their lexical spelling is a symlink ancestor.
@@ -976,6 +1157,57 @@ pub(crate) fn set_rule_external_symlinks(enabled: bool) {
     RULE_EXTERNAL_SYMLINKS.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether `AGENTS.md`/`CLAUDE.md` of the enclosing git repository's root and
+/// of the directories down to the launch directory are read
+/// (`repo_root_instruction_files`). On by default.
+static REPO_ROOT_INSTRUCTION_FILES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+pub(crate) fn set_repo_root_instruction_files(enabled: bool) {
+    REPO_ROOT_INSTRUCTION_FILES.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn repo_root_instruction_files_enabled() -> bool {
+    REPO_ROOT_INSTRUCTION_FILES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `(directory, file name, content, truncated)` of the `AGENTS.md` and
+/// `CLAUDE.md` found from the git repository root down to, but excluding, the
+/// launch directory, outermost first. Empty when the launch directory is not
+/// below a repository root (the root must be below the home directory, never
+/// the filesystem root, and its `.git` must not be a symlink).
+fn ancestor_instruction_files(launch: &Path) -> Vec<(PathBuf, String, String, bool)> {
+    if !repo_root_instruction_files_enabled() {
+        return Vec::new();
+    }
+    let home = crate::paths::process_home_dir();
+    let Some(root) = crate::project_root::enclosing_git_root(launch, home.as_deref()) else {
+        return Vec::new();
+    };
+    let Ok(launch) = launch.canonicalize() else {
+        return Vec::new();
+    };
+    let mut directories: Vec<PathBuf> = launch
+        .ancestors()
+        .skip(1)
+        .take_while(|dir| dir.starts_with(&root))
+        .map(Path::to_path_buf)
+        .collect();
+    directories.reverse();
+    let mut found = Vec::new();
+    for directory in directories {
+        let Ok(binding) = crate::paths::WorkspaceBinding::capture(&directory) else {
+            continue;
+        };
+        for (_, name, content, truncated, _) in
+            binding.read_root_context_files(&["AGENTS.md", "CLAUDE.md"], MAX_ANCESTOR_CONTEXT_BYTES)
+        {
+            found.push((directory.clone(), name, content, truncated));
+        }
+    }
+    found
+}
+
 /// Install the `user_instruction_files` opt-in used by later loads.
 pub(crate) fn set_user_instruction_files(enabled: bool) {
     USER_INSTRUCTION_FILES.store(enabled, std::sync::atomic::Ordering::Relaxed);
@@ -1160,6 +1392,66 @@ mod repository_context_tests {
         assert!(agents.contains("WORKSPACE_CONTEXT_MARKER"));
         assert!(!agents.contains("PARENT_CONTEXT_MARKER"));
         std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn nvnkx231_repository_ancestors_load_outermost_first_and_only_inside_a_repository() {
+        let dir = crate::tests::OwnedTestDirectory::new("ancestor-instructions");
+        let repo = dir.path().join("repo");
+        let launch = repo.join("pkg/src");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&launch).unwrap();
+        std::fs::write(repo.join("AGENTS.md"), "ROOT_RULES").unwrap();
+        std::fs::write(repo.join("pkg/AGENTS.md"), "PKG_RULES").unwrap();
+        std::fs::write(launch.join("AGENTS.md"), "LAUNCH_RULES").unwrap();
+        // Above the repository: never read, repository or not.
+        std::fs::write(dir.path().join("AGENTS.md"), "OUTSIDE_RULES").unwrap();
+
+        let (agents, _, _) = walk_context_files(Some(&launch));
+        let agents = agents.expect("instruction files load");
+        let at = |marker: &str| {
+            agents
+                .find(marker)
+                .unwrap_or_else(|| panic!("{marker}: {agents}"))
+        };
+        assert!(at("ROOT_RULES") < at("PKG_RULES") && at("PKG_RULES") < at("LAUNCH_RULES"));
+        assert!(!agents.contains("OUTSIDE_RULES"));
+
+        // Without a repository nothing above the launch directory loads.
+        let plain = dir.path().join("plain/inner");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(dir.path().join("plain/AGENTS.md"), "PLAIN_PARENT").unwrap();
+        let (agents, _, _) = walk_context_files(Some(&plain));
+        assert!(agents.is_none_or(|text| !text.contains("PLAIN_PARENT")));
+
+        // The switch turns the ancestors off again.
+        set_repo_root_instruction_files(false);
+        let (agents, _, _) = walk_context_files(Some(&launch));
+        set_repo_root_instruction_files(true);
+        let agents = agents.unwrap();
+        assert!(agents.contains("LAUNCH_RULES") && !agents.contains("ROOT_RULES"));
+    }
+
+    #[test]
+    fn nvnkx219_an_edited_instruction_file_is_noticed_once() {
+        let dir = crate::tests::OwnedTestDirectory::new("instruction-reload");
+        let workspace_dir = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        std::fs::write(workspace_dir.join("AGENTS.md"), "RULES_A").unwrap();
+        let workspace = crate::paths::WorkspaceBinding::capture(&workspace_dir).unwrap();
+        let (agents, _, roots) = walk_bound_context_files(&workspace);
+        assert!(agents.unwrap().contains("RULES_A"));
+        assert!(change_notices(&roots).is_empty());
+        std::fs::write(workspace_dir.join("AGENTS.md"), "RULES_B_LONGER").unwrap();
+        let notices = change_notices(&roots);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("AGENTS.md changed on disk: /reload"));
+        // The same change is reported only once.
+        assert!(change_notices(&roots).is_empty());
+        // A reload reads the new text and records the new identity.
+        let (agents, _, roots) = walk_bound_context_files(&workspace);
+        assert!(agents.unwrap().contains("RULES_B_LONGER"));
+        assert!(change_notices(&roots).is_empty());
     }
 
     // mini-agent-ag4ze: one oversized file is cut to the byte cap, and nothing

@@ -1,4 +1,5 @@
 pub(crate) mod add;
+mod aliases;
 pub(crate) mod config;
 mod content;
 pub(crate) mod context;
@@ -256,32 +257,75 @@ impl SlashCtx<'_> {
     /// given prompt name. Returns `true` if a model switch occurred (and the
     /// agent was rebuilt). When `false`, the caller should call
     /// `rebuild_agent()` to pick up other prompt changes (mode directive, etc.).
+    ///
+    /// A prompt without a route puts back the model and provider a previous
+    /// routed prompt replaced (see [`route_origin`]), so a route never outlives
+    /// the prompt that asked for it.
     pub async fn switch_to_prompt_model(&mut self, prompt_name: &str) -> bool {
-        let Some((qm_name, qmc)) = mapped_prompt_route(self.cfg, prompt_name) else {
-            return false;
-        };
-
-        let new_model = compact_str::CompactString::from(&*qmc.model);
-        let provider_changed = qmc.provider != self.session.provider;
-
-        // Create the new provider's client before touching the session: a
-        // failure must leave provider, model and agent consistent.
-        if provider_changed {
-            if let Err(e) = self.switch_client(&qmc.provider) {
+        match self.prepare_prompt_route(prompt_name) {
+            Ok(prepared) => self.apply_prompt_route(prompt_name, prepared).await,
+            Err(error) => {
                 let _ = self.renderer.write_line(
                     &format!(
                         "failed to switch provider for prompt '{}': {}",
-                        prompt_name, e
+                        prompt_name, error
                     ),
                     C_ERROR,
                 );
-                return false;
+                false
             }
+        }
+    }
+
+    /// Resolve `prompt_name`'s route and create its provider client without
+    /// touching the session, so a failure leaves everything as it was.
+    pub(crate) fn prepare_prompt_route(&self, prompt_name: &str) -> anyhow::Result<PreparedRoute> {
+        let Some((qm_name, qmc)) = mapped_prompt_route(self.cfg, prompt_name) else {
+            return Ok(PreparedRoute::Unrouted);
+        };
+        let client = if qmc.provider != self.session.provider {
+            Some(crate::provider::create_client(
+                &qmc.provider,
+                self.cli.api_key_for(self.cfg, &qmc.provider),
+                self.cfg.custom_providers_map(),
+                self.cfg.api_keys.as_ref(),
+            )?)
         } else {
-            #[cfg(feature = "advisor")]
-            {
-                crate::extras::advisor::update_client(&self.session.provider, self.client.clone());
-            }
+            None
+        };
+        Ok(PreparedRoute::Routed {
+            qm_name,
+            qmc,
+            client,
+        })
+    }
+
+    pub(crate) async fn apply_prompt_route(
+        &mut self,
+        prompt_name: &str,
+        prepared: PreparedRoute,
+    ) -> bool {
+        let PreparedRoute::Routed {
+            qm_name,
+            qmc,
+            client,
+        } = prepared
+        else {
+            return self.restore_routed_model().await;
+        };
+        route_origin_remember(
+            &self.session.id,
+            &self.session.provider,
+            &self.session.model,
+        );
+        let new_model = compact_str::CompactString::from(&*qmc.model);
+        if let Some(client) = client {
+            *self.client = client;
+            self.session.provider = compact_str::CompactString::new(&qmc.provider);
+        }
+        #[cfg(feature = "advisor")]
+        {
+            crate::extras::advisor::update_client(&self.session.provider, self.client.clone());
         }
         self.session.model = new_model.clone();
         let new_agent = self
@@ -316,6 +360,67 @@ impl SlashCtx<'_> {
         );
         true
     }
+
+    /// Put back the provider and model a routed prompt replaced. `false`
+    /// when no route is in effect (nothing to restore) or the provider
+    /// client cannot be rebuilt (the session then keeps the routed model).
+    pub(crate) async fn restore_routed_model(&mut self) -> bool {
+        let Some((provider, model)) = route_origin_take(&self.session.id) else {
+            return false;
+        };
+        if provider != self.session.provider.as_str()
+            && let Err(error) = self.switch_client(&provider)
+        {
+            write_error(
+                self.renderer,
+                format!("failed to restore provider {provider}: {error}"),
+            );
+            return false;
+        }
+        providers::apply_model(self, &model, None).await;
+        true
+    }
+}
+
+/// A `[prompt_to_model]` route resolved ahead of any session change.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum PreparedRoute {
+    Unrouted,
+    Routed {
+        qm_name: String,
+        qmc: crate::config::QuickModelConfig,
+        /// The new provider's client, when the route changes provider.
+        client: Option<crate::provider::AnyClient>,
+    },
+}
+
+/// Provider and model that were active before a prompt route replaced them,
+/// per session id. Set when a route is applied (the first one wins when
+/// routes chain), consumed when an unrouted prompt is selected or the prompt
+/// is cleared, and dropped by an explicit `/model` or `/provider`.
+static ROUTE_ORIGINS: std::sync::Mutex<
+    Option<std::collections::HashMap<String, (String, String)>>,
+> = std::sync::Mutex::new(None);
+
+pub(crate) fn route_origin_remember(session_id: &str, provider: &str, model: &str) {
+    ROUTE_ORIGINS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Default::default)
+        .entry(session_id.to_owned())
+        .or_insert_with(|| (provider.to_owned(), model.to_owned()));
+}
+
+pub(crate) fn route_origin_take(session_id: &str) -> Option<(String, String)> {
+    ROUTE_ORIGINS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+        .and_then(|map| map.remove(session_id))
+}
+
+pub(crate) fn route_origin_clear(session_id: &str) {
+    route_origin_take(session_id);
 }
 
 /// The quick model `[prompt_to_model]` maps `prompt_name` to, if it exists.
@@ -1300,6 +1405,14 @@ pub(crate) async fn handle_slash(
     terminal_guard: &mut TerminalGuard,
     cron_store: &mut crate::ui::cron::CronStore,
 ) -> anyhow::Result<()> {
+    // A command name learned in another tool (/resume, /status, ...) runs its
+    // mini-agent equivalent unless a custom command already owns the name.
+    let alias_text = aliases::rewrite(text).filter(|_| {
+        let name = split_command(text)[0].trim_start_matches('/');
+        !crate::context::commands::load_cached(&mut slash.custom_commands, &ui.workspace)
+            .is_some_and(|commands| commands.contains_key(name))
+    });
+    let text = alias_text.as_deref().unwrap_or(text);
     let parts = split_command(text);
     let path_args: Vec<String> = if takes_path_args(parts[0]) {
         let rest = text.trim().strip_prefix(parts[0]).unwrap_or("");
@@ -1365,7 +1478,7 @@ pub(crate) async fn handle_slash(
             providers::handle(&model_parts, &mut ctx).await
         }
         command if routes_to_providers(command) => providers::handle(&parts, &mut ctx).await,
-        "/prompt" | "/agent" | "/theme" | "/regen-prompts" | "/regen-themes" => {
+        "/prompt" | "/agent" | "/theme" | "/regen-prompts" | "/regen-themes" | "/reload" => {
             content::handle(&parts, &mut ctx).await
         }
         "/cost" | "/reasoning" | "/thinking" | "/mode" | "/permissions" | "/sandbox"
@@ -1486,9 +1599,27 @@ pub(crate) async fn handle_slash(
                 }
                 .into());
             }
+            if let Some(hint) = aliases::hint(parts[0]) {
+                write_result(ctx.renderer, hint);
+                return Ok(());
+            }
+            let custom_names: Vec<String> =
+                crate::context::commands::load_cached(ctx.custom_commands, ctx.workspace)
+                    .map(|commands| commands.keys().cloned().collect())
+                    .unwrap_or_default();
+            let suggestions = aliases::suggest(
+                parts[0],
+                crate::ui::pickers::list::suggestion_candidates(),
+                custom_names.iter().map(String::as_str),
+            );
+            let did_you_mean = if suggestions.is_empty() {
+                String::new()
+            } else {
+                format!("; did you mean {}?", suggestions.join(", "))
+            };
             write_error(
                 ctx.renderer,
-                format!("unknown command: {} (try /help)", parts[0]),
+                format!("unknown command: {} (try /help{did_you_mean})", parts[0]),
             );
             Ok(())
         }

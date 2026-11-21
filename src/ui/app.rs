@@ -5242,6 +5242,17 @@ impl<'a> App<'a> {
                 .write_line(super::NATIVE_GOAL_NOTICE, C_ERROR)?;
             return Ok(());
         }
+        // An instruction file edited since it was read changes nothing until
+        // `/reload`; say so once per change instead of staying silent.
+        if matches!(
+            question_origin,
+            crate::question::QuestionOrigin::NewUserTurn
+        ) {
+            for notice in self.ui.context.instruction_change_notices() {
+                self.renderer
+                    .write_line(&sanitize_output(&notice), Color::DarkGrey)?;
+            }
+        }
         // The echo is already on screen; show the spinner and Working
         // activity before memory refresh, prebuild adoption and agent build.
         self.paint_submission_started()?;
@@ -6367,6 +6378,56 @@ impl<'a> App<'a> {
         self.input.set_custom_commands(commands);
     }
 
+    /// Runs a template's inline ``!`command` `` spans through the sandboxed
+    /// user-shell path. The command file grants nothing: every span must be
+    /// allowed by the existing shell permission rules (a deny rule refuses the
+    /// expansion; a span that would need an approval prompt refuses it too,
+    /// naming every such command), so nothing runs unless every span may.
+    async fn run_template_shell(&mut self, commands: &[String]) -> Result<Vec<String>, String> {
+        use crate::permission::checker::CheckResult;
+        let mut needs_approval = Vec::new();
+        if let Some(permission) = &self.ui.permission {
+            let mut checker = permission.lock().unwrap_or_else(|e| e.into_inner());
+            for command in commands {
+                match checker.check("shell", command) {
+                    CheckResult::Allowed | CheckResult::AllowedWithCoaching(_) => {}
+                    CheckResult::Ask => needs_approval.push(command.clone()),
+                    CheckResult::Denied(reason) => {
+                        return Err(format!("inline command !`{command}` is denied: {reason}"));
+                    }
+                }
+            }
+        }
+        if !needs_approval.is_empty() {
+            return Err(format!(
+                "inline shell commands need an allow rule for the shell tool (nothing was run): {}",
+                needs_approval
+                    .iter()
+                    .map(|command| format!("`{command}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        let sandbox = self.ui.sandbox.clone();
+        let mut outputs = Vec::with_capacity(commands.len());
+        for command in commands {
+            let run = sandbox
+                .run_explicit_shell(
+                    &format!("!{command}"),
+                    crate::sandbox::configured_command_limits(),
+                    None,
+                )
+                .await
+                .map_err(|error| format!("inline command !`{command}` failed to start: {error}"))?;
+            outputs.push(crate::context::commands::format_shell_output(
+                command,
+                &run.rendered_output(),
+                run.succeeded(),
+            ));
+        }
+        Ok(outputs)
+    }
+
     async fn submit_custom_command(
         &mut self,
         command: crate::context::commands::DeferredCustomCommand,
@@ -6381,15 +6442,42 @@ impl<'a> App<'a> {
                 .write_line("custom command names an unavailable prompt mode", C_ERROR)?;
             return Ok(());
         }
-        let message =
-            match template.expand(&command.arguments, &self.ui.workspace, &self.ui.permission) {
-                Ok(message) => message,
+        let shell_commands = template.shell_commands();
+        let shell_outputs = if shell_commands.is_empty() {
+            None
+        } else {
+            match self.run_template_shell(&shell_commands).await {
+                Ok(outputs) => Some(outputs),
                 Err(error) => {
-                    self.renderer
-                        .write_line(&format!("custom command: {error}"), C_ERROR)?;
+                    self.renderer.write_line(
+                        &sanitize_output(&format!("custom command: {error}")),
+                        C_ERROR,
+                    )?;
                     return Ok(());
                 }
-            };
+            }
+        };
+        let message = match template.expand_full(
+            &command.arguments,
+            &self.ui.workspace,
+            &self.ui.permission,
+            shell_outputs.as_deref(),
+        ) {
+            Ok((message, notices)) => {
+                for notice in notices {
+                    self.renderer.write_line(
+                        &sanitize_output(&format!("custom command: {notice}")),
+                        Color::DarkGrey,
+                    )?;
+                }
+                message
+            }
+            Err(error) => {
+                self.renderer
+                    .write_line(&format!("custom command: {error}"), C_ERROR)?;
+                return Ok(());
+            }
+        };
         let reserve = self.ui.cfg.resolve_reserve_tokens(
             &self.ui.session.model,
             config::quick_models_map(self.ui.cfg),

@@ -7,11 +7,16 @@ pub(crate) const MAX_TEMPLATE_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_EXPANDED_BYTES: usize = 256 * 1024;
 const MAX_INCLUDE_BYTES: usize = 64 * 1024;
 const MAX_INCLUDES: usize = 8;
+const MAX_SHELL_SPANS: usize = 8;
+/// Largest output of one inline command kept in the prompt.
+const MAX_SHELL_OUTPUT_BYTES: usize = 32 * 1024;
 const MAX_ENTRIES: usize = 1024;
 const MAX_FILES: usize = 128;
-/// One level of `<layer>/<namespace>/<name>.md` subdirectories, invoked as
-/// `/<namespace>:<name>`.
+/// Up to `MAX_NAMESPACE_DEPTH` levels of `<layer>/<a>/<b>/<name>.md`
+/// subdirectories, invoked as `/<a>:<b>:<name>`; at most `MAX_NAMESPACES`
+/// subdirectories are read per directory.
 const MAX_NAMESPACES: usize = 32;
+const MAX_NAMESPACE_DEPTH: usize = 4;
 const MAX_SKIPPED_REPORTS: usize = 32;
 
 /// Files skipped by the most recent load (`path: reason`), shown by `/help`.
@@ -47,8 +52,20 @@ pub(crate) fn normalize_name(stem: &str) -> String {
 enum Segment {
     Text(String),
     Arguments,
+    /// `$N`, one-based for older Claude Code templates (`$0` stays literal).
+    /// Left as literal `$N` when the command was given no arguments.
     Argument(usize),
-    Include(String),
+    /// `$ARGUMENTS[N]`, zero based exactly as in skills.
+    ArgumentAt(usize),
+    /// A file include. `optional` marks the unbraced `@word` form, which
+    /// falls back to its literal text when it names no workspace file.
+    Include {
+        path: String,
+        optional: bool,
+    },
+    /// ``!`command` ``: fixed command text (never built from arguments) whose
+    /// output the interactive session splices in after permission checks.
+    Shell(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,6 +78,8 @@ pub(crate) struct CommandTemplate {
     pub(crate) security_mode: Option<String>,
     /// Claude Code `argument-hint`, shown as the input hint (display only).
     pub(crate) argument_hint: Option<String>,
+    /// Frontmatter keys that were read but have no effect here.
+    pub(crate) ignored_keys: Vec<String>,
     segments: Vec<Segment>,
 }
 
@@ -113,6 +132,7 @@ impl CommandTemplate {
         let mut mode = None;
         let mut model = None;
         let mut argument_hint = None;
+        let mut ignored_keys = Vec::new();
         if text
             .lines()
             .next()
@@ -150,11 +170,12 @@ impl CommandTemplate {
                         argument_hint = bounded_field(value, 128).ok();
                     }
                     Some("allowed-tools" | "disable-model-invocation") => {}
-                    _ => {
-                        return Err(
-                            "unsupported frontmatter field (only description, mode, model)".into(),
-                        );
+                    // Keys Claude Code files routinely carry (name, effort,
+                    // context, ...) are not applied; they never fail the file.
+                    Some(other) if ignored_keys.len() < 16 => {
+                        ignored_keys.push(other.chars().take(32).collect::<String>());
                     }
+                    Some(_) | None => {}
                 }
             }
             body = &text[start..];
@@ -182,6 +203,7 @@ impl CommandTemplate {
             model,
             security_mode,
             argument_hint,
+            ignored_keys,
             segments,
         })
     }
@@ -190,7 +212,18 @@ impl CommandTemplate {
     pub(crate) fn has_includes(&self) -> bool {
         self.segments
             .iter()
-            .any(|segment| matches!(segment, Segment::Include(_)))
+            .any(|segment| matches!(segment, Segment::Include { .. }))
+    }
+
+    /// The fixed ``!`command` `` spans, in order.
+    pub(crate) fn shell_commands(&self) -> Vec<String> {
+        self.segments
+            .iter()
+            .filter_map(|segment| match segment {
+                Segment::Shell(command) => Some(command.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Includes are authorized against the pre-command read policy. Ask is
@@ -201,43 +234,91 @@ impl CommandTemplate {
         workspace: &crate::paths::WorkspaceBinding,
         permission: &Option<crate::permission::checker::PermCheck>,
     ) -> Result<String, String> {
+        self.expand_with_notices(arguments, workspace, permission)
+            .map(|(output, _)| output)
+    }
+
+    /// [`expand`](Self::expand) plus one-line notices for `@word` tokens that
+    /// named no workspace file and were kept as literal text.
+    pub(crate) fn expand_with_notices(
+        &self,
+        arguments: &str,
+        workspace: &crate::paths::WorkspaceBinding,
+        permission: &Option<crate::permission::checker::PermCheck>,
+    ) -> Result<(String, Vec<String>), String> {
+        self.expand_full(arguments, workspace, permission, None)
+    }
+
+    /// Full expansion. `shell_outputs` holds the already formatted output of
+    /// each ``!`command` `` span (see [`format_shell_output`]); without it a
+    /// template that has spans fails closed, because only the interactive
+    /// session runs them, after its permission checks.
+    pub(crate) fn expand_full(
+        &self,
+        arguments: &str,
+        workspace: &crate::paths::WorkspaceBinding,
+        permission: &Option<crate::permission::checker::PermCheck>,
+        shell_outputs: Option<&[String]>,
+    ) -> Result<(String, Vec<String>), String> {
         if arguments.len() > MAX_TEMPLATE_BYTES {
             return Err("command arguments exceed 64 KiB".into());
         }
         let words = crate::ui::slash::split_args(arguments)?;
+        let has_arguments = !arguments.trim().is_empty();
         let mut output = String::new();
+        let mut notices: Vec<String> = Vec::new();
+        let mut included = 0usize;
+        let mut uses_arguments = false;
+        let mut shell_index = 0usize;
         for segment in &self.segments {
             let value = match segment {
                 Segment::Text(text) => text.clone(),
-                Segment::Arguments => arguments.to_string(),
-                Segment::Argument(index) => words.get(index - 1).cloned().unwrap_or_default(),
-                Segment::Include(path) => {
-                    workspace.validate()?;
-                    let identity = workspace
-                        .logical_relative_path(Path::new(path))
-                        .map_err(|_| "include must stay in the workspace")?;
-                    if permission.as_ref().is_some_and(|permission| {
-                        !permission
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .allows_mutation_preimage(&identity.to_string_lossy(), true)
-                    }) {
-                        return Err("template include requires existing read permission (denied or approval required)".into());
+                Segment::Shell(command) => {
+                    let output = shell_outputs.and_then(|outputs| outputs.get(shell_index));
+                    shell_index += 1;
+                    match output {
+                        Some(output) => output.clone(),
+                        None => {
+                            return Err(format!(
+                                "inline shell command !`{command}` runs only in the interactive session, after its permission check; it fails closed in headless and ACP runs"
+                            ));
+                        }
                     }
-                    let file = workspace.open_regular_relative(Path::new(path))
-                        .map_err(|_| "template include must be a readable regular workspace file without links")?;
-                    let content = crate::paths::read_utf8_bounded_status(file, MAX_INCLUDE_BYTES)
-                        .map_err(|_| "could not read template include")?;
-                    let crate::paths::BoundedUtf8Read::Content(content) = content else {
-                        return Err("template include must be UTF-8 and at most 64 KiB".into());
-                    };
-                    // Explicit data fences; nothing from an included file is
-                    // parsed as a mode, model, placeholder or further include.
-                    let content = content.replace("</template_file>", "<\u{2060}/template_file>");
-                    format!(
-                        "<template_file path={}>\n{content}\n</template_file>",
-                        serde_json::to_string(path).unwrap()
-                    )
+                }
+                Segment::Arguments => {
+                    uses_arguments = true;
+                    arguments.to_string()
+                }
+                Segment::Argument(index) => {
+                    uses_arguments = true;
+                    if has_arguments {
+                        words.get(index - 1).cloned().unwrap_or_default()
+                    } else {
+                        format!("${index}")
+                    }
+                }
+                Segment::ArgumentAt(index) => {
+                    uses_arguments = true;
+                    words.get(*index).cloned().unwrap_or_default()
+                }
+                Segment::Include { path, optional } => {
+                    match render_include(path, *optional, workspace, permission)? {
+                        Some(text) => {
+                            included += 1;
+                            if included > MAX_INCLUDES {
+                                return Err("template has more than eight file includes".into());
+                            }
+                            text
+                        }
+                        None => {
+                            let notice =
+                                format!("@{path} names no workspace file; kept as literal text");
+                            if !notices.contains(&notice) && notices.len() < 8 {
+                                notices.push(notice);
+                            }
+                            format!("@{path}")
+                        }
+                    }
                 }
             };
             if output.len().saturating_add(value.len()) > MAX_EXPANDED_BYTES {
@@ -245,29 +326,157 @@ impl CommandTemplate {
             }
             output.push_str(&value);
         }
+        if !uses_arguments && has_arguments {
+            // Claude Code and skills append the arguments when the file has
+            // no placeholder, so they are never dropped silently.
+            let tail = format!("\n\nARGUMENTS: {arguments}");
+            if output.len().saturating_add(tail.len()) > MAX_EXPANDED_BYTES {
+                return Err("expanded template exceeds 256 KiB".into());
+            }
+            while output.ends_with('\n') {
+                output.pop();
+            }
+            output.push_str(&tail);
+        }
         if output.trim().is_empty() {
             return Err("expanded template is empty".into());
         }
-        Ok(output)
+        Ok((output, notices))
     }
 }
 
+/// The text spliced in for one ``!`command` `` span: the output as fenced,
+/// untrusted data, cut at 32 KiB with a marker.
+pub(crate) fn format_shell_output(command: &str, output: &str, succeeded: bool) -> String {
+    let mut text = output.trim_end().to_string();
+    if text.len() > MAX_SHELL_OUTPUT_BYTES {
+        let mut end = MAX_SHELL_OUTPUT_BYTES;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push_str("\n[output truncated at 32 KiB]");
+    }
+    let text = text.replace("</command_output>", "<\u{2060}/command_output>");
+    format!(
+        "<command_output command={} status={}>\n{text}\n</command_output>",
+        serde_json::to_string(command).unwrap(),
+        if succeeded { "\"ok\"" } else { "\"failed\"" }
+    )
+}
+
+/// Reads one include. `Ok(None)` means an unbraced `@word` that names no
+/// readable regular workspace file, which stays literal prompt text. An
+/// existing file that permission denies, or any braced include that cannot be
+/// read, is an error.
+fn render_include(
+    path: &str,
+    optional: bool,
+    workspace: &crate::paths::WorkspaceBinding,
+    permission: &Option<crate::permission::checker::PermCheck>,
+) -> Result<Option<String>, String> {
+    workspace.validate()?;
+    let identity = match workspace.logical_relative_path(Path::new(path)) {
+        Ok(identity) => identity,
+        Err(_) if optional => return Ok(None),
+        Err(_) => return Err("include must stay in the workspace".into()),
+    };
+    let file = match workspace.open_regular_relative(Path::new(path)) {
+        Ok(file) => file,
+        Err(_) if optional => return Ok(None),
+        Err(_) => {
+            return Err(
+                "template include must be a readable regular workspace file without links".into(),
+            );
+        }
+    };
+    if permission.as_ref().is_some_and(|permission| {
+        !permission
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .allows_mutation_preimage(&identity.to_string_lossy(), true)
+    }) {
+        return Err(
+            "template include requires existing read permission (denied or approval required)"
+                .into(),
+        );
+    }
+    let content = crate::paths::read_utf8_bounded_status(file, MAX_INCLUDE_BYTES)
+        .map_err(|_| "could not read template include")?;
+    let crate::paths::BoundedUtf8Read::Content(content) = content else {
+        return Err("template include must be UTF-8 and at most 64 KiB".into());
+    };
+    // Explicit data fences; nothing from an included file is
+    // parsed as a mode, model, placeholder or further include.
+    let content = content.replace("</template_file>", "<\u{2060}/template_file>");
+    Ok(Some(format!(
+        "<template_file path={}>\n{content}\n</template_file>",
+        serde_json::to_string(path).unwrap()
+    )))
+}
+
+/// Byte ranges of fenced code blocks (``` or ~~~), fence lines included. An
+/// unterminated fence runs to the end of the body.
+fn fenced_ranges(body: &str) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut open: Option<(usize, &str)> = None;
+    let mut offset = 0;
+    for line in body.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        let marker = ["```", "~~~"].into_iter().find(|m| trimmed.starts_with(m));
+        match (open, marker) {
+            (None, Some(m)) => open = Some((offset, m)),
+            (Some((start, open_marker)), Some(m)) if m == open_marker => {
+                ranges.push(start..offset + line.len());
+                open = None;
+            }
+            _ => {}
+        }
+        offset += line.len();
+    }
+    if let Some((start, _)) = open {
+        ranges.push(start..body.len());
+    }
+    ranges
+}
+
 fn parse_segments(body: &str) -> Result<Vec<Segment>, String> {
+    let fences = fenced_ranges(body);
     let mut segments = Vec::new();
     let mut literal = String::new();
     let mut at = 0;
     let mut includes = 0;
     while at < body.len() {
         let rest = &body[at..];
+        let in_fence = fences.iter().any(|range| range.contains(&at));
         let mut replacement = None;
-        if rest.starts_with("$ARGUMENTS")
-            && rest[10..]
+        if let Some(after) = rest.strip_prefix("$$")
+            && (after.starts_with(|c: char| c.is_ascii_digit()) || after.starts_with("ARGUMENTS"))
+        {
+            // Escape: `$$1` and `$$ARGUMENTS` are a literal `$1` / `$ARGUMENTS`.
+            literal.push('$');
+            at += 2;
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("$ARGUMENTS")
+            && after
                 .chars()
                 .next()
                 .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
         {
-            replacement = Some((10, Segment::Arguments));
-        } else if let Some(number) = rest.strip_prefix('$') {
+            replacement = Some(
+                match after.strip_prefix('[').and_then(|inner| {
+                    let end = inner.find(']')?;
+                    let index = inner[..end].trim().parse::<usize>().ok()?;
+                    Some((index, end + 2))
+                }) {
+                    Some((index, bracket)) if index <= 127 => {
+                        (10 + bracket, Segment::ArgumentAt(index))
+                    }
+                    _ => (10, Segment::Arguments),
+                },
+            );
+        } else if !in_fence && let Some(number) = rest.strip_prefix('$') {
             let digits = number.bytes().take_while(u8::is_ascii_digit).count();
             if digits > 0 {
                 let index: usize = number[..digits]
@@ -281,42 +490,88 @@ fn parse_segments(body: &str) -> Result<Vec<Segment>, String> {
                 }
             }
         }
-        if rest.starts_with('@')
+        if !in_fence
+            && replacement.is_none()
+            && let Some(span) = rest.strip_prefix("!`")
+            && (at == 0
+                || body[..at]
+                    .chars()
+                    .next_back()
+                    .is_some_and(char::is_whitespace))
+            && let Some(end) = span.find(['`', '\n'])
+            && span[end..].starts_with('`')
+            && !span[..end].trim().is_empty()
+        {
+            if segments
+                .iter()
+                .filter(|segment| matches!(segment, Segment::Shell(_)))
+                .count()
+                >= MAX_SHELL_SPANS
+            {
+                return Err("template has more than eight inline shell commands".into());
+            }
+            replacement = Some((end + 3, Segment::Shell(span[..end].trim().to_string())));
+        }
+        if !in_fence
+            && replacement.is_none()
+            && rest.starts_with('@')
             && (at == 0
                 || body[..at]
                     .chars()
                     .next_back()
                     .is_some_and(char::is_whitespace))
         {
-            let (used, path) = if let Some(braced) = rest.strip_prefix("@{") {
+            if let Some(braced) = rest.strip_prefix("@{") {
                 let end = braced
                     .find('}')
                     .ok_or("unterminated authored file include")?;
-                (end + 3, &braced[..end])
+                let path = &braced[..end];
+                validate_include_path(path)?;
+                includes += 1;
+                if includes > MAX_INCLUDES {
+                    return Err("template has more than eight file includes".into());
+                }
+                replacement = Some((
+                    end + 3,
+                    Segment::Include {
+                        path: path.into(),
+                        optional: false,
+                    },
+                ));
             } else {
+                // Unbraced `@word`: trailing sentence punctuation is not part
+                // of the name, and a token that is not a plausible relative
+                // path (`@alice`, `@/etc`) is just text.
                 let length = rest[1..]
                     .find(char::is_whitespace)
                     .unwrap_or(rest.len() - 1);
-                (length + 1, &rest[1..1 + length])
-            };
-            let path_obj = Path::new(path);
-            if path.is_empty()
-                || path_obj.is_absolute()
-                || path.contains('\\')
-                || path_obj
-                    .components()
-                    .any(|part| !matches!(part, Component::Normal(_)))
-            {
-                return Err(
-                    "authored file include must be a relative workspace path without traversal"
-                        .into(),
-                );
+                let path = rest[1..1 + length].trim_end_matches(|c: char| {
+                    matches!(
+                        c,
+                        '.' | ','
+                            | ';'
+                            | ':'
+                            | '!'
+                            | '?'
+                            | ')'
+                            | ']'
+                            | '}'
+                            | '"'
+                            | '\''
+                            | '`'
+                            | '>'
+                    )
+                });
+                if !path.is_empty() && validate_include_path(path).is_ok() {
+                    replacement = Some((
+                        path.len() + 1,
+                        Segment::Include {
+                            path: path.into(),
+                            optional: true,
+                        },
+                    ));
+                }
             }
-            includes += 1;
-            if includes > MAX_INCLUDES {
-                return Err("template has more than eight file includes".into());
-            }
-            replacement = Some((used, Segment::Include(path.into())));
         }
         if let Some((used, segment)) = replacement {
             if !literal.is_empty() {
@@ -334,6 +589,22 @@ fn parse_segments(body: &str) -> Result<Vec<Segment>, String> {
         segments.push(Segment::Text(literal));
     }
     Ok(segments)
+}
+
+fn validate_include_path(path: &str) -> Result<(), String> {
+    let path_obj = Path::new(path);
+    if path.is_empty()
+        || path_obj.is_absolute()
+        || path.contains('\\')
+        || path_obj
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err(
+            "authored file include must be a relative workspace path without traversal".into(),
+        );
+    }
+    Ok(())
 }
 
 /// Result of looking up a headless `-p "/name args"` prompt.
@@ -431,23 +702,27 @@ struct DirStamp {
     link: (Option<std::time::SystemTime>, u64, bool),
     target: Option<(Option<std::time::SystemTime>, u64)>,
     entries: Vec<(std::ffi::OsString, Option<std::time::SystemTime>, u64)>,
-    children: Vec<(std::ffi::OsString, DirStampEntries)>,
+    children: Vec<(std::ffi::OsString, DirStamp)>,
 }
 
-type DirStampEntries = Vec<(std::ffi::OsString, Option<std::time::SystemTime>, u64)>;
-
 fn dir_stamp(path: &Path) -> Option<DirStamp> {
+    dir_stamp_at(path, 0)
+}
+
+fn dir_stamp_at(path: &Path, depth: usize) -> Option<DirStamp> {
     let mut stamp = dir_stamp_flat(path)?;
     // Namespace subdirectories change their own mtime, not the layer's.
-    for (name, _, _) in stamp.entries.clone() {
-        let child = path.join(&name);
-        if std::fs::symlink_metadata(&child).is_ok_and(|meta| meta.is_dir())
-            && let Some(nested) = dir_stamp_flat(&child)
-        {
-            stamp.children.push((name, nested.entries));
-        }
-        if stamp.children.len() >= MAX_NAMESPACES {
-            break;
+    if depth < MAX_NAMESPACE_DEPTH {
+        for (name, _, _) in stamp.entries.clone() {
+            let child = path.join(&name);
+            if std::fs::symlink_metadata(&child).is_ok_and(|meta| meta.is_dir())
+                && let Some(nested) = dir_stamp_at(&child, depth + 1)
+            {
+                stamp.children.push((name, nested));
+            }
+            if stamp.children.len() >= MAX_NAMESPACES {
+                break;
+            }
         }
     }
     Some(stamp)
@@ -487,6 +762,7 @@ struct CommandsStamp {
     config_dir: PathBuf,
     workspace: PathBuf,
     trusted: bool,
+    claude_user: Option<PathBuf>,
     layers: Vec<Option<DirStamp>>,
 }
 
@@ -495,7 +771,11 @@ fn commands_stamp(
     workspace: &crate::paths::WorkspaceBinding,
 ) -> CommandsStamp {
     let trusted = crate::config::load::project_config_is_trusted_in_workspace(paths, workspace);
-    let mut layers = vec![dir_stamp(&paths.config_dir.join("commands"))];
+    let claude_user = claude_user_commands_dir();
+    let mut layers = vec![
+        claude_user.as_deref().and_then(dir_stamp),
+        dir_stamp(&paths.config_dir.join("commands")),
+    ];
     if trusted {
         layers.extend(
             PROJECT_LAYERS
@@ -507,8 +787,37 @@ fn commands_stamp(
         config_dir: paths.config_dir.clone(),
         workspace: workspace.root().to_path_buf(),
         trusted,
+        claude_user,
         layers,
     }
+}
+
+/// Whether the user's `~/.claude/commands` are read (`claude_user_commands`,
+/// default on: personal Claude Code commands carry over like skills do).
+static CLAUDE_USER_COMMANDS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+pub(crate) fn set_claude_user_commands(enabled: bool) {
+    CLAUDE_USER_COMMANDS.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only `~/.claude/commands` directory (`None`: layer absent).
+    static CLAUDE_USER_DIR_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn claude_user_commands_dir() -> Option<PathBuf> {
+    // Tests never read the real home directory unless they install a path.
+    #[cfg(test)]
+    return CLAUDE_USER_DIR_OVERRIDE.with(|cell| cell.borrow().clone());
+    #[cfg(not(test))]
+    CLAUDE_USER_COMMANDS
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .then(crate::paths::process_home_dir)
+        .flatten()
+        .map(|home| home.join(".claude").join("commands"))
 }
 
 /// Templates loaded by [`load_cached`], with the layer stamp they match.
@@ -587,6 +896,26 @@ fn load_layers_reporting(
 ) -> (BTreeMap<String, CommandTemplate>, Vec<String>) {
     let mut commands = BTreeMap::new();
     let mut skipped = Vec::new();
+    // Lowest priority: the user's Claude Code commands, read through a
+    // capability bound to ~/.claude so links cannot leave it.
+    if let Some(dir) = claude_user_commands_dir()
+        && let Some(parent) = dir.parent()
+        && dir.is_dir()
+    {
+        match crate::paths::WorkspaceBinding::capture(parent) {
+            Ok(user) if user.validate().is_ok() => {
+                merge_layer(
+                    &mut commands,
+                    &user,
+                    Path::new("commands"),
+                    None,
+                    &mut skipped,
+                );
+            }
+            Ok(_) => tracing::warn!("~/.claude changed or was linked"),
+            Err(error) => tracing::warn!(%error, "could not load ~/.claude/commands"),
+        }
+    }
     // Global definitions are only read through the private app root. Missing
     // command directories are optional and never created while listing.
     if paths.config_dir.join("commands").exists() {
@@ -634,6 +963,17 @@ fn merge_layer(
     namespace: Option<&str>,
     skipped: &mut Vec<String>,
 ) {
+    merge_layer_at(commands, binding, directory, namespace, 0, skipped);
+}
+
+fn merge_layer_at(
+    commands: &mut BTreeMap<String, CommandTemplate>,
+    binding: &crate::paths::WorkspaceBinding,
+    directory: &Path,
+    namespace: Option<&str>,
+    depth: usize,
+    skipped: &mut Vec<String>,
+) {
     #[cfg(test)]
     LAYER_READS.with(|reads| reads.set(reads.get() + 1));
     let entries = match binding.read_relative_definition_layer(
@@ -674,6 +1014,13 @@ fn merge_layer(
         }
         match text.and_then(|text| CommandTemplate::parse(&text)) {
             Ok(template) => {
+                if !template.ignored_keys.is_empty() {
+                    skipped.push(format!(
+                        "{}: loaded; frontmatter {} not applied",
+                        file.display(),
+                        template.ignored_keys.join(", ")
+                    ));
+                }
                 commands.insert(name, template);
             }
             Err(error) => {
@@ -682,29 +1029,39 @@ fn merge_layer(
             }
         }
     }
-    if namespace.is_none() {
-        for sub in binding
-            .relative_subdirectories(directory, MAX_ENTRIES)
-            .unwrap_or_default()
-            .into_iter()
-            .take(MAX_NAMESPACES)
-        {
-            let normalized = normalize_name(&sub);
-            if !valid_name(&normalized) {
-                skipped.push(format!(
-                    "{}/: namespace must normalise to 1-64 of a-z, 0-9 and single '-'",
-                    directory.join(&sub).display()
-                ));
-                continue;
-            }
-            merge_layer(
-                commands,
-                binding,
-                &directory.join(&sub),
-                Some(&normalized),
-                skipped,
-            );
+    let subdirectories = binding
+        .relative_subdirectories(directory, MAX_ENTRIES)
+        .unwrap_or_default();
+    if depth >= MAX_NAMESPACE_DEPTH {
+        for sub in subdirectories {
+            skipped.push(format!(
+                "{}/: namespaces nest at most {MAX_NAMESPACE_DEPTH} levels",
+                directory.join(&sub).display()
+            ));
         }
+        return;
+    }
+    for sub in subdirectories.into_iter().take(MAX_NAMESPACES) {
+        let normalized = normalize_name(&sub);
+        if !valid_name(&normalized) {
+            skipped.push(format!(
+                "{}/: namespace must normalise to 1-64 of a-z, 0-9 and single '-'",
+                directory.join(&sub).display()
+            ));
+            continue;
+        }
+        let nested = match namespace {
+            Some(parent) => format!("{parent}:{normalized}"),
+            None => normalized,
+        };
+        merge_layer_at(
+            commands,
+            binding,
+            &directory.join(&sub),
+            Some(&nested),
+            depth + 1,
+            skipped,
+        );
     }
 }
 
@@ -744,12 +1101,12 @@ mod tests {
         assert_eq!(template.security_mode.as_deref(), Some("readonly"));
         for bad in [
             "---\nmode: [plan]\n---\nbody",
-            "---\nmodel: '$1'\nfoo: unknown\n---\nbody",
+            "---\nmodel: [x]\n---\nbody",
             "%%grant=config_dir:read\nbody",
             "%%agent=review\nbody",
             "%%mode=unknown\nbody",
-            "@../secret",
-            "@/tmp/secret",
+            "@{../secret}",
+            "@{/tmp/secret}",
             "@{unterminated",
             "$99999",
             "---\nunclosed",
@@ -1151,7 +1508,7 @@ mod tests {
         std::fs::remove_file(&fifo).unwrap();
         drop(crate::tests::process_gate::ProcessGate::new(&fifo).unwrap());
         assert!(
-            CommandTemplate::parse("@fifo")
+            CommandTemplate::parse("@{fifo}")
                 .unwrap()
                 .expand("", &workspace, &None)
                 .is_err()
@@ -1190,7 +1547,7 @@ mod tests {
         std::fs::remove_file(workspace_dir.join("link")).unwrap();
         std::os::unix::fs::symlink(&outside, workspace_dir.join("link")).unwrap();
         assert!(
-            CommandTemplate::parse("@link")
+            CommandTemplate::parse("@{link}")
                 .unwrap()
                 .expand("", &workspace, &None)
                 .is_err()
@@ -1199,11 +1556,223 @@ mod tests {
         std::fs::create_dir(&workspace_dir).unwrap();
         std::fs::write(workspace_dir.join("secret"), "REPLACEMENT").unwrap();
         assert!(
-            CommandTemplate::parse("@secret")
+            CommandTemplate::parse("@{secret}")
                 .unwrap()
                 .expand("", &workspace, &None)
                 .is_err()
         );
         assert!(!crate::config::load::project_config_is_trusted_in_workspace(&paths, &workspace));
+    }
+
+    fn expand_plain(body: &str, arguments: &str) -> String {
+        let root = crate::tests::OwnedTestDirectory::new("command-expand");
+        let workspace = crate::paths::WorkspaceBinding::capture(root.path()).unwrap();
+        CommandTemplate::parse(body)
+            .unwrap()
+            .expand(arguments, &workspace, &None)
+            .unwrap()
+    }
+
+    #[test]
+    fn nvnkx75_bracket_arguments_fences_and_escapes_follow_the_skill_rules() {
+        assert_eq!(expand_plain("first=$ARGUMENTS[0]", "a b"), "first=a");
+        assert_eq!(expand_plain("second=$ARGUMENTS[1]", "a b"), "second=b");
+        assert_eq!(expand_plain("x=$ARGUMENTS[ 0 ]!", "a"), "x=a!");
+        // A fenced awk program keeps its $1, with or without arguments.
+        let body = "Run:\n```sh\nawk '{print $1}'\n```\nthen $1";
+        assert_eq!(
+            expand_plain(body, "x"),
+            "Run:\n```sh\nawk '{print $1}'\n```\nthen x"
+        );
+        assert_eq!(
+            expand_plain(body, ""),
+            "Run:\n```sh\nawk '{print $1}'\n```\nthen $1"
+        );
+        // $0 is literal, $$N escapes.
+        assert_eq!(
+            expand_plain("$0 $$1 $$ARGUMENTS $1", "a"),
+            "$0 $1 $ARGUMENTS a"
+        );
+        // Pinned difference from skills: bare $N is one based here.
+        let template = "$1|$ARGUMENTS[0]";
+        assert_eq!(expand_plain(template, "a b"), "a|a");
+        assert_eq!(
+            crate::extras::skills::placeholders::substitute(template, "a b", ""),
+            "b|a"
+        );
+    }
+
+    #[test]
+    fn nvnkx76_arguments_are_appended_when_no_placeholder_uses_them() {
+        let out = expand_plain("Review the code.", "src/auth.rs");
+        assert!(out.ends_with("ARGUMENTS: src/auth.rs"), "{out}");
+        assert_eq!(expand_plain("Review the code.", ""), "Review the code.");
+        assert_eq!(expand_plain("Review $1.", "a"), "Review a.");
+    }
+
+    #[test]
+    fn nvnkx74_at_words_that_are_not_files_stay_literal() {
+        let root = crate::tests::OwnedTestDirectory::new("command-at-words");
+        std::fs::write(root.path().join("README.md"), "readme text").unwrap();
+        let workspace = crate::paths::WorkspaceBinding::capture(root.path()).unwrap();
+        let template = CommandTemplate::parse(
+            "ask @alice\n```python\n@dataclass\n@README.md\n```\nsee @README.md. also @types/node and @/etc @{README.md}",
+        )
+        .unwrap();
+        let (out, notices) = template.expand_with_notices("", &workspace, &None).unwrap();
+        assert!(out.contains("ask @alice"), "{out}");
+        assert!(out.contains("@dataclass\n@README.md\n```"), "{out}");
+        assert_eq!(out.matches("readme text").count(), 2, "{out}");
+        assert!(
+            out.contains("</template_file>. also @types/node and @/etc"),
+            "{out}"
+        );
+        assert!(notices.iter().any(|n| n.contains("@alice")), "{notices:?}");
+        // The explicit braced form still fails when the file is missing.
+        let missing = CommandTemplate::parse("read @{nope.md}").unwrap();
+        assert!(missing.expand("", &workspace, &None).is_err());
+    }
+
+    #[test]
+    fn nvnkx74_a_denied_read_of_an_existing_at_file_still_fails() {
+        let root = crate::tests::OwnedTestDirectory::new("command-at-denied");
+        std::fs::write(root.path().join("secret.md"), "s").unwrap();
+        let workspace = crate::paths::WorkspaceBinding::capture(root.path()).unwrap();
+        let template = CommandTemplate::parse("see @secret.md and @nobody").unwrap();
+        for action in [Action::Deny, Action::Ask] {
+            let checker = crate::permission::checker::PermissionChecker::new(
+                &PermissionConfigs::from(PermissionConfig {
+                    read: Some(ToolPerm::Simple(action)),
+                    ..Default::default()
+                }),
+                SecurityMode::Standard,
+                Some(root.path().to_path_buf()),
+                None,
+            )
+            .unwrap();
+            let permission = Some(std::sync::Arc::new(std::sync::Mutex::new(checker)));
+            assert!(
+                template
+                    .expand("", &workspace, &permission)
+                    .unwrap_err()
+                    .contains("read permission")
+            );
+        }
+    }
+
+    #[test]
+    fn nvnkx77_unknown_frontmatter_keys_load_with_a_notice() {
+        let root = crate::tests::OwnedTestDirectory::new("command-unknown-keys");
+        let paths = paths(root.path());
+        let commands = paths.config_dir.join("commands");
+        std::fs::create_dir_all(&commands).unwrap();
+        crate::fs::ensure_private_directory(&paths.config_dir).unwrap();
+        std::fs::write(
+            commands.join("ported.md"),
+            "---\nname: ported\neffort: high\ncontext: fork\ndescription: P\n---\nDo $1",
+        )
+        .unwrap();
+        let workspace_dir = root.path().join("workspace");
+        std::fs::create_dir(&workspace_dir).unwrap();
+        let workspace = crate::paths::WorkspaceBinding::capture(&workspace_dir).unwrap();
+        let (loaded, skipped) = load_layers_reporting(&paths, &workspace, false);
+        assert_eq!(loaded["ported"].description, "P");
+        assert_eq!(
+            loaded["ported"].expand("x", &workspace, &None).unwrap(),
+            "Do x"
+        );
+        let report = skipped.join("\n");
+        assert!(
+            report.contains("ported.md")
+                && report.contains("name")
+                && report.contains("effort")
+                && report.contains("context")
+                && report.contains("not applied"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn nvnkx78_user_claude_commands_load_below_the_private_layer() {
+        let root = crate::tests::OwnedTestDirectory::new("command-claude-user");
+        let paths = paths(root.path());
+        let private = paths.config_dir.join("commands");
+        std::fs::create_dir_all(&private).unwrap();
+        crate::fs::ensure_private_directory(&paths.config_dir).unwrap();
+        let home_commands = root.path().join("home/.claude/commands");
+        std::fs::create_dir_all(&home_commands).unwrap();
+        std::fs::write(home_commands.join("fix.md"), "from claude").unwrap();
+        std::fs::write(home_commands.join("both.md"), "claude both").unwrap();
+        std::fs::write(private.join("both.md"), "private both").unwrap();
+        let workspace_dir = root.path().join("workspace");
+        std::fs::create_dir(&workspace_dir).unwrap();
+        let workspace = crate::paths::WorkspaceBinding::capture(&workspace_dir).unwrap();
+        let expand = |commands: &BTreeMap<String, CommandTemplate>, name: &str| {
+            commands[name].expand("", &workspace, &None).unwrap()
+        };
+        // Opt-out (and the test default): the layer is not read.
+        assert!(!load_layers(&paths, &workspace, false).contains_key("fix"));
+        CLAUDE_USER_DIR_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(home_commands.clone()));
+        let before = commands_stamp(&paths, &workspace);
+        let commands = load_layers(&paths, &workspace, false);
+        assert_eq!(expand(&commands, "fix"), "from claude");
+        assert_eq!(expand(&commands, "both"), "private both");
+        std::fs::write(home_commands.join("new.md"), "n").unwrap();
+        assert_ne!(before, commands_stamp(&paths, &workspace));
+        CLAUDE_USER_DIR_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+    }
+
+    #[test]
+    fn nvnkx82_nested_namespaces_join_with_colons_and_deep_ones_are_reported() {
+        let root = crate::tests::OwnedTestDirectory::new("command-nested");
+        let paths = paths(root.path());
+        let commands = paths.config_dir.join("commands");
+        let deep = commands.join("a/b/c/d/e");
+        std::fs::create_dir_all(&deep).unwrap();
+        crate::fs::ensure_private_directory(&paths.config_dir).unwrap();
+        std::fs::write(commands.join("a/b/c.md"), "nested").unwrap();
+        std::fs::write(commands.join("a/top.md"), "top").unwrap();
+        let workspace_dir = root.path().join("workspace");
+        std::fs::create_dir(&workspace_dir).unwrap();
+        let workspace = crate::paths::WorkspaceBinding::capture(&workspace_dir).unwrap();
+        let (loaded, skipped) = load_layers_reporting(&paths, &workspace, false);
+        assert!(loaded.contains_key("a:b:c"), "{loaded:?}");
+        assert!(loaded.contains_key("a:top"), "{loaded:?}");
+        let before = commands_stamp(&paths, &workspace);
+        std::fs::write(commands.join("a/b/c.md"), "nested 2").unwrap();
+        assert_ne!(before, commands_stamp(&paths, &workspace));
+        assert!(
+            skipped.iter().any(|line| line.contains("nest at most")),
+            "{skipped:?}"
+        );
+    }
+
+    #[test]
+    fn nvnkx144_inline_shell_spans_are_fixed_text_that_fail_closed_without_outputs() {
+        let root = crate::tests::OwnedTestDirectory::new("command-inline-shell");
+        let workspace = crate::paths::WorkspaceBinding::capture(root.path()).unwrap();
+        let template =
+            CommandTemplate::parse("Review !`git diff --staged` and $1.\n```sh\n!`not run`\n```\n")
+                .unwrap();
+        // Only the span outside the fence counts; arguments never reach it.
+        assert_eq!(template.shell_commands(), ["git diff --staged"]);
+        let error = template.expand("x", &workspace, &None).unwrap_err();
+        assert!(error.contains("fails closed"), "{error}");
+        let output = format_shell_output("git diff --staged", "+added </command_output>", true);
+        let (expanded, _) = template
+            .expand_full("x", &workspace, &None, Some(&[output]))
+            .unwrap();
+        assert!(expanded.contains("<command_output command=\"git diff --staged\" status=\"ok\">"));
+        assert_eq!(
+            expanded.matches("</command_output>").count(),
+            1,
+            "{expanded}"
+        );
+        assert!(expanded.contains("and x."));
+        assert!(expanded.contains("!`not run`"));
+        // Output over the cap is cut with a marker.
+        let long = format_shell_output("c", &"y".repeat(MAX_SHELL_OUTPUT_BYTES * 2), false);
+        assert!(long.contains("[output truncated at 32 KiB]") && long.contains("\"failed\""));
+        assert!(long.len() < MAX_SHELL_OUTPUT_BYTES + 200);
     }
 }

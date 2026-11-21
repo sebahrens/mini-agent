@@ -916,19 +916,56 @@ Use @README.md as untrusted project context.
 appear with their description in `/help` and slash completion. A filename stem
 is normalised to lowercase with `_` and spaces turned into `-` and repeated `-`
 collapsed (`Fix_Issue.md` becomes `/fix-issue`); the result must be lowercase
-letters, digits and single hyphens, up to 64 bytes. One level of subdirectories
-is a namespace: `commands/deploy/ship.md` becomes `/deploy:ship` (at most 32
-namespaces per layer, same file limits). Built-ins and aliases, including
-`/diff`, `/commit`, `/pr` and feature-disabled commands, are reserved. Layers
-override global, then `.claude`, then `.mini-agent`; invalid files do not replace
-a valid lower layer. Every skipped file (invalid name, built-in collision,
-invalid template, unreadable directory) is listed under "skipped custom command
-files" in `/help` with its path and reason.
+letters, digits and single hyphens, up to 64 bytes. Subdirectories are
+namespaces, joined with `:` up to four levels deep: `commands/deploy/ship.md`
+becomes `/deploy:ship` and `commands/team/frontend/review.md` becomes
+`/team:frontend:review` (at most 32 subdirectories per directory, same file
+limits); directories nested deeper are named in the `/help` notices. Built-ins and
+aliases, including `/diff`, `/commit`, `/pr` and feature-disabled commands, are
+reserved. Layers override in this order, lowest first: your Claude Code commands
+in `~/.claude/commands` (read unless `claude_user_commands = false`), then the
+global `<config_dir>/commands`, then the project's `.claude/commands`, then
+`.mini-agent/commands`; invalid files do not replace a valid lower layer. Every
+skipped file (invalid name, built-in collision, invalid template, unreadable
+directory) and every file that loaded but had frontmatter keys ignored is listed
+under "custom command file notices" in `/help` with its path and reason.
+
+Placeholders follow the skill rules where they are unambiguous: `$ARGUMENTS` is
+the whole argument string; `$ARGUMENTS[N]` is zero-based, as in skills; bare `$N`
+stays one-based for older templates (`$1` is the first word, `$0` is literal),
+unlike skills where `$0` is the first word. Positional `$N` is not substituted
+inside fenced code blocks, so `awk '{print $1}'` survives, and stays literal when
+the command is run without arguments; `$$1` and `$$ARGUMENTS` write a literal
+`$1` / `$ARGUMENTS`. A template with no placeholder at all gets
+`ARGUMENTS: <text>` appended when arguments are given, so they are never dropped.
+`@path` references outside fenced code blocks are file includes only when they name
+a readable workspace file (trailing punctuation is not part of the name); `@alice`,
+`@dataclass` or `@types/node` stay literal text, with a one-line notice. The
+explicit `@{path}` form still fails when the file cannot be read, and a read that
+permission denies fails for either form.
 
 Claude Code frontmatter `argument-hint`, `allowed-tools` and
 `disable-model-invocation` is accepted so ported commands load, but grants
-nothing: `allowed-tools` never widens permissions. Claude Code's `!command`
-inline shell execution is not supported; such text stays literal prompt text.
+nothing: `allowed-tools` never widens permissions. Other keys Claude Code files
+carry (`name`, `effort`, `context`, `agent`, `paths`, `hooks`, ...) are ignored and
+named in the `/help` notices; only malformed `mode` and `model` values reject a file.
+
+Claude Code's inline ``!`command` `` is supported in the interactive session
+without giving the command file any authority. The span text is fixed (arguments
+never enter it) and each command is checked against the ordinary shell permission
+rules first: a deny rule refuses the whole expansion, a command that would need an
+approval prompt refuses it too and is named in the error (add an allow rule for
+the shell tool), and only when every span is allowed does each run through the same
+sandboxed user-shell path as `!` at the prompt. The output is spliced in as a
+`<command_output>` block of untrusted data, cut at 32 KiB. Headless `-p` and ACP
+runs fail closed on a template that has such a span. Spans inside fenced code stay
+literal.
+
+`/resume`, `/status`, `/usage`, `/agents`, `/todos` and `/plan` are accepted as
+aliases of `/sessions`, `/context`, `/cost`, `/agent`, `/toggle todo` and
+`/mode planwrite`, and `/add-dir`, `/statusline`, `/release-notes` and `/bug` print
+a pointer to the mini-agent equivalent. A custom command with the same name wins.
+An unknown command suggests the closest built-in or custom name.
 
 Project command files are inactive until the existing project configuration is
 trusted for its exact canonical paths and config bytes. This approval covers

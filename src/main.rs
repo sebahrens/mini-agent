@@ -500,6 +500,7 @@ async fn run_one_shot(
                 .map_err(anyhow::Error::msg)?;
             context::agents::set_claude_project_agents(cfg.resolve_claude_project_agents());
             context::agents::set_claude_user_agents(cfg.resolve_claude_user_agents());
+            context::commands::set_claude_user_commands(cfg.resolve_claude_user_commands());
             let mut report =
                 diagnostics::DoctorReport::capture(cli, &cfg, app_paths, None, None, true);
             report.section("Terminal");
@@ -973,6 +974,7 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
     );
     context::agents::set_claude_project_agents(cfg.resolve_claude_project_agents());
     context::agents::set_claude_user_agents(cfg.resolve_claude_user_agents());
+    context::commands::set_claude_user_commands(cfg.resolve_claude_user_commands());
 
     // Headless and ACP runs never prompt: personas stay inert, so say so once.
     if !is_interactive && let Some(notice) = context::agents::untrusted_personas_notice(&workspace)
@@ -988,6 +990,7 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
     );
     context::agents::set_claude_project_agents(cfg.resolve_claude_project_agents());
     context::agents::set_claude_user_agents(cfg.resolve_claude_user_agents());
+    context::commands::set_claude_user_commands(cfg.resolve_claude_user_commands());
     provider::set_provider_timeouts(cfg.provider_timeouts);
     provider::set_cli_fallback_model(cli.fallback_model.clone());
     for warning in &cfg.load_warnings[loaded_warning_count..] {

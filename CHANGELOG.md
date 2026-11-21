@@ -20,6 +20,11 @@ Notable changes to mini-agent are documented in this file. The format follows
 - `$CLAUDE_PROJECT_DIR`/`$MINI_AGENT_PROJECT_DIR` prefixes in hook `command`/args are expanded at launch and `CLAUDE_PROJECT_DIR` is exported to hooks; a Claude-style command string with shell operators skips only that handler instead of the whole file (mini-agent-nvnkx.181).
 - `--trust-project-hooks` (env `MINI_AGENT_TRUST_PROJECT_HOOKS`) and `mini-agent hooks trust [--list|--yes]` let headless and CI runs approve project hooks; skipped bindings now raise a startup notice (mini-agent-nvnkx.179).
 - Brokered JS `writeFile`, `fetch` and `spawn` effects run PreToolUse hooks as `write`, `web_fetch` and `bash` (spawn also still as `js_spawn`), and PostToolUse/PostToolUseFailure after they settle (mini-agent-nvnkx.335).
+- Custom commands load `~/.claude/commands` (below `<config_dir>/commands`; `claude_user_commands = false` opts out) and nested namespaces up to four levels (`team/frontend/review.md` is `/team:frontend:review`); other frontmatter keys are ignored with a `/help` notice instead of rejecting the file (mini-agent-nvnkx.78, .82, .77).
+- Inline ``!`command` `` in custom commands runs in the interactive session only after the ordinary shell permission rules allow every span (deny refuses; an approval-needing span refuses and is named), through the sandboxed user-shell path, output spliced in as fenced untrusted data capped at 32 KiB; headless and ACP fail closed (mini-agent-nvnkx.144).
+- `AGENTS.md`/`CLAUDE.md` from the enclosing git repository root and the directories down to the launch directory load by default (outermost first, inert text under the context budget; `repo_root_instruction_files = false` turns it off), `/reload` re-reads instruction files, and a submit after an edit prints one notice naming the changed file (mini-agent-nvnkx.231, .219).
+- `/resume`, `/status`, `/usage`, `/agents`, `/todos` and `/plan` dispatch to their mini-agent equivalents, `/add-dir` and friends print a pointer, and an unknown command suggests the closest name; custom commands of the same name win (mini-agent-nvnkx.131).
+- `/context` reports each row as a share of the window with `Free space` and `Until auto-compaction`, falls back to the last tool-definition estimate (labelled) when the live lookup is slow, and moves calibration notes behind `/context verbose` (mini-agent-nvnkx.296).
 
 ### Fixed
 
@@ -151,6 +156,11 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Chat Completions requests send the generated `prompt_cache_key` and the global `reasoning_effort` default only to the built-in OpenAI endpoint and Azure, not to custom gateways; an explicit `null` in `extra_body` removes a generated default (mini-agent-nvnkx.33).
 - Responses requests send `store: false` by default while encrypted reasoning content is requested; `[reasoning] store = true` opts back in (mini-agent-nvnkx.204).
 - The configured `[reasoning] effort` now reaches non-Claude OpenRouter models as `reasoning.effort` (mini-agent-nvnkx.156).
+- Custom command placeholders follow the skill rules: `$ARGUMENTS[N]` works, positional `$N` is skipped in fenced code and stays literal without arguments, `$$` escapes, and arguments are appended as `ARGUMENTS: ...` when the template has no placeholder; an `@word` that names no workspace file stays literal text instead of failing the command (mini-agent-nvnkx.75, .76, .74).
+- Bundled prompts and themes copied into the user directory are refreshed silently on upgrade when never edited (install manifest with its own version marker, every launch mode), `auto_update_prompts`/`auto_update_themes = true` apply in headless and ACP runs, and the question is asked only when files really differ (mini-agent-nvnkx.343).
+- `--load-prompt` no longer inherits the default prompt's `[prompt_to_model]` route (mini-agent-nvnkx.352).
+- `/model` refuses an id missing from a known provider listing and suggests near matches (`/model --force <id>` overrides); `/provider` refuses a switch to a provider with no default model that cannot take the current id; `/prompt` restores the model and provider a routed prompt replaced when another prompt is selected or the prompt is cleared, and a failing route leaves the previous prompt active (mini-agent-nvnkx.294, .298, .292).
+- A repeated bare `/export` writes the next numbered file instead of refusing (mini-agent-nvnkx.295).
 
 ### Added
 

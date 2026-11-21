@@ -11,8 +11,35 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
         "/theme" => handle_theme(parts, ctx).await,
         "/regen-prompts" => handle_regen_prompts(ctx).await,
         "/regen-themes" => handle_regen_themes(ctx).await,
+        "/reload" => handle_reload(parts, ctx).await,
         _ => Ok(()),
     }
+}
+
+/// `/reload`: re-read the root `AGENTS.md`/`CLAUDE.md` files (and the other
+/// instruction sources captured at startup) and rebuild the agent so the next
+/// request carries them. Never automatic: it changes the cached system prefix.
+async fn handle_reload(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
+    if parts.len() > 1 {
+        write_usage(ctx.renderer, "usage: /reload");
+        return Ok(());
+    }
+    let no_context_files = ctx.cli.resolve_no_context_files(ctx.cfg);
+    ctx.context
+        .reload_instruction_files(no_context_files, ctx.workspace);
+    if *ctx.is_running {
+        // The running turn keeps its agent; the next turn builds a new one.
+        ctx.prebuild_invalidated
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        *ctx.agent = None;
+    } else {
+        ctx.rebuild_agent().await;
+    }
+    write_ok(
+        ctx.renderer,
+        "reloaded instruction files; the next request uses them (the provider prompt cache restarts)",
+    );
+    Ok(())
 }
 
 async fn handle_agent(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
@@ -78,11 +105,21 @@ async fn handle_agent(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<
     let mut rebuilt = false;
     if let Some(prompt_name) = outcome.default_prompt {
         if outcome.prompt_applied {
-            rebuilt = ctx.switch_to_prompt_model(&prompt_name).await;
-            write_ok(
-                ctx.renderer,
-                format!("active prompt: {prompt_name} (from agent '{name}')"),
-            );
+            match ctx.prepare_prompt_route(&prompt_name) {
+                Ok(prepared) => {
+                    rebuilt = ctx.apply_prompt_route(&prompt_name, prepared).await;
+                    write_ok(
+                        ctx.renderer,
+                        format!("active prompt: {prompt_name} (from agent '{name}')"),
+                    );
+                }
+                Err(error) => write_error(
+                    ctx.renderer,
+                    format!(
+                        "failed to switch provider for prompt '{prompt_name}': {error}; the persona's prompt is active on the unchanged model"
+                    ),
+                ),
+            }
         } else {
             write_error(
                 ctx.renderer,
@@ -202,9 +239,11 @@ async fn handle_prompt(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
             let routed = cleared_name
                 .as_deref()
                 .is_some_and(|name| super::mapped_prompt_route(ctx.cfg, name).is_some());
-            let mut reverted = false;
             let mut revert_failed = false;
-            if routed {
+            // A route applied during this session records what it replaced;
+            // restore that rather than re-deriving from the outgoing name.
+            let mut reverted = ctx.restore_routed_model().await;
+            if routed && !reverted {
                 let default_model = ctx.cli.resolve_model(ctx.cfg);
                 let default_provider = ctx.cli.resolve_provider(ctx.cfg);
                 let provider_changed = default_provider != ctx.session.provider;
@@ -232,6 +271,20 @@ async fn handle_prompt(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
     } else {
         let name = parts[1].trim();
         if ctx.context.prompts.contains_key(name) {
+            // Create the route's client first: on failure the previous prompt,
+            // mode and model stay exactly as they were.
+            let prepared = match ctx.prepare_prompt_route(name) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    write_error(
+                        ctx.renderer,
+                        format!(
+                            "failed to switch provider for prompt '{name}': {error}; the previous prompt, mode and model stay active"
+                        ),
+                    );
+                    return Ok(());
+                }
+            };
             write_prompt_warnings(ctx.renderer, &ctx.context.prompts[name]);
             match apply_prompt_mode(name, ctx.context, ctx.permission) {
                 PromptModeOutcome::RestoredUserMode => {
@@ -252,7 +305,7 @@ async fn handle_prompt(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
                 }
                 PromptModeOutcome::None => {}
             }
-            let model_switched = ctx.switch_to_prompt_model(name).await;
+            let model_switched = ctx.apply_prompt_route(name, prepared).await;
             if !model_switched {
                 ctx.rebuild_agent().await;
             }

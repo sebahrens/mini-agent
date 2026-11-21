@@ -33,12 +33,23 @@ pub fn ensure_global() -> anyhow::Result<()> {
     let dir = global_dir();
     if !dir.exists() {
         crate::context::copy_embedded_to(&EMBEDDED, &dir)?;
+        crate::context::record_embedded_install(&EMBEDDED, &dir)?;
+        return Ok(());
+    }
+    // Replace copies the user never edited with the running version's text,
+    // in every launch mode and independently of the docs version marker.
+    let report = crate::context::sync_embedded_to(&EMBEDDED, &dir)?;
+    if !report.refreshed.is_empty() {
+        tracing::info!(files = ?report.refreshed, "refreshed unedited bundled files");
     }
     Ok(())
 }
 
 pub(crate) fn regen() -> anyhow::Result<crate::context::RegenReport> {
-    crate::context::regen_embedded_to(&EMBEDDED, &global_dir())
+    let dir = global_dir();
+    let report = crate::context::regen_embedded_to(&EMBEDDED, &dir)?;
+    crate::context::record_embedded_install(&EMBEDDED, &dir)?;
+    Ok(report)
 }
 
 /// (embedded file count, user-edited file names) for the global directory.

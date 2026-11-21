@@ -194,6 +194,23 @@ impl InstructionRoot {
         self
     }
 
+    /// The file's current `(path, mtime, len)` when it no longer matches what
+    /// was captured (edited, replaced or removed); `None` when unchanged or
+    /// when no identity was captured. Costs one `stat`.
+    pub(crate) fn changed_on_disk(&self) -> Option<(PathBuf, Option<std::time::SystemTime>, u64)> {
+        let captured = self.identity.as_ref()?;
+        let base = match &self.origin {
+            RootOrigin::Workspace { root, .. } => root.as_path(),
+            RootOrigin::Global(binding) => binding.root(),
+        };
+        let full = base.join(&self.path);
+        let was = (captured.modified().ok(), captured.len());
+        let now = std::fs::metadata(&full)
+            .map(|meta| (meta.modified().ok(), meta.len()))
+            .unwrap_or((None, 0));
+        (now != was).then_some((full, now.0, now.1))
+    }
+
     pub(super) fn with_identity(mut self, identity: crate::fs::CheckedMetadata) -> Self {
         self.identity = Some(identity);
         self

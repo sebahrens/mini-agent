@@ -215,8 +215,10 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     key("context_files_max_bytes").described("Combined byte budget for root context files (AGENTS.md, CLAUDE.md, ARCHITECTURE.md). Default: the model's context window in tokens, clamped to 16384..524288.").shaped(ConfigShape::Integer),
     key("compact_restore_read_tokens").described("Token budget for re-attaching the newest file windows (up to 5) read before a compaction. Default: window/20 capped at 25000; 0 disables.").shaped(ConfigShape::Integer),
     key("tool_result_spill_tail_chars").described("Characters kept from the end of a spilled tool result. Default: threshold*2/3.").shaped(ConfigShape::Integer),
+    key("repo_root_instruction_files").described("Also read AGENTS.md and CLAUDE.md from the enclosing git repository root and the directories down to the launch directory (outermost first, as inert text under the context-file budget). Executable project assets (.mcp.json, hooks, config, agents, skills) are never read from ancestors. Default: true; false reads only the launch directory.").shaped(ConfigShape::Bool),
     key("claude_project_agents").shaped(ConfigShape::Bool),
     key("claude_user_agents").shaped(ConfigShape::Bool),
+    key("claude_user_commands").described("Read the user's ~/.claude/commands/*.md as custom slash commands, below mini-agent's own commands directory in priority. Default: true; false opts out. Restart required.").shaped(ConfigShape::Bool),
     key("mid_turn_compact_threshold").described("Mid-turn compaction threshold, as a fraction of the context window (0.0–1.0) of real provider prompt pressure. Default 0.9; 0 disables.").shaped(ConfigShape::Number),
     key("compact_size_fraction").described("Fraction (0.0–1.0) of the 32 MiB persisted-session ceiling at which automatic compaction starts, so image-heavy sessions compact before saving stops. Default 0.75; 0 disables.").shaped(ConfigShape::Number),
     key("always_show_welcome").shaped(ConfigShape::Bool),
@@ -620,7 +622,7 @@ fn normalize(spelling: &str) -> String {
 }
 
 /// Levenshtein distance over chars.
-fn edit_distance(a: &str, b: &str) -> usize {
+pub(crate) fn edit_distance(a: &str, b: &str) -> usize {
     let b: Vec<char> = b.chars().collect();
     let mut previous: Vec<usize> = (0..=b.len()).collect();
     let mut current = vec![0; b.len() + 1];

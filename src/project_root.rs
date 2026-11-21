@@ -58,6 +58,12 @@ pub(crate) fn enclosing_git_root(start: &Path, home: Option<&Path>) -> Option<Pa
 pub(crate) fn assets_at(root: &Path) -> Vec<&'static str> {
     ASSETS
         .iter()
+        .filter(|(label, _)| {
+            // Instruction files are read from the repository root anyway
+            // while `repo_root_instruction_files` is on.
+            !(crate::context::repo_root_instruction_files_enabled()
+                && matches!(*label, "AGENTS.md" | "CLAUDE.md"))
+        })
         .filter(|(_, relative)| std::fs::symlink_metadata(root.join(relative)).is_ok())
         .map(|(label, _)| *label)
         .collect()
@@ -186,15 +192,12 @@ mod tests {
     fn skipped_assets_are_named_and_a_bare_repository_is_quiet() {
         let (_dir, root, sub) = repo();
         let notice = skipped_assets_notice(&sub, None).unwrap();
-        for name in [
-            ".mcp.json",
-            "AGENTS.md",
-            ".claude/skills",
-            "project_root_discovery",
-        ] {
+        for name in [".mcp.json", ".claude/skills", "project_root_discovery"] {
             assert!(notice.contains(name), "{name}: {notice}");
         }
-        assert!(!notice.contains("CLAUDE.md"));
+        // The root's instruction files are read anyway, so they are not
+        // listed as skipped.
+        assert!(!notice.contains("AGENTS.md") && !notice.contains("CLAUDE.md"));
         assert!(skipped_assets_notice(&root, None).is_none());
         std::fs::remove_file(root.join(".mcp.json")).unwrap();
         std::fs::remove_file(root.join("AGENTS.md")).unwrap();

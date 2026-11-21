@@ -50,6 +50,7 @@ const BASE_COMMANDS: &[&str] = &[
     "/reasoning",
     "/redo",
     "/regen-prompts",
+    "/reload",
     "/regen-themes",
     "/rename",
     "/retry",
@@ -102,6 +103,11 @@ pub(crate) fn available_commands() -> Vec<&'static str> {
 /// The sorted command list and its lowercase forms, built once per process:
 /// the slash picker opens on every `/` and borrows these instead of
 /// rebuilding and re-sorting the list.
+/// The built-in command names completion offers, for "did you mean" hints.
+pub(crate) fn suggestion_candidates() -> &'static [&'static str] {
+    &static_commands().0
+}
+
 fn static_commands() -> &'static (Vec<&'static str>, Vec<String>) {
     static COMMANDS: OnceLock<(Vec<&'static str>, Vec<String>)> = OnceLock::new();
     COMMANDS.get_or_init(|| {
