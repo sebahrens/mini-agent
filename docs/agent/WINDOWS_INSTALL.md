@@ -24,6 +24,10 @@ installation source for mini-agent.
 4. Open the verified MSI. The default installation is per-user, requires no administrator rights,
    installs `mini-agent.exe`, and attempts to install its bundled VSIX when VS Code is present.
 5. Open a new PowerShell window and run `mini-agent --version` and `mini-agent --js-runtime-check`.
+   The installer adds its install directory to `PATH` (the user `PATH` for a per-user install, the
+   system `PATH` for `ALLUSERS=1`) and removes the entry on uninstall. A window that was already open
+   keeps its old `PATH`; if `mini-agent` is still not recognised in a new window, see
+   [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
 For managed deployment, an administrator can use:
 

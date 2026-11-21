@@ -787,6 +787,16 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "installed MSI binary failed its startup/configuration smoke"
           }
+          # PATH smoke: bare-name resolution from the persisted user PATH, as a new shell sees it.
+          $installDir = Split-Path $installed
+          $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+          if (-not (($userPath -split ';') -contains $installDir)) {
+            throw "PATH smoke: bare-name resolution failed, user PATH lacks $installDir"
+          }
+          $fresh = (& pwsh -NoProfile -Command "`$env:Path = [Environment]::GetEnvironmentVariable('Path','User') + ';' + [Environment]::GetEnvironmentVariable('Path','Machine'); (Get-Command mini-agent.exe -ErrorAction Stop).Source")
+          if ($LASTEXITCODE -ne 0 -or $fresh -ne $installed) {
+            throw "PATH smoke: bare-name resolution returned '$fresh', expected $installed"
+          }
           $uninstallResult = Start-Process msiexec.exe `
             -ArgumentList "/x `"$msi`" /quiet /norestart" `
             -Wait -PassThru
@@ -794,6 +804,10 @@ jobs:
             throw "MSI uninstall failed with exit code $($uninstallResult.ExitCode)"
           }
           if (Test-Path $installed) { throw "MSI uninstall left the installed binary behind" }
+          $userPathAfter = [Environment]::GetEnvironmentVariable('Path', 'User')
+          if (($userPathAfter -split ';') -contains $installDir) {
+            throw "PATH smoke: uninstall removed the entry check failed, user PATH still has $installDir"
+          }
 
       - name: Generate MSI checksum
         shell: pwsh

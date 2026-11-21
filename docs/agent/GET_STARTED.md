@@ -21,6 +21,10 @@ readonly BTW and Task agents. See [context limits and review](CONFIG.md)
 for details. A mutation denied pending instruction review has made no change;
 the agent must receive and review the native notice before deliberately retrying.
 
+Related guides: [coming from Claude Code, Codex or opencode](MIGRATING.md), [editor setup for Zed,
+JetBrains and Neovim](EDITORS.md), [running mini-agent in CI](CI.md), and
+[troubleshooting and error messages](TROUBLESHOOTING.md).
+
 ## 1. Installation
 
 You can build from source or use the shell installer. The shell installer requires a
@@ -106,6 +110,10 @@ mini-agent --completions powershell > "$HOME/mini-agent-completions.ps1"
 
 The repository retains a Homebrew formula for package-channel compatibility, but no canonical
 `sebahrens` tap is published yet, so this guide does not advertise a tap command that cannot work.
+It also holds winget, scoop and npm manifest templates (`packaging/`), rendered from a release's
+checksums by `scripts/render_package_manifests.py`; none is published, so `winget install`,
+`scoop install` and `npm i -g` are not install paths yet. Maintainers: see
+[PUBLISHING_RELEASES.md](PUBLISHING_RELEASES.md#publishing-to-winget-scoop-and-npm).
 
 ### Linux prerequisites
 

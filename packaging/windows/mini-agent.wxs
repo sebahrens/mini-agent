@@ -40,11 +40,21 @@
         <Component Id="ThirdPartyLicensesComponent" Guid="*" Bitness="always64">
           <File Id="ThirdPartyLicenses" Source="$(var.ThirdPartyLicensesPath)" Name="THIRD_PARTY_LICENSES.txt" />
         </Component>
+        <Component Id="PathUserComponent" Guid="*" Bitness="always64" Condition="NOT ALLUSERS = 1">
+          <RegistryValue Root="HKCU" Key="Software\mini-agent" Name="PathEntry" Type="integer" Value="1" KeyPath="yes" />
+          <Environment Id="PathUser" Name="PATH" Value="[INSTALLFOLDER]" Part="last" Action="set" Permanent="no" System="no" />
+        </Component>
+        <Component Id="PathMachineComponent" Guid="*" Bitness="always64" Condition="ALLUSERS = 1">
+          <RegistryValue Root="HKLM" Key="Software\mini-agent" Name="PathEntry" Type="integer" Value="1" KeyPath="yes" />
+          <Environment Id="PathMachine" Name="PATH" Value="[INSTALLFOLDER]" Part="last" Action="set" Permanent="no" System="yes" />
+        </Component>
       </Directory>
     </StandardDirectory>
 
     <Feature Id="Complete" Title="mini-agent" Level="1">
       <ComponentRef Id="MiniAgentExeComponent" />
+      <ComponentRef Id="PathUserComponent" />
+      <ComponentRef Id="PathMachineComponent" />
       <ComponentRef Id="MiniAgentVsixComponent" />
       <ComponentRef Id="InstallVsCodeExtensionScriptComponent" />
       <ComponentRef Id="LicenseTextComponent" />

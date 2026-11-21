@@ -141,8 +141,8 @@ sandbox tests.
 
 ## Supported distribution surfaces
 
-Supported package channels are source/Cargo, AUR, Conda, and Homebrew. Their status is
-deliberately explicit:
+Supported package channels are source/Cargo, AUR, Conda, and Homebrew. winget, scoop and npm have
+in-repo manifests and templates but no published package. Their status is deliberately explicit:
 
 | Surface | Support status |
 |---|---|
@@ -152,6 +152,7 @@ deliberately explicit:
 | Native VS Code VSIX | Supported local-install candidates for five release targets; Marketplace/Open VSX publication remains a separate deferred step. |
 | AUR and Conda | Repository-maintained recipes; publication remains the manual downstream step described below. |
 | Homebrew | Compatibility formula retained, but no end-user install command is supported until a canonical tap exists and its archive smoke passes. |
+| winget, scoop, npm | Templates under `packaging/winget`, `packaging/scoop` and `packaging/npm`, rendered by `scripts/render_package_manifests.py`. Nothing is published; see "Publishing to winget, scoop and npm" below. |
 
 ### Node `url.parse` deprecation warning
 
@@ -536,6 +537,50 @@ After `post-release`, commit the checksum updates and publish manually:
 
 Do not publish Homebrew install instructions until a canonical `sebahrens` tap exists and the
 formula has passed its archive smoke there.
+
+### Publishing to winget, scoop and npm
+
+Every manifest is rendered from the published release's own checksum manifests, so a digest can
+never be copied from an older release by hand. `scripts/render_package_manifests.py` refuses a missing,
+duplicated or malformed digest, a version that is not a release version, and any placeholder left
+unfilled; `scripts/tests/test_render_package_manifests.py` pins that. Run these after `just post-release`
+(or against any published release) with the release's `SHA256SUMS` and `MSI_SHA256SUMS` downloaded:
+
+```bash
+python3 scripts/render_package_manifests.py winget --version X.Y.Z --msi-sums MSI_SHA256SUMS --out out/winget
+python3 scripts/render_package_manifests.py scoop  --version X.Y.Z --sums SHA256SUMS --out out/scoop
+python3 scripts/render_package_manifests.py npm    --version X.Y.Z --sums SHA256SUMS --archives archives --out out/npm
+```
+
+`--archives` is a directory holding the release's `mini-agent-<target>.tar.gz` files; the npm renderer
+checks each against `SHA256SUMS` before it extracts the binary into the platform package.
+
+| Channel | Publish by hand (none of this is done by CI) |
+| --- | --- |
+| winget | Fork `microsoft/winget-pkgs`, copy the three rendered `sebahrens.MiniAgent*.yaml` files to `manifests/s/sebahrens/MiniAgent/X.Y.Z/`, validate with `winget validate`, and open a pull request. The installer is the verified MSI; it is unsigned, so expect SmartScreen reputation findings in the review. |
+| scoop | Put the rendered `mini-agent.json` in a bucket repository's `bucket/` folder (your own bucket, or a pull request to an existing one). `checkver` and `autoupdate` are already in the template. |
+| npm | Own the `@sebahrens` scope, then publish the five platform packages first and the wrapper last, each from its rendered directory with `npm publish --access public --provenance` (provenance needs a GitHub Actions publisher). The wrapper pins every platform package to the exact release version and has no `postinstall` script, so no byte is downloaded at install time and the archives' `SHA256SUMS` and attestation still cover what runs. |
+
+After publishing, run a smoke on each channel on a clean machine (`brew install`, `npm i -g
+@sebahrens/mini-agent`, `scoop install mini-agent`, `winget install sebahrens.MiniAgent`) and check
+`mini-agent --version`, then update the install section of GET_STARTED.md. The self-update notice
+classifies npm installs (any path under `node_modules`) and Windows installs as package-managed and
+prints their own upgrade instruction; add an explicit scoop and winget case in `src/self_update.rs`
+when the packages exist.
+
+### ACP agent registry submission (manual)
+
+`docs/acp-registry.json` is the repository's capability summary. Listing mini-agent in a public ACP
+agent registry publishes to a third party, so it is a manual release step and is not automated:
+
+1. After the release is public, confirm `docs/acp-registry.json` has the release version and that
+   `scripts/ci/acp_smoke.py --binary <release binary>` passes for every client in `docs/agent/EDITORS.md`.
+2. Read the registry's current submission rules (its repository README or contribution guide); each
+   registry defines its own entry format, so translate the summary rather than copying the file.
+3. The entry needs a stable launch contract: executable `mini-agent`, arguments `--acp`, and a download
+   source for the verified release archive per platform (the archive names and `SHA256SUMS` above).
+4. Open the pull request, then record the listing and the editor versions you confirmed in
+   EDITORS.md ("Confirmed with" lines).
 
 ## Standalone commands
 

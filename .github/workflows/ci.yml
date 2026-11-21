@@ -162,6 +162,11 @@ jobs:
       - name: Test VS Code CI policy
         run: python3 -m unittest scripts.tests.test_vscode_ci_workflow
 
+      - name: Test documentation site, guides and package manifests
+        run: >-
+          python3 -m unittest scripts.tests.test_build_docs_site
+          scripts.tests.test_ci_docs_guides scripts.tests.test_render_package_manifests
+
       - name: Test CI documentation-only filter
         run: >-
           python3 -m unittest scripts.tests.test_ci_docs_filter

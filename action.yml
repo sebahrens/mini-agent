@@ -1,0 +1,174 @@
+name: mini-agent
+description: Install a pinned, attested mini-agent release and run one headless prompt (`mini-agent -p --output json`).
+author: mini-agent contributors
+branding:
+  icon: terminal
+  color: green
+
+inputs:
+  prompt:
+    description: The prompt to run. Passed as one argument, never interpolated into a shell command.
+    required: true
+  version:
+    description: Release to install (for example `1.12.0`). Empty installs the latest release, which is not reproducible; pin it in real workflows.
+    required: false
+    default: ''
+  binary:
+    description: Path to an existing mini-agent executable. When set, nothing is downloaded and `version` is ignored (used by this repository's self-test).
+    required: false
+    default: ''
+  install-dir:
+    description: Directory the release binary is installed into. Defaults to a directory under RUNNER_TEMP.
+    required: false
+    default: ''
+  provider:
+    description: Value for `--provider`. Empty uses the configuration default.
+    required: false
+    default: ''
+  model:
+    description: Value for `--model`. Empty uses the configuration default.
+    required: false
+    default: ''
+  permission-mode:
+    description: One of standard, restrictive, readonly, guarded, yolo. `readonly` is the safe default for untrusted pull request content. In `-p` runs an operation that would need approval is refused, not asked.
+    required: false
+    default: readonly
+  allow:
+    description: Newline-separated `TOOL:PATTERN` rules passed as repeated `--allow`.
+    required: false
+    default: ''
+  deny:
+    description: Newline-separated `TOOL:PATTERN` rules passed as repeated `--deny`. Deny rules win in every mode.
+    required: false
+    default: ''
+  max-budget-usd:
+    description: Value for `--max-budget-usd`. Empty means no cap; always set one in CI.
+    required: false
+    default: ''
+  max-turns:
+    description: Value for `--max-agent-turns`. Empty keeps the default (1000).
+    required: false
+    default: ''
+  working-directory:
+    description: Directory to run in (the repository checkout by default).
+    required: false
+    default: '.'
+  extra-args:
+    description: Extra mini-agent arguments, one per line (no shell quoting is applied).
+    required: false
+    default: ''
+  fail-on-error:
+    description: Fail the step when mini-agent exits nonzero or reports `is_error`. Set to `false` to inspect the outputs yourself.
+    required: false
+    default: 'true'
+  github-token:
+    description: Token the installer hands to `gh attestation verify`. Needs no scopes beyond public read.
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  result:
+    description: The turn's final answer (`result` from the JSON record). Truncated to 60000 characters; the full text is in `result-file`.
+    value: ${{ steps.run.outputs.result }}
+  result-file:
+    description: Path of a file holding the full JSON result record.
+    value: ${{ steps.run.outputs.result-file }}
+  session-id:
+    description: Saved session id (`session_id`).
+    value: ${{ steps.run.outputs.session-id }}
+  cost:
+    description: Estimated spend in USD (`total_cost_usd`).
+    value: ${{ steps.run.outputs.cost }}
+  exit-code:
+    description: Exit code of mini-agent (0 success, 1 runtime failure, 2 usage error, 3 turn cap, 4 budget; see GET_STARTED.md).
+    value: ${{ steps.run.outputs.exit-code }}
+  is-error:
+    description: '`true` when the JSON record reports `is_error`.'
+    value: ${{ steps.run.outputs.is-error }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install mini-agent
+      id: install
+      shell: bash
+      env:
+        MA_VERSION: ${{ inputs.version }}
+        MA_BINARY: ${{ inputs.binary }}
+        MA_INSTALL_DIR: ${{ inputs.install-dir }}
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+        if [ -n "$MA_BINARY" ]; then
+          [ -x "$MA_BINARY" ] || { echo "binary input is not an executable file: $MA_BINARY" >&2; exit 2; }
+          echo "bin=$(cd "$(dirname "$MA_BINARY")" && pwd)/$(basename "$MA_BINARY")" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        dir="${MA_INSTALL_DIR:-$RUNNER_TEMP/mini-agent-bin}"
+        # The installer ships with the action, so its version is the action's ref.
+        # It verifies the archive against the release SHA256SUMS and, with GH_TOKEN
+        # set, runs `gh attestation verify` and aborts if provenance does not match.
+        args=(--dir "$dir")
+        [ -z "$MA_VERSION" ] || args+=(--release "$MA_VERSION")
+        bash "$GITHUB_ACTION_PATH/install.sh" "${args[@]}"
+        echo "bin=$dir/mini-agent" >> "$GITHUB_OUTPUT"
+
+    - name: Run mini-agent
+      id: run
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        MA_BIN: ${{ steps.install.outputs.bin }}
+        MA_PROMPT: ${{ inputs.prompt }}
+        MA_PROVIDER: ${{ inputs.provider }}
+        MA_MODEL: ${{ inputs.model }}
+        MA_MODE: ${{ inputs.permission-mode }}
+        MA_ALLOW: ${{ inputs.allow }}
+        MA_DENY: ${{ inputs.deny }}
+        MA_BUDGET: ${{ inputs.max-budget-usd }}
+        MA_TURNS: ${{ inputs.max-turns }}
+        MA_EXTRA: ${{ inputs.extra-args }}
+        MA_FAIL: ${{ inputs.fail-on-error }}
+      run: |
+        set -uo pipefail
+        out="$RUNNER_TEMP/mini-agent-result.json"
+        err="$RUNNER_TEMP/mini-agent-stderr.log"
+        args=(-p --output json --permission-mode "$MA_MODE")
+        [ -z "$MA_PROVIDER" ] || args+=(--provider "$MA_PROVIDER")
+        [ -z "$MA_MODEL" ] || args+=(--model "$MA_MODEL")
+        [ -z "$MA_BUDGET" ] || args+=(--max-budget-usd "$MA_BUDGET")
+        [ -z "$MA_TURNS" ] || args+=(--max-agent-turns "$MA_TURNS")
+        while IFS= read -r line; do [ -z "$line" ] || args+=(--allow "$line"); done <<< "$MA_ALLOW"
+        while IFS= read -r line; do [ -z "$line" ] || args+=(--deny "$line"); done <<< "$MA_DENY"
+        while IFS= read -r line; do [ -z "$line" ] || args+=("$line"); done <<< "$MA_EXTRA"
+        # Close stdin: with an explicit prompt and a silent pipe the run would wait for it.
+        "$MA_BIN" "${args[@]}" -- "$MA_PROMPT" < /dev/null > "$out" 2> "$err"
+        code=$?
+        cat "$err" >&2
+        {
+          echo "exit-code=$code"
+          echo "result-file=$out"
+        } >> "$GITHUB_OUTPUT"
+        if command -v jq >/dev/null 2>&1 && jq -e . "$out" >/dev/null 2>&1; then
+          delim="MA_EOF_$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+          result="$(jq -r '.result // ""' "$out" | head -c 60000)"
+          {
+            echo "result<<$delim"
+            printf '%s\n' "$result"
+            echo "$delim"
+            echo "session-id=$(jq -r '.session_id // ""' "$out")"
+            echo "cost=$(jq -r '.total_cost_usd // .cost // 0' "$out")"
+            echo "is-error=$(jq -r '.is_error // false' "$out")"
+          } >> "$GITHUB_OUTPUT"
+          is_error="$(jq -r '.is_error // false' "$out")"
+        else
+          echo "mini-agent did not print one JSON record; stdout follows" >&2
+          cat "$out" >&2
+          echo "is-error=true" >> "$GITHUB_OUTPUT"
+          is_error=true
+        fi
+        if [ "$MA_FAIL" = "true" ] && { [ "$code" -ne 0 ] || [ "$is_error" = "true" ]; }; then
+          echo "mini-agent failed (exit $code, is_error=$is_error)" >&2
+          exit 1
+        fi
+        exit 0

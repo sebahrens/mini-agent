@@ -102,6 +102,12 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Global-only `sandbox-network-private-hosts` lets exact listed intranet hosts resolve to RFC 1918 addresses (loopback, link-local and metadata stay refused) and global-only `sandbox-network-upstream-proxy` chains the allowlist proxy through a corporate HTTP proxy with `CONNECT` after its own decision (mini-agent-nvnkx.187).
 - `/permissions session` lists the running session's grants in plain words and `/permissions revoke <n|all>` removes them (checker rebuilt, session saved); `/permissions rules` also shows configured rules and built-ins, and `forget` now applies to the running session (mini-agent-nvnkx.67).
 - The approval prompt offers `(r)` (prefix) and `(d)` (folder) project-scoped variants of `(x)` and `(f)` under `persist_project_approvals`; project approvals live in their own checker list that `/resume` no longer clears (mini-agent-nvnkx.68).
+- `docs/agent/MIGRATING.md`: coming from Claude Code, Codex or opencode, listing which files are read as-is, which need an opt-in key or flag, and what has no equivalent (mini-agent-nvnkx.128).
+- The published docs site has a sidebar from `docs/agent/manifest.txt`, client-side search over a build-time JSON index, a config-key reference generated from `src/config/keys.rs`, `docs/vscode-acp-setup.md`, repository links rewritten to GitHub, and a build that fails on a missing manifest file, an unlisted page, an uncovered key or a dead link; `docs/agent/TROUBLESHOOTING.md` lists each error message with its fix (mini-agent-nvnkx.135).
+- `docs/agent/EDITORS.md`: ACP configuration for Zed, JetBrains and Neovim with a capability table and limits, `scripts/ci/acp_smoke.py` drives `mini-agent --acp` with each documented argv against an offline stub provider, and PUBLISHING_RELEASES.md documents the manual ACP registry submission (mini-agent-nvnkx.136).
+- Root `action.yml` (composite GitHub Action: attested release install, `mini-agent -p --output json`, outputs `result`, `session-id`, `cost`, `exit-code`), example PR-review and @mention workflows in `examples/ci/`, `docs/agent/CI.md` with a GitLab recipe and untrusted-content defaults, and an offline self-test workflow (mini-agent-nvnkx.104).
+- `docs/agent/PARITY.md`: the feature parity matrix, refreshed against the current code (mini-agent-nvnkx.146).
+- winget, scoop and npm manifest templates under `packaging/` with `scripts/render_package_manifests.py`, which fills them from a release's checksum manifests and fails closed on a missing, duplicate or malformed digest; publishing steps are documented, nothing is published (mini-agent-nvnkx.127).
 
 ### Fixed
 
@@ -352,6 +358,8 @@ Notable changes to mini-agent are documented in this file. The format follows
 - A `SubagentStop` hook's continuation sends only the hook's reason when the child's history already ends with its answer, instead of the answer a second time as a user turn (mini-agent-nvnkx.342)
 - The goal judge's last unquoted `VERDICT:` line decides: quoted transcript text and tentative earlier lines no longer complete or fail a goal (mini-agent-nvnkx.341)
 - A resumed session is told once that background shell jobs and tasks started by the previous process are gone (mini-agent-nvnkx.270)
+- Fixed: a headless run no longer panics with "JoinHandle polled after completion" when the OpenRouter pricing refresh finishes inside its wait (`finish_within` awaited the finished handle a second time).
+- Fixed: the Windows MSI adds its install directory to `PATH` (user `PATH` per-user, system `PATH` for `ALLUSERS=1`, removed on uninstall), so the install guide's `mini-agent --version` step works in a new shell; the release smoke resolves `mini-agent.exe` by bare name and checks the entry is removed (mini-agent-nvnkx.301).
 
 ### Added
 
