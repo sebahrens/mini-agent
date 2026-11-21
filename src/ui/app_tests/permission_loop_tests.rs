@@ -2144,3 +2144,116 @@ async fn per_event_future_sizes_are_visible() {
     );
     assert!(batch_size > 0 && plan_size > 0 && standard_size > 0 && key_size > 0);
 }
+
+#[cfg(feature = "multimodal")]
+#[tokio::test]
+async fn nvnkx255_ctrl_v_without_an_image_pastes_text_or_says_nothing_to_paste() {
+    use super::super::clipboard_image::{ClipboardImage, ClipboardImageReader};
+    struct NoImage;
+    impl ClipboardImageReader for NoImage {
+        fn read<'a>(
+            &'a self,
+            _sandbox: &'a crate::sandbox::Sandbox,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = io::Result<Option<ClipboardImage>>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(None) })
+        }
+    }
+    let root = crate::tests::OwnedTestDirectory::new("nvnkx255-app");
+    let _environment = environment(&root);
+    let cli = crate::cli::Cli {
+        no_session: true,
+        no_tools: true,
+        no_sandbox: true,
+        ..Default::default()
+    };
+    let cfg = fixture_config();
+    let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+    let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+    let mut session = Session::new("permission-fixture", "test-model", 128_000, "");
+    let mut app = fixture_app(fixture_ui(
+        &cli,
+        &cfg,
+        &mut session,
+        &mut context,
+        workspace,
+    ));
+    // Text on the clipboard is pasted into the draft.
+    crate::startup::heap_future(|| {
+        app.paste_clipboard_key(&NoImage, || async { Ok("hello".to_owned()) })
+    })
+    .await
+    .unwrap();
+    assert_eq!(app.input.buffer, "hello");
+    assert!(app.ui.session.pending_media.is_empty());
+    // An empty clipboard is a notice, not an error line.
+    crate::startup::heap_future(|| {
+        app.paste_clipboard_key(&NoImage, || async { Ok(String::new()) })
+    })
+    .await
+    .unwrap();
+    assert_eq!(app.input.buffer, "hello");
+    app.refresh().unwrap();
+    let shown = app.renderer.captured_output();
+    assert!(shown.contains("nothing to paste"), "{shown}");
+    assert!(!shown.contains("unavailable on this platform"));
+}
+
+#[cfg(feature = "multimodal")]
+#[tokio::test]
+async fn nvnkx256_pasted_image_path_attaches_the_image_and_other_pastes_stay_text() {
+    use super::super::clipboard_image;
+    let root = crate::tests::OwnedTestDirectory::new("nvnkx256-app");
+    let outside = crate::tests::OwnedTestDirectory::new("nvnkx256-outside");
+    let _environment = environment(&root);
+    let cli = crate::cli::Cli {
+        no_session: true,
+        no_tools: true,
+        no_sandbox: true,
+        ..Default::default()
+    };
+    let cfg = fixture_config();
+    let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+    let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+    let mut session = Session::new("permission-fixture", "test-model", 128_000, "");
+    let mut app = fixture_app(fixture_ui(
+        &cli,
+        &cfg,
+        &mut session,
+        &mut context,
+        workspace,
+    ));
+    let png = root.path().join("shot.png");
+    std::fs::write(&png, clipboard_image::tests::png()).unwrap();
+    std::fs::write(root.path().join("main.rs"), "fn main() {}").unwrap();
+    std::fs::write(outside.path().join("far.png"), clipboard_image::tests::png()).unwrap();
+
+    macro_rules! paste {
+        ($app:expr, $text:expr) => {
+            drop(
+                crate::startup::heap_future(|| $app.handle_user_event(UserEvent::Paste($text)))
+                    .await
+                    .unwrap(),
+            )
+        };
+    }
+    // The workspace image attaches and nothing reaches the draft.
+    paste!(app, format!("{} ", png.display()));
+    assert_eq!(app.ui.session.pending_media.len(), 1);
+    assert!(app.input.buffer.is_empty());
+    // A source file, a multi-line paste and an image outside the allowed
+    // roots stay text.
+    let source = root.path().join("main.rs").display().to_string();
+    paste!(app, source.clone());
+    assert_eq!(app.input.buffer, source.as_str());
+    app.input.clear_buffer();
+    paste!(app, format!("{}\nsecond", png.display()));
+    assert_eq!(app.ui.session.pending_media.len(), 1);
+    assert!(app.input.buffer.contains("second"));
+    app.input.clear_buffer();
+    let far = outside.path().join("far.png").display().to_string();
+    paste!(app, far.clone());
+    assert_eq!(app.ui.session.pending_media.len(), 1);
+    assert_eq!(app.input.buffer, far.as_str());
+}

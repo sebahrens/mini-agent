@@ -21,7 +21,7 @@ pub(crate) struct QuestionState {
     draft: String,
     text_mode: bool,
     was_at_bottom: bool,
-    /// When the overlay opened; answer keys are ignored briefly after this.
+    /// When the overlay opened or last discarded a key (quiet period).
     opened: std::time::Instant,
 }
 impl Drop for QuestionState {
@@ -144,9 +144,10 @@ impl QuestionState {
             self.show(renderer)?;
             return Ok(QuestionEvent::Waiting);
         }
-        if super::permission_handler::premature_prompt_key(
+        if super::permission_handler::prompt_key_premature(
+            &mut self.opened,
             event,
-            self.opened.elapsed(),
+            std::time::Instant::now(),
             super::permission_handler::prompt_arming_delay(),
         ) {
             return Ok(QuestionEvent::Waiting);

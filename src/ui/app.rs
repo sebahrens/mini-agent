@@ -2104,6 +2104,82 @@ impl<'a> App<'a> {
         }
     }
 
+    /// A pasted (or dragged-in) path to an image file attaches the image, as
+    /// `/add <path>` would, instead of putting the path in the prompt.
+    /// Returns whether it did; any doubt (not a single image path, not
+    /// readable under the permission policy, text-only model, load failure)
+    /// leaves the paste as ordinary text.
+    #[cfg(feature = "multimodal")]
+    async fn paste_image_path(&mut self, data: &str) -> anyhow::Result<bool> {
+        if !self.clipboard_image_allowed() {
+            return Ok(false);
+        }
+        let Some(raw) = super::clipboard_image::pasted_image_path(data) else {
+            return Ok(false);
+        };
+        let expanded = crate::fs::expand_tilde(&raw);
+        let path = crate::ui::slash::add::resolve_path(self.ui.workspace.root(), &expanded);
+        let Ok(canonical) = path.canonicalize() else {
+            return Ok(false);
+        };
+        if !canonical.is_file() || !self.pasted_path_readable(&canonical) {
+            return Ok(false);
+        }
+        if crate::extras::multimodal::ensure_vision(
+            &self.ui.session.provider,
+            &self.ui.session.model,
+        )
+        .is_err()
+        {
+            return Ok(false);
+        }
+        let session_id = self.ui.session.id.clone();
+        let workspace = self.ui.workspace.clone();
+        let loaded = crate::agent::runner::spawn_blocking_scoped(move || {
+            let mut attachment = crate::extras::multimodal::load_attachment(&canonical)
+                .map_err(|error| error.to_string())?;
+            crate::extras::multimodal::fit_image_attachment(&mut attachment)
+                .map(|_| attachment)
+        })
+        .await
+        .unwrap_or_else(|_| Err("image load job failed".to_owned()));
+        if self.ui.session.id != session_id
+            || !Arc::ptr_eq(&workspace, &self.ui.workspace)
+            || !self.clipboard_image_allowed()
+        {
+            return Ok(false);
+        }
+        match loaded {
+            Ok(attachment @ crate::extras::multimodal::MediaAttachment::Image { .. }) => {
+                self.ui.session.pending_media.push(attachment);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Whether the permission policy lets the session read `path`; without a
+    /// policy, only files inside the workspace qualify.
+    #[cfg(feature = "multimodal")]
+    fn pasted_path_readable(&self, path: &std::path::Path) -> bool {
+        use crate::permission::checker::CheckResult;
+        match &self.ui.permission {
+            Some(permission) => matches!(
+                permission
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .check_path("read", &path.to_string_lossy()),
+                CheckResult::Allowed | CheckResult::AllowedWithCoaching(_)
+            ),
+            None => self
+                .ui
+                .workspace
+                .root()
+                .canonicalize()
+                .is_ok_and(|root| path.starts_with(root)),
+        }
+    }
+
     #[cfg(feature = "multimodal")]
     fn clipboard_image_allowed(&self) -> bool {
         !self.run.is_running
@@ -2113,6 +2189,35 @@ impl<'a> App<'a> {
             && self.renderer.chain_prompt.is_none()
             && !self.renderer.chain_but_mode
             && !self.input.picker.as_ref().is_some_and(Picker::active)
+    }
+
+    /// Ctrl+V: attach a clipboard image when there is one, else paste the
+    /// clipboard's text. With neither, say so; a missing image is not an
+    /// error.
+    async fn paste_clipboard_key<Fut>(
+        &mut self,
+        #[cfg(feature = "multimodal")] images: &dyn super::clipboard_image::ClipboardImageReader,
+        read_text: impl FnOnce() -> Fut,
+    ) -> anyhow::Result<()>
+    where
+        Fut: std::future::Future<Output = anyhow::Result<String>>,
+    {
+        #[cfg(feature = "multimodal")]
+        if self.clipboard_image_allowed() && self.paste_clipboard_image(images).await? {
+            return Ok(());
+        }
+        match read_text().await {
+            Ok(text) if text.is_empty() => {
+                self.renderer
+                    .show_notice("nothing to paste: the clipboard has no image or text", C_TOOL);
+            }
+            Ok(text) => self.input.handle_paste(text),
+            Err(error) => self.renderer.write_line(
+                &format!("paste from clipboard failed: {error}"),
+                C_ERROR,
+            )?,
+        }
+        Ok(())
     }
 
     #[cfg(feature = "multimodal")]
@@ -2936,7 +3041,7 @@ impl<'a> App<'a> {
                         self.paste_clipboard_image(&super::clipboard_image::SystemClipboard)
                     })
                     .await?;
-                } else {
+                } else if !self.paste_image_path(&data).await? {
                     self.input.handle_paste(data);
                 }
                 #[cfg(not(feature = "multimodal"))]
@@ -2966,23 +3071,14 @@ impl<'a> App<'a> {
                     }
                     Some(KeyAction::PasteClipboard) => {
                         self.ctrl_c_exit_armed = false;
-                        #[cfg(feature = "multimodal")]
-                        if self.clipboard_image_allowed()
-                            && crate::startup::heap_future(|| {
-                                self.paste_clipboard_image(&super::clipboard_image::SystemClipboard)
-                            })
-                            .await?
-                        {
-                            self.refresh()?;
-                            return Ok(ControlFlow::Continue(()));
-                        }
-                        match read_from_clipboard() {
-                            Ok(text) => self.input.handle_paste(text),
-                            Err(error) => self.renderer.write_line(
-                                &format!("paste from clipboard failed: {error}"),
-                                C_ERROR,
-                            )?,
-                        }
+                        crate::startup::heap_future(|| {
+                            self.paste_clipboard_key(
+                                #[cfg(feature = "multimodal")]
+                                &super::clipboard_image::SystemClipboard,
+                                || read_from_clipboard(),
+                            )
+                        })
+                        .await?;
                         self.refresh()?;
                         return Ok(ControlFlow::Continue(()));
                     }
@@ -3107,12 +3203,25 @@ impl<'a> App<'a> {
             // The outcome is a transient status-line notice: copying must not
             // grow the transcript it is copying from.
             Ok(ClipboardCopyOutcome::Confirmed) => {
-                self.renderer.show_notice("copied selection", Color::Green);
+                let route = super::clipboard_route::last_route_label();
+                self.renderer.show_notice(
+                    &if route == "clipboard" {
+                        "copied selection".to_owned()
+                    } else {
+                        format!("copied selection via {route}")
+                    },
+                    Color::Green,
+                );
                 self.renderer.clear_selection();
             }
             Ok(ClipboardCopyOutcome::FallbackRequested) => {
-                self.renderer
-                    .show_notice("copy requested through terminal", Color::Green);
+                self.renderer.show_notice(
+                    &format!(
+                        "sent selection to {} (the terminal must allow it)",
+                        super::clipboard_route::last_route_label()
+                    ),
+                    Color::Green,
+                );
                 self.renderer.clear_selection();
             }
             Err(error) => {
@@ -3672,7 +3781,8 @@ impl<'a> App<'a> {
             }
 
             if !one_shot
-                && (text.starts_with('/') || crate::ui::slash::is_readonly_diagnostic(&text))
+                && ((text.starts_with('/') && crate::ui::is_slash_command_text(&text))
+                    || crate::ui::slash::is_readonly_diagnostic(&text))
             {
                 self.run_slash_command(&text).await?;
             } else if !one_shot && text.starts_with('!') {
@@ -4902,15 +5012,16 @@ impl<'a> App<'a> {
 
     /// True while the chain/plan/git prompt is not armed yet: keys typed into
     /// the draft just before it appeared must not answer it.
-    fn chain_prompt_premature(&self, key: KeyEvent) -> bool {
+    fn chain_prompt_premature(&mut self, key: KeyEvent) -> bool {
         self.chain_prompt_premature_with(key, super::permission_handler::prompt_arming_delay())
     }
 
-    fn chain_prompt_premature_with(&self, key: KeyEvent, delay: std::time::Duration) -> bool {
-        self.renderer.chain_prompt.as_ref().is_some_and(|p| {
-            super::permission_handler::premature_prompt_key(
+    fn chain_prompt_premature_with(&mut self, key: KeyEvent, delay: std::time::Duration) -> bool {
+        self.renderer.chain_prompt.as_mut().is_some_and(|p| {
+            super::permission_handler::prompt_key_premature(
+                &mut p.opened,
                 &UserEvent::Key(key),
-                p.opened.elapsed(),
+                std::time::Instant::now(),
                 delay,
             )
         })
@@ -8244,6 +8355,42 @@ mod explicit_shell_persistence_tests {
         assert!(!app.chain_prompt_premature_with(y, Duration::ZERO));
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         assert!(!app.chain_prompt_premature_with(esc, Duration::from_secs(60)));
+    }
+
+    #[tokio::test]
+    async fn an_open_picker_is_not_drawn_over_a_permission_prompt() {
+        use crate::ui::renderer::PermissionPrompt;
+        let root = crate::tests::OwnedTestDirectory::new("picker-under-prompt");
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let cfg = crate::config::Config::default();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new("openrouter", "fixture", 128_000, "");
+        let ui = shell_ui(&cli, &cfg, &mut session, &mut context, workspace);
+        let mut app = fixture_app(ui);
+        app.input.start_command_picker();
+        app.refresh().unwrap();
+        assert!(app.renderer.captured_output().contains("/agent"));
+
+        app.renderer.permission_prompt = Some(PermissionPrompt {
+            tool: "shell".into(),
+            options: "[y] allow".into(),
+            expanded: false,
+        });
+        let before = app.renderer.captured_output().len();
+        app.refresh().unwrap();
+        let during = app.renderer.captured_output()[before..].to_owned();
+        assert!(!during.contains("/agent"), "picker drawn over prompt");
+        assert!(app.input.picker.as_ref().is_some_and(|p| p.active()));
+
+        app.renderer.permission_prompt = None;
+        let before = app.renderer.captured_output().len();
+        app.refresh().unwrap();
+        assert!(app.renderer.captured_output()[before..].contains("/agent"));
     }
 
     #[tokio::test]

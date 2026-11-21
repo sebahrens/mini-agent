@@ -14,8 +14,10 @@ use crate::ui::utils::suggest_pattern;
 use super::{C_ERROR, C_PERM};
 
 /// Keystrokes already queued (or in flight) when an overlay opens were typed
-/// for the draft, not for the prompt. Answer keys are ignored for this long
-/// after the overlay appears; Esc and Ctrl+C/D always work immediately.
+/// for the draft, not for the prompt, and a user still typing keeps typing.
+/// Answer keys are ignored until this long passes with no key at all (the
+/// window restarts on every discarded key); Esc and Ctrl+C/D always work
+/// immediately.
 #[cfg(not(test))]
 const PROMPT_ARMING_DELAY: std::time::Duration = std::time::Duration::from_millis(350);
 #[cfg(test)]
@@ -32,6 +34,23 @@ pub(super) fn premature_prompt_key(
         UserEvent::Key(key) => elapsed < delay && classify_prompt_key(*key) != PromptInput::Abort,
         _ => false,
     }
+}
+
+/// [`premature_prompt_key`] with a quiet period: `quiet_since` is when the
+/// prompt opened or when a key was last discarded, so a user still typing a
+/// draft keeps the prompt unarmed until a pause of `delay`. The caller passes
+/// the clock reading as `now`.
+pub(super) fn prompt_key_premature(
+    quiet_since: &mut std::time::Instant,
+    event: &UserEvent,
+    now: std::time::Instant,
+    delay: std::time::Duration,
+) -> bool {
+    let premature = premature_prompt_key(event, now.saturating_duration_since(*quiet_since), delay);
+    if premature {
+        *quiet_since = now;
+    }
+    premature
 }
 
 /// A paste into a one-line draft: line breaks become single spaces (so pasted
@@ -266,7 +285,8 @@ pub(crate) struct PermissionState {
     instruction: Option<String>,
     /// Draft of a deny note while the user is typing one for this request.
     note: Option<String>,
-    /// When the overlay opened; answer keys are ignored briefly after this.
+    /// When the overlay opened or last discarded a key; answer keys are
+    /// ignored until a quiet period passes after this.
     opened: std::time::Instant,
 }
 
@@ -534,7 +554,12 @@ impl PermissionState {
             draw_prompt(renderer)?;
             return Ok(PermissionEvent::Waiting);
         }
-        if premature_prompt_key(event, self.opened.elapsed(), PROMPT_ARMING_DELAY) {
+        if prompt_key_premature(
+            &mut self.opened,
+            event,
+            std::time::Instant::now(),
+            PROMPT_ARMING_DELAY,
+        ) {
             return Ok(PermissionEvent::Waiting);
         }
         if let Some(note) = self.note.as_mut() {
@@ -989,6 +1014,28 @@ mod tests {
             early,
             delay
         ));
+    }
+
+    #[test]
+    fn continued_typing_keeps_the_prompt_unarmed_until_a_quiet_period() {
+        use std::time::{Duration, Instant};
+        let delay = Duration::from_millis(350);
+        let key = |c| UserEvent::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        let mut quiet_since = Instant::now();
+        let mut now = quiet_since;
+        // Keys every 200 ms for 2 s: every one is discarded.
+        for _ in 0..10 {
+            now += Duration::from_millis(200);
+            assert!(prompt_key_premature(&mut quiet_since, &key('y'), now, delay));
+        }
+        // After a 400 ms pause the next key answers.
+        now += Duration::from_millis(400);
+        assert!(!prompt_key_premature(&mut quiet_since, &key('y'), now, delay));
+        // Esc is never premature and never restarts the window.
+        let esc = UserEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let mut fresh = now;
+        assert!(!prompt_key_premature(&mut fresh, &esc, now, delay));
+        assert_eq!(fresh, now);
     }
 
     #[test]

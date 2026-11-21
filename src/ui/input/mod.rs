@@ -338,6 +338,9 @@ pub struct InputEditor {
     /// removes whole; submit and the external editor expand it. Append-only
     /// for a draft, so undo snapshots stay valid.
     pastes: Vec<(CompactString, String)>,
+    /// A prompt took the bottom area while a picker was open, so the picker
+    /// is not drawn until the prompt closes (set by `refresh_display`).
+    pub(crate) picker_hidden: bool,
     pub buffer: CompactString,
     pub cursor: usize,
     history: Vec<CompactString>,
@@ -404,6 +407,7 @@ impl InputEditor {
             undo_bytes: 0,
             undo_run_end: None,
             pastes: Vec::new(),
+            picker_hidden: false,
             buffer: CompactString::new(""),
             cursor: 0,
             history: Vec::new(),

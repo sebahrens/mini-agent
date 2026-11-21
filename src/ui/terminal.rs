@@ -79,12 +79,11 @@ pub(crate) struct BackgroundQuery {
 /// reply's round trip with other construction and collects it last, still
 /// before the input thread exists.
 pub(crate) struct PendingBackgroundQuery {
+    /// Whether the OSC 11 query was written and its reply is still owed.
     #[cfg(unix)]
-    deadline: Option<std::time::Instant>,
+    queried: bool,
     hint: Option<crossterm::style::Color>,
 }
-
-const BACKGROUND_REPLY_TIMEOUT: Duration = Duration::from_millis(150);
 
 /// Writes the OSC 11 query, unless `COLORFGBG` already names the background:
 /// then no query is sent and nothing waits on a terminal that may never reply.
@@ -110,13 +109,13 @@ pub(crate) fn start_background_query(enabled: bool) -> PendingBackgroundQuery {
                 .is_ok()
             {
                 return PendingBackgroundQuery {
-                    deadline: Some(std::time::Instant::now() + BACKGROUND_REPLY_TIMEOUT),
+                    queried: true,
                     hint,
                 };
             }
         }
         PendingBackgroundQuery {
-            deadline: None,
+            queried: false,
             hint,
         }
     }
@@ -125,14 +124,21 @@ pub(crate) fn start_background_query(enabled: bool) -> PendingBackgroundQuery {
 }
 
 impl PendingBackgroundQuery {
-    /// Collects the reply within what remains of the original deadline.
+    /// Collects the reply. Rather than waiting a fixed time, this writes a
+    /// Primary Device Attributes request (through crossterm's keyboard
+    /// enhancement probe, which sends `CSI ? u` and `CSI c` and waits for the
+    /// `CSI c` answer) behind the OSC 11 query. Every terminal answers it, in
+    /// order, so on return the colour reply is already queued, however slow
+    /// the link, and a terminal that ignores OSC 11 does not keep us waiting.
+    /// Crossterm bounds the wait at about 2 s for a terminal that answers
+    /// neither.
     pub(crate) fn collect(self) -> BackgroundQuery {
         #[cfg(unix)]
-        if let Some(deadline) = self.deadline {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            // A reply that already arrived is still decoded after the deadline.
-            return collect_background_events(
-                remaining.max(Duration::from_millis(1)),
+        if self.queried {
+            return collect_after_sentinel(
+                || {
+                    let _ = crossterm::terminal::supports_keyboard_enhancement();
+                },
                 |remaining| {
                     if crossterm::event::poll(remaining)? {
                         crossterm::event::read().map(Some)
@@ -263,6 +269,19 @@ impl BackgroundReply {
     }
 }
 
+/// Decode the OSC 11 reply after `sentinel` (the Primary Device Attributes
+/// round trip) returned: everything the terminal sent before answering it is
+/// queued, so a zero-wait drain sees the whole reply and nothing is left to
+/// arrive later as typed input.
+#[cfg(any(unix, test))]
+fn collect_after_sentinel(
+    sentinel: impl FnOnce(),
+    mut next: impl FnMut(Duration) -> io::Result<Option<crossterm::event::Event>>,
+) -> BackgroundQuery {
+    sentinel();
+    collect_background_events(Duration::from_secs(1), |_| next(Duration::ZERO))
+}
+
 #[cfg(any(unix, test))]
 fn collect_background_events(
     timeout: Duration,
@@ -372,7 +391,7 @@ mod background_hint_tests {
             let query = start_background_query(true).collect();
             assert_eq!(query.color, Some(crossterm::style::Color::AnsiValue(15)));
             assert!(query.pending.is_empty());
-            assert!(started.elapsed() < BACKGROUND_REPLY_TIMEOUT);
+            assert!(started.elapsed() < Duration::from_millis(150));
             // Disabled colour negotiation ignores the hint as before.
             assert_eq!(start_background_query(false).collect().color, None);
         }
@@ -527,6 +546,31 @@ mod background_hint_tests {
             assert!(result.color.is_none());
             assert_eq!(result.pending.into_iter().collect::<Vec<_>>(), input);
         }
+    }
+
+    #[test]
+    fn a_slow_osc_reply_is_decoded_after_the_sentinel_and_not_replayed_as_input() {
+        // The reply arrives 400 ms after the query, past the old 150 ms
+        // deadline but before the DA1 answer the sentinel waits for.
+        let mut events = reply("1e1e/1e1e/1e1e", true, false).into_iter();
+        let mut slept = false;
+        let result = collect_after_sentinel(
+            || {
+                std::thread::sleep(Duration::from_millis(400));
+                slept = true;
+            },
+            |wait| {
+                assert!(wait.is_zero(), "the drain never waits");
+                Ok(events.next())
+            },
+        );
+        assert!(slept);
+        assert!(result.color.is_some());
+        assert!(result.pending.is_empty());
+        // A terminal that ignores OSC 11 leaves nothing queued: no colour,
+        // and nothing replayed.
+        let silent = collect_after_sentinel(|| {}, |_| Ok(None));
+        assert!(silent.color.is_none() && silent.pending.is_empty());
     }
 
     #[test]
