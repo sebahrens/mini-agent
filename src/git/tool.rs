@@ -438,6 +438,27 @@ impl GitTool {
         })
     }
 
+    /// A tool over `root` that runs git directly, for tests of callers that
+    /// need real repository output without a platform sandbox.
+    #[cfg(test)]
+    pub(crate) fn uncontained_for_test(root: &Path) -> Self {
+        let workspace = Arc::new(
+            crate::paths::WorkspaceBinding::capture(root).expect("capture test repository"),
+        );
+        Self {
+            runner: GitRunner::discover().expect("discover Git"),
+            workspace: workspace.clone(),
+            sandbox: Sandbox::new(false, "bwrap").with_workspace_binding(workspace),
+            permission: None,
+            ask_tx: None,
+            exact_files: false,
+            read_only: false,
+            filter_drivers: Arc::default(),
+            mutation_key: Arc::default(),
+            test_uncontained: true,
+        }
+    }
+
     /// Restrict the tool to the inspection operations (status, diff, log,
     /// show, blame, branches, stash_list), for subagents.
     #[cfg(feature = "git-worktree")]
