@@ -518,8 +518,7 @@ fn is_unbilled_stream_error(error: &(dyn std::error::Error + 'static)) -> bool {
     if !is_retryable(error) {
         return false;
     }
-    let code = provider_response_status(error).map(|code| code.as_u16());
-    if code == Some(429) || code == Some(529) {
+    if provider_response_status(error).is_some_and(|status| matches!(status.as_u16(), 429 | 529)) {
         return true;
     }
     error_sources(error).any(|source| {
