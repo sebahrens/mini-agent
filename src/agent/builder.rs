@@ -119,6 +119,110 @@ pub(crate) async fn collect_mcp_tools(
     tools
 }
 
+/// Outcome of checking `--tools` against the connected MCP tool catalogue.
+#[cfg(feature = "mcp")]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AllowlistMcpCheck {
+    Ok,
+    /// Names that might belong to a server that did not connect.
+    Warn(String),
+    /// Names no built-in or listed MCP tool matches.
+    Error(String),
+}
+
+/// Check every `--tools` entry against the built-ins and the listed MCP tools.
+/// An unmatched name is an error, unless a server failed to connect and the
+/// name is not a near miss of a known tool: then it may belong to that server,
+/// and only a warning is returned.
+#[cfg(feature = "mcp")]
+pub(crate) fn check_allowlist_against_mcp(
+    allowlist: &[String],
+    mcp_tools: &[String],
+    failed_servers: &[String],
+) -> AllowlistMcpCheck {
+    let known = || {
+        BUILTIN_TOOL_NAMES
+            .iter()
+            .copied()
+            .chain(mcp_tools.iter().map(String::as_str))
+    };
+    let mut errors = Vec::new();
+    let mut maybe_failed = Vec::new();
+    for name in allowlist.iter().map(String::as_str) {
+        let canonical = canonical_tool_name(name);
+        if name.is_empty()
+            || is_reserved_builtin_tool_name(canonical)
+            || mcp_tools.iter().any(|tool| tool == canonical)
+        {
+            continue;
+        }
+        match crate::config::keys::nearest_name(name, known()) {
+            Some(hint) => errors.push(format!("'{name}' (did you mean '{hint}'?)")),
+            None if failed_servers.is_empty() => errors.push(format!("'{name}'")),
+            None => maybe_failed.push(format!("'{name}'")),
+        }
+    }
+    if !errors.is_empty() {
+        let mut message = format!(
+            "--tools: unknown tool{} {}; built-in tools: {}",
+            if errors.len() == 1 { "" } else { "s" },
+            errors.join(", "),
+            BUILTIN_TOOL_NAMES.join(", ")
+        );
+        if !mcp_tools.is_empty() {
+            message.push_str("; MCP tools: ");
+            message.push_str(&mcp_tools.join(", "));
+        }
+        return AllowlistMcpCheck::Error(message);
+    }
+    if maybe_failed.is_empty() {
+        return AllowlistMcpCheck::Ok;
+    }
+    AllowlistMcpCheck::Warn(format!(
+        "--tools: {} not found among the listed tools; MCP server{} {} did not connect and may provide {}",
+        maybe_failed.join(", "),
+        if failed_servers.len() == 1 { "" } else { "s" },
+        failed_servers.join(", "),
+        if maybe_failed.len() == 1 {
+            "it"
+        } else {
+            "them"
+        },
+    ))
+}
+
+/// [`check_allowlist_against_mcp`] against a live manager: its tool names and
+/// the servers that are enabled but not connected.
+#[cfg(feature = "mcp")]
+pub(crate) async fn check_allowlist_against_manager(
+    cli: &crate::cli::Cli,
+    cfg: &crate::config::Config,
+    manager: &McpClientManager,
+) -> AllowlistMcpCheck {
+    if cli.tools.is_empty() || cli.resolve_no_tools(cfg) {
+        return AllowlistMcpCheck::Ok;
+    }
+    let timeouts = crate::extras::mcp::McpToolTimeouts::from_config_secs(cfg.mcp_tool_timeout_secs);
+    let names: Vec<String> = collect_mcp_tools(manager, None, None, timeouts)
+        .await
+        .iter()
+        .map(rig::tool::ToolDyn::name)
+        .collect();
+    let failed: Vec<String> = cfg
+        .mcp_servers
+        .as_ref()
+        .map(|servers| {
+            manager
+                .server_statuses(servers)
+                .into_iter()
+                .filter(|status| !matches!(status.status, "connected" | "disabled"))
+                .map(|status| status.name)
+                .collect()
+        })
+        .unwrap_or_default();
+    check_allowlist_against_mcp(&cli.tools, &names, &failed)
+}
+
 fn canonical_tool_name(name: &str) -> &str {
     if name == "bash" { "shell" } else { name }
 }
@@ -3100,8 +3204,19 @@ mod js_tests {
         let cli = crate::cli::Cli::default();
         let agent = test_main_agent(&cli, sandbox, workspace).await;
         let definitions = agent.tool_server_handle.get_tool_defs(None).await.unwrap();
+        let mut total_bytes = 0;
+        let mut total_tokens = 0;
+        let mut table = String::from("| tool | bytes | ~tokens |\n|---|---:|---:|\n");
         for definition in &definitions {
             let size = definition.description.len() + definition.parameters.to_string().len();
+            // The same 3.25 chars/token estimator the session uses.
+            let tokens = crate::session::Session::estimate_tokens(&format!(
+                "{}{}",
+                definition.description, definition.parameters
+            ));
+            total_bytes += size;
+            total_tokens += tokens;
+            table.push_str(&format!("| {} | {size} | {tokens} |\n", definition.name));
             let budget = match definition.name.as_str() {
                 "js" => 11_000,
                 "task" => 9_000,
@@ -3111,10 +3226,11 @@ mod js_tests {
             };
             assert!(
                 size <= budget,
-                "{} is {size} bytes (budget {budget})",
+                "{} is {size} bytes, ~{tokens} tokens (budget {budget})",
                 definition.name
             );
         }
+        println!("{table}| total | {total_bytes} | {total_tokens} |");
     }
 
     #[tokio::test]
@@ -3931,5 +4047,100 @@ mod js_tests {
                 "a 2000-character objective must raise the estimate: {without} -> {with}"
             );
         }
+    }
+}
+
+#[cfg(all(test, feature = "mcp"))]
+mod allowlist_mcp_tests {
+    use super::*;
+
+    fn list(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[test]
+    fn built_in_and_listed_mcp_names_pass() {
+        assert_eq!(
+            check_allowlist_against_mcp(
+                &list(&["read", "bash", "", "web_fetch_x"]),
+                &list(&["web_fetch_x"]),
+                &[]
+            ),
+            AllowlistMcpCheck::Ok
+        );
+    }
+
+    #[test]
+    fn an_unmatched_name_is_an_error_naming_the_closest_tool() {
+        let AllowlistMcpCheck::Error(message) =
+            check_allowlist_against_mcp(&list(&["serch_docs"]), &list(&["search_docs"]), &[])
+        else {
+            panic!("a typo must be an error");
+        };
+        assert!(
+            message.contains("'serch_docs' (did you mean 'search_docs'?)"),
+            "{message}"
+        );
+        let AllowlistMcpCheck::Error(message) =
+            check_allowlist_against_mcp(&list(&["totally_unrelated"]), &[], &[])
+        else {
+            panic!("an unmatched name must be an error");
+        };
+        assert!(message.contains("'totally_unrelated'"), "{message}");
+    }
+
+    #[test]
+    fn a_name_that_may_belong_to_a_failed_server_only_warns() {
+        let AllowlistMcpCheck::Warn(message) = check_allowlist_against_mcp(
+            &list(&["deploy_prod"]),
+            &list(&["search_docs"]),
+            &list(&["ops"]),
+        ) else {
+            panic!("expected a warning");
+        };
+        assert!(
+            message.contains("'deploy_prod'") && message.contains("ops"),
+            "{message}"
+        );
+        assert!(message.contains("did not connect"), "{message}");
+        // A near miss of a known tool stays an error even with a failed server.
+        assert!(matches!(
+            check_allowlist_against_mcp(
+                &list(&["serch_docs"]),
+                &list(&["search_docs"]),
+                &list(&["ops"])
+            ),
+            AllowlistMcpCheck::Error(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_connected_manager_makes_a_typo_a_usage_error_in_headless() {
+        let manager = McpClientManager::from_handles(Vec::new());
+        let cfg = crate::config::Config::default();
+        let cli = crate::cli::Cli {
+            print: true,
+            tools: vec!["raed".into()],
+            ..Default::default()
+        };
+        assert!(matches!(
+            check_allowlist_against_manager(&cli, &cfg, &manager).await,
+            AllowlistMcpCheck::Error(_)
+        ));
+        let root = std::env::temp_dir();
+        let error = crate::startup::validate_tool_allowlist_after_mcp(&cli, &cfg, &root, &manager)
+            .await
+            .unwrap_err();
+        let usage = error
+            .downcast_ref::<crate::startup::HeadlessUsageError>()
+            .expect("exit-2 usage error");
+        assert!(usage.0.contains("did you mean 'read'"), "{}", usage.0);
+        let fine = crate::cli::Cli {
+            tools: vec!["read".into()],
+            ..Default::default()
+        };
+        crate::startup::validate_tool_allowlist_after_mcp(&fine, &cfg, &root, &manager)
+            .await
+            .unwrap();
     }
 }

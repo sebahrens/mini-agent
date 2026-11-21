@@ -2348,3 +2348,53 @@ saved session under the retention limits above.
   to `[tool_limits] skip_dirs`.
 - `read` keeps the last parsed PDF (up to 32 MiB of source) so consecutive `pages` windows of one
   unchanged file parse it once.
+
+## Fixed tool-definition size (mini-agent-sskdu.174)
+
+Every request re-sends the tool definitions, so
+`built_in_tool_definitions_stay_within_their_size_budgets` (`src/agent/builder.rs`)
+bounds each one and prints this table with `--nocapture`. Bytes are the
+description plus the serialized parameter schema; tokens use the session
+estimator (`Session::estimate_tokens`, 3.25 characters per token). The set is
+the test fixture's registered built-ins (no `js`, `task` or `git`, which have
+their own larger budgets), so it is a floor, not the cost of every run.
+
+| tool | bytes | ~tokens |
+|---|---:|---:|
+| web_fetch | 1170 | 360 |
+| read | 3302 | 1016 |
+| write | 569 | 175 |
+| edit | 2026 | 623 |
+| ask_user_question | 1863 | 573 |
+| shell | 2724 | 838 |
+| job_status | 2791 | 858 |
+| grep | 2656 | 817 |
+| notebook_edit | 879 | 270 |
+| find_files | 1846 | 568 |
+| list_dir | 1246 | 383 |
+| todo_write | 769 | 236 |
+| todo_read | 117 | 36 |
+| memory_write | 1404 | 432 |
+| memory_edit | 1404 | 432 |
+| memory_read | 905 | 278 |
+| memory_search | 662 | 203 |
+| lsp_diagnostics | 1589 | 488 |
+| lsp_navigate | 3457 | 1063 |
+| skills_search | 480 | 147 |
+| **total** | **31859** | **9796** |
+
+## `--tools` names and MCP tools (mini-agent-sskdu.75)
+
+`Cli::validate_tool_allowlist` rejects a misspelt `--tools` name only when no
+MCP server is configured. With servers configured, the check runs once the MCP
+catalogue is known (`builder::check_allowlist_against_mcp`): a name that is
+neither a built-in nor a listed MCP tool is a usage error in headless (exit 2,
+`HeadlessUsageError`, naming the closest tool) and an error notice in the TUI.
+When a server did not connect, a name that is not a near miss of a known tool
+only warns, naming the failed servers.
+
+## Closed-set argument completion (mini-agent-sskdu.55)
+
+`/reasoning`, `/vim`, `/sessions` and `/compress` (`COMPLETE_ONLY_COMMANDS` in
+`src/ui/pickers/handlers.rs`) list their fixed arguments on Tab but never open
+the argument picker on Enter or space, so the bare form still runs.

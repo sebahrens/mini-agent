@@ -64,6 +64,20 @@ fn every_finite_argument_command_supports_shell_style_tab_completion() {
     }
 }
 
+#[test]
+fn tab_after_vim_space_lists_on_and_off() {
+    let mut editor = InputEditor::new();
+    editor.load_text("/vim ");
+    editor.handle_key(press(KeyCode::Tab));
+    match editor.picker.as_ref() {
+        Some(Picker::Prefixed(picker, prefix)) => {
+            assert_eq!(*prefix, "/vim ");
+            assert_eq!(picker.matches().collect::<Vec<_>>(), ["on", "off"]);
+        }
+        _ => panic!("Tab after `/vim ` should list its values"),
+    }
+}
+
 #[cfg(feature = "subagents")]
 #[test]
 fn tasks_tab_completion_offers_verbs_and_live_task_ids() {

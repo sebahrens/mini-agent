@@ -703,6 +703,31 @@ pub(crate) async fn connect_headless_mcp(
     Some(manager)
 }
 
+/// Check `--tools` against the MCP tools that actually connected. A name that
+/// no built-in or listed MCP tool matches is a usage error (exit 2 with a
+/// preflight record); a name that may belong to a server that failed to
+/// connect only warns on stderr (mini-agent-sskdu.75).
+#[cfg(feature = "mcp")]
+pub(crate) async fn validate_tool_allowlist_after_mcp(
+    cli: &Cli,
+    cfg: &Config,
+    workspace_root: &std::path::Path,
+    manager: &crate::extras::mcp::McpClientManager,
+) -> anyhow::Result<()> {
+    use crate::agent::builder::AllowlistMcpCheck;
+    match crate::agent::builder::check_allowlist_against_manager(cli, cfg, manager).await {
+        AllowlistMcpCheck::Ok => Ok(()),
+        AllowlistMcpCheck::Warn(message) => {
+            eprintln!("{}", crate::ui::events::sanitize_output(&message));
+            Ok(())
+        }
+        AllowlistMcpCheck::Error(message) => {
+            crate::print::emit_headless_preflight_failure(cli, workspace_root, &message).await?;
+            Err(HeadlessUsageError(message).into())
+        }
+    }
+}
+
 /// Drain both connection and later catalog notices to the headless diagnostic sink.
 #[cfg(feature = "mcp")]
 pub(crate) fn report_headless_mcp_notices(
@@ -3343,6 +3368,16 @@ impl Startup {
                     .await
                     .map(std::sync::Arc::new)
             };
+            #[cfg(feature = "mcp")]
+            if let Some(manager) = mcp_manager.as_deref() {
+                validate_tool_allowlist_after_mcp(
+                    &self.cli,
+                    &self.cfg,
+                    self.workspace.root(),
+                    manager,
+                )
+                .await?;
+            }
             // Boxed: building an agent pulls in every provider's setup, and this
             // future is inlined into the startup frame otherwise.
             let agent = heap_future(|| {
@@ -3930,6 +3965,11 @@ impl Startup {
         } else {
             connect_headless_mcp(&self.cfg, &self.workspace).await
         };
+        #[cfg(feature = "mcp")]
+        if let Some(manager) = mcp_manager.as_ref() {
+            validate_tool_allowlist_after_mcp(&self.cli, &self.cfg, self.workspace.root(), manager)
+                .await?;
+        }
         let agent = provider::build_agent_in_workspace(
             model_completion,
             &self.cli,

@@ -562,11 +562,11 @@ impl<M: CompletionModel> AgentHook<M> for ToolLoopGuard {
                 internal_call_id,
                 ..
             } => {
-                if outcome.is_error() || outcome.is_denied() {
-                    record_tool_failure(internal_call_id);
-                } else {
-                    record_accepted_goal_report(tool_name, internal_call_id);
-                }
+                record_tool_outcome(
+                    tool_name,
+                    internal_call_id,
+                    outcome.is_error() || outcome.is_denied(),
+                );
                 record_settled_result(internal_call_id, result);
                 show_settled_call(internal_call_id, outcome, result);
                 let rewritten = take_effective_args(internal_call_id);
@@ -2020,6 +2020,16 @@ static ACCEPTED_GOAL_REPORTS: std::sync::Mutex<VecDeque<String>> =
     std::sync::Mutex::new(VecDeque::new());
 #[cfg(feature = "goal")]
 const ACCEPTED_GOAL_REPORTS_MAX: usize = 128;
+
+/// Record how a finished call ended. Whether a `goal_report` was accepted is
+/// decided only by `failed` (the typed outcome), never by the result text.
+fn record_tool_outcome(tool_name: &str, internal_call_id: &str, failed: bool) {
+    if failed {
+        record_tool_failure(internal_call_id);
+    } else {
+        record_accepted_goal_report(tool_name, internal_call_id);
+    }
+}
 
 fn record_accepted_goal_report(tool_name: &str, internal_call_id: &str) {
     #[cfg(feature = "goal")]
@@ -15489,5 +15499,33 @@ mod replay_and_gate_attribution_tests {
         );
         assert_ne!(source, TaskOutcomeSource::NoVerifyCommand);
         assert_eq!(source, TaskOutcomeSource::GateSkipped);
+    }
+}
+
+#[cfg(all(test, feature = "goal"))]
+mod goal_report_signal_tests {
+    use super::*;
+
+    const NAME: &str = <crate::extras::goal::report_tool::GoalReport as rig::tool::Tool>::NAME;
+
+    #[test]
+    fn a_failed_goal_report_is_not_accepted_whatever_its_text_says() {
+        // The result text ("Report recorded for round 1 of 5.") is not an
+        // input: only the typed outcome is.
+        record_tool_outcome(NAME, "gr-failed", true);
+        assert!(!take_accepted_goal_report("gr-failed"));
+    }
+
+    #[test]
+    fn a_successful_goal_report_is_accepted_once() {
+        record_tool_outcome(NAME, "gr-ok", false);
+        assert!(take_accepted_goal_report("gr-ok"));
+        assert!(!take_accepted_goal_report("gr-ok"));
+    }
+
+    #[test]
+    fn other_tools_are_never_accepted_reports() {
+        record_tool_outcome("shell", "sh-ok", false);
+        assert!(!take_accepted_goal_report("sh-ok"));
     }
 }
