@@ -902,3 +902,72 @@ fn compaction_queues_the_replaced_transcript_for_a_sidecar() {
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0].content, "first");
 }
+
+/// The commit step shared by the TUI, headless and ACP compaction drivers:
+/// only the summarized prefix is drained, the removed tokens are recorded, and
+/// a leading summary record is skipped as summarizer input but still replaced.
+#[test]
+fn shared_compaction_commit_drains_only_the_summarized_prefix() {
+    for (included, expect_kept) in [(4usize, 4usize), (2, 2), (9, 4)] {
+        let mut s = session_with_messages(6, 40);
+        let (skipped, input) = s.compaction_input(4, 0);
+        assert_eq!((skipped, input.len()), (0, 4));
+        let per_message = Session::estimate_tokens(&"x".repeat(40));
+        let mut staged = None;
+        let (first_kept, tokens_before) = s
+            .commit_summarized_cut(
+                skipped,
+                4,
+                "SUMMARY".to_string(),
+                4096,
+                included,
+                0,
+                |summary, drained| staged = Some((summary.to_string(), drained)),
+            )
+            .unwrap();
+        assert_eq!(first_kept, expect_kept, "included={included}");
+        assert_eq!(tokens_before, per_message * expect_kept as u64);
+        assert_eq!(staged, Some(("SUMMARY".to_string(), expect_kept)));
+        // Everything past the drained prefix is untouched.
+        assert!(s.messages.len() >= 6 - expect_kept);
+        assert_eq!(s.compactions.len(), 1);
+    }
+    let mut s = session_with_messages(4, 40);
+    assert!(
+        s.commit_summarized_cut(0, 3, "S".into(), 4096, 0, 0, |_, _| {})
+            .is_err(),
+        "a summarizer that covered nothing drains nothing"
+    );
+    assert!(s.compactions.is_empty());
+    assert_eq!(s.messages.len(), 4);
+}
+
+/// Cut invariants for every compaction gate: whatever the keep-recent budget,
+/// a cut never lands inside a parallel tool batch (between a call and any of
+/// its results) and never splits a result from the assistant turn before it.
+#[cfg(feature = "acp")]
+#[test]
+fn compaction_cut_never_splits_a_parallel_tool_batch() {
+    let mut session = Session::new("openai", "gpt-4", 128_000, "");
+    session.add_message(MessageRole::User, "first question");
+    session.add_message(MessageRole::Assistant, "plan");
+    for round in 0..3 {
+        session.add_tool_call("read", &serde_json::json!({"path": format!("a{round}")}));
+        session.add_tool_call("read", &serde_json::json!({"path": format!("b{round}")}));
+        session.add_tool_result("read", &"x".repeat(300));
+        session.add_tool_result("read", &"y".repeat(300));
+    }
+    session.add_message(MessageRole::Assistant, "answer");
+    session.add_message(MessageRole::User, "second question");
+    for keep in [0u64, 1, 50, 100, 200, 400, 800, 100_000] {
+        let cut = Session::select_compaction_cut(&session.messages, keep);
+        assert!(cut <= session.messages.len(), "keep={keep}");
+        if cut > 0 && cut < session.messages.len() {
+            assert!(
+                Session::is_legal_cut(&session.messages, cut),
+                "keep={keep} cut={cut} lands inside a tool batch"
+            );
+            assert_ne!(session.messages[cut].role, MessageRole::ToolResult);
+        }
+    }
+}

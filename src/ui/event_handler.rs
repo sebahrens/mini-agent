@@ -1281,40 +1281,23 @@ async fn finish_goal_round(
                 Some(max_turns) => rebuilt.with_max_agent_turns(max_turns),
                 None => rebuilt.clone(),
             };
-            #[cfg(feature = "agent-skills")]
-            let round_agent = round_agent.with_instruction_turn(run.instruction_turn.clone());
-            let budget_carry = run.fresh_budget_carry();
-            let paused = round_agent
-                .with_main_session(ui.cfg, ui.session)
-                .with_spend_for_session(ui.session, ui.cfg, crate::spend::RequestKind::Turn)
-                .with_file_checkpoints(ui.session.file_checkpoints.recorder(
-                    &ui.session.id,
-                    ui.session.messages.len(),
-                    ui.cli.no_session,
-                ))
-                .with_question_turn(run.question_turn.clone())
-                .with_budget_carry(budget_carry)
-                .spawn_runner_paused(
-                    relaunch.prompt,
-                    history,
-                    ui.cfg.retry.clone(),
-                    #[cfg(feature = "hooks")]
-                    None,
-                )
-                .await;
+            let checkpoint_index = ui.session.messages.len();
+            let paused = super::build_paused_main_runner(
+                ui,
+                run,
+                round_agent,
+                relaunch.prompt,
+                history,
+                checkpoint_index,
+            )
+            .await;
             #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
             let mut paused = paused;
             #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
             super::adopt_runner_hook_context(&mut paused, run.pending_turn.as_mut(), ui.session);
             let runner = paused.start_interactive();
-            run.compaction_decision_tx = runner.compaction_decision_tx;
-            run.agent_rx = Some(runner.event_rx);
-            run.main_abort = Some(runner.abort_handle);
-            run.is_running = true;
+            super::adopt_started_runner(run, ui.status_signals.as_ref(), runner);
             run.goal_round = Some(driver::RoundCollector::new());
-            if let Some(signals) = ui.status_signals.as_ref() {
-                signals.send_start();
-            }
             Ok(true)
         }
     }

@@ -2447,39 +2447,22 @@ impl<'a> App<'a> {
                         ));
                 }
                 let agent = run.agent.as_ref().unwrap().clone();
-                #[cfg(feature = "agent-skills")]
-                let agent = agent.with_instruction_turn(run.instruction_turn.clone());
-                let budget_carry = run.fresh_budget_carry();
-                let paused = agent
-                    .with_main_session(ui.cfg, ui.session)
-                    .with_spend_for_session(ui.session, ui.cfg, crate::spend::RequestKind::Turn)
-                    .with_file_checkpoints(ui.session.file_checkpoints.recorder(
-                        &ui.session.id,
-                        pending_turn.message_index(),
-                        ui.cli.no_session,
-                    ))
-                    .with_question_turn(run.question_turn.clone())
-                    .with_budget_carry(budget_carry)
-                    .spawn_runner_paused(
-                        prompt,
-                        history,
-                        ui.cfg.retry.clone(),
-                        #[cfg(feature = "hooks")]
-                        None,
-                    )
-                    .await;
+                let checkpoint_index = pending_turn.message_index();
+                let paused = super::build_paused_main_runner(
+                    &mut ui,
+                    &mut run,
+                    agent,
+                    prompt,
+                    history,
+                    checkpoint_index,
+                )
+                .await;
                 #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
                 let mut paused = paused;
                 #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
                 super::adopt_runner_hook_context(&mut paused, Some(&mut pending_turn), ui.session);
                 let runner = paused.start_interactive();
-                run.compaction_decision_tx = runner.compaction_decision_tx;
-                run.agent_rx = Some(runner.event_rx);
-                run.main_abort = Some(runner.abort_handle);
-                run.is_running = true;
-                if let Some(ss) = ui.status_signals.as_ref() {
-                    ss.send_start();
-                }
+                super::adopt_started_runner(&mut run, ui.status_signals.as_ref(), runner);
                 record_started_main_turn(pending_turn, &mut run, &mut ui);
             }
         }
@@ -4783,7 +4766,12 @@ impl<'a> App<'a> {
                     return Ok(());
                 }
                 super::SubmitAction::Queue => {
-                    if self.ui.cfg.running_input == Some(crate::config::RunningInput::Steer) {
+                    // A run that does not accept steering (none is expected
+                    // now that every start records the handle) queues the
+                    // message instead of bouncing it back into the editor.
+                    if self.ui.cfg.running_input == Some(crate::config::RunningInput::Steer)
+                        && self.run.steering.is_some()
+                    {
                         self.submit_steering(&text)?;
                         return Ok(());
                     }
@@ -7825,33 +7813,16 @@ impl<'a> App<'a> {
                                 None,
                             ));
                     }
-                    let budget_carry = self.run.fresh_budget_carry();
-                    let paused = crate::startup::heap_future(|| {
-                        let agent = self.run.agent.as_ref().unwrap().clone();
-                        #[cfg(feature = "agent-skills")]
-                        let agent = agent.with_instruction_turn(self.run.instruction_turn.clone());
-                        agent
-                            .with_main_session(self.ui.cfg, self.ui.session)
-                            .with_spend_for_session(
-                                self.ui.session,
-                                self.ui.cfg,
-                                crate::spend::RequestKind::Turn,
-                            )
-                            .with_file_checkpoints(self.ui.session.file_checkpoints.recorder(
-                                &self.ui.session.id,
-                                self.ui.session.messages.len(),
-                                self.ui.cli.no_session,
-                            ))
-                            .with_question_turn(self.run.question_turn.clone())
-                            .with_budget_carry(budget_carry)
-                            .spawn_runner_paused(
-                                prompt,
-                                history,
-                                self.ui.cfg.retry.clone(),
-                                #[cfg(feature = "hooks")]
-                                None,
-                            )
-                    })
+                    let agent = self.run.agent.as_ref().unwrap().clone();
+                    let checkpoint_index = self.ui.session.messages.len();
+                    let paused = super::build_paused_main_runner(
+                        &mut self.ui,
+                        &mut self.run,
+                        agent,
+                        prompt,
+                        history,
+                        checkpoint_index,
+                    )
                     .await;
                     #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
                     let mut paused = paused;
@@ -7862,13 +7833,11 @@ impl<'a> App<'a> {
                         self.ui.session,
                     );
                     let runner = paused.start_interactive();
-                    self.run.compaction_decision_tx = runner.compaction_decision_tx;
-                    self.run.agent_rx = Some(runner.event_rx);
-                    self.run.main_abort = Some(runner.abort_handle);
-                    self.run.is_running = true;
-                    if let Some(ss) = self.ui.status_signals.as_ref() {
-                        ss.send_start();
-                    }
+                    super::adopt_started_runner(
+                        &mut self.run,
+                        self.ui.status_signals.as_ref(),
+                        runner,
+                    );
                 }
             }
             Err(e)
@@ -7974,33 +7943,16 @@ impl<'a> App<'a> {
                                 None,
                             ));
                     }
-                    let budget_carry = self.run.fresh_budget_carry();
-                    let paused = crate::startup::heap_future(|| {
-                        let agent = self.run.agent.as_ref().unwrap().clone();
-                        #[cfg(feature = "agent-skills")]
-                        let agent = agent.with_instruction_turn(self.run.instruction_turn.clone());
-                        agent
-                            .with_main_session(self.ui.cfg, self.ui.session)
-                            .with_spend_for_session(
-                                self.ui.session,
-                                self.ui.cfg,
-                                crate::spend::RequestKind::Turn,
-                            )
-                            .with_file_checkpoints(self.ui.session.file_checkpoints.recorder(
-                                &self.ui.session.id,
-                                self.ui.session.messages.len(),
-                                self.ui.cli.no_session,
-                            ))
-                            .with_question_turn(self.run.question_turn.clone())
-                            .with_budget_carry(budget_carry)
-                            .spawn_runner_paused(
-                                prompt,
-                                Vec::new(),
-                                self.ui.cfg.retry.clone(),
-                                #[cfg(feature = "hooks")]
-                                None,
-                            )
-                    })
+                    let agent = self.run.agent.as_ref().unwrap().clone();
+                    let checkpoint_index = self.ui.session.messages.len();
+                    let paused = super::build_paused_main_runner(
+                        &mut self.ui,
+                        &mut self.run,
+                        agent,
+                        prompt,
+                        std::sync::Arc::from(Vec::new()),
+                        checkpoint_index,
+                    )
                     .await;
                     #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
                     let mut paused = paused;
@@ -8011,10 +7963,11 @@ impl<'a> App<'a> {
                         self.ui.session,
                     );
                     let runner = paused.start_interactive();
-                    self.run.compaction_decision_tx = runner.compaction_decision_tx;
-                    self.run.agent_rx = Some(runner.event_rx);
-                    self.run.main_abort = Some(runner.abort_handle);
-                    self.run.is_running = true;
+                    super::adopt_started_runner(
+                        &mut self.run,
+                        self.ui.status_signals.as_ref(),
+                        runner,
+                    );
                     self.run.goal_round = Some(crate::extras::goal::driver::RoundCollector::new());
                 }
             }
@@ -16151,6 +16104,55 @@ mod plan_approval_tests {
         assert_eq!(provider.calls().len(), 0);
         drop(app);
         provider.finish().await;
+    }
+
+    /// With `running_input = steer`, a run that holds no steering handle (any
+    /// run started through a path that skipped `adopt_started_runner`) must
+    /// queue the typed message rather than bounce it back into the editor.
+    #[tokio::test]
+    async fn steer_mode_enter_queues_when_run_has_no_steering_handle() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let roots = Roots::new();
+        let provider = Provider::new(vec!["hold-open"]).await;
+        let mut cfg = provider.config();
+        cfg.running_input = Some(crate::config::RunningInput::Steer);
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            ..Default::default()
+        };
+        let workspace = roots.workspace();
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new(
+            "plan49",
+            "owned-model",
+            128_000,
+            workspace.root().to_str().unwrap(),
+        );
+        let mut app = owned_app(ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+            SecurityMode::Standard,
+        ));
+        user(&mut app, UserEvent::Paste("original task".into())).await;
+        key(&mut app, KeyCode::Enter).await;
+        // The shared start path records the steering handle.
+        assert!(app.run.is_running);
+        assert!(app.run.steering.is_some());
+        app.run.steering = None;
+        user(&mut app, UserEvent::Paste("typed during goal".into())).await;
+        key(&mut app, KeyCode::Enter).await;
+        assert_eq!(
+            app.run.pending_inputs.pop_front().as_deref(),
+            Some("typed during goal")
+        );
+        assert!(app.input.buffer.is_empty());
+        drop(app);
+        provider.cancel().await;
     }
 
     #[tokio::test]

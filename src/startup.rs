@@ -1329,27 +1329,16 @@ where
     // (mini-agent-i6q98).
     let usage = cfg.normalize_usage(&session.provider, usage);
     session.charge_usage_delta(usage, cfg.is_anthropic_native(&session.provider));
-    // `messages_included` is the length of the oldest prefix of the cut slice
-    // whose content the summarizer saw (`cut_idx` with full coverage). Drain
-    // exactly that prefix so unsummarized history is never discarded.
-    let first_kept_index =
-        skipped + Session::compaction_drain_len(plan.cut_idx - skipped, messages_included)?;
-    let tokens_before = if first_kept_index == plan.cut_idx {
-        plan.tokens_before
-    } else {
-        session.messages[..first_kept_index]
-            .iter()
-            .map(|message| message.estimated_tokens)
-            .sum()
-    };
     let restore_read_tokens = cfg.resolve_compact_restore_read_tokens(session.context_window);
-    session.compress_with_budget_restoring(
+    let (first_kept_index, _) = session.commit_summarized_cut(
+        skipped,
+        plan.cut_idx,
         summary.clone(),
-        first_kept_index,
-        tokens_before,
         summary_byte_budget,
+        messages_included,
         restore_read_tokens,
-    );
+        |_, _| {},
+    )?;
     Ok(Some(HeadlessCompaction {
         summary,
         first_kept_index,
