@@ -3,7 +3,6 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::num::NonZeroU64;
 use std::sync::Arc;
-#[cfg(any(test, feature = "skills"))]
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -173,11 +172,24 @@ struct PermCancellationState {
     cancelled: AtomicBool,
     permission_prompt_timed_out: AtomicBool,
     pending_permission_prompts: AtomicU64,
+    /// Parent-side clock of time spent awaiting a user approval this invocation initiated.
+    prompt_pause: Mutex<PromptPauseClock>,
+    /// Nanoseconds of approval wait the parent may exclude from the step budget; zero (the
+    /// default) excludes nothing. Only the parent sets it, before the invocation starts.
+    approval_allowance_nanos: AtomicU64,
     notify: tokio::sync::Notify,
     #[cfg(any(test, feature = "skills"))]
     next_blocking_wake: AtomicU64,
     #[cfg(any(test, feature = "skills"))]
     blocking_wakes: Mutex<BTreeMap<u64, Arc<dyn Fn() + Send + Sync>>>,
+}
+
+/// Accumulated wall time during which at least one permission prompt was pending.
+#[derive(Default)]
+struct PromptPauseClock {
+    accumulated: Duration,
+    since: Option<Instant>,
+    active: u32,
 }
 
 pub(crate) struct PermissionPromptGuard {
@@ -248,10 +260,47 @@ impl PermCancellation {
                 count.checked_add(1)
             })
             .is_ok();
+        if registered {
+            let mut clock = self
+                .state
+                .prompt_pause
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if clock.active == 0 {
+                clock.since = Some(Instant::now());
+            }
+            clock.active = clock.active.saturating_add(1);
+        }
         PermissionPromptGuard {
             state: Arc::clone(&self.state),
             registered,
         }
+    }
+
+    /// Allow the parent to exclude up to `allowance` of cumulative approval wait from the step
+    /// budget (phase-6 timing rule). The overall bound becomes step budget plus `allowance`.
+    pub(crate) fn set_approval_allowance(&self, allowance: Duration) {
+        let nanos = u64::try_from(allowance.as_nanos()).unwrap_or(u64::MAX);
+        self.state
+            .approval_allowance_nanos
+            .store(nanos, Ordering::Release);
+    }
+
+    /// Cumulative time this invocation spent awaiting a parent-side approval, capped at the
+    /// configured allowance. Never reflects any worker-supplied value.
+    pub(crate) fn approval_pause(&self) -> Duration {
+        let allowance =
+            Duration::from_nanos(self.state.approval_allowance_nanos.load(Ordering::Acquire));
+        if allowance.is_zero() {
+            return Duration::ZERO;
+        }
+        let clock = self
+            .state
+            .prompt_pause
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let pending = clock.since.map_or(Duration::ZERO, |since| since.elapsed());
+        clock.accumulated.saturating_add(pending).min(allowance)
     }
 
     pub(crate) fn mark_permission_prompt_timed_out(&self) {
@@ -308,6 +357,18 @@ impl PermCancellation {
 impl Drop for PermissionPromptGuard {
     fn drop(&mut self) {
         if self.registered {
+            let mut clock = self
+                .state
+                .prompt_pause
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            clock.active = clock.active.saturating_sub(1);
+            if clock.active == 0
+                && let Some(since) = clock.since.take()
+            {
+                clock.accumulated = clock.accumulated.saturating_add(since.elapsed());
+            }
+            drop(clock);
             self.state
                 .pending_permission_prompts
                 .fetch_sub(1, Ordering::AcqRel);
@@ -707,6 +768,38 @@ mod js_permission_types {
         cancellation.mark_permission_prompt_timed_out();
         assert!(cancellation.permission_prompt_blocked_deadline());
         assert!(!PermCancellation::new().permission_prompt_blocked_deadline());
+    }
+
+    #[test]
+    fn approval_pause_is_parent_clocked_scoped_and_capped() {
+        let cancellation = PermCancellation::new();
+        // No allowance configured: nothing is ever excluded from the step budget.
+        {
+            let _guard = cancellation.begin_permission_prompt();
+            std::thread::sleep(Duration::from_millis(20));
+            assert_eq!(cancellation.approval_pause(), Duration::ZERO);
+        }
+        let cancellation = PermCancellation::new();
+        cancellation.set_approval_allowance(Duration::from_millis(200));
+        assert_eq!(cancellation.approval_pause(), Duration::ZERO);
+        {
+            let _outer = cancellation.begin_permission_prompt();
+            let _nested = cancellation.begin_permission_prompt();
+            std::thread::sleep(Duration::from_millis(30));
+            assert!(cancellation.approval_pause() >= Duration::from_millis(30));
+        }
+        let settled = cancellation.approval_pause();
+        assert!(settled >= Duration::from_millis(30));
+        // Time outside a prompt does not accrue.
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(cancellation.approval_pause(), settled);
+        // The cumulative pause never exceeds the allowance.
+        {
+            let _guard = cancellation.begin_permission_prompt();
+            std::thread::sleep(Duration::from_millis(250));
+            assert_eq!(cancellation.approval_pause(), Duration::from_millis(200));
+        }
+        assert_eq!(cancellation.approval_pause(), Duration::from_millis(200));
     }
 
     #[test]

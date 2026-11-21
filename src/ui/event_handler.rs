@@ -519,7 +519,8 @@ pub async fn handle_agent_event(
             crate::ui::settle_native_main_turn(run, ui.session, crate::session::native_replay::RetiredNativeOutcome::LiveToolReply).await?;
             #[cfg(feature = "goal")]
             if ui.session.goal_store.is_active() {
-                let collector = run.goal_round.take().unwrap_or_default();
+                let mut collector = run.goal_round.take().unwrap_or_default();
+                collector.add_usage(crate::extras::goal::driver::child_usage_delta(&ui.session.id));
                 let open_todos = ui.session.todos.snapshot().iter().filter(|todo| !matches!(todo.status.as_str(), "completed" | "cancelled")).count();
                 let summary = collector.finish(ui.session.goal_store.snapshot().as_ref().expect("active goal"), crate::extras::goal::gate::RoundEnd::AwaitingUser, open_todos);
                 crate::extras::goal::driver::park_for_question(&ui.session.goal_store, summary);
@@ -837,9 +838,12 @@ async fn run_goal_round(
 ) -> anyhow::Result<bool> {
     use crate::extras::goal::gate;
 
-    let Some(collector) = run.goal_round.take() else {
+    let Some(mut collector) = run.goal_round.take() else {
         return Ok(false);
     };
+    collector.add_usage(crate::extras::goal::driver::child_usage_delta(
+        &ui.session.id,
+    ));
     let goal = ui.session.goal_store.snapshot();
     let Some(goal) = goal.filter(|g| g.status.is_running()) else {
         // The goal was paused (or cleared) while this round ran. The round's

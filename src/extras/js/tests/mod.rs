@@ -82,6 +82,7 @@ mod skill_verification_semantics;
 pub(super) mod sqlite_contention;
 mod tool_console_output;
 mod vendor_integrity;
+mod worker_approval_pause;
 mod worker_broker;
 mod worker_containment;
 mod worker_effect_cancellation;

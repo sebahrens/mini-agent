@@ -599,7 +599,9 @@ pub(crate) async fn run_single_tool<M>(
     tool_extensions: &ToolCallExtensions,
     tool_call: &ToolCall,
     internal_call_id: &str,
-    error_history: &[Message],
+    // Built only when a call is cancelled: cloning the whole history per tool
+    // batch just to have it ready is tens of MB for image-heavy sessions.
+    error_history: impl Fn() -> Vec<Message>,
 ) -> Result<ToolCallOutcome, PromptError>
 where
     M: CompletionModel,
@@ -651,7 +653,7 @@ where
     let effective_args: serde_json::Value = match flow_into_tool_call(flow) {
         ToolCallDecision::Terminate(reason) => {
             return Err(PromptError::prompt_cancelled(
-                error_history.to_vec(),
+                error_history(),
                 reason,
             ));
         }
@@ -745,7 +747,7 @@ where
             // prevent exactly that leak.
             tracing::info!("tool {tool_name} with args {args}; run terminated by a result hook");
             Err(PromptError::prompt_cancelled(
-                error_history.to_vec(),
+                error_history(),
                 reason,
             ))
         }

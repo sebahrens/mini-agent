@@ -8,7 +8,10 @@ use sha2::{Digest, Sha256};
 
 const MAX_OBSERVATIONS: usize = 128;
 const STOP_AFTER: u32 = 5;
-pub(super) const STOP_REASON: &str = "tool-loop detected: repeated successful reads returned unchanged evidence; use the retained results or change the approach";
+/// The notice a repeated unchanged read gets as its tool result. The model
+/// sees it (unlike a run-ending error), so it can use the retained results or
+/// change approach.
+pub(super) const UNCHANGED_READ_NOTICE: &str = "tool-loop detected: this exact read has returned unchanged evidence repeatedly and was not executed again; use the retained results or change the approach";
 
 #[derive(Clone)]
 struct Observation {
@@ -20,11 +23,17 @@ struct Observation {
 pub(super) struct ReadLoopState {
     observations: HashMap<[u8; 32], Observation>,
     order: VecDeque<[u8; 32]>,
-    stop: bool,
 }
 
 pub(super) fn is_evidence_read(tool: &str) -> bool {
     super::tools::tool_class(tool) == super::tools::ToolClass::Evidence
+}
+
+/// Polling a job or waiting changes what an identical read would now return
+/// (a log grew, a file was written by the job), so it restarts the counters
+/// instead of letting a legitimate poll-and-read loop look unchanged.
+pub(super) fn resets_read_loop(tool: &str) -> bool {
+    matches!(tool, "wait" | "job_status")
 }
 
 /// Unknown/executable tools can mutate even when they subsequently report an error.
@@ -35,8 +44,12 @@ pub(super) fn invalidates_evidence(tool: &str) -> bool {
 }
 
 impl ReadLoopState {
-    pub(super) fn stop_requested(&self) -> bool {
-        self.stop
+    /// Whether the exact read `fingerprint` has already returned the same
+    /// output `STOP_AFTER` times since the last change or mutation.
+    pub(super) fn is_stuck(&self, fingerprint: &[u8; 32]) -> bool {
+        self.observations
+            .get(fingerprint)
+            .is_some_and(|seen| seen.repetitions >= STOP_AFTER)
     }
 
     pub(super) fn clear_after_mutation(&mut self) {
@@ -45,15 +58,13 @@ impl ReadLoopState {
 
     pub(super) fn observe(&mut self, fingerprint: [u8; 32], output: &str) {
         let output: [u8; 32] = Sha256::digest(output.as_bytes()).into();
-        let repetitions = if let Some(previous) = self.observations.get_mut(&fingerprint) {
+        if let Some(previous) = self.observations.get_mut(&fingerprint) {
             if previous.output == output {
                 previous.repetitions = previous.repetitions.saturating_add(1);
             } else {
                 previous.output = output;
                 previous.repetitions = 1;
-                self.stop = false;
             }
-            previous.repetitions
         } else {
             while self.order.len() >= MAX_OBSERVATIONS {
                 if let Some(oldest) = self.order.pop_front() {
@@ -68,11 +79,6 @@ impl ReadLoopState {
                     repetitions: 1,
                 },
             );
-            self.stop = false;
-            1
-        };
-        if repetitions >= STOP_AFTER {
-            self.stop = true;
         }
     }
 }
@@ -87,12 +93,13 @@ mod tests {
         state.observe([1; 32], "first");
         state.observe([1; 32], "first");
         state.observe([1; 32], "first");
-        assert!(!state.stop_requested());
+        assert!(!state.is_stuck(&[1; 32]));
         state.observe([1; 32], "first");
         state.observe([1; 32], "first");
-        assert!(state.stop_requested());
+        assert!(state.is_stuck(&[1; 32]));
+        assert!(!state.is_stuck(&[2; 32]));
         state.observe([1; 32], "changed");
-        assert!(!state.stop_requested());
+        assert!(!state.is_stuck(&[1; 32]));
         state.clear_after_mutation();
         state.observe([1; 32], "changed");
     }
@@ -105,9 +112,9 @@ mod tests {
             state.observe([2; 32], "b");
         }
         state.observe([1; 32], "a");
-        assert!(state.stop_requested());
+        assert!(state.is_stuck(&[1; 32]));
         state.observe([2; 32], "new b");
-        assert!(!state.stop_requested());
+        assert!(!state.is_stuck(&[2; 32]));
     }
 
     #[test]
@@ -150,6 +157,8 @@ mod tests {
         for tool in ["skills_search", "lsp_navigate", "memory_search"] {
             assert!(is_evidence_read(tool), "{tool}");
         }
+        assert!(resets_read_loop("wait") && resets_read_loop("job_status"));
+        assert!(!resets_read_loop("read"));
         assert!(invalidates_evidence("shell"));
         assert!(is_evidence_read("grep"));
     }

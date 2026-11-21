@@ -1507,7 +1507,7 @@ impl Cli {
     }
 
     #[cfg(feature = "skills")]
-    fn has_learned_skill_command(&self) -> bool {
+    pub(crate) fn has_learned_skill_command(&self) -> bool {
         self.learned_skill_stats
             || self.list_learned_skill_proposals
             || self.learned_skill_proposal.is_some()

@@ -569,6 +569,29 @@ pub(crate) fn verify_resume_provider_safety() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The argument checks that only need the CLI and the loaded configuration
+/// (`--quick-model`, `--tools`). A headless run reports a failure as a usage
+/// error (exit 2) with a machine-readable record, before any provider or
+/// session setup; an interactive one returns the error as is.
+pub(crate) async fn validate_cli_against_config(
+    cli: &Cli,
+    cfg: &Config,
+    workspace_root: &std::path::Path,
+) -> anyhow::Result<()> {
+    let checked = cli
+        .validate_quick_model(cfg)
+        .and_then(|()| cli.validate_tool_allowlist(cfg));
+    let Err(error) = checked else {
+        return Ok(());
+    };
+    if !cli.print {
+        return Err(error);
+    }
+    let message = error.to_string();
+    crate::print::emit_headless_preflight_failure(cli, workspace_root, &message).await?;
+    Err(HeadlessUsageError(message).into())
+}
+
 /// Error for a `--load-prompt NAME` that matches no prompt, listing the
 /// available names once (the message is the only output; callers must not
 /// print the list separately).
@@ -931,6 +954,20 @@ async fn settle_headless_preparation_failure(
             "preparation accounting could not be saved: {error}"
         )),
     }
+}
+
+#[cfg(feature = "memory")]
+tokio::task_local! {
+    /// The memory block the running headless turn was prepared with, so its
+    /// mid-turn context relief reserves for it exactly as the pre-turn
+    /// compaction did (mini-agent-sskdu.240).
+    static HEADLESS_RELIEF_MEMORY: Option<String>;
+}
+
+/// The memory block of the current headless turn, if one was scoped.
+#[cfg(feature = "memory")]
+fn headless_relief_memory() -> Option<String> {
+    HEADLESS_RELIEF_MEMORY.try_with(Clone::clone).ok().flatten()
 }
 
 async fn compact_headless_session_if_needed(
@@ -1688,24 +1725,7 @@ impl Startup {
             });
         }
 
-        if let Err(error) = cli.validate_quick_model(&cfg) {
-            if !cli.print {
-                return Err(error);
-            }
-            // Headless: a usage error (exit 2) with a machine-readable
-            // failure record, before any provider/session setup.
-            let message = error.to_string();
-            crate::print::emit_headless_preflight_failure(&cli, workspace.root(), &message).await?;
-            return Err(HeadlessUsageError(message).into());
-        }
-        if let Err(error) = cli.validate_tool_allowlist(&cfg) {
-            if !cli.print {
-                return Err(error);
-            }
-            let message = error.to_string();
-            crate::print::emit_headless_preflight_failure(&cli, workspace.root(), &message).await?;
-            return Err(HeadlessUsageError(message).into());
-        }
+        validate_cli_against_config(&cli, &cfg, workspace.root()).await?;
         let max_budget_usd = cli.resolve_max_budget_usd(&cfg)?;
         cfg.max_budget_usd = max_budget_usd;
         if let Some(warning) =
@@ -3489,7 +3509,9 @@ impl Startup {
             // Construct the child in heap_future's short frame; Box::pin alone
             // still reserves its temporary in this parent poll frame. The
             // regression consumer uses the unchanged 1 MiB default stack.
-            let response_result = heap_future(|| {
+            #[cfg(feature = "memory")]
+            let relief_memory = self.context.memory.clone();
+            let rounds = heap_future(|| {
                 run_headless_goal_rounds(
                     &agent,
                     &mut self.session,
@@ -3508,8 +3530,11 @@ impl Startup {
                     #[cfg(feature = "hooks")]
                     false,
                 )
-            })
-            .await;
+            });
+            #[cfg(feature = "memory")]
+            let response_result = HEADLESS_RELIEF_MEMORY.scope(relief_memory, rounds).await;
+            #[cfg(not(feature = "memory"))]
+            let response_result = rounds.await;
             let mut response_result = response_result;
             // Schema HTTP runs before the measured large final persistence
             // frame is polled; effects, accounting and repair order are unchanged.
@@ -4628,12 +4653,14 @@ async fn relieve_native_headless_segment(
 ) -> anyhow::Result<NativeRelief> {
     let pending_tokens =
         Session::estimate_tokens(crate::agent::runner::HEADLESS_CONTEXT_RELIEF_PROMPT);
+    #[cfg(feature = "memory")]
+    let memory = headless_relief_memory();
     if headless_compaction_plan_with(
         session,
         cfg,
         pending_tokens,
         #[cfg(feature = "memory")]
-        None,
+        memory.as_deref(),
         true,
     )
     .is_none()
@@ -4652,7 +4679,7 @@ async fn relieve_native_headless_segment(
         client,
         cfg,
         #[cfg(feature = "memory")]
-        None,
+        memory.as_deref(),
         pending_tokens,
         cli.compact_instructions.as_deref(),
         true,
@@ -5145,7 +5172,7 @@ async fn run_headless_goal_rounds_inner(
                 &goal,
                 &round_interactions,
                 &driver::RoundCost {
-                    usage: turn.usage,
+                    usage: crate::extras::goal::driver::with_child_usage(&session.id, turn.usage),
                     active: round_elapsed,
                 },
                 turn.failure.as_ref(),
@@ -5516,13 +5543,15 @@ async fn run_relieved_headless_turn(
         async |session: &mut Session, pending_tokens| {
             let keep = cfg.resolve_keep_recent_tool_results();
             let before = session.cold_context_tokens_after_tool_result_pruning(keep);
+            #[cfg(feature = "memory")]
+            let memory = headless_relief_memory();
             let (usage, happened) = heap_future(|| {
                 compact_headless_session(
                     session,
                     client,
                     cfg,
                     #[cfg(feature = "memory")]
-                    None,
+                    memory.as_deref(),
                     pending_tokens,
                     cli.compact_instructions.as_deref(),
                     true,
@@ -7202,6 +7231,28 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(result.summary, "TEXT_SUMMARY");
+    }
+
+    /// Mid-turn relief reserves for the same memory block the pre-turn
+    /// compaction used (mini-agent-sskdu.240).
+    #[cfg(feature = "memory")]
+    #[tokio::test]
+    async fn headless_relief_sees_the_turns_memory_block() {
+        assert_eq!(super::headless_relief_memory(), None);
+        let scoped = super::HEADLESS_RELIEF_MEMORY
+            .scope(Some("remembered".to_string()), async {
+                super::headless_relief_memory()
+            })
+            .await;
+        assert_eq!(scoped.as_deref(), Some("remembered"));
+        let (mut session, cfg) = fork_test_session();
+        session.memory_placement = crate::session::MemoryPlacement::LegacySystem;
+        let plan = |memory: Option<&str>| {
+            super::headless_compaction_plan_with(&session, &cfg, 0, memory, true)
+                .unwrap()
+                .response_token_budget
+        };
+        assert!(plan(Some(&"m".repeat(400))) > plan(None));
     }
 
     #[test]

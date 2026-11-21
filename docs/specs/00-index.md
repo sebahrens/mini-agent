@@ -447,3 +447,12 @@ that could get a freshly launched worker SIGKILLed (the intermittent
 See "Delivered corrections (2026-10-22 launch-thread fix)" in
 [`phase-6-brokered-js-runtime.md`](phase-6-brokered-js-runtime.md). The canonical invariant
 checklist is unchanged; this is an implementation detail of invariant 1.
+
+## Delivered corrections (2026-11-21 approval wait)
+
+`mini-agent-sskdu.267`: user-approval wait inside a `js` step no longer counts against the step
+deadline; the parent excludes up to one permission-prompt timeout of it and still enforces the hard
+overall bound (step budget plus that allowance). The `EffectResponse` wire frame gained a
+parent-to-worker `approval_wait_ms`. See "Delivered corrections (2026-11-21 approval wait and the
+step deadline)" in [`phase-6-brokered-js-runtime.md`](phase-6-brokered-js-runtime.md); canonical
+invariant 4 carries the changed timing rule.

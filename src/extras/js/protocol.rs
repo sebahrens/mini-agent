@@ -716,6 +716,15 @@ pub(crate) enum SkillProposalScope {
 pub(crate) struct EffectResponse {
     pub(crate) effect_ordinal: u32,
     pub(crate) result: EffectResult,
+    /// Milliseconds of parent-measured user-approval wait during this effect that the worker
+    /// must exclude from its step clock. Parent-to-worker only: the parent measures it and caps
+    /// the cumulative total; a worker has no frame that can set or raise it.
+    #[serde(default, skip_serializing_if = "is_zero_ms")]
+    pub(crate) approval_wait_ms: u64,
+}
+
+fn is_zero_ms(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

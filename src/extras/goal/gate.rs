@@ -41,6 +41,10 @@ pub enum RoundEnd {
     /// The run failed before the agent could finish: a provider error, an
     /// exhausted per-response turn budget, or a failed verification gate.
     Failed(String),
+    /// The run failed because the request exceeded the model's context window
+    /// and compaction could not clear it. Classified once, where the error
+    /// text enters ([`RoundEnd::from_error`]), so the gate matches a variant.
+    ContextOverflow(String),
     /// A typed main-agent clarification parked after actual work settled.
     /// Unlike an interrupt, its observed usage and active time still count.
     AwaitingUser,
@@ -64,13 +68,18 @@ impl RoundEnd {
             || message.starts_with("Agent exhausted its cumulative token budget")
         {
             Self::Capped(message)
+        } else if crate::retry::is_context_length_error_message(&message) {
+            Self::ContextOverflow(message)
         } else {
             Self::Failed(message)
         }
     }
 
     fn is_failed_or_capped(&self) -> bool {
-        matches!(self, Self::Failed(_) | Self::Capped(_))
+        matches!(
+            self,
+            Self::Failed(_) | Self::ContextOverflow(_) | Self::Capped(_)
+        )
     }
 }
 
@@ -426,7 +435,7 @@ pub fn gate_pre(goal: &Goal, round: &RoundSummary) -> Step {
     // actionable pause below.
     if progress.wrap_up_issued
         && round.end.is_failed_or_capped()
-        && !matches!(&round.end, RoundEnd::Failed(d) if crate::retry::is_context_length_error_message(d))
+        && !matches!(&round.end, RoundEnd::ContextOverflow(_))
     {
         if round.report_status() == Some(ReportStatus::Met) && round.open_todos == 0 {
             return Step::Verify(met_claim_request(goal, round));
@@ -438,18 +447,18 @@ pub fn gate_pre(goal: &Goal, round: &RoundSummary) -> Step {
     // so a broken provider or workspace cannot burn the whole budget. A run
     // that merely hit its turn or token cap is not a failure and falls through
     // to the ordinary rows.
+    // A context overflow that compaction could not clear will not clear by
+    // running the same round again, so it parks immediately rather than
+    // spending the retry budget. The goal itself is kept: it survives outside
+    // the conversation, which is the whole point of the record.
+    if let RoundEnd::ContextOverflow(diagnostic) = &round.end {
+        return Step::Decided(GateDecision::paused(
+            format!("the context window overflowed unrecoverably: {diagnostic}"),
+            PauseReason::ContextOverflow,
+            VerdictSource::Runtime,
+        ));
+    }
     if let RoundEnd::Failed(diagnostic) = &round.end {
-        // A context overflow that compaction could not clear will not clear by
-        // running the same round again, so it parks immediately rather than
-        // spending the retry budget. The goal itself is kept: it survives
-        // outside the conversation, which is the whole point of the record.
-        if crate::retry::is_context_length_error_message(diagnostic) {
-            return Step::Decided(GateDecision::paused(
-                format!("the context window overflowed unrecoverably: {diagnostic}"),
-                PauseReason::ContextOverflow,
-                VerdictSource::Runtime,
-            ));
-        }
         return Step::Decided(
             if progress.consecutive_round_failures.saturating_add(1)
                 > MAX_CONSECUTIVE_ROUND_FAILURES
@@ -1069,7 +1078,7 @@ pub fn apply(
         .saturating_add(round.active.as_secs());
 
     match &round.end {
-        RoundEnd::Failed(_) => {
+        RoundEnd::Failed(_) | RoundEnd::ContextOverflow(_) => {
             goal.progress.consecutive_round_failures =
                 goal.progress.consecutive_round_failures.saturating_add(1)
         }
@@ -2517,7 +2526,7 @@ mod tests {
     fn a_context_overflow_parks_the_goal_immediately_instead_of_retrying() {
         let mut g = goal();
         let round = RoundSummary {
-            end: RoundEnd::Failed("context_length_exceeded: too many tokens".into()),
+            end: RoundEnd::from_error("context_length_exceeded: too many tokens"),
             ..RoundSummary::completed()
         };
         let decision = decided(&g, &round);
