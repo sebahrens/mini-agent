@@ -2467,9 +2467,16 @@ mod extra_file_tests {
         } else {
             ""
         };
-        assert_eq!(
-            normal.description(),
-            format!("{}{note}", uncontained.description())
+        // A contained shell without network access additionally states that
+        // (deny-by-default network note); nothing else may differ.
+        let expected = format!("{}{note}", uncontained.description());
+        let actual_description = normal.description();
+        let tail = actual_description
+            .strip_prefix(&expected)
+            .expect("the contained description extends the uncontained one");
+        assert!(
+            tail.is_empty() || tail.starts_with(" Network: "),
+            "unexpected description tail: {tail}"
         );
     }
 

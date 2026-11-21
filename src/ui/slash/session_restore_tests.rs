@@ -1031,7 +1031,11 @@ async fn export_and_legacy_import_accept_public_and_legacy_filenames() {
         let path = workspace.root().join(name);
         let markdown = std::fs::read_to_string(&path).unwrap();
         assert!(markdown.starts_with("# Markdown export fixture\n"));
-        assert!(markdown.contains("## you\n\n```text\nexported conversation\n```"));
+        // Conversation text is exported as Markdown, not fenced (mini-agent-nvnkx.56).
+        assert!(
+            markdown.contains("## you\n\nexported conversation\n"),
+            "{markdown}"
+        );
         std::fs::write(&path, "retain existing Markdown export").unwrap();
         session::handle(&["/export", name], &mut ctx).await.unwrap();
         assert_eq!(

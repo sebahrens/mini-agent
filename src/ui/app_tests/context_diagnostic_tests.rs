@@ -258,7 +258,7 @@ async fn actual_context_and_doctor_are_pure_cold_busy_and_built_without_provider
         );
     }
     app.renderer.clear_content().unwrap();
-    crate::startup::heap_future(|| app.run_slash_command("/context"))
+    crate::startup::heap_future(|| app.run_slash_command("/context verbose"))
         .await
         .unwrap();
     let output = app.renderer.captured_output();

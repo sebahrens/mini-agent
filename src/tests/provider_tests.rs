@@ -2459,7 +2459,8 @@ async fn anthropic_bearer_redirects_refuse_other_origins_and_isolated_custom_tok
     for name in ["gateway", "anthropic"] {
         let mut custom = timeout_cfg(2, 2);
         custom.provider_type = "anthropic".into();
-        custom.base_url = endpoint.clone();
+        // A non-loopback origin: loopback custom providers are keyless by design.
+        custom.base_url = "https://gateway.example.invalid/v1".into();
         let providers = HashMap::from([(name.to_owned(), custom)]);
         let client =
             crate::provider::create_client_with_env(name, None, &providers, None, |read| {

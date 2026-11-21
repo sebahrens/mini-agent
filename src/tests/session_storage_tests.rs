@@ -598,6 +598,13 @@ fn failed_turn_persistence_rollback_keeps_partial_events_off_disk() {
     });
 
     assert!(!persist_session_if_settled(&mut session, true, &run, |_| {}).unwrap());
+    // The crash-recovery turn journal (not the snapshot) holds the partial
+    // events; loading replays it with a "cut off" host note.
+    let replayed = find_sessions_by_prefix(&session.id[..8]).unwrap();
+    assert_eq!(replayed.len(), 1);
+    assert!(replayed[0].messages.len() > 2);
+    // The snapshot itself stays at the pre-turn state.
+    crate::session::turn_journal::discard(&session.id);
     let on_disk_during_turn = find_sessions_by_prefix(&session.id[..8]).unwrap();
     assert_eq!(on_disk_during_turn.len(), 1);
     assert_eq!(
@@ -815,6 +822,9 @@ fn failed_turn_persistence_rollback_save_failure_keeps_prior_snapshot() {
     std::fs::rename(&saved_sessions_dir, &sessions_dir).unwrap();
     assert!(failed_save.is_err());
 
+    // The snapshot is untouched; drop the crash-recovery journal, which load
+    // would otherwise replay on top of it.
+    crate::session::turn_journal::discard(&session.id);
     let reloaded = find_sessions_by_prefix(&session.id[..8]).unwrap();
     assert_eq!(reloaded.len(), 1);
     assert_eq!(serde_json::to_value(&reloaded[0]).unwrap(), expected);
@@ -852,6 +862,7 @@ fn successful_turn_persistence_failure_keeps_live_success_and_prior_disk_snapsho
     // only its rollback snapshot. The last valid disk file remains pre-turn.
     run.pending_turn = None;
     assert_eq!(session.messages.len(), 4);
+    crate::session::turn_journal::discard(&session.id);
     let reloaded = find_sessions_by_prefix(&session.id[..8]).unwrap();
     assert_eq!(reloaded.len(), 1);
     assert_eq!(serde_json::to_value(&reloaded[0]).unwrap(), expected_disk);

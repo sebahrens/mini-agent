@@ -16959,7 +16959,7 @@ base_url = "http://127.0.0.1:9/v1"
 
 [custom_providers.remote]
 provider_type = "openai"
-base_url = "http://127.0.0.1:9/v1"
+base_url = "https://remote.example.invalid/v1"
 api_key_env = "MINI_AGENT_ACP_PERSONA_TEST_KEY_THAT_IS_NEVER_SET"
 
 [quick_models.review-fast]
@@ -19321,7 +19321,7 @@ provider = "acme"
 
 [custom_providers.acme]
 provider_type = "openai"
-base_url = "http://127.0.0.1:9/v1"
+base_url = "https://acme.example.invalid/v1"
 model = "acme-default"
 
 [quick_models.fast]

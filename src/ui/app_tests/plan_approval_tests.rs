@@ -3350,8 +3350,12 @@ async fn usd_budget_initial_interactive_invalid_tool_and_cancel_retain_incomplet
             continue;
         }
         assert_eq!(provider.calls().len(), 1);
-        assert!(app.ui.session.spend_account.snapshot().tracking_error);
-        assert!(!app.ui.session.spend_account.has_pending());
+        // The cancelled stream never reported usage: it is settled as a
+        // conservative estimated receipt that still counts against the cap,
+        // instead of latching a tracking failure (mini-agent-nvnkx.159).
+        let snapshot = app.ui.session.spend_account.snapshot();
+        assert!(!snapshot.tracking_error);
+        assert!(snapshot.observed_cost > 0.0 && snapshot.observed_cost <= 1.0);
         assert_eq!(app.ui.session.total_cost, 0.0);
         let ledger =
             crate::spend::Ledger::new(&roots.directory.path().join("MINI_AGENT_STATE_DIR"));
@@ -3369,6 +3373,7 @@ async fn usd_budget_initial_interactive_invalid_tool_and_cancel_retain_incomplet
         let saved = crate::session::storage::load_session_exact(&app.ui.session.id)
             .unwrap()
             .unwrap();
+        // A saved account with an unflushed receipt is restored as incomplete.
         assert!(saved.spend_account.snapshot().tracking_error);
         assert_eq!(saved.total_cost, 0.0);
         key(&mut app, KeyCode::Char('y')).await;
