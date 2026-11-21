@@ -55,6 +55,17 @@ cargo install --path . --debug # the development build/install command
   Linux gate (`linux-sandbox-policy`) still runs on every push and pull request because Linux-only
   code cannot be compiled on a Mac, while the macOS gates can be reproduced locally on one. Run
   the full matrix by hand with `gh workflow run ci.yml` (scope `full`).
+- CI wall-clock shape (mini-agent-nvnkx.8). Every job hangs directly off `changes`, so a run takes as long
+  as its slowest job plus any wait for hosted-runner slots; most of the long tail is queueing for the
+  small macOS pool, not compute. The `--features skills` row of `test` and `clippy` was removed because
+  `skills` implies `js`, so it resolved to exactly the same feature set (and suite) as `js,skills`, which
+  keeps the extra skill benchmark steps. That is 2 fewer Linux jobs per run and, by shrinking the
+  concurrent job count, shortens queueing on busy days; nothing is lost in coverage. Expected saving
+  is roughly 5-6 Linux runner-minutes (one 250-360 s suite plus its compile) per run, with only a small
+  wall-clock effect: the estimate is reasoning, not a measured hosted run. The 25-minute median target
+  needs further work that cannot be validated locally: sharing one compiled test binary per row between
+  jobs (nextest archives), partitioning the default suite, and running the non-platform Linux rows only
+  on schedule and tags. Containment gates, fingerprints and `ci-success` aggregation are unchanged.
 - CI test-impact selection (`scripts/ci_scope.py`, `scripts/ci_fingerprint.py`; tests in
   `scripts/tests/test_ci_scope.py` and `test_ci_fingerprint.py`). The `changes` job classifies a push
   or pull request as `docs`, `tests` or `code`. `tests` means every non-docs path is test-only by

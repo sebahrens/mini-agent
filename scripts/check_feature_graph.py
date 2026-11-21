@@ -120,13 +120,15 @@ FEATURE_ROWS = (
     ),
 )
 
+# The `skills` row is still a FEATURE_ROWS graph check, but it is no longer a
+# workflow matrix row: `skills` implies `js`, so `--features skills` resolves to
+# exactly the `js-skills` row's feature set (mini-agent-nvnkx.8).
 TEST_MATRIX_ROWS = (
     "default",
     "no-default",
     "memory",
     "js",
     "sandbox",
-    "skills",
     "js-sandbox",
     "mcp",
     "acp",
