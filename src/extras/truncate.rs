@@ -5,11 +5,7 @@ pub(crate) fn truncate_cjk(s: &str, max: usize, marker: &str) -> String {
     if s.len() <= max {
         return s.to_string();
     }
-    let mut cut = max;
-    while cut > 0 && !s.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    let mut out = s[..cut].to_string();
+    let mut out = crate::byte_text::clip_to_bytes(s, max).0.to_string();
     out.push_str(marker);
     out
 }

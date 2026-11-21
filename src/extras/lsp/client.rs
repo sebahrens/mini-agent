@@ -2247,14 +2247,9 @@ fn sanitize_diagnostics(
 }
 
 fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
-    if value.len() <= max_bytes {
-        return value.to_string();
-    }
-    let mut end = max_bytes;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    value[..end].to_string()
+    crate::byte_text::clip_to_bytes(value, max_bytes)
+        .0
+        .to_string()
 }
 
 fn retained_diagnostic_bytes(

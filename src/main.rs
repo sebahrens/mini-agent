@@ -3,6 +3,7 @@
 mod acp_auth;
 mod agent;
 mod auth;
+mod byte_text;
 mod cli;
 mod config;
 mod context;
