@@ -6525,8 +6525,8 @@ fn unknown_quick_model_headless_is_exit_2_with_failure_record() {
 fn headless_json_result_does_not_wait_for_a_never_answering_title() {
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     let root = TempRoot::new();
@@ -6618,8 +6618,7 @@ fn headless_json_result_does_not_wait_for_a_never_answering_title() {
     server.join().unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
-    let value: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("one JSON result");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("one JSON result");
     assert_eq!(value["result"], "finished", "{value}");
     assert_eq!(
         extra.load(Ordering::SeqCst),

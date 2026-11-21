@@ -5,7 +5,9 @@ use rig::tool::Tool;
 use serde::Deserialize;
 
 use crate::agent::tools::{ToolError, check_perm, check_perm_bound_path};
-use crate::git::runner::{GitRunError, GitRunner, LOCAL_MUTATION_LIMITS, QUERY_LIMITS, command_result};
+use crate::git::runner::{
+    GitRunError, GitRunner, LOCAL_MUTATION_LIMITS, QUERY_LIMITS, command_result,
+};
 use crate::permission::ask::AskSender;
 use crate::permission::checker::PermCheck;
 use crate::sandbox::{CommandOutput, CommandStatus, Sandbox};
@@ -1101,12 +1103,10 @@ impl GitTool {
             .map_err(|error| match error {
                 // Only an output overflow is fixed by staging less at once; a
                 // timeout, cancellation or repository error is not.
-                GitRunError::OutputLimit { .. } => {
-                    ToolError::Msg(format!(
-                        "{error}; the selection is too large to stage at once. Stage a narrower \
+                GitRunError::OutputLimit { .. } => ToolError::Msg(format!(
+                    "{error}; the selection is too large to stage at once. Stage a narrower \
                          set of subdirectories in separate calls."
-                    ))
-                }
+                )),
                 other => other.into(),
             })?;
         Ok(output
@@ -3699,6 +3699,15 @@ mod tests {
             .to_string();
         assert!(error.contains("not supported by status"), "{error}");
         assert!(error.contains("accepted by diff, log, show"), "{error}");
+    }
+
+    /// A definition is paid for in every request (mini-agent-sskdu.174).
+    #[test]
+    fn the_git_definition_stays_within_its_size_budget() {
+        let repo = TestRepo::new();
+        let tool = repo.tool();
+        let size = tool.description().len() + tool.parameters().to_string().len();
+        assert!(size <= 5_100, "git definition is {size} bytes");
     }
 
     #[test]

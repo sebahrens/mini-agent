@@ -295,14 +295,15 @@ const CHANGED_FILES_LISTED: usize = 40;
 /// model wrote about its work, so the judge can see what was touched even when
 /// the tail's budget has only the last few messages.
 fn with_changed_files(session: &crate::session::Session, tail: String) -> String {
-    let calls = session.messages.iter().filter_map(|message| {
-        match message.tool.as_ref()? {
+    let calls = session
+        .messages
+        .iter()
+        .filter_map(|message| match message.tool.as_ref()? {
             crate::session::PersistedToolMessage::Call { name, arguments } => {
                 Some((name.as_str(), arguments))
             }
             _ => None,
-        }
-    });
+        });
     prefix_changed_files(changed_file_paths(calls), tail)
 }
 

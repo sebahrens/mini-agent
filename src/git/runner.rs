@@ -2388,7 +2388,10 @@ mod tests {
         ];
         for (error, kind) in cases {
             assert_eq!(error.kind(), kind);
-            assert_eq!(GitRunError::kind_is_uncertain(kind), kind != GitRunErrorKind::Failed);
+            assert_eq!(
+                GitRunError::kind_is_uncertain(kind),
+                kind != GitRunErrorKind::Failed
+            );
         }
         // Git's own stderr mentioning a marker is still a definite refusal.
         let refused = GitRunError::Failed {
@@ -2504,7 +2507,7 @@ mod tests {
         let err = command_result("fetch", limits(), make_output(CommandStatus::TimedOut, b""))
             .err()
             .expect("expected Err")
-        .to_string();
+            .to_string();
         assert!(err.contains("timed out"), "unexpected: {err}");
         assert!(err.contains("fetch"), "unexpected: {err}");
     }
