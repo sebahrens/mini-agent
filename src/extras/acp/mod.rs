@@ -5207,6 +5207,457 @@ async fn run_command(
     CommandFlow::Continue(responder)
 }
 
+/// How long a goal round's agent worked: the turn's wall clock minus whatever
+/// the user spent on a permission prompt. A goal's time bound measures how long
+/// the agent worked, so the clock starts when the prompt is admitted.
+#[cfg(feature = "goal")]
+struct GoalRoundClock {
+    started: std::time::Instant,
+    /// Filled by the permission bridge with the time the user held this turn.
+    blocked_ms: Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[cfg(feature = "goal")]
+impl GoalRoundClock {
+    fn start() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            blocked_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    fn active(&self) -> std::time::Duration {
+        self.started
+            .elapsed()
+            .saturating_sub(std::time::Duration::from_millis(
+                self.blocked_ms.load(std::sync::atomic::Ordering::Relaxed),
+            ))
+    }
+}
+
+/// The goal decision a settled round reports: the line, the goal, and the
+/// instruction a relaunch carries into the next turn.
+#[cfg(feature = "goal")]
+type GoalLine = (String, crate::extras::goal::Goal, Option<String>);
+
+/// What one finished segment means for the prompt.
+enum SegmentFlow {
+    /// The prompt is over with this result.
+    Finished(Box<Result<PromptOutcome, agent_client_protocol::Error>>),
+    /// The segment stopped for context relief: compact and run another.
+    Relieve { reactive: bool },
+}
+
+/// Bookkeeping across the segments of one prompt turn.
+///
+/// Mid-turn compaction (mini-agent-sgzh0): a segment that stops at a
+/// tool-batch boundary under context pressure is persisted, the history is
+/// compacted at the start of the next segment, and the turn continues with a
+/// continuation prompt. At most `MAX_MID_TURN_RELIEFS` per prompt.
+struct PromptSegments {
+    current_input: crate::agent::input::PromptInput,
+    /// The run the prompt's usage is accounted to, and the prices it uses.
+    run: Option<crate::spend::run::Run>,
+    pricing: crate::print::HeadlessPricing,
+    /// Set once a turn is routed to a model other than the startup one.
+    routed_run: Option<crate::spend::run::Run>,
+    native_owner: Option<crate::provider::NativeRunOwner>,
+    is_compact: bool,
+    reliefs: usize,
+    /// Native relief has no fixed cap (as in headless): it stops when a relief
+    /// segment ran no tools or its compaction found nothing to compact.
+    native_relieving: bool,
+    /// The provider rejecting a request as exceeding its context window gets
+    /// one compact-and-resume per prompt (mini-agent-cj9oh); a second rejection
+    /// surfaces unchanged.
+    reactive_used: bool,
+    /// Usage already committed to the session by native relief segments; the
+    /// end-of-prompt commit charges only what came after (mini-agent-wkzav).
+    usage_committed: crate::event::UsageDelta,
+    #[cfg(feature = "goal")]
+    carried_usage: rig::completion::Usage,
+}
+
+impl PromptSegments {
+    fn new(
+        current_input: crate::agent::input::PromptInput,
+        run: Option<crate::spend::run::Run>,
+        pricing: crate::print::HeadlessPricing,
+        is_compact: bool,
+    ) -> Self {
+        let usage_committed = run
+            .as_ref()
+            .map_or_else(Default::default, |run| run.accepted_usage());
+        Self {
+            current_input,
+            run,
+            pricing,
+            routed_run: None,
+            native_owner: None,
+            is_compact,
+            reliefs: 0,
+            native_relieving: false,
+            reactive_used: false,
+            usage_committed,
+            #[cfg(feature = "goal")]
+            carried_usage: rig::completion::Usage::default(),
+        }
+    }
+
+    /// Whether the next segment may stop for mid-turn relief.
+    fn relief_allowed(&self) -> bool {
+        self.reliefs < MAX_MID_TURN_RELIEFS || self.native_relieving
+    }
+
+    /// Decides what a finished segment means: the prompt is over, or the
+    /// segment is committed and the next one starts after compaction.
+    #[allow(clippy::too_many_arguments)]
+    async fn settle_segment(
+        &mut self,
+        state: &AcpState,
+        history: &mut SessionHistory,
+        control: &TurnControl,
+        result: Result<PromptOutcome, agent_client_protocol::Error>,
+        compactions_at_segment_start: usize,
+    ) -> SegmentFlow {
+        let mut outcome = match result {
+            Ok(outcome)
+                if outcome.compaction_boundary
+                    || (!self.reactive_used
+                        && self.native_owner.is_none()
+                        && state.cfg.resolve_compact_enabled()
+                        && !control.is_cancelled()
+                        && outcome
+                            .error
+                            .as_deref()
+                            .is_some_and(crate::retry::is_context_length_error_message)) =>
+            {
+                outcome
+            }
+            other => return SegmentFlow::Finished(Box::new(other)),
+        };
+        let reactive = outcome.error.take().is_some();
+        self.reactive_used |= reactive;
+        let progress = outcome.progress.take().unwrap_or_default();
+        if control.is_cancelled() {
+            // Cancellation won: keep what already ran, never continue.
+            outcome.compaction_boundary = false;
+            outcome.reason = StopReason::Cancelled;
+            outcome.progress = Some(progress);
+            return SegmentFlow::Finished(Box::new(Ok(outcome)));
+        }
+        let response = last_assistant_text(&progress);
+        match commit_relief_segment(
+            history,
+            &mut self.native_owner,
+            self.run.as_ref(),
+            &mut self.usage_committed,
+            &self.current_input,
+            &response,
+            &progress,
+            self.pricing,
+            self.reliefs,
+            compactions_at_segment_start,
+            outcome.compaction_boundary,
+        )
+        .await
+        {
+            Ok(ReliefCommit::Native) => self.native_relieving = true,
+            Ok(ReliefCommit::Persisted) => {}
+            Err(stop) => {
+                outcome.compaction_boundary = false;
+                outcome.error = Some(stop.error);
+                outcome.progress = stop.keep_progress.then_some(progress);
+                return SegmentFlow::Finished(Box::new(Ok(outcome)));
+            }
+        }
+        #[cfg(feature = "goal")]
+        {
+            let carried = &mut self.carried_usage;
+            carried.input_tokens = carried
+                .input_tokens
+                .saturating_add(outcome.usage.input_tokens);
+            carried.output_tokens = carried
+                .output_tokens
+                .saturating_add(outcome.usage.output_tokens);
+            carried.total_tokens = carried
+                .total_tokens
+                .saturating_add(outcome.usage.total_tokens);
+        }
+        self.reliefs += 1;
+        SegmentFlow::Relieve { reactive }
+    }
+
+    /// Runs segments until the prompt is over: each stops either finished or
+    /// for mid-turn context relief, which compacts and continues.
+    async fn run_segments(
+        &mut self,
+        state: &AcpState,
+        turn: &PromptTurn,
+        history: &mut SessionHistory,
+        #[cfg(feature = "goal")] clock: &GoalRoundClock,
+        #[cfg(feature = "mcp")] mcp_manager: &mut Option<PromptMcp>,
+    ) -> Result<PromptOutcome, agent_client_protocol::Error> {
+        loop {
+            let compactions_at_segment_start = history.session.compaction_count();
+            let relief_allowed = self.relief_allowed();
+            let result = crate::startup::heap_future(|| {
+                execute_prompt(
+                    state,
+                    turn.clone(),
+                    &self.current_input,
+                    self.is_compact,
+                    relief_allowed,
+                    history,
+                    &mut self.native_owner,
+                    &mut self.routed_run,
+                    #[cfg(feature = "mcp")]
+                    mcp_manager,
+                    #[cfg(feature = "goal")]
+                    clock.blocked_ms.clone(),
+                )
+            })
+            .await
+            .or_else(PromptExit::settle);
+            // The cost estimate follows the routed model's prices
+            // (mini-agent-1ly5i).
+            if let Some(routed) = &self.routed_run {
+                self.pricing = headless_pricing_for_run(routed);
+            }
+            // A compaction that could not shrink the history must not leave
+            // the forced-compaction flag armed for the next prompt.
+            history.manual_compact = false;
+            history.relief_pending = false;
+            match self
+                .settle_segment(
+                    state,
+                    history,
+                    &turn.control,
+                    result,
+                    compactions_at_segment_start,
+                )
+                .await
+            {
+                SegmentFlow::Finished(result) => return *result,
+                SegmentFlow::Relieve { reactive } => {
+                    notify_relief(&turn.session_id, &turn.cx, reactive);
+                    self.begin_relief(history);
+                    // A manager this segment connected stays at the session's
+                    // disposal so the next segment reuses it instead of
+                    // reconnecting.
+                    #[cfg(feature = "mcp")]
+                    if let Some(mcp) = mcp_manager.take() {
+                        history.reuse.mcp = Some(mcp);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Commits the finished prompt: settles the goal round, writes the
+    /// transcript and usage to the session, saves it, and reports the context
+    /// meter, title and goal decision to the client.
+    async fn settle_prompt(
+        &mut self,
+        state: &AcpState,
+        turn: &PromptTurn,
+        history: &mut SessionHistory,
+        outcome: &mut PromptOutcome,
+        #[cfg(feature = "goal")] todo_snapshot: &[crate::agent::tools::todo::TodoItem],
+        #[cfg(feature = "goal")] clock: &GoalRoundClock,
+    ) {
+        // Settle the goal round this prompt turn was, before the transcript is
+        // committed, so the gate sees the round's own record.
+        #[cfg(feature = "goal")]
+        let goal_line = settle_prompt_goal(
+            state,
+            turn,
+            self.is_compact,
+            outcome,
+            history,
+            todo_snapshot,
+            clock,
+        )
+        .await;
+        history.pending_question = outcome.question.clone();
+        history.session.pending_question = outcome.question.clone();
+        history.session.todos = turn.todo_store.clone();
+        #[cfg(feature = "goal")]
+        {
+            history.session.goal_store = turn.goal_store.clone();
+        }
+        let usage = self.run.as_ref().map_or_else(Default::default, |run| {
+            run.accepted_usage()
+                .nonnegative_difference(self.usage_committed)
+        });
+        commit_prompt_transcript(
+            history,
+            &mut self.native_owner,
+            outcome,
+            &self.current_input,
+            usage,
+            self.pricing,
+        );
+        save_prompt_session(
+            state,
+            history,
+            self.native_owner.take(),
+            outcome,
+            self.is_compact,
+            turn,
+        )
+        .await;
+        // Context meter and cost, then the title when it changed. Both are
+        // best-effort display data and never fail the prompt.
+        send_usage_update(state, history, &turn.session_id, &turn.cx);
+        send_session_info(history, &turn.session_id, &turn.cx);
+        #[cfg(feature = "goal")]
+        if let Some(line) = goal_line {
+            notify_goal_decision(history, &turn.session_id, &turn.cx, line);
+        }
+    }
+
+    /// Arms the next segment: it compacts the persisted history first, keeping
+    /// a recent tail (mini-agent-sskdu.230), and continues with the relief
+    /// prompt.
+    fn begin_relief(&mut self, history: &mut SessionHistory) {
+        history.relief_pending = true;
+        self.current_input = crate::agent::input::PromptInput::text(
+            crate::agent::runner::HEADLESS_CONTEXT_RELIEF_PROMPT.to_owned(),
+        );
+    }
+
+    /// The prompt's final result. A later segment that fails to start (`Err`)
+    /// must not drop what the earlier, already persisted relief segments spent
+    /// or wrote: answer with the error, but through the commit tail so that
+    /// usage is charged and the transcript checkpointed (mini-agent-ccuu8).
+    /// Every way out of the loop owes the round the tokens earlier relief
+    /// segments spent: a cancelled or failed final segment included
+    /// (mini-agent-51okt).
+    fn finish(
+        &self,
+        result: Result<PromptOutcome, agent_client_protocol::Error>,
+    ) -> Result<PromptOutcome, agent_client_protocol::Error> {
+        let result = match result {
+            Err(error) if self.reliefs > 0 => Ok(PromptOutcome::failed(error.to_string())),
+            other => other,
+        };
+        self.with_carried_usage(result)
+    }
+
+    #[cfg(feature = "goal")]
+    fn with_carried_usage(
+        &self,
+        result: Result<PromptOutcome, agent_client_protocol::Error>,
+    ) -> Result<PromptOutcome, agent_client_protocol::Error> {
+        result.map(|mut outcome| {
+            let usage = &mut outcome.usage;
+            usage.input_tokens = usage
+                .input_tokens
+                .saturating_add(self.carried_usage.input_tokens);
+            usage.output_tokens = usage
+                .output_tokens
+                .saturating_add(self.carried_usage.output_tokens);
+            usage.total_tokens = usage
+                .total_tokens
+                .saturating_add(self.carried_usage.total_tokens);
+            outcome
+        })
+    }
+
+    #[cfg(not(feature = "goal"))]
+    fn with_carried_usage(
+        &self,
+        result: Result<PromptOutcome, agent_client_protocol::Error>,
+    ) -> Result<PromptOutcome, agent_client_protocol::Error> {
+        result
+    }
+}
+
+/// Tells the client why the session is being compacted mid-turn.
+fn notify_relief(session_id: &SessionId, cx: &ConnectionTo<Client>, reactive: bool) {
+    let _ = cx.send_notification(SessionNotification::new(
+        session_id.clone(),
+        SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
+            TextContent::new(if reactive {
+                "the provider rejected the prompt as too long: compacting the session and retrying once..."
+            } else {
+                "mid-turn context relief: compacting the session and continuing..."
+            }),
+        ))),
+    ));
+}
+
+/// The MCP manager a prompt starts with: none.
+#[cfg(all(not(test), feature = "mcp"))]
+fn initial_prompt_mcp(_state: &AcpState) -> Option<PromptMcp> {
+    None
+}
+
+/// The MCP manager a prompt starts with: the test fixture's, when set.
+#[cfg(all(test, feature = "mcp"))]
+fn initial_prompt_mcp(state: &AcpState) -> Option<PromptMcp> {
+    lock_unpoisoned(&state.mcp_fixture)
+        .take()
+        .map(|manager| PromptMcp {
+            manager,
+            scope: crate::agent::runner::AgentWorkScope::new(),
+            key: None,
+        })
+}
+
+/// The answer to a question the goal asked is what it was waiting for, as in
+/// the terminal: admitting the prompt resumes it, so the round it starts is
+/// settled. `/compact` is housekeeping and answers nothing.
+#[cfg(feature = "goal")]
+fn admit_goal_answer(
+    command: &Option<commands::Command>,
+    goal_store: &crate::extras::goal::GoalStore,
+    history: &mut SessionHistory,
+    input: crate::agent::input::PromptInput,
+) -> crate::agent::input::PromptInput {
+    if matches!(command, Some(commands::Command::Compact)) {
+        return input;
+    }
+    goal_store.with_mut(|goal| {
+        if goal.status == crate::extras::goal::GoalStatus::AwaitingUser {
+            goal.resume();
+        }
+    });
+    // The gate's last instruction (a failing check's output, the judge's
+    // assessment) reaches the worker as a non-persisted turn directive;
+    // otherwise the editor user sees the failure and the model never does.
+    let pending = history.pending_goal_instruction.take();
+    match pending.filter(|_| goal_store.is_active()) {
+        Some(instruction) => acp_goal_directive(&input, &instruction),
+        None => input,
+    }
+}
+
+/// Keeps the history lock and generation registered until every server this
+/// prompt does not hand back to the session is closed, including cancellation
+/// during agent/runner preparation. Only a prompt that ended cleanly leaves its
+/// servers connected for the next one.
+#[cfg(feature = "mcp")]
+async fn release_prompt_mcp(
+    history: &mut SessionHistory,
+    mcp: PromptMcp,
+    registration: &TurnRegistration,
+    result: &Result<PromptOutcome, agent_client_protocol::Error>,
+) {
+    let cancelled = registration.control.is_cancelled();
+    let clean = !cancelled
+        && matches!(
+            result,
+            Ok(outcome) if outcome.reason == StopReason::EndTurn && outcome.error.is_none()
+        );
+    if clean {
+        history.reuse.mcp = Some(mcp);
+    } else {
+        mcp.close(cancelled).await;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_prompt(
     state: &AcpState,
@@ -5249,248 +5700,56 @@ async fn run_prompt(
     } else {
         responder
     };
-    #[cfg(all(not(test), feature = "mcp"))]
-    let mut mcp_manager: Option<PromptMcp> = None;
-    #[cfg(all(test, feature = "mcp"))]
-    let mut mcp_manager: Option<PromptMcp> =
-        lock_unpoisoned(&state.mcp_fixture)
-            .take()
-            .map(|manager| PromptMcp {
-                manager,
-                scope: crate::agent::runner::AgentWorkScope::new(),
-                key: None,
-            });
-    #[cfg(feature = "goal")]
-    let goal_store_for_gate = goal_store.clone();
-    #[cfg(feature = "goal")]
-    let sandbox_for_gate = sandbox.clone();
+    #[cfg(feature = "mcp")]
+    let mut mcp_manager = initial_prompt_mcp(state);
     #[cfg(feature = "goal")]
     let todo_snapshot = todo_store.snapshot();
-    // A goal's time bound measures how long the agent worked, so the turn's
-    // wall clock is taken here and whatever the user spent on a permission
-    // prompt is subtracted from it.
     #[cfg(feature = "goal")]
-    let blocked_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    #[cfg(feature = "goal")]
-    let round_started = std::time::Instant::now();
-    let run = crate::spend::run::Run::current();
-    let usage_before = run
-        .as_ref()
-        .map_or_else(Default::default, |run| run.accepted_usage());
-    // Usage already committed to the session by native relief segments; the
-    // end-of-prompt commit charges only what came after
-    // (mini-agent-wkzav).
-    let mut usage_committed = usage_before;
-    let mut pricing = crate::print::HeadlessPricing::from_session(&history.session, &state.cfg);
-    // Set once a turn is routed to a model other than the startup one.
-    let mut routed_run: Option<crate::spend::run::Run> = None;
+    let clock = GoalRoundClock::start();
+    let pricing = crate::print::HeadlessPricing::from_session(&history.session, &state.cfg);
     history.pending_question = None;
-    let mut native_owner = None;
-    // Mid-turn compaction (mini-agent-sgzh0): a segment that stops at a
-    // tool-batch boundary under context pressure is persisted, the history is
-    // compacted at the start of the next segment, and the turn continues with
-    // a continuation prompt. At most `MAX_MID_TURN_RELIEFS` per prompt.
-    let mut current_input = prompt_input.clone();
-    let mut reliefs = 0usize;
-    // Native relief has no fixed cap (as in headless): it stops when a relief
-    // segment ran no tools or its compaction found nothing to compact.
-    let mut native_relieving = false;
-    // The provider rejecting a request as exceeding its context window gets
-    // one compact-and-resume per prompt (mini-agent-cj9oh); a second rejection
-    // surfaces unchanged.
-    let mut reactive_used = false;
+    let is_compact = matches!(command, Some(commands::Command::Compact));
     #[cfg(feature = "goal")]
-    let mut carried_usage = rig::completion::Usage::default();
-    // The answer to a question the goal asked is what it was waiting for, as in
-    // the terminal: admitting the prompt resumes it, so the round it starts is
-    // settled. `/compact` is housekeeping and answers nothing.
-    #[cfg(feature = "goal")]
-    if !matches!(command, Some(commands::Command::Compact)) {
-        goal_store.with_mut(|goal| {
-            if goal.status == crate::extras::goal::GoalStatus::AwaitingUser {
-                goal.resume();
-            }
-        });
-        // The gate's last instruction (a failing check's output, the judge's
-        // assessment) reaches the worker as a non-persisted turn directive;
-        // otherwise the editor user sees the failure and the model never does.
-        let pending = history.pending_goal_instruction.take();
-        if let Some(instruction) = pending.filter(|_| goal_store.is_active()) {
-            current_input = acp_goal_directive(&current_input, &instruction);
-        }
-    }
-    let result = loop {
-        let compactions_at_segment_start = history.session.compaction_count();
-        let result = crate::startup::heap_future(|| {
-            execute_prompt(
-                state,
-                &current_input,
-                matches!(command, Some(commands::Command::Compact)),
-                reliefs < MAX_MID_TURN_RELIEFS || native_relieving,
-                session_id.clone(),
-                &mut history,
-                &mut native_owner,
-                &mut routed_run,
-                workspace.clone(),
-                context.clone(),
-                read_tracker.clone(),
-                todo_store.clone(),
-                #[cfg(feature = "goal")]
-                goal_store.clone(),
-                sandbox.clone(),
-                #[cfg(feature = "js")]
-                js_session_state.clone(),
-                #[cfg(feature = "skills")]
-                skill_services.clone(),
-                cx.clone(),
-                control.clone(),
-                #[cfg(feature = "mcp")]
-                &mut mcp_manager,
-                #[cfg(feature = "goal")]
-                blocked_ms.clone(),
-            )
-        })
-        .await;
-        // The cost estimate follows the routed model's prices
-        // (mini-agent-1ly5i).
-        if let Some(routed) = &routed_run {
-            pricing = headless_pricing_for_run(routed);
-        }
-        // A compaction that could not shrink the history must not leave the
-        // forced-compaction flag armed for the next prompt.
-        history.manual_compact = false;
-        history.relief_pending = false;
-        let mut outcome = match result {
-            Ok(outcome)
-                if outcome.compaction_boundary
-                    || (!reactive_used
-                        && native_owner.is_none()
-                        && state.cfg.resolve_compact_enabled()
-                        && !control.is_cancelled()
-                        && outcome
-                            .error
-                            .as_deref()
-                            .is_some_and(crate::retry::is_context_length_error_message)) =>
-            {
-                outcome
-            }
-            other => break other,
-        };
-        let reactive = outcome.error.take().is_some();
-        reactive_used |= reactive;
-        let progress = outcome.progress.take().unwrap_or_default();
-        if control.is_cancelled() {
-            // Cancellation won: keep what already ran, never continue.
-            outcome.compaction_boundary = false;
-            outcome.reason = StopReason::Cancelled;
-            outcome.progress = Some(progress);
-            break Ok(outcome);
-        }
-        let response = last_assistant_text(&progress);
-        match commit_relief_segment(
-            &mut history,
-            &mut native_owner,
-            run.as_ref(),
-            &mut usage_committed,
-            &current_input,
-            &response,
-            &progress,
-            pricing,
-            reliefs,
-            compactions_at_segment_start,
-            outcome.compaction_boundary,
-        )
-        .await
-        {
-            Ok(ReliefCommit::Native) => native_relieving = true,
-            Ok(ReliefCommit::Persisted) => {}
-            Err(stop) => {
-                outcome.compaction_boundary = false;
-                outcome.error = Some(stop.error);
-                outcome.progress = stop.keep_progress.then_some(progress);
-                break Ok(outcome);
-            }
-        }
+    let first_input = admit_goal_answer(&command, &goal_store, &mut history, prompt_input.clone());
+    #[cfg(not(feature = "goal"))]
+    let first_input = prompt_input.clone();
+    let mut segments = PromptSegments::new(
+        first_input,
+        crate::spend::run::Run::current(),
+        pricing,
+        is_compact,
+    );
+    let turn = PromptTurn {
+        session_id,
+        workspace,
+        context,
+        read_tracker,
+        todo_store,
         #[cfg(feature = "goal")]
-        {
-            carried_usage.input_tokens = carried_usage
-                .input_tokens
-                .saturating_add(outcome.usage.input_tokens);
-            carried_usage.output_tokens = carried_usage
-                .output_tokens
-                .saturating_add(outcome.usage.output_tokens);
-            carried_usage.total_tokens = carried_usage
-                .total_tokens
-                .saturating_add(outcome.usage.total_tokens);
-        }
-        reliefs += 1;
-        let _ = cx.send_notification(SessionNotification::new(
-            session_id.clone(),
-            SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
-                TextContent::new(if reactive {
-                    "the provider rejected the prompt as too long: compacting the session and retrying once..."
-                } else {
-                    "mid-turn context relief: compacting the session and continuing..."
-                }),
-            ))),
-        ));
-        // The next segment compacts the persisted history first, keeping a
-        // recent tail (mini-agent-sskdu.230).
-        history.relief_pending = true;
-        // A manager this segment connected stays at the session's disposal so
-        // the next segment reuses it instead of reconnecting.
-        #[cfg(feature = "mcp")]
-        if let Some(mcp) = mcp_manager.take() {
-            history.reuse.mcp = Some(mcp);
-        }
-        current_input = crate::agent::input::PromptInput::text(
-            crate::agent::runner::HEADLESS_CONTEXT_RELIEF_PROMPT.to_owned(),
-        );
+        goal_store,
+        sandbox,
+        #[cfg(feature = "js")]
+        js_session_state,
+        #[cfg(feature = "skills")]
+        skill_services,
+        cx,
+        control,
     };
-    // A later segment that fails to start (`Err`) must not drop what the
-    // earlier, already persisted relief segments spent or wrote: answer with
-    // the error, but through the commit tail below so that usage is charged and
-    // the transcript checkpointed (mini-agent-ccuu8).
-    let result = match result {
-        Err(error) if reliefs > 0 => Ok(PromptOutcome::failed(error.to_string())),
-        other => other,
-    };
-    // Every way out of the loop owes the round the tokens earlier relief
-    // segments spent: a cancelled or failed final segment included
-    // (mini-agent-51okt).
-    #[cfg(feature = "goal")]
-    let result = result.map(|mut outcome| {
-        outcome.usage.input_tokens = outcome
-            .usage
-            .input_tokens
-            .saturating_add(carried_usage.input_tokens);
-        outcome.usage.output_tokens = outcome
-            .usage
-            .output_tokens
-            .saturating_add(carried_usage.output_tokens);
-        outcome.usage.total_tokens = outcome
-            .usage
-            .total_tokens
-            .saturating_add(carried_usage.total_tokens);
-        outcome
-    });
-    // Keep the history lock and generation registered until every server this
-    // prompt does not hand back to the session is closed, including
-    // cancellation during agent/runner preparation. Only a prompt that ended
-    // cleanly leaves its servers connected for the next one.
+    let result = segments
+        .run_segments(
+            state,
+            &turn,
+            &mut history,
+            #[cfg(feature = "goal")]
+            &clock,
+            #[cfg(feature = "mcp")]
+            &mut mcp_manager,
+        )
+        .await;
+    let result = segments.finish(result);
     #[cfg(feature = "mcp")]
     if let Some(mcp) = mcp_manager {
-        let cancelled = registration.control.is_cancelled();
-        let clean = !cancelled
-            && matches!(
-                &result,
-                Ok(outcome) if outcome.reason == StopReason::EndTurn && outcome.error.is_none()
-            );
-        if clean {
-            history.reuse.mcp = Some(mcp);
-        } else {
-            mcp.close(cancelled).await;
-        }
+        release_prompt_mcp(&mut history, mcp, registration, &result).await;
     }
     let mut outcome = match result {
         Ok(outcome) => outcome,
@@ -5501,89 +5760,100 @@ async fn run_prompt(
         outcome.error = None;
         outcome.question = None;
     }
-    // Settle the goal round this prompt turn was, before the transcript is
-    // committed, so the gate sees the round's own record.
-    #[cfg(feature = "goal")]
-    let goal_line = if outcome.question.is_some() {
-        goal_store_for_gate
+    segments
+        .settle_prompt(
+            state,
+            &turn,
+            &mut history,
+            &mut outcome,
+            #[cfg(feature = "goal")]
+            &todo_snapshot,
+            #[cfg(feature = "goal")]
+            &clock,
+        )
+        .await;
+    let title_eligible = outcome.error.is_none()
+        && outcome.question.is_none()
+        && outcome.reason == StopReason::EndTurn;
+    respond_prompt_outcome(registration, responder, outcome)?;
+    if title_eligible {
+        crate::startup::heap_future(|| {
+            generate_session_title(state, history, &turn.session_id, &turn.cx)
+        })
+        .await;
+    }
+    Ok(())
+}
+
+/// Settles the goal round this prompt turn was: parks it when the turn asked
+/// the user a question, skips it for `/compact`, otherwise runs the gate.
+#[cfg(feature = "goal")]
+async fn settle_prompt_goal(
+    state: &AcpState,
+    turn: &PromptTurn,
+    is_compact: bool,
+    outcome: &PromptOutcome,
+    history: &SessionHistory,
+    todo_snapshot: &[crate::agent::tools::todo::TodoItem],
+    clock: &GoalRoundClock,
+) -> Option<GoalLine> {
+    use crate::extras::goal::driver;
+    let cost = || driver::RoundCost {
+        usage: driver::with_child_usage(&history.session.id, outcome.usage),
+        // What the agent worked for, excluding whatever the user spent
+        // deciding on a permission prompt.
+        active: clock.active(),
+    };
+    let progress = outcome.progress.as_deref().unwrap_or(&[]);
+    if outcome.question.is_some() {
+        let goal = turn
+            .goal_store
             .snapshot()
-            .filter(|goal| goal.status.is_running())
-            .and_then(|goal| {
-                let open_todos = todo_snapshot
-                    .iter()
-                    .filter(|todo| !matches!(todo.status.as_str(), "completed" | "cancelled"))
-                    .count();
-                let cost = crate::extras::goal::driver::RoundCost {
-                    usage: crate::extras::goal::driver::with_child_usage(
-                        &history.session.id,
-                        outcome.usage,
-                    ),
-                    active: round_started.elapsed().saturating_sub(
-                        std::time::Duration::from_millis(
-                            blocked_ms.load(std::sync::atomic::Ordering::Relaxed),
-                        ),
-                    ),
-                };
-                let summary = crate::extras::goal::driver::summary_from_headless_turn(
-                    &goal,
-                    outcome.progress.as_deref().unwrap_or(&[]),
-                    &cost,
-                    None,
-                    open_todos,
-                    false,
-                );
-                match crate::extras::goal::driver::park_for_question(&goal_store_for_gate, summary)
-                {
-                    crate::extras::goal::driver::RoundOutcome::Stopped { line, .. } => {
-                        goal_store_for_gate
-                            .snapshot()
-                            .map(|goal| (line, goal, None))
-                    }
-                    _ => None,
-                }
-            })
-    } else if matches!(command, Some(commands::Command::Compact)) {
+            .filter(|goal| goal.status.is_running())?;
+        let open_todos = todo_snapshot
+            .iter()
+            .filter(|todo| !matches!(todo.status.as_str(), "completed" | "cancelled"))
+            .count();
+        let summary =
+            driver::summary_from_headless_turn(&goal, progress, &cost(), None, open_todos, false);
+        match driver::park_for_question(&turn.goal_store, summary) {
+            driver::RoundOutcome::Stopped { line, .. } => {
+                turn.goal_store.snapshot().map(|goal| (line, goal, None))
+            }
+            _ => None,
+        }
+    } else if is_compact {
         // `/compact` is housekeeping, not a round of goal work: settling it
         // would spend a round, grow the no-progress streak and run the gate's
         // checks (mini-agent-argjb).
         None
     } else {
         settle_acp_goal_round(
-            &goal_store_for_gate,
+            &turn.goal_store,
             outcome.reason,
             outcome.error.as_deref(),
-            outcome.progress.as_deref().unwrap_or(&[]),
-            &todo_snapshot,
+            progress,
+            todo_snapshot,
             state,
-            &sandbox_for_gate,
-            &control,
-            &crate::extras::goal::driver::RoundCost {
-                usage: crate::extras::goal::driver::with_child_usage(
-                    &history.session.id,
-                    outcome.usage,
-                ),
-                // What the agent worked for, excluding whatever the user spent
-                // deciding on a permission prompt.
-                active: round_started
-                    .elapsed()
-                    .saturating_sub(std::time::Duration::from_millis(
-                        blocked_ms.load(std::sync::atomic::Ordering::Relaxed),
-                    )),
-            },
+            &turn.sandbox,
+            &turn.control,
+            &cost(),
         )
         .await
-    };
-
-    history.pending_question = outcome.question.clone();
-    history.session.pending_question = outcome.question.clone();
-    history.session.todos = todo_store;
-    #[cfg(feature = "goal")]
-    {
-        history.session.goal_store = goal_store_for_gate;
     }
-    let usage = run.as_ref().map_or_else(Default::default, |run| {
-        run.accepted_usage().nonnegative_difference(usage_committed)
-    });
+}
+
+/// Commits the finished turn's transcript and usage to the session: through
+/// the native owner's binding when the turn was native, otherwise as a
+/// canonical headless turn. A failure is reported as the outcome's error.
+fn commit_prompt_transcript(
+    history: &mut SessionHistory,
+    native_owner: &mut Option<crate::provider::NativeRunOwner>,
+    outcome: &mut PromptOutcome,
+    current_input: &crate::agent::input::PromptInput,
+    usage: crate::event::UsageDelta,
+    pricing: crate::print::HeadlessPricing,
+) {
     let response = outcome
         .progress
         .as_deref()
@@ -5604,7 +5874,7 @@ async fn run_prompt(
         if let Some(binding) = &owner.binding
             && let Err(reason) = binding.commit_canonical_input_into_with_outcome(
                 &mut history.session,
-                &current_input,
+                current_input,
                 &response,
                 outcome.progress.as_deref().unwrap_or(&[]),
                 usage,
@@ -5619,7 +5889,7 @@ async fn run_prompt(
             && (outcome.reason == StopReason::EndTurn || !progress.is_empty())
             && crate::print::persist_headless_turn_input(
                 &mut history.session,
-                &current_input,
+                current_input,
                 &response,
                 progress,
             )
@@ -5641,25 +5911,43 @@ async fn run_prompt(
         .session
         .total_cost
         .max(history.session.spend_account.snapshot().recorded_spend());
+}
+
+/// Warns the client about a session-save notice, as a thought chunk.
+fn notify_save_warning(session_id: &SessionId, cx: &ConnectionTo<Client>, notice: &str) {
+    let _ = cx.send_notification(SessionNotification::new(
+        session_id.clone(),
+        SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(TextContent::new(
+            format!("warning: {notice}"),
+        )))),
+    ));
+}
+
+/// Retires the native owner or checkpoints the session, then reports pending
+/// save notices. A failed save is reported as the outcome's error.
+async fn save_prompt_session(
+    state: &AcpState,
+    history: &mut SessionHistory,
+    native_owner: Option<crate::provider::NativeRunOwner>,
+    outcome: &mut PromptOutcome,
+    is_compact: bool,
+    turn: &PromptTurn,
+) {
+    let (session_id, cx) = (&turn.session_id, &turn.cx);
     if let Some(mut owner) = native_owner {
         if let Err(error) = owner.finish(&mut history.session).await {
             outcome.error = Some(error.to_string());
         }
     } else if !state.cli.no_session {
-        let saved = if matches!(command, Some(commands::Command::Compact))
+        let saved = if is_compact
             && crate::session::native_publication::is_native_bearing(&history.session)
         {
             // No model turn ran, so there is no ticket to retire: republish the
             // compacted transcript as a new native epoch.
             crate::session::native_publication::republish_idle(&mut history.session).await
         } else {
-            sessions::checkpoint(&mut history, |notice| {
-                let _ = cx.send_notification(SessionNotification::new(
-                    session_id.clone(),
-                    SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
-                        TextContent::new(format!("warning: {notice}")),
-                    ))),
-                ));
+            sessions::checkpoint(history, |notice| {
+                notify_save_warning(session_id, cx, notice);
             })
             .await
         };
@@ -5667,63 +5955,62 @@ async fn run_prompt(
             outcome.error = Some(error.to_string());
         }
     }
-
     crate::session::storage::report_pending_save_notices(&mut history.session, |notice| {
-        let _ = cx.send_notification(SessionNotification::new(
-            session_id.clone(),
-            SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
-                TextContent::new(format!("warning: {notice}")),
-            ))),
-        ));
+        notify_save_warning(session_id, cx, notice);
     });
+}
 
-    // Context meter and cost, then the title when it changed. Both are
-    // best-effort display data and never fail the prompt.
-    send_usage_update(state, &history, &session_id, &cx);
-    send_session_info(&mut history, &session_id, &cx);
+/// Reports the goal decision twice: as a thought chunk a person can read, and
+/// as `_meta` a client can act on without parsing prose. Clients routinely hide
+/// thoughts, and an agent that kept working with no visible reason is the
+/// complaint this exists to prevent.
+#[cfg(feature = "goal")]
+fn notify_goal_decision(
+    history: &mut SessionHistory,
+    session_id: &SessionId,
+    cx: &ConnectionTo<Client>,
+    (line, goal, relaunch): GoalLine,
+) {
+    history.pending_goal_instruction = relaunch;
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        "goal".to_string(),
+        serde_json::json!({
+            "id": goal.id.as_str(),
+            "status": goal.status.label(),
+            "round": goal.progress.rounds,
+            "max_rounds": goal.bounds.max_rounds,
+            "reason": line,
+            // What the verdict actually rests on. A client that shows a
+            // completion has to be able to tell one a command proved from
+            // one the model asserted, without reading the prose.
+            "verified": goal
+                .last_verdict
+                .as_ref()
+                .is_some_and(crate::extras::goal::Verdict::externally_verified),
+            "evidence": goal
+                .last_verdict
+                .as_ref()
+                .map(|verdict| verdict.evidence_labels())
+                .unwrap_or_default(),
+        }),
+    );
+    let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(line.clone())));
+    let mut notification =
+        SessionNotification::new(session_id.clone(), SessionUpdate::AgentThoughtChunk(chunk));
+    notification.meta = Some(meta);
+    let _ = cx.send_notification(notification);
+}
 
-    // Report the decision twice: as a thought chunk a person can read, and as
-    // `_meta` a client can act on without parsing prose. Clients routinely hide
-    // thoughts, and an agent that kept working with no visible reason is the
-    // complaint this exists to prevent.
-    #[cfg(feature = "goal")]
-    if let Some((line, goal, relaunch)) = goal_line {
-        history.pending_goal_instruction = relaunch;
-        let mut meta = serde_json::Map::new();
-        meta.insert(
-            "goal".to_string(),
-            serde_json::json!({
-                "id": goal.id.as_str(),
-                "status": goal.status.label(),
-                "round": goal.progress.rounds,
-                "max_rounds": goal.bounds.max_rounds,
-                "reason": line,
-                // What the verdict actually rests on. A client that shows a
-                // completion has to be able to tell one a command proved from
-                // one the model asserted, without reading the prose.
-                "verified": goal
-                    .last_verdict
-                    .as_ref()
-                    .is_some_and(crate::extras::goal::Verdict::externally_verified),
-                "evidence": goal
-                    .last_verdict
-                    .as_ref()
-                    .map(|verdict| verdict.evidence_labels())
-                    .unwrap_or_default(),
-            }),
-        );
-        let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(line.clone())));
-        let mut notification =
-            SessionNotification::new(session_id.clone(), SessionUpdate::AgentThoughtChunk(chunk));
-        notification.meta = Some(meta);
-        let _ = cx.send_notification(notification);
-    }
-    let title_eligible = outcome.error.is_none()
-        && outcome.question.is_none()
-        && outcome.reason == StopReason::EndTurn;
-    // An internal failure (provider, runner, workspace or configuration) is
-    // not a model refusal: it is answered as a JSON-RPC error so a client can
-    // tell the two apart. Progress the turn made is still committed above.
+/// Answers the prompt. An internal failure (provider, runner, workspace or
+/// configuration) is not a model refusal: it is answered as a JSON-RPC error
+/// so a client can tell the two apart. Progress the turn made is still
+/// committed before this.
+fn respond_prompt_outcome(
+    registration: &TurnRegistration,
+    responder: PromptReply,
+    outcome: PromptOutcome,
+) -> Result<(), agent_client_protocol::Error> {
     if let Some(error) = outcome.error {
         let _ = respond_terminal_error(registration, responder, error);
     } else if let Some(question) = outcome.question {
@@ -5743,10 +6030,6 @@ async fn run_prompt(
         let _ = responder.respond(response);
     } else {
         let _ = respond_terminal(registration, responder, outcome.reason);
-    }
-    if title_eligible {
-        crate::startup::heap_future(|| generate_session_title(state, history, &session_id, &cx))
-            .await;
     }
     Ok(())
 }
@@ -6382,68 +6665,411 @@ async fn compact_history_for_prompt(
     Ok(usage)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn execute_prompt(
-    state: &AcpState,
-    prompt_input: &crate::agent::input::PromptInput,
-    compact_only: bool,
-    mid_turn_enabled: bool,
+/// How a phase of a prompt segment ended it early: a finished outcome
+/// (cancelled, failed, `/compact`, a test fixture's reply) or a protocol error.
+enum PromptExit {
+    Outcome(Box<PromptOutcome>),
+    Error(Box<agent_client_protocol::Error>),
+}
+
+impl PromptExit {
+    /// The segment's result as `run_prompt` consumes it.
+    fn settle(self) -> Result<PromptOutcome, agent_client_protocol::Error> {
+        match self {
+            Self::Outcome(outcome) => Ok(*outcome),
+            Self::Error(error) => Err(*error),
+        }
+    }
+}
+
+impl From<PromptOutcome> for PromptExit {
+    fn from(outcome: PromptOutcome) -> Self {
+        Self::Outcome(Box::new(outcome))
+    }
+}
+
+impl From<agent_client_protocol::Error> for PromptExit {
+    fn from(error: agent_client_protocol::Error) -> Self {
+        Self::Error(Box::new(error))
+    }
+}
+
+/// The handles every segment of one prompt turn shares.
+#[derive(Clone)]
+struct PromptTurn {
     session_id: SessionId,
-    history: &mut SessionHistory,
-    native_owner: &mut Option<crate::provider::NativeRunOwner>,
-    // The run this turn's requests are accounted to once its route is known.
-    routed_run: &mut Option<crate::spend::run::Run>,
     workspace: Arc<crate::paths::WorkspaceBinding>,
     context: Arc<ContextFiles>,
     read_tracker: crate::agent::tools::ReadTracker,
     todo_store: crate::agent::tools::TodoStore,
-    #[cfg(feature = "goal")] goal_store: crate::extras::goal::GoalStore,
+    #[cfg(feature = "goal")]
+    goal_store: crate::extras::goal::GoalStore,
     sandbox: crate::sandbox::Sandbox,
-    #[cfg(feature = "js")] js_session_state: crate::extras::js::session::JsSessionStateOwner,
-    #[cfg(feature = "skills")] skill_services: Arc<
-        crate::extras::js::skills::session::SkillServiceOwner,
-    >,
+    #[cfg(feature = "js")]
+    js_session_state: crate::extras::js::session::JsSessionStateOwner,
+    #[cfg(feature = "skills")]
+    skill_services: Arc<crate::extras::js::skills::session::SkillServiceOwner>,
     cx: ConnectionTo<Client>,
     control: Arc<TurnControl>,
+}
+
+/// The permission checker, its ask channel and the provider client one segment
+/// runs with.
+struct TurnGate {
+    permission: Option<crate::permission::checker::PermCheck>,
+    ask_tx: Option<crate::permission::ask::AskSender>,
+    client: crate::provider::AnyClient,
+}
+
+/// The work scope one segment's agent runs in, and the hook context bound to it.
+struct TurnScope {
+    work_scope: Arc<crate::agent::runner::AgentWorkScope>,
+    #[cfg(feature = "hooks")]
+    hook_context: crate::extras::hooks::HookCtx,
+}
+
+/// Compaction usage a goal round is charged for.
+#[cfg(feature = "goal")]
+type CompactionUsage = crate::event::UsageDelta;
+#[cfg(not(feature = "goal"))]
+type CompactionUsage = ();
+
+/// One model segment of a prompt turn: admit it, prepare the session, agent and
+/// runner, then relay the runner's events until it stops.
+#[allow(clippy::too_many_arguments)]
+async fn execute_prompt(
+    state: &AcpState,
+    turn: PromptTurn,
+    prompt_input: &crate::agent::input::PromptInput,
+    compact_only: bool,
+    mid_turn_enabled: bool,
+    history: &mut SessionHistory,
+    native_owner: &mut Option<crate::provider::NativeRunOwner>,
+    // The run this turn's requests are accounted to once its route is known.
+    routed_run: &mut Option<crate::spend::run::Run>,
     #[cfg(feature = "mcp")] mcp_manager: &mut Option<PromptMcp>,
     // Filled by the permission bridge with the time the user held this turn.
     #[cfg(feature = "goal")] blocked_ms: Arc<std::sync::atomic::AtomicU64>,
-) -> Result<PromptOutcome, agent_client_protocol::Error> {
-    let prompt_text = prompt_input.literal_text();
-    if control.is_cancelled() {
-        return Ok(PromptOutcome::cancelled(None));
-    }
-    if let Err(error) = workspace.validate() {
-        return Ok(PromptOutcome::failed(error.to_string()));
-    }
+) -> Result<PromptOutcome, PromptExit> {
     let TurnSelection {
         route,
         overrides,
         run,
-    } = match select_turn_route(state, &session_id, history, &context, routed_run).await {
-        Ok(selection) => selection,
-        Err(outcome) => return Ok(outcome),
-    };
-    #[cfg(test)]
-    lock_unpoisoned(&state.turn_routes).push(route.clone());
-    if let Some(refusal) = image_route_refusal(prompt_input, &route.provider, &route.model) {
-        return Ok(PromptOutcome::failed(refusal));
-    }
-    // The relay reads the same session-local store the actual tool mutates.
-    // Tool output and arguments are display data, never a second TODO source.
-    let plan_store = todo_store.clone();
+    } = admit_segment(state, &turn, prompt_input, history, routed_run).await?;
     // The provider this turn's usage is reported by, so a goal's token total
     // is normalised the same way as the TUI's and headless rounds'.
     #[cfg(feature = "goal")]
     let usage_provider = route.provider.clone();
     #[cfg(test)]
+    if let Some(outcome) = run_fixture_segment(
+        state,
+        &turn,
+        prompt_input.literal_text(),
+        history,
+        mid_turn_enabled,
+        #[cfg(feature = "goal")]
+        &usage_provider,
+    )
+    .await?
+    {
+        return Ok(outcome);
+    }
+    let SegmentPrep {
+        compaction_usage,
+        anthropic_native,
+        launch,
+    } = prepare_segment(
+        state,
+        &turn,
+        history,
+        route,
+        run.clone(),
+        prompt_input,
+        native_owner,
+        compact_only,
+        #[cfg(feature = "goal")]
+        blocked_ms,
+    )
+    .await?;
+    let paused_runner = start_runner(
+        state,
+        &turn,
+        prompt_input,
+        history,
+        native_owner,
+        launch,
+        overrides.effort,
+        run,
+        #[cfg(feature = "mcp")]
+        mcp_manager,
+    )
+    .await?;
+    let mid_turn = acp_mid_turn(state, history, mid_turn_enabled, anthropic_native);
+    #[cfg_attr(not(feature = "goal"), allow(unused_mut))]
+    let mut outcome = relay_paused_runner(
+        turn.session_id,
+        turn.workspace.root().to_path_buf(),
+        turn.cx,
+        turn.control,
+        paused_runner,
+        turn.todo_store,
+        mid_turn,
+        #[cfg(feature = "goal")]
+        (&state.cfg, &usage_provider),
+    )
+    .await;
+    // The compaction ran on this round's behalf, so its tokens count toward
+    // the goal's total and `max_tokens` bound like the agent's own
+    // (mini-agent-i6q98).
+    #[cfg(feature = "goal")]
+    // `compaction_usage` was normalised once in the summarizer closure; it is
+    // not normalised again here (mini-agent-yhlut).
+    add_normalized_goal_usage(&mut outcome.usage, compaction_usage);
+    #[cfg(not(feature = "goal"))]
+    let () = compaction_usage;
+    Ok(outcome)
+}
+
+/// What `start_runner` needs from a prepared segment.
+struct RunnerLaunch {
+    gate: TurnGate,
+    model_str: String,
+    route_description: String,
+    scope: TurnScope,
+    native: bool,
+}
+
+/// A prepared segment: the compaction it ran and the runner launch inputs.
+struct SegmentPrep {
+    compaction_usage: CompactionUsage,
+    anthropic_native: bool,
+    launch: RunnerLaunch,
+}
+
+/// Prepares a segment: the permission gate and client, history limits, the work
+/// scope, the native owner, and the compaction the history needs. `/compact`
+/// ends here with its outcome.
+#[allow(clippy::too_many_arguments)]
+async fn prepare_segment(
+    state: &AcpState,
+    turn: &PromptTurn,
+    history: &mut SessionHistory,
+    route: persona::TurnRoute,
+    run: Option<crate::spend::run::Run>,
+    prompt_input: &crate::agent::input::PromptInput,
+    native_owner: &mut Option<crate::provider::NativeRunOwner>,
+    compact_only: bool,
+    #[cfg(feature = "goal")] blocked_ms: Arc<std::sync::atomic::AtomicU64>,
+) -> Result<SegmentPrep, PromptExit> {
+    let gate = open_turn_gate(
+        state,
+        turn,
+        history,
+        &route,
+        #[cfg(feature = "goal")]
+        blocked_ms,
+    )?;
+    let persona::TurnRoute {
+        provider: provider_str,
+        model: model_str,
+        ..
+    } = route;
+    let route_description = format!("{provider_str}/{model_str}");
+    tracing::debug!(
+        "ACP run_prompt: provider={}, model={}, prompt={:?}, prompt_len={}",
+        provider_str,
+        model_str,
+        turn.context.current_prompt_name,
+        prompt_input.literal_text().len(),
+    );
+    let native = matches!(&gate.client, crate::provider::AnyClient::Anthropic(_))
+        || crate::session::native_publication::is_native_bearing(&history.session);
+    apply_history_limits(state, history, &provider_str, &model_str);
+    let needs_compaction = history.needs_compaction();
+    let scope = open_turn_scope(turn, &gate);
+    // `/compact` runs no model: it republishes the compacted transcript itself
+    // instead of opening a model turn's ticket (see the prompt's save step).
+    if native && !compact_only {
+        *native_owner = Some(open_native_owner(state, history, &gate, &scope).await?);
+    }
+    // Goal calibration uses the compaction's usage too. Financial receipts
+    // belong to this ACP logical session and survive prompt cancellation.
+    let compaction_usage = compact_segment_history(
+        state,
+        turn,
+        history,
+        &gate.client,
+        (&provider_str, &model_str),
+        run,
+        native,
+        native_owner,
+        needs_compaction,
+        compact_only,
+    )
+    .await?;
+    Ok(SegmentPrep {
+        compaction_usage,
+        anthropic_native: state.cfg.is_anthropic_native(&provider_str),
+        launch: RunnerLaunch {
+            gate,
+            model_str: model_str.to_string(),
+            route_description,
+            scope,
+            native,
+        },
+    })
+}
+
+/// Builds the turn's agent and spawns its paused runner: the history snapshot,
+/// MCP connection, agent construction and configuration, and native binding.
+#[allow(clippy::too_many_arguments)]
+async fn start_runner(
+    state: &AcpState,
+    turn: &PromptTurn,
+    prompt_input: &crate::agent::input::PromptInput,
+    history: &mut SessionHistory,
+    native_owner: &mut Option<crate::provider::NativeRunOwner>,
+    launch: RunnerLaunch,
+    effort: Option<crate::config::types::ReasoningEffort>,
+    run: Option<crate::spend::run::Run>,
+    #[cfg(feature = "mcp")] mcp_manager: &mut Option<PromptMcp>,
+) -> Result<crate::agent::runner::PausedAgentRunner, PromptExit> {
+    let RunnerLaunch {
+        gate,
+        model_str,
+        route_description,
+        scope,
+        native,
+    } = launch;
+    // Refreshed after compaction, so the recap this turn replays is the one
+    // whose daily-memory copy is left out of the block.
+    #[cfg(feature = "memory")]
+    let context = turn
+        .context
+        .with_refreshed_memory(history.active_compaction_ref())
+        .await;
+    #[cfg(not(feature = "memory"))]
+    let context = Arc::clone(&turn.context);
+    #[cfg(not(feature = "hooks"))]
+    let prior_history =
+        history.snapshot_with_tool_result_retention(state.cfg.resolve_keep_recent_tool_results());
+    #[cfg(feature = "hooks")]
+    let (prior_history, owned_startup_context) =
+        snapshot_prior_history(state, turn, history, &gate, &scope, native).await?;
+    #[cfg(not(feature = "hooks"))]
+    let _ = native;
+    #[cfg(feature = "mcp")]
+    connect_turn_mcp(state, turn, history, mcp_manager).await?;
+    #[cfg(all(feature = "hooks", feature = "mcp"))]
+    scope.work_scope.set_hook_mcp_peers(
+        mcp_manager
+            .as_ref()
+            .map(|mcp| mcp.manager.hook_peers())
+            .unwrap_or_default(),
+    );
+    let agent = build_turn_agent(
+        state,
+        turn,
+        &context,
+        history,
+        gate,
+        &model_str,
+        &scope.work_scope,
+        #[cfg(feature = "mcp")]
+        mcp_manager.as_ref().map(|mcp| &mcp.manager),
+    )
+    .await?;
+    let (agent, file_checkpoints) = configure_turn_agent(
+        state,
+        history,
+        agent,
+        effort,
+        &route_description,
+        run,
+        #[cfg(feature = "hooks")]
+        scope.hook_context,
+    )?;
+    let (agent, prior_history) = match native_owner.as_mut() {
+        Some(owner) => {
+            bind_native_history(
+                history,
+                owner,
+                agent,
+                prior_history,
+                &file_checkpoints,
+                #[cfg(feature = "hooks")]
+                owned_startup_context,
+            )
+            .await?
+        }
+        None => (agent, prior_history.into()),
+    };
+    run_owned_pre_run(
+        &turn.control,
+        &scope.work_scope,
+        agent.spawn_runner_paused_input_in_scope(
+            prompt_input.clone(),
+            prior_history,
+            state.cfg.retry.clone(),
+            #[cfg(feature = "hooks")]
+            None, // ACP is not loop mode; global lifecycle hooks remain active.
+            Arc::clone(&scope.work_scope),
+        ),
+    )
+    .await
+    .ok_or_else(|| PromptOutcome::cancelled(None).into())
+}
+
+/// Admission: cancellation and workspace checks, then the turn's route.
+async fn admit_segment(
+    state: &AcpState,
+    turn: &PromptTurn,
+    prompt_input: &crate::agent::input::PromptInput,
+    history: &mut SessionHistory,
+    routed_run: &mut Option<crate::spend::run::Run>,
+) -> Result<TurnSelection, PromptExit> {
+    if turn.control.is_cancelled() {
+        return Err(PromptOutcome::cancelled(None).into());
+    }
+    if let Err(error) = turn.workspace.validate() {
+        return Err(PromptOutcome::failed(error.to_string()).into());
+    }
+    let selection =
+        select_turn_route(state, &turn.session_id, history, &turn.context, routed_run).await?;
+    #[cfg(test)]
+    lock_unpoisoned(&state.turn_routes).push(selection.route.clone());
+    if let Some(refusal) = image_route_refusal(
+        prompt_input,
+        &selection.route.provider,
+        &selection.route.model,
+    ) {
+        return Err(PromptOutcome::failed(refusal).into());
+    }
+    Ok(selection)
+}
+
+/// Runs the test fixture that stands in for the runner or the event stream,
+/// when one is installed. `None` means the real runner path continues.
+#[cfg(test)]
+async fn run_fixture_segment(
+    state: &AcpState,
+    turn: &PromptTurn,
+    prompt_text: &str,
+    history: &mut SessionHistory,
+    mid_turn_enabled: bool,
+    #[cfg(feature = "goal")] usage_provider: &str,
+) -> Result<Option<PromptOutcome>, PromptExit> {
+    // The relay reads the same session-local store the actual tool mutates.
+    // Tool output and arguments are display data, never a second TODO source.
+    let plan_store = turn.todo_store.clone();
+    let control = turn.control.clone();
     if let Some(fixture) = &state.runner_fixture {
         let prior_history = history
             .snapshot_with_tool_result_retention(state.cfg.resolve_keep_recent_tool_results());
         let paused_runner = tokio::select! {
             biased;
             _ = control.cancelled() => {
-                return Ok(PromptOutcome::cancelled(None));
+                return Ok(Some(PromptOutcome::cancelled(None)));
             }
             runner = fixture(prompt_text.to_owned(), prior_history.clone()) => runner,
         };
@@ -6464,35 +7090,36 @@ async fn execute_prompt(
                 threshold,
                 anthropic_native: false,
             });
-        return Ok(relay_paused_runner(
-            session_id,
-            workspace.root().to_path_buf(),
-            cx,
-            control,
-            paused_runner,
-            plan_store,
-            mid_turn,
-            #[cfg(feature = "goal")]
-            (&state.cfg, &usage_provider),
-        )
-        .await);
+        return Ok(Some(
+            relay_paused_runner(
+                turn.session_id.clone(),
+                turn.workspace.root().to_path_buf(),
+                turn.cx.clone(),
+                control,
+                paused_runner,
+                plan_store,
+                mid_turn,
+                #[cfg(feature = "goal")]
+                (&state.cfg, usage_provider),
+            )
+            .await,
+        ));
     }
 
-    #[cfg(test)]
     if let Some(fixture) = &state.prompt_fixture {
         let prior_history = history
             .snapshot_with_tool_result_retention(state.cfg.resolve_keep_recent_tool_results());
         let fixture_result = tokio::select! {
             biased;
             _ = control.cancelled() => {
-                return Ok(PromptOutcome::cancelled(None));
+                return Ok(Some(PromptOutcome::cancelled(None)));
             }
             result = fixture(prompt_text.to_owned(), prior_history) => result,
         };
         let events = match fixture_result {
             Ok(events) => events,
             Err(error) => {
-                return Ok(PromptOutcome::failed(error));
+                return Ok(Some(PromptOutcome::failed(error)));
             }
         };
         let (event_tx, event_rx) = tokio::sync::mpsc::channel(events.len().max(1));
@@ -6502,26 +7129,38 @@ async fn execute_prompt(
             })?;
         }
         drop(event_tx);
-        return Ok(relay_prompt_events(
-            session_id,
-            workspace.root().to_path_buf(),
-            cx,
-            control,
-            event_rx,
-            plan_store,
-            None,
-            #[cfg(feature = "goal")]
-            (&state.cfg, &usage_provider),
-        )
-        .await);
+        return Ok(Some(
+            relay_prompt_events(
+                turn.session_id.clone(),
+                turn.workspace.root().to_path_buf(),
+                turn.cx.clone(),
+                control,
+                event_rx,
+                plan_store,
+                None,
+                #[cfg(feature = "goal")]
+                (&state.cfg, usage_provider),
+            )
+            .await,
+        ));
     }
+    Ok(None)
+}
 
-    let workspace_root = workspace.root();
+/// The turn's execution authority, interactive permission checker (with its
+/// ask bridge) and provider client.
+fn open_turn_gate(
+    state: &AcpState,
+    turn: &PromptTurn,
+    history: &mut SessionHistory,
+    route: &persona::TurnRoute,
+    #[cfg(feature = "goal")] blocked_ms: Arc<std::sync::atomic::AtomicU64>,
+) -> Result<TurnGate, PromptExit> {
     let mut authority =
         match crate::permission::resolve_configured_execution_authority(&state.cli, &state.cfg) {
             Ok(resolved) => resolved,
             Err(error) => {
-                return Ok(PromptOutcome::failed(error.to_string()));
+                return Err(PromptOutcome::failed(error.to_string()).into());
             }
         }
         .0;
@@ -6533,22 +7172,22 @@ async fn execute_prompt(
         &state.cli,
         &state.cfg,
         authority,
-        Some(workspace_root.to_path_buf()),
+        Some(turn.workspace.root().to_path_buf()),
     )
     .map_err(|error| agent_client_protocol::Error::new(-32602, error.to_string()))?;
     history.policy.apply(&permission);
     // The session prompt's `%%mode=` directive may only narrow this turn's
     // operator-configured mode.
-    if let Err(error) = persona::apply_permission_mode(&permission, tools_enabled, &context) {
-        return Ok(PromptOutcome::failed(error));
+    if let Err(error) = persona::apply_permission_mode(&permission, tools_enabled, &turn.context) {
+        return Err(PromptOutcome::failed(error).into());
     }
     if let Some(rx) = ask_rx {
         tokio::spawn(state.idle.admit()?.track(drive_permission_bridge(
-            cx.clone(),
+            turn.cx.clone(),
             idle::Activity::default(),
-            session_id.clone(),
+            turn.session_id.clone(),
             rx,
-            control.clone(),
+            turn.control.clone(),
             Some(BridgePolicy {
                 policy: history.policy.clone(),
                 permission: permission.clone(),
@@ -6557,60 +7196,64 @@ async fn execute_prompt(
             blocked_ms,
         )));
     }
-    let client =
-        match persona::route_client(&state.cli, &state.cfg, &route, &state.provider_clients) {
-            Ok(client) => client,
-            Err(error) => return Ok(PromptOutcome::failed(error)),
-        };
-    let persona::TurnRoute {
-        provider: provider_str,
-        model: model_str,
-        ..
-    } = route;
-    let provider_is_anthropic_native = state.cfg.is_anthropic_native(&provider_str);
-    let route_description = format!("{provider_str}/{model_str}");
-
-    tracing::debug!(
-        "ACP run_prompt: provider={}, model={}, prompt={:?}, prompt_len={}",
-        provider_str,
-        model_str,
-        context.current_prompt_name,
-        prompt_text.len(),
-    );
-
-    let native = matches!(&client, crate::provider::AnyClient::Anthropic(_))
-        || crate::session::native_publication::is_native_bearing(&history.session);
+    let client = match persona::route_client(&state.cli, &state.cfg, route, &state.provider_clients)
     {
-        let quick_models = crate::config::quick_models_map(&state.cfg);
-        let window = state
-            .cfg
-            .resolve_context_window(&provider_str, &model_str, quick_models);
-        let reserve = state
-            .cfg
-            .resolve_reserve_tokens(&model_str, quick_models, window);
-        history.limits = AcpHistoryLimits::from_config(&state.cfg, window, reserve);
-    }
-    let needs_compaction = history.needs_compaction();
+        Ok(client) => client,
+        Err(error) => return Err(PromptOutcome::failed(error).into()),
+    };
+    Ok(TurnGate {
+        permission,
+        ask_tx,
+        client,
+    })
+}
+
+/// Sizes the session's history limits from the route's context window.
+fn apply_history_limits(
+    state: &AcpState,
+    history: &mut SessionHistory,
+    provider_str: &str,
+    model_str: &str,
+) {
+    let quick_models = crate::config::quick_models_map(&state.cfg);
+    let window = state
+        .cfg
+        .resolve_context_window(provider_str, model_str, quick_models);
+    let reserve = state
+        .cfg
+        .resolve_reserve_tokens(model_str, quick_models, window);
+    history.limits = AcpHistoryLimits::from_config(&state.cfg, window, reserve);
+}
+
+/// The permission mode's label as hooks report it.
+#[cfg(feature = "hooks")]
+fn permission_mode_label(permission: &Option<crate::permission::checker::PermCheck>) -> String {
+    permission
+        .as_ref()
+        .map(|permission| {
+            permission
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .mode()
+                .to_string()
+        })
+        .unwrap_or_else(|| "standard".into())
+}
+
+/// The segment's work scope, with the hook root, permission and session
+/// context installed.
+fn open_turn_scope(turn: &PromptTurn, gate: &TurnGate) -> TurnScope {
     let work_scope = crate::agent::runner::AgentWorkScope::new();
     #[cfg(feature = "hooks")]
-    work_scope.set_hook_execution_root(workspace.root());
+    work_scope.set_hook_execution_root(turn.workspace.root());
     #[cfg(feature = "hooks")]
-    work_scope.set_hook_permission(permission.clone());
+    work_scope.set_hook_permission(gate.permission.clone());
     #[cfg(feature = "hooks")]
     let hook_context = {
-        let mode = permission
-            .as_ref()
-            .map(|permission| {
-                permission
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .mode()
-                    .to_string()
-            })
-            .unwrap_or_else(|| "standard".into());
+        let mode = permission_mode_label(&gate.permission);
         let mut ctx = crate::extras::hooks::context_for_session(
-            &session_id.to_string(),
-            workspace.root(),
+            &turn.session_id.to_string(),
+            turn.workspace.root(),
             &mode,
         );
         // ACP transcripts are not the process session store.
@@ -6618,51 +7261,79 @@ async fn execute_prompt(
         work_scope.set_hook_session_context(ctx.clone());
         ctx
     };
-    // `/compact` runs no model: it republishes the compacted transcript itself
-    // instead of opening a model turn's ticket (see the prompt's save step).
-    if native && !compact_only {
-        let ticket = if crate::session::native_publication::startup_requires_publication(
-            &history.session,
-            matches!(&client, crate::provider::AnyClient::Anthropic(_)),
-            state.cli.no_session,
-        )
-        .map_err(|error| agent_client_protocol::Error::new(-32603, error.to_string()))?
-        {
-            Some(
-                crate::session::native_publication::begin_owned(&mut history.session, &work_scope)
-                    .await
-                    .map_err(|error| {
-                        agent_client_protocol::Error::new(-32603, error.to_string())
-                    })?,
-            )
-        } else {
-            None
-        };
-        *native_owner = Some(crate::provider::NativeRunOwner::with_scope(
-            ticket,
-            work_scope.clone(),
-        ));
+    #[cfg(not(feature = "hooks"))]
+    let _ = (turn, gate);
+    TurnScope {
+        work_scope,
+        #[cfg(feature = "hooks")]
+        hook_context,
     }
-    #[cfg(feature = "hooks")]
-    let mut owned_startup_context = None;
+}
 
-    // Goal calibration uses the compaction's usage too. Financial receipts
-    // belong to this ACP logical session and survive prompt cancellation.
+/// Opens the native run owner (and its publication ticket when startup needs
+/// one) for a model turn on a native-bearing session.
+async fn open_native_owner(
+    state: &AcpState,
+    history: &mut SessionHistory,
+    gate: &TurnGate,
+    scope: &TurnScope,
+) -> Result<crate::provider::NativeRunOwner, PromptExit> {
+    let ticket = if crate::session::native_publication::startup_requires_publication(
+        &history.session,
+        matches!(&gate.client, crate::provider::AnyClient::Anthropic(_)),
+        state.cli.no_session,
+    )
+    .map_err(|error| agent_client_protocol::Error::new(-32603, error.to_string()))?
+    {
+        Some(
+            crate::session::native_publication::begin_owned(
+                &mut history.session,
+                &scope.work_scope,
+            )
+            .await
+            .map_err(|error| agent_client_protocol::Error::new(-32603, error.to_string()))?,
+        )
+    } else {
+        None
+    };
+    Ok(crate::provider::NativeRunOwner::with_scope(
+        ticket,
+        scope.work_scope.clone(),
+    ))
+}
+
+/// Compacts the session history when it needs it, reports the compaction
+/// events, and ends the segment for `/compact`, which runs no model.
+#[allow(clippy::too_many_arguments)]
+async fn compact_segment_history(
+    state: &AcpState,
+    turn: &PromptTurn,
+    history: &mut SessionHistory,
+    client: &crate::provider::AnyClient,
+    (provider_str, model_str): (&str, &str),
+    run: Option<crate::spend::run::Run>,
+    native: bool,
+    native_owner: &mut Option<crate::provider::NativeRunOwner>,
+    needs_compaction: bool,
+    compact_only: bool,
+) -> Result<CompactionUsage, PromptExit> {
     #[cfg(feature = "goal")]
     let mut compaction_usage = crate::event::UsageDelta::default();
+    #[cfg(not(feature = "goal"))]
+    let compaction_usage = ();
     if needs_compaction {
         match compact_history_for_prompt(
             state,
             history,
-            &control,
-            &client,
-            &provider_str,
-            &model_str,
-            run.clone(),
+            &turn.control,
+            client,
+            provider_str,
+            model_str,
+            run,
             native,
             native_owner,
             #[cfg(feature = "goal")]
-            &goal_store,
+            &turn.goal_store,
         )
         .await
         {
@@ -6674,12 +7345,12 @@ async fn execute_prompt(
                 #[cfg(not(feature = "goal"))]
                 let _ = usage;
             }
-            Err(outcome) => return Ok(outcome),
+            Err(outcome) => return Err(outcome.into()),
         }
     }
-    report_compaction_events(history, compact_only, &session_id, &cx);
+    report_compaction_events(history, compact_only, &turn.session_id, &turn.cx);
     if compact_only {
-        return Ok(PromptOutcome {
+        return Err(PromptOutcome {
             reason: StopReason::EndTurn,
             question: None,
             progress: None,
@@ -6687,133 +7358,156 @@ async fn execute_prompt(
             compaction_boundary: false,
             #[cfg(feature = "goal")]
             usage: compaction_usage.into(),
-        });
+        }
+        .into());
     }
-    // Refreshed after compaction, so the recap this turn replays is the one
-    // whose daily-memory copy is left out of the block.
-    #[cfg(feature = "memory")]
-    let context = context
-        .with_refreshed_memory(history.active_compaction_ref())
-        .await;
-    #[cfg(not(feature = "hooks"))]
-    let prior_history =
-        history.snapshot_with_tool_result_retention(state.cfg.resolve_keep_recent_tool_results());
+    Ok(compaction_usage)
+}
 
-    let model = client.completion_model_with_cache_ttl(
+/// The history snapshot the runner replays, after the session-start hooks ran
+/// once for this session. The startup context is returned when a native turn
+/// must append it to the transcript itself.
+#[cfg(feature = "hooks")]
+async fn snapshot_prior_history(
+    state: &AcpState,
+    turn: &PromptTurn,
+    history: &mut SessionHistory,
+    gate: &TurnGate,
+    scope: &TurnScope,
+    native: bool,
+) -> Result<
+    (
+        Vec<Message>,
+        Option<crate::extras::hooks::OwnedSessionStartContext>,
+    ),
+    PromptExit,
+> {
+    let mut owned_startup_context = None;
+    if !history.hooks_started {
+        if let Some(dispatcher) = crate::extras::hooks::get_dispatcher() {
+            let hook_ctx = crate::extras::hooks::HookCtx {
+                session_id: turn.session_id.to_string(),
+                session_path: String::new(),
+                cwd: turn.workspace.root().to_string_lossy().into_owned(),
+                permission_mode: permission_mode_label(&gate.permission),
+            };
+            let Some(notices) = run_owned_pre_run(
+                &turn.control,
+                &scope.work_scope,
+                crate::extras::hooks::dispatch_session_start_with(
+                    &dispatcher,
+                    &hook_ctx,
+                    "startup",
+                ),
+            )
+            .await
+            else {
+                return Err(PromptOutcome::cancelled(None).into());
+            };
+            if native {
+                owned_startup_context = Some(notices);
+            } else {
+                history.record_hook_context(notices.into_notices());
+            }
+        }
+        history.hooks_started = true;
+    }
+    Ok((
+        history.snapshot_with_tool_result_retention(state.cfg.resolve_keep_recent_tool_results()),
+        owned_startup_context,
+    ))
+}
+
+/// Reuses the session's MCP manager when its configuration still matches,
+/// otherwise closes it and connects the servers under their own scope.
+#[cfg(feature = "mcp")]
+async fn connect_turn_mcp(
+    state: &AcpState,
+    turn: &PromptTurn,
+    history: &mut SessionHistory,
+    mcp_manager: &mut Option<PromptMcp>,
+) -> Result<(), PromptExit> {
+    if !state.cli.mcp_is_eligible(&state.cfg) {
+        return Ok(());
+    }
+    let (client_servers, fingerprint) = state
+        .sessions
+        .lock()
+        .await
+        .get(&turn.session_id)
+        .map(|session| {
+            (
+                session.client_mcp_servers.clone(),
+                session.mcp_servers_fingerprint.clone(),
+            )
+        })
+        .unwrap_or_else(|| (Default::default(), McpKey::servers_fingerprint(&state.cfg)));
+    let key = McpKey::from_servers(fingerprint, &turn.workspace);
+    // A manager this prompt did not connect stays at the session's
+    // disposal until the prompt finishes (`run_prompt` hands it back).
+    match history.reuse.mcp.take() {
+        Some(previous) if previous.is_reusable(&key) => *mcp_manager = Some(previous),
+        stale => {
+            if let Some(stale) = stale {
+                stale.close(false).await;
+            }
+            // The servers belong to the session, not to this prompt: they
+            // connect under their own scope so a later prompt's cancellation
+            // cannot reach connections it did not start.
+            let mcp_cfg = with_client_mcp_servers(&state.cfg, &client_servers);
+            let scope = crate::agent::runner::AgentWorkScope::new();
+            #[cfg(feature = "hooks")]
+            scope.set_hook_execution_root(turn.workspace.root());
+            let Some(connected) =
+                connect_prompt_mcp(&mcp_cfg, &turn.workspace, &scope, turn.control.cancelled())
+                    .await
+            else {
+                return Err(PromptOutcome::cancelled(None).into());
+            };
+            *mcp_manager = connected.map(|manager| PromptMcp {
+                manager,
+                scope,
+                key: Some(key),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Builds the turn's agent in the session workspace, inside the work scope so
+/// cancellation during preparation reaches it.
+#[allow(clippy::too_many_arguments)]
+async fn build_turn_agent(
+    state: &AcpState,
+    turn: &PromptTurn,
+    context: &ContextFiles,
+    history: &SessionHistory,
+    gate: TurnGate,
+    model_str: &str,
+    work_scope: &Arc<crate::agent::runner::AgentWorkScope>,
+    #[cfg(feature = "mcp")] mcp_manager: Option<&crate::extras::mcp::McpClientManager>,
+) -> Result<crate::provider::AnyAgent, PromptExit> {
+    let model = gate.client.completion_model_with_cache_ttl(
         model_str.to_string(),
         state.cfg.cache_ttl.unwrap_or_default(),
     );
-
-    let temperature = crate::config::resolve_temperature(&state.cli, &state.cfg, &model_str);
-    let extra_body = crate::config::resolve_extra_body(&state.cfg, &model_str);
-    #[cfg(feature = "hooks")]
-    let prior_history = {
-        if !history.hooks_started {
-            if let Some(dispatcher) = crate::extras::hooks::get_dispatcher() {
-                let hook_ctx = crate::extras::hooks::HookCtx {
-                    session_id: session_id.to_string(),
-                    session_path: String::new(),
-                    cwd: workspace.root().to_string_lossy().into_owned(),
-                    permission_mode: permission
-                        .as_ref()
-                        .map(|permission| {
-                            permission
-                                .lock()
-                                .unwrap_or_else(|error| error.into_inner())
-                                .mode()
-                                .to_string()
-                        })
-                        .unwrap_or_else(|| "standard".into()),
-                };
-                let Some(notices) = run_owned_pre_run(
-                    &control,
-                    &work_scope,
-                    crate::extras::hooks::dispatch_session_start_with(
-                        &dispatcher,
-                        &hook_ctx,
-                        "startup",
-                    ),
-                )
-                .await
-                else {
-                    return Ok(PromptOutcome::cancelled(None));
-                };
-                if native {
-                    owned_startup_context = Some(notices);
-                } else {
-                    history.record_hook_context(notices.into_notices());
-                }
-            }
-            history.hooks_started = true;
-        }
-        history.snapshot_with_tool_result_retention(state.cfg.resolve_keep_recent_tool_results())
-    };
-    #[cfg(feature = "mcp")]
-    if state.cli.mcp_is_eligible(&state.cfg) {
-        let (client_servers, fingerprint) = state
-            .sessions
-            .lock()
-            .await
-            .get(&session_id)
-            .map(|session| {
-                (
-                    session.client_mcp_servers.clone(),
-                    session.mcp_servers_fingerprint.clone(),
-                )
-            })
-            .unwrap_or_else(|| (Default::default(), McpKey::servers_fingerprint(&state.cfg)));
-        let key = McpKey::from_servers(fingerprint, &workspace);
-        // A manager this prompt did not connect stays at the session's
-        // disposal until the prompt finishes (`run_prompt` hands it back).
-        match history.reuse.mcp.take() {
-            Some(previous) if previous.is_reusable(&key) => *mcp_manager = Some(previous),
-            stale => {
-                if let Some(stale) = stale {
-                    stale.close(false).await;
-                }
-                // The servers belong to the session, not to this prompt: they
-                // connect under their own scope so a later prompt's cancellation
-                // cannot reach connections it did not start.
-                let mcp_cfg = with_client_mcp_servers(&state.cfg, &client_servers);
-                let scope = crate::agent::runner::AgentWorkScope::new();
-                #[cfg(feature = "hooks")]
-                scope.set_hook_execution_root(workspace.root());
-                let Some(connected) =
-                    connect_prompt_mcp(&mcp_cfg, &workspace, &scope, control.cancelled()).await
-                else {
-                    return Ok(PromptOutcome::cancelled(None));
-                };
-                *mcp_manager = connected.map(|manager| PromptMcp {
-                    manager,
-                    scope,
-                    key: Some(key),
-                });
-            }
-        }
-    }
-    #[cfg(all(feature = "hooks", feature = "mcp"))]
-    work_scope.set_hook_mcp_peers(
-        mcp_manager
-            .as_ref()
-            .map(|mcp| mcp.manager.hook_peers())
-            .unwrap_or_default(),
-    );
+    let temperature = crate::config::resolve_temperature(&state.cli, &state.cfg, model_str);
+    let extra_body = crate::config::resolve_extra_body(&state.cfg, model_str);
     let native_js_context = history.session.native_js_context();
-    let tool_output_session_id = session_id.to_string();
-    let workspace_root = workspace.root().to_path_buf();
+    let tool_output_session_id = turn.session_id.to_string();
     let build = crate::provider::build_agent_in_workspace(
         model,
         &state.cli,
         &state.cfg,
-        &context,
-        workspace,
-        permission,
-        ask_tx,
-        sandbox,
-        read_tracker,
-        todo_store,
+        context,
+        turn.workspace.clone(),
+        gate.permission,
+        gate.ask_tx,
+        turn.sandbox.clone(),
+        turn.read_tracker.clone(),
+        turn.todo_store.clone(),
         #[cfg(feature = "goal")]
-        goal_store,
+        turn.goal_store.clone(),
         &tool_output_session_id,
         None,
         native_js_context,
@@ -6821,11 +7515,11 @@ async fn execute_prompt(
         temperature,
         extra_body,
         #[cfg(feature = "js")]
-        js_session_state,
+        turn.js_session_state.clone(),
         #[cfg(feature = "skills")]
-        skill_services,
+        turn.skill_services.clone(),
         #[cfg(feature = "mcp")]
-        mcp_manager.as_ref().map(|mcp| &mcp.manager),
+        mcp_manager,
     );
     // Language servers outlive the turn: the builder reuses the session's
     // manager instead of re-scanning PATH and restarting every server.
@@ -6834,10 +7528,29 @@ async fn execute_prompt(
         let lsp_session = history.reuse.lsp.clone();
         async move { lsp_session.scope(build).await }
     };
-    let Some(agent) = run_owned_pre_run(&control, &work_scope, build).await else {
-        return Ok(PromptOutcome::cancelled(None));
-    };
+    match run_owned_pre_run(&turn.control, work_scope, build).await {
+        Some(agent) => Ok(agent),
+        None => Err(PromptOutcome::cancelled(None).into()),
+    }
+}
 
+/// Binds the session, hook context, effort override, file checkpoints, spend
+/// run and question origin to the built agent.
+fn configure_turn_agent(
+    state: &AcpState,
+    history: &SessionHistory,
+    agent: crate::provider::AnyAgent,
+    effort: Option<crate::config::types::ReasoningEffort>,
+    route_description: &str,
+    run: Option<crate::spend::run::Run>,
+    #[cfg(feature = "hooks")] hook_context: crate::extras::hooks::HookCtx,
+) -> Result<
+    (
+        crate::provider::AnyAgent,
+        crate::session::file_checkpoints::Recorder,
+    ),
+    PromptExit,
+> {
     let file_checkpoints = history.session.file_checkpoints.recorder(
         &history.session.id,
         history.session.messages.len(),
@@ -6849,17 +7562,18 @@ async fn execute_prompt(
     // The session's effort selection overrides the saved controls in memory
     // only; an effort this route's model cannot honour fails the prompt
     // rather than being silently dropped.
-    let agent = match overrides.effort {
+    let agent = match effort {
         Some(effort) => {
             let mut controls = history.session.reasoning_controls;
             controls.effort = Some(effort);
             let agent = agent.with_reasoning_controls(&state.cfg, controls);
             if let Err(error) = agent.effective_reasoning() {
-                return Ok(PromptOutcome::failed(persona::bounded_message(&format!(
+                return Err(PromptOutcome::failed(persona::bounded_message(&format!(
                     "reasoning effort '{}' is not usable on {route_description}: {error}; \
                      choose another effort or reset it to default",
                     effort.as_wire_str()
-                ))));
+                )))
+                .into());
             }
             agent
         }
@@ -6869,66 +7583,73 @@ async fn execute_prompt(
         .with_file_checkpoints(file_checkpoints.clone())
         .with_spend(run)
         .with_question_turn(cron::question_origin().capture(None));
-    let (agent, prior_history) = if let Some(owner) = native_owner.as_mut() {
-        use crate::session::native_replay::ReplayBoundary;
-        let boundary = match history.session.native_history_snapshot() {
-            Some(saved) => saved
-                .saved_boundary()
-                .map_err(|reason| agent_client_protocol::Error::new(-32603, reason.to_string()))?,
-            None => ReplayBoundary::CompletedTurn,
-        };
-        #[cfg_attr(not(feature = "hooks"), allow(unused_mut))]
-        let (agent, mut binding) = agent
-            .bind_native_turn(
-                &history.session,
-                prior_history.into(),
-                boundary,
-                crate::provider::RecordedToolIds::Canonical,
-            )
-            .map_err(|reason| agent_client_protocol::Error::new(-32603, reason.to_string()))?;
-        #[cfg(feature = "hooks")]
-        if let Some(context) = owned_startup_context.take() {
-            binding
-                .append_owned_startup_context(&mut history.session, context)
-                .map_err(|reason| agent_client_protocol::Error::new(-32603, reason.to_string()))?;
-            file_checkpoints.rebase_turn(history.session.messages.len());
-        }
-        owner
-            .progress(&mut history.session)
-            .await
-            .map_err(|error| agent_client_protocol::Error::new(-32603, error.to_string()))?;
-        if let Some(ticket) = &mut owner.ticket {
-            binding
-                .pair_publication(&history.session, ticket)
-                .map_err(|error| agent_client_protocol::Error::new(-32603, error.to_string()))?;
-        }
-        let prior_history = binding.history();
-        owner.binding = Some(binding);
-        (agent, prior_history)
-    } else {
-        (agent, prior_history.into())
+    Ok((agent, file_checkpoints))
+}
+
+/// Binds a native turn to the agent: the replay boundary, the hook startup
+/// context, the epoch's progress and the publication ticket. Returns the
+/// native history the runner replays.
+async fn bind_native_history(
+    history: &mut SessionHistory,
+    owner: &mut crate::provider::NativeRunOwner,
+    agent: crate::provider::AnyAgent,
+    prior_history: Vec<Message>,
+    file_checkpoints: &crate::session::file_checkpoints::Recorder,
+    #[cfg(feature = "hooks")] owned_startup_context: Option<
+        crate::extras::hooks::OwnedSessionStartContext,
+    >,
+) -> Result<(crate::provider::AnyAgent, Arc<[Message]>), PromptExit> {
+    use crate::session::native_replay::ReplayBoundary;
+    let protocol_error = |reason: String| agent_client_protocol::Error::new(-32603, reason);
+    let boundary = match history.session.native_history_snapshot() {
+        Some(saved) => saved
+            .saved_boundary()
+            .map_err(|reason| protocol_error(reason.to_string()))?,
+        None => ReplayBoundary::CompletedTurn,
     };
-    let Some(paused_runner) = run_owned_pre_run(
-        &control,
-        &work_scope,
-        agent.spawn_runner_paused_input_in_scope(
-            prompt_input.clone(),
-            prior_history,
-            state.cfg.retry.clone(),
-            #[cfg(feature = "hooks")]
-            None, // ACP is not loop mode; global lifecycle hooks remain active.
-            Arc::clone(&work_scope),
-        ),
-    )
-    .await
-    else {
-        return Ok(PromptOutcome::cancelled(None));
-    };
-    // Mid-turn compaction: only when the token pressure limits are set
-    // (compaction enabled, window known), and only while this prompt still has
-    // relief budget. Native history relieves too: `run_prompt` closes the
-    // native epoch at the boundary (mini-agent-wkzav).
-    let mid_turn = mid_turn_enabled
+    #[cfg_attr(not(feature = "hooks"), allow(unused_mut))]
+    let (agent, mut binding) = agent
+        .bind_native_turn(
+            &history.session,
+            prior_history.into(),
+            boundary,
+            crate::provider::RecordedToolIds::Canonical,
+        )
+        .map_err(|reason| protocol_error(reason.to_string()))?;
+    #[cfg(feature = "hooks")]
+    if let Some(context) = owned_startup_context {
+        binding
+            .append_owned_startup_context(&mut history.session, context)
+            .map_err(|reason| protocol_error(reason.to_string()))?;
+        file_checkpoints.rebase_turn(history.session.messages.len());
+    }
+    #[cfg(not(feature = "hooks"))]
+    let _ = file_checkpoints;
+    owner
+        .progress(&mut history.session)
+        .await
+        .map_err(|error| protocol_error(error.to_string()))?;
+    if let Some(ticket) = &mut owner.ticket {
+        binding
+            .pair_publication(&history.session, ticket)
+            .map_err(|error| protocol_error(error.to_string()))?;
+    }
+    let prior_history = binding.history();
+    owner.binding = Some(binding);
+    Ok((agent, prior_history))
+}
+
+/// The mid-turn compaction trigger for a segment: only when the token
+/// pressure limits are set (compaction enabled, window known), and only while
+/// this prompt still has relief budget. Native history relieves too:
+/// `run_prompt` closes the native epoch at the boundary (mini-agent-wkzav).
+fn acp_mid_turn(
+    state: &AcpState,
+    history: &SessionHistory,
+    mid_turn_enabled: bool,
+    anthropic_native: bool,
+) -> Option<AcpMidTurn> {
+    mid_turn_enabled
         .then(|| {
             let pressure = history.limits.token_pressure?;
             // Byte pressure (images) arms the boundary even when the token
@@ -6941,31 +7662,10 @@ async fn execute_prompt(
             Some(AcpMidTurn {
                 window: pressure.window,
                 threshold,
-                anthropic_native: provider_is_anthropic_native,
+                anthropic_native,
             })
         })
-        .flatten();
-    #[cfg_attr(not(feature = "goal"), allow(unused_mut))]
-    let mut outcome = relay_paused_runner(
-        session_id,
-        workspace_root,
-        cx,
-        control,
-        paused_runner,
-        plan_store,
-        mid_turn,
-        #[cfg(feature = "goal")]
-        (&state.cfg, &usage_provider),
-    )
-    .await;
-    // The compaction ran on this round's behalf, so its tokens count toward
-    // the goal's total and `max_tokens` bound like the agent's own
-    // (mini-agent-i6q98).
-    #[cfg(feature = "goal")]
-    // `compaction_usage` was normalised once in the summarizer closure; it is
-    // not normalised again here (mini-agent-yhlut).
-    add_normalized_goal_usage(&mut outcome.usage, compaction_usage);
-    Ok(outcome)
+        .flatten()
 }
 
 #[cfg(feature = "mcp")]
