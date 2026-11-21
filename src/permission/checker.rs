@@ -437,6 +437,9 @@ pub struct PermissionChecker {
     working_dir: String,
     plan_write_root: Option<PlanWriteRoot>,
     session_allowlist: Vec<(String, Pattern)>,
+    /// Argv-prefix shell grants approved at a prompt for this session; they
+    /// follow the same precedence as configured prefixes (deny rules win).
+    session_shell_prefixes: Vec<crate::permission::shell_prefix::ShellPrefix>,
     last_call: Option<(String, String)>,
     consecutive_repeat_count: usize,
     mode: SecurityMode,
@@ -631,6 +634,7 @@ impl PermissionChecker {
             working_dir,
             plan_write_root: Some(plan_write_root),
             session_allowlist: Vec::new(),
+            session_shell_prefixes: Vec::new(),
             last_call: None,
             consecutive_repeat_count: 0,
             mode: self.mode,
@@ -924,6 +928,7 @@ impl PermissionChecker {
             working_dir,
             plan_write_root: Some(plan_write_root),
             session_allowlist: Vec::new(),
+            session_shell_prefixes: Vec::new(),
             last_call: None,
             consecutive_repeat_count: 0,
             mode,
@@ -1443,7 +1448,11 @@ impl PermissionChecker {
             && tool == "shell"
             && let Some(argv) = crate::permission::shell_prefix::literal_argv(policy_input)
         {
-            for prefix in &self.shell_allow_prefixes {
+            for prefix in self
+                .shell_allow_prefixes
+                .iter()
+                .chain(&self.session_shell_prefixes)
+            {
                 if prefix.matches(&argv) {
                     matched.push((prefix.specificity(), Action::Allow));
                 }
@@ -2226,6 +2235,12 @@ impl PermissionChecker {
 
     pub fn load_session_allowlist(&mut self, entries: &[(String, String)]) {
         for (tool, pat) in entries {
+            if tool == SESSION_SHELL_PREFIX_TOOL {
+                if let Ok(prefix) = crate::permission::shell_prefix::ShellPrefix::parse(pat) {
+                    self.session_shell_prefixes.push(prefix);
+                }
+                continue;
+            }
             // Persisted grants keep their stored tool identity: a legacy runtime
             // alias (`fetch`, `write_todo_list`) must not revive an allow on the
             // canonical tool. Configured rules canonicalize those aliases instead.
@@ -2260,6 +2275,27 @@ impl PermissionChecker {
                 }
             }
         }
+    }
+
+    /// The argv prefix the prompt may offer for a shell request, if any
+    /// (mini-agent-sskdu.149). Offered only for a literal two-word command.
+    pub fn shell_prefix_offer(&self, tool: &str, input: &str) -> Option<String> {
+        if canonical_permission_tool(tool) != "shell" {
+            return None;
+        }
+        crate::permission::shell_prefix::offered_prefix(input)
+    }
+
+    /// Record an approved prefix for this session. Returns the entry to persist
+    /// with the session so a resume restores it; empty when `prefix` is not a
+    /// literal command.
+    pub fn add_session_shell_prefix(&mut self, prefix: &str) -> Vec<(String, String)> {
+        let Ok(parsed) = crate::permission::shell_prefix::ShellPrefix::parse(prefix) else {
+            return Vec::new();
+        };
+        self.session_shell_prefixes.push(parsed);
+        self.policy_changed();
+        vec![(SESSION_SHELL_PREFIX_TOOL.to_string(), prefix.to_string())]
     }
 
     /// The folder a one-approval grant for this request would cover: the
@@ -3253,6 +3289,10 @@ fn deny_rule_denial(rule: &str) -> CheckResult {
     CheckResult::Denied(format!("Blocked by deny rule: {rule}"))
 }
 
+/// Tool name under which a prompt-approved shell prefix is stored with the
+/// session (never a real tool, so it can never match a request itself).
+pub(crate) const SESSION_SHELL_PREFIX_TOOL: &str = "shell_prefix";
+
 fn normalize_path(path: &Path) -> PathBuf {
     let mut result = PathBuf::new();
     for component in path.components() {
@@ -3722,6 +3762,64 @@ mod tests {
             ),
             CheckResult::Allowed,
             "a relative session allowlist must match the capability-relative identity"
+        );
+    }
+
+    #[test]
+    fn session_shell_prefix_allows_literal_commands_only_and_denies_still_win() {
+        let temp = TempDir::new_canonical("permission-checker");
+        let config = PermissionConfig {
+            bash: Some(ToolPerm::Granular(
+                [("mytool run danger*".to_string(), Action::Deny)].into(),
+            )),
+            ..PermissionConfig::default()
+        };
+        let mut checker = PermissionChecker::new(
+            &PermissionConfigs::from(config),
+            SecurityMode::Guarded,
+            Some(temp.path().to_owned()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(checker.shell_prefix_offer("shell", "ls; rm x"), None);
+        assert_eq!(checker.shell_prefix_offer("read", "mytool run foo"), None);
+        let offer = checker
+            .shell_prefix_offer("shell", "mytool run foo")
+            .expect("literal two-word command is offered");
+        assert_eq!(offer, "mytool run");
+        assert_eq!(checker.check("shell", "mytool run bar"), CheckResult::Ask);
+        let entries = checker.add_session_shell_prefix(&offer);
+        assert_eq!(entries, vec![("shell_prefix".to_string(), offer.clone())]);
+        assert_eq!(
+            checker.check("shell", "mytool run bar"),
+            CheckResult::Allowed
+        );
+        assert_eq!(
+            checker.check("shell", "mytool run bar baz"),
+            CheckResult::Allowed
+        );
+        assert_ne!(
+            checker.check("shell", "mytool run bar; rm x"),
+            CheckResult::Allowed
+        );
+        assert_ne!(checker.check("shell", "mytool runx"), CheckResult::Allowed);
+        assert_ne!(checker.check("shell", "mytool other"), CheckResult::Allowed);
+        assert!(matches!(
+            checker.check("shell", "mytool run danger1"),
+            CheckResult::Denied(_)
+        ));
+        // A resumed session restores the grant from its persisted entry.
+        let mut resumed = PermissionChecker::new(
+            &PermissionConfigs::from(PermissionConfig::default()),
+            SecurityMode::Guarded,
+            Some(temp.path().to_owned()),
+            None,
+        )
+        .unwrap();
+        resumed.load_session_allowlist(&entries);
+        assert_eq!(
+            resumed.check("shell", "mytool run again"),
+            CheckResult::Allowed
         );
     }
 

@@ -50,6 +50,9 @@ enum PromptInput {
     AllowFolder,
     /// Only native write/edit under the captured workspace, for this session.
     AllowWorkspaceEdits,
+    /// `x`: any literal command starting with the offered argv prefix, for
+    /// this session (mini-agent-sskdu.149).
+    AllowPrefix,
     Deny,
     /// `t`: deny once and tell the model what to do differently (one line).
     DenyWithNote,
@@ -146,6 +149,7 @@ fn classify_prompt_key(key: KeyEvent) -> PromptInput {
         KeyCode::Char('p' | 'P') if plain => PromptInput::AllowProject,
         KeyCode::Char('f' | 'F') if plain => PromptInput::AllowFolder,
         KeyCode::Char('w' | 'W') if plain => PromptInput::AllowWorkspaceEdits,
+        KeyCode::Char('x' | 'X') if plain => PromptInput::AllowPrefix,
         KeyCode::Char('n' | 'N') if plain => PromptInput::Deny,
         KeyCode::Char('t' | 'T') if plain => PromptInput::DenyWithNote,
         KeyCode::Char('s' | 'S') if plain => PromptInput::StopWithInstruction,
@@ -234,6 +238,8 @@ pub(crate) struct PermissionState {
     /// What `(a)` / `(p)` would grant, shown in the options and decision line.
     /// `None` when the request offers no session or project grant.
     grant_scope: Option<String>,
+    /// Offered argv prefix for a literal shell command (`cargo test`).
+    shell_prefix: Option<String>,
     workspace_edits: Option<std::sync::Arc<crate::paths::WorkspaceBinding>>,
     /// Canonical workspace root when `persist_project_approvals` is on.
     project: Option<std::path::PathBuf>,
@@ -275,13 +281,17 @@ impl PermissionState {
             renderer.write_line("", Color::White)?;
             run.agent_line_started = false;
         }
-        let (offer, folder) = ui.permission.as_ref().map_or((None, None), |permission| {
-            let guard = permission.lock().unwrap_or_else(|error| error.into_inner());
-            (
-                guard.prompt_grant_offer_for(&request.tool, &request.input),
-                guard.folder_grant_scope(&request.tool, &request.input),
-            )
-        });
+        let (offer, folder, shell_prefix) =
+            ui.permission
+                .as_ref()
+                .map_or((None, None, None), |permission| {
+                    let guard = permission.lock().unwrap_or_else(|error| error.into_inner());
+                    (
+                        guard.prompt_grant_offer_for(&request.tool, &request.input),
+                        guard.folder_grant_scope(&request.tool, &request.input),
+                        guard.shell_prefix_offer(&request.tool, &request.input),
+                    )
+                });
         let workspace_edits = ui.permission.as_ref().and_then(|permission| {
             permission
                 .lock()
@@ -305,6 +315,7 @@ impl PermissionState {
             offer,
             folder,
             grant_scope,
+            shell_prefix,
             workspace_edits,
             project: (may_persist && ui.cfg.persist_project_approvals.unwrap_or(false))
                 .then(|| ui.workspace.root().to_path_buf()),
@@ -328,6 +339,7 @@ impl PermissionState {
             offer: None,
             folder: None,
             grant_scope: None,
+            shell_prefix: None,
             workspace_edits: None,
             project: None,
             was_at_bottom: !renderer.is_scrolling(),
@@ -407,6 +419,14 @@ impl PermissionState {
             options.push_str(&format!(
                 "  (w) allow writes/edits in {} for this session",
                 workspace.root().display()
+            ));
+        }
+        if self.offer.is_none()
+            && let Some(prefix) = &self.shell_prefix
+        {
+            options.push_str(&format!(
+                "  (x) allow commands starting with \"{}\" for this session",
+                sanitize_for_review(prefix)
             ));
         }
         if self.offer.is_none() && self.project.is_some() {
@@ -605,6 +625,8 @@ impl PermissionState {
         if input == PromptInput::Ignore
             || (input == PromptInput::AllowFolder && self.folder.is_none())
             || (input == PromptInput::AllowWorkspaceEdits && self.workspace_edits.is_none())
+            || (input == PromptInput::AllowPrefix
+                && (self.shell_prefix.is_none() || self.offer.is_some()))
             || (input == PromptInput::AllowProject && self.project.is_none())
             || (input == PromptInput::AllowSession
                 && self.offer.is_none()
@@ -724,6 +746,37 @@ impl PermissionState {
             return Ok(PermissionEvent::Finished);
         }
         let request = self.request.take().expect("approval owns its request");
+        if input == PromptInput::AllowPrefix {
+            let mut allowed = false;
+            let mut scope = String::new();
+            let entries = if request.reply.send(UserDecision::AllowOnce).is_ok() {
+                allowed = true;
+                match (&self.shell_prefix, &ui.permission) {
+                    (Some(prefix), Some(permission)) => {
+                        scope =
+                            format!("commands starting with \"{}\"", sanitize_for_review(prefix));
+                        permission
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .add_session_shell_prefix(prefix)
+                    }
+                    _ => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+            self.finish(renderer)?;
+            if allowed {
+                note_decision(
+                    renderer,
+                    &request.tool,
+                    &request.input,
+                    &format!("allowed (this session: {scope})"),
+                )?;
+            }
+            record_session_grants(entries, renderer, ui, run)?;
+            return Ok(PermissionEvent::Finished);
+        }
         if input == PromptInput::AllowFolder {
             let mut allowed = false;
             let entries = if request.reply.send(UserDecision::AllowOnce).is_ok() {
@@ -943,6 +996,14 @@ mod tests {
         );
         let long = "x".repeat(300);
         assert!(grant_scope("shell", &long, "other").chars().count() <= 100);
+    }
+
+    #[test]
+    fn prefix_answer_requires_plain_x() {
+        let key = |c, m| classify_prompt_key(KeyEvent::new(KeyCode::Char(c), m));
+        assert_eq!(key('x', KeyModifiers::NONE), PromptInput::AllowPrefix);
+        assert_eq!(key('X', KeyModifiers::SHIFT), PromptInput::AllowPrefix);
+        assert_eq!(key('x', KeyModifiers::CONTROL), PromptInput::Ignore);
     }
 
     #[test]
