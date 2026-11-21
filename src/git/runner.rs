@@ -734,7 +734,17 @@ impl GitRunner {
         } else {
             None
         }
-        .ok_or("approved global Git services require an original Git-for-Windows shell")?;
+        .map(Path::to_path_buf)
+        .or_else(|| scoop_git_root(&original))
+        .ok_or_else(|| {
+            format!(
+                "approved global Git services require an original Git-for-Windows shell; \
+                 {} is not in a recognised layout (<root>\\cmd\\git.exe, \
+                 <root>\\[mingw64\\]bin\\git.exe or a scoop shim next to <scoop>\\apps\\git\\current); \
+                 put the real git.exe directory first on PATH",
+                original.display()
+            )
+        })?;
         super::runtime::TrustedShell::capture(&root.join("usr/bin"), roots)
     }
 
@@ -2327,8 +2337,40 @@ fn resolve_git_executable(path: Option<&OsStr>) -> Option<PathBuf> {
     find_git_executable(path)
 }
 
+/// A scoop shim (`<scoop>\\shims\\git.exe`) forwards to the real install under
+/// `<scoop>\\apps\\git\\current`; return that root when it holds a Git-for-Windows
+/// `usr\\bin`. The caller still applies the disjointness check and the identity
+/// pin to the shell found there.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn scoop_git_root(original: &Path) -> Option<PathBuf> {
+    let shims = original.parent()?;
+    if !shims
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| name.eq_ignore_ascii_case("shims"))
+    {
+        return None;
+    }
+    let root = shims.parent()?.join("apps").join("git").join("current");
+    root.join("usr").join("bin").is_dir().then_some(root)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scoop_shim_resolves_to_the_current_git_install() {
+        let root = std::env::temp_dir().join(format!("scoop-fixture-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let shim = root.join("shims").join("git.exe");
+        std::fs::create_dir_all(root.join("shims")).unwrap();
+        assert_eq!(scoop_git_root(&shim), None);
+        let current = root.join("apps").join("git").join("current");
+        std::fs::create_dir_all(current.join("usr").join("bin")).unwrap();
+        assert_eq!(scoop_git_root(&shim), Some(current));
+        assert_eq!(scoop_git_root(&root.join("bin").join("git.exe")), None);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     use std::time::Duration;
 
     use super::*;

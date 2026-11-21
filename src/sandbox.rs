@@ -617,6 +617,149 @@ impl ShellDialect {
     }
 }
 
+/// Layer the fixed environment, the operator's `shell-env` entries and the
+/// private per-command values. Names compare case-insensitively (Windows
+/// variables do); a later layer replaces an earlier one, so the private
+/// profile and temp directories always win. Entries with an empty name or a
+/// name containing `=` or NUL cannot be represented in an environment block
+/// and are dropped.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn merge_environment(
+    fixed: Vec<(String, String)>,
+    extra: &[(String, String)],
+    private: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut merged: Vec<(String, String)> = Vec::new();
+    for (name, value) in fixed
+        .into_iter()
+        .chain(extra.iter().cloned())
+        .chain(private.iter().cloned())
+    {
+        if name.is_empty() || name.contains(['=', '\0']) || value.contains('\0') {
+            continue;
+        }
+        match merged
+            .iter_mut()
+            .find(|(existing, _)| existing.eq_ignore_ascii_case(&name))
+        {
+            Some(slot) => *slot = (name, value),
+            None => merged.push((name, value)),
+        }
+    }
+    merged.sort_by_key(|entry| entry.0.to_ascii_uppercase());
+    merged
+}
+
+/// The journaled roots that still exist on disk. A root whose object (or an
+/// ancestor) is gone carries no ACE and needs no recovery; any other
+/// inspection result, including errors, keeps the root so the caller fails
+/// closed on it. Relative roots resolve against `base`.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn roots_present_on_disk(roots: &[PathBuf], base: &Path) -> Vec<PathBuf> {
+    roots
+        .iter()
+        .map(|root| {
+            if root.is_absolute() {
+                root.clone()
+            } else {
+                base.join(root)
+            }
+        })
+        .filter(|root| {
+            !matches!(
+                std::fs::symlink_metadata(root),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            )
+        })
+        .collect()
+}
+
+/// Prefix a Windows shell script so the shell's own output is UTF-8. Failure
+/// to switch (no console attached) is ignored: the script still runs.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn windows_utf8_output_prelude(dialect: ShellDialect, command: &str) -> String {
+    match dialect {
+        ShellDialect::Cmd => format!("chcp 65001>nul 2>&1 & {command}"),
+        ShellDialect::PowerShell => format!(
+            "try {{ [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); $OutputEncoding = [Text.UTF8Encoding]::new($false) }} catch {{}}; {command}"
+        ),
+        ShellDialect::Posix => command.to_owned(),
+    }
+}
+
+/// Render a Windows path for text pasted into a shell command: `canonicalize`
+/// returns the verbatim `\\?\C:\dir` (or `\\?\UNC\host\share`) spelling,
+/// which cmd.exe rejects as a current directory and Git Bash mangles.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn strip_verbatim_prefix(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("\\\\?\\UNC\\") {
+        return format!("\\\\{rest}");
+    }
+    match path.strip_prefix("\\\\?\\") {
+        Some(rest) => rest.to_owned(),
+        None => path.to_owned(),
+    }
+}
+
+/// Quote one argument by the MSVCRT rules that `CommandLineToArgvW` and the
+/// Rust standard library parse.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn quote_windows_argument(argument: &str) -> String {
+    if !argument.is_empty() && !argument.chars().any(|c| c == ' ' || c == '\t' || c == '"') {
+        return argument.to_string();
+    }
+    let mut quoted = String::from("\"");
+    let mut slashes = 0usize;
+    for ch in argument.chars() {
+        if ch == '\\' {
+            slashes += 1;
+            continue;
+        }
+        if ch == '"' {
+            quoted.push_str(&"\\".repeat(slashes * 2 + 1));
+            quoted.push('"');
+        } else {
+            quoted.push_str(&"\\".repeat(slashes));
+            quoted.push(ch);
+        }
+        slashes = 0;
+    }
+    quoted.push_str(&"\\".repeat(slashes * 2));
+    quoted.push('"');
+    quoted
+}
+
+/// Build the CreateProcess command line. cmd.exe does not parse MSVCRT
+/// escapes: with `/S /C "<script>"` it strips exactly the first and last quote
+/// and runs the rest literally, so for cmd.exe the script after `/C` is
+/// wrapped in one pair of quotes with its bytes unchanged. Every other program
+/// (PowerShell, bash.exe, tools) parses CRT quoting and gets it.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn windows_command_line_text(program: &str, arguments: &[String]) -> String {
+    let file = program.rsplit(['\\', '/']).next().unwrap_or(program);
+    let is_cmd = file.eq_ignore_ascii_case("cmd.exe") || file.eq_ignore_ascii_case("cmd");
+    let raw_tail = if is_cmd {
+        arguments
+            .iter()
+            .position(|argument| argument.eq_ignore_ascii_case("/C"))
+            .filter(|index| index + 2 == arguments.len())
+    } else {
+        None
+    };
+    let quoted_count = raw_tail.map_or(arguments.len(), |index| index + 1);
+    let mut line = std::iter::once(program)
+        .chain(arguments[..quoted_count].iter().map(String::as_str))
+        .map(quote_windows_argument)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if raw_tail.is_some() {
+        line.push_str(" \"");
+        line.push_str(&arguments[arguments.len() - 1]);
+        line.push('"');
+    }
+    line
+}
+
 /// One identity-pinned shell contract used by every rebuild of an agent.
 /// Explicit worktree transitions may replace only workspace-relative
 /// contracts after verifying the corresponding image under the new binding.
@@ -3978,6 +4121,10 @@ impl Sandbox {
                 };
                 namespace_path.to_string_lossy()
             }
+            None if cfg!(windows) => {
+                namespace_path = PathBuf::from(strip_verbatim_prefix(&resolved.to_string_lossy()));
+                namespace_path.to_string_lossy()
+            }
             None => resolved.to_string_lossy(),
         };
         let dialect = self
@@ -4320,6 +4467,19 @@ impl Sandbox {
     }
 
     fn wrap_command_inner(&self, command: &str) -> Result<ExecutionCommand, String> {
+        // cmd.exe built-ins and Windows PowerShell 5.1 write redirected output
+        // in the OEM code page; ask them for UTF-8 so the model never sees
+        // U+FFFD for accented text or file names.
+        #[cfg(windows)]
+        let utf8_command;
+        #[cfg(windows)]
+        let command = match self.shell_capability().map(ShellCapability::dialect) {
+            Some(dialect @ (ShellDialect::Cmd | ShellDialect::PowerShell)) => {
+                utf8_command = windows_utf8_output_prelude(dialect, command);
+                utf8_command.as_str()
+            }
+            _ => command,
+        };
         if let Some(workspace) = &self.workspace_binding {
             workspace.validate()?;
         }
@@ -4345,8 +4505,20 @@ impl Sandbox {
             SandboxPolicy::Disabled => {
                 let mut cmd = Command::new(&self.shell);
                 cmd.args(&self.shell_prefix_args)
-                    .arg(&self.shell_command_arg)
-                    .arg(command);
+                    .arg(&self.shell_command_arg);
+                // cmd.exe does not understand CRT backslash-escaped quotes;
+                // `/S` strips the outer pair and runs the rest literally.
+                #[cfg(windows)]
+                if self
+                    .shell_capability()
+                    .is_some_and(|capability| capability.dialect() == ShellDialect::Cmd)
+                {
+                    cmd.raw_arg(format!("\"{command}\""));
+                } else {
+                    cmd.arg(command);
+                }
+                #[cfg(not(windows))]
+                cmd.arg(command);
                 cmd.current_dir(&requested_cwd);
                 // Model-authored commands never inherit provider credentials,
                 // even when the operator explicitly disables OS containment.
@@ -4390,6 +4562,7 @@ impl Sandbox {
                 &self.windows_appcontainer_read_roots,
                 &self.windows_appcontainer_write_roots,
                 self.pty_launch.as_ref(),
+                &self.shell_env_extra(),
             )
             .map(ExecutionCommand::appcontainer_helper);
         }
@@ -5119,6 +5292,11 @@ impl Sandbox {
         for (key, value) in self.get_essential_env() {
             cmd.arg(format!("{key}={value}"));
         }
+        // The profile denies reads of the real home directory, and Git treats
+        // an unreadable `~/.gitconfig` (EPERM, unlike ENOENT) as fatal, so
+        // every `git` call would fail. Point the global config at an empty
+        // file; `shell-env` below can still override it.
+        cmd.arg("GIT_CONFIG_GLOBAL=/dev/null");
         for (key, value) in self.shell_env_extra() {
             cmd.arg(format!("{key}={value}"));
         }
@@ -7919,6 +8097,12 @@ pub(crate) fn kill_process_group(pid: u32) {
             if let Err(error) = killpg(Pid::from_raw(group), signal)
                 && error != Errno::ESRCH
             {
+                // macOS reports EPERM, not ESRCH, for a group whose members
+                // are all unreaped zombies: nothing is left to signal.
+                if cfg!(target_os = "macos") && error == Errno::EPERM {
+                    tracing::debug!("sandbox: process group {pid} has no live member ({label})");
+                    continue;
+                }
                 tracing::warn!(
                     "sandbox: failed to send {label} to child process group {pid}: {error}"
                 );
@@ -8389,7 +8573,7 @@ fn seatbelt_profile_ladder(
             format!("(allow file-read-metadata{metadata_ancestors})\n")
         };
         format!(
-            "(allow file-read-data (literal \"/\"))\n{ancestor_metadata}(allow file-read-metadata (literal \"/var\") (literal \"/Applications\") (regex #\"^/Applications/Xcode[^/]*[.]app(/Contents)?$\"))\n(allow file-read* (literal \"/var/select/developer_dir\") (literal \"/private/var/select/developer_dir\") (literal \"/var/select/sh\") (literal \"/private/var/select/sh\"))\n(allow file-read* (subpath \"{workspace}\") (subpath \"{cache}\")\n (subpath \"/usr\") (subpath \"/bin\") (subpath \"/sbin\")\n (subpath \"/System\") (subpath \"/Library/Apple\") (subpath \"/private/var/db\")\n (subpath \"/opt/homebrew/Cellar\") (subpath \"/opt/homebrew/opt\")\n (subpath \"/Library/Developer/CommandLineTools\")\n (subpath \"/Library/Developer/PrivateFrameworks\")\n (regex #\"^/Applications/Xcode[^/]*[.]app/Contents/Developer(/|$)\")\n (regex #\"^/Applications/Xcode[^/]*[.]app/Contents/SharedFrameworks(/|$)\")\n (regex #\"^/Applications/Xcode[^/]*[.]app/Contents/Info[.]plist$\")\n (regex #\"^/Applications/Xcode[^/]*[.]app/Contents/Frameworks(/|$)\")\n (subpath \"/dev\"){extra_reads})"
+            "(allow file-read-data (literal \"/\"))\n{ancestor_metadata}(allow file-read-metadata (literal \"/\") (literal \"/var\") (literal \"/Library\") (literal \"/Library/Developer\") (literal \"/etc\") (literal \"/private/etc\") (literal \"/Applications\") (regex #\"^/Applications/Xcode[^/]*[.]app(/Contents)?$\"))\n(allow file-read* (literal \"/private/etc/gitconfig\"))\n(allow file-read* (literal \"/var/select/developer_dir\") (literal \"/private/var/select/developer_dir\") (literal \"/var/select/sh\") (literal \"/private/var/select/sh\"))\n(allow file-read* (subpath \"{workspace}\") (subpath \"{cache}\")\n (subpath \"/usr\") (subpath \"/bin\") (subpath \"/sbin\")\n (subpath \"/System\") (subpath \"/Library/Apple\") (subpath \"/private/var/db\")\n (subpath \"/opt/homebrew/Cellar\") (subpath \"/opt/homebrew/opt\")\n (subpath \"/Library/Developer/CommandLineTools\")\n (subpath \"/Library/Developer/PrivateFrameworks\")\n (regex #\"^/Applications/Xcode[^/]*[.]app/Contents/Developer(/|$)\")\n (regex #\"^/Applications/Xcode[^/]*[.]app/Contents/SharedFrameworks(/|$)\")\n (regex #\"^/Applications/Xcode[^/]*[.]app/Contents/Info[.]plist$\")\n (regex #\"^/Applications/Xcode[^/]*[.]app/Contents/Frameworks(/|$)\")\n (subpath \"/dev\"){extra_reads})"
         )
     } else {
         "(allow file-read*)".to_owned()
@@ -8502,7 +8686,7 @@ const SEATBELT_ALLOW_NETWORK: &str = "(allow network*)\n(allow system-socket)\n(
 /// granted: the proxy resolves.
 const SEATBELT_PROXY_TRUST: &str = "(allow mach-lookup (global-name \"com.apple.trustd\") (global-name \"com.apple.trustd.agent\"))";
 /// Resolver and CA files the workspace profile does not otherwise read.
-const SEATBELT_NETWORK_READS: &str = "(allow file-read* (literal \"/etc\") (literal \"/private/etc/hosts\") (literal \"/private/etc/resolv.conf\") (literal \"/private/etc/services\") (literal \"/private/etc/protocols\") (subpath \"/private/etc/ssl\") (literal \"/private/etc/gitconfig\") (subpath \"/private/var/run/resolv.conf\") (subpath \"/Library/Keychains\"))";
+const SEATBELT_NETWORK_READS: &str = "(allow file-read* (literal \"/etc\") (literal \"/private/etc/hosts\") (literal \"/private/etc/resolv.conf\") (literal \"/private/etc/services\") (literal \"/private/etc/protocols\") (subpath \"/private/etc/ssl\") (subpath \"/private/var/run/resolv.conf\") (subpath \"/Library/Keychains\"))";
 
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) fn seatbelt_shell_profile(
@@ -11717,6 +11901,164 @@ echo COMMITTED"#;
         assert!(!workspace.join(".git/commondir").exists());
     }
 
+    #[test]
+    fn windows_argument_quoting_handles_empty_quotes_and_trailing_slashes() {
+        assert_eq!(quote_windows_argument("plain"), "plain");
+        assert_eq!(quote_windows_argument(""), "\"\"");
+        assert_eq!(quote_windows_argument("a b"), "\"a b\"");
+        assert_eq!(quote_windows_argument("a\\\"b"), "\"a\\\\\\\"b\"");
+        assert_eq!(quote_windows_argument("a b\\"), "\"a b\\\\\"");
+    }
+
+    #[test]
+    fn cmd_exe_script_is_passed_verbatim_and_other_programs_are_crt_quoted() {
+        let cmd_args = |script: &str| -> Vec<String> {
+            ["/D", "/S", "/C", script].map(str::to_owned).to_vec()
+        };
+        assert_eq!(
+            windows_command_line_text(r"C:\Windows\System32\cmd.exe", &cmd_args(r#"echo "a b""#)),
+            r#"C:\Windows\System32\cmd.exe /D /S /C "echo "a b"""#
+        );
+        assert_eq!(
+            windows_command_line_text("CMD.EXE", &cmd_args(r#"git commit -m "fix bug""#)),
+            r#"CMD.EXE /D /S /C "git commit -m "fix bug"""#
+        );
+        assert_eq!(
+            windows_command_line_text("cmd.exe", &cmd_args("echo plain")),
+            r#"cmd.exe /D /S /C "echo plain""#
+        );
+        // PowerShell parses CRT quoting, so it keeps it.
+        assert_eq!(
+            windows_command_line_text(
+                "powershell.exe",
+                &["-NoProfile".into(), "-Command".into(), r#"echo "a""#.into()]
+            ),
+            r#"powershell.exe -NoProfile -Command "echo \"a\"""#
+        );
+        // A cmd.exe call without the final `/C <script>` shape is left to CRT quoting.
+        assert_eq!(
+            windows_command_line_text("cmd.exe", &["/C".into()]),
+            "cmd.exe /C"
+        );
+    }
+
+    #[test]
+    fn merged_environment_has_unique_names_and_private_values_win() {
+        let pair = |name: &str, value: &str| (name.to_string(), value.to_string());
+        let merged = merge_environment(
+            vec![pair("PATH", "fixed"), pair("TEMP", "fixed-temp")],
+            &[
+                pair("JAVA_HOME", "jdk"),
+                pair("path", "operator"),
+                pair("temp", "operator-temp"),
+                pair("BAD=NAME", "x"),
+                pair("", "x"),
+            ],
+            &[pair("TEMP", "private")],
+        );
+        assert_eq!(
+            merged,
+            vec![
+                pair("JAVA_HOME", "jdk"),
+                pair("path", "operator"),
+                pair("TEMP", "private"),
+            ]
+        );
+    }
+
+    #[test]
+    fn journal_roots_that_vanished_are_not_recovered() {
+        let scratch = TempDir::new("journal-roots");
+        let present = scratch.path().join("present");
+        std::fs::create_dir(&present).unwrap();
+        let gone = scratch.path().join("deleted-worktree");
+        let below_gone = gone.join("sub");
+        let kept =
+            roots_present_on_disk(&[gone.clone(), present.clone(), below_gone], scratch.path());
+        assert_eq!(kept, vec![present]);
+    }
+
+    #[test]
+    fn windows_shells_are_asked_for_utf8_output() {
+        assert_eq!(
+            windows_utf8_output_prelude(ShellDialect::Cmd, "dir /b"),
+            "chcp 65001>nul 2>&1 & dir /b"
+        );
+        let ps = windows_utf8_output_prelude(ShellDialect::PowerShell, "Get-ChildItem -Name");
+        assert!(ps.contains("OutputEncoding") && ps.ends_with("; Get-ChildItem -Name"));
+        assert_eq!(windows_utf8_output_prelude(ShellDialect::Posix, "ls"), "ls");
+    }
+
+    #[test]
+    fn verbatim_prefix_is_stripped_for_shell_text() {
+        assert_eq!(strip_verbatim_prefix(r"\\?\C:\ws\sub"), r"C:\ws\sub");
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\UNC\host\share\d"),
+            r"\\host\share\d"
+        );
+        assert_eq!(strip_verbatim_prefix(r"C:\ws"), r"C:\ws");
+        assert_eq!(strip_verbatim_prefix("/tmp/ws"), "/tmp/ws");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn seatbelt_workspace_developer_tools_run_and_negative_controls_hold() {
+        let _env = crate::tests::ScopedProcessEnv::set(&[]);
+        if !seatbelt_exists() {
+            eprintln!("skipping: Seatbelt is unusable on this host");
+            return;
+        }
+        let scratch = TempDir::new("sandbox");
+        let workspace = host_git_repository(scratch.path());
+        std::fs::write(workspace.join("Makefile"), "all:\n\t@echo built\n").unwrap();
+        let outside = scratch.path().join("outside-secret");
+        std::fs::write(&outside, "secret").unwrap();
+        let sandbox = Sandbox::new(true, "seatbelt").with_working_dir(&workspace);
+        for (command, needle) in [
+            ("/usr/bin/python3 -c 'print(12345)'", "12345"),
+            ("python3 -c 'print(23456)'", "23456"),
+            ("git status --short && echo GIT_OK", "GIT_OK"),
+            ("git --version", "git version"),
+            ("make -n", "built"),
+            ("make -v", "GNU Make"),
+        ] {
+            let output = sandbox
+                .output_command_with_limits(command, DEFAULT_COMMAND_LIMITS)
+                .await
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stdout.contains(needle), "{command}: {stdout}\n{stderr}");
+        }
+        // Negative controls: reads and writes outside the workspace stay denied.
+        let read = sandbox
+            .output_command_with_limits(
+                &format!("cat '{}' && echo READ_OUTSIDE", outside.display()),
+                DEFAULT_COMMAND_LIMITS,
+            )
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&read.stdout).contains("READ_OUTSIDE"));
+        let escape = scratch.path().join("escaped");
+        let write = sandbox
+            .output_command_with_limits(
+                &format!("echo x > '{}' && echo WROTE_OUTSIDE", escape.display()),
+                DEFAULT_COMMAND_LIMITS,
+            )
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&write.stdout).contains("WROTE_OUTSIDE"));
+        assert!(!escape.exists());
+        let home = sandbox
+            .output_command_with_limits(
+                "cat \"$HOME/.ssh/id_rsa\" /private/etc/master.passwd && echo READ_SECRET",
+                DEFAULT_COMMAND_LIMITS,
+            )
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&home.stdout).contains("READ_SECRET"));
+    }
+
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn seatbelt_workspace_git_metadata_rejects_cached_aliases() {
@@ -12073,7 +12415,7 @@ echo COMMITTED"#;
             assert!(!rendered.contains("(subpath \"/\")"));
             assert!(!rendered.contains("(allow file-read-metadata)"));
             for runtime in [
-                "(allow file-read-metadata (literal \"/var\") (literal \"/Applications\") (regex #\"^/Applications/Xcode[^/]*[.]app(/Contents)?$\"))",
+                "(allow file-read-metadata (literal \"/\") (literal \"/var\") (literal \"/Library\") (literal \"/Library/Developer\") (literal \"/etc\") (literal \"/private/etc\") (literal \"/Applications\") (regex #\"^/Applications/Xcode[^/]*[.]app(/Contents)?$\"))",
                 "(subpath \"/opt/homebrew/Cellar\")",
                 "(subpath \"/opt/homebrew/opt\")",
                 "(subpath \"/Library/Developer/CommandLineTools\")",
