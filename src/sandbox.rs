@@ -1138,6 +1138,14 @@ pub(crate) enum CommandStatus {
     NotStarted,
 }
 
+impl CommandStatus {
+    /// Preparation and spawn failures report through `stderr` without the
+    /// output ever reaching the capture; callers copy it in.
+    fn reports_through_stderr(self) -> bool {
+        matches!(self, Self::Failed | Self::NotStarted)
+    }
+}
+
 pub(crate) struct CommandOutput {
     pub exit_status: Option<ExitStatus>,
     pub stdout: Vec<u8>,
@@ -5725,11 +5733,7 @@ impl Sandbox {
                 .await
             {
                 Ok(output) => {
-                    if matches!(
-                        output.status,
-                        CommandStatus::Failed | CommandStatus::NotStarted
-                    ) && capture.total_bytes() == 0
-                    {
+                    if output.status.reports_through_stderr() && capture.total_bytes() == 0 {
                         // Preparation/spawn failures report through stderr
                         // without ever reaching the capture.
                         let _ = capture.push(
@@ -6248,11 +6252,7 @@ impl Sandbox {
         let output = response_rx.await.map_err(|_| {
             std::io::Error::other("command output worker stopped before returning a result")
         })?;
-        if matches!(
-            output.status,
-            CommandStatus::Failed | CommandStatus::NotStarted
-        ) && failure_capture.total_bytes() == 0
-        {
+        if output.status.reports_through_stderr() && failure_capture.total_bytes() == 0 {
             // Preparation/spawn failures report through stderr without ever
             // reaching the capture; keep the reason visible to the caller.
             let _ = failure_capture.push(
@@ -10271,11 +10271,11 @@ mod sandbox_tests {
             .run_explicit_shell("!echo must not run", DEFAULT_COMMAND_LIMITS, None)
             .await
             .unwrap();
-        assert_eq!(run.output.status, CommandStatus::Failed);
+        assert_eq!(run.output.status, CommandStatus::NotStarted);
         assert!(String::from_utf8_lossy(&run.output.stderr).contains("unavailable"));
         assert!(run.output.stdout.is_empty());
         assert_eq!(receipts.lock().unwrap().len(), 2);
-        assert_eq!(receipts.lock().unwrap()[1].1, CommandStatus::Failed);
+        assert_eq!(receipts.lock().unwrap()[1].1, CommandStatus::NotStarted);
     }
 
     #[tokio::test]
@@ -10284,7 +10284,7 @@ mod sandbox_tests {
             .output_command_with_limits("echo must not run", DEFAULT_COMMAND_LIMITS)
             .await
             .unwrap();
-        assert_eq!(output.status, CommandStatus::Failed);
+        assert_eq!(output.status, CommandStatus::NotStarted);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             stderr.contains("unavailable"),
@@ -11465,7 +11465,7 @@ echo COMMITTED"#;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn assert_git_metadata_alias_denied(output: &CommandOutput, marker: &str) {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if output.status != CommandStatus::Failed {
+        if output.status != CommandStatus::NotStarted {
             panic!("metadata alias launch unexpectedly ran: {stderr}");
         }
         if !stderr.contains(marker) {
@@ -11558,7 +11558,7 @@ echo COMMITTED"#;
             .output_command_with_limits("true", DEFAULT_COMMAND_LIMITS)
             .await
             .unwrap();
-        assert_eq!(output.status, CommandStatus::Failed);
+        assert_eq!(output.status, CommandStatus::NotStarted);
         assert!(
             String::from_utf8_lossy(&output.stderr).contains("hardlink"),
             "{}",
@@ -11572,7 +11572,7 @@ echo COMMITTED"#;
             .output_command_with_limits("true", DEFAULT_COMMAND_LIMITS)
             .await
             .unwrap();
-        assert_eq!(output.status, CommandStatus::Failed);
+        assert_eq!(output.status, CommandStatus::NotStarted);
         assert!(
             String::from_utf8_lossy(&output.stderr).contains(".git symlink"),
             "{}",

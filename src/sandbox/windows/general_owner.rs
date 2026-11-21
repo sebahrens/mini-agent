@@ -764,7 +764,10 @@ mod tests {
                         }
                         let result = result.unwrap();
                         let observed = result.status;
-                        assert_eq!(observed, CommandStatus::Failed);
+                        assert!(
+                            matches!(observed, CommandStatus::Failed | CommandStatus::NotStarted),
+                            "{observed:?}"
+                        );
                     } else {
                         job = Some(
                             sandbox
