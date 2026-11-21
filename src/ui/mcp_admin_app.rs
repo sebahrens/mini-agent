@@ -403,7 +403,12 @@ impl App<'_> {
                 &|| proof.valid(&proof.session_id, &proof.workspace),
             )
             .await
-            .map_err(|_| "MCP connection failed (credential values omitted)".to_owned())?
+            .map_err(|error| {
+                format!(
+                    "MCP connection failed{}",
+                    crate::extras::mcp::connect_failure_detail(&task_name, &error)
+                )
+            })?
             .with_source_proof(
                 crate::extras::mcp::project::ServerSourceProof::capture(
                     workspace,
@@ -452,6 +457,9 @@ impl App<'_> {
             .ok_or_else(|| anyhow::anyhow!("MCP OAuth settings are unavailable"))?;
         let allow_local = *allow_local;
         let allowed_cidrs = server.options().allowed_cidrs;
+        let setup_timeout = server
+            .options()
+            .startup_timeout(crate::extras::mcp::client::MCP_INITIALIZE_TIMEOUT);
         let origin = self
             .mcp_current_config()
             .mcp_origins
@@ -482,8 +490,10 @@ impl App<'_> {
             tokio::select! {
                 biased;
                 _ = crate::agent::runner::current_work_scope_cancelled() => Err("MCP login cancelled".into()),
-                result = tokio::time::timeout(crate::extras::mcp::client::MCP_INITIALIZE_TIMEOUT, crate::extras::mcp::oauth::begin_login_bound(&task_name, &url, &settings, allow_local, &allowed_cidrs, Arc::new(move || proof.valid(&proof.session_id, &proof.workspace)))) => {
-                    let login = result.map_err(|_| "MCP OAuth setup timed out")?.map_err(|_| "MCP OAuth setup failed (credential values omitted)")?;
+                result = tokio::time::timeout(setup_timeout, crate::extras::mcp::oauth::begin_login_bound(&task_name, &url, &settings, allow_local, &allowed_cidrs, Arc::new(move || proof.valid(&proof.session_id, &proof.workspace)))) => {
+                    let login = result
+                        .map_err(|_| format!("MCP OAuth setup timed out after {} s (raise startup_timeout_sec)", setup_timeout.as_secs()))?
+                        .map_err(|error| crate::extras::mcp::oauth::describe_login_error("MCP OAuth setup failed", &error))?;
                     Ok(Completion::LoginReady(Box::new(login)))
                 }
             }
@@ -1018,8 +1028,11 @@ impl App<'_> {
                             Ok(())
                         })
                         .await
-                        .map_err(|_| {
-                            "MCP login failed or cancelled (credential values omitted)".to_owned()
+                        .map_err(|error| {
+                            crate::extras::mcp::oauth::describe_login_error(
+                                "MCP login failed",
+                                &error,
+                            )
                         })?;
                     Ok(Completion::Authorized)
                 })?;

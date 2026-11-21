@@ -130,7 +130,7 @@ const CONNECT_DETAIL_NOTICE_CHARS: usize = 600;
 /// other error may carry an expanded URL or header credential and is
 /// reduced to "(credential values omitted)". The full detail of a typed
 /// failure is logged at info (log file only), never to stderr.
-fn connect_failure_detail(server: &str, error: &anyhow::Error) -> String {
+pub(crate) fn connect_failure_detail(server: &str, error: &anyhow::Error) -> String {
     if let Some(refusal) = bounded_http::redirect_refusal(error) {
         return format!(": {refusal}");
     }
