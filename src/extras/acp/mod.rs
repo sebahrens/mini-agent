@@ -9165,7 +9165,8 @@ mod protocol_tests {
                         ),
                         (
                             format!(
-                                "/goal {}",
+                                // Two words: a lone word is a (possibly unknown) goal verb.
+                                "/goal oversized {}",
                                 "x".repeat(crate::extras::goal::MAX_OBJECTIVE_CHARS + 1)
                             ),
                             "invalid ACP goal",
@@ -9176,7 +9177,10 @@ mod protocol_tests {
                             .block_task()
                             .await
                             .unwrap_err();
-                        assert!(error.to_string().contains(expected), "{error}");
+                        assert!(
+                            error.to_string().contains(expected),
+                            "{text:?} expected {expected:?}: {error}"
+                        );
                         cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
                             .block_task()
                             .await?;

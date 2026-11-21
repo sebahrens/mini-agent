@@ -2576,6 +2576,24 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "NON-PROCESS",
     ),
+    (
+        "src/ui/mcp_admin_app_tests.rs",
+        "status.contains(\"attempt #\") && status.contains(\": failed\"),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/ui/mcp_admin_app_tests.rs",
+        "assert!(status.contains(\"reason:\"), \"{status}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/ui/mcp_admin_app_tests.rs",
+        "assert!(status.contains(\"tools: \"), \"{status}\");",
+        1,
+        "NON-PROCESS",
+    ),
     // Pressure continuation assertion inspects SDK ToolResult output text.
     (
         "src/ui/app.rs",
@@ -3920,7 +3938,7 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     ("src/key_command.rs", "status", 1, "NON-PROCESS"),
-    ("src/provider.rs", "output,", 9, "NON-PROCESS"),
+    ("src/provider.rs", "output,", 3, "NON-PROCESS"),
     (
         "src/provider_effort_tests.rs",
         "Self::spawn(responses, \"/v1/messages\", true)",
@@ -4288,10 +4306,24 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     ),
     (
         "src/ui/mcp_admin_app_tests.rs",
-        &[(
-            "523c9c17d8bf92e6dfeeb73177d8ef9fd174d1406a081b1418ef1c825ff40a13",
-            1,
-        )],
+        &[
+            (
+                "4693571b3b75e2cab6670639f5777643c31863db105e12066eb088960c52f191",
+                1,
+            ),
+            (
+                "4ca10e3645fe77ac257cc93a32633382fa445d7d71e74d8d1150e9273280e7b8",
+                1,
+            ),
+            (
+                "523c9c17d8bf92e6dfeeb73177d8ef9fd174d1406a081b1418ef1c825ff40a13",
+                1,
+            ),
+            (
+                "7d327890e257f7e9756aeb583bc18429718eb2fa5a7567646d1199456da73f1a",
+                1,
+            ),
+        ],
     ),
     (
         "src/spend/request_tests.rs",
@@ -5497,7 +5529,7 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     (
         "src/provider.rs",
         &[(
-            "2544a43f58db98f7e0aa66a33286959c9587ce7dd8ee92935ac05d7f8b6a2484",
+            "0cdbbd4deccdcddfef5ad81a669b729b0a26d5d929bf1bb27bae6b4881cf4387",
             1,
         )],
     ),
@@ -5833,7 +5865,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/acp/commands.rs",
         "commands.push(AvailableCommand::new(",
-        1,
+        2,
         "NON-PROCESS",
     ),
     (
@@ -5844,7 +5876,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/extras/acp/sessions.rs",
-        ".status(ToolCallStatus::Pending),",
+        ".status(ToolCallStatus::Failed)",
         1,
         "NON-PROCESS",
     ),
@@ -6317,6 +6349,12 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     ("src/extras/acp/mod.rs", "cx.spawn({", 1, "NON-PROCESS"),
+    (
+        "src/extras/acp/mod.rs",
+        "cx.spawn(tasks::watch(",
+        1,
+        "NON-PROCESS",
+    ),
     // The ACP /cron driver is a connection task on the ACP executor, not a process.
     (
         "src/extras/acp/cron.rs",

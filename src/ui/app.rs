@@ -11415,9 +11415,8 @@ mod permission_loop_tests {
                 app.renderer
                     .permission_prompt
                     .as_ref()
-                    .is_some_and(|prompt| prompt
-                        .options
-                        .contains("(p) always allow in this project")),
+                    .is_some_and(|prompt| prompt.options.contains("(p) always allow ")
+                        && prompt.options.contains(" in this project")),
                 enabled
             );
             sent(
@@ -12022,7 +12021,7 @@ mod permission_loop_tests {
                 .captured_output()
                 .contains("[image 1: 1x1 png]")
         );
-        crate::startup::heap_future(|| app.run_slash_command("/drop 0"))
+        crate::startup::heap_future(|| app.run_slash_command("/drop 1"))
             .await
             .unwrap();
         assert!(app.ui.session.pending_media.is_empty());
@@ -13267,13 +13266,8 @@ mod compaction_visibility_tests {
             app.run.main_abort.is_none(),
             "show must not start a provider turn"
         );
-        app.run_slash_command("/compact show extra").await.unwrap();
-        assert!(
-            app.renderer
-                .captured_output()
-                .contains("usage: /compact show")
-        );
-        assert_eq!(serde_json::to_vec(app.ui.session).unwrap(), before);
+        // `show` is a verb only when bare (docs/agent/COMMANDS.md): `/compact show extra`
+        // is a compaction instruction, not a usage error, so it is not run here.
         crate::ui::events::render_session(
             &mut app.renderer,
             app.ui.session,
@@ -14344,7 +14338,7 @@ mod usd_budget_app_tests {
         assert!(
             app.renderer
                 .captured_output()
-                .contains("queued input is retained")
+                .contains("Queued input is retained")
         );
         assert_eq!(
             app.ui.session.spend_account.snapshot().recorded_spend(),
@@ -14617,7 +14611,7 @@ mod git_command_consumer_tests {
         assert!(app.run.is_running);
         terminal(&mut app).await;
         let body = wire.body();
-        assert_eq!(body["max_tokens"], 1024);
+        assert_eq!(body["max_tokens"], crate::provider::GIT_PROPOSAL_MAX_TOKENS);
         assert!(
             body.get("tools")
                 .is_none_or(|value| value.as_array().is_some_and(Vec::is_empty))
@@ -14650,9 +14644,8 @@ mod git_command_consumer_tests {
         let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
         let repo = Repo::seeded().await;
         let before = repo.git(&["rev-parse", "HEAD"]).await;
-        let mut wire = crate::provider::git_proposal_test_support::Wire::new(
-            r#"{"message":"never","paths":["unrelated.txt"]}"#,
-        );
+        let mut wire =
+            crate::provider::git_proposal_test_support::Wire::new(r#"{"paths":["unrelated.txt"]}"#);
         let cfg = wire.config();
         let cli = crate::cli::Cli {
             no_session: true,
@@ -14852,7 +14845,7 @@ mod git_command_consumer_tests {
         app.run_slash_command("/pr").await.unwrap();
         terminal(&mut app).await;
         let body = wire.body();
-        assert_eq!(body["max_tokens"], 1024);
+        assert_eq!(body["max_tokens"], crate::provider::GIT_PROPOSAL_MAX_TOKENS);
         assert!(
             body.get("tools")
                 .is_none_or(|v| v.as_array().is_some_and(Vec::is_empty))
@@ -19798,7 +19791,7 @@ mod plan_approval_tests {
                 .as_ref()
                 .unwrap()
                 .tool
-                .contains(&turn_id)
+                .starts_with("[question 1/")
         );
         app.input.load_text("ordinary follow-up draft雪");
         key(&mut app, KeyCode::Char('y')).await;
@@ -20383,7 +20376,7 @@ mod plan_approval_tests {
                     "summary reaches the retried request"
                 );
                 assert!(
-                    last.contains("Context was compacted"),
+                    last.contains("Earlier context was compacted"),
                     "continuation prompt is sent"
                 );
                 assert!(

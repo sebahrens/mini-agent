@@ -310,7 +310,9 @@ impl ProviderHttpClient {
 /// TLS, refusal and timeout are distinguishable.
 pub(crate) fn listing_transport_message(error: &str) -> &'static str {
     let lower = error.to_ascii_lowercase();
-    if lower.contains("dns") || lower.contains("lookup") || lower.contains("resolve") {
+    if lower.contains("official") {
+        "model listing refused: saved credentials are restricted to the official endpoint (check base_url)"
+    } else if lower.contains("dns") || lower.contains("lookup") || lower.contains("resolve") {
         "model listing failed: host name could not be resolved (check base_url)"
     } else if lower.contains("certificate") || lower.contains("tls") || lower.contains("ssl") {
         "model listing failed: TLS handshake or certificate error"

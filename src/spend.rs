@@ -1035,11 +1035,13 @@ impl Account {
         if state.cap.is_none() {
             return Ok(());
         }
-        if self.has_pending() {
-            return Err(BudgetRefusal::LedgerPending);
-        }
+        // An exhausted budget is the more specific cause, and it holds whether or
+        // not the write that recorded the spend has reached the ledger yet.
         if state.exhausted() {
             return Err(BudgetRefusal::UsdExhausted);
+        }
+        if self.has_pending() {
+            return Err(BudgetRefusal::LedgerPending);
         }
         if state.tracking_error || state.unpriced_tokens != 0 {
             return Err(BudgetRefusal::TrackingIncomplete);
