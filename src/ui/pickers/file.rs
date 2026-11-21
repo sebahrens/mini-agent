@@ -933,9 +933,14 @@ impl FilePicker {
             #[cfg(test)]
             count_filter(1, false);
             let lower = entry.lower.as_deref().unwrap_or(&entry.text);
-            let Some(score) = score_path(lower, &query) else {
+            let Some(mut score) = score_path(lower, &query) else {
                 continue;
             };
+            // Mentions and opaque operands are explicit completions: they
+            // always lead paths that match as well.
+            if !empty && entry.kind != EntryKind::Path {
+                score += 5000;
+            }
             top += usize::from(score >= 0);
             self.ranked.push(Ranked {
                 score,

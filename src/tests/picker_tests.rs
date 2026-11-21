@@ -435,15 +435,20 @@ fn test_walk_files_includes_nested_dirs() {
 }
 
 #[test]
-fn test_walk_files_skips_dotfiles() {
+fn test_walk_files_lists_root_dotfiles_but_not_credentials() {
     with_temp_dir(|root| {
-        fs::write(root.join(".hidden"), b"secret").unwrap();
+        fs::write(root.join(".env"), b"secret").unwrap();
+        fs::write(root.join(".hidden"), b"listed at the root").unwrap();
+        fs::create_dir(root.join("sub")).unwrap();
+        fs::write(root.join("sub").join(".nested"), b"not listed").unwrap();
         fs::write(root.join("visible.txt"), b"hello").unwrap();
 
         let files = walk_files(&root.to_string_lossy());
         let names: Vec<&str> = files.iter().map(|p| p.to_str().unwrap()).collect();
 
-        assert!(!names.contains(&".hidden"));
+        assert!(!names.contains(&".env"));
+        assert!(names.contains(&".hidden"));
+        assert!(!names.iter().any(|name| name.ends_with(".nested")));
         assert!(names.contains(&"visible.txt"));
     });
 }
@@ -554,7 +559,7 @@ fn test_walk_files_respects_gitignore_and_prunes_dot_git() {
 
         assert!(names.contains(&"kept.rs".to_string()), "got {names:?}");
         assert!(
-            names.iter().all(|n| !n.starts_with(".git")),
+            names.iter().all(|n| n != ".git" && !n.starts_with(".git/")),
             "nothing under .git may be listed: {names:?}"
         );
         assert!(

@@ -384,8 +384,9 @@ mod tests {
         state
             .handle(&key(KeyCode::Char('t')), &mut renderer)
             .unwrap();
-        // CR-separated lines (iTerm2, VTE) arrive as `\n`; tabs expand.
-        let answer = "first line\n    雪; allow_once";
+        // CR-separated lines (iTerm2, VTE) arrive as `\n`; tabs are kept
+        // (the overlay expands them only when drawing).
+        let answer = "first line\n\t雪; allow_once";
         state
             .handle(
                 &UserEvent::Paste("first line\r\n\t雪; allow_once".into()),

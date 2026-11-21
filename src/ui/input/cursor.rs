@@ -12,7 +12,7 @@ pub fn floor_char_boundary(s: &str, idx: usize) -> usize {
 /// Start of the Unicode scalar before `idx`. Picker queries are edited one
 /// char at a time, so they pair this with `String::remove`.
 pub fn prev_scalar_boundary(s: &str, idx: usize) -> usize {
-    let mut i = floor_char_boundary(s, idx).saturating_sub(1);
+    let mut i = idx.saturating_sub(1);
     while i > 0 && !s.is_char_boundary(i) {
         i -= 1;
     }
@@ -33,6 +33,11 @@ pub fn next_scalar_boundary(s: &str, idx: usize) -> usize {
 /// ZWJ emoji sequences, flags, skin-tone modifiers and base letters with
 /// combining marks are one unit, so the cursor never stops inside one.
 pub fn prev_char_boundary(s: &str, idx: usize) -> usize {
+    if idx > s.len() {
+        // A stale offset past the end lands on the end, as one char step back
+        // from it always did.
+        return s.len();
+    }
     let idx = floor_char_boundary(s, idx);
     match s[..idx].graphemes(true).next_back() {
         Some(cluster) => idx - cluster.len(),

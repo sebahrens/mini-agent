@@ -2446,12 +2446,13 @@ mod settings_history_tests {
     }
 
     #[test]
-    fn load_text_strips_escape_sequences_and_tabs() {
+    fn load_text_strips_escape_sequences_and_keeps_tabs() {
         // mini-agent-x894j: history text must not reach the terminal raw.
         let mut input = InputEditor::new();
         input.load_text("a\x1b]52;c;ZXZpbA==\x07b\tc\nnext");
         assert!(!input.buffer.contains('\x1b'));
-        assert!(!input.buffer.contains('\t'));
+        // Tabs are kept; only drawing expands them (mini-agent-nvnkx.87).
+        assert!(input.buffer.contains('\t'));
         assert!(input.buffer.starts_with('a') && input.buffer.ends_with("c\nnext"));
         assert_eq!(input.cursor, input.buffer.len());
     }
