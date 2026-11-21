@@ -64,7 +64,11 @@ fn test_build_stderr_filter_log_level() {
 
 #[test]
 fn test_build_stderr_filter_invalid_log_level_does_not_panic() {
-    let cli = parse_cli(&["--log-level", "invalid"]);
+    // The CLI now rejects unknown levels at parse time; the filter builder must still
+    // fall back safely if an invalid value reaches it.
+    assert!(Cli::try_parse_from(["mini-agent", "--log-level", "invalid"]).is_err());
+    let mut cli = parse_cli(&[]);
+    cli.log_level = Some("invalid".to_string());
     let filter = logging::build_stderr_filter(&cli).to_string();
     assert!(filter.contains("warn"));
     assert!(!filter.contains("invalid"));

@@ -9225,7 +9225,10 @@ mod protocol_tests {
                             .block_task()
                             .await
                             .unwrap_err();
-                        assert!(error.to_string().contains(expected), "{error}");
+                        assert!(
+                            error.to_string().contains(expected),
+                            "{text:?} expected {expected:?}: {error}"
+                        );
                         cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
                             .block_task()
                             .await?;

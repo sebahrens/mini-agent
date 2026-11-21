@@ -2379,7 +2379,8 @@ mod model_listing48_tests {
     }
     #[tokio::test]
     async fn model_listing48_repeated_cursor_oversize_and_echo_errors_are_closed() {
-        for case in ["cursor", "duplicate", "oversize", "echo", "malformed"] {
+        // A duplicate row is skipped, not fatal (provider_listing::tests).
+        for case in ["cursor", "oversize", "echo", "malformed"] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let mut config = cfg(None);
             config.provider_type = "anthropic".into();
@@ -2425,7 +2426,9 @@ mod model_listing48_tests {
             };
             let error = tokio::time::timeout(Duration::from_secs(3), async {
                 let (result, ()) = tokio::join!(client.list_models(), server);
-                result.err().expect("listing must fail")
+                result
+                    .err()
+                    .unwrap_or_else(|| panic!("listing must fail: {case}"))
             })
             .await
             .unwrap();

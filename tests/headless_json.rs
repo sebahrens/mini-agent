@@ -120,7 +120,14 @@ fn doctor_cli_is_read_only_with_missing_invalid_and_configured_credentials_and_n
     let mut invalid = root.command();
     invalid.arg("--doctor");
     let output = bounded_output(invalid);
-    assert!(output.status.success());
+    // A layer that cannot load is a failing diagnosis (exit 1), but the report is
+    // still printed in full.
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.contains("invalid; defaults shown"));
     assert!(!text.contains("DOCTOR_PRIVATE_PARSE_VALUE"));
@@ -1500,7 +1507,7 @@ fn provider_print_json_retains_progress_and_reports_terminal_failures() {
 fn headless_interrupt_preserves_progress_and_settles_owned_work() {
     use nix::sys::signal::{Signal, kill};
     use nix::unistd::Pid;
-    use std::io;
+    use std::io::{self, Read as _};
     use std::os::unix::process::ExitStatusExt;
     use std::process::Stdio;
     use std::time::{Duration, Instant};
@@ -1582,6 +1589,20 @@ fn headless_interrupt_preserves_progress_and_settles_owned_work() {
                 .stderr(Stdio::piped())
                 .spawn()
                 .expect("start headless command");
+            // Drain both pipes while the child runs: a child whose output exceeds
+            // the pipe buffer (16 KiB on macOS) would otherwise block in write and
+            // never observe the signal.
+            let drain = |pipe: Option<Box<dyn io::Read + Send>>| {
+                std::thread::spawn(move || {
+                    let mut bytes = Vec::new();
+                    if let Some(mut pipe) = pipe {
+                        let _ = pipe.read_to_end(&mut bytes);
+                    }
+                    bytes
+                })
+            };
+            let stdout_drain = drain(child.stdout.take().map(|p| Box::new(p) as _));
+            let stderr_drain = drain(child.stderr.take().map(|p| Box::new(p) as _));
             let mut command_pid = None;
             let observation = (|| -> io::Result<_> {
                 let deadline = Instant::now() + Duration::from_secs(10);
@@ -1625,7 +1646,12 @@ fn headless_interrupt_preserves_progress_and_settles_owned_work() {
             {
                 let _ = kill(pid, Signal::SIGKILL);
             }
-            let output = child.wait_with_output().unwrap();
+            let status = child.wait().unwrap();
+            let output = std::process::Output {
+                status,
+                stdout: stdout_drain.join().unwrap(),
+                stderr: stderr_drain.join().unwrap(),
+            };
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(
                 !stderr.contains("mini-agent --setup"),
@@ -2887,7 +2913,10 @@ fn stream_json_system_records_report_mode_cwd_sandbox_tools_and_mcp_status() {
     assert!(
         broken["error"]
             .as_str()
-            .is_some_and(|error| error.contains("not connected") && !error.contains("nonexistent")),
+            // A typed failure (here: command lookup) is shown with its own
+            // generated detail; only untyped errors are reduced to a placeholder.
+            .is_some_and(|error| error.contains("not connected")
+                && error.contains("command resolution failed")),
         "{servers:?}"
     );
     // The capabilities record precedes the first model-driven event.

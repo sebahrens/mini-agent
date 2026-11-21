@@ -1260,7 +1260,7 @@ impl GitRunner {
         command_result(operation, limits, output)
     }
 
-    #[cfg(any(test, feature = "git-worktree"))]
+    #[cfg(feature = "git-worktree")]
     pub(crate) async fn acquire_mutation(
         &self,
         repo_path: &Path,

@@ -134,6 +134,9 @@ async fn headless_budget_runs(
     let cfg: crate::config::Config = serde_json::from_value(json!({
         "session_title_model":"off",
         "custom_providers":{"search-cost":{"provider_type":"anthropic","base_url":wire.base}},
+        // `--api-key` is scoped to the startup provider, which a resumed session does not
+        // select; the resumed run resolves this provider's key from its own config slot.
+        "api_keys":{"search-cost":"unused-key"},
         "quick_models":{"priced":{"provider":"search-cost","model":"claude-opus-5-5",
             "context_window":200000,"input_token_cost":2.0,"output_token_cost":4.0}}
     }))

@@ -759,6 +759,7 @@ pub(crate) fn record_child_usage(session_id: &str, usage: crate::event::UsageDel
 }
 
 /// Takes (and clears) the child usage recorded for `session_id`.
+#[cfg(feature = "goal")]
 pub(crate) fn take_child_usage(session_id: &str) -> crate::event::UsageDelta {
     UNCOUNTED_CHILD_USAGE
         .lock()

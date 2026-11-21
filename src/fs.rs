@@ -1912,6 +1912,7 @@ pub(crate) fn lexical_normalize(path: &Path) -> PathBuf {
 }
 
 /// [`lexical_normalize`] of `path`, resolved against `base` when relative.
+#[cfg(any(feature = "js", test))]
 pub(crate) fn absolute_lexical_from_base(base: &Path, path: &Path) -> PathBuf {
     if path.is_absolute() {
         lexical_normalize(path)

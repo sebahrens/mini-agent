@@ -2316,7 +2316,7 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "NON-PROCESS",
     ),
-    ("src/provider.rs", "output,", 9, "NON-PROCESS"),
+    ("src/provider.rs", "output,", 3, "NON-PROCESS"),
     (
         "src/provider_effort_tests.rs",
         "Self::spawn(responses, \"/v1/messages\", true)",
@@ -2475,7 +2475,7 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     (
         "src/provider.rs",
         &[(
-            "2544a43f58db98f7e0aa66a33286959c9587ce7dd8ee92935ac05d7f8b6a2484",
+            "0cdbbd4deccdcddfef5ad81a669b729b0a26d5d929bf1bb27bae6b4881cf4387",
             1,
         )],
     ),

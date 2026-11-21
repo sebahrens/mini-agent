@@ -1067,7 +1067,7 @@ See [interactive settings](CONFIG.md#interactive-settings-editor).
 With the `multimodal` feature, Ctrl+V can paste a clipboard image into an idle
 prompt (terminals may reserve Ctrl+V; an empty bracketed paste also requests an
 image). The input footer shows `[image 1: WIDTHxHEIGHT png]`; type a question or
-press Enter to send the image alone. `/drop 0` removes the first pending
+press Enter to send the image alone. `/drop 1` removes the first pending
 attachment. Pasting stages data and makes no model request. Sent clipboard
 images are saved inline with the session, rather than reopened from a file on
 resume. A clipboard PNG over 2 MiB (up to 24 MiB) is downscaled to at most 2000

@@ -246,7 +246,7 @@ async fn usd_budget_actual_app_cost_query_is_readonly_and_queue_stays_visible() 
     assert!(
         app.renderer
             .captured_output()
-            .contains("queued input is retained")
+            .contains("Queued input is retained")
     );
     assert_eq!(
         app.ui.session.spend_account.snapshot().recorded_spend(),
