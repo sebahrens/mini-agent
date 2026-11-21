@@ -1746,8 +1746,8 @@ place, so those turns surface the error directly.
 | Relief cap per prompt | none | none (stops on no progress) | 3 for non-native sessions |
 | Native (Anthropic replay) session | chain restarted as a new epoch | same | between prompts and mid-turn at a tool-batch boundary; chain restarted |
 | Summarizer failure | history kept, error shown | history kept, run continues | history kept under token pressure, evicted only for the byte bound or turn cap; the client is told why |
-| Cancel | Esc or Ctrl-C while compacting; history is unchanged | interrupt | prompt cancellation |
-| Report | line with messages, tokens freed net of the summary and the sidecar path | stderr line and a `compactions` object (`count`, `messages`, `tokens_freed`) on the final JSON / stream-json result | agent-thought notice, or the `/compact` reply; `/compact show` prints the active summary |
+| Cancel | Esc or Ctrl-C while compacting; history is unchanged. A progress line (elapsed time, `request k of ~n`) prints every ten seconds | interrupt | prompt cancellation |
+| Report | line with messages, tokens freed net of the summary and the sidecar path | stderr line and a `compactions` object (`count`, `messages`, `tokens_freed`, `usage`) on the final JSON / stream-json result, plus a `compaction` record in stream-json as each one finishes | agent-thought notice, or the `/compact` reply; `/compact show` prints the active summary |
 | User instructions | `/compact <instructions>` (manual only) | `--compact-instructions` | none |
 
 The summarizer is asked for a handoff summary with fixed sections in this order:

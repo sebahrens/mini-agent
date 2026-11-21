@@ -15067,11 +15067,28 @@ brainstorm = "no-such-quick-model"
         let log = workspace.path().join("compaction-hooks.log");
         let mut config = HooksConfig::new();
         for event in ["PreCompact", "PostCompact", "SessionStart"] {
-            config.insert(event.into(), vec![HookGroup { matcher:None, hooks:vec![HookHandler {
-                kind:"command".into(), command:Some("/bin/sh".into()),
-                args:Some(vec!["-c".into(), "{ cat; printf '\\n'; } >> \"$1\"".into(), "record".into(), log.display().to_string()]),
-                timeout:Some(10), is_async:false, condition:None, once:false, trust:HookTrust::Trusted, env:Default::default(),
-            }] }]);
+            config.insert(
+                event.into(),
+                vec![HookGroup {
+                    matcher: None,
+                    hooks: vec![HookHandler {
+                        kind: "command".into(),
+                        command: Some("/bin/sh".into()),
+                        args: Some(vec![
+                            "-c".into(),
+                            "{ cat; printf '\\n'; } >> \"$1\"".into(),
+                            "record".into(),
+                            log.display().to_string(),
+                        ]),
+                        timeout: Some(10),
+                        is_async: false,
+                        condition: None,
+                        once: false,
+                        trust: HookTrust::Trusted,
+                        env: Default::default(),
+                    }],
+                }],
+            );
         }
         crate::extras::hooks::init_dispatcher(HookDispatcher::from_config(&config).unwrap());
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -15093,7 +15110,10 @@ brainstorm = "no-such-quick-model"
                 let head = String::from_utf8_lossy(&bytes[..header]).to_ascii_lowercase();
                 let length = head
                     .lines()
-                    .find_map(|line| line.strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap()))
+                    .find_map(|line| {
+                        line.strip_prefix("content-length:")
+                            .map(|v| v.trim().parse::<usize>().unwrap())
+                    })
                     .unwrap();
                 if bytes.len() >= header + 4 + length {
                     break;
@@ -15102,7 +15122,10 @@ brainstorm = "no-such-quick-model"
             let first = serde_json::json!({"id":"acp-hook","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"HOOK_SUMMARY"},"finish_reason":null}]});
             let last = serde_json::json!({"id":"acp-hook","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":4,"total_tokens":13}});
             let body = format!("data: {first}\n\ndata: {last}\n\ndata: [DONE]\n\n");
-            let wire = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            let wire = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
             stream.write_all(wire.as_bytes()).unwrap();
         });
         let cfg = format!(
@@ -15148,7 +15171,11 @@ brainstorm = "no-such-quick-model"
                     .iter()
                     .filter_map(|event| event["hook_event_name"].as_str())
                     .collect();
-                assert_eq!(names, ["PreCompact", "PostCompact", "SessionStart"], "{events:?}");
+                assert_eq!(
+                    names,
+                    ["PreCompact", "PostCompact", "SessionStart"],
+                    "{events:?}"
+                );
                 let sessions = inspect.sessions.lock().await;
                 let history = sessions[&session].history.lock().await;
                 let stored = history.session.compacted_context().0.unwrap().to_owned();

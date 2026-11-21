@@ -1381,7 +1381,13 @@ mod tests {
         let prefix = crate::agent::runner::cache_fork_history(&session, 2, 0, 1_000_000)
             .expect("native fork prefix");
         assert_eq!(prefix.len(), 2, "q1 and a1 only: {prefix:?}");
-        assert_eq!(serde_json::to_string(&prefix[0]).unwrap().matches("q1").count(), 1);
+        assert_eq!(
+            serde_json::to_string(&prefix[0])
+                .unwrap()
+                .matches("q1")
+                .count(),
+            1
+        );
         // A cut that is not a user prompt, or one the wire cannot prove, is refused.
         assert!(crate::agent::runner::cache_fork_history(&session, 1, 0, 1_000_000).is_none());
         let mut drifted = session.clone();

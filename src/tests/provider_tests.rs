@@ -1827,6 +1827,87 @@ fn a_summary_cut_off_at_the_output_limit_says_so() {
     assert_eq!(whole, "## Task\nok");
 }
 
+/// Serves one streamed chat completion ending with `finish_reason` and returns
+/// the summarizer's output for it.
+async fn summarize_against_local_stream(finish_reason: &str) -> crate::provider::CompactionOutput {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let finish_reason = finish_reason.to_owned();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let count = stream.read(&mut chunk).await.unwrap();
+            assert_ne!(count, 0);
+            bytes.extend_from_slice(&chunk[..count]);
+            let Some(header) = bytes.windows(4).position(|part| part == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&bytes[..header]).to_ascii_lowercase();
+            let length: usize = head
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("content-length:")
+                        .map(|v| v.trim().parse().unwrap())
+                })
+                .unwrap();
+            if bytes.len() >= header + 4 + length {
+                break;
+            }
+        }
+        let first = serde_json::json!({"id":"cap","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"## Task\nfix the parser\n## Decisions\nuse a"},"finish_reason":null}]});
+        let last = serde_json::json!({"id":"cap","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":finish_reason}],"usage":{"prompt_tokens":90,"completion_tokens":40,"total_tokens":130}});
+        let body = format!("data: {first}\n\ndata: {last}\n\ndata: [DONE]\n\n");
+        let wire = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(wire.as_bytes()).await.unwrap();
+    });
+    let custom: HashMap<String, CustomProviderConfig> = serde_json::from_value(
+        serde_json::json!({"capped":{"provider_type":"openai","base_url":format!("http://{address}/v1"),"api_style":"completions"}}),
+    )
+    .unwrap();
+    let client =
+        crate::provider::create_client("capped", Some("unused-key"), &custom, None).unwrap();
+    let output = client
+        .compress_messages_observed_with_timeout(
+            "capped-model",
+            &compaction_messages(2, "short history"),
+            None,
+            None,
+            100_000,
+            4_096,
+            &crate::retry::RetryConfig::default(),
+            crate::spend::run::UsageObserver::default(),
+            Some(Duration::from_secs(20)),
+        )
+        .await
+        .unwrap();
+    server.await.unwrap();
+    output
+}
+
+#[tokio::test]
+async fn a_streamed_summary_stopped_at_the_output_cap_is_marked_truncated() {
+    // mini-agent-sskdu.233: through the real streaming adapter, a
+    // `finish_reason: length` response keeps its text and gains the marker; a
+    // normal stop does not.
+    let capped = summarize_against_local_stream("length").await;
+    assert!(capped.summary.contains("use a"), "{}", capped.summary);
+    assert!(
+        capped
+            .summary
+            .ends_with(crate::provider::SUMMARY_TRUNCATED_MARKER),
+        "{}",
+        capped.summary
+    );
+    let whole = summarize_against_local_stream("stop").await;
+    assert!(!whole.summary.contains("truncated by the output limit"));
+}
+
 #[test]
 fn fork_instruction_does_not_refer_to_fences_it_lacks_or_repeat_the_suffix() {
     // mini-agent-sskdu.241

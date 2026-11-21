@@ -454,12 +454,41 @@ pub fn undo_last(session: &mut Session) -> usize {
     session.rewind_to(start)
 }
 
+/// How often a running compaction reports progress; short under test.
+#[cfg(not(test))]
+const COMPACTION_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+#[cfg(test)]
+const COMPACTION_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// One progress line for a compaction in flight: elapsed time and the
+/// summarizer request being waited on, of an estimated lower bound
+/// (mini-agent-sskdu.232).
+pub(crate) fn compaction_progress_line(
+    elapsed: std::time::Duration,
+    requests_started: u64,
+    estimated_requests: usize,
+) -> String {
+    let current = usize::try_from(requests_started)
+        .unwrap_or(usize::MAX)
+        .max(1);
+    let total = estimated_requests.max(current);
+    let seconds = elapsed.as_secs();
+    format!(
+        "  summarising: request {current} of ~{total}, {}m{:02}s elapsed (Esc cancels)",
+        seconds / 60,
+        seconds % 60
+    )
+}
+
 /// `/compact undo`: restore the transcript the newest compaction replaced from
 /// its sidecar (mini-agent-sskdu.244). Not available on native Anthropic
 /// sessions, whose replay history is bound to the compacted feed.
 pub(super) fn undo_compaction(ctx: &mut SlashCtx<'_>) {
     if *ctx.is_running {
-        write_error(ctx.renderer, "wait for the current turn to finish before /compact undo");
+        write_error(
+            ctx.renderer,
+            "wait for the current turn to finish before /compact undo",
+        );
         return;
     }
     if ctx.cfg.is_anthropic_native(&ctx.session.provider) {
@@ -487,27 +516,33 @@ pub(super) fn undo_compaction(ctx: &mut SlashCtx<'_>) {
         Ok(count) => count,
         Err(error) => {
             *ctx.session = previous;
-            write_error(ctx.renderer, format!("cannot undo the compaction: {error:#}"));
+            write_error(
+                ctx.renderer,
+                format!("cannot undo the compaction: {error:#}"),
+            );
             return;
         }
     };
     if !ctx.cli.no_session
-        && let Err(error) = crate::session::storage::save_session_recovering(ctx.session, |notice| {
-            write_error(ctx.renderer, format!("warning: {notice}"))
-        })
+        && let Err(error) =
+            crate::session::storage::save_session_recovering(ctx.session, |notice| {
+                write_error(ctx.renderer, format!("warning: {notice}"))
+            })
     {
         *ctx.session = previous;
-        write_error(ctx.renderer, format!("failed to save the restored session: {error:#}"));
+        write_error(
+            ctx.renderer,
+            format!("failed to save the restored session: {error:#}"),
+        );
         return;
     }
-    if let Err(error) = crate::ui::events::render_session(
-        ctx.renderer,
-        ctx.session,
-        ctx.cli,
-        ctx.cfg,
-        ctx.context,
-    ) {
-        write_error(ctx.renderer, format!("could not redraw the session: {error:#}"));
+    if let Err(error) =
+        crate::ui::events::render_session(ctx.renderer, ctx.session, ctx.cli, ctx.cfg, ctx.context)
+    {
+        write_error(
+            ctx.renderer,
+            format!("could not redraw the session: {error:#}"),
+        );
     }
     write_ok(
         ctx.renderer,
@@ -744,6 +779,11 @@ async fn handle_compress_unfloored(
     // or stalled summarizer can be abandoned; history is only touched after the
     // summary arrives, so a cancelled compaction leaves it intact.
     let cancel = crate::ui::CompactionCancel::begin();
+    let estimated_requests = crate::provider::estimated_compaction_requests(
+        &ui.session.messages[..cut_idx.min(ui.session.messages.len())],
+        summarizer_input_budget,
+        reserve,
+    );
     let compaction = compact_session_with_restoring(
         ui.session,
         cut_idx,
@@ -806,12 +846,34 @@ async fn handle_compress_unfloored(
             let _ = (summary, first_kept_index);
         },
     );
-    let compacted = tokio::select! {
-        biased;
-        _ = cancel.cancelled() => Err(anyhow::anyhow!(
-            "compaction cancelled; the history is unchanged"
-        )),
-        result = compaction => result,
+    // The event loop is parked on this await, so show liveness here: elapsed
+    // time and the summarizer request in flight, on each progress tick.
+    let started_at = std::time::Instant::now();
+    let mut progress = tokio::time::interval_at(
+        tokio::time::Instant::now() + COMPACTION_PROGRESS_INTERVAL,
+        COMPACTION_PROGRESS_INTERVAL,
+    );
+    let compacted = {
+        tokio::pin!(compaction);
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break Err(anyhow::anyhow!(
+                    "compaction cancelled; the history is unchanged"
+                )),
+                result = &mut compaction => break result,
+                _ = progress.tick() => {
+                    let _ = renderer.write_line(
+                        &compaction_progress_line(
+                            started_at.elapsed(),
+                            observed.requests_started(),
+                            estimated_requests,
+                        ),
+                        crossterm::style::Color::DarkGrey,
+                    );
+                }
+            }
+        }
     };
     drop(cancel);
     let (first_kept_index, tokens_before, usage) = match compacted {

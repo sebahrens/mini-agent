@@ -1586,6 +1586,7 @@ impl AnyClient {
                 let preamble = preamble.clone();
                 let retry_config = retry_config.clone();
                 let observed = observed.clone();
+                observed.request_started();
                 async move {
                     let model = self.completion_model_with_cache_ttl(
                         model_name.to_string(),
@@ -1615,6 +1616,25 @@ impl AnyClient {
         )
         .await
     }
+}
+
+/// A lower-bound estimate of the rolling summarizer requests `messages` need
+/// at these budgets, for a progress line (mini-agent-sskdu.232). The real count
+/// can be higher when summaries grow; never zero.
+pub(crate) fn estimated_compaction_requests(
+    messages: &[SessionMessage],
+    input_token_budget: u64,
+    response_token_budget: u64,
+) -> usize {
+    let (prompt_budget, _) = compaction_request_limits(
+        input_token_budget,
+        response_token_budget,
+        summarizer_preamble().len(),
+    );
+    let bytes: usize = messages.iter().map(|message| message.content.len()).sum();
+    bytes
+        .div_ceil(prompt_budget.max(1))
+        .clamp(1, MAX_COMPACTION_REQUESTS)
 }
 
 /// Default per-request compaction timeout: 300 s plus one second per 2,000
@@ -4037,6 +4057,7 @@ impl AnyAgent {
     ) -> anyhow::Result<CompactionOutput> {
         let request_timeout = request_timeout
             .unwrap_or_else(|| default_compaction_request_timeout(input_token_budget));
+        let observed_progress = observed.clone();
         let instruction = fork_instruction(instructions);
         let (prompt_budget, max_output_tokens) =
             compaction_request_limits(input_token_budget, response_token_budget, instruction.len());
@@ -4056,6 +4077,7 @@ impl AnyAgent {
                 )
             };
         }
+        observed_progress.request_started();
         let work = async {
             match &self.inner {
                 AnyAgentInner::Anthropic(agent) => fork!(agent).await,

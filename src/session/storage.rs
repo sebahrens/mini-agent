@@ -2015,16 +2015,27 @@ mod readonly_import_tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o077,
+                0
+            );
         }
 
         let replaced = read_precompact(&session.id, 1).unwrap();
         // A sidecar that does not match the record is refused untouched.
         let mut mismatched = session.clone();
-        assert!(mismatched.undo_last_compaction(replaced[..1].to_vec()).is_err());
+        assert!(
+            mismatched
+                .undo_last_compaction(replaced[..1].to_vec())
+                .is_err()
+        );
         assert_eq!(mismatched.messages.len(), 2);
         assert_eq!(session.undo_last_compaction(replaced).unwrap(), 2);
-        let texts: Vec<&str> = session.messages.iter().map(|m| m.content.as_str()).collect();
+        let texts: Vec<&str> = session
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
         assert_eq!(texts, ["first", "second", "kept"]);
         assert!(session.compactions.is_empty());
         assert!(session.undo_last_compaction(Vec::new()).is_err());
