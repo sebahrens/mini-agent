@@ -157,7 +157,8 @@ fn record_asked_dir_idempotent() {
     archmd::record_asked_dir_with_path(&dir, &ap).unwrap();
     let content = fs::read_to_string(&ap).unwrap();
     let lines: Vec<&str> = content.lines().collect();
-    assert_eq!(lines.len(), 2);
+    // A repeated record does not grow the file.
+    assert_eq!(lines.len(), 1);
 }
 
 #[test]
@@ -230,4 +231,16 @@ fn ask_and_create_false_when_arch_exists() {
     fs::write(dir.join("ARCHITECTURE.md"), "# test").unwrap();
     // No interactive prompt — should_ask returns false immediately
     assert!(!archmd::ask_and_create(&dir).unwrap());
+}
+
+#[test]
+fn only_directories_inside_a_vcs_project_are_offered() {
+    let tmp = temp_dir("vcs");
+    let plain = tmp.join("scratch");
+    fs::create_dir_all(&plain).unwrap();
+    assert!(!archmd::is_in_vcs_project(&plain));
+    let repo = tmp.join("repo");
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    fs::create_dir_all(repo.join("sub")).unwrap();
+    assert!(archmd::is_in_vcs_project(&repo.join("sub")));
 }

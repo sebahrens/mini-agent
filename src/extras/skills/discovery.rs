@@ -241,6 +241,9 @@ impl Package {
 pub(crate) struct Discovery {
     pub(crate) packages: BTreeMap<String, Package>,
     pub(crate) diagnostics: Vec<String>,
+    /// A source directory could not be scanned, so the result must not be
+    /// reused: the next pass should look again.
+    pub(crate) scan_incomplete: bool,
     // Catalog owners retain their existing leases for every published record.
     pub(crate) catalogues: Vec<AgentSkillCatalog>,
 }
@@ -381,22 +384,28 @@ fn sanitize_reason(reason: &str) -> String {
         .collect()
 }
 
-/// Whether every source root that exists is still authorized. A cached
-/// discovery is only reusable when none of its roots lost (or newly gained)
-/// the trust and read authority it was built under; a root that cannot even be
-/// opened sends the caller to the full pass, which reports why.
-pub(crate) fn roots_still_authorized(
+/// The authorization verdict of every source root, in root order: `true` for
+/// a root that exists and is authorized, `false` for a missing or
+/// unauthorized one. `None` when a root cannot even be opened (other than
+/// missing), which sends the caller to the full pass that reports why. A
+/// cached discovery is reusable only while the verdicts equal those it was
+/// built under, so a persistent untrusted root does not defeat the cache.
+pub(crate) fn root_authorizations(
     roots: &[SourceRoot],
     paths: &AppPaths,
     permission: &Option<PermCheck>,
-) -> bool {
+) -> Option<Vec<bool>> {
     let memo = SourceAuthMemo::default();
-    roots.iter().all(
-        |source| match source.binding.open_dir_relative(&source.directory) {
-            Ok(_) => memo.authorized(source, paths, permission),
-            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
-        },
-    )
+    roots
+        .iter()
+        .map(
+            |source| match source.binding.open_dir_relative(&source.directory) {
+                Ok(_) => Some(memo.authorized(source, paths, permission)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
+                Err(_) => None,
+            },
+        )
+        .collect()
 }
 
 /// Source order is priority order. First valid name wins; invalid packages do
@@ -505,6 +514,7 @@ pub(crate) fn discover(
             Ok(())
         })();
         if let Err(error) = scan {
+            result.scan_incomplete = true;
             result
                 .diagnostics
                 .push(format!("{}: {error}", source.origin));
