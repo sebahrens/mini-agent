@@ -163,35 +163,6 @@ pub(super) async fn announce(
     id: &SessionId,
     cx: &agent_client_protocol::ConnectionTo<agent_client_protocol::Client>,
 ) -> Result<(), agent_client_protocol::Error> {
-    // A busy history means a turn is running; the turn re-announces itself if
-    // it makes the session native-bearing (`announce_for`).
-    let history = state
-        .sessions
-        .lock()
-        .await
-        .get(id)
-        .map(|session| session.history.clone());
-    let native = history
-        .and_then(|history| history.try_lock_owned().ok())
-        .is_some_and(|history| {
-            crate::session::native_publication::is_native_bearing(&history.session)
-        });
-    announce_for(state, id, cx, native).await
-}
-
-/// `/compact`, `/undo` and `/rename` cannot run on a session that holds
-/// provider-native state (see `super::native_command_refusal`), so they are
-/// not advertised for one.
-pub(super) fn honoured_without_native(name: &str) -> bool {
-    !matches!(name, "compact" | "undo" | "rename")
-}
-
-pub(super) async fn announce_for(
-    state: &super::AcpState,
-    id: &SessionId,
-    cx: &agent_client_protocol::ConnectionTo<agent_client_protocol::Client>,
-    native: bool,
-) -> Result<(), agent_client_protocol::Error> {
     let workspace = state
         .sessions
         .lock()
@@ -242,9 +213,6 @@ pub(super) async fn announce_for(
     ));
     #[cfg(not(feature = "goal"))]
     let _ = &mut commands;
-    if native {
-        commands.retain(|command| honoured_without_native(&command.name));
-    }
     for (name, description, hint) in custom {
         let description = if description.is_empty() {
             "Custom prompt command".to_owned()
@@ -286,16 +254,6 @@ mod tests {
             None
         );
         assert_eq!(classify(&text("/tasks")).unwrap(), None);
-    }
-
-    #[test]
-    fn native_sessions_do_not_advertise_commands_they_refuse() {
-        for name in ["compact", "undo", "rename"] {
-            assert!(!honoured_without_native(name));
-        }
-        for name in ["cost", "model", "effort", "cron", "tasks", "goal"] {
-            assert!(honoured_without_native(name));
-        }
     }
 
     #[test]

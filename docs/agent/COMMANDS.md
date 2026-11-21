@@ -888,7 +888,9 @@ standing preference: automatic compaction in the TUI and ACP takes none, and the
 manual `/compact <instructions>` applies to that one compaction. Preferences are fenced
 below the summarization contract. A headless result that compacted carries a
 `compactions` object (`count`, `messages`, `tokens_freed`); ACP answers `/compact` with
-what it did and `/compact show` with the active summary. Esc or Ctrl-C cancels a TUI
+what it did (it keeps the recent tail verbatim at a legal cut and re-attaches recent file
+windows, as the TUI does, and says so when nothing is older than that tail) and
+`/compact show` with the active summary. Esc or Ctrl-C cancels a TUI
 compaction in progress and leaves the history unchanged.
 
 ## Custom prompt commands

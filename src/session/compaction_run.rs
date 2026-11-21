@@ -17,6 +17,9 @@ use super::{Session, SessionMessage};
 use crate::event::UsageDelta;
 use crate::provider::CompactionOutput;
 
+/// Resolves where the kept history starts from the summarizer's covered end.
+pub(crate) type SnapFn = dyn Fn(&Session, usize) -> Option<usize> + Sync;
+
 /// One compaction of `messages[..cut_idx]`.
 pub(crate) struct Plan<'a> {
     /// Exclusive end of the prefix to summarize.
@@ -40,7 +43,7 @@ pub(crate) struct Plan<'a> {
     /// of the cut (`consumed` is the covered end). `None` drains exactly the
     /// covered prefix; `Some` lets a front end require a legal cut boundary,
     /// and `None` from it fails the round with [`RunError::NoLegalCut`].
-    pub snap: Option<&'a (dyn Fn(&Session, usize) -> Option<usize> + Sync)>,
+    pub snap: Option<&'a SnapFn>,
 }
 
 /// What the summarizer is asked to do.
@@ -58,6 +61,7 @@ pub(crate) struct SummaryRequest {
 /// Front-end behaviour that is not part of the compaction itself.
 pub(crate) trait Observer {
     /// Background tasks were cancelled to pause history writers.
+    #[cfg_attr(not(feature = "subagents"), allow(dead_code))]
     fn paused(&mut self, _notice: &str) {}
     /// Charge the summarizer's usage; returns what was charged (normalized
     /// for the session's provider) so the caller can credit a goal round.
@@ -102,6 +106,7 @@ pub(crate) struct Compacted {
 /// Why a round did not commit. The history is unchanged in every case.
 pub(crate) enum RunError {
     /// Background work could not be paused (the pool is closing).
+    #[cfg_attr(not(feature = "subagents"), allow(dead_code))]
     Pause(anyhow::Error),
     /// The summarizer failed.
     Summary(anyhow::Error),
@@ -173,7 +178,7 @@ where
     #[cfg(feature = "hooks")]
     dispatch_pre_compact_once(plan.pre_compact_sent, plan.auto, plan.instructions).await;
     #[cfg(not(feature = "hooks"))]
-    let _ = (plan.pre_compact_sent, plan.instructions);
+    let _ = (plan.pre_compact_sent, plan.instructions, plan.auto);
 
     let cut_idx = plan.cut_idx;
     let (skipped, messages) = session.compaction_input(cut_idx);
@@ -279,6 +284,7 @@ mod tests {
     #[tokio::test]
     async fn drain_follows_coverage_for_every_gate() {
         type Snap = fn(&Session, usize) -> Option<usize>;
+        #[allow(clippy::type_complexity)]
         let cases: [(&str, usize, usize, Option<Snap>, Result<usize, &str>); 6] = [
             ("full coverage", 8, 8, None, Ok(8)),
             (
@@ -309,9 +315,7 @@ mod tests {
             let mut s = session();
             let before = s.messages.len();
             let sent = AtomicBool::new(false);
-            let snap_ref = snap
-                .as_ref()
-                .map(|f| f as &(dyn Fn(&Session, usize) -> Option<usize> + Sync));
+            let snap_ref = snap.as_ref().map(|f| f as &SnapFn);
             let result = run(
                 &mut s,
                 Plan {

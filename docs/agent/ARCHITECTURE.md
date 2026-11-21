@@ -156,6 +156,7 @@ reproducing code; focus on structure, relationships, and rationale.
 ## Key Types
 - `AnyAgent` / `AnyClient` — type-erased agent and LLM client
 - `Session` — conversation state, messages, tokens, compactions
+- `session::compaction_run::run` — the one compaction driver the TUI, headless and ACP front ends share: background pause, summarizer input, once-per-compaction `PreCompact`, charging, the legal drain/commit with the summarizer's byte budget and file-window restore, and the `PostCompact`/`SessionStart(compact)` hooks. A front end supplies only its gate (auto/force/manual), the summarizer (text request or cache fork) and an `Observer` (usage billing, memory copy, client notices)
 - `ContextFiles` — loaded AGENTS.md, ARCHITECTURE.md, prompts, themes
 
 ## Control Flow
