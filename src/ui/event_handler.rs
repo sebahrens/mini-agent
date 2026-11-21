@@ -48,7 +48,23 @@ pub async fn ensure_agent(
     }
     #[cfg(feature = "mcp")]
     if ui.cli.mcp_is_eligible(ui.cfg) {
-        crate::ui::ensure_mcp_manager(&mut ui.mcp_manager, ui.cfg, &ui.workspace).await;
+        let first_connect = ui.mcp_manager.is_none();
+        if let Some(manager) =
+            crate::ui::ensure_mcp_manager(&mut ui.mcp_manager, ui.cfg, &ui.workspace).await
+            && first_connect
+        {
+            // An unmatched `--tools` name is reported once, as a visible
+            // error notice, when the MCP catalogue is first known.
+            use crate::agent::builder::AllowlistMcpCheck;
+            match crate::agent::builder::check_allowlist_against_manager(ui.cli, ui.cfg, manager)
+                .await
+            {
+                AllowlistMcpCheck::Ok => {}
+                AllowlistMcpCheck::Warn(message) | AllowlistMcpCheck::Error(message) => {
+                    manager.push_tool_notice(message);
+                }
+            }
+        }
     }
     *agent = Some(
         ui.agent_build_ctx()

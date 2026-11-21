@@ -1603,8 +1603,10 @@ impl Cli {
     /// Reject a `--tools` allowlist that names tools nothing can supply. A
     /// name that is not a built-in may still be an MCP server tool, which is
     /// unknowable before the servers connect, so unknown names are an error
-    /// only when no MCP server is configured (they would otherwise leave the
-    /// model with no tools and only a log line to say why).
+    /// here only when no MCP server is configured (they would otherwise leave
+    /// the model with no tools and only a log line to say why). With servers
+    /// configured, `builder::check_allowlist_against_mcp` decides once the
+    /// MCP tool catalogue is known.
     pub fn validate_tool_allowlist(&self, cfg: &config::Config) -> anyhow::Result<()> {
         let unknown: Vec<&str> = self
             .tools

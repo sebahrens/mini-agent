@@ -293,7 +293,7 @@ fn opens_sub_picker(command: &str, ctx: &CommandPickerCtx) -> bool {
         "/subagent-models" | "/models-subagent" => !ctx.quick_model_names.is_empty(),
         "/queue" | "/add" => true,
         "/mode" => ctx.security_mode.is_some(),
-        _ => argument_picker_spec(command).is_some(),
+        _ => !COMPLETE_ONLY_COMMANDS.contains(&command) && argument_picker_spec(command).is_some(),
     }
 }
 
@@ -354,6 +354,10 @@ pub(crate) fn argument_picker_spec(
             ],
             "/goal ",
         )),
+        "/reasoning" => Some((&["on", "off"], "/reasoning ")),
+        "/vim" => Some((&["on", "off"], "/vim ")),
+        "/sessions" => Some((&["--all", "delete"], "/sessions ")),
+        "/compress" => Some((&["show", "undo"], "/compress ")),
         _ => None,
     }
 }
@@ -375,7 +379,17 @@ pub(crate) const FINITE_ARGUMENT_COMMANDS: &[&str] = &[
     "/effort",
     "/cron",
     "/jobs",
+    "/reasoning",
+    "/vim",
+    "/sessions",
+    "/compress",
 ];
+
+/// Commands whose bare form is a complete command (`/vim` toggles). Their
+/// arguments complete on Tab, but accepting the command with Enter or a space
+/// never opens the argument picker, so Enter still runs the bare form.
+pub(crate) const COMPLETE_ONLY_COMMANDS: &[&str] =
+    &["/reasoning", "/vim", "/sessions", "/compress"];
 
 /// Replace the typed `/query` with the highlighted command plus a space, and
 /// open the argument picker when the command has one.
@@ -384,6 +398,18 @@ fn accept_command(
     cursor: &mut usize,
     ctx: &CommandPickerCtx,
     picker: &mut ListPicker,
+) -> (bool, Option<Picker>) {
+    accept_command_with(buffer, cursor, ctx, picker, false)
+}
+
+/// [`accept_command`]; `tab` also opens the argument picker of a
+/// complete-only command.
+fn accept_command_with(
+    buffer: &mut CompactString,
+    cursor: &mut usize,
+    ctx: &CommandPickerCtx,
+    picker: &mut ListPicker,
+    tab: bool,
 ) -> (bool, Option<Picker>) {
     if let Some(cmd) = picker.selected_name() {
         let selected = cmd.to_string();
@@ -402,7 +428,9 @@ fn accept_command(
         *buffer = replacement.into();
         *cursor = new_cursor;
 
-        if opens_sub_picker(&selected, ctx) {
+        if opens_sub_picker(&selected, ctx)
+            || (tab && COMPLETE_ONLY_COMMANDS.contains(&selected.as_str()))
+        {
             picker.deactivate();
             let sub = match selected.as_str() {
                 "/model" | "/models" => {
@@ -600,7 +628,7 @@ pub fn handle_command_key(
             if picker.is_empty() {
                 return (true, None);
             }
-            accept_command(buffer, cursor, ctx, picker)
+            accept_command_with(buffer, cursor, ctx, picker, true)
         }
         KeyCode::Enter => {
             let typed_in_full = picker.selected_name().is_some_and(|cmd| {
@@ -1031,6 +1059,42 @@ mod tests {
             assert_eq!(buffer, expected);
             assert_eq!(replacement.is_some(), expects_picker, "{command}");
             assert!(!picker.active, "{command}");
+        }
+    }
+
+    #[test]
+    fn complete_only_commands_run_bare_on_enter_and_complete_on_tab() {
+        for command in super::COMPLETE_ONLY_COMMANDS {
+            let typed = |code| {
+                let mut buffer = CompactString::from(*command);
+                let mut cursor = buffer.len();
+                let mut picker = ListPicker::with_static_commands();
+                picker.activate();
+                for character in command.trim_start_matches('/').chars() {
+                    picker.char_input(character);
+                }
+                let result = handle_command_key(
+                    &mut buffer,
+                    &mut cursor,
+                    &empty_command_context(),
+                    &mut picker,
+                    key(code),
+                );
+                (buffer, result)
+            };
+            // Enter on the bare command is not consumed: it submits.
+            let (buffer, (handled, replacement)) = typed(KeyCode::Enter);
+            assert!(!handled && replacement.is_none(), "{command}");
+            assert_eq!(buffer, *command);
+            // Tab opens the fixed arguments.
+            let (buffer, (handled, replacement)) = typed(KeyCode::Tab);
+            assert!(handled, "{command}");
+            assert_eq!(buffer, format!("{command} "));
+            let Some(super::Picker::Prefixed(list, _)) = replacement else {
+                panic!("{command}: Tab should list the arguments");
+            };
+            let (items, _) = argument_picker_spec(command).unwrap();
+            assert_eq!(list.matches().collect::<Vec<_>>(), items, "{command}");
         }
     }
 

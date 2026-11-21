@@ -596,11 +596,20 @@ pub(crate) fn unknown_nested_key_warnings(source: &str, root: &toml::Table) -> V
 }
 
 pub(crate) fn nearest_field(spelling: &str, fields: &[&'static str]) -> Option<&'static str> {
+    nearest_name(spelling, fields.iter().copied())
+}
+
+/// [`nearest_field`] over any set of candidate names (for example the tools an
+/// MCP server listed at run time).
+pub(crate) fn nearest_name<'a>(
+    spelling: &str,
+    candidates: impl IntoIterator<Item = &'a str>,
+) -> Option<&'a str> {
     let wanted = normalize(spelling);
     let limit = (wanted.chars().count() / 4).max(2);
-    fields
-        .iter()
-        .map(|field| (*field, edit_distance(&wanted, field)))
+    candidates
+        .into_iter()
+        .map(|field| (field, edit_distance(&wanted, field)))
         .filter(|(_, distance)| *distance <= limit)
         .min_by_key(|(_, distance)| *distance)
         .map(|(field, _)| field)
