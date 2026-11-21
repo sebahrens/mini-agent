@@ -3375,6 +3375,96 @@ fn stream_json_control_approves_and_denies_asks_and_stays_closed_by_default() {
     assert!(!root.0.join("tmp/effect.txt").exists());
 }
 
+/// mini-agent-nvnkx.102: an Agent SDK style session. The driver opens with
+/// `initialize`, then answers the `can_use_tool` ask with `updatedInput`; the
+/// edited call (not the model's) runs and the turn reaches its result.
+#[test]
+fn stream_json_control_handshake_set_model_and_updated_input_reach_a_result() {
+    let root = TempRoot::new();
+    std::fs::create_dir(root.0.join("tmp")).unwrap();
+    let server = root.local_provider("permission_ask");
+    let mut command = root.command();
+    command
+        .env("HEADLESS_LOCAL_TEST_KEY", "local-test-key")
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .args([
+            "--no-sandbox",
+            "--no-context-files",
+            "--guarded",
+            "--tools",
+            "write",
+            "--provider",
+            "local-test",
+            "--model",
+            "test",
+            "-p",
+            "--input-format",
+            "stream-json",
+            "--output",
+            "stream-json",
+            "--stream-json-schema",
+            "claude",
+            "--stream-json-control",
+            "write the file",
+        ]);
+    let mut driver = ControlDriver::start(command);
+    driver.send(r#"{"type":"control_request","request_id":"init-1","request":{"subtype":"initialize","hooks":{"PreToolUse":[]},"sdkMcpServers":["x"]}}"#);
+    let ack = driver.until("the initialize reply", |row| {
+        row["type"] == "control_response" && row["response"]["request_id"] == "init-1"
+    });
+    assert_eq!(ack["response"]["subtype"], "success", "{ack}");
+    assert_eq!(
+        ack["response"]["response"]["protocol"],
+        "mini-agent-control/1"
+    );
+    assert!(
+        ack["response"]["response"]["supported_requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|name| name == "set_model")
+    );
+    assert!(
+        !ack["response"]["response"]["session_id"]
+            .as_str()
+            .unwrap()
+            .is_empty()
+    );
+    driver.send(r#"{"type":"control_request","request_id":"model-1","request":{"subtype":"set_model","model":"no-such-alias"}}"#);
+    let refused = driver.until("the set_model reply", |row| {
+        row["type"] == "control_response" && row["response"]["request_id"] == "model-1"
+    });
+    assert_eq!(refused["response"]["subtype"], "error", "{refused}");
+    let request = driver.until("a can_use_tool request", |row| {
+        row["type"] == "control_request"
+    });
+    assert_eq!(request["request"]["tool_input"]["path"], "tmp/effect.txt");
+    let id = request["request_id"].as_str().unwrap().to_owned();
+    driver.send(&format!(
+        r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{id}","response":{{"behavior":"allow","updatedInput":{{"path":"tmp/edited.txt","content":"edited\n"}}}}}}}}"#
+    ));
+    // The edited call is checked and asked again; the driver echoes the
+    // arguments it was offered, which is a plain allow.
+    let second = driver.until("the second can_use_tool request", |row| {
+        row["type"] == "control_request"
+    });
+    assert_eq!(second["request"]["tool_input"]["path"], "tmp/edited.txt");
+    let second_id = second["request_id"].as_str().unwrap().to_owned();
+    driver.send(&format!(
+        r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{second_id}","response":{{"behavior":"allow","updatedInput":{}}}}}}}"#,
+        second["request"]["tool_input"]
+    ));
+    driver.until("the turn result", |row| row["type"] == "result");
+    assert!(driver.finish().success());
+    server.join().unwrap().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.0.join("tmp/edited.txt")).unwrap(),
+        "edited\n"
+    );
+    assert!(!root.0.join("tmp/effect.txt").exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn stream_json_control_interrupts_a_running_tool() {

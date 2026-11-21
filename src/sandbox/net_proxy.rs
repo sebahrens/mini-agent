@@ -981,7 +981,8 @@ impl Shared {
             // that says `"scope":"run"` is remembered for the rest of the run.
             if let Some(control) = control {
                 return match control.ask_network(key).await {
-                    crate::headless_control::Reply::Allow => Ok(()),
+                    crate::headless_control::Reply::Allow
+                    | crate::headless_control::Reply::AllowWith(_) => Ok(()),
                     crate::headless_control::Reply::AllowForRun => {
                         remember_allow(self);
                         Ok(())

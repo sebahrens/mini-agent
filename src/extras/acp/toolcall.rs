@@ -343,6 +343,8 @@ struct PendingCall {
     id: String,
     title: String,
     args: Option<Value>,
+    /// For a `shell` call: its `workdir` argument (`Some(None)` when absent).
+    shell_workdir: Option<Option<String>>,
 }
 
 fn pending() -> &'static Mutex<VecDeque<PendingCall>> {
@@ -363,6 +365,7 @@ pub(super) fn remember_args(
     title: &str,
     root: Option<&Path>,
 ) {
+    let shell_args = args;
     let args = matches!(tool, "edit" | "write").then(|| {
         let mut args = args.clone();
         if let Some(path) = str_arg(&args, "path").map(|path| absolute_path(root, path))
@@ -403,7 +406,20 @@ pub(super) fn remember_args(
         id: tool_call_id.to_owned(),
         title: title.to_owned(),
         args,
+        shell_workdir: (tool == "shell")
+            .then(|| str_arg(shell_args, "workdir").map(|dir| absolute_path(root, dir))),
     });
+}
+
+/// `Some(workdir)` when the call is a `shell` call: the console metadata its
+/// result update carries as `rawOutput` (mini-agent-nvnkx.110).
+pub(super) fn recall_shell(tool_call_id: &str) -> Option<Option<String>> {
+    pending()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|call| call.id == tool_call_id)
+        .and_then(|call| call.shell_workdir.clone())
 }
 
 pub(super) fn recall_args(tool_call_id: &str) -> Option<Value> {

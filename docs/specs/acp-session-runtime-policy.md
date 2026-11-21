@@ -64,3 +64,30 @@ requests. Live lifecycle IDs and persisted model IDs remain separate identities.
 Its inert signatures exercise retention and request construction, not a claim that a
 paid provider accepted the signatures. The unchanged generic fixture covers ordered
 images, retry identity, private save/load, literal commands and cumulative usage.
+
+## Authentication, rewind, additional directories and shell output (2026-11-21)
+
+- **Auth methods** (mini-agent-nvnkx.109): `initialize` lists a `credentials` agent method and, for a
+  client that advertised `auth.terminal`, terminal methods `login-openai` and `login-copilot` whose
+  args are `--login <provider>`; the client runs them in its own terminal. The login flows print to
+  stdout, the protocol channel here, so the server never runs them in-process. `authenticate` accepts
+  only listed method ids and returns success when the default provider's credential resolves, else
+  `auth_required`. `session/new` returns `auth_required` (data: reason and method ids) when a client that
+  advertised `auth.terminal` has no credential for the default provider; other clients keep the failure at
+  the first prompt. This needs the `unstable_auth_methods` feature of `agent-client-protocol`.
+- **`/rewind [n]` and `/redo`** (mini-agent-nvnkx.107): `/rewind` lists the user turns newest first;
+  `/rewind n` restores the files recorded since the n-th most recent turn from the session's file
+  checkpoints, then removes that turn and later ones from the conversation; a refused restore (changed
+  file, unrestorable change, imported checkpoints) leaves the conversation untouched. `/redo` restores the
+  conversation only. Both follow the single-text-block authority rule and use the `/undo` native-session
+  republish path; `n` must be digits 1-9999, anything else is a -32602 error. `/context`, `/mcp`, `/diff`,
+  `/init` and `/fork` are not offered over ACP yet.
+- **Shell output and client terminals** (mini-agent-nvnkx.110, decision): commands keep running in
+  mini-agent's own sandbox; ACP `terminal/create` is not used, because moving execution to the client
+  would bypass the sandbox profile and permission policy. The result update of a `shell` call carries
+  `rawOutput` `{kind:"shell", status, workdir, output}` so a client can render a console. An opt-in client
+  terminal key was considered and not built; do not reopen it as a defect.
+- **`additionalDirectories`** (mini-agent-nvnkx.111): `session/new` and `session/load` accept up to 16
+  absolute existing directories when `add_dir_tool_access = true`, canonicalised and added to the
+  session's `--add-dir` list for every turn (permission rules and denies still decide each access).
+  Without the key the request fails with -32602 naming it.

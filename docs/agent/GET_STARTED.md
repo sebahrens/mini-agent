@@ -511,6 +511,17 @@ With `--stream-json-control`, stdin is read while a turn runs and these lines ac
   Only an explicit `allow` approves (never an allow-always grant for tools or escalation). A `deny`, an `error` reply, the
   timeout, a closed stdin or an interrupted turn all deny, and a reply with an unknown id is an `input_error`.
 
+- `{"type":"control_request","request_id":"x","request":{"subtype":"initialize"}}` is the Agent SDK handshake:
+  the success reply carries `protocol` (`mini-agent-control/1`), `supported_requests`, `session_id` and the
+  `models` that `set_model` accepts; unknown optional fields are ignored.
+- `{"type":"control_request","request_id":"x","request":{"subtype":"set_model","model":"<quick-model alias>"}}`
+  switches to a configured `[quick_models]` alias from the next turn (a session holding provider-native state
+  refuses, reported as an `input_error`).
+- An allow reply may add `"updatedInput":{...}` (the call's arguments; the ask carries them as `tool_input`).
+  The tool then runs with the edited arguments after its permission check runs again against them.
+
+The record shapes are versioned in [docs/specs/stream-json-control.md](../specs/stream-json-control.md).
+
 User messages that arrive during a turn are queued in order (up to 64) and run after its `result`.
 The channel is a CLI flag only; no project configuration can enable it.
 

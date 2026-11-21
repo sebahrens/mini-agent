@@ -69,6 +69,11 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Large pastes (more than 10 lines or 1,000 characters) become an atomic `[Pasted text #N +M lines]` chip in the prompt that the cursor steps over and Backspace removes whole; submit, history and the external editor use the full text (mini-agent-nvnkx.88).
 - `/vim` Normal mode: operators `d`/`c`/`y` with counts, motions (`w e b 0 ^ $ gg G f F t T`, `iw`/`aw`), `x X D C p P o O r ~` and `.` repeat of the last change (mini-agent-nvnkx.89).
 - Pasting or dragging an image file path into the prompt attaches the image as `/add <path>` would, when the permission policy allows reading it (mini-agent-nvnkx.256).
+- stream-json control accepts the Agent SDK `initialize` handshake and `set_model` (a `[quick_models]` alias, applied at the next turn), and an allow reply may carry `updatedInput` (the ask now includes `tool_input`); the call reruns with the edited arguments after its permission check runs again; record shapes are versioned in `docs/specs/stream-json-control.md` (mini-agent-nvnkx.102).
+- ACP `/rewind [n]` lists turns or restores files and conversation to before one, and `/redo` puts the conversation back (mini-agent-nvnkx.107).
+- ACP `initialize` advertises `authMethods` (provider credentials, and terminal logins for a client with `auth.terminal`), `authenticate` re-checks the credential, and `session/new` answers `auth_required` for such a client when the default provider has no credential (mini-agent-nvnkx.109).
+- ACP shell tool results carry `rawOutput` (`kind`, `status`, `workdir`, `output`); commands still run in mini-agent's sandbox rather than a client terminal (mini-agent-nvnkx.110).
+- ACP `additionalDirectories` map onto `--add-dir` when `add_dir_tool_access = true` (otherwise the -32602 error names the key) (mini-agent-nvnkx.111).
 
 ### Fixed
 

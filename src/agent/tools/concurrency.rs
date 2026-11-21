@@ -231,7 +231,6 @@ impl Lane {
 /// before anything runs, so no other call can observe the gap as an effect.
 /// A no-op outside a bound tool call, or while the lease is suspended for a
 /// prompt.
-#[cfg(any(test, feature = "hooks"))]
 pub(crate) async fn readmit_for_effective_args(effective: &str) {
     let Ok(slot) = LANE.try_with(Arc::clone) else {
         return;
@@ -360,6 +359,26 @@ impl ConcurrencyBoundTool {
         })
     }
 
+    /// Before a rerun with arguments the stream-json driver edited: take the
+    /// lease those arguments need and show what will really run. The first
+    /// pass (the model's own arguments) is untouched.
+    async fn prepare_effective(&self, original: &str, effective: &str) {
+        if effective == original {
+            return;
+        }
+        readmit_for_effective_args(effective).await;
+        if let Some(id) = crate::agent::tools::bash::current_any_call_id() {
+            crate::agent::runner::record_effective_args(&id, effective);
+            if let Some(events) = crate::agent::tools::mutation_diff::scoped_event_sender() {
+                let _ = events.try_send(crate::event::AgentEvent::ToolInputRewritten {
+                    id,
+                    name: self.name.as_str().into(),
+                    args: serde_json::from_str(effective).unwrap_or(serde_json::Value::Null),
+                });
+            }
+        }
+    }
+
     fn question_admission() -> Result<(), ToolError> {
         match crate::question::required() {
             Some(required) => Err(ToolError::ToolCallError(Box::new(required))),
@@ -394,7 +413,19 @@ impl ToolDyn for ConcurrencyBoundTool {
                     .await
                     .map_err(|error| ToolError::ToolCallError(error.into()))?;
                 Self::question_admission()?;
-                self.inner.call(args).await
+                let original = args.clone();
+                crate::headless_control::call_with_updates(
+                    args,
+                    |out: &Result<String, ToolError>| out.as_ref().err().map(ToString::to_string),
+                    |args| {
+                        let original = &original;
+                        async move {
+                            self.prepare_effective(original, &args).await;
+                            self.inner.call(args).await
+                        }
+                    },
+                )
+                .await
             })
             .await
         };
@@ -420,7 +451,19 @@ impl ToolDyn for ConcurrencyBoundTool {
                     .await
                     .map_err(|error| ToolError::ToolCallError(error.into()))?;
                 Self::question_admission()?;
-                self.inner.call_with_extensions(args, extensions).await
+                let original = args.clone();
+                crate::headless_control::call_with_updates(
+                    args,
+                    |out: &Result<String, ToolError>| out.as_ref().err().map(ToString::to_string),
+                    |args| {
+                        let original = &original;
+                        async move {
+                            self.prepare_effective(original, &args).await;
+                            self.inner.call_with_extensions(args, extensions).await
+                        }
+                    },
+                )
+                .await
             })
             .await
         };
@@ -451,7 +494,19 @@ impl ToolDyn for ConcurrencyBoundTool {
                 if let Err(error) = Self::question_admission() {
                     return ToolExecutionResult::denied(error.to_string());
                 }
-                self.inner.call_structured(args, extensions).await
+                let original = args.clone();
+                crate::headless_control::call_with_updates(
+                    args,
+                    |out: &ToolExecutionResult| Some(out.model_output().to_owned()),
+                    |args| {
+                        let original = &original;
+                        async move {
+                            self.prepare_effective(original, &args).await;
+                            self.inner.call_structured(args, extensions).await
+                        }
+                    },
+                )
+                .await
             })
             .await
         };

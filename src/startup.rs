@@ -3116,6 +3116,15 @@ impl Startup {
                 std::time::Duration::from_secs(self.cli.stream_json_ask_timeout),
             )
         });
+        if let Some(control) = crate::headless_control::state() {
+            control.set_info(
+                self.session.id.as_str(),
+                config::quick_models_map(&self.cfg)
+                    .keys()
+                    .cloned()
+                    .collect(),
+            );
+        }
         loop {
             // Held for the whole line: an interrupt control request is only
             // accepted (and kept for the turn) while a line is outstanding.
@@ -3173,6 +3182,17 @@ impl Startup {
             };
             if crate::print::headless_force_stopped() {
                 break;
+            }
+            if let Some(alias) = crate::headless_control::state()
+                .and_then(crate::headless_control::ControlState::take_model)
+                && let Err(error) = self.apply_headless_model(&alias)
+            {
+                output
+                    .emit_event(serde_json::json!({
+                        "type":"input_error",
+                        "message":format!("set_model {alias:?} was not applied: {error:#}"),
+                    }))
+                    .await?;
             }
             self.cli.message = vec![prompt];
             crate::print::reset_headless_result_emitted();
@@ -3238,6 +3258,49 @@ impl Startup {
             .await?;
         }
         result
+    }
+
+    /// A `set_model` control request, applied between turns: switches the
+    /// session to a configured `[quick_models]` alias with the same checks
+    /// `/model` makes (a session holding provider-native state refuses, and a
+    /// failed client build leaves the old route in place).
+    fn apply_headless_model(&mut self, alias: &str) -> anyhow::Result<()> {
+        let entry = config::quick_models_map(&self.cfg)
+            .get(alias)
+            .ok_or_else(|| anyhow::anyhow!("no [quick_models] entry named {alias:?}"))?;
+        anyhow::ensure!(
+            self.native_headless.is_none()
+                && !crate::session::native_publication::is_native_bearing(&self.session),
+            "the session holds provider-managed (native) conversation state tied to its model"
+        );
+        let provider = entry.provider.clone();
+        let model = entry.model.clone();
+        let prices = entry.resolved_prices();
+        let client = provider::create_client(
+            &provider,
+            self.cli.api_key_for(&self.cfg, &provider),
+            self.cfg.custom_providers_map(),
+            self.cfg.api_keys.as_ref(),
+        )?;
+        let window =
+            self.cfg
+                .resolve_context_window(&provider, &model, config::quick_models_map(&self.cfg));
+        self.client = client;
+        self.session.provider = CompactString::new(&provider);
+        self.session.model = CompactString::new(&model);
+        self.session.update_context_window(window);
+        self.session.set_input_output_prices(prices);
+        self.session
+            .set_cache_prices(crate::pricing::cache_prices_for_model(
+                &provider,
+                &model,
+                &self.cfg,
+                Some(alias),
+                self.session.input_token_cost,
+            ));
+        self.provider = CompactString::new(&provider);
+        self.model = CompactString::new(&model);
+        Ok(())
     }
 
     /// Images for this headless turn: `-i/--image` files (first turn only)

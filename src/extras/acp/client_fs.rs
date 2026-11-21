@@ -71,6 +71,8 @@ fn expected_meta(expected: &str) -> agent_client_protocol::schema::v1::Meta {
 pub(super) struct ClientFsGate {
     opted_in: bool,
     advertised: AtomicU8,
+    /// The client can run a terminal login (`auth.terminal`); see `auth`.
+    auth_terminal: std::sync::atomic::AtomicBool,
 }
 
 impl ClientFsGate {
@@ -78,7 +80,18 @@ impl ClientFsGate {
         Self {
             opted_in,
             advertised: AtomicU8::new(0),
+            auth_terminal: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Remember whether the client advertised terminal authentication.
+    pub(super) fn record_auth(&self, capabilities: &ClientCapabilities) {
+        self.auth_terminal
+            .store(capabilities.auth.terminal, Ordering::Release);
+    }
+
+    pub(super) fn auth_terminal(&self) -> bool {
+        self.auth_terminal.load(Ordering::Acquire)
     }
 
     /// Remember what the client advertised in `initialize`. Without the

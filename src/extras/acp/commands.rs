@@ -8,6 +8,12 @@ pub(super) enum Command {
     /// `/compact show`: print the active summary.
     CompactShow,
     Undo,
+    /// `/rewind [n]`: list the turns, or restore files and conversation to
+    /// just before the n-th most recent user turn (1 = the latest).
+    Rewind(Option<usize>),
+    /// `/redo`: put back what the last `/rewind` or `/undo` removed from the
+    /// conversation (files are not touched).
+    Redo,
     Rename(String),
     /// `/model [alias|default]`: show or select the session's model.
     Model(String),
@@ -46,7 +52,25 @@ pub(super) fn classify(
             })
         }
         "/compact" if arguments == "show" => Some(Command::CompactShow),
-        "/compact" | "/undo" | "/cost" => {
+        "/rewind" => {
+            // Digits only, bounded: a malformed argument is a bounded error,
+            // never a guess at what the user meant.
+            let n = if arguments.is_empty() {
+                None
+            } else if arguments.len() <= 4
+                && arguments.bytes().all(|b| b.is_ascii_digit())
+                && arguments.parse::<usize>().is_ok_and(|n| n >= 1)
+            {
+                arguments.parse::<usize>().ok()
+            } else {
+                return Err(agent_client_protocol::Error::new(
+                    -32602,
+                    "usage: /rewind [n] (n counts user turns back from the latest, starting at 1)",
+                ));
+            };
+            Some(Command::Rewind(n))
+        }
+        "/compact" | "/undo" | "/cost" | "/redo" => {
             if !arguments.is_empty() {
                 return Err(agent_client_protocol::Error::new(
                     -32602,
@@ -56,6 +80,7 @@ pub(super) fn classify(
             Some(match name {
                 "/compact" => Command::Compact,
                 "/cost" => Command::Cost,
+                "/redo" => Command::Redo,
                 _ => Command::Undo,
             })
         }
@@ -158,6 +183,82 @@ pub(super) async fn expand_custom(
     })
 }
 
+/// Preview lines of `/rewind` without an argument.
+const REWIND_LIST_LIMIT: usize = 20;
+
+/// The `/rewind` listing: user turns newest first, numbered for `/rewind n`.
+pub(super) fn rewind_listing(session: &crate::session::Session) -> String {
+    let targets = crate::ui::rewind_targets(session);
+    if targets.is_empty() {
+        return "Nothing to rewind to.".to_owned();
+    }
+    let mut text = String::from("Turns you can rewind to (newest first):\n");
+    for (n, (_, preview)) in targets.iter().rev().take(REWIND_LIST_LIMIT).enumerate() {
+        text.push_str(&format!(
+            "{}. {}\n",
+            n + 1,
+            crate::ui::events::sanitize_output(preview)
+        ));
+    }
+    text.push_str(
+        "Run /rewind n to restore files and conversation to just before that turn; /redo puts the conversation back (files stay restored).",
+    );
+    text
+}
+
+/// `/rewind n`: restore the files recorded since the n-th most recent user
+/// turn, then drop that turn and everything after it from the conversation.
+/// A refused file restore leaves the conversation as it was.
+pub(super) async fn rewind_to_turn(
+    session: &mut crate::session::Session,
+    workspace: std::sync::Arc<crate::paths::WorkspaceBinding>,
+    n: usize,
+) -> String {
+    let targets = crate::ui::rewind_targets(session);
+    let Some(&(index, _)) = targets.len().checked_sub(n).and_then(|at| targets.get(at)) else {
+        return format!(
+            "There is no turn {n}; {} turn(s) can be rewound to. Run /rewind to list them.",
+            targets.len()
+        );
+    };
+    #[cfg(feature = "subagents")]
+    session.reset_background_tasks().await;
+    let store = session.file_checkpoints.clone();
+    let id = session.id.to_string();
+    let restored = tokio::task::spawn_blocking(move || store.restore(&id, index, &workspace))
+        .await
+        .map_err(|_| anyhow::anyhow!("file restore task failed"))
+        .and_then(|result| result);
+    let restored = match restored {
+        Ok(count) => count,
+        Err(error) => {
+            // Never trust cached reads after a restore that may be partial.
+            session.read_tracker.clear();
+            return format!(
+                "File rewind refused: {}. The conversation was not changed.",
+                super::persona::bounded_message(&crate::ui::events::sanitize_output(
+                    &error.to_string()
+                ))
+            );
+        }
+    };
+    session.read_tracker.clear();
+    let removed = session.rewind_to(index);
+    format!(
+        "Rewound to before turn {n}: restored {restored} file(s), removed {removed} conversation record(s). /redo puts the conversation back; files stay restored."
+    )
+}
+
+/// `/redo`: the conversation half of the last rewind or undo.
+pub(super) fn redo_line(session: &mut crate::session::Session) -> String {
+    if session.redo() {
+        "Restored the conversation removed by the last /rewind or /undo; files were not touched."
+            .to_owned()
+    } else {
+        "Nothing to redo.".to_owned()
+    }
+}
+
 pub(super) async fn announce(
     state: &super::AcpState,
     id: &SessionId,
@@ -185,6 +286,14 @@ pub(super) async fn announce(
         AvailableCommand::new(
             "undo",
             "Remove the last conversation turn; files and billed usage remain",
+        ),
+        AvailableCommand::new(
+            "rewind",
+            "List turns, or restore files and conversation to before one: /rewind [n]",
+        ),
+        AvailableCommand::new(
+            "redo",
+            "Put back the conversation removed by /rewind or /undo",
         ),
         AvailableCommand::new("rename", "Rename this saved session"),
         AvailableCommand::new("cost", "Show this session's cost and context use"),
@@ -254,6 +363,39 @@ mod tests {
             None
         );
         assert_eq!(classify(&text("/tasks")).unwrap(), None);
+    }
+
+    #[test]
+    fn rewind_and_redo_take_only_bounded_digits_from_the_sole_text_block() {
+        let text = |value: &str| vec![ContentBlock::Text(TextContent::new(value))];
+        assert_eq!(
+            classify(&text("/rewind")).unwrap(),
+            Some(Command::Rewind(None))
+        );
+        assert_eq!(
+            classify(&text(" /rewind  3 ")).unwrap(),
+            Some(Command::Rewind(Some(3)))
+        );
+        assert_eq!(classify(&text("/redo")).unwrap(), Some(Command::Redo));
+        for bad in [
+            "/rewind 0",
+            "/rewind -1",
+            "/rewind x",
+            "/rewind 1 2",
+            "/rewind 12345",
+            "/redo now",
+        ] {
+            let error = classify(&text(bad)).unwrap_err();
+            assert_eq!(i32::from(error.code), -32602, "{bad}");
+        }
+        assert_eq!(
+            classify(&[
+                ContentBlock::Text(TextContent::new("/rewind 1")),
+                ContentBlock::Text(TextContent::new("data")),
+            ])
+            .unwrap(),
+            None
+        );
     }
 
     #[test]
