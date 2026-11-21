@@ -15,6 +15,8 @@ use std::sync::Arc;
 use super::pdf_crypt;
 use super::pdf_filters;
 
+#[path = "pdf_glyphs.rs"]
+mod pdf_glyphs;
 #[cfg(feature = "multimodal")]
 #[path = "pdf_images.rs"]
 mod pdf_images;
@@ -569,7 +571,7 @@ fn has_identity_crypt_filter(dict: &Dict) -> bool {
 }
 
 /// What one page's content streams yielded.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct PageContent {
     pub(crate) text: String,
     /// Content streams that were skipped and why, e.g.
@@ -614,6 +616,40 @@ struct ContentFlags {
     text_operators: bool,
     images: usize,
     image_names: Vec<Vec<u8>>,
+    /// Page notes raised while extracting (unreadable forms, unmapped fonts).
+    notes: Vec<String>,
+    /// Form XObjects being expanded (cycle guard) and how many ran in all.
+    form_stack: Vec<u32>,
+    forms_run: usize,
+    /// Depth of form XObjects with their own `/Resources`: image names found
+    /// there are not names of the page's resources.
+    foreign_resources: usize,
+    /// Codes without a Unicode mapping, per font resource name.
+    unmapped: std::collections::BTreeMap<Vec<u8>, usize>,
+}
+
+/// Form XObject nesting `Do` follows.
+const MAX_FORM_DEPTH: usize = 8;
+/// Form XObject invocations one page may run (repeats of one form count).
+const MAX_FORMS_PER_PAGE: usize = 512;
+
+impl ContentFlags {
+    fn note(&mut self, note: String) {
+        if !self.notes.contains(&note) && self.notes.len() < 16 {
+            self.notes.push(note);
+        }
+    }
+
+    /// Turn the per-font unmapped counts into page notes.
+    fn finish_unmapped(&mut self) {
+        let counts = std::mem::take(&mut self.unmapped);
+        for (font, count) in counts {
+            self.note(format!(
+                "{count} character(s) in font {} had no Unicode mapping, so text is missing",
+                String::from_utf8_lossy(&font)
+            ));
+        }
+    }
 }
 
 impl std::fmt::Display for PdfError {
@@ -652,6 +688,9 @@ impl Document {
     fn parse_until(data: &[u8], deadline: std::time::Instant) -> Result<Self, PdfError> {
         let mut objects: HashMap<u32, Obj> = HashMap::new();
         let mut generations: HashMap<u32, u16> = HashMap::new();
+        // File offset of each top-level object's latest definition, so object
+        // streams can be ordered against direct objects by revision.
+        let mut offsets: HashMap<u32, usize> = HashMap::new();
         // The last `/Encrypt` entry (object dictionary or trailer) and the
         // first `/ID` string beside it.
         let mut encrypt: Option<(Obj, Vec<u8>)> = None;
@@ -750,6 +789,7 @@ impl Document {
                 encrypt = Some((entry.clone(), first_id(dict)));
             }
             generations.insert(number, generation);
+            offsets.insert(number, found);
             objects.insert(number, object);
         }
         // Classic trailers are not objects; check them separately.
@@ -785,7 +825,7 @@ impl Document {
             decoded_budget: std::cell::Cell::new(MAX_TOTAL_DECODED),
             encrypted,
         };
-        document.expand_object_streams(nodes, deadline)?;
+        document.expand_object_streams(nodes, deadline, &offsets)?;
         document.collect_pages()?;
         Ok(document)
     }
@@ -794,20 +834,26 @@ impl Document {
         &mut self,
         mut nodes: usize,
         deadline: std::time::Instant,
+        offsets: &HashMap<u32, usize>,
     ) -> Result<(), PdfError> {
-        let streams: Vec<(Dict, Vec<u8>)> = self
+        // Newest container (latest file offset) first, so the first definition
+        // of an object number seen here is the newest revision.
+        let mut streams: Vec<(usize, u32, Dict, Vec<u8>)> = self
             .objects
-            .values()
-            .filter_map(|object| match object {
+            .iter()
+            .filter_map(|(number, object)| match object {
                 Obj::Stream(dict, data)
                     if dict.get(b"Type").and_then(Obj::as_name) == Some(b"ObjStm") =>
                 {
-                    Some((dict.clone(), data.clone()))
+                    let at = offsets.get(number).copied().unwrap_or(0);
+                    Some((at, *number, dict.clone(), data.clone()))
                 }
                 _ => None,
             })
             .collect();
-        for (dict, raw) in streams {
+        streams.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+        let mut compressed: HashSet<u32> = HashSet::new();
+        for (container_at, _, dict, raw) in streams {
             let Ok(decoded) = self.decode(&dict, &raw) else {
                 continue;
             };
@@ -831,13 +877,22 @@ impl Document {
                 if index.is_multiple_of(256) && std::time::Instant::now() >= deadline {
                     return Err(PdfError::TimedOut);
                 }
-                if self.objects.contains_key(&number) {
+                if compressed.contains(&number) {
+                    // A newer container already defined it.
+                    continue;
+                }
+                // A direct object wins only when it is defined after this
+                // container (a later incremental update).
+                if self.objects.contains_key(&number)
+                    && offsets.get(&number).is_none_or(|at| *at > container_at)
+                {
                     continue;
                 }
                 let mut lexer = Lexer::new(&decoded, first.saturating_add(offset));
                 let object = lexer.object(0);
                 nodes = nodes.saturating_add(lexer.nodes_total);
                 if let Some(object) = object {
+                    compressed.insert(number);
                     self.objects.insert(number, object);
                 }
             }
@@ -1128,7 +1183,20 @@ impl Document {
         let fonts = self.fonts(resources.as_deref())?;
         let images = self.image_names(resources.as_deref());
         let mut flags = ContentFlags::default();
-        let text = normalize_text(&extract_text(&content, &fonts, &images, &mut flags));
+        let text = normalize_text(&extract_in(
+            Some((self, resources.as_deref())),
+            &content,
+            &fonts,
+            &images,
+            IDENTITY,
+            &mut flags,
+        ));
+        flags.finish_unmapped();
+        for note in std::mem::take(&mut flags.notes) {
+            if !notes.contains(&note) {
+                notes.push(note);
+            }
+        }
         Ok(PageContent {
             text,
             notes,
@@ -1176,19 +1244,12 @@ impl Document {
                 continue;
             };
             let composite = font.get(b"Subtype").and_then(Obj::as_name) == Some(b"Type0");
-            let mac_roman = match font.get(b"Encoding").map(|e| self.resolve(e)) {
-                Some(Obj::Name(name)) => name == b"MacRomanEncoding",
-                Some(Obj::Dict(dict)) => {
-                    dict.get(b"BaseEncoding").and_then(Obj::as_name) == Some(b"MacRomanEncoding")
-                }
-                _ => false,
-            };
             let mut decoder = FontDecoder {
                 code_bytes: if composite { 2 } else { 1 },
-                map: std::rc::Rc::default(),
                 composite,
-                mac_roman,
+                ..FontDecoder::plain()
             };
+            decoder.read_encoding(self, font);
             let to_unicode = font.get(b"ToUnicode");
             let key = match to_unicode {
                 Some(Obj::Ref(number)) => Some(*number),
@@ -1270,6 +1331,12 @@ struct FontDecoder {
     map: std::rc::Rc<HashMap<u32, String>>,
     composite: bool,
     mac_roman: bool,
+    /// Non-symbolic Type 1 font without `/Encoding`, or `/BaseEncoding
+    /// /StandardEncoding`.
+    standard: bool,
+    /// `/Encoding /Differences`: code to glyph text (`None` for an unknown
+    /// glyph name, whose characters are counted as unmapped).
+    differences: HashMap<u8, Option<String>>,
 }
 
 fn utf16be(bytes: &[u8]) -> String {
@@ -1379,12 +1446,83 @@ impl FontDecoder {
         Ok(code_bytes)
     }
 
-    fn decode(&self, bytes: &[u8], out: &mut String) {
+    /// A simple font with the default WinAnsi/Latin-1 fallback.
+    fn plain() -> Self {
+        Self {
+            code_bytes: 1,
+            map: std::rc::Rc::default(),
+            composite: false,
+            mac_roman: false,
+            standard: false,
+            differences: HashMap::new(),
+        }
+    }
+
+    /// Read a font's `/Encoding` (name or dictionary with `/BaseEncoding` and
+    /// `/Differences`) into this decoder.
+    fn read_encoding(&mut self, doc: &Document, font: &Dict) {
+        let encoding = font.get(b"Encoding").map(|e| doc.resolve(e));
+        let base = match encoding {
+            Some(Obj::Name(name)) => Some(name.as_slice()),
+            Some(Obj::Dict(dict)) => dict.get(b"BaseEncoding").and_then(Obj::as_name),
+            _ => None,
+        };
+        self.mac_roman = base == Some(b"MacRomanEncoding");
+        let type1 = font.get(b"Subtype").and_then(Obj::as_name) == Some(b"Type1");
+        let symbolic = font
+            .get(b"FontDescriptor")
+            .map(|d| doc.resolve(d))
+            .and_then(Obj::as_dict)
+            .and_then(|d| d.get(b"Flags"))
+            .and_then(Obj::as_num)
+            .is_some_and(|flags| (flags as u32) & 4 != 0);
+        self.standard = base == Some(b"StandardEncoding")
+            || (type1 && base.is_none() && !symbolic && !self.composite);
+        if let Some(Obj::Dict(dict)) = encoding
+            && let Some(Obj::Array(items)) = dict.get(b"Differences").map(|d| doc.resolve(d))
+        {
+            let mut code = 0usize;
+            for item in items.iter().take(1024) {
+                match doc.resolve(item) {
+                    Obj::Num(value) => code = (*value).max(0.0) as usize,
+                    Obj::Name(name) => {
+                        if let Ok(byte) = u8::try_from(code) {
+                            self.differences.insert(byte, pdf_glyphs::glyph_text(name));
+                        }
+                        code += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Append the text of `bytes`; returns how many codes had no mapping.
+    fn decode(&self, bytes: &[u8], out: &mut String) -> usize {
+        let mut dropped = 0;
         for code in bytes.chunks(self.code_bytes.max(1)) {
             let value = code_value(code);
             if let Some(text) = self.map.get(&value) {
                 out.push_str(text);
-            } else if !self.composite && code.len() == 1 {
+            } else if self.composite || code.len() != 1 {
+                dropped += 1;
+            } else if let Some(glyph) = self.differences.get(&code[0]) {
+                match glyph {
+                    Some(text) => out.push_str(text),
+                    None => dropped += 1,
+                }
+            } else if self.standard && code[0] >= 0x80 {
+                match (
+                    pdf_glyphs::standard_ligature(code[0]),
+                    pdf_glyphs::standard_encoding(code[0]),
+                ) {
+                    (Some(text), _) => out.push_str(text),
+                    (None, Some(ch)) => out.push(ch),
+                    (None, None) => dropped += 1,
+                }
+            } else if self.standard && matches!(code[0], 0x27 | 0x60) {
+                out.extend(pdf_glyphs::standard_encoding(code[0]));
+            } else {
                 out.push(if self.mac_roman && code[0] >= 0x80 {
                     MAC_ROMAN_HIGH
                         .chars()
@@ -1395,6 +1533,7 @@ impl FontDecoder {
                 });
             }
         }
+        dropped
     }
 }
 
@@ -1506,24 +1645,135 @@ impl TextLayout {
     }
 }
 
+#[cfg(test)]
 fn extract_text(
     content: &[u8],
     fonts: &HashMap<Vec<u8>, FontDecoder>,
     images: &HashSet<Vec<u8>>,
     flags: &mut ContentFlags,
 ) -> String {
-    let fallback = FontDecoder {
-        code_bytes: 1,
-        map: std::rc::Rc::default(),
-        composite: false,
-        mac_roman: false,
-    };
+    extract_in(None, content, fonts, images, IDENTITY, flags)
+}
+
+/// The resources, fonts and image names a `Do` resolves a form XObject against.
+type FormResources<'a> = (
+    Option<&'a Dict>,
+    &'a HashMap<Vec<u8>, FontDecoder>,
+    &'a HashSet<Vec<u8>>,
+);
+
+/// The document and resource dictionary `Do` resolves form XObjects in.
+type FormScope<'a> = Option<(&'a Document, Option<&'a Dict>)>;
+
+impl Document {
+    /// Extract the text of the form XObject `name` painted under `ctm`.
+    fn form_text(
+        &self,
+        scope: FormResources<'_>,
+        name: &[u8],
+        ctm: Matrix,
+        flags: &mut ContentFlags,
+    ) -> Option<String> {
+        let (resources, fonts, images) = scope;
+        let entry = resources?
+            .get(b"XObject")
+            .map(|x| self.resolve(x))
+            .and_then(Obj::as_dict)?
+            .get(name)?;
+        let number = match entry {
+            Obj::Ref(number) => Some(*number),
+            _ => None,
+        };
+        let Obj::Stream(dict, raw) = self.resolve(entry) else {
+            return None;
+        };
+        if dict.get(b"Subtype").and_then(Obj::as_name) != Some(b"Form") {
+            return None;
+        }
+        if number.is_some_and(|number| flags.form_stack.contains(&number)) {
+            return None;
+        }
+        flags.forms_run += 1;
+        if flags.forms_run > MAX_FORMS_PER_PAGE {
+            flags.note("too many form XObjects on the page; some were not read".to_owned());
+            return None;
+        }
+        let content = match self.decode(dict, raw) {
+            Ok(content) => content,
+            Err(error) => {
+                flags.note(format!(
+                    "form XObject {} not read: {}",
+                    String::from_utf8_lossy(name),
+                    error.to_string().replace("content stream ", "")
+                ));
+                return None;
+            }
+        };
+        let matrix = match dict.get(b"Matrix").map(|m| self.resolve(m)) {
+            Some(Obj::Array(items)) => {
+                let items: Vec<Obj> = items.iter().map(|i| self.resolve(i).clone()).collect();
+                matrix_operands(&items)
+            }
+            _ => None,
+        };
+        let ctm = multiply(&matrix.unwrap_or(IDENTITY), &ctm);
+        let own = dict
+            .get(b"Resources")
+            .map(|r| self.resolve(r))
+            .and_then(Obj::as_dict);
+        let own_sets = match own {
+            Some(own) => match self.fonts(Some(own)) {
+                Ok(own_fonts) => Some((own_fonts, self.image_names(Some(own)))),
+                Err(_) => {
+                    flags.note(format!(
+                        "form XObject {} not read: too many fonts",
+                        String::from_utf8_lossy(name)
+                    ));
+                    return None;
+                }
+            },
+            None => None,
+        };
+        let (fonts, images) = match &own_sets {
+            Some((fonts, images)) => (fonts, images),
+            None => (fonts, images),
+        };
+        if let Some(number) = number {
+            flags.form_stack.push(number);
+        }
+        flags.foreign_resources += usize::from(own.is_some());
+        let text = extract_in(
+            Some((self, own.or(resources))),
+            &content,
+            fonts,
+            images,
+            ctm,
+            flags,
+        );
+        flags.foreign_resources -= usize::from(own.is_some());
+        if number.is_some() {
+            flags.form_stack.pop();
+        }
+        Some(text)
+    }
+}
+
+fn extract_in(
+    scope: FormScope<'_>,
+    content: &[u8],
+    fonts: &HashMap<Vec<u8>, FontDecoder>,
+    images: &HashSet<Vec<u8>>,
+    base_ctm: Matrix,
+    flags: &mut ContentFlags,
+) -> String {
+    let fallback = FontDecoder::plain();
     let mut font = &fallback;
+    let mut font_name: Vec<u8> = b"?".to_vec();
     let mut out = String::new();
     let mut operands: Vec<Obj> = Vec::new();
     let mut lexer = Lexer::new(content, 0);
     let mut layout = TextLayout {
-        ctm: IDENTITY,
+        ctm: base_ctm,
         ctm_stack: Vec::new(),
         line: IDENTITY,
         font_size: 1.0,
@@ -1531,9 +1781,17 @@ fn extract_text(
         pen: None,
         advance: 0.0,
     };
-    let show = |bytes: &[u8], font: &FontDecoder, layout: &mut TextLayout, out: &mut String| {
+    let show = |bytes: &[u8],
+                font: &FontDecoder,
+                font_name: &[u8],
+                layout: &mut TextLayout,
+                out: &mut String,
+                flags: &mut ContentFlags| {
         let mut text = String::new();
-        font.decode(bytes, &mut text);
+        let dropped = font.decode(bytes, &mut text);
+        if dropped > 0 {
+            *flags.unmapped.entry(font_name.to_vec()).or_default() += dropped;
+        }
         if text.is_empty() {
             return;
         }
@@ -1553,7 +1811,7 @@ fn extract_text(
         let number = |index: usize| operands.get(index).and_then(Obj::as_num).unwrap_or(0.0);
         match operator.as_slice() {
             b"q" if layout.ctm_stack.len() < 256 => layout.ctm_stack.push(layout.ctm),
-            b"Q" => layout.ctm = layout.ctm_stack.pop().unwrap_or(IDENTITY),
+            b"Q" => layout.ctm = layout.ctm_stack.pop().unwrap_or(base_ctm),
             b"cm" => {
                 if let Some(matrix) = matrix_operands(&operands) {
                     layout.ctm = multiply(&matrix, &layout.ctm);
@@ -1566,6 +1824,7 @@ fn extract_text(
             b"Tf" => {
                 if let Some(Obj::Name(name)) = operands.first() {
                     font = fonts.get(name).unwrap_or(&fallback);
+                    font_name = name.clone();
                 }
                 layout.font_size = number(1);
             }
@@ -1585,14 +1844,14 @@ fn extract_text(
             b"Tj" => {
                 flags.text_operators = true;
                 if let Some(Obj::Str(bytes)) = operands.last() {
-                    show(bytes, font, &mut layout, &mut out);
+                    show(bytes, font, &font_name, &mut layout, &mut out, flags);
                 }
             }
             b"'" | b"\"" => {
                 flags.text_operators = true;
                 layout.move_line(0.0, -layout.leading);
                 if let Some(Obj::Str(bytes)) = operands.last() {
-                    show(bytes, font, &mut layout, &mut out);
+                    show(bytes, font, &font_name, &mut layout, &mut out, flags);
                 }
             }
             b"TJ" => {
@@ -1600,7 +1859,9 @@ fn extract_text(
                 if let Some(Obj::Array(items)) = operands.last() {
                     for item in items {
                         match item {
-                            Obj::Str(bytes) => show(bytes, font, &mut layout, &mut out),
+                            Obj::Str(bytes) => {
+                                show(bytes, font, &font_name, &mut layout, &mut out, flags)
+                            }
                             Obj::Num(adjust) => {
                                 if *adjust < -200.0
                                     && !out.ends_with([' ', '\n'])
@@ -1621,12 +1882,26 @@ fn extract_text(
                 }
             }
             b"Do" => {
-                if let Some(Obj::Name(name)) = operands.first()
-                    && images.contains(name)
-                {
-                    flags.images += 1;
-                    if flags.image_names.len() < 64 {
-                        flags.image_names.push(name.clone());
+                if let Some(Obj::Name(name)) = operands.first() {
+                    if images.contains(name) {
+                        flags.images += 1;
+                        if flags.image_names.len() < 64 && flags.foreign_resources == 0 {
+                            flags.image_names.push(name.clone());
+                        }
+                    } else if let Some((document, resources)) = scope
+                        && flags.form_stack.len() < MAX_FORM_DEPTH
+                        && let Some(text) =
+                            document.form_text((resources, fonts, images), name, layout.ctm, flags)
+                    {
+                        let text = text.trim_matches('\n');
+                        if !text.is_empty() {
+                            if !out.is_empty() && !out.ends_with('\n') {
+                                out.push('\n');
+                            }
+                            out.push_str(text);
+                            out.push('\n');
+                            layout.pen = None;
+                        }
                     }
                 }
             }
@@ -1810,7 +2085,7 @@ fn no_text_report(
         .collect();
     if !empty.is_empty() {
         out.push_str(&format!(
-            " Page(s) {} contain no text and no images (blank, or drawn only as vector graphics or form XObjects).",
+            " Page(s) {} contain no text and no images (blank, or drawn only as vector graphics).",
             page_list(&empty)
         ));
     }
@@ -1851,6 +2126,9 @@ struct Attached {
     document_pages: Vec<usize>,
     /// Why other scanned pages have no image.
     problems: Vec<String>,
+    /// The pages were attached on request (`visual`), not because they lack
+    /// a text layer.
+    visual: bool,
 }
 
 impl Attached {
@@ -1864,10 +2142,17 @@ impl Attached {
                 .enumerate()
                 .map(|(slot, page)| format!("document page {} = page {page}", slot + 1))
                 .collect();
-            out.push_str(&format!(
-                " The page(s) without a text layer are attached as one PDF document block holding only those pages ({}); read their text and figures from it.",
-                items.join(", ")
-            ));
+            out.push_str(&if self.visual {
+                format!(
+                    " The requested page(s) are attached as one PDF document block holding only those pages ({}); look at their figures and layout there.",
+                    items.join(", ")
+                )
+            } else {
+                format!(
+                    " The page(s) without a text layer are attached as one PDF document block holding only those pages ({}); read their text and figures from it.",
+                    items.join(", ")
+                )
+            });
         }
         if !self.images.is_empty() {
             let items: Vec<String> = self
@@ -1880,10 +2165,17 @@ impl Attached {
                     )
                 })
                 .collect();
-            out.push_str(&format!(
-                " The scanned page image(s) are attached as image blocks: {}; read the text from them.",
-                items.join(", ")
-            ));
+            out.push_str(&if self.visual {
+                format!(
+                    " The page image(s) you asked for are attached as image blocks: {}.",
+                    items.join(", ")
+                )
+            } else {
+                format!(
+                    " The scanned page image(s) are attached as image blocks: {}; read the text from them.",
+                    items.join(", ")
+                )
+            });
         }
         if !self.problems.is_empty() {
             out.push_str(&format!(
@@ -1933,7 +2225,35 @@ pub(crate) fn render_with_images(
 ) -> Result<Rendered, String> {
     let document = Document::parse(bytes)
         .map_err(|error| format!("Cannot read '{path}' as PDF text: {error}."))?;
-    render_document(&document, path, pages, budget, max_images, native_pdf)
+    render_document(
+        &document,
+        path,
+        pages,
+        budget,
+        max_images,
+        (native_pdf, false),
+    )
+}
+
+/// [`render_with_images`] for a read that asked for `visual` page attachment.
+#[cfg(all(test, feature = "multimodal"))]
+pub(crate) fn render_visual(
+    bytes: &[u8],
+    path: &str,
+    pages: Option<&str>,
+    max_images: usize,
+    native_pdf: bool,
+) -> Result<Rendered, String> {
+    let document = Document::parse(bytes)
+        .map_err(|error| format!("Cannot read '{path}' as PDF text: {error}."))?;
+    render_document(
+        &document,
+        path,
+        pages,
+        10_000,
+        max_images,
+        (native_pdf, true),
+    )
 }
 
 /// Identity of a PDF on disk for [`DocumentCache`]: the same path with the
@@ -1991,7 +2311,7 @@ pub(crate) fn render_cached(
     pages: Option<&str>,
     budget: usize,
     max_images: usize,
-    native_pdf: bool,
+    delivery: (bool, bool),
 ) -> Result<Rendered, String> {
     let document = match (cached, bytes) {
         (Some(document), _) => document,
@@ -2011,7 +2331,18 @@ pub(crate) fn render_cached(
     let document = document.lock().unwrap_or_else(|error| error.into_inner());
     // The decoded-byte budget bounds one read, not the cached document's life.
     document.reset_decoded_budget();
-    render_document(&document, path, pages, budget, max_images, native_pdf)
+    render_document(&document, path, pages, budget, max_images, delivery)
+}
+
+/// A line telling the model that a text page also paints images it can ask for.
+fn figure_note(page: usize, content: &PageContent, suppress: bool) -> String {
+    if suppress || content.images == 0 || cfg!(not(feature = "multimodal")) {
+        return String::new();
+    }
+    format!(
+        "\n[page {page} also paints {} image(s) (figures, charts or image-only tables); pass visual:true with pages:\"{page}\" to see them]",
+        content.images
+    )
 }
 
 fn render_document(
@@ -2020,7 +2351,8 @@ fn render_document(
     pages: Option<&str>,
     budget: usize,
     max_images: usize,
-    native_pdf: bool,
+    // (native PDF block allowed, attach the pages even with a text layer)
+    (native_pdf, visual): (bool, bool),
 ) -> Result<Rendered, String> {
     let count = document.page_count();
     let selected = match pages {
@@ -2034,16 +2366,24 @@ fn render_document(
         }
         None => (1..=count).collect(),
     };
+    let can_attach = native_pdf || max_images > 0;
     let mut body = String::new();
     let mut body_chars = 0;
     let mut shown = Vec::new();
     let mut without_text: Vec<(usize, PageContent)> = Vec::new();
+    // `visual`: every shown page is a candidate for attachment.
+    let mut visual_pages: Vec<(usize, PageContent)> = Vec::new();
     let mut stopped_at = None;
     for &page in &selected {
         let content = document.page_content(page - 1).map_err(|error| {
             format!("Cannot read page {page} of '{path}' as PDF text: {error}.")
         })?;
         let notes = content.notes.join("; ");
+        let visual_content = if visual && !content.text.is_empty() {
+            content.clone()
+        } else {
+            PageContent::default()
+        };
         let mut pending_without_text = None;
         let mut block = if content.text.is_empty() {
             let block = if notes.is_empty() {
@@ -2054,11 +2394,16 @@ fn render_document(
             pending_without_text = Some(content);
             block
         } else if notes.is_empty() {
-            format!("--- page {page} ---\n{}\n\n", content.text)
+            format!(
+                "--- page {page} ---\n{}{}\n\n",
+                content.text,
+                figure_note(page, &content, visual || !can_attach)
+            )
         } else {
             format!(
-                "--- page {page} ---\n{}\n[page {page}: some content was not extracted: {notes}]\n\n",
-                content.text
+                "--- page {page} ---\n{}\n[page {page}: some content was not extracted: {notes}]{}\n\n",
+                content.text,
+                figure_note(page, &content, visual || !can_attach)
             )
         };
         let mut block_chars = block.chars().count();
@@ -2082,19 +2427,38 @@ fn render_document(
         shown.push(page);
         // Only pages actually emitted are candidates for image lifting or the
         // all-scanned report; a page cut by the budget is re-read on continue.
+        if visual {
+            visual_pages.push((
+                page,
+                pending_without_text
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(|| visual_content.clone()),
+            ));
+        }
         if let Some(content) = pending_without_text {
             without_text.push((page, content));
         }
     }
     #[cfg_attr(not(feature = "multimodal"), allow(unused_mut))]
-    let mut attached = Attached::default();
+    let mut attached = Attached {
+        visual,
+        ..Attached::default()
+    };
+    if visual && !can_attach {
+        attached
+            .problems
+            .push("the captured model does not accept images or documents".to_owned());
+    }
     #[cfg(feature = "multimodal")]
     let mut images: Vec<PdfImage> = Vec::new();
     #[cfg(feature = "multimodal")]
     let mut native_document: Option<Vec<u8>> = None;
     #[cfg(feature = "multimodal")]
-    if native_pdf && !without_text.is_empty() {
-        let numbers: Vec<usize> = without_text.iter().map(|(page, _)| *page).collect();
+    let attach: &[(usize, PageContent)] = if visual { &visual_pages } else { &without_text };
+    #[cfg(feature = "multimodal")]
+    if native_pdf && !attach.is_empty() {
+        let numbers: Vec<usize> = attach.iter().map(|(page, _)| *page).collect();
         match document.subset_pdf(&numbers) {
             Ok(subset) => {
                 attached.document_pages = numbers;
@@ -2107,12 +2471,14 @@ fn render_document(
         }
     }
     #[cfg(not(feature = "multimodal"))]
-    let _ = native_pdf;
+    let _ = (native_pdf, visual, &visual_pages);
     #[cfg(feature = "multimodal")]
     if native_document.is_none() {
         let mut skipped_for_limit = Vec::new();
-        for (page, content) in &without_text {
-            if !content.notes.is_empty() || content.text_operators || content.images == 0 {
+        for (page, content) in attach {
+            if content.images == 0
+                || (!visual && (!content.notes.is_empty() || content.text_operators))
+            {
                 continue;
             }
             let remaining = max_images.saturating_sub(images.len());
@@ -2573,7 +2939,7 @@ mod tests {
                 Some(pages),
                 10_000,
                 0,
-                false,
+                (false, false),
             )
             .unwrap()
             .text
@@ -3105,5 +3471,364 @@ mod tests {
         let pdf = font_page_pdf(8, true);
         let document = Document::parse(&pdf).unwrap();
         assert_eq!(document.page_text(0).unwrap(), "B");
+    }
+    fn stream_obj(dict: &str, data: &str) -> String {
+        format!(
+            "<< /Length {} {dict} >>\nstream\n{data}\nendstream",
+            data.len()
+        )
+    }
+
+    fn assemble(objects: &[(u32, String)]) -> Vec<u8> {
+        let mut out = b"%PDF-1.7\n".to_vec();
+        for (number, object) in objects {
+            out.extend_from_slice(format!("{number} 0 obj\n{object}\nendobj\n").as_bytes());
+        }
+        out.extend_from_slice(b"%%EOF\n");
+        out
+    }
+
+    /// Catalog, page tree and a page with the given inline resources, whose
+    /// content is object 4.
+    fn single_page(resources: &str, content: &str, extra: Vec<(u32, String)>) -> Vec<u8> {
+        let mut objects = vec![
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".to_owned()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_owned()),
+            (
+                3,
+                format!(
+                    "<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << {resources} >> >>"
+                ),
+            ),
+            (4, stream_obj("", content)),
+        ];
+        objects.extend(extra);
+        assemble(&objects)
+    }
+
+    const FORM: &str = "/Type /XObject /Subtype /Form /BBox [0 0 100 100]";
+
+    // mini-agent-nvnkx.233
+    #[test]
+    fn form_xobject_text_is_extracted() {
+        let pdf = build_with(
+            &[Content::Plain("q /Fm0 Do Q".into())],
+            false,
+            "/XObject << /Fm0 7 0 R >>",
+            vec![stream_obj(FORM, "BT /F1 12 Tf (Hello) Tj ET").into_bytes()],
+        );
+        let document = Document::parse(&pdf).unwrap();
+        let content = document.page_content(0).unwrap();
+        assert_eq!(content.text, "Hello");
+        assert!(content.text_operators);
+        assert!(content.notes.is_empty());
+    }
+
+    #[test]
+    fn nested_forms_with_own_resources_and_matrix_are_extracted() {
+        let pdf = single_page(
+            "/XObject << /Fm0 5 0 R >>",
+            "BT /F1 12 Tf (Top) Tj ET /Fm0 Do",
+            vec![
+                (
+                    5,
+                    stream_obj(
+                        &format!(
+                            "{FORM} /Matrix [1 0 0 1 0 -50] /Resources << /XObject << /Fm1 6 0 R >> /Font << /F1 7 0 R >> >>"
+                        ),
+                        "BT /F1 12 Tf (Outer) Tj ET /Fm1 Do",
+                    ),
+                ),
+                (
+                    6,
+                    stream_obj(
+                        &format!("{FORM} /Resources << /Font << /F1 7 0 R >> >>"),
+                        "BT /F1 12 Tf (Inner) Tj ET",
+                    ),
+                ),
+                (
+                    7,
+                    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+                        .to_owned(),
+                ),
+            ],
+        );
+        let document = Document::parse(&pdf).unwrap();
+        let text = document.page_text(0).unwrap();
+        // The page text has no font of its own (F1 is only in the forms), so
+        // only the forms' text can come out of the form resources.
+        assert!(text.contains("Outer"), "{text}");
+        assert!(text.contains("Inner"), "{text}");
+    }
+
+    #[test]
+    fn self_referencing_forms_terminate_and_read_once() {
+        let pdf = build_with(
+            &[Content::Plain("/Fm0 Do".into())],
+            false,
+            "/XObject << /Fm0 7 0 R /Fm1 8 0 R >>",
+            vec![
+                stream_obj(FORM, "BT /F1 12 Tf (Loop) Tj ET /Fm0 Do /Fm1 Do").into_bytes(),
+                stream_obj(FORM, "/Fm0 Do /Fm1 Do").into_bytes(),
+            ],
+        );
+        let document = Document::parse(&pdf).unwrap();
+        assert_eq!(document.page_text(0).unwrap(), "Loop");
+    }
+
+    #[test]
+    fn form_nesting_is_depth_bounded() {
+        let depth = MAX_FORM_DEPTH + 4;
+        let mut extra = Vec::new();
+        for level in 0..depth {
+            let body = if level + 1 == depth {
+                "BT /F1 12 Tf (Deep) Tj ET".to_owned()
+            } else {
+                format!("/Fm{} Do", level + 1)
+            };
+            extra.push((10 + level as u32, stream_obj(FORM, &body)));
+        }
+        let names: String = (0..depth)
+            .map(|level| format!("/Fm{level} {} 0 R ", 10 + level))
+            .collect();
+        let pdf = single_page(
+            &format!("/XObject << {names}>> /Font << /F1 5 0 R >>"),
+            "/Fm0 Do",
+            {
+                extra.push((
+                    5,
+                    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+                ));
+                extra
+            },
+        );
+        let document = Document::parse(&pdf).unwrap();
+        assert_eq!(document.page_text(0).unwrap(), "");
+    }
+
+    #[test]
+    fn images_inside_forms_are_counted_and_unreadable_forms_are_noted() {
+        let pdf = single_page(
+            "/XObject << /Fm0 5 0 R /Fm1 7 0 R >>",
+            "/Fm0 Do /Fm1 Do",
+            vec![
+                (
+                    5,
+                    stream_obj(
+                        &format!("{FORM} /Resources << /XObject << /Im9 6 0 R >> >>"),
+                        "/Im9 Do",
+                    ),
+                ),
+                (
+                    6,
+                    stream_obj("/Type /XObject /Subtype /Image /Width 1 /Height 1", "x"),
+                ),
+                (
+                    7,
+                    stream_obj(&format!("{FORM} /Filter /JBIG2Decode"), "abc"),
+                ),
+            ],
+        );
+        let document = Document::parse(&pdf).unwrap();
+        let content = document.page_content(0).unwrap();
+        assert_eq!(content.images, 1);
+        assert!(content.image_names.is_empty());
+        assert_eq!(content.notes.len(), 1, "{:?}", content.notes);
+        assert!(
+            content.notes[0].contains("form XObject Fm1"),
+            "{:?}",
+            content.notes
+        );
+    }
+
+    // mini-agent-nvnkx.234
+    fn font_pdf(font: &str, content: &str) -> Vec<u8> {
+        single_page(
+            "/Font << /F2 5 0 R /F3 6 0 R >>",
+            content,
+            vec![
+                (5, font.to_owned()),
+                (6, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".into()),
+            ],
+        )
+    }
+
+    #[test]
+    fn differences_encoding_maps_glyph_names() {
+        let pdf = font_pdf(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /X /Encoding << /Type /Encoding /Differences [12 /fi /fl 45 /endash /eacute] >> >>",
+            "BT /F2 12 Tf <0C0D2D2E41> Tj ET",
+        );
+        let document = Document::parse(&pdf).unwrap();
+        let content = document.page_content(0).unwrap();
+        assert_eq!(content.text, "fifl–éA");
+        assert!(content.notes.is_empty());
+    }
+
+    #[test]
+    fn standard_encoding_is_the_default_of_type1_fonts_without_encoding() {
+        let pdf = font_pdf(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman >>",
+            "BT /F2 12 Tf <AE27D0> Tj /F3 12 Tf <27> Tj ET",
+        );
+        let document = Document::parse(&pdf).unwrap();
+        assert_eq!(document.page_text(0).unwrap(), "fi’—'");
+    }
+
+    #[test]
+    fn composite_font_without_to_unicode_keeps_mapped_text_and_adds_a_note() {
+        let cmap = "begincmap 1 begincodespacerange <0000> <FFFF> endcodespacerange 2 beginbfchar <0001> <0048> <0002> <00E9> endbfchar endcmap";
+        let pdf = single_page(
+            "/Font << /F1 5 0 R /F9 6 0 R >>",
+            "BT /F1 12 Tf <00010002> Tj /F9 12 Tf <00050006> Tj ET",
+            vec![
+                (
+                    5,
+                    "<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding /Identity-H /ToUnicode 7 0 R >>"
+                        .into(),
+                ),
+                (
+                    6,
+                    "<< /Type /Font /Subtype /Type0 /BaseFont /Y /Encoding /Identity-H >>".into(),
+                ),
+                (7, stream_obj("", cmap)),
+            ],
+        );
+        let document = Document::parse(&pdf).unwrap();
+        let content = document.page_content(0).unwrap();
+        assert_eq!(content.text, "Hé");
+        assert_eq!(content.notes.len(), 1, "{:?}", content.notes);
+        assert!(
+            content.notes[0].starts_with("2 character(s) in font F9 had no Unicode mapping"),
+            "{:?}",
+            content.notes
+        );
+        let output = render(&pdf, "doc.pdf", None, 10_000).unwrap();
+        assert!(output.contains("no Unicode mapping"), "{output}");
+    }
+
+    // mini-agent-nvnkx.235
+    fn objstm(number: u32, members: &[(u32, &str)]) -> (u32, String) {
+        let mut header = String::new();
+        let mut body = String::new();
+        for (member, text) in members {
+            header.push_str(&format!("{member} {} ", body.len()));
+            body.push_str(text);
+            body.push(' ');
+        }
+        let data = format!("{header}{body}");
+        (
+            number,
+            stream_obj(
+                &format!("/Type /ObjStm /N {} /First {}", members.len(), header.len()),
+                &data,
+            ),
+        )
+    }
+
+    fn two_contents() -> Vec<(u32, String)> {
+        vec![
+            (4, stream_obj("", "BT (Old) Tj ET")),
+            (6, stream_obj("", "BT (New) Tj ET")),
+        ]
+    }
+
+    const OLD_PAGE: &str = "<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>";
+    const NEW_PAGE: &str = "<< /Type /Page /Parent 2 0 R /Contents 6 0 R >>";
+
+    fn catalog() -> Vec<(u32, String)> {
+        vec![
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".to_owned()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_owned()),
+        ]
+    }
+
+    #[test]
+    fn later_object_stream_wins_over_an_earlier_one_every_time() {
+        for (older, newer) in [(10, 11), (11, 10)] {
+            let mut objects = catalog();
+            objects.extend(two_contents());
+            objects.push(objstm(older, &[(3, OLD_PAGE)]));
+            objects.push(objstm(newer, &[(3, NEW_PAGE)]));
+            let pdf = assemble(&objects);
+            for _ in 0..50 {
+                let document = Document::parse(&pdf).unwrap();
+                assert_eq!(document.page_text(0).unwrap(), "New");
+            }
+        }
+    }
+
+    #[test]
+    fn revision_order_decides_between_direct_and_compressed_objects() {
+        // Old direct object, later object stream: the stream wins.
+        let mut objects = catalog();
+        objects.extend(two_contents());
+        objects.push((3, OLD_PAGE.to_owned()));
+        objects.push(objstm(10, &[(3, NEW_PAGE)]));
+        for _ in 0..50 {
+            let document = Document::parse(&assemble(&objects)).unwrap();
+            assert_eq!(document.page_text(0).unwrap(), "New");
+        }
+        // Old object stream, later direct object: the direct object wins.
+        let mut objects = catalog();
+        objects.extend(two_contents());
+        objects.push(objstm(10, &[(3, OLD_PAGE)]));
+        objects.push((3, NEW_PAGE.to_owned()));
+        for _ in 0..50 {
+            let document = Document::parse(&assemble(&objects)).unwrap();
+            assert_eq!(document.page_text(0).unwrap(), "New");
+        }
+    }
+    // mini-agent-nvnkx.236
+    #[cfg(feature = "multimodal")]
+    #[test]
+    fn text_pages_with_figures_say_so_and_attach_them_on_request() {
+        let jpeg = include_bytes!("fixtures/read-image64/3x2.jpg");
+        let mut object = format!(
+            "<< /Type /XObject /Subtype /Image /Width 3 /Height 2 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length {} >>\nstream\n",
+            jpeg.len()
+        )
+        .into_bytes();
+        object.extend_from_slice(jpeg);
+        object.extend_from_slice(b"\nendstream");
+        let pdf = build_with(
+            &[Content::Plain(format!(
+                "{HELLO_PAGE} q 100 0 0 100 0 0 cm /Im0 Do Q"
+            ))],
+            false,
+            &format!("/XObject << /Im0 {} 0 R >>", first_extra_object(1)),
+            vec![object],
+        );
+        let plain = render_with_images(&pdf, "doc.pdf", None, 10_000, 4, false).unwrap();
+        assert!(plain.images.is_empty());
+        assert!(plain.text.contains("Hello filters"), "{}", plain.text);
+        assert!(
+            plain.text.contains(
+                "[page 1 also paints 1 image(s) (figures, charts or image-only tables); pass visual:true with pages:\"1\" to see them]"
+            ),
+            "{}",
+            plain.text
+        );
+        let visual = render_visual(&pdf, "doc.pdf", Some("1"), 4, false).unwrap();
+        assert_eq!(visual.images.len(), 1, "{}", visual.text);
+        assert!(visual.text.contains("Hello filters"), "{}", visual.text);
+        assert!(visual.text.contains("image 1 = page 1"), "{}", visual.text);
+        assert!(!visual.text.contains("pass visual:true"), "{}", visual.text);
+        // Without a model that takes images the request says why nothing came.
+        let blind = render_visual(&pdf, "doc.pdf", Some("1"), 0, false).unwrap();
+        assert!(blind.images.is_empty());
+        assert!(
+            blind.text.contains("does not accept images"),
+            "{}",
+            blind.text
+        );
+        // A native document block carries the whole page.
+        let native = render_visual(&pdf, "doc.pdf", Some("1"), 4, true).unwrap();
+        assert!(native.document.is_some());
+        assert!(
+            native.text.contains("document page 1 = page 1"),
+            "{}",
+            native.text
+        );
     }
 }

@@ -35,6 +35,8 @@ Notable changes to mini-agent are documented in this file. The format follows
 - `/logout openai all` and `--logout openai --login-account all|N` revoke and clear every (or one numbered) ChatGPT registration under one lock; plain logout reports how many others stay signed in (mini-agent-nvnkx.206).
 - A custom provider on a loopback `base_url` (LM Studio, llama.cpp, vLLM) needs no API key and sends no `Authorization` header; `api_keys.<name> = "none"` declares any other route keyless; CONFIG.md gains a local-server recipe (mini-agent-nvnkx.41).
 - Bedrock resolves its region from the selected AWS profile in `~/.aws/config` when `AWS_REGION`/`AWS_DEFAULT_REGION` are unset (mini-agent-nvnkx.313).
+- `read` with `visual:true` attaches the selected PDF pages as page images or a native document block even when they have a text layer, and text pages that also paint images now say so with the exact `visual:true` call to see them (mini-agent-nvnkx.236).
+- `read` returns PNG and JPEG outputs of notebook cells in the selected window as image blocks (at most 4, mapped by `image N = cell C output O`) when the model accepts images; other outputs and text-only models keep the mime label (mini-agent-nvnkx.240).
 
 ### Fixed
 
@@ -195,6 +197,15 @@ Notable changes to mini-agent are documented in this file. The format follows
 - A refused Copilot token exchange (HTTP 401/403/404) explains that the endpoint is limited to approved integrations and names the token fallbacks; live verification against github.com is still pending (mini-agent-nvnkx.207).
 - Bedrock credential-chain failures say which class failed (no credentials, timeout, provider error) and an expired SSO session names `aws sso login --profile` (mini-agent-nvnkx.314).
 - A 404 or 400 that says the model or its endpoints cannot call tools, an OpenRouter data-policy 404 and a wrong-path 404 no longer tell you to run /models, HTTP 402 is treated as exhausted credit, and OpenRouter models whose `supported_parameters` lack `tools` are hidden from the agent model list (mini-agent-nvnkx.42).
+- PDF text extraction now reads text drawn inside Form XObjects (nested, with their own resources and `/Matrix`, bounded in depth and count, cycle-safe), counts images painted inside forms, and notes forms it cannot read (mini-agent-nvnkx.233).
+- PDF simple fonts honour `/Encoding /Differences` through a compact Adobe Glyph List subset (ligatures expand to `fi`/`fl`, `uniXXXX` names) and `StandardEncoding` for non-symbolic Type 1 fonts without an encoding; codes with no Unicode mapping (composite fonts without ToUnicode, unknown glyph names) are counted per font and reported as a page note instead of vanishing silently (mini-agent-nvnkx.234).
+- PDF object streams are expanded newest-first by file offset and a compressed object replaces a direct one only when its container is later in the file, so incrementally saved PDFs give the same, newest revision on every run (mini-agent-nvnkx.235).
+- `notebook_edit` by `cell_index` now requires a current cell view from `read` (size and modification time unchanged since) and otherwise refuses with a re-read hint, so an autosave or out-of-band cell insert cannot redirect the edit; `cell_id` edits are unaffected (mini-agent-nvnkx.237).
+- `notebook_edit` keeps the file's own key order for the root and every cell (Colab, hand-written and converter-generated notebooks no longer get every cell reordered by a one-cell edit); inserted cells follow the nbformat key order (mini-agent-nvnkx.238).
+- Notebooks with missing, duplicate or invalid cell ids open instead of being refused: the cell view marks the cells (`id missing`, `(duplicate)`) with one notice, edits by `cell_index` work, an ambiguous `cell_id` is refused naming the cells, and untouched ids are never rewritten (mini-agent-nvnkx.239).
+- `notebook_edit` results name the affected index, the new cell's id and the cell count when the preimage may be disclosed, and `replace` accepts `cell_type` to convert a cell (outputs and `execution_count` are dropped when leaving code and added when entering it) (mini-agent-nvnkx.241).
+- `read` downscales images that are within the 5 MiB / 8000 px limits but exceed 2000 px on the long edge or 1 MiB (GIFs only for pixels), keeping the `resized from` note; small images stay byte-identical and `full_resolution:true` keeps the original pixels (mini-agent-nvnkx.242).
+- `task` calls that name a read-only persona (`explore` or any persona that is not `mode: write` and has no memory, hooks or MCP servers) share the tool lane like an argument-free call, so a model that writes `"agent_type":"explore"` still overlaps with other readers (mini-agent-nvnkx.243).
 
 ### Added
 

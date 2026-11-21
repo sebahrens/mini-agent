@@ -20,6 +20,32 @@ const MAX_DECODE_SIDE: u32 = 30_000;
 const MAX_DECODE_ALLOC: u64 = 768 * 1024 * 1024;
 const JPEG_QUALITY: u8 = 85;
 
+/// Encoded size above which an image is re-encoded smaller even when its
+/// pixels are within [`FIT_LONG_EDGE`]: providers downsample to roughly this
+/// resolution anyway, while the bytes would be stored in history and re-sent
+/// with every later request.
+pub(crate) const SOFT_TARGET_BYTES: usize = 1024 * 1024;
+
+/// Whether an in-limits image is still worth shrinking before it enters the
+/// conversation.
+pub(crate) fn exceeds_target(format: ImageFormat, width: u32, height: u32, len: usize) -> bool {
+    if width.max(height) > FIT_LONG_EDGE {
+        return true;
+    }
+    // Resizing flattens an animation, so a GIF is only shrunk for its pixels.
+    format != ImageFormat::Gif && len > SOFT_TARGET_BYTES
+}
+
+/// Shrink an image that [`exceeds_target`]; `None` keeps the original (it is
+/// not larger than the target, could not be decoded, or the result would not
+/// be smaller).
+pub(crate) fn fit_to_target(bytes: &[u8]) -> Option<Fitted> {
+    let fitted = fit(bytes, SOFT_TARGET_BYTES, super::read_image::MAX_IMAGE_SIDE).ok()?;
+    (fitted.data.len() < bytes.len()
+        || fitted.width.max(fitted.height) < fitted.original_width.max(fitted.original_height))
+    .then_some(fitted)
+}
+
 #[derive(Debug)]
 pub(crate) struct Fitted {
     pub(crate) data: Vec<u8>,
@@ -242,6 +268,29 @@ pub(crate) mod tests {
         );
         let upright = fit(&exif_rotated_jpeg(3000, 1000, 1), 5 * 1024 * 1024, 8_000).unwrap();
         assert!(upright.width > upright.height);
+    }
+
+    #[test]
+    fn target_resizes_large_screenshots_and_keeps_small_images_byte_identical() {
+        let big = noisy_png(2400, 400);
+        let info = super::super::read_image::inspect(&big).unwrap().unwrap();
+        assert!(exceeds_target(
+            info.format,
+            info.width,
+            info.height,
+            big.len()
+        ));
+        let fitted = fit_to_target(&big).unwrap();
+        assert!(fitted.width.max(fitted.height) <= FIT_LONG_EDGE);
+        assert!(fitted.note().starts_with("resized from 2400 x 400 to "));
+        let small = noisy_png(40, 30);
+        let info = super::super::read_image::inspect(&small).unwrap().unwrap();
+        assert!(!exceeds_target(
+            info.format,
+            info.width,
+            info.height,
+            small.len()
+        ));
     }
 
     #[test]

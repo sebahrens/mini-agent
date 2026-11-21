@@ -53,9 +53,11 @@ enum ToolAccess {
     /// mutates a job and stays exclusive, as does any unparseable request.
     JobStatus,
     /// `task`: the default explorer persona is read-only, so such calls share
-    /// the lane and several can overlap. Any `agent_type` (a persona may be
-    /// `mode: write`), `resume` (the stored child may be a write persona) or
-    /// worktree option keeps the exclusive lease.
+    /// the lane and several can overlap. An `agent_type` naming a persona of
+    /// the read-only set (`explore` and every persona that is not `mode:
+    /// write`) counts like an absent key; any other `agent_type`, `resume`
+    /// (the stored child may be a write persona) or worktree option keeps the
+    /// exclusive lease.
     Task,
     /// `git`: only the inspection operations share the lane.
     Git,
@@ -83,8 +85,23 @@ fn access_for(name: &str) -> ToolAccess {
     }
 }
 
-/// The lease one call needs. Only `job_status` depends on its arguments.
+/// Persona names whose `task` children never write: just the built-in explorer.
+fn default_read_only_personas() -> std::collections::HashSet<String> {
+    std::collections::HashSet::from(["explore".to_owned()])
+}
+
+/// The lease one call needs. Only `job_status` and `task` depend on their
+/// arguments.
+#[cfg(test)]
 fn access_for_call(access: ToolAccess, args: &str) -> ToolAccess {
+    access_for_call_with(access, args, &default_read_only_personas())
+}
+
+fn access_for_call_with(
+    access: ToolAccess,
+    args: &str,
+    read_only_personas: &std::collections::HashSet<String>,
+) -> ToolAccess {
     match access {
         ToolAccess::JobStatus => {
             let action = serde_json::from_str::<serde_json::Value>(args)
@@ -109,9 +126,16 @@ fn access_for_call(access: ToolAccess, args: &str) -> ToolAccess {
                 return ToolAccess::Write;
             };
             let absent = |key: &str| map.get(key).is_none_or(serde_json::Value::is_null);
-            if ["agent_type", "resume", "isolation", "base_ref"]
-                .iter()
-                .all(|key| absent(key))
+            // A persona that is declared read-only is the same as no persona.
+            let persona_is_read_only = match map.get("agent_type") {
+                None | Some(serde_json::Value::Null) => true,
+                Some(serde_json::Value::String(name)) => read_only_personas.contains(name),
+                Some(_) => false,
+            };
+            if persona_is_read_only
+                && ["resume", "isolation", "base_ref"]
+                    .iter()
+                    .all(|key| absent(key))
             {
                 ToolAccess::Read
             } else {
@@ -175,6 +199,7 @@ struct LaneSlot {
     /// re-derives the lease from the arguments that will actually run.
     #[cfg_attr(not(any(test, feature = "hooks")), allow(dead_code))]
     access: ToolAccess,
+    read_only_personas: Arc<std::collections::HashSet<String>>,
     lease: std::sync::Mutex<Option<Lease>>,
     /// The exclusive ordering ticket; held until the call ends.
     #[cfg_attr(not(any(test, feature = "hooks")), allow(dead_code))]
@@ -211,7 +236,8 @@ pub(crate) async fn readmit_for_effective_args(effective: &str) {
     let Ok(slot) = LANE.try_with(Arc::clone) else {
         return;
     };
-    let want_exclusive = access_for_call(slot.access, effective) != ToolAccess::Read;
+    let want_exclusive =
+        access_for_call_with(slot.access, effective, &slot.read_only_personas) != ToolAccess::Read;
     {
         let mut lease = slot.lease.lock().unwrap_or_else(|e| e.into_inner());
         let have_exclusive = match &*lease {
@@ -290,6 +316,7 @@ struct ConcurrencyBoundTool {
     inner: Box<dyn ToolDyn>,
     lane: Lane,
     access: ToolAccess,
+    read_only_personas: Arc<std::collections::HashSet<String>>,
     /// Foreground `shell` calls claim their announced internal call id so
     /// their live output preview is labelled like the transcript; other
     /// tools (MCP progress previews) find it through `TOOL_CALL_ID`.
@@ -302,6 +329,7 @@ impl ConcurrencyBoundTool {
         inner: Box<dyn ToolDyn>,
         lane: Lane,
         shared_names: &std::collections::HashSet<String>,
+        read_only_personas: Arc<std::collections::HashSet<String>>,
     ) -> Self {
         let name = inner.name();
         let access = if shared_names.contains(&name) {
@@ -313,17 +341,20 @@ impl ConcurrencyBoundTool {
             inner,
             lane,
             access,
+            read_only_personas,
             is_shell: name == "shell",
             name,
         }
     }
 
     async fn lease(&self, args: &str) -> Arc<LaneSlot> {
-        let exclusive = access_for_call(self.access, args) != ToolAccess::Read;
+        let exclusive =
+            access_for_call_with(self.access, args, &self.read_only_personas) != ToolAccess::Read;
         let (lease, ticket) = self.lane.acquire(exclusive).await;
         Arc::new(LaneSlot {
             lane: self.lane.clone(),
             access: self.access,
+            read_only_personas: Arc::clone(&self.read_only_personas),
             lease: std::sync::Mutex::new(Some(lease)),
             ticket: std::sync::Mutex::new(ticket),
         })
@@ -453,12 +484,29 @@ pub(crate) fn bind_with_shared(
     tools: Vec<Box<dyn ToolDyn>>,
     shared_names: &std::collections::HashSet<String>,
 ) -> Vec<Box<dyn ToolDyn>> {
+    bind_with_personas(tools, shared_names, default_read_only_personas())
+}
+
+/// [`bind_with_shared`] with the `task` agent_type names whose children are
+/// read-only (always including `explore` unless the user redefined it as a
+/// write persona), so a model that writes `"agent_type":"explore"` still
+/// overlaps with other readers (mini-agent-nvnkx.243).
+pub(crate) fn bind_with_personas(
+    tools: Vec<Box<dyn ToolDyn>>,
+    shared_names: &std::collections::HashSet<String>,
+    read_only_personas: std::collections::HashSet<String>,
+) -> Vec<Box<dyn ToolDyn>> {
     let lane = Lane::new();
+    let personas = Arc::new(read_only_personas);
     tools
         .into_iter()
         .map(|tool| {
-            Box::new(ConcurrencyBoundTool::new(tool, lane.clone(), shared_names))
-                as Box<dyn ToolDyn>
+            Box::new(ConcurrencyBoundTool::new(
+                tool,
+                lane.clone(),
+                shared_names,
+                Arc::clone(&personas),
+            )) as Box<dyn ToolDyn>
         })
         .collect()
 }
@@ -698,6 +746,17 @@ mod tests {
                 r#"{"briefs":[{"objective":"x"}]}"#,
                 ToolAccess::Read,
             ),
+            // The built-in explorer named explicitly is the same as omitting it.
+            (
+                "task",
+                r#"{"prompts":["a"],"agent_type":"explore"}"#,
+                ToolAccess::Read,
+            ),
+            (
+                "task",
+                r#"{"prompts":["a"],"agent_type":7}"#,
+                ToolAccess::Write,
+            ),
             (
                 "task",
                 r#"{"prompts":["a"],"agent_type":"impl"}"#,
@@ -756,6 +815,63 @@ mod tests {
                 expected,
                 "{name} {args}"
             );
+        }
+    }
+
+    #[test]
+    fn declared_read_only_personas_share_the_task_lane() {
+        let personas = std::collections::HashSet::from(["explore".to_owned(), "review".to_owned()]);
+        for (args, expected) in [
+            (
+                r#"{"prompts":["a"],"agent_type":"review"}"#,
+                ToolAccess::Read,
+            ),
+            (
+                r#"{"prompts":["a"],"agent_type":"impl"}"#,
+                ToolAccess::Write,
+            ),
+            (
+                r#"{"prompts":["a"],"agent_type":"review","resume":"c1"}"#,
+                ToolAccess::Write,
+            ),
+        ] {
+            assert_eq!(
+                access_for_call_with(ToolAccess::Task, args, &personas),
+                expected,
+                "{args}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_explore_task_calls_overlap_but_write_personas_serialize() {
+        for (agent_type, expected_max) in [("explore", 2), ("impl", 1)] {
+            let (first, entered, release, maximum) = probe("task");
+            let mut second = first.clone();
+            second.entered = Arc::clone(&entered);
+            second.release = Arc::clone(&release);
+            let tools = bind_with_personas(
+                vec![Box::new(first), Box::new(second)],
+                &std::collections::HashSet::new(),
+                std::collections::HashSet::from(["explore".to_owned()]),
+            );
+            let args = format!(r#"{{"prompts":["a"],"agent_type":"{agent_type}"}}"#);
+            let joined = tokio::spawn(async move {
+                let one = tools[0].call(args.clone());
+                let two = tools[1].call(args);
+                tokio::join!(one, two)
+            });
+            entered.notified().await;
+            let second_started =
+                tokio::time::timeout(std::time::Duration::from_millis(100), entered.notified())
+                    .await
+                    .is_ok();
+            assert_eq!(second_started, expected_max == 2, "{agent_type}");
+            release.notify_waiters();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            release.notify_waiters();
+            let _ = joined.await.unwrap();
+            assert_eq!(maximum.load(Ordering::SeqCst), expected_max, "{agent_type}");
         }
     }
 

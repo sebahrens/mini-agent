@@ -1153,6 +1153,8 @@ mod tests {
         .call(ReadArgs {
             pages: None,
             raw_notebook: false,
+            visual: false,
+            full_resolution: false,
             character_offset: None,
             character_limit: None,
             path: path.into(),
@@ -1348,7 +1350,7 @@ mod tests {
     async fn rewind_restores_exact_notebook_preimage_after_notebook_edit() {
         let root = crate::tests::OwnedTestDirectory::new("rewind-notebook");
         // Jupyter-style bytes (indent 1, trailing newline) must come back exactly.
-        let original = "{\n \"cells\": [\n  {\n   \"cell_type\": \"code\",\n   \"execution_count\": 3,\n   \"metadata\": {},\n   \"outputs\": [],\n   \"source\": [\n    \"print(1)\"\n   ]\n  }\n ],\n \"metadata\": {},\n \"nbformat\": 4,\n \"nbformat_minor\": 4\n}\n";
+        let original = "{\n \"cells\": [\n  {\n   \"cell_type\": \"code\",\n   \"execution_count\": 3,\n   \"id\": \"c1\",\n   \"metadata\": {},\n   \"outputs\": [],\n   \"source\": [\n    \"print(1)\"\n   ]\n  }\n ],\n \"metadata\": {},\n \"nbformat\": 4,\n \"nbformat_minor\": 5\n}\n";
         std::fs::write(root.path().join("book.ipynb"), original).unwrap();
         let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
         let store = FileCheckpoints::default();
@@ -1363,7 +1365,7 @@ mod tests {
             )
             .call(
                 serde_json::from_value(serde_json::json!({
-                    "path": "book.ipynb", "mode": "replace", "cell_index": 0, "source": "print(2)"
+                    "path": "book.ipynb", "mode": "replace", "cell_id": "c1", "source": "print(2)"
                 }))
                 .unwrap(),
             )
@@ -1559,6 +1561,8 @@ mod tests {
         .call(ReadArgs {
             pages: None,
             raw_notebook: false,
+            visual: false,
+            full_resolution: false,
             character_offset: None,
             character_limit: None,
             path: "file".into(),

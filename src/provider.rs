@@ -7970,6 +7970,8 @@ mod compaction_quality_tests {
                 .call(ReadArgs {
                     pages: None,
                     raw_notebook: false,
+                    visual: false,
+                    full_resolution: false,
                     character_offset: None,
                     character_limit: None,
                     path,

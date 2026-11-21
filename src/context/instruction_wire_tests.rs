@@ -1209,7 +1209,7 @@ async fn context63_actual_read_edit_and_notebook_consumers_require_accepted_noti
                     json!({"path":path,"block":"<<<<<<< SEARCH\nbefore\n=======\nafter\n>>>>>>> REPLACE"})
                 }
                 "notebook_edit" => {
-                    json!({"path":path,"mode":"replace","cell_index":0,"source":"after\n"})
+                    json!({"path":path,"mode":"replace","cell_id":"one","source":"after\n"})
                 }
                 _ => unreachable!(),
             };

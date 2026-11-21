@@ -553,6 +553,23 @@ impl ReadTracker {
         self.check_read_kind(ReadKind::NotebookView, path, offset, limit, metadata, crc)
     }
 
+    /// Whether a notebook cell view of `path` was served for the file's current
+    /// size and modification time (so cell indices still mean what the model saw).
+    pub(crate) fn notebook_view_is_current(
+        &self,
+        path: &str,
+        metadata: &std::fs::Metadata,
+    ) -> bool {
+        let tracked = self.tracked.lock().unwrap_or_else(|e| e.into_inner());
+        tracked.get(path).is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry.kind == ReadKind::NotebookView
+                    && entry.version.len == metadata.len()
+                    && entry.version.modified == metadata.modified().ok()
+            })
+        })
+    }
+
     fn check_read_kind(
         &self,
         kind: ReadKind,
@@ -901,6 +918,14 @@ pub struct ReadArgs {
     /// 1-indexed PDF page selection such as `1-5` or `2,4`.
     #[serde(default)]
     pub pages: Option<String>,
+    /// PDF only: attach the selected pages as images/a document even when
+    /// they have a text layer (figures, charts, image-only tables).
+    #[serde(default)]
+    pub visual: bool,
+    /// Images only: keep the original pixels instead of downscaling to the
+    /// provider's useful resolution.
+    #[serde(default)]
+    pub full_resolution: bool,
 }
 
 #[derive(Deserialize)]

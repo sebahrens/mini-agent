@@ -60,6 +60,8 @@ async fn read_whole(
         .call(ReadArgs {
             pages: None,
             raw_notebook: false,
+            visual: false,
+            full_resolution: false,
             character_offset: None,
             character_limit: None,
             path: path.into(),
@@ -101,6 +103,8 @@ async fn overwriting_an_unread_file_is_refused_and_leaves_it_intact() {
         .call(ReadArgs {
             pages: None,
             raw_notebook: false,
+            visual: false,
+            full_resolution: false,
             character_offset: None,
             character_limit: None,
             path: "b.txt".into(),

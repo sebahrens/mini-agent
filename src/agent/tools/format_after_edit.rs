@@ -1070,6 +1070,8 @@ mod tests {
             .call(ReadArgs {
                 pages: None,
                 raw_notebook: false,
+                visual: false,
+                full_resolution: false,
                 character_offset: None,
                 character_limit: None,
                 path: "source.rs".into(),
@@ -1528,6 +1530,8 @@ mod tests {
             .call(ReadArgs {
                 pages: None,
                 raw_notebook: false,
+                visual: false,
+                full_resolution: false,
                 character_offset: None,
                 character_limit: None,
                 path: "same.rs".into(),

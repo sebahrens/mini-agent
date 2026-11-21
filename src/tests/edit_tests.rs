@@ -1668,6 +1668,8 @@ async fn utf16_bom_files_are_read_decoded_and_edited_in_their_own_encoding() {
         let read = ReadTool::new(None, None, None, 1024)
             .call(crate::agent::tools::ReadArgs {
                 raw_notebook: false,
+                visual: false,
+                full_resolution: false,
                 character_offset: None,
                 character_limit: None,
                 path: tmp.path().into(),
