@@ -2172,6 +2172,81 @@ mod tests {
     }
 
     #[test]
+    fn stream_json_companions_need_stream_json_output() {
+        let parse = |args: &[&str]| {
+            let mut line = vec!["mini-agent", "-p"];
+            line.extend_from_slice(args);
+            line.push("q");
+            Cli::try_parse_command_line_from(line)
+        };
+        for flag in [
+            &["--include-partial-messages"][..],
+            &["--stream-json-schema", "claude"],
+            &["--stream-json-preview-bytes", "512"],
+            &["--input-format", "stream-json"],
+            &["--output", "json", "--include-partial-messages"],
+            &["--output", "stream-json", "--stream-json-control"],
+            &[
+                "--output",
+                "stream-json",
+                "--input-format",
+                "text",
+                "--stream-json-control",
+            ],
+        ] {
+            let error = parse(flag).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{flag:?}"
+            );
+        }
+        for flag in [
+            &["--output", "stream-json", "--include-partial-messages"][..],
+            &["--output", "stream-json", "--stream-json-schema", "claude"],
+            &["--output", "stream-json", "--input-format", "stream-json"],
+            &[
+                "--output",
+                "stream-json",
+                "--input-format",
+                "stream-json",
+                "--stream-json-control",
+            ],
+        ] {
+            assert!(parse(flag).is_ok(), "{flag:?}");
+        }
+        assert!(Cli::try_parse_command_line_from(["mini-agent", "--pure-stdout"]).is_err());
+    }
+
+    #[test]
+    fn free_form_value_flags_are_validated() {
+        let parse = |args: &[&str]| {
+            let mut line = vec!["mini-agent"];
+            line.extend_from_slice(args);
+            Cli::try_parse_from(line)
+        };
+        assert_eq!(
+            parse(&["--log-level", "DEBUG"])
+                .unwrap()
+                .log_level
+                .as_deref(),
+            Some("debug")
+        );
+        assert!(parse(&["--log-level", "verbose"]).is_err());
+        assert!(parse(&["--log-level", "warning"]).is_err());
+        assert!(parse(&["--login", "openai"]).is_ok());
+        assert!(parse(&["--login", "gemini"]).is_err());
+        assert!(parse(&["--logout", "copilot"]).is_ok());
+        assert!(parse(&["--logout", "gemini"]).is_err());
+        assert!(parse(&["--logout", "anthropic"]).is_err());
+        #[cfg(feature = "hooks")]
+        {
+            assert!(parse(&["--hooks-test", "shell", "--hooks-test-input", "{\"a\":1}"]).is_ok());
+            assert!(parse(&["--hooks-test", "shell", "--hooks-test-input", "{oops"]).is_err());
+        }
+    }
+
+    #[test]
     fn permission_mode_flags_are_mutually_exclusive() {
         let flags = [
             "--restrictive",

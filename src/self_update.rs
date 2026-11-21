@@ -65,6 +65,7 @@ Replace this mini-agent with the latest (or a given) GitHub release.
 
 Options:
       --check             Report whether an update exists; install nothing
+                          (exit 0 up to date, 10 update available, 1 check failed)
       --release X.Y.Z     Install this version instead of the latest
       --allow-unattested  Install when build provenance cannot be verified with `gh`
       --allow-downgrade   Allow --release to pick a version older than the running one
@@ -527,6 +528,9 @@ fn running_version() -> &'static str {
 /// Entry point. Returns the process exit code and prints to stdout/stderr.
 pub(crate) async fn run(args: UpdateArgs) -> i32 {
     match run_inner(args).await {
+        Ok(()) if UPDATE_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed) => {
+            EXIT_UPDATE_AVAILABLE
+        }
         Ok(()) => 0,
         Err(message) => {
             eprintln!("Error: {message}");
@@ -534,6 +538,11 @@ pub(crate) async fn run(args: UpdateArgs) -> i32 {
         }
     }
 }
+
+/// Exit status of `update --check` when a newer release exists (0: up to date,
+/// 1: the check failed).
+pub(crate) const EXIT_UPDATE_AVAILABLE: i32 = 10;
+static UPDATE_AVAILABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 async fn run_inner(args: UpdateArgs) -> Result<(), String> {
     let current = running_version();
@@ -545,6 +554,7 @@ async fn run_inner(args: UpdateArgs) -> Result<(), String> {
     let newer = crate::update::stable_version(&requested) > crate::update::stable_version(current);
     if args.check {
         if newer {
+            UPDATE_AVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
             println!(
                 "mini-agent {current} -> {requested} is available. Run `mini-agent update` to install it."
             );
