@@ -80,7 +80,7 @@ fn wrap_urls_osc8(text: &str) -> String {
     let mut last = 0;
     for m in URL_RE.find_iter(text) {
         let url = trim_url(m.as_str());
-        if url.len() <= "https://".len() - 1 {
+        if url.len() < "http://".len() {
             continue;
         }
         result.push_str(&text[last..m.start()]);
