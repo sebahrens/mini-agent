@@ -8820,7 +8820,10 @@ mod session_title_completion_tests {
         assert_eq!(body["stream"], true);
         assert_eq!(body["temperature"], 0.25);
         if protocol == "openai" {
-            assert_eq!(body["reasoning_effort"], "low");
+            // The fixture is a third-party gateway (not api.openai.com), which
+            // never receives the generated `reasoning_effort` default, and the
+            // hostile non-string override is dropped (mini-agent-nvnkx.33).
+            assert!(body.get("reasoning_effort").is_none_or(|v| v.is_null()));
         } else {
             assert_eq!(body["provider"]["data_collection"], "deny");
             assert_eq!(body["provider"]["allow_fallbacks"], false);

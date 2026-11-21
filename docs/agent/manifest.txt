@@ -19,6 +19,7 @@ Configure | CONFIG_KEYS.md
 Configure | PROVIDERS.md
 Configure | providers/Minimax.md
 Configure | COST_TRACKING.md
+Configure | TELEMETRY.md
 Configure | MCP_CONFIGURATION.md
 Configure | MCP_INTERACTION.md
 Configure | HASHEDIT.md

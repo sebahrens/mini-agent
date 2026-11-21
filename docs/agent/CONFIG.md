@@ -409,6 +409,11 @@ configured provider endpoints win endpoint environment fallbacks.
 | `MINI_AGENT_ACP_TLS_CERT`, `MINI_AGENT_ACP_TLS_KEY` | ACP TCP TLS certificate/key paths, supplied together; the remote listener requires TLS unless the explicit insecure-remote override below is enabled. |
 | `MINI_AGENT_ACP_ALLOW_INSECURE_REMOTE` | Value `1` explicitly permits an insecure remote ACP TCP listener; other values retain the TLS requirement. |
 | `MINI_AGENT_ACP_TRUST_CLIENT_MCP` | Value `1` authorizes ACP client-supplied MCP registrations to launch; otherwise they are not trusted. It does not replace configured MCP policy. |
+| `AWS_PROFILE` | AWS named profile for the Bedrock provider: selects the shared-config profile whose credentials and `region` are used (default profile `default`); credential errors name it. Region itself comes from `AWS_REGION`, then `AWS_DEFAULT_REGION`, then the profile's `region`. |
+| `MINI_AGENT_CLIPBOARD` | Copy route override for the TUI: `osc52`, `helper` or `tmux` restricts copying to that one method; any other or unset value keeps automatic selection (OSC 52 over SSH, the helper locally, with tmux passthrough when `TMUX` is set). |
+| `MINI_AGENT_LOGIN_PORT` | Fixed loopback port (1024..=65535) for the browser sign-in redirect, so an SSH or container session can forward it before `/login`; unset or empty uses a random port, and an invalid value fails the login with an error. |
+| `MINI_AGENT_TRUST_PROJECT_CONFIG` | Environment form of `--trust-project-config`: applies the project's sensitive config keys (MCP servers, permission rules, ...) for this run without the confirmation prompt and records nothing; for CI and containers. |
+| `MINI_AGENT_TRUST_PROJECT_HOOKS` | Environment form of `--trust-project-hooks` (hooks builds): runs the project's hooks for this run without the confirmation prompt and records nothing; for CI and containers. |
 | `MINI_AGENT_PROJECT_DIR` | Set by mini-agent for hook children to the canonical selected workspace. The key is reserved: hook `env` cannot override it in any ASCII case, and an inherited parent value is replaced. |
 
 Names designated by provider/embedding `api_key_env`, whole-string `${VAR}` custom

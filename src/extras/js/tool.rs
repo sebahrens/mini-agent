@@ -4059,15 +4059,14 @@ mod js_permission_bridge {
         )
         .with_scratch_store(scratch.clone());
 
-        assert_eq!(
-            first
-                .call(JsArgs {
-                    code: "scratch_get('missing') === null".into(),
-                })
-                .await
-                .unwrap(),
-            "true"
-        );
+        // A null read from an empty store carries the "scratch is empty" note.
+        let missing = first
+            .call(JsArgs {
+                code: "scratch_get('missing') === null".into(),
+            })
+            .await
+            .unwrap();
+        assert!(missing.starts_with("true\n[note: the scratch store is empty"));
         assert_eq!(
             first
                 .call(JsArgs {

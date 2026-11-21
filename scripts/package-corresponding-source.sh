@@ -112,7 +112,11 @@ STAGING_DIR=$(mktemp -d)
 trap 'rm -rf "$STAGING_DIR"' EXIT
 
 mkdir -p "$OUTPUT_DIR" "$STAGING_DIR/$SOURCE_ROOT"
-git archive --format=tar "$SOURCE_COMMIT" | tar xf - -C "$STAGING_DIR/$SOURCE_ROOT"
+# Extract from a file, not a pipe: bsdtar stops reading at the end-of-archive
+# marker, so `git archive | tar` can die of SIGPIPE (exit 141) on macOS.
+git archive --format=tar --output="$STAGING_DIR/source.tar" "$SOURCE_COMMIT"
+tar xf "$STAGING_DIR/source.tar" -C "$STAGING_DIR/$SOURCE_ROOT"
+rm -f "$STAGING_DIR/source.tar"
 if [[ -n "$COMPLIANCE_DOCS" ]]; then
     for document in NOTICE SOURCE.md; do
         if [[ ! -f "$STAGING_DIR/$SOURCE_ROOT/$document" ]]; then

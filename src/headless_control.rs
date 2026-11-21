@@ -554,8 +554,7 @@ impl ControlState {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .models
-                    .iter()
-                    .any(|alias| *alias == model);
+                    .contains(&model);
                 if known {
                     *self.pending_model.lock().unwrap_or_else(|e| e.into_inner()) = Some(model);
                     ack(request_id, Ok(None))

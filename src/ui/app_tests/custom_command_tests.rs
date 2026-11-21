@@ -72,10 +72,9 @@ async fn actual_custom_slash_submits_one_literal_user_turn_and_restores_one_shot
     };
     let mut app = fixture_app(ui);
     let before = serde_json::to_vec(app.ui.session).unwrap();
-    app.run_slash_command("/blocked").await.unwrap();
-    assert_eq!(serde_json::to_vec(app.ui.session).unwrap(), before);
-    assert_eq!(app.ui.context.active_selection(), original);
-    assert!(app.run.main_abort.is_none());
+    // A missing @file is kept as literal text with a notice and the command
+    // proceeds (mini-agent-nvnkx.74); only an existing file the read policy
+    // refuses blocks the command, which the loop below pins.
     std::fs::write(root.path().join("missing"), "PRIVATE_DENIED_CONTENT").unwrap();
     for action in [
         crate::permission::Action::Deny,
