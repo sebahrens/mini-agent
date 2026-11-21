@@ -1116,19 +1116,40 @@ pub(crate) fn append_stdin_reference(prompt: &str, stdin: &str) -> String {
 }
 
 /// Compactions this headless run performed: (count, records summarized,
-/// tokens freed net of the summary), reported once on the next final result
-/// so scripts can tell a run was lossy (mini-agent-sskdu.243).
+/// tokens freed net of the summary, summarizer usage), reported once on the
+/// next final result so scripts can tell a run was lossy
+/// (mini-agent-sskdu.243).
+type CompactionTotals = (u64, u64, u64, Option<crate::event::UsageDelta>);
 #[cfg(not(test))]
-static HEADLESS_COMPACTIONS: std::sync::Mutex<(u64, u64, u64)> = std::sync::Mutex::new((0, 0, 0));
+static HEADLESS_COMPACTIONS: std::sync::Mutex<CompactionTotals> =
+    std::sync::Mutex::new((0, 0, 0, None));
 // Tests run in parallel in one process: keep each test's counters to its own
 // thread so a compaction in one cannot leak a field into another's output.
 #[cfg(test)]
 thread_local! {
-    static HEADLESS_COMPACTIONS_TEST: std::cell::Cell<(u64, u64, u64)> =
-        const { std::cell::Cell::new((0, 0, 0)) };
+    static HEADLESS_COMPACTIONS_TEST: std::cell::Cell<CompactionTotals> =
+        const { std::cell::Cell::new((0, 0, 0, None)) };
 }
 
-pub(crate) fn record_headless_compaction(messages: usize, tokens_freed: u64) {
+/// The stream-json record for one finished compaction.
+fn compaction_event(
+    messages: usize,
+    tokens_freed: u64,
+    usage: crate::event::UsageDelta,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "compaction",
+        "messages": messages,
+        "tokens_freed": tokens_freed,
+        "usage": usage,
+    })
+}
+
+pub(crate) fn record_headless_compaction(
+    messages: usize,
+    tokens_freed: u64,
+    usage: crate::event::UsageDelta,
+) {
     #[cfg(not(test))]
     {
         let mut totals = HEADLESS_COMPACTIONS
@@ -1137,14 +1158,30 @@ pub(crate) fn record_headless_compaction(messages: usize, tokens_freed: u64) {
         totals.0 += 1;
         totals.1 = totals.1.saturating_add(messages as u64);
         totals.2 = totals.2.saturating_add(tokens_freed);
+        totals.3 = Some(totals.3.unwrap_or_default().saturating_add(usage));
+        // `--output-format stream-json` also gets the record as it happens.
+        if FATAL_CONFIG_OUTPUT.get() == Some(&cli::OutputFormat::StreamJson)
+            && !HEADLESS_STDOUT_CLOSED.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let event = compaction_event(messages, tokens_freed, usage);
+            let records = if claude_schema() {
+                claude_stream_records(event)
+            } else {
+                vec![event]
+            };
+            for record in records {
+                headless_stdout(format_args!("{}\n", terminal_safe_json(&record)));
+            }
+        }
     }
     #[cfg(test)]
     HEADLESS_COMPACTIONS_TEST.with(|totals| {
-        let (count, seen, freed) = totals.get();
+        let (count, seen, freed, spent) = totals.get();
         totals.set((
             count + 1,
             seen.saturating_add(messages as u64),
             freed.saturating_add(tokens_freed),
+            Some(spent.unwrap_or_default().saturating_add(usage)),
         ));
     });
 }
@@ -1153,16 +1190,23 @@ pub(crate) fn record_headless_compaction(messages: usize, tokens_freed: u64) {
 /// when nothing was compacted so existing output is unchanged.
 fn take_headless_compactions() -> Option<serde_json::Value> {
     #[cfg(not(test))]
-    let (count, messages, tokens_freed) = std::mem::take(
+    let (count, messages, tokens_freed, usage) = std::mem::replace(
         &mut *HEADLESS_COMPACTIONS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner),
+        (0, 0, 0, None),
     );
     #[cfg(test)]
-    let (count, messages, tokens_freed) = HEADLESS_COMPACTIONS_TEST.with(|totals| totals.take());
-    (count > 0).then(
-        || serde_json::json!({"count": count, "messages": messages, "tokens_freed": tokens_freed}),
-    )
+    let (count, messages, tokens_freed, usage) =
+        HEADLESS_COMPACTIONS_TEST.with(|totals| totals.replace((0, 0, 0, None)));
+    (count > 0).then(|| {
+        serde_json::json!({
+            "count": count,
+            "messages": messages,
+            "tokens_freed": tokens_freed,
+            "usage": usage.unwrap_or_default(),
+        })
+    })
 }
 
 static FATAL_CONFIG_OUTPUT: std::sync::OnceLock<cli::OutputFormat> = std::sync::OnceLock::new();
@@ -3684,13 +3728,43 @@ mod tests {
     fn compactions_are_reported_once_and_only_when_they_happened() {
         // mini-agent-sskdu.243
         assert!(super::take_headless_compactions().is_none());
-        super::record_headless_compaction(5, 100);
-        super::record_headless_compaction(2, 30);
+        let usage = |input, output| crate::event::UsageDelta {
+            input_tokens: input,
+            output_tokens: output,
+            total_tokens: input + output,
+            ..Default::default()
+        };
+        super::record_headless_compaction(5, 100, usage(1_000, 200));
+        super::record_headless_compaction(2, 30, usage(500, 50));
         let value = super::take_headless_compactions().unwrap();
         assert_eq!(value["count"], 2);
         assert_eq!(value["messages"], 7);
         assert_eq!(value["tokens_freed"], 130);
+        assert_eq!(value["usage"]["input_tokens"], 1_500);
+        assert_eq!(value["usage"]["output_tokens"], 250);
+        assert_eq!(value["usage"]["total_tokens"], 1_750);
         assert!(super::take_headless_compactions().is_none());
+    }
+
+    #[test]
+    fn compaction_event_is_a_typed_stream_json_record() {
+        // mini-agent-sskdu.243
+        let event = super::compaction_event(
+            4,
+            90,
+            crate::event::UsageDelta {
+                input_tokens: 10,
+                output_tokens: 3,
+                total_tokens: 13,
+                ..Default::default()
+            },
+        );
+        assert_eq!(event["type"], "compaction");
+        assert_eq!(event["messages"], 4);
+        assert_eq!(event["tokens_freed"], 90);
+        assert_eq!(event["usage"]["total_tokens"], 13);
+        // The Claude-schema mapper passes it through unchanged.
+        assert_eq!(super::claude_stream_records(event.clone()), vec![event]);
     }
 
     use super::{Path, normalize_tool_path};

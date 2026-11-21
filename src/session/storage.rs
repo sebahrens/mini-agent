@@ -1061,6 +1061,32 @@ pub(crate) fn precompact_path(session_id: &str, number: usize) -> anyhow::Result
     Ok(session_dir().join(format!("{session_id}.precompact-{number}.jsonl")))
 }
 
+/// The messages compaction number `number` replaced, read back from its
+/// sidecar (mini-agent-sskdu.244). Bounded by the session size limit; a line
+/// that does not parse refuses the whole file rather than restoring a part.
+pub(crate) fn read_precompact(
+    session_id: &str,
+    number: usize,
+) -> anyhow::Result<Vec<crate::session::SessionMessage>> {
+    let path = precompact_path(session_id, number)?;
+    let file = crate::fs::open_private_file(&path)
+        .map_err(|error| anyhow::anyhow!("no saved transcript at {}: {error}", path.display()))?;
+    let mut body = String::new();
+    file.take(MAX_SESSION_BYTES as u64 + 1)
+        .read_to_string(&mut body)?;
+    anyhow::ensure!(
+        body.len() <= MAX_SESSION_BYTES,
+        "saved transcript exceeds the session size limit"
+    );
+    body.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str(line)
+                .map_err(|error| anyhow::anyhow!("saved transcript is corrupt: {error}"))
+        })
+        .collect()
+}
+
 /// Write the transcript the latest compaction replaced to its sidecar so a bad
 /// summary can be repaired from the original. Best effort: a failure becomes a
 /// notice and never blocks the save. Retention follows the session: deleting
@@ -1946,6 +1972,62 @@ mod readonly_import_tests {
         std::fs::remove_file(&path).unwrap();
         symlink(root.path().join("outside.json"), &path).unwrap();
         assert!(load_session_exact_read_only(&sessions, &original.id, &workspace).is_err());
+    }
+
+    /// mini-agent-sskdu.244: the sidecar really lands on disk, and the newest
+    /// compaction can be reversed from it.
+    #[test]
+    fn precompact_sidecar_is_written_to_disk_and_undo_restores_the_transcript() {
+        let root = crate::tests::OwnedTestDirectory::new("session-precompact-undo");
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            (
+                "MINI_AGENT_STATE_DIR",
+                Some(root.path().join("state").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_CONFIG_DIR",
+                Some(root.path().join("config").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_DATA_DIR",
+                Some(root.path().join("data").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_CACHE_DIR",
+                Some(root.path().join("cache").into_os_string()),
+            ),
+        ]);
+        let mut session = Session::new("openai", "gpt-4", 128_000, "");
+        for (role, text) in [
+            (crate::session::MessageRole::User, "first"),
+            (crate::session::MessageRole::Assistant, "second"),
+            (crate::session::MessageRole::User, "kept"),
+        ] {
+            session.add_message(role, text);
+        }
+        session.compress("summary".into(), 2, 0);
+        assert_eq!(session.messages.len(), 2);
+        save_session_recovering(&mut session, |_| {}).unwrap();
+        let path = precompact_path(&session.id, 1).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(body.lines().count(), 2, "{body}");
+        assert!(body.contains("first") && body.contains("second") && !body.contains("kept"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0);
+        }
+
+        let replaced = read_precompact(&session.id, 1).unwrap();
+        // A sidecar that does not match the record is refused untouched.
+        let mut mismatched = session.clone();
+        assert!(mismatched.undo_last_compaction(replaced[..1].to_vec()).is_err());
+        assert_eq!(mismatched.messages.len(), 2);
+        assert_eq!(session.undo_last_compaction(replaced).unwrap(), 2);
+        let texts: Vec<&str> = session.messages.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(texts, ["first", "second", "kept"]);
+        assert!(session.compactions.is_empty());
+        assert!(session.undo_last_compaction(Vec::new()).is_err());
     }
 
     #[test]

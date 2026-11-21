@@ -1237,7 +1237,11 @@ async fn compact_headless_session(
             "compacted {} messages into a summary (freed ~{freed} tokens net)",
             compacted.first_kept_index,
         );
-        crate::print::record_headless_compaction(compacted.first_kept_index, freed);
+        crate::print::record_headless_compaction(
+            compacted.first_kept_index,
+            freed,
+            compacted.usage,
+        );
     }
     Ok((
         compacted

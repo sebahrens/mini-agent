@@ -454,6 +454,69 @@ pub fn undo_last(session: &mut Session) -> usize {
     session.rewind_to(start)
 }
 
+/// `/compact undo`: restore the transcript the newest compaction replaced from
+/// its sidecar (mini-agent-sskdu.244). Not available on native Anthropic
+/// sessions, whose replay history is bound to the compacted feed.
+pub(super) fn undo_compaction(ctx: &mut SlashCtx<'_>) {
+    if *ctx.is_running {
+        write_error(ctx.renderer, "wait for the current turn to finish before /compact undo");
+        return;
+    }
+    if ctx.cfg.is_anthropic_native(&ctx.session.provider) {
+        write_error(
+            ctx.renderer,
+            "/compact undo is not available on native Anthropic sessions: their replay history is bound to the compacted transcript",
+        );
+        return;
+    }
+    let number = ctx.session.compaction_count();
+    if ctx.session.compactions.is_empty() {
+        write_ok(ctx.renderer, "no compaction to undo");
+        return;
+    }
+    let replaced = match ctx.session.pending_precompact.take() {
+        Some((pending, messages)) if pending == number => Ok(messages),
+        other => {
+            ctx.session.pending_precompact = other;
+            crate::session::storage::read_precompact(&ctx.session.id, number)
+        }
+    };
+    let previous = ctx.session.clone();
+    let restored = replaced.and_then(|messages| ctx.session.undo_last_compaction(messages));
+    let count = match restored {
+        Ok(count) => count,
+        Err(error) => {
+            *ctx.session = previous;
+            write_error(ctx.renderer, format!("cannot undo the compaction: {error:#}"));
+            return;
+        }
+    };
+    if !ctx.cli.no_session
+        && let Err(error) = crate::session::storage::save_session_recovering(ctx.session, |notice| {
+            write_error(ctx.renderer, format!("warning: {notice}"))
+        })
+    {
+        *ctx.session = previous;
+        write_error(ctx.renderer, format!("failed to save the restored session: {error:#}"));
+        return;
+    }
+    if let Err(error) = crate::ui::events::render_session(
+        ctx.renderer,
+        ctx.session,
+        ctx.cli,
+        ctx.cfg,
+        ctx.context,
+    ) {
+        write_error(ctx.renderer, format!("could not redraw the session: {error:#}"));
+    }
+    write_ok(
+        ctx.renderer,
+        format!(
+            "restored {count} messages from the saved transcript; file checkpoints of the summarized turns stay retired"
+        ),
+    );
+}
+
 pub(super) fn show_compaction_summary(renderer: &mut Renderer, session: &Session) {
     let Some(summary) = session.compacted_context().0 else {
         write_result(renderer, "no active compaction summary");

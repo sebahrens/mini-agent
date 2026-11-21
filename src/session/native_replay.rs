@@ -1321,6 +1321,21 @@ mod tests {
         .unwrap()
     }
 
+    /// mini-agent-sskdu.244: `/compact undo` refuses under a native history.
+    #[test]
+    fn compaction_undo_refuses_a_session_with_a_native_history() {
+        let mut session = super::super::Session::new("anthropic", "claude-opus-5-5", 32_000, "");
+        session.add_message(super::super::MessageRole::User, "literal user");
+        session.add_message(super::super::MessageRole::Assistant, "done");
+        session.store_native_history(plain_history()).unwrap();
+        session.compress("summary".into(), 1, 0);
+        let replaced = session.pending_precompact.clone().unwrap().1;
+        let before = serde_json::to_vec(&session).unwrap();
+        let error = session.undo_last_compaction(replaced).unwrap_err();
+        assert!(error.to_string().contains("native"), "{error}");
+        assert_eq!(serde_json::to_vec(&session).unwrap(), before);
+    }
+
     /// mini-agent-sskdu.265: a native Anthropic session forks compaction from
     /// its native wire history, cut before the prompt at the compaction cut.
     #[test]

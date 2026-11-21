@@ -1777,10 +1777,14 @@ compaction, before the first summarizer request of either path.
 Compaction is otherwise irreversible, so each committed compaction also writes the
 transcript it replaced to `<session id>.precompact-<n>.jsonl` beside the session file
 (private permissions, one persisted message per line; the newest five are kept and all
-go when the session is deleted or pruned by `session_retention_days`). To recover from
-a bad summary, copy the sidecar's records back into the `messages` array of the session
-JSON, ahead of the kept messages, and remove the unwanted `compactions` entry. There is
-no `/compact undo`: restoring in place would conflict with native replay publication.
+go when the session is deleted or pruned by `session_retention_days`). `/compact undo`
+(TUI) swaps the newest compaction's summary back for its sidecar's records and removes
+that compaction record, while the summary is still the first record and the sidecar
+exists. It is refused on native Anthropic sessions, whose replay history is bound to the
+compacted transcript, and while a turn is running. Rewind checkpoints of the summarized
+turns stay retired (their files cannot be restored), and a restored session that is still
+over budget compacts again on the next turn. Headless and ACP sessions can copy the
+sidecar's records back into the session JSON by hand.
 
 Compaction is paid for like any other completion. The summarizer runs on the
 session's model (or on `compaction_model` when set, at that model's prices), so the usage of every rolling request is summed and charged to
