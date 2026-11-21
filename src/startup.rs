@@ -4023,6 +4023,34 @@ fn apply_goal_flags(cli: &Cli, cfg: &config::Config, session: &Session) -> anyho
         .map(str::trim)
         .filter(|o| !o.is_empty())
     else {
+        if cli.goal_args.goal_resume {
+            if cli.resolve_no_tools(cfg) {
+                anyhow::bail!("a goal needs the goal_report tool; remove --no-tools");
+            }
+            let max_rounds = cli.goal_args.goal_max_rounds;
+            let resumed = session.goal_store.with_mut(|goal| {
+                if let Some(max_rounds) = max_rounds {
+                    goal.bounds.max_rounds = max_rounds.max(1);
+                }
+                goal.resume()
+            });
+            return match resumed {
+                Some(true) => Ok(()),
+                Some(false) => anyhow::bail!(
+                    "the session's goal is finished and cannot resume; start a new one with --goal"
+                ),
+                None => anyhow::bail!("--goal-resume needs a session with a goal (use --continue)"),
+            };
+        }
+        // The answer to a goal's question is what it was waiting for, as in
+        // the terminal: with a prompt given, the goal resumes.
+        if !cli.message.is_empty() {
+            session.goal_store.with_mut(|goal| {
+                if goal.status == crate::extras::goal::GoalStatus::AwaitingUser {
+                    goal.resume();
+                }
+            });
+        }
         if has_live_goal && cli.resolve_no_tools(cfg) {
             anyhow::bail!(
                 "this session has an unfinished goal, which needs the goal_report tool; \
@@ -5053,6 +5081,7 @@ async fn run_headless_goal_rounds_inner(
                 &session.provider,
                 &session.model,
             );
+            session.goal_store.record_judge(judge.as_ref());
             // The round that just ran is persisted after the gate settles, so
             // the session does not contain it yet and the judge would be shown
             // every round except the one it was asked about. The turn's own

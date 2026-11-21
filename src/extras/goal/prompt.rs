@@ -36,6 +36,13 @@ verification rather than ending the goal.\n\
 objective cannot be satisfied as written, and `needs_user` when you need an answer to continue.\n\
 - Do not narrow the objective to something smaller or easier to verify than what was asked.";
 
+/// The rules for a goal that is parked (paused, blocked, awaiting the user or
+/// out of budget). `goal_report` is not available or not accepted until it
+/// runs again, so telling the model to call it would only cost it a failed call.
+const PARKED_RULES: &str = "This goal is parked and is not being worked on right now. \
+Answer the user's messages normally. Do not call goal_report, and do not continue the \
+goal's work unless the user asks for it.";
+
 /// Render the preamble block for a goal, or `None` when it is finished.
 pub fn goal_block(goal: Option<&Goal>) -> Option<String> {
     let goal = goal.filter(|g| !g.status.is_terminal())?;
@@ -53,7 +60,13 @@ pub fn goal_block(goal: Option<&Goal>) -> Option<String> {
         }
     }
     out.push_str("\n</goal>\n");
-    out.push_str(GOAL_RULES);
+    // The rules differ between a running and a parked goal, so the block
+    // changes at park and resume; both are rebuild points already.
+    out.push_str(if goal.status.is_running() {
+        GOAL_RULES
+    } else {
+        PARKED_RULES
+    });
     Some(out)
 }
 
@@ -128,7 +141,6 @@ mod tests {
             evidence: Vec::new(),
             at: compact_str::CompactString::new("now"),
         });
-        g.set_status(GoalStatus::Blocked, None);
 
         assert_eq!(
             goal_block(Some(&g)).expect("still live"),
@@ -162,10 +174,12 @@ mod tests {
         ] {
             let mut g = goal();
             g.set_status(status, None);
+            let block = goal_block(Some(&g)).expect("a parked goal keeps its block");
             assert!(
-                goal_block(Some(&g)).is_some(),
-                "{status:?} must keep the block"
+                !block.contains("Call goal_report"),
+                "{status:?} must not tell the model to call a tool that refuses: {block}"
             );
+            assert!(block.contains("parked"), "{block}");
         }
     }
 
@@ -228,7 +242,9 @@ impl<M: rig::completion::CompletionModel> rig::agent::AgentHook<M> for GoalRemin
         let Some(goal) = self.store.snapshot() else {
             return rig::agent::Flow::cont();
         };
-        if goal.status.is_terminal() {
+        // Only a running goal accepts goal_report; a parked one must not be
+        // reminded to call it.
+        if !goal.status.is_running() {
             return rig::agent::Flow::cont();
         }
         let seen = ctx.scratchpad().update(|count: &mut ReminderCount| {

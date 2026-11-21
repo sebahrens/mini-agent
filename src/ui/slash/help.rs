@@ -404,7 +404,7 @@ pub(crate) fn help_lines(
         );
         emit(
             false,
-            "  /goal status           objective, round, verification and last check",
+            "  /goal status           objective, round, bounds, verification and last decision",
         );
         emit(
             false,

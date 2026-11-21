@@ -973,12 +973,19 @@ fn loop_control_while_running(_text: &str) -> bool {
     false
 }
 
-/// `/goal status` and `/goal pause`, and only those two.
+/// `/goal status`, `pause`, `bounds` and `check`: the verbs that only read or
+/// edit the goal record. `resume`, `reopen`, `clear` and a new objective wait.
 #[cfg(feature = "goal")]
 fn goal_control_while_running(text: &str) -> bool {
     matches!(
         text.split_whitespace().collect::<Vec<_>>().as_slice(),
-        ["/goal", "status"] | ["/goal", "pause"] | ["/goal"]
+        ["/goal", "status"]
+            | ["/goal", "pause"]
+            | ["/goal"]
+            // These only edit the record the gate reads at the next round
+            // boundary, so they are safe while a round runs.
+            | ["/goal", "bounds", ..]
+            | ["/goal", "check", ..]
     )
 }
 
@@ -1370,8 +1377,10 @@ pub(crate) async fn start_main_run_with_directive(
         || ui.session.native_history_snapshot().is_some();
     #[cfg(feature = "goal")]
     anyhow::ensure!(
-        !native || !ui.session.goal_store.is_live(),
-        "native automatic goal work requires its round publication owner; the input is retained"
+        !native || !ui.session.goal_store.is_active(),
+        "a goal is running, and the direct Anthropic route cannot drive automatic goal rounds; \
+         the input is retained. Run /goal pause or /goal clear, or switch to a non-native \
+         provider route"
     );
     let mut native_owner = if native {
         let scope = crate::agent::runner::AgentWorkScope::new();
@@ -1393,7 +1402,7 @@ pub(crate) async fn start_main_run_with_directive(
     // `/goal resume` to get the work moving again.
     #[cfg(feature = "goal")]
     ui.session.goal_store.with_mut(|goal| {
-        if goal.status == crate::extras::goal::GoalStatus::AwaitingUser {
+        if !native && goal.status == crate::extras::goal::GoalStatus::AwaitingUser {
             goal.resume();
         }
     });

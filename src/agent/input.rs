@@ -63,7 +63,7 @@ impl PromptInput {
     pub(crate) fn first_request_tool(&self) -> Option<&'static str> {
         self.first_request_tool
     }
-    #[cfg(test)]
+    #[cfg(any(test, all(feature = "goal", feature = "acp")))]
     pub(crate) fn turn_directive(&self) -> Option<&str> {
         self.turn_directive.as_deref()
     }

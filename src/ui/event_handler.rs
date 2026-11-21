@@ -804,6 +804,28 @@ async fn run_goal_round(
     };
     let goal = ui.session.goal_store.snapshot();
     let Some(goal) = goal.filter(|g| g.status.is_running()) else {
+        // The goal was paused (or cleared) while this round ran. The round's
+        // cost is real and was charged to the session, so fold it into the
+        // goal's counters without a gate decision; otherwise `tokens:` and
+        // `max_tokens` undercount.
+        if let Some(parked) = ui.session.goal_store.snapshot()
+            && !parked.status.is_terminal()
+        {
+            let spent = collector.finish(&parked, gate::RoundEnd::Done, 0);
+            ui.session.goal_store.with_mut(|goal| {
+                goal.progress.tokens_used =
+                    goal.progress.tokens_used.saturating_add(spent.tokens_used);
+                goal.progress.active_secs = goal
+                    .progress
+                    .active_secs
+                    .saturating_add(spent.active.as_secs());
+                goal.touch();
+            });
+            renderer.write_line(
+                "goal: the round that was running when you paused finished; its cost was counted",
+                C_AGENT,
+            )?;
+        }
         return Ok(false);
     };
 
@@ -868,6 +890,7 @@ async fn start_goal_verification(
         &ui.session.provider,
         &ui.session.model,
     );
+    ui.session.goal_store.record_judge(judge.as_ref());
     let transcript = crate::extras::goal::judge::transcript_tail(ui.session);
     let spend =
         crate::spend::run::Run::for_session(ui.session, ui.cfg, crate::spend::RequestKind::Judge);
