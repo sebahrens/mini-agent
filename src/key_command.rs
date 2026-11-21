@@ -639,12 +639,59 @@ pub(crate) async fn run_with(
 
 static REGISTRY: RwLock<Option<HashMap<String, Arc<CommandCredential>>>> = RwLock::new(None);
 
+/// Test-only registry ownership: a test that installs entries claims the
+/// registry, and `configure` calls from other threads (startup or diagnostics
+/// helpers run by unrelated tests) then leave it untouched.
+#[cfg(test)]
+pub(crate) mod test_turn {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static CLAIMED: AtomicBool = AtomicBool::new(false);
+    thread_local! {
+        static OWNER: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn claimed_by_another_thread() -> bool {
+        CLAIMED.load(Ordering::SeqCst) && !OWNER.with(Cell::get)
+    }
+
+    pub(crate) struct Turn(#[allow(dead_code)] tokio::sync::MutexGuard<'static, ()>);
+
+    static TURNS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn claim(guard: tokio::sync::MutexGuard<'static, ()>) -> Turn {
+        OWNER.with(|owner| owner.set(true));
+        CLAIMED.store(true, Ordering::SeqCst);
+        Turn(guard)
+    }
+
+    pub(crate) fn blocking() -> Turn {
+        claim(TURNS.blocking_lock())
+    }
+
+    pub(crate) async fn acquire() -> Turn {
+        claim(TURNS.lock().await)
+    }
+
+    impl Drop for Turn {
+        fn drop(&mut self) {
+            CLAIMED.store(false, Ordering::SeqCst);
+            OWNER.with(|owner| owner.set(false));
+        }
+    }
+}
+
 /// Installs the configured `api_key_commands`. An unchanged entry keeps its
 /// cached credential. An invalid entry is an error naming it (never its
 /// arguments).
 pub(crate) fn configure(specs: Option<&HashMap<String, ApiKeyCommandSpec>>) -> Result<(), String> {
     let mut next = HashMap::new();
     let mut registry = REGISTRY.write().unwrap_or_else(|error| error.into_inner());
+    #[cfg(test)]
+    if test_turn::claimed_by_another_thread() {
+        return Ok(());
+    }
     for (provider, spec) in specs.into_iter().flatten() {
         spec.validate(provider)?;
         let key = provider.to_ascii_lowercase();
@@ -842,12 +889,9 @@ mod tests {
         );
     }
 
-    /// The registry is process-global: tests that install entries take turns.
-    static REGISTRY_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     #[test]
     fn configure_rejects_invalid_entries_and_looks_providers_up_case_insensitively() {
-        let _turn = REGISTRY_TESTS.blocking_lock();
+        let _turn = super::test_turn::blocking();
         let mut specs = HashMap::new();
         specs.insert("Gateway-X".to_owned(), spec("echo t"));
         configure(Some(&specs)).unwrap();
@@ -873,7 +917,7 @@ mod tests {
     #[test]
     fn credential_commands_are_closed_by_default_and_rank_below_the_cli_key() {
         use crate::auth::{AuthResolver, CredentialSource, ProviderKind};
-        let _turn = REGISTRY_TESTS.blocking_lock();
+        let _turn = super::test_turn::blocking();
         let resolver = || {
             AuthResolver::new(ProviderKind::OpenAI)
                 .with_custom_provider_name(Some("prio-gw"))
@@ -1092,7 +1136,7 @@ mod tests {
     async fn an_expired_token_is_refreshed_once_on_401_and_the_request_succeeds() {
         use futures::StreamExt as _;
         use rig::completion::CompletionModel as _;
-        let _turn = REGISTRY_TESTS.lock().await;
+        let _turn = super::test_turn::acquire().await;
         let dir = crate::tests::OwnedTestDirectory::new("key-command-refresh");
         let (base, seen) = token_server("rot-2", 3).await;
         let mut specs = HashMap::new();
@@ -1138,7 +1182,7 @@ mod tests {
     #[tokio::test]
     async fn an_unchanged_token_after_refresh_surfaces_the_401_without_a_resend() {
         use rig::completion::CompletionModel as _;
-        let _turn = REGISTRY_TESTS.lock().await;
+        let _turn = super::test_turn::acquire().await;
         let dir = crate::tests::OwnedTestDirectory::new("key-command-same");
         let (base, seen) = token_server("never", 3).await;
         let mut specs = HashMap::new();
@@ -1174,7 +1218,7 @@ mod tests {
     #[tokio::test]
     async fn an_expired_ttl_refreshes_before_the_request() {
         use rig::completion::CompletionModel as _;
-        let _turn = REGISTRY_TESTS.lock().await;
+        let _turn = super::test_turn::acquire().await;
         let dir = crate::tests::OwnedTestDirectory::new("key-command-ttl-live");
         let (base, seen) = token_server("ttl-2", 1).await;
         let mut spec = counting_command(dir.path(), "ttl", true);
@@ -1357,7 +1401,7 @@ mod tests {
         use crate::tests::support::loopback_http::asynchronous as http;
         use futures::StreamExt as _;
         use rig::completion::CompletionModel as _;
-        let _turn = REGISTRY_TESTS.lock().await;
+        let _turn = super::test_turn::acquire().await;
         let dir = crate::tests::OwnedTestDirectory::new("gemini-initial-query-encoding");
         for (index, secret) in ["a+b", "a&b=c", "a#b", "a%b", "a b", "a?b/ü"]
             .into_iter()
@@ -1478,7 +1522,7 @@ mod tests {
     async fn gemini_query_string_key_is_refreshed_and_renewed_on_401() {
         use crate::tests::support::loopback_http::asynchronous as http;
         use rig::completion::CompletionModel as _;
-        let _turn = REGISTRY_TESTS.lock().await;
+        let _turn = super::test_turn::acquire().await;
         let dir = crate::tests::OwnedTestDirectory::new("key-command-gemini");
         let (listener, base) = http::bind().await;
         let seen = Arc::new(Mutex::new(Vec::<String>::new()));
