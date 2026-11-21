@@ -31,6 +31,11 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Added: edit/write diff previews carry a line-number gutter (old line for deletions, new line otherwise); stored previews without numbers render as before (mini-agent-nvnkx.257, intra-line highlighting not yet).
 - Added: replacing a file keeps its group and extended attributes (ACLs on Linux) and tells the model when other hard links keep the previous content (mini-agent-nvnkx.193).
 - Added: a failed format-after-edit command reports its exit status or signal to the model, logs and notifies the user with a stderr tail once per extension, and is skipped after three consecutive failures (mini-agent-nvnkx.246).
+- Added: steering keeps a bounded queue (64 KiB in total) instead of one pending message; every queued message is delivered at the next settled tool batch as its own user message, in order (mini-agent-nvnkx.18).
+- Added: a headless turn announces a provider retry as a stderr line (text mode) or a `retry` stream-json event with the attempt, limit, delay and reason (mini-agent-nvnkx.17).
+- Added: an interrupted headless run (SIGINT, SIGTERM or a control-channel interrupt) reports `stop_reason: "interrupted"` with `is_error: true`, the text produced so far plus a cut-short marker in `result`, and exits 130 (SIGINT) or 143 (SIGTERM) (mini-agent-nvnkx.158).
+- Added: a job id from an earlier process of the session answers that the job started in an earlier process and is no longer running, and names its output log when it still exists (mini-agent-nvnkx.315).
+- Added: ACP answers `max_turn_requests` for a spent turn cap and `max_tokens` for a spent token budget or a final answer cut off at the output limit, instead of a JSON-RPC internal error or `end_turn`; the explanation arrives as a thought chunk (mini-agent-nvnkx.273).
 
 ### Fixed
 
@@ -173,6 +178,19 @@ Notable changes to mini-agent are documented in this file. The format follows
 - A UTF-8 byte-order mark is preserved across read, hashedit/similarity edits of line 1 and write overwrite (mini-agent-nvnkx.23).
 - `read` treats NUL bytes in the first 8 KiB of an otherwise valid UTF-8 file as binary, like `grep` (mini-agent-nvnkx.25).
 - Diff previews use a linear-space Myers diff and split distant changes into hunks, so large rewrites no longer fall back to a coarse delete/re-add preview; the input cap is 16 MiB (mini-agent-nvnkx.247).
+- Fixed: a cancelled ACP turn that already ran tools keeps the prompt, the completed calls and results (calls without a result closed as unknown) and an interruption marker in history; the runner reports them before it stops (mini-agent-nvnkx.272).
+- Fixed: stored OpenAI provider item ids and reasoning replay only on the provider (and, for encrypted blocks, the model) that issued them, so `/model` to another provider no longer sends `rs_`/`fc_` items to it; the history cache is keyed by provider and model (mini-agent-nvnkx.161).
+- Fixed: context-length errors from llama.cpp (`exceed_context_size_error`), LM Studio and xAI (`maximum prompt length`) are recognised, so they get the `/compress` hint, are not retried and trigger compaction (mini-agent-nvnkx.37).
+- Fixed: a resumed subagent keeps its whole conversation (the returned history starts with the history it was given), so a second resume and a `SubagentStop` continuation see the earlier tool results (mini-agent-nvnkx.10).
+- Fixed: a subagent that fails on a stream error, or finishes with no final text after tool work, keeps its history, tool log and turns; the empty-final case gets the tool-free write-up used for an exhausted turn budget (mini-agent-nvnkx.15, .14).
+- Fixed: images kept across a compaction are sent as identity lines to a model the catalog marks as having no image input, and `/model` says so once (mini-agent-nvnkx.297).
+- Fixed: headless mid-turn pressure counts the completion's output and the estimated results just appended, and falls back to the session estimate when the provider reports no usage; the TUI and ACP count the completion's output (mini-agent-nvnkx.164).
+- Fixed: a turn whose tool work is done but whose final text is empty gets one nudge and then ends normally with `(no closing message)` instead of failing; the empty-response counter resets on text or a tool call (mini-agent-nvnkx.13).
+- Fixed: a verification retry or blocking `Stop` hook starts the response over, so the turn's result is the last answer, not two answers glued together; headless text mode separates them with a newline (mini-agent-nvnkx.12).
+- Fixed: output-truncation continuation instructions are host rows; the TUI stores a host instruction when it happens (after the answer it followed, before the work it caused) and headless runs persist verification, hook and truncation instructions between the two answers (mini-agent-nvnkx.11).
+- Fixed: the steering checkpoint failure reports the messages of every stream of the turn, not just the current one (mini-agent-nvnkx.16).
+- Fixed: a call that completed and was reported is no longer recorded as "outcome unknown" when the user interrupts before the UI read its result event (mini-agent-nvnkx.166).
+- Fixed: the loop guard lets an identical failing call run again after a `job_status` poll or eight other tool results, so polling for a port, CI run or lock is not blocked for the rest of the turn (mini-agent-nvnkx.19).
 
 ### Added
 

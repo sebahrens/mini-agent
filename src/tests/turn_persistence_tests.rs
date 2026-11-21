@@ -405,10 +405,28 @@ fn host_continuation_instruction_is_a_system_row_in_both_frontends() {
     );
     assert_eq!(headless.messages[2].content, instruction);
 
+    // The TUI stores the row when the runner announces it (mini-agent-nvnkx.11),
+    // after the answer it followed and before the work it caused.
     let mut tui = session();
+    crate::ui::event_handler::record_host_instruction(&mut tui, "done", &instruction);
+    tui.add_tool_call_with_id("c1", "edit", &serde_json::json!({"path": "a.rs"}));
+    tui.add_tool_result_with_id("c1", "edit", "ok");
     crate::ui::event_handler::commit_turn_response(&mut tui, "fixed", &interactions);
-    assert_eq!(roles(&tui), [MessageRole::System, MessageRole::Assistant]);
-    assert_eq!(tui.messages[0].content, instruction);
+    assert_eq!(
+        roles(&tui),
+        [
+            MessageRole::Assistant,
+            MessageRole::System,
+            MessageRole::ToolCall,
+            MessageRole::ToolResult,
+            MessageRole::Assistant
+        ]
+    );
+    assert_eq!(tui.messages[1].content, instruction);
+    // ...and replays in that order.
+    let replay = crate::agent::runner::convert_history(&tui);
+    assert!(matches!(&replay[1], Message::User { content }
+        if matches!(content.first(), UserContent::Text(text) if text.text == instruction)));
 }
 
 // mini-agent-sskdu.190: host context (job output tails, hook context, memory

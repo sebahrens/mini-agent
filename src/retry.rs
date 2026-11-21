@@ -621,6 +621,20 @@ pub fn is_context_length_error_message(message: &str) -> bool {
                 || lower.contains("too large")))
         || (lower.contains("context limit")
             && (lower.contains("exceed") || lower.contains("too long")))
+        // llama.cpp server: "the request exceeds the available context size"
+        // (type `exceed_context_size_error`).
+        || lower.contains("exceed_context_size_error")
+        || (lower.contains("context size") && lower.contains("exceed"))
+        // LM Studio: "the model is loaded with context length of only N
+        // tokens" / "tokens to keep from the initial prompt is greater than
+        // the context length".
+        || (lower.contains("context length")
+            && (lower.contains("only")
+                || lower.contains("greater than")
+                || lower.contains("exceed")))
+        // xAI: "This model's maximum prompt length is N but the request
+        // contains M tokens".
+        || lower.contains("maximum prompt length")
 }
 
 /// The user-facing text of a terminal provider error: the message plus
@@ -1600,6 +1614,10 @@ mod tests {
             "Gemini INVALID_ARGUMENT: The input token count (1200000) exceeds the maximum number of tokens allowed (1048576).",
             "Bedrock ValidationException: Input is too long for requested model.",
             "Copilot 400 model_max_prompt_tokens_exceeded: prompt token count of 140000 exceeds the limit of 128000",
+            r#"{"error":{"code":400,"message":"the request exceeds the available context size, try increasing it","type":"exceed_context_size_error","n_prompt_tokens":9000,"n_ctx":4096}}"#,
+            "LM Studio: Trying to keep the first 6269 tokens when context overflows. However, the model is loaded with context length of only 4096 tokens, which is not enough.",
+            "LM Studio: tokens to keep from the initial prompt is greater than the context length",
+            "xAI 400: This model's maximum prompt length is 131072 but the request contains 150000 tokens.",
         ] {
             assert!(
                 is_context_length_error_message(message),
@@ -1609,6 +1627,13 @@ mod tests {
         assert!(!is_context_length_error_message(
             "HTTP 400: invalid temperature"
         ));
+        assert!(!is_context_length_error_message(
+            "HTTP 400: unsupported context type for this request"
+        ));
+        let local = "the request exceeds the available context size";
+        let err = io::Error::other(local);
+        assert!(!is_retryable(&err));
+        assert!(with_context_length_hint(local).contains("/compress"));
     }
 
     #[test]

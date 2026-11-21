@@ -66,6 +66,9 @@ call is interrupted before either happens, the job is stopped. At most
 `shell-max-background-jobs` (default 8, maximum 64) jobs run at once; when the
 table is full an explicit `background = true` call fails naming the key, while
 an `auto_background` call simply runs as an ordinary foreground command.
+Job records live in memory: after `--continue`/`--resume` or a restart a `job-<uuid>` id from an
+earlier process answers that the job was started by an earlier process of the session and is no
+longer running, and names its output log when that log still exists.
 
 On Unix every model shell, background and pty command also runs with
 `RLIMIT_CORE=0` (no core files), `RLIMIT_NPROC` from `shell-max-processes`
@@ -1118,7 +1121,9 @@ read-loop guard (`is_evidence_read`, `invalidates_evidence`). Listed read-only a
 `lsp_diagnostics`, MCP resource tools, `ask_user_question`, `schedule_wakeup`) never count as
 mutations; anything else, including MCP tools, is treated as mutating. A completed mutating call also
 resets the identical-failure counters of `ToolLoopGuard`, so a call that failed before an edit can run
-again after it.
+again after it. After three identical failures the call is also allowed again once a `job_status`
+poll has run or eight other tool results have followed, so a call that depends on time (a port
+opening, a CI run, a lock) is not blocked for the rest of the turn.
 
 ### Host messages, interrupts and live rows
 
@@ -1907,9 +1912,10 @@ memory mutation. See [Subagents](SUBAGENTS.md#opt-in-implementation-personas).
 
 ### Mid-turn steering
 
-In the interactive UI, `/steer <message>` holds one pending text message (up to
-64 KiB) for the next settled tool batch. It does not interrupt tools or start a
-second turn. The runner runs `UserPromptSubmit` at that boundary, appends accepted
+In the interactive UI, `/steer <message>` holds pending text messages (up to
+64 KiB in total, queued in order) for the next settled tool batch. It does not
+interrupt tools or start a second turn; every queued message is appended as its
+own user message at that boundary. The runner runs `UserPromptSubmit` at that boundary, appends accepted
 context notices and the user message to the SDK's canonical transcript, and
 reports delivery before the next completion request. Later requests and saved
 sessions retain that message exactly once. A blocked hook reports its reason.
@@ -1920,7 +1926,7 @@ steer instead; `running_input = "queue"` preserves the default. Commands and
 attachments keep their existing handling. Steering has no headless or ACP input
 surface and grants no additional tool permission.
 
-`src/agent/steering.rs` owns the bounded invocation-local slot and hook. The
+`src/agent/steering.rs` owns the bounded invocation-local queue and hook. The
 patched SDK's `RequestPatch::append_input` adds ordinary text to the real run
 state before request preparation; unlike `RequestPatch::history`, it is durable
 canonical input rather than a one-request history replacement.

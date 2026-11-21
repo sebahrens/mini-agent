@@ -3865,6 +3865,11 @@ impl Startup {
                     .is_some()
             }) {
                 crate::print::HeadlessStopReason::Budget
+            } else if failure
+                .as_ref()
+                .is_some_and(crate::agent::runner::is_headless_interrupt)
+            {
+                crate::print::HeadlessStopReason::Interrupted
             } else if failure.is_some() || persistence_failure.is_some() {
                 crate::print::HeadlessStopReason::Failed
             } else if schema_outcome.exhausted {
@@ -3885,9 +3890,15 @@ impl Startup {
                     crate::print::HeadlessStopReason::Completed
                 }
             };
+            let result_text =
+                if matches!(stop_reason, crate::print::HeadlessStopReason::Interrupted) {
+                    crate::print::interrupted_result(&response)
+                } else {
+                    response.to_string()
+                };
             let rendered = crate::print::render_headless_json(
                 self.workspace.root(),
-                &response,
+                &result_text,
                 &reported_interactions,
                 json_usage,
                 files_changed,
@@ -4571,6 +4582,9 @@ async fn run_bound_headless_segment(
             window: session.context_window,
             threshold,
             anthropic_native: cfg.is_anthropic_native(&session.provider),
+            baseline_estimate: session
+                .effective_context_tokens()
+                .saturating_add(Session::estimate_tokens(message)),
         });
     let mut turn = heap_future(|| {
         crate::agent::runner::with_headless_mid_turn(
@@ -5654,6 +5668,9 @@ async fn relieve_headless_turn(
                     window: session.context_window,
                     threshold,
                     anthropic_native: cfg.is_anthropic_native(&session.provider),
+                    baseline_estimate: session
+                        .effective_context_tokens()
+                        .saturating_add(Session::estimate_tokens(&prompt)),
                 });
         let turn = crate::agent::runner::with_headless_budget_carry(
             budget_carry.clone(),

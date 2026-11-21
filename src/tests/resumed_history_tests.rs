@@ -150,11 +150,13 @@ async fn resumed_session_history_survives_stop_hook_continuation() {
     .await
     .expect("run_print should succeed against the fake model");
 
+    // The first answer was complete when the Stop hook blocked it, so the
+    // result is the answer to the continuation, not both glued together
+    // (mini-agent-nvnkx.12).
     assert_eq!(
-        response, "partial answerfinal answer",
+        response, "final answer",
         "the Stop-forced continuation must run to completion and the returned \
-         response must keep both turns' text (the first turn was already \
-         streamed to stdout), not just the second turn's"
+         response is the last answer"
     );
 
     // Guards the `retry_history` seed (runner.rs ~601, consumed by the
@@ -195,6 +197,7 @@ async fn resumed_session_reasoning_reaches_model_before_its_tool_call() {
                     data: "gAAAAABm-opaque".into(),
                 }],
             }],
+            ..Default::default()
         },
     );
     let expected_history = convert_history(&session);

@@ -179,6 +179,7 @@ fn compacted_session_with_provider_reasoning() -> Session {
                     data: "opaque-reasoning".into(),
                 }],
             }],
+            ..Default::default()
         },
     );
     session.add_message(MessageRole::Assistant, "finished");

@@ -635,6 +635,27 @@ fn partial_event(kind: &str, text: &str, truncated: bool) -> serde_json::Value {
     serde_json::json!({"type":kind, "message_id":current_message_id(), "text":text, "truncated":truncated})
 }
 
+/// The stream-json `retry` event of one provider retry.
+fn retry_event(
+    attempt: usize,
+    max: usize,
+    delay: std::time::Duration,
+    reason: &str,
+) -> serde_json::Value {
+    let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+    serde_json::json!({
+        "type":"retry", "attempt":attempt, "max_attempts":max,
+        "delay_ms":delay_ms, "reason":reason,
+    })
+}
+
+/// The stderr line of one provider retry (text mode). Headless runs have no
+/// "Esc to cancel".
+fn retry_line(attempt: usize, max: usize, delay: std::time::Duration, reason: &str) -> String {
+    let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+    crate::event::retry_notice_text(attempt, max, delay_ms, reason).replace(", Esc to cancel", "")
+}
+
 impl HeadlessOutputPolicy {
     pub(crate) fn from_cli(cli: &cli::Cli) -> Self {
         Self {
@@ -673,6 +694,24 @@ impl HeadlessOutputPolicy {
             } else {
                 headless_stdout_async(format!("{}\n", terminal_safe_json(&event))).await?;
             }
+        }
+        Ok(())
+    }
+
+    /// A provider retry, so a run waiting out a long `Retry-After` does not
+    /// look hung: a `retry` event in stream-json, a stderr line in text mode
+    /// (mini-agent-nvnkx.17).
+    pub(crate) async fn retry_notice(
+        self,
+        attempt: usize,
+        max: usize,
+        delay: std::time::Duration,
+        reason: &str,
+    ) -> anyhow::Result<()> {
+        self.emit_event(retry_event(attempt, max, delay, reason))
+            .await?;
+        if self.format == cli::OutputFormat::Text && !self.quiet {
+            headless_stderr_async(format!("{}\n", retry_line(attempt, max, delay, reason))).await?;
         }
         Ok(())
     }
@@ -1651,6 +1690,31 @@ pub(crate) const HEADLESS_FORCED_STOP_EXIT_CODE: i32 = 130;
 static HEADLESS_FORCED_STOP: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Exit status of an interrupted headless run: 128 plus the signal that
+/// interrupted it (130 for SIGINT or a control-channel interrupt, 143 for
+/// SIGTERM) (mini-agent-nvnkx.158).
+static HEADLESS_INTERRUPT_EXIT_CODE: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(HEADLESS_FORCED_STOP_EXIT_CODE);
+
+pub(crate) fn headless_interrupt_exit_code() -> i32 {
+    HEADLESS_INTERRUPT_EXIT_CODE.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Marker appended to the `result` of a run the operator cut short.
+pub(crate) const HEADLESS_INTERRUPTED_RESULT_MARKER: &str = "[interrupted: the run was cut short]";
+
+/// The `result` of an interrupted run: the text produced so far, then the marker.
+pub(crate) fn interrupted_result(partial: &str) -> String {
+    if partial.trim().is_empty() {
+        HEADLESS_INTERRUPTED_RESULT_MARKER.to_string()
+    } else {
+        format!(
+            "{}\n{HEADLESS_INTERRUPTED_RESULT_MARKER}",
+            partial.trim_end()
+        )
+    }
+}
+
 pub(crate) fn headless_force_stopped() -> bool {
     HEADLESS_FORCED_STOP.load(std::sync::atomic::Ordering::Acquire)
 }
@@ -1756,8 +1820,14 @@ impl HeadlessInterrupts {
                 terminate,
             } => {
                 tokio::select! {
-                    _ = interrupt.recv() => Ok(()),
-                    _ = terminate.recv() => Ok(()),
+                    _ = interrupt.recv() => {
+                        HEADLESS_INTERRUPT_EXIT_CODE.store(130, std::sync::atomic::Ordering::Release);
+                        Ok(())
+                    }
+                    _ = terminate.recv() => {
+                        HEADLESS_INTERRUPT_EXIT_CODE.store(143, std::sync::atomic::Ordering::Release);
+                        Ok(())
+                    }
                 }
             }
             #[cfg(not(unix))]
@@ -2140,6 +2210,8 @@ impl HeadlessGoal {
 pub(crate) enum HeadlessStopReason {
     Completed,
     Failed,
+    /// The operator interrupted the run (SIGINT or SIGTERM).
+    Interrupted,
     Budget,
     SchemaFailed,
     AwaitingUser,
@@ -2183,6 +2255,7 @@ impl HeadlessStopReason {
         match self {
             Self::Completed => 0,
             Self::Failed | Self::SchemaFailed | Self::Budget => 1,
+            Self::Interrupted => headless_interrupt_exit_code(),
             #[cfg(feature = "goal")]
             Self::GoalMet => 0,
             #[cfg(feature = "goal")]
@@ -2711,6 +2784,8 @@ fn persist_headless_turn_rows(
                                         .as_deref()
                                         .map(CompactString::new),
                                     reasoning: std::mem::take(&mut pending_reasoning),
+                                    route_provider: None,
+                                    route_model: None,
                                 },
                             );
                         }
@@ -3767,6 +3842,41 @@ mod headless_goal_tests {
 
 #[cfg(test)]
 mod tests {
+    // mini-agent-nvnkx.17
+    #[test]
+    fn a_retry_is_visible_as_a_stderr_line_and_a_stream_json_event() {
+        let delay = std::time::Duration::from_millis(30_000);
+        let line = super::retry_line(2, 5, delay, "rate limited");
+        assert!(line.contains("rate limited") && line.contains("30s") && line.contains("(2/5)"));
+        assert!(!line.contains("Esc"), "{line}");
+        let event = super::retry_event(2, 5, delay, "rate limited");
+        assert_eq!(event["type"], "retry");
+        assert_eq!(event["attempt"], 2);
+        assert_eq!(event["max_attempts"], 5);
+        assert_eq!(event["delay_ms"], 30_000);
+        assert_eq!(event["reason"], "rate limited");
+    }
+
+    // mini-agent-nvnkx.158
+    #[test]
+    fn an_interrupted_result_keeps_the_partial_text_and_marks_the_cut() {
+        use super::{HeadlessStopReason, interrupted_result};
+        assert_eq!(
+            interrupted_result("partial answer\n"),
+            "partial answer\n[interrupted: the run was cut short]"
+        );
+        assert_eq!(
+            interrupted_result("  "),
+            "[interrupted: the run was cut short]"
+        );
+        assert!(HeadlessStopReason::Interrupted.is_error());
+        assert_eq!(
+            serde_json::to_value(HeadlessStopReason::Interrupted).unwrap(),
+            "interrupted"
+        );
+        assert_eq!(super::headless_interrupt_exit_code(), 130);
+    }
+
     #[test]
     fn a_schema_repair_turn_is_a_system_note_not_a_user_prompt() {
         // mini-agent-sskdu.193

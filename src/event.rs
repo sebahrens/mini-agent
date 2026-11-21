@@ -204,6 +204,18 @@ pub enum AgentEvent {
         message: CompactString,
         interactions: Vec<rig::completion::Message>,
     },
+    /// Why the terminal event that follows ends the turn short, as a typed
+    /// reason a client maps to a protocol stop reason without matching message
+    /// text (mini-agent-nvnkx.273). Sent right before `Done` or `Error`.
+    StopCause(StopCause),
+    /// The run was cancelled (session/cancel, connection teardown). Carries the
+    /// transcript of the work that already happened, calls without a result
+    /// closed as unknown and a host marker, so a client can keep the prompt and
+    /// the effects in history instead of rolling the turn back
+    /// (mini-agent-nvnkx.272). Sent best-effort: a full channel drops it.
+    Interrupted {
+        interactions: Vec<rig::completion::Message>,
+    },
     /// Completed progress retained while the exact main turn waits for a new
     /// ordinary user message. This is data, never an approval or live reply.
     AwaitingUser {
@@ -222,6 +234,16 @@ pub enum AgentEvent {
     /// notice; the runner continues the turn or ends it as the message says.
     OutputTruncated {
         message: CompactString,
+    },
+    /// The runner starts a continuation with a host-authored instruction that
+    /// carries information (a failed verification, a blocking `Stop` hook, an
+    /// output-truncation notice). Clients that persist history as it streams
+    /// store it here, at the point it happened, instead of at commit
+    /// (mini-agent-nvnkx.11). `flush_response` means the answer streamed so
+    /// far was complete and is replaced, not continued, by the next stream.
+    HostInstruction {
+        text: CompactString,
+        flush_response: bool,
     },
     Verification {
         attempt: u32,
@@ -250,6 +272,18 @@ pub enum AgentEvent {
         /// never need to reconstruct model interactions from display events.
         interactions: Vec<rig::completion::Message>,
     },
+}
+
+/// Why a turn ended short of a normal completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopCause {
+    /// The agent used its whole per-prompt model-call budget.
+    TurnLimit,
+    /// The cumulative token budget of the turn was spent.
+    TokenBudget,
+    /// The provider cut the output off at its token limit and the automatic
+    /// continuations were spent.
+    OutputTruncated,
 }
 
 /// User-visible text for a provider retry, naming the actual wait so a

@@ -49,6 +49,15 @@ impl TurnStop {
         }
     }
 
+    /// The typed reason a client maps to a protocol stop reason.
+    pub(super) fn cause(&self) -> Option<crate::event::StopCause> {
+        match self {
+            Self::NonTerminalEof(_) => None,
+            Self::TurnBudget { .. } => Some(crate::event::StopCause::TurnLimit),
+            Self::TokenBudget(_) => Some(crate::event::StopCause::TokenBudget),
+        }
+    }
+
     /// The error a headless turn fails with. The typed non-terminal error is
     /// kept so a caller can still downcast it.
     pub(super) fn into_error(self) -> anyhow::Error {
@@ -96,7 +105,15 @@ pub(super) enum EmptyFinal {
     Abort,
     /// Ask the model to continue.
     Continue,
+    /// Tool work was delivered and the model stayed silent after one nudge:
+    /// end the turn successfully with [`NO_CLOSING_MESSAGE`] as its response
+    /// (mini-agent-nvnkx.13).
+    Complete,
 }
+
+/// The host note that stands in for a closing message when a model finished
+/// its tool work and then stayed silent.
+pub(super) const NO_CLOSING_MESSAGE: &str = "(no closing message)";
 
 /// A stream boundary that starts another stream.
 pub(super) struct Continuation {
@@ -123,7 +140,15 @@ pub(super) struct TurnState {
     /// An accepted `goal_report` ended the round (mini-agent-64qyf).
     pub(super) goal_report_accepted: bool,
     pub(super) workspace_may_have_changed: bool,
+    /// The final answer was cut off at the output-token limit and the
+    /// continuation budget is spent (mini-agent-nvnkx.273).
+    pub(super) output_cut_off: bool,
     empty_response_count: u32,
+    /// At least one tool result was delivered in this turn.
+    tool_results_delivered: bool,
+    /// The next stream starts a fresh answer (the previous one was complete),
+    /// so its text must not be appended to the previous final answer.
+    restart_response: bool,
     verification_attempt: u32,
     /// Overrides the default continuation message.
     pub(super) next_instruction: Option<String>,
@@ -152,7 +177,10 @@ impl TurnState {
             turn_token_budget,
             goal_report_accepted: false,
             workspace_may_have_changed: false,
+            output_cut_off: false,
             empty_response_count: 0,
+            tool_results_delivered: false,
+            restart_response: false,
             verification_attempt: 0,
             next_instruction: None,
             response: String::new(),
@@ -178,6 +206,9 @@ impl TurnState {
 
     /// Streamed assistant text.
     pub(super) fn on_text(&mut self, text: &str) {
+        if !text.is_empty() {
+            self.empty_response_count = 0;
+        }
         self.response.push_str(text);
         append_streamed_text(&mut self.interactions, text);
     }
@@ -192,6 +223,7 @@ impl TurnState {
     ) -> Result<(), ToolCallTrackerError> {
         self.workspace_may_have_changed |= tool_may_mutate_workspace(&tool_call.function.name);
         self.tool_calls.record(internal_call_id, tool_call)?;
+        self.empty_response_count = 0;
         self.response.clear();
         self.response_len_at_stream_start = 0;
         append_tool_call(&mut self.interactions, tool_call);
@@ -212,6 +244,7 @@ impl TurnState {
             tool_result,
         )?;
         self.goal_report_accepted |= take_accepted_goal_report(internal_call_id);
+        self.tool_results_delivered = true;
         Some(attributed)
     }
 
@@ -277,15 +310,21 @@ impl TurnState {
                 self.next_instruction = Some(instruction.clone());
                 (notice, Some(instruction))
             }
-            TruncationDecision::Exhausted { .. } | TruncationDecision::Notice { .. } => {
+            TruncationDecision::Exhausted { .. } => {
+                self.output_cut_off = true;
                 (notice, None)
             }
+            TruncationDecision::Notice { .. } => (notice, None),
         })
     }
 
-    /// A final response without text: abort after too many in a row, else ask
-    /// the model to continue.
+    /// A final response without text. After delivered tool work the turn gets
+    /// one nudge and then completes; a turn that produced nothing aborts after
+    /// too many empty responses in a row, else the model is asked to continue.
     pub(super) fn on_empty_final(&mut self) -> EmptyFinal {
+        if self.tool_results_delivered && self.empty_response_count >= 1 {
+            return EmptyFinal::Complete;
+        }
         if empty_response_limit_reached(&mut self.empty_response_count) {
             tracing::warn!(
                 "agent: {} consecutive empty responses, aborting",
@@ -323,6 +362,7 @@ impl TurnState {
             return VerificationNext::Passed;
         }
         if self.verification_attempt < verification.max_attempts {
+            self.restart_response = true;
             self.next_instruction = Some(verification_retry_instruction(
                 verification.command.as_deref().unwrap_or(""),
                 self.verification_attempt,
@@ -347,6 +387,7 @@ impl TurnState {
         ) {
             Some(instruction) => {
                 self.next_instruction = Some(instruction);
+                self.restart_response = true;
                 true
             }
             None => false,
@@ -439,11 +480,28 @@ impl TurnState {
         })
     }
 
+    /// Whether the next stream replaces the complete answer streamed so far.
+    pub(super) fn restart_pending(&self) -> bool {
+        self.restart_response && !self.response.is_empty()
+    }
+
     /// A new stream has been started after [`Self::begin_continuation`].
-    pub(super) fn stream_started(&mut self) {
+    ///
+    /// A continuation that follows a complete final answer (failed
+    /// verification, blocking `Stop` hook) starts the response over so the
+    /// turn's result is the last answer, not both glued together; it returns
+    /// `true` then so a streaming caller can separate the two on its output.
+    /// Truncation, transient retry and EOF resumes keep appending
+    /// (mini-agent-nvnkx.12).
+    pub(super) fn stream_started(&mut self) -> bool {
         self.usage_ledger.start_stream();
         self.turns_at_stream_start = self.turns_used;
+        let restarted = std::mem::take(&mut self.restart_response) && !self.response.is_empty();
+        if restarted {
+            self.response.clear();
+        }
         self.response_len_at_stream_start = self.response.len();
+        restarted
     }
 }
 
@@ -521,6 +579,61 @@ mod tests {
         turn.on_text("abc");
         turn.stream_started();
         assert_eq!(turn.response_len_at_stream_start, 3);
+    }
+
+    #[test]
+    fn a_complete_answer_is_not_glued_to_its_continuation_answer() {
+        let mut turn = state(None);
+        let cfg = crate::config::Config {
+            verify_command: Some("true".into()),
+            verify_max_attempts: Some(3),
+            ..Default::default()
+        };
+        let verification =
+            CompletionVerification::from_config(&cfg, crate::sandbox::Sandbox::new(false, "bwrap"))
+                .unwrap();
+        turn.on_text("A");
+        turn.begin_verification();
+        assert!(matches!(
+            turn.verification_finished(&verification, false, "boom"),
+            VerificationNext::Retry
+        ));
+        turn.begin_continuation(true, false, 5).ok().unwrap();
+        assert!(turn.stream_started());
+        turn.on_text("B");
+        assert_eq!(turn.response, "B");
+        // A truncation resume continues the same sentence instead.
+        turn.next_instruction = Some("cont".into());
+        turn.begin_continuation(true, false, 5).ok().unwrap();
+        assert!(!turn.stream_started());
+        turn.on_text("C");
+        assert_eq!(turn.response, "BC");
+    }
+
+    #[test]
+    fn silence_after_tool_work_completes_after_one_nudge() {
+        let mut turn = state(None);
+        turn.on_tool_call("i1", &call("p1", "read")).unwrap();
+        let result = ToolResult {
+            id: "p1".into(),
+            call_id: None,
+            content: rig::OneOrMany::one(rig::message::ToolResultContent::text("ok")),
+            is_error: None,
+        };
+        turn.on_tool_result("i1", &result).unwrap();
+        assert!(matches!(turn.on_empty_final(), EmptyFinal::Continue));
+        assert!(matches!(turn.on_empty_final(), EmptyFinal::Complete));
+    }
+
+    #[test]
+    fn text_or_a_tool_call_resets_the_empty_counter() {
+        let mut turn = state(None);
+        assert!(matches!(turn.on_empty_final(), EmptyFinal::Continue));
+        assert!(matches!(turn.on_empty_final(), EmptyFinal::Continue));
+        turn.on_text("hi");
+        assert!(matches!(turn.on_empty_final(), EmptyFinal::Continue));
+        assert!(matches!(turn.on_empty_final(), EmptyFinal::Continue));
+        assert!(matches!(turn.on_empty_final(), EmptyFinal::Abort));
     }
 
     #[test]

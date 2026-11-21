@@ -69,11 +69,14 @@ impl OutputTruncation {
             format!("output truncated: the response was cut off at the output-token limit{tokens}");
         Some(self.decide(
             notice,
-            format!(
-                "[output truncated] Your previous response was cut off at the output-token \
-                 limit (max_tokens){tokens}. Continue exactly where it stopped, without \
-                 repeating text you already wrote. If you were producing a large file or \
-                 document, write it in smaller pieces."
+            crate::agent::input::host_instruction(
+                "output truncated",
+                &format!(
+                    "Your previous response was cut off at the output-token \
+                     limit (max_tokens){tokens}. Continue exactly where it stopped, without \
+                     repeating text you already wrote. If you were producing a large file or \
+                     document, write it in smaller pieces."
+                ),
             ),
         ))
     }
@@ -100,9 +103,11 @@ impl OutputTruncation {
             StopReason::PauseTurn => Some(self.decide(
                 "the provider paused the turn while a hosted tool was still running (stop_reason: pause_turn)"
                     .to_string(),
-                "[pause_turn] Your previous turn was paused while a hosted tool was still \
-                 running. Continue exactly where it stopped."
-                    .to_string(),
+                crate::agent::input::host_instruction(
+                    "pause_turn",
+                    "Your previous turn was paused while a hosted tool was still \
+                     running. Continue exactly where it stopped.",
+                ),
             )),
             StopReason::EndTurn
             | StopReason::ToolUse
@@ -126,11 +131,14 @@ impl OutputTruncation {
         );
         Some(self.decide(
             notice,
-            format!(
-                "[output truncated] Your previous response hit the output-token limit \
-                 (max_tokens) while writing tool-call arguments{tool}, so that call was NOT \
-                 executed. Redo it in smaller steps: split large file contents across \
-                 several smaller write or edit calls instead of one large payload."
+            crate::agent::input::host_instruction(
+                "output truncated",
+                &format!(
+                    "Your previous response hit the output-token limit \
+                     (max_tokens) while writing tool-call arguments{tool}, so that call was NOT \
+                     executed. Redo it in smaller steps: split large file contents across \
+                     several smaller write or edit calls instead of one large payload."
+                ),
             ),
         ))
     }
@@ -384,11 +392,11 @@ mod tests {
             "truncation must trigger one continuation"
         );
         assert!(
-            requests[1].contains("[output truncated]"),
+            requests[1].contains("[Host: output truncated;"),
             "{}",
             requests[1]
         );
-        assert!(!requests[0].contains("[output truncated]"));
+        assert!(!requests[0].contains("[Host: output truncated;"));
         assert_eq!(response, "partial rest.");
     }
 
@@ -459,7 +467,7 @@ mod tests {
             "truncation must trigger one continuation"
         );
         assert!(
-            requests[1].contains("[output truncated]"),
+            requests[1].contains("[Host: output truncated;"),
             "{}",
             requests[1]
         );

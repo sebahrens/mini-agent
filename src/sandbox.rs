@@ -5972,7 +5972,27 @@ impl Sandbox {
                 "background job record was pruned (only the newest {MAX_RETAINED_BACKGROUND_JOBS} are kept); its complete output log remains at {}",
                 log.display()
             ),
-            None => format!("background job not found: {id}"),
+            None => {
+                // A job of an earlier process of this session (after
+                // `--continue`/`--resume` or a restart): the registry is in
+                // memory, but its complete log is on disk at a path that is a
+                // function of the session's log directory and the job id
+                // (mini-agent-nvnkx.315).
+                let log = self
+                    .command_log_dir
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .as_ref()
+                    .map(|dir| dir.join(format!("shell-{id}.log")))
+                    .filter(|path| path.is_file());
+                match log {
+                    Some(log) => format!(
+                        "background job not found: {id}. This job was started by an earlier process of this session and is no longer running; its output log is at {}",
+                        log.display()
+                    ),
+                    None => format!("background job not found: {id}"),
+                }
+            }
         }
     }
 
@@ -13932,6 +13952,28 @@ echo PRIVATE_TEMP_PASS"#,
                 "zerobox command restored non-allow-listed variable {key:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_job_id_from_an_earlier_process_points_at_its_log() {
+        let scratch = TempDir::new("sandbox");
+        let sandbox = Sandbox::new(false, "none");
+        sandbox.set_command_log_dir(Some(scratch.path().to_path_buf()));
+        let id = format!("job-{}", uuid::Uuid::new_v4());
+        let log = scratch.path().join(format!("shell-{id}.log"));
+        std::fs::write(&log, "earlier output").unwrap();
+        let message = sandbox.background_job_snapshot(&id).unwrap_err();
+        assert!(
+            message.contains("earlier process of this session"),
+            "{message}"
+        );
+        assert!(message.contains(&log.display().to_string()), "{message}");
+        // An unknown id without a log keeps the plain text.
+        let unknown = format!("job-{}", uuid::Uuid::new_v4());
+        assert_eq!(
+            sandbox.background_job_snapshot(&unknown).unwrap_err(),
+            format!("background job not found: {unknown}")
+        );
     }
 
     #[test]

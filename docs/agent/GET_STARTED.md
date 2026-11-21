@@ -632,7 +632,7 @@ provider preferences stop the auxiliary request; they are never silently removed
 In text mode, closing stdout early (for example `mini-agent -p ... | head -5`) no longer aborts
 the run: output stops, the turn finishes, and the session is still saved.
 
-`stop_reason` is `"completed"` on success and `"failed"` when the agent, explicit shell command,
+`stop_reason` is `"completed"` on success, `"interrupted"` when the operator interrupted the run, and `"failed"` when the agent, explicit shell command,
 or session save fails. Failed turns retain observed output, tool counts, changed files, usage,
 and cost, and exit nonzero; completed tool records are saved unless `--no-session` is set or
 persistence itself fails. Errors before a turn result is available can exit without JSON.
@@ -641,8 +641,9 @@ providers include setup guidance from provider initialization.
 
 During headless agent turns (`-p` and `--loop`), Ctrl+C or Unix SIGTERM cancels provider
 waits and active work, waits for registered tool and hook cleanup, then saves completed
-tool records and observed usage before exiting nonzero. An interrupted `-p --output json`
-turn reports `"stop_reason":"failed"` with its partial result. Completion verification
+tool records and observed usage before exiting nonzero (130 for SIGINT, 143 for SIGTERM). An
+interrupted `-p --output json` turn reports `"stop_reason":"interrupted"` and `is_error: true`,
+with the text produced so far in `result` followed by `[interrupted: the run was cut short]`. Completion verification
 is interrupted through the same cleanup path. The wait after the first signal is bounded:
 a second Ctrl+C/SIGTERM, or 10 seconds without the turn and its cleanup settling, saves
 whatever the turn returned and exits with status 130 without
