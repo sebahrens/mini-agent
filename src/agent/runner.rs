@@ -4436,6 +4436,43 @@ where
         .await
 }
 
+/// The images a tool result carries, as the transcript retains them. A `read`
+/// result whose image cannot be decoded is a hard error for the turn (the
+/// model would otherwise reason about a file it never saw); other tools keep
+/// their legacy text projection. One rule for the interactive loop, the
+/// headless loop and headless persistence (mini-agent-sskdu.101).
+pub(crate) fn tool_result_images(
+    tool_name: &str,
+    result: &ToolResult,
+) -> Result<Vec<crate::session::tool_image::PersistedToolImage>, &'static str> {
+    match crate::session::tool_image::from_result(result) {
+        Ok(images) => Ok(images),
+        Err(error) if tool_name == "read" => Err(error),
+        Err(_) => Ok(Vec::new()),
+    }
+}
+
+/// User-facing notices produced while a request round ran and not yet shown:
+/// images elided from the request, hook problems and language-server notices.
+/// Drained once per round by the interactive loop (as UI events) and the
+/// headless loop (on stderr), so neither surface leaves a queue growing
+/// unseen (mini-agent-sskdu.101).
+fn take_round_user_notices() -> Vec<String> {
+    #[cfg(feature = "hooks")]
+    let hook_notices = crate::extras::hooks::take_hook_problem_notices();
+    #[cfg(not(feature = "hooks"))]
+    let hook_notices: Vec<String> = Vec::new();
+    #[cfg(feature = "lsp")]
+    let hook_notices: Vec<String> = hook_notices
+        .into_iter()
+        .chain(crate::extras::lsp::take_user_notices())
+        .collect();
+    crate::agent::image_budget::take_notices()
+        .into_iter()
+        .chain(hook_notices)
+        .collect()
+}
+
 /// Whether `message` is an assistant message made only of reasoning blocks.
 fn is_thinking_only_assistant(message: &Message) -> bool {
     match message {
@@ -5211,9 +5248,9 @@ where
                         let is_error = take_tool_failure(&internal_call_id);
                         // Delivered normally: the interrupt fallback is not needed.
                         let _ = take_settled_result(&internal_call_id);
-                        let images = match crate::session::tool_image::from_result(&tool_result) {
+                        let images = match tool_result_images(&tool_name, &tool_result) {
                             Ok(images) => images,
-                            Err(error) if tool_name == "read" => {
+                            Err(error) => {
                                 let _ = event_tx
                                     .send(AgentEvent::error_with(
                                         CompactString::from(error),
@@ -5222,8 +5259,6 @@ where
                                     .await;
                                 return;
                             }
-                            // Preserve legacy text projection of nonliteral remote image tools.
-                            Err(_) => Vec::new(),
                         };
                         // The notice precedes its result so the UI can render the
                         // diagnostic instead of the normal result view.
@@ -5283,19 +5318,7 @@ where
                         };
                         completed_interactions.extend(completed_delta);
                         // Tell the user when older images were left out of a request.
-                        #[cfg(feature = "hooks")]
-                        let hook_notices = crate::extras::hooks::take_hook_problem_notices();
-                        #[cfg(not(feature = "hooks"))]
-                        let hook_notices: Vec<String> = Vec::new();
-                        #[cfg(feature = "lsp")]
-                        let hook_notices: Vec<String> = hook_notices
-                            .into_iter()
-                            .chain(crate::extras::lsp::take_user_notices())
-                            .collect();
-                        for notice in crate::agent::image_budget::take_notices()
-                            .into_iter()
-                            .chain(hook_notices)
-                        {
+                        for notice in take_round_user_notices() {
                             tracing::warn!("{notice}");
                             let _ = event_tx
                                 .send(AgentEvent::OutputTruncated {
@@ -6305,6 +6328,11 @@ where
                         #[cfg(feature = "acp")]
                         crate::permission::ask::finish_tool_call(&name, &internal_call_id);
                         goal_report_accepted |= is_accepted_goal_report(&name, &output);
+                        // A `read` image that cannot be decoded ends the turn here, as
+                        // it does interactively, instead of failing at persistence.
+                        if let Err(error) = tool_result_images(&name, &tool_result) {
+                            fail_turn!(error);
+                        }
                         // Append the actual result before awaiting machine output;
                         // interruption must retain the successful tool transcript.
                         if let Some(mutations) = mutations
@@ -6384,7 +6412,7 @@ where
                         }
                         // Tell the operator when older images were left out of a
                         // request, as the interactive loop does (mini-agent-sskdu.93).
-                        for notice in crate::agent::image_budget::take_notices() {
+                        for notice in take_round_user_notices() {
                             tracing::warn!("{notice}");
                             if let Err(error) =
                                 crate::print::headless_stderr_async(format!("{notice}\n")).await

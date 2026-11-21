@@ -1084,6 +1084,30 @@ fn image_read64_borrowed_batch_limits_precede_payload_decoding() {
     );
 }
 
+/// One rule for every surface: an undecodable `read` image is an error, any
+/// other tool keeps its legacy text projection (mini-agent-sskdu.101).
+#[test]
+fn tool_result_images_rule_is_shared_by_every_turn_surface() {
+    let mut invalid = image();
+    invalid.data = rig::message::DocumentSourceKind::Base64("not base64!".into());
+    let result = ToolResult {
+        id: "image-call".into(),
+        call_id: None,
+        content: OneOrMany::one(ToolResultContent::Image(invalid)),
+        is_error: None,
+    };
+    assert!(
+        crate::agent::runner::tool_result_images("read", &result)
+            .unwrap_err()
+            .contains("base64")
+    );
+    assert!(
+        crate::agent::runner::tool_result_images("web_fetch", &result)
+            .unwrap()
+            .is_empty()
+    );
+}
+
 #[test]
 fn image_read64_hybrid_response_preserves_literal_text_and_object_shape() {
     for (response, expected) in [
