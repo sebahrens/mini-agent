@@ -431,6 +431,12 @@ pub struct PermissionChecker {
     readonly_git_auto_allow: bool,
     /// The shell is contained by an active sandbox (recursive reads may auto-allow).
     readonly_contained: bool,
+    /// Dialect of the shell that will run scripts. The read-only classifier
+    /// lexes with POSIX rules, so only `Posix` may auto-allow (nvnkx.358).
+    shell_dialect: crate::sandbox::ShellDialect,
+    /// The built-in convenience shell allows are installed (no user allow/ask
+    /// rule replaced them).
+    builtin_shell_allows: bool,
     default_action: Action,
     ext_dir_rules: Vec<(Pattern, Action)>,
     doom_loop_action: Action,
@@ -628,6 +634,8 @@ impl PermissionChecker {
             shell_allow_prefixes: self.shell_allow_prefixes.clone(),
             readonly_git_auto_allow: self.readonly_git_auto_allow,
             readonly_contained: self.readonly_contained,
+            shell_dialect: self.shell_dialect,
+            builtin_shell_allows: self.builtin_shell_allows,
             default_action: self.default_action,
             ext_dir_rules: self.ext_dir_rules.clone(),
             doom_loop_action: self.doom_loop_action,
@@ -749,8 +757,8 @@ impl PermissionChecker {
                                     "invalid `{config_field}` rule for tool `{tool_name}` pattern `{pat}`: {error}"
                                 )
                             })?
-                        } else if is_url_identity_tool(tool_name) && *action == Action::Deny {
-                            Pattern::new(&fetch_deny_glob(pat))
+                        } else if widens_star(tool_name, *action) {
+                            widened_pattern(tool_name, pat)
                         } else {
                             Pattern::new(pat)
                         };
@@ -839,7 +847,14 @@ impl PermissionChecker {
         Self::merge_entries(&mut rules, &configs.glob.ask_entries, Action::Ask);
         Self::merge_entries(&mut rules, &configs.glob.deny_entries, Action::Deny);
 
-        let user_configured_shell = rules.contains_key("shell") || rules.contains_key("bash");
+        // Only an allow or ask rule replaces the built-in convenience allows; a
+        // deny can only narrow, so it never removes unrelated allows
+        // (mini-agent-nvnkx.63).
+        let user_configured_shell = ["shell", "bash"].iter().any(|key| {
+            rules
+                .get(*key)
+                .is_some_and(|entries| entries.iter().any(|(_, action)| *action != Action::Deny))
+        });
         for key in ["shell", "bash"] {
             let entry = rules.entry(key.to_string()).or_default();
             for (pattern, action) in crate::permission::default_bash_rules_for(sandbox) {
@@ -922,6 +937,8 @@ impl PermissionChecker {
             readonly_git_auto_allow: sandbox
                 != crate::permission::SandboxResolution::DegradedUnavailable,
             readonly_contained: sandbox == crate::permission::SandboxResolution::Enforced,
+            shell_dialect: crate::permission::default_shell_dialect(),
+            builtin_shell_allows: !user_configured_shell,
             default_action,
             ext_dir_rules,
             doom_loop_action,
@@ -1002,8 +1019,8 @@ impl PermissionChecker {
                                 entry.push((Pattern::new_path(&canonical), action));
                             }
                             Pattern::new_path(pat)
-                        } else if is_url_identity_tool(alias) && action == Action::Deny {
-                            Pattern::new(&fetch_deny_glob(pat))
+                        } else if widens_star(alias, action) {
+                            widened_pattern(alias, pat)
                         } else {
                             Pattern::new(pat)
                         };
@@ -1425,18 +1442,48 @@ impl PermissionChecker {
         tool: &str,
         policy_input: &str,
     ) -> SmallVec<[(usize, Action); 4]> {
+        self.matched_script_rules_split(tool, policy_input).0
+    }
+
+    /// Matched rules plus how many of them are configured rules; the rest
+    /// came from prefix grants.
+    fn matched_script_rules_split(
+        &self,
+        tool: &str,
+        policy_input: &str,
+    ) -> (SmallVec<[(usize, Action); 4]>, usize) {
         let mut matched: SmallVec<[(usize, Action); 4]> = SmallVec::new();
         if self.apply_rules()
             && let Some(rules) = self.rules.get(tool)
         {
             for (pattern, action) in rules {
+                // Guarded withholds the built-in allows that write or run
+                // workspace code (`cargo fmt`, `cargo test`, ...); only reads
+                // are free there (mini-agent-nvnkx.64).
+                if tool == "shell"
+                    && *action == Action::Allow
+                    && self.mode == SecurityMode::Guarded
+                    && self.builtin_shell_allows
+                    && pattern.original != "git status"
+                    && crate::permission::UNSANDBOXED_EXEC_DEFAULT_ALLOWS
+                        .contains(&pattern.original.as_str())
+                {
+                    continue;
+                }
                 let matches = if tool == "shell" && *action == Action::Allow {
                     // Model B: allow only the exact, complete script. Ask and
                     // deny rules remain pattern-based so broad safeguards keep
                     // working, but globs/regexes cannot widen Bash execution.
                     pattern.original == policy_input
                 } else {
+                    // A live fetch key is `<url> destinations=[...]`; an
+                    // exact-URL allow or ask must match the bare URL too, as
+                    // it does on a cache hit (mini-agent-nvnkx.66).
                     pattern.matches(policy_input)
+                        || is_url_identity_tool(tool)
+                            && policy_input
+                                .split_once(" destinations=[")
+                                .is_some_and(|(bare, _)| pattern.matches(bare))
                 };
                 if matches {
                     matched.push((pattern.specificity(), *action));
@@ -1444,6 +1491,7 @@ impl PermissionChecker {
             }
         }
 
+        let rule_matches = matched.len();
         if self.apply_rules()
             && tool == "shell"
             && let Some(argv) = crate::permission::shell_prefix::literal_argv(policy_input)
@@ -1459,7 +1507,7 @@ impl PermissionChecker {
             }
         }
 
-        matched
+        (matched, rule_matches)
     }
 
     /// Recheck only revocation of a previously admitted shell invocation.
@@ -1482,6 +1530,12 @@ impl PermissionChecker {
     /// policy's deny and protected-path checks, and recursive commands run
     /// under an active sandbox.
     fn read_only_script_verified(&self, script: &str) -> bool {
+        // cmd.exe and PowerShell quote, escape and expand differently from
+        // POSIX (`'` is ordinary in cmd, `%VAR%` expands, `-Path:x` is a
+        // parameter), so a POSIX parse proves nothing about them: ask.
+        if self.shell_dialect != crate::sandbox::ShellDialect::Posix {
+            return false;
+        }
         let Some(report) = crate::permission::readonly_shell::classify(
             script,
             &self.working_dir,
@@ -1571,7 +1625,7 @@ impl PermissionChecker {
             return CheckResult::Allowed;
         }
 
-        let matched = self.matched_script_rules(tool, policy_input);
+        let (matched, rule_matches) = self.matched_script_rules_split(tool, policy_input);
 
         let mut action = self.resolve_check_action(tool, &matched);
         if Self::resolve_matched(&matched) == Some(Action::Ask) {
@@ -1580,10 +1634,22 @@ impl PermissionChecker {
         // Standard mode runs a script made only of read-only allowlisted
         // commands (see `readonly_shell`) without a prompt; a configured rule
         // of any action has already decided otherwise.
-        if self.mode == SecurityMode::Standard
+        if matches!(self.mode, SecurityMode::Standard | SecurityMode::Guarded)
             && tool == "shell"
             && matched.is_empty()
             && action == Action::Ask
+            && self.read_only_script_verified(policy_input)
+        {
+            action = Action::Allow;
+        }
+        // Read-only and plan-write deny shell by mode; a script proven
+        // read-only is a read, but only where the sandbox backs the
+        // classification with containment.
+        if matches!(self.mode, SecurityMode::ReadOnly | SecurityMode::PlanWrite)
+            && tool == "shell"
+            && matched.is_empty()
+            && action == Action::Deny
+            && self.readonly_contained
             && self.read_only_script_verified(policy_input)
         {
             action = Action::Allow;
@@ -1592,7 +1658,9 @@ impl PermissionChecker {
         // destructive one; a configured rule for the script always decides.
         if self.mode == SecurityMode::Yolo
             && tool == "shell"
-            && matched.is_empty()
+            // A script allowed only by a prefix grant stays subject to the
+            // destructive ask (`git push` must not cover `--force`).
+            && rule_matches == 0
             && action == Action::Allow
             && crate::permission::is_destructive_shell_script(policy_input)
         {
@@ -2236,6 +2304,9 @@ impl PermissionChecker {
 
     pub(crate) fn replace_session_allowlist(&mut self, entries: &[(String, String)]) {
         self.session_allowlist.clear();
+        // Prefix grants belong to the outgoing session too (nvnkx.59).
+        self.session_shell_prefixes.clear();
+        self.policy_changed();
         self.last_call = None;
         self.consecutive_repeat_count = 0;
         self.load_session_allowlist(entries);
@@ -2380,6 +2451,12 @@ impl PermissionChecker {
 
     /// Arm (or clear) the scoped grant the active prompt requested. Called on
     /// every prompt activation so a stale offer never outlives its prompt.
+    /// Record the dialect of the session's shell. Anything but POSIX disables
+    /// the read-only script auto-allow.
+    pub(crate) fn set_shell_dialect(&mut self, dialect: crate::sandbox::ShellDialect) {
+        self.shell_dialect = dialect;
+    }
+
     pub fn set_prompt_grant_offer(&mut self, offer: Option<PromptGrantOffer>) {
         self.prompt_grant_offer = offer;
     }
@@ -3094,6 +3171,29 @@ fn deny_probe_inputs<'a>(
 /// so their deny globs use [`fetch_deny_glob`] widening.
 fn is_url_identity_tool(tool: &str) -> bool {
     matches!(tool, "js/fetch" | "web_fetch" | "web_search")
+}
+
+/// Whether a glob rule for `tool` compiles with `*` crossing `/`. The matched
+/// input of these tools is an opaque string, not a path: a URL deny, a shell
+/// deny or ask (`curl *` must cover `curl https://x/y`, nvnkx.61) and every
+/// `mcp_tool:{server}:{operation}` rule, because MCP operations and
+/// server-chosen tool names may contain `/` (nvnkx.190).
+fn widens_star(tool: &str, action: Action) -> bool {
+    match tool {
+        "mcp_tool" => true,
+        "shell" | "bash" => matches!(action, Action::Deny | Action::Ask),
+        _ => is_url_identity_tool(tool) && action == Action::Deny,
+    }
+}
+
+/// Compile `pat` with `*` widened. Shell and MCP rules keep the user's own
+/// spelling as `original` so denial messages quote the rule as written.
+fn widened_pattern(tool: &str, pat: &str) -> Pattern {
+    let mut pattern = Pattern::new(&fetch_deny_glob(pat));
+    if !is_url_identity_tool(tool) {
+        pattern.original = pat.to_owned();
+    }
+    pattern
 }
 
 /// A URL-identity (`js/fetch`, `web_fetch`, `web_search`) deny glob with every `*` run widened to `**`. Fetch identities
@@ -6142,5 +6242,248 @@ fn restored_session_grants_never_widen_readonly_or_planwrite_modes() {
             ),
             "{mode:?} mcp"
         );
+    }
+}
+
+#[cfg(test)]
+mod harness_review_policy_tests {
+    use super::*;
+
+    fn checker(configs: &PermissionConfigs, mode: SecurityMode) -> PermissionChecker {
+        PermissionChecker::new(configs, mode, Some(std::env::temp_dir()), None).unwrap()
+    }
+
+    fn mcp_rule(action: Action) -> PermissionConfigs {
+        PermissionConfigs::from(PermissionConfig {
+            default: Some(Action::Ask),
+            mcp_tool: Some(ToolPerm::Granular(
+                [("mcp_tool:srv:*".to_owned(), action)].into(),
+            )),
+            ..PermissionConfig::default()
+        })
+    }
+
+    // mini-agent-nvnkx.190
+    #[test]
+    fn mcp_tool_star_crosses_slashes_for_deny_and_allow() {
+        let mut deny = checker(&mcp_rule(Action::Deny), SecurityMode::Standard);
+        let mut allow = checker(&mcp_rule(Action::Allow), SecurityMode::Standard);
+        for key in [
+            "mcp_tool:srv:resources/read",
+            "mcp_tool:srv:ns/tool",
+            "mcp_tool:srv:plain",
+        ] {
+            assert!(
+                matches!(deny.check("mcp_tool", key), CheckResult::Denied(_)),
+                "{key}"
+            );
+            assert_eq!(allow.check("mcp_tool", key), CheckResult::Allowed, "{key}");
+        }
+        assert_eq!(
+            allow.check("mcp_tool", "mcp_tool:other:plain"),
+            CheckResult::Ask
+        );
+        let managed = PermissionConfigs::from(PermissionConfig {
+            deny_entries: Some([("mcp_tool".to_owned(), vec!["mcp_tool:srv:*".to_owned()])].into()),
+            ..PermissionConfig::default()
+        });
+        let mut managed = checker(&managed, SecurityMode::Yolo);
+        assert!(matches!(
+            managed.check("mcp_tool", "mcp_tool:srv:ns/tool"),
+            CheckResult::Denied(_)
+        ));
+    }
+
+    // mini-agent-nvnkx.191
+    #[test]
+    fn server_scoped_allow_does_not_cover_a_colon_named_server() {
+        let mut allow = checker(&mcp_rule(Action::Allow), SecurityMode::Standard);
+        // The documented `srv` server is covered; a server named `srv2`
+        // (keyed under a different component) is not.
+        assert_eq!(
+            allow.check("mcp_tool", "mcp_tool:srv2:tool"),
+            CheckResult::Ask
+        );
+        #[cfg(feature = "mcp")]
+        {
+            use crate::extras::mcp::config::{is_valid_server_name, permission_tool_component};
+            assert!(is_valid_server_name("github"));
+            for bad in ["github:x", "*", "a/b", "a?b", "", "a b", &"x".repeat(65)] {
+                assert!(!is_valid_server_name(bad), "{bad:?}");
+            }
+            assert_eq!(permission_tool_component("a:b%c"), "a%3Ab%25c");
+            assert_eq!(permission_tool_component("plain"), "plain");
+        }
+    }
+
+    // mini-agent-nvnkx.61
+    #[test]
+    fn shell_deny_and_ask_star_cross_slashes() {
+        let deny = PermissionConfigs::from(PermissionConfig {
+            deny_entries: Some([("shell".to_owned(), vec!["curl *".to_owned()])].into()),
+            ..PermissionConfig::default()
+        });
+        let mut c = checker(&deny, SecurityMode::Yolo);
+        assert!(matches!(
+            c.check("shell", "curl https://example.com/a/b"),
+            CheckResult::Denied(_)
+        ));
+        let mut c = checker(&PermissionConfigs::default(), SecurityMode::Yolo);
+        c.apply_ephemeral_cli_rules(&PermissionConfig {
+            deny_entries: Some([("shell".to_owned(), vec!["curl *".to_owned()])].into()),
+            ..PermissionConfig::default()
+        })
+        .unwrap();
+        assert!(matches!(
+            c.check("shell", "curl https://example.com/a/b"),
+            CheckResult::Denied(_)
+        ));
+        let ask = PermissionConfigs::from(PermissionConfig {
+            ask_entries: Some([("shell".to_owned(), vec!["git push *".to_owned()])].into()),
+            ..PermissionConfig::default()
+        });
+        let mut c = checker(&ask, SecurityMode::Yolo);
+        assert_eq!(c.check("shell", "git push origin a/b"), CheckResult::Ask);
+    }
+
+    // mini-agent-nvnkx.63
+    #[test]
+    fn a_shell_deny_keeps_the_builtin_allows() {
+        let deny = PermissionConfigs::from(PermissionConfig {
+            deny_entries: Some([("shell".to_owned(), vec!["curl **".to_owned()])].into()),
+            ..PermissionConfig::default()
+        });
+        let mut c = checker(&deny, SecurityMode::Standard);
+        assert_eq!(c.check("shell", "cargo test"), CheckResult::Allowed);
+        assert!(matches!(
+            c.check("shell", "curl http://x/y"),
+            CheckResult::Denied(_)
+        ));
+        let allow = PermissionConfigs::from(PermissionConfig {
+            allow_entries: Some([("shell".to_owned(), vec!["make".to_owned()])].into()),
+            ..PermissionConfig::default()
+        });
+        let mut c = checker(&allow, SecurityMode::Standard);
+        assert_eq!(c.check("shell", "cargo test"), CheckResult::Ask);
+    }
+
+    // mini-agent-nvnkx.59
+    #[test]
+    fn replacing_the_session_clears_shell_prefix_grants() {
+        let mut c = checker(&PermissionConfigs::default(), SecurityMode::Standard);
+        c.add_session_shell_prefix("make build");
+        assert_eq!(c.check("shell", "make build x"), CheckResult::Allowed);
+        c.replace_session_allowlist(&[]);
+        assert_eq!(c.check("shell", "make build x"), CheckResult::Ask);
+        let entry = (
+            SESSION_SHELL_PREFIX_TOOL.to_owned(),
+            "make build".to_owned(),
+        );
+        c.replace_session_allowlist(std::slice::from_ref(&entry));
+        c.replace_session_allowlist(std::slice::from_ref(&entry));
+        assert_eq!(c.session_shell_prefixes.len(), 1);
+    }
+
+    // mini-agent-nvnkx.72
+    #[test]
+    fn prefix_grants_do_not_cover_destructive_scripts_in_yolo() {
+        use crate::permission::shell_prefix::offered_prefix;
+        for script in [
+            "rm -rf build",
+            "git -C x status",
+            "python -m pytest",
+            "git push --force origin main",
+        ] {
+            assert_eq!(offered_prefix(script), None, "{script}");
+        }
+        assert_eq!(
+            offered_prefix("git push origin x").as_deref(),
+            Some("git push")
+        );
+        let mut c = checker(&PermissionConfigs::default(), SecurityMode::Yolo);
+        c.add_session_shell_prefix("git push");
+        assert_eq!(
+            c.check("shell", "git push origin main"),
+            CheckResult::Allowed
+        );
+        assert_eq!(
+            c.check("shell", "git push --force origin main"),
+            CheckResult::Ask
+        );
+    }
+
+    // mini-agent-nvnkx.66
+    #[test]
+    fn exact_url_allow_and_ask_match_the_live_fetch_key() {
+        let key = "https://example.com/a destinations=[93.184.216.34:443]";
+        let allow = PermissionConfigs::from(PermissionConfig {
+            allow_entries: Some(
+                [(
+                    "web_fetch".to_owned(),
+                    vec!["https://example.com/a".to_owned()],
+                )]
+                .into(),
+            ),
+            ..PermissionConfig::default()
+        });
+        assert_eq!(
+            checker(&allow, SecurityMode::Standard).check("web_fetch", key),
+            CheckResult::Allowed
+        );
+        let ask = PermissionConfigs::from(PermissionConfig {
+            ask_entries: Some(
+                [(
+                    "web_fetch".to_owned(),
+                    vec!["https://example.com/a".to_owned()],
+                )]
+                .into(),
+            ),
+            ..PermissionConfig::default()
+        });
+        assert_eq!(
+            checker(&ask, SecurityMode::Yolo).check("web_fetch", key),
+            CheckResult::Ask
+        );
+    }
+
+    // mini-agent-nvnkx.64
+    #[test]
+    fn read_only_scripts_are_reads_in_guarded_readonly_and_planwrite() {
+        use crate::permission::SandboxResolution;
+        let make = |mode, sandbox| {
+            PermissionChecker::new_for_sandbox(
+                &PermissionConfigs::default(),
+                mode,
+                Some(std::env::temp_dir()),
+                None,
+                sandbox,
+            )
+            .unwrap()
+        };
+        let mut guarded = make(SecurityMode::Guarded, SandboxResolution::Enforced);
+        assert_eq!(
+            guarded.check("shell", "git log --oneline"),
+            CheckResult::Allowed
+        );
+        assert_eq!(guarded.check("shell", "cargo fmt"), CheckResult::Ask);
+        assert_eq!(guarded.check("shell", "cargo test"), CheckResult::Ask);
+        assert_eq!(guarded.check("shell", "pwd"), CheckResult::Allowed);
+        for mode in [SecurityMode::ReadOnly, SecurityMode::PlanWrite] {
+            let mut contained = make(mode, SandboxResolution::Enforced);
+            assert_eq!(
+                contained.check("shell", "ls src"),
+                CheckResult::Allowed,
+                "{mode:?}"
+            );
+            assert!(matches!(
+                contained.check("shell", "touch x"),
+                CheckResult::Denied(_)
+            ));
+            let mut off = make(mode, SandboxResolution::Disabled);
+            assert!(
+                matches!(off.check("shell", "ls src"), CheckResult::Denied(_)),
+                "{mode:?}"
+            );
+        }
     }
 }

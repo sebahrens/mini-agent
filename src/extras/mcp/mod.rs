@@ -578,6 +578,19 @@ impl McpClientManager {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         sorted.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        // A name outside the closed charset would make the permission key
+        // `mcp_tool:{server}:{tool}` ambiguous; refuse it with a message.
+        let mut rejected = Vec::new();
+        sorted.retain(|(name, _)| {
+            let valid = config::is_valid_server_name(name);
+            if !valid {
+                tracing::warn!("MCP server name {name:?} is invalid; not connecting");
+                rejected.push(McpNotice::error(format!(
+                    "MCP server {name:?} not connected: the name must be 1-64 letters, digits, . _ -"
+                )));
+            }
+            valid
+        });
         // `enabled = false` keeps an entry configured but never launches it.
         let mut disabled = Vec::new();
         sorted.retain(|(name, cfg)| {
@@ -685,6 +698,7 @@ impl McpClientManager {
                 }
             }
         }
+        notices.extend(rejected);
         let mut manager = Self::with_notices(handles, notices);
         manager.health = health;
         manager.connect_errors = connect_errors;

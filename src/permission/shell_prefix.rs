@@ -90,6 +90,12 @@ pub(crate) fn offered_prefix(script: &str) -> Option<String> {
     if NEVER_OFFERED.contains(&program.to_ascii_lowercase().as_str()) {
         return None;
     }
+    // An option as the second word (`rm -rf`, `git -C x`, `python -m`) would
+    // grant far more than the command suggests, and a destructive script
+    // must be approved each time (mini-agent-nvnkx.72).
+    if argv[1].starts_with('-') || crate::permission::is_destructive_shell_script(script) {
+        return None;
+    }
     Some(format!("{} {}", argv[0], argv[1]))
 }
 

@@ -269,6 +269,27 @@ impl From<McpHeadersHelperWire> for McpHeadersHelper {
     }
 }
 
+/// Closed charset for MCP server names (1-64 letters, digits, `.`, `_`, `-`;
+/// non-ASCII letters are accepted). The name is a
+/// component of the permission key `mcp_tool:{server}:{tool}`, so `:`, glob
+/// characters and `/` would make keys ambiguous (mini-agent-nvnkx.191).
+pub(crate) fn is_valid_server_name(name: &str) -> bool {
+    (1..=64).contains(&name.chars().count())
+        && name
+            .chars()
+            .all(|ch| ch.is_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+}
+
+/// Percent-encode `%` and `:` in a server-chosen tool name so the permission
+/// key `mcp_tool:{server}:{tool}` has exactly one unambiguous split.
+pub(crate) fn permission_tool_component(tool: &str) -> std::borrow::Cow<'_, str> {
+    if tool.contains([':', '%']) {
+        std::borrow::Cow::Owned(tool.replace('%', "%25").replace(':', "%3A"))
+    } else {
+        std::borrow::Cow::Borrowed(tool)
+    }
+}
+
 impl McpHeadersHelper {
     /// Structural bounds, checked when a definition is parsed.
     pub(crate) fn validate(&self) -> Result<(), &'static str> {

@@ -442,7 +442,10 @@ impl ToolDyn for McpTool {
             // suspended; only then can the approved source have outlived its
             // revision unnoticed. Never carried across calls.
             let suspended = AtomicBool::new(false);
-            let perm_key = format!("mcp_tool:{server_name}:{tool_name}");
+            let perm_key = format!(
+                "mcp_tool:{server_name}:{}",
+                super::config::permission_tool_component(&tool_name)
+            );
             let coaching = track_suspension(
                 &suspended,
                 check_mcp_perm(

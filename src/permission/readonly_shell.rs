@@ -985,6 +985,47 @@ mod tests {
         assert_eq!(restrictive.check("bash", "ls"), CheckResult::Ask);
     }
 
+    #[test]
+    fn windows_dialects_never_auto_allow_through_posix_parsing() {
+        use crate::permission::checker::CheckResult;
+        use crate::permission::{SandboxResolution::Enforced, SecurityMode};
+        use crate::sandbox::ShellDialect;
+        let scripts = [
+            "grep 'x & del y & rem ' f",
+            "cat \"a\\\" & del y & rem \\\"\"",
+            "sort \"%USERPROFILE%\\x\"",
+            "cat -Path:.env",
+            "ls",
+            "git log",
+        ];
+        for dialect in [ShellDialect::Cmd, ShellDialect::PowerShell] {
+            let mut c = checker(SecurityMode::Standard, Enforced);
+            c.set_shell_dialect(dialect);
+            for script in scripts {
+                assert_eq!(
+                    c.check("bash", script),
+                    CheckResult::Ask,
+                    "{dialect:?} {script}"
+                );
+            }
+        }
+        let mut posix = checker(SecurityMode::Standard, Enforced);
+        posix.set_shell_dialect(ShellDialect::Posix);
+        assert_eq!(posix.check("bash", "ls"), CheckResult::Allowed);
+        assert_eq!(posix.check("bash", "git log"), CheckResult::Allowed);
+    }
+
+    #[test]
+    fn shell_dialect_follows_the_shell_name() {
+        use crate::permission::shell_dialect_for_name as d;
+        use crate::sandbox::ShellDialect::*;
+        assert_eq!(d("bash"), Posix);
+        assert_eq!(d("C:\\Git\\bin\\bash.exe"), Posix);
+        assert_eq!(d("CMD.EXE"), Cmd);
+        assert_eq!(d("pwsh"), PowerShell);
+        assert_eq!(d("C:\\Windows\\powershell.exe"), PowerShell);
+    }
+
     #[cfg(unix)]
     #[test]
     fn checker_refuses_symlinks_leaving_the_workspace_and_uncontained_recursion() {

@@ -913,16 +913,10 @@ impl ManagedPolicy {
             for key in std::iter::once(tool.as_str()).chain(keys.iter().copied()) {
                 let entry = deny.entry(key.to_string()).or_default();
                 for pattern in patterns {
-                    // A shell command is one opaque string whose arguments are
-                    // paths and URLs: `*` must cross `/`, or the documented
-                    // `rm -rf *` would miss `rm -rf build/out`.
-                    let pattern = if matches!(tool.as_str(), "shell" | "bash") {
-                        crate::permission::checker::fetch_deny_glob(pattern)
-                    } else {
-                        pattern.clone()
-                    };
-                    if !entry.contains(&pattern) {
-                        entry.push(pattern);
+                    // The checker widens `*` to cross `/` for shell rules
+                    // (mini-agent-nvnkx.61), so the text is kept as written.
+                    if !entry.contains(pattern) {
+                        entry.push(pattern.clone());
                     }
                 }
             }
@@ -1031,7 +1025,7 @@ mod tests {
         assert_eq!(cfg.permission_checks_required, Some(true));
         assert_eq!(
             cfg.permission_deny.as_ref().unwrap()["shell"],
-            ["curl *", "rm -rf **"]
+            ["curl *", "rm -rf *"]
         );
     }
 
