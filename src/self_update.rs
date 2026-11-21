@@ -624,6 +624,7 @@ async fn run_inner(args: UpdateArgs) -> Result<(), String> {
     if attestation != Attestation::Verified {
         eprintln!("Note: this install was not provenance-verified.");
     }
+    println!("Run /release-notes in mini-agent to see what changed.");
     // The archive digest was verified above; its notices now replace the old ones.
     let outcome = match (archive_documents(&archive), notice_directory(&exe)) {
         (Ok(documents), Some(directory)) => refresh_notice_documents(&directory, &documents),

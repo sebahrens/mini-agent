@@ -91,6 +91,8 @@ fn main() {
     }
     hash_field(&mut digest, &rustc_version.stdout);
 
+    write_release_notes(&root, &out);
+
     let fingerprint = digest
         .finalize()
         .iter()
@@ -101,6 +103,43 @@ fn main() {
         "cargo:rustc-env=MINI_AGENT_BUILD_TARGET={}",
         env::var("TARGET").expect("Cargo must provide TARGET")
     );
+}
+
+/// Extract this version's CHANGELOG section (or `[Unreleased]` when the
+/// version has no heading yet) into `OUT_DIR/release_notes.md` for `/release-notes`.
+/// Kept to 24 KiB so the binary does not carry the whole changelog.
+fn write_release_notes(root: &std::path::Path, out: &std::path::Path) {
+    let path = root.join("CHANGELOG.md");
+    println!("cargo:rerun-if-changed={}", path.display());
+    let changelog = std::fs::read_to_string(&path).unwrap_or_default();
+    let version = env::var("CARGO_PKG_VERSION").unwrap_or_default();
+    let section = |name: &str| {
+        let heading = format!("## [{name}]");
+        let start = changelog
+            .lines()
+            .position(|line| line.starts_with(&heading))?;
+        let body: Vec<&str> = changelog
+            .lines()
+            .skip(start)
+            .enumerate()
+            .take_while(|(index, line)| *index == 0 || !line.starts_with("## ["))
+            .map(|(_, line)| line)
+            .collect();
+        Some(body.join("\n"))
+    };
+    let mut notes = section(&version)
+        .or_else(|| section("Unreleased"))
+        .unwrap_or_else(|| "No release notes are embedded in this build.".to_owned());
+    const LIMIT: usize = 24 * 1024;
+    if notes.len() > LIMIT {
+        let mut end = LIMIT;
+        while !notes.is_char_boundary(end) {
+            end -= 1;
+        }
+        notes.truncate(end);
+        notes.push_str("\n[truncated; see CHANGELOG.md in the repository]");
+    }
+    std::fs::write(out.join("release_notes.md"), notes).expect("write embedded release notes");
 }
 
 fn hash_environment(digest: &mut Sha256, key: &str) {

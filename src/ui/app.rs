@@ -6139,6 +6139,10 @@ impl<'a> App<'a> {
         if share_app::is_confirm(text) {
             return self.start_share();
         }
+        #[cfg(feature = "export")]
+        if share_app::is_unshare(text) {
+            return self.start_unshare();
+        }
 
         // Commands that hand the tty to a synchronous stdin consumer must not
         // race the crossterm event thread for keystrokes (same pattern as

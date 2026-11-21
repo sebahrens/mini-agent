@@ -400,9 +400,9 @@ pub enum UserEvent {
     // Sent only from the non-test opener; tests construct it directly.
     #[cfg_attr(test, allow(dead_code))]
     LinkOpenFailed(String),
-    /// A background `/share confirm` upload finished: the gist URL or the error.
+    /// A background `/share confirm` upload finished: the gist or the error.
     #[cfg(feature = "export")]
-    ShareDone(Result<String, String>),
+    ShareDone(Result<crate::extras::export::GistShare, String>),
     /// Boxed: this variant carries a whole verification result, and
     /// `UserEvent` is held in the interactive future the startup path builds on
     /// the stack. A regression test runs the binary under the 1 MiB Windows

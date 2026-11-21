@@ -580,6 +580,26 @@ async fn run_async(credential: &CommandCredential) -> Result<String, String> {
     credential_from_output(&output).map_err(|reason| credential.failure(reason))
 }
 
+/// Runs one credential command once, uncached, and returns its single-line
+/// output (used for `gh auth token`). Same launcher, timeout and output rules
+/// as `api_key_commands`; failures name the program, never its output.
+#[cfg_attr(not(feature = "export"), allow(dead_code))]
+pub(crate) async fn run_once(
+    label: &str,
+    command: Vec<String>,
+    timeout_secs: u64,
+) -> Result<String, String> {
+    let credential = CommandCredential::new(
+        label,
+        ApiKeyCommandSpec {
+            command,
+            ttl_secs: Some(0),
+            timeout_secs: Some(timeout_secs),
+        },
+    );
+    run_async(&credential).await
+}
+
 static REGISTRY: RwLock<Option<HashMap<String, Arc<CommandCredential>>>> = RwLock::new(None);
 
 /// Installs the configured `api_key_commands`. An unchanged entry keeps its

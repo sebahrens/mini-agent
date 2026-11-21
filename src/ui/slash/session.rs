@@ -34,6 +34,8 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
         "/import" => handle_import(parts, ctx).await,
         #[cfg(feature = "export")]
         "/share" => handle_share(parts, ctx).await,
+        #[cfg(feature = "export")]
+        "/unshare" => handle_unshare(ctx).await,
         _ => Ok(()),
     }
 }
@@ -422,9 +424,50 @@ async fn handle_share(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<
             crate::byte_text::format_bytes(html.len() as u64)
         ),
     );
-    match crate::extras::export::share_gist(&filename, &html, &description).await {
-        Ok(url) => write_ok(ctx.renderer, format!("shared as secret gist: {}", url)),
+    let existing = ctx.session.shared_gist_id.as_ref().map(|id| id.to_string());
+    match crate::extras::export::share_gist(&filename, &html, &description, existing.as_deref())
+        .await
+    {
+        Ok(share) => {
+            ctx.session.shared_gist_id = Some(share.id.as_str().into());
+            let no_session = ctx.cli.no_session;
+            let _ = persist_session_unless_ephemeral(no_session, ctx.session, |notice| {
+                write_error(ctx.renderer, format!("warning: {notice}"))
+            });
+            let verb = if share.updated { "updated" } else { "shared as" };
+            write_ok(
+                ctx.renderer,
+                format!(
+                    "{verb} secret gist: {} (via {}; /unshare deletes it)",
+                    share.url,
+                    share.source.label()
+                ),
+            );
+        }
         Err(e) => write_error(ctx.renderer, format!("share failed: {}", e)),
+    }
+    Ok(())
+}
+
+#[cfg(feature = "export")]
+async fn handle_unshare(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
+    let Some(id) = ctx.session.shared_gist_id.as_ref().map(|id| id.to_string()) else {
+        write_ok(ctx.renderer, "this session has no shared gist (nothing to unshare)");
+        return Ok(());
+    };
+    match crate::extras::export::unshare_gist(&id).await {
+        Ok(source) => {
+            ctx.session.shared_gist_id = None;
+            let no_session = ctx.cli.no_session;
+            let _ = persist_session_unless_ephemeral(no_session, ctx.session, |notice| {
+                write_error(ctx.renderer, format!("warning: {notice}"))
+            });
+            write_ok(
+                ctx.renderer,
+                format!("unshared: the gist was deleted (via {})", source.label()),
+            );
+        }
+        Err(e) => write_error(ctx.renderer, format!("unshare failed: {}", e)),
     }
     Ok(())
 }

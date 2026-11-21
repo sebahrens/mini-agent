@@ -14,6 +14,11 @@ fn active() -> std::sync::MutexGuard<'static, Option<tokio::task::AbortHandle>> 
     ACTIVE.lock().unwrap_or_else(|error| error.into_inner())
 }
 
+/// Whether the submitted text is `/unshare`.
+pub(super) fn is_unshare(text: &str) -> bool {
+    text.split_whitespace().collect::<Vec<_>>() == ["/unshare"]
+}
+
 /// Whether the submitted text is the confirming form of `/share`.
 pub(super) fn is_confirm(text: &str) -> bool {
     matches!(
@@ -58,10 +63,16 @@ impl App<'_> {
             ),
             C_AGENT,
         )?;
+        let existing = session.shared_gist_id.as_ref().map(|id| id.to_string());
         let tx = self.user_tx.clone();
         let task = tokio::spawn(async move {
-            let result = crate::extras::export::share_gist(&filename, &html, &description)
-                .await
+            let result = crate::extras::export::share_gist(
+                &filename,
+                &html,
+                &description,
+                existing.as_deref(),
+            )
+            .await
                 .map_err(|error| error.to_string());
             *active() = None;
             let _ = tx.send(UserEvent::ShareDone(result)).await;
@@ -70,12 +81,65 @@ impl App<'_> {
         Ok(())
     }
 
-    /// Report a finished upload.
-    pub(super) fn finish_share(&mut self, result: Result<String, String>) -> anyhow::Result<()> {
+    /// Delete the session's shared gist (`/unshare`) and forget its id.
+    pub(super) fn start_unshare(&mut self) -> anyhow::Result<()> {
+        let Some(id) = self.ui.session.shared_gist_id.clone() else {
+            self.renderer
+                .write_line("this session has no shared gist (nothing to unshare)", C_AGENT)?;
+            return Ok(());
+        };
+        if active().is_some() {
+            self.renderer
+                .write_line("a share request is already running (Esc cancels it)", C_ERROR)?;
+            return Ok(());
+        }
+        self.renderer
+            .write_line("deleting the shared gist… (Esc cancels)", C_AGENT)?;
+        let tx = self.user_tx.clone();
+        let task = tokio::spawn(async move {
+            let result = crate::extras::export::unshare_gist(&id)
+                .await
+                .map(|source| crate::extras::export::GistShare {
+                    url: String::new(),
+                    id: String::new(),
+                    updated: false,
+                    source,
+                })
+                .map_err(|error| error.to_string());
+            *active() = None;
+            let _ = tx.send(UserEvent::ShareDone(result)).await;
+        });
+        *active() = Some(task.abort_handle());
+        Ok(())
+    }
+
+    /// Report a finished upload or deletion. An empty URL marks a deletion.
+    pub(super) fn finish_share(
+        &mut self,
+        result: Result<crate::extras::export::GistShare, String>,
+    ) -> anyhow::Result<()> {
         match result {
-            Ok(url) => self
-                .renderer
-                .write_line(&format!("shared as secret gist: {url}"), C_AGENT)?,
+            Ok(share) if share.url.is_empty() => {
+                self.ui.session.shared_gist_id = None;
+                let _ = self.save_session();
+                self.renderer.write_line(
+                    &format!("unshared: the gist was deleted (via {})", share.source.label()),
+                    C_AGENT,
+                )?
+            }
+            Ok(share) => {
+                self.ui.session.shared_gist_id = Some(share.id.as_str().into());
+                let _ = self.save_session();
+                let verb = if share.updated { "updated" } else { "shared as" };
+                self.renderer.write_line(
+                    &format!(
+                        "{verb} secret gist: {} (via {}; /unshare deletes it)",
+                        share.url,
+                        share.source.label()
+                    ),
+                    C_AGENT,
+                )?
+            }
             Err(error) => self
                 .renderer
                 .write_line(&format!("share failed: {error}"), C_ERROR)?,
@@ -87,6 +151,13 @@ impl App<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unshare_is_recognised_exactly() {
+        assert!(is_unshare("/unshare"));
+        assert!(is_unshare(" /unshare "));
+        assert!(!is_unshare("/unshare now"));
+    }
 
     #[test]
     fn only_the_confirming_form_starts_an_upload() {

@@ -1102,6 +1102,10 @@ pub struct Session {
     /// (mini-agent-sskdu.11); see `title::MAX_TITLE_ATTEMPTS`.
     #[serde(default, skip_serializing_if = "is_zero_u8")]
     pub title_attempts: u8,
+    /// Id of the secret gist `/share` created for this session, so a repeated
+    /// `/share` updates it and `/unshare` deletes it (mini-agent-nvnkx.55).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_gist_id: Option<CompactString>,
     /// Closed session data only; never a runtime permission or replay owner.
     #[serde(
         default,
@@ -1750,6 +1754,7 @@ impl Session {
             generated_title: None,
             first_prompt: None,
             title_attempts: 0,
+            shared_gist_id: None,
             reasoning_controls: Default::default(),
             #[cfg(feature = "acp")]
             acp_selection: None,
