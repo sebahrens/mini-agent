@@ -569,6 +569,26 @@ pub(crate) fn verify_resume_provider_safety() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Error for a `--load-prompt NAME` that matches no prompt, listing the
+/// available names once (the message is the only output; callers must not
+/// print the list separately).
+fn unknown_prompt_check<'a>(
+    name: &str,
+    available: impl Iterator<Item = &'a String>,
+) -> anyhow::Result<()> {
+    let mut names: Vec<&String> = available.collect();
+    if names.iter().any(|candidate| candidate.as_str() == name) {
+        return Ok(());
+    }
+    names.sort();
+    let list = names
+        .iter()
+        .map(|candidate| format!("  {candidate}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    anyhow::bail!("unknown prompt '{name}'\navailable prompts:\n{list}")
+}
+
 /// Whether an explicit `--model`/`--provider`/`--quick-model` (or its
 /// environment form) pins the startup model. A pinned model is never replaced
 /// by the `[prompt_to_model]` mapping of the startup persona.
@@ -2498,6 +2518,12 @@ impl Startup {
             }
         }
 
+        // Reject an unknown `--load-prompt` before the SessionStart hook, the
+        // MCP prompts or any other effect of this phase.
+        if let Some(name) = &self.cli.load_prompt {
+            unknown_prompt_check(name, self.context.prompts.keys())?;
+        }
+
         // Recommended MCP prompts on first startup
         #[cfg(feature = "mcp")]
         if recommended_mcp_prompt_due(
@@ -2615,28 +2641,20 @@ impl Startup {
             }
         }
 
-        // --load-prompt overrides the default prompt
-        if let Some(ref name) = self.cli.load_prompt {
-            if self.context.activate_main_prompt(name).is_some() {
-                if !self.session_resumed && !cli_pins_startup_model(&self.cli) {
-                    apply_startup_prompt_model(
-                        name,
-                        &self.cfg,
-                        &mut self.provider,
-                        &mut self.model,
-                        &mut self.session,
-                    );
-                }
-            } else {
-                let mut sorted: Vec<&String> = self.context.prompts.keys().collect();
-                sorted.sort();
-                eprintln!("error: unknown prompt '{}'", name);
-                eprintln!("available prompts:");
-                for p in &sorted {
-                    eprintln!("  {}", p);
-                }
-                anyhow::bail!("unknown prompt '{}'", name);
-            }
+        // --load-prompt overrides the default prompt (validated earlier, before
+        // any hook or session effect, by `unknown_prompt_check`).
+        if let Some(ref name) = self.cli.load_prompt
+            && self.context.activate_main_prompt(name).is_some()
+            && !self.session_resumed
+            && !cli_pins_startup_model(&self.cli)
+        {
+            apply_startup_prompt_model(
+                name,
+                &self.cfg,
+                &mut self.provider,
+                &mut self.model,
+                &mut self.session,
+            );
         }
 
         // Rebuild client if the provider changed due to prompt-to-model mapping
@@ -2870,6 +2888,33 @@ impl Startup {
         failure.map_or(Ok(()), Err)
     }
 
+    /// Join the `SessionStart` hook task (a no-op without hooks or when none
+    /// was spawned) and hand its context to the session, or to the native
+    /// startup owner when one is in charge of the first model call.
+    async fn join_session_start_hook(&mut self) -> anyhow::Result<()> {
+        #[cfg(feature = "hooks")]
+        if let Some(task) = self.session_start_task.take() {
+            match task.await {
+                Ok(context) => {
+                    if self.native_startup.is_some() {
+                        self.pending_session_start_context = Some(context);
+                    } else {
+                        crate::extras::hooks::append_context_session(
+                            &mut self.session,
+                            &context.into_notices(),
+                        );
+                    }
+                }
+                Err(error) => {
+                    if let Some(owner) = &self.native_startup {
+                        owner.hook_retired(Err(error))?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn dispatch_inner(mut self: Box<Self>) -> anyhow::Result<()> {
         session::storage::report_pending_save_notices(&mut self.session, |notice| {
             eprintln!("warning: {notice}")
@@ -2898,26 +2943,7 @@ impl Startup {
             None
         };
         if self.cli.print {
-            #[cfg(feature = "hooks")]
-            if let Some(task) = self.session_start_task.take() {
-                match task.await {
-                    Ok(context) => {
-                        if self.native_startup.is_some() {
-                            self.pending_session_start_context = Some(context);
-                        } else {
-                            crate::extras::hooks::append_context_session(
-                                &mut self.session,
-                                &context.into_notices(),
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        if let Some(owner) = &self.native_startup {
-                            owner.hook_retired(Err(error))?;
-                        }
-                    }
-                }
-            }
+            self.join_session_start_hook().await?;
             self.join_native_startup().await?;
             let result = if self.cli.input_format() == crate::cli::InputFormat::StreamJson {
                 heap_future(|| self.dispatch_print_stream_input()).await
@@ -2938,26 +2964,7 @@ impl Startup {
         } else {
             #[cfg(feature = "loop")]
             if self.cli.loop_mode {
-                #[cfg(feature = "hooks")]
-                if let Some(task) = self.session_start_task.take() {
-                    match task.await {
-                        Ok(context) => {
-                            if self.native_startup.is_some() {
-                                self.pending_session_start_context = Some(context);
-                            } else {
-                                crate::extras::hooks::append_context_session(
-                                    &mut self.session,
-                                    &context.into_notices(),
-                                );
-                            }
-                        }
-                        Err(error) => {
-                            if let Some(owner) = &self.native_startup {
-                                owner.hook_retired(Err(error))?;
-                            }
-                        }
-                    }
-                }
+                self.join_session_start_hook().await?;
                 self.join_native_startup().await?;
                 return heap_future(|| self.dispatch_loop()).await;
             }
@@ -6045,6 +6052,19 @@ mod tests {
         assert_eq!(
             startup_prompt_provider(&missing, &cfg, false, &prompts),
             None
+        );
+    }
+
+    #[test]
+    fn unknown_load_prompt_error_lists_prompts_once() {
+        let known = ["plan".to_owned(), "build".to_owned()];
+        assert!(super::unknown_prompt_check("plan", known.iter()).is_ok());
+        let error = super::unknown_prompt_check("nope", known.iter())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "unknown prompt 'nope'\navailable prompts:\n  build\n  plan"
         );
     }
 
