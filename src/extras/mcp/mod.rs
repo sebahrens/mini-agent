@@ -707,6 +707,7 @@ impl McpClientManager {
     /// [`INSTRUCTIONS_TOTAL_BYTES`] overall (with a visible notice), stripped
     /// of control characters, and fenced so it cannot close its own block or
     /// claim system authority. Empty when no server sent any.
+    #[cfg(test)]
     pub(crate) fn instructions_section(&self) -> String {
         self.instructions_section_filtered(None)
     }

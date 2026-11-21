@@ -66,8 +66,11 @@ Files from all levels are concatenated, with source-path headers indicating
 where each block came from. This lets you define organization-wide conventions
 in the global file while having project-specific architecture in each repo.
 
-At an interactive startup, if no `ARCHITECTURE.md` is found anywhere in the
-directory tree, mini-agent offers to create one. Headless runs (`-p`, `--goal`
+At an interactive startup inside a version-controlled project (the directory or
+an ancestor holds `.git`, `.hg`, `.jj` or `.svn`), if no `ARCHITECTURE.md` is
+found anywhere in the directory tree, mini-agent offers to create one. Other
+directories (a home folder, a scratch directory) are never asked. Each directory
+is asked once; the answer is remembered. Headless runs (`-p`, `--goal`
 with `-p`, `--loop`, `--acp`) never ask, so they cannot stop on the question or
 consume piped input:
 

@@ -912,9 +912,9 @@ impl HookDispatcher {
         // One canonicalize of the project directory per event, shared by all
         // handlers; the next event resolves it afresh.
         let dir_memo = Arc::new(ProjectDirMemo::default());
-        let mut futures: Vec<
-            std::pin::Pin<Box<dyn std::future::Future<Output = (String, HookOutput)> + Send>>,
-        > = Vec::new();
+        type LabeledRun =
+            std::pin::Pin<Box<dyn std::future::Future<Output = (String, HookOutput)> + Send>>;
+        let mut futures: Vec<LabeledRun> = Vec::new();
         for handler in handlers {
             let Some(command) = handler.command.clone() else {
                 continue;

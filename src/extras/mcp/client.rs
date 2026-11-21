@@ -126,7 +126,7 @@ pub(crate) struct NamedConnectError {
 }
 
 impl NamedConnectError {
-    fn new(server: &str, detail: impl std::fmt::Display) -> anyhow::Error {
+    fn error(server: &str, detail: impl std::fmt::Display) -> anyhow::Error {
         anyhow::Error::new(Self {
             server: server.to_owned(),
             detail: detail.to_string(),
@@ -1187,13 +1187,13 @@ impl McpClientHandle {
                 let transport = AuthHttpClient::with_client(auth_client, cfg);
                 serve_client(elicitation.clone(), transport)
                     .await
-                    .map_err(|e| NamedConnectError::new(&server_name, e))
+                    .map_err(|e| NamedConnectError::error(&server_name, e))
             } else {
                 type HttpClient = rmcp::transport::StreamableHttpClientTransport<BoundedHttpClient>;
                 let transport = HttpClient::with_client(http_client, cfg);
                 serve_client(elicitation.clone(), transport)
                     .await
-                    .map_err(|e| NamedConnectError::new(&server_name, e))
+                    .map_err(|e| NamedConnectError::error(&server_name, e))
             }
         };
         let initialized = tokio::select! {
@@ -2756,15 +2756,16 @@ mod connect_classification_tests {
     #[test]
     fn server_names_do_not_steer_retry_classification() {
         for name in ["disabled-tests", "forbidden-zone", "unauthorized-proxy"] {
-            let refused = NamedConnectError::new(name, "error sending request: connection refused");
+            let refused =
+                NamedConnectError::error(name, "error sending request: connection refused");
             assert!(is_transient_connect_error(&refused), "{name}");
-            let auth = NamedConnectError::new(name, "HTTP 401 unauthorized");
+            let auth = NamedConnectError::error(name, "HTTP 401 unauthorized");
             assert!(!is_transient_connect_error(&auth), "{name}");
         }
         // A name that looks like a status code is not read as one.
-        let named = NamedConnectError::new("HTTP 404 service", "connection reset by peer");
+        let named = NamedConnectError::error("HTTP 404 service", "connection reset by peer");
         assert!(is_transient_connect_error(&named));
-        let hinted = NamedConnectError::new("x [retry-after: 9]", "HTTP 503 [retry-after: 2]");
+        let hinted = NamedConnectError::error("x [retry-after: 9]", "HTTP 503 [retry-after: 2]");
         assert_eq!(retry_after_hint(&hinted), Some(Duration::from_secs(2)));
         // Errors from elsewhere keep full-text classification.
         assert!(!is_transient_connect_error(&anyhow::anyhow!(
