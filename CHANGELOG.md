@@ -79,6 +79,12 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Added: an interrupted headless run (SIGINT, SIGTERM or a control-channel interrupt) reports `stop_reason: "interrupted"` with `is_error: true`, the text produced so far plus a cut-short marker in `result`, and exits 130 (SIGINT) or 143 (SIGTERM) (mini-agent-nvnkx.158).
 - Added: a job id from an earlier process of the session answers that the job started in an earlier process and is no longer running, and names its output log when it still exists (mini-agent-nvnkx.315).
 - Added: ACP answers `max_turn_requests` for a spent turn cap and `max_tokens` for a spent token budget or a final answer cut off at the output limit, instead of a JSON-RPC internal error or `end_turn`; the explanation arrives as a thought chunk (mini-agent-nvnkx.273).
+- `docs/agent/MIGRATING.md`: coming from Claude Code, Codex or opencode, listing which files are read as-is, which need an opt-in key or flag, and what has no equivalent (mini-agent-nvnkx.128).
+- The published docs site has a sidebar from `docs/agent/manifest.txt`, client-side search over a build-time JSON index, a config-key reference generated from `src/config/keys.rs`, `docs/vscode-acp-setup.md`, repository links rewritten to GitHub, and a build that fails on a missing manifest file, an unlisted page, an uncovered key or a dead link; `docs/agent/TROUBLESHOOTING.md` lists each error message with its fix (mini-agent-nvnkx.135).
+- `docs/agent/EDITORS.md`: ACP configuration for Zed, JetBrains and Neovim with a capability table and limits, `scripts/ci/acp_smoke.py` drives `mini-agent --acp` with each documented argv against an offline stub provider, and PUBLISHING_RELEASES.md documents the manual ACP registry submission (mini-agent-nvnkx.136).
+- Root `action.yml` (composite GitHub Action: attested release install, `mini-agent -p --output json`, outputs `result`, `session-id`, `cost`, `exit-code`), example PR-review and @mention workflows in `examples/ci/`, `docs/agent/CI.md` with a GitLab recipe and untrusted-content defaults, and an offline self-test workflow (mini-agent-nvnkx.104).
+- `docs/agent/PARITY.md`: the feature parity matrix, refreshed against the current code (mini-agent-nvnkx.146).
+- winget, scoop and npm manifest templates under `packaging/` with `scripts/render_package_manifests.py`, which fills them from a release's checksum manifests and fails closed on a missing, duplicate or malformed digest; publishing steps are documented, nothing is published (mini-agent-nvnkx.127).
 
 ### Fixed
 
@@ -315,6 +321,8 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Fixed: the steering checkpoint failure reports the messages of every stream of the turn, not just the current one (mini-agent-nvnkx.16).
 - Fixed: a call that completed and was reported is no longer recorded as "outcome unknown" when the user interrupts before the UI read its result event (mini-agent-nvnkx.166).
 - Fixed: the loop guard lets an identical failing call run again after a `job_status` poll or eight other tool results, so polling for a port, CI run or lock is not blocked for the rest of the turn (mini-agent-nvnkx.19).
+- Fixed: a headless run no longer panics with "JoinHandle polled after completion" when the OpenRouter pricing refresh finishes inside its wait (`finish_within` awaited the finished handle a second time).
+- Fixed: the Windows MSI adds its install directory to `PATH` (user `PATH` per-user, system `PATH` for `ALLUSERS=1`, removed on uninstall), so the install guide's `mini-agent --version` step works in a new shell; the release smoke resolves `mini-agent.exe` by bare name and checks the entry is removed (mini-agent-nvnkx.301).
 
 ### Added
 

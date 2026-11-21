@@ -8,6 +8,8 @@ on:
     paths:
       - 'action.yml'
       - 'scripts/ci/stub_provider.py'
+      - 'scripts/ci/acp_smoke.py'
+      - 'docs/agent/EDITORS.md'
       - '.github/workflows/action-selftest.yml'
       - 'install.sh'
   workflow_dispatch:
@@ -45,11 +47,15 @@ jobs:
           cat > "$RUNNER_TEMP/ma-config/config.toml" <<TOML
           provider = "stub"
           model = "stub"
+          models_catalog_refresh_days = 0
           [custom_providers.stub]
           provider_type = "openai"
           api_style = "completions"
           base_url = "http://127.0.0.1:${port}/v1"
           model = "stub"
+          [custom_providers.stub.model_prices.stub]
+          input_token_cost = 1.0
+          output_token_cost = 2.0
           TOML
           {
             echo "MINI_AGENT_CONFIG_DIR=$RUNNER_TEMP/ma-config"
@@ -80,3 +86,6 @@ jobs:
           [ "$RESULT" = "STUB-REVIEW-OK" ] || { echo "result=$RESULT"; exit 1; }
           [ -n "$SESSION_ID" ] || { echo "empty session-id"; exit 1; }
           jq -e '.total_cost_usd != null' "$RESULT_FILE" >/dev/null
+
+      - name: ACP smoke for every documented editor launch
+        run: python3 scripts/ci/acp_smoke.py --binary target/debug/mini-agent

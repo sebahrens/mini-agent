@@ -199,6 +199,12 @@ fails. A stream that stalls ends after `stream_idle_timeout_secs` (300 by defaul
 `-p --output json` always ends with one result record, even when startup fails: `is_error: true`,
 `stop_reason: "failed"`, and the failure text in `result`.
 
+### cost cap requires known model pricing; add model_prices for this model or switch
+
+`--max-budget-usd` (or `max_budget_usd`) cannot bound spend on a model with no known price, so the run
+stops with exit code `4`. Add `model_prices` to the custom provider (see [CONFIG.md](CONFIG.md)),
+switch to a model the catalog prices, or cap the run with `--max-agent-turns` instead.
+
 ### a permission was refused in -p mode
 
 Without a terminal there is nobody to approve, so an operation that would ask is refused and listed in

@@ -1,0 +1,37 @@
+# Ordered navigation for the published site (scripts/build_docs_site.py).
+# One page per line: "Section | path relative to docs/agent". Sections appear in first-use
+# order. The build fails when a listed file is missing or a page is not listed here.
+Start | GET_STARTED.md
+Start | MIGRATING.md
+Start | WINDOWS_INSTALL.md
+Start | PARITY.md
+Use | COMMANDS.md
+Use | input-keybindings.md
+Use | SKILLS.md
+Use | SUBAGENTS.md
+Use | GOALS.md
+Use | MEMORY.md
+Use | file-checkpoints.md
+Use | ASK_USER_QUESTION.md
+Use | IMAGE_READ.md
+Configure | CONFIG.md
+Configure | CONFIG_KEYS.md
+Configure | PROVIDERS.md
+Configure | providers/Minimax.md
+Configure | COST_TRACKING.md
+Configure | MCP_CONFIGURATION.md
+Configure | MCP_INTERACTION.md
+Configure | HASHEDIT.md
+Integrate | EDITORS.md
+Integrate | vscode-acp-setup.md
+Integrate | CI.md
+Help | TROUBLESHOOTING.md
+Internals | ARCHITECTURE.md
+Internals | TOOL_RUNTIME.md
+Internals | native-compatibility.md
+Internals | native-publication.md
+Internals | GYM.md
+Internals | HARNESS_EVAL.md
+Release | PUBLISHING_RELEASES.md
+Release | WINDOWS_SIGNING.md
+Release | DEPENDENCY_POLICY.md

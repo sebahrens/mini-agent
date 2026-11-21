@@ -48,11 +48,29 @@ article hr{border:none;border-top:1px solid var(--border);margin:32px 0}
 article img{max-width:100%;height:auto}
 footer{padding:32px 0;text-align:center;font-size:.78rem;color:var(--text-dim);border-top:1px solid var(--border)}
 @media(max-width:600px){.container{padding:0 16px}article h1{font-size:1.4rem}}
+.layout{display:flex;align-items:flex-start;max-width:1180px;margin:0 auto}
+.sidebar{width:260px;flex:none;position:sticky;top:0;max-height:100vh;overflow-y:auto;padding:20px 16px;border-right:1px solid var(--border);font-size:.8rem}
+.sidebar h2{font-size:.72rem;text-transform:uppercase;letter-spacing:.08em;color:var(--text-dim);margin:18px 0 6px}
+.sidebar ul{list-style:none}
+.sidebar li{margin:2px 0}
+.sidebar a.current{color:var(--heading);font-weight:700}
+.search input{width:100%;padding:7px 9px;background:var(--surface);border:1px solid var(--border);border-radius:4px;color:var(--text);font:inherit}
+#results{margin-top:8px;border:1px solid var(--border);border-radius:4px;background:var(--surface)}
+#results li{padding:6px 8px;border-bottom:1px solid var(--border)}
+#results li:last-child{border-bottom:none}
+#results small{display:block;color:var(--text-dim)}
+.main{flex:1;min-width:0}
+@media(max-width:860px){.layout{display:block}.sidebar{position:static;width:auto;max-height:none;border-right:none;border-bottom:1px solid var(--border)}}
 </style>
 </head>
 <body>
+<div class="layout">
+$for(include-before)$
+$include-before$
+$endfor$
+<div class="main">
 <div class="container">
-<nav><a href="./">← mini-agent</a></nav>
+<nav><a href="$root$index.html">&larr; mini-agent docs</a></nav>
 <article>
 $if(title)$
 <h1>$title$</h1>
@@ -63,5 +81,56 @@ $body$
 <p>mini-agent &mdash; <a href="https://github.com/sebahrens/mini-agent" target="_blank" rel="noopener">GitHub</a></p>
 </footer>
 </div>
+</div>
+</div>
+<script>
+(function () {
+  var input = document.getElementById("q"), list = document.getElementById("results");
+  if (!input || !list) return;
+  var root = "$root$", index = null, loading = false;
+  function load(done) {
+    if (index) return done();
+    if (loading) return;
+    loading = true;
+    fetch(root + "search-index.json").then(function (r) { return r.json(); })
+      .then(function (data) { index = data; done(); })
+      .catch(function () { loading = false; list.hidden = false; list.textContent = "Search index unavailable."; });
+  }
+  function score(entry, terms) {
+    var h = entry.h.toLowerCase(), t = entry.t.toLowerCase(), x = entry.x.toLowerCase(), s = 0;
+    for (var i = 0; i < terms.length; i++) {
+      var term = terms[i], hit = 0;
+      if (h.indexOf(term) >= 0) hit += 8;
+      if (t.indexOf(term) >= 0) hit += 2;
+      if (x.indexOf(term) >= 0) hit += 1;
+      if (!hit) return 0;
+      s += hit;
+    }
+    return s;
+  }
+  function run() {
+    var q = input.value.trim().toLowerCase();
+    list.textContent = "";
+    if (q.length < 2) { list.hidden = true; return; }
+    var terms = q.split(/\s+/), hits = [];
+    for (var i = 0; i < index.length; i++) {
+      var s = score(index[i], terms);
+      if (s) hits.push([s, index[i]]);
+    }
+    hits.sort(function (a, b) { return b[0] - a[0]; });
+    hits.slice(0, 20).forEach(function (hit) {
+      var e = hit[1], li = document.createElement("li"), a = document.createElement("a"), small = document.createElement("small");
+      a.href = root + e.p + (e.a ? "#" + e.a : "");
+      a.textContent = e.h;
+      small.textContent = e.t;
+      li.appendChild(a); li.appendChild(small); list.appendChild(li);
+    });
+    if (!hits.length) { var none = document.createElement("li"); none.textContent = "No matches."; list.appendChild(none); }
+    list.hidden = false;
+  }
+  input.addEventListener("input", function () { load(run); });
+  input.addEventListener("focus", function () { load(function () {}); });
+})();
+</script>
 </body>
 </html>

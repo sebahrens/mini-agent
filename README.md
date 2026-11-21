@@ -618,7 +618,12 @@ mini-agent -p --output json "Update the README example"
 
 See [Getting started](docs/agent/GET_STARTED.md),
 [provider configuration](docs/agent/PROVIDERS.md), and
-[the complete configuration reference](docs/agent/CONFIG.md). Contributors can
+[the complete configuration reference](docs/agent/CONFIG.md). Coming from another agent? Read
+[Coming from Claude Code, Codex or opencode](docs/agent/MIGRATING.md). To use mini-agent from an editor
+see [Zed, JetBrains and Neovim setup](docs/agent/EDITORS.md); to run it in pull request review or other
+automation see [mini-agent in CI](docs/agent/CI.md) and the root `action.yml`. If something fails, the
+[troubleshooting guide](docs/agent/TROUBLESHOOTING.md) lists each message with its fix, and the
+[feature parity matrix](docs/agent/PARITY.md) shows how mini-agent compares with other agents. Contributors can
 also run the [deterministic harness evaluation](docs/agent/HARNESS_EVAL.md) for
 task-level regression coverage without a live provider.
 

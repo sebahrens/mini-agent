@@ -62,6 +62,9 @@ def write_config(config_dir: Path, port: int) -> None:
                 'api_style = "completions"',
                 f'base_url = "http://127.0.0.1:{port}/v1"',
                 'model = "stub"',
+                "[custom_providers.stub.model_prices.stub]",
+                "input_token_cost = 1.0",
+                "output_token_cost = 2.0",
                 "",
             ]
         ),

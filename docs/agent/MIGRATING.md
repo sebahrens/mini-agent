@@ -48,7 +48,7 @@ Three rules hold for every tool:
 | `~/.claude/CLAUDE.md` and `~/.claude/rules` | `user_instruction_files = true` |
 | `~/.claude/commands/*.md` | On by default; `claude_user_commands = false` turns it off. |
 | `~/.claude/agents/*.md` | `claude_user_agents = true` |
-| `--add-dir DIR` to give Claude access to another directory | `--add-dir DIR` only adds skill roots. Add `add_dir_tool_access = true` so the file tools may reach DIR under the normal permission rules. |
+| `--add-dir DIR` to give Claude Code access to another directory | `--add-dir DIR` only adds skill roots. Add `add_dir_tool_access = true` so the file tools may reach DIR under the normal permission rules. |
 | Hooks run from a headless job | `--trust-project-hooks` (or `MINI_AGENT_TRUST_PROJECT_HOOKS`), or approve once with `mini-agent hooks trust`. |
 | A project config in CI or a container | `--trust-project-config`, or `mini-agent trust --yes`. |
 
@@ -61,7 +61,7 @@ Three rules hold for every tool:
 | Plugins and marketplaces | None; `skills_plugin_dirs` points at plugin-shaped skill folders only. |
 | SDKs, GitHub app, desktop app, web/mobile, voice | None. For CI see [CI.md](CI.md); for editors see [EDITORS.md](EDITORS.md). |
 | Agent teams | None. Subagents (`task`) and `@agent:<name>` mentions exist. |
-| Inline `` !`command` `` in headless or ACP runs | Works in the interactive session only (after the shell permission rules allow it). Headless `-p` and ACP fail closed on a command file that uses it. |
+| Inline ``!`command` `` in headless or ACP runs | Works in the interactive session only (after the shell permission rules allow it). Headless `-p` and ACP fail closed on a command file that uses it. |
 
 ### Concept map
 

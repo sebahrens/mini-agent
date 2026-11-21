@@ -151,10 +151,10 @@ runs:
         } >> "$GITHUB_OUTPUT"
         if command -v jq >/dev/null 2>&1 && jq -e . "$out" >/dev/null 2>&1; then
           delim="MA_EOF_$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+          result="$(jq -r '.result // ""' "$out" | head -c 60000)"
           {
             echo "result<<$delim"
-            jq -r '.result // ""' "$out" | head -c 60000
-            echo
+            printf '%s\n' "$result"
             echo "$delim"
             echo "session-id=$(jq -r '.session_id // ""' "$out")"
             echo "cost=$(jq -r '.total_cost_usd // .cost // 0' "$out")"

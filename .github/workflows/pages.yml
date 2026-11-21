@@ -6,6 +6,9 @@ on:
       - main
     paths:
       - 'docs/agent/**'
+      - 'docs/vscode-acp-setup.md'
+      - 'scripts/build_docs_site.py'
+      - 'src/config/keys.rs'
       - '.github/workflows/pages.yml'
 
 permissions:
@@ -26,43 +29,21 @@ jobs:
       - name: Install pandoc
         run: sudo apt-get update && sudo apt-get install -y pandoc
 
-      - name: Convert markdown to HTML
-        # The published site is the agent documentation tree under docs/agent
-        # (plus docs/agent/providers). Specs, plans, and benchmarks stay
-        # repository-only.
+      - name: Build the site (pages, sidebar, search index, config-key reference)
+        # The published site is the agent documentation tree under docs/agent (plus
+        # docs/agent/providers and docs/vscode-acp-setup.md), listed in order in
+        # docs/agent/manifest.txt. The script fails the build when a manifest entry has
+        # no file, a page is missing from the manifest, a src/config/keys.rs key is
+        # missing from the generated reference, or an internal link is broken. Specs,
+        # plans, and benchmarks stay repository-only.
         run: |
           set -euo pipefail
-          cd docs/agent
-          test -f template.html
-          # Internal .md links must point at the built .html pages.
-          sed -i -e 's/\.md#/.html#/g' -e 's/\.md)/.html)/g' -- *.md providers/*.md
-          {
-            echo '# mini-agent documentation'
-            echo
-            for md in *.md providers/*.md; do
-              name="${md%.md}"
-              title="$(grep -m1 '^# ' "$md" | sed 's/^# //')"
-              [ -n "$title" ] || title="$name"
-              echo "- [${title}](${name}.html)"
-            done
-          } > index.md
-          for md in *.md providers/*.md; do
-            name="${md%.md}"
-            title="$(grep -m1 '^# ' "$md" | sed 's/^# //')"
-            [ -n "$title" ] || title="$name"
-            pandoc "$md" \
-              --template=template.html \
-              --wrap=none \
-              --metadata title="$title" \
-              --metadata pagetitle="$title — mini-agent" \
-              --metadata name="$name" \
-              -o "${name}.html"
-          done
+          python3 scripts/build_docs_site.py --out site
 
       - name: Generate sitemap.xml and robots.txt
         run: |
           set -euo pipefail
-          cd docs/agent
+          cd site
           base="https://sebahrens.github.io/mini-agent"
           today="$(date +%F)"
           {
@@ -84,7 +65,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
-          path: docs/agent
+          path: site
 
       - name: Deploy to GitHub Pages
         id: deployment

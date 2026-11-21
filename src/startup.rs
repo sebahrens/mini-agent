@@ -8099,16 +8099,15 @@ mod tests {
 
     #[tokio::test]
     async fn pricing_refresh_finishing_inside_the_wait_returns_its_result_once() {
-        let mut refresh = OpenRouterPricingRefresh::start(
-            "test/model".into(),
-            true,
-            true,
-            128_000,
-            async { Ok(std::collections::HashMap::new()) },
-        );
+        let mut refresh =
+            OpenRouterPricingRefresh::start("test/model".into(), true, true, 128_000, async {
+                Ok(std::collections::HashMap::new())
+            });
         // The handle completes while `finish_within` polls it; awaiting it a second
         // time used to panic with "JoinHandle polled after completion".
-        let result = refresh.finish_within(std::time::Duration::from_secs(5)).await;
+        let result = refresh
+            .finish_within(std::time::Duration::from_secs(5))
+            .await;
         assert!(matches!(result, Some(Ok(_))));
         assert!(refresh.finish_without_wait().await.is_none());
     }
