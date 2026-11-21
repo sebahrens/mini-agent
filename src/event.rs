@@ -319,6 +319,9 @@ pub enum UserEvent {
     Resize,
     Paste(String),
     LinkOpenFailed(String),
+    /// A background `/share confirm` upload finished: the gist URL or the error.
+    #[cfg(feature = "export")]
+    ShareDone(Result<String, String>),
     /// Boxed: this variant carries a whole verification result, and
     /// `UserEvent` is held in the interactive future the startup path builds on
     /// the stack. A regression test runs the binary under the 1 MiB Windows

@@ -543,11 +543,11 @@ impl McpClientManager {
                         })
                         .await
                     };
-                    attempt.finish(if result.is_ok() {
-                        health::AttemptOutcome::Succeeded
-                    } else {
-                        health::AttemptOutcome::Failed
-                    });
+                    match &result {
+                        Ok(_) => attempt.finish(health::AttemptOutcome::Succeeded),
+                        Err(error) => attempt
+                            .finish_with(health::AttemptOutcome::Failed, &format!("{error:#}")),
+                    }
                     (name, result)
                 }
             })
@@ -950,7 +950,7 @@ impl McpClientManager {
         {
             Ok(handle) => handle,
             Err(error) => {
-                attempt.finish(health::AttemptOutcome::Failed);
+                attempt.finish_with(health::AttemptOutcome::Failed, &format!("{error:#}"));
                 return Err(error);
             }
         };

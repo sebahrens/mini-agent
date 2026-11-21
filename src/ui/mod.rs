@@ -349,7 +349,9 @@ fn draw_main_frame(
                     fg: None,
                     bg: None,
                     layout: crate::ui::statusline::SpanLayout::Item {
-                        priority: 0,
+                        // Above every ordinary item: an attachment that is not
+                        // shown gets sent by accident.
+                        priority: 255,
                         plain: format!("{image_label} "),
                         compact: None,
                         dynamic_color: false,
@@ -367,9 +369,13 @@ fn draw_main_frame(
                     fg: None,
                     bg: None,
                     layout: crate::ui::statusline::SpanLayout::Item {
-                        priority: 0,
+                        // Modal editing without a mode indicator misreads
+                        // keystrokes, and the search echo has no other home.
+                        priority: 255,
                         plain: format!("{vim_label} "),
-                        compact: None,
+                        compact: (!vim_label.contains('/'))
+                            .then(|| vim_label.chars().next().map(|c| format!("{c} ")))
+                            .flatten(),
                         dynamic_color: false,
                     },
                 },

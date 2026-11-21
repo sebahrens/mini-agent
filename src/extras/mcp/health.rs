@@ -31,6 +31,27 @@ pub(crate) struct Attempt {
 pub(crate) struct ServerHealth {
     pub connection: Option<Attempt>,
     pub catalogue: Option<Attempt>,
+    /// Bounded, single-line reason of the last failed attempt of each kind.
+    pub connection_detail: Option<String>,
+    pub catalogue_detail: Option<String>,
+}
+
+/// Longest stored failure reason, in characters.
+const MAX_DETAIL_CHARS: usize = 160;
+
+fn bound_detail(reason: &str) -> String {
+    let flat: String = reason
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() > MAX_DETAIL_CHARS {
+        let mut cut: String = flat.chars().take(MAX_DETAIL_CHARS - 1).collect();
+        cut.push('…');
+        cut
+    } else {
+        flat
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -88,8 +109,13 @@ impl Health {
             AttemptKind::Connection => {
                 row.connection = attempt;
                 row.catalogue = None;
+                row.connection_detail = None;
+                row.catalogue_detail = None;
             }
-            AttemptKind::Catalogue => row.catalogue = attempt,
+            AttemptKind::Catalogue => {
+                row.catalogue = attempt;
+                row.catalogue_detail = None;
+            }
         }
         AttemptGuard {
             health: self.clone(),
@@ -112,10 +138,15 @@ pub(crate) struct AttemptGuard {
 }
 impl AttemptGuard {
     pub(crate) fn finish(mut self, outcome: AttemptOutcome) {
-        self.record(outcome);
+        self.record(outcome, None);
         self.id = None;
     }
-    fn record(&self, outcome: AttemptOutcome) {
+    /// [`Self::finish`] keeping a bounded reason for the outcome.
+    pub(crate) fn finish_with(mut self, outcome: AttemptOutcome, reason: &str) {
+        self.record(outcome, Some(bound_detail(reason)));
+        self.id = None;
+    }
+    fn record(&self, outcome: AttemptOutcome, detail: Option<String>) {
         let Some(id) = self.id else {
             return;
         };
@@ -138,12 +169,16 @@ impl AttemptGuard {
         };
         if let Some(attempt) = current.as_mut().filter(|attempt| attempt.id == id) {
             attempt.outcome = outcome;
+            match self.kind {
+                AttemptKind::Connection => row.connection_detail = detail,
+                AttemptKind::Catalogue => row.catalogue_detail = detail,
+            }
         }
     }
 }
 impl Drop for AttemptGuard {
     fn drop(&mut self) {
-        self.record(AttemptOutcome::Cancelled);
+        self.record(AttemptOutcome::Cancelled, None);
     }
 }
 
@@ -177,6 +212,21 @@ mod tests {
             snapshot.servers["server"].catalogue.unwrap().outcome,
             AttemptOutcome::Cancelled
         );
+    }
+    #[test]
+    fn a_failure_reason_is_kept_bounded_and_single_line() {
+        let health = Health::default();
+        health.begin("s", AttemptKind::Connection).finish_with(
+            AttemptOutcome::Failed,
+            &format!("spawn failed\n\x1b[31m{}", "x".repeat(500)),
+        );
+        let row = &health.snapshot().servers["s"];
+        let detail = row.connection_detail.as_deref().unwrap();
+        assert!(detail.chars().count() <= MAX_DETAIL_CHARS);
+        assert!(!detail.contains('\n') && !detail.contains('\x1b'));
+        assert!(detail.starts_with("spawn failed"));
+        health.begin("s", AttemptKind::Connection);
+        assert!(health.snapshot().servers["s"].connection_detail.is_none());
     }
     #[test]
     fn bounded_metadata_omission_never_claims_a_connection_or_loses_cancellation() {

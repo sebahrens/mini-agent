@@ -3,7 +3,7 @@ use crossterm::style::Color;
 use pulldown_cmark::{Alignment, Event, Options, Tag, TagEnd};
 use smallvec::{SmallVec, smallvec};
 
-use super::renderer::LineEntry;
+use super::renderer::{Cont, LineEntry};
 use super::utils::display_width;
 
 /// Translate only colors produced by this parser; callers' explicit colors
@@ -19,16 +19,40 @@ pub(crate) fn palette_color(color: Color, palette: super::feed::ForegroundPalett
 }
 
 pub(crate) fn word_wrap(text: &str, max_width: usize) -> SmallVec<[CompactString; 4]> {
+    let mut lines: SmallVec<[CompactString; 4]> = SmallVec::new();
+    word_wrap_each(text, max_width, |chunk, _| lines.push(chunk));
+    lines
+}
+
+/// `word_wrap` that also reports how each chunk continues the previous one.
+pub(crate) fn word_wrap_flagged(
+    text: &str,
+    max_width: usize,
+) -> SmallVec<[(CompactString, Cont); 4]> {
+    let mut lines: SmallVec<[(CompactString, Cont); 4]> = SmallVec::new();
+    word_wrap_each(text, max_width, |chunk, cont| lines.push((chunk, cont)));
+    lines
+}
+
+fn word_wrap_each(text: &str, max_width: usize, mut emit: impl FnMut(CompactString, Cont)) {
     // Display width never exceeds the byte length, so short text fits without
     // being measured.
     if text.is_empty() || max_width == 0 || text.len() <= max_width {
-        return smallvec![CompactString::from(text)];
+        emit(CompactString::from(text), Cont::None);
+        return;
     }
     if display_width(text) <= max_width {
-        return smallvec![CompactString::from(text)];
+        emit(CompactString::from(text), Cont::None);
+        return;
     }
 
-    let mut lines: SmallVec<[CompactString; 4]> = SmallVec::new();
+    let emitted = std::cell::Cell::new(false);
+    let mut start_cont = Cont::None;
+    let mut push = |chunk: CompactString, next: Cont, start_cont: &mut Cont| {
+        emit(chunk, *start_cont);
+        emitted.set(true);
+        *start_cont = next;
+    };
     let mut line = String::new();
     let mut line_width: usize = 0;
 
@@ -65,7 +89,11 @@ pub(crate) fn word_wrap(text: &str, max_width: usize) -> SmallVec<[CompactString
             }
         } else {
             if !line.is_empty() {
-                lines.push(CompactString::from(line.trim_end()));
+                push(
+                    CompactString::from(line.trim_end()),
+                    Cont::Space,
+                    &mut start_cont,
+                );
             }
             line.clear();
             line_width = 0;
@@ -75,15 +103,19 @@ pub(crate) fn word_wrap(text: &str, max_width: usize) -> SmallVec<[CompactString
                     let cw = super::utils::char_display_width(ch);
                     if cw > max_width {
                         if !line.is_empty() {
-                            lines.push(CompactString::from(&line));
+                            push(CompactString::from(&line), Cont::Split, &mut start_cont);
                             line.clear();
                             line_width = 0;
                         }
-                        lines.push(CompactString::from("\u{fffd}"));
+                        push(
+                            CompactString::from("\u{fffd}"),
+                            Cont::Split,
+                            &mut start_cont,
+                        );
                         continue;
                     }
                     if line_width + cw > max_width && !line.is_empty() {
-                        lines.push(CompactString::from(&line));
+                        push(CompactString::from(&line), Cont::Split, &mut start_cont);
                         line.clear();
                         line_width = 0;
                     }
@@ -103,14 +135,23 @@ pub(crate) fn word_wrap(text: &str, max_width: usize) -> SmallVec<[CompactString
 
     let trimmed = line.trim_end();
     if !trimmed.is_empty() {
-        lines.push(CompactString::from(trimmed));
+        push(CompactString::from(trimmed), Cont::Space, &mut start_cont);
     }
 
-    if lines.is_empty() {
-        lines.push(CompactString::from(text));
+    if !emitted.get() {
+        push(CompactString::from(text), Cont::Space, &mut start_cont);
     }
+}
 
-    lines
+fn blank_row(color: Color) -> LineEntry {
+    LineEntry {
+        syntax_spans: None,
+        text: CompactString::new(""),
+        color,
+        theme_accent: false,
+        cont: Cont::None,
+        lead: 0,
+    }
 }
 
 fn flush_acc(acc: &str, color: Color, max_width: usize, out: &mut Vec<LineEntry>) {
@@ -120,23 +161,184 @@ fn flush_acc(acc: &str, color: Color, max_width: usize, out: &mut Vec<LineEntry>
     for line in acc.split('\n') {
         let trimmed = line.trim_end_matches('\r');
         if trimmed.is_empty() {
-            out.push(LineEntry {
-                syntax_spans: None,
-                text: CompactString::new(""),
-                color,
-                theme_accent: false,
-            });
+            out.push(blank_row(color));
         } else {
-            for chunk in word_wrap(trimmed, max_width) {
+            for (chunk, cont) in word_wrap_flagged(trimmed, max_width) {
                 out.push(LineEntry {
                     syntax_spans: None,
                     text: chunk,
                     color,
                     theme_accent: false,
+                    cont,
+                    lead: 0,
                 });
             }
         }
     }
+}
+
+/// Wrap `line` with `first` as the first row's prefix and a hanging indent of
+/// `indent` columns on continuation rows.
+fn push_hanging(
+    out: &mut Vec<LineEntry>,
+    line: &str,
+    color: Color,
+    max_width: usize,
+    first: &str,
+    indent: usize,
+) {
+    let prefix_w = display_width(first).max(indent);
+    let avail = if max_width == 0 {
+        0
+    } else {
+        max_width.saturating_sub(prefix_w).max(1)
+    };
+    for (i, (chunk, cont)) in word_wrap_flagged(line, avail).into_iter().enumerate() {
+        let (text, lead) = if i == 0 {
+            (format!("{first}{chunk}"), 0)
+        } else {
+            (
+                format!("{:indent$}{chunk}", "", indent = indent),
+                indent.min(u8::MAX as usize) as u8,
+            )
+        };
+        out.push(LineEntry {
+            syntax_spans: None,
+            text: CompactString::from(text),
+            color,
+            theme_accent: false,
+            cont,
+            lead,
+        });
+    }
+}
+
+struct ListFrame {
+    ordered: bool,
+    next: u64,
+    /// Hanging indent of the item currently open in this list.
+    indent: usize,
+}
+
+/// Nested list state: one frame per open list, the pending marker prefix of
+/// the current item (taken by the first text flushed for it), and the hanging
+/// indent of the current item's text.
+#[derive(Default)]
+struct ListCtx {
+    frames: Vec<ListFrame>,
+    marker: Option<String>,
+    indent: usize,
+}
+
+impl ListCtx {
+    fn start_item(&mut self, color: Color) {
+        let depth = self.frames.len();
+        let Some(frame) = self.frames.last_mut() else {
+            return;
+        };
+        let mut prefix = "  ".repeat(depth.saturating_sub(1));
+        if frame.ordered {
+            use std::fmt::Write as _;
+            let _ = write!(prefix, " {}. ", frame.next);
+            frame.next += 1;
+        } else {
+            prefix.push_str(bullet_prefix(color));
+        }
+        self.indent = display_width(&prefix);
+        frame.indent = self.indent;
+        self.marker = Some(prefix);
+    }
+}
+
+/// Flush `acc` as paragraph text. Inside a list the first row of the item
+/// carries its marker and the other rows hang under the item text.
+fn flush_text(
+    acc: &str,
+    color: Color,
+    max_width: usize,
+    lists: &mut ListCtx,
+    out: &mut Vec<LineEntry>,
+) {
+    if acc.is_empty() {
+        return;
+    }
+    if lists.frames.is_empty() {
+        flush_acc(acc, color, max_width, out);
+        return;
+    }
+    let indent = lists.indent;
+    let mut first = lists.marker.take();
+    for line in acc.split('\n') {
+        let trimmed = line.trim_end_matches('\r');
+        if trimmed.is_empty() {
+            out.push(blank_row(color));
+            continue;
+        }
+        let prefix = first.take().unwrap_or_else(|| " ".repeat(indent));
+        push_hanging(out, trimmed, color, max_width, &prefix, indent);
+    }
+}
+
+/// Emit the `↪ url` rows collected for links in the paragraph just flushed.
+fn flush_links(links: &mut Vec<String>, max_width: usize, out: &mut Vec<LineEntry>) {
+    for url in links.drain(..) {
+        push_hanging(out, &url, Color::DarkGrey, max_width, "  ↪ ", 4);
+    }
+}
+
+/// Hard-wrap one code row at `max_width` display columns (no whitespace
+/// collapsing), splitting its syntax spans at the cuts.
+fn push_code_rows(
+    out: &mut Vec<LineEntry>,
+    text: &str,
+    spans: Option<std::sync::Arc<[super::highlight::TokenSpan]>>,
+    max_width: usize,
+) {
+    let mut push = |range: std::ops::Range<usize>, cont: Cont, whole: bool| {
+        let syntax_spans = match (&spans, whole) {
+            (Some(spans), true) => Some(spans.clone()),
+            (Some(spans), false) => {
+                let clipped: Vec<_> = spans
+                    .iter()
+                    .filter(|span| span.range.start < range.end && span.range.end > range.start)
+                    .map(|span| super::highlight::TokenSpan {
+                        range: span.range.start.max(range.start) - range.start
+                            ..span.range.end.min(range.end) - range.start,
+                        color: span.color,
+                        attrs: span.attrs,
+                    })
+                    .collect();
+                Some(clipped.into()).filter(|c: &std::sync::Arc<[_]>| !c.is_empty())
+            }
+            (None, _) => None,
+        };
+        out.push(LineEntry {
+            text: CompactString::from(&text[range]),
+            color: Color::DarkYellow,
+            syntax_spans,
+            theme_accent: false,
+            cont,
+            lead: 0,
+        });
+    };
+    if max_width == 0 || text.len() <= max_width || display_width(text) <= max_width {
+        push(0..text.len(), Cont::None, true);
+        return;
+    }
+    let mut start = 0;
+    let mut width = 0;
+    let mut cont = Cont::None;
+    for (idx, ch) in text.char_indices() {
+        let cw = super::utils::char_display_width(ch);
+        if width + cw > max_width && idx > start {
+            push(start..idx, cont, false);
+            cont = Cont::Split;
+            start = idx;
+            width = 0;
+        }
+        width += cw;
+    }
+    push(start..text.len(), cont, false);
 }
 
 /// `text.trim()` without reallocating: the leading whitespace is drained and
@@ -211,8 +413,15 @@ pub(crate) fn markdown_with_code_state(
     let mut in_heading = false;
     let mut in_code_block = false;
     let mut in_blockquote = false;
-    let mut ordered_list = false;
-    let mut list_item_count: u64 = 0;
+    let mut lists = ListCtx::default();
+    let mut pending_links: Vec<String> = Vec::new();
+    // Byte range of the link text in `acc`, to colour a paragraph that is one link.
+    // Whether the current paragraph holds link text and text outside a link,
+    // to colour a paragraph that is only a link as a whole row.
+    let mut para_link = false;
+    let mut para_other = false;
+    let mut in_link = false;
+    let mut heading_level: Option<pulldown_cmark::HeadingLevel> = None;
     let mut table_rows: Vec<Vec<String>> = Vec::new();
     let mut table_row: Vec<String> = Vec::new();
     let mut table_cell = String::new();
@@ -224,13 +433,27 @@ pub(crate) fn markdown_with_code_state(
         match event {
             Event::Start(tag) => match tag {
                 Tag::Paragraph => {}
-                Tag::Heading { .. } => {
-                    flush_acc(&acc, Color::White, max_width, &mut result);
+                Tag::Heading { level, .. } => {
+                    flush_text(&acc, Color::White, max_width, &mut lists, &mut result);
                     acc.clear();
                     in_heading = true;
+                    // Heading levels differ by attribute: h1 bold and
+                    // underlined, h2 bold, the rest italic.
+                    match level {
+                        pulldown_cmark::HeadingLevel::H1 => {
+                            acc.push(BOLD_ON);
+                            acc.push(UNDER_ON);
+                        }
+                        pulldown_cmark::HeadingLevel::H2 => acc.push(BOLD_ON),
+                        _ => acc.push(ITAL_ON),
+                    }
+                    heading_level = Some(level);
                 }
+                Tag::Emphasis if !in_table_cell => acc.push(ITAL_ON),
+                Tag::Strong if !in_table_cell => acc.push(BOLD_ON),
+                Tag::Strikethrough if !in_table_cell => acc.push(STRIKE_ON),
                 Tag::CodeBlock(kind) => {
-                    flush_acc(&acc, Color::White, max_width, &mut result);
+                    flush_text(&acc, Color::White, max_width, &mut lists, &mut result);
                     acc.clear();
                     code_state = if highlighting {
                         match kind {
@@ -245,22 +468,37 @@ pub(crate) fn markdown_with_code_state(
                     in_code_block = true;
                 }
                 Tag::BlockQuote(_) => {
-                    flush_acc(&acc, Color::White, max_width, &mut result);
+                    flush_text(&acc, Color::White, max_width, &mut lists, &mut result);
                     acc.clear();
                     in_blockquote = true;
                 }
-                Tag::List(t) => {
-                    ordered_list = t.is_some();
-                    list_item_count = 0;
+                Tag::List(start) => {
+                    let color = if in_blockquote {
+                        Color::DarkGrey
+                    } else {
+                        Color::White
+                    };
+                    flush_text(&acc, color, max_width, &mut lists, &mut result);
+                    acc.clear();
+                    lists.frames.push(ListFrame {
+                        ordered: start.is_some(),
+                        next: start.unwrap_or(1),
+                        indent: 0,
+                    });
                 }
                 Tag::Item => {
-                    flush_acc(&acc, Color::White, max_width, &mut result);
+                    let color = if in_blockquote {
+                        Color::DarkGrey
+                    } else {
+                        Color::White
+                    };
+                    flush_text(&acc, color, max_width, &mut lists, &mut result);
                     acc.clear();
-                    list_item_count += 1;
+                    lists.start_item(color);
                 }
                 Tag::FootnoteDefinition(_) => {}
                 Tag::Table(alignments) => {
-                    flush_acc(&acc, Color::White, max_width, &mut result);
+                    flush_text(&acc, Color::White, max_width, &mut lists, &mut result);
                     acc.clear();
                     table_rows.clear();
                     table_row.clear();
@@ -277,12 +515,16 @@ pub(crate) fn markdown_with_code_state(
                     table_cell.clear();
                     in_table_cell = true;
                 }
-                Tag::Link {
-                    link_type: _,
-                    dest_url,
-                    title: _,
-                    id: _,
-                } => {
+                Tag::Link { dest_url, .. } => {
+                    link_url.clear();
+                    link_url.push_str(&dest_url);
+                    if !in_table_cell {
+                        acc.push(LINK_ON);
+                        in_link = true;
+                        para_link = true;
+                    }
+                }
+                Tag::Image { dest_url, .. } => {
                     link_url.clear();
                     link_url.push_str(&dest_url);
                 }
@@ -292,21 +534,39 @@ pub(crate) fn markdown_with_code_state(
                 TagEnd::Paragraph => {
                     let color = if in_blockquote {
                         Color::DarkGrey
+                    } else if lists.frames.is_empty() && para_link && !para_other {
+                        Color::DarkCyan
                     } else {
                         Color::White
                     };
-                    flush_acc(&acc, color, max_width, &mut result);
+                    para_link = false;
+                    para_other = false;
+                    flush_text(&acc, color, max_width, &mut lists, &mut result);
                     acc.clear();
+                    flush_links(&mut pending_links, max_width, &mut result);
                 }
                 TagEnd::Heading(_) => {
+                    match heading_level.take() {
+                        Some(pulldown_cmark::HeadingLevel::H1) => {
+                            acc.push(UNDER_OFF);
+                            acc.push(BOLD_OFF);
+                        }
+                        Some(pulldown_cmark::HeadingLevel::H2) => acc.push(BOLD_OFF),
+                        _ => acc.push(ITAL_OFF),
+                    }
                     flush_acc(&acc, Color::Cyan, max_width, &mut result);
                     acc.clear();
+                    para_link = false;
+                    para_other = false;
+                    flush_links(&mut pending_links, max_width, &mut result);
                     in_heading = false;
                     result.push(LineEntry {
                         syntax_spans: None,
                         text: CompactString::new(""),
                         color: Color::White,
                         theme_accent: false,
+                        cont: Cont::None,
+                        lead: 0,
                     });
                 }
                 TagEnd::CodeBlock => {
@@ -322,12 +582,7 @@ pub(crate) fn markdown_with_code_state(
                                 }
                                 None => state.line(line, palette),
                             });
-                        result.push(LineEntry {
-                            text: CompactString::from(trimmed),
-                            color: Color::DarkYellow,
-                            syntax_spans,
-                            theme_accent: false,
-                        });
+                        push_code_rows(&mut result, trimmed, syntax_spans, max_width);
                     }
                     if acc.is_empty() || acc.ends_with('\n') {
                         result.push(LineEntry {
@@ -335,6 +590,8 @@ pub(crate) fn markdown_with_code_state(
                             color: Color::DarkYellow,
                             syntax_spans: None,
                             theme_accent: false,
+                            cont: Cont::None,
+                            lead: 0,
                         });
                     }
                     last_code_state = code_state.take();
@@ -345,6 +602,8 @@ pub(crate) fn markdown_with_code_state(
                         color: Color::White,
                         syntax_spans: None,
                         theme_accent: false,
+                        cont: Cont::None,
+                        lead: 0,
                     });
                 }
                 TagEnd::BlockQuote(_) => {
@@ -357,6 +616,8 @@ pub(crate) fn markdown_with_code_state(
                                 text: CompactString::new(""),
                                 color: Color::DarkGrey,
                                 theme_accent: false,
+                                cont: Cont::None,
+                                lead: 0,
                             });
                         } else {
                             prefixed.clear();
@@ -368,6 +629,8 @@ pub(crate) fn markdown_with_code_state(
                                     text: chunk,
                                     color: Color::DarkGrey,
                                     theme_accent: false,
+                                    cont: Cont::None,
+                                    lead: 0,
                                 });
                             }
                         }
@@ -380,6 +643,8 @@ pub(crate) fn markdown_with_code_state(
                         text: CompactString::new(""),
                         color: Color::White,
                         theme_accent: false,
+                        cont: Cont::None,
+                        lead: 0,
                     });
                 }
                 TagEnd::Item => {
@@ -388,81 +653,36 @@ pub(crate) fn markdown_with_code_state(
                     } else {
                         Color::White
                     };
-                    prefixed.clear();
-                    if ordered_list {
-                        use std::fmt::Write as _;
-                        let _ = write!(prefixed, " {list_item_count}. ");
-                    } else {
-                        prefixed.push_str(bullet_prefix(color));
-                    }
-                    let bullet_len = prefixed.len();
-                    let mut item_lines = Vec::new();
-                    let mut first = true;
-                    for line in acc.split('\n') {
-                        let trimmed = line.trim_end_matches('\r');
-                        if trimmed.is_empty() {
-                            item_lines.push(LineEntry {
-                                syntax_spans: None,
-                                text: CompactString::new(""),
-                                color,
-                                theme_accent: false,
-                            });
-                        } else if first {
-                            prefixed.truncate(bullet_len);
-                            prefixed.push_str(trimmed);
-                            for chunk in word_wrap(&prefixed, max_width) {
-                                item_lines.push(LineEntry {
-                                    syntax_spans: None,
-                                    text: chunk,
-                                    color,
-                                    theme_accent: false,
-                                });
-                            }
-                            first = false;
-                        } else {
-                            for chunk in word_wrap(trimmed, max_width) {
-                                item_lines.push(LineEntry {
-                                    syntax_spans: None,
-                                    text: chunk,
-                                    color,
-                                    theme_accent: false,
-                                });
-                            }
-                        }
-                    }
-                    result.extend(item_lines);
+                    flush_text(&acc, color, max_width, &mut lists, &mut result);
                     acc.clear();
+                    para_link = false;
+                    para_other = false;
+                    flush_links(&mut pending_links, max_width, &mut result);
+                    lists.marker = None;
                 }
                 TagEnd::List(_) => {
-                    ordered_list = false;
-                    list_item_count = 0;
-                    result.push(LineEntry {
-                        syntax_spans: None,
-                        text: CompactString::new(""),
-                        color: Color::White,
-                        theme_accent: false,
-                    });
+                    lists.frames.pop();
+                    // A nested list's parent item keeps its hanging indent.
+                    lists.indent = lists.frames.last().map_or(0, |frame| frame.indent);
+                    if lists.frames.is_empty() {
+                        result.push(blank_row(Color::White));
+                    }
                 }
-                TagEnd::Link => {
+                TagEnd::Emphasis if !in_table_cell => acc.push(ITAL_OFF),
+                TagEnd::Strong if !in_table_cell => acc.push(BOLD_OFF),
+                TagEnd::Strikethrough if !in_table_cell => acc.push(STRIKE_OFF),
+                TagEnd::Link | TagEnd::Image => {
+                    if in_link && matches!(tag_end, TagEnd::Link) {
+                        acc.push(LINK_OFF);
+                        in_link = false;
+                    }
                     if !link_url.is_empty() {
                         if in_table_cell {
                             table_cell.push_str(" (");
                             table_cell.push_str(&link_url);
                             table_cell.push(')');
-                        } else if !acc.is_empty() {
-                            flush_acc(&acc, Color::DarkCyan, max_width, &mut result);
-                            prefixed.clear();
-                            prefixed.push_str("  ↪ ");
-                            prefixed.push_str(&link_url);
-                            for chunk in word_wrap(&prefixed, max_width) {
-                                result.push(LineEntry {
-                                    syntax_spans: None,
-                                    text: chunk,
-                                    color: Color::DarkGrey,
-                                    theme_accent: false,
-                                });
-                            }
-                            acc.clear();
+                        } else {
+                            pending_links.push(link_url.clone());
                         }
                     }
                     link_url.clear();
@@ -476,6 +696,8 @@ pub(crate) fn markdown_with_code_state(
                         text: CompactString::new(""),
                         color: Color::White,
                         theme_accent: false,
+                        cont: Cont::None,
+                        lead: 0,
                     });
                 }
                 TagEnd::TableHead => {
@@ -503,10 +725,22 @@ pub(crate) fn markdown_with_code_state(
                 if in_table_cell {
                     table_cell.push_str(&t);
                 } else {
-                    acc.push_str(&t);
+                    if !in_link {
+                        para_other = true;
+                    }
+                    // Layout marks are private to this module: never let
+                    // model text forge one.
+                    if t.chars().any(is_mark) {
+                        acc.extend(t.chars().filter(|c| !is_mark(*c)));
+                    } else {
+                        acc.push_str(&t);
+                    }
                 }
             }
             Event::Code(t) => {
+                if !in_link {
+                    para_other = true;
+                }
                 let target = if in_table_cell {
                     &mut table_cell
                 } else {
@@ -532,12 +766,16 @@ pub(crate) fn markdown_with_code_state(
                     text: CompactString::from(rule),
                     color: Color::DarkGrey,
                     theme_accent: false,
+                    cont: Cont::None,
+                    lead: 0,
                 });
                 result.push(LineEntry {
                     syntax_spans: None,
                     text: CompactString::new(""),
                     color: Color::White,
                     theme_accent: false,
+                    cont: Cont::None,
+                    lead: 0,
                 });
             }
             Event::Html(t) => {
@@ -581,9 +819,95 @@ pub(crate) fn markdown_with_code_state(
         flush_acc(&acc, color, max_width, &mut result);
     }
 
+    apply_marks(&mut result, palette);
     StyledMarkdown {
         lines: result,
         code_state: last_code_state,
+    }
+}
+
+// Zero-width layout marks carried inside `acc` through wrapping, then turned
+// into attribute spans by `apply_marks`. They are zero columns wide, so
+// wrapping measures the visible text only.
+const BOLD_ON: char = '\u{2061}';
+const BOLD_OFF: char = '\u{2062}';
+const ITAL_ON: char = '\u{2063}';
+const ITAL_OFF: char = '\u{2064}';
+const STRIKE_ON: char = '\u{206A}';
+const STRIKE_OFF: char = '\u{206B}';
+const LINK_ON: char = '\u{206C}';
+const LINK_OFF: char = '\u{206D}';
+const UNDER_ON: char = '\u{206E}';
+const UNDER_OFF: char = '\u{206F}';
+
+fn is_mark(c: char) -> bool {
+    matches!(c, '\u{2061}'..='\u{2064}' | '\u{206A}'..='\u{206F}')
+}
+
+/// Replace layout marks in `rows` with attribute spans (bold, italic,
+/// strikethrough, underline and link colour), carrying the open state across
+/// wrapped rows.
+fn apply_marks(rows: &mut [LineEntry], palette: super::feed::ForegroundPalette) {
+    use super::highlight::{ATTR_BOLD, ATTR_ITALIC, ATTR_STRIKE, ATTR_UNDERLINE, TokenSpan};
+    // bold, italic, strike, underline, link
+    let mut open = [0i32; 5];
+    for row in rows {
+        let active = open.iter().any(|count| *count > 0);
+        if !active && (!row.text.bytes().any(|b| b == 0xE2) || !row.text.chars().any(is_mark)) {
+            continue;
+        }
+        let state = |open: &[i32; 5]| {
+            let mut attrs = 0u8;
+            for (count, bit) in
+                open[..4]
+                    .iter()
+                    .zip([ATTR_BOLD, ATTR_ITALIC, ATTR_STRIKE, ATTR_UNDERLINE])
+            {
+                if *count > 0 {
+                    attrs |= bit;
+                }
+            }
+            (attrs, open[4] > 0)
+        };
+        let mut clean = String::with_capacity(row.text.len());
+        let mut spans: Vec<TokenSpan> = Vec::new();
+        let mut seg_start = 0;
+        let mut current = state(&open);
+        let close = |spans: &mut Vec<TokenSpan>, start: usize, end: usize, cur: (u8, bool)| {
+            if (cur.0 != 0 || cur.1) && end > start {
+                spans.push(TokenSpan {
+                    range: start..end,
+                    color: if cur.1 { palette.link } else { Color::Reset },
+                    attrs: cur.0,
+                });
+            }
+        };
+        for c in row.text.chars() {
+            if is_mark(c) {
+                close(&mut spans, seg_start, clean.len(), current);
+                match c {
+                    BOLD_ON => open[0] += 1,
+                    BOLD_OFF => open[0] = (open[0] - 1).max(0),
+                    ITAL_ON => open[1] += 1,
+                    ITAL_OFF => open[1] = (open[1] - 1).max(0),
+                    STRIKE_ON => open[2] += 1,
+                    STRIKE_OFF => open[2] = (open[2] - 1).max(0),
+                    UNDER_ON => open[3] += 1,
+                    UNDER_OFF => open[3] = (open[3] - 1).max(0),
+                    LINK_ON => open[4] += 1,
+                    _ => open[4] = (open[4] - 1).max(0),
+                }
+                seg_start = clean.len();
+                current = state(&open);
+            } else {
+                clean.push(c);
+            }
+        }
+        close(&mut spans, seg_start, clean.len(), current);
+        row.text = CompactString::from(clean);
+        if row.syntax_spans.is_none() && !spans.is_empty() {
+            row.syntax_spans = Some(spans.into());
+        }
     }
 }
 
@@ -685,6 +1009,8 @@ fn push_table_line(text: &str, color: Color, out: &mut Vec<LineEntry>) {
         text: CompactString::from(text),
         color,
         theme_accent: false,
+        cont: Cont::None,
+        lead: 0,
     });
 }
 

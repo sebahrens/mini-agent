@@ -202,13 +202,23 @@ impl App<'_> {
                 .map_or(crate::extras::mcp::config::McpDefer::Auto, |server| {
                     server.defer()
                 });
-            rows.push(format!("    schema loading: {defer:?}"));
+            rows.push(format!(
+                "    schema loading: {}",
+                match defer {
+                    crate::extras::mcp::config::McpDefer::Eager => "eager",
+                    crate::extras::mcp::config::McpDefer::Deferred => "deferred",
+                    crate::extras::mcp::config::McpDefer::Auto => "automatic",
+                }
+            ));
             if let Some(client) = self.ui.mcp_manager.as_ref().and_then(|manager| {
                 manager
                     .handles
                     .iter()
                     .find(|client| client.server_name == name)
             }) {
+                if let Some(count) = client.tools.cached_count() {
+                    rows.push(format!("    tools: {count} (cached listing)"));
+                }
                 let current =
                     crate::extras::mcp::catalogue::RpcClient::capture(client).is_current();
                 if current && let Some(catalogue) = client.auxiliary.get() {
@@ -244,9 +254,27 @@ impl App<'_> {
                 ] {
                     if let Some(attempt) = attempt {
                         rows.push(format!(
-                            "    last {kind} attempt #{}: {:?}",
-                            attempt.id, attempt.outcome
+                            "    last {kind} attempt #{}: {}",
+                            attempt.id,
+                            attempt_outcome_text(attempt.outcome)
                         ));
+                        let detail = if kind == "connection" {
+                            observed.connection_detail.as_deref()
+                        } else {
+                            observed.catalogue_detail.as_deref()
+                        };
+                        if let Some(detail) = detail {
+                            rows.push(format!("    reason: {}", sanitize_output(detail)));
+                        }
+                        if matches!(
+                            attempt.outcome,
+                            crate::extras::mcp::health::AttemptOutcome::Failed
+                                | crate::extras::mcp::health::AttemptOutcome::TimedOut
+                        ) {
+                            rows.push(format!(
+                                "    next: check the {name} command or URL in .mcp.json; /mcp login {name} re-authorizes OAuth servers"
+                            ));
+                        }
                     }
                 }
             }
@@ -694,14 +722,12 @@ impl App<'_> {
         let server = work.server.clone();
         let origin = work.origin.clone();
         if let Some(attempt) = work.attempt.take() {
-            let outcome = if !valid {
-                crate::extras::mcp::health::AttemptOutcome::Cancelled
-            } else if result.is_ok() {
-                crate::extras::mcp::health::AttemptOutcome::Succeeded
-            } else {
-                crate::extras::mcp::health::AttemptOutcome::Failed
-            };
-            attempt.finish(outcome);
+            use crate::extras::mcp::health::AttemptOutcome;
+            match &result {
+                _ if !valid => attempt.finish(AttemptOutcome::Cancelled),
+                Ok(_) => attempt.finish(AttemptOutcome::Succeeded),
+                Err(error) => attempt.finish_with(AttemptOutcome::Failed, &format!("{error:#}")),
+            }
         }
         if !valid && !matches!(result, Ok(Completion::Discarded)) {
             self.mcp_state().work = None;
@@ -1480,5 +1506,18 @@ impl App<'_> {
         }
         self.refresh()?;
         Ok(true)
+    }
+}
+
+/// Plain wording for a connection or catalogue attempt outcome.
+fn attempt_outcome_text(outcome: crate::extras::mcp::health::AttemptOutcome) -> &'static str {
+    use crate::extras::mcp::health::AttemptOutcome as O;
+    match outcome {
+        O::Pending => "in progress",
+        O::Succeeded => "succeeded",
+        O::Failed => "failed",
+        O::TimedOut => "timed out",
+        O::Cancelled => "cancelled",
+        O::Removed => "removed",
     }
 }
