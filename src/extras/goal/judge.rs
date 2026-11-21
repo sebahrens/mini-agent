@@ -295,14 +295,24 @@ const CHANGED_FILES_LISTED: usize = 40;
 /// model wrote about its work, so the judge can see what was touched even when
 /// the tail's budget has only the last few messages.
 fn with_changed_files(session: &crate::session::Session, tail: String) -> String {
+    let calls = session.messages.iter().filter_map(|message| {
+        match message.tool.as_ref()? {
+            crate::session::PersistedToolMessage::Call { name, arguments } => {
+                Some((name.as_str(), arguments))
+            }
+            _ => None,
+        }
+    });
+    prefix_changed_files(changed_file_paths(calls), tail)
+}
+
+/// Distinct paths named by the mutating (non-shell) tool calls, in call order.
+fn changed_file_paths<'a>(
+    calls: impl Iterator<Item = (&'a str, &'a serde_json::Value)>,
+) -> Vec<String> {
     let mut files: Vec<String> = Vec::new();
-    for message in &session.messages {
-        let Some(crate::session::PersistedToolMessage::Call { name, arguments }) =
-            message.tool.as_ref()
-        else {
-            continue;
-        };
-        if name.as_str() == "bash" || !crate::agent::runner::tool_may_mutate_workspace(name) {
+    for (name, arguments) in calls {
+        if name == "bash" || !crate::agent::runner::tool_may_mutate_workspace(name) {
             continue;
         }
         let path = ["path", "file_path", "filePath"]
@@ -314,6 +324,10 @@ fn with_changed_files(session: &crate::session::Session, tail: String) -> String
             files.push(clip(path, 200));
         }
     }
+    files
+}
+
+fn prefix_changed_files(mut files: Vec<String>, tail: String) -> String {
     if files.is_empty() {
         return tail;
     }
@@ -413,7 +427,23 @@ fn assemble_tail(newest_first: Vec<String>) -> String {
 /// look unsupported.
 #[cfg(feature = "acp")]
 pub fn transcript_from_interactions(interactions: &[rig::completion::Message]) -> String {
-    assemble_tail(interaction_blocks(interactions))
+    use rig::message::{AssistantContent, Message};
+    let calls: Vec<(String, serde_json::Value)> = interactions
+        .iter()
+        .filter_map(|message| match message {
+            Message::Assistant { content, .. } => Some(content.iter()),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|item| match item {
+            AssistantContent::ToolCall(call) => {
+                Some((call.function.name.clone(), call.function.arguments.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    let files = changed_file_paths(calls.iter().map(|(name, args)| (name.as_str(), args)));
+    prefix_changed_files(files, assemble_tail(interaction_blocks(interactions)))
 }
 
 /// Blocks from one turn's interactions, newest first.
@@ -1203,6 +1233,36 @@ mod tests {
         let mut small = Session::new("openrouter", "model", 200_000, "");
         small.add_tool_result("bash", &two_kib);
         assert!(transcript_tail(&small).contains("result: pass"));
+    }
+
+    /// The ACP judge has no session, only the turn's interactions; it still
+    /// gets the harness-built changed-files section (mini-agent-sskdu.208).
+    #[cfg(feature = "acp")]
+    #[test]
+    fn the_acp_judge_sees_files_changed_by_the_turn() {
+        use rig::OneOrMany;
+        use rig::message::{AssistantContent, Message, ToolCall, ToolFunction};
+        let call = |id: &str, name: &str, args: serde_json::Value| Message::Assistant {
+            id: None,
+            content: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
+                id: id.into(),
+                call_id: None,
+                function: ToolFunction {
+                    name: name.into(),
+                    arguments: args,
+                },
+                signature: None,
+                additional_params: None,
+            })),
+        };
+        let interactions = vec![
+            call("1", "edit", serde_json::json!({"path": "src/lib.rs"})),
+            call("2", "bash", serde_json::json!({"command": "ls"})),
+        ];
+        let tail = transcript_from_interactions(&interactions);
+        assert!(tail.contains("files changed by tool calls"), "{tail}");
+        assert!(tail.contains("- src/lib.rs"), "{tail}");
+        assert!(!tail.contains("- ls"), "{tail}");
     }
 
     #[test]
