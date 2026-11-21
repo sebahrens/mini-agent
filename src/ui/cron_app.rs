@@ -350,7 +350,7 @@ impl App<'_> {
         self.ui.session.cron_schedule = self.cron.export(Instant::now(), jiff::Timestamp::now());
     }
 
-    /// The active session changed (`/resume`, `/new`, `/clear`, `/fork`,
+    /// The active session changed (`/sessions`, `/new`, `/clear`, `/fork`,
     /// ...): schedules of the previous session end here (they were saved with
     /// it), and the new session's saved schedules are held disarmed behind one
     /// notice until `/cron resume`.

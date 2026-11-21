@@ -49,47 +49,49 @@ mod subagent_registration_tests {
     }
 }
 
-#[cfg(any(feature = "mcp", all(test, feature = "goal", feature = "js")))]
+/// Every built-in tool name, including ones gated behind features this build
+/// may lack. MCP tools may not take these names, and `--tools` accepts them.
+pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
+    "read",
+    "write",
+    "edit",
+    "notebook_edit",
+    "web_fetch",
+    "web_search",
+    "grep",
+    "find_files",
+    "list_dir",
+    "todo_write",
+    "todo_read",
+    "goal_report",
+    "shell",
+    "job_status",
+    "bash",
+    "git",
+    "js",
+    "task",
+    "task_result",
+    "task_list",
+    "task_cancel",
+    "task_send",
+    "task_evidence",
+    "memory_write",
+    "memory_edit",
+    "memory_read",
+    "memory_search",
+    "advisor",
+    "lsp_diagnostics",
+    "lsp_navigate",
+    "skills_search",
+    "ask_user_question",
+    "mcp_search",
+    "list_mcp_resources",
+    "read_mcp_resource",
+    "schedule_wakeup",
+];
+
 pub(crate) fn is_reserved_builtin_tool_name(name: &str) -> bool {
-    matches!(
-        name,
-        "read"
-            | "write"
-            | "edit"
-            | "notebook_edit"
-            | "web_fetch"
-            | "web_search"
-            | "grep"
-            | "find_files"
-            | "list_dir"
-            | "todo_write"
-            | "todo_read"
-            | "goal_report"
-            | "shell"
-            | "job_status"
-            | "bash"
-            | "git"
-            | "js"
-            | "task"
-            | "task_result"
-            | "task_list"
-            | "task_cancel"
-            | "task_send"
-            | "task_evidence"
-            | "memory_write"
-            | "memory_edit"
-            | "memory_read"
-            | "memory_search"
-            | "advisor"
-            | "lsp_diagnostics"
-            | "lsp_navigate"
-            | "skills_search"
-            | "ask_user_question"
-            | "mcp_search"
-            | "list_mcp_resources"
-            | "read_mcp_resource"
-            | "schedule_wakeup"
-    )
+    BUILTIN_TOOL_NAMES.contains(&name)
 }
 
 #[cfg(feature = "mcp")]

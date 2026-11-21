@@ -180,7 +180,9 @@ the agent from another machine, keep it on loopback and tunnel (for example
 `ssh -L 7890:127.0.0.1:7890 host`).
 The default port when only `--acp-host` is given is `7243`.
 The server waits up to 300 seconds for the first authenticated peer by default;
-use `--acp-accept-timeout-secs` to select a different positive deadline.
+use `--acp-accept-timeout-secs` (or `acp_accept_timeout_secs`) to select a different
+deadline, or `0` to wait indefinitely. When it expires the server exits with an error;
+`--idle-exit` separately bounds a server that has served a peer.
 
 ### 5. Point your client at the agent
 

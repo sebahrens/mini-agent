@@ -379,7 +379,7 @@ configured provider endpoints win endpoint environment fallbacks.
 | `GIT_CONFIG_GLOBAL` | Explicit operator Git configuration source. Its bounded include graph is captured before project/model effects; the exact platform null device disables that source. Repository-owned sources cannot grant executable authority. |
 | `EDITOR` | Editor command fallback after config `editor`; otherwise the command is `editor`. |
 | `RUST_LOG` | Standard tracing filter for stderr; explicit `--log-level` wins. File logging remains controlled by `--verbose`/`--log-file`. |
-| `MINI_AGENT_ACP_API_KEY` | ACP TCP authentication key; non-empty environment value wins the configured `acp_api_key`. |
+| `MINI_AGENT_ACP_API_KEY` | ACP TCP authentication key; non-empty environment value wins the `api_key` of the matching `acp_servers` TCP entry. |
 | `MINI_AGENT_ACP_TLS_CERT`, `MINI_AGENT_ACP_TLS_KEY` | ACP TCP TLS certificate/key paths, supplied together; the remote listener requires TLS unless the explicit insecure-remote override below is enabled. |
 | `MINI_AGENT_ACP_ALLOW_INSECURE_REMOTE` | Value `1` explicitly permits an insecure remote ACP TCP listener; other values retain the TLS requirement. |
 | `MINI_AGENT_ACP_TRUST_CLIENT_MCP` | Value `1` authorizes ACP client-supplied MCP registrations to launch; otherwise they are not trusted. It does not replace configured MCP policy. |
@@ -901,7 +901,7 @@ Accepted top-level keys:
 | `acp_servers`             | object  | ACP server config map when compiled with the `acp` feature. See the ACP section below.                                                                                       |
 | `acp_host`                | string  | TCP bind host for ACP server mode (equivalent to `--acp-host`).                                                                                                              |
 | `acp_port`                | integer | TCP bind port for ACP server mode (equivalent to `--acp-port`, default: 7243).                                                                                               |
-| `acp_accept_timeout_secs` | integer | Maximum seconds to wait for the first authenticated ACP TCP peer (equivalent to `--acp-accept-timeout-secs`, default: 300).                                                  |
+| `acp_accept_timeout_secs` | integer | Maximum seconds to wait for the first authenticated ACP TCP peer, then exit with an error (equivalent to `--acp-accept-timeout-secs`, default: 300; `0` waits indefinitely). |
 | `task_max_turns`          | integer | Maximum model turns per subagent. Default: `20`; requires `subagents`. |
 | `task_max_prompts`        | integer | Maximum prompts in one `task` call. Default: `8`; requires `subagents`. |
 | `task_max_concurrency`    | integer | Maximum concurrently polled child futures. Default: `4`; requires `subagents`. |
@@ -1410,7 +1410,7 @@ prompt and model are shown in the project-hook approval prompt; `command`, `args
   tools. The model is still the startup model, not live `/model` switches.
 
 Hook envelopes use the current logical session ID and transcript path, including after
-`/new` or `/resume`. ACP uses its own session ID and an empty transcript path. Child work
+`/new` or `/sessions`. ACP uses its own session ID and an empty transcript path. Child work
 inherits its owning session identity and its explicitly selected workspace. Ignore matching
 checks each parent before descending: an ignore file inside an excluded directory cannot
 re-include a child; `.ignore` overrides `.gitignore`, which overrides `.git/info/exclude`.
@@ -3204,7 +3204,7 @@ name or URL. Custom servers—including servers using the same name or
 endpoint—follow normal MCP permission rules, and any unlisted tool on a
 built-in server does too.
 
-## ACP (Agent Communication Protocol) configuration
+## ACP (Agent Client Protocol) configuration
 
 When compiled with the `acp` feature, mini-agent can act as an ACP agent server.
 The following config keys are available:
