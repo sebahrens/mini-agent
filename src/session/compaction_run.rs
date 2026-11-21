@@ -60,9 +60,6 @@ pub(crate) struct SummaryRequest {
 
 /// Front-end behaviour that is not part of the compaction itself.
 pub(crate) trait Observer {
-    /// Background tasks were cancelled to pause history writers.
-    #[cfg_attr(not(feature = "subagents"), allow(dead_code))]
-    fn paused(&mut self, _notice: &str) {}
     /// Charge the summarizer's usage; returns what was charged (normalized
     /// for the session's provider) so the caller can credit a goal round.
     fn charge(&mut self, session: &mut Session, usage: UsageDelta) -> UsageDelta;
@@ -171,10 +168,6 @@ where
         Some(pool) => Some(pool.pause_for_history().await.map_err(RunError::Pause)?),
         None => None,
     };
-    #[cfg(feature = "subagents")]
-    if let Some(Some(notice)) = _background_pause.as_ref().map(|pause| pause.notice()) {
-        observer.paused(&notice);
-    }
     #[cfg(feature = "hooks")]
     dispatch_pre_compact_once(plan.pre_compact_sent, plan.auto, plan.instructions).await;
     #[cfg(not(feature = "hooks"))]

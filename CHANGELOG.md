@@ -69,6 +69,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Large pastes (more than 10 lines or 1,000 characters) become an atomic `[Pasted text #N +M lines]` chip in the prompt that the cursor steps over and Backspace removes whole; submit, history and the external editor use the full text (mini-agent-nvnkx.88).
 - `/vim` Normal mode: operators `d`/`c`/`y` with counts, motions (`w e b 0 ^ $ gg G f F t T`, `iw`/`aw`), `x X D C p P o O r ~` and `.` repeat of the last change (mini-agent-nvnkx.89).
 - Pasting or dragging an image file path into the prompt attaches the image as `/add <path>` would, when the permission policy allows reading it (mini-agent-nvnkx.256).
+- `/worktree` with no name (or `/worktree list`) lists the worktrees it created with branch, base, dirty state and age; `/worktree <name>` re-enters an existing one; `/wt-discard [name] [--force]` removes a worktree and its branch without merging and refuses uncommitted or unmerged work unless forced; `/wt-exit` names the commands for the kept worktree (mini-agent-nvnkx.52)
+- `/worktree` names submodules that `git worktree add` left unpopulated and the command that fills them (mini-agent-nvnkx.220)
+- Background task completion notices carry the task's report when it is small (up to 12 KiB each, 32 KiB per request), so the model needs no `task_result` round trip; larger reports keep the pointer plus a short head (mini-agent-nvnkx.177)
+- `/wt-merge --pull` syncs the target with its remote before squashing, and `-m <message>` sets the squash commit message (mini-agent-nvnkx.216, .318)
 
 ### Fixed
 
@@ -292,6 +296,14 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Ctrl+V with no clipboard image pastes the clipboard text (`pbpaste`, `wl-paste`, `xclip`) or says there is nothing to paste, instead of reporting an unavailable platform; a missing Linux image target is "no image" (mini-agent-nvnkx.255).
 - macOS and Windows clipboard image helpers accept PNGs up to the 24 MiB raw bound so large Retina screenshots reach the downscaler (mini-agent-nvnkx.249).
 - Copying selected text over SSH or inside tmux uses OSC 52 or `tmux load-buffer -w` instead of the remote machine's clipboard helpers, names the route in the notice, refuses payloads too large for OSC 52, and `MINI_AGENT_CLIPBOARD=auto|osc52|helper|tmux` overrides the choice (mini-agent-nvnkx.285).
+- The goal gate no longer counts `goal_report`, `todo_write`, memory writes or the `task` call itself as workspace changes, so a blocked goal stops after `blocked_rounds` rounds and a refused `task` parks the goal on the setting that needs the user (mini-agent-nvnkx.333)
+- Context compaction (`/compact` and automatic) no longer cancels running background tasks: they keep running and their file-checkpoint launch rows move with the compacted history (mini-agent-nvnkx.176)
+- The resumable-child store serializes each history once on the blocking pool and coalesces a fan-out of children into one debounced file write instead of a full rewrite per child on the async executor (mini-agent-nvnkx.340)
+- A goal whose judge stays unavailable on an `impossible` claim parks as judge-unavailable after three rounds, like a `met` claim (mini-agent-nvnkx.339)
+- `/wt-merge` is local by default: it no longer fetches every remote or pulls into the target, reports how far the target is behind its fetched upstream, ignores ignored files in the main checkout, refuses untracked files only when they collide with a merged path, restores the stashed changes after the squash lands, and writes `Merge worktree <branch>` with the source commit subjects instead of Git's squash text (mini-agent-nvnkx.216, .215, .318)
+- A `SubagentStop` hook's continuation sends only the hook's reason when the child's history already ends with its answer, instead of the answer a second time as a user turn (mini-agent-nvnkx.342)
+- The goal judge's last unquoted `VERDICT:` line decides: quoted transcript text and tentative earlier lines no longer complete or fail a goal (mini-agent-nvnkx.341)
+- A resumed session is told once that background shell jobs and tasks started by the previous process are gone (mini-agent-nvnkx.270)
 
 ### Added
 

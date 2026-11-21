@@ -179,6 +179,8 @@ bound is still used up says so and buys a single round. A zero `max_tokens` or `
 removes the bound; a zero `wrap_up_max_agent_turns` makes the round bound exact. When a bound is exhausted the agent gets one short wrap-up round to land what it has, rather
 than being cut off mid-edit or allowed to start something new.
 
+A round counts as having changed the workspace only through tools that can change it: filing a `goal_report`, updating the todo list, writing memory or calling `task` does not, though the file and shell calls a `task` child makes do. So `blocked_rounds` consecutive blocked reports stop the goal as blocked, and a judge that stays unavailable for three rounds on a `met` or an `impossible` claim parks it as judge-unavailable. The judge's last unquoted `VERDICT:` line is the one that counts.
+
 Time spent waiting on a permission prompt does not count: the budget measures how long the agent
 worked, not how long you took to answer.
 

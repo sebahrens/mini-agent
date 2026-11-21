@@ -17,6 +17,7 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
         "/worktree" => handle_worktree(parts, ctx).await,
         "/wt-merge" => handle_wt_merge(parts, ctx).await,
         "/wt-exit" => handle_wt_exit(parts, ctx).await,
+        "/wt-discard" => handle_wt_discard(parts, ctx).await,
         _ => Ok(()),
     }
 }
@@ -166,9 +167,8 @@ async fn handle_loop(_parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<
 
 #[cfg(feature = "git-worktree")]
 async fn handle_worktree(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
-    if parts.len() < 2 {
-        write_usage(ctx.renderer, "usage: /worktree <name>");
-        return Ok(());
+    if parts.len() < 2 || (parts.len() == 2 && parts[1] == "list") {
+        return list_worktrees(ctx).await;
     }
     let name = parts[1].trim();
     if name.is_empty() || name.contains(' ') || name.contains('/') {
@@ -179,11 +179,40 @@ async fn handle_worktree(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
         return Ok(());
     }
 
+    // A worktree this harness created under that name is re-entered, not an
+    // error (mini-agent-nvnkx.52).
+    if let Ok(Some(existing)) =
+        crate::extras::git_worktree::find_managed(ctx.workspace.root(), name).await
+        && existing.info.worktree_path.exists()
+    {
+        write_ok(
+            ctx.renderer,
+            format!("re-entering existing worktree '{name}'"),
+        );
+        return Err(anyhow::Error::new(
+            crate::extras::git_worktree::DeferredWorktreeAction::Switch {
+                path: existing.info.worktree_path,
+                branch: existing.info.branch,
+            },
+        ));
+    }
+
     let wt_base_dir = ctx.cli.resolve_wt_base_dir(ctx.cfg);
     match crate::extras::git_worktree::create(ctx.workspace.root(), name, wt_base_dir.as_deref())
         .await
     {
         Ok((path, info)) => {
+            let submodules = crate::extras::git_worktree::uninitialised_submodules(&path).await;
+            if !submodules.is_empty() {
+                write_ok(
+                    ctx.renderer,
+                    format!(
+                        "note: submodule{} not populated in the new worktree: {}. Run `git submodule update --init` there (outside the sandbox) before building",
+                        if submodules.len() == 1 { "" } else { "s" },
+                        submodules.join(", ")
+                    ),
+                );
+            }
             return Err(anyhow::Error::new(
                 crate::extras::git_worktree::DeferredWorktreeAction::Switch {
                     path,
@@ -195,6 +224,55 @@ async fn handle_worktree(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
             write_error(ctx.renderer, format!("failed: {}", e));
         }
     }
+    Ok(())
+}
+
+/// `/worktree` with no name: the worktrees `/worktree` created, with branch,
+/// base, dirty state and age.
+#[cfg(feature = "git-worktree")]
+async fn list_worktrees(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
+    let worktrees = match crate::extras::git_worktree::list_managed(ctx.workspace.root()).await {
+        Ok(worktrees) => worktrees,
+        Err(error) => {
+            write_error(ctx.renderer, format!("cannot list worktrees: {error}"));
+            return Ok(());
+        }
+    };
+    if worktrees.is_empty() {
+        write_usage(
+            ctx.renderer,
+            "no worktrees created by /worktree; usage: /worktree <name>  |  /worktree list  |  /wt-discard <name>",
+        );
+        return Ok(());
+    }
+    for worktree in &worktrees {
+        let age = worktree.age_secs.map_or_else(
+            || "unknown age".to_string(),
+            |secs| match secs {
+                0..=3_599 => format!("{}m old", secs / 60),
+                3_600..=86_399 => format!("{}h old", secs / 3_600),
+                _ => format!("{}d old", secs / 86_400),
+            },
+        );
+        let state = match worktree.dirty {
+            Some(true) => "dirty",
+            Some(false) => "clean",
+            None => "status unknown",
+        };
+        write_ok(
+            ctx.renderer,
+            format!(
+                "{}  base {}  {state}  {age}  {}",
+                worktree.info.branch,
+                worktree.base.as_deref().unwrap_or("(none)"),
+                worktree.info.worktree_path.display()
+            ),
+        );
+    }
+    write_ok(
+        ctx.renderer,
+        "enter one with /worktree <name>; remove one with /wt-discard <name>",
+    );
     Ok(())
 }
 
@@ -216,8 +294,38 @@ async fn handle_wt_merge(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
             return Ok(());
         }
     };
-    let (target, source) = if parts.len() >= 2 {
-        (parts[1].trim().to_string(), "given on the command line")
+    // `/wt-merge [--pull] [branch] [-m message...]`
+    let mut options = crate::extras::git_worktree::MergeOptions::default();
+    let mut given_target: Option<&str> = None;
+    let mut index = 1;
+    while index < parts.len() {
+        match parts[index] {
+            "--pull" => options.pull = true,
+            "-m" | "--message" => {
+                let message = parts[index + 1..].join(" ");
+                if message.trim().is_empty() {
+                    write_usage(
+                        ctx.renderer,
+                        "usage: /wt-merge [--pull] [branch] [-m <commit message>]",
+                    );
+                    return Ok(());
+                }
+                options.message = Some(message);
+                break;
+            }
+            other if other.starts_with('-') => {
+                write_usage(
+                    ctx.renderer,
+                    "usage: /wt-merge [--pull] [branch] [-m <commit message>]",
+                );
+                return Ok(());
+            }
+            other => given_target = Some(other),
+        }
+        index += 1;
+    }
+    let (target, source) = if let Some(target) = given_target {
+        (target.trim().to_string(), "given on the command line")
     } else {
         match crate::extras::git_worktree::resolve_merge_target(&info).await {
             Some((b, source)) => (b, source.describe()),
@@ -239,7 +347,11 @@ async fn handle_wt_merge(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
         ),
     );
     Err(anyhow::Error::new(
-        crate::extras::git_worktree::DeferredWorktreeAction::Merge { info, target },
+        crate::extras::git_worktree::DeferredWorktreeAction::Merge {
+            info,
+            target,
+            options,
+        },
     ))
 }
 
@@ -264,11 +376,103 @@ async fn handle_wt_exit(_parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
     let main_path = info.main_repo_path;
     write_ok(
         ctx.renderer,
-        format!("returning to main repo at {}", main_path.display()),
+        format!(
+            "returning to main repo at {}; worktree '{}' and its branch are kept (/worktree {} re-enters it, /wt-merge merges it, /wt-discard {} removes it)",
+            main_path.display(),
+            info.branch,
+            info.branch,
+            info.branch,
+        ),
     );
     Err(anyhow::Error::new(
         crate::extras::git_worktree::DeferredWorktreeAction::Exit { main_path },
     ))
+}
+
+/// `/wt-discard [name] [--force]`: remove a worktree and its branch without
+/// merging. Refuses uncommitted or unmerged work unless `--force` confirms.
+#[cfg(feature = "git-worktree")]
+async fn handle_wt_discard(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
+    let force = parts[1..].contains(&"--force");
+    let name = parts[1..]
+        .iter()
+        .find(|part| !part.starts_with('-'))
+        .copied();
+    let target = match name {
+        Some(name) => name.to_string(),
+        None => match crate::extras::git_worktree::detect(ctx.workspace.root()).await {
+            Some(info) => info.branch,
+            None => {
+                write_usage(
+                    ctx.renderer,
+                    "usage: /wt-discard <name> [--force]  (or run it inside the worktree to discard)",
+                );
+                return Ok(());
+            }
+        },
+    };
+    let worktree =
+        match crate::extras::git_worktree::find_managed(ctx.workspace.root(), &target).await {
+            Ok(Some(worktree)) => worktree,
+            Ok(None) => {
+                write_error(
+                    ctx.renderer,
+                    format!(
+                        "no worktree named '{target}' was created by /worktree; see /worktree list"
+                    ),
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                write_error(ctx.renderer, format!("cannot list worktrees: {error}"));
+                return Ok(());
+            }
+        };
+    if worktree.info.worktree_path.as_path() == ctx.workspace.root() {
+        write_error(
+            ctx.renderer,
+            format!(
+                "'{target}' is the current workspace; run /wt-exit first, then /wt-discard {target}"
+            ),
+        );
+        return Ok(());
+    }
+    if !force {
+        match crate::extras::git_worktree::discard_blockers(&worktree).await {
+            Ok(blockers) if blockers.is_empty() => {}
+            Ok(blockers) => {
+                write_error(
+                    ctx.renderer,
+                    format!(
+                        "not discarding '{target}': {}. Merge it with /wt-merge, or run /wt-discard {target} --force to throw the work away",
+                        blockers.join("; ")
+                    ),
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                write_error(ctx.renderer, format!("cannot check '{target}': {error}"));
+                return Ok(());
+            }
+        }
+    }
+    match crate::extras::git_worktree::discard_worktree(&worktree.info).await {
+        Ok(()) => write_ok(
+            ctx.renderer,
+            format!("discarded worktree '{target}' and its branch"),
+        ),
+        Err(error) => write_error(ctx.renderer, format!("discard failed: {error}")),
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "git-worktree"))]
+async fn handle_wt_discard(_parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
+    write_error(
+        ctx.renderer,
+        super::feature_missing("/wt-discard", "git-worktree"),
+    );
+    Ok(())
 }
 
 #[cfg(not(feature = "git-worktree"))]

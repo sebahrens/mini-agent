@@ -1330,10 +1330,6 @@ struct HeadlessObserver<'a> {
 }
 
 impl crate::session::compaction_run::Observer for HeadlessObserver<'_> {
-    fn paused(&mut self, notice: &str) {
-        eprintln!("{notice}");
-    }
-
     fn charge(
         &mut self,
         session: &mut Session,
@@ -2948,6 +2944,9 @@ impl Startup {
         self.session.sync_environment(now, self.session_resumed);
         // Resumable child conversations restore only within the count/byte limits.
         self.session.note_stale_child_ids(self.session_resumed);
+        if self.session_resumed {
+            note_gone_background_work(&mut self.session, &self.sandbox);
+        }
     }
 
     /// Give detached work its configured grace period at the actual session
@@ -6153,6 +6152,29 @@ pub(crate) fn note_entered_session(
         true,
     );
     session.note_stale_child_ids(true);
+    note_gone_background_work(session, sandbox);
+}
+
+/// Tell a resumed model that background shell jobs and tasks of the previous
+/// process are gone (mini-agent-nvnkx.270).
+fn note_gone_background_work(session: &mut Session, sandbox: &Sandbox) {
+    #[cfg(feature = "subagents")]
+    let live_tasks: Vec<String> = session
+        .background_tasks()
+        .into_iter()
+        .filter(|row| row.status.is_active())
+        .map(|row| row.id)
+        .collect();
+    session.note_gone_background_work(true, |id| {
+        sandbox.background_job_snapshot(id).is_ok() || {
+            #[cfg(feature = "subagents")]
+            {
+                live_tasks.iter().any(|task| task == id)
+            }
+            #[cfg(not(feature = "subagents"))]
+            false
+        }
+    });
 }
 
 fn tool_set_label(no_tools: bool, allowlist: &[String]) -> String {

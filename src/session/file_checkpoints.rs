@@ -144,6 +144,11 @@ struct State {
     scans: usize,
     #[cfg(feature = "subagents")]
     observation: crate::session::background_observation::ObservationStamp,
+    /// Launch-row anchors of live background recorders, shifted together with
+    /// the rows when compaction replaces a prefix so a job that keeps running
+    /// across compaction records its edits at the right turn.
+    #[cfg(feature = "subagents")]
+    background_turns: Vec<std::sync::Weak<std::sync::atomic::AtomicUsize>>,
 }
 impl State {
     fn limits(&self) -> Limits {
@@ -178,6 +183,8 @@ impl Default for FileCheckpoints {
             scans: 0,
             #[cfg(feature = "subagents")]
             observation: Default::default(),
+            #[cfg(feature = "subagents")]
+            background_turns: Vec::new(),
         })))
     }
 }
@@ -234,6 +241,8 @@ impl<'de> Deserialize<'de> for FileCheckpoints {
             scans: 0,
             #[cfg(feature = "subagents")]
             observation: Default::default(),
+            #[cfg(feature = "subagents")]
+            background_turns: Vec::new(),
         }))))
     }
 }
@@ -304,6 +313,8 @@ impl FileObservation {
             #[cfg(test)]
             scans: 0,
             observation: Default::default(),
+            #[cfg(feature = "subagents")]
+            background_turns: Vec::new(),
         })))
     }
     pub(crate) fn validates_since(
@@ -482,6 +493,18 @@ impl FileCheckpoints {
     /// with their exact checkpoints. Pruned turns cannot become later turns.
     pub(crate) fn compact_prefix(&self, removed: usize) {
         let mut state = self.edit();
+        #[cfg(feature = "subagents")]
+        state.background_turns.retain(|turn| {
+            let Some(turn) = turn.upgrade() else {
+                return false;
+            };
+            use std::sync::atomic::Ordering::Relaxed;
+            let old = turn.load(Relaxed);
+            // A launch row the summary replaced now sits at the summary row.
+            let shifted = if old < removed { 0 } else { old - removed + 1 };
+            turn.store(shifted, Relaxed);
+            true
+        });
         for record in &mut state.data.records {
             if record.turn < removed {
                 record.retired = true;
@@ -508,6 +531,16 @@ impl FileCheckpoints {
     /// from older retirements, so `/rewind` still cannot reach them.
     pub(crate) fn uncompact_prefix(&self, removed: usize) {
         let mut state = self.edit();
+        #[cfg(feature = "subagents")]
+        state.background_turns.retain(|turn| {
+            let Some(turn) = turn.upgrade() else {
+                return false;
+            };
+            use std::sync::atomic::Ordering::Relaxed;
+            let old = turn.load(Relaxed);
+            turn.store(old.saturating_sub(1).saturating_add(removed), Relaxed);
+            true
+        });
         for record in &mut state.data.records {
             if !record.retired {
                 record.turn = record.turn.saturating_sub(1).saturating_add(removed);
@@ -656,10 +689,18 @@ impl Recorder {
         &self,
         observation: crate::session::background_observation::JobObservation,
     ) -> Self {
+        let turn = Arc::new(std::sync::atomic::AtomicUsize::new(self.turn()));
+        {
+            let mut state = self.store.0.lock().unwrap_or_else(|e| e.into_inner());
+            state
+                .background_turns
+                .retain(|turn| turn.strong_count() > 0);
+            state.background_turns.push(Arc::downgrade(&turn));
+        }
         Self {
             // This launch row stays fixed even when foreground steering rebases
             // the original recorder before subsequent foreground effects.
-            turn: Arc::new(std::sync::atomic::AtomicUsize::new(self.turn())),
+            turn,
             observation: Some(observation),
             ..self.clone()
         }
@@ -1976,5 +2017,28 @@ mod retired_checkpoint_reason_tests {
             !summary.contains("12345-byte"),
             "the only surviving unavailable edit was READ-denied, but the summary names a retired size failure: {summary}"
         );
+    }
+
+    /// A background job keeps its launch row across compaction: the row moves
+    /// with the kept rows, or onto the summary when it was summarized away
+    /// (mini-agent-nvnkx.176).
+    #[cfg(feature = "subagents")]
+    #[test]
+    fn compaction_shifts_the_launch_row_of_live_background_recorders() {
+        let store = FileCheckpoints::default();
+        let owner = crate::session::background_observation::ObservationOwner::new();
+        let (kept, _kept_life) = owner.admit().unwrap();
+        let (gone, _gone_life) = owner.admit().unwrap();
+        let kept = store.recorder("s", 12, false).for_background(kept);
+        let gone = store.recorder("s", 3, false).for_background(gone);
+        store.compact_prefix(10);
+        assert_eq!(kept.turn(), 3, "row 12 follows the 10 summarized rows");
+        assert_eq!(
+            gone.turn(),
+            0,
+            "a summarized launch row sits at the summary"
+        );
+        store.uncompact_prefix(10);
+        assert_eq!(kept.turn(), 12);
     }
 }

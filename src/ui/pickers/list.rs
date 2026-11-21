@@ -143,6 +143,7 @@ fn build_available_commands() -> Vec<&'static str> {
         cmds.push("/worktree");
         cmds.push("/wt-exit");
         cmds.push("/wt-merge");
+        cmds.push("/wt-discard");
     }
 
     #[cfg(feature = "hooks")]
@@ -181,6 +182,7 @@ pub(crate) fn reserved_command(name: &str) -> bool {
             "/worktree",
             "/wt-exit",
             "/wt-merge",
+            "/wt-discard",
             "/hooks",
             "/loop",
             "/mcp",

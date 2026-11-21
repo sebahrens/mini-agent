@@ -899,10 +899,30 @@ fn gate_post_tiers(
                 Some(JudgeOutcome::Verdict { reason, .. }) => {
                     GateDecision::cont(judge_guidance(reason), VerdictSource::Judge)
                 }
-                Some(JudgeOutcome::Unavailable { .. }) => GateDecision::cont(
-                    "The completion judge was unavailable; keep working toward the goal.",
-                    VerdictSource::Judge,
-                ),
+                // Counted like a met claim: an agent that has concluded the
+                // objective is impossible files that again each round, so an
+                // unreachable judge must park the goal rather than let it
+                // burn its budget (mini-agent-nvnkx.339).
+                Some(JudgeOutcome::Unavailable { reason: error }) => {
+                    if goal.progress.judge_failures.saturating_add(1) >= MAX_JUDGE_FAILURES {
+                        return GateDecision::paused(
+                            format!(
+                                "the completion judge was unavailable ({error}); the agent \
+                                 reports the goal is impossible: {reason}"
+                            ),
+                            PauseReason::JudgeUnavailable,
+                            VerdictSource::Runtime,
+                        );
+                    }
+                    GateDecision::cont(
+                        format!(
+                            "The completion judge was unavailable ({error}), so the claim \
+                             that the goal is impossible could not be reviewed; keep working \
+                             toward the goal."
+                        ),
+                        VerdictSource::Judge,
+                    )
+                }
             }
         }
         VerifyCause::MetClaim => {
@@ -1106,9 +1126,10 @@ pub fn apply(
     // it was denied. Any answer at all, whatever it asked, clears the streak,
     // because it proves the judge is reachable.
     match (judge, cause) {
-        (Some(JudgeOutcome::Unavailable { .. }), Some(VerifyCause::MetClaim)) => {
-            goal.progress.judge_failures = goal.progress.judge_failures.saturating_add(1)
-        }
+        (
+            Some(JudgeOutcome::Unavailable { .. }),
+            Some(VerifyCause::MetClaim | VerifyCause::ImpossibleClaim),
+        ) => goal.progress.judge_failures = goal.progress.judge_failures.saturating_add(1),
         (Some(JudgeOutcome::Verdict { .. }), _) => goal.progress.judge_failures = 0,
         _ => {}
     }
@@ -2603,6 +2624,45 @@ mod tests {
             }
             other => panic!("expected a judge-unavailable pause, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn repeated_judge_outages_on_an_impossible_claim_park_the_goal() {
+        let mut g = goal();
+        let round = RoundSummary {
+            report: Some(report(ReportStatus::Impossible)),
+            ..worked()
+        };
+        let request = verification(&g, &round);
+        let unavailable = JudgeOutcome::Unavailable {
+            reason: "connection refused".into(),
+        };
+        for attempt in 1..=MAX_JUDGE_FAILURES {
+            let decision = gate_post(&g, &round, &request, None, Some(&unavailable));
+            if attempt < MAX_JUDGE_FAILURES {
+                assert!(matches!(decision, GateDecision::Continue { .. }));
+            } else {
+                assert!(
+                    matches!(
+                        decision,
+                        GateDecision::Stop {
+                            paused_reason: Some(PauseReason::JudgeUnavailable),
+                            ..
+                        }
+                    ),
+                    "{decision:?}"
+                );
+            }
+            apply(
+                &mut g,
+                &round,
+                &decision,
+                Some(&unavailable),
+                Some(VerifyCause::ImpossibleClaim),
+            );
+        }
+        assert_eq!(g.progress.rounds, MAX_JUDGE_FAILURES);
+        assert_eq!(g.status, GoalStatus::Paused);
     }
 
     /// A judge that cannot answer a drift check has withheld nothing: the goal

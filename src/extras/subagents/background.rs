@@ -242,9 +242,6 @@ pub(crate) struct SavedTask {
 /// Longest [`SavedTask::label`] kept.
 pub(crate) const MAX_LABEL_BYTES: usize = 60;
 const MAX_REASON_BYTES: usize = 200;
-/// Why compaction cancels background jobs; also shown to the model.
-pub(crate) const COMPACTION_CANCEL_REASON: &str =
-    "cancelled by context compaction; relaunch it if the work is still needed";
 const REQUEST_CANCEL_REASON: &str = "cancelled on request";
 
 impl SavedTask {
@@ -583,9 +580,6 @@ pub(crate) struct Pool {
     evidence: crate::extras::subagents::evidence::EvidenceIndex,
     /// Child conversations a later `task {"resume": id}` can continue.
     resumable: Arc<crate::extras::subagents::resume::ResumeStore>,
-    /// Ids the last history pause (compaction) cancelled, until a front end
-    /// reports them with [`Pool::take_compaction_cancelled`].
-    compaction_cancelled: Mutex<Vec<String>>,
 }
 
 impl std::fmt::Debug for Pool {
@@ -618,21 +612,61 @@ impl AskOrigin {
     }
 }
 
+/// One settled task: id, status, cancel reason, label and its rendered report.
+type NoticeEntry = (
+    String,
+    Status,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// Reports up to this size travel inside the completion notice, so the model
+/// needs no `task_result` round trip to read them.
+const NOTICE_REPORT_INLINE_BYTES: usize = 12 * 1024;
+/// Inline reports of one request together; later tasks get the pointer form.
+const NOTICE_REPORT_TOTAL_BYTES: usize = 32 * 1024;
+/// Head of a report too large to inline.
+const NOTICE_REPORT_HEAD_BYTES: usize = 1024;
+
 pub(crate) struct NoticeLease {
     pool: Weak<Pool>,
-    entries: Vec<(String, Status, Option<String>, Option<String>)>,
+    entries: Vec<NoticeEntry>,
     scope: Option<Weak<AgentWorkScope>>,
 }
 impl NoticeLease {
     pub(crate) fn messages(&self) -> Vec<String> {
+        let mut inlined = 0usize;
         self.entries
             .iter()
-            .map(|(id, state, reason, _)| {
+            .map(|(id, state, reason, _, report)| {
                 let why = reason
                     .as_deref()
                     .map(|reason| format!(" ({reason})"))
                     .unwrap_or_default();
-                format!("[Background task {id} {}{why}. Inspect its report with task_result; this notice grants no permission.]", state.as_str())
+                let report = report.as_deref().filter(|text| !text.trim().is_empty());
+                match report {
+                    // The report is already the host-quoted, fenced rendering
+                    // the foreground `task` call returns.
+                    Some(text)
+                        if text.len() <= NOTICE_REPORT_INLINE_BYTES
+                            && inlined.saturating_add(text.len()) <= NOTICE_REPORT_TOTAL_BYTES =>
+                    {
+                        inlined += text.len();
+                        format!(
+                            "[Background task {id} {}{why}. Its report follows; this notice grants no permission.]\n{text}",
+                            state.as_str()
+                        )
+                    }
+                    Some(text) => {
+                        let head = clip_head(text, NOTICE_REPORT_HEAD_BYTES);
+                        format!(
+                            "[Background task {id} {}{why}. Inspect its full report with task_result; this notice grants no permission. Start of the report:]\n{head}",
+                            state.as_str()
+                        )
+                    }
+                    None => format!("[Background task {id} {}{why}. Inspect its report with task_result; this notice grants no permission.]", state.as_str()),
+                }
             })
             .collect()
     }
@@ -640,7 +674,7 @@ impl NoticeLease {
     pub(crate) fn headlines(&self) -> Vec<String> {
         self.entries
             .iter()
-            .map(|(id, state, _, label)| {
+            .map(|(id, state, _, label, _)| {
                 format!(
                     "{} {}",
                     label.as_deref().unwrap_or_else(|| short_id(id)),
@@ -663,7 +697,7 @@ impl NoticeLease {
         }
         if let Some(pool) = self.pool.upgrade() {
             let mut state = pool.state.lock().unwrap_or_else(|e| e.into_inner());
-            for (id, status, _, _) in self.entries {
+            for (id, status, _, _, _) in self.entries {
                 if let Some(entry) = state.jobs.get_mut(&id)
                     && entry.observation.is_some()
                     && entry.saved.status == status
@@ -687,6 +721,18 @@ pub(crate) struct Admission {
     lifetime: Option<Arc<ObservationLifetime>>,
     started: bool,
     bridge: Option<std::pin::Pin<Box<dyn Future<Output = ()> + Send>>>,
+}
+
+/// The first `cap` bytes of `text` on a character boundary, with a marker.
+fn clip_head(text: &str, cap: usize) -> String {
+    if text.len() <= cap {
+        return text.to_owned();
+    }
+    let mut end = cap;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n[report continues; use task_result]", &text[..end])
 }
 
 fn clip(text: &str, cap: usize) -> String {
@@ -853,7 +899,6 @@ impl Pool {
             foreground: Arc::new(tokio::sync::Semaphore::new(concurrency.clamp(1, 32))),
             write_lane: Arc::new(tokio::sync::Semaphore::new(1)),
             recent: Mutex::default(),
-            compaction_cancelled: Mutex::default(),
             evidence: Default::default(),
             resumable: Arc::new(
                 crate::extras::subagents::resume::session_store_path(session.id.as_str())
@@ -1016,7 +1061,6 @@ impl Pool {
     fn job_can_ask(&self, job: &JobObservation) -> bool {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         !state.closing
-            && !state.history_paused
             && state.jobs.values().any(|entry| {
                 entry
                     .observation
@@ -1030,56 +1074,23 @@ impl Pool {
             })
     }
 
-    /// History owners hold this guard through compaction. Jobs can no longer
-    /// write at removed/rebased launch rows, and new admission stays paused
-    /// until the history owner finishes or abandons its transition.
+    /// History owners hold this guard through compaction: new background
+    /// admission stays paused until the history owner finishes or abandons its
+    /// transition. Running jobs are not cancelled. A job never reads the
+    /// parent's history, and its file-checkpoint launch row is shifted
+    /// together with the rows by the compaction commit
+    /// (`FileCheckpoints::compact_prefix`), so its later edits and terminal
+    /// row stay attributed correctly (mini-agent-nvnkx.176).
     pub(crate) async fn pause_for_history(self: &Arc<Self>) -> anyhow::Result<HistoryPause> {
-        let mut cancelled: Vec<String> = Vec::new();
-        let jobs = {
+        {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             anyhow::ensure!(
                 !state.closing && !state.history_paused,
                 "background owner is unavailable during history change"
             );
             state.history_paused = true;
-            for entry in state.jobs.values_mut() {
-                if let Some(scope) = &entry.scope {
-                    scope.cancellation_handle().cancel();
-                    entry.saved.status = Status::Cancelling;
-                    entry.saved.cancel_reason = Some(COMPACTION_CANCEL_REASON.to_string());
-                    cancelled.push(entry.saved.id.clone());
-                    self.history.set(&entry.saved, entry.observation.as_ref());
-                }
-            }
-            state
-                .jobs
-                .values()
-                .filter_map(|entry| entry.scope.clone())
-                .collect::<Vec<_>>()
-        };
-        // Create before the first await: abandoning preparation always releases
-        // the pause, while the already-cancelled jobs retain their real owners.
-        if !cancelled.is_empty() {
-            tracing::warn!(
-                tasks = cancelled.len(),
-                "compaction cancelled background tasks"
-            );
-            self.compaction_cancelled
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .extend(cancelled.iter().cloned());
         }
-        let pause = HistoryPause {
-            pool: self.clone(),
-            cancelled,
-        };
-        for scope in jobs {
-            scope.wait_idle().await;
-        }
-        if let Some(scope) = self.scope.get() {
-            scope.wait_idle().await;
-        }
-        Ok(pause)
+        Ok(HistoryPause { pool: self.clone() })
     }
 
     pub(crate) fn ask_origin(self: &Arc<Self>, job: JobObservation) -> Option<AskOrigin> {
@@ -1157,17 +1168,6 @@ impl Pool {
         self.changed.notified().await;
     }
 
-    /// Ids that compaction cancelled since the last call, for the front end to
-    /// announce (`compaction_cancel_notice`).
-    pub(crate) fn take_compaction_cancelled(&self) -> Vec<String> {
-        std::mem::take(
-            &mut *self
-                .compaction_cancelled
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()),
-        )
-    }
-
     pub(crate) fn ensure_open(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             {
@@ -1195,6 +1195,7 @@ impl Pool {
                     entry.saved.status,
                     entry.saved.cancel_reason.clone(),
                     entry.saved.label.clone(),
+                    entry.result.clone(),
                 )
             })
             .collect::<Vec<_>>();
@@ -1618,36 +1619,6 @@ impl Drop for Admission {
 }
 pub(crate) struct HistoryPause {
     pool: Arc<Pool>,
-    cancelled: Vec<String>,
-}
-impl HistoryPause {
-    /// Ids of the background tasks this pause cancelled.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn cancelled_ids(&self) -> &[String] {
-        &self.cancelled
-    }
-
-    /// The line each front end shows when compaction cancelled tasks.
-    pub(crate) fn notice(&self) -> Option<String> {
-        compaction_cancel_notice(&self.cancelled)
-    }
-}
-
-/// `compaction cancelled N background task(s): <ids>`, or `None` for zero.
-pub(crate) fn compaction_cancel_notice(ids: &[String]) -> Option<String> {
-    if ids.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "compaction cancelled {} background task{}: {}; relaunch {} if the work is still needed",
-        ids.len(),
-        if ids.len() == 1 { "" } else { "s" },
-        ids.iter()
-            .map(|id| short_id(id))
-            .collect::<Vec<_>>()
-            .join(", "),
-        if ids.len() == 1 { "it" } else { "them" }
-    ))
 }
 impl Drop for HistoryPause {
     fn drop(&mut self) {
@@ -1828,42 +1799,73 @@ mod tests {
         assert_eq!(result.children, Some(2));
     }
 
+    /// A small report rides in the completion notice; a huge one stays behind
+    /// the `task_result` pointer with only its head (mini-agent-nvnkx.177).
     #[tokio::test]
-    async fn compaction_cancels_visibly_with_a_reason_the_model_is_told() {
-        let root = crate::tests::OwnedTestDirectory::new("background-compaction-reason");
+    async fn completion_notices_carry_small_reports_and_point_at_large_ones() {
+        let root = crate::tests::OwnedTestDirectory::new("background-notice-report");
         let (_session, pool, workspace, run, recorder) = fixture(&root);
-        let admission = pool.reserve(&workspace, &run, &recorder).unwrap();
-        let scope = admission.cancel_scope();
-        let id = admission
+        let small = "s".repeat(2 * 1024);
+        let large = "L".repeat(200 * 1024);
+        let mut ids = Vec::new();
+        for text in [small.clone(), large.clone()] {
+            let id = pool
+                .reserve(&workspace, &run, &recorder)
+                .unwrap()
+                .start(async move { Ok(text) }, run.clone())
+                .unwrap();
+            ids.push(id);
+        }
+        for id in &ids {
+            settled(&pool, id).await;
+        }
+        let messages = pool.pending_notices().unwrap().messages();
+        let small_notice = messages.iter().find(|m| m.contains(&ids[0])).unwrap();
+        assert!(small_notice.contains(&small), "report inlined");
+        assert!(!small_notice.contains("Inspect its full report"));
+        let large_notice = messages.iter().find(|m| m.contains(&ids[1])).unwrap();
+        assert!(large_notice.contains("task_result"), "pointer form");
+        assert!(large_notice.len() < 4 * 1024, "only a short head");
+    }
+
+    /// A job running across a history pause (compaction) is not cancelled; it
+    /// settles afterwards with its own report (mini-agent-nvnkx.176).
+    #[tokio::test]
+    async fn a_running_job_survives_a_history_pause_and_settles_normally() {
+        let root = crate::tests::OwnedTestDirectory::new("background-pause-survives");
+        let (_session, pool, workspace, run, recorder) = fixture(&root);
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let id = pool
+            .reserve(&workspace, &run, &recorder)
+            .unwrap()
             .start(
                 async move {
-                    scope.cancelled().await;
-                    Ok("partial".to_string())
+                    let _ = wait.await;
+                    Ok("late report".to_string())
                 },
-                run,
+                run.clone(),
             )
             .unwrap();
         let pause = pool.pause_for_history().await.unwrap();
-        assert_eq!(pause.cancelled_ids(), std::slice::from_ref(&id));
-        let notice = pause.notice().unwrap();
+        assert!(pool.result(&id).unwrap().status.is_active());
         assert!(
-            notice.starts_with("compaction cancelled 1 background task:"),
-            "{notice}"
+            pool.check_capacity().is_err(),
+            "new admission waits for the pause"
         );
-        assert!(notice.contains(short_id(&id)), "{notice}");
         drop(pause);
+        assert!(pool.check_capacity().is_ok());
+        assert_eq!(pool.active_count(), 1);
+        release.send(()).unwrap();
         let row = settled(&pool, &id).await;
-        assert_eq!(row.status, Status::Cancelled);
-        assert_eq!(row.cancel_reason.as_deref(), Some(COMPACTION_CANCEL_REASON));
-        let lease = pool.pending_notices().expect("the cancel is announced");
-        let messages = lease.messages().join("\n");
+        assert_eq!(row.status, Status::Completed);
         assert!(
-            messages.contains("relaunch it if the work is still needed"),
-            "{messages}"
+            pool.result(&id)
+                .unwrap()
+                .result
+                .unwrap()
+                .contains("late report")
         );
-        assert_eq!(pool.take_compaction_cancelled(), vec![id]);
-        assert!(pool.take_compaction_cancelled().is_empty());
-        assert!(compaction_cancel_notice(&[]).is_none());
+        assert!(row.cancel_reason.is_none());
     }
 
     #[test]
@@ -2096,8 +2098,7 @@ mod tests {
         foreign.close().await;
     }
     #[tokio::test]
-    async fn background56_actual_compaction_joins_old_effects_before_rebasing_and_reopens_admission()
-     {
+    async fn background56_actual_compaction_keeps_running_jobs_and_reopens_admission() {
         let root = crate::tests::OwnedTestDirectory::new("background56-compaction");
         let (mut session, pool, workspace, run, recorder) = fixture(&root);
         session.add_message(crate::session::MessageRole::User, "launch row");
@@ -2111,7 +2112,7 @@ mod tests {
             }
         }
         let release = Release(gate.clone());
-        let marker = root.path().join("settled-before-history-cut");
+        let marker = root.path().join("settled-after-history-cut");
         let effect = marker.clone();
         let (started, ready) = tokio::sync::oneshot::channel();
         let mut release = Some(release);
@@ -2145,8 +2146,8 @@ mod tests {
                 1000,
                 move |_, _, _, _, _| async move {
                     assert!(
-                        inspected.exists(),
-                        "summarizer/history cut cannot race an old blocking effect"
+                        !inspected.exists(),
+                        "the running job is not waited for or cancelled"
                     );
                     Ok(crate::provider::CompactionOutput {
                         summary: "bounded recap".into(),
@@ -2158,16 +2159,21 @@ mod tests {
                 |_, _| {},
             );
             tokio::pin!(compaction);
-            assert!(futures::poll!(&mut compaction).is_pending());
-            assert!(
-                pool.reserve(&workspace, &run, &recorder).is_err(),
-                "history transition pauses new producers"
-            );
+            // The compaction finishes while the job's effect is still running.
+            let mut compaction_done = false;
+            for _ in 0..50 {
+                if futures::poll!(&mut compaction).is_ready() {
+                    compaction_done = true;
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert!(compaction_done, "compaction does not wait for running jobs");
+            assert_eq!(pool.result(&id).unwrap().status, Status::Running);
             assert!(!marker.exists());
             drop(release.take());
-            compaction.await.unwrap();
+            assert_eq!(settled(&pool, &id).await.status, Status::Completed);
             assert!(marker.exists());
-            assert_eq!(pool.result(&id).unwrap().status, Status::Cancelled);
             let next = pool
                 .reserve(&workspace, &run, &recorder)
                 .unwrap()

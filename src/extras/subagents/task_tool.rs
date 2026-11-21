@@ -2730,7 +2730,7 @@ impl ChildPlan {
                 && remaining_child_turns(max_turns, run.turns) > 0
             {
                 tracing::info!("hooks: SubagentStop forced continuation: {reason}");
-                let continuation = format!("{response}\n\n{reason}");
+                let continuation = subagent_stop_continuation(&run.history, response, &reason);
                 let retried = agent
                     .run_subagent_with_history(
                         &continuation,
@@ -2878,8 +2878,9 @@ impl ChildPlan {
             };
             let resume_limits = super::resume::ResumeLimits::from_config(&config);
             let (resume_id, resume_note) = if output.is_ok() {
-                let outcome =
-                    resume_store.insert_with(resume_limits, resume_agent_type, conversation);
+                let outcome = resume_store
+                    .insert_off_executor(resume_limits, resume_agent_type, conversation)
+                    .await;
                 let note = super::resume::insert_note(&outcome, resume_limits);
                 match outcome {
                     super::resume::Insert::Stored { id, .. } => (Some(id), note),
@@ -3255,6 +3256,29 @@ fn remaining_child_turns(limit: usize, spent: u32) -> usize {
 }
 
 #[cfg(feature = "hooks")]
+/// The user turn that continues a child a `SubagentStop` hook blocked.
+///
+/// When the child's history already ends with its own final assistant message,
+/// resending that text would add a second copy attributed to the user role, so
+/// only the hook's reason goes, as a labelled host instruction like the main
+/// agent's Stop continuation. Without that message the response is the only
+/// record of what the child said and is kept (mini-agent-nvnkx.342).
+#[cfg(feature = "hooks")]
+fn subagent_stop_continuation(
+    history: &[rig::completion::Message],
+    response: &str,
+    reason: &str,
+) -> String {
+    if matches!(
+        history.last(),
+        Some(rig::completion::Message::Assistant { .. })
+    ) {
+        crate::agent::input::host_instruction("a SubagentStop hook blocked completion", reason)
+    } else {
+        format!("{response}\n\n{reason}")
+    }
+}
+
 fn merge_forced_continuation_run(
     mut original: SubagentRunOutput,
     mut retried: SubagentRunOutput,
@@ -10135,5 +10159,19 @@ mod evidence_contract_tests {
             .await
             .render();
         assert!(rendered.ends_with(SUBAGENT_OUTPUT_ENDS), "{rendered}");
+    }
+
+    #[cfg(feature = "hooks")]
+    #[test]
+    fn a_subagent_stop_continuation_does_not_repeat_the_childs_own_answer() {
+        use rig::completion::Message;
+        let history = vec![Message::user("task"), Message::assistant("the full report")];
+        let text = subagent_stop_continuation(&history, "the full report", "add tests");
+        assert!(text.contains("add tests"), "{text}");
+        assert!(!text.contains("the full report"), "{text}");
+        assert!(crate::agent::input::is_host_instruction(&text));
+        // Without the child's final message in history the response is kept.
+        let bare = subagent_stop_continuation(&[Message::user("task")], "the report", "why");
+        assert!(bare.starts_with("the report"), "{bare}");
     }
 }
