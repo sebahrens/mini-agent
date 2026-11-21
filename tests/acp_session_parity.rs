@@ -663,7 +663,7 @@ fn acp53_stdio_live_writer_refusal_does_not_fork_or_release_another_process() {
 }
 
 #[test]
-fn acp53_stdio_native_turns_publish_restore_and_refuse_prefix_rewrite() {
+fn acp53_stdio_native_turns_publish_restore_and_rename_republishes() {
     let roots = Roots::new();
     std::fs::write(roots.0.join("native-read.txt"), "ACP53_OWNED_NATIVE_READ").unwrap();
     let mut provider = Provider::start_protocol(&roots, true);
@@ -719,22 +719,20 @@ fn acp53_stdio_native_turns_publish_restore_and_refuse_prefix_rewrite() {
             .count(),
         1
     );
-    for (request, text) in [(5, "/undo"), (6, "/compact"), (7, "/rename changed native")] {
-        assert!(
-            peer.exchange(
-                request,
-                "session/prompt",
-                serde_json::json!({"sessionId":id,"prompt":[{"type":"text","text":text}]})
-            )
-            .get("error")
-            .is_some()
-        );
-        assert_eq!(
-            std::fs::read(&path).unwrap(),
-            before,
-            "refused local changes preserve the native file"
-        );
-    }
+    // mini-agent-sskdu.122: /rename works on a native session and republishes
+    // it without touching the saved conversation or its native chain.
+    let renamed = peer.exchange(
+        5,
+        "session/prompt",
+        serde_json::json!({"sessionId":id,"prompt":[{"type":"text","text":"/rename changed native"}]}),
+    );
+    assert!(renamed.get("error").is_none(), "{renamed}");
+    let after_rename: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(after_rename["name"], "changed native");
+    assert!(after_rename["native_history"].is_object(), "{after_rename}");
+    assert_eq!(after_rename["messages"], saved["messages"]);
+    let before = std::fs::read(&path).unwrap();
     #[cfg(feature = "goal")]
     {
         assert!(
@@ -851,6 +849,88 @@ fn acp53_stdio_native_turns_publish_restore_and_refuse_prefix_rewrite() {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["tool_call_id"], "acp53-native-read");
     }
+}
+
+/// mini-agent-sskdu.122: `/undo` and `/compact` succeed on a native session by
+/// republishing it as a new epoch; the republished file restores on a fresh
+/// peer and the next prompt completes.
+#[test]
+fn acp122_stdio_native_undo_and_compact_republish_and_restore() {
+    let roots = Roots::new();
+    std::fs::write(roots.0.join("native-read.txt"), "ACP53_OWNED_NATIVE_READ").unwrap();
+    let mut provider = Provider::start_protocol(&roots, true);
+    let config = roots.0.join("config.toml");
+    let base = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(
+        &config,
+        format!("compact_enabled=true\nkeep_recent_tokens=1\n{base}"),
+    )
+    .unwrap();
+    let mut peer = Peer::start_with_read(&roots, true);
+    peer.request(
+        1,
+        "initialize",
+        serde_json::json!({"protocolVersion":1,"clientCapabilities":{}}),
+    );
+    let id = peer.request(
+        2,
+        "session/new",
+        serde_json::json!({"cwd":roots.0,"mcpServers":[]}),
+    )["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for (request, text) in [(3, "native first"), (4, "native second")] {
+        assert_eq!(
+            peer.request(
+                request,
+                "session/prompt",
+                serde_json::json!({"sessionId":id,"prompt":[{"type":"text","text":text}]})
+            )["stopReason"],
+            "end_turn"
+        );
+    }
+    let path = roots.0.join("sessions").join(format!("{id}.json"));
+    for (request, text) in [(5, "/undo"), (6, "/compact")] {
+        let outcome = peer.exchange(
+            request,
+            "session/prompt",
+            serde_json::json!({"sessionId":id,"prompt":[{"type":"text","text":text}]}),
+        );
+        assert!(outcome.get("error").is_none(), "{text}: {outcome}");
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        // The republished epoch carries a native frontier (the old chain is
+        // retired, not rewritten); /undo dropped the second turn.
+        assert!(saved["native_frontier"].is_object(), "{text}: {saved}");
+        if text == "/undo" {
+            assert_eq!(saved["messages"].as_array().unwrap().len(), 4, "{saved}");
+        }
+    }
+    peer.request(7, "session/close", serde_json::json!({"sessionId":id}));
+    peer.finish();
+    let mut resumed = Peer::start_with_read(&roots, true);
+    resumed.request(
+        1,
+        "initialize",
+        serde_json::json!({"protocolVersion":1,"clientCapabilities":{}}),
+    );
+    resumed.request(
+        2,
+        "session/load",
+        serde_json::json!({"sessionId":id,"cwd":roots.0,"mcpServers":[]}),
+    );
+    assert_eq!(
+        resumed.request(
+            3,
+            "session/prompt",
+            serde_json::json!({"sessionId":id,"prompt":[{"type":"text","text":"native third"}]})
+        )["stopReason"],
+        "end_turn"
+    );
+    resumed.request(4, "session/close", serde_json::json!({"sessionId":id}));
+    resumed.finish();
+    provider.finish();
 }
 
 /// Opt-in `headless_agent_mentions` over the real ACP wire: an unknown
