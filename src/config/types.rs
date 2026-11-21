@@ -1233,6 +1233,13 @@ pub enum TerminalNotify {
     /// `OSC 777 ; notify ; <title> ; <body> BEL` (rxvt-unicode, foot,
     /// Ghostty, WezTerm, VTE-based terminals with the patch).
     Osc777,
+    /// A plain BEL (`\x07`): every terminal and multiplexer maps it to a bell,
+    /// badge or urgency hint.
+    Bell,
+    /// Pick from the environment: `osc9` in iTerm2, WezTerm, Ghostty and
+    /// kitty, `osc777` in foot and VTE terminals, a bell elsewhere; wrapped
+    /// in tmux's passthrough when `TMUX` is set.
+    Auto,
 }
 
 /// Where ordinary Enter sends text while an interactive turn is running.

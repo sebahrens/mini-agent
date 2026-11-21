@@ -70,7 +70,8 @@ impl ConfigPicker {
                                             crate::config::ConfigLayer::Local => {
                                                 cfg.provenance.local_file.as_ref()
                                             }
-                                            crate::config::ConfigLayer::Cli => None,
+                                            crate::config::ConfigLayer::Cli
+                                            | crate::config::ConfigLayer::Managed => None,
                                         };
                                         match file {
                                             Some(file) => format!(

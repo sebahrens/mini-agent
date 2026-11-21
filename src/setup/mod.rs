@@ -147,7 +147,11 @@ enum Screen {
     },
 }
 
+/// Advisory key check: `(config, provider name, key)` to a status line.
+type KeyChecker = fn(&Config, &str, &str) -> Result<String, String>;
+
 struct Ctx {
+    key_checker: KeyChecker,
     cfg: Config,
     credentials_dir: std::path::PathBuf,
     cli_key: Option<String>,
@@ -381,6 +385,16 @@ fn render_main_menu(ctx: &Ctx) -> io::Result<()> {
     let providers = collect_provider_names(&ctx.cfg);
     let models = collect_models(&ctx.cfg);
     let layout = main_menu_layout(ctx.rows, providers.len(), models.len());
+    write_line(
+        3,
+        2,
+        &format!(
+            "Default: {} / {}   (D changes it; subscriptions: /login openai | copilot)",
+            crate::cli::configured_provider(&ctx.cfg),
+            ctx.cfg.model.as_deref().unwrap_or("(provider default)")
+        ),
+        Color::DarkGrey,
+    )?;
     let mut row = 4u16;
 
     write_line(row, 2, "PROVIDERS", Color::Yellow)?;
@@ -455,6 +469,7 @@ fn render_main_menu(ctx: &Ctx) -> io::Result<()> {
         "Q) Quit (Ctrl-C quits from any screen)",
         Color::White,
     )?;
+    write_line(row, 44, "D) Default provider/model", Color::White)?;
 
     if let Some(msg) = &ctx.message {
         write_line(row + 1, 2, msg, Color::DarkYellow)?;
@@ -634,7 +649,7 @@ fn render_provider_detail(ctx: &Ctx) -> io::Result<()> {
         write_line(
             row,
             4,
-            "[Up/Down] Select field  [Enter] Edit  [S] Save  [Esc] Back",
+            "[Up/Down] Select field  [Enter] Edit  [T] Test key  [S] Save  [Esc] Back",
             Color::White,
         )?;
     }
@@ -921,6 +936,34 @@ pub fn run(
     result
 }
 
+/// Ask the provider whether `key` works, with the cheapest authenticated call
+/// the provider layer has (the model listing) and a short timeout. Runs on its
+/// own thread and runtime: the wizard itself is synchronous.
+fn check_key_live(cfg: &Config, provider: &str, key: &str) -> Result<String, String> {
+    let custom = cfg.custom_providers.clone().unwrap_or_default();
+    let client =
+        crate::provider::create_client(provider, Some(key), &custom, cfg.api_keys.as_ref())
+            .map_err(|error| error.to_string())?;
+    let outcome = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| error.to_string())?;
+                runtime.block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_secs(8), client.list_models())
+                        .await
+                        .map_err(|_| "timed out after 8 seconds".to_string())?
+                        .map_err(|error| error.to_string())
+                })
+            })
+            .join()
+            .unwrap_or_else(|_| Err("key check panicked".into()))
+    });
+    outcome.map(|models| format!("key accepted ({} models listed)", models.len()))
+}
+
 fn run_inner(
     cfg: &mut Config,
     cli_key: Option<&str>,
@@ -929,6 +972,7 @@ fn run_inner(
     let original = cfg.clone();
     let (cols, rows) = terminal::size()?;
     let mut ctx = Ctx {
+        key_checker: check_key_live,
         cfg: cfg.clone(),
         credentials_dir: credentials_dir.to_owned(),
         cli_key: cli_key.map(str::to_owned),
@@ -1031,6 +1075,39 @@ fn handle_main_menu_key(ctx: &Ctx, key: KeyEvent) -> anyhow::Result<KeyResult> {
             selected: 0,
             confirm_delete: false,
         })),
+        KeyCode::Char('d') | KeyCode::Char('D') => {
+            // Cycle the default provider through those with a usable key or
+            // saved login, and pair it with that provider's default model.
+            let usable: Vec<&str> = builtin_provider_names()
+                .iter()
+                .copied()
+                .filter(|name| {
+                    crate::diagnostics::provider_credential_with_env(
+                        &ctx.cfg,
+                        name,
+                        ctx.cli_key.as_deref(),
+                        &ctx.credentials_dir,
+                        |var| std::env::var(var),
+                    )
+                    .is_provided()
+                })
+                .collect();
+            if usable.is_empty() {
+                return Ok(KeyResult::Screen(ctx.screen.clone()));
+            }
+            let current = crate::cli::configured_provider(&ctx.cfg);
+            let next = usable
+                .iter()
+                .position(|name| *name == current.as_str())
+                .map_or(usable[0], |index| usable[(index + 1) % usable.len()]);
+            let mut new_cfg = ctx.cfg.clone();
+            new_cfg.provider = Some(CompactString::new(next));
+            new_cfg.model = None;
+            if let Some((model, _)) = crate::provider::default_model_for_provider(next, &new_cfg) {
+                new_cfg.model = Some(CompactString::new(model));
+            }
+            Ok(KeyResult::ScreenWithConfig(Screen::MainMenu, new_cfg))
+        }
         KeyCode::Char('l') | KeyCode::Char('L') => {
             Ok(KeyResult::Outcome(SetupOutcome::Launch, ctx.cfg.clone()))
         }
@@ -1308,6 +1385,32 @@ fn handle_provider_detail_key(ctx: &Ctx, key: KeyEvent) -> anyhow::Result<KeyRes
                     Ok(KeyResult::Screen(ctx.screen.clone()))
                 }
             }
+            KeyCode::Char('t') | KeyCode::Char('T') => {
+                let typed_key = fields
+                    .iter()
+                    .find(|f| f.label == "API Key Value")
+                    .map(|f| f.value.trim().to_owned())
+                    .unwrap_or_default();
+                let provider = fields
+                    .iter()
+                    .find(|f| f.label == "Name")
+                    .map(|f| f.value.clone())
+                    .unwrap_or_else(|| name.clone());
+                let status = if typed_key.is_empty() {
+                    "Enter an API Key Value first, then press T to check it".to_string()
+                } else {
+                    match (ctx.key_checker)(&ctx.cfg, &provider, &typed_key) {
+                        Ok(message) => message,
+                        Err(message) => format!("key check failed: {message} (S still saves it)"),
+                    }
+                };
+                Ok(KeyResult::Screen(make_screen(
+                    fields,
+                    selected_field,
+                    None,
+                    Some(status),
+                )))
+            }
             KeyCode::Char('s') | KeyCode::Char('S') => {
                 let mut new_cfg = ctx.cfg.clone();
 
@@ -1335,10 +1438,11 @@ fn handle_provider_detail_key(ctx: &Ctx, key: KeyEvent) -> anyhow::Result<KeyRes
                     .map(|f| f.value.clone())
                     .unwrap_or_default();
 
+                // A pasted key often carries a trailing newline or spaces.
                 let new_api_key_value = fields
                     .iter()
                     .find(|f| f.label == "API Key Value")
-                    .map(|f| f.value.clone())
+                    .map(|f| f.value.trim().to_owned())
                     .unwrap_or_default();
 
                 if is_builtin {
@@ -1382,33 +1486,55 @@ fn handle_provider_detail_key(ctx: &Ctx, key: KeyEvent) -> anyhow::Result<KeyRes
                     name.clone()
                 };
 
+                if crate::auth::ProviderKind::from_name(&new_provider_type).is_none() {
+                    return Ok(KeyResult::Screen(make_screen(
+                        fields,
+                        selected_field,
+                        None,
+                        Some(format!("Unknown Provider Type `{new_provider_type}`")),
+                    )));
+                }
+
                 let custom = new_cfg.custom_providers.get_or_insert_with(HashMap::new);
-                custom.insert(
-                    final_name.clone(),
-                    CustomProviderConfig {
-                        provider_type: CompactString::new(&new_provider_type),
-                        inherit_builtin_key: false,
-                        base_url: new_base_url,
-                        api_key_env: if new_api_key_env.is_empty() {
-                            None
-                        } else {
-                            Some(CompactString::new(&new_api_key_env))
-                        },
-                        danger_accept_invalid_certs: None,
-                        api_style: None,
-                        headers: HashMap::new(),
-                        timeout_secs: None,
-                        connect_timeout_secs: None,
-                        stream_idle_timeout_secs: None,
-                        model: None,
-                        prompt_caching: false,
-                        model_prices: std::collections::HashMap::new(),
-                    },
-                );
+                // Edit the three fields this screen shows; every other field of
+                // an existing entry (headers, timeouts, model, prices, ...) is
+                // kept as it was (mini-agent-nvnkx.222).
+                let mut entry = if is_new {
+                    None
+                } else {
+                    custom.get(&final_name).cloned()
+                }
+                .unwrap_or_else(|| CustomProviderConfig {
+                    provider_type: CompactString::new(""),
+                    inherit_builtin_key: false,
+                    base_url: String::new(),
+                    api_key_env: None,
+                    danger_accept_invalid_certs: None,
+                    api_style: None,
+                    headers: HashMap::new(),
+                    timeout_secs: None,
+                    connect_timeout_secs: None,
+                    stream_idle_timeout_secs: None,
+                    model: None,
+                    prompt_caching: false,
+                    model_prices: std::collections::HashMap::new(),
+                });
+                entry.provider_type = CompactString::new(&new_provider_type);
+                entry.base_url = new_base_url;
+                entry.api_key_env = if new_api_key_env.is_empty() {
+                    None
+                } else {
+                    Some(CompactString::new(&new_api_key_env))
+                };
+                custom.insert(final_name.clone(), entry);
 
                 if !new_api_key_value.is_empty() {
                     let keys = new_cfg.api_keys.get_or_insert_with(HashMap::new);
                     keys.insert(final_name.clone(), new_api_key_value);
+                } else if let Some(ref mut keys) = new_cfg.api_keys {
+                    // Clearing the field removes the stored key, as it does
+                    // for the built-in providers.
+                    keys.remove(&final_name);
                 }
 
                 Ok(KeyResult::ScreenWithConfig(Screen::MainMenu, new_cfg))
@@ -1940,6 +2066,7 @@ mod tests {
 
     fn wizard(cfg: Config) -> Ctx {
         Ctx {
+            key_checker: |_, _, _| Ok("stub".into()),
             cfg,
             credentials_dir: std::path::PathBuf::new(),
             cli_key: None,
@@ -1972,6 +2099,138 @@ mod tests {
                 .map(|field| field.value.clone()),
             _ => None,
         }
+    }
+
+    fn custom_provider_with_extras() -> Config {
+        let mut cfg = Config::default();
+        let mut headers = HashMap::new();
+        headers.insert("x-gateway".to_string(), "secret".to_string());
+        cfg.custom_providers = Some(
+            [(
+                "gw".to_string(),
+                CustomProviderConfig {
+                    provider_type: CompactString::new("openai"),
+                    inherit_builtin_key: false,
+                    base_url: "https://old.example/v1".into(),
+                    api_key_env: Some(CompactString::new("GW_KEY")),
+                    danger_accept_invalid_certs: None,
+                    api_style: None,
+                    headers,
+                    timeout_secs: Some(77),
+                    connect_timeout_secs: None,
+                    stream_idle_timeout_secs: None,
+                    model: Some(CompactString::new("gw-model")),
+                    prompt_caching: true,
+                    model_prices: HashMap::new(),
+                },
+            )]
+            .into(),
+        );
+        cfg.api_keys = Some([("gw".to_string(), "old-key".to_string())].into());
+        cfg
+    }
+
+    fn open_gw(ctx: &mut Ctx) {
+        assert!(press(ctx, KeyCode::Char('p')).is_none());
+        let names = collect_provider_names(&ctx.cfg);
+        let index = names.iter().position(|name| name == "gw").unwrap();
+        for _ in 0..index {
+            assert!(press(ctx, KeyCode::Down).is_none());
+        }
+        assert!(press(ctx, KeyCode::Enter).is_none());
+        assert!(matches!(
+            ctx.screen,
+            Screen::ProviderDetail { is_new: false, .. }
+        ));
+    }
+
+    #[test]
+    fn editing_a_custom_provider_keeps_the_fields_the_screen_does_not_show() {
+        let mut ctx = wizard(custom_provider_with_extras());
+        open_gw(&mut ctx);
+        // Fields: Name (read-only), Provider Type, Base URL, API Key Env, ..., API Key Value.
+        assert!(press(&mut ctx, KeyCode::Down).is_none());
+        assert!(press(&mut ctx, KeyCode::Down).is_none());
+        assert!(press(&mut ctx, KeyCode::Enter).is_none());
+        for _ in 0..40 {
+            assert!(press(&mut ctx, KeyCode::Backspace).is_none());
+        }
+        for c in "https://new.example/v1".chars() {
+            assert!(press(&mut ctx, KeyCode::Char(c)).is_none());
+        }
+        assert!(press(&mut ctx, KeyCode::Enter).is_none());
+        assert!(press(&mut ctx, KeyCode::Char('s')).is_none());
+        let provider = &ctx.cfg.custom_providers.as_ref().unwrap()["gw"];
+        assert_eq!(provider.base_url, "https://new.example/v1");
+        assert_eq!(
+            provider.headers.get("x-gateway").map(String::as_str),
+            Some("secret")
+        );
+        assert_eq!(provider.timeout_secs, Some(77));
+        assert_eq!(provider.model.as_deref(), Some("gw-model"));
+        assert!(provider.prompt_caching);
+    }
+
+    #[test]
+    fn key_check_is_advisory_and_pasted_keys_are_trimmed() {
+        let mut ctx = wizard(Config::default());
+        ctx.key_checker = |_, _, key| {
+            if key == "good" {
+                Ok("key accepted".into())
+            } else {
+                Err("401 unauthorized".into())
+            }
+        };
+        assert!(press(&mut ctx, KeyCode::Char('p')).is_none());
+        assert!(press(&mut ctx, KeyCode::Enter).is_none());
+        let Screen::ProviderDetail { fields, .. } = &ctx.screen else {
+            panic!("provider detail expected");
+        };
+        let key_field = fields.len() - 1;
+        for _ in 0..key_field {
+            assert!(press(&mut ctx, KeyCode::Down).is_none());
+        }
+        type_field(&mut ctx, "bad\n ");
+        assert!(press(&mut ctx, KeyCode::Char('t')).is_none());
+        let Screen::ProviderDetail { error, .. } = &ctx.screen else {
+            panic!("provider detail expected");
+        };
+        assert!(error.as_deref().unwrap().contains("401"), "{error:?}");
+        assert!(press(&mut ctx, KeyCode::Char('s')).is_none());
+        let stored = ctx.cfg.api_keys.as_ref().unwrap().values().next().unwrap();
+        assert_eq!(
+            stored, "bad",
+            "a failed check never blocks saving, and keys are trimmed"
+        );
+    }
+
+    #[test]
+    fn d_cycles_the_default_provider_through_those_with_credentials() {
+        let cfg = Config {
+            api_keys: Some([("anthropic".to_string(), "k".to_string())].into()),
+            ..Default::default()
+        };
+        let mut ctx = wizard(cfg);
+        // The environment may add other providers; every press must land on
+        // one that has a credential, and the model follows the provider.
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..10 {
+            assert!(press(&mut ctx, KeyCode::Char('d')).is_none());
+            let provider = ctx.cfg.provider.clone().expect("provider set");
+            assert!(
+                crate::diagnostics::provider_credential_with_env(
+                    &ctx.cfg,
+                    &provider,
+                    None,
+                    &ctx.credentials_dir,
+                    |var| std::env::var(var),
+                )
+                .is_provided()
+            );
+            assert!(ctx.cfg.model.is_some());
+            seen.insert(provider.to_string());
+        }
+        assert!(seen.contains("anthropic"));
     }
 
     #[test]

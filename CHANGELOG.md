@@ -55,6 +55,12 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Headless results (native and `--stream-json-schema claude`) list refused tool calls in `permission_denials` (tool, input, reason; bounded, with `permission_denials_truncated`), replacing the always-empty list (mini-agent-nvnkx.100).
 - An exhausted `--max-agent-turns` reports stop reason `max_turns` and exits 3, and an exhausted budget exits 4, classified from typed errors rather than message text (mini-agent-nvnkx.101).
 - stream-json input accepts an image-only user message (mini-agent-nvnkx.248).
+- `mini-agent trust [--list|--yes|--revoke <path>]` and `--trust-project-config` (env `MINI_AGENT_TRUST_PROJECT_CONFIG`) approve a project config for CI and containers; approvals bind to the sensitive keys only, so comment and benign edits keep them, and the ignored-key note and the stream-json init record name the keys (mini-agent-nvnkx.345).
+- `terminal_notify` accepts `bell` and `auto` (terminal-aware, tmux passthrough), stays quiet while the terminal reports focus, and `terminal_notify_min_secs` (default 10) suppresses short "turn finished" notices (mini-agent-nvnkx.93).
+- `--print-config` shows a `Managed policy` section and labels policy-decided keys `managed policy`; policy clamps are printed at startup (mini-agent-nvnkx.348, .349).
+- The TUI falls back to 256 or 16 colours unless `COLORTERM`/`TERM`/`TERM_PROGRAM` show truecolor; `/doctor` shows the detected depth (mini-agent-nvnkx.252).
+- Setup wizard: `D` cycles the default provider/model among providers with a key or login, `T` checks a typed key with a model listing, and first run selects the one provider that has a credential (mini-agent-nvnkx.223, .224).
+- Unknown-key warnings now cover `[goal]`, `[lsp]`, `[colors]`, `[chain]`, `[statusline]` and `[embedding]`, with field lists taken from the structs (mini-agent-nvnkx.99).
 
 ### Fixed
 
@@ -245,6 +251,14 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Default headless stderr no longer carries the withheld-built-in-LSP warning or the ignored-`%%grant=` warning (now debug logs) (mini-agent-nvnkx.154).
 - `--accept-all` help states that it selects standard mode (shell and web still ask) (mini-agent-nvnkx.73).
 - The `task` tool description and the system prompt share one delegation rule (read known files directly; delegate unknown search spaces), and the background start message says the result is announced and to wait once with a long `wait_secs` (mini-agent-nvnkx.175).
+- A project layer adds to, rather than replaces, `permission-deny` and `permission-ask` rules (mini-agent-nvnkx.344).
+- Global-only keys in a project config are dropped before the trust prompt with a warning naming the key (mini-agent-nvnkx.350).
+- Saving settings keeps `config.json` as JSON and keeps `config.toml` comments and key order; MCP add/remove and saved quick models edit the file in place (mini-agent-nvnkx.346, .347).
+- The project-config trust store is updated under a lock, so concurrent sessions keep each other's approvals (mini-agent-nvnkx.357).
+- The "root assets were not loaded" notice no longer lists `.mini-agent/config.toml`, which is loaded (mini-agent-nvnkx.354).
+- A symlinked or read-only global config loads (owner and mode checked, never chmod-ed) instead of exiting (mini-agent-nvnkx.192).
+- `managed-settings.json` and, on Windows, `managed-config.toml` must be administrator-owned; a planted file loads no hooks and fails closed (mini-agent-nvnkx.221).
+- Setup wizard: saving an existing custom provider keeps its headers, timeouts, model and prices; an empty key clears the stored key; keys are trimmed; unknown provider types are rejected (mini-agent-nvnkx.222).
 
 ### Added
 

@@ -75,6 +75,9 @@ pub struct ConfigProvenance {
     pub(crate) local_keys: BTreeSet<&'static str>,
     pub(crate) local_trust: Option<&'static str>,
     pub(crate) sources: BTreeMap<&'static str, BTreeSet<ConfigLayer>>,
+    /// Sensitive project keys that were not applied because the config is not
+    /// trusted and the run could not ask: (file, key names).
+    pub(crate) ignored_sensitive: Vec<(std::path::PathBuf, Vec<String>)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -83,6 +86,8 @@ pub(crate) enum ConfigLayer {
     Project,
     Local,
     Cli,
+    /// The administrator's managed policy, applied last.
+    Managed,
 }
 
 impl ConfigLayer {
@@ -92,6 +97,7 @@ impl ConfigLayer {
             Self::Project => "project",
             Self::Local => "project-local",
             Self::Cli => "CLI --config",
+            Self::Managed => "managed policy",
         }
     }
 }
@@ -106,7 +112,7 @@ impl ConfigProvenance {
             ConfigLayer::Global => self.global_file.as_ref(),
             ConfigLayer::Project => self.project_file.as_ref(),
             ConfigLayer::Local => self.local_file.as_ref(),
-            ConfigLayer::Cli => None,
+            ConfigLayer::Cli | ConfigLayer::Managed => None,
         }?;
         file.parent().map(std::path::Path::to_path_buf)
     }
@@ -882,6 +888,10 @@ pub struct Config {
     /// finishes or a permission prompt waits. Default: off.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_notify: Option<TerminalNotify>,
+    /// Seconds a turn must run before "turn finished" notifies (approval and
+    /// question waits always notify). Default: 10.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_notify_min_secs: Option<u64>,
     /// Emit OSC 133 semantic prompt marks: a prompt while the TUI waits for
     /// input, command start while a run is active, command end when it
     /// finishes. Default: false.
@@ -1517,6 +1527,10 @@ impl Config {
 
     pub fn resolve_terminal_notify(&self) -> TerminalNotify {
         self.terminal_notify.unwrap_or_default()
+    }
+
+    pub fn resolve_terminal_notify_min_secs(&self) -> u64 {
+        self.terminal_notify_min_secs.unwrap_or(10)
     }
 
     pub fn resolve_terminal_prompt_marks(&self) -> bool {
@@ -2852,7 +2866,12 @@ brainstorm = ""
         assert!(cfg.resolve_terminal_prompt_marks());
         let cfg: Config = toml::from_str("terminal_notify = \"osc9\"\n").unwrap();
         assert_eq!(cfg.resolve_terminal_notify(), TerminalNotify::Osc9);
-        assert!(toml::from_str::<Config>("terminal_notify = \"bell\"\n").is_err());
+        let cfg: Config = toml::from_str("terminal_notify = \"bell\"\n").unwrap();
+        assert_eq!(cfg.resolve_terminal_notify(), TerminalNotify::Bell);
+        let cfg: Config = toml::from_str("terminal_notify = \"auto\"\n").unwrap();
+        assert_eq!(cfg.resolve_terminal_notify(), TerminalNotify::Auto);
+        assert!(toml::from_str::<Config>("terminal_notify = \"flash\"\n").is_err());
+        assert_eq!(cfg.resolve_terminal_notify_min_secs(), 10);
     }
 
     #[test]

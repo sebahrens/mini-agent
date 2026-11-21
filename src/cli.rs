@@ -80,6 +80,27 @@ fn rewrite_hooks_trust_invocation(args: Vec<std::ffi::OsString>) -> Vec<std::ffi
     ]
 }
 
+/// `mini-agent trust [--list|--yes|--revoke <path>]` is a subcommand spelling
+/// of `--config-trust`. Only that exact form is rewritten, so
+/// `mini-agent trust the docs` stays an ordinary prompt.
+fn rewrite_config_trust_invocation(args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    let words: Vec<Option<&str>> = args.iter().map(|arg| arg.to_str()).collect();
+    if words.get(1) != Some(&Some("trust")) {
+        return args;
+    }
+    let mode = match &words[2..] {
+        [] => "ask".to_owned(),
+        [Some("--list")] => "list".to_owned(),
+        [Some("--yes")] => "yes".to_owned(),
+        [Some("--revoke"), Some(path)] => format!("revoke={path}"),
+        _ => return args,
+    };
+    vec![
+        args[0].clone(),
+        std::ffi::OsString::from(format!("--config-trust={mode}")),
+    ]
+}
+
 #[cfg(feature = "hooks")]
 fn parse_hooks_test_input(value: &str) -> Result<String, String> {
     serde_json::from_str::<serde_json::Value>(value)
@@ -1037,6 +1058,21 @@ pub struct Cli {
     #[arg(long = "no-hooks", help = "Disable all hooks")]
     pub no_hooks: bool,
 
+    #[arg(
+        long = "trust-project-config",
+        env = "MINI_AGENT_TRUST_PROJECT_CONFIG",
+        help = "Apply the project's sensitive config keys (MCP servers, permission rules, ...) for this run without the confirmation prompt (nothing is recorded); for CI and containers"
+    )]
+    pub trust_project_config: bool,
+
+    #[arg(
+        long = "config-trust",
+        value_name = "MODE",
+        hide = true,
+        help = "Review project config trust, then exit; written `mini-agent trust [--list|--yes|--revoke <path>]`"
+    )]
+    pub config_trust: Option<String>,
+
     #[cfg(feature = "hooks")]
     #[arg(
         long = "trust-project-hooks",
@@ -1542,6 +1578,7 @@ impl Cli {
         let args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
         #[cfg(feature = "hooks")]
         let args = rewrite_hooks_trust_invocation(args);
+        let args = rewrite_config_trust_invocation(args);
         let completions = args
             .iter()
             .skip(1)
@@ -1669,7 +1706,7 @@ impl Cli {
     /// and `--print-config`/`--tutor` must not create the default config file.
     pub(crate) fn is_informational_command(&self) -> bool {
         #[allow(unused_mut)]
-        let mut informational = self.print_config || self.tutor;
+        let mut informational = self.print_config || self.tutor || self.config_trust.is_some();
         #[cfg(feature = "hooks")]
         {
             informational |= self.hooks_test.is_some() || self.hooks_trust.is_some();
@@ -4070,5 +4107,34 @@ mod hooks_trust_cli_tests {
             Cli::try_parse_command_line_from(["mini-agent", "hooks", "trust", "the", "docs"])
                 .unwrap();
         assert_eq!(prompt.hooks_trust, None);
+    }
+}
+
+#[cfg(test)]
+mod config_trust_cli_tests {
+    use super::*;
+
+    #[test]
+    fn trust_subcommand_maps_to_the_flag() {
+        for (argv, mode) in [
+            (&["mini-agent", "trust"][..], "ask"),
+            (&["mini-agent", "trust", "--list"][..], "list"),
+            (&["mini-agent", "trust", "--yes"][..], "yes"),
+            (
+                &["mini-agent", "trust", "--revoke", "/work/repo"][..],
+                "revoke=/work/repo",
+            ),
+        ] {
+            let cli = Cli::try_parse_command_line_from(argv.iter().copied()).unwrap();
+            assert_eq!(cli.config_trust.as_deref(), Some(mode), "{argv:?}");
+            assert!(cli.is_informational_command());
+        }
+        let prompt =
+            Cli::try_parse_command_line_from(["mini-agent", "trust", "the", "docs"]).unwrap();
+        assert_eq!(prompt.config_trust, None);
+        let flag =
+            Cli::try_parse_command_line_from(["mini-agent", "--trust-project-config", "-p", "x"])
+                .unwrap();
+        assert!(flag.trust_project_config);
     }
 }

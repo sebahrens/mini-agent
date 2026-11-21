@@ -19,7 +19,8 @@ const ASSETS: &[(&str, &str)] = &[
     (".mcp.json", ".mcp.json"),
     ("AGENTS.md", "AGENTS.md"),
     ("CLAUDE.md", "CLAUDE.md"),
-    (".mini-agent/config.toml", ".mini-agent/config.toml"),
+    // `.mini-agent/config.toml` is not listed: config discovery walks up to the
+    // repository root itself, so that file is loaded (mini-agent-nvnkx.354).
     (".mini-agent/agents", ".mini-agent/agents"),
     (".claude/agents", ".claude/agents"),
     (".mini-agent/skills", ".mini-agent/skills"),
@@ -225,5 +226,22 @@ mod tests {
             !discovery_enabled(Some(&user), &[]),
             "unparseable stays closed"
         );
+    }
+}
+
+#[cfg(test)]
+mod config_asset_tests {
+    use super::*;
+
+    #[test]
+    fn a_root_holding_only_a_project_config_is_not_reported_as_skipped() {
+        let dir = crate::tests::OwnedTestDirectory::new("projrootcfgonly");
+        let root = dir.path().join("repo");
+        let sub = root.join("a/b");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join(".mini-agent")).unwrap();
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(root.join(".mini-agent/config.toml"), "max_tokens = 1\n").unwrap();
+        assert!(skipped_assets_notice(&sub, None).is_none());
     }
 }

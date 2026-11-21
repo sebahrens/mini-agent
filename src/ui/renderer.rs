@@ -1160,6 +1160,8 @@ pub struct Renderer {
     activity_signals: crate::ui::terminal::ActivitySignals,
     /// Activity of the last frame, for the transitions those signals report.
     last_activity: Option<crate::ui::terminal::AgentActivity>,
+    /// When the current turn started working, for the notification threshold.
+    turn_started: Option<std::time::Instant>,
 }
 
 /// A status-line message that disappears on its own.
@@ -1309,6 +1311,7 @@ impl Renderer {
             title_activity: None,
             activity_signals: crate::ui::terminal::ActivitySignals::default(),
             last_activity: None,
+            turn_started: None,
         })
     }
 
@@ -1548,6 +1551,14 @@ impl Renderer {
     /// Enable the opt-in notification and prompt-mark sequences.
     pub(crate) fn set_activity_signals(&mut self, signals: crate::ui::terminal::ActivitySignals) {
         self.activity_signals = signals;
+        if signals.notify != crate::config::TerminalNotify::Off {
+            // Focus reports let notifications stay quiet while the user is
+            // looking at the window. Written once; reset on leaving the
+            // alternate screen.
+            let _ = self.frame(|this| {
+                frame_out!(this).write_all(crate::ui::terminal::enable_focus_reporting().as_bytes())
+            });
+        }
     }
 
     /// Announce `activity` in the terminal title when it changed, and emit
@@ -1557,12 +1568,17 @@ impl Renderer {
         &mut self,
         activity: crate::ui::terminal::AgentActivity,
     ) -> io::Result<()> {
+        use crate::ui::terminal::AgentActivity;
+        if activity == AgentActivity::Working
+            && matches!(self.last_activity, None | Some(AgentActivity::Idle))
+        {
+            self.turn_started = Some(std::time::Instant::now());
+        }
         let mut out = if self.activity_signals.any() {
-            crate::ui::terminal::activity_sequences(
-                self.last_activity,
-                activity,
-                self.activity_signals,
-            )
+            let mut signals = self.activity_signals;
+            signals.focused = crate::ui::terminal::terminal_is_focused();
+            signals.turn_elapsed = self.turn_started.map(|started| started.elapsed());
+            crate::ui::terminal::activity_sequences(self.last_activity, activity, signals)
         } else {
             String::new()
         };

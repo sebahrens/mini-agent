@@ -3290,6 +3290,17 @@ impl Startup {
             "sandbox":self.sandbox.effective_summary(),
         });
         crate::print::annotate_stdin_abandoned(&mut system);
+        if !self.cfg.provenance.ignored_sensitive.is_empty() {
+            // Operators in CI need to see which project settings stayed off.
+            system["ignored_project_config_keys"] = serde_json::Value::Array(
+                self.cfg
+                    .provenance
+                    .ignored_sensitive
+                    .iter()
+                    .flat_map(|(_, keys)| keys.iter().map(|key| serde_json::json!(key)))
+                    .collect(),
+            );
+        }
         output.emit_event(system).await?;
         // The `git status` baseline runs concurrently with the work that
         // cannot change the workspace (compaction, MCP connect, agent build)

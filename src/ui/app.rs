@@ -966,6 +966,8 @@ impl<'a> App<'a> {
         renderer.set_activity_signals(crate::ui::terminal::ActivitySignals {
             notify: ui.cfg.resolve_terminal_notify(),
             prompt_marks: ui.cfg.resolve_terminal_prompt_marks(),
+            min_turn_secs: ui.cfg.resolve_terminal_notify_min_secs(),
+            ..Default::default()
         });
         renderer.set_chat_margin(ui.cfg.resolve_chat_left_margin());
 

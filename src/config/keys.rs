@@ -340,7 +340,8 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     key("mouse_capture").described("Capture mouse events in the TUI (wheel scrolling, click-to-place-cursor, link opening, drag-to-copy). `false` leaves the mouse to the terminal so its native selection works. Default: true.").shaped(ConfigShape::Bool),
     key("mouse_scroll_lines").described("Transcript lines scrolled per plain mouse-wheel notch (1..=20); Shift/Ctrl + wheel scrolls a page per notch. Only used while `mouse_capture` is on. Default: 3.").shaped(ConfigShape::Integer),
     key("terminal_title").described("Report agent activity in the terminal/window title (`mini-agent: working`, `waiting for approval`, `idle`) so terminal multiplexers and tab bars can show it; the previous title is…").shaped(ConfigShape::Bool),
-    key("terminal_notify").described("Desktop notification escape (`osc9`, `osc777`) emitted when a turn finishes or a permission prompt waits. Default: off.").shaped(ConfigShape::Enum(&["off", "osc9", "osc777"])),
+    key("terminal_notify").described("Notification emitted when a turn finishes or a permission prompt waits: `osc9`, `osc777`, `bell` (BEL), or `auto` (picks from the terminal, tmux-aware). Skipped while the terminal reports it is focused. Default: off.").shaped(ConfigShape::Enum(&["off", "osc9", "osc777", "bell", "auto"])),
+    key("terminal_notify_min_secs").described("Seconds a turn must run before `terminal_notify` announces \"turn finished\"; approval and question waits always notify. Default: 10.").shaped(ConfigShape::Integer),
     key("terminal_prompt_marks").described("Emit OSC 133 semantic prompt marks: a prompt while the TUI waits for input, command start while a run is active, command end when it finishes. Default: false.").shaped(ConfigShape::Bool),
     key("default_prompt").shaped(ConfigShape::String),
     gated_aliased("git-worktree", "wt-auto-merge", &["wt_auto_merge"]).shaped(ConfigShape::Bool),
@@ -513,87 +514,199 @@ pub(crate) fn nearest_known_key(spelling: &str) -> Option<&'static str> {
         .map(|(name, _)| name)
 }
 
-const RETRY_FIELDS: &[&str] = &[
-    "max_attempts",
-    "initial_backoff_ms",
-    "max_backoff_ms",
-    "max_retry_after_ms",
-];
-const QUICK_MODEL_FIELDS: &[&str] = &[
-    "provider",
-    "model",
-    "input_token_cost",
-    "output_token_cost",
-    "cache_read_token_cost",
-    "cache_write_token_cost",
-    "cache_write_1h_token_cost",
-    "reserve_tokens",
-    "temperature",
-    "extra_body",
-    "context_window",
-];
-const CUSTOM_PROVIDER_FIELDS: &[&str] = &[
-    "provider_type",
-    "base_url",
-    "api_key_env",
-    "inherit_builtin_key",
-    "danger_accept_invalid_certs",
-    "api_style",
-    "headers",
-    "timeout_secs",
-    "connect_timeout_secs",
-    "stream_idle_timeout_secs",
-    "model",
-    "prompt_caching",
-    "model_prices",
-];
-const ADVISOR_FIELDS: &[&str] = &[
-    "enabled",
-    "model",
-    "max_uses",
-    "human_handoff",
-    "advisor_kilobytes_limit",
-];
+/// The field names serde knows for `T`, read from the derive's own list so a
+/// checker can never drift from the struct. `None` for a non-struct type.
+fn fields_of<'de, T: serde::Deserialize<'de>>() -> Option<&'static [&'static str]> {
+    use serde::de::{self, Visitor};
+    struct Probe<'a>(&'a mut Option<&'static [&'static str]>);
+    #[derive(Debug)]
+    struct Stop;
+    impl std::fmt::Display for Stop {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("field probe")
+        }
+    }
+    impl std::error::Error for Stop {}
+    impl de::Error for Stop {
+        fn custom<M: std::fmt::Display>(_: M) -> Self {
+            Stop
+        }
+    }
+    impl<'de> de::Deserializer<'de> for Probe<'_> {
+        type Error = Stop;
+        fn deserialize_any<V: Visitor<'de>>(self, _: V) -> Result<V::Value, Stop> {
+            Err(Stop)
+        }
+        fn deserialize_struct<V: Visitor<'de>>(
+            self,
+            _name: &'static str,
+            fields: &'static [&'static str],
+            _visitor: V,
+        ) -> Result<V::Value, Stop> {
+            *self.0 = Some(fields);
+            Err(Stop)
+        }
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+            bytes byte_buf option unit unit_struct newtype_struct seq tuple
+            tuple_struct map enum identifier ignored_any
+        }
+    }
+    let mut found = None;
+    let _ = T::deserialize(Probe(&mut found));
+    found
+}
+
+/// How one typed config table is checked.
+enum NestedShape {
+    /// The table's own fields.
+    Table(Option<&'static [&'static str]>),
+    /// Every entry of the table is itself a struct (`[quick_models.<name>]`).
+    Entries(Option<&'static [&'static str]>),
+}
+
+fn nested_shape(canonical: &str) -> Option<NestedShape> {
+    use NestedShape::{Entries, Table};
+    Some(match canonical {
+        "retry" => Table(fields_of::<super::RetryConfig>()),
+        "quick_models" => Entries(fields_of::<super::QuickModelConfig>()),
+        "custom_providers" => Entries(fields_of::<super::CustomProviderConfig>()),
+        #[cfg(feature = "advisor")]
+        "advisor" => Table(fields_of::<super::AdvisorConfig>()),
+        // The table is accepted (and kept) by builds without the feature, so
+        // typos in it are still reported there.
+        #[cfg(not(feature = "advisor"))]
+        "advisor" => Table(Some(&[
+            "enabled",
+            "model",
+            "max_uses",
+            "human_handoff",
+            "advisor_kilobytes_limit",
+        ])),
+        #[cfg(feature = "goal")]
+        "goal" => Table(fields_of::<super::GoalConfig>()),
+        #[cfg(feature = "lsp")]
+        "lsp" => Table(fields_of::<super::LspConfig>()),
+        "colors" => Table(fields_of::<super::ColorsConfig>()),
+        "chain" => Table(fields_of::<super::ChainConfig>()),
+        "statusline" => Table(fields_of::<super::StatusLineConfig>()),
+        "embedding" => Table(fields_of::<super::EmbeddingConfig>()),
+        _ => return None,
+    })
+}
+
+/// Names of the typed top-level tables the nested checker covers.
+#[cfg(test)]
+pub(crate) fn checked_nested_tables() -> Vec<&'static str> {
+    let mut names = vec![
+        "retry",
+        "quick_models",
+        "custom_providers",
+        "colors",
+        "chain",
+        "statusline",
+        "embedding",
+    ];
+    names.push("advisor");
+    #[cfg(feature = "goal")]
+    names.push("goal");
+    #[cfg(feature = "lsp")]
+    names.push("lsp");
+    names
+}
 
 /// Warnings for misspelled keys inside the typed config tables (`[retry]`,
+/// `[goal]`, `[lsp]`, `[colors]`, `[chain]`, `[statusline]`, `[embedding]`,
 /// `[advisor]`, `[quick_models.*]`, `[custom_providers.*]`), which serde
 /// otherwise drops silently. Key names are shown (never values), each with the
-/// nearest field as a hint.
+/// nearest field as a hint. Field lists come from the structs themselves.
 pub(crate) fn unknown_nested_key_warnings(source: &str, root: &toml::Table) -> Vec<String> {
     let mut warnings = Vec::new();
+    let mut check = |prefix: String, table: &toml::Table, fields: &[&'static str]| {
+        for spelling in table.keys() {
+            if fields.contains(&spelling.as_str()) {
+                continue;
+            }
+            let hint = nearest_field(spelling, fields)
+                .map(|field| format!(" (did you mean `{field}`?)"))
+                .unwrap_or_default();
+            warnings.push(format!(
+                "{source}: unknown key `{prefix}{spelling}` is ignored{hint}"
+            ));
+        }
+    };
     for (top, value) in root {
         let Some(table) = value.as_table() else {
             continue;
         };
         let canonical = lookup(top).map_or(top.as_str(), |key| key.name);
-        let (fields, per_entry): (&[&str], bool) = match canonical {
-            "retry" => (RETRY_FIELDS, false),
-            "advisor" => (ADVISOR_FIELDS, false),
-            "quick_models" => (QUICK_MODEL_FIELDS, true),
-            "custom_providers" => (CUSTOM_PROVIDER_FIELDS, true),
-            _ => continue,
-        };
-        let mut check = |prefix: String, table: &toml::Table| {
-            for spelling in table.keys() {
-                if fields.contains(&spelling.as_str()) {
-                    continue;
+        match nested_shape(canonical) {
+            Some(NestedShape::Table(Some(fields))) => {
+                check(format!("{canonical}."), table, fields);
+                match canonical {
+                    #[cfg(feature = "lsp")]
+                    "lsp" => {
+                        let server_fields = fields_of::<super::LspServerConfig>();
+                        if let (Some(server_fields), Some(servers)) = (
+                            server_fields,
+                            table.get("servers").and_then(toml::Value::as_table),
+                        ) {
+                            for (name, entry) in servers {
+                                if let Some(entry) = entry.as_table() {
+                                    check(format!("lsp.servers.{name}."), entry, server_fields);
+                                }
+                            }
+                        }
+                    }
+                    "statusline" => {
+                        let line_fields = fields_of::<super::StatusLineLine>();
+                        let segment_fields = fields_of::<super::StatusLineSegment>();
+                        for (index, line) in table
+                            .get("lines")
+                            .and_then(toml::Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .enumerate()
+                        {
+                            let Some(line) = line.as_table() else {
+                                continue;
+                            };
+                            if let Some(line_fields) = line_fields {
+                                check(format!("statusline.lines[{index}]."), line, line_fields);
+                            }
+                            let Some(segment_fields) = segment_fields else {
+                                continue;
+                            };
+                            for (segment_index, segment) in line
+                                .get("segments")
+                                .and_then(toml::Value::as_array)
+                                .into_iter()
+                                .flatten()
+                                .enumerate()
+                            {
+                                if let Some(segment) = segment.as_table() {
+                                    check(
+                                        format!(
+                                            "statusline.lines[{index}].segments[{segment_index}]."
+                                        ),
+                                        segment,
+                                        segment_fields,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
-                let hint = nearest_field(spelling, fields)
-                    .map(|field| format!(" (did you mean `{field}`?)"))
-                    .unwrap_or_default();
-                warnings.push(format!(
-                    "{source}: unknown key `{prefix}{spelling}` is ignored{hint}"
-                ));
             }
-        };
-        if per_entry {
-            for (name, entry) in table {
-                if let Some(entry) = entry.as_table() {
-                    check(format!("{canonical}.{name}."), entry);
+            Some(NestedShape::Entries(Some(fields))) => {
+                for (name, entry) in table {
+                    if let Some(entry) = entry.as_table() {
+                        check(format!("{canonical}.{name}."), entry, fields);
+                    }
                 }
             }
-        } else {
-            check(format!("{canonical}."), table);
+            _ => {}
         }
     }
     warnings
@@ -841,6 +954,47 @@ mod tests {
                     preserved, !owned,
                     "`{spelling}` ownership disagrees with the catalogue"
                 );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod nested_key_tests {
+    use super::*;
+
+    fn warnings(text: &str) -> Vec<String> {
+        unknown_nested_key_warnings("test", &toml::from_str::<toml::Table>(text).unwrap())
+    }
+
+    #[test]
+    fn misspelled_keys_in_typed_tables_warn_with_a_hint() {
+        let goal = warnings("[goal]\nmax_round = 1\n");
+        if cfg!(feature = "goal") {
+            assert_eq!(goal.len(), 1, "{goal:?}");
+            assert!(goal[0].contains("goal.max_round") && goal[0].contains("max_rounds"));
+        }
+        let colors = warnings("[colors]\naccnt = 'red'\n");
+        assert!(colors[0].contains("accent"), "{colors:?}");
+        let chain = warnings("[chain]\nplan-to-cod = true\n");
+        assert_eq!(chain.len(), 1, "{chain:?}");
+        let status = warnings("[[statusline.lines]]\nsegmnts = []\n");
+        assert_eq!(status.len(), 1, "{status:?}");
+        if cfg!(feature = "lsp") {
+            let lsp = warnings("[lsp]\nenabeld = true\n[lsp.servers.rust]\ncomand = 'x'\n");
+            assert_eq!(lsp.len(), 2, "{lsp:?}");
+        }
+        assert!(warnings("[colors]\naccent = 'red'\n[retry]\nmax_attempts = 2\n").is_empty());
+    }
+
+    #[test]
+    fn every_typed_table_is_covered_and_has_fields() {
+        for table in checked_nested_tables() {
+            match nested_shape(table) {
+                Some(NestedShape::Table(Some(fields)) | NestedShape::Entries(Some(fields))) => {
+                    assert!(!fields.is_empty(), "{table}");
+                }
+                _ => panic!("typed table `{table}` has no field list"),
             }
         }
     }

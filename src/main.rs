@@ -993,12 +993,37 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
     // Commands that only report state never ask for project trust, and
     // `--print-config` never creates the default config file.
     config::set_create_default_config(!cli.print_config);
+    config::set_run_trust_project_config(cli.trust_project_config);
     print::arm_fatal_config_record(&cli);
     let (mut cfg, is_first_startup) = config::load_in_workspace(
         &app_paths,
         &workspace,
         is_interactive && !cli.is_informational_command(),
     );
+    if let Some(mode) = cli.config_trust.as_deref() {
+        let mode = match mode {
+            "ask" => config::ConfigTrustMode::Ask,
+            "list" => config::ConfigTrustMode::List,
+            "yes" => config::ConfigTrustMode::Yes,
+            other => match other.strip_prefix("revoke=") {
+                Some(path) => config::ConfigTrustMode::Revoke(path.to_owned()),
+                None => anyhow::bail!(
+                    "mini-agent trust: use --list, --yes or --revoke <path> (got `{other}`)"
+                ),
+            },
+        };
+        let report = config::run_config_trust(&app_paths, &workspace, mode, &|description| {
+            use std::io::Write;
+            let mut input = String::new();
+            eprint!("{description}\nTrust these settings for this exact project config? [y/N] ");
+            let _ = std::io::stderr().flush();
+            std::io::stdin().read_line(&mut input).is_ok()
+                && matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+        })
+        .map_err(anyhow::Error::msg)?;
+        println!("{report}");
+        return Ok(());
+    }
     context::agents::set_claude_project_agents(cfg.resolve_claude_project_agents());
     context::agents::set_claude_user_agents(cfg.resolve_claude_user_agents());
     context::commands::set_claude_user_commands(cfg.resolve_claude_user_commands());

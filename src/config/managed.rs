@@ -391,6 +391,180 @@ fn bounded_list(what: &str, list: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether `path` (a managed file) and its directory can only be changed by
+/// root (Unix) or by Administrators/SYSTEM/TrustedInstaller (Windows). Used for
+/// every administrator-owned file the program trusts without a prompt: the
+/// managed policy and the managed hooks (mini-agent-nvnkx.221).
+pub(crate) fn check_administrator_authority(path: &Path) -> Result<(), String> {
+    let shown = path.display();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::symlink_metadata(path)
+            .map_err(|error| format!("managed file {shown} cannot be inspected: {error}"))?;
+        if !metadata.file_type().is_file() {
+            return Err(format!("managed file {shown} is not a regular file"));
+        }
+        if metadata.uid() != 0 {
+            return Err(format!(
+                "managed file {shown} must be owned by root (uid {} found)",
+                metadata.uid()
+            ));
+        }
+        if metadata.mode() & 0o022 != 0 {
+            return Err(format!(
+                "managed file {shown} must not be group- or world-writable"
+            ));
+        }
+        if let Some(parent) = path.parent() {
+            let parent_meta = std::fs::metadata(parent)
+                .map_err(|error| format!("managed file directory is unreadable: {error}"))?;
+            if parent_meta.uid() != 0 || parent_meta.mode() & 0o022 != 0 {
+                return Err(format!(
+                    "managed file directory of {shown} must be root-owned and not group- or world-writable"
+                ));
+            }
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        for target in [Some(path), path.parent()].into_iter().flatten() {
+            let sddl = windows_sddl(target).map_err(|error| {
+                format!(
+                    "managed file ACL of {} is unreadable: {error}",
+                    target.display()
+                )
+            })?;
+            admin_only_sddl(&sddl)
+                .map_err(|reason| format!("managed file {shown}: {} {reason}", target.display()))?;
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = shown;
+        Ok(())
+    }
+}
+
+/// The owner and DACL of `path` as SDDL text, through PowerShell (a short
+/// administrator-only code path; the path travels in the environment, never in
+/// the command text).
+#[cfg(windows)]
+fn windows_sddl(path: &Path) -> Result<String, String> {
+    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+    let exe = Path::new(&root).join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+    let output = std::process::Command::new(exe)
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "(Get-Acl -LiteralPath $env:MINI_AGENT_ACL_PATH).Sddl",
+        ])
+        .env("MINI_AGENT_ACL_PATH", path)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err("Get-Acl failed".into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// Accept an SDDL string only when its owner and every allow entry that
+/// grants write, delete or ACL-change rights belong to Administrators, SYSTEM
+/// or TrustedInstaller. Pure text logic, so it is testable on any platform.
+#[cfg(any(windows, test))]
+pub(crate) fn admin_only_sddl(sddl: &str) -> Result<(), String> {
+    fn trusted(sid: &str) -> bool {
+        matches!(
+            sid,
+            "SY" | "BA" | "S-1-5-18" | "S-1-5-32-544" | "CO" | "S-1-3-0"
+        ) || sid.starts_with("S-1-5-80-")
+    }
+    let owner_start = sddl.find("O:").ok_or_else(|| "has no owner".to_owned())? + 2;
+    let owner_end = ["G:", "D:", "S:"]
+        .iter()
+        .filter_map(|marker| sddl[owner_start..].find(marker))
+        .min()
+        .map_or(sddl.len(), |index| owner_start + index);
+    let owner = &sddl[owner_start..owner_end];
+    if !trusted(owner) {
+        return Err(format!("is owned by `{owner}`, not an administrator"));
+    }
+    let dacl = sddl
+        .find("D:")
+        .ok_or_else(|| "has no DACL, so everyone may write".to_owned())?;
+    let mut rest = &sddl[dacl..];
+    while let Some(open) = rest.find('(') {
+        let Some(close) = rest[open..].find(')') else {
+            break;
+        };
+        let ace = &rest[open + 1..open + close];
+        rest = &rest[open + close + 1..];
+        let fields: Vec<&str> = ace.split(';').collect();
+        let [kind, _flags, rights, _object, _inherit, sid, ..] = fields[..] else {
+            continue;
+        };
+        if !matches!(kind, "A" | "OA" | "XA") || trusted(sid) {
+            continue;
+        }
+        if sddl_rights_write(rights) {
+            return Err(format!("grants write access to `{sid}`"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn sddl_rights_write(rights: &str) -> bool {
+    const WRITE_MASK: u64 = 0x2
+        | 0x4
+        | 0x10
+        | 0x40
+        | 0x100
+        | 0x1_0000
+        | 0x4_0000
+        | 0x8_0000
+        | 0x4000_0000
+        | 0x1000_0000;
+    if let Some(hex) = rights
+        .strip_prefix("0x")
+        .or_else(|| rights.strip_prefix("0X"))
+    {
+        return u64::from_str_radix(hex, 16).is_ok_and(|mask| mask & WRITE_MASK != 0);
+    }
+    let bytes = rights.as_bytes();
+    bytes.chunks(2).any(|token| {
+        matches!(
+            token,
+            b"FA" | b"FW" | b"GA" | b"GW" | b"WD" | b"WO" | b"SD" | b"DC"
+        )
+    })
+}
+
+/// Record that the managed policy decided `key` (`--print-config` labels it
+/// `managed`). A scalar is attributed to the policy alone; a table or list the
+/// policy only adds to keeps its earlier layers.
+fn mark_managed(cfg: &mut super::Config, key: &str, scalar: bool) {
+    let Some(known) = super::keys::lookup(key) else {
+        return;
+    };
+    let layers = cfg.provenance.sources.entry(known.name).or_default();
+    if scalar {
+        layers.clear();
+    }
+    layers.insert(super::ConfigLayer::Managed);
+}
+
+/// Push a clamp warning unless the same text is already listed: the policy is
+/// applied again after `--config` overrides and must not repeat itself.
+fn warn_once(cfg: &mut super::Config, message: String) {
+    if !cfg.load_warnings.contains(&message) {
+        cfg.load_warnings.push(message);
+    }
+}
+
 impl ManagedPolicy {
     /// Read and validate `path`. `Ok(None)` when it does not exist. With
     /// `require_root`, a non-root owner or a group/world-writable file or
@@ -437,7 +611,9 @@ impl ManagedPolicy {
             }
         }
         #[cfg(not(unix))]
-        let _ = require_root;
+        if require_root {
+            check_administrator_authority(path)?;
+        }
         let text = std::fs::read_to_string(path)
             .map_err(|error| format!("managed policy {shown} cannot be read: {error}"))?;
         super::layers::validate_toml_bounds(&text)
@@ -863,9 +1039,12 @@ impl ManagedPolicy {
             }
         }
         for key in dropped {
-            cfg.load_warnings.push(format!(
-                "{key} entries outside sandbox.allowed_roots were removed by the managed policy {file} (max_profile is set)"
-            ));
+            warn_once(
+                cfg,
+                format!(
+                    "{key} entries outside sandbox.allowed_roots were removed by the managed policy {file} (max_profile is set)"
+                ),
+            );
         }
     }
 
@@ -878,9 +1057,11 @@ impl ManagedPolicy {
             && cfg.sandbox_profile.is_some_and(|p| p.rank() > max.rank())
         {
             cfg.sandbox_profile = Some(max);
-            cfg.load_warnings.push(format!(
-                "sandbox-profile was lowered to `{max}` by the managed policy {file}"
-            ));
+            mark_managed(cfg, "sandbox-profile", true);
+            warn_once(
+                cfg,
+                format!("sandbox-profile was lowered to `{max}` by the managed policy {file}"),
+            );
         }
         // A host pin is meaningless under `allow`: it caps the network at
         // `allowlist` even when no `max_network` is set.
@@ -895,18 +1076,24 @@ impl ManagedPolicy {
             && cfg.sandbox_network.is_some_and(|n| n.rank() > max.rank())
         {
             cfg.sandbox_network = Some(max);
-            cfg.load_warnings.push(format!(
-                "sandbox-network was lowered to `{max}` by the managed policy {file}"
-            ));
+            mark_managed(cfg, "sandbox-network", true);
+            warn_once(
+                cfg,
+                format!("sandbox-network was lowered to `{max}` by the managed policy {file}"),
+            );
         }
         if sandbox.allowed_hosts.is_some() {
             let before = cfg.sandbox_network_hosts.len();
             cfg.sandbox_network_hosts
                 .retain(|entry| self.host_entry_allowed(entry));
             if cfg.sandbox_network_hosts.len() != before {
-                cfg.load_warnings.push(format!(
-                    "sandbox-network-hosts entries outside the managed allowed_hosts were removed by the managed policy {file}"
-                ));
+                mark_managed(cfg, "sandbox-network-hosts", true);
+                warn_once(
+                    cfg,
+                    format!(
+                        "sandbox-network-hosts entries outside the managed allowed_hosts were removed by the managed policy {file}"
+                    ),
+                );
             }
         }
         if sandbox.max_profile.is_some() {
@@ -914,9 +1101,11 @@ impl ManagedPolicy {
         }
         if sandbox.forbid_home_mounts && !cfg.sandbox_home_mounts.is_empty() {
             cfg.sandbox_home_mounts.clear();
-            cfg.load_warnings.push(format!(
-                "sandbox-home-mounts was cleared by the managed policy {file}"
-            ));
+            mark_managed(cfg, "sandbox-home-mounts", true);
+            warn_once(
+                cfg,
+                format!("sandbox-home-mounts was cleared by the managed policy {file}"),
+            );
         }
     }
 
@@ -943,31 +1132,48 @@ impl ManagedPolicy {
                 }
             }
         }
+        if !self.file.permissions.deny.is_empty() {
+            mark_managed(cfg, "permission-deny", false);
+        }
         if self.sandbox_required() {
             cfg.sandbox = Some(true);
             cfg.sandbox_required = Some(true);
+            mark_managed(cfg, "sandbox", true);
+            mark_managed(cfg, "sandbox-required", true);
         }
         self.apply_sandbox_pins(cfg);
         if self.permission_checks_required() {
             cfg.permission_checks_required = Some(true);
+            mark_managed(cfg, "permission-checks-required", true);
         }
         if !self.mode_allowed(SecurityMode::Yolo) {
             cfg.yolo = Some(false);
+            mark_managed(cfg, "yolo", true);
         }
         #[cfg(feature = "mcp")]
-        if let Some(servers) = cfg.mcp_servers.as_mut() {
-            let removed: Vec<String> = servers
-                .iter()
-                .filter(|(name, config)| !self.mcp_allowed(name, config))
-                .map(|(name, _)| name.clone())
-                .collect();
+        {
+            let removed: Vec<String> = cfg
+                .mcp_servers
+                .as_ref()
+                .map(|servers| {
+                    servers
+                        .iter()
+                        .filter(|(name, config)| !self.mcp_allowed(name, config))
+                        .map(|(name, _)| name.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
             for name in removed {
-                servers.remove(&name);
-                cfg.load_warnings.push(format!(
+                if let Some(servers) = cfg.mcp_servers.as_mut() {
+                    servers.remove(&name);
+                }
+                mark_managed(cfg, "mcp_servers", false);
+                let message = format!(
                     "MCP server `{}` was removed by the managed policy {}",
                     crate::ui::events::sanitize_for_review(&name),
                     self.path.display()
-                ));
+                );
+                warn_once(cfg, message);
             }
         }
     }
@@ -1730,5 +1936,71 @@ mod tests {
             deny.check_mcp_server("x", &server("command = \"sh\"\nenv = { A = \"1\" }\n"))
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod label_and_authority_tests {
+    use super::*;
+
+    fn policy(text: &str) -> ManagedPolicy {
+        ManagedPolicy::from_file(
+            PathBuf::from("/etc/mini-agent/managed-config.toml"),
+            toml::from_str(text).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn applied_policy_labels_its_keys_and_warns_exactly_once() {
+        let policy = policy(
+            "[permissions]\ndeny = { shell = ['rm *'] }\ndisable_yolo = true\n[sandbox]\nmax_profile = 'workspace'\n",
+        );
+        let mut cfg: super::super::Config =
+            toml::from_str("yolo = true\nsandbox-profile = 'host-full'\n").unwrap();
+        policy.apply(&mut cfg);
+        policy.apply(&mut cfg);
+        let lowered: Vec<_> = cfg
+            .load_warnings
+            .iter()
+            .filter(|warning| warning.contains("was lowered"))
+            .collect();
+        assert_eq!(lowered.len(), 1, "{:?}", cfg.load_warnings);
+        for key in ["permission-deny", "yolo", "sandbox-profile"] {
+            let known = super::super::keys::lookup(key).unwrap();
+            assert!(
+                cfg.provenance.sources[known.name].contains(&super::super::ConfigLayer::Managed),
+                "{key}"
+            );
+        }
+        assert_eq!(super::super::ConfigLayer::Managed.label(), "managed policy");
+    }
+
+    #[test]
+    fn sddl_accepts_admin_only_and_refuses_user_writable_acls() {
+        assert!(admin_only_sddl("O:BAG:SYD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)").is_ok());
+        assert!(admin_only_sddl("O:S-1-5-80-956008885-3418522649D:(A;;FA;;;SY)").is_ok());
+        let user_write = admin_only_sddl("O:BAG:SYD:(A;;FA;;;BA)(A;;0x1301bf;;;BU)").unwrap_err();
+        assert!(user_write.contains("BU"), "{user_write}");
+        assert!(admin_only_sddl("O:BAD:(A;;FW;;;AU)").is_err());
+        assert!(admin_only_sddl("O:S-1-5-21-1-2-3-1001G:SYD:(A;;FA;;;SY)").is_err());
+        assert!(
+            admin_only_sddl("O:BAG:SY").is_err(),
+            "no DACL means everyone"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_not_owned_by_root_is_refused() {
+        use std::os::unix::fs::MetadataExt;
+        let root = crate::tests::OwnedTestDirectory::new("managed-authority");
+        let file = root.path().join("managed-settings.json");
+        std::fs::write(&file, "{}").unwrap();
+        if std::fs::metadata(&file).unwrap().uid() == 0 {
+            return;
+        }
+        let error = check_administrator_authority(&file).unwrap_err();
+        assert!(error.contains("owned by root"), "{error}");
     }
 }

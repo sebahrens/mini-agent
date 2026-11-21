@@ -667,11 +667,30 @@ impl AuthResolver {
                     None => String::new(),
                 }
             ),
-            None => anyhow::bail!(
-                "No API key found. Set the {} environment variable, add it to config.api_keys under '{}', pass --api-key, or run `mini-agent --setup` to configure interactively.",
-                env_var.unwrap_or_else(|| self.env_var_name()),
-                self.provider_slug(),
-            ),
+            None => {
+                // Name a provider whose key is already exported, so the user
+                // is not sent to configure the one they did not pick.
+                let other = ["anthropic", "openai", "gemini", "openrouter"]
+                    .into_iter()
+                    .filter_map(|name| ProviderKind::from_name(name).map(|kind| (name, kind)))
+                    .filter(|(_, kind)| *kind != self.provider_kind)
+                    .find(|(_, kind)| {
+                        std::env::var(kind.env_var_name()).is_ok_and(|value| !value.is_empty())
+                    });
+                let hint = other
+                    .map(|(name, kind)| {
+                        format!(
+                            " {} is set: run with --provider {name} or set provider in config.",
+                            kind.env_var_name()
+                        )
+                    })
+                    .unwrap_or_default();
+                anyhow::bail!(
+                    "No API key found. Set the {} environment variable, add it to config.api_keys under '{}', pass --api-key, or run `mini-agent --setup` to configure interactively.{hint}",
+                    env_var.unwrap_or_else(|| self.env_var_name()),
+                    self.provider_slug(),
+                )
+            }
         }
     }
 

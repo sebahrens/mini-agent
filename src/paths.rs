@@ -3284,11 +3284,17 @@ fn converge_legacy_config(
     interactive: bool,
 ) -> Result<LegacyMigrationStatus, LegacyMigrationError> {
     for name in ["config.toml", "config.yaml", "config.yml", "config.json"] {
-        if path_exists_no_follow(
-            &paths.config_dir.join(name),
-            "configuration",
-            LegacyArtifactKind::File,
-        )? {
+        let canonical = paths.config_dir.join(name);
+        // A config file the user links in (stow, home-manager, a mounted
+        // ConfigMap) is the current config, not a legacy path
+        // (mini-agent-nvnkx.192).
+        if std::fs::symlink_metadata(&canonical)
+            .is_ok_and(|metadata| portable::is_link_or_reparse(&metadata))
+            && std::fs::metadata(&canonical).is_ok_and(|metadata| metadata.is_file())
+        {
+            return Ok(LegacyMigrationStatus::CanonicalPresent);
+        }
+        if path_exists_no_follow(&canonical, "configuration", LegacyArtifactKind::File)? {
             return Ok(LegacyMigrationStatus::CanonicalPresent);
         }
     }
