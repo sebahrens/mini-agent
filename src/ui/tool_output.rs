@@ -51,27 +51,47 @@ impl ToolResultView {
     }
 }
 
-/// Heuristic error detection for replayed results, which do not persist the
-/// live `is_error` flag.
-pub(crate) fn looks_like_error(output: &str) -> bool {
-    let head: String = output
-        .trim_start()
-        .chars()
-        .take(24)
-        .collect::<String>()
-        .to_ascii_lowercase();
-    // Whole-token prefixes: `errors.rs` or `error_codes.go:12:` are file names,
-    // not failures.
-    ["error", "tool error", "permission denied", "denied:"]
+/// Prefixes of the failure texts mini-agent itself writes into a tool result.
+/// Records stored before the `is_error` flag existed carry only this text, so
+/// replay recognises exactly these renderings and nothing a tool or program
+/// merely printed (source files and logs that begin with "Error" are not
+/// failures). Each entry is a whole rendering that starts the result:
+/// permission denials (`permission::ask`, `agent::tools`), the shell status
+/// markers of a command that did not succeed (`agent::tools::bash`), the
+/// corrective text for an unavailable tool (`agent::runner`), rig's wrapped
+/// tool errors, and MCP call failures (`extras::mcp::tool`).
+const LEGACY_FAILURE_PREFIXES: &[&str] = &[
+    "Permission denied: ",
+    "Permission denied by user",
+    "Permission denied (non-interactive mode)",
+    "Permission denied by the stream-json control channel: ",
+    "Permission denied by PermissionRequest hook: ",
+    "[status: failed]",
+    "[status: not_started; the command was not run] ",
+    "[status: timed_out; ",
+    "[status: cancelled]",
+    "[status: output_truncated; ",
+    "Toolset error: ",
+    "ToolCallError: ",
+    "ToolNotFoundError: ",
+    "MCP tool error: ",
+    "MCP connection retired: ",
+];
+
+/// Whether a stored result with no persisted `is_error` flag is one of the
+/// failure renderings in [`LEGACY_FAILURE_PREFIXES`] (or the unavailable-tool
+/// correction `Tool `name` is not available; it was not executed.`).
+pub(crate) fn is_legacy_failure_rendering(output: &str) -> bool {
+    if LEGACY_FAILURE_PREFIXES
         .iter()
-        .any(|prefix| {
-            head.strip_prefix(prefix).is_some_and(|rest| {
-                !rest
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '-' | '/'))
-            })
-        })
+        .any(|prefix| output.starts_with(prefix))
+    {
+        return true;
+    }
+    output
+        .strip_prefix("Tool `")
+        .and_then(|rest| rest.split_once("` "))
+        .is_some_and(|(_, rest)| rest.starts_with("is not available; it was not executed."))
 }
 
 fn plural(count: usize, one: &str) -> String {

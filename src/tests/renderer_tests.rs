@@ -1596,7 +1596,7 @@ mod tool_output_folding {
     use crate::ui::feed::{Block, BlockStyle, Feed};
     use crate::ui::renderer::Renderer;
     use crate::ui::tool_output::{
-        FoldTarget, fold_command, looks_like_error, parse_fold_target, tool_result_view,
+        FoldTarget, fold_command, is_legacy_failure_rendering, parse_fold_target, tool_result_view,
     };
 
     fn long_output() -> String {
@@ -1720,15 +1720,37 @@ mod tool_output_folding {
     }
 
     #[test]
-    fn replayed_errors_are_recognised_by_their_text() {
-        assert!(looks_like_error("Error: boom"));
-        assert!(looks_like_error("  error reading file"));
-        assert!(looks_like_error("Permission denied by user"));
-        assert!(!looks_like_error("File: src/main.rs (10 lines)"));
-        assert!(!looks_like_error("errors.rs\nlib.rs"));
-        assert!(!looks_like_error("error_codes.go:12: match"));
-        assert!(looks_like_error("Error: boom"));
-        assert!(looks_like_error("error"));
+    fn replayed_errors_are_recognised_only_by_minis_own_failure_renderings() {
+        for failed in [
+            "Permission denied by user",
+            "Permission denied by user: use pnpm",
+            "Permission denied: Blocked by deny rule: shell = \"**\"",
+            "Permission denied (non-interactive mode); effective mode: guarded",
+            "Permission denied by PermissionRequest hook: no",
+            "[status: failed]\nboom",
+            "[status: not_started; the command was not run] no sandbox",
+            "[status: timed_out; timeout_ms: 5]",
+            "Tool `bash` is not available; it was not executed. Did you mean: shell?",
+            "ToolCallError: boom",
+            "Toolset error: ToolCallError: boom",
+            "MCP tool error: transport closed",
+        ] {
+            assert!(is_legacy_failure_rendering(failed), "{failed}");
+        }
+        for ok in [
+            "Error: boom",
+            "error: cannot find value `x` in this scope",
+            "  error reading file",
+            "Error handling in Rust is done with Result.",
+            "error",
+            "Permission denied while reading is a common errno",
+            "File: src/main.rs (10 lines)",
+            "errors.rs\nlib.rs",
+            "error_codes.go:12: match",
+            "Tool `x` works.",
+        ] {
+            assert!(!is_legacy_failure_rendering(ok), "{ok}");
+        }
     }
 
     #[test]

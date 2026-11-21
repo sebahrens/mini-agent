@@ -505,7 +505,7 @@ impl ToolDyn for McpTool {
             };
             let proof = source_proof.clone();
             let live = client_is_live.clone();
-            let _elicitation_lease = elicitation.enter(
+            let elicitation_lease = elicitation.enter(
                 server_name.to_string(),
                 ask_tx.clone(),
                 std::sync::Arc::new(move || {
@@ -567,7 +567,7 @@ impl ToolDyn for McpTool {
                     }
                     error_msg.push_str(&rendered);
                 }
-                let msg = if error_msg.is_empty() {
+                let mut msg = if error_msg.is_empty() {
                     "MCP tool returned an error".to_string()
                 } else {
                     bounded_mcp_output(
@@ -577,6 +577,10 @@ impl ToolDyn for McpTool {
                         &format!("mcp:{server_name}:{tool_name}:error"),
                     )
                 };
+                if let Some(note) = elicitation_lease.take_unanswerable_note() {
+                    msg.push('\n');
+                    msg.push_str(&note);
+                }
                 return Err(ToolError::ToolCallError(Box::new(McpToolError(
                     CompactString::new(msg),
                 ))));
@@ -589,7 +593,7 @@ impl ToolDyn for McpTool {
                 msg.push_str("\n\n");
                 msg
             });
-            Ok(render_success_content(
+            let mut rendered = render_success_content(
                 result.content,
                 result.structured_content.as_ref(),
                 |response| {
@@ -601,7 +605,12 @@ impl ToolDyn for McpTool {
                         &format!("mcp:{server_name}:{tool_name}"),
                     )
                 },
-            ))
+            );
+            if let Some(note) = elicitation_lease.take_unanswerable_note() {
+                rendered.push('\n');
+                rendered.push_str(&note);
+            }
+            Ok(rendered)
         })
     }
 }
