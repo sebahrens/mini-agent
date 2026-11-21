@@ -617,6 +617,28 @@ fn non_agent_by_id_deny_list_partial_match() {
     assert!(!is_agent_model(&model("veo-video-gen", None)));
 }
 
+#[test]
+fn short_deny_words_match_only_whole_segments() {
+    for denied in [
+        "gemini-2.5-flash-tts",
+        "gpt-4o-realtime-preview",
+        "vendor/sora-2",
+        "veo-3.0",
+        "text-to-speech",
+    ] {
+        assert!(!is_agent_model(&model(denied, None)), "{denied}");
+    }
+    for kept in [
+        "vendor/stories-13b",
+        "gpt-5-bursts",
+        "tts2chat-pro",
+        "aquarius-aqarium",
+        "unrealtime-x",
+    ] {
+        assert!(is_agent_model(&model(kept, None)), "{kept}");
+    }
+}
+
 // --- serialize_conversation tests ---
 
 #[test]

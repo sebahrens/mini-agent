@@ -227,6 +227,9 @@ pub enum AgentEvent {
 
 /// User-visible text for a provider retry, naming the actual wait so a
 /// long provider `Retry-After` does not look like a hang.
+/// Waits at least this long (ms) get a live statusline countdown.
+pub const RETRY_COUNTDOWN_MIN_MS: u64 = 10_000;
+
 pub fn retry_notice_text(attempt: usize, max: usize, delay_ms: u64, reason: &str) -> String {
     let secs = delay_ms as f64 / 1000.0;
     let prefix = if reason.is_empty() {

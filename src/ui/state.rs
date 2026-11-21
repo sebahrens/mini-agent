@@ -518,6 +518,9 @@ pub(crate) struct AgentRunState {
     pub(crate) native_blocked: Option<crate::session::native_replay::RestartReason>,
     pub agent: Option<AnyAgent>,
     pub is_running: bool,
+    /// A long provider retry wait in progress: its deadline and cause, shown
+    /// as a countdown in the statusline (mini-agent-sskdu.3).
+    pub(crate) retry_wait: Option<(std::time::Instant, String)>,
     pub agent_rx: Option<mpsc::Receiver<AgentEvent>>,
     pub main_abort: Option<tokio::task::AbortHandle>,
     pub compaction_decision_tx: Option<crate::agent::runner::CompactionDecisionTx>,

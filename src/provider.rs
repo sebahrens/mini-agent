@@ -2092,6 +2092,10 @@ pub fn is_agent_model(m: &ModelEntry) -> bool {
         }
     }
     let id = m.id.to_lowercase();
+    // Short words must be a whole `-`/`/`/`_`/`.`/`:` delimited segment, so an
+    // id that merely contains them (`...-bursts`, `stories`) stays listed.
+    const DENY_SEGMENT: &[&str] = &["tts", "sora", "veo", "aqa", "imagen", "speech", "realtime"];
+    // Longer, distinctive fragments stay substring matches.
     const DENY: &[&str] = &[
         "embedding",
         "embed-",
@@ -2099,23 +2103,20 @@ pub fn is_agent_model(m: &ModelEntry) -> bool {
         "gemini-embedding",
         "whisper",
         "transcribe",
-        "tts",
         "-audio",
-        "realtime",
-        "speech",
         "dall-e",
         "gpt-image",
         "image-generation",
-        "imagen",
-        "sora",
-        "veo",
         "moderation",
         "rerank",
-        "aqa",
         "davinci-002",
         "babbage-002",
     ];
-    !DENY.iter().any(|d| id.contains(d))
+    if DENY.iter().any(|d| id.contains(d)) {
+        return false;
+    }
+    !id.split(['-', '/', '_', '.', ':'])
+        .any(|segment| DENY_SEGMENT.contains(&segment))
 }
 
 impl AnyClient {

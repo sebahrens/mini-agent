@@ -2746,6 +2746,16 @@ impl<'a> App<'a> {
                 .filter(|_| !self.git_status_in_flight);
             let cron_wakeup = self.cron_wakeup();
             let cron_repaint = self.cron_label_repaint_at();
+            let retry_repaint = self
+                .run
+                .retry_wait
+                .as_ref()
+                .filter(|_| self.run.is_running)
+                .and_then(|(deadline, _)| {
+                    let now = std::time::Instant::now();
+                    crate::ui::statusline::retry_wait_repaint_in(*deadline, now)
+                        .map(|delay| tokio::time::Instant::now() + delay)
+                });
             let job_wake = self.job_wake_armed();
             let job_queue = self.ui.sandbox.job_notice_queue().clone();
 
@@ -2876,6 +2886,12 @@ impl<'a> App<'a> {
                 // A background shell job ended while the session is idle.
                 _ = job_queue.wait_pending(), if job_wake => {
                     crate::startup::heap_future(|| self.wake_for_job_notices()).await?;
+                }
+                // The retry-wait countdown stepped to its next second.
+                _ = tokio::time::sleep_until(
+                    retry_repaint.unwrap_or_else(tokio::time::Instant::now)
+                ), if retry_repaint.is_some() => {
+                    self.refresh()?;
                 }
                 // The `/cron` statusline countdown rolled to its next minute.
                 _ = tokio::time::sleep_until(
@@ -11540,13 +11556,51 @@ mod permission_loop_tests {
         .unwrap();
         let after = app.renderer.captured_output();
         assert!(
-            after[before.len()..].contains("USD budget: further model requests/effects stopped"),
+            after[before.len()..].contains("USD budget reached"),
             "image-only Enter must enter ordinary budget admission"
         );
         assert_eq!(app.ui.session.pending_media.len(), 1);
         assert!(app.ui.session.messages.is_empty());
         assert!(!app.run.is_running);
         assert!(app.run.agent_rx.is_none());
+    }
+
+    // mini-agent-sskdu.6: a user submit refused at the cap says why every time,
+    // not only the first time (the once-per-session latch is for automatic starts).
+    #[tokio::test]
+    async fn every_refused_submit_at_the_budget_cap_prints_a_notice() {
+        let root = crate::tests::OwnedTestDirectory::new("budget-notice-twice-app");
+        let _environment = environment(&root);
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        let mut cfg = fixture_config();
+        cfg.max_budget_usd = Some(0.0);
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let mut session = Session::new("permission-fixture", "test-model", 128_000, "");
+        let mut app = fixture_app(fixture_ui(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+        ));
+        for _ in 0..2 {
+            app.input.buffer = "hello".into();
+            app.input.cursor = app.input.buffer.len();
+            crate::startup::heap_future(|| {
+                app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            })
+            .await
+            .unwrap();
+        }
+        let output = app.renderer.captured_output();
+        assert_eq!(output.matches("USD budget reached").count(), 2, "{output}");
+        assert!(!app.run.is_running);
     }
 
     #[tokio::test]

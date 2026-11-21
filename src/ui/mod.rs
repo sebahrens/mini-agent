@@ -271,6 +271,17 @@ fn draw_main_frame(
     // running (see `GoalStore::status_label`).
     #[cfg(feature = "goal")]
     let goal_label = ui.session.goal_store.status_label();
+    let retry_label =
+        run.retry_wait
+            .as_ref()
+            .filter(|_| run.is_running)
+            .and_then(|(deadline, reason)| {
+                crate::ui::statusline::retry_wait_label(
+                    *deadline,
+                    reason,
+                    std::time::Instant::now(),
+                )
+            });
     let statusline_ctx = crate::ui::statusline::StatusContext {
         workspace: ui.workspace.root(),
         loop_label: chain.loop_label.as_deref(),
@@ -279,6 +290,7 @@ fn draw_main_frame(
         #[cfg(not(feature = "goal"))]
         goal_label: None,
         cron_label,
+        retry_label: retry_label.as_deref(),
         prompt_name: ui.context.current_prompt_name.as_deref(),
         reasoning_effort: ui
             .session

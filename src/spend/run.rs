@@ -408,6 +408,9 @@ impl Run {
     }
     /// The accounting kind every request of this run records.
     #[cfg_attr(not(any(feature = "hooks", feature = "acp")), allow(dead_code))]
+    pub(crate) fn provider_name(&self) -> &str {
+        &self.provider
+    }
     pub(crate) fn kind(&self) -> RequestKind {
         self.kind
     }

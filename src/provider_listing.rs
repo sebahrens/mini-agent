@@ -165,23 +165,7 @@ impl AnyClient {
                 .ok_or_else(|| anyhow::anyhow!("invalid model listing response"))?;
             entries = entries.saturating_add(array.len());
             anyhow::ensure!(entries <= MAX_ENTRIES, "model listing entry limit exceeded");
-            for value in array {
-                // One odd row (empty name, repeated id) must not discard the
-                // whole list; a malformed envelope above still fails hard.
-                match decode(protocol, value) {
-                    Ok(Some(model)) => {
-                        if !ids.insert(model.id.clone()) {
-                            skipped = skipped.saturating_add(1);
-                            continue;
-                        }
-                        if crate::provider::is_agent_model(&model) {
-                            all.push(model);
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(_) => skipped = skipped.saturating_add(1),
-                }
-            }
+            collect_page(protocol, array, &mut ids, &mut all, &mut skipped);
             anyhow::ensure!(
                 tokio::time::Instant::now() < deadline,
                 "model listing deadline exceeded"
@@ -203,6 +187,32 @@ impl AnyClient {
             }
         }
         anyhow::bail!("model listing page limit exceeded")
+    }
+}
+/// Decodes one page of rows into `all`. One odd row (empty name, repeated id)
+/// is counted in `skipped` rather than discarding the whole list; a malformed
+/// envelope is rejected by the caller before this runs.
+fn collect_page(
+    protocol: Protocol,
+    array: &[Value],
+    ids: &mut HashSet<String>,
+    all: &mut Vec<ModelEntry>,
+    skipped: &mut usize,
+) {
+    for value in array {
+        match decode(protocol, value) {
+            Ok(Some(model)) => {
+                if !ids.insert(model.id.to_string()) {
+                    *skipped = skipped.saturating_add(1);
+                    continue;
+                }
+                if crate::provider::is_agent_model(&model) {
+                    all.push(model);
+                }
+            }
+            Ok(None) => {}
+            Err(_) => *skipped = skipped.saturating_add(1),
+        }
     }
 }
 fn path(protocol: Protocol, cursor: Option<&str>) -> String {
@@ -445,6 +455,21 @@ mod tests {
             crate::provider::is_agent_model(&chat),
             "typed text output wins over the id deny-list"
         );
+    }
+
+    #[test]
+    fn one_bad_and_one_duplicate_row_do_not_discard_the_listing() {
+        let rows = vec![
+            serde_json::json!({"id":"good-a","name":"Good A"}),
+            serde_json::json!({"id":"bad-name","name":""}),
+            serde_json::json!({"id":"good-a","name":"Good A again"}),
+            serde_json::json!({"id":"good-b"}),
+        ];
+        let (mut ids, mut all, mut skipped) = (HashSet::new(), Vec::new(), 0);
+        collect_page(Protocol::OpenAI, &rows, &mut ids, &mut all, &mut skipped);
+        let kept: Vec<&str> = all.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(kept, ["good-a", "good-b"]);
+        assert_eq!(skipped, 2);
     }
 
     #[test]
