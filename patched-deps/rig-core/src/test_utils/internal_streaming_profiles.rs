@@ -124,6 +124,26 @@ impl CompatibleStreamProfile for DistinctToolCallEvictionProfile {
                 CompatibleFinishReason::Other,
                 vec![tool_call_chunk(0, None, None, Some("{\"query\":\"two\"}"))],
             )),
+            // Two complete single-chunk calls to the same tool that share an
+            // index but carry distinct ids (nvnkx.309).
+            "complete_one" => Some(tool_call_choice(
+                CompatibleFinishReason::Other,
+                vec![tool_call_chunk(
+                    0,
+                    Some("call_1"),
+                    Some("read"),
+                    Some("{\"path\":\"a\"}"),
+                )],
+            )),
+            "complete_two" => Some(tool_call_choice(
+                CompatibleFinishReason::Other,
+                vec![tool_call_chunk(
+                    0,
+                    Some("call_2"),
+                    Some("read"),
+                    Some("{\"path\":\"b\"}"),
+                )],
+            )),
             "finish" => Some(tool_call_choice(
                 CompatibleFinishReason::ToolCalls,
                 Vec::new(),

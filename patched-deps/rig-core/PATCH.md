@@ -429,3 +429,26 @@ not parse is kept, with arguments `{"__invalid_json": <raw, bounded>, "__invalid
 when the stream ended with a `tool_calls` finish reason, and the eviction path uses the same marker
 instead of `{}`. A stream that ends without a finish reason still drops a partial call. The host
 short-circuits a marked call with a corrective tool result.
+
+## Provider stream parsing and request shaping (mini-agent-nvnkx.35, .194-.197, .306-.312)
+
+- Anthropic: `StreamingEvent::Error` yields the raw error body (type string preserved for retry
+  classification) and ends the stream; a stream that closes without a `message_delta`
+  `stop_reason` yields a `stream ended before message_stop` error instead of a zero-usage final.
+- Shared Chat Completions decoder: a chunk with an `error` object and a choice finishing with
+  `finish_reason: "error"` (OpenRouter's mid-stream failure) is a stream error; a new non-empty
+  tool-call id together with a non-empty name always starts a new call, even for the same tool and
+  index; `finish_reason: content_filter` is recorded on the final response.
+- OpenRouter `Usage` reads `completion_tokens_details.reasoning_tokens`.
+- Gemini: `FinishReason`/`BlockReason` carry a `#[serde(other)] Unrecognized` variant;
+  `promptFeedback.blockReason` ends the stream with an error; `FunctionCall.args` defaults and a null
+  value streams as `{}`; the schema converter bounds `$ref` expansion (cycle chain plus budget,
+  unresolvable references become `{"type":"object"}`), restricts `format` to Gemini's set, defaults
+  untyped properties to `string`, drops non-string enums and prunes `required`.
+- OpenAI Responses and Copilot Responses streams error with `stream ended before response.completed`
+  when the body closes without `response.completed`; Copilot `response.incomplete` keeps its raw
+  event as the error body.
+- `completion::StopReason` and `GetTokenUsage::stop_reason()` carry a normalised stop reason from the
+  Anthropic, Chat Completions and Gemini final responses through `CompletionCall.stop_reason`.
+- `openai::completion::CompletionModel::base_url()` exposes the endpoint for route-gated request
+  defaults.

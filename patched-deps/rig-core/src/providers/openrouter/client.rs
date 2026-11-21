@@ -107,6 +107,18 @@ pub struct Usage {
     /// with server-side automatic caching).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
+    /// Completion-token breakdown; carries `reasoning_tokens` for reasoning
+    /// models. (mini-agent patch, nvnkx.308)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+/// Completion-token breakdown reported by OpenRouter.
+#[derive(Clone, Debug, Deserialize, Serialize, Default)]
+pub struct CompletionTokensDetails {
+    /// Tokens spent on reasoning.
+    #[serde(default)]
+    pub reasoning_tokens: usize,
 }
 
 /// Prompt-token breakdown reported by OpenRouter for cached requests.
@@ -148,7 +160,11 @@ impl GetTokenUsage for Usage {
             cache_creation: None,
             tool_use_prompt_tokens: 0,
             hosted_search_requests: 0,
-            reasoning_tokens: 0,
+            reasoning_tokens: self
+                .completion_tokens_details
+                .as_ref()
+                .map(|d| d.reasoning_tokens as u64)
+                .unwrap_or(0),
         }
     }
 }

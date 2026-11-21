@@ -725,7 +725,11 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
                     cache_creation: None,
                     tool_use_prompt_tokens: 0,
                     hosted_search_requests: 0,
-                    reasoning_tokens: 0,
+                    reasoning_tokens: usage
+                        .completion_tokens_details
+                        .as_ref()
+                        .map(|d| d.reasoning_tokens as u64)
+                        .unwrap_or(0),
                 }
             })
             .unwrap_or_default();
@@ -1848,6 +1852,44 @@ mod tests {
         let response: CompletionResponse = serde_json::from_value(json).unwrap();
         let converted = completion::CompletionResponse::try_from(response).unwrap();
         assert_eq!(converted.usage.output_tokens, 10);
+    }
+
+    #[test]
+    fn test_completion_response_maps_reasoning_tokens() {
+        let json = json!({
+            "id": "gen-reasoning",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "moonshotai/kimi",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 20,
+                "total_tokens": 30,
+                "completion_tokens_details": {"reasoning_tokens": 7}
+            }
+        });
+
+        let response: CompletionResponse = serde_json::from_value(json).unwrap();
+        let converted = completion::CompletionResponse::try_from(response).unwrap();
+        assert_eq!(converted.usage.reasoning_tokens, 7);
+
+        // Streamed final usage chunk goes through `GetTokenUsage for Usage`.
+        let usage: super::super::client::Usage = serde_json::from_value(json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 20,
+            "total_tokens": 30,
+            "completion_tokens_details": {"reasoning_tokens": 7}
+        }))
+        .unwrap();
+        assert_eq!(
+            crate::completion::GetTokenUsage::token_usage(&usage).reasoning_tokens,
+            7
+        );
     }
 
     #[test]

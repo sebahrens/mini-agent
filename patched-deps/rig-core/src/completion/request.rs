@@ -40,13 +40,13 @@ use crate::provider_response;
 use crate::streaming::StreamingCompletionResponse;
 use crate::tool::server::ToolServerError;
 use crate::wasm_compat::{WasmCompatSend, WasmCompatSync};
-use std::sync::Arc;
 use crate::{OneOrMany, http_client};
 use crate::{
     json_utils,
     message::{Message, UserContent},
     tool::ToolSetError,
 };
+use std::sync::Arc;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -505,6 +505,47 @@ pub struct CompletionResponse<T> {
 pub const OUTPUT_TRUNCATED_ERROR_MARKER: &str =
     "model output truncated at the output-token limit (max_tokens)";
 
+/// Why a provider stopped a response, normalised across providers.
+/// (mini-agent patch, nvnkx.35)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StopReason {
+    /// The model finished its turn.
+    EndTurn,
+    /// The model stopped to call tools.
+    ToolUse,
+    /// The output-token limit was reached.
+    MaxTokens,
+    /// The model declined to answer (Anthropic `refusal`).
+    Refusal,
+    /// A server-side tool is still running (Anthropic `pause_turn`); resend to continue.
+    PauseTurn,
+    /// The context window was exceeded mid-generation
+    /// (Anthropic `model_context_window_exceeded`).
+    ContextWindow,
+    /// A content or safety filter stopped the response (OpenAI `content_filter`,
+    /// Gemini SAFETY/RECITATION/BLOCKLIST/PROHIBITED_CONTENT/SPII).
+    ContentFilter,
+    /// Any other stop reason.
+    Other,
+}
+
+impl StopReason {
+    /// A short name for notices and machine-readable reports.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::EndTurn => "end_turn",
+            Self::ToolUse => "tool_use",
+            Self::MaxTokens => "max_tokens",
+            Self::Refusal => "refusal",
+            Self::PauseTurn => "pause_turn",
+            Self::ContextWindow => "model_context_window_exceeded",
+            Self::ContentFilter => "content_filter",
+            Self::Other => "other",
+        }
+    }
+}
+
 /// A trait for grabbing the token usage of a completion response.
 ///
 /// Primarily designed for streamed completion responses in streamed multi-turn, as otherwise it would be impossible to do.
@@ -528,6 +569,12 @@ pub trait GetTokenUsage {
     fn output_truncated(&self) -> bool {
         false
     }
+
+    /// The normalised provider stop reason, when the provider reported one.
+    /// (mini-agent patch)
+    fn stop_reason(&self) -> Option<StopReason> {
+        None
+    }
 }
 
 impl GetTokenUsage for () {
@@ -550,6 +597,10 @@ where
 
     fn output_truncated(&self) -> bool {
         self.as_ref().is_some_and(GetTokenUsage::output_truncated)
+    }
+
+    fn stop_reason(&self) -> Option<StopReason> {
+        self.as_ref().and_then(GetTokenUsage::stop_reason)
     }
 }
 

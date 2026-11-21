@@ -3166,7 +3166,10 @@ mod provider_param_tests {
 
         let body = send_child_request(model, params, &persona, requests).await;
 
-        assert_eq!(body["reasoning_effort"], "high", "{body}");
+        // The capture server is a custom (loopback) gateway: neither generated
+        // OpenAI-only key is sent there (mini-agent-nvnkx.33).
+        assert!(body.get("reasoning_effort").is_none(), "{body}");
+        assert!(body.get("prompt_cache_key").is_none(), "{body}");
         assert!(body.get("reasoning").is_none(), "{body}");
         // Inherited user extra_body survives; persona params win on collision.
         assert_eq!(body["seed"], 1, "{body}");

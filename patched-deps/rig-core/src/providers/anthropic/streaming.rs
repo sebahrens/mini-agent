@@ -100,6 +100,13 @@ pub enum StreamingEvent {
     },
     MessageStop,
     Ping,
+    /// In-stream API error (`event: error`), for example `overloaded_error`.
+    /// The body is kept as raw JSON so the error type survives into retry
+    /// classification. (mini-agent patch, nvnkx.306)
+    Error {
+        #[allow(dead_code)]
+        error: Value,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -277,9 +284,29 @@ pub struct StreamingCompletionResponse {
     /// `native_end_turn`.
     #[serde(skip)]
     output_truncated: bool,
+    /// Normalised `stop_reason` (mini-agent patch, nvnkx.35); runtime-only.
+    #[serde(skip)]
+    stop_reason: Option<crate::completion::StopReason>,
+}
+
+fn anthropic_stop_reason(raw: &str) -> crate::completion::StopReason {
+    use crate::completion::StopReason;
+    match raw {
+        "end_turn" | "stop_sequence" => StopReason::EndTurn,
+        "tool_use" => StopReason::ToolUse,
+        "max_tokens" => StopReason::MaxTokens,
+        "refusal" => StopReason::Refusal,
+        "pause_turn" => StopReason::PauseTurn,
+        "model_context_window_exceeded" => StopReason::ContextWindow,
+        _ => StopReason::Other,
+    }
 }
 
 impl GetTokenUsage for StreamingCompletionResponse {
+    fn stop_reason(&self) -> Option<crate::completion::StopReason> {
+        self.stop_reason
+    }
+
     fn output_truncated(&self) -> bool {
         self.output_truncated
     }
@@ -459,6 +486,8 @@ where
             let mut final_usage = None;
             let mut native_end_turn = false;
             let mut output_truncated = false;
+            let mut stop_reason_seen = false;
+            let mut normalised_stop_reason = None;
             // A tool_use block whose JSON input failed to parse. At
             // `stop_reason: max_tokens` this is truncation, reported as such;
             // otherwise the original parse error is surfaced. (mini-agent patch)
@@ -477,7 +506,7 @@ where
                                     StreamingEvent::MessageStart { message } => {
                                         match PartialUsage::from_start(&message.usage) {
                                             Ok(usage) => accumulated_usage = usage,
-                                            Err(error) => { yield Err(error); break; }
+                                            Err(error) => { yield Err(error); return; }
                                         }
 
                                         let span = tracing::Span::current();
@@ -487,9 +516,11 @@ where
                                     StreamingEvent::MessageDelta { delta, usage } => {
                                         if let Err(error) = accumulated_usage.apply_delta(usage) {
                                             yield Err(error);
-                                            break;
+                                            return;
                                         }
                                         if delta.stop_reason.is_some() {
+                                            stop_reason_seen = true;
+                                            normalised_stop_reason = delta.stop_reason.as_deref().map(anthropic_stop_reason);
                                             native_end_turn = delta.stop_reason.as_deref() == Some("end_turn");
                                             output_truncated = delta.stop_reason.as_deref() == Some("max_tokens");
                                             if let Some((tool_name, error)) = pending_tool_input_error.take() {
@@ -501,13 +532,21 @@ where
                                                 } else {
                                                     yield Err(error);
                                                 }
-                                                break;
+                                                return;
                                             }
                                             let span = tracing::Span::current();
                                             span.record_token_usage(&accumulated_usage);
                                             final_usage = Some(accumulated_usage.clone());
                                             break;
                                         }
+                                    }
+                                    StreamingEvent::Error { .. } => {
+                                        // Keep the raw body so `overloaded_error` /
+                                        // `rate_limit_error` reach retry classification.
+                                        yield Err(crate::provider_response::completion_error_from_body(
+                                            sse.data.clone(),
+                                        ));
+                                        return;
                                     }
                                     _ => {}
                                 }
@@ -549,13 +588,23 @@ where
                     },
                     Err(e) => {
                         yield Err(CompletionError::from_stream_transport(e));
-                        break;
+                        return;
                     }
                 }
             }
 
             // Ensure event source is closed when stream ends
             sse_stream.close();
+
+            if !stop_reason_seen && pending_tool_input_error.is_none() {
+                // The body closed without a `message_delta` stop_reason: a cut-off
+                // stream, not a finished turn. The text contains "stream ended",
+                // which the retry layer treats as transient.
+                yield Err(CompletionError::ProviderError(
+                    "stream ended before message_stop".into(),
+                ));
+                return;
+            }
 
             if let Some((_, error)) = pending_tool_input_error.take() {
                 yield Err(error);
@@ -566,6 +615,7 @@ where
                 usage: final_usage.unwrap_or_default(),
                 native_end_turn,
                 output_truncated,
+                stop_reason: normalised_stop_reason,
             }))
         }.instrument(span));
 
@@ -758,6 +808,7 @@ fn handle_event(
         | StreamingEvent::MessageDelta { .. }
         | StreamingEvent::MessageStop
         | StreamingEvent::Ping
+        | StreamingEvent::Error { .. }
         | StreamingEvent::Unknown => None,
     }
 }
@@ -1783,6 +1834,7 @@ mod tests {
             yield Ok(RawStreamingChoice::FinalResponse(StreamingCompletionResponse {
                 native_end_turn: false,
                 output_truncated: false,
+                stop_reason: None,
                 usage: PartialUsage::default(),
             }));
         };
@@ -1930,6 +1982,7 @@ mod tests {
             yield Ok(RawStreamingChoice::FinalResponse(StreamingCompletionResponse {
                 native_end_turn: false,
                 output_truncated: false,
+                stop_reason: None,
                 usage: PartialUsage::default(),
             }));
         };
@@ -1954,5 +2007,83 @@ mod tests {
         let json = r#"{"type": "something_new_from_anthropic", "field": "x"}"#;
         let delta: ContentDelta = serde_json::from_str(json).unwrap();
         assert!(matches!(delta, ContentDelta::Unknown));
+    }
+
+    async fn collect_sse(
+        sse: &str,
+    ) -> Vec<
+        Result<
+            crate::streaming::StreamedAssistantContent<StreamingCompletionResponse>,
+            CompletionError,
+        >,
+    > {
+        use crate::client::CompletionClient;
+        use crate::completion::CompletionModel as _;
+        use crate::test_utils::MockStreamingClient;
+
+        let client = crate::providers::anthropic::Client::builder()
+            .api_key("test-key")
+            .http_client(MockStreamingClient {
+                sse_bytes: bytes::Bytes::from(sse.to_string()),
+            })
+            .build()
+            .expect("client should build");
+        let model = client.completion_model(super::super::completion::CLAUDE_SONNET_4_6);
+        let request = model.completion_request("hello").build();
+        let mut stream = model.stream(request).await.expect("stream should start");
+        let mut items = Vec::new();
+        while let Some(item) = stream.next().await {
+            items.push(item);
+        }
+        items
+    }
+
+    const SSE_PREFIX: &str = concat!(
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hel\"}}\n\n",
+    );
+
+    #[tokio::test]
+    async fn in_stream_error_event_yields_error_without_final_response() {
+        let sse = format!(
+            "{SSE_PREFIX}event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}}}\n\n"
+        );
+        let items = collect_sse(&sse).await;
+        let last = items.last().expect("items");
+        let error = last.as_ref().expect_err("stream should end with an error");
+        assert!(error.to_string().contains("overloaded_error"), "{error}");
+        assert!(!items.iter().any(|item| matches!(
+            item,
+            Ok(crate::streaming::StreamedAssistantContent::Final(_))
+        )));
+    }
+
+    #[tokio::test]
+    async fn stream_ending_without_stop_reason_is_an_error() {
+        let items = collect_sse(SSE_PREFIX).await;
+        let error = items
+            .last()
+            .expect("items")
+            .as_ref()
+            .expect_err("a cut-off stream must not look finished");
+        assert!(error.to_string().contains("stream ended"), "{error}");
+        assert!(!items.iter().any(|item| matches!(
+            item,
+            Ok(crate::streaming::StreamedAssistantContent::Final(_))
+        )));
+    }
+
+    #[tokio::test]
+    async fn stream_with_stop_reason_still_finishes() {
+        let sse = format!(
+            "{SSE_PREFIX}event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\",\"stop_sequence\":null}},\"usage\":{{\"output_tokens\":5}}}}\n\n"
+        );
+        let items = collect_sse(&sse).await;
+        assert!(items.iter().all(|item| item.is_ok()), "{items:?}");
+        assert!(items.iter().any(|item| matches!(
+            item,
+            Ok(crate::streaming::StreamedAssistantContent::Final(_))
+        )));
     }
 }

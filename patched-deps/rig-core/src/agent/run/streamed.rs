@@ -285,6 +285,8 @@ pub enum StreamedTurnEvent {
         native_end_turn: bool,
         /// The provider stopped at its output-token limit (mini-agent patch).
         output_truncated: bool,
+        /// The normalised provider stop reason (mini-agent patch).
+        stop_reason: Option<crate::completion::StopReason>,
     },
 }
 
@@ -479,6 +481,7 @@ impl StreamedTurnAssembler {
                     emit_final,
                     native_end_turn: final_response.native_anthropic_end_turn(),
                     output_truncated: final_response.output_truncated(),
+                    stop_reason: final_response.stop_reason(),
                 }])
             }
             StreamedAssistantContent::Unknown(_) => {

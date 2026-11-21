@@ -1201,8 +1201,11 @@ pub struct ReasoningConfig {
     /// `false` only for an endpoint that rejects the `include` value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encrypted_content: Option<bool>,
-    /// Responses `store`. `None` leaves the provider default (true at OpenAI)
-    /// untouched. See the type-level caveats before changing it.
+    /// Responses `store`. `None` sends `store: false` while encrypted reasoning
+    /// content is requested (the default), since the agent never reads server
+    /// state; `Some(true)` opts back in. With `encrypted_content = false` the
+    /// provider default (true at OpenAI) applies. See the type-level caveats
+    /// before changing it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub store: Option<bool>,
 }

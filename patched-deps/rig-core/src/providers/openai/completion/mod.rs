@@ -1590,6 +1590,11 @@ where
         }
     }
 
+    /// Base URL of the endpoint this model sends requests to (mini-agent patch).
+    pub fn base_url(&self) -> &str {
+        self.client.base_url()
+    }
+
     /// Enable strict mode for tool schemas.
     ///
     /// When enabled, tool schemas are automatically sanitized to meet OpenAI's strict mode requirements:

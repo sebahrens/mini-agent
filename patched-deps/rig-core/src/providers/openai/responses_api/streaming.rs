@@ -221,6 +221,8 @@ struct RawChoiceAccumulator {
     hosted_search_requests: u64,
     tool_calls: Vec<StreamingRawChoice>,
     tool_call_internal_ids: std::collections::HashMap<String, String>,
+    /// `response.completed` was seen (mini-agent patch, nvnkx.197).
+    completed: bool,
 }
 
 impl RawChoiceAccumulator {
@@ -230,6 +232,7 @@ impl RawChoiceAccumulator {
             hosted_search_requests: 0,
             tool_calls: Vec::new(),
             tool_call_internal_ids: std::collections::HashMap::new(),
+            completed: false,
         }
     }
 
@@ -315,6 +318,7 @@ impl RawChoiceAccumulator {
     ) -> Result<(), CompletionError> {
         match kind {
             ResponseChunkKind::ResponseCompleted => {
+                self.completed = true;
                 if let Some(usage) = response.usage {
                     self.final_usage = usage;
                 }
@@ -689,6 +693,16 @@ where
         event_source.close();
 
         if terminated_with_error {
+            return;
+        }
+
+        if !accumulator.completed {
+            // The body closed without `response.completed`: a gateway or proxy
+            // cut the stream, so the partial output must not pass as a finished
+            // turn. "stream ended" is classified retryable. (nvnkx.197)
+            yield Err(CompletionError::ProviderError(
+                "stream ended before response.completed".into(),
+            ));
             return;
         }
 
@@ -1564,6 +1578,45 @@ mod tests {
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.output_tokens, 5);
         assert_eq!(usage.total_tokens, 15);
+    }
+
+    #[tokio::test]
+    async fn stream_ending_without_response_completed_is_an_error() {
+        use crate::providers::internal::openai_chat_completions_compatible::test_support::sse_bytes_from_json_events;
+
+        let delta = json!({
+            "type": "response.output_text.delta",
+            "sequence_number": 1,
+            "item_id": "msg_1",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "partial"
+        });
+        let client = openai::Client::builder()
+            .http_client(MockStreamingClient {
+                sse_bytes: sse_bytes_from_json_events(&[delta]),
+            })
+            .api_key("test-key")
+            .build()
+            .expect("client should build");
+        let model = client.completion_model("gpt-5.4");
+        let request = model.completion_request("hello").build();
+        let mut stream = model.stream(request).await.expect("stream should start");
+        let mut items = Vec::new();
+        while let Some(item) = stream.next().await {
+            items.push(item);
+        }
+        let err = items
+            .pop()
+            .expect("items")
+            .expect_err("a cut-off stream must not finish");
+        assert!(err.to_string().contains("stream ended"), "{err}");
+        assert!(
+            !items
+                .iter()
+                .any(|item| matches!(item, Ok(StreamedAssistantContent::Final(_)))),
+            "no final response before the error"
+        );
     }
 
     #[tokio::test]
