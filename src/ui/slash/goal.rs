@@ -121,6 +121,19 @@ pub(crate) fn parse_bound(goal: &mut Goal, assignment: &str) -> Result<String, S
 
 /// A zero token or time bound removes the bound; echo it as such, not as a
 /// zero budget.
+/// Answer a raised bound: a budget-limited goal resumes (reporting it), and a
+/// goal whose wrap-up round is still running gets its wrap-up re-armed so the
+/// new budget is judged afresh instead of ending `budget limited` anyway.
+fn rearm_after_bound_change(goal: &mut Goal) -> bool {
+    if goal.status == GoalStatus::BudgetLimited {
+        return goal.resume();
+    }
+    if goal.status == GoalStatus::Active {
+        goal.progress.wrap_up_issued = false;
+    }
+    false
+}
+
 fn unlimited_or(value: u64) -> String {
     if value == 0 {
         "unlimited".to_string()
@@ -420,8 +433,8 @@ pub(crate) async fn handle_goal(parts: &[&str], body: &str, ctx: &mut SlashCtx<'
                 }
                 // Raising a bound is how a user answers a budget stop, so the
                 // wrap-up is re-armed for the new budget.
-                if !applied.is_empty() && goal.status == GoalStatus::BudgetLimited {
-                    rearmed = goal.resume();
+                if !applied.is_empty() {
+                    rearmed = rearm_after_bound_change(goal);
                 }
             });
             if store.is_empty() {
@@ -529,6 +542,15 @@ pub(crate) async fn handle_goal(parts: &[&str], body: &str, ctx: &mut SlashCtx<'
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raising_a_bound_during_the_wrap_up_round_rearms_the_wrap_up() {
+        let mut goal = Goal::new("x", Vec::new()).unwrap();
+        goal.progress.wrap_up_issued = true;
+        assert!(goal.status == GoalStatus::Active);
+        assert!(!rearm_after_bound_change(&mut goal));
+        assert!(!goal.progress.wrap_up_issued);
+    }
 
     /// An objective that happens to start with a command word is still an
     /// objective. Before this, `/goal clear the cache` deleted the goal and

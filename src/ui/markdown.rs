@@ -186,6 +186,29 @@ fn flush_acc(acc: &str, color: Color, max_width: usize, out: &mut Vec<LineEntry>
     }
 }
 
+/// Flush `acc` as quoted paragraph text: every wrapped row carries the `│ `
+/// bar (its two columns are `lead`, so copying skips them).
+fn flush_quote(acc: &str, color: Color, max_width: usize, out: &mut Vec<LineEntry>) {
+    let width = max_width.saturating_sub(2).max(1);
+    for line in acc.split('\n') {
+        let trimmed = line.trim_end_matches('\r');
+        if trimmed.is_empty() {
+            out.push(blank_row(color));
+            continue;
+        }
+        for (chunk, cont) in word_wrap_flagged(trimmed, width) {
+            out.push(LineEntry {
+                syntax_spans: None,
+                text: CompactString::from(format!("│ {chunk}")),
+                color,
+                theme_accent: false,
+                cont,
+                lead: "│ ".len() as u8,
+            });
+        }
+    }
+}
+
 /// Wrap `line` with `first` as the first row's prefix and a hanging indent of
 /// `indent` columns on continuation rows.
 fn push_hanging(
@@ -550,7 +573,11 @@ pub(crate) fn markdown_with_code_state(
                     };
                     para_link = false;
                     para_other = false;
-                    flush_text(&acc, color, max_width, &mut lists, &mut result);
+                    if in_blockquote && lists.frames.is_empty() {
+                        flush_quote(&acc, color, max_width, &mut result);
+                    } else {
+                        flush_text(&acc, color, max_width, &mut lists, &mut result);
+                    }
                     acc.clear();
                     flush_links(&mut pending_links, max_width, &mut result);
                 }
@@ -1149,5 +1176,18 @@ mod narrow_table_tests {
         let lines = word_wrap("                    word another", 10);
         assert!(lines.iter().all(|l| display_width(l) <= 10));
         assert!(lines.iter().any(|l| l.contains("another")));
+    }
+
+    #[test]
+    fn blockquote_paragraph_rows_all_carry_the_quote_bar() {
+        let lines = markdown_to_styled("> alpha beta gamma delta epsilon zeta eta theta", 16);
+        let rows: Vec<&str> = lines
+            .iter()
+            .map(|l| l.text.as_str())
+            .filter(|t| !t.is_empty())
+            .collect();
+        assert!(rows.len() >= 2, "{rows:?}");
+        assert!(rows.iter().all(|r| r.starts_with("│ ")), "{rows:?}");
+        assert!(rows.iter().all(|r| display_width(r) <= 16), "{rows:?}");
     }
 }

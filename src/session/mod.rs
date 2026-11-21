@@ -2278,6 +2278,24 @@ impl Session {
         }
     }
 
+    #[cfg(feature = "goal")]
+    /// Count a judge call's tokens as unpriced, including cached and
+    /// cache-creation input for an Anthropic-native judge, the same way for a
+    /// judge with no price and one whose price cannot cost this usage.
+    fn add_unpriced_judge_tokens(&mut self, charge: &crate::extras::goal::judge::JudgeCharge) {
+        self.unpriced_judge_tokens = self
+            .unpriced_judge_tokens
+            .saturating_add(Self::real_input_tokens(
+                charge.anthropic_native,
+                charge.usage.input_tokens,
+                charge.usage.total_tokens,
+                charge.usage.output_tokens,
+                charge.usage.cached_input_tokens,
+                charge.usage.cache_creation_input_tokens,
+            ))
+            .saturating_add(charge.usage.output_tokens);
+    }
+
     /// Charge a goal completion-judge call at the judge model's own prices
     /// (mini-agent-kfsup). Its tokens always join the session totals; with no
     /// known price they add no cost and are counted in
@@ -2303,17 +2321,7 @@ impl Session {
                     )
                     .is_some();
                 if !priced {
-                    self.unpriced_judge_tokens = self
-                        .unpriced_judge_tokens
-                        .saturating_add(Self::real_input_tokens(
-                            charge.anthropic_native,
-                            charge.usage.input_tokens,
-                            charge.usage.total_tokens,
-                            charge.usage.output_tokens,
-                            charge.usage.cached_input_tokens,
-                            charge.usage.cache_creation_input_tokens,
-                        ))
-                        .saturating_add(charge.usage.output_tokens);
+                    self.add_unpriced_judge_tokens(charge);
                 }
                 priced
             }
@@ -2325,12 +2333,7 @@ impl Session {
                     0.0,
                     crate::pricing::CachePrices::default(),
                 );
-                self.unpriced_judge_tokens = self.unpriced_judge_tokens.saturating_add(
-                    charge
-                        .usage
-                        .input_tokens
-                        .saturating_add(charge.usage.output_tokens),
-                );
+                self.add_unpriced_judge_tokens(charge);
                 false
             }
         }
@@ -2795,14 +2798,32 @@ impl Session {
     /// estimator applies the per-message delta in either direction so clearing
     /// an unusually short result cannot make the gate undercount the request.
     pub fn effective_context_tokens_after_tool_result_pruning(&self, keep_recent: usize) -> u64 {
+        self.context_tokens_after_pruning(keep_recent, true)
+    }
+
+    /// As [`Self::effective_context_tokens_after_tool_result_pruning`] but
+    /// ignoring provider calibration, i.e. the figure a calibration reset
+    /// would report. Compare it with a post-reset figure (compaction resets
+    /// calibration) so a before/after "freed" check never mixes a calibrated
+    /// number with a cold estimate.
+    pub fn cold_context_tokens_after_tool_result_pruning(&self, keep_recent: usize) -> u64 {
+        self.context_tokens_after_pruning(keep_recent, false)
+    }
+
+    fn context_tokens_after_pruning(&self, keep_recent: usize, calibrated: bool) -> u64 {
+        let calibrated_tokens = if calibrated {
+            self.calibrated_tokens
+        } else {
+            0
+        };
         let (_, first_live) = self.compacted_context();
         let current_clear = self.live_tool_result_clear_count(first_live, keep_recent);
         let anchor = self.calibrated_msg_count.min(self.messages.len());
-        let mut effective = if self.calibrated_tokens == 0 {
+        let mut effective = if calibrated_tokens == 0 {
             self.overhead_tokens
                 .saturating_add(self.compacted_image_token_estimate())
         } else {
-            self.calibrated_tokens
+            calibrated_tokens
         };
         let mut result_ordinal = 0usize;
 
@@ -2820,7 +2841,7 @@ impl Session {
                 message.estimated_tokens
             };
 
-            if self.calibrated_tokens == 0 || index >= anchor {
+            if calibrated_tokens == 0 || index >= anchor {
                 effective = effective.saturating_add(current_tokens);
             } else if old_pruned != current_pruned {
                 let old_tokens = if old_pruned {
@@ -3364,11 +3385,7 @@ impl Session {
             .map(|c| c.prose.as_ref().unwrap_or(&c.summary).to_string())
     }
 
-    pub fn compaction_input(
-        &self,
-        cut_idx: usize,
-        _keep_recent_tool_results: usize,
-    ) -> (usize, Vec<SessionMessage>) {
+    pub fn compaction_input(&self, cut_idx: usize) -> (usize, Vec<SessionMessage>) {
         let skipped = match self.compacted_context() {
             (Some(_), 1) if cut_idx > 1 => 1,
             _ => 0,
@@ -3664,6 +3681,41 @@ mod shell_interaction_tests {
 #[cfg(test)]
 mod preflight_tests {
     use super::*;
+
+    #[test]
+    fn cold_context_tokens_ignore_provider_calibration() {
+        let mut session = Session::new("openai", "big", 128_000, "");
+        session.add_message(MessageRole::User, "hello there");
+        let cold = session.cold_context_tokens_after_tool_result_pruning(3);
+        session.calibrated_tokens = 50_000;
+        session.calibrated_msg_count = session.messages.len();
+        assert_eq!(
+            session.cold_context_tokens_after_tool_result_pruning(3),
+            cold
+        );
+        assert!(session.effective_context_tokens_after_tool_result_pruning(3) >= 50_000);
+    }
+
+    #[cfg(feature = "goal")]
+    #[test]
+    fn unpriced_native_judge_tokens_include_cached_input() {
+        let mut session = Session::new("anthropic", "big", 128_000, "");
+        let charge = crate::extras::goal::judge::JudgeCharge {
+            usage: crate::event::UsageDelta {
+                input_tokens: 1_000,
+                output_tokens: 100,
+                total_tokens: 1_600,
+                cached_input_tokens: 500,
+                ..crate::event::UsageDelta::default()
+            },
+            anthropic_native: true,
+            prices: None,
+            cache_prices: crate::pricing::CachePrices::default(),
+            model: "anthropic/judge".into(),
+        };
+        assert!(!session.charge_judge_call(&charge));
+        assert_eq!(session.unpriced_judge_tokens, 1_600);
+    }
 
     /// Judge calls are charged at the judge model's prices; an unknown price
     /// records the tokens without cost and counts them (mini-agent-kfsup).

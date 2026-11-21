@@ -314,6 +314,15 @@ impl OutputSchema {
     }
 
     fn native_params_for_model(&self, model: &str) -> Option<Value> {
+        // A dated snapshot id (`claude-sonnet-4-6-20260101`) is the same model.
+        let model = match model.rsplit_once('-') {
+            Some((base, date))
+                if date.len() == 8 && date.bytes().all(|byte| byte.is_ascii_digit()) =>
+            {
+                base
+            }
+            _ => model,
+        };
         if !matches!(
             model,
             "claude-opus-5-5"
@@ -635,6 +644,16 @@ mod tests {
         assert!(native_schema(&schema.schema, &mut 0));
         assert!(schema.native_params_for_model("claude-opus-5-5").is_some());
         assert!(schema.native_params_for_model("unknown-model").is_none());
+        assert!(
+            schema
+                .native_params_for_model("claude-sonnet-4-6-20260101")
+                .is_some()
+        );
+        assert!(
+            schema
+                .native_params_for_model("unknown-model-20260101")
+                .is_none()
+        );
         assert!(native_endpoint_allowed("anthropic", false, None));
         assert!(native_endpoint_allowed(
             "anthropic",

@@ -210,7 +210,7 @@ impl DiscoveryView {
             .map(|entry| entry.definition.name.as_str())
             .collect();
         let mut text = String::from(
-            "\n\nMCP tools below require mcp_search before use; search enables schemas only, never permissions.\n<mcp_tool_index>\n[",
+            "\n\nMCP tools below require mcp_search before use unless they already appear in your tool list; search enables schemas only, never permissions.\n<mcp_tool_index>\n[",
         );
         let mut included = 0;
         for name in names {

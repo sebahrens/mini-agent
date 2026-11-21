@@ -5757,35 +5757,41 @@ async fn generate_session_title(
     if matches!(client, crate::provider::AnyClient::Anthropic(_)) {
         return;
     }
-    let (mut history, applied) = title_without_history_lock(history, &state.cfg, &client, |job| {
-        crate::startup::heap_future(|| job.run(&state.cfg, false))
-    })
-    .await;
-    if !applied {
+    let (mut history, applied, charged) =
+        title_without_history_lock(history, &state.cfg, &client, |job| {
+            crate::startup::heap_future(|| job.run(&state.cfg, false))
+        })
+        .await;
+    if !charged {
         return;
     }
+    // A failed title still spent tokens that `finish` charged, so persist and
+    // report them; only a stored title changes the session info.
     let _ = sessions::checkpoint(&mut history, |_| {}).await;
-    send_session_info(&mut history, session_id, cx);
+    if applied {
+        send_session_info(&mut history, session_id, cx);
+    }
     send_usage_update(state, &history, session_id, cx);
 }
 
 /// Snapshot the title request under `history`, release the lock while `run`
 /// makes the model call, then re-take it to charge the spend (once) and store
 /// the title if nothing named the session meanwhile. Returns the re-taken
-/// guard and whether a title was stored. Nothing is stored when no title is due.
+/// guard, whether a title was stored, and whether a request ran (and so was
+/// charged). Nothing is stored when no title is due.
 async fn title_without_history_lock<F, Fut>(
     mut history: tokio::sync::OwnedMutexGuard<SessionHistory>,
     cfg: &Config,
     client: &crate::provider::AnyClient,
     run: F,
-) -> (tokio::sync::OwnedMutexGuard<SessionHistory>, bool)
+) -> (tokio::sync::OwnedMutexGuard<SessionHistory>, bool, bool)
 where
     F: FnOnce(crate::session::title::TitleJob) -> Fut,
     Fut: std::future::Future<Output = crate::session::title::TitleOutcome>,
 {
     let Some(job) = crate::session::title::TitleJob::prepare(&mut history.session, cfg, client)
     else {
-        return (history, false);
+        return (history, false, false);
     };
     history.title_in_flight = true;
     let mutex = tokio::sync::OwnedMutexGuard::mutex(&history).clone();
@@ -5794,7 +5800,7 @@ where
     let mut history = mutex.lock_owned().await;
     history.title_in_flight = false;
     let (_, _, applied) = outcome.finish(&mut history.session);
-    (history, applied)
+    (history, applied, true)
 }
 
 /// Judge the goal round this ACP prompt turn was.
@@ -8981,7 +8987,7 @@ mod protocol_tests {
         let guard = history.clone().lock_owned().await;
         let parked = release.clone();
         let task = tokio::spawn(async move {
-            let (guard, applied) =
+            let (guard, applied, _) =
                 title_without_history_lock(guard, &Config::default(), &client, |job| async move {
                     let _ = started_tx.send(());
                     parked.notified().await;

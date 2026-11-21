@@ -2150,7 +2150,6 @@ mod tests {
                 2,
                 4000,
                 1000,
-                0,
                 move |_, _, _, _, _| async move {
                     assert!(
                         inspected.exists(),

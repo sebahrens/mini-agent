@@ -470,7 +470,9 @@ fn record_response_metadata(
 }
 
 fn append_tool_call_arguments(tool_call: &mut RawStreamingToolCall, chunk: &str) {
-    let current_args = match &tool_call.arguments {
+    // Take the accumulated string instead of cloning it, so each fragment
+    // costs the fragment's length rather than the whole payload so far.
+    let mut combined = match std::mem::take(&mut tool_call.arguments) {
         serde_json::Value::Null => String::new(),
         serde_json::Value::String(existing) => {
             // Some OpenAI-compatible gateways emit a literal `null` placeholder
@@ -480,13 +482,12 @@ fn append_tool_call_arguments(tool_call: &mut RawStreamingToolCall, chunk: &str)
             if existing.trim() == "null" && !chunk.trim().is_empty() {
                 String::new()
             } else {
-                existing.clone()
+                existing
             }
         }
         value => value.to_string(),
     };
-
-    let combined = format!("{current_args}{chunk}");
+    combined.push_str(chunk);
 
     if combined.trim_start().starts_with('{') && combined.trim_end().ends_with('}') {
         match serde_json::from_str(&combined) {

@@ -254,25 +254,28 @@ pub fn load_attachment(path: &Path) -> std::io::Result<MediaAttachment> {
     if !meta.is_file() {
         return Err(not_regular());
     }
-    let too_large = || {
+    let too_large = |size: Option<u64>| {
+        let size = size.map_or(String::new(), |size| {
+            format!("{:.1} MiB; ", size as f64 / (1024.0 * 1024.0))
+        });
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
-                "file too large: {} (max {} bytes)",
+                "file too large: {} ({size}max {} MiB)",
                 path.display(),
-                MAX_MEDIA_BYTES
+                MAX_MEDIA_BYTES / (1024 * 1024)
             ),
         )
     };
     if meta.len() > MAX_MEDIA_BYTES {
-        return Err(too_large());
+        return Err(too_large(Some(meta.len())));
     }
     #[cfg(test)]
     tests::interpose(path, tests::ReadStage::BeforeRead);
     let mut data = Vec::new();
     file.take(MAX_MEDIA_BYTES + 1).read_to_end(&mut data)?;
     if data.len() as u64 > MAX_MEDIA_BYTES {
-        return Err(too_large());
+        return Err(too_large(None));
     }
     let extension_mime = detect_media(path).ok_or_else(|| {
         std::io::Error::new(

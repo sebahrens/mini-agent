@@ -1527,7 +1527,7 @@ impl CommitIdentity {
 pub(crate) const COMMIT_IDENTITY_UNRESOLVED: &str = "git commit requires an author identity: \
 the contained git process has no HOME or global config, so set user.name and user.email in \
 this repository (`git config user.name ...` / `git config user.email ...`) or export \
-GIT_AUTHOR_NAME/GIT_AUTHOR_EMAIL (and GIT_COMMITTER_NAME/GIT_COMMITTER_EMAIL) before starting";
+GIT_AUTHOR_NAME/GIT_AUTHOR_EMAIL (and GIT_COMMITTER_NAME/GIT_COMMITTER_EMAIL) before starting (identity settings are read once at startup: restart mini-agent after changing them)";
 
 /// The complete environment a contained commit runs with: the hardened base
 /// plus the resolved identity, and nothing else.

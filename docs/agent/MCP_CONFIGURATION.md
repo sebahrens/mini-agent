@@ -435,7 +435,7 @@ client, ordinary Ask/deny policy, hook invocation identity, cost admission,
 concurrency lane and structured result extensions. A model cannot call a hidden
 tool in the same response as its search: the SDK validates calls against the
 immutable definitions advertised for that response before executing siblings.
-The next generic request advertises the newly enabled schema. Omitting `mcp_search`
+The next generic request advertises the newly enabled schema. Each search that enables tools appends their definitions to the request's tool list, so on providers without native tool references it changes the cacheable prefix once per activating search (one search may enable up to eight tools, so batch related words into one query). Omitting `mcp_search`
 from an explicit CLI tool ceiling keeps the admitted MCP tools eager; tools
 outside that ceiling remain unavailable. Discovery never widens the ceiling.
 
