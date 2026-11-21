@@ -2855,7 +2855,7 @@ best-effort workflow guardrails; shell syntax can reshape equivalent commands,
 so these patterns are not a containment boundary. An unmatched Bash script asks in `guarded` and
 `standard`; `yolo` remains the explicit allow-all mode subject to deny rules,
 except that an unmatched script containing a recognizably destructive command
-still asks: `rm` with a recursive or force flag, `dd`, `mkfs`, `shred`,
+still asks: `rm` with a recursive or force flag or a glob operand, `dd`, `mkfs`, `shred`,
 `wipefs`, `mkswap`, `fdisk`, `find … -delete`, recursive `chmod`/`chown`, and
 `git push --force`/`--delete`, `git reset --hard`, `git clean -f`, and
 `git branch -D`. Each command separated by a newline, `;`, `&`, or `|` is
@@ -2865,8 +2865,11 @@ matches the script (for example an exact `"rm -rf target": allow`) decides
 instead. Like other Bash patterns it is a best-effort guard rail, not a
 containment boundary, and in non-interactive runs the ask is refused. Note
 that configuring any `bash` rule replaces only the built-in convenience
-allows; the built-in destructive denies (such as `rm -rf /**`, `dd **` and
-`^rm\s+.*\*`) always remain in force and cannot be replaced by user rules.
+allows; the built-in destructive denies (`rm -rf /**`, `dd **of=/dev/**`, and
+one `rm` command targeting `/*`, `~/*` or `$HOME/*`) always remain in force and
+cannot be replaced by user rules. Other wildcard `rm` (`rm *.tmp`, `rm -r
+build/*`) and `dd` that does not write to a device are not denied: they ask in
+every mode, including `yolo`.
 
 `planwrite` is read-only except for the narrow built-in plan-file exception:
 `write`, `edit`, and `js/write_file` may modify `PLAN*.md` only when the

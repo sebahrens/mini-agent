@@ -4284,13 +4284,59 @@ mod tests {
         let mut checker =
             PermissionChecker::new(&configs, SecurityMode::Standard, None, None).unwrap();
         assert!(matches!(
-            checker.check("shell", "dd if=/dev/zero of=x"),
+            checker.check("shell", "dd if=/dev/zero of=/dev/disk2"),
             CheckResult::Denied(_)
         ));
         assert!(matches!(
             checker.check("shell", "rm -rf /tmp/x/*"),
             CheckResult::Denied(_)
         ));
+    }
+
+    // mini-agent-nvnkx.65: only catastrophic wildcard rm and device-writing dd
+    // are hard denies; other wildcard rm and dd ask in every mode.
+    #[test]
+    fn wildcard_rm_and_dd_deny_only_catastrophic_forms() {
+        for mode in [SecurityMode::Standard, SecurityMode::Yolo] {
+            let mut checker =
+                PermissionChecker::new(&PermissionConfigs::default(), mode, None, None).unwrap();
+            for script in [
+                "rm -rf /*",
+                "rm -fr ~/*",
+                "rm -rf $HOME/*",
+                "sudo rm -rf /*",
+                "dd of=/dev/disk2",
+                "dd if=/dev/zero of=/dev/disk2",
+            ] {
+                assert!(
+                    matches!(checker.check("bash", script), CheckResult::Denied(_)),
+                    "{mode:?} {script}"
+                );
+            }
+            for script in [
+                "rm *.tmp",
+                "rm -r build/*",
+                "rm -f target/*.d",
+                "dd if=a of=b",
+            ] {
+                assert_eq!(
+                    checker.check("bash", script),
+                    CheckResult::Ask,
+                    "{mode:?} {script}"
+                );
+            }
+            for script in [
+                "rm out.log && ls *.md",
+                "rm a.txt\nfind . -name '*.rs'",
+                "grep -r 'rm *' .",
+                "echo \"rm x*\"",
+            ] {
+                assert!(
+                    !matches!(checker.check("bash", script), CheckResult::Denied(_)),
+                    "{mode:?} {script}"
+                );
+            }
+        }
     }
 
     // mini-agent-st28w: edit/notebook_edit rules also govern js/write_file.

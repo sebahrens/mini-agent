@@ -140,6 +140,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Added: Bedrock Converse/ConverseStream route: with `provider = "bedrock"`, non-`anthropic.` model ids (Amazon Nova, Llama, Mistral, DeepSeek, gpt-oss) are served through a rig `CompletionModel` over the event-stream wire layer (text, tool calls, usage and cache tokens; SigV4 or Bedrock API key under the same destination pinning), selected per model id while Claude ids keep the native Messages route; the catalog maps Converse ids to their priced entries when listed (mini-agent-nvnkx.44)
 - Added: `/remote on|off|status` (feature `remote`, off by default) starts a loopback-only browser view of the running TUI session: the URL with its one-time token is printed once, session events stream to the page, and browser steer messages, permission answers (allow once or deny; the first answer, terminal or browser, wins) and cancel go through the existing steering queue, permission prompt and interrupt path; a non-loopback bind needs `--host <ip> --allow-non-loopback` and prints a warning (mini-agent-nvnkx.139)
 
+### Changed
+
+- Built-in wildcard `rm` and `dd` hard denies loosened: only `rm` targeting `/*`, `~/*` or `$HOME/*` and `dd` writing to `/dev/**` stay denied; other wildcard `rm` and `dd` now ask in every mode including yolo, and the old `^rm\s+.*\*` regex no longer over-matches other commands in the script (mini-agent-nvnkx.65)
+
 ### Fixed
 
 - Read-only shell auto-allow no longer lets `git log -p`, `git show`, `git diff` or `git blame` (including `REV:path` arguments) read denied files from history: with any read deny rule they ask (mini-agent-qc4cf).
