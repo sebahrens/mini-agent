@@ -3554,7 +3554,15 @@ async fn mcp_auxiliary_stdio_elicitation_exact_rpc_headless_and_raw_constraint_n
         );
         let output = result.map_err(|error| error.to_string());
         manager.shutdown().await;
-        let output = output.unwrap();
+        let mut output = output.unwrap();
+        let note = "[note: server 'owned' asked for user input (elicitation) that this client cannot answer; it was cancelled]";
+        if !interactive {
+            // Headless has no front end: the model is told why.
+            assert!(output.ends_with(&format!("\n{note}")), "{output}");
+            output.truncate(output.len() - note.len() - 1);
+        } else {
+            assert!(!output.contains("[note:"), "{output}");
+        }
         let action = parse_fixture_output(&output);
         assert_eq!(action["result"]["action"], expected);
         if expected == "accept" {
@@ -3570,6 +3578,54 @@ async fn mcp_auxiliary_stdio_elicitation_exact_rpc_headless_and_raw_constraint_n
             "MCP form never claims a main question or persisted requirement"
         );
     }
+    fixture.cleanup();
+}
+
+#[tokio::test]
+async fn mcp_elicitation_cancelled_by_a_front_end_that_cannot_answer_notes_the_result() {
+    use crate::permission::ask::UserRequest;
+    let fixture = FixtureBuild::compile();
+    let cfg = fixture.config(
+        fixture.executable.to_string_lossy().into_owned(),
+        Vec::new(),
+        "aux-elicit",
+        &fixture.lease("cannot-answer"),
+    );
+    let handle = McpClientHandle::connect_in("owned".into(), &cfg, &fixture.root)
+        .await
+        .unwrap();
+    let manager = McpClientManager::from_handles(vec![handle]);
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
+    let tools = manager
+        .collect_tools_with_timeouts(
+            None,
+            Some(sender),
+            McpToolTimeouts {
+                call: Duration::from_secs(3),
+                ..Default::default()
+            },
+        )
+        .await;
+    let scope = crate::agent::runner::AgentWorkScope::new();
+    let turn = crate::question::QuestionTurn::default();
+    let mut call = Box::pin(scope.run(crate::question::scope(
+        Some(turn.clone()),
+        tools[0].call("{}".into()),
+    )));
+    let output = tokio::select! {biased;request=receiver.recv()=>{
+        let UserRequest::McpElicitation(request)=request.unwrap() else {panic!("expected a form");};
+        // What the ACP front end does.
+        request.cannot_answer.store(true, std::sync::atomic::Ordering::Release);
+        request.question.reply.send(crate::question::QuestionAnswer::Cancelled).unwrap();
+        tokio::time::timeout(Duration::from_secs(3),&mut call).await.unwrap()
+    },result=&mut call=>panic!("call completed before its form: {result:?}")};
+    drop(call);
+    manager.shutdown().await;
+    let output = output.unwrap();
+    assert!(
+        output.contains("[note: server 'owned' asked for user input (elicitation) that this client cannot answer; it was cancelled]"),
+        "{output}"
+    );
     fixture.cleanup();
 }
 

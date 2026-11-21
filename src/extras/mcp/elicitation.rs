@@ -21,6 +21,9 @@ pub(crate) struct Request {
     pub question: QuestionRequest,
     pub owner: FrontendOwner,
     pub valid: Arc<dyn Fn() -> bool + Send + Sync>,
+    /// Set by a front end that cannot answer MCP elicitation at all (ACP)
+    /// before it replies `Cancelled`, so the call result can say why.
+    pub cannot_answer: Arc<AtomicBool>,
 }
 #[derive(Clone)]
 pub(crate) struct AskOrigin {
@@ -136,8 +139,23 @@ struct LeaseInner {
     question: Option<QuestionTurn>,
     server: String,
     asking: AtomicBool,
+    /// An elicitation of this call was cancelled because no front end can
+    /// answer it; consumed once into a note on the call result.
+    unanswerable: AtomicBool,
 }
 pub(crate) struct Lease(Arc<LeaseInner>);
+impl Lease {
+    /// The one-line note for the model when this call's elicitation was
+    /// cancelled because the client cannot answer it. Reports once.
+    pub(crate) fn take_unanswerable_note(&self) -> Option<String> {
+        self.0.unanswerable.swap(false, Ordering::AcqRel).then(|| {
+            format!(
+                "[note: server '{}' asked for user input (elicitation) that this client cannot answer; it was cancelled]",
+                self.0.server
+            )
+        })
+    }
+}
 impl Drop for Lease {
     fn drop(&mut self) {
         self.0.active.store(false, Ordering::Release);
@@ -198,6 +216,7 @@ impl Handler {
             question,
             server,
             asking: AtomicBool::new(false),
+            unanswerable: AtomicBool::new(false),
         });
         let mut leases = self.leases.lock().unwrap_or_else(|e| e.into_inner());
         // Only prune dropped leases here: `current()` revalidates the MCP
@@ -320,6 +339,8 @@ impl rmcp::ClientHandler for Handler {
             (None, None) => return Ok(response(ElicitationAction::Decline, None)),
         };
         let Some(ask) = lease.ask.clone() else {
+            // Headless: there is no front end to ask.
+            lease.unanswerable.store(true, Ordering::Release);
             return Ok(response(ElicitationAction::Decline, None));
         };
         let Some(owner) = lease.owner.clone() else {
@@ -339,7 +360,8 @@ impl rmcp::ClientHandler for Handler {
         };
         let (reply,receiver)=tokio::sync::oneshot::channel();
         let proof=lease.clone();
-        let request=Request {question:QuestionRequest{id:uuid::Uuid::new_v4().to_string(),questions,#[cfg(feature="acp")]tool_call_id:None,reply},owner,valid:Arc::new(move ||proof.current())};
+        let cannot_answer=Arc::new(AtomicBool::new(false));
+        let request=Request {question:QuestionRequest{id:uuid::Uuid::new_v4().to_string(),questions,#[cfg(feature="acp")]tool_call_id:None,reply},owner,valid:Arc::new(move ||proof.current()),cannot_answer:cannot_answer.clone()};
         let answer=tokio::select! {biased;
             _=context.ct.cancelled()=>return Ok(response(ElicitationAction::Cancel,None)),
             _=lease.retired()=>return Ok(response(ElicitationAction::Cancel,None)),
@@ -353,7 +375,10 @@ impl rmcp::ClientHandler for Handler {
                 [crate::question::Answer::Option(0)]=>None,
                 _=>return Ok(response(ElicitationAction::Decline,None)),
             },
-            _=>return Ok(response(ElicitationAction::Cancel,None)),
+            _=>{
+                if cannot_answer.load(Ordering::Acquire){lease.unanswerable.store(true,Ordering::Release);}
+                return Ok(response(ElicitationAction::Cancel,None));
+            }
         };
         // The answer can unblock the already authorized remote tool. Recheck
         // its captured financial admission before returning any submitted data.

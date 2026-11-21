@@ -4116,6 +4116,7 @@ mod mcp_bridge_tests {
                                 "main".into(),
                             ),
                             valid: Arc::new(|| true),
+                            cannot_answer: Default::default(),
                         },
                     ))
                     .await
@@ -4492,6 +4493,9 @@ async fn drive_permission_bridge(
                 // cancelled rather than routed through the permission
                 // protocol; say so instead of failing silently.
                 send_thought(&session_id, &cx, MCP_ELICITATION_REFUSED);
+                request
+                    .cannot_answer
+                    .store(true, std::sync::atomic::Ordering::Release);
                 let _ = request
                     .question
                     .reply

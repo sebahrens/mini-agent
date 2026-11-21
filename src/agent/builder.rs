@@ -440,6 +440,7 @@ fn build_preamble_with_overrides(
         persona,
         appended,
         None,
+        true,
     )
     .text
 }
@@ -454,6 +455,7 @@ fn compose_preamble(
     persona: Option<&str>,
     appended: Option<&str>,
     shell_cwd_alias: Option<&Path>,
+    include_skill_policy: bool,
 ) -> PreambleComposition {
     let reasoning_prefix = if reasoning_enabled {
         "You reason carefully and think step-by-step.\n\n"
@@ -601,11 +603,13 @@ fn compose_preamble(
         preamble.push_str(appended);
     }
     record_part(&mut parts, &preamble, "Appended system prompt");
-    // Unconditional: skill context can be injected per turn even when
-    // `skills_search` is not offered, and native (signed-prefix) sessions
-    // require this static policy in the captured system prompt.
+    // Decided once per session by the caller (`skills_search` registered, or a
+    // native session whose captured static prompt requires it), so the
+    // prompt stays byte-stable across turns.
+    #[cfg(not(feature = "agent-skills"))]
+    let _ = include_skill_policy;
     #[cfg(feature = "agent-skills")]
-    {
+    if include_skill_policy {
         preamble.push_str(crate::extras::skills::selection::POLICY);
         record_part(&mut parts, &preamble, "Instruction skill policy");
     }
@@ -670,10 +674,12 @@ fn build_registered_preamble(
         registered_tools,
         cli,
         goal_block,
+        crate::context::instructions::InstructionProtocol::Anthropic,
     )
     .text
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compose_registered_preamble(
     context: &ContextFiles,
     reasoning_enabled: bool,
@@ -682,7 +688,15 @@ fn compose_registered_preamble(
     registered_tools: &[&str],
     cli: &Cli,
     goal_block: Option<&str>,
+    instruction_protocol: crate::context::instructions::InstructionProtocol,
 ) -> PreambleComposition {
+    let has = |name: &str| registered_tools.contains(&name);
+    // Native (Anthropic) sessions capture their static prompt and require the
+    // policy in it; other sessions carry it only with `skills_search`.
+    let native = matches!(
+        instruction_protocol,
+        crate::context::instructions::InstructionProtocol::Anthropic
+    );
     let mut composition = compose_preamble(
         context,
         reasoning_enabled,
@@ -692,8 +706,8 @@ fn compose_registered_preamble(
         cli.system_prompt.as_deref(),
         cli.append_system_prompt.as_deref(),
         sandbox.shell_cwd_alias().as_deref(),
+        native || has("skills_search"),
     );
-    let has = |name: &str| registered_tools.contains(&name);
     // Bullets are collected under one "## Tools" heading so none attaches to
     // user-authored text; self-contained sections follow them.
     let mut bullets = String::new();
@@ -895,6 +909,8 @@ pub(crate) fn estimate_overhead_breakdown(
         &tools,
         cli,
         goal_block,
+        // A diagnostic estimate: the policy follows `skills_search` alone.
+        crate::context::instructions::InstructionProtocol::Chat,
     );
     let total = crate::session::Session::estimate_tokens(&composition.text);
     let parts = composition
@@ -1899,6 +1915,7 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         &registered_tools,
         cli,
         goal_block.as_deref(),
+        instruction_protocol,
     );
     #[cfg(feature = "mcp")]
     if !discovery_index.is_empty() {
@@ -2342,6 +2359,7 @@ mod extra_file_tests {
             &[],
             &cli,
             None,
+            crate::context::instructions::InstructionProtocol::Unverified,
         );
         let prior = super::compose_preamble(
             &context,
@@ -2352,6 +2370,7 @@ mod extra_file_tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(actual.text, prior.text);
         assert_eq!(sandbox.shell_cwd_alias(), None);
@@ -2403,6 +2422,7 @@ mod extra_file_tests {
             &[],
             &crate::cli::Cli::default(),
             None,
+            crate::context::instructions::InstructionProtocol::Unverified,
         );
         let lines: Vec<_> = actual.text.lines().collect();
         let cwd = lines
@@ -2452,6 +2472,7 @@ mod extra_file_tests {
             &[],
             &crate::cli::Cli::default(),
             None,
+            crate::context::instructions::InstructionProtocol::Unverified,
         );
         let workspace = actual
             .parts
@@ -3246,6 +3267,7 @@ mod js_tests {
                 tools,
                 &crate::cli::Cli::default(),
                 Some("GOAL_TAIL"),
+                crate::context::instructions::InstructionProtocol::Anthropic,
             )
         };
         let mut composition = compose(&["write", "shell"]);
@@ -3263,6 +3285,37 @@ mod js_tests {
             assert!(composition.text.contains(policy));
             assert!(composition.text.find(policy) < composition.text.find("GOAL_TAIL"));
         }
+    }
+
+    #[cfg(feature = "agent-skills")]
+    #[tokio::test]
+    async fn skill_policy_follows_skills_search_except_in_native_sessions() {
+        use crate::context::instructions::InstructionProtocol as Protocol;
+        let workspace = workspace_binding();
+        let sandbox = shell_sandbox();
+        let policy = crate::extras::skills::selection::POLICY;
+        let compose = |tools: &[&str], protocol: Protocol| {
+            super::compose_registered_preamble(
+                &empty_context(),
+                false,
+                workspace.root(),
+                &sandbox,
+                tools,
+                &crate::cli::Cli::default(),
+                None,
+                protocol,
+            )
+            .text
+        };
+        assert!(!compose(&["read"], Protocol::Unverified).contains(policy));
+        assert!(compose(&["read", "skills_search"], Protocol::Unverified).contains(policy));
+        assert!(compose(&["read"], Protocol::Anthropic).contains(policy));
+        assert!(compose(&["read", "skills_search"], Protocol::Anthropic).contains(policy));
+        // Byte-stable for one session: same inputs, same prompt.
+        assert_eq!(
+            compose(&["read"], Protocol::Unverified),
+            compose(&["read"], Protocol::Unverified)
+        );
     }
 
     #[tokio::test]
@@ -3404,6 +3457,7 @@ mod js_tests {
                 Some("STATIC_PERSONA"),
                 Some("STATIC_APPEND"),
                 None,
+                true,
             );
             let mut snapshot = composition.snapshot();
             let mut preamble = composition.text;
@@ -3428,7 +3482,7 @@ mod js_tests {
         assert_eq!(projected[0].as_bytes(), projected[1].as_bytes());
         context.memory = Some("x".repeat(crate::extras::memory::MAX_INJECT_BYTES + 1));
         let composition =
-            super::compose_preamble(&context, false, None, false, None, None, None, None);
+            super::compose_preamble(&context, false, None, false, None, None, None, None, true);
         let mut snapshot = composition.snapshot();
         let mut preamble = composition.text;
         let before = preamble.clone();

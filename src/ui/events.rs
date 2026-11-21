@@ -320,8 +320,9 @@ fn push_runtime_availability(
 }
 
 /// The transcript block for a stored tool result: folded per `tool_output`
-/// like the live view. The live `is_error` flag is not persisted, so a
-/// replayed failure is recognised by its text.
+/// like the live view. A record without a stored failure flag (written before
+/// the flag existed) is a failure only when it is one of mini-agent's own
+/// failure renderings.
 /// The stored failure flag of a tool result, when the record carries one.
 fn persisted_error(msg: &crate::session::SessionMessage) -> Option<bool> {
     match &msg.tool {
@@ -341,7 +342,7 @@ fn tool_result_block(
     }
     let view = crate::ui::tool_output::tool_result_view(
         output,
-        stored_error.unwrap_or_else(|| crate::ui::tool_output::looks_like_error(output)),
+        stored_error.unwrap_or_else(|| crate::ui::tool_output::is_legacy_failure_rendering(output)),
         cfg.resolve_tool_output(),
     );
     if view.foldable() {

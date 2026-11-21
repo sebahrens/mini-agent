@@ -655,7 +655,7 @@ mod tests {
                         id: id.clone(),
                         call_id: None,
                         content: OneOrMany::one(rig::message::ToolResultContent::text(*output)),
-                        is_error: Some(crate::ui::tool_output::looks_like_error(output)),
+                        is_error: Some(output.starts_with("Error")),
                     },
                 )),
             });
