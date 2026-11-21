@@ -237,61 +237,6 @@ impl<M: rig::completion::CompletionModel> rig::agent::AgentHook<M> for ShellCall
     }
 }
 
-/// Run a foreground command, forwarding a throttled display-only preview of
-/// its output as [`crate::event::AgentEvent::ToolProgress`]. The output
-/// future wins every race, so no preview is sent once the command finished;
-/// a full event channel drops the preview instead of slowing the command.
-async fn output_with_progress(
-    sandbox: &Sandbox,
-    command: &str,
-    limits: CommandLimits,
-    capture: &ShellOutputCapture,
-    (pty, separate_streams): (bool, bool),
-    id: CompactString,
-    events: tokio::sync::mpsc::Sender<crate::event::AgentEvent>,
-) -> std::io::Result<CommandOutput> {
-    let progress = CommandProgress::new();
-    let mut changes = progress.subscribe();
-    let command_run = sandbox.output_shell_command_captured(
-        command,
-        limits,
-        Some(progress.clone()),
-        capture,
-        pty,
-        separate_streams,
-    );
-    tokio::pin!(command_run);
-    let mut last_sent: Option<tokio::time::Instant> = None;
-    let mut pending = false;
-    loop {
-        let due = last_sent.map(|sent| sent + SHELL_PROGRESS_INTERVAL);
-        tokio::select! {
-            biased;
-            result = &mut command_run => return result,
-            changed = changes.changed(), if !pending => {
-                if changed.is_ok() {
-                    pending = true;
-                }
-            }
-            _ = async {
-                if let Some(due) = due {
-                    tokio::time::sleep_until(due).await;
-                }
-            }, if pending => {
-                pending = false;
-                last_sent = Some(tokio::time::Instant::now());
-                let text = progress.tail_lines(SHELL_PROGRESS_LINES);
-                if !text.is_empty() {
-                    let _ = events.try_send(crate::event::AgentEvent::ToolProgress {
-                        id: id.clone(),
-                        text: CompactString::from(text),
-                    });
-                }
-            }
-        }
-    }
-}
-
 /// Immutable observation of the actual foreground child, before display limits,
 /// permission coaching or hooks rewrite model-visible text. Payload is bounded;
 /// consumers must require complete successful output before interpreting it.
@@ -835,16 +780,18 @@ impl ShellTool {
             .zip(crate::agent::tools::mutation_diff::scoped_event_sender());
         let output = match live {
             Some((id, events)) => {
-                output_with_progress(
-                    &self.sandbox,
+                // The output future wins every race in `forward_progress`, so
+                // no preview is sent once the command finished.
+                let progress = CommandProgress::new();
+                let command_run = self.sandbox.output_shell_command_captured(
                     &args.command,
                     limits,
+                    Some(progress.clone()),
                     &capture,
-                    (args.pty, args.separate_streams),
-                    id,
-                    events,
-                )
-                .await?
+                    args.pty,
+                    args.separate_streams,
+                );
+                forward_progress(&progress, command_run, id, events).await?
             }
             None => {
                 self.sandbox
@@ -894,45 +841,18 @@ impl ShellTool {
         }
 
         let output_len = transcript.total_bytes;
-        let mut result = render_transcript(&transcript);
-        if args.pty {
-            // The log file keeps the raw bytes.
-            result = normalize_terminal_output(&result);
-        }
-        if output.descendants_escaped {
-            if !result.is_empty() && !result.ends_with('\n') {
-                result.push('\n');
-            }
-            result.push_str(
-                "[status: descendants_escaped; direct command result preserved; containment cleanup incomplete]",
-            );
-        }
-        if let Some(termination) = termination {
-            if !result.is_empty() && !result.ends_with('\n') {
-                result.push('\n');
-            }
-            result.push_str(&termination);
-        }
-        let failed = output.exit_status.is_some_and(|status| !status.success());
-        if let Some(note) =
-            sandbox_failure_note(&self.sandbox, self.allow_escalation, failed, &result)
-        {
-            if !result.is_empty() && !result.ends_with('\n') {
-                result.push('\n');
-            }
-            result.push_str(&note);
-        }
-
-        let transcript = self.spill_line_capped_output(transcript, &result);
-        let mut result = bound_output_lines(result, self.max_output_lines, &transcript);
-        push_log_footer(&mut result, &transcript);
-        if result.is_empty()
-            && output
-                .exit_status
-                .is_some_and(|status| status.code() == Some(0))
-        {
-            result = SUCCESS_NO_OUTPUT.to_string();
-        }
+        let result = self.render_completed(
+            transcript,
+            CompletedCommand {
+                pty: args.pty,
+                descendants_escaped: output.descendants_escaped,
+                termination,
+                failed: output.exit_status.is_some_and(|status| !status.success()),
+                clean_exit: output
+                    .exit_status
+                    .is_some_and(|status| status.code() == Some(0)),
+            },
+        );
 
         let result = match coaching {
             Some(msg) => format!("{}\n\n{}", msg, result),
@@ -1055,45 +975,74 @@ impl ShellTool {
                 self.max_output_lines,
             ));
         }
-        let mut result = render_transcript(&transcript);
-        if args.pty {
-            result = normalize_terminal_output(&result);
-        }
-        if snapshot.descendants_escaped {
+        let result = self.render_completed(
+            transcript,
+            CompletedCommand {
+                pty: args.pty,
+                descendants_escaped: snapshot.descendants_escaped,
+                termination: termination_note(snapshot.exit_code, snapshot.signal),
+                failed: snapshot.exit_code.is_some_and(|code| code != 0)
+                    || snapshot.signal.is_some(),
+                clean_exit: snapshot.exit_code == Some(0),
+            },
+        );
+        Ok(Some(result))
+    }
+}
+
+/// How a completed shell command ended, for [`ShellTool::render_completed`].
+struct CompletedCommand {
+    pty: bool,
+    descendants_escaped: bool,
+    /// `Exit code: N`, a signal line, or the no-exit-code fallback; `None` for
+    /// a clean exit.
+    termination: Option<String>,
+    failed: bool,
+    /// The command exited with code 0 (an empty result is then reported as a
+    /// success rather than as nothing).
+    clean_exit: bool,
+}
+
+impl ShellTool {
+    /// The model-visible text of a command that ran to completion. Shared by
+    /// the foreground and auto-background paths so the two cannot drift: pty
+    /// normalisation, the escaped-descendants status, the termination line,
+    /// sandbox coaching, line capping with its spill log, the log footer and
+    /// the empty-success placeholder always apply in this order.
+    fn render_completed(&self, transcript: OutputTranscript, done: CompletedCommand) -> String {
+        fn ensure_newline(result: &mut String) {
             if !result.is_empty() && !result.ends_with('\n') {
                 result.push('\n');
             }
+        }
+        let mut result = render_transcript(&transcript);
+        if done.pty {
+            // The log file keeps the raw bytes.
+            result = normalize_terminal_output(&result);
+        }
+        if done.descendants_escaped {
+            ensure_newline(&mut result);
             result.push_str(
                 "[status: descendants_escaped; direct command result preserved; containment cleanup incomplete]",
             );
         }
-        let ended = snapshot
-            .exit_code
-            .filter(|code| *code != 0)
-            .map(|code| format!("Exit code: {code}"))
-            .or_else(|| snapshot.signal.map(describe_signal));
-        if let Some(ended) = ended {
-            if !result.is_empty() && !result.ends_with('\n') {
-                result.push('\n');
-            }
-            result.push_str(&ended);
+        if let Some(termination) = done.termination {
+            ensure_newline(&mut result);
+            result.push_str(&termination);
         }
-        let failed = snapshot.exit_code.is_some_and(|code| code != 0) || snapshot.signal.is_some();
         if let Some(note) =
-            sandbox_failure_note(&self.sandbox, self.allow_escalation, failed, &result)
+            sandbox_failure_note(&self.sandbox, self.allow_escalation, done.failed, &result)
         {
-            if !result.is_empty() && !result.ends_with('\n') {
-                result.push('\n');
-            }
+            ensure_newline(&mut result);
             result.push_str(&note);
         }
         let transcript = self.spill_line_capped_output(transcript, &result);
         let mut result = bound_output_lines(result, self.max_output_lines, &transcript);
         push_log_footer(&mut result, &transcript);
-        if result.is_empty() && snapshot.exit_code == Some(0) {
+        if result.is_empty() && done.clean_exit {
             result = SUCCESS_NO_OUTPUT.to_string();
         }
-        Ok(Some(result))
+        result
     }
 }
 
@@ -2082,17 +2031,22 @@ pub(crate) fn describe_signal(number: i32) -> String {
     format!("Terminated by signal: {name} ({number})")
 }
 
+/// `Exit code: N` for a non-zero exit, the signal line for a signal death,
+/// `None` for a clean exit. Shared by foreground and auto-background results.
+fn termination_note(code: Option<i32>, signal: Option<i32>) -> Option<String> {
+    match code {
+        Some(code) => (code != 0).then(|| format!("Exit code: {code}")),
+        None => signal.map(describe_signal),
+    }
+}
+
 fn render_termination(status: Option<std::process::ExitStatus>) -> Option<String> {
     let status = status?;
-    if let Some(code) = status.code() {
-        return (code != 0).then(|| format!("Exit code: {code}"));
+    let (code, signal) = (status.code(), crate::sandbox::exit_signal(status));
+    if code.is_none() && signal.is_none() {
+        return Some("Process terminated without an exit code".to_string());
     }
-
-    if let Some(number) = crate::sandbox::exit_signal(status) {
-        return Some(describe_signal(number));
-    }
-
-    Some("Process terminated without an exit code".to_string())
+    termination_note(code, signal)
 }
 
 /// Make terminal output model-readable: drop CSI/OSC/DCS and other escape
@@ -3787,6 +3741,42 @@ mod tests {
             !finished.contains("begin-ok"),
             "only new output after promotion: {finished}"
         );
+    }
+
+    /// Foreground and auto-background completion share `render_completed`, so
+    /// every ending reads identically on both paths.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn foreground_and_auto_background_render_identical_endings() {
+        for command in [
+            "printf out",
+            "printf out; exit 3",
+            "exit 0",
+            "exit 2",
+            "printf partial; kill -KILL $$",
+        ] {
+            let shell = test_tool();
+            let run = |auto| {
+                let shell = &shell;
+                async move {
+                    shell
+                        .call(BashArgs {
+                            command: command.to_string(),
+                            auto_background: Some(auto),
+                            ..Default::default()
+                        })
+                        .await
+                        .unwrap()
+                }
+            };
+            assert_eq!(run(false).await, run(true).await, "{command}");
+        }
+        assert_eq!(termination_note(Some(0), None), None);
+        assert_eq!(
+            termination_note(Some(5), None).as_deref(),
+            Some("Exit code: 5")
+        );
+        assert_eq!(termination_note(None, Some(9)), Some(describe_signal(9)));
     }
 
     #[cfg(unix)]
