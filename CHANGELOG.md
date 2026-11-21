@@ -16,6 +16,7 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Persona frontmatter `background: true` (delegations detach as background tasks), `memory: user|project|local` (private notes directory injected at start and writable through an `agent_memory` tool) and `hooks:` (scoped to the child's tool calls) are now implemented; memory and hooks are opt-in via `[subagents] agent_memory` / `agent_hooks` (mini-agent-scu2y).
 - Skills run with `/<name> args` now substitute `$ARGUMENTS`, `$ARGUMENTS[N]`, `$N` and `${CLAUDE_SKILL_DIR}`, rewrite ``!`cmd` `` spans into shell-tool instructions (`skills_shell_placeholders`), and honour `context: fork` with `agent:` by delegating the body to one `task` child (mini-agent-h7wxv).
 - Skill frontmatter `model` (forked skills; the `task` tool takes a per-call `model` limited to configured `[quick_models]` aliases and never overrides a persona-pinned model) and `paths` (automatic selection only when the request names a matching file); `effort` and `hooks` now report a reason (mini-agent-h7wxv).
+- `install.sh --uninstall` removes the binary and its `share/doc/mini-agent` directory (mini-agent-nvnkx.356).
 
 ### Fixed
 
@@ -98,6 +99,12 @@ Notable changes to mini-agent are documented in this file. The format follows
   caps concurrent relays at 256 (mini-agent-y42nd). `update` and `install.sh` treat a `gh` whose
   `attestation verify --help` lacks the pin flags as unavailable (upgrade gh), not a failed
   verification (mini-agent-0cshc).
+- Windows test build compiles again: `windows_runtime_tests` compared a `GitRunError` with `.contains` (mini-agent-nvnkx.1). The all-features build no longer fails on a dead `feature_missing` helper (mini-agent-nvnkx.2).
+- The two Linux workspace-preamble tests follow the cwd, date/platform, sandbox-notice order and a platform-neutral test pins the part order (mini-agent-nvnkx.3). `/prompt default` no longer says "back to default" when the provider revert failed, and its test no longer needs `OPENROUTER_API_KEY` (mini-agent-nvnkx.4).
+- `test_sync_version` reads the expected ACP protocol version from the registry fixture instead of a literal (mini-agent-nvnkx.5).
+- `install.sh` runs everything from a `main` function invoked on the last line, so a truncated `curl | bash` runs nothing (mini-agent-nvnkx.112). It checks for curl (wget fallback), tar and a SHA-256 tool, and for a writable install directory before any download, and points MSYS/Cygwin shells to the Windows install (mini-agent-nvnkx.356).
+- README no longer claims replacing an existing workspace file fails closed on Windows (mini-agent-nvnkx.304). The structured-Git ADR lists the full operation set and permission keys (mini-agent-nvnkx.51).
+- The repository's own loop-verification self-check (`--loop-verification-policy-check`) is no longer part of the shipped binary; CI runs the policy through `scripts.tests.test_loop_lifecycle` (mini-agent-nvnkx.185).
 
 ### Added
 

@@ -279,7 +279,9 @@ async fn windows_missing_shell_refuses_only_selected_shell_services() {
         Err(error) => error,
     };
     assert!(
-        error.contains("require an original Git-for-Windows shell"),
+        error
+            .to_string()
+            .contains("require an original Git-for-Windows shell"),
         "{error}"
     );
     // Native argv[0] without Git's shell metacharacters remains usable even

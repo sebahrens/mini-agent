@@ -2,6 +2,9 @@
 #
 # Install mini-agent from GitHub Releases.
 #
+# The whole installer lives in main(), invoked on the last line, so a download
+# truncated mid-transfer parses as an unterminated function and runs nothing.
+#
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/sebahrens/mini-agent/main/install.sh | bash
 #
@@ -26,12 +29,14 @@ FIRST_INVENTORY_RELEASE="1.9.5"
 usage() {
     local status="${1:-0}"
     cat <<EOF
-Usage: install.sh [--dir <path>] [--release <version>]
+Usage: install.sh [--dir <path>] [--release <version>] [--uninstall]
 
 Options:
   --dir <path>   Install directory (default: ~/.local/bin)
   --release <version>
                  Install an exact release (for example, 1.7.2). Defaults to latest.
+  --uninstall    Remove ${BINARY_NAME} from the install directory together with the
+                 documents directory (share/doc/${BINARY_NAME}), then exit
   --help         Show this message
 
 Private releases: if the anonymous download fails, the installer retries with
@@ -47,561 +52,639 @@ EOF
     exit "$status"
 }
 
-# ---- parse args ----
-INSTALL_DIR=""
-RELEASE_VERSION=""
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --dir)
-            if [[ $# -lt 2 ]]; then
-                echo "Missing value for --dir" >&2
-                exit 2
-            fi
-            INSTALL_DIR="$2"
-            shift 2
-            ;;
-        --release)
-            if [[ $# -lt 2 ]]; then
-                echo "Missing value for --release" >&2
-                exit 2
-            fi
-            RELEASE_VERSION="$2"
-            shift 2
-            ;;
-        --help|-h)
-            usage
+main() {
+    # ---- parse args ----
+    INSTALL_DIR=""
+    RELEASE_VERSION=""
+    UNINSTALL=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dir)
+                if [[ $# -lt 2 ]]; then
+                    echo "Missing value for --dir" >&2
+                    exit 2
+                fi
+                INSTALL_DIR="$2"
+                shift 2
+                ;;
+            --release)
+                if [[ $# -lt 2 ]]; then
+                    echo "Missing value for --release" >&2
+                    exit 2
+                fi
+                RELEASE_VERSION="$2"
+                shift 2
+                ;;
+            --uninstall)
+                UNINSTALL=1
+                shift
+                ;;
+            --help|-h)
+                usage
+                ;;
+            *)
+                echo "Unknown option: $1" >&2
+                usage 2
+                ;;
+        esac
+    done
+
+    # ---- prompt for install path ----
+    if [[ -z "$INSTALL_DIR" ]] && [[ -t 0 ]]; then
+        read -r -p "Install directory [${DEFAULT_DIR}]: " INPUT
+        INSTALL_DIR="${INPUT:-${DEFAULT_DIR}}"
+    else
+        INSTALL_DIR="${INSTALL_DIR:-${DEFAULT_DIR}}"
+    fi
+
+    # A typed or quoted "~" is not expanded by the shell; expand the current
+    # user's home so "~/bin" never becomes a literal "./~/bin" directory.
+    case "$INSTALL_DIR" in
+        \~) INSTALL_DIR="$HOME" ;;
+        \~/*) INSTALL_DIR="${HOME}/${INSTALL_DIR#\~/}" ;;
+    esac
+
+    doc_dir_for() {
+        if [[ "$(basename "$1")" == "bin" ]]; then
+            echo "$(dirname "$1")/share/doc/${BINARY_NAME}"
+        else
+            echo "$1/share/doc/${BINARY_NAME}"
+        fi
+    }
+
+    # ---- uninstall ----
+    if [[ "$UNINSTALL" -eq 1 ]]; then
+        DOC_DIR="$(doc_dir_for "$INSTALL_DIR")"
+        rm -f "${INSTALL_DIR}/${BINARY_NAME}"
+        rm -rf "$DOC_DIR"
+        echo "Removed ${INSTALL_DIR}/${BINARY_NAME}"
+        echo "Removed ${DOC_DIR}"
+        return 0
+    fi
+
+    # ---- detect platform ----
+    OS="$(uname -s)"
+    ARCH="$(uname -m)"
+
+    case "$OS" in
+        Darwin) OS="apple-darwin" ;;
+        Linux)  OS="unknown-linux-musl" ;;
+        MINGW*|MSYS*|CYGWIN*)
+            echo "Unsupported shell: ${OS}. This installer targets macOS and Linux." >&2
+            echo "  On Windows use the MSI installer or WSL; see" >&2
+            echo "  https://github.com/${REPO}/blob/main/docs/agent/WINDOWS_INSTALL.md" >&2
+            exit 1
             ;;
         *)
-            echo "Unknown option: $1" >&2
-            usage 2
+            echo "Unsupported OS: $OS" >&2
+            exit 1
             ;;
     esac
-done
 
-# ---- prompt for install path ----
-if [[ -z "$INSTALL_DIR" ]] && [[ -t 0 ]]; then
-    read -r -p "Install directory [${DEFAULT_DIR}]: " INPUT
-    INSTALL_DIR="${INPUT:-${DEFAULT_DIR}}"
-else
-    INSTALL_DIR="${INSTALL_DIR:-${DEFAULT_DIR}}"
-fi
+    case "$ARCH" in
+        x86_64|amd64) ARCH="x86_64" ;;
+        aarch64|arm64) ARCH="aarch64" ;;
+        *)
+            echo "Unsupported architecture: $ARCH" >&2
+            exit 1
+            ;;
+    esac
 
-# A typed or quoted "~" is not expanded by the shell; expand the current
-# user's home so "~/bin" never becomes a literal "./~/bin" directory.
-case "$INSTALL_DIR" in
-    \~) INSTALL_DIR="$HOME" ;;
-    \~/*) INSTALL_DIR="${HOME}/${INSTALL_DIR#\~/}" ;;
-esac
-
-# ---- detect platform ----
-OS="$(uname -s)"
-ARCH="$(uname -m)"
-
-case "$OS" in
-    Darwin) OS="apple-darwin" ;;
-    Linux)  OS="unknown-linux-musl" ;;
-    *)
-        echo "Unsupported OS: $OS" >&2
-        exit 1
-        ;;
-esac
-
-case "$ARCH" in
-    x86_64|amd64) ARCH="x86_64" ;;
-    aarch64|arm64) ARCH="aarch64" ;;
-    *)
-        echo "Unsupported architecture: $ARCH" >&2
-        exit 1
-        ;;
-esac
-
-ASSET_NAME="${BINARY_NAME}-${ARCH}-${OS}"
-ARCHIVE_FILE="${ASSET_NAME}.tar.gz"
-
-# ---- download ----
-if [[ -n "$RELEASE_VERSION" ]]; then
-    if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
-        echo "Invalid release version: ${RELEASE_VERSION}" >&2
+    # ---- preflight: tools and a writable install location, before any network ----
+    if command -v curl >/dev/null 2>&1; then
+        HTTP_TOOL="curl"
+    elif command -v wget >/dev/null 2>&1; then
+        HTTP_TOOL="wget"
+    else
+        echo "Error: curl is required to download releases (wget is accepted as a fallback);" >&2
+        echo "  neither was found on PATH. Install curl and rerun the installer." >&2
         exit 1
     fi
-    BASE_URL="https://github.com/${REPO}/releases/download/v${RELEASE_VERSION}"
-    RELEASE_LABEL="v${RELEASE_VERSION}"
-else
-    BASE_URL="https://github.com/${REPO}/releases/latest/download"
-    RELEASE_LABEL="latest"
-fi
-
-echo "Downloading ${BINARY_NAME} ${RELEASE_LABEL} (${ASSET_NAME})..."
-echo "  -> ${BASE_URL}/${ARCHIVE_FILE}"
-
-TMPDIR="$(mktemp -d)"
-trap 'rm -rf "$TMPDIR"' EXIT
-
-ARCHIVE_PATH="${TMPDIR}/${ARCHIVE_FILE}"
-MANIFEST="${TMPDIR}/SHA256SUMS"
-
-# Authenticated fallbacks for private or access-restricted releases. They run
-# only after the anonymous download fails or returns a non-release page, and
-# whatever they fetch goes through the same checksum verification below.
-#
-#   GITHUB_TOKEN                   sent as an Authorization header to the GitHub
-#                                  REST API (from a 0600 file, never in argv)
-#   gh                             `gh release download`, used only when gh is
-#                                  installed and `gh auth status` succeeds
-#   MINI_AGENT_INSTALL_NO_TOKEN=1  ignore GITHUB_TOKEN
-#   MINI_AGENT_INSTALL_NO_GH=1     never invoke gh
-API_BASE="https://api.github.com"
-if [[ -n "$RELEASE_VERSION" ]]; then
-    API_RELEASE_URL="${API_BASE}/repos/${REPO}/releases/tags/v${RELEASE_VERSION}"
-else
-    API_RELEASE_URL="${API_BASE}/repos/${REPO}/releases/latest"
-fi
-
-is_html() {
-    local prefix
-    prefix="$(head -c 512 "$1" | tr -d '\000' | tr '[:upper:]' '[:lower:]')"
-    [[ "$prefix" == *"<!doctype html"* || "$prefix" == *"<html"* ]]
-}
-
-clear_assets() {
-    rm -f "$ARCHIVE_PATH" "$MANIFEST"
-}
-
-# ---- reject non-release responses before checksum parsing ----
-#
-# A sign-in or error page served with HTTP 200 (for example when the release
-# is private or the request needs authentication) passes curl -f. Detect it
-# here so the failure names the real cause instead of a missing checksum.
-# Sets ASSET_WHAT and ASSET_PROBLEM and returns non-zero when the downloaded
-# files are not release assets.
-check_assets() {
-    ASSET_WHAT=""
-    ASSET_PROBLEM=""
-    if [[ ! -f "$ARCHIVE_PATH" ]]; then
-        ASSET_WHAT="archive ${ARCHIVE_FILE}"
-        ASSET_PROBLEM="missing"
-        return 1
+    if ! command -v tar >/dev/null 2>&1; then
+        echo "Error: tar is required to unpack the release archive but was not found on PATH." >&2
+        exit 1
     fi
-    local magic
-    magic="$(head -c 2 "$ARCHIVE_PATH" | od -An -tx1 | tr -d ' \n')"
-    if [[ "$magic" != "1f8b" ]]; then
-        ASSET_WHAT="archive ${ARCHIVE_FILE}"
-        if is_html "$ARCHIVE_PATH"; then
-            ASSET_PROBLEM="an HTML page"
-        else
-            ASSET_PROBLEM="data that is not gzip"
-        fi
-        return 1
+    if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
+        echo "Error: sha256sum or shasum is required to verify the archive but neither was found on PATH." >&2
+        exit 1
     fi
-    ASSET_WHAT="checksum manifest SHA256SUMS"
-    if [[ ! -f "$MANIFEST" ]]; then
-        ASSET_PROBLEM="missing"
-        return 1
-    fi
-    if is_html "$MANIFEST"; then
-        ASSET_PROBLEM="an HTML page"
-        return 1
-    fi
-    ASSET_WHAT=""
-    return 0
-}
 
-fetch_anonymous() {
-    if ! curl -fsSL --max-time 300 -o "$ARCHIVE_PATH" "${BASE_URL}/${ARCHIVE_FILE}"; then
-        rm -f "$ARCHIVE_PATH"
-        return 1
+    DOC_DIR_REQUESTED="$(doc_dir_for "$INSTALL_DIR")"
+    # Test write access without creating anything: a directory that exists must
+    # be writable, otherwise its nearest existing ancestor must be.
+    can_write_path() {
+        local probe="$1"
+        while [[ ! -e "$probe" ]]; do
+            local parent
+            parent="$(dirname "$probe")"
+            [[ "$parent" == "$probe" ]] && return 1
+            probe="$parent"
+        done
+        [[ -d "$probe" && -w "$probe" ]]
+    }
+    if ! can_write_path "$INSTALL_DIR" || ! can_write_path "$DOC_DIR_REQUESTED"; then
+        echo "Error: cannot create or write to ${INSTALL_DIR} (or ${DOC_DIR_REQUESTED})." >&2
+        echo "  Nothing was downloaded. Choose a writable directory with --dir <path>," >&2
+        echo "  or rerun with sudo (for example: curl -fsSL <url> | sudo bash -s -- --dir ${INSTALL_DIR})." >&2
+        exit 1
     fi
-    if ! curl -fsSL --max-time 60 -o "$MANIFEST" "${BASE_URL}/SHA256SUMS"; then
-        rm -f "$MANIFEST"
-        return 1
-    fi
-}
 
-# Print the REST API download URL of the named asset from a release JSON
-# document. Each asset object lists its "url" before its "name"; only URLs of
-# this repository's release assets are accepted, so the token is never sent to
-# any other endpoint.
-release_asset_url() {
-    local url
-    url="$(grep -oE '"(url|name)"[[:space:]]*:[[:space:]]*"[^"]*"' "$1" | awk -v target="$2" '
-        /^"url"/ {
-            url = $0
-            sub(/^"url"[[:space:]]*:[[:space:]]*"/, "", url)
-            sub(/"$/, "", url)
-            if (url !~ /\/releases\/assets\/[0-9]+$/) url = ""
-            next
-        }
-        /^"name"/ {
-            name = $0
-            sub(/^"name"[[:space:]]*:[[:space:]]*"/, "", name)
-            sub(/"$/, "", name)
-            if (name == target && url != "") { print url; exit }
-        }')"
-    if [[ "$url" != "${API_BASE}/repos/${REPO}/releases/assets/"* ]]; then
-        return 1
-    fi
-    printf '%s\n' "$url"
-}
+    ASSET_NAME="${BINARY_NAME}-${ARCH}-${OS}"
+    ARCHIVE_FILE="${ASSET_NAME}.tar.gz"
 
-fetch_with_token() {
-    local header="${TMPDIR}/.auth-header" meta="${TMPDIR}/.release.json"
-    local archive_url manifest_url status=1
-    # Keep the token out of argv (visible in ps) by handing curl a header file.
-    (umask 077 && printf 'Authorization: Bearer %s\n' "$GITHUB_TOKEN" > "$header")
-    if curl -fsSL --max-time 60 -H "@${header}" \
-        -H "Accept: application/vnd.github+json" \
-        -o "$meta" "$API_RELEASE_URL" \
-        && archive_url="$(release_asset_url "$meta" "$ARCHIVE_FILE")" \
-        && manifest_url="$(release_asset_url "$meta" SHA256SUMS)" \
-        && curl -fsSL --max-time 300 -H "@${header}" \
-            -H "Accept: application/octet-stream" \
-            -o "$ARCHIVE_PATH" "$archive_url" \
-        && curl -fsSL --max-time 60 -H "@${header}" \
-            -H "Accept: application/octet-stream" \
-            -o "$MANIFEST" "$manifest_url"; then
-        status=0
-    fi
-    rm -f "$header" "$meta"
-    return "$status"
-}
-
-gh_usable() {
-    [[ "${MINI_AGENT_INSTALL_NO_GH:-}" != "1" ]] \
-        && command -v gh >/dev/null 2>&1 \
-        && gh auth status >/dev/null 2>&1
-}
-
-fetch_with_gh() {
-    local dir="${TMPDIR}/gh-download"
-    rm -rf "$dir"
-    mkdir "$dir"
+    # ---- download ----
     if [[ -n "$RELEASE_VERSION" ]]; then
-        gh release download "v${RELEASE_VERSION}" --repo "$REPO" \
-            --pattern "$ARCHIVE_FILE" --pattern SHA256SUMS --dir "$dir" || return 1
-    else
-        gh release download --repo "$REPO" \
-            --pattern "$ARCHIVE_FILE" --pattern SHA256SUMS --dir "$dir" || return 1
-    fi
-    [[ -f "${dir}/${ARCHIVE_FILE}" && -f "${dir}/SHA256SUMS" ]] || return 1
-    mv -f "${dir}/${ARCHIVE_FILE}" "$ARCHIVE_PATH"
-    mv -f "${dir}/SHA256SUMS" "$MANIFEST"
-}
-
-download_error() {
-    local what="$1" problem="$2" tried="$3"
-    if [[ "$problem" == "missing" ]]; then
-        echo "Error: could not download the ${what}." >&2
-    else
-        echo "Error: the downloaded ${what} is not a release asset (received ${problem})." >&2
-    fi
-    echo "  URL: ${BASE_URL}" >&2
-    if [[ -n "$tried" ]]; then
-        echo "  Authenticated retries also failed:${tried}." >&2
-    fi
-    echo "  The release may not exist for this platform, or the repository may be" >&2
-    echo "  private and require authentication. For a private repository, set" >&2
-    echo "  GITHUB_TOKEN or sign in with 'gh auth login' and rerun the installer," >&2
-    echo "  or download the assets with an authenticated client, for example:" >&2
-    echo "    gh release download --repo ${REPO} --pattern '${ARCHIVE_FILE}' --pattern SHA256SUMS" >&2
-    exit 1
-}
-
-# ---- download, with authenticated fallbacks ----
-DOWNLOAD_SOURCE=""
-fetch_anonymous || true
-if check_assets; then
-    DOWNLOAD_SOURCE="anonymous"
-else
-    FIRST_WHAT="$ASSET_WHAT"
-    FIRST_PROBLEM="$ASSET_PROBLEM"
-    TRIED=""
-    if [[ -n "${GITHUB_TOKEN:-}" && "${MINI_AGENT_INSTALL_NO_TOKEN:-}" != "1" ]]; then
-        echo "Anonymous download failed; retrying with GITHUB_TOKEN..." >&2
-        clear_assets
-        if fetch_with_token && check_assets; then
-            DOWNLOAD_SOURCE="GITHUB_TOKEN"
-        else
-            TRIED="${TRIED} GITHUB_TOKEN"
+        if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release version: ${RELEASE_VERSION}" >&2
+            exit 1
         fi
-    fi
-    if [[ -z "$DOWNLOAD_SOURCE" ]] && gh_usable; then
-        echo "Retrying with the authenticated GitHub CLI (gh release download)..." >&2
-        clear_assets
-        if fetch_with_gh && check_assets; then
-            DOWNLOAD_SOURCE="gh"
-        else
-            TRIED="${TRIED} gh"
-        fi
-    fi
-    if [[ -z "$DOWNLOAD_SOURCE" ]]; then
-        download_error "$FIRST_WHAT" "$FIRST_PROBLEM" "$TRIED"
-    fi
-    echo "Downloaded release assets with ${DOWNLOAD_SOURCE}."
-fi
-
-# ---- verify checksum before extraction ----
-#
-# Parse the single line for this exact archive from the manifest.
-# Fail closed for: missing manifest, no entry, duplicate entries,
-# wrong filename, or hash mismatch. This applies equally to assets fetched
-# anonymously, with GITHUB_TOKEN, or with gh.
-
-if [[ ! -s "$MANIFEST" ]]; then
-    echo "Error: checksum manifest is missing or empty." >&2
-    exit 1
-fi
-
-# Match the filename as an exact whitespace-delimited field, not as a regular
-# expression. Dots and other punctuation in the platform name must stay
-# literal, and extra fields make the selected line non-canonical below.
-MATCH_COUNT=$(awk -v target="$ARCHIVE_FILE" '$2 == target { count++ } END { print count + 0 }' "$MANIFEST")
-if [[ "$MATCH_COUNT" -eq 0 ]]; then
-    echo "Error: SHA256SUMS has no entry for ${ARCHIVE_FILE}." >&2
-    exit 1
-fi
-if [[ "$MATCH_COUNT" -gt 1 ]]; then
-    echo "Error: SHA256SUMS has duplicate entries for ${ARCHIVE_FILE}." >&2
-    exit 1
-fi
-
-MATCH_LINE=$(awk -v target="$ARCHIVE_FILE" '$2 == target { print }' "$MANIFEST")
-EXPECTED_HASH=$(printf '%s\n' "$MATCH_LINE" | awk '{print $1}')
-
-# Validate hash is a 64-character hex string
-if [[ ! "$EXPECTED_HASH" =~ ^[0-9a-f]{64}$ ]]; then
-    echo "Error: SHA256SUMS contains a malformed hash for ${ARCHIVE_FILE}." >&2
-    exit 1
-fi
-if [[ "$MATCH_LINE" != "${EXPECTED_HASH}  ${ARCHIVE_FILE}" ]]; then
-    echo "Error: SHA256SUMS contains a malformed entry for ${ARCHIVE_FILE}." >&2
-    exit 1
-fi
-
-# Compute actual hash using an available SHA-256 implementation
-if command -v sha256sum >/dev/null 2>&1; then
-    ACTUAL_HASH=$(sha256sum "${TMPDIR}/${ARCHIVE_FILE}" | awk '{print $1}')
-elif command -v shasum >/dev/null 2>&1; then
-    ACTUAL_HASH=$(shasum -a 256 "${TMPDIR}/${ARCHIVE_FILE}" | awk '{print $1}')
-else
-    echo "Error: no sha256sum or shasum found; cannot verify archive." >&2
-    exit 1
-fi
-
-if [[ "$ACTUAL_HASH" != "$EXPECTED_HASH" ]]; then
-    echo "Error: checksum mismatch for ${ARCHIVE_FILE}." >&2
-    echo "  Expected: ${EXPECTED_HASH}" >&2
-    echo "  Actual:   ${ACTUAL_HASH}" >&2
-    exit 1
-fi
-
-# ---- verify build provenance before extraction ----
-#
-# SHA256SUMS comes from the same origin as the archive, so the checksum above
-# detects a corrupted or truncated download but not a replaced release. The
-# release workflow signs SLSA build provenance for every asset; when an
-# authenticated GitHub CLI is available, require that attestation to verify
-# against this repository. A missing, unauthenticated, or too-old gh is a
-# warning with the manual command, never a silent pass: only a failed
-# verification aborts.
-#
-#   MINI_AGENT_SKIP_ATTESTATION=1  skip provenance verification
-#   MINI_AGENT_INSTALL_NO_GH=1     never invoke gh (also skips verification)
-attestation_manual_hint() {
-    echo "  Verify it yourself with the GitHub CLI (https://cli.github.com):" >&2
-    echo "    gh attestation verify ${ARCHIVE_FILE} --repo ${REPO} ${ATTESTATION_PIN[*]}" >&2
-}
-
-# Pin the attestation to the release workflow (not any workflow in the repo)
-# and, when a version was requested, to its tag. For "latest" the tag is not
-# known before the archive is opened, so the signing identity is matched to the
-# release workflow at any v* tag instead.
-if [[ -n "$RELEASE_VERSION" ]]; then
-    ATTESTATION_PIN=(--signer-workflow "${REPO}/.github/workflows/release.yml" \
-        --source-ref "refs/tags/v${RELEASE_VERSION}")
-else
-    ATTESTATION_PIN=(--cert-identity-regex \
-        "^https://github\\.com/${REPO//./\\.}/\\.github/workflows/release\\.yml@refs/tags/v[0-9]")
-fi
-
-verify_attestation() {
-    if [[ "${MINI_AGENT_SKIP_ATTESTATION:-}" == "1" ]]; then
-        echo "Warning: skipping build provenance verification (MINI_AGENT_SKIP_ATTESTATION=1)." >&2
-        attestation_manual_hint
-        return 0
-    fi
-    local reason=""
-    if [[ "${MINI_AGENT_INSTALL_NO_GH:-}" == "1" ]]; then
-        reason="MINI_AGENT_INSTALL_NO_GH=1 disables the GitHub CLI"
-    elif ! command -v gh >/dev/null 2>&1; then
-        reason="the GitHub CLI ('gh') is not installed"
-    elif ! gh auth status >/dev/null 2>&1; then
-        reason="the GitHub CLI is not signed in (run 'gh auth login')"
+        BASE_URL="https://github.com/${REPO}/releases/download/v${RELEASE_VERSION}"
+        RELEASE_LABEL="v${RELEASE_VERSION}"
     else
-        # Probe the help text for the exact pin flags used below, so an older
-        # gh that has the subcommand but not these flags is "unavailable"
-        # (upgrade gh) instead of a failed verification.
-        local help_text flag
-        if ! help_text="$(gh attestation verify --help 2>&1)"; then
-            reason="this GitHub CLI does not support 'gh attestation verify'; upgrade gh"
-        else
-            for flag in "${ATTESTATION_PIN[@]}"; do
-                if [[ "$flag" == --* && "$help_text" != *"$flag"* ]]; then
-                    reason="this GitHub CLI's 'gh attestation verify' lacks ${flag}; upgrade gh"
-                    break
-                fi
-            done
+        BASE_URL="https://github.com/${REPO}/releases/latest/download"
+        RELEASE_LABEL="latest"
+    fi
+
+    echo "Downloading ${BINARY_NAME} ${RELEASE_LABEL} (${ASSET_NAME})..."
+    echo "  -> ${BASE_URL}/${ARCHIVE_FILE}"
+
+    TMPDIR="$(mktemp -d)"
+    trap 'rm -rf "$TMPDIR"' EXIT
+
+    ARCHIVE_PATH="${TMPDIR}/${ARCHIVE_FILE}"
+    MANIFEST="${TMPDIR}/SHA256SUMS"
+
+    # Authenticated fallbacks for private or access-restricted releases. They run
+    # only after the anonymous download fails or returns a non-release page, and
+    # whatever they fetch goes through the same checksum verification below.
+    #
+    #   GITHUB_TOKEN                   sent as an Authorization header to the GitHub
+    #                                  REST API (from a 0600 file, never in argv)
+    #   gh                             `gh release download`, used only when gh is
+    #                                  installed and `gh auth status` succeeds
+    #   MINI_AGENT_INSTALL_NO_TOKEN=1  ignore GITHUB_TOKEN
+    #   MINI_AGENT_INSTALL_NO_GH=1     never invoke gh
+    API_BASE="https://api.github.com"
+    if [[ -n "$RELEASE_VERSION" ]]; then
+        API_RELEASE_URL="${API_BASE}/repos/${REPO}/releases/tags/v${RELEASE_VERSION}"
+    else
+        API_RELEASE_URL="${API_BASE}/repos/${REPO}/releases/latest"
+    fi
+
+    is_html() {
+        local prefix
+        prefix="$(head -c 512 "$1" | tr -d '\000' | tr '[:upper:]' '[:lower:]')"
+        [[ "$prefix" == *"<!doctype html"* || "$prefix" == *"<html"* ]]
+    }
+
+    clear_assets() {
+        rm -f "$ARCHIVE_PATH" "$MANIFEST"
+    }
+
+    # ---- reject non-release responses before checksum parsing ----
+    #
+    # A sign-in or error page served with HTTP 200 (for example when the release
+    # is private or the request needs authentication) passes curl -f. Detect it
+    # here so the failure names the real cause instead of a missing checksum.
+    # Sets ASSET_WHAT and ASSET_PROBLEM and returns non-zero when the downloaded
+    # files are not release assets.
+    check_assets() {
+        ASSET_WHAT=""
+        ASSET_PROBLEM=""
+        if [[ ! -f "$ARCHIVE_PATH" ]]; then
+            ASSET_WHAT="archive ${ARCHIVE_FILE}"
+            ASSET_PROBLEM="missing"
+            return 1
         fi
-    fi
-    if [[ -n "$reason" ]]; then
-        echo "Warning: build provenance was not verified: ${reason}." >&2
-        echo "  The archive matched SHA256SUMS, which is served from the same release;" >&2
-        echo "  that detects a damaged download, not a replaced release." >&2
-        attestation_manual_hint
+        local magic
+        magic="$(head -c 2 "$ARCHIVE_PATH" | od -An -tx1 | tr -d ' \n')"
+        if [[ "$magic" != "1f8b" ]]; then
+            ASSET_WHAT="archive ${ARCHIVE_FILE}"
+            if is_html "$ARCHIVE_PATH"; then
+                ASSET_PROBLEM="an HTML page"
+            else
+                ASSET_PROBLEM="data that is not gzip"
+            fi
+            return 1
+        fi
+        ASSET_WHAT="checksum manifest SHA256SUMS"
+        if [[ ! -f "$MANIFEST" ]]; then
+            ASSET_PROBLEM="missing"
+            return 1
+        fi
+        if is_html "$MANIFEST"; then
+            ASSET_PROBLEM="an HTML page"
+            return 1
+        fi
+        ASSET_WHAT=""
         return 0
+    }
+
+    # Anonymous GET of $1 into $2 with a $3-second limit, via curl or wget.
+    http_get() {
+        if [[ "$HTTP_TOOL" == "curl" ]]; then
+            curl -fsSL --max-time "$3" -o "$2" "$1"
+        else
+            wget -q -T "$3" -O "$2" "$1"
+        fi
+    }
+
+    fetch_anonymous() {
+        if ! http_get "${BASE_URL}/${ARCHIVE_FILE}" "$ARCHIVE_PATH" 300; then
+            rm -f "$ARCHIVE_PATH"
+            return 1
+        fi
+        if ! http_get "${BASE_URL}/SHA256SUMS" "$MANIFEST" 60; then
+            rm -f "$MANIFEST"
+            return 1
+        fi
+    }
+
+    # Print the REST API download URL of the named asset from a release JSON
+    # document. Each asset object lists its "url" before its "name"; only URLs of
+    # this repository's release assets are accepted, so the token is never sent to
+    # any other endpoint.
+    release_asset_url() {
+        local url
+        url="$(grep -oE '"(url|name)"[[:space:]]*:[[:space:]]*"[^"]*"' "$1" | awk -v target="$2" '
+            /^"url"/ {
+                url = $0
+                sub(/^"url"[[:space:]]*:[[:space:]]*"/, "", url)
+                sub(/"$/, "", url)
+                if (url !~ /\/releases\/assets\/[0-9]+$/) url = ""
+                next
+            }
+            /^"name"/ {
+                name = $0
+                sub(/^"name"[[:space:]]*:[[:space:]]*"/, "", name)
+                sub(/"$/, "", name)
+                if (name == target && url != "") { print url; exit }
+            }')"
+        if [[ "$url" != "${API_BASE}/repos/${REPO}/releases/assets/"* ]]; then
+            return 1
+        fi
+        printf '%s\n' "$url"
+    }
+
+    fetch_with_token() {
+        [[ "$HTTP_TOOL" == "curl" ]] || return 1
+        local header="${TMPDIR}/.auth-header" meta="${TMPDIR}/.release.json"
+        local archive_url manifest_url status=1
+        # Keep the token out of argv (visible in ps) by handing curl a header file.
+        (umask 077 && printf 'Authorization: Bearer %s\n' "$GITHUB_TOKEN" > "$header")
+        if curl -fsSL --max-time 60 -H "@${header}" \
+            -H "Accept: application/vnd.github+json" \
+            -o "$meta" "$API_RELEASE_URL" \
+            && archive_url="$(release_asset_url "$meta" "$ARCHIVE_FILE")" \
+            && manifest_url="$(release_asset_url "$meta" SHA256SUMS)" \
+            && curl -fsSL --max-time 300 -H "@${header}" \
+                -H "Accept: application/octet-stream" \
+                -o "$ARCHIVE_PATH" "$archive_url" \
+            && curl -fsSL --max-time 60 -H "@${header}" \
+                -H "Accept: application/octet-stream" \
+                -o "$MANIFEST" "$manifest_url"; then
+            status=0
+        fi
+        rm -f "$header" "$meta"
+        return "$status"
+    }
+
+    gh_usable() {
+        [[ "${MINI_AGENT_INSTALL_NO_GH:-}" != "1" ]] \
+            && command -v gh >/dev/null 2>&1 \
+            && gh auth status >/dev/null 2>&1
+    }
+
+    fetch_with_gh() {
+        local dir="${TMPDIR}/gh-download"
+        rm -rf "$dir"
+        mkdir "$dir"
+        if [[ -n "$RELEASE_VERSION" ]]; then
+            gh release download "v${RELEASE_VERSION}" --repo "$REPO" \
+                --pattern "$ARCHIVE_FILE" --pattern SHA256SUMS --dir "$dir" || return 1
+        else
+            gh release download --repo "$REPO" \
+                --pattern "$ARCHIVE_FILE" --pattern SHA256SUMS --dir "$dir" || return 1
+        fi
+        [[ -f "${dir}/${ARCHIVE_FILE}" && -f "${dir}/SHA256SUMS" ]] || return 1
+        mv -f "${dir}/${ARCHIVE_FILE}" "$ARCHIVE_PATH"
+        mv -f "${dir}/SHA256SUMS" "$MANIFEST"
+    }
+
+    download_error() {
+        local what="$1" problem="$2" tried="$3"
+        if [[ "$problem" == "missing" ]]; then
+            echo "Error: could not download the ${what}." >&2
+        else
+            echo "Error: the downloaded ${what} is not a release asset (received ${problem})." >&2
+        fi
+        echo "  URL: ${BASE_URL}" >&2
+        if [[ -n "$tried" ]]; then
+            echo "  Authenticated retries also failed:${tried}." >&2
+        fi
+        echo "  The release may not exist for this platform, or the repository may be" >&2
+        echo "  private and require authentication. For a private repository, set" >&2
+        echo "  GITHUB_TOKEN or sign in with 'gh auth login' and rerun the installer," >&2
+        echo "  or download the assets with an authenticated client, for example:" >&2
+        echo "    gh release download --repo ${REPO} --pattern '${ARCHIVE_FILE}' --pattern SHA256SUMS" >&2
+        exit 1
+    }
+
+    # ---- download, with authenticated fallbacks ----
+    DOWNLOAD_SOURCE=""
+    fetch_anonymous || true
+    if check_assets; then
+        DOWNLOAD_SOURCE="anonymous"
+    else
+        FIRST_WHAT="$ASSET_WHAT"
+        FIRST_PROBLEM="$ASSET_PROBLEM"
+        TRIED=""
+        if [[ -n "${GITHUB_TOKEN:-}" && "${MINI_AGENT_INSTALL_NO_TOKEN:-}" != "1" ]]; then
+            echo "Anonymous download failed; retrying with GITHUB_TOKEN..." >&2
+            clear_assets
+            if fetch_with_token && check_assets; then
+                DOWNLOAD_SOURCE="GITHUB_TOKEN"
+            else
+                TRIED="${TRIED} GITHUB_TOKEN"
+            fi
+        fi
+        if [[ -z "$DOWNLOAD_SOURCE" ]] && gh_usable; then
+            echo "Retrying with the authenticated GitHub CLI (gh release download)..." >&2
+            clear_assets
+            if fetch_with_gh && check_assets; then
+                DOWNLOAD_SOURCE="gh"
+            else
+                TRIED="${TRIED} gh"
+            fi
+        fi
+        if [[ -z "$DOWNLOAD_SOURCE" ]]; then
+            download_error "$FIRST_WHAT" "$FIRST_PROBLEM" "$TRIED"
+        fi
+        echo "Downloaded release assets with ${DOWNLOAD_SOURCE}."
     fi
-    local log="${TMPDIR}/.attestation.log"
-    if gh attestation verify "$ARCHIVE_PATH" --repo "$REPO" "${ATTESTATION_PIN[@]}" >"$log" 2>&1; then
-        echo "Verified build provenance for ${ARCHIVE_FILE} (gh attestation verify --repo ${REPO}, pinned to the release workflow)."
-        return 0
+
+    # ---- verify checksum before extraction ----
+    #
+    # Parse the single line for this exact archive from the manifest.
+    # Fail closed for: missing manifest, no entry, duplicate entries,
+    # wrong filename, or hash mismatch. This applies equally to assets fetched
+    # anonymously, with GITHUB_TOKEN, or with gh.
+
+    if [[ ! -s "$MANIFEST" ]]; then
+        echo "Error: checksum manifest is missing or empty." >&2
+        exit 1
     fi
-    echo "Error: build provenance verification failed for ${ARCHIVE_FILE}." >&2
-    echo "  'gh attestation verify --repo ${REPO} ${ATTESTATION_PIN[*]}' did not accept the archive:" >&2
-    sed 's/^/    /' "$log" >&2
-    echo "  Nothing was installed. To install without provenance verification anyway," >&2
-    echo "  rerun with MINI_AGENT_SKIP_ATTESTATION=1." >&2
-    exit 1
-}
 
-verify_attestation
-
-# ---- install ----
-mkdir -p "$INSTALL_DIR"
-# Use an absolute path without a trailing slash for the PATH checks below.
-INSTALL_DIR="$(cd "$INSTALL_DIR" && pwd)"
-
-tar xzf "${TMPDIR}/${ARCHIVE_FILE}" -C "$TMPDIR"
-
-if [[ ! -f "${TMPDIR}/${BINARY_NAME}" ]]; then
-    echo "Error: archive does not contain the canonical ${BINARY_NAME} executable." >&2
-    exit 1
-fi
-# Succeeds only when version $1 (major.minor.patch; a pre-release or build
-# suffix is ignored) is a well-formed version strictly older than $2. An
-# unparseable version is never treated as older.
-version_predates() {
-    local have want i
-    have="${1%%[-+]*}"
-    want="$2"
-    [[ "$have" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
-    IFS=. read -r -a have <<< "$have"
-    IFS=. read -r -a want <<< "$want"
-    for i in 0 1 2; do
-        if ((10#${have[i]} < 10#${want[i]})); then return 0; fi
-        if ((10#${have[i]} > 10#${want[i]})); then return 1; fi
-    done
-    return 1
-}
-
-# The release version of the verified archive: the requested --release, or
-# for "latest" the version the verified executable reports. Empty when it
-# cannot be determined, in which case every document stays required.
-ARCHIVE_VERSION="$RELEASE_VERSION"
-if [[ -z "$ARCHIVE_VERSION" ]]; then
-    ARCHIVE_VERSION="$("${TMPDIR}/${BINARY_NAME}" --version 2>/dev/null \
-        | sed -n "s/^${BINARY_NAME} \([0-9][0-9A-Za-z.+-]*\)\$/\1/p" | head -1 || true)"
-fi
-
-INSTALL_DOCUMENTS=()
-for document in "${REQUIRED_DOCUMENTS[@]}"; do
-    if [[ -f "${TMPDIR}/${document}" ]]; then
-        INSTALL_DOCUMENTS+=("$document")
-        continue
+    # Match the filename as an exact whitespace-delimited field, not as a regular
+    # expression. Dots and other punctuation in the platform name must stay
+    # literal, and extra fields make the selected line non-canonical below.
+    MATCH_COUNT=$(awk -v target="$ARCHIVE_FILE" '$2 == target { count++ } END { print count + 0 }' "$MANIFEST")
+    if [[ "$MATCH_COUNT" -eq 0 ]]; then
+        echo "Error: SHA256SUMS has no entry for ${ARCHIVE_FILE}." >&2
+        exit 1
     fi
-    if [[ "$document" == "$INVENTORY_DOCUMENT" ]]; then
-        if version_predates "$ARCHIVE_VERSION" "$FIRST_INVENTORY_RELEASE"; then
-            echo "Warning: ${BINARY_NAME} ${ARCHIVE_VERSION} does not include ${document}:" \
-                "this release predates the bundled third-party licence inventory" \
-                "(first shipped in ${FIRST_INVENTORY_RELEASE})." >&2
+    if [[ "$MATCH_COUNT" -gt 1 ]]; then
+        echo "Error: SHA256SUMS has duplicate entries for ${ARCHIVE_FILE}." >&2
+        exit 1
+    fi
+
+    MATCH_LINE=$(awk -v target="$ARCHIVE_FILE" '$2 == target { print }' "$MANIFEST")
+    EXPECTED_HASH=$(printf '%s\n' "$MATCH_LINE" | awk '{print $1}')
+
+    # Validate hash is a 64-character hex string
+    if [[ ! "$EXPECTED_HASH" =~ ^[0-9a-f]{64}$ ]]; then
+        echo "Error: SHA256SUMS contains a malformed hash for ${ARCHIVE_FILE}." >&2
+        exit 1
+    fi
+    if [[ "$MATCH_LINE" != "${EXPECTED_HASH}  ${ARCHIVE_FILE}" ]]; then
+        echo "Error: SHA256SUMS contains a malformed entry for ${ARCHIVE_FILE}." >&2
+        exit 1
+    fi
+
+    # Compute actual hash using an available SHA-256 implementation
+    if command -v sha256sum >/dev/null 2>&1; then
+        ACTUAL_HASH=$(sha256sum "${TMPDIR}/${ARCHIVE_FILE}" | awk '{print $1}')
+    elif command -v shasum >/dev/null 2>&1; then
+        ACTUAL_HASH=$(shasum -a 256 "${TMPDIR}/${ARCHIVE_FILE}" | awk '{print $1}')
+    else
+        echo "Error: no sha256sum or shasum found; cannot verify archive." >&2
+        exit 1
+    fi
+
+    if [[ "$ACTUAL_HASH" != "$EXPECTED_HASH" ]]; then
+        echo "Error: checksum mismatch for ${ARCHIVE_FILE}." >&2
+        echo "  Expected: ${EXPECTED_HASH}" >&2
+        echo "  Actual:   ${ACTUAL_HASH}" >&2
+        exit 1
+    fi
+
+    # ---- verify build provenance before extraction ----
+    #
+    # SHA256SUMS comes from the same origin as the archive, so the checksum above
+    # detects a corrupted or truncated download but not a replaced release. The
+    # release workflow signs SLSA build provenance for every asset; when an
+    # authenticated GitHub CLI is available, require that attestation to verify
+    # against this repository. A missing, unauthenticated, or too-old gh is a
+    # warning with the manual command, never a silent pass: only a failed
+    # verification aborts.
+    #
+    #   MINI_AGENT_SKIP_ATTESTATION=1  skip provenance verification
+    #   MINI_AGENT_INSTALL_NO_GH=1     never invoke gh (also skips verification)
+    attestation_manual_hint() {
+        echo "  Verify it yourself with the GitHub CLI (https://cli.github.com):" >&2
+        echo "    gh attestation verify ${ARCHIVE_FILE} --repo ${REPO} ${ATTESTATION_PIN[*]}" >&2
+    }
+
+    # Pin the attestation to the release workflow (not any workflow in the repo)
+    # and, when a version was requested, to its tag. For "latest" the tag is not
+    # known before the archive is opened, so the signing identity is matched to the
+    # release workflow at any v* tag instead.
+    if [[ -n "$RELEASE_VERSION" ]]; then
+        ATTESTATION_PIN=(--signer-workflow "${REPO}/.github/workflows/release.yml" \
+            --source-ref "refs/tags/v${RELEASE_VERSION}")
+    else
+        ATTESTATION_PIN=(--cert-identity-regex \
+            "^https://github\\.com/${REPO//./\\.}/\\.github/workflows/release\\.yml@refs/tags/v[0-9]")
+    fi
+
+    verify_attestation() {
+        if [[ "${MINI_AGENT_SKIP_ATTESTATION:-}" == "1" ]]; then
+            echo "Warning: skipping build provenance verification (MINI_AGENT_SKIP_ATTESTATION=1)." >&2
+            attestation_manual_hint
+            return 0
+        fi
+        local reason=""
+        if [[ "${MINI_AGENT_INSTALL_NO_GH:-}" == "1" ]]; then
+            reason="MINI_AGENT_INSTALL_NO_GH=1 disables the GitHub CLI"
+        elif ! command -v gh >/dev/null 2>&1; then
+            reason="the GitHub CLI ('gh') is not installed"
+        elif ! gh auth status >/dev/null 2>&1; then
+            reason="the GitHub CLI is not signed in (run 'gh auth login')"
+        else
+            # Probe the help text for the exact pin flags used below, so an older
+            # gh that has the subcommand but not these flags is "unavailable"
+            # (upgrade gh) instead of a failed verification.
+            local help_text flag
+            if ! help_text="$(gh attestation verify --help 2>&1)"; then
+                reason="this GitHub CLI does not support 'gh attestation verify'; upgrade gh"
+            else
+                for flag in "${ATTESTATION_PIN[@]}"; do
+                    if [[ "$flag" == --* && "$help_text" != *"$flag"* ]]; then
+                        reason="this GitHub CLI's 'gh attestation verify' lacks ${flag}; upgrade gh"
+                        break
+                    fi
+                done
+            fi
+        fi
+        if [[ -n "$reason" ]]; then
+            echo "Warning: build provenance was not verified: ${reason}." >&2
+            echo "  The archive matched SHA256SUMS, which is served from the same release;" >&2
+            echo "  that detects a damaged download, not a replaced release." >&2
+            attestation_manual_hint
+            return 0
+        fi
+        local log="${TMPDIR}/.attestation.log"
+        if gh attestation verify "$ARCHIVE_PATH" --repo "$REPO" "${ATTESTATION_PIN[@]}" >"$log" 2>&1; then
+            echo "Verified build provenance for ${ARCHIVE_FILE} (gh attestation verify --repo ${REPO}, pinned to the release workflow)."
+            return 0
+        fi
+        echo "Error: build provenance verification failed for ${ARCHIVE_FILE}." >&2
+        echo "  'gh attestation verify --repo ${REPO} ${ATTESTATION_PIN[*]}' did not accept the archive:" >&2
+        sed 's/^/    /' "$log" >&2
+        echo "  Nothing was installed. To install without provenance verification anyway," >&2
+        echo "  rerun with MINI_AGENT_SKIP_ATTESTATION=1." >&2
+        exit 1
+    }
+
+    verify_attestation
+
+    # ---- install ----
+    mkdir -p "$INSTALL_DIR"
+    # Use an absolute path without a trailing slash for the PATH checks below.
+    INSTALL_DIR="$(cd "$INSTALL_DIR" && pwd)"
+
+    tar xzf "${TMPDIR}/${ARCHIVE_FILE}" -C "$TMPDIR"
+
+    if [[ ! -f "${TMPDIR}/${BINARY_NAME}" ]]; then
+        echo "Error: archive does not contain the canonical ${BINARY_NAME} executable." >&2
+        exit 1
+    fi
+    # Succeeds only when version $1 (major.minor.patch; a pre-release or build
+    # suffix is ignored) is a well-formed version strictly older than $2. An
+    # unparseable version is never treated as older.
+    version_predates() {
+        local have want i
+        have="${1%%[-+]*}"
+        want="$2"
+        [[ "$have" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+        IFS=. read -r -a have <<< "$have"
+        IFS=. read -r -a want <<< "$want"
+        for i in 0 1 2; do
+            if ((10#${have[i]} < 10#${want[i]})); then return 0; fi
+            if ((10#${have[i]} > 10#${want[i]})); then return 1; fi
+        done
+        return 1
+    }
+
+    # The release version of the verified archive: the requested --release, or
+    # for "latest" the version the verified executable reports. Empty when it
+    # cannot be determined, in which case every document stays required.
+    ARCHIVE_VERSION="$RELEASE_VERSION"
+    if [[ -z "$ARCHIVE_VERSION" ]]; then
+        ARCHIVE_VERSION="$("${TMPDIR}/${BINARY_NAME}" --version 2>/dev/null \
+            | sed -n "s/^${BINARY_NAME} \([0-9][0-9A-Za-z.+-]*\)\$/\1/p" | head -1 || true)"
+    fi
+
+    INSTALL_DOCUMENTS=()
+    for document in "${REQUIRED_DOCUMENTS[@]}"; do
+        if [[ -f "${TMPDIR}/${document}" ]]; then
+            INSTALL_DOCUMENTS+=("$document")
             continue
         fi
-        echo "Error: archive does not contain the required third-party licence inventory ${document}." >&2
+        if [[ "$document" == "$INVENTORY_DOCUMENT" ]]; then
+            if version_predates "$ARCHIVE_VERSION" "$FIRST_INVENTORY_RELEASE"; then
+                echo "Warning: ${BINARY_NAME} ${ARCHIVE_VERSION} does not include ${document}:" \
+                    "this release predates the bundled third-party licence inventory" \
+                    "(first shipped in ${FIRST_INVENTORY_RELEASE})." >&2
+                continue
+            fi
+            echo "Error: archive does not contain the required third-party licence inventory ${document}." >&2
+            exit 1
+        fi
+        echo "Error: archive does not contain required GPL document ${document}." >&2
         exit 1
-    fi
-    echo "Error: archive does not contain required GPL document ${document}." >&2
-    exit 1
-done
-
-if [[ "$(basename "$INSTALL_DIR")" == "bin" ]]; then
-    DOC_DIR="$(dirname "$INSTALL_DIR")/share/doc/${BINARY_NAME}"
-else
-    DOC_DIR="${INSTALL_DIR}/share/doc/${BINARY_NAME}"
-fi
-mkdir -p "$DOC_DIR"
-for document in "${INSTALL_DOCUMENTS[@]}"; do
-    cp "${TMPDIR}/${document}" "${DOC_DIR}/${document}"
-done
-
-# Stage the new binary beside the target and rename it into place. Writing
-# over the existing file would reuse its inode: Linux refuses that while a
-# session is running (ETXTBSY), macOS kills a rewritten signed executable, and
-# an interrupted copy would leave a truncated binary. A rename replaces the
-# directory entry atomically and leaves running processes on the old inode.
-TARGET="${INSTALL_DIR}/${BINARY_NAME}"
-STAGED="${INSTALL_DIR}/.${BINARY_NAME}.tmp.$$"
-trap 'rm -rf "$TMPDIR"; rm -f "$STAGED"' EXIT
-cp "${TMPDIR}/${BINARY_NAME}" "$STAGED"
-chmod +x "$STAGED"
-mv -f "$STAGED" "$TARGET"
-
-echo "Installed ${BINARY_NAME} to ${TARGET}"
-echo "Installed license and source notices to ${DOC_DIR}"
-
-# ---- Linux sandbox prerequisite ----
-# bubblewrap backs the default Linux subprocess sandbox and the JS runtime but
-# is not bundled. Only warn: the binary itself runs without it.
-if [[ "$OS" == "unknown-linux-musl" ]] && ! command -v bwrap >/dev/null 2>&1; then
-    echo
-    echo "Warning: bubblewrap ('bwrap') was not found on your PATH."
-    echo "  ${BINARY_NAME} uses it for the default Linux sandbox and the JS runtime;"
-    echo "  without it the sandbox cannot be enforced and the js tool is unavailable."
-    echo "  Install it with your package manager, for example:"
-    echo "    sudo apt install bubblewrap"
-    echo "  On Ubuntu 23.10+/24.04, AppArmor must also allow bwrap's user namespaces; see"
-    echo "  https://github.com/${REPO}#linux-prerequisites"
-fi
-
-# ---- path hint ----
-INSTALL_DIR_ON_PATH=0
-IFS=':' read -r -a PATH_ENTRIES <<< "$PATH"
-for entry in "${PATH_ENTRIES[@]}"; do
-    # Compare whole entries, ignoring a trailing slash, so /usr/local/bin2
-    # does not count as /usr/local/bin.
-    while [[ "$entry" == */ && "$entry" != "/" ]]; do
-        entry="${entry%/}"
     done
-    if [[ "$entry" == "$INSTALL_DIR" ]]; then
-        INSTALL_DIR_ON_PATH=1
-        break
-    fi
-done
 
-if [[ "$INSTALL_DIR_ON_PATH" -eq 0 ]]; then
-    echo
-    echo "Note: ${INSTALL_DIR} is not in your PATH."
-    echo "Add it with:"
-    echo "  export PATH=\"${INSTALL_DIR}:\$PATH\""
-    echo
-    echo "To make it permanent, add that line to your shell rc file (~/.bashrc, ~/.zshrc, etc.)."
-else
-    RESOLVED="$(command -v "$BINARY_NAME" 2>/dev/null || true)"
-    if [[ -n "$RESOLVED" && "$RESOLVED" != "$TARGET" ]]; then
+    DOC_DIR="$(doc_dir_for "$INSTALL_DIR")"
+    mkdir -p "$DOC_DIR"
+    for document in "${INSTALL_DOCUMENTS[@]}"; do
+        cp "${TMPDIR}/${document}" "${DOC_DIR}/${document}"
+    done
+
+    # Stage the new binary beside the target and rename it into place. Writing
+    # over the existing file would reuse its inode: Linux refuses that while a
+    # session is running (ETXTBSY), macOS kills a rewritten signed executable, and
+    # an interrupted copy would leave a truncated binary. A rename replaces the
+    # directory entry atomically and leaves running processes on the old inode.
+    TARGET="${INSTALL_DIR}/${BINARY_NAME}"
+    STAGED="${INSTALL_DIR}/.${BINARY_NAME}.tmp.$$"
+    trap 'rm -rf "$TMPDIR"; rm -f "$STAGED"' EXIT
+    cp "${TMPDIR}/${BINARY_NAME}" "$STAGED"
+    chmod +x "$STAGED"
+    mv -f "$STAGED" "$TARGET"
+
+    echo "Installed ${BINARY_NAME} to ${TARGET}"
+    echo "Installed license and source notices to ${DOC_DIR}"
+
+    # ---- Linux sandbox prerequisite ----
+    # bubblewrap backs the default Linux subprocess sandbox and the JS runtime but
+    # is not bundled. Only warn: the binary itself runs without it.
+    if [[ "$OS" == "unknown-linux-musl" ]] && ! command -v bwrap >/dev/null 2>&1; then
         echo
-        echo "Warning: '${BINARY_NAME}' on your PATH resolves to a different binary."
-        echo "  Resolves to: ${RESOLVED}"
-        echo "  Installed:   ${TARGET}"
-        echo "Move ${INSTALL_DIR} earlier in PATH (or remove the other binary), then run"
-        echo "'hash -r' or open a new shell."
+        echo "Warning: bubblewrap ('bwrap') was not found on your PATH."
+        echo "  ${BINARY_NAME} uses it for the default Linux sandbox and the JS runtime;"
+        echo "  without it the sandbox cannot be enforced and the js tool is unavailable."
+        echo "  Install it with your package manager, for example:"
+        echo "    sudo apt install bubblewrap"
+        echo "  On Ubuntu 23.10+/24.04, AppArmor must also allow bwrap's user namespaces; see"
+        echo "  https://github.com/${REPO}#linux-prerequisites"
     fi
-fi
 
-echo "Shell completions: mini-agent --completions <shell> (bash, zsh, fish, powershell)"
+    # ---- path hint ----
+    INSTALL_DIR_ON_PATH=0
+    IFS=':' read -r -a PATH_ENTRIES <<< "$PATH"
+    for entry in "${PATH_ENTRIES[@]}"; do
+        # Compare whole entries, ignoring a trailing slash, so /usr/local/bin2
+        # does not count as /usr/local/bin.
+        while [[ "$entry" == */ && "$entry" != "/" ]]; do
+            entry="${entry%/}"
+        done
+        if [[ "$entry" == "$INSTALL_DIR" ]]; then
+            INSTALL_DIR_ON_PATH=1
+            break
+        fi
+    done
+
+    if [[ "$INSTALL_DIR_ON_PATH" -eq 0 ]]; then
+        echo
+        echo "Note: ${INSTALL_DIR} is not in your PATH."
+        echo "Add it with:"
+        echo "  export PATH=\"${INSTALL_DIR}:\$PATH\""
+        echo
+        echo "To make it permanent, add that line to your shell rc file (~/.bashrc, ~/.zshrc, etc.)."
+    else
+        RESOLVED="$(command -v "$BINARY_NAME" 2>/dev/null || true)"
+        if [[ -n "$RESOLVED" && "$RESOLVED" != "$TARGET" ]]; then
+            echo
+            echo "Warning: '${BINARY_NAME}' on your PATH resolves to a different binary."
+            echo "  Resolves to: ${RESOLVED}"
+            echo "  Installed:   ${TARGET}"
+            echo "Move ${INSTALL_DIR} earlier in PATH (or remove the other binary), then run"
+            echo "'hash -r' or open a new shell."
+        fi
+    fi
+
+    echo "Shell completions: mini-agent --completions <shell> (bash, zsh, fish, powershell)"
+}
+
+main "$@"

@@ -21,6 +21,19 @@ def extract_function(source: str, name: str, next_name: str) -> str:
 
 
 class LoopLifecycleTests(unittest.TestCase):
+    def test_workflow_only_changes_are_relevant_to_headless_verification(self) -> None:
+        # Formerly the shipped --loop-verification-policy-check flag.
+        harness = (
+            VERIFICATION_POLICY.read_text()
+            + "\npath_is_relevant_for_profile .github/workflows/ci.yml headless rust\n"
+            + "path_is_relevant_for_profile .github/workflows/ci.yaml headless rust\n"
+            + "! path_is_relevant_for_profile docs/architecture.md headless rust\n"
+        )
+        result = subprocess.run(
+            ["bash", "-c", harness], capture_output=True, text=True, check=False
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+
     def test_production_verifier_never_selects_the_research_spike(self) -> None:
         source = LOOP_SCRIPT.read_text()
 

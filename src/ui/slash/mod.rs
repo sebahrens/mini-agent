@@ -1496,6 +1496,15 @@ pub(crate) async fn handle_slash(
 }
 
 /// The one message for a command whose Cargo feature is not compiled in.
+#[cfg(any(
+    test,
+    not(feature = "advisor"),
+    not(feature = "mcp"),
+    not(feature = "loop"),
+    not(feature = "git-worktree"),
+    not(feature = "memory"),
+    not(feature = "goal")
+))]
 pub(crate) fn feature_missing(command: &str, feature: &str) -> String {
     format!(
         "{command} requires the '{feature}' feature: cargo install --path . --features {feature}"

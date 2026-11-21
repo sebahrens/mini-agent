@@ -148,6 +148,21 @@ fn active_agent_message(
     }
 }
 
+/// The transcript line after `/prompt default`. When the routed prompt's
+/// provider could not be reverted the model did not change, so the line must
+/// not claim a return to the default.
+fn prompt_cleared_message(model: &str, mode: Option<&str>, revert_failed: bool) -> String {
+    let head = if revert_failed {
+        "prompt cleared (model not switched back: provider revert failed)"
+    } else {
+        "prompt cleared (back to default)"
+    };
+    match mode {
+        Some(mode) => format!("{head}; model: {model}, security mode: {mode}"),
+        None => format!("{head}; model: {model}"),
+    }
+}
+
 async fn handle_prompt(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     let mut sorted: Vec<&String> = ctx.context.prompts.keys().collect();
     sorted.sort();
@@ -188,6 +203,7 @@ async fn handle_prompt(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
                 .as_deref()
                 .is_some_and(|name| super::mapped_prompt_route(ctx.cfg, name).is_some());
             let mut reverted = false;
+            let mut revert_failed = false;
             if routed {
                 let default_model = ctx.cli.resolve_model(ctx.cfg);
                 let default_provider = ctx.cli.resolve_provider(ctx.cfg);
@@ -196,6 +212,7 @@ async fn handle_prompt(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
                     Some(Err(e)) => {
                         // Keep the current provider with its own model.
                         write_error(ctx.renderer, format!("failed to revert provider: {}", e));
+                        revert_failed = true;
                     }
                     Some(Ok(())) | None => {
                         // Same prices, cache prices and context window as /model.
@@ -209,16 +226,7 @@ async fn handle_prompt(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
             }
             write_ok(
                 ctx.renderer,
-                match mode_note {
-                    Some(mode) => format!(
-                        "prompt cleared (back to default); model: {}, security mode: {mode}",
-                        ctx.session.model
-                    ),
-                    None => format!(
-                        "prompt cleared (back to default); model: {}",
-                        ctx.session.model
-                    ),
-                },
+                prompt_cleared_message(&ctx.session.model, mode_note.as_deref(), revert_failed),
             );
         }
     } else {
@@ -705,7 +713,7 @@ mod prompt_default_tests {
     #[tokio::test]
     async fn clearing_a_routed_prompt_reprices_and_resizes_for_the_default_model() {
         let cfg: crate::config::Config = toml::from_str(
-            "context_window = 64000\n[quick_models.cheap]\nprovider = \"anthropic\"\nmodel = \"cheap-model\"\n[prompt_to_model]\nplan = \"cheap\"\n",
+            "context_window = 64000\n[quick_models.cheap]\nprovider = \"anthropic\"\nmodel = \"cheap-model\"\n[prompt_to_model]\nplan = \"cheap\"\n[api_keys]\nopenrouter = \"unused-test-key\"\n",
         )
         .unwrap();
         let default_model = crate::cli::Cli::default().resolve_model(&cfg);
@@ -715,6 +723,19 @@ mod prompt_default_tests {
         assert_ne!(
             cleared.input_cost, 9.0,
             "the previous model's price is gone"
+        );
+    }
+
+    #[test]
+    fn failed_revert_message_does_not_claim_the_default() {
+        let failed = prompt_cleared_message("picked-model", None, true);
+        assert!(!failed.contains("back to default"), "{failed}");
+        assert!(failed.contains("provider revert failed"), "{failed}");
+        assert!(failed.ends_with("model: picked-model"), "{failed}");
+        let ok = prompt_cleared_message("m", Some("standard"), false);
+        assert_eq!(
+            ok,
+            "prompt cleared (back to default); model: m, security mode: standard"
         );
     }
 }

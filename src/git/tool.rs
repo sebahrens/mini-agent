@@ -2669,6 +2669,61 @@ fn parse_status_paths(stdout: &[u8], truncated: bool) -> Vec<serde_json::Value> 
 
 #[cfg(test)]
 mod tests {
+    /// The structured-Git ADR lists every model-visible operation. The
+    /// exhaustive match makes adding a variant a compile error here until the
+    /// array below, and then the ADR, are updated.
+    #[test]
+    fn adr_lists_every_git_operation() {
+        use super::GitOperation as Op;
+        fn covered(operation: Op) {
+            match operation {
+                Op::Status
+                | Op::Diff
+                | Op::Log
+                | Op::Show
+                | Op::Blame
+                | Op::Stage
+                | Op::Unstage
+                | Op::Commit
+                | Op::Branches
+                | Op::BranchCreate
+                | Op::Switch
+                | Op::StashPush
+                | Op::StashPop
+                | Op::StashList
+                | Op::Tag
+                | Op::Restore => {}
+            }
+        }
+        let all = [
+            Op::Status,
+            Op::Diff,
+            Op::Log,
+            Op::Show,
+            Op::Blame,
+            Op::Stage,
+            Op::Unstage,
+            Op::Commit,
+            Op::Branches,
+            Op::BranchCreate,
+            Op::Switch,
+            Op::StashPush,
+            Op::StashPop,
+            Op::StashList,
+            Op::Tag,
+            Op::Restore,
+        ];
+        let adr = include_str!("../../docs/specs/structured-git-mutations.md");
+        for operation in all {
+            covered(operation);
+            assert!(
+                adr.contains(&format!("`{}`", operation.name())),
+                "docs/specs/structured-git-mutations.md must list `{}`",
+                operation.name()
+            );
+        }
+    }
+
     use std::path::Path;
     use std::process::Command;
     use std::sync::{Arc, Mutex};

@@ -673,8 +673,7 @@ the configured model-turn budget.
 Offline policy probes—`--config-preservation-check`,
 `--project-config-trust-check`, `--js-runtime-check`,
 `--memory-editor-preservation-check`, `--resume-provider-safety-check`,
-`--acp-authentication-check`, `--acp-permission-policy-check`, and
-`--loop-verification-policy-check`—run one named self-check and exit. They are
+`--acp-authentication-check`, and `--acp-permission-policy-check`—run one named self-check and exit. They are
 intended for packaging and CI diagnostics rather than ordinary sessions.
 
 ## 6. Feature contract
