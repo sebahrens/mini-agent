@@ -173,3 +173,27 @@ fn s3uqw_prompt_agent_and_mcp_tool_handlers_parse_and_reject_hostile_shapes() {
         json!({"p": "${tool_input.file_path}"})
     );
 }
+
+#[test]
+fn nvnkx181_shell_syntax_skips_one_handler_and_keeps_the_rest() {
+    let (config, skipped) = crate::extras::hooks::settings::parse_hooks_config_with_skips(
+        &serde_json::json!({"PreToolUse":[{"hooks":[
+            {"type":"command","command":"a | b"},
+            {"type":"command","command":"\"$CLAUDE_PROJECT_DIR\"/x.sh --flag"}
+        ]}]}),
+    )
+    .unwrap();
+    let handlers = &config["PreToolUse"][0].hooks;
+    assert_eq!(handlers.len(), 1);
+    assert_eq!(
+        handlers[0].command.as_deref(),
+        Some("$CLAUDE_PROJECT_DIR/x.sh")
+    );
+    assert_eq!(handlers[0].args.as_deref().unwrap(), ["--flag"]);
+    assert_eq!(skipped.len(), 1);
+    assert!(
+        skipped[0].reason.contains("/bin/sh"),
+        "{}",
+        skipped[0].reason
+    );
+}

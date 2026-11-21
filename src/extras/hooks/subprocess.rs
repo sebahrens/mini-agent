@@ -286,6 +286,7 @@ impl HookPolicy {
                 || key.contains('=')
                 || key.contains('\0')
                 || key.eq_ignore_ascii_case(crate::product::HOOK_PROJECT_DIR_ENV)
+                || key.eq_ignore_ascii_case(super::pins::CLAUDE_PROJECT_DIR_VARIABLE)
             {
                 return Err(format!("invalid or reserved environment key {key:?}"));
             }
@@ -300,6 +301,11 @@ impl HookPolicy {
         }
         env.insert(
             crate::product::HOOK_PROJECT_DIR_ENV.to_string(),
+            project_dir.to_string(),
+        );
+        // Claude Code compatibility spelling of the same workspace root.
+        env.insert(
+            super::pins::CLAUDE_PROJECT_DIR_VARIABLE.to_string(),
             project_dir.to_string(),
         );
         Ok(env)
@@ -489,7 +495,15 @@ fn prepare_hook_command(
             diagnostics: policy.launch_denied_diagnostics(),
         })
     };
-    let program = super::pins::resolve_hook_program(program, search_path, project_dir)
+    // `$CLAUDE_PROJECT_DIR/...` and `$MINI_AGENT_PROJECT_DIR/...` command and
+    // argument prefixes name the validated execution root (no shell is run).
+    let program = super::pins::expand_leading_project_dir(program, project_dir);
+    let expanded_args: Vec<String> = args
+        .iter()
+        .map(|arg| super::pins::expand_leading_project_dir(arg, project_dir))
+        .collect();
+    let args = expanded_args.as_slice();
+    let program = super::pins::resolve_hook_program(&program, search_path, project_dir)
         .map_err(|message| denied(message.into_bytes()))?;
     if let Some(pins) = &policy.content_pins
         && let Err(message) = pins.verify_launch(project_dir, &program, args)
@@ -663,7 +677,30 @@ async fn run_hook_with_policy_and_limits(
                 capture_pipe(stderr_pipe, OutputStream::Stderr, captured.clone(), limits)
             });
             let wait = async { child.wait().await.map_err(RunError::Wait) };
-            let (_, _, _, status) = tokio::try_join!(write_stdin, read_stdout, read_stderr, wait)?;
+            // Finish when the hook process exits, not when every inherited
+            // pipe closes: a descendant that keeps stdout/stderr open (a
+            // daemon, `cmd &`) must not hold a finished hook until its
+            // timeout. After the exit, readers get a short grace period to
+            // drain what is already buffered; the post-reap group termination
+            // then kills whatever still holds the pipes (mini-agent-nvnkx.337).
+            let readers =
+                async { tokio::try_join!(write_stdin, read_stdout, read_stderr).map(|_| ()) };
+            tokio::pin!(readers, wait);
+            let mut readers_done = false;
+            let status = loop {
+                tokio::select! {
+                    result = &mut readers, if !readers_done => {
+                        result?;
+                        readers_done = true;
+                    }
+                    status = &mut wait => break status?,
+                }
+            };
+            if !readers_done
+                && let Ok(result) = tokio::time::timeout(PIPE_DRAIN_GRACE, &mut readers).await
+            {
+                result?;
+            }
             Ok::<_, RunError>(status)
         };
         tokio::select! {
@@ -734,6 +771,10 @@ async fn run_hook_with_policy_and_limits(
         }
     }
 }
+
+/// How long the output readers may keep draining after the hook process has
+/// exited, before inherited pipes held by descendants are abandoned.
+const PIPE_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
 
 async fn capture_pipe<R>(
     pipe: Option<R>,

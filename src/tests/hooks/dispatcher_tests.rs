@@ -1472,3 +1472,65 @@ async fn i24tio_permission_request_hook_answers_only_when_opted_in() {
         Some(crate::extras::hooks::dispatcher::PermissionHookDecision::Allow)
     );
 }
+
+#[tokio::test]
+async fn nvnkx180_rule_conditions_match_in_process() {
+    let config = config_with(
+        "PreToolUse",
+        None,
+        vec![handler_with_condition(
+            r#"echo '{"permissionDecision":"deny"}'"#,
+            "Bash(rm *)",
+        )],
+    );
+    let dispatcher = HookDispatcher::from_config(&config).unwrap();
+    let hit = dispatcher
+        .dispatch_pre_tool_use(&ctx(), "bash", serde_json::json!({"command": "rm -rf x"}))
+        .await;
+    assert_eq!(hit.verdict, Verdict::Deny);
+    let miss = dispatcher
+        .dispatch_pre_tool_use(&ctx(), "bash", serde_json::json!({"command": "ls"}))
+        .await;
+    assert_eq!(miss.verdict, Verdict::Defer);
+}
+
+#[tokio::test]
+async fn nvnkx180_unevaluable_shell_condition_runs_the_handler_with_a_notice() {
+    let config = config_with(
+        "PreToolUse",
+        None,
+        vec![handler_with_condition(
+            r#"echo '{"permissionDecision":"deny"}'"#,
+            "Bash(unclosed",
+        )],
+    );
+    let dispatcher = HookDispatcher::from_config(&config).unwrap();
+    let decision = dispatcher
+        .dispatch_pre_tool_use(&ctx(), "bash", serde_json::json!({"command": "ls"}))
+        .await;
+    assert_eq!(decision.verdict, Verdict::Deny);
+    let notices = crate::extras::hooks::take_hook_problem_notices();
+    assert!(
+        notices
+            .iter()
+            .any(|notice| notice.contains("`if` condition could not be evaluated")),
+        "{notices:?}"
+    );
+}
+
+#[tokio::test]
+async fn nvnkx336_failing_post_tool_use_hook_is_reported_and_leaves_result_unchanged() {
+    let config = config_with("PostToolUse", None, vec![handler("exit 1")]);
+    let dispatcher = HookDispatcher::from_config(&config).unwrap();
+    let decision = dispatcher
+        .dispatch_post_tool_use(&ctx(), "nvnkx336_tool", serde_json::json!({}), "result")
+        .await;
+    assert!(matches!(decision, Decision::Continue), "{decision:?}");
+    let notices = crate::extras::hooks::take_hook_problem_notices();
+    assert!(
+        notices
+            .iter()
+            .any(|notice| notice == "hook 'sh' (PostToolUse) exited 1; ignored (exit 2 blocks)"),
+        "{notices:?}"
+    );
+}

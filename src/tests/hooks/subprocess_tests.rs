@@ -861,3 +861,51 @@ async fn handlers_of_one_event_share_one_project_dir_canonicalization() {
     assert_eq!(memo.resolutions(), 1, "three handlers, one canonicalize");
     let _ = std::fs::remove_dir_all(&project);
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn nvnkx337_hook_completes_when_process_exits_despite_inherited_pipes() {
+    let args = shell_args("sleep 30 & echo '{}'");
+    let started = Instant::now();
+    let output = run_hook(
+        "sh",
+        Some(&args),
+        b"",
+        Duration::from_secs(5),
+        std::env::temp_dir().to_str().unwrap(),
+    )
+    .await;
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(
+        matches!(output.status, HookStatus::Completed),
+        "{:?}",
+        output.status
+    );
+    assert_eq!(output.exit_code, Some(0));
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "{}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn nvnkx181_hook_child_sees_claude_project_dir() {
+    let project = unique_temp_path("claude-project-dir");
+    std::fs::create_dir_all(&project).unwrap();
+    let args = shell_args("printf '%s|%s' \"$CLAUDE_PROJECT_DIR\" \"$MINI_AGENT_PROJECT_DIR\"");
+    let output = run_hook(
+        "sh",
+        Some(&args),
+        b"",
+        Duration::from_secs(2),
+        project.to_str().unwrap(),
+    )
+    .await;
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    let (claude, mini) = text.split_once('|').expect("two values");
+    assert!(!claude.is_empty());
+    assert_eq!(claude, mini);
+    let _ = std::fs::remove_dir_all(&project);
+}

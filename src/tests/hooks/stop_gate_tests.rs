@@ -91,3 +91,33 @@ async fn failing_stop_hook_releases_but_leaves_a_notice() {
     let _ = gate_stop(&dispatcher, &ctx(), false, None, None, None).await;
     assert!(crate::extras::hooks::take_hook_problem_notices().is_empty());
 }
+
+#[tokio::test]
+async fn nvnkx334_unlaunchable_stop_hook_releases_and_reports() {
+    use crate::extras::hooks::pins::HookContentPins;
+    let root = std::env::temp_dir().canonicalize().unwrap();
+    let configured = handler("true");
+    let mut config: HooksConfig = HashMap::new();
+    config.insert(
+        "Stop".to_string(),
+        vec![HookGroup {
+            matcher: None,
+            hooks: vec![configured.clone()],
+        }],
+    );
+    let pins = HashMap::from([(configured, HookContentPins::rejected("x"))]);
+    let dispatcher =
+        HookDispatcher::from_config_with_backend_root_and_pins(&config, "unused", &root, pins)
+            .unwrap();
+    let gate = gate_stop(&dispatcher, &ctx(), false, None, None, None).await;
+    assert!(matches!(gate, StopGate::Release));
+    let notices = crate::extras::hooks::take_hook_problem_notices();
+    assert_eq!(
+        notices
+            .iter()
+            .filter(|notice| notice.contains("hook 'sh' (Stop) could not launch"))
+            .count(),
+        1,
+        "{notices:?}"
+    );
+}

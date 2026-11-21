@@ -43,6 +43,27 @@ fn parse_log_level(value: &str) -> Result<String, String> {
     )
 }
 
+/// `mini-agent hooks trust [--list|--yes]` is a subcommand spelling of
+/// `--hooks-trust`. Only that exact form is rewritten, so
+/// `mini-agent hooks trust the docs` stays an ordinary prompt.
+#[cfg(feature = "hooks")]
+fn rewrite_hooks_trust_invocation(args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    let words: Vec<Option<&str>> = args.iter().map(|arg| arg.to_str()).collect();
+    if words.get(1) != Some(&Some("hooks")) || words.get(2) != Some(&Some("trust")) {
+        return args;
+    }
+    let mode = match &words[3..] {
+        [] => "ask",
+        [Some("--list")] => "list",
+        [Some("--yes")] => "yes",
+        _ => return args,
+    };
+    vec![
+        args[0].clone(),
+        std::ffi::OsString::from(format!("--hooks-trust={mode}")),
+    ]
+}
+
 #[cfg(feature = "hooks")]
 fn parse_hooks_test_input(value: &str) -> Result<String, String> {
     serde_json::from_str::<serde_json::Value>(value)
@@ -973,6 +994,23 @@ pub struct Cli {
 
     #[cfg(feature = "hooks")]
     #[arg(
+        long = "trust-project-hooks",
+        env = "MINI_AGENT_TRUST_PROJECT_HOOKS",
+        help = "Run the project's hooks for this run without the confirmation prompt (nothing is recorded); for CI and containers"
+    )]
+    pub trust_project_hooks: bool,
+
+    #[cfg(feature = "hooks")]
+    #[arg(
+        long = "hooks-trust",
+        value_name = "MODE",
+        value_parser = ["ask", "list", "yes"],
+        help = "Review project hooks and record trust, then exit; written `mini-agent hooks trust [--list|--yes]`"
+    )]
+    pub hooks_trust: Option<String>,
+
+    #[cfg(feature = "hooks")]
+    #[arg(
         long = "hooks-test",
         value_name = "TOOL",
         help = "Dry-run PreToolUse hooks for TOOL with --hooks-test-input, print the merged decision, and exit"
@@ -1434,6 +1472,8 @@ impl Cli {
         args: impl IntoIterator<Item = impl Into<std::ffi::OsString>>,
     ) -> Result<Self, clap::Error> {
         let args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
+        #[cfg(feature = "hooks")]
+        let args = rewrite_hooks_trust_invocation(args);
         let completions = args
             .iter()
             .skip(1)
@@ -1550,7 +1590,7 @@ impl Cli {
         let mut informational = self.print_config || self.tutor;
         #[cfg(feature = "hooks")]
         {
-            informational |= self.hooks_test.is_some();
+            informational |= self.hooks_test.is_some() || self.hooks_trust.is_some();
         }
         #[cfg(feature = "skills")]
         {
@@ -3773,5 +3813,27 @@ mod d01h4_tests {
         };
         assert_eq!(cli.resolve_max_agent_turns(&cfg), 7);
         assert!(super::MAX_AGENT_TURNS_HINT.contains("continue"));
+    }
+}
+
+#[cfg(all(test, feature = "hooks"))]
+mod hooks_trust_cli_tests {
+    use super::*;
+
+    #[test]
+    fn hooks_trust_subcommand_maps_to_the_flag() {
+        for (argv, mode) in [
+            (&["mini-agent", "hooks", "trust", "--yes"][..], "yes"),
+            (&["mini-agent", "hooks", "trust", "--list"][..], "list"),
+            (&["mini-agent", "hooks", "trust"][..], "ask"),
+        ] {
+            let cli = Cli::try_parse_command_line_from(argv.iter().copied()).unwrap();
+            assert_eq!(cli.hooks_trust.as_deref(), Some(mode), "{argv:?}");
+            assert!(cli.is_informational_command());
+        }
+        let prompt =
+            Cli::try_parse_command_line_from(["mini-agent", "hooks", "trust", "the", "docs"])
+                .unwrap();
+        assert_eq!(prompt.hooks_trust, None);
     }
 }
