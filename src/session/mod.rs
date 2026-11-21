@@ -3387,6 +3387,63 @@ impl Session {
         }
         Ok(drain)
     }
+
+    /// Replaces `messages[..first_kept_index]` with `summary`, re-attaching
+    /// recent file windows within `restore_read_tokens`, and returns the
+    /// estimated tokens the replaced prefix held. The one commit step shared
+    /// by the TUI, headless and ACP compaction drivers.
+    pub(crate) fn commit_compaction_prefix(
+        &mut self,
+        summary: String,
+        first_kept_index: usize,
+        summary_byte_budget: usize,
+        restore_read_tokens: u64,
+    ) -> u64 {
+        let tokens_before: u64 = self.messages[..first_kept_index]
+            .iter()
+            .map(|message| message.estimated_tokens)
+            .sum();
+        self.compress_with_budget_restoring(
+            summary,
+            first_kept_index,
+            tokens_before,
+            summary_byte_budget,
+            restore_read_tokens,
+        );
+        tokens_before
+    }
+
+    /// Commits a summarizer result for the cut `messages[..cut_idx]` whose
+    /// input began after `skipped` leading messages (see
+    /// [`compaction_input`](Self::compaction_input)). The summarizer's
+    /// `messages_included` is the length of the oldest prefix of the cut slice
+    /// it saw; exactly that prefix is drained, so unsummarized history is
+    /// never discarded and summarized history never lingers to re-trigger
+    /// compaction. `stage_summary` observes the summary and drain length
+    /// before the session is mutated. Returns the drain length and the
+    /// estimated tokens it removed.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_summarized_cut(
+        &mut self,
+        skipped: usize,
+        cut_idx: usize,
+        summary: String,
+        summary_byte_budget: usize,
+        messages_included: usize,
+        restore_read_tokens: u64,
+        stage_summary: impl FnOnce(&str, usize),
+    ) -> anyhow::Result<(usize, u64)> {
+        let first_kept_index =
+            skipped + Self::compaction_drain_len(cut_idx - skipped, messages_included)?;
+        stage_summary(&summary, first_kept_index);
+        let tokens_before = self.commit_compaction_prefix(
+            summary,
+            first_kept_index,
+            summary_byte_budget,
+            restore_read_tokens,
+        );
+        Ok((first_kept_index, tokens_before))
+    }
 }
 
 /// A borrowed view of the transcript with old tool results projected to their

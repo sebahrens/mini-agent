@@ -632,14 +632,9 @@ impl SessionHistory {
             // Honour the summarizer's window-scaled byte budget instead of the
             // fixed 16 KiB clamp, and record the tokens removed
             // (mini-agent-sskdu.230, partial).
-            let removed: u64 = self.session.messages[..completed_cut]
-                .iter()
-                .map(|message| message.estimated_tokens)
-                .sum();
-            self.session.compress_with_budget_restoring(
+            self.session.commit_compaction_prefix(
                 output.summary,
                 completed_cut,
-                removed,
                 output.summary_byte_budget,
                 self.limits.restore_read_tokens,
             );

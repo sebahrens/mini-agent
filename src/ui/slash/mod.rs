@@ -998,20 +998,15 @@ where
         response_token_budget,
     )
     .await?;
-    let first_kept_index =
-        skipped + Session::compaction_drain_len(cut_idx - skipped, messages_included)?;
-    let tokens_before: u64 = session.messages[..first_kept_index]
-        .iter()
-        .map(|message| message.estimated_tokens)
-        .sum();
-    stage_summary(&summary, first_kept_index);
-    session.compress_with_budget_restoring(
+    let (first_kept_index, tokens_before) = session.commit_summarized_cut(
+        skipped,
+        cut_idx,
         summary,
-        first_kept_index,
-        tokens_before,
         summary_byte_budget,
+        messages_included,
         restore_read_tokens,
-    );
+        stage_summary,
+    )?;
     Ok((first_kept_index, tokens_before, usage))
 }
 
