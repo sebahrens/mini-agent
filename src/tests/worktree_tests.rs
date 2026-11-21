@@ -10,6 +10,19 @@ mod tests {
     use crate::cli::Cli;
     use crate::config::Config;
     use crate::extras::git_worktree::*;
+
+    /// A merge that syncs the target with its remote first (`--pull`).
+    async fn try_merge_pulling(info: &WorktreeInfo, target: &str) -> (MergeState, MergeOutcome) {
+        try_merge_with_options(
+            info,
+            target,
+            MergeOptions {
+                pull: true,
+                message: None,
+            },
+        )
+        .await
+    }
     use crate::sandbox::CommandLimits;
 
     #[cfg(feature = "hooks")]
@@ -1198,6 +1211,226 @@ mod tests {
         assert!(!worktree.exists());
     }
 
+    /// A feature worktree of `repo` with one committed file, as every merge
+    /// test below needs it.
+    fn feature_worktree(repo: &TempRepo, file: &str, body: &str) -> (PathBuf, WorktreeInfo) {
+        let worktree = repo.path().parent().unwrap().join("linked worktree");
+        git(
+            repo.path(),
+            vec![
+                OsString::from("worktree"),
+                OsString::from("add"),
+                OsString::from("-b"),
+                OsString::from("feature"),
+                worktree.as_os_str().to_os_string(),
+            ],
+        );
+        std::fs::write(worktree.join(file), body).unwrap();
+        git(&worktree, ["add", file]);
+        git(&worktree, ["commit", "-m", "add the feature"]);
+        let info = WorktreeInfo {
+            branch: "feature".into(),
+            worktree_path: worktree.clone(),
+            main_repo_path: repo.path().to_path_buf(),
+        };
+        (worktree, info)
+    }
+
+    /// mini-agent-nvnkx.216: the target tracks an unreachable remote; the
+    /// default merge is local, `--pull` reports the fetch failure and leaves
+    /// the repository unchanged.
+    #[tokio::test]
+    async fn merge_is_local_by_default_and_pull_reports_an_unreachable_remote() {
+        let repo = TempRepo::new("offline upstream");
+        let missing = repo
+            .path()
+            .parent()
+            .unwrap()
+            .join("missing upstream remote");
+        git(
+            repo.path(),
+            [
+                OsStr::new("remote"),
+                OsStr::new("add"),
+                OsStr::new("origin"),
+                missing.as_os_str(),
+            ],
+        );
+        git(repo.path(), ["config", "branch.main.remote", "origin"]);
+        git(
+            repo.path(),
+            ["config", "branch.main.merge", "refs/heads/main"],
+        );
+        let (worktree, info) = feature_worktree(&repo, "feature.txt", "local feature\n");
+        let head_before = git_stdout(repo.path(), ["rev-parse", "HEAD"]);
+
+        let (_state, outcome) = try_merge_pulling(&info, "main").await;
+        assert!(
+            matches!(&outcome, MergeOutcome::Error(error) if error.contains("fetch failed")),
+            "{outcome:?}"
+        );
+        assert_eq!(git_stdout(repo.path(), ["rev-parse", "HEAD"]), head_before);
+        assert!(!repo.path().join("feature.txt").exists());
+
+        let (mut state, outcome) = try_merge(&info, "main").await;
+        assert_eq!(outcome, MergeOutcome::Success);
+        complete_merge(&mut state).await.unwrap();
+        assert!(repo.path().join("feature.txt").exists());
+        assert!(!worktree.exists());
+    }
+
+    /// mini-agent-nvnkx.215 and .318: a dirty tracked file, an ignored
+    /// directory and an unrelated untracked note do not block the merge, are
+    /// left alone, and the squash commit has a composed message.
+    #[tokio::test]
+    async fn merge_tolerates_ignored_and_unrelated_untracked_files_and_composes_its_message() {
+        let repo = TempRepo::new("ignored files");
+        std::fs::write(repo.path().join(".gitignore"), "target/\n").unwrap();
+        git(repo.path(), ["add", ".gitignore"]);
+        git(repo.path(), ["commit", "-m", "ignore target"]);
+        let (worktree, info) = feature_worktree(&repo, "feature.txt", "local feature\n");
+        // The harness's own save commit must not reach the target's history.
+        std::fs::write(worktree.join("feature.txt"), "local feature 2\n").unwrap();
+        git(&worktree, ["add", "feature.txt"]);
+        git(
+            &worktree,
+            ["commit", "-m", "auto-commit: save changes before merge"],
+        );
+        std::fs::create_dir(repo.path().join("target")).unwrap();
+        std::fs::write(repo.path().join("target/out.bin"), b"build output").unwrap();
+        std::fs::write(repo.path().join("note.txt"), "unrelated\n").unwrap();
+        std::fs::write(repo.path().join("tracked.txt"), "modified in main\n").unwrap();
+
+        let (mut state, outcome) = try_merge(&info, "main").await;
+        assert_eq!(outcome, MergeOutcome::Success);
+        complete_merge(&mut state).await.unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap(),
+            "modified in main\n",
+            "the modification is restored from the stash"
+        );
+        assert!(repo.path().join("target/out.bin").exists());
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("note.txt")).unwrap(),
+            "unrelated\n"
+        );
+        let message = git_stdout(repo.path(), ["log", "-1", "--format=%B"]);
+        assert!(message.starts_with("Merge worktree feature"), "{message}");
+        assert!(message.contains("add the feature"), "{message}");
+        assert!(
+            !message.contains("auto-commit: save changes before merge"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("Squashed commit of the following"),
+            "{message}"
+        );
+    }
+
+    /// An untracked file that sits where the merge brings a tracked path is
+    /// still refused, and left in place.
+    #[tokio::test]
+    async fn an_untracked_file_colliding_with_a_merged_path_still_refuses() {
+        let repo = TempRepo::new("colliding untracked");
+        let (_worktree, info) = feature_worktree(&repo, "feature.txt", "from feature\n");
+        std::fs::write(repo.path().join("feature.txt"), "mine\n").unwrap();
+        let (_state, outcome) = try_merge(&info, "main").await;
+        assert!(
+            matches!(&outcome, MergeOutcome::Error(error) if error.contains("would collide")),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("feature.txt")).unwrap(),
+            "mine\n"
+        );
+    }
+
+    /// An explicit message replaces the composed one.
+    #[tokio::test]
+    async fn merge_accepts_an_explicit_commit_message() {
+        let repo = TempRepo::new("explicit merge message");
+        let (_worktree, info) = feature_worktree(&repo, "feature.txt", "local feature\n");
+        let (mut state, outcome) = try_merge_with_options(
+            &info,
+            "main",
+            MergeOptions {
+                pull: false,
+                message: Some("feat: ship the feature".into()),
+            },
+        )
+        .await;
+        assert_eq!(outcome, MergeOutcome::Success);
+        complete_merge(&mut state).await.unwrap();
+        assert_eq!(
+            git_stdout(repo.path(), ["log", "-1", "--format=%s"]),
+            "feat: ship the feature"
+        );
+    }
+
+    /// mini-agent-nvnkx.52: list, re-enter and discard.
+    #[tokio::test]
+    async fn managed_worktrees_can_be_listed_found_and_discarded() {
+        let repo = TempRepo::new("worktree lifecycle");
+        let base_dir = repo.path().parent().unwrap().to_path_buf();
+        let (path, info) = create(repo.path(), "scratch", Some(&base_dir))
+            .await
+            .unwrap();
+        let listed = list_managed(repo.path()).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].info.branch, "scratch");
+        assert_eq!(listed[0].info.worktree_path, path.canonicalize().unwrap());
+        assert_eq!(listed[0].base.as_deref(), Some("main"));
+        assert_eq!(listed[0].dirty, Some(false));
+        let found = find_managed(repo.path(), "scratch").await.unwrap().unwrap();
+        assert_eq!(found.info.worktree_path, listed[0].info.worktree_path);
+        assert!(find_managed(repo.path(), "other").await.unwrap().is_none());
+        // The same name is found again from inside the worktree.
+        assert!(find_managed(&path, "scratch").await.unwrap().is_some());
+
+        // A clean worktree with no commits is discardable and disappears.
+        assert!(discard_blockers(&found).await.unwrap().is_empty());
+        // A dirty one is not, until forced.
+        std::fs::write(path.join("wip.txt"), "x\n").unwrap();
+        let dirty = find_managed(repo.path(), "scratch").await.unwrap().unwrap();
+        let blockers = discard_blockers(&dirty).await.unwrap();
+        assert!(
+            blockers.iter().any(|b| b.contains("uncommitted")),
+            "{blockers:?}"
+        );
+        std::fs::remove_file(path.join("wip.txt")).unwrap();
+        discard_worktree(&info).await.unwrap();
+        assert!(!path.exists());
+        assert!(list_managed(repo.path()).await.unwrap().is_empty());
+        assert!(!optional_test_ref_exists(repo.path(), "refs/heads/scratch"));
+    }
+
+    /// mini-agent-nvnkx.220: a tracked gitlink whose directory is empty is
+    /// named so the user can populate it.
+    #[tokio::test]
+    async fn unpopulated_submodules_are_reported() {
+        let repo = TempRepo::new("submodule notice");
+        let sha = git_stdout(repo.path(), ["rev-parse", "HEAD"]);
+        git(
+            repo.path(),
+            [
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                format!("160000,{sha},vendor/lib").as_str(),
+            ],
+        );
+        git(repo.path(), ["commit", "-m", "add a gitlink"]);
+        let base_dir = repo.path().parent().unwrap().to_path_buf();
+        let (path, _info) = create(repo.path(), "withsub", Some(&base_dir))
+            .await
+            .unwrap();
+        assert_eq!(
+            uninitialised_submodules(&path).await,
+            vec!["vendor/lib".to_string()]
+        );
+    }
+
     #[tokio::test]
     async fn local_only_merge_does_not_fetch_unreachable_remotes() {
         let repo = TempRepo::new("local-only unreachable remote");
@@ -1266,7 +1499,7 @@ mod tests {
                 main_repo_path: repo.path().to_path_buf(),
             };
 
-            let (_state, outcome) = try_merge(&info, "main").await;
+            let (_state, outcome) = try_merge_pulling(&info, "main").await;
             assert!(
                 matches!(outcome, MergeOutcome::Error(error) if error.contains("pull failed")),
                 "incomplete {key} configuration must not be treated as local-only"
@@ -1417,7 +1650,8 @@ mod tests {
             .nth(1)
             .expect("direct merge action");
         assert!(
-            direct_merge.contains("handle_worktree_merge(info.clone(), target.clone(), true)"),
+            direct_merge.contains("options.clone()")
+                && direct_merge.contains("self.handle_worktree_merge("),
             "direct /wt-merge must dispatch the typed merge transaction"
         );
         assert!(!app.contains("spawn_merge_agent"));
@@ -3024,7 +3258,7 @@ wait
         let mut task = Some(tokio::spawn(async move {
             caller_scope
                 .run(async move {
-                    let (_, outcome) = try_merge(&info, "main").await;
+                    let (_, outcome) = try_merge_pulling(&info, "main").await;
                     Err::<(), _>(format!("merge returned before cancellation: {outcome:?}"))
                 })
                 .await
@@ -4427,7 +4661,8 @@ wait
         let (_state, outcome) = try_merge(&info, "main").await;
 
         assert!(
-            matches!(outcome, MergeOutcome::Error(error) if error.contains("untracked or ignored files"))
+            matches!(&outcome, MergeOutcome::Error(error) if error.contains("would collide")),
+            "{outcome:?}"
         );
         assert_eq!(std::fs::read(&preserved).unwrap(), bytes);
         assert!(repo.path().join("tracked.txt").is_dir());
@@ -4828,7 +5063,7 @@ wait
             main_repo_path: repo.path().to_path_buf(),
         };
 
-        let (_state, outcome) = try_merge(&info, "main").await;
+        let (_state, outcome) = try_merge_pulling(&info, "main").await;
 
         assert!(matches!(outcome, MergeOutcome::Error(error) if error.contains("pull failed")));
         assert_eq!(current_branch(repo.path()).await.as_deref(), Some("main"));
@@ -4894,7 +5129,7 @@ wait
             main_repo_path: repo.path().to_path_buf(),
         };
 
-        let (_state, outcome) = try_merge(&info, "main").await;
+        let (_state, outcome) = try_merge_pulling(&info, "main").await;
 
         let MergeOutcome::Error(error) = outcome else {
             panic!("unexpected outcome: {outcome:?}");
@@ -4958,7 +5193,7 @@ wait
             main_repo_path: repo.path().to_path_buf(),
         };
 
-        let (_state, outcome) = try_merge(&info, "main").await;
+        let (_state, outcome) = try_merge_pulling(&info, "main").await;
 
         assert!(
             matches!(outcome, MergeOutcome::Error(error) if error.contains("target branch was not checked out"))

@@ -461,11 +461,15 @@ pub(crate) fn help_lines(
     {
         emit(
             false,
-            "  /worktree <name>       create a git worktree on <name> branch and cd into it",
+            "  /worktree [name|list]  create a git worktree on <name> branch (or re-enter it; no name lists them)",
         );
         emit(
             false,
-            "  /wt-merge [branch]     merge worktree branch into [branch] (default: main/master)",
+            "  /wt-merge [--pull] [branch] [-m msg]  merge worktree branch into [branch] (default: main/master)",
+        );
+        emit(
+            false,
+            "  /wt-discard [name]     remove a worktree and its branch without merging (--force if it has work)",
         );
         emit(
             false,

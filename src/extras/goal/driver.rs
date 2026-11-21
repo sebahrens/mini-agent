@@ -49,6 +49,31 @@ pub struct RoundCollector {
     blocked_since: Option<Instant>,
 }
 
+/// Whether a tool call counts as a workspace change for the goal gate's
+/// read-only-round rules (blocked streak, user-gate park, check reuse).
+///
+/// Harness bookkeeping (`goal_report`, `todo_write`, memory writes, task
+/// management) never changes the workspace, but `tool_class` fails closed on
+/// every name it does not list. A `task` call itself is not a change either:
+/// the child's own tool calls arrive as `SubagentToolCall` events carrying
+/// their real names and are judged by this same predicate
+/// (mini-agent-nvnkx.333).
+pub(crate) fn round_changes_workspace(name: &str) -> bool {
+    const BOOKKEEPING: &[&str] = &[
+        "goal_report",
+        "todo_write",
+        "memory_write",
+        "memory_edit",
+        "agent_memory",
+        "task",
+        "task_send",
+        "task_result",
+        "task_cancel",
+        "schedule_wakeup",
+    ];
+    !BOOKKEEPING.contains(&name) && crate::agent::runner::tool_may_mutate_workspace(name)
+}
+
 impl RoundCollector {
     pub fn new() -> Self {
         Self::started_at(Instant::now())
@@ -70,7 +95,7 @@ impl RoundCollector {
         match event {
             AgentEvent::ToolCall { id, name, .. } => {
                 self.tool_calls += 1;
-                if crate::agent::runner::tool_may_mutate_workspace(name.as_str()) {
+                if round_changes_workspace(name.as_str()) {
                     self.mutating_tool_calls += 1;
                     self.pending_mutating
                         .insert(id.to_string(), name.to_string());
@@ -79,7 +104,7 @@ impl RoundCollector {
             #[cfg(feature = "subagents")]
             AgentEvent::SubagentToolCall { name, .. } => {
                 self.tool_calls += 1;
-                if crate::agent::runner::tool_may_mutate_workspace(name.as_str()) {
+                if round_changes_workspace(name.as_str()) {
                     self.mutating_tool_calls += 1;
                 }
             }
@@ -281,7 +306,7 @@ fn failure_fingerprint_from_turn(interactions: &[rig::completion::Message]) -> O
             Message::Assistant { content, .. } => {
                 for item in content.iter() {
                     if let AssistantContent::ToolCall(call) = item
-                        && crate::agent::runner::tool_may_mutate_workspace(&call.function.name)
+                        && round_changes_workspace(&call.function.name)
                     {
                         mutating += 1;
                         pending.insert(call.id.clone(), call.function.name.clone());
@@ -1973,6 +1998,85 @@ mod settle_tests {
         );
     }
 
+    fn live_round(store: &GoalStore, events: &[AgentEvent]) -> RoundSummary {
+        let mut collector = RoundCollector::new();
+        for event in events {
+            collector.observe(event);
+        }
+        collector.finish(&store.snapshot().unwrap(), RoundEnd::Done, 0)
+    }
+
+    fn call(id: &str, name: &str) -> AgentEvent {
+        AgentEvent::ToolCall {
+            id: compact_str::CompactString::new(id),
+            name: compact_str::CompactString::new(name),
+            args: serde_json::json!({}),
+        }
+    }
+
+    fn result(id: &str, name: &str, output: &str, is_error: bool) -> AgentEvent {
+        AgentEvent::ToolResult {
+            id: compact_str::CompactString::new(id),
+            name: compact_str::CompactString::new(name),
+            output: compact_str::CompactString::new(output),
+            images: Vec::new(),
+            is_error,
+        }
+    }
+
+    /// The real event sequence of a round that only files a blocked report
+    /// must not count as a workspace change (mini-agent-nvnkx.333).
+    #[tokio::test]
+    async fn three_report_only_blocked_rounds_stop_the_goal_as_blocked() {
+        let _paths = isolated_paths();
+        let store = store();
+        let mut last = None;
+        for _ in 0..3 {
+            report(&store, ReportStatus::Blocked);
+            let summary = live_round(
+                &store,
+                &[
+                    call("r", "goal_report"),
+                    result("r", "goal_report", "recorded", false),
+                ],
+            );
+            assert_eq!(summary.mutating_tool_calls, 0);
+            last = Some(settle_round(&store, summary, no_verification).await);
+        }
+        match last.unwrap() {
+            RoundOutcome::Stopped { status, .. } => assert_eq!(status, GoalStatus::Blocked),
+            other => panic!("expected a blocked stop, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_task_then_a_blocked_report_parks_on_the_user_gate() {
+        let _paths = isolated_paths();
+        let store = store();
+        report(&store, ReportStatus::Blocked);
+        let refusal = crate::agent::tools::requires_user_configuration(
+            "[subagents] allow_write = true",
+            "task: write personas require [subagents] allow_write = true",
+        );
+        let summary = live_round(
+            &store,
+            &[
+                call("t", "task"),
+                result("t", "task", &refusal.to_string(), true),
+                call("r", "goal_report"),
+                result("r", "goal_report", "recorded", false),
+            ],
+        );
+        assert_eq!(summary.mutating_tool_calls, 0);
+        match settle_round(&store, summary, no_verification).await {
+            RoundOutcome::Stopped { status, line } => {
+                assert_eq!(status, GoalStatus::Blocked);
+                assert!(line.contains("allow_write"), "{line}");
+            }
+            other => panic!("expected a user-gate stop, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn a_working_round_relaunches_with_a_visible_reason() {
         let _paths = isolated_paths();
@@ -2349,6 +2453,7 @@ pub fn summary_from_headless_turn(
     let mut mutating_tool_calls = 0u32;
     let mut task_call_ids = std::collections::HashSet::new();
     let mut user_gate = None;
+    let mut refused_tasks = 0u32;
     for message in interactions {
         // Only a refusal returned by the `task` tool itself counts: a file or
         // command output that merely quotes the marker must not park a goal.
@@ -2363,6 +2468,7 @@ pub fn summary_from_headless_turn(
                                 crate::agent::tools::user_gated_setting(&text.text)
                         {
                             user_gate = Some(setting.to_string());
+                            refused_tasks += 1;
                         }
                     }
                 }
@@ -2378,12 +2484,16 @@ pub fn summary_from_headless_turn(
                 if call.function.name == "task" {
                     task_call_ids.insert(call.id.clone());
                 }
-                if crate::agent::runner::tool_may_mutate_workspace(&call.function.name) {
+                if round_changes_workspace(&call.function.name) {
                     mutating_tool_calls += 1;
                 }
             }
         }
     }
+
+    // A headless turn does not carry the children's own tool calls, so a
+    // `task` call that was not refused is assumed to have worked in the tree.
+    mutating_tool_calls += (task_call_ids.len() as u32).saturating_sub(refused_tasks);
 
     let round = goal.progress.current_round();
     RoundSummary {

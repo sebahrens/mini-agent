@@ -6881,9 +6881,18 @@ impl<'a> App<'a> {
                             C_AGENT,
                         )?;
                     }
-                    crate::extras::git_worktree::DeferredWorktreeAction::Merge { info, target } => {
+                    crate::extras::git_worktree::DeferredWorktreeAction::Merge {
+                        info,
+                        target,
+                        options,
+                    } => {
                         crate::startup::heap_future(|| {
-                            self.handle_worktree_merge(info.clone(), target.clone(), true)
+                            self.handle_worktree_merge(
+                                info.clone(),
+                                target.clone(),
+                                options.clone(),
+                                true,
+                            )
                         })
                         .await?;
                     }
@@ -7899,7 +7908,13 @@ impl<'a> App<'a> {
             C_AGENT,
         );
 
-        self.handle_worktree_merge(info, target, false).await
+        self.handle_worktree_merge(
+            info,
+            target,
+            crate::extras::git_worktree::MergeOptions::default(),
+            false,
+        )
+        .await
     }
 
     #[cfg(feature = "git-worktree")]
@@ -7907,6 +7922,7 @@ impl<'a> App<'a> {
         &mut self,
         info: crate::extras::git_worktree::WorktreeInfo,
         target: String,
+        options: crate::extras::git_worktree::MergeOptions,
         refresh_ui: bool,
     ) -> anyhow::Result<()> {
         let _ = self.renderer.write_line(
@@ -7988,8 +8004,12 @@ impl<'a> App<'a> {
         if !proceed {
             return Ok(());
         }
-        let (state, outcome) = crate::extras::git_worktree::try_merge(&info, &target).await;
+        let (state, outcome) =
+            crate::extras::git_worktree::try_merge_with_options(&info, &target, options).await;
         let mut state = state;
+        for notice in &state.notices {
+            let _ = self.renderer.write_line(notice, C_AGENT);
+        }
         match outcome {
             crate::extras::git_worktree::MergeOutcome::Success => {
                 super::rebind_worktree_workspace(

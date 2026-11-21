@@ -394,9 +394,10 @@ either spelling prints that the feature is required.
 
 | Command | Description |
 | ------- | ----------- |
-| `/worktree <name>` | Create a git worktree on a new branch and `cd` into it. |
-| `/wt-merge [branch]` | Merge the worktree branch back into the target branch. Without a branch the target is the one the worktree was created from (recorded as `branch.<name>.mini-agent-base`), else the branch checked out in the main repository, `origin/HEAD`, `init.defaultBranch`, then `main`/`master`; the chosen target and its source are printed before merging. The exit auto-merge uses the same rule and refuses (instead of assuming `main`) when none applies. |
-| `/wt-exit` | Exit the worktree and return to the main repo. |
+| `/worktree <name>` | Create a git worktree on a new branch and `cd` into it; when a worktree of that name was already created by `/worktree`, re-enter it instead. `/worktree` with no name (or `/worktree list`) lists the worktrees `/worktree` created, with branch, base, dirty state and age. |
+| `/wt-merge [--pull] [branch] [-m message]` | Merge the worktree branch back into the target branch. The merge is local: the squash lands on the target as it is and the target is not fetched or pulled; when its upstream is ahead in already-fetched refs, the number of commits behind is reported. `--pull` fetches the target's own remote and pulls first (a failure leaves the repository unchanged). The squash commit message is `Merge worktree <branch>` with the source commits as a body (the harness's auto-commits omitted), or the `-m` text. Uncommitted tracked changes in the main checkout are stashed and restored; ignored files never block the merge, and untracked files only when they collide with a merged path. Without a branch the target is the one the worktree was created from (recorded as `branch.<name>.mini-agent-base`), else the branch checked out in the main repository, `origin/HEAD`, `init.defaultBranch`, then `main`/`master`; the chosen target and its source are printed before merging. The exit auto-merge uses the same rule and refuses (instead of assuming `main`) when none applies. |
+| `/wt-exit` | Exit the worktree and return to the main repo. The worktree directory and its branch are kept; the message names `/worktree <name>`, `/wt-merge` and `/wt-discard <name>`. |
+| `/wt-discard [name] [--force]` | Remove a worktree created by `/worktree` and its branch without merging (no name: the worktree you are in, after `/wt-exit`). Refuses uncommitted changes and commits not merged into the base branch unless `--force` is given. |
 
 During a merge, a dirty worktree requires an explicit `c` to commit all changes;
 a conflict offers `l` to leave it for manual resolution. Uppercase action keys

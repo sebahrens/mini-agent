@@ -14,7 +14,8 @@
 use std::collections::VecDeque;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use rig::completion::Message;
 
@@ -102,11 +103,35 @@ pub(crate) struct StoredChild {
     pub history: Vec<Message>,
 }
 
+/// A stored child with its serialized form, computed once so rewriting the
+/// store file never serializes a history again (mini-agent-nvnkx.340).
+#[derive(Debug)]
+struct Entry {
+    child: StoredChild,
+    /// `None` for a child loaded from disk until the first write needs it.
+    bytes: Option<Arc<Vec<u8>>>,
+}
+
+/// How long finished children are collected into one store write.
+const FLUSH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(50);
+
 #[derive(Debug, Default)]
 pub(crate) struct ResumeStore {
-    children: Mutex<VecDeque<StoredChild>>,
-    /// Private file the store is mirrored to after every change.
+    children: Mutex<VecDeque<Entry>>,
+    /// Private file the store is mirrored to after changes.
     persist: Option<PathBuf>,
+    /// Limits of the latest insert, used by the coalesced writer.
+    limits: Mutex<ResumeLimits>,
+    /// Changes not yet written to `persist`.
+    dirty: AtomicBool,
+    /// A debounced write is already scheduled.
+    flush_scheduled: AtomicBool,
+    #[cfg(test)]
+    writes: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    serializations: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    write_thread: Mutex<Option<std::thread::ThreadId>>,
 }
 
 const PERSIST_VERSION: u32 = 1;
@@ -223,9 +248,9 @@ impl ResumeStore {
                                 .is_none_or(|name| name.len() <= MAX_AGENT_TYPE_BYTES)
                             && !children
                                 .iter()
-                                .any(|kept: &StoredChild| kept.id == child.id);
+                                .any(|kept: &Entry| kept.child.id == child.id);
                         if valid {
-                            children.push_back(child);
+                            children.push_back(Entry { child, bytes: None });
                         }
                     }
                 }
@@ -238,21 +263,28 @@ impl ResumeStore {
         Self {
             children: Mutex::new(children),
             persist: Some(path),
+            ..Self::default()
         }
     }
 
     /// Mirrors the store to its file: the newest children whose serialized
     /// size sums to at most `limits.bytes` (the newest is always kept). An
     /// empty store removes the file. Failures are logged; resumption in this
-    /// process is unaffected.
-    fn persist_locked(&self, children: &VecDeque<StoredChild>, limits: ResumeLimits) {
+    /// process is unaffected. Blocking: callers on an async executor go
+    /// through [`ResumeStore::schedule_flush`] or [`ResumeStore::flush`].
+    fn persist_locked(&self, children: &mut VecDeque<Entry>, limits: ResumeLimits) {
         let Some(path) = &self.persist else {
             return;
         };
-        let mut parts: Vec<Vec<u8>> = Vec::new();
+        let mut parts: Vec<Arc<Vec<u8>>> = Vec::new();
         let mut total = 0usize;
-        for child in children.iter().rev() {
-            let Ok(bytes) = serde_json::to_vec(child) else {
+        for entry in children.iter_mut().rev() {
+            if entry.bytes.is_none() {
+                #[cfg(test)]
+                self.serializations.fetch_add(1, Ordering::SeqCst);
+                entry.bytes = serde_json::to_vec(&entry.child).ok().map(Arc::new);
+            }
+            let Some(bytes) = entry.bytes.clone() else {
                 continue;
             };
             if !parts.is_empty() && total.saturating_add(bytes.len()) > limits.bytes {
@@ -260,6 +292,12 @@ impl ResumeStore {
             }
             total += bytes.len();
             parts.push(bytes);
+        }
+        #[cfg(test)]
+        {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            *self.write_thread.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(std::thread::current().id());
         }
         if parts.is_empty() {
             let _ = std::fs::remove_file(path);
@@ -286,6 +324,47 @@ impl ResumeStore {
         }
     }
 
+    /// Write pending changes now, blocking the calling thread.
+    fn flush_blocking(&self) {
+        if !self.dirty.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let limits = *self.limits.lock().unwrap_or_else(|e| e.into_inner());
+        let mut children = self.children.lock().unwrap_or_else(|e| e.into_inner());
+        self.persist_locked(&mut children, limits);
+    }
+
+    /// Write pending changes on the blocking pool and wait for it.
+    #[cfg(test)]
+    pub(crate) async fn flush(self: &Arc<Self>) {
+        let store = self.clone();
+        let _ = tokio::task::spawn_blocking(move || store.flush_blocking()).await;
+    }
+
+    /// Request a write of pending changes. Children finishing within
+    /// [`FLUSH_DEBOUNCE`] of each other share one write, which runs on the
+    /// blocking pool and never on an async worker. Without a runtime the write
+    /// happens inline.
+    pub(crate) fn schedule_flush(self: &Arc<Self>) {
+        if self.persist.is_none() {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            self.flush_blocking();
+            return;
+        };
+        if self.flush_scheduled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let store = self.clone();
+        handle.spawn(async move {
+            tokio::time::sleep(FLUSH_DEBOUNCE).await;
+            store.flush_scheduled.store(false, Ordering::Release);
+            let writer = store.clone();
+            let _ = tokio::task::spawn_blocking(move || writer.flush_blocking()).await;
+        });
+    }
+
     /// Keep `history` for resumption under the default limits and return its
     /// id, or `None` when it is empty or too large.
     #[cfg(test)]
@@ -300,7 +379,23 @@ impl ResumeStore {
         }
     }
 
+    /// [`ResumeStore::insert_deferred`] followed by an immediate blocking write.
+    #[cfg(test)]
     pub(crate) fn insert_with(
+        &self,
+        limits: ResumeLimits,
+        agent_type: Option<String>,
+        history: Vec<Message>,
+    ) -> Insert {
+        let outcome = self.insert_deferred(limits, agent_type, history);
+        self.flush_blocking();
+        outcome
+    }
+
+    /// Keep a finished conversation, serializing it once and leaving the file
+    /// write to [`ResumeStore::schedule_flush`]. CPU-bound: async callers run
+    /// it through [`ResumeStore::insert_off_executor`].
+    pub(crate) fn insert_deferred(
         &self,
         limits: ResumeLimits,
         agent_type: Option<String>,
@@ -311,7 +406,10 @@ impl ResumeStore {
         }
         // An unserializable history is reported as over the limit rather than
         // silently kept or dropped.
-        let bytes = serde_json::to_vec(&history).map_or(usize::MAX, |bytes| bytes.len());
+        let history_bytes = serde_json::to_vec(&history).ok();
+        #[cfg(test)]
+        self.serializations.fetch_add(1, Ordering::SeqCst);
+        let bytes = history_bytes.as_ref().map_or(usize::MAX, Vec::len);
         if bytes > limits.bytes {
             return Insert::TooLarge {
                 bytes,
@@ -319,20 +417,53 @@ impl ResumeStore {
             };
         }
         let id = uuid::Uuid::new_v4().to_string();
+        // The child's persisted form, assembled around the already serialized
+        // history instead of serializing it a second time.
+        let encoded = history_bytes.and_then(|history_bytes| {
+            let agent = serde_json::to_vec(&agent_type).ok()?;
+            let mut out = Vec::with_capacity(history_bytes.len() + agent.len() + 80);
+            out.extend_from_slice(format!("{{\"id\":\"{id}\",\"agent_type\":").as_bytes());
+            out.extend_from_slice(&agent);
+            out.extend_from_slice(b",\"history\":");
+            out.extend_from_slice(&history_bytes);
+            out.push(b'}');
+            Some(Arc::new(out))
+        });
+        *self.limits.lock().unwrap_or_else(|e| e.into_inner()) = limits;
         let mut children = self.children.lock().unwrap_or_else(|e| e.into_inner());
-        children.push_back(StoredChild {
-            id: id.clone(),
-            agent_type,
-            history,
+        children.push_back(Entry {
+            child: StoredChild {
+                id: id.clone(),
+                agent_type,
+                history,
+            },
+            bytes: encoded,
         });
         let mut evicted = Vec::new();
         while children.len() > limits.children {
             if let Some(dropped) = children.pop_front() {
-                evicted.push(dropped.id);
+                evicted.push(dropped.child.id);
             }
         }
-        self.persist_locked(&children, limits);
+        self.dirty.store(true, Ordering::Release);
         Insert::Stored { id, evicted }
+    }
+
+    /// Insert on the blocking pool, so serializing a large history does not
+    /// run on an async worker, then request one coalesced file write.
+    pub(crate) async fn insert_off_executor(
+        self: &Arc<Self>,
+        limits: ResumeLimits,
+        agent_type: Option<String>,
+        history: Vec<Message>,
+    ) -> Insert {
+        let store = self.clone();
+        let outcome =
+            tokio::task::spawn_blocking(move || store.insert_deferred(limits, agent_type, history))
+                .await
+                .unwrap_or(Insert::Empty);
+        self.schedule_flush();
+        outcome
     }
 
     pub(crate) fn get(&self, id: &str) -> Option<StoredChild> {
@@ -340,8 +471,8 @@ impl ResumeStore {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .find(|child| child.id == id)
-            .cloned()
+            .find(|entry| entry.child.id == id)
+            .map(|entry| entry.child.clone())
     }
 }
 
@@ -502,6 +633,44 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode & 0o077, 0, "private file mode, got {mode:o}");
         }
+    }
+
+    /// Eight children finishing together cost one store write on the blocking
+    /// pool and one serialization of each history (mini-agent-nvnkx.340).
+    #[tokio::test]
+    async fn a_fan_out_of_children_writes_the_store_once_off_the_executor() {
+        let (_dir, path) = store_file("resume-coalesced-write");
+        let store = Arc::new(ResumeStore::persistent(path.clone()));
+        let limits = ResumeLimits::default();
+        let mut ids = Vec::new();
+        for index in 0..8 {
+            let Insert::Stored { id, .. } = store
+                .insert_off_executor(limits, None, vec![Message::user(format!("q{index}"))])
+                .await
+            else {
+                panic!("stored");
+            };
+            ids.push(id);
+        }
+        store.flush().await;
+        assert_eq!(
+            store.writes.load(Ordering::SeqCst),
+            1,
+            "one coalesced write"
+        );
+        assert_eq!(
+            store.serializations.load(Ordering::SeqCst),
+            8,
+            "each history is serialized exactly once"
+        );
+        let writer = store.write_thread.lock().unwrap().expect("a write ran");
+        assert_ne!(
+            writer,
+            std::thread::current().id(),
+            "not the caller's thread"
+        );
+        let restored = ResumeStore::persistent(path);
+        assert!(ids.iter().all(|id| restored.get(id).is_some()));
     }
 
     fn restorable_ids_at(path: &Path) -> Vec<String> {

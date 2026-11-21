@@ -100,14 +100,10 @@ session with no background tasks stays readable by an older binary; a session
 that saved tasks with these fields is rejected by an older binary (it validates
 saved task rows strictly). Persona MCP servers are connected once per `task`
 call and shared by its children (each child keeps its own tools and permission
-checker; worktree-isolated children connect their own). Context compaction (`/compact` and automatic compaction) cancels
-every running background task with the reason "cancelled by context compaction;
-relaunch it if the work is still needed"; the TUI and headless runs print
-`compaction cancelled N background task(s): <ids>`, and the model's completion
-notice carries the same reason. The default
+checker; worktree-isolated children connect their own). Context compaction (`/compact` and automatic compaction) leaves running background tasks alone: new admission pauses while the transcript is rewritten, and each running job's file-checkpoint launch row moves with the compacted rows (a launch row that was summarized sits at the summary). The default
 `background_tasks` footer item shows active tasks and reports awaiting delivery.
 The next admitted main turn receives one literal completion notice; an abandoned
-preparation keeps it pending. Notices contain status/ID only and grant no authority.
+preparation keeps it pending. A notice carries the task's rendered report when it is at most 12 KiB (32 KiB across one request); a larger report keeps the `task_result` pointer plus its first KiB. Notices grant no authority.
 
 Jobs outlive the foreground turn, including while a new native Anthropic prompt
 runs. Their approvals remain ordinary TUI/ACP requests belonging to the exact
@@ -240,7 +236,7 @@ file (symlink, wrong owner or mode, invalid ids) is ignored. Only ids that could
 (dropped by the limits, removed artifacts, or a forked/imported session) are named in one system
 notice as no longer resumable (ids from before the last such notice are not repeated), so the
 model starts a new task instead of using a dead id. An unknown or expired id is rejected with an
-explicit error. The task tool without a session pool keeps its conversations in memory only.
+explicit error. Each history is serialized once on the blocking pool and finished children are written to the store file in one coalesced write about 50 ms after the last one, never on an async worker. A resumed session also gets one system notice naming background shell jobs and tasks that were still running when the previous process ended: they are gone. The task tool without a session pool keeps its conversations in memory only.
 Worktree-isolated children are not resumable (their worktree ends with them); failed children get
 no id.
 

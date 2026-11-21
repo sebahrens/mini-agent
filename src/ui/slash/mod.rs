@@ -1063,16 +1063,6 @@ async fn handle_compress_unfloored(
         ),
         C_AGENT,
     )?;
-    // Compaction cancels the session's running background tasks; say so, since
-    // the model otherwise only learns it from a later task notice.
-    #[cfg(feature = "subagents")]
-    if let Some(pool) = &ui.session.background_pool
-        && let Some(notice) = crate::extras::subagents::background::compaction_cancel_notice(
-            &pool.take_compaction_cancelled(),
-        )
-    {
-        renderer.write_line(&notice, crate::ui::C_ERROR)?;
-    }
     // render_session above already displayed the full active recap. Add an
     // explicit manual-completion hint without printing the same body twice.
     if !auto && let Some(summary) = ui.session.compacted_context().0 {
@@ -1554,7 +1544,7 @@ pub(crate) async fn handle_slash(
             }
             Ok(())
         }
-        "/compress" | "/compact" | "/worktree" | "/wt-merge" | "/wt-exit" => {
+        "/compress" | "/compact" | "/worktree" | "/wt-merge" | "/wt-exit" | "/wt-discard" => {
             features::handle(&parts, &mut ctx).await
         }
         #[cfg(feature = "hooks")]

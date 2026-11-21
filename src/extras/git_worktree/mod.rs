@@ -41,11 +41,33 @@ fn stash_publish_test_gates() -> &'static StdMutex<HashMap<PathBuf, StashPublish
     STASH_PUBLISH_TEST_GATES.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
+/// What `/wt-merge` was asked beyond the target branch.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MergeOptions {
+    /// Sync the target with its remote (fetch the target's own remote, then
+    /// pull) before the squash. Off by default: the merge is local and only
+    /// reports how far the target is behind its already-fetched upstream
+    /// (mini-agent-nvnkx.216).
+    pub pull: bool,
+    /// The squash commit's message; otherwise one is composed from the source
+    /// branch's commits (mini-agent-nvnkx.318).
+    pub message: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub enum DeferredWorktreeAction {
-    Switch { path: PathBuf, branch: String },
-    Merge { info: WorktreeInfo, target: String },
-    Exit { main_path: PathBuf },
+    Switch {
+        path: PathBuf,
+        branch: String,
+    },
+    Merge {
+        info: WorktreeInfo,
+        target: String,
+        options: MergeOptions,
+    },
+    Exit {
+        main_path: PathBuf,
+    },
 }
 
 impl fmt::Display for DeferredWorktreeAction {
@@ -58,7 +80,7 @@ impl fmt::Display for DeferredWorktreeAction {
                     path.display()
                 )
             }
-            Self::Merge { info, target } => {
+            Self::Merge { info, target, .. } => {
                 write!(f, "deferred worktree merge: {} -> {}", info.branch, target)
             }
             Self::Exit { main_path, .. } => {
@@ -121,6 +143,9 @@ struct CreateState {
 
 pub struct MergeState {
     pub info: WorktreeInfo,
+    /// Non-fatal observations for the user, such as how far the target is
+    /// behind its upstream.
+    pub notices: Vec<String>,
     pub original_branch: String,
     /// The workspace the caller was operating in before the merge. It is kept
     /// for UI state and compatibility; Git operations never use it as CWD.
@@ -132,6 +157,10 @@ pub struct MergeState {
     branch_switch_attempted: bool,
     index_mutation_attempted: bool,
     original_head_oid: String,
+    /// `ls-files --others --directory -z` of the main checkout before the
+    /// merge touched it: untracked and ignored entries that already existed
+    /// and must not be mistaken for content the stash restore created.
+    others_before: Option<Vec<u8>>,
     source_head_oid: String,
     target_branch: String,
     target_head_before_pull: Option<String>,
@@ -363,6 +392,190 @@ async fn current_branch_at(repo_path: &Path) -> Result<Option<String>, String> {
     }
     let branch = String::from_utf8_lossy(trim_line(&output.stdout)).into_owned();
     Ok(Some(branch))
+}
+
+/// Untracked paths of a `status --porcelain -z --untracked-files=all` listing.
+fn untracked_from_status(stdout: &[u8]) -> Vec<String> {
+    stdout
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| entry.strip_prefix(b"?? "))
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .collect()
+}
+
+/// The untracked paths that occupy a path (or a directory of a path) some
+/// `refs` tree tracks. At most [`MAX_COLLISION_PATHS`] untracked paths are
+/// checked; beyond that every one of them is reported, which is conservative.
+async fn untracked_collisions(
+    repo_path: &Path,
+    untracked: &[String],
+    refs: &[&str],
+) -> Result<Vec<String>, String> {
+    const MAX_COLLISION_PATHS: usize = 1000;
+    if untracked.len() > MAX_COLLISION_PATHS {
+        return Ok(untracked.iter().take(20).cloned().collect());
+    }
+    let mut specs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for path in untracked {
+        specs.insert(path.clone());
+        let mut end = 0;
+        while let Some(at) = path[end..].find('/') {
+            end += at;
+            specs.insert(path[..end].to_string());
+            end += 1;
+        }
+    }
+    let mut tracked: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for reference in refs {
+        let mut args: Vec<std::ffi::OsString> = vec![
+            "ls-tree".into(),
+            "-r".into(),
+            "--name-only".into(),
+            "-z".into(),
+            (*reference).into(),
+            "--".into(),
+        ];
+        // `ls-tree` patterns are literal paths, not pathspecs with magic.
+        args.extend(specs.iter().map(|spec| spec.as_str().into()));
+        let output = run_query(repo_path, "untracked-collisions", args).await?;
+        tracked.extend(
+            output
+                .stdout
+                .split(|byte| *byte == 0)
+                .filter(|name| !name.is_empty())
+                .map(|name| String::from_utf8_lossy(name).into_owned()),
+        );
+    }
+    Ok(untracked
+        .iter()
+        .filter(|path| {
+            let dir = format!("{path}/");
+            tracked.contains(*path)
+                || tracked.iter().any(|name| name.starts_with(&dir))
+                || path
+                    .match_indices('/')
+                    .any(|(at, _)| tracked.contains(&path[..at]))
+        })
+        .cloned()
+        .collect())
+}
+
+/// The remote `git pull` would use for `target`, when one is configured.
+async fn target_remote(repo_path: &Path, target: &str) -> Result<Option<String>, String> {
+    let key = format!("branch.{target}.remote");
+    let output = worktree_runner()
+        .run_allow_exit(
+            repo_path,
+            "target-remote",
+            ["config", "--get", key.as_str()],
+            QUERY_LIMITS,
+        )
+        .await?;
+    if output.exit_status.and_then(|status| status.code()) != Some(0) {
+        return Ok(None);
+    }
+    let remote = String::from_utf8_lossy(trim_line(&output.stdout)).into_owned();
+    // `.` means the upstream is a local branch: nothing to fetch. A name that
+    // is not a configured remote is left to `git pull` to report.
+    if remote.is_empty() || remote == "." {
+        return Ok(None);
+    }
+    let url_key = format!("remote.{remote}.url");
+    let configured = worktree_runner()
+        .run_allow_exit(
+            repo_path,
+            "target-remote-url",
+            ["config", "--get", url_key.as_str()],
+            QUERY_LIMITS,
+        )
+        .await?;
+    Ok((configured.exit_status.and_then(|status| status.code()) == Some(0)).then_some(remote))
+}
+
+/// `target is N commits behind origin/target`, from refs already fetched, or
+/// `None` when it is current, has no upstream or the refs cannot be read.
+async fn behind_upstream_notice(repo_path: &Path, target: &str) -> Result<Option<String>, String> {
+    let upstream_spec = format!("{target}@{{upstream}}");
+    let upstream = worktree_runner()
+        .run_allow_exit(
+            repo_path,
+            "target-upstream-name",
+            ["rev-parse", "--abbrev-ref", upstream_spec.as_str()],
+            QUERY_LIMITS,
+        )
+        .await?;
+    if upstream.exit_status.and_then(|status| status.code()) != Some(0) {
+        return Ok(None);
+    }
+    let upstream = String::from_utf8_lossy(trim_line(&upstream.stdout)).into_owned();
+    let range = format!("{target}..{upstream_spec}");
+    let count = worktree_runner()
+        .run_allow_exit(
+            repo_path,
+            "target-behind",
+            ["rev-list", "--count", range.as_str()],
+            QUERY_LIMITS,
+        )
+        .await?;
+    if count.exit_status.and_then(|status| status.code()) != Some(0) {
+        return Ok(None);
+    }
+    let behind: u64 = String::from_utf8_lossy(trim_line(&count.stdout))
+        .parse()
+        .unwrap_or(0);
+    Ok((behind > 0).then(|| {
+        format!(
+            "target '{target}' is {behind} commit{} behind {upstream} (from already-fetched refs); it was not pulled. Use /wt-merge --pull to sync it first.",
+            if behind == 1 { "" } else { "s" }
+        )
+    }))
+}
+
+/// The subject the harness gives its own save commits; never a useful entry
+/// in the squashed history.
+const AUTO_COMMIT_SUBJECT: &str = "auto-commit: save changes before merge";
+
+/// The squash commit's message: the user's, or `Merge worktree <branch>` with
+/// the source commit subjects (without the harness's auto-commits) as a body.
+async fn squash_commit_message(
+    repo_path: &Path,
+    branch: &str,
+    given: Option<&str>,
+    base: &str,
+    source: &str,
+) -> Result<String, String> {
+    if let Some(message) = given.map(str::trim).filter(|message| !message.is_empty()) {
+        return Ok(format!("{message}\n"));
+    }
+    let range = format!("{base}..{source}");
+    let log = run_query(
+        repo_path,
+        "merge-subjects",
+        [
+            "log",
+            "--no-merges",
+            "--reverse",
+            "--format=%s",
+            range.as_str(),
+        ],
+    )
+    .await?;
+    let subjects: Vec<String> = String::from_utf8_lossy(&log.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && *line != AUTO_COMMIT_SUBJECT)
+        .map(str::to_owned)
+        .collect();
+    let mut message = format!("Merge worktree {branch}\n");
+    if !subjects.is_empty() {
+        message.push('\n');
+        for subject in subjects {
+            message.push_str("- ");
+            message.push_str(&subject);
+            message.push('\n');
+        }
+    }
+    Ok(message)
 }
 
 /// A local-only target has nothing to pull. If either half of Git's upstream
@@ -1266,21 +1479,38 @@ pub fn repo_name(path: &Path) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+#[cfg(test)]
 pub async fn try_merge(info: &WorktreeInfo, target: &str) -> MergeResponse {
-    try_merge_with_switch_limits(info, target, LOCAL_MUTATION_LIMITS).await
+    try_merge_with_options(info, target, MergeOptions::default()).await
+}
+
+pub async fn try_merge_with_options(
+    info: &WorktreeInfo,
+    target: &str,
+    options: MergeOptions,
+) -> MergeResponse {
+    try_merge_with_switch_limits(info, target, LOCAL_MUTATION_LIMITS, options).await
 }
 
 async fn try_merge_with_switch_limits(
     info: &WorktreeInfo,
     target: &str,
     switch_limits: CommandLimits,
+    options: MergeOptions,
 ) -> MergeResponse {
     let fallback_info = info.clone();
     let (response_tx, response_rx) = oneshot::channel();
     let owned_info = info.clone();
     let owned_target = target.to_string();
     std::mem::drop(crate::agent::runner::spawn_async_scoped(async move {
-        supervise_merge(owned_info, owned_target, switch_limits, response_tx).await;
+        supervise_merge(
+            owned_info,
+            owned_target,
+            switch_limits,
+            options,
+            response_tx,
+        )
+        .await;
     }));
     response_rx.await.unwrap_or_else(|_| {
         (
@@ -1294,9 +1524,10 @@ async fn supervise_merge(
     info: WorktreeInfo,
     target: String,
     switch_limits: CommandLimits,
+    options: MergeOptions,
     mut response_tx: oneshot::Sender<MergeResponse>,
 ) {
-    match try_merge_transaction(&info, &target, switch_limits, &mut response_tx).await {
+    match try_merge_transaction(&info, &target, switch_limits, &options, &mut response_tx).await {
         SupervisedMerge::Deliver(result) => {
             if let Err(mut abandoned) = response_tx.send(result) {
                 rollback_abandoned_merge(&mut abandoned.0).await;
@@ -1327,6 +1558,7 @@ async fn try_merge_transaction(
     info: &WorktreeInfo,
     target: &str,
     switch_limits: CommandLimits,
+    options: &MergeOptions,
     response_tx: &mut oneshot::Sender<MergeResponse>,
 ) -> SupervisedMerge {
     let main_repo_path = match canonical_path(&info.main_repo_path, "main repository") {
@@ -1412,18 +1644,26 @@ async fn try_merge_transaction(
         let status = run_query(
             &main_repo_path,
             "status",
-            ["status", "--porcelain", "--untracked-files=all"],
+            ["status", "--porcelain", "--untracked-files=all", "-z"],
         )
         .await?;
         if trim_line(&status.stdout).is_empty() {
             return Ok(false);
         }
-        let extras = worktree_extra_paths(&main_repo_path).await?;
-        if !extras.is_empty() {
-            return Err(format!(
-                "merge refused because the main workspace contains untracked or ignored files; commit or stash them manually. {}",
-                extras.describe(),
-            ));
+        // Ignored files are never committed, stashed or removed by the reset
+        // and switch that follow, so they cannot block the merge. An untracked
+        // file blocks it only when it sits where the target or the source
+        // branch has a tracked path, which is what `git switch` and the
+        // squash would refuse (mini-agent-nvnkx.215).
+        let untracked = untracked_from_status(&status.stdout);
+        if !untracked.is_empty() {
+            let collisions = untracked_collisions(&main_repo_path, &untracked, &[target, info.branch.as_str()]).await?;
+            if !collisions.is_empty() {
+                return Err(format!(
+                    "merge refused because untracked files in the main workspace would collide with files being merged; move or commit them first: {:?}",
+                    collisions
+                ));
+            }
         }
         Ok(true)
     })
@@ -1437,6 +1677,14 @@ async fn try_merge_transaction(
         Err(MergeStepError::CallerDropped) => return SupervisedMerge::CallerDropped(state),
     };
     if has_changes {
+        match await_merge_step(response_tx, others_listing(&main_repo_path)).await {
+            Ok(listing) => state.others_before = Some(listing),
+            Err(MergeStepError::Command(error)) => {
+                state.repository_guard.take();
+                return SupervisedMerge::Deliver((state, MergeOutcome::Error(error)));
+            }
+            Err(MergeStepError::CallerDropped) => return SupervisedMerge::CallerDropped(state),
+        }
         state.stash_before =
             match await_merge_step(response_tx, optional_ref_oid(&main_repo_path, "refs/stash"))
                 .await
@@ -1497,35 +1745,60 @@ async fn try_merge_transaction(
         }
     }
 
-    // The merge itself is local; fetched refs only matter to the later `git
-    // pull`, which runs only when the target has upstream configuration. Skip
-    // contacting every remote for a local-only target.
-    let pull_configured = match await_merge_step(
-        response_tx,
-        target_has_pull_configuration(&main_repo_path, target),
-    )
-    .await
-    {
-        Ok(configured) => configured,
-        Err(MergeStepError::Command(error)) => {
-            return SupervisedMerge::Deliver(early_merge_error(&mut state, error).await);
-        }
-        Err(MergeStepError::CallerDropped) => return SupervisedMerge::CallerDropped(state),
-    };
-    if pull_configured {
+    // The merge is local by default: the squash lands on the target as it is
+    // and the user's branch is never advanced by an unrequested pull. Without
+    // `--pull` only already-fetched refs are read, to say how far behind its
+    // upstream the target is. With `--pull`, only the target's own remote is
+    // fetched (an unrelated unreachable remote cannot block the merge) and a
+    // fetch or pull failure leaves the repository unchanged.
+    let pull_configured = if options.pull {
         match await_merge_step(
             response_tx,
-            run_network(&main_repo_path, "fetch", ["fetch", "--all"]),
+            target_has_pull_configuration(&main_repo_path, target),
         )
         .await
         {
-            Ok(_) => {}
+            Ok(configured) => configured,
             Err(MergeStepError::Command(error)) => {
-                return SupervisedMerge::Deliver(
-                    early_merge_error(&mut state, format!("fetch failed: {error}")).await,
-                );
+                return SupervisedMerge::Deliver(early_merge_error(&mut state, error).await);
             }
             Err(MergeStepError::CallerDropped) => return SupervisedMerge::CallerDropped(state),
+        }
+    } else {
+        match await_merge_step(response_tx, behind_upstream_notice(&main_repo_path, target)).await {
+            Ok(Some(notice)) => state.notices.push(notice),
+            Ok(None) => {}
+            Err(MergeStepError::Command(_)) => {}
+            Err(MergeStepError::CallerDropped) => return SupervisedMerge::CallerDropped(state),
+        }
+        false
+    };
+    if pull_configured {
+        let remote =
+            match await_merge_step(response_tx, target_remote(&main_repo_path, target)).await {
+                Ok(remote) => remote,
+                Err(MergeStepError::Command(error)) => {
+                    return SupervisedMerge::Deliver(early_merge_error(&mut state, error).await);
+                }
+                Err(MergeStepError::CallerDropped) => return SupervisedMerge::CallerDropped(state),
+            };
+        if let Some(remote) = remote {
+            match await_merge_step(
+                response_tx,
+                run_network(&main_repo_path, "fetch", ["fetch", "--", remote.as_str()]),
+            )
+            .await
+            {
+                Ok(_) => {}
+                Err(MergeStepError::Command(error)) => {
+                    return SupervisedMerge::Deliver(
+                        early_merge_error(&mut state, format!("fetch failed: {error}")).await,
+                    );
+                }
+                Err(MergeStepError::CallerDropped) => {
+                    return SupervisedMerge::CallerDropped(state);
+                }
+            }
         }
     }
     state.branch_switch_attempted = true;
@@ -1645,6 +1918,7 @@ async fn try_merge_transaction(
         target,
         &main_repo_path,
         &target_ref,
+        options,
         response_tx,
         state,
     )
@@ -1659,6 +1933,7 @@ async fn squash_and_commit(
     target: &str,
     main_repo_path: &Path,
     target_ref: &str,
+    options: &MergeOptions,
     response_tx: &mut oneshot::Sender<MergeResponse>,
     mut state: MergeState,
 ) -> SupervisedMerge {
@@ -1748,10 +2023,37 @@ async fn squash_and_commit(
                 state.successful_merge_head = Some(pre_merge_head);
                 return SupervisedMerge::Deliver((state, MergeOutcome::Success));
             }
-            match await_merge_step(
+            let message = match await_merge_step(
                 response_tx,
-                run_local(main_repo_path, "merge-commit", ["commit", "--no-edit"]),
+                squash_commit_message(
+                    main_repo_path,
+                    &info.branch,
+                    options.message.as_deref(),
+                    &pre_merge_head,
+                    &state.source_head_oid,
+                ),
             )
+            .await
+            {
+                Ok(message) => message,
+                Err(MergeStepError::Command(_)) => format!("Merge worktree {}\n", info.branch),
+                Err(MergeStepError::CallerDropped) => {
+                    return SupervisedMerge::CallerDropped(state);
+                }
+            };
+            match await_merge_step(response_tx, async {
+                Ok::<_, String>(
+                    worktree_runner()
+                        .run_with_input(
+                            main_repo_path,
+                            "merge-commit",
+                            ["commit", "--file=-", "--cleanup=verbatim"],
+                            message.into_bytes(),
+                            LOCAL_MUTATION_LIMITS,
+                        )
+                        .await?,
+                )
+            })
             .await
             {
                 Ok(_) => match await_merge_step(
@@ -2162,7 +2464,16 @@ async fn restore_stash_after_abandonment(state: &mut MergeState) -> Result<(), S
                     .to_string(),
             );
         }
-        verify_applied_stash_exact(&state.info.main_repo_path, expected).await?;
+        // An unknown starting HEAD is verified strictly.
+        let head_moved = !state.original_head_oid.is_empty()
+            && revision_oid(&state.info.main_repo_path, "HEAD").await? != state.original_head_oid;
+        verify_applied_stash_exact(
+            &state.info.main_repo_path,
+            expected,
+            head_moved,
+            state.others_before.as_deref(),
+        )
+        .await?;
         if let Some(previous) = state.stash_before.as_deref() {
             compare_and_set_direct_ref(
                 &state.info.main_repo_path,
@@ -2187,36 +2498,82 @@ async fn restore_stash_after_abandonment(state: &mut MergeState) -> Result<(), S
     Ok(())
 }
 
-async fn verify_applied_stash_exact(repo_path: &Path, stash_oid: &str) -> Result<(), String> {
-    let expected_index = revision_oid(repo_path, &format!("{stash_oid}^2^{{tree}}")).await?;
-    let actual_index = run_query(repo_path, "verify-restored-stash-index", ["write-tree"]).await?;
-    if String::from_utf8_lossy(trim_line(&actual_index.stdout)) != expected_index {
-        return Err(
-            "restored stash retained because the index changed after exact apply".to_string(),
-        );
-    }
-    let expected_worktree = revision_oid(repo_path, &format!("{stash_oid}^{{tree}}")).await?;
-    let worktree = worktree_runner()
-        .run_allow_exit(
+/// Untracked and ignored entries of the checkout, directories collapsed.
+async fn others_listing(repo_path: &Path) -> Result<Vec<u8>, String> {
+    Ok(run_query(
+        repo_path,
+        "list-untracked-and-ignored",
+        [
+            "ls-files",
+            "--others",
+            "--directory",
+            "--no-empty-directory",
+            "-z",
+        ],
+    )
+    .await?
+    .stdout)
+}
+
+/// Check a stash applied back onto the checkout. With HEAD where it was when
+/// the stash was taken the index and tracked content must equal the stash's
+/// exactly. When a merge moved HEAD the stash was legitimately three-way
+/// applied onto the merge result, so only a clean apply (no unmerged paths) is
+/// required. Either way nothing may have appeared among the untracked or
+/// ignored entries that `others_before` did not already list.
+async fn verify_applied_stash_exact(
+    repo_path: &Path,
+    stash_oid: &str,
+    head_moved: bool,
+    others_before: Option<&[u8]>,
+) -> Result<(), String> {
+    if head_moved {
+        let unmerged = run_query(
             repo_path,
-            "verify-restored-stash-worktree",
-            ["diff", "--quiet", expected_worktree.as_str(), "--"],
-            QUERY_LIMITS,
+            "verify-restored-stash-conflicts",
+            ["ls-files", "--unmerged", "-z"],
         )
         .await?;
-    if !worktree.exit_status.is_some_and(|status| status.success()) {
-        return Err(
-            "restored stash retained because tracked workspace content changed after exact apply"
-                .to_string(),
-        );
+        if !unmerged.stdout.is_empty() {
+            return Err(
+                "restored stash retained because applying it left conflicts in the workspace"
+                    .to_string(),
+            );
+        }
+    } else {
+        let expected_index = revision_oid(repo_path, &format!("{stash_oid}^2^{{tree}}")).await?;
+        let actual_index =
+            run_query(repo_path, "verify-restored-stash-index", ["write-tree"]).await?;
+        if String::from_utf8_lossy(trim_line(&actual_index.stdout)) != expected_index {
+            return Err(
+                "restored stash retained because the index changed after exact apply".to_string(),
+            );
+        }
+        let expected_worktree = revision_oid(repo_path, &format!("{stash_oid}^{{tree}}")).await?;
+        let worktree = worktree_runner()
+            .run_allow_exit(
+                repo_path,
+                "verify-restored-stash-worktree",
+                ["diff", "--quiet", expected_worktree.as_str(), "--"],
+                QUERY_LIMITS,
+            )
+            .await?;
+        if !worktree.exit_status.is_some_and(|status| status.success()) {
+            return Err(
+                "restored stash retained because tracked workspace content changed after exact apply"
+                    .to_string(),
+            );
+        }
     }
-    let untracked = run_query(
-        repo_path,
-        "verify-restored-stash-untracked",
-        ["ls-files", "--others", "-z"],
-    )
-    .await?;
-    if !untracked.stdout.is_empty() {
+    let untracked = others_listing(repo_path).await?;
+    let known: std::collections::HashSet<&[u8]> = others_before
+        .unwrap_or_default()
+        .split(|byte| *byte == 0)
+        .collect();
+    if untracked
+        .split(|byte| *byte == 0)
+        .any(|entry| !entry.is_empty() && !known.contains(entry))
+    {
         return Err(
             "restored stash retained because untracked or ignored workspace content appeared after exact apply"
                 .to_string(),
@@ -2264,6 +2621,7 @@ async fn rollback_abandoned_merge(state: &mut MergeState) {
 fn empty_merge_state(info: &WorktreeInfo) -> MergeState {
     MergeState {
         info: info.clone(),
+        notices: Vec::new(),
         original_branch: String::new(),
         orig_dir: info.worktree_path.clone(),
         stashed: false,
@@ -2273,6 +2631,7 @@ fn empty_merge_state(info: &WorktreeInfo) -> MergeState {
         branch_switch_attempted: false,
         index_mutation_attempted: false,
         original_head_oid: String::new(),
+        others_before: None,
         source_head_oid: String::new(),
         target_branch: String::new(),
         target_head_before_pull: None,
@@ -2300,6 +2659,7 @@ fn state_with_guard(
 ) -> MergeState {
     MergeState {
         info: info.clone(),
+        notices: Vec::new(),
         original_branch,
         orig_dir: info.worktree_path.clone(),
         stashed,
@@ -2309,6 +2669,7 @@ fn state_with_guard(
         branch_switch_attempted: false,
         index_mutation_attempted: false,
         original_head_oid: String::new(),
+        others_before: None,
         source_head_oid: String::new(),
         target_branch: String::new(),
         target_head_before_pull: None,
@@ -2595,6 +2956,205 @@ async fn verify_target_and_delete_source(
         .await
         .map(|_| ())
         .map_err(String::from)
+}
+
+/// Submodules the repository tracks whose directories were not populated in
+/// `worktree_path`: `git worktree add` leaves them empty and internal git runs
+/// never recurse into submodules, so builds there fail until the user runs
+/// `git submodule update --init` (mini-agent-nvnkx.220).
+pub async fn uninitialised_submodules(worktree_path: &Path) -> Vec<String> {
+    let Ok(listing) = run_query(
+        worktree_path,
+        "worktree-gitlinks",
+        ["ls-files", "--stage", "-z"],
+    )
+    .await
+    else {
+        return Vec::new();
+    };
+    listing
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| entry.strip_prefix(b"160000 "))
+        .filter_map(|entry| {
+            entry
+                .iter()
+                .position(|byte| *byte == b'\t')
+                .map(|at| &entry[at + 1..])
+        })
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .filter(|path| !worktree_path.join(path).join(".git").exists())
+        .collect()
+}
+
+/// A linked worktree this harness created (its branch records a base).
+#[derive(Debug, Clone)]
+pub struct ManagedWorktree {
+    pub info: WorktreeInfo,
+    /// The branch it was created from (`branch.<name>.mini-agent-base`).
+    pub base: Option<String>,
+    /// Uncommitted or untracked changes in the worktree; `None` if unreadable.
+    pub dirty: Option<bool>,
+    /// Seconds since the branch's latest commit; `None` if unreadable.
+    pub age_secs: Option<u64>,
+}
+
+/// Linked worktrees of the repository containing `repo_path` that were
+/// created by `/worktree` (mini-agent-nvnkx.52), newest first by name.
+pub async fn list_managed(repo_path: &Path) -> Result<Vec<ManagedWorktree>, String> {
+    let repo_path = canonical_path(repo_path, "repository")?;
+    let (_, common_dir) = checkout_roots(&repo_path).await?;
+    let main_repo_path = common_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "repository has no main checkout".to_string())?;
+    let listing = run_query(
+        &repo_path,
+        "worktree-list",
+        ["worktree", "list", "--porcelain", "-z"],
+    )
+    .await?;
+    // `-z`: NUL-terminated attribute lines, an empty field between records.
+    let mut records: Vec<(Option<PathBuf>, Option<String>)> = Vec::new();
+    let mut current: (Option<PathBuf>, Option<String>) = (None, None);
+    for field in listing.stdout.split(|byte| *byte == 0) {
+        if field.is_empty() {
+            if current.0.is_some() {
+                records.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        let text = String::from_utf8_lossy(field);
+        if let Some(path) = text.strip_prefix("worktree ") {
+            if current.0.is_some() {
+                records.push(std::mem::take(&mut current));
+            }
+            current.0 = Some(PathBuf::from(path.to_string()));
+        } else if let Some(branch) = text.strip_prefix("branch refs/heads/") {
+            current.1 = Some(branch.to_string());
+        }
+    }
+    if current.0.is_some() {
+        records.push(current);
+    }
+    let mut managed = Vec::new();
+    for (path, branch) in records {
+        let (Some(path), Some(branch)) = (path, branch) else {
+            continue;
+        };
+        let canonical = path.canonicalize().unwrap_or(path.clone());
+        if canonical == main_repo_path {
+            continue;
+        }
+        let key = base_config_key(&branch);
+        let base = worktree_runner()
+            .run_allow_exit(
+                &main_repo_path,
+                "worktree-base",
+                ["config", "--get", key.as_str()],
+                QUERY_LIMITS,
+            )
+            .await?;
+        if base.exit_status.and_then(|status| status.code()) != Some(0) {
+            continue;
+        }
+        let base = String::from_utf8_lossy(trim_line(&base.stdout)).into_owned();
+        let dirty = if canonical.exists() {
+            has_uncommitted_changes_at(&canonical).await.ok()
+        } else {
+            None
+        };
+        let age_secs = match run_query(
+            &main_repo_path,
+            "worktree-age",
+            [
+                "log",
+                "-1",
+                "--format=%ct",
+                format!("refs/heads/{branch}").as_str(),
+                "--",
+            ],
+        )
+        .await
+        {
+            Ok(output) => String::from_utf8_lossy(trim_line(&output.stdout))
+                .parse::<u64>()
+                .ok()
+                .and_then(|then| {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|now| now.as_secs().saturating_sub(then))
+                }),
+            Err(_) => None,
+        };
+        managed.push(ManagedWorktree {
+            info: WorktreeInfo {
+                branch,
+                worktree_path: canonical,
+                main_repo_path: main_repo_path.clone(),
+            },
+            base: (!base.is_empty()).then_some(base),
+            dirty,
+            age_secs,
+        });
+    }
+    managed.sort_by(|a, b| a.info.branch.cmp(&b.info.branch));
+    Ok(managed)
+}
+
+/// The managed worktree whose branch is `name`, if any.
+pub async fn find_managed(repo_path: &Path, name: &str) -> Result<Option<ManagedWorktree>, String> {
+    Ok(list_managed(repo_path)
+        .await?
+        .into_iter()
+        .find(|worktree| worktree.info.branch == name))
+}
+
+/// Why discarding `worktree` would lose work: uncommitted changes, or commits
+/// not reachable from its base branch. Empty when discarding loses nothing.
+pub async fn discard_blockers(worktree: &ManagedWorktree) -> Result<Vec<String>, String> {
+    let mut blockers = Vec::new();
+    match worktree.dirty {
+        Some(false) => {}
+        Some(true) => blockers.push("it has uncommitted changes".to_string()),
+        None => blockers.push("its working tree status could not be read".to_string()),
+    }
+    let main = &worktree.info.main_repo_path;
+    let base = match &worktree.base {
+        Some(base) => Some(base.clone()),
+        None => default_branch(main).await,
+    };
+    match base {
+        Some(base) => {
+            let range = format!("refs/heads/{base}..refs/heads/{}", worktree.info.branch);
+            match run_query(
+                main,
+                "worktree-unmerged",
+                ["rev-list", "--count", range.as_str()],
+            )
+            .await
+            {
+                Ok(output) => {
+                    let count: u64 = String::from_utf8_lossy(trim_line(&output.stdout))
+                        .parse()
+                        .unwrap_or(0);
+                    if count > 0 {
+                        blockers.push(format!(
+                            "branch '{}' has {count} commit{} not merged into '{base}'",
+                            worktree.info.branch,
+                            if count == 1 { "" } else { "s" }
+                        ));
+                    }
+                }
+                Err(error) => blockers.push(format!(
+                    "its unmerged commits could not be counted: {error}"
+                )),
+            }
+        }
+        None => blockers.push("no base branch is known to compare its commits with".to_string()),
+    }
+    Ok(blockers)
 }
 
 #[cfg(test)]
@@ -3012,7 +3572,7 @@ pub(crate) async fn try_merge_with_switch_limits_for_test(
     target: &str,
     limits: CommandLimits,
 ) -> MergeResponse {
-    try_merge_with_switch_limits(info, target, limits).await
+    try_merge_with_switch_limits(info, target, limits, MergeOptions::default()).await
 }
 
 #[cfg(test)]

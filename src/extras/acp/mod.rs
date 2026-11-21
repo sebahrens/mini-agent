@@ -589,9 +589,7 @@ impl SessionHistory {
                 pre_compact_sent: &pre_compact_sent,
                 snap: Some(&snap),
             };
-            let mut observer = AcpCompactionObserver {
-                events: &mut self.compaction_events,
-            };
+            let mut observer = AcpCompactionObserver;
             let result = tokio::select! {
                 biased;
                 _ = control.cancelled() => return None,
@@ -663,20 +661,11 @@ impl SessionHistory {
     }
 }
 
-/// ACP's part of the shared compaction driver: cancelled background work is
-/// reported to the client, and the summarizer is charged at the turn's captured
-/// prices.
-struct AcpCompactionObserver<'a> {
-    events: &'a mut Vec<String>,
-}
+/// ACP's part of the shared compaction driver: the summarizer is charged at the
+/// turn's captured prices.
+struct AcpCompactionObserver;
 
-impl crate::session::compaction_run::Observer for AcpCompactionObserver<'_> {
-    fn paused(&mut self, notice: &str) {
-        // Compaction cancels running background tasks; tell the client, since
-        // nothing else reports it.
-        self.events.push(notice.to_owned());
-    }
-
+impl crate::session::compaction_run::Observer for AcpCompactionObserver {
     fn charge(
         &mut self,
         session: &mut crate::session::Session,

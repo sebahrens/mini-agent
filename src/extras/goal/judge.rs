@@ -568,8 +568,17 @@ fn clip(text: &str, max_bytes: usize) -> String {
 pub fn parse_verdict(raw: &str) -> Result<(Outcome, String), String> {
     let text = raw.trim();
 
+    // The last well-formed verdict line wins: a judge that quotes transcript
+    // text or reasons aloud before answering ends with its real answer. A
+    // blockquoted line is quoted material, never the judge's own verdict.
+    let mut found: Option<Outcome> = None;
+    let mut unrecognized: Option<String> = None;
     for line in text.lines() {
-        let line = line.trim().trim_start_matches(['*', '#', '-', '>']).trim();
+        let line = line.trim();
+        if line.starts_with('>') {
+            continue;
+        }
+        let line = line.trim_start_matches(['*', '#', '-']).trim();
         let Some(rest) = line
             .strip_prefix("VERDICT:")
             .or_else(|| line.strip_prefix("verdict:"))
@@ -590,13 +599,20 @@ pub fn parse_verdict(raw: &str) -> Result<(Outcome, String), String> {
             // An echoed format line decides nothing; a real verdict may follow.
             continue;
         }
-        let outcome = match token.as_str() {
-            "met" => Outcome::Met,
-            "not_yet" | "not yet" | "notyet" => Outcome::NotYet,
-            "impossible" => Outcome::Impossible,
-            other => return Err(format!("unrecognized verdict {other:?}")),
-        };
+        match token.as_str() {
+            "met" => found = Some(Outcome::Met),
+            "not_yet" | "not yet" | "notyet" => found = Some(Outcome::NotYet),
+            "impossible" => found = Some(Outcome::Impossible),
+            other => {
+                unrecognized.get_or_insert_with(|| format!("unrecognized verdict {other:?}"));
+            }
+        }
+    }
+    if let Some(outcome) = found {
         return Ok((outcome, text_reason(text)));
+    }
+    if let Some(error) = unrecognized {
+        return Err(error);
     }
 
     // JSON fallback, fenced or bare.
@@ -1139,6 +1155,25 @@ mod tests {
             Outcome::NotYet,
             "an echoed template followed by a real answer reads the answer"
         );
+    }
+
+    /// The judge's last own verdict line decides; quoted text and tentative
+    /// lines before it do not (mini-agent-nvnkx.341).
+    #[test]
+    fn the_last_unquoted_verdict_line_wins() {
+        assert_eq!(
+            parse_verdict("> VERDICT: met\nVERDICT: not_yet\nREASON: tests missing")
+                .unwrap()
+                .0,
+            Outcome::NotYet
+        );
+        assert_eq!(
+            parse_verdict("VERDICT: met? checking\nVERDICT: not_yet\nREASON: x")
+                .unwrap()
+                .0,
+            Outcome::NotYet
+        );
+        assert!(parse_verdict("> VERDICT: met\nno answer").is_err());
     }
 
     /// The judge hears which commands the harness ran and how they ended, so

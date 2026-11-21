@@ -140,6 +140,139 @@ impl super::Session {
     }
 }
 
+/// Start of the system notice [`Session::note_gone_background_work`] appends.
+const GONE_WORK_NOTICE: &str = "Background shell jobs and tasks started earlier in this session";
+const JOB_STARTED_MARKER: &str = "Background job started: ";
+const JOB_LOG_MARKER: &str = "Complete output is logged to ";
+const TASK_STARTED_MARKER: &str = "Background task started: ";
+
+/// Job or task id characters.
+fn id_at(text: &str) -> String {
+    text.chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .take(64)
+        .collect()
+}
+
+impl super::Session {
+    /// A resumed session's transcript still says that a background shell job
+    /// or task was started and is running, but both died with the previous
+    /// process. Append one system notice naming those started after the last
+    /// such notice and not recorded as finished, so the model does not wait on
+    /// a dev server or test run that no longer exists. `live` says whether an
+    /// id still belongs to this process (a session switched back to within one
+    /// process keeps its jobs). Returns whether a notice was added
+    /// (mini-agent-nvnkx.270).
+    pub fn note_gone_background_work(
+        &mut self,
+        resumed: bool,
+        live: impl Fn(&str) -> bool,
+    ) -> bool {
+        if !resumed {
+            return false;
+        }
+        let start = self
+            .messages
+            .iter()
+            .rposition(|message| {
+                message.role == super::MessageRole::System
+                    && message.content.starts_with(GONE_WORK_NOTICE)
+            })
+            .map_or(0, |index| index + 1);
+        let segment = &self.messages[start..];
+        // (id, log path) in start order.
+        let mut jobs: Vec<(String, Option<String>)> = Vec::new();
+        let mut tasks: Vec<String> = Vec::new();
+        for message in segment {
+            if !matches!(message.role, super::MessageRole::ToolResult) {
+                continue;
+            }
+            let text = message.content.as_str();
+            if let Some(at) = text.find(JOB_STARTED_MARKER) {
+                let id = id_at(&text[at + JOB_STARTED_MARKER.len()..]);
+                let log = text.find(JOB_LOG_MARKER).map(|at| {
+                    text[at + JOB_LOG_MARKER.len()..]
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string()
+                });
+                if !id.is_empty() && !jobs.iter().any(|(known, _)| *known == id) {
+                    jobs.push((id, log.filter(|path| !path.is_empty())));
+                }
+            }
+            if let Some(at) = text.find(TASK_STARTED_MARKER) {
+                let id = id_at(&text[at + TASK_STARTED_MARKER.len()..]);
+                if !id.is_empty() && !tasks.contains(&id) {
+                    tasks.push(id);
+                }
+            }
+        }
+        if jobs.is_empty() && tasks.is_empty() {
+            return false;
+        }
+        let mentions = |needle: &str| {
+            segment
+                .iter()
+                .any(|message| message.content.contains(needle))
+        };
+        // A job whose status poll reported anything but running/stopping ended.
+        jobs.retain(|(id, _)| {
+            if live(id) {
+                return false;
+            }
+            let marker = format!("Job: {id}\nStatus: ");
+            !segment.iter().any(|message| {
+                message.content.match_indices(&marker).any(|(at, _)| {
+                    let status = id_at(&message.content[at + marker.len()..]);
+                    !matches!(status.as_str(), "running" | "stopping")
+                })
+            })
+        });
+        #[cfg(feature = "subagents")]
+        let rows = self.background_tasks();
+        tasks.retain(|id| {
+            if live(id) || mentions(&format!("[Background task {id} ")) {
+                return false;
+            }
+            #[cfg(feature = "subagents")]
+            if rows.iter().any(|row| {
+                row.id == *id
+                    && !row.status.is_active()
+                    && row.status != crate::extras::subagents::background::Status::Interrupted
+            }) {
+                return false;
+            }
+            true
+        });
+        let total = jobs.len() + tasks.len();
+        if total == 0 {
+            return false;
+        }
+        let mut named: Vec<String> = jobs
+            .iter()
+            .map(|(id, log)| match log {
+                Some(path) => format!("{id} (log: {path})"),
+                None => id.clone(),
+            })
+            .collect();
+        named.extend(tasks.iter().map(|id| format!("task {id}")));
+        let more = if total > MAX_STALE_CHILD_IDS {
+            format!(" (and {} more)", total - MAX_STALE_CHILD_IDS)
+        } else {
+            String::new()
+        };
+        named.truncate(MAX_STALE_CHILD_IDS);
+        let text = format!(
+            "{GONE_WORK_NOTICE} are no longer running: {}{more}. They ended with the previous process, so polling them fails and nothing will finish or notify. Treat their output as incomplete, and start them again if the work is still needed.",
+            named.join(", ")
+        );
+        self.add_message(super::MessageRole::System, &text);
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,5 +380,44 @@ mod tests {
         let mut plain = session();
         plain.add_message(MessageRole::ToolResult, "nothing here");
         assert!(!plain.note_stale_child_ids(true));
+    }
+
+    #[test]
+    fn restored_sessions_are_told_once_that_background_work_is_gone() {
+        let mut s = session();
+        let job = "job-6f1c0c5e-0000-4000-8000-000000000001";
+        let done = "job-6f1c0c5e-0000-4000-8000-000000000002";
+        let task = "6f1c0c5e-0000-4000-8000-000000000003";
+        s.add_message(
+            MessageRole::ToolResult,
+            &format!("Background job started: {job}\nUse job_status.\nComplete output is logged to /tmp/shell-{job}.log"),
+        );
+        s.add_message(
+            MessageRole::ToolResult,
+            &format!("Background job started: {done}"),
+        );
+        s.add_message(
+            MessageRole::ToolResult,
+            &format!("Job: {done}\nStatus: completed\nCommand: true"),
+        );
+        s.add_message(
+            MessageRole::ToolResult,
+            &format!("Background task started: {task}. Its result is announced."),
+        );
+        assert!(!s.note_gone_background_work(false, |_| false));
+        assert!(s.note_gone_background_work(true, |_| false));
+        let text = s.messages.last().unwrap().content.to_string();
+        assert!(text.contains(job) && text.contains("/tmp/shell-"), "{text}");
+        assert!(text.contains(task), "{text}");
+        assert!(!text.contains(done), "a finished job is not listed: {text}");
+        // The second resume has nothing newer to report.
+        assert!(!s.note_gone_background_work(true, |_| false));
+        // A job still owned by this process is not reported.
+        let mut live = session();
+        live.add_message(
+            MessageRole::ToolResult,
+            &format!("Background job started: {job}"),
+        );
+        assert!(!live.note_gone_background_work(true, |id| id == job));
     }
 }
