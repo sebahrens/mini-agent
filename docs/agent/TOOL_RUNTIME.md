@@ -430,8 +430,9 @@ read-only tools use shared access. `job_status` chooses per call: `poll`,
 `wait` and `list` only read the session job registry and share the lane, so a
 60-second wait does not stall parallel reads; `stop` and malformed arguments
 take exclusive access. `git` shares the lane for `status`, `diff`, `log`,
-`show`, `branches` and `stash_list` only; `task` shares it for the default
-read-only explorer (no `agent_type`, `resume`, `isolation` or `base_ref`), so
+`show`, `branches` and `stash_list` only; `task` shares it for a read-only explorer (no `resume`, `isolation` or `base_ref`, and
+no `agent_type` or one naming `explore` or a persona that is not `mode: write` and has no
+memory, hooks or MCP servers, computed when the tools are built), so
 several such calls in one message overlap; `lsp_navigate`, `list_mcp_resources`,
 `read_mcp_resource` and `task_evidence` always share. An MCP tool shares the
 lane only when its server sets `parallel_read_only = true` and the tool
@@ -1146,8 +1147,17 @@ streams, walks the page tree, inflates `FlateDecode`/`ASCIIHexDecode` content
 streams (also `ASCII85Decode`, `LZWDecode` with `/EarlyChange`, `RunLengthDecode`, and the PNG and TIFF
 predictors of `/DecodeParms`, alone or chained) and collects the strings shown by text operators, placing line breaks
 and word spaces from the text and graphics matrices. Fonts with a `ToUnicode`
-CMap decode through it; simple fonts use WinAnsi or MacRoman. Form XObjects and
-annotations are not searched. Nothing executes, renders or touches the network.
+CMap decode through it; simple fonts honour `/Encoding /Differences` (glyph names map through
+a compact Adobe Glyph List subset in `src/agent/tools/pdf_glyphs.rs`, ligatures expand to
+`fi`/`fl`), `StandardEncoding` (non-symbolic Type 1 fonts without an `/Encoding`), WinAnsi or
+MacRoman. Characters with no Unicode mapping (composite fonts without a usable `ToUnicode`,
+unknown glyph names) are counted per font and reported as a page note
+(`N character(s) in font F had no Unicode mapping, so text is missing`). Text inside Form
+XObjects is extracted (nested forms with their own `/Resources` and `/Matrix`, at most 8 deep
+and 512 invocations per page, cycle-safe, charged to the decode budget; unreadable forms are
+noted). Annotations are not searched. An object defined both directly and in an object stream,
+or in several object streams, resolves to the revision latest in the file. Nothing executes,
+renders or touches the network.
 
 Output starts with `PDF: <path> (N pages; extracted text layer of page(s) ...)`
 and marks each page with `--- page N ---`. `pages` selects 1-indexed pages
@@ -1163,7 +1173,7 @@ dropped silently: the page shows `[page N: content stream uses JBIG2Decode, not 
 adds `[page N: some content was not extracted: ...]`. When no selected page has text the result
 explains why per page: skipped streams are named; only pages that paint images (image XObjects
 or inline images) and run no text operator are called probably scanned, with the `pdftoppm`
-export hint; pages with neither text nor images are called blank or vector-only; pages whose
+export hint; pages with neither text nor images are called blank or vector-only (form XObjects are read); pages whose
 text operators decode to nothing say their characters could not be mapped. `web_fetch` PDFs use
 the same classification.
 
@@ -1179,6 +1189,12 @@ which page, and `continue with pages:"N-M"` for scanned pages left over. Fax (`C
 instead of attached, and the `pdftoppm` hint remains for them. Without image input (no captured
 transport, or a text-only model) the answer is the text-only scanned message and nothing is
 attached.
+
+**Figures on text pages.** A page that has a text layer but also paints images ends its text
+with `[page N also paints K image(s) ...; pass visual:true with pages:"N" to see them]` when the
+model could take them. `read` with `visual:true` attaches the selected pages (at most 20 per
+call, 4 page images) as page images, or as one native document block where that is available,
+regardless of the text layer; the result text maps image/document pages to source pages.
 
 **Provider-native PDF block.** When the captured transport can carry a document inside a tool
 result (Anthropic `document` blocks, OpenAI Responses `input_file` parts, Gemini inline
@@ -1233,7 +1249,7 @@ unique IDs and receives a new ID on insertion.
 
 The rewritten file keeps the original layout: the indentation unit is detected
 from the file (nbformat/Jupyter writes one space), single-line files stay
-compact, keys are written in sorted order like nbformat, and a final newline is
+compact, keys keep the order of the file (an inserted cell uses nbformat's sorted order), and a final newline is
 kept when the original had one. Unchanged fields are written from their raw
 source fragments, so for a Jupyter-written notebook only the edited cell's lines
 change in a git diff.
@@ -1249,7 +1265,9 @@ because embedded image outputs routinely make executed notebooks larger than the
 above the limit is refused with a message naming it. There are at most 4,096 cells,
 256 interpreted fields per notebook/cell/output object, 1,024 bytes per field
 name and 1 MiB of decoded source per cell. Duplicate interpreted object fields,
-invalid UTF-8 and ambiguous cell IDs are rejected. Unselected unknown cell
+and invalid UTF-8 are rejected. Missing, duplicate or invalid cell IDs are not: the view marks
+those cells (`id missing`, `(duplicate)`) with one notice, `cell_index` addressing works, and a
+`cell_id` shared by several cells is refused as ambiguous naming them; ids are never rewritten. Unselected unknown cell
 types are preserved; mutation of an unknown type is refused.
 
 The default `read` view shows virtual cell/source/output lines. Its existing
@@ -1263,11 +1281,21 @@ cell range is inspectable with offset/limit), and at most 4,096 output objects p
 Stream outputs show their text; `execute_result` and `display_data` outputs show
 their `text/plain` data; `error` outputs show `ename: evalue` and the traceback with
 ANSI colour codes removed (an over-budget traceback keeps the exception line and its
-last frames after a `[N traceback bytes omitted]` marker). Other mime types, such as
-images and HTML, are listed as `[image/png output omitted]`; their payloads are never
+last frames after a `[N traceback bytes omitted]` marker). When the model accepts images,
+`image/png` and `image/jpeg` outputs of cells inside the selected window come back as image
+blocks (at most 4 per read, through the ordinary image fit), mapped by lines such as
+`[image/png output attached as image 1 (cell 7 output 1)]`; beyond the cap the label says to
+narrow `offset`/`limit` to that cell. Other mime types, such as HTML, and every image for a
+text-only model, are listed as `[image/png output omitted]`; those payloads are never
 rendered. Outputs with nothing decodable show `[opaque output payload omitted]`. This view provides no raw line hashes,
 raw-file CRC or whole-file overwrite authorization. Set `raw_notebook: true`
 to use the ordinary raw JSON line reader and its existing edit/write contract.
+
+`notebook_edit` addressed by `cell_index` requires that `read` served a cell view of the
+notebook whose size and modification time still match the file; otherwise it fails with
+`notebook changed since it was read` (a `cell_id` edit needs no view). A successful edit forgets
+the view. The result names the affected index, the cell's id (nbformat 4.5+) and the resulting
+cell count when the preimage may be disclosed; `replace` accepts `cell_type` to convert a cell.
 
 `notebook_edit` uses its own permission name, with matching configured `edit`
 rules as fallback when no notebook-specific rule matches. Either tool's deny

@@ -72,6 +72,8 @@ async fn read_through_in_workspace_symlink_names_the_link() {
         .call(ReadArgs {
             pages: None,
             raw_notebook: false,
+            visual: false,
+            full_resolution: false,
             character_offset: None,
             character_limit: None,
             path: "docs/CLAUDE.md".into(),
@@ -91,6 +93,8 @@ async fn read_through_in_workspace_symlink_names_the_link() {
         .call(ReadArgs {
             pages: None,
             raw_notebook: false,
+            visual: false,
+            full_resolution: false,
             character_offset: None,
             character_limit: None,
             path: "packages/x/lib.ts".into(),
@@ -111,6 +115,8 @@ async fn read_through_in_workspace_symlink_names_the_link() {
         .call(ReadArgs {
             pages: None,
             raw_notebook: false,
+            visual: false,
+            full_resolution: false,
             character_offset: None,
             character_limit: None,
             path: fixture
@@ -208,6 +214,8 @@ async fn non_symlink_errors_pass_through_unchanged() {
         .call(ReadArgs {
             pages: None,
             raw_notebook: false,
+            visual: false,
+            full_resolution: false,
             character_offset: None,
             character_limit: None,
             path: "AGENTS.md/child".into(),
@@ -232,6 +240,8 @@ async fn escaping_symlink_target_is_not_disclosed() {
         .call(ReadArgs {
             pages: None,
             raw_notebook: false,
+            visual: false,
+            full_resolution: false,
             character_offset: None,
             character_limit: None,
             path: "docs/escape.md".into(),

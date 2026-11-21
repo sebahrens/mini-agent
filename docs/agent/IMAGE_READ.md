@@ -5,11 +5,15 @@ from the bytes of the file admitted by the existing read permission path. It
 returns one image block and a text summary containing dimensions and byte size.
 Names and extensions do not decide the format. Images require a regular file
 and no text `offset`/`limit`. An image within 5 MiB and 1 to 8000 pixels per side
-is sent unchanged. A larger one (up to 64 MiB encoded) is decoded with bounded
+is sent unchanged unless its long edge exceeds 2000 pixels or it is over 1 MiB
+(a Retina screenshot would otherwise be stored in history and re-sent whole with every
+request); then, like a larger one (up to 64 MiB encoded), it is decoded with bounded
 side and allocation limits, downscaled to at most 2000 pixels on its long edge
 and re-encoded (PNG while transparency fits, otherwise JPEG at quality 85); the
 summary ends with `resized from W x H to W2 x H2 (...)`. Only undecodable or
-unsupported data is refused. Animated GIFs are reduced to their first frame.
+unsupported data is refused. Pass `full_resolution:true` to keep the original pixels of an
+image that is within the 5 MiB / 8000 px limits; an image that is already inside the targets
+is never re-encoded. Animated GIFs are reduced to their first frame.
 An image read never establishes the raw full-read proof required for a text
 overwrite. Text, notebook and CRC reading retain their existing behavior.
 

@@ -262,6 +262,8 @@ async fn concurrent_read_tools_with_different_settings_do_not_share_history() {
     let args = || ReadArgs {
         pages: None,
         raw_notebook: false,
+        visual: false,
+        full_resolution: false,
         character_offset: None,
         character_limit: None,
         path: path.clone(),
@@ -297,6 +299,8 @@ async fn repeated_read_is_allowed_after_same_length_mtime_preserving_change() {
     let args = || ReadArgs {
         pages: None,
         raw_notebook: false,
+        visual: false,
+        full_resolution: false,
         character_offset: None,
         character_limit: None,
         path: path.to_string_lossy().into_owned(),
@@ -335,6 +339,8 @@ async fn failed_read_is_not_recorded_as_successful() {
     let args = || ReadArgs {
         pages: None,
         raw_notebook: false,
+        visual: false,
+        full_resolution: false,
         character_offset: None,
         character_limit: None,
         path: path.to_string_lossy().into_owned(),
@@ -368,6 +374,8 @@ async fn rebuilt_read_tool_keeps_its_logical_session_history() {
     let args = || ReadArgs {
         pages: None,
         raw_notebook: false,
+        visual: false,
+        full_resolution: false,
         character_offset: None,
         character_limit: None,
         path: path.clone(),
@@ -401,6 +409,8 @@ async fn loading_another_session_starts_fresh_read_history() {
     let args = || ReadArgs {
         pages: None,
         raw_notebook: false,
+        visual: false,
+        full_resolution: false,
         character_offset: None,
         character_limit: None,
         path: path.clone(),
@@ -435,6 +445,8 @@ async fn imported_session_uses_active_allow_repeated_reads_setting() {
     let args = || ReadArgs {
         pages: None,
         raw_notebook: false,
+        visual: false,
+        full_resolution: false,
         character_offset: None,
         character_limit: None,
         path: path.clone(),
@@ -474,6 +486,8 @@ async fn canonical_path_key_blocks_dot_alias_of_same_file() {
         tool.call(ReadArgs {
             pages: None,
             raw_notebook: false,
+            visual: false,
+            full_resolution: false,
             character_offset: None,
             character_limit: None,
             path: dot_spelling.to_string_lossy().into_owned(),
@@ -487,6 +501,8 @@ async fn canonical_path_key_blocks_dot_alias_of_same_file() {
         tool.call(ReadArgs {
             pages: None,
             raw_notebook: false,
+            visual: false,
+            full_resolution: false,
             character_offset: None,
             character_limit: None,
             path: canonical_spelling.to_string_lossy().into_owned(),
@@ -518,6 +534,8 @@ async fn edit_file_version_change_invalidates_every_session_tracker() {
     let read_args = || ReadArgs {
         pages: None,
         raw_notebook: false,
+        visual: false,
+        full_resolution: false,
         character_offset: None,
         character_limit: None,
         path: path.clone(),
@@ -566,6 +584,8 @@ async fn edit_of_canonical_target_invalidates_read_through_symlink_alias() {
     let alias_args = || ReadArgs {
         pages: None,
         raw_notebook: false,
+        visual: false,
+        full_resolution: false,
         character_offset: None,
         character_limit: None,
         path: alias.to_string_lossy().into_owned(),
@@ -607,6 +627,8 @@ fn read_args(path: &str, offset: Option<usize>, limit: Option<usize>) -> ReadArg
     ReadArgs {
         pages: None,
         raw_notebook: false,
+        visual: false,
+        full_resolution: false,
         character_offset: None,
         character_limit: None,
         path: path.into(),

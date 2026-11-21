@@ -182,6 +182,8 @@ async fn image_read64_actual_read_keeps_bytes_permissions_and_overwrite_proof_se
         offset: None,
         limit: None,
         raw_notebook: false,
+        visual: false,
+        full_resolution: false,
         character_offset: None,
         character_limit: None,
     };
@@ -891,6 +893,8 @@ async fn image_read64_existing_read_deny_and_byte_limit_precede_payload() {
         offset: None,
         limit: None,
         raw_notebook: false,
+        visual: false,
+        full_resolution: false,
         character_offset: None,
         character_limit: None,
     };
@@ -950,6 +954,8 @@ async fn oversized_image_reads_are_downscaled_and_report_the_new_size() {
                 offset: None,
                 limit: None,
                 raw_notebook: false,
+                visual: false,
+                full_resolution: false,
                 character_offset: None,
                 character_limit: None,
             })
@@ -1021,6 +1027,8 @@ async fn image_read64_feature_off_retains_data_but_refuses_read_and_dispatch() {
             offset: None,
             limit: None,
             raw_notebook: false,
+            visual: false,
+            full_resolution: false,
             character_offset: None,
             character_limit: None,
         })
@@ -1291,4 +1299,97 @@ async fn pdf_document_envelopes_survive_the_generic_spill_hook() {
         carried,
         "the document block must reach the next request intact"
     );
+}
+
+/// mini-agent-nvnkx.242: an image inside the hard limits is still shrunk when
+/// its long edge exceeds 2000 px or it is over 1 MiB; a small one is untouched.
+#[cfg(feature = "multimodal")]
+#[tokio::test]
+async fn in_limit_screenshots_are_downscaled_unless_full_resolution_is_requested() {
+    use crate::agent::tools::{ReadArgs, ReadTool, ReadTracker, read_image::ImageReadSupport};
+    use base64::Engine;
+    use rig::tool::Tool;
+    let root = super::OwnedTestDirectory::new("image-soft-target");
+    let large = crate::agent::tools::image_fit::tests::noisy_png(2400, 400);
+    assert!(large.len() < crate::agent::tools::read_image::MAX_IMAGE_BYTES);
+    std::fs::write(root.path().join("shot.png"), &large).unwrap();
+    let small = crate::agent::tools::image_fit::tests::noisy_png(60, 40);
+    std::fs::write(root.path().join("small.png"), &small).unwrap();
+    let mut tracker = ReadTracker::new(false);
+    tracker.image_support = ImageReadSupport::captured("anthropic", "claude-fable-5-1", false);
+    let read = |name: &str, full_resolution: bool| {
+        let tool = ReadTool::new_with_tracker(None, None, None, 100, tracker.clone())
+            .with_workspace(root.path());
+        let args = ReadArgs {
+            path: name.into(),
+            full_resolution,
+            ..Default::default()
+        };
+        async move {
+            let output = tool.call(args).await.unwrap();
+            let envelope: serde_json::Value = serde_json::from_str(&output).unwrap();
+            let summary = envelope["response"].as_str().unwrap().to_owned();
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(envelope["parts"][0]["data"].as_str().unwrap())
+                .unwrap();
+            (summary, data)
+        }
+    };
+    let (summary, data) = read("shot.png", false).await;
+    let info = crate::agent::tools::read_image::inspect(&data)
+        .unwrap()
+        .unwrap();
+    assert!(info.width.max(info.height) <= 2000, "{info:?}");
+    assert!(summary.contains("resized from 2400 x 400 to "), "{summary}");
+    assert!(data.len() < large.len());
+    let (summary, data) = read("shot.png", true).await;
+    assert_eq!(data, large);
+    assert!(!summary.contains("resized"), "{summary}");
+    let (summary, data) = read("small.png", false).await;
+    assert_eq!(data, small);
+    assert!(!summary.contains("resized"), "{summary}");
+}
+
+/// mini-agent-nvnkx.240: PNG outputs of a notebook cell view reach a vision
+/// model as image parts; a text-only transport keeps the mime label.
+#[cfg(feature = "multimodal")]
+#[tokio::test]
+async fn notebook_png_outputs_are_returned_as_images() {
+    use crate::agent::tools::{ReadArgs, ReadTool, ReadTracker, read_image::ImageReadSupport};
+    use rig::tool::Tool;
+    let root = super::OwnedTestDirectory::new("notebook-image-output");
+    let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    let notebook = format!(
+        r#"{{"nbformat":4,"nbformat_minor":5,"metadata":{{}},"cells":[{{"cell_type":"code","id":"a","source":"plot()","metadata":{{}},"execution_count":1,"outputs":[{{"output_type":"display_data","metadata":{{}},"data":{{"image/png":"{png}"}}}}]}}]}}"#
+    );
+    std::fs::write(root.path().join("n.ipynb"), notebook).unwrap();
+    let mut vision = ReadTracker::new(false);
+    vision.image_support = ImageReadSupport::captured("anthropic", "claude-fable-5-1", false);
+    let args = || ReadArgs {
+        path: "n.ipynb".into(),
+        ..Default::default()
+    };
+    let output = ReadTool::new_with_tracker(None, None, None, 100, vision)
+        .with_workspace(root.path())
+        .call(args())
+        .await
+        .unwrap();
+    let envelope: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert!(
+        envelope["response"]
+            .as_str()
+            .unwrap()
+            .contains("image 1 (cell 0 output 1)"),
+        "{output}"
+    );
+    assert_eq!(envelope["parts"].as_array().unwrap().len(), 1);
+    assert_eq!(envelope["parts"][0]["type"], "image");
+    // Without a captured vision transport the output stays plain text.
+    let plain = ReadTool::new_with_tracker(None, None, None, 100, ReadTracker::new(false))
+        .with_workspace(root.path())
+        .call(args())
+        .await
+        .unwrap();
+    assert!(plain.contains("[image/png output omitted]"), "{plain}");
+    assert!(serde_json::from_str::<serde_json::Value>(&plain).is_err());
 }

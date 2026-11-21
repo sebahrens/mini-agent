@@ -233,15 +233,15 @@ impl Tool for ReadTool {
         };
         // Image and PDF-document delivery exists only in multimodal builds.
         #[cfg(feature = "multimodal")]
-        let image_note = "PNG, JPEG, GIF and WebP images are returned as image blocks when the captured model/transport supports them (images over 5 MiB or 8000 px per side are downscaled to at most 2000 px and re-encoded; the summary names the new size); line offset/limit do not apply and an image read never authorizes a text overwrite. ";
+        let image_note = "PNG, JPEG, GIF and WebP images are returned as image blocks when the captured model/transport supports them (images over 5 MiB, 8000 px per side, 2000 px on the long edge or 1 MiB are downscaled to at most 2000 px and re-encoded, and the summary names both sizes; pass full_resolution:true to keep the original pixels); line offset/limit do not apply and an image read never authorizes a text overwrite. ";
         #[cfg(not(feature = "multimodal"))]
         let image_note = "";
         #[cfg(feature = "multimodal")]
-        let pdf_media_note = "pages without a text layer that paint images (scans) come back as image blocks, at most 4 per call and only when the captured model accepts images (the result maps image N to its page and names the pages to continue with); otherwise they are reported as scanned. When the captured transport and model take PDF documents (Anthropic, OpenAI Responses, Gemini; catalogued vision models only) all pages without a text layer, scans and vector figures alike, come back instead as one PDF document block holding only those pages, with the text mapping document pages to source pages (documents over 6 MiB, encrypted files or failed extraction fall back to page images).";
+        let pdf_media_note = "pages without a text layer that paint images (scans) come back as image blocks, at most 4 per call and only when the captured model accepts images (the result maps image N to its page and names the pages to continue with); otherwise they are reported as scanned. Pages that have text but also paint figures say so; pass visual:true with pages to attach those pages as images or a document as well. When the captured transport and model take PDF documents (Anthropic, OpenAI Responses, Gemini; catalogued vision models only) all pages without a text layer, scans and vector figures alike, come back instead as one PDF document block holding only those pages, with the text mapping document pages to source pages (documents over 6 MiB, encrypted files or failed extraction fall back to page images).";
         #[cfg(not(feature = "multimodal"))]
         let pdf_media_note = "pages without a text layer are reported as scanned.";
         format!(
-            "{text} One result is bounded by a {} character budget; a longer line-mode read stops early and names the next offset. Lines longer than {} characters are clipped with a marker naming the character_offset that continues them (hashedit tags still cover the full line). For very long lines or tool-output spills, use character_offset/character_limit (1-indexed Unicode characters, not bytes or lines); do not combine with line offset/limit. {}.ipynb files default to bounded virtual cell views showing source, stream text, text/plain results and error tracebacks (outputs at most 4 KiB per output cell and the whole view at most 64 KiB, so choose offset/limit to reach later cells; image and other rich outputs are labelled by mime type); offset/limit then address virtual lines. Set raw_notebook:true for raw JSON, raw CRC tags or full-overwrite authorization. PDF files return their extracted text layer with page markers; select pages with pages (at most 20 per call, required above 20 pages); {}",
+            "{text} One result is bounded by a {} character budget; a longer line-mode read stops early and names the next offset. Lines longer than {} characters are clipped with a marker naming the character_offset that continues them (hashedit tags still cover the full line). For very long lines or tool-output spills, use character_offset/character_limit (1-indexed Unicode characters, not bytes or lines); do not combine with line offset/limit. {}.ipynb files default to bounded virtual cell views showing source, stream text, text/plain results and error tracebacks (outputs at most 4 KiB per output cell and the whole view at most 64 KiB, so choose offset/limit to reach later cells; PNG and JPEG outputs of the cells in the window come back as at most 4 image blocks mapped by a line such as 'image 2 = cell 7 output 1' when the model accepts images; other rich outputs are labelled by mime type); offset/limit then address virtual lines. Set raw_notebook:true for raw JSON, raw CRC tags or full-overwrite authorization. PDF files return their extracted text layer with page markers; select pages with pages (at most 20 per call, required above 20 pages); {}",
             super::limits::current().max_result_chars,
             super::limits::current().max_read_line_chars,
             image_note,
@@ -259,6 +259,8 @@ impl Tool for ReadTool {
                 "character_offset": { "type": "integer", "minimum": 1, "description": "1-indexed Unicode character offset for a bounded text slice, including inside very long lines. Cannot combine with line offset/limit." },
                 "character_limit": { "type": "integer", "minimum": 1, "description": "Maximum Unicode characters for a text slice (default 16000); output byte cap still applies. Partial slices never authorize a text overwrite." },
                 "pages": { "type": "string", "description": "PDF only: 1-indexed pages to extract, e.g. \"1-5\" or \"2,4,7-9\" (at most 20 per call; required for PDFs over 20 pages)" },
+                "visual": { "type": "boolean", "description": "PDF only: also attach the selected pages as images or a document even when they have a text layer, to see figures, charts and image-only tables (within the 20-page and 4-image limits)", "default": false },
+                "full_resolution": { "type": "boolean", "description": "Images only: keep the original pixels instead of downscaling to at most 2000 px / about 1 MiB", "default": false },
                 "raw_notebook": { "type": "boolean", "description": "For .ipynb: read raw JSON instead of virtual cell/source/output lines; required for raw hashedit or full-file overwrite authorization", "default": false }
             },
             "required": ["path"]
@@ -328,9 +330,42 @@ impl Tool for ReadTool {
 #[cfg(feature = "multimodal")]
 async fn fit_for_model(
     bytes: Vec<u8>,
+    full_resolution: bool,
 ) -> Result<(Vec<u8>, super::read_image::ImageMetadata, Option<String>), ToolError> {
     match super::read_image::inspect(&bytes) {
-        Ok(Some(info)) => Ok((bytes, info, None)),
+        Ok(Some(info)) => {
+            // Within the hard limits: still shrink what exceeds the useful
+            // resolution, unless the caller asked for the pixels.
+            if full_resolution
+                || !super::image_fit::exceeds_target(
+                    info.format,
+                    info.width,
+                    info.height,
+                    info.bytes,
+                )
+            {
+                return Ok((bytes, info, None));
+            }
+            let fitted = crate::agent::runner::spawn_blocking_scoped({
+                let bytes = bytes.clone();
+                move || super::image_fit::fit_to_target(&bytes)
+            })
+            .await
+            .map_err(|_| ToolError::Msg("Image resize job failed".into()))?;
+            match fitted {
+                Some(fitted) => {
+                    let note = format!(
+                        "{}; pass full_resolution:true to keep the original pixels",
+                        fitted.note()
+                    );
+                    match super::read_image::inspect(&fitted.data) {
+                        Ok(Some(info)) => Ok((fitted.data, info, Some(note))),
+                        _ => Ok((bytes, info, None)),
+                    }
+                }
+                None => Ok((bytes, info, None)),
+            }
+        }
         Ok(None) => Err(ToolError::Msg(
             "Image signature changed during the read".into(),
         )),
@@ -526,8 +561,30 @@ impl ReadTool {
                 ));
             }
             let render_path = path.clone();
+            // PNG/JPEG outputs of the cells in the window go to the model as
+            // images when it accepts them.
+            #[cfg(feature = "multimodal")]
+            let max_images = if self
+                .read_tracker
+                .image_support
+                .check(super::read_image::ImageFormat::Png)
+                .is_ok()
+            {
+                super::pdf_text::MAX_PDF_IMAGES_PER_READ
+            } else {
+                0
+            };
+            #[cfg(not(feature = "multimodal"))]
+            let max_images = 0;
             let view = crate::agent::runner::spawn_blocking_scoped(move || {
-                super::notebook::view(&bytes, &render_path, offset, limit, cap)
+                super::notebook::view_with_images(
+                    &bytes,
+                    &render_path,
+                    offset,
+                    limit,
+                    cap,
+                    max_images,
+                )
             })
             .await
             .map_err(|_| ToolError::Msg("Notebook view job failed".into()))??;
@@ -547,6 +604,30 @@ impl ReadTool {
                 &metadata,
                 view.crc,
             );
+            #[cfg(feature = "multimodal")]
+            {
+                use base64::Engine;
+                let mut encoded = Vec::new();
+                for output in view.images {
+                    // An output that cannot be fitted (corrupt payload) keeps
+                    // its text line only.
+                    if let Ok((data, info, _)) = fit_for_model(output.bytes, false).await {
+                        encoded.push((
+                            info.format.mime(),
+                            base64::engine::general_purpose::STANDARD.encode(&data),
+                        ));
+                    }
+                }
+                if !encoded.is_empty() {
+                    let (mime, data) = encoded.remove(0);
+                    *image = Some(super::read_image::ImageRead {
+                        mime,
+                        data,
+                        more: encoded,
+                        document: None,
+                    });
+                }
+            }
             return Ok(match coaching {
                 Some(coaching) => format!("{coaching}\n\n{}", view.text),
                 None => view.text,
@@ -596,7 +677,7 @@ impl ReadTool {
             if bytes.len() > cap {
                 return Err(ToolError::Msg("Image grew beyond the input limit".into()));
             }
-            let (bytes, info, note) = fit_for_model(bytes).await?;
+            let (bytes, info, note) = fit_for_model(bytes, args.full_resolution).await?;
             self.read_tracker.untrack_read_path(&permission_path);
             let summary = format!(
                 "Image: {path} ({}; {} x {}; {} bytes{})",
@@ -659,6 +740,7 @@ impl ReadTool {
                 .saturating_sub(READ_RESULT_RESERVE_CHARS);
             let render_path = path.clone();
             let pages = args.pages.clone();
+            let visual = args.visual;
             // Scanned pages (images, no text layer) are handed over as page
             // images when the captured model can take images.
             #[cfg(feature = "multimodal")]
@@ -692,7 +774,7 @@ impl ReadTool {
                     pages.as_deref(),
                     budget,
                     max_images,
-                    native_pdf,
+                    (native_pdf, visual),
                 )
             })
             .await
@@ -703,7 +785,7 @@ impl ReadTool {
                 use base64::Engine;
                 let mut encoded = Vec::new();
                 for page_image in rendered.images {
-                    let (data, info, _) = fit_for_model(page_image.data).await?;
+                    let (data, info, _) = fit_for_model(page_image.data, false).await?;
                     encoded.push((
                         info.format.mime(),
                         base64::engine::general_purpose::STANDARD.encode(&data),
@@ -1482,6 +1564,8 @@ mod tests {
             .call(crate::agent::tools::ReadArgs {
                 pages: None,
                 raw_notebook: false,
+                visual: false,
+                full_resolution: false,
                 character_offset: None,
                 character_limit: None,
                 path: "missing-file".into(),
@@ -1499,6 +1583,8 @@ mod tests {
             tool.call(crate::agent::tools::ReadArgs {
                 pages: None,
                 raw_notebook: false,
+                visual: false,
+                full_resolution: false,
                 character_offset: None,
                 character_limit: None,
                 path: "missing-file".into(),
@@ -1551,6 +1637,8 @@ mod tests {
             .call(ReadArgs {
                 pages: None,
                 raw_notebook: false,
+                visual: false,
+                full_resolution: false,
                 character_offset: None,
                 character_limit: None,
                 path: path.to_string_lossy().into_owned(),
@@ -1581,6 +1669,8 @@ mod tests {
             .call(ReadArgs {
                 pages: None,
                 raw_notebook: false,
+                visual: false,
+                full_resolution: false,
                 character_offset: None,
                 character_limit: None,
                 path: path.to_string_lossy().into_owned(),
@@ -1611,6 +1701,8 @@ mod tests {
             .call(ReadArgs {
                 pages: None,
                 raw_notebook: false,
+                visual: false,
+                full_resolution: false,
                 character_offset: None,
                 character_limit: None,
                 path: path.to_string_lossy().into_owned(),
@@ -1638,6 +1730,8 @@ mod tests {
             .call(ReadArgs {
                 pages: None,
                 raw_notebook: false,
+                visual: false,
+                full_resolution: false,
                 character_offset: None,
                 character_limit: None,
                 path: path.to_string_lossy().into_owned(),
@@ -1666,6 +1760,8 @@ mod tests {
         let args = |offset, limit| ReadArgs {
             pages: None,
             raw_notebook: false,
+            visual: false,
+            full_resolution: false,
             character_offset: None,
             character_limit: None,
             path: path.to_string_lossy().into_owned(),
@@ -1730,6 +1826,8 @@ mod tests {
         let call = tool.call(ReadArgs {
             pages: None,
             raw_notebook: false,
+            visual: false,
+            full_resolution: false,
             character_offset: None,
             character_limit: None,
             path: link.to_string_lossy().into_owned(),
@@ -1809,6 +1907,8 @@ mod tests {
                 offset: None,
                 limit: None,
                 raw_notebook: false,
+                visual: false,
+                full_resolution: false,
                 character_offset: None,
                 character_limit: None,
             })
@@ -1842,6 +1942,8 @@ mod tests {
             .call(ReadArgs {
                 pages: None,
                 raw_notebook: false,
+                visual: false,
+                full_resolution: false,
                 character_offset: None,
                 character_limit: None,
                 path: path.to_string_lossy().into_owned(),
@@ -1860,6 +1962,8 @@ mod tests {
         ReadArgs {
             pages: None,
             raw_notebook: false,
+            visual: false,
+            full_resolution: false,
             character_offset: None,
             character_limit: None,
             path: path.to_string_lossy().into_owned(),

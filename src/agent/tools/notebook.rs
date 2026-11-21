@@ -1,5 +1,4 @@
 //! Bounded notebook JSON transformations. Opaque fields stay raw; cells never execute.
-use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 
 use serde::de::{MapAccess, SeqAccess, Visitor};
@@ -31,9 +30,38 @@ pub(crate) fn notebook_byte_limit(configured_text_cap: u64) -> u64 {
 
 // A map visitor rejects duplicate interpreted fields. Opaque nested values are
 // validated JSON fragments, not recursively traversed or converted through f64.
-#[derive(Serialize)]
-#[serde(transparent)]
-struct Fields(BTreeMap<String, Box<RawValue>>);
+/// JSON object members in file order, so an edit never reorders keys the
+/// notebook's own writer (Colab, hand-written, converters) laid out.
+#[derive(Default)]
+struct OrderedMap(Vec<(String, Box<RawValue>)>);
+impl OrderedMap {
+    fn get(&self, key: &str) -> Option<&RawValue> {
+        self.0.iter().find(|(k, _)| k == key).map(|(_, v)| &**v)
+    }
+    fn contains_key(&self, key: &str) -> bool {
+        self.get(key).is_some()
+    }
+    /// Replaces in place, or appends a new member.
+    fn insert(&mut self, key: String, value: Box<RawValue>) {
+        match self.0.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, slot)) => *slot = value,
+            None => self.0.push((key, value)),
+        }
+    }
+    fn remove(&mut self, key: &str) {
+        self.0.retain(|(k, _)| k != key);
+    }
+    fn iter(&self) -> impl ExactSizeIterator<Item = (&String, &Box<RawValue>)> {
+        self.0.iter().map(|(k, v)| (k, v))
+    }
+}
+impl std::ops::Index<&str> for OrderedMap {
+    type Output = RawValue;
+    fn index(&self, key: &str) -> &Self::Output {
+        self.get(key).expect("notebook member")
+    }
+}
+struct Fields(OrderedMap);
 impl<'de> Deserialize<'de> for Fields {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct FieldsVisitor;
@@ -43,16 +71,14 @@ impl<'de> Deserialize<'de> for Fields {
                 f.write_str("a notebook object")
             }
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Fields, A::Error> {
-                let mut fields = BTreeMap::new();
+                let mut fields = OrderedMap::default();
                 while let Some((key, value)) = map.next_entry::<String, Box<RawValue>>()? {
-                    if fields.len() >= 256
-                        || key.len() > 1024
-                        || fields.insert(key, value).is_some()
-                    {
+                    if fields.0.len() >= 256 || key.len() > 1024 || fields.contains_key(&key) {
                         return Err(serde::de::Error::custom(
                             "duplicate or oversized notebook fields",
                         ));
                     }
+                    fields.0.push((key, value));
                 }
                 Ok(Fields(fields))
             }
@@ -248,9 +274,6 @@ impl NotebookArgs {
             NotebookMode::Delete if self.source.is_some() || self.cell_type.is_some() => {
                 return Err(error("Delete does not accept source or cell_type"));
             }
-            NotebookMode::Replace if self.cell_type.is_some() => {
-                return Err(error("Replace preserves cell_type; omit cell_type"));
-            }
             NotebookMode::Insert | NotebookMode::Replace if self.source.is_none() => {
                 return Err(error("Insert and replace require source"));
             }
@@ -315,6 +338,52 @@ fn source(cell: &Fields) -> Result<(String, bool), ToolError> {
     }
     Ok((text, array))
 }
+/// How a cell's `id` relates to nbformat 4.5's unique-id rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdState {
+    Ok,
+    Missing,
+    Duplicate,
+    Invalid,
+}
+
+/// The id of each cell and its state. Cells without ids are only a defect from
+/// nbformat 4.5 on; older notebooks have none and are reported as `Ok`.
+fn id_states(cells: &[Fields], minor: u64) -> Vec<(Option<String>, IdState)> {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let ids: Vec<Option<Result<String, ()>>> = cells
+        .iter()
+        .map(|cell| {
+            cell.0
+                .contains_key("id")
+                .then(|| cell.get::<String>("id").map_err(|_| ()))
+        })
+        .collect();
+    for id in ids.iter().flatten().flatten() {
+        *counts.entry(id.clone()).or_default() += 1;
+    }
+    ids.into_iter()
+        .map(|id| match id {
+            None if minor >= 5 => (None, IdState::Missing),
+            None => (None, IdState::Ok),
+            Some(Err(())) => (None, IdState::Invalid),
+            Some(Ok(id)) if !valid_id(&id) => (Some(id), IdState::Invalid),
+            Some(Ok(id)) if counts.get(&id).copied().unwrap_or(0) > 1 => {
+                (Some(id), IdState::Duplicate)
+            }
+            Some(Ok(id)) => (Some(id), IdState::Ok),
+        })
+        .collect()
+}
+
+/// What an edit changed, for the result line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EditSummary {
+    index: usize,
+    id: Option<String>,
+    cells: usize,
+}
+
 struct Notebook {
     root: Fields,
     cells: Vec<Fields>,
@@ -357,19 +426,12 @@ impl Notebook {
         {
             return Err(error("Notebook metadata must be an object"));
         }
-        let mut ids = HashSet::new();
+        // Missing, duplicate and invalid ids are repairable by Jupyter, so they
+        // are marked in the view and refused only as an ambiguous selector.
         for cell in &cells.0 {
             let kind: String = cell.get("cell_type")?;
             if matches!(kind.as_str(), "code" | "markdown" | "raw") {
                 source(cell)?;
-            }
-            if cell.0.contains_key("id") {
-                let id: String = cell.get("id")?;
-                if !valid_id(&id) || !ids.insert(id) {
-                    return Err(error("Notebook contains invalid or duplicate cell IDs"));
-                }
-            } else if minor >= 5 {
-                return Err(error("nbformat 4.5+ requires cell IDs"));
             }
         }
         Ok(Self {
@@ -379,15 +441,44 @@ impl Notebook {
             layout: Layout::detect(bytes),
         })
     }
-    fn edit(mut self, args: &NotebookArgs, limit: u64) -> Result<Option<Vec<u8>>, ToolError> {
+    #[cfg(test)]
+    fn edit(self, args: &NotebookArgs, limit: u64) -> Result<Option<Vec<u8>>, ToolError> {
+        Ok(self.edit_summary(args, limit)?.0)
+    }
+    fn edit_summary(
+        mut self,
+        args: &NotebookArgs,
+        limit: u64,
+    ) -> Result<(Option<Vec<u8>>, EditSummary), ToolError> {
         args.validate()?;
         let index = match args.cell_index {
             Some(index) => index,
-            None => self
-                .cells
-                .iter()
-                .position(|c| c.get::<String>("id").ok().as_deref() == args.cell_id.as_deref())
-                .ok_or_else(|| error("No cell matches the requested ID"))?,
+            None => {
+                let wanted = args.cell_id.as_deref();
+                let matches: Vec<usize> = id_states(&self.cells, self.minor)
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (id, state))| {
+                        id.as_deref() == wanted && matches!(state, IdState::Ok | IdState::Duplicate)
+                    })
+                    .map(|(index, _)| index)
+                    .collect();
+                match matches.as_slice() {
+                    [] => return Err(error("No cell matches the requested ID")),
+                    [index] => *index,
+                    several => {
+                        return Err(ToolError::Msg(format!(
+                            "cell_id '{}' is ambiguous: cells {} share it; address the cell with cell_index",
+                            wanted.unwrap_or_default(),
+                            several
+                                .iter()
+                                .map(usize::to_string)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )));
+                    }
+                }
+            }
         };
         if index > self.cells.len()
             || (index == self.cells.len() && args.mode != NotebookMode::Insert)
@@ -411,11 +502,23 @@ impl Notebook {
                 }
                 let (old, array) = source(&self.cells[index])?;
                 let text = args.source.as_deref().expect("validated source");
-                if old == text {
-                    return Ok(None);
+                let new_kind = args.cell_type.as_deref().unwrap_or(&kind).to_owned();
+                if old == text && new_kind == kind {
+                    return Ok((None, self.summary(index)));
                 }
                 let layout = &self.layout;
                 let cell = &mut self.cells[index];
+                if new_kind != kind {
+                    cell.set("cell_type", &new_kind, layout)?;
+                    if new_kind == "code" {
+                        // Entering code: the fields nbformat requires of one.
+                        cell.set("outputs", &Vec::<u8>::new(), layout)?;
+                        cell.set("execution_count", &Option::<u64>::None, layout)?;
+                    } else if kind == "code" {
+                        cell.0.remove("outputs");
+                        cell.0.remove("execution_count");
+                    }
+                }
                 if array {
                     cell.set(
                         "source",
@@ -426,7 +529,7 @@ impl Notebook {
                     cell.set("source", &text, layout)?;
                 }
                 // Outputs of the old source would look like results of the new one.
-                if kind == "code" {
+                if kind == "code" && new_kind == "code" {
                     cell.set("outputs", &Vec::<u8>::new(), layout)?;
                     cell.set("execution_count", &Option::<u64>::None, layout)?;
                 }
@@ -437,7 +540,7 @@ impl Notebook {
                 }
                 let kind = args.cell_type.as_deref().unwrap_or("code");
                 let layout = &self.layout;
-                let mut cell = Fields(BTreeMap::new());
+                let mut cell = Fields(OrderedMap::default());
                 cell.set("cell_type", &kind, layout)?;
                 cell.set("metadata", &serde_json::json!({}), layout)?;
                 cell.set(
@@ -457,6 +560,8 @@ impl Notebook {
                 if self.minor >= 5 {
                     cell.set("id", &uuid::Uuid::new_v4().to_string(), layout)?;
                 }
+                // nbformat writes keys sorted; a new cell follows that order.
+                cell.0.0.sort_by(|a, b| a.0.cmp(&b.0));
                 self.cells.insert(index, cell);
             }
         }
@@ -464,7 +569,18 @@ impl Notebook {
         if result.len() as u64 > byte_limit(limit) {
             return Err(error("Resulting notebook exceeds the bounded raw-file cap"));
         }
-        Ok(Some(result))
+        let summary = self.summary(index);
+        Ok((Some(result), summary))
+    }
+    fn summary(&self, index: usize) -> EditSummary {
+        EditSummary {
+            index,
+            id: self
+                .cells
+                .get(index)
+                .and_then(|cell| cell.get::<String>("id").ok()),
+            cells: self.cells.len(),
+        }
     }
 }
 
@@ -512,13 +628,19 @@ struct RenderedOutput {
     text: Option<String>,
     keep_tail: bool,
     labels: Vec<String>,
+    /// PNG/JPEG payloads (mime, whitespace-free base64) the caller may attach.
+    images: Vec<(String, String)>,
 }
 
-fn render_output(kind: &str, output: &Fields) -> RenderedOutput {
+/// Largest base64 image payload one notebook output may attach.
+const MAX_OUTPUT_IMAGE_B64: usize = 8 * 1024 * 1024;
+
+fn render_output(kind: &str, output: &Fields, want_images: bool) -> RenderedOutput {
     let mut rendered = RenderedOutput {
         text: None,
         keep_tail: false,
         labels: Vec::new(),
+        images: Vec::new(),
     };
     match kind {
         "execute_result" | "display_data" | "update_display_data" => {
@@ -527,9 +649,20 @@ fn render_output(kind: &str, output: &Fields) -> RenderedOutput {
                 .get("data")
                 .and_then(|raw| serde_json::from_str::<Fields>(raw.get()).ok());
             if let Some(data) = data {
-                for (mime, raw) in &data.0 {
+                for (mime, raw) in data.0.iter() {
                     if mime == "text/plain" {
                         rendered.text = multiline_text(raw).map(|text| strip_ansi(&text));
+                    } else if want_images && matches!(mime.as_str(), "image/png" | "image/jpeg") {
+                        match multiline_text(raw) {
+                            Some(text) if text.len() <= MAX_OUTPUT_IMAGE_B64 => {
+                                let b64: String =
+                                    text.chars().filter(|c| !c.is_whitespace()).collect();
+                                rendered.images.push((mime.clone(), b64));
+                            }
+                            _ => rendered
+                                .labels
+                                .push(format!("[{mime} output omitted: payload too large]")),
+                        }
                     } else {
                         rendered.labels.push(format!("[{mime} output omitted]"));
                     }
@@ -551,9 +684,9 @@ fn render_output(kind: &str, output: &Fields) -> RenderedOutput {
             rendered.text = Some(strip_ansi(&text));
             rendered.keep_tail = true;
         }
-        _ => rendered.text = output.0.get("text").and_then(|raw| multiline_text(raw)),
+        _ => rendered.text = output.0.get("text").and_then(multiline_text),
     }
-    if rendered.text.is_none() && rendered.labels.is_empty() {
+    if rendered.text.is_none() && rendered.labels.is_empty() && rendered.images.is_empty() {
         rendered
             .labels
             .push("[opaque output payload omitted]".to_owned());
@@ -565,7 +698,80 @@ fn render_output(kind: &str, output: &Fields) -> RenderedOutput {
 pub(crate) struct NotebookView {
     pub text: String,
     pub crc: u32,
+    /// PNG/JPEG cell outputs inside the window, decoded; image N of the text
+    /// is `images[N - 1]`.
+    #[cfg_attr(not(feature = "multimodal"), allow(dead_code))]
+    pub images: Vec<NotebookImage>,
 }
+/// One decoded image output of a notebook cell.
+#[cfg_attr(not(feature = "multimodal"), allow(dead_code))]
+pub(crate) struct NotebookImage {
+    pub bytes: Vec<u8>,
+}
+
+/// The selected slice of the notebook's virtual lines.
+struct Window {
+    offset: usize,
+    end: usize,
+    selected_cap: usize,
+    selected: String,
+    total: usize,
+    selected_lines: usize,
+    truncated_at: Option<usize>,
+}
+impl Window {
+    /// Whether the next line would be inside the window.
+    fn visible(&self) -> bool {
+        self.total >= self.offset && self.total < self.end
+    }
+    /// Adds one virtual line; returns whether it was shown.
+    fn push(&mut self, line: &str) -> bool {
+        use std::fmt::Write;
+        let mut shown = false;
+        if self.visible() {
+            if self
+                .selected
+                .len()
+                .saturating_add(line.len())
+                .saturating_add(32)
+                > self.selected_cap
+            {
+                if self.selected_lines == 0 {
+                    // A single over-cap virtual line is clipped, not refused.
+                    let mut cut = self.selected_cap.saturating_sub(256).min(line.len());
+                    while !line.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    writeln!(
+                        &mut self.selected,
+                        "{}| {} … [virtual line truncated: {} bytes; use raw_notebook:true with character_offset/character_limit for the rest]",
+                        self.total + 1,
+                        &line[..cut],
+                        line.len()
+                    )
+                    .expect("string writing");
+                    self.selected_lines += 1;
+                    self.total += 1;
+                    self.truncated_at = Some(self.total);
+                    self.end = self.total;
+                    return true;
+                }
+                // Stop the window before this line and say where to resume.
+                self.truncated_at = Some(self.total);
+                self.end = self.total;
+                self.total += 1;
+                return false;
+            }
+            writeln!(&mut self.selected, "{}| {}", self.total + 1, line).expect("string writing");
+            self.selected_lines += 1;
+            shown = true;
+        }
+        self.total += 1;
+        shown
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn view(
     bytes: &[u8],
     path: &str,
@@ -573,78 +779,68 @@ pub(crate) fn view(
     limit: usize,
     byte_cap: u64,
 ) -> Result<NotebookView, ToolError> {
+    view_with_images(bytes, path, offset, limit, byte_cap, 0)
+}
+
+/// [`view`] that also decodes up to `max_images` PNG/JPEG outputs of the cells
+/// inside the window (0 keeps every image as a mime label).
+pub(crate) fn view_with_images(
+    bytes: &[u8],
+    path: &str,
+    offset: usize,
+    limit: usize,
+    byte_cap: u64,
+    max_images: usize,
+) -> Result<NotebookView, ToolError> {
+    use base64::Engine;
     let notebook = Notebook::parse(bytes, byte_cap)?;
     let cap = (byte_cap as usize).min(MAX_VIEW_BYTES);
-    let mut selected = String::new();
-    let mut total = 0usize;
-    let mut selected_lines = 0usize;
-    let mut end = offset.saturating_add(limit);
-    // Room for the header and continuation notice inside the view cap.
-    let selected_cap = cap.saturating_sub(1024);
-    let mut truncated_at: Option<usize> = None;
-    let mut push = |line: &str| -> Result<(), ToolError> {
-        if total >= offset && total < end {
-            if selected.len().saturating_add(line.len()).saturating_add(32) > selected_cap {
-                use std::fmt::Write;
-                if selected_lines == 0 {
-                    // A single over-cap virtual line is clipped, not refused.
-                    let mut cut = selected_cap.saturating_sub(256).min(line.len());
-                    while !line.is_char_boundary(cut) {
-                        cut -= 1;
-                    }
-                    writeln!(
-                        &mut selected,
-                        "{}| {} … [virtual line truncated: {} bytes; use raw_notebook:true with character_offset/character_limit for the rest]",
-                        total + 1,
-                        &line[..cut],
-                        line.len()
-                    )
-                    .expect("string writing");
-                    selected_lines += 1;
-                    total += 1;
-                    truncated_at = Some(total);
-                    end = total;
-                    return Ok(());
-                }
-                // Stop the window before this line and say where to resume.
-                truncated_at = Some(total);
-                end = total;
-                total += 1;
-                return Ok(());
-            }
-            use std::fmt::Write;
-            writeln!(&mut selected, "{}| {}", total + 1, line).expect("string writing");
-            selected_lines += 1;
-        }
-        total += 1;
-        Ok(())
+    let mut win = Window {
+        offset,
+        end: offset.saturating_add(limit),
+        // Room for the header and continuation notice inside the view cap.
+        selected_cap: cap.saturating_sub(1024),
+        selected: String::new(),
+        total: 0,
+        selected_lines: 0,
+        truncated_at: None,
     };
+    let mut images: Vec<NotebookImage> = Vec::new();
+    let states = id_states(&notebook.cells, notebook.minor);
+    let flagged = states
+        .iter()
+        .filter(|(_, state)| *state != IdState::Ok)
+        .count();
     for (index, cell) in notebook.cells.iter().enumerate() {
         let kind: String = cell.get("cell_type")?;
-        let id = cell.get::<String>("id").ok();
-        push(&format!(
-            "[cell {index}: {kind}{}]",
-            id.map(|id| format!("; id={id}")).unwrap_or_default()
-        ))?;
+        let id = match &states[index] {
+            (Some(id), IdState::Ok) => format!("; id={id}"),
+            (Some(id), IdState::Duplicate) => format!("; id={id} (duplicate)"),
+            (Some(id), _) => format!("; id={id} (invalid)"),
+            (None, IdState::Missing) => "; id missing".to_owned(),
+            (None, IdState::Invalid) => "; id invalid".to_owned(),
+            (None, _) => String::new(),
+        };
+        win.push(&format!("[cell {index}: {kind}{id}]"));
         let text = if matches!(kind.as_str(), "code" | "markdown" | "raw") {
             source(cell)?.0
         } else {
             "[opaque unknown cell preserved]".into()
         };
         for line in text.split('\n') {
-            push(line)?;
+            win.push(line);
         }
         if let Some(raw) = cell.0.get("outputs") {
             // Each output stays opaque until its few display fields are decoded.
             let outputs: Cells = serde_json::from_str(raw.get())
                 .map_err(|_| error("Invalid or oversized notebook outputs"))?;
             let mut cell_budget = MAX_OUTPUT_CELL;
-            for output in &outputs.0 {
+            for (output_index, output) in outputs.0.iter().enumerate() {
                 let kind = output
                     .get::<String>("output_type")
                     .unwrap_or_else(|_| "unknown".into());
-                push(&format!("[output: {kind}]"))?;
-                let rendered = render_output(&kind, output);
+                win.push(&format!("[output: {kind}]"));
+                let rendered = render_output(&kind, output, max_images > 0);
                 if let Some(text) = rendered.text {
                     let permitted = cell_budget.min(text.len());
                     if rendered.keep_tail {
@@ -655,11 +851,11 @@ pub(crate) fn view(
                         // The exception line itself always leads.
                         let (first, _) = text.split_once('\n').unwrap_or((&text, ""));
                         if start > 0 {
-                            push(first)?;
-                            push(&format!("[{start} traceback bytes omitted]"))?;
+                            win.push(first);
+                            win.push(&format!("[{start} traceback bytes omitted]"));
                         }
                         for line in text[start..].split('\n') {
-                            push(line)?;
+                            win.push(line);
                         }
                         let kept = text.len() - start;
                         cell_budget -= kept;
@@ -669,37 +865,77 @@ pub(crate) fn view(
                             cutoff -= 1;
                         }
                         for line in text[..cutoff].split('\n') {
-                            push(line)?;
+                            win.push(line);
                         }
                         cell_budget -= cutoff;
                         if cutoff < text.len() {
-                            push(&format!("[{} output bytes omitted]", text.len() - cutoff))?;
+                            win.push(&format!("[{} output bytes omitted]", text.len() - cutoff));
                         }
                     }
                 }
                 for label in &rendered.labels {
-                    push(label)?;
+                    win.push(label);
+                }
+                for (mime, b64) in rendered.images {
+                    let number = output_index + 1;
+                    if !win.visible() {
+                        win.push(&format!("[{mime} output omitted]"));
+                        continue;
+                    }
+                    if images.len() >= max_images {
+                        win.push(&format!(
+                            "[{mime} output omitted: {max_images} image(s) already attached; read a narrower offset/limit window around cell {index} to see it]"
+                        ));
+                        continue;
+                    }
+                    let decoded = base64::engine::general_purpose::STANDARD
+                        .decode(&b64)
+                        .ok()
+                        .filter(|bytes| {
+                            super::read_image::ImageFormat::from_magic(bytes).is_some()
+                        });
+                    let Some(decoded) = decoded else {
+                        win.push(&format!("[{mime} output omitted: not a valid image]"));
+                        continue;
+                    };
+                    images.push(NotebookImage { bytes: decoded });
+                    let line = format!(
+                        "[{mime} output attached as image {} (cell {index} output {number})]",
+                        images.len()
+                    );
+                    if !win.push(&line) {
+                        images.pop();
+                    }
                 }
             }
         }
     }
+    let notice = if flagged > 0 {
+        format!(
+            "Notice: {flagged} cell(s) have a missing, duplicate or invalid id (marked in their headers); address them by cell_index. Ids are not rewritten.\n"
+        )
+    } else {
+        String::new()
+    };
     let header = format!(
-        "Notebook cell view: {path} ({} cells; {total} virtual lines; showing {} line(s) from {})\nNo raw-file CRC or full-overwrite authorization. Use raw_notebook:true for raw JSON.\n\n",
+        "Notebook cell view: {path} ({} cells; {} virtual lines; showing {} line(s) from {})\nNo raw-file CRC or full-overwrite authorization. Use raw_notebook:true for raw JSON.\n{notice}\n",
         notebook.cells.len(),
-        selected_lines,
+        win.total,
+        win.selected_lines,
         offset.saturating_add(1)
     );
-    if header.len().saturating_add(selected.len()) > cap {
+    if header.len().saturating_add(win.selected.len()) > cap {
         return Err(error(
             "Notebook view exceeds its output cap; use a narrower virtual line window",
         ));
     }
-    let mut text = header + &selected;
-    if let Some(next) = truncated_at {
+    let mut text = header + &win.selected;
+    if let Some(next) = win.truncated_at {
         use std::fmt::Write;
         write!(
             &mut text,
-            "\n[view truncated after {selected_lines} line(s) at the {} KiB notebook view cap; continue with offset={}]",
+            "\n[view truncated after {} line(s) at the {} KiB notebook view cap; continue with offset={}]",
+            win.selected_lines,
             cap / 1024,
             next + 1
         )
@@ -710,6 +946,7 @@ pub(crate) fn view(
     Ok(NotebookView {
         text,
         crc: crc.finalize(),
+        images,
     })
 }
 
@@ -854,11 +1091,24 @@ impl NotebookTool {
         }
         let limit = self.limit;
         let transform_args = args.clone();
-        let (before, after, base) = crate::agent::runner::spawn_blocking_scoped(move || {
+        let tracker = self.tracker.clone();
+        let view_key = identity.clone();
+        let (before, after, base, summary) = crate::agent::runner::spawn_blocking_scoped(move || {
             use std::io::Read;
-            let recorded = file.metadata()?.len();
+            let metadata = file.metadata()?;
+            let recorded = metadata.len();
             if recorded > limit {
                 return Err(error("Notebook exceeds the bounded raw-file cap"));
+            }
+            // A cell_index is only meaningful against the cells the model saw:
+            // refuse it when the notebook was not viewed or changed since.
+            // A cell_id stays valid across unrelated changes.
+            if transform_args.cell_index.is_some()
+                && !tracker.notebook_view_is_current(&view_key, &metadata)
+            {
+                return Err(error(
+                    "notebook changed since it was read, or was not read: read the notebook (a cell view) again before editing by cell_index, or address the cell with cell_id",
+                ));
             }
             let mut bytes = Vec::with_capacity(recorded as usize);
             file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
@@ -867,8 +1117,8 @@ impl NotebookTool {
             }
             let base = crate::fs::ContentDigest::of(&bytes);
             let notebook = Notebook::parse(&bytes, limit)?;
-            let after = notebook.edit(&transform_args, limit)?;
-            Ok::<_, ToolError>((bytes, after, base))
+            let (after, summary) = notebook.edit_summary(&transform_args, limit)?;
+            Ok::<_, ToolError>((bytes, after, base, summary))
         })
         .await
         .map_err(|_| error("Notebook preparation job failed"))??;
@@ -957,6 +1207,27 @@ impl NotebookTool {
             },
             args.path
         );
+        // The index and generated id come from this tool, not from the file's
+        // content, but the cell count does reveal it: report only when the
+        // preimage may be disclosed.
+        if disclose {
+            let EditSummary { index, id, cells } = &summary;
+            let id = id
+                .as_deref()
+                .map(|id| format!(" (id={id})"))
+                .unwrap_or_default();
+            match args.mode {
+                NotebookMode::Insert => output.push_str(&format!(
+                    ": inserted cell at index {index}{id}; notebook now has {cells} cells"
+                )),
+                NotebookMode::Replace => output.push_str(&format!(
+                    ": replaced cell at index {index}{id}; notebook has {cells} cells"
+                )),
+                NotebookMode::Delete => output.push_str(&format!(
+                    ": deleted cell at index {index}; notebook now has {cells} cells"
+                )),
+            }
+        }
         if let Some(notice) = crate::session::file_checkpoints::take_uncaptured_notice() {
             output.push_str(&notice);
         }
@@ -972,14 +1243,14 @@ impl Tool for NotebookTool {
     type Args = NotebookArgs;
     type Output = String;
     fn description(&self) -> String {
-        "Edit an .ipynb notebook cell without execution. replace changes source and keeps metadata/type; a replaced code cell has its stale outputs and execution_count cleared. insert adds before a zero-based index or cell ID (index=len appends); delete removes the selected cell. Exactly one cell_index or cell_id is required. Legacy notebooks retain their format version. Use read for cell views, raw_notebook:true for raw JSON.".into()
+        "Edit an .ipynb notebook cell without execution. replace changes source (and the type when cell_type is given) and keeps metadata; a replaced code cell has its stale outputs and execution_count cleared. cell_index edits require a current cell view from read (the call fails when the notebook changed since); cell_id edits do not. The result names the affected index, cell id and cell count. insert adds before a zero-based index or cell ID (index=len appends); delete removes the selected cell. Exactly one cell_index or cell_id is required. Legacy notebooks retain their format version. Use read for cell views, raw_notebook:true for raw JSON.".into()
     }
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({"type":"object","additionalProperties":false,"properties":{
         "path":{"type":"string"},"mode":{"type":"string","enum":["replace","insert","delete"]},
         "cell_index":{"type":"integer","minimum":0},"cell_id":{"type":"string","maxLength":64},
         "source":{"type":"string","description":"Literal new source; required for replace/insert"},
-        "cell_type":{"type":"string","enum":["code","markdown","raw"],"description":"Insert only; default code"}},"required":["path","mode"]})
+        "cell_type":{"type":"string","enum":["code","markdown","raw"],"description":"Insert: type of the new cell (default code). Replace: converts the cell to this type (outputs/execution_count are dropped when leaving code and added when entering it)"}},"required":["path","mode"]})
     }
     async fn call(&self, args: NotebookArgs) -> Result<String, ToolError> {
         Ok(self.apply(args, &ToolCallExtensions::new()).await?.output)
@@ -1011,6 +1282,15 @@ mod tests {
             cell_id: None,
             source: source.map(str::to_owned),
             cell_type: None,
+        }
+    }
+    /// As [`args`], addressing the first fixture cell by its id (no prior view
+    /// of the file is needed for an id).
+    fn id_args(mode: NotebookMode, source: Option<&str>) -> NotebookArgs {
+        NotebookArgs {
+            cell_index: None,
+            cell_id: Some("first".into()),
+            ..args(mode, source)
         }
     }
     fn transformed(input: &str, args: NotebookArgs) -> String {
@@ -1071,7 +1351,8 @@ mod tests {
         let compact = Notebook::parse(FIXTURE.as_bytes(), MAX_NOTEBOOK_BYTES).unwrap();
         let reencoded = String::from_utf8(compact.encode().unwrap()).unwrap();
         assert!(!reencoded.contains('\n'), "{reencoded}");
-        assert!(reencoded.starts_with("{\"cells\":[{\"cell_type\":\"code\""));
+        // Key order is the file's own, not alphabetical.
+        assert_eq!(reencoded, FIXTURE);
         assert_eq!(
             Notebook::parse(reencoded.as_bytes(), MAX_NOTEBOOK_BYTES)
                 .unwrap()
@@ -1149,8 +1430,6 @@ mod tests {
     #[test]
     fn notebook_invalid_schema_ids_selectors_and_caps_fail_without_disclosing_values() {
         for input in [
-            FIXTURE.replace("\"second\"", "\"first\""),
-            FIXTURE.replace("\"id\":\"first\",", ""),
             FIXTURE.replace("\"nbformat\":4", "\"nbformat\":3"),
             FIXTURE.replace("\"nbformat\":4", "\"nbformat\":4,\"nbformat\":4"),
             FIXTURE.replace("\"source\":\"# title\"", "\"source\":{\"secret\":1}"),
@@ -1532,14 +1811,14 @@ mod tests {
             let tool = tool(root.path(), Some(p), None, ReadTracker::new(true));
             let noop = tool
                 .call_structured(
-                    args(NotebookMode::Replace, Some("old\r\nlast")),
+                    id_args(NotebookMode::Replace, Some("old\r\nlast")),
                     &ToolCallExtensions::new(),
                 )
                 .await
                 .unwrap();
             let changed = tool
                 .call_structured(
-                    args(NotebookMode::Replace, Some("new")),
+                    id_args(NotebookMode::Replace, Some("new")),
                     &ToolCallExtensions::new(),
                 )
                 .await
@@ -1579,6 +1858,8 @@ mod tests {
                 pages: None,
                 path: "book.ipynb".into(),
                 raw_notebook: false,
+                visual: false,
+                full_resolution: false,
                 character_offset: None,
                 character_limit: None,
                 offset: None,
@@ -1598,6 +1879,8 @@ mod tests {
                 pages: None,
                 path: "book.ipynb".into(),
                 raw_notebook: true,
+                visual: false,
+                full_resolution: false,
                 character_offset: None,
                 character_limit: None,
                 offset: None,
@@ -1619,7 +1902,7 @@ mod tests {
         );
         assert!(
             tool(root.path(), Some(p), None, ReadTracker::default())
-                .call(args(NotebookMode::Replace, Some("new")))
+                .call(id_args(NotebookMode::Replace, Some("new")))
                 .await
                 .is_err()
         );
@@ -1629,7 +1912,7 @@ mod tests {
         );
         let result = tool(root.path(), None, None, ReadTracker::default())
             .call_structured(
-                args(NotebookMode::Replace, Some("new")),
+                id_args(NotebookMode::Replace, Some("new")),
                 &ToolCallExtensions::new(),
             )
             .await
@@ -1658,10 +1941,9 @@ mod tests {
                 Some(tx),
                 ReadTracker::default(),
             );
-            let task =
-                tokio::spawn(
-                    async move { tool.call(args(NotebookMode::Replace, Some("new"))).await },
-                );
+            let task = tokio::spawn(async move {
+                tool.call(id_args(NotebookMode::Replace, Some("new"))).await
+            });
             let prompt = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
                 .await
                 .unwrap()
@@ -1716,7 +1998,7 @@ mod tests {
             let _release = ReleaseProbe(probe.clone());
             let mut tool = tool(root.path(), None, None, ReadTracker::default());
             tool.publication_cancellation = Some(cancel);
-            let mut request = args(NotebookMode::Replace, Some("new"));
+            let mut request = id_args(NotebookMode::Replace, Some("new"));
             if external {
                 request.path = path.to_string_lossy().into_owned();
             }
@@ -1746,7 +2028,9 @@ mod tests {
         let mut tool = tool(root.path(), None, None, ReadTracker::default());
         tool.publication_cancellation = Some(cancel);
         let task =
-            tokio::spawn(async move { tool.call(args(NotebookMode::Replace, Some("new"))).await });
+            tokio::spawn(
+                async move { tool.call(id_args(NotebookMode::Replace, Some("new"))).await },
+            );
         tokio::task::spawn_blocking(move || probe.wait_until_reached())
             .await
             .unwrap();
@@ -1768,7 +2052,7 @@ mod tests {
         symlink("target.ipynb", root.path().join("book.ipynb")).unwrap();
         assert!(
             tool(root.path(), None, None, ReadTracker::default())
-                .call(args(NotebookMode::Replace, Some("new")))
+                .call(id_args(NotebookMode::Replace, Some("new")))
                 .await
                 .is_err()
         );
@@ -1795,7 +2079,7 @@ mod tests {
                         .build()
                         .unwrap();
                     runtime.block_on(
-                        worker_scope.run(tool.call(args(NotebookMode::Replace, Some("new")))),
+                        worker_scope.run(tool.call(id_args(NotebookMode::Replace, Some("new")))),
                     )
                 }),)
             })
@@ -1851,5 +2135,281 @@ mod tests {
             p.lock().unwrap().check_path("notebook_edit", "book.ipynb"),
             CheckResult::Denied(_)
         ));
+    }
+    // mini-agent-nvnkx.238: a notebook whose keys are not alphabetical (Colab
+    // writes nbformat first, cells keyed cell_type/source/metadata) keeps its
+    // order, so an edit changes only the edited cell's lines.
+    const COLAB: &str = "{\n \"nbformat\": 4,\n \"nbformat_minor\": 5,\n \"metadata\": {\n  \"colab\": {}\n },\n \"cells\": [\n  {\n   \"cell_type\": \"markdown\",\n   \"source\": [\n    \"# T\"\n   ],\n   \"metadata\": {},\n   \"id\": \"m1\"\n  },\n  {\n   \"cell_type\": \"code\",\n   \"source\": [\n    \"x = 1\"\n   ],\n   \"metadata\": {},\n   \"id\": \"c1\",\n   \"outputs\": [],\n   \"execution_count\": null\n  }\n ]\n}\n";
+
+    fn by_id(mode: NotebookMode, id: &str, source: Option<&str>) -> NotebookArgs {
+        NotebookArgs {
+            cell_index: None,
+            cell_id: Some(id.into()),
+            ..args(mode, source)
+        }
+    }
+
+    #[test]
+    fn notebook_edit_keeps_the_files_own_key_order() {
+        let notebook = Notebook::parse(COLAB.as_bytes(), MAX_NOTEBOOK_BYTES).unwrap();
+        assert_eq!(
+            String::from_utf8(notebook.encode().unwrap()).unwrap(),
+            COLAB
+        );
+        let output = transformed(COLAB, by_id(NotebookMode::Replace, "c1", Some("x = 2")));
+        assert_eq!(output, COLAB.replace("\"x = 1\"", "\"x = 2\""));
+        // Converting a markdown cell to code appends the fields code needs;
+        // the existing keys keep their place.
+        let mut convert = by_id(NotebookMode::Replace, "m1", Some("# T"));
+        convert.cell_type = Some("code".into());
+        let output = transformed(COLAB, convert);
+        assert!(output.contains(
+            "   \"cell_type\": \"code\",\n   \"source\": [\n    \"# T\"\n   ],\n   \"metadata\": {},\n   \"id\": \"m1\",\n   \"outputs\": [],\n   \"execution_count\": null\n  },"
+        ), "{output}");
+        // And back: leaving code drops outputs and execution_count.
+        let mut back = by_id(NotebookMode::Replace, "c1", Some("x = 1"));
+        back.cell_type = Some("markdown".into());
+        let output = transformed(COLAB, back);
+        assert!(
+            !output[output.find("\"c1\"").unwrap()..].contains("outputs"),
+            "{output}"
+        );
+        assert!(output.contains("\"cell_type\": \"markdown\""), "{output}");
+    }
+
+    // mini-agent-nvnkx.239
+    #[test]
+    fn missing_and_duplicate_cell_ids_are_marked_not_refused() {
+        let missing = FIXTURE.replace("\"id\":\"first\",", "");
+        let shown = view(missing.as_bytes(), "book.ipynb", 0, 100, MAX_NOTEBOOK_BYTES).unwrap();
+        assert!(
+            shown.text.contains("[cell 0: code; id missing]"),
+            "{}",
+            shown.text
+        );
+        assert!(
+            shown.text.contains("[cell 1: markdown; id=second]"),
+            "{}",
+            shown.text
+        );
+        assert!(
+            shown.text.contains("Notice: 1 cell(s) have a missing"),
+            "{}",
+            shown.text
+        );
+        let output = transformed(&missing, args(NotebookMode::Replace, Some("new")));
+        let notebook = Notebook::parse(output.as_bytes(), MAX_NOTEBOOK_BYTES).unwrap();
+        assert_eq!(source(&notebook.cells[0]).unwrap().0, "new");
+        // Ids of untouched cells are not rewritten, and none is invented.
+        assert!(!notebook.cells[0].0.contains_key("id"));
+
+        let duplicate = FIXTURE.replace("\"second\"", "\"first\"");
+        let shown = view(
+            duplicate.as_bytes(),
+            "book.ipynb",
+            0,
+            100,
+            MAX_NOTEBOOK_BYTES,
+        )
+        .unwrap();
+        assert!(
+            shown.text.contains("id=first (duplicate)"),
+            "{}",
+            shown.text
+        );
+        let error = Notebook::parse(duplicate.as_bytes(), MAX_NOTEBOOK_BYTES)
+            .unwrap()
+            .edit(
+                &by_id(NotebookMode::Replace, "first", Some("x")),
+                MAX_NOTEBOOK_BYTES,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("ambiguous") && error.contains("cell_index"),
+            "{error}"
+        );
+        let mut second = args(NotebookMode::Replace, Some("x"));
+        second.cell_index = Some(1);
+        let output = transformed(&duplicate, second);
+        let notebook = Notebook::parse(output.as_bytes(), MAX_NOTEBOOK_BYTES).unwrap();
+        assert_eq!(source(&notebook.cells[1]).unwrap().0, "x");
+    }
+
+    // mini-agent-nvnkx.240
+    const PNG_1X1: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+    #[test]
+    fn png_outputs_become_images_mapped_to_their_cell() {
+        let notebook = format!(
+            r#"{{"nbformat":4,"nbformat_minor":5,"metadata":{{}},"cells":[{{"cell_type":"code","id":"a","source":"plot()","metadata":{{}},"execution_count":1,"outputs":[{{"output_type":"display_data","metadata":{{}},"data":{{"text/plain":"<Figure>","image/png":"{PNG_1X1}\n","image/svg+xml":"<svg/>"}}}}]}}]}}"#
+        );
+        let with = view_with_images(
+            notebook.as_bytes(),
+            "n.ipynb",
+            0,
+            100,
+            MAX_NOTEBOOK_BYTES,
+            4,
+        )
+        .unwrap();
+        assert_eq!(with.images.len(), 1);
+        assert!(with.images[0].bytes.starts_with(b"\x89PNG"));
+        assert!(
+            with.text
+                .contains("[image/png output attached as image 1 (cell 0 output 1)]"),
+            "{}",
+            with.text
+        );
+        assert!(
+            with.text.contains("[image/svg+xml output omitted]"),
+            "{}",
+            with.text
+        );
+        // A model without vision keeps the plain label.
+        let without = view(notebook.as_bytes(), "n.ipynb", 0, 100, MAX_NOTEBOOK_BYTES).unwrap();
+        assert!(without.images.is_empty());
+        assert!(
+            without.text.contains("[image/png output omitted]"),
+            "{}",
+            without.text
+        );
+        // Past the cap the label says how to reach the image.
+        let capped = view_with_images(
+            notebook.as_bytes(),
+            "n.ipynb",
+            0,
+            100,
+            MAX_NOTEBOOK_BYTES,
+            0,
+        )
+        .unwrap();
+        assert!(capped.images.is_empty());
+        // Outside the selected window nothing is decoded.
+        let outside = view_with_images(
+            notebook.as_bytes(),
+            "n.ipynb",
+            50,
+            10,
+            MAX_NOTEBOOK_BYTES,
+            4,
+        )
+        .unwrap();
+        assert!(outside.images.is_empty());
+    }
+
+    // mini-agent-nvnkx.237 / .241
+    fn record_view(tracker: &ReadTracker, root: &Path, name: &str) {
+        let metadata = std::fs::metadata(root.join(name)).unwrap();
+        let key = super::super::capture_workspace_binding(root.into())
+            .logical_relative_path(Path::new(name))
+            .unwrap();
+        tracker.record_notebook_view(&key.to_string_lossy(), 0, 100, &metadata, 0);
+    }
+
+    #[tokio::test]
+    async fn cell_index_edits_require_a_current_view_but_cell_ids_do_not() {
+        let root = crate::tests::OwnedTestDirectory::new("notebook-stale-view");
+        let path = root.path().join("book.ipynb");
+        std::fs::write(&path, FIXTURE).unwrap();
+        let tracker = ReadTracker::new(true);
+        let mut by_index = args(NotebookMode::Replace, Some("changed"));
+        by_index.cell_index = Some(1);
+        // Never viewed.
+        let error = tool(root.path(), None, None, tracker.clone())
+            .call(by_index.clone())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("changed since it was read"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), FIXTURE);
+        // Viewed, then a cell is inserted out of band.
+        record_view(&tracker, root.path(), "book.ipynb");
+        let shifted = FIXTURE.replacen(
+            "\"cells\":[",
+            "\"cells\":[{\"cell_type\":\"raw\",\"id\":\"zero\",\"source\":\"z\",\"metadata\":{}},",
+            1,
+        );
+        std::fs::write(&path, &shifted).unwrap();
+        let error = tool(root.path(), None, None, tracker.clone())
+            .call(by_index.clone())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("changed since it was read"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), shifted);
+        // The same sequence by id edits the intended cell.
+        tool(root.path(), None, None, tracker.clone())
+            .call(by_id(NotebookMode::Replace, "second", Some("changed")))
+            .await
+            .unwrap();
+        let notebook = Notebook::parse(&std::fs::read(&path).unwrap(), MAX_NOTEBOOK_BYTES).unwrap();
+        assert_eq!(source(&notebook.cells[0]).unwrap().0, "z");
+        assert_eq!(source(&notebook.cells[2]).unwrap().0, "changed");
+        // With a fresh view the index is accepted.
+        record_view(&tracker, root.path(), "book.ipynb");
+        let mut again = args(NotebookMode::Replace, Some("again"));
+        again.cell_index = Some(2);
+        tool(root.path(), None, None, tracker.clone())
+            .call(again)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn insert_result_names_the_new_cell_and_a_follow_up_edit_by_id_needs_no_read() {
+        let root = crate::tests::OwnedTestDirectory::new("notebook-result-details");
+        let path = root.path().join("book.ipynb");
+        std::fs::write(&path, FIXTURE).unwrap();
+        let tracker = ReadTracker::new(true);
+        record_view(&tracker, root.path(), "book.ipynb");
+        let mut insert = args(NotebookMode::Insert, Some("y = 2"));
+        insert.cell_index = Some(2);
+        let output = tool(root.path(), None, None, tracker.clone())
+            .call(insert)
+            .await
+            .unwrap();
+        assert!(output.contains("inserted cell at index 2 (id="), "{output}");
+        assert!(output.contains("notebook now has 3 cells"), "{output}");
+        let id = output
+            .split("(id=")
+            .nth(1)
+            .and_then(|rest| rest.split(')').next())
+            .unwrap()
+            .to_owned();
+        let output = tool(root.path(), None, None, tracker.clone())
+            .call(by_id(NotebookMode::Replace, &id, Some("y = 3")))
+            .await
+            .unwrap();
+        assert!(output.contains("replaced cell at index 2"), "{output}");
+        let notebook = Notebook::parse(&std::fs::read(&path).unwrap(), MAX_NOTEBOOK_BYTES).unwrap();
+        assert_eq!(source(&notebook.cells[2]).unwrap().0, "y = 3");
+    }
+    #[tokio::test]
+    async fn a_real_read_of_the_cell_view_authorizes_cell_index_edits() {
+        use super::super::{ReadArgs, ReadTool};
+        let root = crate::tests::OwnedTestDirectory::new("notebook-read-then-edit");
+        std::fs::write(root.path().join("book.ipynb"), FIXTURE).unwrap();
+        let tracker = ReadTracker::new(true);
+        let read = ReadTool::new_with_tracker(None, None, None, 200, tracker.clone())
+            .with_workspace(root.path());
+        let mut by_index = args(NotebookMode::Replace, Some("viewed"));
+        by_index.cell_index = Some(1);
+        assert!(
+            tool(root.path(), None, None, tracker.clone())
+                .call(by_index.clone())
+                .await
+                .is_err()
+        );
+        read.call(ReadArgs {
+            path: "book.ipynb".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        tool(root.path(), None, None, tracker)
+            .call(by_index)
+            .await
+            .unwrap();
     }
 }

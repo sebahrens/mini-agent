@@ -17,6 +17,8 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Skills run with `/<name> args` now substitute `$ARGUMENTS`, `$ARGUMENTS[N]`, `$N` and `${CLAUDE_SKILL_DIR}`, rewrite ``!`cmd` `` spans into shell-tool instructions (`skills_shell_placeholders`), and honour `context: fork` with `agent:` by delegating the body to one `task` child (mini-agent-h7wxv).
 - Skill frontmatter `model` (forked skills; the `task` tool takes a per-call `model` limited to configured `[quick_models]` aliases and never overrides a persona-pinned model) and `paths` (automatic selection only when the request names a matching file); `effort` and `hooks` now report a reason (mini-agent-h7wxv).
 - `install.sh --uninstall` removes the binary and its `share/doc/mini-agent` directory (mini-agent-nvnkx.356).
+- `read` with `visual:true` attaches the selected PDF pages as page images or a native document block even when they have a text layer, and text pages that also paint images now say so with the exact `visual:true` call to see them (mini-agent-nvnkx.236).
+- `read` returns PNG and JPEG outputs of notebook cells in the selected window as image blocks (at most 4, mapped by `image N = cell C output O`) when the model accepts images; other outputs and text-only models keep the mime label (mini-agent-nvnkx.240).
 
 ### Fixed
 
@@ -105,6 +107,15 @@ Notable changes to mini-agent are documented in this file. The format follows
 - `install.sh` runs everything from a `main` function invoked on the last line, so a truncated `curl | bash` runs nothing (mini-agent-nvnkx.112). It checks for curl (wget fallback), tar and a SHA-256 tool, and for a writable install directory before any download, and points MSYS/Cygwin shells to the Windows install (mini-agent-nvnkx.356).
 - README no longer claims replacing an existing workspace file fails closed on Windows (mini-agent-nvnkx.304). The structured-Git ADR lists the full operation set and permission keys (mini-agent-nvnkx.51).
 - The repository's own loop-verification self-check (`--loop-verification-policy-check`) is no longer part of the shipped binary; CI runs the policy through `scripts.tests.test_loop_lifecycle` (mini-agent-nvnkx.185).
+- PDF text extraction now reads text drawn inside Form XObjects (nested, with their own resources and `/Matrix`, bounded in depth and count, cycle-safe), counts images painted inside forms, and notes forms it cannot read (mini-agent-nvnkx.233).
+- PDF simple fonts honour `/Encoding /Differences` through a compact Adobe Glyph List subset (ligatures expand to `fi`/`fl`, `uniXXXX` names) and `StandardEncoding` for non-symbolic Type 1 fonts without an encoding; codes with no Unicode mapping (composite fonts without ToUnicode, unknown glyph names) are counted per font and reported as a page note instead of vanishing silently (mini-agent-nvnkx.234).
+- PDF object streams are expanded newest-first by file offset and a compressed object replaces a direct one only when its container is later in the file, so incrementally saved PDFs give the same, newest revision on every run (mini-agent-nvnkx.235).
+- `notebook_edit` by `cell_index` now requires a current cell view from `read` (size and modification time unchanged since) and otherwise refuses with a re-read hint, so an autosave or out-of-band cell insert cannot redirect the edit; `cell_id` edits are unaffected (mini-agent-nvnkx.237).
+- `notebook_edit` keeps the file's own key order for the root and every cell (Colab, hand-written and converter-generated notebooks no longer get every cell reordered by a one-cell edit); inserted cells follow the nbformat key order (mini-agent-nvnkx.238).
+- Notebooks with missing, duplicate or invalid cell ids open instead of being refused: the cell view marks the cells (`id missing`, `(duplicate)`) with one notice, edits by `cell_index` work, an ambiguous `cell_id` is refused naming the cells, and untouched ids are never rewritten (mini-agent-nvnkx.239).
+- `notebook_edit` results name the affected index, the new cell's id and the cell count when the preimage may be disclosed, and `replace` accepts `cell_type` to convert a cell (outputs and `execution_count` are dropped when leaving code and added when entering it) (mini-agent-nvnkx.241).
+- `read` downscales images that are within the 5 MiB / 8000 px limits but exceed 2000 px on the long edge or 1 MiB (GIFs only for pixels), keeping the `resized from` note; small images stay byte-identical and `full_resolution:true` keeps the original pixels (mini-agent-nvnkx.242).
+- `task` calls that name a read-only persona (`explore` or any persona that is not `mode: write` and has no memory, hooks or MCP servers) share the tool lane like an argument-free call, so a model that writes `"agent_type":"explore"` still overlaps with other readers (mini-agent-nvnkx.243).
 
 ### Added
 

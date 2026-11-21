@@ -167,6 +167,8 @@ async fn read_and_edit_home_paths_resolve_through_the_ambient_path() {
         .call(ReadArgs {
             pages: None,
             raw_notebook: false,
+            visual: false,
+            full_resolution: false,
             character_offset: None,
             character_limit: None,
             path: "$HOME/notes.txt".into(),

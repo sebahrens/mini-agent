@@ -1828,7 +1828,16 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         let all_tools =
             crate::extras::hooks::wrap_from_global(all_tools, permission.clone(), ask_tx.clone());
 
-        let all_tools = tools::concurrency::bind_with_shared(all_tools, &parallel_mcp_names);
+        #[cfg(feature = "subagents")]
+        let read_only_personas =
+            crate::context::agents::read_only_persona_names_for_workspace(Some(workspace.as_ref()));
+        #[cfg(not(feature = "subagents"))]
+        let read_only_personas = std::collections::HashSet::from(["explore".to_owned()]);
+        let all_tools = tools::concurrency::bind_with_personas(
+            all_tools,
+            &parallel_mcp_names,
+            read_only_personas,
+        );
 
         #[cfg(feature = "mcp")]
         let all_tools = {

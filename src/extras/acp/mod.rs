@@ -16892,6 +16892,8 @@ mod workspace_tests {
             first_read.call(ReadArgs {
                 pages: None,
                 raw_notebook: false,
+                visual: false,
+                full_resolution: false,
                 character_offset: None,
                 character_limit: None,
                 path: "sentinel.txt".into(),
@@ -16901,6 +16903,8 @@ mod workspace_tests {
             second_read.call(ReadArgs {
                 pages: None,
                 raw_notebook: false,
+                visual: false,
+                full_resolution: false,
                 character_offset: None,
                 character_limit: None,
                 path: "sentinel.txt".into(),
@@ -17079,6 +17083,8 @@ mod workspace_tests {
             .call(ReadArgs {
                 pages: None,
                 raw_notebook: false,
+                visual: false,
+                full_resolution: false,
                 character_offset: None,
                 character_limit: None,
                 path: relative_escape.to_string_lossy().into_owned(),
@@ -17168,6 +17174,8 @@ mod workspace_tests {
             read.call(ReadArgs {
                 pages: None,
                 raw_notebook: false,
+                visual: false,
+                full_resolution: false,
                 character_offset: None,
                 character_limit: None,
                 path: "sentinel.txt".into(),
@@ -17234,6 +17242,8 @@ mod workspace_tests {
             .call(ReadArgs {
                 pages: None,
                 raw_notebook: false,
+                visual: false,
+                full_resolution: false,
                 character_offset: None,
                 character_limit: None,
                 path: "safe/link.txt".into(),

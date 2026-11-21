@@ -2154,6 +2154,44 @@ pub(crate) fn available_described_names_for_paths_and_workspace(
     described_names(&load_for_paths_and_workspace(paths, workspace))
 }
 
+/// Persona names whose `task` children never write the workspace or other
+/// shared state: not `mode: write`, with no persona memory, hooks or MCP
+/// servers. `explore` is always included unless a user file redefines it as
+/// anything else. Used to let such `task` calls share the tool lane.
+#[cfg(feature = "subagents")]
+pub(crate) fn read_only_persona_names_for_workspace(
+    workspace: Option<&crate::paths::WorkspaceBinding>,
+) -> std::collections::HashSet<String> {
+    let agents = match workspace {
+        Some(workspace) => shared_for_workspace_binding(workspace),
+        None => std::sync::Arc::new(load()),
+    };
+    let mut names: std::collections::HashSet<String> = agents
+        .iter()
+        .filter(|(_, definition)| {
+            let mcp = {
+                #[cfg(feature = "mcp")]
+                {
+                    definition.mcp_servers.is_some()
+                }
+                #[cfg(not(feature = "mcp"))]
+                {
+                    false
+                }
+            };
+            definition.mode.as_deref() != Some("write")
+                && definition.extras.memory.is_none()
+                && definition.extras.hooks.is_none()
+                && !mcp
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    if !agents.contains_key("explore") {
+        names.insert("explore".to_owned());
+    }
+    names
+}
+
 #[cfg(feature = "subagents")]
 fn write_names(agents: &HashMap<String, AgentDefinition>) -> Vec<String> {
     let mut names: Vec<String> = agents

@@ -900,6 +900,8 @@ mod tests {
         read.call(ReadArgs {
             pages: None,
             raw_notebook: false,
+            visual: false,
+            full_resolution: false,
             character_offset: None,
             character_limit: None,
             path: "existing.txt".into(),
@@ -937,6 +939,8 @@ mod tests {
             read.call(ReadArgs {
                 pages: None,
                 raw_notebook: false,
+                visual: false,
+                full_resolution: false,
                 character_offset: None,
                 character_limit: None,
                 path: "big.txt".into(),
@@ -978,6 +982,8 @@ mod tests {
         let read_args = |limit: Option<usize>| ReadArgs {
             pages: None,
             raw_notebook: false,
+            visual: false,
+            full_resolution: false,
             character_offset: None,
             character_limit: None,
             path: "long.txt".into(),
@@ -1015,6 +1021,8 @@ mod tests {
         read.call(ReadArgs {
             pages: None,
             raw_notebook: false,
+            visual: false,
+            full_resolution: false,
             character_offset: None,
             character_limit: None,
             path: "existing.txt".into(),

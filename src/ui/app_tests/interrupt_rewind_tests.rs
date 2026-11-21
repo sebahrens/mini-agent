@@ -133,6 +133,8 @@ async fn actual_rewind_confirmation_restores_shell_command_in_editor() {
             read.call(crate::agent::tools::ReadArgs {
                 pages: None,
                 raw_notebook: false,
+                visual: false,
+                full_resolution: false,
                 character_offset: None,
                 character_limit: None,
                 path: "rewound.txt".into(),

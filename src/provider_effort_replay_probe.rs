@@ -5034,6 +5034,8 @@ async fn cache71_memory_actual_paused_write_checkpoint_tracks_the_literal_user_a
         .call(crate::agent::tools::ReadArgs {
             pages: None,
             raw_notebook: false,
+            visual: false,
+            full_resolution: false,
             character_offset: None,
             character_limit: None,
             path: "file.txt".into(),
