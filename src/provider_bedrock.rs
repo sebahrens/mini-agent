@@ -239,16 +239,40 @@ impl BedrockAuth {
         })
     }
 
+    /// The base path the Converse route hangs off: the endpoint path without
+    /// its mandatory `/anthropic` suffix.
+    fn converse_path(&self) -> String {
+        let path = self.endpoint.path().trim_end_matches('/');
+        path.strip_suffix("/anthropic").unwrap_or(path).to_owned()
+    }
+
+    /// The URL prefix of the Converse route (`{origin}{base path}`).
+    pub(crate) fn converse_base(&self) -> String {
+        format!(
+            "{}{}",
+            self.endpoint.origin().ascii_serialization(),
+            self.converse_path()
+        )
+    }
+
     pub(crate) async fn prepare(
         &self,
         request: &mut http::Request<Bytes>,
     ) -> http_client::Result<()> {
         let url = reqwest::Url::parse(&request.uri().to_string())
             .map_err(|_| auth_error("invalid Bedrock request URL"))?;
+        // The Anthropic route lives under `{base}/anthropic`; the Converse route
+        // (non-Anthropic model ids) under `{base}/model/{id}/converse[-stream]`.
+        // Both are pinned to the one captured origin and base path.
+        let converse = url
+            .path()
+            .starts_with(&format!("{}/model/", self.converse_path()));
         if url.origin() != self.endpoint.origin()
-            || !url
-                .path()
-                .starts_with(&format!("{}/", self.endpoint.path().trim_end_matches('/')))
+            || !(converse
+                || url
+                    .path()
+                    .starts_with(&format!("{}/", self.endpoint.path().trim_end_matches('/'))))
+            || (converse && request.method() != http::Method::POST)
         {
             return Err(auth_error("Bedrock request changed credential destination"));
         }
@@ -264,7 +288,21 @@ impl BedrockAuth {
             request.headers_mut().remove(name);
         }
         if let Some(key) = &self.key {
-            request.headers_mut().insert("x-api-key", key.clone());
+            if converse {
+                // Bedrock API keys authenticate Converse as a bearer token.
+                let mut bearer = http::HeaderValue::from_str(&format!(
+                    "Bearer {}",
+                    key.to_str()
+                        .map_err(|_| auth_error("invalid Bedrock key"))?
+                ))
+                .map_err(|_| auth_error("invalid Bedrock key"))?;
+                bearer.set_sensitive(true);
+                request
+                    .headers_mut()
+                    .insert(http::header::AUTHORIZATION, bearer);
+            } else {
+                request.headers_mut().insert("x-api-key", key.clone());
+            }
             return Ok(());
         }
         let credentials = tokio::time::timeout(AUTH_TIMEOUT, async {
@@ -603,6 +641,3 @@ pub(crate) fn build_client(
 #[cfg(test)]
 #[path = "provider_bedrock_tests.rs"]
 mod tests;
-
-#[path = "provider_bedrock_converse.rs"]
-pub(crate) mod converse;

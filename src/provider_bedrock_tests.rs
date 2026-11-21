@@ -528,3 +528,248 @@ fn bedrock_region_falls_back_to_the_selected_profile_and_names_both_sources() {
         }
     }
 }
+
+fn converse_stream_body(step: usize) -> Vec<u8> {
+    use crate::provider::bedrock_converse::test_frame as frame;
+    let mut wire = frame("event", "messageStart", &json!({"role": "assistant"}));
+    if step == 0 {
+        wire.extend(frame(
+            "event",
+            "contentBlockStart",
+            &json!({"contentBlockIndex": 0, "start": {"toolUse": {"toolUseId": "tu_nova", "name": Probe::NAME}}}),
+        ));
+        wire.extend(frame(
+            "event",
+            "contentBlockDelta",
+            &json!({"contentBlockIndex": 0, "delta": {"toolUse": {"input": "{}"}}}),
+        ));
+    } else {
+        wire.extend(frame(
+            "event",
+            "contentBlockDelta",
+            &json!({"contentBlockIndex": 0, "delta": {"text": "NOVA_DONE"}}),
+        ));
+    }
+    wire.extend(frame(
+        "event",
+        "contentBlockStop",
+        &json!({"contentBlockIndex": 0}),
+    ));
+    wire.extend(frame(
+        "event",
+        "messageStop",
+        &json!({"stopReason": if step == 0 {"tool_use"} else {"end_turn"}}),
+    ));
+    wire.extend(frame(
+        "event",
+        "metadata",
+        &json!({"usage": {"inputTokens": 10, "outputTokens": 2, "totalTokens": 12}}),
+    ));
+    wire
+}
+
+/// A non-Anthropic Bedrock id takes the Converse route through the same
+/// pinned, signed (or bearer-keyed) transport: path, credentials, body and the
+/// decoded text + tool-use stream, with usage (mini-agent-nvnkx.44).
+#[tokio::test]
+async fn bedrock44_converse_stream_is_signed_pinned_and_decodes_text_and_tool_use() {
+    use sha2::Digest;
+    for source in ["api-key", "env"] {
+        let temp = crate::tests::OwnedTestDirectory::new("bedrock44-auth");
+        let empty_config = temp.path().join("config");
+        std::fs::write(&empty_config, "").unwrap();
+        let _env = crate::tests::ScopedProcessEnv::set(&[
+            (
+                "AWS_ACCESS_KEY_ID",
+                (source == "env").then(|| "OWNED_ENV_ID".into()),
+            ),
+            (
+                "AWS_SECRET_ACCESS_KEY",
+                (source == "env").then(|| "OWNED_ENV_SECRET".into()),
+            ),
+            ("AWS_PROFILE", None),
+            ("AWS_SESSION_TOKEN", None),
+            ("AWS_CONFIG_FILE", Some(empty_config.into_os_string())),
+            ("AWS_EC2_METADATA_DISABLED", Some("true".into())),
+        ]);
+        let (listener, base) = bind().await;
+        let custom = HashMap::from([(
+            "owned-bedrock".into(),
+            serde_json::from_value::<crate::config::CustomProviderConfig>(json!({
+                "provider_type": "bedrock",
+                "base_url": format!("{base}/anthropic"),
+                "inherit_builtin_key": true
+            }))
+            .unwrap(),
+        )]);
+        let client =
+            crate::provider::create_client_with_env("owned-bedrock", None, &custom, None, |name| {
+                match name {
+                    "AWS_REGION" => Ok("us-east-1".into()),
+                    "AWS_BEARER_TOKEN_BEDROCK" if source == "api-key" => {
+                        Ok("OWNED_BEDROCK_KEY".into())
+                    }
+                    _ => Err(VarError::NotPresent),
+                }
+            })
+            .unwrap();
+        assert!(matches!(
+            client.completion_model("us.anthropic.claude-sonnet-5-v1:0"),
+            crate::provider::AnyModel::Anthropic(_)
+        ));
+        let crate::provider::AnyModel::BedrockConverse(model) =
+            client.completion_model("amazon.nova-pro-v1:0")
+        else {
+            panic!("a non-Anthropic id must take the Converse route")
+        };
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let task_count = count.clone();
+        let server = async {
+            for step in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let req = read_request(&mut socket).await;
+                let (headers, body) = (req.headers.clone(), req.json());
+                assert!(
+                    headers
+                        .starts_with("post /model/amazon.nova-pro-v1%3a0/converse-stream http/1.1"),
+                    "{headers}"
+                );
+                assert!(headers.contains("\r\naccept: application/vnd.amazon.eventstream\r\n"));
+                if source == "api-key" {
+                    assert!(headers.contains("\r\nauthorization: bearer owned_bedrock_key\r\n"));
+                    assert!(!headers.contains("\r\nx-api-key:"));
+                } else {
+                    assert!(headers.contains("credential=owned_env_id/"));
+                    assert!(headers.contains("/us-east-1/bedrock/aws4_request"));
+                    assert!(headers.contains(&format!(
+                        "x-amz-content-sha256: {}",
+                        sha2::Sha256::digest(&req.body)
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<String>()
+                    )));
+                }
+                assert!(
+                    body["messages"][0]["content"][0]["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("owned literal task"))
+                );
+                assert_eq!(
+                    body["toolConfig"]["tools"][0]["toolSpec"]["name"],
+                    Probe::NAME
+                );
+                assert_eq!(body["inferenceConfig"]["maxTokens"], 32);
+                if step == 1 {
+                    assert!(body.to_string().contains("OWNED_BEDROCK_TOOL_OK"));
+                    assert!(body.to_string().contains("tu_nova"));
+                }
+                let wire = converse_stream_body(step);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/vnd.amazon.eventstream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    wire.len()
+                );
+                socket.write_all(head.as_bytes()).await.unwrap();
+                socket.write_all(&wire).await.unwrap();
+                socket.shutdown().await.ok();
+            }
+        };
+        let task = crate::startup::heap_future(|| async move {
+            let agent = rig::agent::AgentBuilder::new(model)
+                .tool(Probe(task_count))
+                .max_tokens(32)
+                .default_max_turns(3)
+                .build();
+            let mut stream = agent
+                .stream_chat("owned literal task", Vec::<Message>::new())
+                .await;
+            let mut finished = false;
+            while let Some(item) = stream.next().await {
+                if let rig::agent::MultiTurnStreamItem::FinalResponse(result) = item.unwrap() {
+                    assert_eq!(result.output, "NOVA_DONE");
+                    assert_eq!(
+                        (result.usage().input_tokens, result.usage().output_tokens),
+                        (20, 4)
+                    );
+                    finished = true;
+                }
+            }
+            assert!(finished);
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(server, task);
+        })
+        .await
+        .unwrap();
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+}
+
+/// The buffered `converse` call decodes text, a tool call and cache usage, and
+/// the transport refuses a Converse path outside the captured base.
+#[tokio::test]
+async fn bedrock44_converse_buffered_completion_and_destination_pin() {
+    use rig::completion::CompletionModel as _;
+    use rig::http_client::HttpClientExt as _;
+    let (listener, base) = bind().await;
+    let auth = Arc::new(
+        BedrockAuth::new(
+            ResolvedCredential::ApiKey("OWNED_BEDROCK_KEY".into()),
+            &format!("{base}/anthropic"),
+            "us-east-1",
+        )
+        .unwrap(),
+    );
+    assert_eq!(auth.converse_base(), base);
+    let http = ProviderHttpClient::with_bedrock(reqwest::Client::new(), auth);
+    let model = crate::provider::bedrock_converse::ConverseModel::new(
+        http.clone(),
+        http.bedrock_converse_base().unwrap(),
+        "meta.llama3-1-70b-instruct-v1:0",
+    );
+    let server = async {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let req = read_request(&mut socket).await;
+        assert!(
+            req.headers
+                .starts_with("post /model/meta.llama3-1-70b-instruct-v1%3a0/converse http/1.1")
+        );
+        let body = json!({
+            "output": {"message": {"role": "assistant", "content": [
+                {"text": "hi"},
+                {"toolUse": {"toolUseId": "t1", "name": "read", "input": {"path": "a"}}}
+            ]}},
+            "stopReason": "tool_use",
+            "usage": {"inputTokens": 5, "outputTokens": 3, "cacheReadInputTokens": 7}
+        });
+        crate::tests::support::loopback_http::asynchronous::respond_json(
+            &mut socket,
+            &body.to_string(),
+        )
+        .await;
+    };
+    let call = async {
+        let request = model.completion_request("hello").build();
+        model.completion(request).await.unwrap()
+    };
+    let (_, response) = tokio::join!(server, call);
+    assert_eq!(response.choice.len(), 2);
+    assert!(matches!(
+        response.choice.iter().nth(1),
+        Some(rig::message::AssistantContent::ToolCall(call)) if call.id == "t1"
+    ));
+    assert_eq!(
+        (
+            response.usage.input_tokens,
+            response.usage.output_tokens,
+            response.usage.cached_input_tokens
+        ),
+        (5, 3, 7)
+    );
+    // A request outside the captured base never gets a credential.
+    let stray = http::Request::builder()
+        .method(http::Method::POST)
+        .uri("https://example.invalid/model/x/converse")
+        .body(Bytes::new())
+        .unwrap();
+    assert!(http.send::<_, Bytes>(stray).await.is_err());
+}

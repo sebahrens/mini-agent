@@ -6,22 +6,31 @@
 //! Messages path. The module owns the three pure pieces of that route:
 //!
 //! * [`request_body`] encodes a rig `CompletionRequest` as a Converse body;
-//! * [`signed_request`] builds the URL and signs it with the existing SigV4
-//!   signer (the same destination checks and credential chain as the
-//!   Anthropic route);
+//! * [`build_request`] builds the URL; the Bedrock auth owner signs it with the
+//!   existing SigV4 signer (the same destination checks and credential chain
+//!   as the Anthropic route);
 //! * [`EventStream`] / [`StreamAccumulator`] decode the
 //!   `application/vnd.amazon.eventstream` binary framing and the Converse
 //!   events into text, tool-use and usage items.
 //!
 //! The wire formats follow the AWS Bedrock Runtime API reference. They were
-//! exercised against recorded frames only, never a live account. The module is
-//! not yet attached to a rig `CompletionModel`, so it has no production
-//! caller.
-#![allow(dead_code)]
-
+//! exercised against recorded frames and loopback servers only, never a live
+//! account. [`ConverseModel`] adapts the layer to rig's `CompletionModel`; the
+//! request is signed (SigV4) or given the Bedrock API key by the Bedrock auth
+//! owner inside `ProviderHttpClient`, with the same destination pinning as the
+//! Anthropic route.
+use crate::provider_http::ProviderHttpClient;
 use bytes::Bytes;
-use rig::completion::{CompletionRequest, Message};
+use futures::StreamExt;
+use rig::OneOrMany;
+use rig::completion::{
+    CompletionError, CompletionModel, CompletionRequest, CompletionResponse, GetTokenUsage,
+    Message, StopReason, Usage,
+};
+use rig::http_client::HttpClientExt;
 use rig::message::{AssistantContent, ToolResultContent, UserContent};
+use rig::streaming::{RawStreamingChoice, RawStreamingToolCall, StreamingCompletionResponse};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 /// Whether a Bedrock model id belongs on the native Anthropic route. Ids may
@@ -68,11 +77,6 @@ pub(crate) fn path(model: &str, streaming: bool) -> anyhow::Result<String> {
             "converse"
         }
     ))
-}
-
-/// The regional runtime origin the Converse route is pinned to.
-pub(crate) fn origin(region: &str) -> String {
-    format!("https://bedrock-runtime.{region}.amazonaws.com")
 }
 
 fn tool_result_content(content: &ToolResultContent) -> Value {
@@ -176,25 +180,29 @@ pub(crate) fn request_body(request: &CompletionRequest) -> Value {
     body
 }
 
-/// Build the signed `converse-stream` request against the pinned regional
-/// origin. Signing reuses the Anthropic route's SigV4 signer.
-pub(crate) fn signed_request(
-    region: &str,
+/// Build the unsigned Converse request under `base` (the pinned regional
+/// origin, or a gateway prefix). Signing / the API key is applied at the HTTP
+/// owner, which pins the destination before attaching any credential.
+pub(crate) fn build_request(
+    base: &str,
     model: &str,
     body: &Value,
-    credentials: aws_credential_types::Credentials,
-    now: std::time::SystemTime,
+    streaming: bool,
 ) -> anyhow::Result<http::Request<Bytes>> {
-    let uri = format!("{}{}", origin(region), path(model, true)?);
-    let mut request = http::Request::builder()
+    let uri = format!("{}{}", base.trim_end_matches('/'), path(model, streaming)?);
+    Ok(http::Request::builder()
         .method(http::Method::POST)
         .uri(uri)
         .header(http::header::CONTENT_TYPE, "application/json")
-        .header(http::header::ACCEPT, "application/vnd.amazon.eventstream")
-        .body(Bytes::from(serde_json::to_vec(body)?))?;
-    super::sign_request(&mut request, credentials, region, now)
-        .map_err(|_| anyhow::anyhow!("Bedrock Converse request signing failed"))?;
-    Ok(request)
+        .header(
+            http::header::ACCEPT,
+            if streaming {
+                "application/vnd.amazon.eventstream"
+            } else {
+                "application/json"
+            },
+        )
+        .body(Bytes::from(serde_json::to_vec(body)?))?)
 }
 
 // ---- event-stream framing -------------------------------------------------
@@ -324,7 +332,61 @@ pub(crate) enum Item {
     Usage {
         input_tokens: u64,
         output_tokens: u64,
+        cache_read: u64,
+        cache_write: u64,
     },
+}
+
+fn usage_item(usage: &Value) -> Item {
+    let count = |key: &str| usage[key].as_u64().unwrap_or(0);
+    Item::Usage {
+        input_tokens: count("inputTokens"),
+        output_tokens: count("outputTokens"),
+        cache_read: count("cacheReadInputTokens"),
+        cache_write: count("cacheWriteInputTokens"),
+    }
+}
+
+/// Decode a non-streaming `converse` response into the same [`Item`]s the
+/// stream produces (text and tool calls in order, then stop reason, usage).
+pub(crate) fn parse_response(response: &Value) -> Vec<Item> {
+    let mut items = Vec::new();
+    for block in response["output"]["message"]["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        if let Some(text) = block["text"].as_str() {
+            if !text.is_empty() {
+                items.push(Item::Text(text.to_owned()));
+            }
+        } else if let Some(tool) = block.get("toolUse") {
+            items.push(Item::ToolCall {
+                id: tool["toolUseId"].as_str().unwrap_or_default().into(),
+                name: tool["name"].as_str().unwrap_or_default().into(),
+                arguments: tool.get("input").cloned().unwrap_or_else(|| json!({})),
+            });
+        }
+    }
+    items.push(Item::Stop(
+        response["stopReason"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+    ));
+    items.push(usage_item(&response["usage"]));
+    items
+}
+
+fn stop_reason(reason: &str) -> StopReason {
+    match reason {
+        "end_turn" | "stop_sequence" => StopReason::EndTurn,
+        "tool_use" => StopReason::ToolUse,
+        "max_tokens" => StopReason::MaxTokens,
+        "model_context_window_exceeded" => StopReason::ContextWindow,
+        "guardrail_intervened" | "content_filtered" => StopReason::ContentFilter,
+        _ => StopReason::Other,
+    }
 }
 
 /// Folds Converse stream events into [`Item`]s, assembling each tool call's
@@ -382,51 +444,279 @@ impl StreamAccumulator {
             "messageStop" => items.push(Item::Stop(
                 event["stopReason"].as_str().unwrap_or_default().to_owned(),
             )),
-            "metadata" => items.push(Item::Usage {
-                input_tokens: event["usage"]["inputTokens"].as_u64().unwrap_or(0),
-                output_tokens: event["usage"]["outputTokens"].as_u64().unwrap_or(0),
-            }),
+            "metadata" => items.push(usage_item(&event["usage"])),
             _ => {}
         }
         Ok(items)
     }
 }
 
+// ---- rig CompletionModel --------------------------------------------------
+
+/// What a streamed Converse response ends with: stop reason and usage.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ConverseFinal {
+    pub stop_reason: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+}
+
+impl ConverseFinal {
+    fn absorb(&mut self, item: &Item) {
+        match item {
+            Item::Stop(reason) => self.stop_reason.clone_from(reason),
+            Item::Usage {
+                input_tokens,
+                output_tokens,
+                cache_read,
+                cache_write,
+            } => {
+                self.input_tokens = *input_tokens;
+                self.output_tokens = *output_tokens;
+                self.cache_read = *cache_read;
+                self.cache_write = *cache_write;
+            }
+            _ => {}
+        }
+    }
+}
+
+impl GetTokenUsage for ConverseFinal {
+    fn token_usage(&self) -> Usage {
+        let mut usage = Usage::new();
+        usage.input_tokens = self.input_tokens;
+        usage.output_tokens = self.output_tokens;
+        usage.cached_input_tokens = self.cache_read;
+        usage.cache_creation_input_tokens = self.cache_write;
+        usage.total_tokens =
+            self.input_tokens + self.output_tokens + self.cache_read + self.cache_write;
+        usage
+    }
+    fn output_truncated(&self) -> bool {
+        self.stop_reason == "max_tokens"
+    }
+    fn stop_reason(&self) -> Option<StopReason> {
+        (!self.stop_reason.is_empty()).then(|| stop_reason(&self.stop_reason))
+    }
+}
+
+/// Handle used by rig's `make`: the authenticated transport and the Converse
+/// base URL (the endpoint without its `/anthropic` suffix).
+#[derive(Clone)]
+pub struct ConverseClient {
+    pub(crate) http: ProviderHttpClient,
+    pub(crate) base: String,
+}
+
+/// Bedrock Converse / ConverseStream completion model for every non-Anthropic
+/// model id. Requests go through the Bedrock-authenticated `ProviderHttpClient`,
+/// which pins the destination and signs (SigV4) or attaches the Bedrock API key.
+#[derive(Clone)]
+pub struct ConverseModel {
+    pub model: String,
+    client: ConverseClient,
+}
+
+impl ConverseModel {
+    pub(crate) fn new(http: ProviderHttpClient, base: String, model: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+            client: ConverseClient { http, base },
+        }
+    }
+
+    fn request(
+        &self,
+        request: &CompletionRequest,
+        streaming: bool,
+    ) -> Result<http::Request<Bytes>, CompletionError> {
+        let model = request.model.as_deref().unwrap_or(&self.model);
+        build_request(&self.client.base, model, &request_body(request), streaming)
+            .map_err(|error| CompletionError::RequestError(error.into()))
+    }
+}
+
+struct StreamState {
+    bytes: rig::http_client::sse::BoxedStream,
+    frames: EventStream,
+    accumulator: StreamAccumulator,
+    queue: std::collections::VecDeque<RawStreamingChoice<ConverseFinal>>,
+    last: ConverseFinal,
+    ended: bool,
+}
+
+impl StreamState {
+    fn fail(&mut self, message: String) -> CompletionError {
+        self.ended = true;
+        CompletionError::ResponseError(message)
+    }
+
+    /// The next queued stream choice, reading and decoding more of the wire as
+    /// needed. `None` at the end of the stream.
+    async fn next(&mut self) -> Option<Result<RawStreamingChoice<ConverseFinal>, CompletionError>> {
+        loop {
+            if let Some(choice) = self.queue.pop_front() {
+                return Some(Ok(choice));
+            }
+            if self.ended {
+                return None;
+            }
+            match self.frames.next_frame() {
+                Err(error) => return Some(Err(self.fail(error.to_string()))),
+                Ok(Some(frame)) => {
+                    match self.accumulator.frame(&frame) {
+                        Err(error) => return Some(Err(self.fail(error.to_string()))),
+                        Ok(items) => {
+                            for item in items {
+                                self.last.absorb(&item);
+                                match item {
+                                    Item::Text(text) => {
+                                        self.queue.push_back(RawStreamingChoice::Message(text));
+                                    }
+                                    Item::ToolCall {
+                                        id,
+                                        name,
+                                        arguments,
+                                    } => self.queue.push_back(RawStreamingChoice::ToolCall(
+                                        RawStreamingToolCall::new(id, name, arguments),
+                                    )),
+                                    Item::Stop(_) | Item::Usage { .. } => {}
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+                Ok(None) => {}
+            }
+            match self.bytes.next().await {
+                Some(Ok(bytes)) => self.frames.push(&bytes),
+                Some(Err(error)) => {
+                    self.ended = true;
+                    return Some(Err(CompletionError::HttpError(error)));
+                }
+                None if self.last.stop_reason.is_empty() => {
+                    return Some(Err(
+                        self.fail("Bedrock stream ended before messageStop".into())
+                    ));
+                }
+                None => {
+                    self.ended = true;
+                    self.queue
+                        .push_back(RawStreamingChoice::FinalResponse(self.last.clone()));
+                }
+            }
+        }
+    }
+}
+
+impl CompletionModel for ConverseModel {
+    type Response = Value;
+    type StreamingResponse = ConverseFinal;
+    type Client = ConverseClient;
+
+    fn make(client: &Self::Client, model: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+            client: client.clone(),
+        }
+    }
+
+    async fn completion(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
+        let http_request = self.request(&request, false)?;
+        let response = self.client.http.send::<_, Bytes>(http_request).await?;
+        let bytes = response.into_body().await?;
+        let raw: Value = serde_json::from_slice(&bytes)?;
+        let mut last = ConverseFinal::default();
+        let mut choice = Vec::new();
+        for item in parse_response(&raw) {
+            last.absorb(&item);
+            match item {
+                Item::Text(text) => choice.push(AssistantContent::text(text)),
+                Item::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } => choice.push(AssistantContent::tool_call(id, name, arguments)),
+                Item::Stop(_) | Item::Usage { .. } => {}
+            }
+        }
+        let choice = OneOrMany::many(choice).map_err(|_| {
+            CompletionError::ResponseError("Bedrock Converse response had no content".into())
+        })?;
+        Ok(CompletionResponse {
+            choice,
+            usage: last.token_usage(),
+            raw_response: raw,
+            message_id: None,
+        })
+    }
+
+    async fn stream(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
+        let http_request = self.request(&request, true)?;
+        let response = self.client.http.send_streaming(http_request).await?;
+        let state = StreamState {
+            bytes: response.into_body(),
+            frames: EventStream::default(),
+            accumulator: StreamAccumulator::default(),
+            queue: Default::default(),
+            last: ConverseFinal::default(),
+            ended: false,
+        };
+        let stream = futures::stream::unfold(state, |mut state| async move {
+            state.next().await.map(|item| (item, state))
+        });
+        Ok(StreamingCompletionResponse::stream(Box::pin(stream)))
+    }
+}
+
+#[cfg(test)]
+fn header(name: &str, value: &str) -> Vec<u8> {
+    let mut out = vec![name.len() as u8];
+    out.extend_from_slice(name.as_bytes());
+    out.push(7);
+    out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+    out.extend_from_slice(value.as_bytes());
+    out
+}
+
+#[cfg(test)]
+pub(crate) fn test_frame(message_type: &str, kind: &str, payload: &Value) -> Vec<u8> {
+    let mut headers = header(":message-type", message_type);
+    headers.extend(header(
+        if message_type == "exception" {
+            ":exception-type"
+        } else {
+            ":event-type"
+        },
+        kind,
+    ));
+    headers.extend(header(":content-type", "application/json"));
+    let payload = serde_json::to_vec(payload).unwrap();
+    let total = (16 + headers.len() + payload.len()) as u32;
+    let mut out = Vec::new();
+    out.extend_from_slice(&total.to_be_bytes());
+    out.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+    out.extend_from_slice(&crc32(&out).to_be_bytes());
+    out.extend(headers);
+    out.extend(payload);
+    out.extend_from_slice(&crc32(&out).to_be_bytes());
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn header(name: &str, value: &str) -> Vec<u8> {
-        let mut out = vec![name.len() as u8];
-        out.extend_from_slice(name.as_bytes());
-        out.push(7);
-        out.extend_from_slice(&(value.len() as u16).to_be_bytes());
-        out.extend_from_slice(value.as_bytes());
-        out
-    }
-
-    fn frame(message_type: &str, kind: &str, payload: &Value) -> Vec<u8> {
-        let mut headers = header(":message-type", message_type);
-        headers.extend(header(
-            if message_type == "exception" {
-                ":exception-type"
-            } else {
-                ":event-type"
-            },
-            kind,
-        ));
-        headers.extend(header(":content-type", "application/json"));
-        let payload = serde_json::to_vec(payload).unwrap();
-        let total = (16 + headers.len() + payload.len()) as u32;
-        let mut out = Vec::new();
-        out.extend_from_slice(&total.to_be_bytes());
-        out.extend_from_slice(&(headers.len() as u32).to_be_bytes());
-        out.extend_from_slice(&crc32(&out).to_be_bytes());
-        out.extend(headers);
-        out.extend(payload);
-        out.extend_from_slice(&crc32(&out).to_be_bytes());
-        out
-    }
+    use super::test_frame as frame;
 
     #[test]
     fn crc32_matches_the_standard_check_value() {
@@ -531,7 +821,9 @@ mod tests {
                 Item::Stop("tool_use".into()),
                 Item::Usage {
                     input_tokens: 12,
-                    output_tokens: 5
+                    output_tokens: 5,
+                    cache_read: 0,
+                    cache_write: 0,
                 },
             ]
         );
@@ -620,36 +912,74 @@ mod tests {
     }
 
     #[test]
-    fn the_converse_request_is_signed_for_the_pinned_regional_origin() {
-        let credentials = aws_credential_types::Credentials::new(
-            "AKIDEXAMPLE",
-            "secret",
-            Some("session".into()),
-            None,
-            "test",
-        );
-        let request = signed_request(
-            "us-east-1",
+    fn the_converse_request_targets_the_base_and_stream_or_buffered_path() {
+        let body = json!({"messages": []});
+        let streamed = build_request(
+            "https://bedrock-runtime.us-east-1.amazonaws.com/",
             "amazon.nova-pro-v1:0",
-            &json!({"messages": []}),
-            credentials,
-            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+            &body,
+            true,
         )
         .unwrap();
-        assert_eq!(request.method(), http::Method::POST);
+        assert_eq!(streamed.method(), http::Method::POST);
         assert_eq!(
-            request.uri().to_string(),
+            streamed.uri().to_string(),
             "https://bedrock-runtime.us-east-1.amazonaws.com/model/amazon.nova-pro-v1%3A0/converse-stream"
         );
-        let auth = request.headers()["authorization"].to_str().unwrap();
-        assert!(
-            auth.starts_with(
-                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20231114/us-east-1/bedrock/aws4_request"
-            ),
-            "{auth}"
+        assert_eq!(
+            streamed.headers()["accept"],
+            "application/vnd.amazon.eventstream"
         );
-        assert!(request.headers().contains_key("x-amz-date"));
-        assert_eq!(request.headers()["x-amz-security-token"], "session");
-        assert!(request.headers().contains_key("x-amz-content-sha256"));
+        let buffered = build_request("https://gw.example/aws", "m", &body, false).unwrap();
+        assert_eq!(
+            buffered.uri().to_string(),
+            "https://gw.example/aws/model/m/converse"
+        );
+        assert!(buffered.headers().get("authorization").is_none());
+    }
+
+    #[test]
+    fn non_streaming_response_decodes_text_tool_use_and_cache_usage() {
+        let items = parse_response(&json!({
+            "output": {"message": {"role": "assistant", "content": [
+                {"text": "ok"},
+                {"toolUse": {"toolUseId": "t9", "name": "read", "input": {"path": "x"}}}
+            ]}},
+            "stopReason": "tool_use",
+            "usage": {"inputTokens": 3, "outputTokens": 4, "cacheReadInputTokens": 2}
+        }));
+        assert_eq!(
+            items,
+            vec![
+                Item::Text("ok".into()),
+                Item::ToolCall {
+                    id: "t9".into(),
+                    name: "read".into(),
+                    arguments: json!({"path": "x"}),
+                },
+                Item::Stop("tool_use".into()),
+                Item::Usage {
+                    input_tokens: 3,
+                    output_tokens: 4,
+                    cache_read: 2,
+                    cache_write: 0,
+                },
+            ]
+        );
+        let mut last = ConverseFinal::default();
+        for item in &items {
+            last.absorb(item);
+        }
+        let usage = last.token_usage();
+        assert_eq!(
+            (
+                usage.input_tokens,
+                usage.cached_input_tokens,
+                usage.total_tokens
+            ),
+            (3, 2, 9)
+        );
+        assert_eq!(last.stop_reason(), Some(StopReason::ToolUse));
+        assert!(!last.output_truncated());
     }
 }

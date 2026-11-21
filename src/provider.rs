@@ -24,6 +24,8 @@ pub(crate) mod azure;
 #[cfg(feature = "bedrock")]
 #[path = "provider_bedrock.rs"]
 pub(crate) mod bedrock;
+#[path = "provider_bedrock_converse.rs"]
+pub(crate) mod bedrock_converse;
 /// Stand-in used when the `bedrock` feature is off: every entry point fails
 /// before any credential or network work with the same "not compiled" error.
 #[cfg(not(feature = "bedrock"))]
@@ -444,6 +446,7 @@ macro_rules! with_inner {
             AnyAgentInner::Gemini($a) => $body,
             AnyAgentInner::Ollama($a) => $body,
             AnyAgentInner::Copilot($a) => $body,
+            AnyAgentInner::BedrockConverse($a) => $body,
         }
     };
 }
@@ -465,6 +468,7 @@ macro_rules! map_inner {
             AnyAgentInner::Gemini($a) => AnyAgentInner::Gemini($body),
             AnyAgentInner::Ollama($a) => AnyAgentInner::Ollama($body),
             AnyAgentInner::Copilot($a) => AnyAgentInner::Copilot($body),
+            AnyAgentInner::BedrockConverse($a) => AnyAgentInner::BedrockConverse($body),
         }
     };
 }
@@ -480,6 +484,7 @@ macro_rules! with_model {
             AnyModel::Gemini($m) => $body,
             AnyModel::Ollama($m) => $body,
             AnyModel::Copilot($m) => $body,
+            AnyModel::BedrockConverse($m) => $body,
         }
     };
 }
@@ -500,6 +505,7 @@ macro_rules! map_model {
             AnyModel::Gemini($m) => AnyAgentInner::Gemini($body),
             AnyModel::Ollama($m) => AnyAgentInner::Ollama($body),
             AnyModel::Copilot($m) => AnyAgentInner::Copilot($body),
+            AnyModel::BedrockConverse($m) => AnyAgentInner::BedrockConverse($body),
         }
     };
 }
@@ -1065,7 +1071,8 @@ pub(crate) fn provider_request_params(
         AnyModel::Anthropic(_)
         | AnyModel::Gemini(_)
         | AnyModel::Ollama(_)
-        | AnyModel::Copilot(_) => provider_extra_body,
+        | AnyModel::Copilot(_)
+        | AnyModel::BedrockConverse(_) => provider_extra_body,
     }
 }
 
@@ -1394,6 +1401,7 @@ impl AnyClient {
             AnyModel::OpenAI(OpenAiModel::Completions(_)) => effort::Protocol::OpenAiCompletions,
             AnyModel::Gemini(_) => effort::Protocol::Gemini,
             AnyModel::Ollama(_) => effort::Protocol::Ollama,
+            AnyModel::BedrockConverse(_) => effort::Protocol::Other,
         };
         let raw = crate::config::resolve_extra_body(cfg, &session.model);
         let params = provider_request_params(&model, cfg, raw.clone(), &session.id);
@@ -1473,6 +1481,20 @@ impl AnyClient {
                     model
                 };
                 AnyModel::OpenAI(model)
+            }
+            // Bedrock carries one transport for both routes; a non-Anthropic
+            // model id takes Converse, a Claude id the native Messages path.
+            AnyClient::Anthropic(c)
+                if !bedrock_converse::is_anthropic_model(&name)
+                    && c.http_client().bedrock_converse_base().is_some() =>
+            {
+                AnyModel::BedrockConverse(bedrock_converse::ConverseModel::new(
+                    c.http_client().clone(),
+                    c.http_client()
+                        .bedrock_converse_base()
+                        .expect("checked by the guard"),
+                    name,
+                ))
             }
             AnyClient::Anthropic(c) => {
                 let model = c.completion_model(name).with_prompt_caching();
@@ -2421,6 +2443,17 @@ async fn summarize_with_model(
             )
             .await
         }
+        AnyModel::BedrockConverse(m) => {
+            run_summarizer(
+                m,
+                prompt,
+                preamble,
+                max_output_tokens,
+                &retry_config,
+                observed,
+            )
+            .await
+        }
         AnyModel::Copilot(m) => {
             run_summarizer(
                 m,
@@ -3055,6 +3088,8 @@ pub enum AnyModel {
     Gemini(gemini::completion::CompletionModel<ProviderHttpClient>),
     Copilot(copilot_sdk::CompletionModel<ProviderHttpClient>),
     Ollama(ollama::CompletionModel<ProviderHttpClient>),
+    /// Bedrock Converse for non-Anthropic model ids (mini-agent-nvnkx.44).
+    BedrockConverse(bedrock_converse::ConverseModel),
 }
 
 #[cfg(feature = "multimodal")]
@@ -3080,6 +3115,7 @@ impl AnyModel {
                 false,
                 !model.uses_responses(),
             ),
+            Self::BedrockConverse(model) => ("bedrock", model.model.as_str(), false, false),
         };
         // These three converters merge a literal top-level model override.
         // Responses drops this unknown extra, Gemini routes by URL, and
@@ -3116,6 +3152,7 @@ pub enum AnyAgentInner {
     Gemini(Agent<gemini::completion::CompletionModel<ProviderHttpClient>>),
     Copilot(Agent<copilot_sdk::CompletionModel<ProviderHttpClient>>),
     Ollama(Agent<ollama::CompletionModel<ProviderHttpClient>>),
+    BedrockConverse(Agent<bedrock_converse::ConverseModel>),
 }
 
 impl AnyAgentInner {
@@ -3151,6 +3188,9 @@ impl AnyAgentInner {
             // Ollama drops it with a warning.
             AnyAgentInner::Copilot(_) => Some("the Copilot request builder has no tool_choice"),
             AnyAgentInner::Ollama(_) => Some("Ollama does not support tool_choice"),
+            AnyAgentInner::BedrockConverse(_) => {
+                Some("the Bedrock Converse request builder sends no toolChoice")
+            }
             AnyAgentInner::Anthropic(a) => claude_forced_tool_choice_blocker(
                 effort::Protocol::Anthropic,
                 &a.model.model,
@@ -4497,6 +4537,7 @@ impl AnyAgent {
             }
             AnyAgentInner::Gemini(_) => HistoryProtocol::GeminiGenerateContent,
             AnyAgentInner::Ollama(_) => HistoryProtocol::OllamaChat,
+            AnyAgentInner::BedrockConverse(_) => HistoryProtocol::BedrockConverse,
             AnyAgentInner::Copilot(a) => {
                 if a.model.uses_responses() {
                     HistoryProtocol::OpenAIResponses
@@ -4751,6 +4792,7 @@ impl AnyAgent {
             }
             AnyAgentInner::Gemini(a) => (P::Gemini, &a.model.model),
             AnyAgentInner::Ollama(a) => (P::Ollama, &a.model.model),
+            AnyAgentInner::BedrockConverse(a) => (P::Other, &a.model.model),
             AnyAgentInner::Copilot(a) => (copilot::reasoning_protocol(&a.model), &a.model.model),
         }
     }
@@ -5063,6 +5105,7 @@ impl AnyAgent {
             AnyAgentInner::Gemini(_) => P::Gemini,
             AnyAgentInner::Ollama(_) => P::Ollama,
             AnyAgentInner::Copilot(a) => copilot::instruction_protocol(&a.model),
+            AnyAgentInner::BedrockConverse(_) => P::Chat,
         }
     }
     #[cfg(feature = "agent-skills")]
@@ -7302,6 +7345,42 @@ async fn build_agent_with_probe_snapshot(
             })
             .await,
         ),
+        AnyModel::BedrockConverse(m) => AnyAgentInner::BedrockConverse(
+            crate::startup::heap_future(|| {
+                builder::build_agent_inner_with_snapshot(
+                    &mut context_snapshot,
+                    #[cfg(feature = "lsp")]
+                    &mut diagnostic_lsp,
+                    m,
+                    crate::context::instructions::InstructionProtocol::Chat,
+                    cli,
+                    cfg,
+                    context,
+                    workspace,
+                    permission,
+                    ask_tx,
+                    sandbox,
+                    read_tracker,
+                    todo_store,
+                    #[cfg(feature = "goal")]
+                    goal_store.clone(),
+                    tool_output_session_id,
+                    tool_result_spills,
+                    reasoning_enabled,
+                    temperature,
+                    extra_body,
+                    #[cfg(feature = "js")]
+                    js_worker_containment_status,
+                    #[cfg(feature = "js")]
+                    js_scratch,
+                    #[cfg(feature = "skills")]
+                    skills.clone(),
+                    #[cfg(feature = "mcp")]
+                    mcp_manager,
+                )
+            })
+            .await,
+        ),
         AnyModel::Copilot(m) => AnyAgentInner::Copilot(
             crate::startup::heap_future(|| {
                 builder::build_agent_inner_with_snapshot(
@@ -7936,6 +8015,29 @@ pub async fn build_btw_agent(
                 builder::build_btw_agent_inner(
                     m,
                     crate::context::instructions::InstructionProtocol::Ollama,
+                    #[cfg(feature = "multimodal")]
+                    image_support,
+                    cli,
+                    cfg,
+                    context,
+                    workspace,
+                    captured_instructions.clone(),
+                    permission,
+                    ask_tx,
+                    tool_output_session_id,
+                    tool_result_spills,
+                    reasoning_enabled,
+                    temperature,
+                    extra_body,
+                )
+            })
+            .await,
+        ),
+        AnyModel::BedrockConverse(m) => AnyAgentInner::BedrockConverse(
+            crate::startup::heap_future(|| {
+                builder::build_btw_agent_inner(
+                    m,
+                    crate::context::instructions::InstructionProtocol::Chat,
                     #[cfg(feature = "multimodal")]
                     image_support,
                     cli,

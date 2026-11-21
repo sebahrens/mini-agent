@@ -14,7 +14,7 @@ definitions for OpenAI-compatible endpoints.
 | OpenRouter | `openrouter`        | `OPENROUTER_API_KEY`        |
 | OpenAI     | `openai`            | `OPENAI_API_KEY`            |
 | Azure OpenAI | `azure` / `azure-openai` | `AZURE_OPENAI_API_KEY` |
-| AWS Bedrock (Claude) | `bedrock` / `aws-bedrock` | AWS SDK chain or `AWS_BEARER_TOKEN_BEDROCK` |
+| AWS Bedrock (Claude, plus Converse for other model families) | `bedrock` / `aws-bedrock` | AWS SDK chain or `AWS_BEARER_TOKEN_BEDROCK` |
 | Vertex AI (Claude) | `vertex` / `vertex-ai` | Google ADC or `VERTEX_ACCESS_TOKEN` |
 | GitHub Copilot | `copilot` / `github-copilot` | saved login, `GITHUB_COPILOT_API_TOKEN` or `COPILOT_GITHUB_TOKEN` |
 | Anthropic  | `anthropic`         | `ANTHROPIC_API_KEY`         |
@@ -264,7 +264,8 @@ credentials, timeout, provider error) and an expired SSO session says to run
 This backend uses the current native Anthropic Messages endpoint,
 `https://bedrock-runtime.REGION.amazonaws.com/anthropic/v1/messages`, with
 streaming tools and usage. It supports Claude models exposed by that API; it
-does not translate other Bedrock model families into Claude requests. No common
+does not translate other Bedrock model families into Claude requests; those ids use the
+[Converse route](#bedrock-converse-non-claude-models) below. No common
 model/deployment default is assumed.
 
 The native Bedrock and Vertex back-ends are the default `bedrock` and `vertex`
@@ -685,19 +686,39 @@ Model listing is not available on this route. Catalog context windows and prices
 come from the `gemini` catalog entries. Loopback tests cover the pinned,
 authorized request shape; it was not run against a live Vertex project.
 
-## Bedrock Converse (non-Claude models): partial
+## Bedrock Converse (non-Claude models)
 
-Amazon Nova, Llama, Mistral, DeepSeek and other non-`anthropic.` Bedrock ids use
-`POST https://bedrock-runtime.REGION.amazonaws.com/model/MODEL_ID/converse-stream`.
-`src/provider_bedrock_converse.rs` implements the wire layer: Converse request
-encoding (system, text, tool use, tool results, tool config, inference config),
-SigV4 signing through the same signer as the Claude route, the
-`application/vnd.amazon.eventstream` frame decoder (CRC-checked) and the event
-accumulator (text, tool-use fragments assembled into JSON arguments, stop reason,
-usage, modelled exceptions). It is tested on recorded frames and a signed-request
-witness. It is **not yet attached** to a model client, so `provider = "bedrock"`
-still serves Claude only; the missing piece is a rig `CompletionModel` over these
-functions plus an agent variant. Not verified against a live AWS account.
+With `provider = "bedrock"`, a model id that is not `anthropic.*` (also not a
+`us.`/`eu.`/`global.` inference-profile form of one) is served through the
+Converse API instead of the native Claude Messages path, for example
+`amazon.nova-pro-v1:0`, `us.meta.llama3-3-70b-instruct-v1:0`,
+`mistral.mistral-large-2407-v1:0`, `deepseek.r1-v1:0` or `openai.gpt-oss-120b-1:0`.
+The route is chosen per model id, so `/model`, persona and subagent model
+overrides pick it automatically; a Claude id keeps the existing route.
+Requests are `POST https://bedrock-runtime.REGION.amazonaws.com/model/MODEL_ID/converse-stream`
+(streaming) or `.../converse` (buffered calls such as summaries), under the
+same endpoint override as the Claude route (the `/anthropic` suffix is dropped).
+
+`src/provider_bedrock_converse.rs` holds the wire layer (request encoding of system,
+text, tool use, tool results, tool config and `maxTokens`/`temperature`; the
+CRC-checked `application/vnd.amazon.eventstream` decoder; the accumulator for text,
+tool-use fragments, stop reason, usage and modelled exceptions) and `ConverseModel`,
+a rig `CompletionModel` over it (`AnyModel::BedrockConverse` /
+`AnyAgentInner::BedrockConverse`). Authentication is the Claude route's: the
+`BedrockAuth` owner in `provider_bedrock.rs` pins the origin and base path, then
+SigV4-signs for service `bedrock` (AWS SDK chain) or sends a Bedrock API key as
+`Authorization: Bearer`. Usage includes `cacheReadInputTokens` /
+`cacheWriteInputTokens`. Prices and limits come from the catalog: Converse ids map
+to the slug of the same model when listed (`meta.llama3-1-70b-instruct-v1:0` to
+`meta-llama/llama-3.1-70b-instruct`, `mistral.mistral-large-2407-v1:0` to
+`mistralai/mistral-large-2407`); an id the catalog does not list, such as the Amazon
+Nova family, is unpriced and falls back to default limits.
+
+Limits: no `toolChoice`, reasoning, prompt-cache points, images or documents are
+sent, and `additional_params` is not forwarded; history replay uses plain text and
+tool blocks only. Loopback tests (`bedrock44_*` in `provider_bedrock_tests.rs`, wire
+tests in `provider_bedrock_converse.rs`) cover the signed and bearer-keyed request
+path and a streamed text plus tool-use turn; nothing was run against a live AWS account.
 
 ## GitHub Copilot credential ownership
 

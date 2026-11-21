@@ -10,6 +10,7 @@ pub(crate) enum HistoryProtocol {
     OpenAIChatCompletions,
     GeminiGenerateContent,
     OllamaChat,
+    BedrockConverse,
 }
 
 /// Static local refusal reasons. No opaque payload, endpoint or credentials are
