@@ -436,13 +436,6 @@ pub fn global() -> Option<&'static Collector> {
         .as_ref()
 }
 
-/// Feeds one event to the global collector, if exporting.
-pub fn observe(event: &AgentEvent) {
-    if let Some(collector) = global() {
-        collector.observe(event);
-    }
-}
-
 /// Flushes the global collector, if exporting.
 pub async fn flush() {
     if let Some(collector) = global() {
