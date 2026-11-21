@@ -603,7 +603,28 @@ pub(crate) fn commit_turn_response(
         adopted_provider_identities = adopted,
         "committing turn response; tool records were persisted live"
     );
+    persist_host_instructions(session, interactions);
     session.add_message(MessageRole::Assistant, response);
+}
+
+/// Host continuation instructions (verification failure, Stop-hook reason,
+/// truncation or retry notice) are not streamed as events, so they exist only
+/// in the turn's batch. Store them as host rows, as headless `-p` does, so a
+/// later turn or resume shows why the extra work happened and never attributes
+/// the text to the user (mini-agent-sskdu.187).
+fn persist_host_instructions(session: &mut Session, interactions: &[Message]) {
+    for message in interactions {
+        let Message::User { content } = message else {
+            continue;
+        };
+        for item in content.iter() {
+            if let rig::message::UserContent::Text(text) = item
+                && crate::agent::input::is_host_instruction(&text.text)
+            {
+                session.add_message(MessageRole::System, &text.text);
+            }
+        }
+    }
 }
 
 async fn handle_agent_done(

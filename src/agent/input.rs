@@ -121,6 +121,21 @@ impl PromptInput {
     }
 }
 
+/// Prefix of every host-authored instruction injected as a user-role message
+/// (continuations after verification, hook blocks, truncation, retries).
+pub(crate) const HOST_MESSAGE_PREFIX: &str = "[Host:";
+
+/// One constructor for host continuation text, so the model can tell it from the
+/// human and the transcript can store it as a host row rather than a user prompt.
+pub(crate) fn host_instruction(kind: &str, body: &str) -> String {
+    format!("{HOST_MESSAGE_PREFIX} {kind}; not written by the user]\n{body}")
+}
+
+/// Whether `text` was produced by [`host_instruction`].
+pub(crate) fn is_host_instruction(text: &str) -> bool {
+    text.starts_with(HOST_MESSAGE_PREFIX)
+}
+
 fn bounded_turn_directive(directive: String) -> Option<String> {
     let trimmed = directive.trim();
     if trimmed.is_empty() {

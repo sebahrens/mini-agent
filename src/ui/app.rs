@@ -5178,6 +5178,9 @@ impl<'a> App<'a> {
         self.renderer.feed_mut().finish_reasoning();
         self.cancel_pending_permissions();
         let preserve_progress = preserve_pending_main_turn_progress(&mut self.run, self.ui.session);
+        if preserve_progress {
+            super::record_interrupted_turn_notice(self.ui.session);
+        }
         #[cfg(feature = "loop")]
         self.run.cancel_validation();
         if let Some(handle) = self.run.main_abort.take() {
@@ -5241,6 +5244,9 @@ impl<'a> App<'a> {
         }
         self.cancel_pending_permissions();
         let preserve_progress = preserve_pending_main_turn_progress(&mut self.run, self.ui.session);
+        if preserve_progress {
+            super::record_interrupted_turn_notice(self.ui.session);
+        }
         let validation_active = self.run.cancel_validation();
 
         if !validation_active {
@@ -8875,6 +8881,13 @@ mod initial_turn_tests {
                 .contains(crate::agent::runner::UNKNOWN_TOOL_OUTCOME)
         );
         assert_eq!(session.messages[5].content, "partial explanation");
+        // The closing result keeps the real tool name, and an interrupt adds
+        // a host row after the partial text.
+        assert!(synthetic.content.starts_with("edit:\n"), "{}", synthetic.content);
+        crate::ui::record_interrupted_turn_notice(&mut session);
+        let notice = session.messages.last().unwrap();
+        assert_eq!(notice.role, MessageRole::System);
+        assert!(crate::agent::input::is_host_instruction(&notice.content));
     }
 
     #[test]
@@ -18288,7 +18301,14 @@ mod plan_approval_tests {
         let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
         for response in ["unknown-tool", "hold-open"] {
             let roots = Roots::new();
-            let provider = Provider::new(vec![response]).await;
+            // An unknown tool name is answered with a corrective tool result
+            // (mini-agent-sskdu.246), so that turn needs a second response.
+            let provider = Provider::new(if response == "unknown-tool" {
+                vec![response, "recovered"]
+            } else {
+                vec![response]
+            })
+            .await;
             let mut cfg = provider.config();
             cfg.max_budget_usd = Some(1.0);
             let cli = crate::cli::Cli {
@@ -18341,7 +18361,22 @@ mod plan_approval_tests {
                 assert!(app.run.agent_rx.is_none() && app.run.main_abort.is_none());
                 assert!(app.run.pending_inputs.is_empty());
             } else {
-                assert!(!finish_turn(&mut app).await);
+                // The unknown tool is skipped with a corrective result and the
+                // model's next response completes the turn instead of aborting it.
+                assert!(finish_turn(&mut app).await);
+                let calls = provider.calls();
+                assert_eq!(calls.len(), 2);
+                assert!(
+                    calls[1]
+                        .to_string()
+                        .contains("unknown_unregistered_cost_tool` is not available"),
+                    "{}",
+                    calls[1]
+                );
+                assert!(!app.run.is_running);
+                drop(app);
+                provider.finish().await;
+                continue;
             }
             assert_eq!(provider.calls().len(), 1);
             assert!(app.ui.session.spend_account.snapshot().tracking_error);

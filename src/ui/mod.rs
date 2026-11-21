@@ -1803,6 +1803,21 @@ pub(crate) fn preserve_pending_main_turn_progress(
     true
 }
 
+/// Record in the transcript that the turn was cut off by an interrupt or a
+/// failure, so the next request does not read a truncated assistant message as
+/// a finished one and does not re-run a call whose effects may already have
+/// happened (mini-agent-sskdu.191). Not used when the turn continues after a
+/// compaction, where nothing was cut off.
+pub(crate) fn record_interrupted_turn_notice(session: &mut Session) {
+    session.add_message(
+        MessageRole::System,
+        &crate::agent::input::host_instruction(
+            "the previous turn was cut off",
+            "The previous turn ended here before the model finished it (the user interrupted it, or it failed). Text above may be incomplete, and tool calls marked unknown may have run partially or completely: inspect the workspace before repeating them.",
+        ),
+    );
+}
+
 /// Persist only a settled session. Tool events mutate the live transaction,
 /// but the disk snapshot remains at the pre-turn state until the turn reaches
 /// one terminal success/failure/cancellation transition.

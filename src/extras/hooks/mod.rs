@@ -540,6 +540,19 @@ pub(crate) fn best_effort_ctx() -> HookCtx {
     }
 }
 
+/// The text a forced continuation carries. A `Stop`/`SubagentStop` hook may
+/// block without a reason (`exit 2` with empty stderr, or `{"decision":"block"}`);
+/// an empty user message is rejected by Anthropic-style APIs and tells other
+/// models nothing, so a blank reason is replaced by a fixed one.
+pub(crate) fn stop_block_reason(reason: String) -> String {
+    if reason.trim().is_empty() {
+        "A Stop hook blocked completion without giving a reason; re-check that the task is complete."
+            .to_string()
+    } else {
+        reason
+    }
+}
+
 /// Production entry point: reads the process-wide dispatcher and gates
 /// `prompt` through `UserPromptSubmit` hooks. A prompt passes through
 /// unchanged when no dispatcher is installed.
@@ -601,7 +614,9 @@ pub(crate) async fn gate_stop(
         )
         .await;
     match decision {
-        Decision::Block { reason } => StopGate::Continue { reason },
+        Decision::Block { reason } => StopGate::Continue {
+            reason: stop_block_reason(reason),
+        },
         Decision::Continue | Decision::Rewrite { .. } | Decision::AdditionalContext { .. } => {
             StopGate::Release
         }
@@ -990,7 +1005,9 @@ pub(crate) async fn gate_subagent_stop(
         )
         .await;
     match decision {
-        Decision::Block { reason } => SubagentStopGate::Continue { reason },
+        Decision::Block { reason } => SubagentStopGate::Continue {
+            reason: stop_block_reason(reason),
+        },
         Decision::Continue | Decision::Rewrite { .. } | Decision::AdditionalContext { .. } => {
             SubagentStopGate::Release
         }

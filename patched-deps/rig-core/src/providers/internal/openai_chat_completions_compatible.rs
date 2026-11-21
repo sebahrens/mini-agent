@@ -516,8 +516,16 @@ pub(crate) fn finalize_completed_streaming_tool_call(
             tool_call.arguments = serde_json::Value::Object(serde_json::Map::new());
         }
         serde_json::Value::String(arguments) => {
-            let parsed = json_utils::parse_tool_arguments(arguments)
-                .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+            let parsed = match json_utils::parse_tool_arguments(arguments) {
+                Ok(parsed) => parsed,
+                // Keep the call, marked, so the host can tell the model its
+                // arguments were not valid JSON instead of running the tool
+                // with no arguments.
+                Err(error) => {
+                    tool_call.arguments = json_utils::invalid_tool_arguments(arguments, &error);
+                    return tool_call;
+                }
+            };
             // Guarantee an object even if the string parsed to valid-but-non-object
             // JSON (a bare scalar/array would still trip the provider's
             // `Input should be a valid dictionary` check).
@@ -566,6 +574,7 @@ enum DroppedToolCallContext {
 
 fn drain_finalized_tool_calls(
     tool_calls: &mut HashMap<usize, RawStreamingToolCall>,
+    keep_invalid: bool,
 ) -> (Vec<RawStreamingToolCall>, usize) {
     let mut completed_tool_calls = Vec::new();
     let mut dropped_tool_calls = 0;
@@ -573,8 +582,12 @@ fn drain_finalized_tool_calls(
     pending_tool_calls.sort_by_key(|(index, _)| *index);
 
     for (_, tool_call) in pending_tool_calls {
-        if let Some(tool_call) = finalize_pending_tool_call(tool_call) {
+        if let Some(tool_call) = finalize_pending_tool_call(tool_call.clone()) {
             completed_tool_calls.push(tool_call);
+        } else if keep_invalid && !tool_call.name.is_empty() {
+            // The stream said the calls are complete, so unparseable argument
+            // text is the model's malformed JSON, not a cut-off stream.
+            completed_tool_calls.push(finalize_completed_streaming_tool_call(tool_call));
         } else {
             dropped_tool_calls += 1;
         }
@@ -587,7 +600,10 @@ fn take_finalized_tool_calls(
     tool_calls: &mut HashMap<usize, RawStreamingToolCall>,
     context: DroppedToolCallContext,
 ) -> Vec<RawStreamingToolCall> {
-    let (completed_tool_calls, dropped_tool_calls) = drain_finalized_tool_calls(tool_calls);
+    let (completed_tool_calls, dropped_tool_calls) = drain_finalized_tool_calls(
+        tool_calls,
+        matches!(context, DroppedToolCallContext::ToolCallsFinishReason),
+    );
 
     if dropped_tool_calls > 0 {
         match context {
@@ -873,10 +889,52 @@ mod tests {
             );
         }
         // Pin the evicted call specifically: its unparseable partial string is
-        // normalized to `{}` (not forwarded as a string, not dropped).
+        // kept as an object carrying the invalid-JSON marker (not forwarded as
+        // a string, not dropped, not run with `{}`).
         let evicted = &collected_tool_calls[0];
         assert_eq!(evicted.id, "call_aaa");
-        assert_eq!(evicted.function.arguments, serde_json::json!({}));
+        assert!(
+            json_utils::invalid_tool_arguments_error(&evicted.function.arguments).is_some(),
+            "{:?}",
+            evicted.function.arguments
+        );
+    }
+
+    #[test]
+    fn finish_reason_keeps_calls_with_unparseable_arguments_marked() {
+        let mut calls = HashMap::new();
+        calls.insert(
+            0,
+            RawStreamingToolCall::new(
+                "call_bad".to_owned(),
+                "ping".to_owned(),
+                serde_json::Value::String("{\"x\": \"unterminated".to_owned()),
+            ),
+        );
+        let (kept, dropped) = super::drain_finalized_tool_calls(&mut calls, true);
+        assert_eq!(dropped, 0);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].name, "ping");
+        let error = json_utils::invalid_tool_arguments_error(&kept[0].arguments)
+            .expect("marked invalid arguments");
+        assert!(!error.is_empty());
+        assert_eq!(
+            kept[0].arguments[json_utils::INVALID_TOOL_ARGUMENTS_KEY],
+            "{\"x\": \"unterminated"
+        );
+
+        // A stream that ended without a finish reason may simply be cut off.
+        calls.insert(
+            0,
+            RawStreamingToolCall::new(
+                "call_cut".to_owned(),
+                "ping".to_owned(),
+                serde_json::Value::String("{\"x\":".to_owned()),
+            ),
+        );
+        let (kept, dropped) = super::drain_finalized_tool_calls(&mut calls, false);
+        assert!(kept.is_empty());
+        assert_eq!(dropped, 1);
     }
 
     #[test]

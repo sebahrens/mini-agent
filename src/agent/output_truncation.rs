@@ -348,6 +348,43 @@ mod tests {
         assert_eq!(response, "partial rest.");
     }
 
+    /// mini-agent-sskdu.86: a child report cut off at max_tokens is marked
+    /// partial instead of being returned as complete findings.
+    #[cfg(feature = "subagents")]
+    #[tokio::test]
+    async fn subagent_report_cut_at_max_tokens_is_marked_partial() {
+        use rig::client::CompletionClient;
+        let (url, server) = sse_server(vec![openai_text_turn("half a report", "length")]).await;
+        let client = rig::providers::openrouter::Client::builder()
+            .api_key("unused-test-key")
+            .base_url(url)
+            .http_client(crate::provider_http::ProviderHttpClient::default())
+            .build()
+            .unwrap();
+        let agent = client
+            .agent("test/model")
+            .max_tokens(64)
+            .default_max_turns(5)
+            .build();
+        let out = crate::agent::runner::run_subagent(
+            &agent,
+            "investigate",
+            5,
+            None,
+            &crate::retry::RetryConfig {
+                max_attempts: 1,
+                ..crate::retry::RetryConfig::default()
+            },
+            crate::agent::runner::SharedUsageLedger::default(),
+            None,
+        )
+        .await;
+        let _ = server.await;
+        let response = out.response.expect("the child's text is kept");
+        assert!(response.starts_with("half a report"), "{response}");
+        assert!(response.contains("[partial: output truncated"), "{response}");
+    }
+
     #[tokio::test]
     async fn openai_length_finish_continues_the_turn_with_an_instruction() {
         use rig::client::CompletionClient;
