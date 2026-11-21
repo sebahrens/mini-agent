@@ -1190,15 +1190,14 @@ pub(crate) fn record_headless_compaction(
 /// when nothing was compacted so existing output is unchanged.
 fn take_headless_compactions() -> Option<serde_json::Value> {
     #[cfg(not(test))]
-    let (count, messages, tokens_freed, usage) = std::mem::replace(
+    let (count, messages, tokens_freed, usage) = std::mem::take(
         &mut *HEADLESS_COMPACTIONS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner),
-        (0, 0, 0, None),
     );
     #[cfg(test)]
     let (count, messages, tokens_freed, usage) =
-        HEADLESS_COMPACTIONS_TEST.with(|totals| totals.replace((0, 0, 0, None)));
+        HEADLESS_COMPACTIONS_TEST.with(|totals| totals.take());
     (count > 0).then(|| {
         serde_json::json!({
             "count": count,
