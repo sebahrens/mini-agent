@@ -1050,8 +1050,8 @@ impl PermissionChecker {
         let tool = canonical_permission_tool(tool);
         let mut deny_inputs: SmallVec<[&str; 4]> = SmallVec::new();
         deny_inputs.push(input);
-        if self.matches_deny_rule(tool, &deny_inputs) {
-            return CheckResult::Denied("Blocked by deny rule".to_string());
+        if let Some(rule) = self.matching_deny_rule(tool, &deny_inputs) {
+            return deny_rule_denial(&rule);
         }
         self.ask_cause = AskCause::PreToolUseHook;
         CheckResult::Ask
@@ -1329,7 +1329,10 @@ impl PermissionChecker {
         match action {
             Action::Allow => CheckResult::Allowed,
             Action::Ask => CheckResult::Ask,
-            Action::Deny => CheckResult::Denied("Blocked by permission rules".to_string()),
+            Action::Deny => CheckResult::Denied(format!(
+                "Blocked by permission rules: {} mode does not allow {tool} (change the mode with /mode, or see /permissions)",
+                self.mode
+            )),
         }
     }
 
@@ -1533,8 +1536,8 @@ impl PermissionChecker {
         // matches any single line denies the whole script, so a benign first
         // line can never smuggle a denied command past an anchored pattern.
         let deny_inputs = deny_probe_inputs(tool, policy_input, identity);
-        if self.matches_deny_rule(tool, &deny_inputs) {
-            return CheckResult::Denied("Blocked by deny rule".to_string());
+        if let Some(rule) = self.matching_deny_rule(tool, &deny_inputs) {
+            return deny_rule_denial(&rule);
         }
         #[cfg(feature = "hooks")]
         let hook_approved = self.take_pending_one_shot(tool).is_some();
@@ -1725,8 +1728,8 @@ impl PermissionChecker {
             inputs.push(relative);
         }
         // Deny rules first — security baseline, cannot be bypassed.
-        if self.matches_deny_rule(tool, &inputs) {
-            return CheckResult::Denied("Blocked by deny rule".to_string());
+        if let Some(rule) = self.matching_deny_rule(tool, &inputs) {
+            return deny_rule_denial(&rule);
         }
         // Built-in baseline: process secrets in procfs, in every mode.
         if is_proc_secret_path(Path::new(abs_path), is_proc_walker_tool(tool))
@@ -1925,8 +1928,8 @@ impl PermissionChecker {
             .to_string_lossy()
             .into_owned();
 
-        if self.matches_deny_rule(tool, &[&logical, &relative]) {
-            return CheckResult::Denied("Blocked by deny rule".to_string());
+        if let Some(rule) = self.matching_deny_rule(tool, &[&logical, &relative]) {
+            return deny_rule_denial(&rule);
         }
         if let Some(denial) = self.isolation_denial(tool, &[&logical, &relative]) {
             return denial;
@@ -2043,6 +2046,12 @@ impl PermissionChecker {
     }
 
     fn matches_deny_rule(&self, tool: &str, inputs: &[&str]) -> bool {
+        self.matching_deny_rule(tool, inputs).is_some()
+    }
+
+    /// The first deny rule that matches, rendered as `<tool> = "<pattern>"`
+    /// (patterns are user configuration, already shown by `/permissions`).
+    fn matching_deny_rule(&self, tool: &str, inputs: &[&str]) -> Option<String> {
         for name in std::iter::once(tool)
             .chain((tool == "notebook_edit").then_some("edit"))
             .chain(write_family_siblings(tool).iter().copied())
@@ -2062,11 +2071,14 @@ impl PermissionChecker {
                     }
                 };
                 if *action == Action::Deny && inputs.iter().any(matches) {
-                    return true;
+                    return Some(format!(
+                        "{name} = \"{}\"",
+                        crate::permission::pattern::describe_allow_pattern(&pattern.original)
+                    ));
                 }
             }
         }
-        false
+        None
     }
 
     /// Non-prompting deny probe for one candidate path surfaced by a walking
@@ -3215,6 +3227,32 @@ mod windows_workspace_authority_tests {
     }
 }
 
+#[cfg(test)]
+impl CheckResult {
+    /// Collapse a rule-specific deny text to its stable prefix for assertions
+    /// that do not care which rule fired.
+    pub(crate) fn rule_denied(self) -> CheckResult {
+        match self {
+            CheckResult::Denied(message) if message.starts_with("Blocked by deny rule") => {
+                CheckResult::Denied("Blocked by deny rule".to_string())
+            }
+            other => other,
+        }
+    }
+}
+
+/// The model-visible denial for a matching deny rule. The prefix stays
+/// stable; the rule that fired is appended, bounded and on one line.
+fn deny_rule_denial(rule: &str) -> CheckResult {
+    const MAX: usize = 160;
+    let rule: String = rule
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(MAX)
+        .collect();
+    CheckResult::Denied(format!("Blocked by deny rule: {rule}"))
+}
+
 fn normalize_path(path: &Path) -> PathBuf {
     let mut result = PathBuf::new();
     for component in path.components() {
@@ -3618,7 +3656,9 @@ mod tests {
             "the mutable ambient replacement is intentionally configured as allowed"
         );
         assert_eq!(
-            checker.check_bound_path("read", &logical.to_string_lossy()),
+            checker
+                .check_bound_path("read", &logical.to_string_lossy())
+                .rule_denied(),
             CheckResult::Denied("Blocked by deny rule".to_string()),
             "the captured workspace's denied identity must not become the replacement identity"
         );
@@ -3652,14 +3692,18 @@ mod tests {
         .expect("valid relative-path permission fixture");
 
         assert_eq!(
-            checker.check_bound_path("read", &workspace.join("secret.txt").to_string_lossy()),
+            checker
+                .check_bound_path("read", &workspace.join("secret.txt").to_string_lossy())
+                .rule_denied(),
             CheckResult::Denied("Blocked by deny rule".to_string())
         );
         assert_eq!(
-            checker.check_bound_path(
-                "read",
-                &workspace.join("src/nested/value.rs").to_string_lossy()
-            ),
+            checker
+                .check_bound_path(
+                    "read",
+                    &workspace.join("src/nested/value.rs").to_string_lossy()
+                )
+                .rule_denied(),
             CheckResult::Denied("Blocked by deny rule".to_string())
         );
         assert_eq!(
@@ -3678,6 +3722,46 @@ mod tests {
             ),
             CheckResult::Allowed,
             "a relative session allowlist must match the capability-relative identity"
+        );
+    }
+
+    #[test]
+    fn denials_name_the_mode_or_the_rule_that_fired() {
+        let temp = TempDir::new_canonical("permission-checker");
+        let root = temp.path().to_owned();
+        let mut readonly = PermissionChecker::new(
+            &PermissionConfigs::from(PermissionConfig::default()),
+            SecurityMode::ReadOnly,
+            Some(root.clone()),
+            None,
+        )
+        .unwrap();
+        let CheckResult::Denied(message) = readonly.check("shell", "touch x") else {
+            panic!("readonly mode must deny shell");
+        };
+        assert!(
+            message.starts_with("Blocked by permission rules"),
+            "{message}"
+        );
+        assert!(message.contains("readonly mode"), "{message}");
+        assert!(message.contains("/mode"), "{message}");
+
+        let config = PermissionConfig {
+            bash: Some(ToolPerm::Granular(
+                [("git push*".to_string(), Action::Deny)].into(),
+            )),
+            ..PermissionConfig::default()
+        };
+        let mut guarded = PermissionChecker::new(
+            &PermissionConfigs::from(config),
+            SecurityMode::Guarded,
+            Some(root),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            guarded.check("shell", "git push origin main"),
+            CheckResult::Denied("Blocked by deny rule: shell = \"git push*\"".to_string())
         );
     }
 
@@ -3703,7 +3787,9 @@ mod tests {
 
         assert!(checker.path_is_denied_lexically("read", &missing.to_string_lossy()));
         assert_eq!(
-            checker.check_bound_path("read", &missing.to_string_lossy()),
+            checker
+                .check_bound_path("read", &missing.to_string_lossy())
+                .rule_denied(),
             CheckResult::Denied("Blocked by deny rule".to_string())
         );
     }
@@ -3736,10 +3822,12 @@ mod tests {
             CheckResult::Allowed
         );
         assert_eq!(
-            checker.check_path(
-                "js/write_file",
-                &workspace.join("inside.txt").to_string_lossy()
-            ),
+            checker
+                .check_path(
+                    "js/write_file",
+                    &workspace.join("inside.txt").to_string_lossy()
+                )
+                .rule_denied(),
             CheckResult::Denied("Blocked by deny rule".to_string())
         );
 

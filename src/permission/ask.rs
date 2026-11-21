@@ -760,7 +760,7 @@ mod diagnostic_tests {
         .unwrap_err();
         assert_eq!(
             denied.to_string(),
-            "Permission denied: Blocked by deny rule"
+            "Permission denied: Blocked by deny rule: shell = \"**\""
         );
         assert!(receiver.try_recv().is_err());
         let error = crate::agent::tools::check_perm(

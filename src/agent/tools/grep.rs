@@ -1547,7 +1547,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(ToolError::Msg(ref msg)) if msg == "Permission denied: Blocked by deny rule"
+            Err(ToolError::Msg(ref msg)) if msg.starts_with("Permission denied: Blocked by deny rule")
         ));
     }
 
