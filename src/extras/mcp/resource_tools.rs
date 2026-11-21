@@ -431,6 +431,14 @@ impl Tool for ReadMcpResourceTool {
         let server = find(&self.servers, &args.server)?;
         let requested_offset = args.offset.unwrap_or(0);
         let mut notes: Vec<String> = Vec::new();
+        // A subscribed resource the server reported changed is read afresh.
+        if server.client.take_resource_updated(&args.uri) {
+            self.forget(&server.client.server_name, &args.uri);
+            notes.push(
+                "the server reported this resource changed since it was last read; this is the current content"
+                    .to_owned(),
+            );
+        }
         // A continuation page within the window reuses the first read: no
         // second server request and no second permission prompt.
         let cached = (requested_offset > 0)
@@ -461,6 +469,7 @@ impl Tool for ReadMcpResourceTool {
                 .await
                 .map_err(|error| service_error("read_mcp_resource", error))?;
                 let hash = content_hash(&read.text);
+                server.client.subscribe_best_effort(&args.uri).await;
                 let previous = self.remember(&server.client.server_name, &args.uri, &read, &hash);
                 let mut offset = requested_offset;
                 if let Some(expected) = args.content_hash.as_deref()
@@ -515,6 +524,13 @@ impl Tool for ReadMcpResourceTool {
 }
 
 impl ReadMcpResourceTool {
+    fn forget(&self, server: &str, uri: &str) {
+        self.cache
+            .lock()
+            .expect("resource cache")
+            .retain(|entry| !(entry.server == server && entry.uri == uri));
+    }
+
     fn cached(&self, server: &str, uri: &str) -> Option<(catalogue::ResourceText, String)> {
         let mut cache = self.cache.lock().expect("resource cache");
         cache.retain(|entry| entry.at.elapsed() < CACHE_TTL);

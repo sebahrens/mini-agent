@@ -686,22 +686,26 @@ pub(crate) fn parse_definition(mut value: Value) -> Result<McpServerConfig, &'st
         let valid = if command {
             kind == "stdio"
         } else {
-            kind == "http" || kind == "streamable-http"
+            kind == "http" || kind == "streamable-http" || kind == "sse"
         };
         if !valid {
             return Err(match (command, kind.as_str()) {
-                (false, Some("sse")) => {
-                    "MCP server type \"sse\" (legacy SSE transport) is not supported; set type \"http\" (streamable HTTP) and use the server's streamable-HTTP URL, or remove `type`"
-                }
                 (false, Some("ws" | "websocket")) => {
                     "MCP server type \"ws\" is not supported; use a URL server with type \"http\""
                 }
                 (true, _) => "MCP command servers must have type \"stdio\" (or no type)",
                 (false, _) => {
-                    "MCP URL servers must have type \"http\" or \"streamable-http\" (or no type)"
+                    "MCP URL servers must have type \"http\", \"streamable-http\" or \"sse\" (or no type)"
                 }
             });
         }
+    }
+    if object.get("type").and_then(Value::as_str) == Some("sse")
+        && object
+            .insert("legacy_sse".into(), Value::Bool(true))
+            .is_some()
+    {
+        return Err("duplicate MCP SSE transport selection");
     }
     for key in ["headersHelper", "headers_helper"] {
         if let Some(helper) = object.remove(key) {
@@ -1203,14 +1207,21 @@ mod tests {
         );
         for content in [
             r#"{"mcpServers":{"bad":{"command":"x","url":"https://example.com"}}}"#,
-            r#"{"mcpServers":{"bad":{"type":"sse","url":"https://example.com"}}}"#,
+            r#"{"mcpServers":{"bad":{"type":"sse","command":"x"}}}"#,
         ] {
             assert!(definitions(content).is_err());
         }
         let sse =
             parse_definition(serde_json::json!({"type":"sse","url":"https://example.com/sse"}))
-                .unwrap_err();
-        assert!(sse.contains("\"http\"") && sse.contains("sse"), "{sse}");
+                .unwrap();
+        assert!(sse.options().legacy_sse);
+        let plain =
+            parse_definition(serde_json::json!({"type":"http","url":"https://example.com/mcp"}))
+                .unwrap();
+        assert!(!plain.options().legacy_sse);
+        let ws = parse_definition(serde_json::json!({"type":"ws","url":"wss://example.com"}))
+            .unwrap_err();
+        assert!(ws.contains("ws"), "{ws}");
         assert!(definitions(&" ".repeat(MAX_PROJECT_MCP_BYTES + 1)).is_err());
     }
     #[test]

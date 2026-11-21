@@ -196,6 +196,11 @@ pub struct McpServerOptions {
     /// takes the exclusive lane.
     #[serde(default, skip_serializing_if = "is_false")]
     pub parallel_read_only: bool,
+    /// URL servers only: speak the legacy HTTP+SSE transport (protocol
+    /// 2024-11-05) instead of streamable HTTP. A `.mcp.json` entry selects it
+    /// with `"type": "sse"`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub legacy_sse: bool,
     /// URL servers only: a command run at connect time whose JSON output
     /// supplies extra request headers (for example a short-lived token).
     /// It never runs unless the top-level `mcp_headers_helper = true` opt-in

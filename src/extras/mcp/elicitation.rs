@@ -64,6 +64,118 @@ pub struct Handler {
     /// servers, which already run in that workspace; remote (HTTP) servers
     /// are not told local paths and get no roots capability.
     pub(crate) root: Option<Arc<std::path::Path>>,
+    /// Bounded, sanitised `notifications/message` lines from this server.
+    pub(crate) logs: ServerLog,
+    /// Resource URIs the server reported (`notifications/resources/updated`)
+    /// changed since the model last read them.
+    pub(crate) resources_updated: Arc<Mutex<std::collections::BTreeSet<String>>>,
+    /// Resource URIs this connection subscribed to.
+    pub(crate) subscribed: Arc<Mutex<std::collections::BTreeSet<String>>>,
+}
+
+/// Most log lines kept per server connection.
+const MAX_LOG_LINES: usize = 20;
+/// Longest kept log line, in characters.
+const MAX_LOG_LINE_CHARS: usize = 300;
+/// Most resources subscribed to per connection.
+const MAX_SUBSCRIPTIONS: usize = 64;
+/// Most remembered resource-update URIs.
+const MAX_UPDATED_URIS: usize = 256;
+
+/// Small bounded ring of a server's log notifications. Every line is
+/// untrusted server text: flattened to one line, control characters removed,
+/// truncated, and shown only inside a fence.
+#[derive(Clone, Default)]
+pub(crate) struct ServerLog(Arc<Mutex<LogRing>>);
+
+#[derive(Default)]
+struct LogRing {
+    lines: std::collections::VecDeque<(u64, String)>,
+    next: u64,
+}
+
+impl ServerLog {
+    pub(crate) fn push(&self, level: &str, logger: Option<&str>, data: &serde_json::Value) {
+        let text = match data {
+            serde_json::Value::String(text) => text.clone(),
+            other => other.to_string(),
+        };
+        let mut line = String::new();
+        line.push_str(&one_line(level, 16));
+        if let Some(logger) = logger {
+            line.push(' ');
+            line.push_str(&one_line(logger, 40));
+        }
+        line.push_str(": ");
+        // Backticks cannot close the display fence.
+        line.push_str(&one_line(&text, MAX_LOG_LINE_CHARS).replace('`', "'"));
+        let mut ring = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let id = ring.next;
+        ring.next += 1;
+        ring.lines.push_back((id, line));
+        while ring.lines.len() > MAX_LOG_LINES {
+            ring.lines.pop_front();
+        }
+    }
+
+    /// Position marker: lines pushed after it are returned by [`Self::since`].
+    pub(crate) fn mark(&self) -> u64 {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).next
+    }
+
+    /// The newest `max` lines pushed at or after `mark`, oldest first.
+    pub(crate) fn since(&self, mark: u64, max: usize) -> Vec<String> {
+        let ring = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut lines: Vec<String> = ring
+            .lines
+            .iter()
+            .filter(|(id, _)| *id >= mark)
+            .map(|(_, line)| line.clone())
+            .collect();
+        let skip = lines.len().saturating_sub(max);
+        lines.drain(..skip);
+        lines
+    }
+
+    /// The fenced, labelled block appended to a failed tool call's error.
+    pub(crate) fn fenced_since(&self, mark: u64) -> Option<String> {
+        let lines = self.since(mark, 5);
+        (!lines.is_empty()).then(|| {
+            format!(
+                "\n[recent server log lines (untrusted server output)]\n```\n{}\n```",
+                lines.join("\n")
+            )
+        })
+    }
+}
+
+impl Handler {
+    /// Remember that the server reported `uri` changed.
+    fn record_resource_update(&self, uri: &str) {
+        let mut updated = self
+            .resources_updated
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if updated.len() < MAX_UPDATED_URIS || updated.contains(uri) {
+            updated.insert(uri.to_owned());
+        }
+    }
+
+    /// Claim a subscription slot for `uri`; `false` when it is already
+    /// subscribed or the bounded set is full.
+    pub(crate) fn claim_subscription(&self, uri: &str) -> bool {
+        let mut subscribed = self.subscribed.lock().unwrap_or_else(|e| e.into_inner());
+        subscribed.len() < MAX_SUBSCRIPTIONS && subscribed.insert(uri.to_owned())
+    }
+
+    /// `true` once for each update the server reported for `uri` since the
+    /// last time this was asked.
+    pub(crate) fn take_resource_updated(&self, uri: &str) -> bool {
+        self.resources_updated
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(uri)
+    }
 }
 
 /// Longest URL accepted from a URL-mode elicitation.
@@ -297,6 +409,29 @@ impl rmcp::ClientHandler for Handler {
         tracing::debug!("MCP server announced resources/list_changed");
         self.auxiliary_changed.store(true, Ordering::Release);
     }
+    // Logging is deprecated by SEP-2577 but still what servers send today.
+    #[allow(deprecated)]
+    async fn on_logging_message(
+        &self,
+        params: rmcp::model::LoggingMessageNotificationParam,
+        _context: rmcp::service::NotificationContext<RoleClient>,
+    ) {
+        self.logs.push(
+            &format!("{:?}", params.level).to_lowercase(),
+            params.logger.as_deref(),
+            &params.data,
+        );
+    }
+    async fn on_resource_updated(
+        &self,
+        params: rmcp::model::ResourceUpdatedNotificationParam,
+        _context: rmcp::service::NotificationContext<RoleClient>,
+    ) {
+        tracing::debug!("MCP server announced a resource update");
+        self.record_resource_update(&params.uri);
+        // The cached resource catalogue is stale too.
+        self.auxiliary_changed.store(true, Ordering::Release);
+    }
     async fn on_progress(
         &self,
         params: rmcp::model::ProgressNotificationParam,
@@ -408,6 +543,44 @@ mod capability_tests {
         let local = Handler::with_root(std::path::Path::new("/tmp/ws")).get_info();
         assert!(local.capabilities.roots.is_some());
         assert!(local.capabilities.sampling.is_none());
+    }
+
+    #[test]
+    fn server_log_lines_are_bounded_flattened_and_fence_safe() {
+        let log = ServerLog::default();
+        let mark = log.mark();
+        log.push(
+            "error",
+            Some("db\nx"),
+            &serde_json::json!("boom\u{1b}[31m ``` line\nnext"),
+        );
+        log.push("info", None, &serde_json::json!({"k": "v"}));
+        log.push("warning", None, &serde_json::json!("y".repeat(5000)));
+        let lines = log.since(mark, 10);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].starts_with("error db x: boom"));
+        assert!(!lines[0].contains(['\u{1b}', '\n', '`']), "{:?}", lines[0]);
+        assert!(lines[1].contains("{\"k\":\"v\"}"));
+        assert!(lines[2].chars().count() <= MAX_LOG_LINE_CHARS + 20);
+        for n in 0..40 {
+            log.push("info", None, &serde_json::json!(n));
+        }
+        assert_eq!(log.since(0, 100).len(), MAX_LOG_LINES);
+        let block = log.fenced_since(mark).unwrap();
+        assert!(block.contains("untrusted") && block.matches("```").count() == 2);
+        assert!(log.fenced_since(log.mark()).is_none());
+    }
+
+    #[test]
+    fn resource_updates_are_reported_once_and_bounded() {
+        let handler = Handler::default();
+        handler.record_resource_update("file:///a");
+        assert!(handler.take_resource_updated("file:///a"));
+        assert!(!handler.take_resource_updated("file:///a"));
+        for n in 0..(MAX_UPDATED_URIS + 10) {
+            handler.record_resource_update(&format!("file:///{n}"));
+        }
+        assert!(handler.resources_updated.lock().unwrap().len() <= MAX_UPDATED_URIS);
     }
 
     #[test]

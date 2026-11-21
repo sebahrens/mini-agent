@@ -837,6 +837,17 @@ async fn handle_mcp(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
                 );
             }
 
+            let log_lines = handle.recent_log_lines(10);
+            if !log_lines.is_empty() {
+                write_ok(
+                    ctx.renderer,
+                    "recent server log lines (untrusted server output):",
+                );
+                for line in log_lines {
+                    write_result(ctx.renderer, format!("  {line}"));
+                }
+            }
+
             match handle.cached_tools().await {
                 Ok(listed) => {
                     let filtered = if listed.filtered_by_config > 0 {
@@ -944,7 +955,13 @@ async fn handle_mcp_login(name: Option<&str>, ctx: &mut SlashCtx<'_>) -> anyhow:
     // Validate config here so errors get friendly messages. The actual login
     // (network discovery + browser wait) runs in the event loop, which spawns
     // the wait as a background task so the TUI never freezes.
-    if let Err(e) = resolve_oauth_server(ctx, name) {
+    // A URL server without an oauth block may still sign in: login attempts
+    // OAuth discovery and saves the block on success.
+    let is_plain_url_server = matches!(
+        ctx.cfg.mcp_servers.as_ref().and_then(|m| m.get(name)),
+        Some(crate::extras::mcp::config::McpServerConfig::Url { oauth: None, .. })
+    );
+    if !is_plain_url_server && let Err(e) = resolve_oauth_server(ctx, name) {
         write_error(ctx.renderer, e);
         return Ok(());
     }

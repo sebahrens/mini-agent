@@ -339,11 +339,12 @@ accessible via `/memory read` and `memory_search`.
 | Command | Description |
 | ------- | ----------- |
 | `/mcp` | Show configured origins, inactive definitions, retained peers and observed connection/catalogue attempts; no probe. |
-| `/mcp add <name> <command|url> [args…] [--project] [--allow-local]` | Save a named definition and reconnect. Project JSON requires explicit whole-file trust review. Arguments are literal, not shell expressions. |
+| `/mcp add [--project] [--allow-local] [--oauth] [--sse] [--env KEY[=VALUE]]… [--header 'Name: value']… <name> <command|url> [args…]` | Save a named definition and reconnect. Flags are read only before the command or URL; everything after a command is the server's argv verbatim (so `--`, `--project` and `--allow-local` reach the server), while a URL server's trailing flags still count. `--env KEY` inherits the variable (no secret stored), `--env KEY=VALUE` stores a value, `--header` and `--oauth` apply to URL servers, `--sse` selects the legacy SSE transport. Project JSON requires explicit whole-file trust review (values are redacted in it). Arguments are literal, not shell expressions. |
+| `/mcp enable <name>` / `/mcp disable <name>` | Flip the entry's `enabled` flag in its owning source without removing it; disabling closes the connection, enabling reconnects. |
 | `/mcp remove <name> [--project]` | Remove the selected owning definition and close its retained peer. |
-| `/mcp <server>` | List tools of a specific MCP server. |
+| `/mcp <server>` | List tools of a specific MCP server, with the server's last log lines (`notifications/message`, bounded, shown as untrusted output). |
 | `/mcp reconnect <server>` | Reconnect a configured server from its current definition: revives a stdio server that exited or a remote server whose automatic reconnection gave up. `/mcp` shows such servers as `disconnected` or `failed`. |
-| `/mcp login <server>` | Run the OAuth 2.0 login flow for a URL server, then reconnect it. Outside the TUI use `mini-agent --mcp-login <server>`. |
+| `/mcp login <server>` | Run the OAuth 2.0 login flow for a URL server, then reconnect it. A URL server without an `oauth` block attempts discovery with dynamic registration and, on success, saves `oauth = true` through the same approved edit. Outside the TUI use `mini-agent --mcp-login <server>`. |
 | `/mcp logout <server>` | Remove a server's stored OAuth token. |
 | `/mcp:<server>:<prompt> [JSON arguments]` | Expand a cached server prompt as literal user-turn data, then use ordinary model admission. |
 | `/add mcp:<server>:<uri>` | Read bounded server text through ordinary MCP permission and add a runtime-only resource snapshot. |

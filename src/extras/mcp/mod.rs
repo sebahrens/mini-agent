@@ -14,6 +14,7 @@ pub(crate) mod project;
 pub(crate) mod reconnect;
 pub(crate) mod resource_tools;
 pub(crate) mod server;
+mod sse_legacy;
 pub mod tool;
 
 use std::collections::HashMap;

@@ -1086,15 +1086,27 @@ impl McpClientHandle {
                 let mut handle = retry_transient_connect(
                     || async {
                         validate()?;
-                        Self::connect_http_with_timeout(
-                            server_name.clone(),
-                            url,
-                            headers,
-                            oauth.as_ref(),
-                            Some(&endpoint),
-                            initialize_timeout,
-                        )
-                        .await
+                        if options.legacy_sse {
+                            Self::connect_sse_with_timeout(
+                                server_name.clone(),
+                                url,
+                                headers,
+                                oauth.as_ref(),
+                                Some(&endpoint),
+                                initialize_timeout,
+                            )
+                            .await
+                        } else {
+                            Self::connect_http_with_timeout(
+                                server_name.clone(),
+                                url,
+                                headers,
+                                oauth.as_ref(),
+                                Some(&endpoint),
+                                initialize_timeout,
+                            )
+                            .await
+                        }
                     },
                     retries,
                     MCP_CONNECT_RETRY_BASE,
@@ -1238,8 +1250,103 @@ impl McpClientHandle {
         })
     }
 
+    /// Connect a legacy HTTP+SSE server (`type = "sse"`) under the same
+    /// bounds as [`Self::connect_http_with_timeout`]: egress-pinned client,
+    /// per-event size cap, the OAuth authorization manager, and one timeout
+    /// over the stream open, the `endpoint` event and the MCP handshake.
+    pub(crate) async fn connect_sse_with_timeout(
+        server_name: CompactString,
+        url: &str,
+        headers: &HashMap<String, String>,
+        oauth: Option<&OAuthConfig>,
+        endpoint: Option<&ValidatedEndpoint>,
+        initialize_timeout: Duration,
+    ) -> anyhow::Result<Self> {
+        tracing::debug!(
+            "MCP legacy SSE transport configured ({} headers, OAuth: {})",
+            headers.len(),
+            oauth.is_some(),
+        );
+        let custom_headers = parse_headers(headers)?;
+        let oauth_settings = oauth.and_then(|o| o.settings());
+        let elicitation = super::elicitation::Handler::default();
+        let tools_changed = elicitation.tools_changed.clone();
+        let auxiliary_changed = elicitation.auxiliary_changed.clone();
+        let reqwest_client = http_client_for(initialize_timeout, endpoint)?;
+        let connect = async {
+            let auth = match oauth_settings {
+                Some(settings) => {
+                    let bounded = BoundedHttpClient::new(
+                        reqwest_client.clone(),
+                        super::bounded_http::MCP_HTTP_MAX_BODY_BYTES,
+                    );
+                    let auth_client = super::oauth::build_auth_client(
+                        &server_name,
+                        url,
+                        &settings,
+                        bounded,
+                        endpoint,
+                    )
+                    .await?;
+                    Some(auth_client.auth_manager.clone())
+                }
+                None => None,
+            };
+            let transport = super::sse_legacy::LegacySseTransport::connect(
+                reqwest_client.clone(),
+                url,
+                custom_headers,
+                auth,
+                super::bounded_http::MCP_HTTP_MAX_BODY_BYTES,
+                elicitation.forms.clone(),
+            )
+            .await?;
+            serve_client(elicitation.clone(), transport)
+                .await
+                .map_err(|e| NamedConnectError::error(&server_name, e))
+        };
+        let initialized = tokio::select! {
+            biased;
+            _ = crate::agent::runner::current_work_scope_cancelled() => return Err(ConnectFailure::error(ConnectFailureKind::Cancelled, "cancelled", "MCP SSE connection cancelled")),
+            result = tokio::time::timeout(initialize_timeout, connect) => result,
+        };
+        let running_service = match initialized {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(NamedConnectError::timed_out(
+                    &server_name,
+                    initialize_timeout,
+                ));
+            }
+        };
+        Ok(Self {
+            server_name,
+            trusted_identity: None,
+            running_service,
+            elicitation,
+            source_proof: None,
+            liveness: std::sync::Arc::new(()),
+            auxiliary: Arc::new(super::catalogue::AuxiliaryCache::with_flag(
+                auxiliary_changed,
+            )),
+            tools: Arc::new(ToolListCache::with_flag(tools_changed)),
+            options: Default::default(),
+            defer: Default::default(),
+            link: None,
+        })
+    }
+
     pub fn peer(&self) -> rmcp::service::Peer<RoleClient> {
         self.running_service.peer().clone()
+    }
+
+    /// The newest `max` sanitised log lines the server sent over its live
+    /// connection (untrusted server text; display only inside a fence).
+    pub(crate) fn recent_log_lines(&self, max: usize) -> Vec<String> {
+        match &self.link {
+            Some(link) => link.conn().elicitation.logs.since(0, max),
+            None => self.elicitation.logs.since(0, max),
+        }
     }
 
     /// The peer of the live connection generation: the reconnect link's
@@ -1265,6 +1372,7 @@ impl McpClientHandle {
         proof: &Arc<super::project::ServerSourceProof>,
     ) -> Option<Arc<super::reconnect::ServerLink>> {
         let (workspace, name, config) = proof.reconnect_target()?;
+        let has_headers_helper = config.options().headers_helper.is_some();
         let proof = Arc::clone(proof);
         let connector: super::reconnect::Connector = Arc::new(move || {
             let (workspace, name, config, proof) = (
@@ -1288,7 +1396,7 @@ impl McpClientHandle {
                 .await
             })
         });
-        Some(super::reconnect::ServerLink::new(
+        let link = super::reconnect::ServerLink::new(
             self.server_name.clone(),
             super::reconnect::Conn {
                 peer: self.peer(),
@@ -1298,7 +1406,11 @@ impl McpClientHandle {
             },
             connector,
             super::reconnect::RECONNECT_BASE_DELAY,
-        ))
+        );
+        if has_headers_helper {
+            link.enable_reauth();
+        }
+        Some(link)
     }
 
     /// Called by the owned connection actor after its immutable source proof

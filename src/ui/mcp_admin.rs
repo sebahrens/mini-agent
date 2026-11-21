@@ -18,6 +18,11 @@ pub(super) enum Action {
         name: String,
         project: bool,
     },
+    /// Flip the per-server `enabled` flag without removing the entry.
+    SetEnabled {
+        name: String,
+        enabled: bool,
+    },
     Status,
     Existing,
 }
@@ -86,6 +91,15 @@ pub(super) fn parse(text: &str) -> Result<Action, &'static str> {
     if words.len() == 1 {
         return Ok(Action::Status);
     }
+    if matches!(words[1].as_str(), "enable" | "disable") {
+        if words.len() != 3 || words[2].is_empty() || words[2].starts_with("--") {
+            return Err("usage: /mcp enable|disable <name>");
+        }
+        return Ok(Action::SetEnabled {
+            name: words[2].clone(),
+            enabled: words[1] == "enable",
+        });
+    }
     if !matches!(words[1].as_str(), "add" | "remove") {
         return Ok(Action::Existing);
     }
@@ -93,32 +107,81 @@ pub(super) fn parse(text: &str) -> Result<Action, &'static str> {
     words.drain(..2);
     let mut project = false;
     let mut local = false;
-    let mut positional = Vec::new();
+    let mut oauth = false;
+    let mut sse = false;
+    let mut env: Vec<String> = Vec::new();
+    let mut header_args: Vec<String> = Vec::new();
+    let mut positional: Vec<String> = Vec::new();
+    // Flags are read only in the leading region (before the server command or
+    // URL). Everything after the second positional is the server's argv,
+    // verbatim, including `--`, `--project` and `--allow-local`.
     let mut flags = true;
-    for value in words {
+    let mut iter = words.into_iter();
+    while let Some(value) = iter.next() {
+        // A URL server takes no argv, so its trailing flags stay flags.
+        if add
+            && positional.len() >= 2
+            && !(positional[1].starts_with("http://") || positional[1].starts_with("https://"))
+        {
+            positional.push(value);
+            positional.extend(iter.by_ref());
+            break;
+        }
         if flags && value == "--" {
             flags = false;
             continue;
         }
-        if flags && value == "--project" {
-            if project {
-                return Err("duplicate --project");
-            }
-            project = true;
-        } else if flags && value == "--allow-local" {
-            if local {
-                return Err("duplicate --allow-local");
-            }
-            local = true;
-        } else {
+        if !flags || !value.starts_with("--") {
             positional.push(value);
+            continue;
+        }
+        match value.as_str() {
+            "--project" => {
+                if project {
+                    return Err("duplicate --project");
+                }
+                project = true;
+            }
+            "--allow-local" => {
+                if local {
+                    return Err("duplicate --allow-local");
+                }
+                local = true;
+            }
+            "--sse" if add => {
+                if sse {
+                    return Err("duplicate --sse");
+                }
+                sse = true;
+            }
+            "--oauth" if add => {
+                if oauth {
+                    return Err("duplicate --oauth");
+                }
+                oauth = true;
+            }
+            "--env" | "--header" if add => {
+                let Some(argument) = iter.next() else {
+                    return Err("--env needs KEY or KEY=VALUE; --header needs 'Name: value'");
+                };
+                if value == "--env" {
+                    env.push(argument);
+                } else {
+                    header_args.push(argument);
+                }
+            }
+            other if add && other.starts_with("--env=") => env.push(other[6..].to_owned()),
+            other if add && other.starts_with("--header=") => {
+                header_args.push(other[9..].to_owned())
+            }
+            _ => positional.push(value),
         }
     }
     let Some(name) = positional.first().filter(|name| {
         !name.is_empty() && name.len() <= 256 && !name.chars().any(char::is_control)
     }) else {
         return Err(
-            "usage: /mcp add <name> <command|url> [args...] [--project] [--allow-local], /mcp remove <name> [--project]",
+            "usage: /mcp add [--project] [--allow-local] [--oauth] [--sse] [--env KEY[=VALUE]]... [--header 'Name: value']... <name> <command|url> [args...], /mcp remove <name> [--project], /mcp enable|disable <name>",
         );
     };
     let name = name.clone();
@@ -136,17 +199,63 @@ pub(super) fn parse(text: &str) -> Result<Action, &'static str> {
         if positional.len() != 2 {
             return Err("URL MCP servers do not take command arguments");
         }
+        if !env.is_empty() {
+            return Err("--env applies only to command MCP servers");
+        }
+        let mut headers = HashMap::new();
+        for raw in &header_args {
+            let Some((key, value)) = raw.split_once(':') else {
+                return Err("--header must look like 'Name: value'");
+            };
+            let (key, value) = (key.trim(), value.trim());
+            if key.is_empty()
+                || key.len() > 256
+                || !key.bytes().all(|b| b.is_ascii_graphic() && b != b':')
+                || value.len() > 8192
+                || value.chars().any(char::is_control)
+            {
+                return Err("--header name or value is invalid");
+            }
+            headers.insert(key.to_owned(), value.to_owned());
+        }
+        let mut options: Box<crate::extras::mcp::config::McpServerOptions> = Default::default();
+        options.legacy_sse = sse;
         McpServerConfig::Url {
-            options: Default::default(),
+            options,
             url: target,
             defer: Default::default(),
             allow_local: local,
-            headers: HashMap::new(),
-            oauth: None,
+            headers,
+            oauth: oauth.then_some(crate::extras::mcp::config::OAuthConfig::Enabled(true)),
         }
     } else {
         if local {
             return Err("--allow-local applies only to URL MCP servers");
+        }
+        if oauth || sse || !header_args.is_empty() {
+            return Err("--oauth, --sse and --header apply only to URL MCP servers");
+        }
+        let mut env_values = HashMap::new();
+        let mut inherit_env = Vec::new();
+        for raw in &env {
+            let (key, value) = match raw.split_once('=') {
+                Some((key, value)) => (key, Some(value)),
+                None => (raw.as_str(), None),
+            };
+            if key.is_empty()
+                || key.len() > 256
+                || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                || value.is_some_and(|v| v.len() > 8192 || v.contains('\0'))
+            {
+                return Err("--env needs a valid variable name (KEY or KEY=VALUE)");
+            }
+            match value {
+                Some(value) => {
+                    env_values.insert(key.to_owned(), value.to_owned());
+                }
+                None if !inherit_env.iter().any(|k| k == key) => inherit_env.push(key.to_owned()),
+                None => {}
+            }
         }
         McpServerConfig::Command {
             options: Default::default(),
@@ -154,8 +263,8 @@ pub(super) fn parse(text: &str) -> Result<Action, &'static str> {
             defer: Default::default(),
             args: positional[2..].to_vec(),
             cwd: None,
-            env: HashMap::new(),
-            inherit_env: Vec::new(),
+            env: env_values,
+            inherit_env,
             sandbox: None,
             network: Default::default(),
         }
@@ -338,6 +447,8 @@ pub(super) struct State {
     pub resources: Vec<crate::extras::mcp::catalogue::Attachment>,
     pub auxiliary_draft: Option<String>,
     pub reading_resources: bool,
+    /// Server whose OAuth block is written after a successful discovery login.
+    pub oauth_write: Option<String>,
 }
 
 impl Work {
@@ -434,7 +545,7 @@ mod tests {
             server,
             project,
         } = parse(
-            r#"/mcp add 雪 'C:\Program Files\runner.exe' 'a b' "" '$(touch nope)' --project"#,
+            r#"/mcp add --project 雪 'C:\Program Files\runner.exe' 'a b' "" '$(touch nope)'"#,
         )
         .unwrap()
         else {
@@ -465,18 +576,99 @@ mod tests {
         let McpServerConfig::Command { args, .. } = server else {
             panic!()
         };
-        assert_eq!(args, ["--project"]);
+        assert_eq!(args, ["--", "--project"]);
         for text in [
             "/mcp add",
-            "/mcp add x cmd --allow-local",
+            "/mcp add --allow-local x cmd",
             "/mcp add x https://example.com extra",
             "/mcp remove x --allow-local",
-            "/mcp add x cmd --project --project",
+            "/mcp add --project --project x cmd",
             "/mcp add x 'unterminated",
             "/mcp remove x y",
         ] {
             assert!(parse(text).is_err(), "{text}");
         }
+    }
+
+    fn add_parts(text: &str) -> (String, McpServerConfig, bool) {
+        let Ok(Action::Add {
+            name,
+            server,
+            project,
+        }) = parse(text)
+        else {
+            panic!("{text}")
+        };
+        (name, server, project)
+    }
+
+    #[test]
+    fn server_argv_after_the_command_is_verbatim() {
+        let (_, server, project) = add_parts("/mcp add a npx -y p -- --stdio");
+        let McpServerConfig::Command { args, .. } = server else {
+            panic!()
+        };
+        assert_eq!(args, ["-y", "p", "--", "--stdio"]);
+        assert!(!project);
+        let (_, server, project) = add_parts("/mcp add a tool --project x");
+        let McpServerConfig::Command { args, .. } = server else {
+            panic!()
+        };
+        assert_eq!(args, ["--project", "x"]);
+        assert!(!project);
+        let (name, _, project) = add_parts("/mcp add --project a tool");
+        assert_eq!(name, "a");
+        assert!(project);
+        let (_, server, project) = add_parts("/mcp add a --project tool --allow-local");
+        let McpServerConfig::Command { args, command, .. } = server else {
+            panic!()
+        };
+        assert!(project);
+        assert_eq!(
+            (command.as_str(), args),
+            ("tool", vec!["--allow-local".to_owned()])
+        );
+    }
+
+    #[test]
+    fn env_header_and_oauth_flags_build_the_server() {
+        let (_, server, _) = add_parts("/mcp add --env API_KEY --env MODE=fast s npx --env x");
+        let McpServerConfig::Command {
+            env,
+            inherit_env,
+            args,
+            ..
+        } = server
+        else {
+            panic!()
+        };
+        assert_eq!(inherit_env, ["API_KEY"]);
+        assert_eq!(env["MODE"], "fast");
+        assert_eq!(args, ["--env", "x"]);
+        let (_, server, _) = add_parts(
+            "/mcp add --header 'Authorization: Bearer abc' --oauth r https://example.com/mcp",
+        );
+        let McpServerConfig::Url { headers, oauth, .. } = server else {
+            panic!()
+        };
+        assert_eq!(headers["Authorization"], "Bearer abc");
+        assert!(oauth.is_some());
+        for text in [
+            "/mcp add --env A=b r https://example.com/mcp",
+            "/mcp add --header 'A: b' s cmd",
+            "/mcp add --oauth s cmd",
+            "/mcp add --header nocolon r https://example.com/mcp",
+            "/mcp add --env 'BAD NAME=1' s cmd",
+        ] {
+            assert!(parse(text).is_err(), "{text}");
+        }
+        // After the command, `--env` is the server's own argument.
+        assert!(parse("/mcp add s cmd --env").is_ok());
+        assert!(matches!(
+            parse("/mcp disable files"),
+            Ok(Action::SetEnabled { enabled: false, .. })
+        ));
+        assert!(parse("/mcp enable").is_err());
     }
 
     #[tokio::test]

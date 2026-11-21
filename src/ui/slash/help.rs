@@ -257,7 +257,11 @@ pub(crate) fn help_lines(
         );
         emit(
             false,
-            "  /mcp add <name> <command|url> [args...] [--project] [--allow-local]",
+            "  /mcp add <name> <command|url> [args...]   flags go before the command: --project --allow-local --oauth --sse --env K[=V] --header 'N: v'",
+        );
+        emit(
+            false,
+            "  /mcp enable|disable <name>   flip a server's enabled flag without removing it",
         );
         emit(
             false,
