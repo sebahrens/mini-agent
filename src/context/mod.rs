@@ -1098,7 +1098,7 @@ impl ContextBudget {
 /// Reads context only from the explicitly selected workspace root. Global
 /// application context is loaded separately; parent directories outside the
 /// workspace capability must never influence the prompt.
-#[cfg(any(test, feature = "archmd"))]
+#[cfg(test)]
 fn walk_context_files(
     workspace_root: Option<&Path>,
 ) -> (
@@ -1255,16 +1255,6 @@ mod repository_context_tests {
         assert!(agents.ends_with(CONTEXT_TRUNCATION_NOTICE));
         std::fs::remove_dir_all(workspace).unwrap();
     }
-}
-
-/// Read the architecture document for an explicit workspace.
-///
-/// There is deliberately no process-CWD variant: workspace authority is passed
-/// explicitly so a worktree switch never depends on the process working
-/// directory (see `PermissionChecker::rebind_working_dir`).
-#[cfg(feature = "archmd")]
-pub(crate) fn load_architecture_from(workspace_root: &Path) -> Option<String> {
-    walk_context_files(Some(workspace_root)).1
 }
 
 #[cfg(test)]
