@@ -1158,6 +1158,7 @@ mod event60_tests {
                 crate::permission::ask::send_permission_request(
                     &sender,
                     crate::permission::ask::AskRequest {
+                        workdir: None,
                         diagnostic: None,
                         #[cfg(feature = "subagents")]
                         background: None,

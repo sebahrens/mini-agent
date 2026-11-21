@@ -10,6 +10,7 @@
 //! deny = { shell = ["rm -rf *"], write = ["/etc/**"] }  # appended to permission-deny
 //! allowed_modes = ["standard", "guarded", "readonly"]   # selectable security modes
 //! disable_yolo = true                                   # shorthand: drop `yolo` from the modes
+//! forbid_shell_auto_allow = true                        # force shell-auto-allow-sandboxed off
 //! require_permission_checks = true                      # refuse --dangerously-skip-permissions
 //!                                                       # (implied by deny, allowed_modes, disable_yolo)
 //!
@@ -56,6 +57,9 @@ struct PermissionsPolicy {
     allowed_modes: Option<Vec<String>>,
     disable_yolo: bool,
     require_permission_checks: bool,
+    /// Forbid `shell-auto-allow-sandboxed`: unmatched shell commands keep
+    /// asking even when an enforced sandbox contains them.
+    forbid_shell_auto_allow: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1142,6 +1146,10 @@ impl ManagedPolicy {
             mark_managed(cfg, "sandbox-required", true);
         }
         self.apply_sandbox_pins(cfg);
+        if self.file.permissions.forbid_shell_auto_allow {
+            cfg.shell_auto_allow_sandboxed = Some(false);
+            mark_managed(cfg, "shell-auto-allow-sandboxed", true);
+        }
         if self.permission_checks_required() {
             cfg.permission_checks_required = Some(true);
             mark_managed(cfg, "permission-checks-required", true);
@@ -1190,6 +1198,19 @@ mod tests {
             toml::from_str(text).unwrap(),
         )
         .unwrap()
+    }
+
+    // mini-agent-nvnkx.62
+    #[test]
+    fn managed_policy_can_force_shell_auto_allow_off() {
+        let mut cfg = crate::config::Config {
+            shell_auto_allow_sandboxed: Some(true),
+            ..Default::default()
+        };
+        policy("[sandbox]\nrequired = true\n").apply(&mut cfg);
+        assert_eq!(cfg.shell_auto_allow_sandboxed, Some(true));
+        policy("[permissions]\nforbid_shell_auto_allow = true\n").apply(&mut cfg);
+        assert_eq!(cfg.shell_auto_allow_sandboxed, Some(false));
     }
 
     #[test]

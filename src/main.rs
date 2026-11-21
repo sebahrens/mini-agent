@@ -507,6 +507,7 @@ async fn run_one_shot(
                 (env.app_paths, env.workspace, env.config_overrides);
             git::global_snapshot::wait_initialized().await;
             let mut cfg = config::load_for_diagnostics_in_workspace(app_paths, workspace);
+            cli.apply_workspace_dirs(&mut cfg);
             config::layers::apply_overrides(&mut cfg, config_overrides)
                 .map_err(anyhow::Error::msg)?;
             context::agents::set_claude_project_agents(cfg.resolve_claude_project_agents());
@@ -1040,6 +1041,7 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
     }
 
     let loaded_warning_count = cfg.load_warnings.len();
+    cli.apply_workspace_dirs(&mut cfg);
     config::layers::apply_overrides(&mut cfg, &config_overrides).map_err(anyhow::Error::msg)?;
     #[cfg(feature = "mcp")]
     if cli.strict_mcp_config {
@@ -1138,6 +1140,7 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
         add_dirs.extend(
             cli.add_dir
                 .iter()
+                .chain(&cli.add_workspace_dir)
                 .map(|dir| (dir.to_string_lossy().into_owned(), launch.clone())),
         );
         for note in extras::skills::session::configure_extra_roots(

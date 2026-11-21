@@ -443,6 +443,7 @@ fn standard_app_one_mib_case(pending_permission: bool) {
                     let mut decision = if pending_permission {
                         let (reply, decision) = tokio::sync::oneshot::channel();
                         app.begin_permission_request(crate::permission::ask::AskRequest {
+                            workdir: None,
                             diagnostic: None,
                             #[cfg(feature = "subagents")]
                             background: None,

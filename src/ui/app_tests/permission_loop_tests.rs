@@ -107,6 +107,7 @@ fn request(input: &str) -> (AskRequest, oneshot::Receiver<UserDecision>) {
     let (reply, receiver) = oneshot::channel();
     (
         AskRequest {
+            workdir: None,
             diagnostic: None,
             #[cfg(feature = "subagents")]
             background: None,

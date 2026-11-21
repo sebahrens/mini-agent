@@ -79,6 +79,8 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Added: an interrupted headless run (SIGINT, SIGTERM or a control-channel interrupt) reports `stop_reason: "interrupted"` with `is_error: true`, the text produced so far plus a cut-short marker in `result`, and exits 130 (SIGINT) or 143 (SIGTERM) (mini-agent-nvnkx.158).
 - Added: a job id from an earlier process of the session answers that the job started in an earlier process and is no longer running, and names its output log when it still exists (mini-agent-nvnkx.315).
 - Added: ACP answers `max_turn_requests` for a spent turn cap and `max_tokens` for a spent token budget or a final answer cut off at the output limit, instead of a JSON-RPC internal error or `end_turn`; the explanation arrives as a thought chunk (mini-agent-nvnkx.273).
+- `shell-auto-allow-sandboxed` (global-only, default off; a managed policy can force it off with `forbid_shell_auto_allow`) lets standard mode run unmatched shell commands without a prompt while an enforced `workspace`/`host-read` sandbox with network `deny`/`allowlist` contains them; deny and ask rules, destructive commands and escalation still prompt, and `/sandbox` and the status line show the state (mini-agent-nvnkx.62).
+- `--add-workspace-dir DIR` (and `--add-dir` under `add_dir_tool_access = true`) gives DIR to the file tools and the shell sandbox write roots together, and `/add-dir DIR` grants file-tool access for the running session (mini-agent-nvnkx.71).
 
 ### Fixed
 
@@ -315,6 +317,7 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Fixed: the steering checkpoint failure reports the messages of every stream of the turn, not just the current one (mini-agent-nvnkx.16).
 - Fixed: a call that completed and was reported is no longer recorded as "outcome unknown" when the user interrupts before the UI read its result event (mini-agent-nvnkx.166).
 - Fixed: the loop guard lets an identical failing call run again after a `job_status` poll or eight other tool results, so polling for a port, CI run or lock is not blocked for the rest of the turn (mini-agent-nvnkx.19).
+- Shell calls with `workdir` are checked on the plain command with the directory as a separate field: built-in and configured allows, session prefix grants and the read-only classifier (confined to the directory) now match, so `cargo test` or `ls` with a `workdir` no longer prompt every time; an "always" approval stays per directory and a deny rule still wins (mini-agent-nvnkx.60).
 
 ### Added
 

@@ -300,9 +300,17 @@ pub struct Cli {
         long = "add-dir",
         value_name = "DIR",
         action = clap::ArgAction::Append,
-        help = "Also discover Agent Skills in DIR/.claude/skills and DIR/.agents/skills; repeatable (adds to skills_extra_dirs). Unlike Claude Code it grants no file access to DIR unless add_dir_tool_access = true"
+        help = "Also discover Agent Skills in DIR/.claude/skills and DIR/.agents/skills; repeatable (adds to skills_extra_dirs). Grants no file or shell access to DIR unless add_dir_tool_access = true, which makes it behave like --add-workspace-dir"
     )]
     pub add_dir: Vec<std::path::PathBuf>,
+
+    #[arg(
+        long = "add-workspace-dir",
+        value_name = "DIR",
+        action = clap::ArgAction::Append,
+        help = "Give DIR to both the file tools (an allowed external directory, read/edit rules still apply) and the shell sandbox (a write root, like sandbox-write-roots); repeatable. Also discovers skills in it. Private masks, Git metadata protection and managed allowed_roots still apply"
+    )]
+    pub add_workspace_dir: Vec<std::path::PathBuf>,
 
     #[arg(
         short = 'i',
@@ -2049,6 +2057,55 @@ impl Cli {
                 || !cfg.sandbox_home_mounts.is_empty())
     }
 
+    /// The existing directories that get BOTH file-tool access and a shell
+    /// sandbox write root: every `--add-workspace-dir`, plus every `--add-dir`
+    /// when `add_dir_tool_access` is on (mini-agent-nvnkx.71). Canonical,
+    /// absolute and deduplicated; a missing directory is skipped (the caller
+    /// reports it).
+    pub fn workspace_dirs(&self, cfg: &config::Config) -> Vec<std::path::PathBuf> {
+        let skills_dirs: &[std::path::PathBuf] = if cfg.add_dir_tool_access.unwrap_or(false) {
+            &self.add_dir
+        } else {
+            &[]
+        };
+        let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+        for dir in self.add_workspace_dir.iter().chain(skills_dirs) {
+            let absolute = if dir.is_absolute() {
+                dir.clone()
+            } else if let Ok(cwd) = std::env::current_dir() {
+                cwd.join(dir)
+            } else {
+                continue;
+            };
+            if let Ok(canonical) = absolute.canonicalize()
+                && canonical.is_dir()
+                && !dirs.contains(&canonical)
+            {
+                dirs.push(canonical);
+            }
+        }
+        dirs
+    }
+
+    /// Add [`Self::workspace_dirs`] to `cfg.sandbox_write_roots` so the shell
+    /// sandbox can write there. Call before the managed policy is applied so
+    /// an administrator's `allowed_roots` clamp covers these roots too.
+    pub fn apply_workspace_dirs(&self, cfg: &mut config::Config) {
+        for dir in self.workspace_dirs(cfg) {
+            if !cfg.sandbox_write_roots.contains(&dir) {
+                cfg.sandbox_write_roots.push(dir);
+            }
+        }
+        for dir in self.add_workspace_dir.iter() {
+            if !dir.is_dir() {
+                cfg.load_warnings.push(format!(
+                    "--add-workspace-dir {} is not an existing directory and was ignored",
+                    dir.display()
+                ));
+            }
+        }
+    }
+
     pub fn resolve_sandbox_backend(&self, cfg: &config::Config) -> String {
         self.sandbox_backend
             .clone()
@@ -2082,6 +2139,9 @@ impl Cli {
             fix(path, base);
         }
         self.add_dir.iter_mut().for_each(|p| fix_home(p, base));
+        self.add_workspace_dir
+            .iter_mut()
+            .for_each(|p| fix_home(p, base));
         self.image.iter_mut().for_each(|p| fix_home(p, base));
         self.output_schema
             .iter_mut()
@@ -2343,6 +2403,51 @@ mod tests {
         assert_eq!(cli.image, vec![home("~/a.png")]);
         assert_eq!(cli.output_schema, Some(home("~/s.json")));
         assert_eq!(cli.add_dir, vec![home("~/d")]);
+    }
+
+    // mini-agent-nvnkx.71
+    #[test]
+    fn workspace_dirs_combine_the_dedicated_flag_and_the_add_dir_opt_in() {
+        let base = std::env::temp_dir().join(format!("ws-dirs-{}", std::process::id()));
+        let (ws, skills, missing) = (base.join("ws"), base.join("skills"), base.join("missing"));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&skills).unwrap();
+        let cli = Cli::try_parse_from([
+            "mini-agent",
+            "--add-workspace-dir",
+            ws.to_str().unwrap(),
+            "--add-workspace-dir",
+            missing.to_str().unwrap(),
+            "--add-dir",
+            skills.to_str().unwrap(),
+            "q",
+        ])
+        .unwrap();
+        let canonical = |dir: &std::path::Path| dir.canonicalize().unwrap();
+        // --add-dir alone grants nothing.
+        let mut cfg = config::Config::default();
+        assert_eq!(cli.workspace_dirs(&cfg), vec![canonical(&ws)]);
+        // With the opt-in it means the same as the dedicated flag.
+        cfg.add_dir_tool_access = Some(true);
+        assert_eq!(
+            cli.workspace_dirs(&cfg),
+            vec![canonical(&ws), canonical(&skills)]
+        );
+        cfg.sandbox_write_roots.push(canonical(&ws));
+        cli.apply_workspace_dirs(&mut cfg);
+        assert_eq!(
+            cfg.sandbox_write_roots,
+            vec![canonical(&ws), canonical(&skills)]
+        );
+        assert!(
+            cfg.load_warnings
+                .iter()
+                .any(|warning| warning.contains("--add-workspace-dir")
+                    && warning.contains("missing")),
+            "{:?}",
+            cfg.load_warnings
+        );
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

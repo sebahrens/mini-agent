@@ -233,6 +233,10 @@ pub(crate) fn help_lines(
         false,
         "  /mode <mode>           set mode (standard|restrictive|readonly|planwrite|guarded|yolo)",
     );
+    emit(
+        false,
+        "  /add-dir <dir>         let the file tools reach another directory for this session",
+    );
     emit(false, "  /permissions          choose approval mode");
     emit(false, "  /permissions <mode>   set mode (yolo|auto|manual)");
     emit(

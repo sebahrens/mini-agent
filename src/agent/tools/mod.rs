@@ -1387,6 +1387,9 @@ async fn handle_ask_inner(
         }
         suggested => (suggested, additional_allow_patterns),
     };
+    let shell_workdir = (tool == "shell")
+        .then(|| SHELL_WORKDIR.try_with(Clone::clone).ok().flatten())
+        .flatten();
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     // A mutating tool that opted in gives its exclusive lane lease back while
     // the user decides; nothing has taken effect yet. It is re-acquired before
@@ -1401,6 +1404,7 @@ async fn handle_ask_inner(
             agent_name: crate::permission::ask::subagent_name(),
             tool: CompactString::new(tool),
             input: input.to_string(),
+            workdir: shell_workdir.clone(),
             #[cfg(feature = "acp")]
             tool_call_id: crate::permission::ask::current_tool_call_id(),
             suggested_pattern,
@@ -1438,7 +1442,18 @@ async fn handle_ask_inner(
             if !crate::permission::ask::current_mcp_origin_valid() {
                 return Err(ToolError::Msg("MCP approval source or work retired".into()));
             }
-            checker.add_session_allowlist(tool.to_string(), &pattern);
+            // A directory-scoped shell approval is keyed by command plus
+            // directory, so it never covers the same command elsewhere.
+            match &shell_workdir {
+                Some(dir) => checker.add_session_allowlist(
+                    tool.to_string(),
+                    &crate::permission::checker::shell_workdir_identity(
+                        input,
+                        std::path::Path::new(dir),
+                    ),
+                ),
+                None => checker.add_session_allowlist(tool.to_string(), &pattern),
+            }
             for additional in additional_allow_patterns {
                 checker.add_session_allowlist(tool.to_string(), &additional);
             }
@@ -1484,6 +1499,7 @@ pub(crate) async fn request_sandbox_escalation_approval(
     let sent = tx
         .send(
             AskRequest {
+                workdir: None,
                 diagnostic: None,
                 #[cfg(feature = "subagents")]
                 background: crate::spend::run::Run::current()
@@ -1571,6 +1587,47 @@ pub async fn check_perm(
     input_key: &str,
 ) -> Result<Option<String>, ToolError> {
     check_perm_with_suggestion(permission, ask_tx, tool, input_key, None).await
+}
+
+/// Shell permission check for a call with a validated `workdir` (a host
+/// directory inside the workspace). Rules, prefix grants and the read-only
+/// classifier see the plain `command`; the directory only scopes the
+/// "always" approval and is shown in the prompt (mini-agent-nvnkx.60).
+pub(crate) async fn check_shell_perm_in(
+    permission: &Option<PermCheck>,
+    ask_tx: &Option<AskSender>,
+    command: &str,
+    workdir: &std::path::Path,
+) -> Result<Option<String>, ToolError> {
+    let Some(perm) = permission else {
+        return Ok(None);
+    };
+    let (result, diagnostic) = {
+        let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
+        guard.check_diagnosed(|guard| guard.check_shell_in(command, workdir))
+    };
+    let workdir = Some(workdir.to_string_lossy().into_owned());
+    SHELL_WORKDIR
+        .scope(
+            workdir,
+            settle_check(
+                (result, diagnostic),
+                ask_tx,
+                perm,
+                "shell",
+                command,
+                None,
+                Vec::new(),
+            ),
+        )
+        .await
+}
+
+tokio::task_local! {
+    /// The directory of the shell call being settled, so a prompt raised from
+    /// `handle_ask_inner` can show and key it without widening every ask
+    /// helper's signature.
+    static SHELL_WORKDIR: Option<String>;
 }
 
 pub(crate) async fn check_perm_with_suggestion(

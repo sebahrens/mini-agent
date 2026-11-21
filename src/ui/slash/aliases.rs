@@ -29,9 +29,6 @@ pub(super) fn foreign(name: &str) -> Option<Foreign> {
             "/mode planwrite",
             "/plan takes no description here: run /mode planwrite, then send your request",
         ),
-        "/add-dir" => Foreign::Hint(
-            "/add-dir: start with --add-dir <path> (and add_dir_tool_access in config) to reach more directories",
-        ),
         "/statusline" => Foreign::Hint(
             "/statusline: there is no status line editor; see /config for footer settings",
         ),
@@ -103,7 +100,6 @@ mod tests {
         assert_eq!(rewrite("/plan do x"), None);
         assert!(hint("/plan").unwrap().contains("/mode planwrite"));
         assert_eq!(rewrite("/sessions"), None);
-        assert!(hint("/add-dir").unwrap().contains("--add-dir"));
         let builtins = crate::ui::pickers::list::suggestion_candidates();
         assert_eq!(
             suggest("/sesions", builtins, std::iter::empty())

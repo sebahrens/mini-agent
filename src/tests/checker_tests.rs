@@ -1409,10 +1409,13 @@ fn add_dir_access_is_default_closed_scoped_and_still_permission_checked() {
     // Opted in: the added tree is reachable, a prefix-sharing sibling is not,
     // and the user's own read deny inside the tree still wins.
     let mut checker = make();
-    let cfg = crate::config::Config {
+    let mut cfg = crate::config::Config {
         add_dir_tool_access: Some(true),
         ..Default::default()
     };
+    // Startup adds the directory to the shell sandbox write roots first; the
+    // file-tool grant follows the roots that survive (mini-agent-nvnkx.71).
+    cli.apply_workspace_dirs(&mut cfg);
     grant_add_dir_access(&mut checker, &cli, &cfg);
     assert_eq!(checker.check_path("read", &in_added), CheckResult::Allowed);
     assert!(matches!(

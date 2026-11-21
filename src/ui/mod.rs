@@ -338,7 +338,15 @@ fn draw_main_frame(
         btw_cost: btw.cost,
         btw_in: btw.input,
         btw_out: btw.output,
-        sandbox_label: crate::ui::statusline::sandbox_label(&ui.sandbox),
+        sandbox_label: crate::ui::statusline::sandbox_auto_allow_label(
+            crate::ui::statusline::sandbox_label(&ui.sandbox),
+            ui.permission.as_ref().is_some_and(|permission| {
+                permission
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .sandbox_auto_allow()
+            }),
+        ),
     };
     let base_statusline_key = crate::ui::statusline::cache_key(ui.session, &statusline_ctx);
     let vim_label = input.vim_status_label();

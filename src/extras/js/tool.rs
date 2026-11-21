@@ -667,6 +667,7 @@ async fn resolve_permission(
             if crate::permission::ask::send_permission_request(
                 &ask_tx,
                 AskRequest {
+                    workdir: None,
                     diagnostic: Some(diagnostic),
                     #[cfg(feature = "subagents")]
                     background: None,

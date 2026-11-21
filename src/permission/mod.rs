@@ -580,27 +580,20 @@ pub(crate) fn build_interactive_permission_with_cli_at(
     Ok(result)
 }
 
-/// `add_dir_tool_access = true`: every existing `--add-dir` directory becomes an
-/// allowed external directory for the file tools. Off by default; the per-tool
-/// permission rules and explicit denies still decide each access.
+/// `--add-workspace-dir` (and `--add-dir` under `add_dir_tool_access = true`):
+/// every such directory that is still a shell sandbox write root after the
+/// managed clamp becomes an allowed external directory for the file tools, so
+/// one flag means the same to `edit` and to a contained shell command
+/// (mini-agent-nvnkx.71). The per-tool permission rules and explicit denies
+/// still decide each access.
 pub(crate) fn grant_add_dir_access(
     checker: &mut checker::PermissionChecker,
     cli: &crate::cli::Cli,
     cfg: &crate::config::Config,
 ) {
-    if !cfg.add_dir_tool_access.unwrap_or(false) {
-        return;
-    }
-    for dir in &cli.add_dir {
-        let absolute = if dir.is_absolute() {
-            dir.clone()
-        } else if let Ok(cwd) = std::env::current_dir() {
-            cwd.join(dir)
-        } else {
-            continue;
-        };
-        if absolute.is_dir() {
-            checker.allow_external_directory(&absolute);
+    for dir in cli.workspace_dirs(cfg) {
+        if cfg.sandbox_write_roots.contains(&dir) {
+            checker.allow_external_directory(&dir);
         }
     }
 }
@@ -2177,5 +2170,104 @@ mod compiled_policy_reuse_tests {
             ),
             "the other policy's rule is its own"
         );
+    }
+}
+
+#[cfg(test)]
+mod add_workspace_dir_tests {
+    use super::*;
+    use clap::Parser as _;
+
+    // mini-agent-nvnkx.71
+    #[test]
+    fn workspace_dir_grants_file_tools_only_while_it_is_still_a_sandbox_root() {
+        let base = std::env::temp_dir().join(format!("add-ws-{}", std::process::id()));
+        let (workspace, extra) = (base.join("workspace"), base.join("extra"));
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&extra).unwrap();
+        let (workspace, extra) = (
+            workspace.canonicalize().unwrap(),
+            extra.canonicalize().unwrap(),
+        );
+        let target = extra.join("file.txt");
+        std::fs::write(&target, "x").unwrap();
+        let cli = crate::cli::Cli::try_parse_from([
+            "mini-agent",
+            "--add-workspace-dir",
+            extra.to_str().unwrap(),
+            "q",
+        ])
+        .unwrap();
+        let make = || {
+            checker::PermissionChecker::new(
+                &PermissionConfigs::default(),
+                SecurityMode::Standard,
+                Some(workspace.clone()),
+                None,
+            )
+            .unwrap()
+        };
+        let target = target.to_str().unwrap();
+        // Without the grant the outside directory is not allowed.
+        assert_ne!(
+            make().check_path("read", target),
+            checker::CheckResult::Allowed
+        );
+        // With the flag it is an allowed external directory ...
+        let mut cfg = crate::config::Config::default();
+        cli.apply_workspace_dirs(&mut cfg);
+        assert_eq!(cfg.sandbox_write_roots, vec![extra.clone()]);
+        let mut granted = make();
+        grant_add_dir_access(&mut granted, &cli, &cfg);
+        assert_eq!(
+            granted.check_path("read", target),
+            checker::CheckResult::Allowed
+        );
+        // ... and a deny rule still wins over the grant.
+        let deny = PermissionConfigs::from(PermissionConfig {
+            deny_entries: Some(
+                [("read".to_owned(), vec![format!("{}/**", extra.display())])].into(),
+            ),
+            ..PermissionConfig::default()
+        });
+        let mut denied = checker::PermissionChecker::new(
+            &deny,
+            SecurityMode::Standard,
+            Some(workspace.clone()),
+            None,
+        )
+        .unwrap();
+        grant_add_dir_access(&mut denied, &cli, &cfg);
+        assert!(matches!(
+            denied.check_path("read", target),
+            checker::CheckResult::Denied(_)
+        ));
+        // A managed clamp that dropped the root from the sandbox roots also
+        // drops the file-tool grant: one meaning, never half of it.
+        cfg.sandbox_write_roots.clear();
+        let mut clamped = make();
+        grant_add_dir_access(&mut clamped, &cli, &cfg);
+        assert_ne!(
+            clamped.check_path("read", target),
+            checker::CheckResult::Allowed
+        );
+        // --add-dir alone (no opt-in) grants nothing.
+        let plain = crate::cli::Cli::try_parse_from([
+            "mini-agent",
+            "--add-dir",
+            extra.to_str().unwrap(),
+            "q",
+        ])
+        .unwrap();
+        let mut cfg = crate::config::Config::default();
+        plain.apply_workspace_dirs(&mut cfg);
+        assert!(cfg.sandbox_write_roots.is_empty());
+        let mut none = make();
+        grant_add_dir_access(&mut none, &plain, &cfg);
+        assert_ne!(
+            none.check_path("read", target),
+            checker::CheckResult::Allowed
+        );
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }

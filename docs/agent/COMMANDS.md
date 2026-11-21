@@ -965,9 +965,14 @@ literal.
 
 `/resume`, `/status`, `/usage`, `/agents`, `/todos` and `/plan` are accepted as
 aliases of `/sessions`, `/context`, `/cost`, `/agent`, `/toggle todo` and
-`/mode planwrite`, and `/add-dir`, `/statusline`, `/release-notes` and `/bug` print
+`/mode planwrite`, and `/statusline`, `/release-notes` and `/bug` print
 a pointer to the mini-agent equivalent. A custom command with the same name wins.
 An unknown command suggests the closest built-in or custom name.
+
+`/add-dir <dir>` lets the file tools reach one more existing directory for the running
+session (an allowed external directory; `read`/`edit` rules, protected paths and denies still
+apply, and a managed `allowed_roots` pin refuses a directory outside it). The shell sandbox is
+built at startup, so a shell write root needs `--add-workspace-dir <dir>` on the command line.
 
 Project command files are inactive until the existing project configuration is
 trusted for its exact canonical paths and config bytes. This approval covers

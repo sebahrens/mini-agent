@@ -2453,6 +2453,7 @@ const GLOBAL_ONLY_PROJECT_KEYS: &[&str] = &[
     "sandbox_required",
     "permission_checks_required",
     "shell_env_allow_secrets",
+    "shell_auto_allow_sandboxed",
     "web_fetch_local_origins",
     "max_budget_usd",
     "max_session_input_tokens",

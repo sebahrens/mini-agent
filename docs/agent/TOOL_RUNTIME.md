@@ -99,9 +99,17 @@ workspace). It is resolved with symlinks and `..` followed and must be an
 existing directory inside the canonical workspace root; anything else is
 refused, so a link or `..` cannot leave the workspace. It applies to foreground,
 background and pty commands. Every call is still a fresh shell: `cd` does not
-persist between calls. The permission key is the script with the directory
-change (`cd -- '<dir>' || exit 1; <command>`), so allow rules and approvals are
-per directory, while a deny rule on the bare command still applies.
+persist between calls. The permission check sees the plain command with the
+validated directory as a separate field: built-in and configured allows, session
+and configured prefix grants, deny rules and the read-only classifier (whose
+relative paths are confined to that directory, which must itself pass the read
+policy) all evaluate the command, so a `workdir` never makes a rule stop matching or
+match more widely. The prompt shows the directory, and an "always" answer is
+keyed by command plus directory (a prefix grant `(x)` covers the argv prefix in
+any workspace directory). With `shell-auto-allow-sandboxed = true`, an unmatched
+command in `standard` mode runs without a prompt while an enforced `workspace` or
+`host-read` sandbox with network `deny` or `allowlist` contains it; deny and ask
+rules, destructive commands and `escalate=true` still prompt.
 
 `pty = true` and `job_status action=input`/`keys` exist on Unix and, on
 Windows, under the AppContainer sandbox backend. On Windows the AppContainer

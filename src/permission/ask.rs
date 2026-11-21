@@ -270,6 +270,10 @@ pub struct AskRequest {
     pub agent_name: Option<String>,
     pub tool: CompactString,
     pub input: String,
+    /// Shell only: the validated host directory the command runs in (`input`
+    /// is the plain command). Scopes an AllowAlways approval to that
+    /// directory and is shown in the prompt.
+    pub workdir: Option<String>,
     /// Internal call identity emitted to ACP for this exact tool call.
     #[cfg(feature = "acp")]
     pub tool_call_id: Option<String>,

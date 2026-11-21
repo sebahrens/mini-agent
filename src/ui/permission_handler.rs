@@ -450,7 +450,13 @@ impl PermissionState {
         let (header, mut options) = match &self.offer {
             Some(offer) => (prompt_grant_header(offer), PROMPT_GRANT_OPTIONS.to_string()),
             None => (
-                format!("[permission] {}: {}", request.tool, request.input),
+                match &request.workdir {
+                    Some(dir) => format!(
+                        "[permission] {} (in {}): {}",
+                        request.tool, dir, request.input
+                    ),
+                    None => format!("[permission] {}: {}", request.tool, request.input),
+                },
                 permission_options(self.folder.as_deref(), self.grant_scope.as_deref()),
             ),
         };

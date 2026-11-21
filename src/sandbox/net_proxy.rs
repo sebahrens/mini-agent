@@ -993,6 +993,7 @@ impl Shared {
         };
         let (reply, answer) = tokio::sync::oneshot::channel();
         let request = AskRequest {
+            workdir: None,
             diagnostic: None,
             #[cfg(feature = "subagents")]
             background: None,
