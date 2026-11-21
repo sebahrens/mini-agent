@@ -37,6 +37,7 @@ pub(super) fn fixture_app(ui: UiContext<'_>) -> App<'_> {
         ask_rx: None,
         permission_prompt: None,
         question_prompt: None,
+        remote: None,
         #[cfg(feature = "advisor")]
         handoff_rx: None,
         btw_tx,

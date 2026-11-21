@@ -137,6 +137,7 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Added: JS `scratch_delete(key)` and `scratch_keys()`; a full scratch store names the entry or byte limit it hit, and the first `scratch_get` miss on a never-written store appends a note that scratch does not survive resume (mini-agent-nvnkx.120).
 - Added: the `js` tool description names every catalogued pure helper and states the file policy (allowed roots, or the config key that disables reads/writes) instead of advertising globals that can only fail (mini-agent-nvnkx.115, .123).
 - Added: JS effect audit retention checkpoints and prunes old segments (a new epoch every 16 segments) instead of refusing every effect at a cap, a reopen validates only the newest checkpoint window, and a corrupt slot is renamed `*.quarantine-<ms>` so the next free slot is used; spawn audit targets carry a keyed cwd/env digest (mini-agent-nvnkx.118, .328).
+- Added: `/remote on|off|status` (feature `remote`, off by default) starts a loopback-only browser view of the running TUI session: the URL with its one-time token is printed once, session events stream to the page, and browser steer messages, permission answers (allow once or deny; the first answer, terminal or browser, wins) and cancel go through the existing steering queue, permission prompt and interrupt path; a non-loopback bind needs `--host <ip> --allow-non-loopback` and prints a warning (mini-agent-nvnkx.139)
 
 ### Fixed
 

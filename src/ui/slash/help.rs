@@ -415,6 +415,11 @@ pub(crate) fn help_lines(
         false,
         "  /cron resume           re-arm the schedules saved with a resumed session",
     );
+    #[cfg(feature = "remote")]
+    emit(
+        false,
+        "  /remote on|off|status  watch and steer this session from a browser (loopback)",
+    );
     #[cfg(feature = "loop")]
     {
         emit(

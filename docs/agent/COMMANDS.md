@@ -423,6 +423,26 @@ the source branch remains available. Untracked files must be committed or moved
 before cleanup. A dirty main workspace with either kind of extra file also
 requires a manual commit or stash before merging.
 
+## Remote view (feature-gated)
+
+Builds with `--features remote` add `/remote`, a browser view of the running
+session. It is off until you ask for it and works while a turn is running.
+
+| Command | Effect |
+| --- | --- |
+| `/remote on [--port <n>]` | Start a loopback-only server and print a URL carrying a random access token. The URL is shown once; `/remote off` and `on` again issues a new one. |
+| `/remote on --host <ip> --allow-non-loopback` | Listen on a non-loopback address. Both flags are required; a warning is printed because there is no TLS (use an SSH tunnel or TLS proxy). |
+| `/remote off` | Stop the server and drop every browser connection. |
+| `/remote` or `/remote status` | Show whether it is on and the listening address (never the token). |
+
+The page shows the transcript as it streams, lets you send a steering message to
+the running turn (the same queue as `/steer`), answer a permission ask with
+Allow (once) or Deny, and cancel the run (the same path as Ctrl-C). A permission
+prompt stays usable at the terminal; the first answer wins and the browser's ask
+disappears when the terminal answers. Remote answers never create session or
+project grants, and prompts that offer a grant are answered at the terminal only.
+See [remote control](../development/remote-control.md).
+
 ## Loop (feature-gated)
 
 `--loop` is a preset over [goals](GOALS.md): it sets a goal from the loop prompt

@@ -346,6 +346,7 @@ pub(crate) fn argument_picker_spec(
             "/advisor ",
         )),
         "/mcp" => Some((&["login", "logout"], "/mcp ")),
+        "/remote" => Some((&["on", "off", "status"], "/remote ")),
         "/loop" => Some((&["status", "stop"], "/loop ")),
         "/sandbox" => Some((&["workspace", "host-read", "host-full"], "/sandbox ")),
         "/effort" => Some((
@@ -379,6 +380,7 @@ pub(crate) const FINITE_ARGUMENT_COMMANDS: &[&str] = &[
     "/queue",
     "/advisor",
     "/mcp",
+    "/remote",
     "/loop",
     "/goal",
     "/sandbox",

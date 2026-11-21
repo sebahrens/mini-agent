@@ -20,11 +20,12 @@ fetch('/events',{headers:h}).then(async r=>{
     let i;while((i=buf.indexOf('\n\n'))>=0){const m=buf.slice(0,i);buf=buf.slice(i+2);
       const d=m.split('\n').find(l=>l.startsWith('data: '));if(!d)continue;
       const e=JSON.parse(d.slice(6));
-      if(e.type==='permission'){const box=document.createElement('div');box.className='ask';
+      if(e.type==='permission'){const box=document.createElement('div');box.className='ask';box.dataset.id=e.id;
         box.append('Permission needed: '+e.summary+' ');
         for(const [label,allow] of [['Allow',true],['Deny',false]]){const b=document.createElement('button');b.textContent=label;
           b.onclick=()=>{post('/permission',{id:e.id,allow});box.remove()};box.append(b)}
         add(box)}
+      else if(e.type==='permission_closed'){document.querySelectorAll('.ask').forEach(b=>{if(b.dataset.id===e.id)b.remove()})}
       else if(e.type==='text')line(e.text);
       else line('['+e.type+'] '+(e.summary||e.name||''))}}
 });

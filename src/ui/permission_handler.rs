@@ -445,6 +445,52 @@ impl PermissionState {
         }
     }
 
+    /// The prompt as a remote browser may be offered it: an ordinary
+    /// allow-once/deny request still awaiting an answer. Grant-offer prompts
+    /// and the instruction editor are answered at the terminal only.
+    #[cfg(feature = "remote")]
+    pub(crate) fn remote_view(&self) -> Option<crate::extras::remote::bridge::AskView<'_>> {
+        let request = self.request.as_ref()?;
+        (self.offer.is_none() && !request.reply.is_closed()).then(|| {
+            crate::extras::remote::bridge::AskView {
+                key: self.opened,
+                tool: &request.tool,
+                input: &request.input,
+            }
+        })
+    }
+
+    /// Answers the pending request from the remote view, once. Returns false
+    /// when it was already answered (the first answer wins) or its reply is
+    /// gone. Allow is allow-once only; remote answers never create grants.
+    #[cfg(feature = "remote")]
+    pub(crate) fn answer_remote(
+        &mut self,
+        allow: bool,
+        renderer: &mut Renderer,
+    ) -> anyhow::Result<bool> {
+        use crate::permission::ask::UserDecision;
+        if self.offer.is_some() {
+            return Ok(false);
+        }
+        let Some(request) = self.request.take() else {
+            return Ok(false);
+        };
+        let decision = if allow {
+            UserDecision::AllowOnce
+        } else {
+            UserDecision::Deny
+        };
+        let sent = request.reply.send(decision).is_ok();
+        self.note = None;
+        self.finish(renderer)?;
+        if sent {
+            let verb = if allow { "allowed (remote)" } else { "denied" };
+            note_decision(renderer, &request.tool, &request.input, verb)?;
+        }
+        Ok(sent)
+    }
+
     pub(crate) fn finish(&self, renderer: &mut Renderer) -> std::io::Result<()> {
         renderer.permission_prompt = None;
         if self.was_at_bottom {
