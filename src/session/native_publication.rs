@@ -798,6 +798,48 @@ pub(crate) async fn restart_with_ticket(
     progress_owned(session, ticket, scope).await
 }
 
+/// Durably republishes a native-bearing session after an idle control command
+/// changed it without a model turn (`/compact`, `/undo`, `/rename` over ACP).
+/// A chain the new transcript no longer matches is dropped first and replaced
+/// by a new epoch; the old value is denied on disk before the healthy payload
+/// replaces it, exactly as [`NativeSessionEndOwner::restart_chain`] does for an
+/// idle host change, so an interrupted republish never leaves a stale chain
+/// behind. Nothing is published for an unfinished context.
+#[cfg(feature = "acp")]
+pub(crate) async fn republish_idle(session: &mut Session) -> anyhow::Result<()> {
+    let scope = crate::agent::runner::AgentWorkScope::new();
+    let mut cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(scope.clone());
+    if let Some(publication) = &session.native_publication {
+        cleanup.retain_until_settled(publication.owner.lease.begin_write()?);
+    }
+    let mut dropped_chain = false;
+    let result = async {
+        if session.native_restart_cause().is_some() {
+            session.restart_native_chain()?;
+            dropped_chain = true;
+        }
+        // The Session changed since its last digest: this is a new revision
+        // (like a restart), not a continuation of the retired one.
+        let ticket = begin_owned_with(session, &scope, true).await?;
+        retire_owned(session, ticket, RetiredNativeOutcome::Completed, &scope).await
+    }
+    .await;
+    cleanup.settle().await;
+    if let Err(error) = result {
+        if dropped_chain {
+            // The in-memory chain is gone but its replacement was not
+            // acknowledged: stay conservative instead of replaying a stale
+            // chain.
+            let _ = session.native_frontier.refuse_expected(
+                session.native_frontier.current(),
+                RestartReason::IncompleteTurn,
+            );
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// Before the first model, only the retained, unpaired startup ticket may
 /// adopt an explicit control. It stays InFlight; no completed boundary is made.
 pub(crate) async fn startup_update_reasoning(

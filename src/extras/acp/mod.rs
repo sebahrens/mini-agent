@@ -167,7 +167,13 @@ struct AcpHistoryLimits {
     /// Tokens of recent `read` windows a compaction re-attaches, as in the
     /// TUI (`compact_restore_read_tokens`); `0` restores none.
     restore_read_tokens: u64,
+    /// Recent tokens a `/compact` or a relief keeps verbatim, as the TUI's
+    /// `keep_recent_tokens` does (mini-agent-sskdu.230).
+    keep_recent_tokens: u64,
 }
+
+/// The recent tail kept before any configuration has been read.
+const DEFAULT_ACP_KEEP_RECENT_TOKENS: u64 = 20_000;
 
 #[derive(Clone, Copy, Debug)]
 struct AcpTokenPressure {
@@ -186,6 +192,7 @@ impl Default for AcpHistoryLimits {
             max_bytes: MAX_ACP_HISTORY_BYTES,
             token_pressure: None,
             restore_read_tokens: 0,
+            keep_recent_tokens: DEFAULT_ACP_KEEP_RECENT_TOKENS,
         }
     }
 }
@@ -205,6 +212,7 @@ impl AcpHistoryLimits {
             // (`restart_native_after_compaction`). The mid-turn path closes
             // the native epoch at a tool-batch boundary and does the same.
             restore_read_tokens: cfg.resolve_compact_restore_read_tokens(window),
+            keep_recent_tokens: cfg.resolve_keep_recent_tokens(window),
             token_pressure: (cfg.resolve_compact_enabled() && window > 0).then(|| {
                 AcpTokenPressure {
                     window,
@@ -436,28 +444,25 @@ impl SessionHistory {
         .then_some(pressure)
     }
     fn next_cut(&self) -> usize {
-        if self.relief_pending && !self.manual_compact {
+        if self.relief_pending || self.manual_compact {
             // Keep the most recent tokens verbatim, cutting at a legal
-            // boundary (a user or assistant record or a completed tool batch);
-            // when the recent tail alone is the problem, summarize everything
-            // rather than wedge.
+            // boundary (a user or assistant record or a completed tool batch),
+            // as the TUI's `/compress` does (mini-agent-sskdu.230).
             let live = self.live_start();
-            let keep = self
-                .limits
-                .token_pressure
-                .map_or(20_000, |pressure| pressure.keep_recent_tokens);
             let relative = crate::session::Session::select_compaction_cut(
                 &self.session.messages[live..],
-                keep,
+                self.limits.keep_recent_tokens,
             );
-            return if relative == 0 {
+            return if relative > 0 {
+                live + relative
+            } else if self.relief_pending {
+                // Relief whose recent tail alone is the problem summarizes
+                // everything rather than wedge.
                 self.session.messages.len()
             } else {
-                live + relative
+                // `/compact` with nothing older than the recent tail.
+                live
             };
-        }
-        if self.manual_compact {
-            return self.session.messages.len();
         }
         let starts = self.user_starts();
         if starts.is_empty() {
@@ -518,28 +523,14 @@ impl SessionHistory {
         F: FnMut(Vec<crate::session::SessionMessage>, Option<String>) -> Fut,
         Fut: Future<Output = anyhow::Result<crate::provider::CompactionOutput>>,
     {
-        #[cfg(feature = "subagents")]
-        let _background_pause = if needs {
-            match &self.session.background_pool {
-                Some(pool) => Some(pool.pause_for_history().await.ok()?),
-                None => None,
-            }
-        } else {
-            None
-        };
-        // Compaction cancels running background tasks; tell the client, since
-        // nothing else reports it.
-        #[cfg(feature = "subagents")]
-        if let Some(pause) = &_background_pause
-            && let Some(notice) = pause.notice()
-        {
-            self.compaction_events.push(notice);
-        }
+        use crate::session::compaction_run::{Plan, RunError};
         let mut usage = crate::event::UsageDelta::default();
         #[cfg(feature = "goal")]
         if let Some(goal) = goal_store {
             self.session.goal_store = goal.clone();
         }
+        // One `PreCompact` per compaction, however many rounds it takes.
+        let pre_compact_sent = std::sync::atomic::AtomicBool::new(false);
         while needs {
             if control.is_cancelled() {
                 return None;
@@ -548,6 +539,7 @@ impl SessionHistory {
             // Retained pixels cannot be shrunk by repeatedly summarizing a recap.
             // Let the caller report the remaining fixed evidence pressure.
             if cut <= self.live_start() {
+                self.manual_compact = false;
                 self.relief_pending = false;
                 // Nothing left to summarize: later byte-pressure checks must
                 // know a further relief cannot shrink what remains
@@ -556,93 +548,70 @@ impl SessionHistory {
                     Some(self.session.approx_persisted_bytes());
                 return Some(usage);
             }
-            let previous = self
-                .session
-                .compacted_context()
-                .0
-                .and_then(|_| self.session.previous_summary_prose());
-            // Shared provider serialization describes attachments without putting
-            // base64 into text; apply_compaction retains the original pixels.
-            let messages = self.session.messages[self.live_start()..cut].to_vec();
+            // A partial summarizer prefix must finish a complete User-started
+            // interval (or, for a relief or `/compact`, any legal boundary);
+            // otherwise take the explicit bounded emergency recap.
+            let live = self.live_start();
+            let mid_turn = self.relief_pending || self.manual_compact;
+            let snap = move |session: &crate::session::Session, consumed: usize| {
+                if mid_turn {
+                    (live + 1..=consumed)
+                        .rev()
+                        .find(|idx| crate::session::Session::is_legal_cut(&session.messages, *idx))
+                } else {
+                    session
+                        .messages
+                        .iter()
+                        .enumerate()
+                        .skip(live + 1)
+                        .take(consumed.saturating_sub(live))
+                        .filter(|(_, message)| message.role == crate::session::MessageRole::User)
+                        .map(|(index, _)| index)
+                        .max()
+                        .or_else(|| (consumed == session.messages.len()).then_some(consumed))
+                }
+            };
+            let plan = Plan {
+                cut_idx: cut,
+                // The summarizer closure applies its own capped budgets.
+                input_token_budget: 0,
+                response_token_budget: 0,
+                restore_read_tokens: self.limits.restore_read_tokens,
+                auto: !self.manual_compact,
+                instructions: None,
+                fork_keep_recent_tool_results: None,
+                pre_compact_sent: &pre_compact_sent,
+                snap: Some(&snap),
+            };
+            let mut observer = AcpCompactionObserver {
+                events: &mut self.compaction_events,
+            };
             let result = tokio::select! {
                 biased;
                 _ = control.cancelled() => return None,
-                result = summarize(messages, previous) => result,
+                result = crate::session::compaction_run::run(
+                    &mut self.session,
+                    plan,
+                    &mut observer,
+                    |request| summarize(request.messages, request.previous_summary),
+                ) => result,
             };
-            let output = match result {
-                Ok(output) if output.messages_included > 0 => output,
-                failed => {
-                    let reason = match &failed {
-                        Err(error) => {
-                            tracing::warn!(
-                                %error,
-                                "ACP summarizer failed; history compaction skipped"
-                            );
-                            format!("{error:#}")
-                        }
-                        Ok(_) => {
-                            tracing::warn!(
-                                "ACP summarizer included no messages; history compaction skipped"
-                            );
-                            "the summarizer covered no messages".to_owned()
-                        }
-                    };
+            let compacted = match result {
+                Ok(compacted) => compacted,
+                Err(RunError::Pause(_)) => return None,
+                Err(error) => {
+                    let reason = error.reason();
+                    tracing::warn!(%reason, "ACP summarizer failed; history compaction skipped");
                     self.fall_back_after_summary_failure(&reason);
                     return Some(usage);
                 }
             };
-            if let Some(run) = crate::spend::run::Run::current() {
-                self.session.charge_usage_delta_at(
-                    output.usage,
-                    run.prices.anthropic_native,
-                    run.prices.input.unwrap_or(0.0),
-                    run.prices.output.unwrap_or(0.0),
-                    crate::pricing::CachePrices {
-                        read: run.prices.cache_read,
-                        write: run.prices.cache_write,
-                        write_1h: run.prices.cache_write_1h,
-                        split_required: run.prices.cache_split_required,
-                    },
-                );
-            }
-            usage = usage.saturating_add(output.usage);
-            let consumed = self
-                .live_start()
-                .saturating_add(output.messages_included)
-                .min(cut);
-            // A partial summarizer prefix must finish a complete User-started
-            // interval; otherwise take the explicit bounded emergency recap.
-            let completed_cut = if self.relief_pending && !self.manual_compact {
-                // Relief cuts mid-turn: any legal boundary at or before what
-                // the summarizer covered completes the compaction.
-                (self.live_start() + 1..=consumed)
-                    .rev()
-                    .find(|idx| crate::session::Session::is_legal_cut(&self.session.messages, *idx))
-            } else {
-                self.user_starts()
-                    .into_iter()
-                    .filter(|start| *start > self.live_start() && *start <= consumed)
-                    .max()
-                    .or_else(|| (consumed == self.session.messages.len()).then_some(consumed))
-            };
-            let Some(completed_cut) = completed_cut else {
-                self.fall_back_after_summary_failure("the summary did not cover a whole turn");
-                return Some(usage);
-            };
-            // Honour the summarizer's window-scaled byte budget instead of the
-            // fixed 16 KiB clamp, and record the tokens removed
-            // (mini-agent-sskdu.230, partial).
-            self.session.commit_compaction_prefix(
-                output.summary,
-                completed_cut,
-                output.summary_byte_budget,
-                self.limits.restore_read_tokens,
-            );
+            usage = usage.saturating_add(compacted.usage);
             self.manual_compact = false;
             self.relief_pending = false;
             self.compaction_events.push(format!(
                 "compacted {} records into a summary (~{} tokens freed)",
-                completed_cut,
+                compacted.first_kept_index,
                 self.session
                     .compactions
                     .last()
@@ -685,6 +654,55 @@ impl SessionHistory {
             self.session
                 .compress(Self::EMERGENCY_RECAP.to_owned(), cut, 0);
         }
+    }
+}
+
+/// ACP's part of the shared compaction driver: cancelled background work is
+/// reported to the client, and the summarizer is charged at the turn's captured
+/// prices.
+struct AcpCompactionObserver<'a> {
+    events: &'a mut Vec<String>,
+}
+
+impl crate::session::compaction_run::Observer for AcpCompactionObserver<'_> {
+    fn paused(&mut self, notice: &str) {
+        // Compaction cancels running background tasks; tell the client, since
+        // nothing else reports it.
+        self.events.push(notice.to_owned());
+    }
+
+    fn charge(
+        &mut self,
+        session: &mut crate::session::Session,
+        usage: crate::event::UsageDelta,
+    ) -> crate::event::UsageDelta {
+        if let Some(run) = crate::spend::run::Run::current() {
+            session.charge_usage_delta_at(
+                usage,
+                run.prices.anthropic_native,
+                run.prices.input.unwrap_or(0.0),
+                run.prices.output.unwrap_or(0.0),
+                crate::pricing::CachePrices {
+                    read: run.prices.cache_read,
+                    write: run.prices.cache_write,
+                    write_1h: run.prices.cache_write_1h,
+                    split_required: run.prices.cache_split_required,
+                },
+            );
+        }
+        usage
+    }
+
+    fn memory_summary(&mut self, summary: &str, first_kept_index: usize) {
+        // Tests never write to the operator's real daily log.
+        #[cfg(all(feature = "memory", not(test)))]
+        crate::extras::memory::flush_compaction_summary(
+            &crate::extras::memory::Mem::open(),
+            summary,
+            Some(first_kept_index),
+        );
+        #[cfg(not(all(feature = "memory", not(test))))]
+        let _ = (summary, first_kept_index);
     }
 }
 
@@ -4168,15 +4186,6 @@ mod tool_presentation_tests {
     use serde_json::json;
 
     #[test]
-    fn native_refusal_names_the_command_and_the_next_step() {
-        let undo = native_command_refusal(&commands::Command::Undo);
-        assert!(undo.starts_with("/undo is not available"));
-        assert!(undo.contains("Start a new session"));
-        assert!(native_command_refusal(&commands::Command::Compact).starts_with("/compact"));
-        assert!(!undo.contains("native session changes require"));
-    }
-
-    #[test]
     fn announce_tool_call_titles_kinds_and_absolute_locations() {
         let root = std::env::temp_dir().join("acp-announce");
         let call = announce_tool_call("c1", "edit", &json!({"path": "src/main.rs"}), &root);
@@ -4799,22 +4808,6 @@ fn native_model_refusal() -> String {
     "The model cannot be switched in this session: it holds provider-managed (native) conversation state tied to its model. Reset the model to default, or start a new session to use another model.".to_owned()
 }
 
-/// Refusal for a context-changing command on a session that carries
-/// provider-native state: say which command and what to do instead.
-fn native_command_refusal(command: &commands::Command) -> String {
-    let name = match command {
-        commands::Command::Undo => "/undo",
-        commands::Command::Compact => "/compact",
-        commands::Command::Rename(_) => "/rename",
-        #[cfg(feature = "goal")]
-        commands::Command::Goal(_) => "/goal",
-        _ => "this command",
-    };
-    format!(
-        "{name} is not available in this session: it holds provider-managed (native) conversation state that cannot be rewritten or re-saved in place. Start a new session to use {name}; automatic compaction still runs."
-    )
-}
-
 /// The reply to `/goal ...` over ACP and the goal it changed; `Err` is a
 /// terminal error text (the turn is refused, nothing is sent as a message).
 #[cfg(feature = "goal")]
@@ -4934,6 +4927,135 @@ fn goal_command_line(
     })
 }
 
+/// How a relief segment's transcript was committed.
+enum ReliefCommit {
+    /// The native epoch was closed; the next segment starts a new one.
+    Native,
+    /// The segment was appended to the canonical transcript.
+    Persisted,
+}
+
+/// A relief segment that could not be committed: the prompt ends with `error`.
+struct ReliefStop {
+    error: String,
+    /// The segment's progress is still reported to the client.
+    keep_progress: bool,
+}
+
+/// Commits one finished relief segment before the next one compacts the
+/// persisted history. Provider-native replay history cannot be summarized in
+/// place: the epoch is closed at the tool-batch boundary (every result is
+/// saved), then the next segment compacts the saved transcript and restarts the
+/// thinking chain from it as a new epoch (mini-agent-wkzav).
+#[allow(clippy::too_many_arguments)]
+async fn commit_relief_segment(
+    history: &mut SessionHistory,
+    native_owner: &mut Option<crate::provider::NativeRunOwner>,
+    run: Option<&crate::spend::run::Run>,
+    usage_committed: &mut crate::event::UsageDelta,
+    current_input: &crate::agent::input::PromptInput,
+    response: &str,
+    progress: &[Message],
+    pricing: crate::print::HeadlessPricing,
+    reliefs: usize,
+    compactions_at_segment_start: usize,
+    compaction_boundary: bool,
+) -> Result<ReliefCommit, ReliefStop> {
+    let Some(owner) = native_owner.as_mut().filter(|_| compaction_boundary) else {
+        return crate::print::persist_headless_turn_input(
+            &mut history.session,
+            current_input,
+            response,
+            progress,
+        )
+        .map(|_| ReliefCommit::Persisted)
+        .map_err(|_| ReliefStop {
+            error: "canonical ACP user content could not be retained".into(),
+            keep_progress: false,
+        });
+    };
+    let compacted = history.session.compaction_count() > compactions_at_segment_start;
+    if let Some(why) = native_relief_stop(reliefs, progress, compacted) {
+        return Err(ReliefStop {
+            error: why,
+            keep_progress: true,
+        });
+    }
+    let accepted = run.map_or_else(Default::default, |run| run.accepted_usage());
+    let segment_usage = accepted.nonnegative_difference(*usage_committed);
+    *usage_committed = accepted;
+    close_native_epoch_for_relief(
+        &mut history.session,
+        owner,
+        current_input,
+        response,
+        progress,
+        segment_usage,
+        pricing,
+    )
+    .await
+    .map_err(|reason| ReliefStop {
+        error: persona::bounded_message(&format!(
+            "native context relief could not close the epoch: {reason}"
+        )),
+        keep_progress: false,
+    })?;
+    *native_owner = None;
+    Ok(ReliefCommit::Native)
+}
+
+/// Closes the native epoch at a mid-turn relief boundary: commits the segment's
+/// canonical input, reply and usage, then retires the owner so the next segment
+/// can compact the saved transcript (mini-agent-wkzav).
+async fn close_native_epoch_for_relief(
+    session: &mut crate::session::Session,
+    owner: &mut crate::provider::NativeRunOwner,
+    input: &crate::agent::input::PromptInput,
+    response: &str,
+    progress: &[Message],
+    segment_usage: crate::event::UsageDelta,
+    pricing: crate::print::HeadlessPricing,
+) -> Result<(), String> {
+    owner.outcome = crate::session::native_replay::RetiredNativeOutcome::LiveToolReply;
+    match &owner.binding {
+        Some(binding) => binding
+            .commit_canonical_input_into_with_outcome(
+                session,
+                input,
+                response,
+                progress,
+                segment_usage,
+                pricing,
+                owner.outcome,
+            )
+            .map(drop)
+            .map_err(|reason| reason.to_string()),
+        None => Err("native context owner lost its binding".to_owned()),
+    }?;
+    owner.finish(session).await.map_err(|e| e.to_string())
+}
+
+/// Saves the session after an ACP command changed it. A native-bearing
+/// session cannot be re-saved in place after `/undo` or `/rename` (its
+/// published digest no longer matches), so those republish it as a new epoch
+/// under a fresh owner (`/compact` does the same from its prompt path).
+async fn command_checkpoint(
+    command: &commands::Command,
+    history: &mut SessionHistory,
+    notice: impl FnMut(&str),
+) -> anyhow::Result<()> {
+    let changes_transcript_or_name = matches!(
+        command,
+        commands::Command::Undo | commands::Command::Rename(_)
+    );
+    if changes_transcript_or_name
+        && crate::session::native_publication::is_native_bearing(&history.session)
+    {
+        return crate::session::native_publication::republish_idle(&mut history.session).await;
+    }
+    sessions::checkpoint(history, notice).await
+}
+
 /// What a slash command did to the prompt.
 enum CommandFlow {
     /// The command answered the prompt; return this result.
@@ -4956,22 +5078,19 @@ async fn run_command(
     cx: &ConnectionTo<Client>,
     registration: &TurnRegistration,
 ) -> CommandFlow {
-    let mutates_native_context = match command {
-        commands::Command::Undo | commands::Command::Compact | commands::Command::Rename(_) => true,
-        commands::Command::CompactShow
-        | commands::Command::Model(_)
-        | commands::Command::Effort(_)
-        | commands::Command::Cost => false,
-        #[cfg(feature = "goal")]
-        commands::Command::Goal(arguments) => !arguments.is_empty() && arguments != "status",
-    };
-    if crate::session::native_publication::is_native_bearing(&history.session)
-        && mutates_native_context
+    // The objective of a goal is not part of the saved native context, but its
+    // rounds are judged against model turns this session cannot rewrite; creating
+    // or clearing one stays refused here, reading it does not.
+    #[cfg(feature = "goal")]
+    if let commands::Command::Goal(arguments) = command
+        && !arguments.is_empty()
+        && arguments != "status"
+        && crate::session::native_publication::is_native_bearing(&history.session)
     {
         return CommandFlow::Respond(respond_terminal_error(
             registration,
             responder,
-            native_command_refusal(command),
+            "/goal cannot create or clear a goal in this session because it holds provider-managed (native) conversation state. Start a new session to set a goal; /goal status still works.".into(),
         ));
     }
     let line = match command {
@@ -5044,7 +5163,7 @@ async fn run_command(
             ));
         }
         if !state.cli.no_session
-            && sessions::checkpoint(history, |notice| {
+            && command_checkpoint(command, history, |notice| {
                 let _ = cx.send_notification(SessionNotification::new(
                     session_id.clone(),
                     SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
@@ -5110,7 +5229,6 @@ async fn run_prompt(
     control: Arc<TurnControl>,
     registration: &TurnRegistration,
 ) -> Result<(), agent_client_protocol::Error> {
-    let native_at_start = crate::session::native_publication::is_native_bearing(&history.session);
     let responder = if let Some(command) = command.as_ref() {
         match run_command(
             state,
@@ -5269,70 +5387,29 @@ async fn run_prompt(
             break Ok(outcome);
         }
         let response = last_assistant_text(&progress);
-        if outcome.compaction_boundary && native_owner.is_some() {
-            // Provider-native replay history cannot be summarized in place:
-            // close the epoch at this tool-batch boundary (every result is
-            // saved), then let the next segment compact the saved transcript
-            // and restart the thinking chain from it as a new epoch
-            // (mini-agent-wkzav).
-            let compacted = history.session.compaction_count() > compactions_at_segment_start;
-            if let Some(why) = native_relief_stop(reliefs, &progress, compacted) {
-                outcome.compaction_boundary = false;
-                outcome.error = Some(why);
-                outcome.progress = Some(progress);
-                break Ok(outcome);
-            }
-            let accepted = run
-                .as_ref()
-                .map_or_else(Default::default, |run| run.accepted_usage());
-            let segment_usage = accepted.nonnegative_difference(usage_committed);
-            usage_committed = accepted;
-            let owner = native_owner.as_mut().expect("checked above");
-            owner.outcome = crate::session::native_replay::RetiredNativeOutcome::LiveToolReply;
-            let committed = match &owner.binding {
-                Some(binding) => binding
-                    .commit_canonical_input_into_with_outcome(
-                        &mut history.session,
-                        &current_input,
-                        &response,
-                        &progress,
-                        segment_usage,
-                        pricing,
-                        owner.outcome,
-                    )
-                    .map(drop)
-                    .map_err(|reason| reason.to_string()),
-                None => Err("native context owner lost its binding".to_owned()),
-            };
-            let committed = match committed {
-                Ok(()) => owner
-                    .finish(&mut history.session)
-                    .await
-                    .map_err(|e| e.to_string()),
-                Err(reason) => Err(reason),
-            };
-            if let Err(reason) = committed {
-                outcome.compaction_boundary = false;
-                outcome.error = Some(persona::bounded_message(&format!(
-                    "native context relief could not close the epoch: {reason}"
-                )));
-                outcome.progress = None;
-                break Ok(outcome);
-            }
-            native_owner = None;
-            native_relieving = true;
-        } else if crate::print::persist_headless_turn_input(
-            &mut history.session,
+        match commit_relief_segment(
+            &mut history,
+            &mut native_owner,
+            run.as_ref(),
+            &mut usage_committed,
             &current_input,
             &response,
             &progress,
+            pricing,
+            reliefs,
+            compactions_at_segment_start,
+            outcome.compaction_boundary,
         )
-        .is_err()
+        .await
         {
-            outcome.compaction_boundary = false;
-            outcome.error = Some("canonical ACP user content could not be retained".into());
-            outcome.progress = None;
-            break Ok(outcome);
+            Ok(ReliefCommit::Native) => native_relieving = true,
+            Ok(ReliefCommit::Persisted) => {}
+            Err(stop) => {
+                outcome.compaction_boundary = false;
+                outcome.error = Some(stop.error);
+                outcome.progress = stop.keep_progress.then_some(progress);
+                break Ok(outcome);
+            }
         }
         #[cfg(feature = "goal")]
         {
@@ -5568,18 +5645,27 @@ async fn run_prompt(
         if let Err(error) = owner.finish(&mut history.session).await {
             outcome.error = Some(error.to_string());
         }
-    } else if !state.cli.no_session
-        && let Err(error) = sessions::checkpoint(&mut history, |notice| {
-            let _ = cx.send_notification(SessionNotification::new(
-                session_id.clone(),
-                SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
-                    TextContent::new(format!("warning: {notice}")),
-                ))),
-            ));
-        })
-        .await
-    {
-        outcome.error = Some(error.to_string());
+    } else if !state.cli.no_session {
+        let saved = if matches!(command, Some(commands::Command::Compact))
+            && crate::session::native_publication::is_native_bearing(&history.session)
+        {
+            // No model turn ran, so there is no ticket to retire: republish the
+            // compacted transcript as a new native epoch.
+            crate::session::native_publication::republish_idle(&mut history.session).await
+        } else {
+            sessions::checkpoint(&mut history, |notice| {
+                let _ = cx.send_notification(SessionNotification::new(
+                    session_id.clone(),
+                    SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
+                        TextContent::new(format!("warning: {notice}")),
+                    ))),
+                ));
+            })
+            .await
+        };
+        if let Err(error) = saved {
+            outcome.error = Some(error.to_string());
+        }
     }
 
     crate::session::storage::report_pending_save_notices(&mut history.session, |notice| {
@@ -5657,11 +5743,6 @@ async fn run_prompt(
         let _ = responder.respond(response);
     } else {
         let _ = respond_terminal(registration, responder, outcome.reason);
-    }
-    // The first native publication makes /compact, /undo and /rename refusals;
-    // stop advertising them (a busy history cannot be inspected by `announce`).
-    if !native_at_start && crate::session::native_publication::is_native_bearing(&history.session) {
-        let _ = commands::announce_for(state, &session_id, &cx, true).await;
     }
     if title_eligible {
         crate::startup::heap_future(|| generate_session_title(state, history, &session_id, &cx))
@@ -6152,6 +6233,155 @@ async fn select_turn_route(
     })
 }
 
+/// Tell the client what the compaction did, or why it did nothing; a
+/// `/compact` otherwise ends as an empty reply (mini-agent-sskdu.229, .243).
+fn report_compaction_events(
+    history: &mut SessionHistory,
+    compact_only: bool,
+    session_id: &SessionId,
+    cx: &ConnectionTo<Client>,
+) {
+    let events = std::mem::take(&mut history.compaction_events);
+    if compact_only {
+        let line = if events.is_empty() {
+            "Nothing to compact yet: the session has no history older than its recent context, which is kept verbatim."
+                .to_owned()
+        } else {
+            events.join("\n")
+        };
+        let _ = cx.send_notification(SessionNotification::new(
+            session_id.clone(),
+            SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                TextContent::new(line),
+            ))),
+        ));
+    } else {
+        for event in events {
+            let _ = cx.send_notification(SessionNotification::new(
+                session_id.clone(),
+                SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
+                    TextContent::new(event),
+                ))),
+            ));
+        }
+    }
+}
+
+/// The between-turn (or `/compact`) compaction of one prompt: summarizes
+/// through the shared driver, restarts a native thinking chain over the
+/// compacted transcript, and enforces the live-history bound. `Err` is the
+/// outcome that ends the prompt (cancelled or failed).
+#[allow(clippy::too_many_arguments)]
+async fn compact_history_for_prompt(
+    state: &AcpState,
+    history: &mut SessionHistory,
+    control: &TurnControl,
+    client: &crate::provider::AnyClient,
+    provider_str: &str,
+    model_str: &str,
+    run: Option<crate::spend::run::Run>,
+    native: bool,
+    native_owner: &mut Option<crate::provider::NativeRunOwner>,
+    #[cfg(feature = "goal")] goal_store: &crate::extras::goal::GoalStore,
+) -> Result<crate::event::UsageDelta, PromptOutcome> {
+    let quick_models = crate::config::quick_models_map(&state.cfg);
+    let context_window = state
+        .cfg
+        .resolve_context_window(provider_str, model_str, quick_models);
+    let reserve = state
+        .cfg
+        .resolve_reserve_tokens(model_str, quick_models, context_window);
+    let compaction_client = client;
+    #[cfg(feature = "goal")]
+    let goal_store_for_compaction = goal_store.clone();
+    let configured_compaction = state.cfg.resolve_compaction_model(provider_str);
+    let compaction_model_name = configured_compaction
+        .as_ref()
+        .map_or(model_str, |(_, model)| model.as_str());
+    let compaction_model = &compaction_model_name;
+    let (compaction_input_budget, compaction_response_budget) =
+        crate::config::CompactionBudgetCap::apply(
+            state.cfg.compaction_budget_cap(
+                provider_str,
+                configured_compaction
+                    .as_ref()
+                    .map(|(_, model)| model.as_str()),
+                context_window,
+            ),
+            context_window.saturating_sub(reserve),
+            reserve,
+        );
+    let compaction_timeout = state.cfg.resolve_compaction_timeout();
+    let compaction_retry = &state.cfg.retry;
+    let observed = run.clone().map_or_else(Default::default, |run| {
+        let compaction_run = match &configured_compaction {
+            Some((alias, model)) => run.for_model(
+                provider_str,
+                model,
+                &state.cfg,
+                Some(alias),
+                None,
+                crate::spend::RequestKind::Compaction,
+            ),
+            None => run.with_captured_profile(
+                provider_str,
+                model_str,
+                run.prices,
+                &state.cfg,
+                crate::spend::RequestKind::Compaction,
+            ),
+        };
+        crate::spend::run::UsageObserver::with_run(compaction_run)
+    });
+    let compacted = crate::spend::run::scope(
+        run.clone(),
+        history.compact_with_known(
+            true,
+            control,
+            #[cfg(feature = "goal")]
+            Some(&goal_store_for_compaction),
+            move |messages, previous_summary| {
+                let observed = observed.clone();
+                async move {
+                    let mut output = compaction_client
+                        .compress_messages_observed_with_timeout(
+                            compaction_model,
+                            &messages,
+                            previous_summary.as_deref(),
+                            None,
+                            compaction_input_budget,
+                            compaction_response_budget,
+                            compaction_retry,
+                            observed,
+                            compaction_timeout,
+                        )
+                        .await?;
+                    output.usage = state.cfg.normalize_usage(provider_str, output.usage);
+                    Ok(output)
+                }
+            },
+        ),
+    )
+    .await;
+    let Some(usage) = compacted else {
+        return Err(PromptOutcome::cancelled(None));
+    };
+    if native
+        && let Err(error) =
+            restart_native_after_compaction(&mut history.session, native_owner.as_mut()).await
+    {
+        return Err(PromptOutcome::failed(persona::bounded_message(&format!(
+            "could not restart the native thinking context after compaction: {error:#}"
+        ))));
+    }
+    if history.exceeds_hard_bound() || history.over_turn_cap() {
+        return Err(PromptOutcome::failed(
+            "retained historical image evidence exceeds the ACP history limit; start a fresh session or provide fewer/smaller images".into(),
+        ));
+    }
+    Ok(usage)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_prompt(
     state: &AcpState,
@@ -6388,7 +6618,9 @@ async fn execute_prompt(
         work_scope.set_hook_session_context(ctx.clone());
         ctx
     };
-    if native {
+    // `/compact` runs no model: it republishes the compacted transcript itself
+    // instead of opening a model turn's ticket (see the prompt's save step).
+    if native && !compact_only {
         let ticket = if crate::session::native_publication::startup_requires_publication(
             &history.session,
             matches!(&client, crate::provider::AnyClient::Anthropic(_)),
@@ -6419,168 +6651,33 @@ async fn execute_prompt(
     #[cfg(feature = "goal")]
     let mut compaction_usage = crate::event::UsageDelta::default();
     if needs_compaction {
-        #[cfg(feature = "hooks")]
-        let compactions_before = history.session.compaction_count();
-        // `PreCompact` fires from the first summarizer request, so a relief
-        // that finds nothing to cut does not announce a compaction that never
-        // ran (mini-agent-sskdu.239).
-        #[cfg(feature = "hooks")]
-        let pre_compact_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let quick_models = crate::config::quick_models_map(&state.cfg);
-        let context_window =
-            state
-                .cfg
-                .resolve_context_window(&provider_str, &model_str, quick_models);
-        let reserve = state
-            .cfg
-            .resolve_reserve_tokens(&model_str, quick_models, context_window);
-        let compaction_client = &client;
-        #[cfg(feature = "goal")]
-        let goal_store_for_compaction = goal_store.clone();
-        let configured_compaction = state.cfg.resolve_compaction_model(&provider_str);
-        let compaction_model_name = configured_compaction
-            .as_ref()
-            .map_or(model_str.as_str(), |(_, model)| model.as_str());
-        let compaction_model = &compaction_model_name;
-        let (compaction_input_budget, compaction_response_budget) =
-            crate::config::CompactionBudgetCap::apply(
-                state.cfg.compaction_budget_cap(
-                    &provider_str,
-                    configured_compaction
-                        .as_ref()
-                        .map(|(_, model)| model.as_str()),
-                    context_window,
-                ),
-                context_window.saturating_sub(reserve),
-                reserve,
-            );
-        let compaction_timeout = state.cfg.resolve_compaction_timeout();
-        let compaction_retry = &state.cfg.retry;
-        let observed = run.clone().map_or_else(Default::default, |run| {
-            let compaction_run = match &configured_compaction {
-                Some((alias, model)) => run.for_model(
-                    &provider_str,
-                    model,
-                    &state.cfg,
-                    Some(alias),
-                    None,
-                    crate::spend::RequestKind::Compaction,
-                ),
-                None => run.with_captured_profile(
-                    &provider_str,
-                    &model_str,
-                    run.prices,
-                    &state.cfg,
-                    crate::spend::RequestKind::Compaction,
-                ),
-            };
-            crate::spend::run::UsageObserver::with_run(compaction_run)
-        });
-        let compacted = crate::spend::run::scope(
+        match compact_history_for_prompt(
+            state,
+            history,
+            &control,
+            &client,
+            &provider_str,
+            &model_str,
             run.clone(),
-            history.compact_with_known(
-                needs_compaction,
-                &control,
-                #[cfg(feature = "goal")]
-                Some(&goal_store_for_compaction),
-                move |messages, previous_summary| {
-                    let observed = observed.clone();
-                    let provider_str = provider_str.clone();
-                    #[cfg(feature = "hooks")]
-                    let pre_compact_sent = pre_compact_sent.clone();
-                    async move {
-                        #[cfg(feature = "hooks")]
-                        if !pre_compact_sent.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                            crate::startup::heap_future(|| {
-                                crate::extras::hooks::dispatch_pre_compact(true, None)
-                            })
-                            .await;
-                        }
-                        let mut output = compaction_client
-                            .compress_messages_observed_with_timeout(
-                                compaction_model,
-                                &messages,
-                                previous_summary.as_deref(),
-                                None,
-                                compaction_input_budget,
-                                compaction_response_budget,
-                                compaction_retry,
-                                observed,
-                                compaction_timeout,
-                            )
-                            .await?;
-                        output.usage = state.cfg.normalize_usage(&provider_str, output.usage);
-                        Ok(output)
-                    }
-                },
-            ),
+            native,
+            native_owner,
+            #[cfg(feature = "goal")]
+            &goal_store,
         )
-        .await;
-        let Some(usage) = compacted else {
-            return Ok(PromptOutcome::cancelled(None));
-        };
-        if native
-            && let Err(error) =
-                restart_native_after_compaction(&mut history.session, native_owner.as_mut()).await
+        .await
         {
-            return Ok(PromptOutcome::failed(persona::bounded_message(&format!(
-                "could not restart the native thinking context after compaction: {error:#}"
-            ))));
-        }
-        if history.exceeds_hard_bound() || history.over_turn_cap() {
-            return Ok(PromptOutcome::failed(
-                "retained historical image evidence exceeds the ACP history limit; start a fresh session or provide fewer/smaller images".into(),
-            ));
-        }
-        // `PostCompact` and `SessionStart(compact)` fire only when a
-        // `Compaction` record was committed, not when nothing was cut or the
-        // summarizer failed (mini-agent-sskdu.239).
-        #[cfg(feature = "hooks")]
-        if history.session.compaction_count() > compactions_before {
-            let summary = history.session.compacted_context().0.map(str::to_owned);
-            crate::startup::heap_future(|| {
-                crate::extras::hooks::dispatch_post_compact(true, summary.as_deref())
-            })
-            .await;
-            let notices = crate::startup::heap_future(|| {
-                crate::extras::hooks::dispatch_session_start("compact")
-            })
-            .await;
-            history.record_hook_context(notices.into_notices());
-        }
-        #[cfg(feature = "goal")]
-        {
-            compaction_usage = usage;
-        }
-        #[cfg(not(feature = "goal"))]
-        let _ = usage;
-    }
-    // Tell the client what the compaction did, or why it did nothing; a
-    // `/compact` otherwise ends as an empty reply (mini-agent-sskdu.229, .243).
-    let events = std::mem::take(&mut history.compaction_events);
-    if compact_only {
-        let line = if events.is_empty() {
-            "Nothing to compact: the session has no history older than its current summary."
-                .to_owned()
-        } else {
-            events.join("\n")
-        };
-        let _ = cx.send_notification(SessionNotification::new(
-            session_id.clone(),
-            SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
-                TextContent::new(line),
-            ))),
-        ));
-    } else {
-        for event in events {
-            let _ = cx.send_notification(SessionNotification::new(
-                session_id.clone(),
-                SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
-                    TextContent::new(event),
-                ))),
-            ));
+            Ok(usage) => {
+                #[cfg(feature = "goal")]
+                {
+                    compaction_usage = usage;
+                }
+                #[cfg(not(feature = "goal"))]
+                let _ = usage;
+            }
+            Err(outcome) => return Ok(outcome),
         }
     }
+    report_compaction_events(history, compact_only, &session_id, &cx);
     if compact_only {
         return Ok(PromptOutcome {
             reason: StopReason::EndTurn,
@@ -8371,6 +8468,80 @@ mod history_tests {
         );
     }
 
+    /// mini-agent-sskdu.230: `/compact` keeps the recent tail like the TUI's
+    /// `/compress` and re-attaches the file windows read in the summarized prefix.
+    #[tokio::test]
+    async fn manual_compact_keeps_the_recent_tail_and_restores_read_windows() {
+        let mut history = SessionHistory::default();
+        history.limits.keep_recent_tokens = 400;
+        history.limits.restore_read_tokens = 4_000;
+        history
+            .session
+            .add_message(crate::session::MessageRole::User, "do the work");
+        for i in 0..6 {
+            let id = format!("c{i}");
+            history.session.add_tool_call_with_id(
+                &id,
+                "read",
+                &serde_json::json!({"path": format!("f{i}.rs")}),
+            );
+            history
+                .session
+                .add_tool_result_with_id(&id, "read", &"x".repeat(800));
+        }
+        history.manual_compact = true;
+        let usage = history
+            .compact_with(
+                &TurnControl::new(),
+                #[cfg(feature = "goal")]
+                None,
+                |messages, _| async move { Ok(compaction_output("MANUAL SUMMARY", messages.len())) },
+            )
+            .await;
+        assert!(usage.is_some());
+        assert!(!history.manual_compact);
+        assert_eq!(history.session.compaction_count(), 1);
+        let last = history.session.messages.last().unwrap();
+        assert_eq!(
+            last.role,
+            crate::session::MessageRole::ToolResult,
+            "the recent tool pair stays verbatim"
+        );
+        assert!(history.session.messages.len() > 2, "a recent tail is kept");
+        let (summary, _) = history.session.compacted_context();
+        let summary = summary.unwrap();
+        assert!(summary.starts_with("MANUAL SUMMARY"));
+        assert!(
+            summary.contains("Restored file windows"),
+            "read windows are re-attached: {summary}"
+        );
+    }
+
+    /// `/compact` with nothing older than the recent tail summarizes nothing.
+    #[tokio::test]
+    async fn manual_compact_with_only_a_recent_tail_is_a_no_op() {
+        let mut history = SessionHistory::default();
+        history.limits.keep_recent_tokens = 100_000;
+        history
+            .session
+            .add_message(crate::session::MessageRole::User, "hi");
+        history
+            .session
+            .add_message(crate::session::MessageRole::Assistant, "hello");
+        history.manual_compact = true;
+        let usage = history
+            .compact_with(
+                &TurnControl::new(),
+                #[cfg(feature = "goal")]
+                None,
+                |_, _| async move { panic!("nothing is old enough to summarize") },
+            )
+            .await;
+        assert!(usage.is_some());
+        assert_eq!(history.session.compaction_count(), 0);
+        assert!(!history.manual_compact);
+    }
+
     /// mini-agent-sskdu.230: relief keeps a recent tail at a legal cut and does
     /// not re-clamp a long summary to 16 KiB.
     #[tokio::test]
@@ -8382,6 +8553,7 @@ mod history_tests {
             keep_recent_tokens: 400,
             keep_recent_tool_results: 4,
         });
+        history.limits.keep_recent_tokens = 400;
         history
             .session
             .add_message(crate::session::MessageRole::User, "do the work");
@@ -11141,6 +11313,121 @@ mod protocol_tests {
         let text = format!("{:?}", notifications.lock().unwrap());
         assert!(text.contains("mid-turn context relief"), "{text}");
         assert!(text.contains("finished after native relief"), "{text}");
+    }
+
+    // mini-agent-sskdu.122: /rename, /undo and /compact work on a session that
+    // holds provider-native state, republishing it as a new epoch, and the
+    // next prompt still completes.
+    #[tokio::test]
+    async fn acp_native_session_accepts_rename_undo_and_compact() {
+        let answer = |text: &str| sse_start() + &sse_text(text) + &sse_stop("end_turn");
+        let (base, bodies) = scripted_anthropic(vec![
+            answer("first answer"),
+            answer("second answer"),
+            answer("NATIVE COMPACT SUMMARY"),
+            answer("final answer"),
+        ])
+        .await;
+        let roots = crate::tests::OwnedTestDirectory::new("acp-native-commands");
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            (
+                "MINI_AGENT_CONFIG_DIR",
+                Some(roots.path().join("config").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_DATA_DIR",
+                Some(roots.path().join("data").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_STATE_DIR",
+                Some(roots.path().join("state").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_CACHE_DIR",
+                Some(roots.path().join("cache").into_os_string()),
+            ),
+        ]);
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "provider":"acp-native","model":"claude-opus-5-5",
+            "compact_enabled":true,"keep_recent_tokens":1,
+            "session_title_model":"off",
+            "custom_providers":{"acp-native":{"provider_type":"anthropic","base_url":base}}
+        }))
+        .unwrap();
+        let state = Arc::new(AcpState {
+            idle: idle::Idle::new(None).unwrap(),
+            cli: Cli {
+                no_sandbox: true,
+                tools: vec!["read".into()],
+                ..fixture_cli()
+            },
+            cfg,
+            context: crate::context::load(true),
+            leases: Arc::default(),
+            provider_clients: Default::default(),
+            sessions: Mutex::new(HashMap::new()),
+            cancel_routes: StdMutex::new(HashMap::new()),
+            shell_search_path: std::env::var_os("PATH"),
+            hook_roots: None,
+            client_mcp: ClientMcpPolicy::Sandboxed,
+            client_fs: Default::default(),
+            prompt_fixture: None,
+            runner_fixture: None,
+            #[cfg(feature = "mcp")]
+            mcp_fixture: StdMutex::new(None),
+            prompt_exit_barrier: None,
+            turn_routes: StdMutex::new(Vec::new()),
+        });
+        let observed = state.clone();
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+        let connection = Client
+            .builder()
+            .on_receive_notification(
+                async move |_: SessionNotification, _cx| Ok(()),
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                let session = cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?
+                    .session_id;
+                for text in [
+                    "first question",
+                    "second question",
+                    "/rename Native Renamed",
+                    "/undo",
+                    "/compact",
+                    "third question",
+                ] {
+                    let outcome = cx
+                        .send_request(prompt(session.clone(), text))
+                        .block_task()
+                        .await
+                        .unwrap_or_else(|error| panic!("{text}: {error:?}"));
+                    assert_eq!(outcome.stop_reason, StopReason::EndTurn, "{text}");
+                }
+                Ok(())
+            });
+        tokio::time::timeout(Duration::from_secs(30), connection)
+            .await
+            .unwrap()
+            .unwrap();
+        let history = {
+            let sessions = observed.sessions.lock().await;
+            sessions.values().next().unwrap().history.clone()
+        };
+        let history = history.lock().await;
+        assert_eq!(history.session.name.as_str(), "Native Renamed");
+        assert!(crate::session::native_publication::is_native_bearing(
+            &history.session
+        ));
+        assert_eq!(history.session.compaction_count(), 1);
+        let bodies = bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 4, "two turns, the summarizer, the last turn");
+        let last = bodies[3]["messages"].to_string();
+        assert!(last.contains("NATIVE COMPACT SUMMARY"), "{last}");
     }
 
     #[test]
@@ -15131,7 +15418,7 @@ brainstorm = "no-such-quick-model"
             stream.write_all(wire.as_bytes()).unwrap();
         });
         let cfg = format!(
-            "provider = \"plan80\"\nmodel = \"owned-model\"\n[api_keys]\nplan80 = \"unused-key\"\n[custom_providers.plan80]\nprovider_type = \"openai\"\nbase_url = \"http://{address}/v1\"\napi_style = \"completions\"\n"
+            "keep_recent_tokens = 1\nprovider = \"plan80\"\nmodel = \"owned-model\"\n[api_keys]\nplan80 = \"unused-key\"\n[custom_providers.plan80]\nprovider_type = \"openai\"\nbase_url = \"http://{address}/v1\"\napi_style = \"completions\"\n"
         );
         let mut state = persona_state(&cfg, counting_fixture(Arc::new(AtomicUsize::new(0))));
         let owned = Arc::get_mut(&mut state).unwrap();

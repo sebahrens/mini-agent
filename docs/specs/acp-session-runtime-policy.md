@@ -46,9 +46,14 @@ content only after that actor and its effects retire. ACP uses its JSON-RPC even
 sink throughout; this lifecycle never writes headless print output to stdout.
 Publication failures keep the context refused rather than recreating a fresh owner.
 Saved native thinking/signatures remain opaque data and are excluded from editor
-replay notifications. Local `/undo`, `/compact` and `/rename` refuse changes to a
-native-bearing session without mutating its saved bytes; goal mutations also refuse
-while goal status remains read-only. Start a new ACP session to change that context. Automatic native compaction also refuses before HTTP.
+replay notifications. Local `/undo`, `/compact` and `/rename` work on a
+native-bearing session: the command changes the transcript or name, drops a thinking chain the
+new transcript no longer matches, and republishes the session as a new epoch
+(`native_publication::republish_idle`: the old value is denied on disk first, then the
+healthy payload replaces it); an unfinished native context refuses with its own error and the
+saved bytes stay unchanged. Creating or clearing a goal still refuses on such a session
+(`/goal status` works), naming the command and the next step. Automatic and manual native
+compaction restart the chain the same way.
 
 The native fake-wire fixture checks completed signed block bytes/order and unchanged
 system/tools across same-process turns and process restart at a physical 1 MiB stack.
