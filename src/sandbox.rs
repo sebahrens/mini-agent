@@ -3448,7 +3448,10 @@ impl Sandbox {
         match self.backend.as_str() {
             "bwrap" => bwrap_unavailable_diagnostic(),
             "seatbelt" => seatbelt_unavailable_diagnostic(),
-            _ => None,
+            "zerobox" | "appcontainer" | "restricted-token" => None,
+            _ => Some(
+                "unknown sandbox backend name; expected bwrap, seatbelt, appcontainer or zerobox",
+            ),
         }
     }
 
@@ -8904,7 +8907,12 @@ mod sandbox_tests {
             error.contains("requested-but-unavailable") && !error.contains("bubblewrap"),
             "unknown backends carry no bubblewrap diagnostic: {error}"
         );
-        assert_eq!(unavailable().unavailable_diagnostic(), None);
+        let diagnostic = unavailable().unavailable_diagnostic().unwrap();
+        assert!(
+            diagnostic.contains("unknown sandbox backend"),
+            "{diagnostic}"
+        );
+        assert!(error.contains("unknown sandbox backend"), "{error}");
     }
 
     #[test]

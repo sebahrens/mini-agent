@@ -7090,7 +7090,7 @@ pub struct JsRuntimeReport {
 /// Placeholder used before any agent build has performed the worker probe.
 /// It is an unknown state, not a containment refusal.
 pub(crate) const JS_RUNTIME_PROBE_PENDING_REASON: &str =
-    "JavaScript containment verification is pending; unavailable for this turn";
+    "JavaScript containment verification is pending until a session builds its agent";
 
 impl JsRuntimeReport {
     /// The report to show before any agent build has recorded one. A compiled-in
@@ -7904,7 +7904,7 @@ mod compaction_quality_tests {
                 .iter()
                 .any(|m| m.content.contains("[result cleared:"))
         );
-        let (skipped, input) = session.compaction_input(cut, 0);
+        let (skipped, input) = session.compaction_input(cut);
         assert_eq!(skipped, 0);
         let summary = "## Task\nRemember the read details.\n## Decisions\nUse retained evidence.\n## Files\nHistorical requests are indexed below.\n## Open Items\nContinue.\n## Next Step\nAnswer the question.";
         let reported = rig::completion::Usage {
@@ -8045,7 +8045,7 @@ mod compaction_quality_tests {
             panic!("structured result");
         };
         *artifact_path = Some(artifact.to_string_lossy().into());
-        let (_, input) = session.compaction_input(session.messages.len(), 0);
+        let (_, input) = session.compaction_input(session.messages.len());
         let _ = compress_messages_with(
             &input,
             None,

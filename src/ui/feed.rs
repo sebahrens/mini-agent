@@ -343,7 +343,20 @@ impl Block {
         let mut collapsed = terminal_safe(collapsed.into());
         compact_oversized_block(&mut collapsed);
         let mut expanded = terminal_safe(expanded.into());
-        compact_oversized_block(&mut expanded);
+        // Keep the expanded form's summary row: it is what the reader clicks to
+        // fold the block again, and compaction keeps only the tail.
+        let header = (expanded.len() > MAX_BLOCK_BYTES).then(|| {
+            let mut end = expanded.find('\n').unwrap_or(expanded.len()).min(1024);
+            while !expanded.is_char_boundary(end) {
+                end -= 1;
+            }
+            expanded[..end].to_string()
+        });
+        if compact_oversized_block(&mut expanded)
+            && let Some(header) = header
+        {
+            expanded.insert_str(0, &format!("{header}\n"));
+        }
         let (text, alternate) = if start_expanded {
             (expanded, collapsed)
         } else {
@@ -2861,5 +2874,17 @@ mod progress_tests {
         assert!(!feed.clear_anchor_progress("call-1"));
         assert_eq!(feed.block_count(), 3);
         assert!(feed.is_streaming(2));
+    }
+
+    #[test]
+    fn an_oversized_expanded_fold_keeps_its_summary_row() {
+        let expanded = format!("▾ 99 lines\n{}", "x".repeat(MAX_BLOCK_BYTES + 10));
+        let block = Block::foldable(BlockStyle::ToolResult, "▸ 99 lines", expanded, true);
+        assert!(
+            block.text.starts_with("▾ 99 lines\n"),
+            "{}",
+            &block.text[..40]
+        );
+        assert!(block.text.len() <= MAX_BLOCK_BYTES);
     }
 }

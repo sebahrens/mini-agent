@@ -63,10 +63,34 @@ const TURN_TRACE_MAX: usize = 64;
 const BTW_MAX_INFLIGHT: usize = 4;
 
 #[cfg(feature = "mcp")]
+/// `--no-color`, or a non-empty `NO_COLOR` in the environment (no-color.org):
+/// either one drops syntax colours so spans are not computed for nothing.
+fn monochrome_requested(flag: bool) -> bool {
+    monochrome_from(flag, std::env::var_os("NO_COLOR").as_deref())
+}
+
+fn monochrome_from(flag: bool, env: Option<&std::ffi::OsStr>) -> bool {
+    flag || env.is_some_and(|value| !value.is_empty())
+}
+
 fn mcp_notice_color(level: McpNoticeLevel) -> Color {
     match level {
         McpNoticeLevel::Info => C_RESULT,
         McpNoticeLevel::Error => C_ERROR,
+    }
+}
+
+#[cfg(test)]
+mod monochrome_env_tests {
+    use super::monochrome_from;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn no_color_env_counts_only_when_non_empty() {
+        assert!(monochrome_from(true, None));
+        assert!(monochrome_from(false, Some(OsStr::new("1"))));
+        assert!(!monochrome_from(false, Some(OsStr::new(""))));
+        assert!(!monochrome_from(false, None));
     }
 }
 
@@ -2086,7 +2110,7 @@ impl<'a> App<'a> {
 
         let mut renderer = Renderer::new()?;
         renderer.set_statusline_height(crate::ui::statusline::line_count());
-        renderer.set_monochrome(ui.cli.no_color);
+        renderer.set_monochrome(monochrome_requested(ui.cli.no_color));
         renderer.set_title_status(ui.cfg.resolve_terminal_title());
         renderer.set_activity_signals(crate::ui::terminal::ActivitySignals {
             notify: ui.cfg.resolve_terminal_notify(),
@@ -2098,7 +2122,7 @@ impl<'a> App<'a> {
         input.keybindings = keybindings;
         input.set_vim_enabled(ui.cfg.vim_mode.unwrap_or(false));
         input.set_file_workspace(ui.workspace.clone());
-        input.set_monochrome(ui.cli.no_color);
+        input.set_monochrome(monochrome_requested(ui.cli.no_color));
 
         input.set_prompt_names(ui.context.prompts.keys().cloned().collect());
         input.set_custom_commands(

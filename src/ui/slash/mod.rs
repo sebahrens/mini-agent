@@ -686,7 +686,6 @@ async fn handle_compress_unfloored(
         cut_idx,
         summarizer_input_budget,
         reserve,
-        keep_recent_tool_results,
         restore_read_tokens,
         |model, messages, previous_summary, input_budget, response_budget| async move {
             let model = compaction_model.unwrap_or(model);
@@ -915,7 +914,6 @@ pub(crate) async fn compact_session_with<S, F>(
     cut_idx: usize,
     input_token_budget: u64,
     response_token_budget: u64,
-    keep_recent_tool_results: usize,
     summarize: S,
     stage_summary: impl FnOnce(&str, usize),
 ) -> anyhow::Result<(usize, u64, crate::event::UsageDelta)>
@@ -928,7 +926,6 @@ where
         cut_idx,
         input_token_budget,
         response_token_budget,
-        keep_recent_tool_results,
         0,
         summarize,
         stage_summary,
@@ -968,7 +965,6 @@ pub(crate) async fn compact_session_with_restoring<S, F>(
     cut_idx: usize,
     input_token_budget: u64,
     response_token_budget: u64,
-    keep_recent_tool_results: usize,
     restore_read_tokens: u64,
     summarize: S,
     stage_summary: impl FnOnce(&str, usize),
@@ -983,7 +979,7 @@ where
         Some(pool) => Some(pool.pause_for_history().await?),
         None => None,
     };
-    let (skipped, messages) = session.compaction_input(cut_idx, keep_recent_tool_results);
+    let (skipped, messages) = session.compaction_input(cut_idx);
     let previous_summary = session.previous_summary_prose();
     let crate::provider::CompactionOutput {
         summary,
@@ -1536,7 +1532,6 @@ mod compaction_budget_tests {
             2,
             80,
             20,
-            KEEP_RECENT_TOOL_RESULTS,
             |model, messages, previous_summary, input_budget, response_budget| async move {
                 observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 assert_eq!(model, "model");
@@ -1592,7 +1587,6 @@ mod compaction_budget_tests {
             2,
             80,
             20,
-            KEEP_RECENT_TOOL_RESULTS,
             |_, messages, _, _, _| async move {
                 assert_eq!(messages.len(), 2);
                 Ok(output("PARTIAL", 1))
@@ -1622,7 +1616,6 @@ mod compaction_budget_tests {
             2,
             80,
             20,
-            KEEP_RECENT_TOOL_RESULTS,
             |_, _, _, _, _| async move { Ok(output("EMPTY", 0)) },
             |_, _| panic!("nothing must be staged when nothing is drained"),
         )
@@ -1651,7 +1644,6 @@ mod compaction_budget_tests {
             4,
             9_000,
             1_000,
-            1,
             |_, messages, _, _, _| async move {
                 assert_eq!(messages.len(), 4, "tool calls must not be dropped");
                 assert_eq!(messages[0].role, MessageRole::ToolCall);

@@ -1251,6 +1251,11 @@ impl TryFrom<message::Message> for Message {
                             message::ToolResultContent::Text(message::Text { text, additional_params }) => {
                                 match additional_params.as_ref().and_then(|params|
                                     params.get(crate::tool::NATIVE_TOOL_REFERENCE_KEY)) {
+                                    // Anthropic rejects an empty text block, so a tool
+                                    // that printed nothing is sent as a placeholder.
+                                    None if text.is_empty() => Ok(ToolResultContent::Text {
+                                        text: "(no output)".to_string(),
+                                    }),
                                     None => Ok(ToolResultContent::Text { text }),
                                     Some(serde_json::Value::String(name))
                                         if crate::tool::ToolReferences::new(vec![name.clone()]).is_some() => {

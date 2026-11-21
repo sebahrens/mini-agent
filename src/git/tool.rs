@@ -2111,7 +2111,7 @@ impl Tool for GitTool {
                 "restore",
             ]
         };
-        serde_json::json!({
+        let mut schema = serde_json::json!({
             "type": "object",
             "properties": {
                 "operation": {
@@ -2145,7 +2145,29 @@ impl Tool for GitTool {
             },
             "required": ["operation"],
             "additionalProperties": false
-        })
+        });
+        if self.read_only
+            && let Some(properties) = schema["properties"].as_object_mut()
+        {
+            // The inspection-only variant does not advertise mutation fields.
+            for key in ["name", "message", "amend", "signoff", "allow_empty"] {
+                properties.remove(key);
+            }
+            properties.insert(
+                "paths".to_owned(),
+                serde_json::json!({
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "maxItems": 128,
+                    "description": "Literal repository-relative paths; never options or globs."
+                }),
+            );
+            properties.insert(
+                "revision".to_owned(),
+                serde_json::json!({ "type": "string", "description": "Revision for diff, log, show or blame; diff and log also accept a range a..b or a...b" }),
+            );
+        }
+        schema
     }
 
     async fn call(&self, args: GitArgs) -> Result<Self::Output, Self::Error> {
@@ -2785,6 +2807,9 @@ mod tests {
             "restore",
         ] {
             assert!(!operations.contains(&write.to_string()), "{write} offered");
+        }
+        for field in ["name", "message", "amend", "signoff", "allow_empty"] {
+            assert!(schema["properties"].get(field).is_none(), "{field} offered");
         }
         for operation in [
             GitOperation::Stage,

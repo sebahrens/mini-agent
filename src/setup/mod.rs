@@ -909,11 +909,13 @@ pub fn run(
     credentials_dir: &std::path::Path,
 ) -> anyhow::Result<SetupOutcome> {
     terminal::enable_raw_mode()?;
+    // The wizard paints on the alternate screen so entering and leaving it
+    // never wipes the user's visible scrollback.
+    let _ = io::stdout().execute(terminal::EnterAlternateScreen);
     let result = run_inner(cfg, cli_key, credentials_dir);
     let _ = terminal::disable_raw_mode();
     let mut stdout = io::stdout();
-    let _ = stdout.execute(Clear(ClearType::All));
-    let _ = stdout.execute(MoveTo(0, 0));
+    let _ = stdout.execute(terminal::LeaveAlternateScreen);
     let _ = stdout.execute(Show);
     let _ = stdout.flush();
     result

@@ -208,7 +208,8 @@ mod tests {
     }
 }
 
-/// Appends a one-line goal reminder to every `reinject_every`-th tool result.
+/// Appends a one-line goal reminder to the first tool result after every
+/// `reinject_every`-th provider call.
 ///
 /// A long, tool-heavy round can wander a long way from the objective between
 /// provider calls. This restates it for the cost of one line and no model call,
@@ -220,9 +221,13 @@ pub struct GoalReminderHook {
     store: super::GoalStore,
 }
 
-/// Per-run tool-result count, kept in the hook scratchpad.
+/// Per-run provider-call count and the call count the last reminder rode on,
+/// kept in the hook scratchpad.
 #[derive(Default, Clone)]
-struct ReminderCount(u32);
+struct ReminderCount {
+    calls: u32,
+    reminded_at: u32,
+}
 
 impl GoalReminderHook {
     pub fn new(store: super::GoalStore) -> Self {
@@ -236,9 +241,24 @@ impl<M: rig::completion::CompletionModel> rig::agent::AgentHook<M> for GoalRemin
         ctx: &rig::agent::HookContext,
         event: rig::agent::StepEvent<'_, M>,
     ) -> rig::agent::Flow {
-        let rig::agent::StepEvent::ToolResult { result, .. } = event else {
-            return rig::agent::Flow::cont();
+        let result = match event {
+            rig::agent::StepEvent::CompletionCall { .. } => {
+                ctx.scratchpad().update(|count: &mut ReminderCount| {
+                    count.calls = count.calls.saturating_add(1);
+                });
+                return rig::agent::Flow::cont();
+            }
+            rig::agent::StepEvent::ToolResult { result, .. } => result,
+            _ => return rig::agent::Flow::cont(),
         };
+        // `reinject_every` counts provider calls, so a batch of parallel tool
+        // results carries at most one reminder (on its first result).
+        let (calls, reminded_at) = ctx
+            .scratchpad()
+            .update(|count: &mut ReminderCount| (count.calls, count.reminded_at));
+        if calls == reminded_at {
+            return rig::agent::Flow::cont();
+        }
         let Some(goal) = self.store.snapshot() else {
             return rig::agent::Flow::cont();
         };
@@ -247,19 +267,20 @@ impl<M: rig::completion::CompletionModel> rig::agent::AgentHook<M> for GoalRemin
         if !goal.status.is_running() {
             return rig::agent::Flow::cont();
         }
-        let seen = ctx.scratchpad().update(|count: &mut ReminderCount| {
-            count.0 = count.0.saturating_add(1);
-            count.0
-        });
-        if !reminder_due(seen, goal.bounds.reinject_every) {
+        if !reminder_due(calls, goal.bounds.reinject_every) {
             return rig::agent::Flow::cont();
         }
+        ctx.scratchpad()
+            .update(|count: &mut ReminderCount| count.reminded_at = calls);
         // Appended rather than prepended: the tool's own output is what the
         // model asked for, and the nudge belongs after it.
         rig::agent::Flow::rewrite_result(format!("{result}\n\n{ROUND_REMINDER}"))
     }
 
     fn observes(&self, kind: rig::agent::StepEventKind) -> bool {
-        matches!(kind, rig::agent::StepEventKind::ToolResult)
+        matches!(
+            kind,
+            rig::agent::StepEventKind::ToolResult | rig::agent::StepEventKind::CompletionCall
+        )
     }
 }

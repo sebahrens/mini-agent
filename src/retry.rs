@@ -279,27 +279,48 @@ pub(crate) fn parse_body_retry_hint(message: &str) -> Option<Duration> {
     best
 }
 
-/// The latest reset among `anthropic-ratelimit-*-reset` (RFC 3339 instants)
-/// and OpenAI `x-ratelimit-reset-*` (durations such as `1s`, `6m0s`,
-/// `20ms`).
+/// The latest reset among the exhausted buckets of `anthropic-ratelimit-*-reset`
+/// (RFC 3339 instants) and OpenAI `x-ratelimit-reset-*` (durations such as
+/// `1s`, `6m0s`, `20ms`). A bucket whose sibling `*-remaining` header still
+/// shows capacity is not what blocked the request, so a per-minute token limit
+/// does not wait out a daily request window; when no bucket reports as
+/// exhausted, every reset counts.
 fn rate_limit_reset(headers: &http::HeaderMap, now: SystemTime) -> Option<Duration> {
-    headers
-        .iter()
-        .filter_map(|(name, value)| {
-            let name = name.as_str();
-            let value = value.to_str().ok()?.trim();
-            if name.starts_with("anthropic-ratelimit-") && name.ends_with("-reset") {
-                let instant = value.parse::<jiff::Timestamp>().ok()?;
-                let instant = SystemTime::UNIX_EPOCH
-                    + Duration::from_millis(u64::try_from(instant.as_millisecond()).ok()?);
-                Some(instant.duration_since(now).unwrap_or_default())
-            } else if name.starts_with("x-ratelimit-reset") {
-                parse_go_duration(value)
-            } else {
-                None
-            }
-        })
-        .max()
+    let latest = |only_exhausted: bool| {
+        headers
+            .iter()
+            .filter_map(|(name, value)| {
+                let name = name.as_str();
+                let value = value.to_str().ok()?.trim();
+                let remaining_name =
+                    if name.starts_with("anthropic-ratelimit-") && name.ends_with("-reset") {
+                        format!("{}-remaining", name.strip_suffix("-reset")?)
+                    } else if let Some(bucket) = name.strip_prefix("x-ratelimit-reset-") {
+                        format!("x-ratelimit-remaining-{bucket}")
+                    } else {
+                        return None;
+                    };
+                if only_exhausted
+                    && headers
+                        .get(remaining_name.as_str())
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.trim().parse::<f64>().ok())
+                        .is_some_and(|remaining| remaining > 0.0)
+                {
+                    return None;
+                }
+                if name.starts_with("anthropic-ratelimit-") {
+                    let instant = value.parse::<jiff::Timestamp>().ok()?;
+                    let instant = SystemTime::UNIX_EPOCH
+                        + Duration::from_millis(u64::try_from(instant.as_millisecond()).ok()?);
+                    Some(instant.duration_since(now).unwrap_or_default())
+                } else {
+                    parse_go_duration(value)
+                }
+            })
+            .max()
+    };
+    latest(true).or_else(|| latest(false))
 }
 
 /// A Go-style duration (`1h2m3.5s`, `250ms`, `6m0s`) or plain seconds.
@@ -1132,6 +1153,24 @@ mod tests {
         assert!(!is_retryable(&anthropic));
         // An ordinary rate limit is still retried.
         assert!(is_retryable(&hinted(429, &[])));
+    }
+
+    #[test]
+    fn only_exhausted_rate_limit_buckets_set_the_wait() {
+        let now = SystemTime::now();
+        let openai = hinted(
+            429,
+            &[
+                ("x-ratelimit-reset-requests", "6h0m0s"),
+                ("x-ratelimit-remaining-requests", "400"),
+                ("x-ratelimit-reset-tokens", "20s"),
+                ("x-ratelimit-remaining-tokens", "0"),
+            ],
+        );
+        assert_eq!(
+            provider_retry_hint(&openai, now),
+            Some(Duration::from_secs(20))
+        );
     }
 
     #[test]

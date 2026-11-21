@@ -1277,8 +1277,7 @@ where
         eprintln!("{notice}");
     }
     let model = session.model.to_string();
-    let (skipped, messages) =
-        session.compaction_input(plan.cut_idx, cfg.resolve_keep_recent_tool_results());
+    let (skipped, messages) = session.compaction_input(plan.cut_idx);
     let previous_summary = session.previous_summary_prose();
     let keep_recent_tool_results = cfg.resolve_keep_recent_tool_results();
     let mut output = None;
@@ -4651,7 +4650,7 @@ async fn relieve_native_headless_segment(
     // Publish the retired LiveToolReply boundary before the transcript changes.
     owner.finish(session).await?;
     let tokens_before = session
-        .effective_context_tokens_after_tool_result_pruning(cfg.resolve_keep_recent_tool_results());
+        .cold_context_tokens_after_tool_result_pruning(cfg.resolve_keep_recent_tool_results());
     match compact_headless_session(
         session,
         client,
@@ -4680,7 +4679,7 @@ async fn relieve_native_headless_segment(
         }
     }
     let freed = session
-        .effective_context_tokens_after_tool_result_pruning(cfg.resolve_keep_recent_tool_results())
+        .cold_context_tokens_after_tool_result_pruning(cfg.resolve_keep_recent_tool_results())
         < tokens_before;
     if cli.no_session {
         session.restart_native_chain()?;
@@ -5616,7 +5615,7 @@ async fn run_relieved_headless_turn(
         },
         async |session: &mut Session, pending_tokens| {
             let keep = cfg.resolve_keep_recent_tool_results();
-            let before = session.effective_context_tokens_after_tool_result_pruning(keep);
+            let before = session.cold_context_tokens_after_tool_result_pruning(keep);
             let (usage, happened) = heap_future(|| {
                 compact_headless_session(
                     session,
@@ -5633,7 +5632,7 @@ async fn run_relieved_headless_turn(
             .await?;
             // A compaction that frees no space cannot relieve anything: report
             // it as "nothing to compact" so the caller stops relieving.
-            let freed = session.effective_context_tokens_after_tool_result_pruning(keep) < before;
+            let freed = session.cold_context_tokens_after_tool_result_pruning(keep) < before;
             Ok((usage, happened && freed))
         },
     )

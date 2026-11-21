@@ -704,6 +704,7 @@ fn estimated_registered_tools(cli: &Cli, cfg: &Config, sandbox: &Sandbox) -> Vec
         "todo_read",
         "ask_user_question",
     ];
+    #[cfg(feature = "git-worktree")]
     names.push("git");
     if native_web_search_registered(cfg, tools::web_search::exa_api_key_present()) {
         names.push("web_search");
