@@ -698,14 +698,14 @@ impl<M: CompletionModel> AgentHook<M> for AdmissionHook {
             return Flow::Continue;
         };
         match event {
-            // Rig may fail invalid/unknown tools before draining the actual
-            // provider Final. No usage can be invented from an unread chunk.
-            // Preserve its existing recovery/failure flow, but a capped account
-            // cannot admit another request/effect with incomplete billing state.
-            StepEvent::InvalidToolCall(_) => {
-                run.account.tracking_failed();
-                Flow::Continue
-            }
+            // Rig may resolve an invalid/unknown tool call before it has read
+            // the provider Final. No usage is invented here: when the turn is
+            // recovered or abandoned rig drains the stream and yields the real
+            // `CompletionCall`, whose projection settles this request through
+            // `SdkRequest::consume_projection`. If that drain fails, the
+            // request's `StreamGuard` marks tracking incomplete as for any
+            // other stream that never finished (mini-agent-sskdu.264).
+            StepEvent::InvalidToolCall(_) => Flow::Continue,
             StepEvent::CompletionCall { .. } => {
                 if run.prepare().await.is_err() {
                     return Flow::Terminate {

@@ -808,6 +808,50 @@ async fn usd_budget_native_primary_tool_continuation_never_reuses_previous_reque
     );
 }
 
+/// An unknown-tool call in a capped run is recovered by the runner's loop
+/// guard; the provider's real usage for that turn is charged and the next
+/// request is not refused for incomplete tracking (mini-agent-sskdu.264).
+#[tokio::test]
+async fn usd_budget_unknown_tool_recovery_keeps_tracking_complete_and_admits_the_next_request() {
+    let root = crate::tests::OwnedTestDirectory::new("cost-unknown-tool-recovery");
+    let wire = Wire::new(vec![
+        Some(response("", true)),
+        Some(response("recovered", false)),
+    ])
+    .await;
+    let (client, cfg) = wire.client();
+    let (run, ledger) = profile(&root, &cfg, RequestKind::Turn, Some(1.0));
+    let crate::provider::AnyModel::OpenAI(crate::provider::OpenAiModel::Completions(model)) =
+        client.completion_model("fixture")
+    else {
+        panic!("fixture protocol")
+    };
+    let agent = crate::provider::AnyAgent::without_skills(crate::provider::AnyAgentInner::OpenAI(
+        crate::provider::OpenAiAgent::Completions(
+            rig::agent::AgentBuilder::new(model)
+                .add_hook(crate::agent::runner::ToolLoopGuard)
+                .default_max_turns(3)
+                .build(),
+        ),
+    ))
+    .with_spend(Some(run.clone()));
+    let answer = agent
+        .run_print_with_output(
+            "call a tool that does not exist",
+            crate::print::HeadlessOutputPolicy::legacy(false, false),
+            &cfg.retry,
+            Vec::new(),
+            #[cfg(feature = "hooks")]
+            None,
+        )
+        .await;
+    assert!(answer.failure.is_none(), "{:?}", answer.failure);
+    assert_eq!(wire.calls.load(Ordering::Acquire), 2);
+    assert!(!run.account.snapshot().tracking_error);
+    assert_eq!(ledger.summary().unwrap().all_time.records, 2);
+    assert!(run.admit().is_ok());
+}
+
 #[cfg(feature = "advisor")]
 #[tokio::test]
 async fn usd_budget_native_advisor_receipt_is_retained_and_next_request_refused() {
