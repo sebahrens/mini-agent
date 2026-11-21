@@ -299,6 +299,47 @@ fn require_recent_session(
         .next()
         .ok_or_else(|| anyhow::anyhow!("cannot continue: no saved sessions for this workspace ({}); use --session or /sessions", workspace.display()))
 }
+/// One line per unreadable session file ("skipped unreadable session <id>:
+/// <reason>"), plus a count of any beyond those listed.
+fn skipped_sessions_lines(skips: &[session::storage::SkippedSession], total: usize) -> Vec<String> {
+    let mut lines: Vec<String> = skips
+        .iter()
+        .map(|skip| format!("skipped unreadable session {}: {}", skip.id, skip.reason))
+        .collect();
+    if total > skips.len() {
+        lines.push(format!(
+            "{} more session file(s) could not be read",
+            total - skips.len()
+        ));
+    }
+    lines
+}
+
+/// `--continue`: say so when a newer session file was skipped (the resumed one
+/// is then an older conversation), and when nothing could be read, name the
+/// unreadable files instead of claiming there are no saved sessions.
+fn require_recent_session_reporting(
+    result: anyhow::Result<(Vec<Session>, session::storage::DiscoverySkips)>,
+    workspace: &std::path::Path,
+) -> anyhow::Result<Session> {
+    let (sessions, skips) = match result {
+        Ok(found) => found,
+        Err(error) => return require_recent_session(Err(error), workspace),
+    };
+    let lines = skipped_sessions_lines(&skips.first, skips.total);
+    if sessions.is_empty() && skips.total > 0 {
+        anyhow::bail!(
+            "cannot continue: {} session file(s) for this workspace could not be read (first: {}); use --session or /sessions",
+            skips.total,
+            lines.first().map(String::as_str).unwrap_or("unknown")
+        );
+    }
+    for line in &lines {
+        eprintln!("{line}");
+    }
+    require_recent_session(Ok(sessions), workspace)
+}
+
 fn unavailable_sandbox_must_fail(cli: &Cli, cfg: &Config, is_windows: bool) -> bool {
     cli.resolve_sandbox(cfg) && (is_windows || cli.sandbox_explicitly_requested(cfg))
 }
@@ -1568,21 +1609,39 @@ impl Startup {
         }
 
         if cli.continue_session && cli.session.is_none() {
-            session = require_recent_session(
-                session::storage::find_recent_sessions_for_workspace(1, workspace.root()),
+            session = require_recent_session_reporting(
+                session::storage::find_recent_sessions_for_workspace_reporting(1, workspace.root()),
                 workspace.root(),
             )?;
             session_resumed = true;
         }
 
         if let Some(session_id) = &cli.session {
-            let candidates = session::storage::find_sessions_by_prefix(session_id)?;
+            let (candidates, skips) =
+                session::storage::find_sessions_by_prefix_reporting(session_id)?;
+            let relevant: Vec<_> = skips
+                .first
+                .iter()
+                .filter(|skip| skip.id.starts_with(session_id.as_str()))
+                .cloned()
+                .collect();
+            for line in skipped_sessions_lines(&relevant, relevant.len()) {
+                eprintln!("{line}");
+            }
             match session::storage::select_session(session_id, candidates) {
                 session::storage::SessionSelection::One(selected) => {
                     session = *selected;
                     session_resumed = true;
                 }
                 session::storage::SessionSelection::NoMatch => {
+                    if let Some(skip) = relevant.first() {
+                        anyhow::bail!(
+                            "session '{}' exists but could not be read ({}: {})",
+                            session_id,
+                            skip.id,
+                            skip.reason
+                        );
+                    }
                     anyhow::bail!("no session matching '{}'", session_id);
                 }
                 session::storage::SessionSelection::Ambiguous(sessions) => {
@@ -3463,7 +3522,11 @@ impl Startup {
                 // Persist the actual turn first; title failure cannot lose
                 // history. This awaited no-tools request owns its work and
                 // adds observed usage at its captured model prices.
-                if failure.is_none() {
+                // Print mode never shows the title and a scripted run is
+                // latency-sensitive, so the default (session model) title is
+                // left to the next interactive resume; only an explicit
+                // `session_title_model` is generated here (mini-agent-sskdu.12).
+                if failure.is_none() && self.cfg.session_title_model.is_some() {
                     let cost_before = session.total_cost;
                     // This measured large title child must not add its
                     // construction copies to the primary request's poll.
@@ -5721,9 +5784,9 @@ mod tests {
         OpenRouterPricingRefresh, ResumeProviderDecision, apply_openrouter_pricing_refresh_result,
         apply_resume_provider_decision, compact_headless_session_with, headless_compaction_plan,
         interactive_initial_message, js_runtime_banner_lines, needs_openrouter_context_refresh,
-        relieve_headless_turn, require_recent_session, resolve_resume_provider_decision,
-        run_startup_probes_concurrently, unavailable_sandbox_must_fail,
-        validate_startup_permission_policy,
+        relieve_headless_turn, require_recent_session, require_recent_session_reporting,
+        resolve_resume_provider_decision, run_startup_probes_concurrently,
+        unavailable_sandbox_must_fail, validate_startup_permission_policy,
     };
     use crate::cli::Cli;
 
@@ -5951,6 +6014,26 @@ mod tests {
     #[test]
     fn continue_requires_a_readable_existing_session() {
         let workspace = std::path::Path::new("/workspace/project");
+        let skipped = require_recent_session_reporting(
+            Ok((
+                Vec::new(),
+                crate::session::storage::DiscoverySkips {
+                    total: 1,
+                    first: vec![crate::session::storage::SkippedSession {
+                        id: "abc".into(),
+                        reason: "invalid persisted session JSON (line 1, column 9)".into(),
+                    }],
+                },
+            )),
+            workspace,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            skipped.contains("could not be read") && skipped.contains("abc"),
+            "{skipped}"
+        );
+        assert!(!skipped.contains("no saved sessions"), "{skipped}");
         let missing = require_recent_session(Ok(Vec::new()), workspace).unwrap_err();
         assert!(
             missing

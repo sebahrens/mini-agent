@@ -188,6 +188,8 @@ pub enum AgentEvent {
         max: usize,
         /// The sleep before this retry, including any provider wait hint.
         delay_ms: u64,
+        /// Short cause ("rate limited", "network error", ...); empty if unknown.
+        reason: String,
     },
     /// The provider stopped a response at its output-token limit. Display-only
     /// notice; the runner continues the turn or ends it as the message says.
@@ -225,12 +227,17 @@ pub enum AgentEvent {
 
 /// User-visible text for a provider retry, naming the actual wait so a
 /// long provider `Retry-After` does not look like a hang.
-pub fn retry_notice_text(attempt: usize, max: usize, delay_ms: u64) -> String {
+pub fn retry_notice_text(attempt: usize, max: usize, delay_ms: u64, reason: &str) -> String {
     let secs = delay_ms as f64 / 1000.0;
-    if delay_ms >= 10_000 {
-        format!("retrying in {secs:.0}s... ({attempt}/{max})")
+    let prefix = if reason.is_empty() {
+        String::new()
     } else {
-        format!("retrying in {secs:.1}s... ({attempt}/{max})")
+        format!("{reason}; ")
+    };
+    if delay_ms >= 10_000 {
+        format!("{prefix}retrying in {secs:.0}s... ({attempt}/{max}), Esc to cancel")
+    } else {
+        format!("{prefix}retrying in {secs:.1}s... ({attempt}/{max})")
     }
 }
 

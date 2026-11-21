@@ -6246,11 +6246,12 @@ async fn relay_prompt_events(
                 attempt,
                 max,
                 delay_ms,
+                reason,
             } => {
                 // ACP has no status bar, so surface the retry as an agent
                 // thought. This keeps the client from going silent during the
                 // backoff delay and mirrors how `Reasoning` is forwarded.
-                let text = crate::event::retry_notice_text(attempt, max, delay_ms);
+                let text = crate::event::retry_notice_text(attempt, max, delay_ms, &reason);
                 let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
                 let notif = SessionNotification::new(
                     session_id.clone(),

@@ -6038,7 +6038,7 @@ impl<'a> App<'a> {
             self.chain.git.work.is_none(),
             "Git command cleanup is still pending; no next turn admitted"
         );
-        if self.budget_admission_notice()? {
+        if self.budget_admission_notice_for_user()? {
             self.restore_interrupted_prompt(text);
             return Ok(());
         }
@@ -6151,7 +6151,7 @@ impl<'a> App<'a> {
             self.renderer.write_line("Finish or cancel the MCP operation before starting a model turn; input remains in the editor",C_ERROR)?;
             return Ok(());
         }
-        if self.budget_admission_notice()? {
+        if self.budget_admission_notice_for_user()? {
             return Ok(());
         }
         start_main_run(
@@ -6166,10 +6166,32 @@ impl<'a> App<'a> {
         .await
     }
 
+    /// Automatic starts (queue drain, cron, job wake): the notice is shown once
+    /// per session, since nothing the user did triggered the refusal.
     fn budget_admission_notice(&mut self) -> anyhow::Result<bool> {
+        let Some(text) = self.budget_refusal_text()? else {
+            return Ok(false);
+        };
+        if self.ui.session.spend_account.take_budget_notice() {
+            self.renderer.write_line(&text, C_ERROR)?;
+        }
+        Ok(true)
+    }
+
+    /// User-initiated starts (submit, /review, /init): every refusal says why,
+    /// so a retry after the first notice scrolled away is never silent.
+    fn budget_admission_notice_for_user(&mut self) -> anyhow::Result<bool> {
+        let Some(text) = self.budget_refusal_text()? else {
+            return Ok(false);
+        };
+        self.renderer.write_line(&text, C_ERROR)?;
+        Ok(true)
+    }
+
+    fn budget_refusal_text(&mut self) -> anyhow::Result<Option<String>> {
         let usd_capped = self.ui.cli.resolve_max_budget_usd(self.ui.cfg)?.is_some();
         if !usd_capped && !self.ui.cfg.has_session_token_ceiling() {
-            return Ok(false);
+            return Ok(None);
         }
         let run = crate::spend::run::Run::for_session(
             self.ui.session,
@@ -6177,17 +6199,13 @@ impl<'a> App<'a> {
             crate::spend::RequestKind::Turn,
         );
         if run.admit().is_ok() {
-            return Ok(false);
+            return Ok(None);
         }
-        if self.ui.session.spend_account.take_budget_notice() {
-            let label = if usd_capped {
-                "USD budget"
-            } else {
-                "Token budget"
-            };
-            self.renderer.write_line(&format!("{label}: further model requests/effects stopped; queued input is retained. Use /cost to inspect recorded estimates."), C_ERROR)?;
-        }
-        Ok(true)
+        let reason = run.account.admit_reason(run.prices).err();
+        Ok(Some(crate::spend::budget_notice_text(
+            reason,
+            run.account.snapshot(),
+        )))
     }
 
     async fn ensure_agent(&mut self) {

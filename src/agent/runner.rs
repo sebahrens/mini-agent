@@ -4533,6 +4533,7 @@ where
                                 attempt: notice.attempt,
                                 max: notice.max_attempts,
                                 delay_ms: duration_millis(notice.delay),
+                                reason: notice.reason,
                             })
                             .await;
                     }
@@ -5165,6 +5166,7 @@ where
                                     attempt,
                                     max: retry_config.max_attempts,
                                     delay_ms: duration_millis(delay),
+                                    reason: retry::retry_reason(&e),
                                 })
                                 .await;
                             tokio::time::sleep(delay).await;
@@ -5643,7 +5645,7 @@ where
         Ok(result) => result,
         Err(error) => return HeadlessTurn::failed_before_start(error),
     }
-    .map_err(|e| anyhow::anyhow!(retry::with_provider_error_hint(&e)));
+    .map_err(|e| anyhow::Error::new(retry::ClassifiedProviderError::from_error(&e)));
     let stream = match stream {
         Ok(stream) => stream,
         Err(error) => return HeadlessTurn::failed_before_start(error),
@@ -6065,7 +6067,7 @@ where
                         }
                         // Propagate an exhausted or non-retryable stream failure
                         // instead of returning `Ok` with a truncated response.
-                        fail_turn!(retry::with_provider_error_hint(&e));
+                        fail_turn!(retry::ClassifiedProviderError::from_error(&e));
                     }
                 }
                 Ok(true)

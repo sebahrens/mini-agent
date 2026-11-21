@@ -943,6 +943,11 @@ pub struct Session {
     /// unless that opt-in setting is on (mini-agent-3wsib).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generated_title: Option<CompactString>,
+    /// Title requests that ran and produced nothing usable. Persisted so a
+    /// failing title model is not asked again by every prompt or resume
+    /// (mini-agent-sskdu.11); see `title::MAX_TITLE_ATTEMPTS`.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub title_attempts: u8,
     /// Closed session data only; never a runtime permission or replay owner.
     #[serde(
         default,
@@ -1543,6 +1548,7 @@ impl Session {
             id: CompactString::new(Uuid::new_v4().to_string()),
             name: CompactString::new(name),
             generated_title: None,
+            title_attempts: 0,
             reasoning_controls: Default::default(),
             memory_placement: MemoryPlacement::Messages,
             native_history: None,
@@ -4626,4 +4632,8 @@ mod rfc3339_format_tests {
         let text = rfc3339_utc(jiff::Timestamp::now());
         assert_eq!(rfc3339_utc(text.parse().unwrap()), text);
     }
+}
+
+fn is_zero_u8(value: &u8) -> bool {
+    *value == 0
 }
