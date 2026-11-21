@@ -1064,3 +1064,29 @@ fn the_cron_countdown_repaints_exactly_when_its_minute_bucket_rolls_over() {
     };
     assert_eq!(statusline::cron_label_repaint_in(suspended, false), None);
 }
+
+#[test]
+fn a_high_priority_vim_label_survives_a_narrow_fit() {
+    let session = Session::new("p", "provider/very-long-model-name", 1_000_000, "");
+    let mut context = ctx();
+    context.prompt_name = Some("code");
+    context.perm_mode = Some("yolo");
+    let mut spans =
+        statusline::build_lines(&statusline::default_spec(), &session, &context).remove(0);
+    spans.insert(
+        0,
+        StatusSpan::Text {
+            text: "NORMAL ".into(),
+            fg: None,
+            bg: None,
+            layout: statusline::SpanLayout::Item {
+                priority: 255,
+                plain: "NORMAL ".into(),
+                compact: Some("N ".into()),
+                dynamic_color: false,
+            },
+        },
+    );
+    let text = line_text(&statusline::fit_line(&spans, 20));
+    assert!(text.contains("NORMAL") || text.contains("N "), "{text}");
+}

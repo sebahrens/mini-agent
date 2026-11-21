@@ -363,10 +363,12 @@ pub(crate) fn share_confirmation(session: &crate::session::Session, html_bytes: 
 #[cfg(feature = "export")]
 async fn handle_share(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     let filename = default_export_filename(&ctx.session.id);
-    let html = crate::extras::export::session_to_html(ctx.session);
+    // Render the export only for the branches that need it: a usage error
+    // must not pay for a full HTML export.
     match parts.get(1).map(|arg| arg.trim()) {
         Some("confirm") if parts.len() == 2 => {}
         None | Some("") => {
+            let html = crate::extras::export::session_to_html(ctx.session);
             write_result(ctx.renderer, share_confirmation(ctx.session, html.len()));
             return Ok(());
         }
@@ -375,11 +377,20 @@ async fn handle_share(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<
             return Ok(());
         }
     }
+    let html = crate::extras::export::session_to_html(ctx.session);
     let description = if ctx.session.name.is_empty() {
         "mini-agent session".to_string()
     } else {
         format!("mini-agent session: {}", ctx.session.name)
     };
+    // The upload can take up to its request timeout: say so before waiting.
+    write_ok(
+        ctx.renderer,
+        format!(
+            "uploading {} to gist.github.com…",
+            crate::agent::tools::list_dir::format_size(html.len() as u64)
+        ),
+    );
     match crate::extras::export::share_gist(&filename, &html, &description).await {
         Ok(url) => write_ok(ctx.renderer, format!("shared as secret gist: {}", url)),
         Err(e) => write_error(ctx.renderer, format!("share failed: {}", e)),

@@ -415,3 +415,109 @@ fn syntax_ten_thousand_lines_skip_parser_without_losing_literal_content() {
         "plain bounded fallback unexpectedly stalled"
     );
 }
+
+// ── lists, links, code wrapping (mini-agent-sskdu.16/.17/.19) ───────
+
+fn row_texts(input: &str, width: usize) -> Vec<String> {
+    markdown_to_styled(input, width)
+        .iter()
+        .map(|e| e.text.to_string())
+        .collect()
+}
+
+#[test]
+fn nested_ordered_list_keeps_markers_and_indents_children() {
+    let rows = row_texts("1. one\n   - sub\n2. two\n", 80);
+    let rows: Vec<&str> = rows
+        .iter()
+        .map(String::as_str)
+        .filter(|r| !r.is_empty())
+        .collect();
+    assert_eq!(rows, [" 1. one", "    • sub", " 2. two"]);
+}
+
+#[test]
+fn loose_list_keeps_bullets_and_numbers() {
+    let rows = row_texts("- a\n\n- b\n", 80);
+    assert!(rows.iter().any(|r| r == "  • a"), "{rows:?}");
+    assert!(rows.iter().any(|r| r == "  • b"), "{rows:?}");
+    let rows = row_texts("1. a\n\n2. b\n", 80);
+    assert!(rows.iter().any(|r| r == " 1. a"), "{rows:?}");
+    assert!(rows.iter().any(|r| r == " 2. b"), "{rows:?}");
+}
+
+#[test]
+fn ordered_list_honours_its_start_number() {
+    let rows = row_texts("3. c\n4. d\n", 80);
+    assert!(rows.iter().any(|r| r == " 3. c"), "{rows:?}");
+    assert!(rows.iter().any(|r| r == " 4. d"), "{rows:?}");
+}
+
+#[test]
+fn wrapped_list_item_rows_hang_under_the_item_text() {
+    let rows = row_texts("- alpha beta gamma delta\n", 16);
+    assert_eq!(rows[0], "  • alpha beta");
+    assert!(rows[1].starts_with("    "), "{rows:?}");
+    assert!(rows.iter().all(|r| display_width(r) <= 16));
+}
+
+#[test]
+fn inline_link_keeps_its_paragraph_in_one_block() {
+    let rows = row_texts("See [the docs](https://x.example/y) for details.", 80);
+    assert_eq!(rows[0], "See the docs for details.");
+    assert_eq!(rows[1], "  ↪ https://x.example/y");
+}
+
+#[test]
+fn images_show_alt_text_and_target() {
+    let rows = row_texts("![diagram](https://x.example/d.png)", 80);
+    assert_eq!(rows[0], "diagram");
+    assert_eq!(rows[1], "  ↪ https://x.example/d.png");
+}
+
+#[test]
+fn long_code_rows_wrap_to_the_width_and_split_syntax_spans() {
+    let long = "a".repeat(45);
+    let rows = markdown_to_styled(&format!("```rust\nlet x = \"{long}\";\n```\n"), 20);
+    let code: Vec<_> = rows
+        .iter()
+        .filter(|r| r.color == Color::DarkYellow)
+        .collect();
+    assert!(code.len() >= 3);
+    assert!(code.iter().all(|r| display_width(&r.text) <= 20));
+    assert_eq!(code[0].cont, crate::ui::renderer::Cont::None);
+    assert_eq!(code[1].cont, crate::ui::renderer::Cont::Split);
+    let rejoined: String = code.iter().map(|r| r.text.as_str()).collect();
+    assert!(rejoined.contains(&long));
+    for row in &code {
+        if let Some(spans) = &row.syntax_spans {
+            assert!(spans.iter().all(|s| s.range.end <= row.text.len()));
+        }
+    }
+}
+
+#[test]
+fn wrapped_rows_report_how_they_continue() {
+    use crate::ui::markdown::word_wrap_flagged;
+    use crate::ui::renderer::Cont;
+    let rows = word_wrap_flagged("alpha beta gamma", 10);
+    assert_eq!(rows[0].1, Cont::None);
+    assert_eq!(rows[1].1, Cont::Space);
+    let rows = word_wrap_flagged(&"x".repeat(25), 10);
+    assert_eq!(rows[0].1, Cont::None);
+    assert!(rows[1..].iter().all(|r| r.1 == Cont::Split));
+}
+
+#[test]
+fn laid_out_rows_never_exceed_the_width() {
+    let doc = "# Title heading that is long\n\n> quoted text that keeps going and going\n\n- item with a fairly long line of text here\n  - nested item with another long line of text\n\n| a | b |\n|---|---|\n| one two three four five | six seven eight nine ten |\n\n```\nsome long code line that must wrap around the edge\n```\n";
+    for width in 12..60 {
+        for row in markdown_to_styled(doc, width) {
+            assert!(
+                display_width(&row.text) <= width,
+                "w={width} {:?}",
+                row.text
+            );
+        }
+    }
+}

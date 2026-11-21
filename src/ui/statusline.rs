@@ -805,8 +805,7 @@ fn resolve_item(
         "context_percentage" => Some(format!("{}%", context_percentage(session).unwrap_or(0))),
         "cost" => {
             let amount = session.recorded_total_cost();
-            let unknown = session.known_input_output_prices().is_none()
-                || session.spend_account.snapshot().tracking_error;
+            let unknown = session.cost_is_incomplete();
             if unknown {
                 Some(if amount > 0.0 {
                     format!("${amount:.4}+?")

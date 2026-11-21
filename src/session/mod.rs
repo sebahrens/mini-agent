@@ -2125,6 +2125,23 @@ impl Session {
         self.input_output_prices_known = Some(prices.is_some());
     }
 
+    /// Whether the recorded cost may undercount: prices are unknown or spend
+    /// tracking failed.
+    pub(crate) fn cost_is_incomplete(&self) -> bool {
+        self.known_input_output_prices().is_none() || self.spend_account.snapshot().tracking_error
+    }
+
+    /// The cost as the statusline and exports show it: the recorded amount,
+    /// marked `+?` when it may be incomplete, or `?` when nothing is priced.
+    pub(crate) fn cost_display(&self) -> String {
+        let amount = self.recorded_total_cost();
+        match (self.cost_is_incomplete(), amount > 0.0) {
+            (false, _) => format!("${amount:.4}"),
+            (true, true) => format!("${amount:.4}+?"),
+            (true, false) => "price unknown".into(),
+        }
+    }
+
     pub(crate) fn known_input_output_prices(&self) -> Option<(f64, f64)> {
         let known = self
             .input_output_prices_known

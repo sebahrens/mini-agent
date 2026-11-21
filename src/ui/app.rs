@@ -3787,13 +3787,6 @@ impl<'a> App<'a> {
                 {
                     if self.renderer.toggle_reasoning_at_line(idx) {
                         self.renderer.clear_selection();
-                    } else if let Some(url) = self.renderer.link_url_at(idx, col) {
-                        let tx = self.user_tx.clone();
-                        tokio::spawn(async move {
-                            if let Err(error) = renderer_mod::open_url(&url).await {
-                                let _ = tx.send(UserEvent::LinkOpenFailed(error.to_string())).await;
-                            }
-                        });
                     } else {
                         let text_col = self.renderer.chat_text_col(col);
                         let double = self.renderer.register_click(row, col);
@@ -3838,8 +3831,21 @@ impl<'a> App<'a> {
                         // and unfold or fold a tool result clicked on its
                         // summary row.
                         let clicked = self.renderer.selection_start.map(|point| point.line);
+                        // A link opens on the release of a plain click, so a
+                        // press on a URL can still start a drag selection.
+                        let url = clicked.and_then(|line| self.renderer.link_url_at(line, col));
                         self.renderer.clear_selection();
-                        if let Some(line) = clicked {
+                        if let Some(url) = url {
+                            self.renderer
+                                .show_notice(&format!("opening {url}"), C_AGENT);
+                            let tx = self.user_tx.clone();
+                            tokio::spawn(async move {
+                                if let Err(error) = renderer_mod::open_url(&url).await {
+                                    let _ =
+                                        tx.send(UserEvent::LinkOpenFailed(error.to_string())).await;
+                                }
+                            });
+                        } else if let Some(line) = clicked {
                             self.renderer.toggle_tool_output_at_line(line);
                         }
                     }

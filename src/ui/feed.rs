@@ -9,8 +9,8 @@ use compact_str::CompactString;
 use crossterm::style::Color;
 
 use super::events::{Sanitized, sanitize_output};
-use super::markdown::{StyledMarkdown, markdown_with_code_state, word_wrap};
-use super::renderer::LineEntry;
+use super::markdown::{StyledMarkdown, markdown_with_code_state, word_wrap_flagged};
+use super::renderer::{Cont, LineEntry};
 use super::{C_AGENT, C_ERROR, C_PERM, C_TOOL};
 
 const MAX_FEED_BLOCKS: usize = 4_096;
@@ -190,10 +190,6 @@ struct AgentRender {
     /// `&self` read; `Feed` mutators that rewrite block text invalidate it.
     md: RefCell<Option<MdCache>>,
     syntax: RefCell<super::highlight::TokenCache>,
-    /// Incremental highlight-budget verdict for `text`, computed on first use
-    /// and extended by appends so a repaint never rescans the whole block.
-    /// `None` until a layout needs it, and again after the text is rewritten.
-    budget: Cell<Option<super::highlight::BudgetScan>>,
 }
 
 #[derive(Clone, Debug)]
@@ -289,30 +285,6 @@ struct OpenFence {
 }
 
 impl Block {
-    /// Whether the block's text fits the syntax-highlighting budget. Scans the
-    /// text once; later appends extend the verdict incrementally.
-    fn within_highlight_budget(&self) -> bool {
-        let agent = self.agent_render();
-        match agent.budget.get() {
-            Some(scan) => scan.within(),
-            None => {
-                let scan = super::highlight::BudgetScan::of(&self.text);
-                agent.budget.set(Some(scan));
-                scan.within()
-            }
-        }
-    }
-
-    /// Record `appended` (already pushed onto `text`) in the budget verdict.
-    fn note_appended(&self, appended: &str) {
-        if let Some(agent) = self.agent.get()
-            && let Some(mut scan) = agent.budget.get()
-        {
-            scan.push(appended);
-            agent.budget.set(Some(scan));
-        }
-    }
-
     /// The agent layout state, allocated on first use.
     fn agent_render(&self) -> &AgentRender {
         self.agent.get_or_init(Default::default)
@@ -329,13 +301,6 @@ impl Block {
     fn clear_syntax_cache(&self) {
         if let Some(agent) = self.agent.get() {
             agent.syntax.borrow_mut().clear();
-        }
-    }
-
-    /// Forget the highlight-budget verdict (a no-op before any agent layout).
-    fn clear_highlight_budget(&self) {
-        if let Some(agent) = self.agent.get() {
-            agent.budget.set(None);
         }
     }
 
@@ -403,7 +368,6 @@ impl Block {
         std::mem::swap(&mut self.text, &mut fold.alternate);
         fold.expanded = expanded;
         self.revision = self.revision.wrapping_add(1);
-        self.clear_highlight_budget();
         *self.plain_cache.borrow_mut() = None;
         self.clear_md_cache();
         self.clear_syntax_cache();
@@ -501,6 +465,9 @@ pub struct Feed {
     total_bytes: usize,
     pruned_blocks: u64,
     retention_generation: u64,
+    /// Bumped by retention events that invalidate every row index (clear,
+    /// block compaction), unlike front pruning which keeps the tail intact.
+    reset_generation: u64,
     /// Bumped by every content mutation. The renderer compares generations to
     /// know whether the chat viewport needs a redraw, which also catches
     /// mutations made through `Renderer::feed_mut()`.
@@ -575,6 +542,7 @@ impl Feed {
             total_bytes: 0,
             pruned_blocks: 0,
             retention_generation: 0,
+            reset_generation: 0,
             generation: 0,
             reasoning_display: ReasoningDisplay::Collapsed,
             layout_cache: RefCell::new(None),
@@ -780,6 +748,7 @@ impl Feed {
         self.total_bytes = 0;
         self.pruned_blocks = 0;
         self.retention_generation = self.retention_generation.wrapping_add(1);
+        self.reset_generation = self.reset_generation.wrapping_add(1);
     }
 
     #[cfg(test)]
@@ -793,6 +762,10 @@ impl Feed {
 
     pub(crate) fn retention_generation(&self) -> u64 {
         self.retention_generation
+    }
+
+    pub(crate) fn reset_generation(&self) -> u64 {
+        self.reset_generation
     }
 
     pub fn push_block(&mut self, style: BlockStyle, text: impl Into<String>) {
@@ -1222,7 +1195,6 @@ impl Feed {
                 reasoning.chars = reasoning.chars.saturating_add(chars());
             }
             block.text.push_str(text);
-            block.note_appended(text);
             let compacted = compact_oversized_block(&mut block.text);
             self.total_bytes = self
                 .total_bytes
@@ -1231,11 +1203,11 @@ impl Feed {
             block.revision = block.revision.wrapping_add(1);
             *block.render_cache.borrow_mut() = None;
             if compacted {
-                block.clear_highlight_budget();
                 *block.plain_cache.borrow_mut() = None;
                 block.clear_md_cache();
                 block.clear_syntax_cache();
                 self.retention_generation = self.retention_generation.wrapping_add(1);
+                self.reset_generation = self.reset_generation.wrapping_add(1);
             }
             self.prune_completed_prefix();
             true
@@ -1267,7 +1239,6 @@ impl Feed {
                 self.running_reasoning = None;
             }
             last.revision = last.revision.wrapping_add(1);
-            last.clear_highlight_budget();
             *last.plain_cache.borrow_mut() = None;
             last.clear_md_cache();
             last.clear_syntax_cache();
@@ -1856,6 +1827,8 @@ fn reasoning_block_segments(feed: &Feed, block: &Block, width: usize) -> Vec<Arc
         text: CompactString::from(clipped),
         color: feed.palette.reasoning,
         theme_accent: false,
+        cont: Cont::None,
+        lead: 0,
     }])];
     if expanded {
         segments.extend(plain_body_segments(feed, block, width));
@@ -1929,14 +1902,18 @@ fn push_plain_rows(text: &str, width: usize, color: Color, result: &mut Vec<Line
                 text: CompactString::new(""),
                 color,
                 theme_accent: false,
+                cont: Cont::None,
+                lead: 0,
             });
         } else {
-            for chunk in word_wrap(trimmed, width) {
+            for (chunk, cont) in word_wrap_flagged(trimmed, width) {
                 result.push(LineEntry {
                     syntax_spans: None,
                     text: chunk,
                     color,
                     theme_accent: false,
+                    cont,
+                    lead: 0,
                 });
             }
         }
@@ -2223,9 +2200,7 @@ fn render_region(
     highlighting: bool,
     ends_inside_fence: bool,
 ) -> StyledMarkdown {
-    // `highlighting` already holds the whole block's budget verdict. A region
-    // (with its replayed fence opener) is a subset of the block's lines, so it
-    // never exceeds a budget the block fits.
+    // Fence budgets are enforced per fence by `CodeState`.
     let mut rendered = match entry_fence {
         Some(fence) => {
             let mut replayed = String::with_capacity(fence.opener.len() + 1 + text.len());
@@ -2270,7 +2245,9 @@ fn agent_completed_lines(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Ve
         block.text.len()
     };
 
-    let highlighting = !feed.monochrome && block.within_highlight_budget();
+    // Each fence is bounded by its own `CodeState` budget, so unrelated prose
+    // (a long paragraph, many lines) never turns highlighting off block-wide.
+    let highlighting = !feed.monochrome;
 
     // Try an exact cache hit before scanning markdown boundaries. Appending an
     // unfinished tail leaves completed_len unchanged and needs no markdown work.
@@ -2372,7 +2349,7 @@ fn agent_completed_lines(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Ve
             stable_code = finalized.code_state.take();
             let mut finalized = finalized.lines;
             if !has_rows && !finalized.is_empty() {
-                prefix_agent_first_line(&mut finalized);
+                prefix_agent_first_line(&mut finalized, width);
                 has_rows = true;
             }
             push_stable_segment(&mut stable_segments, finalized);
@@ -2390,7 +2367,7 @@ fn agent_completed_lines(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Ve
         );
         let mut suffix = suffix.lines;
         if !has_rows && !suffix.is_empty() {
-            prefix_agent_first_line(&mut suffix);
+            prefix_agent_first_line(&mut suffix, width);
         }
 
         let cache = MdCache {
@@ -2430,7 +2407,7 @@ fn agent_completed_lines(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Ve
         stable_code = finalized.code_state.take();
         let mut finalized = finalized.lines;
         if !finalized.is_empty() {
-            prefix_agent_first_line(&mut finalized);
+            prefix_agent_first_line(&mut finalized, width);
             has_rows = true;
         }
         stable_segments.push(Arc::new(finalized));
@@ -2447,7 +2424,7 @@ fn agent_completed_lines(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Ve
     );
     let mut suffix = suffix.lines;
     if !has_rows && !suffix.is_empty() {
-        prefix_agent_first_line(&mut suffix);
+        prefix_agent_first_line(&mut suffix, width);
     }
 
     let cache = MdCache {
@@ -2483,16 +2460,73 @@ fn push_stable_segment(segments: &mut Vec<Arc<Vec<LineEntry>>>, rows: Vec<LineEn
     segments.push(Arc::new(rows));
 }
 
-fn prefix_agent_first_line(lines: &mut [LineEntry]) {
-    if let Some(first) = lines.first_mut()
-        && !first.text.starts_with("< ")
-    {
-        first.text = CompactString::from(format!("< {}", first.text));
-        if let Some(spans) = &mut first.syntax_spans {
-            for span in Arc::make_mut(spans) {
-                span.range.start += 2;
-                span.range.end += 2;
+/// Prefix the first row of an agent reply with `< `. The rows were laid out at
+/// `width`, so a first row wider than `width - 2` is re-wrapped with the prefix
+/// included instead of running into the scrollbar gutter.
+fn prefix_agent_first_line(lines: &mut Vec<LineEntry>, width: usize) {
+    let Some(first) = lines.first() else {
+        return;
+    };
+    if first.text.starts_with("< ") {
+        return;
+    }
+    if width > 2 && super::utils::display_width(&first.text) + 2 > width {
+        let first = lines.remove(0);
+        let prefixed = format!("< {}", first.text);
+        let rows: Vec<LineEntry> = if first.syntax_spans.is_none() {
+            word_wrap_flagged(&prefixed, width)
+                .into_iter()
+                .map(|(text, cont)| LineEntry {
+                    text,
+                    cont,
+                    ..first.clone()
+                })
+                .collect()
+        } else {
+            // Code rows: character-split, dropping spans on the split rows.
+            let mut rows = Vec::new();
+            let mut row = String::new();
+            let mut row_w = 0;
+            for ch in prefixed.chars() {
+                let cw = super::utils::char_display_width(ch);
+                if row_w + cw > width && !row.is_empty() {
+                    let cont = if rows.is_empty() {
+                        Cont::None
+                    } else {
+                        Cont::Split
+                    };
+                    rows.push(LineEntry {
+                        text: CompactString::from(std::mem::take(&mut row)),
+                        syntax_spans: None,
+                        cont,
+                        ..first.clone()
+                    });
+                    row_w = 0;
+                }
+                row.push(ch);
+                row_w += cw;
             }
+            rows.push(LineEntry {
+                text: CompactString::from(row),
+                syntax_spans: None,
+                cont: if rows.is_empty() {
+                    Cont::None
+                } else {
+                    Cont::Split
+                },
+                ..first.clone()
+            });
+            rows
+        };
+        lines.splice(0..0, rows);
+        return;
+    }
+    let first = &mut lines[0];
+    first.text = CompactString::from(format!("< {}", first.text));
+    if let Some(spans) = &mut first.syntax_spans {
+        for span in Arc::make_mut(spans) {
+            span.range.start += 2;
+            span.range.end += 2;
         }
     }
 }
@@ -2537,17 +2571,19 @@ fn agent_tail_lines(
         return Vec::new();
     }
     let color = palette.agent;
-    let mut lines = word_wrap(tail, width)
+    let mut lines = word_wrap_flagged(tail, width)
         .into_iter()
-        .map(|text| LineEntry {
+        .map(|(text, cont)| LineEntry {
             syntax_spans: None,
             text,
             color,
             theme_accent: false,
+            cont,
+            lead: 0,
         })
         .collect::<Vec<_>>();
     if needs_prefix {
-        prefix_agent_first_line(&mut lines);
+        prefix_agent_first_line(&mut lines, width);
     }
     lines
 }

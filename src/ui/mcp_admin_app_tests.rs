@@ -2124,7 +2124,7 @@ async fn native_deferred_wire_case(same_response: bool, hook: Option<&str>, cost
             assert_eq!(server.method_count("tools/list"), cached_calls, "cached deferred status must not perform an RPC");
             command(&mut diagnostic_app, "/mcp").await;
             let rendered = diagnostic_app.renderer.captured_output();
-            assert!(rendered.contains("schema loading: Deferred"));
+            assert!(rendered.contains("schema loading: deferred"));
             assert!(rendered.contains(&format!("1 deferred schemas, {} enabled by search",usize::from(!same_response))));
             assert_eq!(server.method_count("tools/list"),cached_calls,"actual cached status command must not query the server");
             assert!(questions.try_recv().is_err());

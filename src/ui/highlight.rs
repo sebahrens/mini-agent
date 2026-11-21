@@ -616,6 +616,7 @@ pub(crate) fn within_budget(text: &str) -> bool {
 /// Incremental form of [`within_budget`] for append-only text. Every limit is
 /// monotone under appends, so once a scan is over budget it stays over and
 /// further appends cost nothing.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct BudgetScan {
     bytes: usize,
@@ -626,6 +627,7 @@ pub(crate) struct BudgetScan {
     over: bool,
 }
 
+#[cfg(test)]
 impl BudgetScan {
     /// Scan `text` from the start (counted by `budget_scans_for_test`).
     pub(crate) fn of(text: &str) -> Self {

@@ -609,6 +609,52 @@ mod dirty {
     }
 
     #[test]
+    fn wrapped_text_and_urls_copy_and_open_as_one_logical_line() {
+        let mut r = Renderer::new().unwrap();
+        let width = r.line_width();
+        let url = format!("https://example.com/{}", "a".repeat(width * 2));
+        r.feed_mut().push_line(BlockStyle::Plain, &url);
+        let rows = r.buffer_len();
+        assert!(rows >= 3);
+        r.selection_active = true;
+        r.selection_start = Some(SelectionPoint::new(0, 0));
+        r.selection_end = Some(SelectionPoint::new(rows - 1, 500));
+        assert_eq!(r.selected_text().as_deref(), Some(url.as_str()));
+        for row in 0..rows {
+            assert_eq!(
+                r.link_url_at(row, 1).as_deref(),
+                Some(url.as_str()),
+                "row {row}"
+            );
+        }
+        let mut r = Renderer::new().unwrap();
+        let words = "word ".repeat(width);
+        r.feed_mut().push_line(BlockStyle::Plain, words.trim_end());
+        r.selection_active = true;
+        r.selection_start = Some(SelectionPoint::new(0, 0));
+        r.selection_end = Some(SelectionPoint::new(r.buffer_len() - 1, 500));
+        assert_eq!(r.selected_text().as_deref(), Some(words.trim_end()));
+    }
+
+    #[test]
+    fn trailing_punctuation_is_not_part_of_a_url() {
+        use crate::ui::renderer::trim_url;
+        assert_eq!(trim_url("https://e.com/a."), "https://e.com/a");
+        assert_eq!(trim_url("https://e.com)"), "https://e.com");
+        assert_eq!(trim_url("https://e.com`"), "https://e.com");
+        assert_eq!(trim_url("https://e.com/a_(b)"), "https://e.com/a_(b)");
+        assert_eq!(trim_url("https://e.com/a),"), "https://e.com/a");
+    }
+
+    #[test]
+    fn error_notices_are_kept_in_the_transcript() {
+        let mut r = Renderer::new().unwrap();
+        let before = r.feed().block_count();
+        r.show_notice("copy failed: wl-copy missing", crate::ui::C_ERROR);
+        assert_eq!(r.feed().block_count(), before + 1);
+    }
+
+    #[test]
     fn copy_notices_are_transient_and_never_enter_the_transcript() {
         let mut r = Renderer::new().unwrap();
         let before = r.feed().block_count();
@@ -671,7 +717,7 @@ mod dirty {
     }
 
     #[test]
-    fn feed_retention_resets_scroll_and_selection_indices() {
+    fn feed_pruning_keeps_a_scrolled_view_and_drops_the_selection() {
         let mut r = Renderer::new().unwrap();
         let (max_blocks, _, _) = Feed::retention_limits_for_test();
         for index in 0..max_blocks {
@@ -687,7 +733,8 @@ mod dirty {
 
         r.reconcile_feed_retention();
 
-        assert!(!r.is_scrolling());
+        // Rows are measured from the bottom, so pruning the front keeps the view.
+        assert!(r.is_scrolling());
         assert!(!r.selection_active);
         assert_eq!(r.selection_start, None);
         assert_eq!(r.selection_end, None);
@@ -1554,6 +1601,10 @@ mod tool_output_folding {
         assert!(looks_like_error("  error reading file"));
         assert!(looks_like_error("Permission denied by user"));
         assert!(!looks_like_error("File: src/main.rs (10 lines)"));
+        assert!(!looks_like_error("errors.rs\nlib.rs"));
+        assert!(!looks_like_error("error_codes.go:12: match"));
+        assert!(looks_like_error("Error: boom"));
+        assert!(looks_like_error("error"));
     }
 
     #[test]

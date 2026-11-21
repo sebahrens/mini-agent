@@ -202,7 +202,14 @@ impl App<'_> {
                 .map_or(crate::extras::mcp::config::McpDefer::Auto, |server| {
                     server.defer()
                 });
-            rows.push(format!("    schema loading: {defer:?}"));
+            rows.push(format!(
+                "    schema loading: {}",
+                match defer {
+                    crate::extras::mcp::config::McpDefer::Eager => "eager",
+                    crate::extras::mcp::config::McpDefer::Deferred => "deferred",
+                    crate::extras::mcp::config::McpDefer::Auto => "automatic",
+                }
+            ));
             if let Some(client) = self.ui.mcp_manager.as_ref().and_then(|manager| {
                 manager
                     .handles
@@ -244,9 +251,19 @@ impl App<'_> {
                 ] {
                     if let Some(attempt) = attempt {
                         rows.push(format!(
-                            "    last {kind} attempt #{}: {:?}",
-                            attempt.id, attempt.outcome
+                            "    last {kind} attempt #{}: {}",
+                            attempt.id,
+                            attempt_outcome_text(attempt.outcome)
                         ));
+                        if matches!(
+                            attempt.outcome,
+                            crate::extras::mcp::health::AttemptOutcome::Failed
+                                | crate::extras::mcp::health::AttemptOutcome::TimedOut
+                        ) {
+                            rows.push(format!(
+                                "    next: check the {name} command or URL in .mcp.json; /mcp login {name} re-authorizes OAuth servers"
+                            ));
+                        }
                     }
                 }
             }
@@ -1482,5 +1499,18 @@ impl App<'_> {
         }
         self.refresh()?;
         Ok(true)
+    }
+}
+
+/// Plain wording for a connection or catalogue attempt outcome.
+fn attempt_outcome_text(outcome: crate::extras::mcp::health::AttemptOutcome) -> &'static str {
+    use crate::extras::mcp::health::AttemptOutcome as O;
+    match outcome {
+        O::Pending => "in progress",
+        O::Succeeded => "succeeded",
+        O::Failed => "failed",
+        O::TimedOut => "timed out",
+        O::Cancelled => "cancelled",
+        O::Removed => "removed",
     }
 }
