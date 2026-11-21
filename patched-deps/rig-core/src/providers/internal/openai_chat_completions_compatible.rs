@@ -701,6 +701,7 @@ mod tests {
     };
     use crate::completion::CompletionError;
     use crate::http_client;
+    use crate::json_utils;
     use crate::streaming::RawStreamingToolCall;
     use crate::streaming::StreamedAssistantContent;
     use crate::test_utils::MockStreamingClient;
@@ -902,7 +903,7 @@ mod tests {
 
     #[test]
     fn finish_reason_keeps_calls_with_unparseable_arguments_marked() {
-        let mut calls = HashMap::new();
+        let mut calls = std::collections::HashMap::new();
         calls.insert(
             0,
             RawStreamingToolCall::new(
@@ -1274,7 +1275,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_calls_finish_reason_drops_partial_argument_payloads() {
+    async fn tool_calls_finish_reason_keeps_partial_argument_payloads_marked_invalid() {
         let client = MockStreamingClient {
             sse_bytes: sse_bytes_from_data_lines(["start", "finish"]),
         };
@@ -1296,20 +1297,25 @@ mod tests {
             match item.expect("stream item should be ok") {
                 StreamedAssistantContent::ToolCallDelta { .. } => {}
                 StreamedAssistantContent::Final(_) => saw_final = true,
-                StreamedAssistantContent::ToolCall { .. } => saw_tool_call = true,
+                StreamedAssistantContent::ToolCall { tool_call, .. } => {
+                    saw_tool_call = true;
+                    assert!(
+                        json_utils::invalid_tool_arguments_error(&tool_call.function.arguments)
+                            .is_some(),
+                        "{:?}",
+                        tool_call.function.arguments
+                    );
+                }
                 other => panic!(
                     "unexpected stream item while asserting finish-reason cleanup: {other:?}"
                 ),
             }
         }
 
+        assert!(saw_final, "stream should still yield a final response");
         assert!(
-            saw_final,
-            "stream should still yield a final response after dropping the partial tool call"
-        );
-        assert!(
-            !saw_tool_call,
-            "finish_reason cleanup should drop partial tool calls instead of emitting them"
+            saw_tool_call,
+            "a finish_reason of tool_calls with unparseable arguments keeps the call, marked invalid, so the host can correct the model"
         );
     }
 }

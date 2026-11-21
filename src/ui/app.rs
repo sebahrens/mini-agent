@@ -8883,11 +8883,43 @@ mod initial_turn_tests {
         assert_eq!(session.messages[5].content, "partial explanation");
         // The closing result keeps the real tool name, and an interrupt adds
         // a host row after the partial text.
-        assert!(synthetic.content.starts_with("edit:\n"), "{}", synthetic.content);
+        assert!(
+            synthetic.content.starts_with("edit:\n"),
+            "{}",
+            synthetic.content
+        );
         crate::ui::record_interrupted_turn_notice(&mut session);
         let notice = session.messages.last().unwrap();
         assert_eq!(notice.role, MessageRole::System);
         assert!(crate::agent::input::is_host_instruction(&notice.content));
+    }
+
+    #[test]
+    fn interrupted_batch_keeps_the_real_result_of_a_call_that_finished() {
+        let mut session = Session::new("openrouter", "test-model", 128_000, "/workspace");
+        let mut run = AgentRunState::default();
+        let pending_turn = PendingMainTurn::capture(&session, "edit then test");
+        crate::ui::mark_main_turn_started(&mut session, &mut run, pending_turn);
+        session.add_tool_call_with_id("settled-edit", "edit", &serde_json::json!({}));
+        session.add_tool_call_with_id("running-test", "shell", &serde_json::json!({}));
+        crate::agent::runner::record_settled_result_for_tests("settled-edit", "edit applied");
+
+        assert!(crate::ui::preserve_pending_main_turn_progress(
+            &mut run,
+            &mut session
+        ));
+        let results: Vec<_> = session
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::ToolResult)
+            .map(|message| message.content.to_string())
+            .collect();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].contains("edit applied"), "{results:?}");
+        assert!(
+            results[1].contains(crate::agent::runner::UNKNOWN_TOOL_OUTCOME),
+            "{results:?}"
+        );
     }
 
     #[test]

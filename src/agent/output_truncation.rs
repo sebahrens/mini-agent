@@ -382,7 +382,10 @@ mod tests {
         let _ = server.await;
         let response = out.response.expect("the child's text is kept");
         assert!(response.starts_with("half a report"), "{response}");
-        assert!(response.contains("[partial: output truncated"), "{response}");
+        assert!(
+            response.contains("[partial: output truncated"),
+            "{response}"
+        );
     }
 
     #[tokio::test]

@@ -441,7 +441,16 @@ impl PendingMainTurn {
         }
 
         for (id, name) in unresolved {
-            session.add_tool_result_with_id(&id, &name, crate::agent::runner::UNKNOWN_TOOL_OUTCOME);
+            // A call that finished while its batch was still running has a real
+            // result; only calls that really did not finish are "unknown".
+            match crate::agent::runner::take_settled_result(&id) {
+                Some(result) => session.add_tool_result_with_id(&id, &name, &result),
+                None => session.add_tool_result_with_id(
+                    &id,
+                    &name,
+                    crate::agent::runner::UNKNOWN_TOOL_OUTCOME,
+                ),
+            };
         }
     }
 

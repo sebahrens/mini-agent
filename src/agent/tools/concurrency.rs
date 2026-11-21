@@ -416,11 +416,8 @@ pub(crate) fn bind_with_shared(
     tools
         .into_iter()
         .map(|tool| {
-            Box::new(ConcurrencyBoundTool::new(
-                tool,
-                lane.clone(),
-                shared_names,
-            )) as Box<dyn ToolDyn>
+            Box::new(ConcurrencyBoundTool::new(tool, lane.clone(), shared_names))
+                as Box<dyn ToolDyn>
         })
         .collect()
 }

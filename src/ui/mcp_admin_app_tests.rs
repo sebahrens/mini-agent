@@ -2141,7 +2141,7 @@ async fn native_deferred_wire_case(same_response: bool, hook: Option<&str>, cost
             assert!(server.provider_streams.lock().unwrap().is_empty());
             assert!(matches!(permission.lock().unwrap().check_mcp("mcp_tool:owned:owned_echo", None, "owned_echo"), crate::permission::checker::CheckResult::Ask));
             let wire = server.requests.lock().unwrap().iter().filter(|(route,_)|route.starts_with("POST /v1/chat/completions ")).map(|(_,body)|body.clone()).collect::<Vec<_>>();
-            assert_eq!(wire.len(),if same_response{2}else if cost_cap{2}else{3});
+            assert_eq!(wire.len(),if same_response || cost_cap {2} else {3});
             if let Some(mode) = hook {
                 let calls = server.requests.lock().unwrap().iter().filter(|(_,body)|body["method"]=="tools/call").map(|(_,body)|body.clone()).collect::<Vec<_>>();
                 let model_tool_results = serde_json::to_string(&wire[2]["messages"]).unwrap();

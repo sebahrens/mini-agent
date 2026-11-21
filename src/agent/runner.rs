@@ -481,6 +481,7 @@ impl<M: CompletionModel> AgentHook<M> for ToolLoopGuard {
                 if outcome.is_error() || outcome.is_denied() {
                     record_tool_failure(internal_call_id);
                 }
+                record_settled_result(internal_call_id, result);
                 let raw = raw_args_hash(args);
                 let cached = ctx.scratchpad().update(|state: &mut ToolLoopState| {
                     state
@@ -577,7 +578,10 @@ fn unknown_tool_message(context: &rig::agent::InvalidToolCallContext) -> String 
     allowed.sort_unstable();
     const MAX_LISTED: usize = 60;
     let listed = allowed.len().min(MAX_LISTED);
-    message.push_str(&format!(" Available tools: {}", allowed[..listed].join(", ")));
+    message.push_str(&format!(
+        " Available tools: {}",
+        allowed[..listed].join(", ")
+    ));
     if allowed.len() > listed {
         message.push_str(&format!(", and {} more", allowed.len() - listed));
     }
@@ -1018,7 +1022,10 @@ impl<M: CompletionModel> AgentHook<M> for StopBarrierHook {
     async fn on_event(&self, _ctx: &HookContext, event: StepEvent<'_, M>) -> Flow {
         match event {
             StepEvent::ToolCall { .. } | StepEvent::CompletionRequestPrepared { .. }
-                if self.0.as_ref().is_some_and(|shared| shared.stop_requested()) =>
+                if self
+                    .0
+                    .as_ref()
+                    .is_some_and(|shared| shared.stop_requested()) =>
             {
                 Flow::terminate("context window exhausted")
             }
@@ -1778,6 +1785,50 @@ fn record_tool_failure(internal_call_id: &str) {
     });
 }
 
+/// Results of calls that finished while their batch was still running.
+///
+/// Rig commits a tool batch atomically: no result reaches the runner until the
+/// slowest call of the batch ends. If the user interrupts meanwhile, the
+/// finished calls would be recorded as "outcome unknown". `ToolLoopGuard` notes
+/// each result as its call settles; the interrupt path
+/// ([`take_settled_result`]) writes the real text instead
+/// (mini-agent-sskdu.249). Bounded in entries and bytes, newest kept.
+static SETTLED_RESULTS: std::sync::Mutex<VecDeque<(String, String)>> =
+    std::sync::Mutex::new(VecDeque::new());
+const SETTLED_RESULT_MAX_ENTRIES: usize = 128;
+const SETTLED_RESULT_MAX_BYTES: usize = 16 * 1024;
+
+fn record_settled_result(internal_call_id: &str, result: &str) {
+    let mut end = result.len().min(SETTLED_RESULT_MAX_BYTES);
+    while !result.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut text = result[..end].to_owned();
+    if end < result.len() {
+        text.push_str(
+            "\n[result truncated: the turn was interrupted before it was recorded in full]",
+        );
+    }
+    let mut settled = SETTLED_RESULTS.lock().unwrap_or_else(|e| e.into_inner());
+    settled.retain(|(id, _)| id != internal_call_id);
+    settled.push_back((internal_call_id.to_owned(), text));
+    while settled.len() > SETTLED_RESULT_MAX_ENTRIES {
+        settled.pop_front();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn record_settled_result_for_tests(internal_call_id: &str, result: &str) {
+    record_settled_result(internal_call_id, result);
+}
+
+/// The result a call produced before its batch settled, consuming it.
+pub(crate) fn take_settled_result(internal_call_id: &str) -> Option<String> {
+    let mut settled = SETTLED_RESULTS.lock().unwrap_or_else(|e| e.into_inner());
+    let position = settled.iter().position(|(id, _)| id == internal_call_id)?;
+    settled.remove(position).map(|(_, text)| text)
+}
+
 /// Whether the tool call with this internal id failed or was denied. Consumes
 /// the record; outside a work scope every result reads as successful.
 pub(crate) fn take_tool_failure(internal_call_id: &str) -> bool {
@@ -2103,7 +2154,8 @@ const UNRESOLVED_TOOL_CALLS_ERROR: &str =
     "Agent stream ended with unresolved tool calls; execution outcome is unknown.";
 const TRANSIENT_PROVIDER_CONTINUATION: &str = "[Host: transient provider error; not written by the user]\nA transient provider error interrupted the previous completion call. Continue from the preserved transcript without repeating completed tool calls.";
 /// The continuation used when nothing more specific applies (an empty response).
-const DEFAULT_CONTINUATION: &str = "[Host: empty response; not written by the user]\nPlease continue.";
+const DEFAULT_CONTINUATION: &str =
+    "[Host: empty response; not written by the user]\nPlease continue.";
 
 struct CompletionRetryState {
     failures: usize,
@@ -4081,6 +4133,7 @@ where
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn continue_prompt_message_injector<M>(
     agent: &Agent<M>,
     original_prompt: &Message,
@@ -4886,6 +4939,8 @@ where
                         goal_report_accepted |= is_accepted_goal_report(&tool_name, &output);
                         let loop_notice = is_tool_loop_notice(&output).then(|| output.clone());
                         let is_error = take_tool_failure(&internal_call_id);
+                        // Delivered normally: the interrupt fallback is not needed.
+                        let _ = take_settled_result(&internal_call_id);
                         let images = match crate::session::tool_image::from_result(&tool_result) {
                             Ok(images) => images,
                             Err(error) if tool_name == "read" => {
@@ -5072,13 +5127,12 @@ where
                                     .await;
                                 if !passed {
                                     if verification_attempt < verification.max_attempts {
-                                        next_instruction =
-                                            Some(verification_retry_instruction(
-                                                verification.command.as_deref().unwrap_or(""),
-                                                verification_attempt,
-                                                verification.max_attempts,
-                                                &diagnostic,
-                                            ));
+                                        next_instruction = Some(verification_retry_instruction(
+                                            verification.command.as_deref().unwrap_or(""),
+                                            verification_attempt,
+                                            verification.max_attempts,
+                                            &diagnostic,
+                                        ));
                                         break;
                                     }
                                     let _ = event_tx
@@ -5251,7 +5305,9 @@ where
                         .await;
                         park_question!();
                         if is_max_turns_stream_error(&e) {
-                            tracing::warn!("agent: maximum turn budget ({max_turns_total}) exhausted");
+                            tracing::warn!(
+                                "agent: maximum turn budget ({max_turns_total}) exhausted"
+                            );
                             let _ = event_tx
                                 .send(AgentEvent::error_with(
                                     CompactString::from(max_turns_exhausted_message(
@@ -11590,6 +11646,25 @@ mod tests {
     }
 
     #[test]
+    fn settled_results_are_bounded_taken_once_and_keep_the_newest() {
+        super::record_settled_result("settle-a", "first");
+        super::record_settled_result("settle-a", "second");
+        assert_eq!(
+            super::take_settled_result("settle-a").as_deref(),
+            Some("second")
+        );
+        assert_eq!(super::take_settled_result("settle-a"), None);
+        super::record_settled_result("settle-big", &"x".repeat(40_000));
+        let big = super::take_settled_result("settle-big").unwrap();
+        assert!(big.len() < 17_000 && big.contains("result truncated"));
+        for index in 0..300 {
+            super::record_settled_result(&format!("settle-many-{index}"), "r");
+        }
+        assert_eq!(super::take_settled_result("settle-many-0"), None);
+        assert!(super::take_settled_result("settle-many-299").is_some());
+    }
+
+    #[test]
     fn closest_tool_names_suggest_aliases_and_typos() {
         let tools: Vec<String> = ["shell", "read", "write", "find_files", "grep"]
             .into_iter()
@@ -12485,7 +12560,10 @@ mod tests {
         ));
         // The continuation instruction is its own trailing user message; no empty
         // assistant message is inserted (mini-agent-em2cw).
-        assert_eq!(history.last_ref(), &Message::user(super::DEFAULT_CONTINUATION));
+        assert_eq!(
+            history.last_ref(),
+            &Message::user(super::DEFAULT_CONTINUATION)
+        );
         assert!(
             !history
                 .iter()
@@ -13736,8 +13814,14 @@ mod tests {
                 None => panic!("runner ended without an error"),
             }
         };
-        assert!(message.contains("exhausted its maximum turn budget (2)"), "{message}");
-        assert!(message.contains(crate::cli::MAX_AGENT_TURNS_HINT), "{message}");
+        assert!(
+            message.contains("exhausted its maximum turn budget (2)"),
+            "{message}"
+        );
+        assert!(
+            message.contains(crate::cli::MAX_AGENT_TURNS_HINT),
+            "{message}"
+        );
 
         let agent = AgentBuilder::new(model())
             .tool(CountingTool(calls))
@@ -13756,7 +13840,10 @@ mod tests {
         .await
         .expect_err("a tool loop past the cap must fail")
         .to_string();
-        assert!(error.contains("exhausted its maximum turn budget (2)"), "{error}");
+        assert!(
+            error.contains("exhausted its maximum turn budget (2)"),
+            "{error}"
+        );
         assert!(error.contains(crate::cli::MAX_AGENT_TURNS_HINT), "{error}");
     }
 
