@@ -70,3 +70,13 @@ gh attestation verify mini-agent-windows-x64.msi --repo sebahrens/mini-agent
 
 The release workflow performs a real quiet per-user install, binary smoke, uninstall, and MSI
 checksum generation on `windows-latest` before the artifact can be published.
+
+## PATH
+
+The package adds its install directory to `PATH` so a new shell resolves `mini-agent` by name. A
+per-user install appends `%LOCALAPPDATA%\Programs\mini-agent` to the user `PATH`; an `ALLUSERS=1`
+install appends `%ProgramFiles%\mini-agent` to the system `PATH`. The entry is removed on
+uninstall (`Permanent="no"`). Two components own the entries (`PathUserComponent`,
+`PathMachineComponent`), selected by the `ALLUSERS` property, and the release smoke resolves
+`mini-agent.exe` by bare name from the registry `PATH` after install and checks the entry is gone
+after uninstall. A shell that was already open keeps its old `PATH`.

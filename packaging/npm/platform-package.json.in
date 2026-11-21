@@ -1,0 +1,24 @@
+{
+  "name": "@sebahrens/mini-agent-@PLATFORM@",
+  "version": "@VERSION@",
+  "description": "mini-agent native binary for @PLATFORM@ (installed through @sebahrens/mini-agent)",
+  "license": "GPL-3.0-only",
+  "homepage": "https://github.com/sebahrens/mini-agent",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sebahrens/mini-agent.git"
+  },
+  "os": ["@OS@"],
+  "cpu": ["@CPU@"],
+  "files": [
+    "@BINARY@",
+    "LICENSE",
+    "NOTICE",
+    "SOURCE.md",
+    "THIRD_PARTY_LICENSES"
+  ],
+  "mini-agent": {
+    "archive": "@ARCHIVE@",
+    "archiveSha256": "@ARCHIVE_SHA256@"
+  }
+}

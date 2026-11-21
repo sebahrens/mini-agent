@@ -1,0 +1,17 @@
+PackageIdentifier: sebahrens.MiniAgent
+PackageVersion: @VERSION@
+PackageLocale: en-US
+Publisher: mini-agent contributors
+PublisherUrl: https://github.com/sebahrens/mini-agent
+PackageName: mini-agent
+PackageUrl: https://github.com/sebahrens/mini-agent
+License: GPL-3.0-only
+LicenseUrl: https://github.com/sebahrens/mini-agent/blob/v@VERSION@/LICENSE
+ShortDescription: Minimalistic coding agent written in Rust.
+Tags:
+  - ai
+  - coding-agent
+  - cli
+ReleaseNotesUrl: https://github.com/sebahrens/mini-agent/releases/tag/v@VERSION@
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

@@ -1,0 +1,7 @@
+# Version manifest. Render with scripts/render_package_manifests.py and submit the three
+# files in this directory to microsoft/winget-pkgs (see docs/agent/PUBLISHING_RELEASES.md).
+PackageIdentifier: sebahrens.MiniAgent
+PackageVersion: @VERSION@
+DefaultLocale: en-US
+ManifestType: version
+ManifestVersion: 1.6.0

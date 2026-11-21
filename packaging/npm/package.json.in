@@ -1,0 +1,30 @@
+{
+  "name": "@sebahrens/mini-agent",
+  "version": "@VERSION@",
+  "description": "Minimalistic coding agent written in Rust (launcher; the native binary comes from a per-platform optional dependency)",
+  "license": "GPL-3.0-only",
+  "homepage": "https://github.com/sebahrens/mini-agent",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sebahrens/mini-agent.git"
+  },
+  "bin": {
+    "mini-agent": "bin/mini-agent.js"
+  },
+  "files": [
+    "bin/mini-agent.js",
+    "LICENSE",
+    "NOTICE",
+    "SOURCE.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "@sebahrens/mini-agent-darwin-arm64": "@VERSION@",
+    "@sebahrens/mini-agent-darwin-x64": "@VERSION@",
+    "@sebahrens/mini-agent-linux-arm64": "@VERSION@",
+    "@sebahrens/mini-agent-linux-x64": "@VERSION@",
+    "@sebahrens/mini-agent-win32-x64": "@VERSION@"
+  }
+}

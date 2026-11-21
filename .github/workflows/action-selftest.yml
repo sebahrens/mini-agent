@@ -1,0 +1,82 @@
+name: Action self-test
+
+# Exercises the root action.yml against an offline OpenAI-compatible stub, so no
+# provider credential or network call is involved. The binary is built from this
+# checkout and handed to the action through its `binary` input.
+on:
+  pull_request:
+    paths:
+      - 'action.yml'
+      - 'scripts/ci/stub_provider.py'
+      - '.github/workflows/action-selftest.yml'
+      - 'install.sh'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RUSTFLAGS: ''
+
+jobs:
+  action:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Prepare guarded Git runtime
+        uses: ./.github/actions/prepare-git-runtime
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+
+      - name: Build the binary under test
+        run: cargo build --locked
+
+      - name: Start the offline provider stub and write an isolated config
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/stub_provider.py --port-file "$RUNNER_TEMP/stub.port" &
+          for _ in $(seq 1 50); do [ -s "$RUNNER_TEMP/stub.port" ] && break; sleep 0.1; done
+          port="$(cat "$RUNNER_TEMP/stub.port")"
+          umask 077
+          mkdir -p "$RUNNER_TEMP/ma-config" "$RUNNER_TEMP/ma-data"
+          chmod 700 "$RUNNER_TEMP/ma-config" "$RUNNER_TEMP/ma-data"
+          cat > "$RUNNER_TEMP/ma-config/config.toml" <<TOML
+          provider = "stub"
+          model = "stub"
+          [custom_providers.stub]
+          provider_type = "openai"
+          api_style = "completions"
+          base_url = "http://127.0.0.1:${port}/v1"
+          model = "stub"
+          TOML
+          {
+            echo "MINI_AGENT_CONFIG_DIR=$RUNNER_TEMP/ma-config"
+            echo "MINI_AGENT_DATA_DIR=$RUNNER_TEMP/ma-data"
+          } >> "$GITHUB_ENV"
+
+      - name: Run the action
+        id: agent
+        uses: ./
+        with:
+          prompt: Say hello.
+          binary: target/debug/mini-agent
+          permission-mode: readonly
+          max-budget-usd: '1'
+          max-turns: '3'
+
+      - name: Assert the outputs
+        env:
+          RESULT: ${{ steps.agent.outputs.result }}
+          EXIT_CODE: ${{ steps.agent.outputs.exit-code }}
+          IS_ERROR: ${{ steps.agent.outputs.is-error }}
+          SESSION_ID: ${{ steps.agent.outputs.session-id }}
+          RESULT_FILE: ${{ steps.agent.outputs.result-file }}
+        run: |
+          set -euo pipefail
+          [ "$EXIT_CODE" = "0" ] || { echo "exit-code=$EXIT_CODE"; exit 1; }
+          [ "$IS_ERROR" = "false" ] || { echo "is-error=$IS_ERROR"; exit 1; }
+          [ "$RESULT" = "STUB-REVIEW-OK" ] || { echo "result=$RESULT"; exit 1; }
+          [ -n "$SESSION_ID" ] || { echo "empty session-id"; exit 1; }
+          jq -e '.total_cost_usd != null' "$RESULT_FILE" >/dev/null
