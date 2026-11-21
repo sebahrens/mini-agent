@@ -23,7 +23,13 @@ pub const MAX_CRITICAL_CONTEXT_BYTES: usize = 32 * 1024;
 pub struct TodoItem {
     pub content: String,
     pub status: CompactString,
+    /// Defaults to `medium` when a model omits it.
+    #[serde(default = "default_priority")]
     pub priority: CompactString,
+}
+
+fn default_priority() -> CompactString {
+    "medium".into()
 }
 
 #[derive(Deserialize)]
@@ -272,9 +278,9 @@ impl Tool for WriteTodoList {
                         "properties": {
                             "content": { "type": "string", "maxLength": MAX_TODO_CONTENT_CHARS, "description": "Short task description" },
                             "status": { "type": "string", "enum": TODO_STATUSES, "description": "pending, in_progress, completed, or cancelled" },
-                            "priority": { "type": "string", "enum": TODO_PRIORITIES, "description": "high, medium, or low" }
+                            "priority": { "type": "string", "enum": TODO_PRIORITIES, "description": "high, medium, or low (default medium)" }
                         },
-                        "required": ["content", "status", "priority"]
+                        "required": ["content", "status"]
                     },
                     "maxItems": MAX_TODO_ITEMS,
                     "description": "Full list of tasks to track"
@@ -382,6 +388,28 @@ mod validation_tests {
         assert_eq!(store.progress(), Some((0, 0)));
     }
     use super::*;
+
+    #[test]
+    fn todo_item_without_priority_defaults_to_medium() {
+        let args: TodoWriteArgs =
+            serde_json::from_str(r#"{"todos":[{"content":"x","status":"pending"}]}"#).unwrap();
+        assert_eq!(args.todos[0].priority, "medium");
+        let schema = WriteTodoList::new_with_store(None, None, TodoStore::default()).parameters();
+        let required = &schema["properties"]["todos"]["items"]["required"];
+        assert!(!required.to_string().contains("priority"), "{required}");
+        let bad = TodoItem {
+            content: "x".into(),
+            status: "pending".into(),
+            priority: "urgent".into(),
+        };
+        assert!(
+            validate_todos(&[bad])
+                .unwrap_err()
+                .to_string()
+                .contains("priority")
+        );
+    }
+
     #[tokio::test]
     async fn todo_labels_reject_invalid_values_without_replacing_stored_tasks() {
         let store = TodoStore::default();

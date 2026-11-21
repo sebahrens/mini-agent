@@ -695,6 +695,20 @@ impl ReadTracker {
         }
     }
 
+    /// Records that the model itself authored the complete current contents of
+    /// `path` (a plain write or create), so an immediate overwrite needs no
+    /// round-trip read. `lines` and `crc` are the `full_text_fingerprint` of
+    /// those contents and `metadata` is the file as just published.
+    pub(crate) fn record_authored_full_text(
+        &self,
+        path: &str,
+        metadata: &std::fs::Metadata,
+        crc: u32,
+        lines: usize,
+    ) {
+        self.record_read_kind(ReadKind::Raw, path, (0, lines.max(1)), metadata, crc, false);
+    }
+
     pub(crate) fn permits_full_overwrite(
         &self,
         path: &str,
@@ -740,6 +754,25 @@ impl ReadTracker {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+    }
+}
+
+/// A one-line note when a replaced file had other hard links: the atomic
+/// replacement gives the path a new inode, so the other names keep the old
+/// content.
+pub(crate) fn hard_link_note(metadata: &std::fs::Metadata) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let links = metadata.nlink();
+        (links > 1).then(|| {
+            format!("file had {links} hard links; the other names keep the previous content")
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
     }
 }
 

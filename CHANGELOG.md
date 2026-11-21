@@ -25,6 +25,12 @@ Notable changes to mini-agent are documented in this file. The format follows
 - `AGENTS.md`/`CLAUDE.md` from the enclosing git repository root and the directories down to the launch directory load by default (outermost first, inert text under the context budget; `repo_root_instruction_files = false` turns it off), `/reload` re-reads instruction files, and a submit after an edit prints one notice naming the changed file (mini-agent-nvnkx.231, .219).
 - `/resume`, `/status`, `/usage`, `/agents`, `/todos` and `/plan` dispatch to their mini-agent equivalents, `/add-dir` and friends print a pointer, and an unknown command suggests the closest name; custom commands of the same name win (mini-agent-nvnkx.131).
 - `/context` reports each row as a share of the window with `Free space` and `Until auto-compaction`, falls back to the last tool-definition estimate (labelled) when the live lookup is slow, and moves calibration notes behind `/context verbose` (mini-agent-nvnkx.296).
+- Added: a file the agent just created or overwrote with `write` can be overwritten again without a read; an external change, a formatter rewrite or an editor-held write still requires one (mini-agent-nvnkx.24).
+- Added: `todo_write` items may omit `priority` (default `medium`) (mini-agent-nvnkx.31).
+- Added: `ask_user_question` allows three question batches per user turn, one at a time, and reports the remaining budget; a batch that never reached the user is not charged (mini-agent-nvnkx.30).
+- Added: edit/write diff previews carry a line-number gutter (old line for deletions, new line otherwise); stored previews without numbers render as before (mini-agent-nvnkx.257, intra-line highlighting not yet).
+- Added: replacing a file keeps its group and extended attributes (ACLs on Linux) and tells the model when other hard links keep the previous content (mini-agent-nvnkx.193).
+- Added: a failed format-after-edit command reports its exit status or signal to the model, logs and notifies the user with a stderr tail once per extension, and is skipped after three consecutive failures (mini-agent-nvnkx.246).
 
 ### Fixed
 
@@ -161,6 +167,12 @@ Notable changes to mini-agent are documented in this file. The format follows
 - `--load-prompt` no longer inherits the default prompt's `[prompt_to_model]` route (mini-agent-nvnkx.352).
 - `/model` refuses an id missing from a known provider listing and suggests near matches (`/model --force <id>` overrides); `/provider` refuses a switch to a provider with no default model that cannot take the current id; `/prompt` restores the model and provider a routed prompt replaced when another prompt is selected or the prompt is cleared, and a failing route leaves the previous prompt active (mini-agent-nvnkx.294, .298, .292).
 - A repeated bare `/export` writes the next numbered file instead of refusing (mini-agent-nvnkx.295).
+- SEARCH/REPLACE input with a missing REPLACE marker or a malformed later marker is rejected whole instead of writing marker lines or dropping a block (mini-agent-nvnkx.20).
+- An empty REPLACE section deletes whole lines instead of leaving a blank line (mini-agent-nvnkx.21).
+- A space-indented SEARCH matching tab-indented source keeps the file's tab indentation in the replacement, or fails when the mapping is not uniform (mini-agent-nvnkx.22).
+- A UTF-8 byte-order mark is preserved across read, hashedit/similarity edits of line 1 and write overwrite (mini-agent-nvnkx.23).
+- `read` treats NUL bytes in the first 8 KiB of an otherwise valid UTF-8 file as binary, like `grep` (mini-agent-nvnkx.25).
+- Diff previews use a linear-space Myers diff and split distant changes into hunks, so large rewrites no longer fall back to a coarse delete/re-add preview; the input cap is 16 MiB (mini-agent-nvnkx.247).
 
 ### Added
 

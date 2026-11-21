@@ -2290,7 +2290,7 @@ const WINDOWS_PROCESS_CAP_MARKER: &str = "not enough quota is available";
 /// have been stopped by the sandbox rather than by its own logic
 /// (mini-agent-sskdu.143). `None` unless containment was requested, the
 /// command failed and the output carries a known sandbox marker.
-fn sandbox_failure_note(
+pub(crate) fn sandbox_failure_note(
     sandbox: &Sandbox,
     allow_escalation: bool,
     failed: bool,

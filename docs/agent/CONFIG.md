@@ -4647,10 +4647,14 @@ or an old read-tracker snapshot does not grant that additional read authority.
 
 The defaults are three context rows and 200 retained rows. Independent hard
 bounds limit previews to 64 KiB, 500 Unicode characters per row, 1000 rows, 128
-applied ranges, and 2 MiB/100000 lines per input image. Omitted rows and clipped
-long rows are labeled. If bounded line matching is exhausted, a labeled coarse
-replacement is shown. Larger images keep the normal tool result without a
-preview. No-op writes report “No content change”; CRLF/LF-only changes are labeled.
+applied ranges, and 16 MiB/100000 lines per input image. Omitted rows and clipped
+long rows are labeled. Lines are matched with a Myers O(ND) diff (edit distance
+up to 1500, bounded work), so a large rewrite that changes a few distant lines
+shows one small hunk per change; beyond that bound a labeled coarse replacement
+is shown. Larger images keep the normal tool result without a preview. Added,
+deleted and context rows carry a right-aligned line-number gutter (new line
+for added and context rows, old line for deleted rows); previews stored by older
+versions have no numbers and render without a gutter. No-op writes report “No content change”; CRLF/LF-only changes are labeled.
 
 Session replay and HTML export retain the bounded historical preview. Imports
 label it as an imported record, never current file state or permission/verification

@@ -100,6 +100,10 @@ combining with an unobserved concurrent change elsewhere in the file.
 
 ## Newlines and file types
 
+A UTF-8 file that starts with the `EF BB BF` byte-order mark is read without it
+(`read` appends a note; line 1's tag and the file CRC cover the text after the mark)
+and `edit` and `write` with `overwrite: true` keep it.
+
 HashEdit accepts UTF-8 text and UTF-16 text that starts with a byte-order mark
 (UTF-16LE `FF FE` or UTF-16BE `FE FF`, common for Windows, .NET and PowerShell
 files). `read` decodes such a file strictly and says so in its output; tags and

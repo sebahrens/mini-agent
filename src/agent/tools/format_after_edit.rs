@@ -33,7 +33,19 @@ pub(crate) struct FormatAfterEdit {
     invalid: std::collections::BTreeSet<String>,
     limits: CommandLimits,
     sandbox: Sandbox,
+    /// Consecutive failures per extension this session; success resets it.
+    failures: std::sync::Mutex<BTreeMap<String, u32>>,
+    /// Where the user (never the model) is told why a formatter failed.
+    notice_sink: std::sync::OnceLock<NoticeSink>,
 }
+
+/// Receives one user-facing line about a formatter failure.
+pub(crate) type NoticeSink = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Consecutive failures after which a formatter is skipped for the session.
+const SKIP_AFTER_FAILURES: u32 = 3;
+/// Characters of formatter stderr shown to the user.
+const NOTICE_STDERR_CHARS: usize = 400;
 
 /// Why one `[format]` entry is unusable, `None` when it is valid.
 fn entry_problem(extension: &str, template: &str) -> Option<&'static str> {
@@ -98,7 +110,7 @@ pub(crate) fn config_warnings(commands: &BTreeMap<String, String>) -> Vec<String
 }
 
 pub(crate) struct FormatResult {
-    pub(crate) status: &'static str,
+    pub(crate) status: std::borrow::Cow<'static, str>,
     /// A fresh, bounded, authorized observation, never an overwrite proof.
     pub(crate) content: Option<String>,
     #[cfg(feature = "lsp")]
@@ -134,8 +146,62 @@ impl FormatAfterEdit {
                     ..LIMITS
                 },
                 sandbox,
+                failures: std::sync::Mutex::new(BTreeMap::new()),
+                notice_sink: std::sync::OnceLock::new(),
             })
         })
+    }
+
+    /// Routes formatter failure explanations (exit status and a stderr tail)
+    /// to the user. They never enter a tool result, which the model reads.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn set_notice_sink(&self, sink: NoticeSink) {
+        let _ = self.notice_sink.set(sink);
+    }
+
+    fn failure_count(&self, extension: &str) -> u32 {
+        self.failures
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(extension)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn record_outcome(&self, extension: &str, failed: bool) -> u32 {
+        let mut failures = self.failures.lock().unwrap_or_else(|e| e.into_inner());
+        if failed {
+            let count = failures.entry(extension.to_string()).or_insert(0);
+            *count += 1;
+            *count
+        } else {
+            failures.remove(extension);
+            0
+        }
+    }
+
+    /// The user-only explanation of a failure: logged, and sent to the notice
+    /// sink on the first failure per extension and when skipping starts.
+    fn tell_user(&self, extension: &str, command: &str, count: u32, detail: &str) {
+        let program = command.split_whitespace().next().unwrap_or(command);
+        tracing::warn!(
+            extension,
+            program,
+            count,
+            detail,
+            "format-after-edit failed"
+        );
+        if count == 1 || count == SKIP_AFTER_FAILURES {
+            let mut line = format!("Formatter for .{extension} ({program}) failed: {detail}");
+            if count == SKIP_AFTER_FAILURES {
+                line.push_str(&format!(
+                    " It failed {SKIP_AFTER_FAILURES} times in a row and is skipped for .{extension} files for the rest of this session."
+                ));
+            }
+            if let Some(sink) = self.notice_sink.get() {
+                sink(&line);
+            }
+        }
     }
 
     pub(crate) async fn run(
@@ -147,8 +213,8 @@ impl FormatAfterEdit {
         ask: &Option<AskSender>,
         limit: u64,
     ) -> Option<FormatResult> {
-        let unavailable = |status| FormatResult {
-            status,
+        let unavailable = |status: &'static str| FormatResult {
+            status: status.into(),
             content: None,
             #[cfg(feature = "lsp")]
             notify_lsp: false,
@@ -160,6 +226,9 @@ impl FormatAfterEdit {
             ));
         }
         let template = self.commands.get(extension)?;
+        if self.failure_count(extension) >= SKIP_AFTER_FAILURES {
+            return None;
+        }
         let Some(operand) = path.to_str() else {
             return Some(unavailable(
                 "Formatter skipped: path is not UTF-8; edit remains committed.",
@@ -214,15 +283,15 @@ impl FormatAfterEdit {
                 ));
             }
         };
-        let status = if blocked() {
-            "Formatter skipped: work stopped; edit remains committed."
+        let status: std::borrow::Cow<'static, str> = if blocked() {
+            "Formatter skipped: work stopped; edit remains committed.".into()
         } else if check_perm(permission, ask, "shell", &command)
             .await
             .is_err()
         {
-            "Formatter not authorized; edit remains committed."
+            "Formatter not authorized; edit remains committed.".into()
         } else if crate::spend::run::admit_current_effect().await.is_err() || blocked() {
-            "Formatter skipped: work stopped; edit remains committed."
+            "Formatter skipped: work stopped; edit remains committed.".into()
         } else if !unchanged_since_capture(
             &target,
             path,
@@ -233,16 +302,16 @@ impl FormatAfterEdit {
         )
         .await
         {
-            "Formatter skipped: target changed after approval; edit remains committed."
+            "Formatter skipped: target changed after approval; edit remains committed.".into()
         } else if blocked() {
-            "Formatter skipped: work stopped; edit remains committed."
+            "Formatter skipped: work stopped; edit remains committed.".into()
         } else if permission.as_ref().is_some_and(|permission| {
             !permission
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .retains_shell_approval(&command)
         }) {
-            "Formatter approval was revoked; edit remains committed."
+            "Formatter approval was revoked; edit remains committed.".into()
         } else {
             // The current tool's captured scope owns this existing process worker
             // through actual family retirement, including a dropped receiver.
@@ -261,13 +330,60 @@ impl FormatAfterEdit {
                         && output.exit_status.is_some_and(|status| status.success())
                         && !output.descendants_escaped =>
                 {
-                    "Formatted."
+                    self.record_outcome(extension, false);
+                    "Formatted.".into()
                 }
                 Ok(output) if output.status == CommandStatus::TimedOut => {
-                    "Formatter failed or stopped: it exceeded format_timeout_secs; edit remains committed."
+                    let count = self.record_outcome(extension, true);
+                    self.tell_user(
+                        extension,
+                        template,
+                        count,
+                        "it exceeded format_timeout_secs",
+                    );
+                    "Formatter failed or stopped: it exceeded format_timeout_secs; edit remains committed.".into()
                 }
-                Ok(_) => "Formatter failed or stopped; edit remains committed.",
-                Err(_) => "Formatter could not start; edit remains committed.",
+                Ok(output) => {
+                    let count = self.record_outcome(extension, true);
+                    let exit = describe_exit(output.exit_status);
+                    let stderr = stderr_tail(&output.stderr);
+                    let stderr_text = String::from_utf8_lossy(&output.stderr);
+                    let sandbox_note =
+                        super::bash::sandbox_failure_note(&self.sandbox, false, true, &stderr_text);
+                    let mut detail = exit.clone();
+                    if !stderr.is_empty() {
+                        detail.push_str(&format!("; stderr: {stderr}"));
+                    }
+                    if let Some(note) = &sandbox_note {
+                        detail.push(' ');
+                        detail.push_str(note);
+                    }
+                    self.tell_user(extension, template, count, &detail);
+                    // The exit status and the sandbox attribution are not
+                    // private; the formatter's own output is never returned.
+                    let mut status =
+                        format!("Formatter failed or stopped ({exit}); edit remains committed.");
+                    if count >= SKIP_AFTER_FAILURES {
+                        status.push_str(&format!(
+                            " It is skipped for .{extension} files for the rest of this session."
+                        ));
+                    }
+                    if let Some(note) = sandbox_note {
+                        status.push(' ');
+                        status.push_str(&note);
+                    }
+                    status.into()
+                }
+                Err(error) => {
+                    let count = self.record_outcome(extension, true);
+                    self.tell_user(
+                        extension,
+                        template,
+                        count,
+                        &format!("could not start: {error}"),
+                    );
+                    "Formatter could not start; edit remains committed.".into()
+                }
             }
         };
         // Never return formatter stdout/stderr: even an error can quote private
@@ -286,9 +402,9 @@ impl FormatAfterEdit {
         let notify_lsp = content.is_some();
         let status = if allowed && content.is_none() && !blocked() {
             if status == "Formatted." {
-                "Formatter completed; final file text unavailable."
+                "Formatter completed; final file text unavailable.".into()
             } else {
-                "Formatter failed or was skipped; final file text unavailable; edit remains committed."
+                "Formatter failed or was skipped; final file text unavailable; edit remains committed.".into()
             }
         } else {
             status
@@ -300,6 +416,35 @@ impl FormatAfterEdit {
             notify_lsp,
         })
     }
+}
+
+/// "exit 3", "signal 9" or "no exit status": never formatter output.
+fn describe_exit(status: Option<std::process::ExitStatus>) -> String {
+    let Some(status) = status else {
+        return "no exit status".to_string();
+    };
+    if let Some(code) = status.code() {
+        return format!("exit {code}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return format!("signal {signal}");
+        }
+    }
+    "no exit status".to_string()
+}
+
+/// The last lines of formatter stderr, bounded and stripped of control
+/// characters, for the user notice only.
+fn stderr_tail(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let tail = lines[lines.len().saturating_sub(4)..].join(" | ");
+    let clean: String = tail.chars().filter(|c| !c.is_control()).collect();
+    let skip = clean.chars().count().saturating_sub(NOTICE_STDERR_CHARS);
+    clean.chars().skip(skip).collect()
 }
 
 fn blocked() -> bool {
@@ -832,6 +977,54 @@ mod tests {
                 .any(|row| row.text.contains("actually formatted"))
         );
         assert!(!diff.rows.iter().any(|row| row.text == "authored"));
+    }
+
+    // mini-agent-nvnkx.246
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn formatter_failure_reports_exit_to_the_model_and_stderr_only_to_the_user() {
+        use super::super::{WriteArgs, WriteTool};
+        use rig::tool::Tool;
+        let (_root, workspace, formatter) = fixture(3);
+        let notices = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&notices);
+        formatter.set_notice_sink(Arc::new(move |line| {
+            sink.lock().unwrap().push(line.to_string())
+        }));
+        let tool = WriteTool::new(None, None, None)
+            .with_workspace_binding(workspace)
+            .with_formatter(Some(formatter));
+        let mut outputs = Vec::new();
+        for name in ["a.rs", "b.rs", "c.rs", "d.rs"] {
+            let scope = crate::agent::runner::AgentWorkScope::new();
+            outputs.push(
+                scope
+                    .run(tool.call(WriteArgs {
+                        path: name.into(),
+                        content: "x\n".into(),
+                        overwrite: false,
+                    }))
+                    .await
+                    .unwrap(),
+            );
+            scope.wait_idle().await;
+        }
+        assert!(outputs[0].contains("exit 3"), "{}", outputs[0]);
+        assert!(!outputs[0].contains("PRIVATE_FORMATTER_OUTPUT"));
+        assert!(
+            outputs[2].contains("skipped for .rs files"),
+            "{}",
+            outputs[2]
+        );
+        assert!(!outputs[3].contains("Formatter"), "{}", outputs[3]);
+        let notices = notices.lock().unwrap();
+        assert_eq!(
+            notices.len(),
+            2,
+            "first failure and the start of skipping: {notices:?}"
+        );
+        assert!(notices[0].contains("PRIVATE_FORMATTER_OUTPUT") && notices[0].contains("exit 3"));
+        assert!(notices[1].contains("skipped"));
     }
 
     #[cfg(unix)]
