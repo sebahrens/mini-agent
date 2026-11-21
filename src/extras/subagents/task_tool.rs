@@ -647,6 +647,7 @@ fn prepare_task_prompts_for(
         .collect()
 }
 
+#[cfg(test)]
 fn render_task_brief(index: usize, brief: &TaskBrief) -> Result<String, ToolError> {
     render_task_brief_for(index, brief, false)
 }
@@ -1938,6 +1939,7 @@ editing in a known location, grepping for a literal you will act on immediately.
             authorization
         };
         let lane_workspace = self.workspace.clone();
+        let abandoned = super::isolation::AbandonedNotes::default();
         let isolation = if isolated {
             Some(super::isolation::IsolationPlan {
                 parent_root: self
@@ -1952,6 +1954,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                     })?,
                 base_dir: self.isolation_base_dir.clone(),
                 base_ref: args.options.base_ref.clone(),
+                abandoned: abandoned.clone(),
                 #[cfg(test)]
                 create_gate: None,
             })
@@ -2556,9 +2559,15 @@ editing in a known location, grepping for a literal you will act on immediately.
                     None => output,
                 };
                 let cost_units = child_budget.used.load(std::sync::atomic::Ordering::Acquire);
+                // The persona's MCP servers are shut down off the result path
+                // (a slow server stop used to add seconds to every child's
+                // wall-clock and to the call deadline); the owning scope
+                // still joins the shutdown before it retires.
                 #[cfg(feature = "mcp")]
                 if let Some(manager) = mcp_manager {
-                    manager.shutdown().await;
+                    drop(crate::agent::runner::spawn_async_scoped(async move {
+                        manager.shutdown().await;
+                    }));
                 }
                 ChildExecution {
                     output,
@@ -2584,19 +2593,26 @@ editing in a known location, grepping for a literal you will act on immediately.
         });
 
         if let Some(admission) = admission {
+            admission.describe(&task_label, agent_type.as_deref(), prompts.len());
+            let cancel_scope = admission.cancel_scope();
             let id = admission
                 .start_with_details(
                     async move {
-                        let report = execute_tasks_with_budget(
+                        let report = execute_tasks_with_budget_cancellable(
                             prompts,
                             limits,
                             executor,
                             result_notice,
                             Some(live_budget),
+                            Some(cancel_scope),
                         )
                         .await;
                         let failed = report.failed();
-                        let text = super::inline_images::guard_text_output(report.render());
+                        let mut rendered = report.render();
+                        if let Some(section) = abandoned.render().await {
+                            rendered.push_str(&section);
+                        }
+                        let text = super::inline_images::guard_text_output(rendered);
                         let details = Some(details_sink.take());
                         (if failed { Err(text) } else { Ok(text) }, details)
                     },
@@ -2613,10 +2629,21 @@ editing in a known location, grepping for a literal you will act on immediately.
         if let Some(pool) = &task_pool {
             pool.record_foreground(task_label, report.failed(), details_sink.take());
         }
+        if report.failed() {
+            // The full report is still returned as ordinary text (not an
+            // error string), but the call is flagged so ACP, hooks and the
+            // loop bookkeeping see a failed delegation, as the background
+            // path already records it.
+            crate::agent::runner::mark_current_tool_failed();
+        }
         // Only the host builds the envelope: the quoted text report first,
         // the admitted images appended after it, in prompt order.
         let images = inline_sink.take(&report);
-        Ok(super::inline_images::envelope(report.render(), &images))
+        let mut rendered = report.render();
+        if let Some(section) = abandoned.render().await {
+            rendered.push_str(&section);
+        }
+        Ok(super::inline_images::envelope(rendered, &images))
     }
 }
 
@@ -3248,6 +3275,9 @@ enum StopReason {
     OutputLimit,
     CostLimit,
     Deadline,
+    /// The call's own cancellation scope was cancelled (a background job:
+    /// `/tasks cancel`, `task_cancel`, or compaction pausing the pool).
+    Cancelled,
 }
 
 impl StopReason {
@@ -3266,6 +3296,7 @@ impl StopReason {
                 "wall-clock deadline of {}s reached",
                 limits.timeout.as_secs()
             ),
+            Self::Cancelled => "cancelled before it finished".to_string(),
         }
     }
 }
@@ -3667,7 +3698,25 @@ async fn execute_tasks_with_budget(
     notice: Option<String>,
     live_budget: Option<LiveTaskBudget>,
 ) -> TaskReport {
+    execute_tasks_with_budget_cancellable(prompts, limits, executor, notice, live_budget, None)
+        .await
+}
+
+/// As [`execute_tasks_with_budget`], and stops as a resource stop when `cancel`
+/// is cancelled: children already finished keep their reports, in-flight ones
+/// return their narration marked partial, queued ones are not started. A
+/// background job passes its own scope, so cancelling it (or compaction
+/// pausing the pool) does not discard completed work.
+async fn execute_tasks_with_budget_cancellable(
+    prompts: Vec<String>,
+    limits: TaskLimits,
+    executor: TaskExecutor,
+    notice: Option<String>,
+    live_budget: Option<LiveTaskBudget>,
+    cancel: Option<Arc<crate::agent::runner::AgentWorkScope>>,
+) -> TaskReport {
     let task_count = prompts.len();
+    let is_cancelled = || cancel.as_ref().is_some_and(|scope| scope.is_cancelled());
     let mut outcomes: Vec<Option<TaskOutcome>> =
         std::iter::repeat_with(|| None).take(task_count).collect();
     let mut started = vec![false; task_count];
@@ -3693,6 +3742,10 @@ async fn execute_tasks_with_budget(
         && next_index < task_count
         && in_flight.len() < limits.max_concurrency
     {
+        if is_cancelled() {
+            stop_reason = Some(StopReason::Cancelled);
+            break;
+        }
         if clock.expired(deadline) {
             stop_reason = Some(StopReason::Deadline);
             break;
@@ -3734,6 +3787,10 @@ async fn execute_tasks_with_budget(
                 Some(budget) => budget.stopped().await,
                 None => std::future::pending::<()>().await,
             } } => { stop_reason = Some(StopReason::CostLimit); break; }
+            () = async { match &cancel {
+                Some(scope) => scope.cancelled().await,
+                None => std::future::pending::<()>().await,
+            } } => { stop_reason = Some(StopReason::Cancelled); break; }
             () = &mut changed => continue,
         };
         let Some((index, child)) = next else {
@@ -3809,6 +3866,10 @@ async fn execute_tasks_with_budget(
             // Retain the result, but do not let it admit another child.
             if live_budget.as_ref().is_some_and(LiveTaskBudget::exhausted) {
                 stop_reason = Some(StopReason::CostLimit);
+                break;
+            }
+            if is_cancelled() {
+                stop_reason = Some(StopReason::Cancelled);
                 break;
             }
             if clock.expired(deadline) {
@@ -5060,7 +5121,7 @@ mod tests {
         assert!(!repaired.contains("important but unstructured finding"));
         assert!(!repaired.contains("forged heading"));
         assert!(repaired.contains("raw child text was omitted"));
-        assert!(repaired.contains("/tasks result"));
+        assert!(repaired.contains("not available to you"));
         assert!(repaired.contains("- [confidence: low]"));
         assert!(repaired.contains("- Covered:"));
         assert!(repaired.contains("- Skipped:"));

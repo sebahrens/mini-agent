@@ -1,7 +1,30 @@
 //! Views and cancellation for the current session's bounded Task pool.
 use super::{C_ERROR, C_RESULT, SlashCtx};
-use crate::extras::subagents::background::TaskDetails;
+use crate::extras::subagents::background::{TaskDetails, resolve_task_id, short_id};
 use crate::ui::{C_TOOL, events::sanitize_output};
+
+/// Whether `token` can be (a prefix of) a task id: the UUID alphabet only, so
+/// a mistyped subcommand still gets the usage line.
+fn looks_like_id(token: &str) -> bool {
+    !token.is_empty() && token.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+}
+
+/// The full id a user typed (a unique prefix is enough, as in `/sessions`),
+/// over the background rows and the recent foreground calls.
+fn resolve(ctx: &SlashCtx<'_>, typed: &str) -> Result<String, String> {
+    let mut ids: Vec<String> = ctx
+        .session
+        .background_tasks()
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+    if let Some(pool) = &ctx.session.background_pool {
+        ids.extend(pool.recent_foreground().into_iter().map(|recent| recent.id));
+    }
+    ids.sort();
+    ids.dedup();
+    resolve_task_id(typed, ids.iter().map(String::as_str))
+}
 
 /// Lines of the `/tasks <id>` view: the status, then each child's bounded
 /// tool log (name, arguments, result size, error).
@@ -30,9 +53,12 @@ pub(super) fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
                 ctx.renderer
                     .write_line("no background tasks in this session", C_TOOL)?;
             }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs());
             for row in rows {
                 ctx.renderer
-                    .write_line(&format!("{}  {}", row.id, row.status.as_str()), C_TOOL)?;
+                    .write_line(&sanitize_output(&row.summary_line(now)), C_TOOL)?;
             }
             if let Some(pool) = &ctx.session.background_pool {
                 for recent in pool.recent_foreground() {
@@ -42,7 +68,11 @@ pub(super) fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
                         "foreground"
                     };
                     ctx.renderer.write_line(
-                        &sanitize_output(&format!("{}  {status}  {}", recent.id, recent.label)),
+                        &sanitize_output(&format!(
+                            "{}  {status}  {}",
+                            short_id(&recent.id),
+                            recent.label
+                        )),
                         C_TOOL,
                     )?;
                 }
@@ -58,7 +88,15 @@ pub(super) fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
             };
             ctx.renderer.write_line(&message, C_TOOL)?;
         }
-        ["/tasks", id] if uuid::Uuid::parse_str(id).is_ok() => {
+        ["/tasks", typed] if looks_like_id(typed) => {
+            let id = match resolve(ctx, typed) {
+                Ok(id) => id,
+                Err(message) => {
+                    ctx.renderer.write_line(&message, C_ERROR)?;
+                    return Ok(());
+                }
+            };
+            let id = id.as_str();
             let recent = ctx
                 .session
                 .background_pool
@@ -90,11 +128,20 @@ pub(super) fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
                 ctx.renderer.write_line(&sanitize_output(&line), C_TOOL)?;
             }
         }
-        ["/tasks", action @ ("cancel" | "result"), id] => {
-            if uuid::Uuid::parse_str(id).is_err() {
-                ctx.renderer.write_line("invalid task id", C_ERROR)?;
-                return Ok(());
-            }
+        ["/tasks", action @ ("cancel" | "result"), typed] => {
+            let resolved = if looks_like_id(typed) {
+                resolve(ctx, typed)
+            } else {
+                Err("invalid task id".to_string())
+            };
+            let id = match resolved {
+                Ok(id) => id,
+                Err(message) => {
+                    ctx.renderer.write_line(&message, C_ERROR)?;
+                    return Ok(());
+                }
+            };
+            let id = &id;
             if *action == "result"
                 && let Some(recent) = ctx
                     .session

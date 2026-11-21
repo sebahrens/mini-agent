@@ -780,7 +780,7 @@ impl GitRunner {
         let output = Sandbox::new(false, "git")
             .output_built_command_with_limits(command, QUERY_LIMITS)
             .await
-            .map_err(|_| format!("git {operation} runner failed"))?;
+            .map_err(|error| spawn_error(operation, &error))?;
         if output.status != CommandStatus::Completed {
             return command_result(operation, QUERY_LIMITS, output).map(|_| Vec::new());
         }
@@ -835,7 +835,7 @@ impl GitRunner {
             first.output_built_command_with_limits(command, QUERY_LIMITS),
             second.output_built_command_with_limits(toplevel, QUERY_LIMITS),
         );
-        let output = output.map_err(|_| format!("git {operation} runner failed"))?;
+        let output = output.map_err(|error| spawn_error(operation, &error))?;
         let unborn = initializing
             && output.status == CommandStatus::Completed
             && output.exit_status.and_then(|status| status.code()) != Some(0)
@@ -871,7 +871,7 @@ impl GitRunner {
             })
             .collect::<Result<Vec<_>, _>>()?;
         if !bare {
-            let output = toplevel.map_err(|_| format!("git {operation} runner failed"))?;
+            let output = toplevel.map_err(|error| spawn_error(operation, &error))?;
             let output = command_result(operation, QUERY_LIMITS, output)?;
             let top = output.stdout.strip_suffix(b"\n").ok_or_else(|| {
                 format!("refusing git {operation}: Git repository roots are malformed")
@@ -1011,7 +1011,7 @@ impl GitRunner {
         let output = Sandbox::new(false, "git")
             .output_built_command_with_limits(command, GITLINK_PROBE_LIMITS)
             .await
-            .map_err(|_| format!("git {operation} runner failed"))?;
+            .map_err(|error| spawn_error(operation, &error))?;
         if output.status != CommandStatus::Completed {
             return command_result(operation, GITLINK_PROBE_LIMITS, output).map(|_| Vec::new());
         }
@@ -1108,18 +1108,27 @@ impl GitRunner {
         let committer_name = override_for("GIT_COMMITTER_NAME");
         let committer_email = override_for("GIT_COMMITTER_EMAIL");
 
-        let user_name = if author_name.is_none() || committer_name.is_none() {
-            self.host_config_value(repo_path, "user.name", config_env)
-                .await?
-        } else {
-            None
-        };
-        let user_email = if author_email.is_none() || committer_email.is_none() {
-            self.host_config_value(repo_path, "user.email", config_env)
-                .await?
-        } else {
-            None
-        };
+        // The two lookups are independent host launches: run them together.
+        let name_needed = author_name.is_none() || committer_name.is_none();
+        let email_needed = author_email.is_none() || committer_email.is_none();
+        let (user_name, user_email) = futures::try_join!(
+            async {
+                if name_needed {
+                    self.host_config_value(repo_path, "user.name", config_env)
+                        .await
+                } else {
+                    Ok(None)
+                }
+            },
+            async {
+                if email_needed {
+                    self.host_config_value(repo_path, "user.email", config_env)
+                        .await
+                } else {
+                    Ok(None)
+                }
+            }
+        )?;
 
         let resolve = |explicit: Option<String>, configured: &Option<String>| {
             explicit
@@ -1157,7 +1166,7 @@ impl GitRunner {
         let output = Sandbox::new(false, "git")
             .output_built_command_with_limits(command, QUERY_LIMITS)
             .await
-            .map_err(|_| "git config runner failed".to_string())?;
+            .map_err(|error| spawn_error("config", &error))?;
         if output.status == CommandStatus::Completed {
             match output.exit_status.and_then(|status| status.code()) {
                 Some(0) => {
@@ -1225,7 +1234,7 @@ impl GitRunner {
         let output = Sandbox::new(false, "git")
             .output_built_command_with_input_and_limits(command, input, limits)
             .await
-            .map_err(|_| format!("git {operation} runner failed"))?;
+            .map_err(|error| spawn_error(operation, &error))?;
         command_result(operation, limits, output)
     }
 
@@ -1247,7 +1256,7 @@ impl GitRunner {
         let output = Sandbox::new(false, "git")
             .output_built_command_with_limits(command, limits)
             .await
-            .map_err(|_| format!("git {operation} runner failed"))?;
+            .map_err(|error| spawn_error(operation, &error))?;
         command_result(operation, limits, output)
     }
 
@@ -1307,7 +1316,7 @@ impl GitRunner {
         let output = Sandbox::new(false, "git")
             .output_built_command_with_input_and_limits(command, input, limits)
             .await
-            .map_err(|_| format!("git {operation} runner failed"))?;
+            .map_err(|error| spawn_error(operation, &error))?;
         command_result(operation, limits, output)
     }
 
@@ -1329,7 +1338,7 @@ impl GitRunner {
         let output = Sandbox::new(false, "git")
             .output_built_command_with_limits(command, limits)
             .await
-            .map_err(|_| format!("git {operation} runner failed"))?;
+            .map_err(|error| spawn_error(operation, &error))?;
         if output.status == CommandStatus::Completed && output.exit_status.is_some() {
             Ok(output)
         } else {
@@ -1359,7 +1368,7 @@ impl GitRunner {
         Sandbox::new(false, "git")
             .output_built_command_with_limits(command, limits)
             .await
-            .map_err(|_| format!("git {operation} runner failed"))
+            .map_err(|error| spawn_error(operation, &error))
     }
 
     #[cfg(test)]
@@ -1381,7 +1390,7 @@ impl GitRunner {
         Sandbox::new(false, "git")
             .output_built_command_with_input_and_limits(command, input, limits)
             .await
-            .map_err(|_| format!("git {operation} runner failed"))
+            .map_err(|error| spawn_error(operation, &error))
     }
 
     #[cfg(any(test, feature = "git-worktree"))]
@@ -1402,7 +1411,7 @@ impl GitRunner {
         let output = sandbox
             .output_built_command_with_limits(command, limits)
             .await
-            .map_err(|_| format!("git {operation} runner failed"))?;
+            .map_err(|error| spawn_error(operation, &error))?;
         if allow_nonzero_or_truncated
             && (matches!(output.status, CommandStatus::OutputLimitExceeded(_))
                 || (output.status == CommandStatus::Completed && !is_silent_failure(&output)))
@@ -1431,7 +1440,7 @@ impl GitRunner {
         sandbox
             .output_built_command_with_limits(command, limits)
             .await
-            .map_err(|_| format!("git {operation} runner failed"))
+            .map_err(|error| spawn_error(operation, &error))
     }
 
     #[cfg(any(test, feature = "git-worktree"))]
@@ -1462,7 +1471,7 @@ impl GitRunner {
         sandbox
             .output_built_command_with_input_and_limits(command, input, limits)
             .await
-            .map_err(|_| format!("git {operation} runner failed"))
+            .map_err(|error| spawn_error(operation, &error))
     }
 }
 
@@ -2099,11 +2108,151 @@ fn git_environment() -> &'static [(OsString, OsString)] {
     CACHED_GIT_ENVIRONMENT.get_or_init(build_git_environment)
 }
 
+/// Why a Git command did not produce a successful result. `Display` is the
+/// message the tool and the worktree flows show; classification of a message
+/// that has already crossed a `String` boundary goes through
+/// [`GitRunError::classify`], which is pinned to this `Display` by a test so a
+/// rewording cannot silently change control flow.
+#[derive(Debug)]
+pub(crate) enum GitRunError {
+    /// The process could not be launched (program missing, permission denied,
+    /// descriptor exhaustion, sandbox backend failure).
+    Spawn {
+        operation: String,
+        source: std::io::Error,
+    },
+    TimedOut {
+        operation: String,
+        millis: u128,
+    },
+    Cancelled {
+        operation: String,
+    },
+    OutputLimit {
+        operation: String,
+        limit: String,
+    },
+    Failed {
+        operation: String,
+        stderr: String,
+    },
+}
+
+/// The class of a [`GitRunError`], recoverable from its rendered message.
+#[cfg_attr(not(feature = "git-worktree"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GitRunErrorKind {
+    Spawn,
+    TimedOut,
+    Cancelled,
+    OutputLimit,
+    Failed,
+}
+
+impl std::fmt::Display for GitRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Spawn { operation, source } => {
+                let what = match source.kind() {
+                    std::io::ErrorKind::NotFound => "program not found",
+                    std::io::ErrorKind::PermissionDenied => "permission denied",
+                    _ => "could not start",
+                };
+                write!(f, "git {operation} {SPAWN_MARKER}: {what}: {source}")
+            }
+            Self::TimedOut { operation, millis } => {
+                write!(f, "git {operation} {TIMED_OUT_MARKER} {millis}ms")
+            }
+            Self::Cancelled { operation } => write!(f, "git {operation} {CANCELLED_MARKER}"),
+            Self::OutputLimit { operation, limit } => {
+                write!(f, "git {operation} {OUTPUT_LIMIT_MARKER} ({limit})")
+            }
+            Self::Failed { operation, stderr } => {
+                if stderr.is_empty() {
+                    write!(f, "git {operation} failed")
+                } else {
+                    write!(f, "git {operation} failed: {stderr}")
+                }
+            }
+        }
+    }
+}
+
+const SPAWN_MARKER: &str = "runner failed";
+const TIMED_OUT_MARKER: &str = "timed out after";
+const CANCELLED_MARKER: &str = "was cancelled";
+const OUTPUT_LIMIT_MARKER: &str = "exceeded bounded output limit";
+
+#[cfg_attr(not(feature = "git-worktree"), allow(dead_code))]
+impl GitRunError {
+    #[cfg(test)]
+    pub(crate) fn kind(&self) -> GitRunErrorKind {
+        match self {
+            Self::Spawn { .. } => GitRunErrorKind::Spawn,
+            Self::TimedOut { .. } => GitRunErrorKind::TimedOut,
+            Self::Cancelled { .. } => GitRunErrorKind::Cancelled,
+            Self::OutputLimit { .. } => GitRunErrorKind::OutputLimit,
+            Self::Failed { .. } => GitRunErrorKind::Failed,
+        }
+    }
+
+    /// The class of an already rendered runner message. This is the only
+    /// place that reads message text; everything else asks for a kind. A
+    /// marker only counts directly after `git <operation>`, so Git's own
+    /// stderr (which is quoted only after `failed:`) never reads as a
+    /// cut-off command.
+    pub(crate) fn classify(message: &str) -> GitRunErrorKind {
+        let has = |marker: &str| {
+            message.match_indices(marker).any(|(at, _)| {
+                let before = message[..at].trim_end_matches(' ');
+                let before_operation = before.rsplit_once(' ').map_or("", |(rest, _)| rest);
+                before_operation == "git" || before_operation.ends_with(" git")
+            })
+        };
+        if has(TIMED_OUT_MARKER) {
+            GitRunErrorKind::TimedOut
+        } else if has(CANCELLED_MARKER) {
+            GitRunErrorKind::Cancelled
+        } else if has(OUTPUT_LIMIT_MARKER) {
+            GitRunErrorKind::OutputLimit
+        } else if has(SPAWN_MARKER) {
+            GitRunErrorKind::Spawn
+        } else {
+            GitRunErrorKind::Failed
+        }
+    }
+
+    /// Whether a command that failed this way may nonetheless have changed the
+    /// repository (it was cut off or could not be observed), as opposed to a
+    /// definite refusal by Git.
+    pub(crate) fn kind_is_uncertain(kind: GitRunErrorKind) -> bool {
+        !matches!(kind, GitRunErrorKind::Failed)
+    }
+}
+
+impl From<GitRunError> for String {
+    fn from(error: GitRunError) -> Self {
+        error.to_string()
+    }
+}
+
+/// The error for a launch that failed in the sandbox or spawn layer; keeps the
+/// OS error that says what is wrong.
+fn spawn_error(operation: &str, source: &std::io::Error) -> String {
+    tracing::warn!(operation, error = %source, "git command could not be launched");
+    GitRunError::Spawn {
+        operation: operation.to_string(),
+        source: std::io::Error::new(source.kind(), source.to_string()),
+    }
+    .to_string()
+}
+
 pub(crate) fn command_result(
     operation: &str,
     limits: CommandLimits,
     output: CommandOutput,
 ) -> Result<CommandOutput, String> {
+    let operation_owned = operation.to_string();
     match output.status {
         CommandStatus::Completed if output.exit_status.is_some_and(|status| status.success()) => {
             Ok(output)
@@ -2111,14 +2260,20 @@ pub(crate) fn command_result(
         CommandStatus::Completed | CommandStatus::Failed => {
             Err(command_failure(operation, &output))
         }
-        CommandStatus::TimedOut => Err(format!(
-            "git {operation} timed out after {}ms",
-            limits.timeout.as_millis()
-        )),
-        CommandStatus::Cancelled => Err(format!("git {operation} was cancelled")),
-        CommandStatus::OutputLimitExceeded(limit) => Err(format!(
-            "git {operation} exceeded bounded output limit ({limit:?})"
-        )),
+        CommandStatus::TimedOut => Err(GitRunError::TimedOut {
+            operation: operation_owned,
+            millis: limits.timeout.as_millis(),
+        }
+        .into()),
+        CommandStatus::Cancelled => Err(GitRunError::Cancelled {
+            operation: operation_owned,
+        }
+        .into()),
+        CommandStatus::OutputLimitExceeded(limit) => Err(GitRunError::OutputLimit {
+            operation: operation_owned,
+            limit: format!("{limit:?}"),
+        }
+        .into()),
     }
 }
 
@@ -2133,13 +2288,11 @@ fn is_silent_failure(output: &CommandOutput) -> bool {
 }
 
 pub(crate) fn command_failure(operation: &str, output: &CommandOutput) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stderr = stderr.trim();
-    if stderr.is_empty() {
-        format!("git {operation} failed")
-    } else {
-        format!("git {operation} failed: {stderr}")
+    GitRunError::Failed {
+        operation: operation.to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
     }
+    .into()
 }
 
 fn find_git_executable(path: Option<&OsStr>) -> Option<PathBuf> {
@@ -2192,6 +2345,64 @@ mod tests {
             stderr_bytes: 1024,
             combined_bytes: 2048,
         }
+    }
+
+    #[test]
+    fn run_error_classes_round_trip_through_their_rendered_message() {
+        use super::{GitRunError, GitRunErrorKind};
+        let errors = [
+            GitRunError::Spawn {
+                operation: "status".into(),
+                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+            },
+            GitRunError::TimedOut {
+                operation: "log".into(),
+                millis: 10,
+            },
+            GitRunError::Cancelled {
+                operation: "diff".into(),
+            },
+            GitRunError::OutputLimit {
+                operation: "show".into(),
+                limit: "Stdout".into(),
+            },
+            GitRunError::Failed {
+                operation: "commit".into(),
+                stderr: "nothing to commit".into(),
+            },
+        ];
+        for error in errors {
+            assert_eq!(GitRunError::classify(&error.to_string()), error.kind());
+        }
+        // Git's own stderr never reads as a cut-off command.
+        let refused = GitRunError::Failed {
+            operation: "commit".into(),
+            stderr: "fatal: pathspec 'timed out.txt' did not match".into(),
+        };
+        assert_eq!(
+            GitRunError::classify(&refused.to_string()),
+            GitRunErrorKind::Failed
+        );
+        assert!(!GitRunError::kind_is_uncertain(refused.kind()));
+        assert!(GitRunError::kind_is_uncertain(GitRunErrorKind::TimedOut));
+        assert!(GitRunError::kind_is_uncertain(GitRunErrorKind::Spawn));
+        assert!(!GitRunError::kind_is_uncertain(GitRunErrorKind::Failed));
+    }
+
+    #[test]
+    fn a_launch_failure_keeps_the_os_error() {
+        let message = super::spawn_error(
+            "status",
+            &std::io::Error::new(std::io::ErrorKind::NotFound, "No such file or directory"),
+        );
+        assert!(message.contains("git status runner failed"), "{message}");
+        assert!(message.contains("program not found"), "{message}");
+        assert!(message.contains("No such file or directory"), "{message}");
+        let denied = super::spawn_error(
+            "log",
+            &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        assert!(denied.contains("permission denied"), "{denied}");
     }
 
     fn make_output(status: CommandStatus, stderr: &[u8]) -> CommandOutput {

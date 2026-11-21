@@ -1133,6 +1133,10 @@ where
         None => None,
     };
     eprintln!("auto-compacting headless session...");
+    #[cfg(feature = "subagents")]
+    if let Some(Some(notice)) = _background_pause.as_ref().map(|pause| pause.notice()) {
+        eprintln!("{notice}");
+    }
     let model = session.model.to_string();
     let (skipped, messages) =
         session.compaction_input(plan.cut_idx, cfg.resolve_keep_recent_tool_results());

@@ -7,12 +7,86 @@
 //! ([`SubagentAuthorization::isolated_to`]); nothing is applied to the parent
 //! checkout. When the child ends, the host (not the model) commits what it
 //! left in the worktree and reports the branch, commits and diff stat. A child
-//! that changed nothing, or whose future is dropped (cancellation, timeout),
-//! has its worktree and branch removed. Merging stays an explicit user action.
+//! that changed nothing has its worktree and branch removed. A child whose
+//! future is dropped (cancellation, timeout) keeps its branch when it left
+//! anything behind, and
+//! the call's report says which of the two happened ([`AbandonedNotes`]).
+//! Merging stays an explicit user action.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use super::builder::SubagentAuthorization;
+
+/// Host-written lines about isolated worktrees whose child was dropped before
+/// it finished (call deadline, sibling stop, Esc, `/tasks cancel`, compaction).
+/// The drop cannot return a value, so its cleanup records the outcome here and
+/// the scheduler appends it to the call's report.
+#[derive(Clone, Default)]
+pub(crate) struct AbandonedNotes(Arc<AbandonedInner>);
+
+#[derive(Default)]
+struct AbandonedInner {
+    pending: std::sync::atomic::AtomicUsize,
+    lines: std::sync::Mutex<Vec<String>>,
+    done: tokio::sync::Notify,
+}
+
+impl std::fmt::Debug for AbandonedNotes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AbandonedNotes")
+    }
+}
+
+#[cfg_attr(not(feature = "git-worktree"), allow(dead_code))]
+impl AbandonedNotes {
+    /// A cleanup was started; [`Self::render`] waits for its [`Self::finish`].
+    fn begin(&self) {
+        self.0
+            .pending
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    fn finish(&self, line: String) {
+        self.0
+            .lines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(line);
+        self.0
+            .pending
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.0.done.notify_waiters();
+    }
+
+    /// The section to append to the call's report, once the cleanups started
+    /// by dropped children have settled (bounded wait).
+    pub(crate) async fn render(&self) -> Option<String> {
+        let settled = async {
+            loop {
+                let notified = self.0.done.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.0.pending.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                    break;
+                }
+                notified.await;
+            }
+        };
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(20), settled).await;
+        let lines = self.0.lines.lock().unwrap_or_else(|e| e.into_inner());
+        if lines.is_empty() {
+            return None;
+        }
+        let mut section = String::from("\n\n## Isolated worktrees of stopped children\n");
+        for line in lines.iter() {
+            section.push_str("- ");
+            section.push_str(line);
+            section.push('\n');
+        }
+        Some(section)
+    }
+}
 
 /// Where and from what isolated children are created.
 #[derive(Clone, Debug)]
@@ -26,6 +100,9 @@ pub(crate) struct IsolationPlan {
     /// Commit-ish the child branches start from (`task` `base_ref`);
     /// `None` is the parent's `HEAD`.
     pub(crate) base_ref: Option<String>,
+    /// Outcomes of worktrees whose child was dropped; shared by all children
+    /// of the call.
+    pub(crate) abandoned: AbandonedNotes,
     /// Test seam: signalled once creation finished, then held until released,
     /// so a test can drop the caller while the create is still in flight.
     #[cfg(test)]
@@ -41,6 +118,13 @@ pub(crate) struct IsolationPlan {
 pub(crate) enum IsolationOutcome {
     /// The child made no change; worktree and branch were removed.
     Unchanged,
+    /// The child made no change, but removing its worktree failed; both are
+    /// still on disk.
+    UnchangedNotRemoved {
+        branch: String,
+        worktree: PathBuf,
+        error: String,
+    },
     /// The child's changes are committed on `branch` in `worktree`.
     Branch {
         branch: String,
@@ -63,6 +147,14 @@ impl IsolationOutcome {
     pub(crate) fn render(&self) -> String {
         match self {
             Self::Unchanged => "\n\n## Isolated worktree\n- The child made no changes; its worktree and branch were removed.".to_string(),
+            Self::UnchangedNotRemoved {
+                branch,
+                worktree,
+                error,
+            } => format!(
+                "\n\n## Isolated worktree\n- The child made no changes, but removing its worktree failed: {error}\n- Branch `{branch}` and worktree {} are still on disk; remove them with `git worktree remove` and `git branch -D`.",
+                worktree.display()
+            ),
             Self::Branch {
                 branch,
                 worktree,
@@ -141,11 +233,60 @@ mod real {
     use crate::extras::git_worktree::{self, WorktreeInfo};
 
     /// A worktree owned by one child. Dropping it while still armed (the child
-    /// future was cancelled or timed out) removes the worktree and branch.
+    /// future was cancelled or timed out) keeps the branch when the child left
+    /// edits or commits, removes the worktree and branch when it left nothing,
+    /// and records which in the call's [`AbandonedNotes`].
     pub(crate) struct IsolatedWorktree {
         info: WorktreeInfo,
         base: String,
         armed: bool,
+        notes: super::AbandonedNotes,
+    }
+
+    /// What became of an abandoned worktree, as one report line.
+    async fn settle_abandoned(info: &WorktreeInfo, base: &str) -> String {
+        let branch = &info.branch;
+        if base.is_empty() {
+            // The worktree was dropped before the child's authorization was
+            // derived from it: no child ever ran in it.
+            return match git_worktree::discard_worktree(info).await {
+                Ok(()) => format!(
+                    "`{branch}`: the child was stopped before it started; its worktree and branch were discarded."
+                ),
+                Err(error) => format!(
+                    "`{branch}`: the child was stopped before it started, but removing its worktree at {} failed: {error}",
+                    info.worktree_path.display()
+                ),
+            };
+        }
+        let message = format!("subagent {branch}: changes");
+        let kept = async {
+            git_worktree::commit_all_if_dirty(&info.worktree_path, &message).await?;
+            git_worktree::branch_report(info, base).await
+        }
+        .await;
+        match kept {
+            Ok(report) if report.commits.is_empty() => {
+                match git_worktree::discard_worktree(info).await {
+                    Ok(()) => format!(
+                        "`{branch}`: the child was stopped before it changed anything; its worktree and branch were discarded."
+                    ),
+                    Err(error) => format!(
+                        "`{branch}`: the child was stopped before it changed anything, but removing its worktree at {} failed: {error}",
+                        info.worktree_path.display()
+                    ),
+                }
+            }
+            Ok(report) => format!(
+                "`{branch}`: the child was stopped; its work was kept as branch `{branch}` at {} ({} commit(s) after {base}). Review it and merge explicitly, or remove it with `git worktree remove` and `git branch -D`.",
+                info.worktree_path.display(),
+                report.commits.len()
+            ),
+            Err(error) => format!(
+                "`{branch}`: the child was stopped and its worktree at {} was kept because its state could not be inspected ({error}); nothing was discarded.",
+                info.worktree_path.display()
+            ),
+        }
     }
 
     impl Drop for IsolatedWorktree {
@@ -154,24 +295,21 @@ mod real {
                 return;
             }
             let info = self.info.clone();
-            let cleanup = async move {
-                if let Err(error) = git_worktree::discard_worktree(&info).await {
-                    tracing::warn!(
-                        %error,
-                        branch = %info.branch,
-                        worktree = %info.worktree_path.display(),
-                        "subagent isolation: could not remove the abandoned worktree"
-                    );
-                }
-            };
+            let base = self.base.clone();
+            let notes = self.notes.clone();
             // Registered with the owning agent scope when there is one, so
-            // retirement waits for the removal.
+            // retirement waits for the settlement.
             if tokio::runtime::Handle::try_current().is_ok() {
-                drop(crate::agent::runner::spawn_async_scoped(cleanup));
+                notes.begin();
+                drop(crate::agent::runner::spawn_async_scoped(async move {
+                    let line = settle_abandoned(&info, &base).await;
+                    tracing::info!(%line, "subagent isolation: abandoned worktree settled");
+                    notes.finish(line);
+                }));
             } else {
                 tracing::warn!(
                     worktree = %self.info.worktree_path.display(),
-                    "subagent isolation: no runtime to remove the abandoned worktree"
+                    "subagent isolation: no runtime to settle the abandoned worktree; it was kept"
                 );
             }
         }
@@ -188,11 +326,13 @@ mod real {
             &self.info.branch
         }
 
-        async fn discard(mut self) {
+        async fn discard(mut self) -> Result<(), String> {
             self.armed = false;
-            if let Err(error) = git_worktree::discard_worktree(&self.info).await {
+            let result = git_worktree::discard_worktree(&self.info).await;
+            if let Err(error) = &result {
                 tracing::warn!(%error, "subagent isolation: worktree removal failed");
             }
+            result
         }
 
         /// Commit whatever the child left, then report or remove the branch.
@@ -206,10 +346,14 @@ mod real {
             }
             .await;
             match collected {
-                Ok(report) if report.commits.is_empty() => {
-                    self.discard().await;
-                    IsolationOutcome::Unchanged
-                }
+                Ok(report) if report.commits.is_empty() => match self.discard().await {
+                    Ok(()) => IsolationOutcome::Unchanged,
+                    Err(error) => IsolationOutcome::UnchangedNotRemoved {
+                        branch,
+                        worktree,
+                        error,
+                    },
+                },
                 Ok(report) => {
                     self.armed = false;
                     IsolationOutcome::Branch {
@@ -276,6 +420,7 @@ mod real {
                 info,
                 base: String::new(),
                 armed: true,
+                notes: create_plan.abandoned.clone(),
             });
             #[cfg(test)]
             if let Some((entered, release)) = &create_plan.create_gate {
@@ -305,7 +450,7 @@ mod real {
         match derived {
             Ok(authorization) => Ok((owned, authorization)),
             Err(error) => {
-                owned.discard().await;
+                let _ = owned.discard().await;
                 Err(error)
             }
         }

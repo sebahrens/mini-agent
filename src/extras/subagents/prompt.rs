@@ -214,7 +214,10 @@ mod tests {
 
     #[test]
     fn tool_section_follows_the_registered_tools() {
-        let preamble = format!("persona\n\n---\n\n{}\n\n---\n\nrules", explore_prompt());
+        let preamble = format!(
+            "persona\n\n---\n\n{}\n\n---\n\nrules",
+            super::explore_prompt()
+        );
         let registered = ["read".to_string(), "grep".to_string()];
         let narrowed = super::with_registered_tools(&preamble, &registered);
         assert!(narrowed.starts_with("persona"));

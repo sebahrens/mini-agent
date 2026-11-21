@@ -1661,6 +1661,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn merge_target_is_the_branch_the_worktree_was_created_from() {
+        let repo = TempRepo::new("merge target develop");
+        git(repo.path(), ["checkout", "-b", "develop"]);
+        let (worktree, info) = create(repo.path(), "feat/from-develop", None)
+            .await
+            .expect("create linked worktree");
+        // The main checkout moves back to main; the recorded base still wins.
+        git(repo.path(), ["checkout", "main"]);
+        assert_eq!(
+            resolve_merge_target(&info).await,
+            Some(("develop".to_string(), MergeTargetSource::RecordedBase))
+        );
+        // Without the record the checked-out branch is used, never a guess.
+        git(
+            repo.path(),
+            [
+                "config",
+                "--unset",
+                "branch.feat/from-develop.mini-agent-base",
+            ],
+        );
+        assert_eq!(
+            resolve_merge_target(&info).await,
+            Some(("main".to_string(), MergeTargetSource::CheckedOut))
+        );
+        cleanup_worktree(&worktree, "feat/from-develop", repo.path(), true)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn merge_target_works_for_a_repository_whose_only_branch_is_trunk() {
+        let repo = TempRepo::new("merge target trunk");
+        git(repo.path(), ["branch", "-m", "main", "trunk"]);
+        assert_eq!(default_branch(repo.path()).await, None);
+        let (worktree, info) = create(repo.path(), "feat/on-trunk", None)
+            .await
+            .expect("create linked worktree");
+        assert_eq!(
+            resolve_merge_target(&info).await,
+            Some(("trunk".to_string(), MergeTargetSource::RecordedBase))
+        );
+        // A detached main checkout with no record falls through to nothing.
+        git(
+            repo.path(),
+            ["config", "--unset", "branch.feat/on-trunk.mini-agent-base"],
+        );
+        git(repo.path(), ["checkout", "--detach"]);
+        assert_eq!(resolve_merge_target(&info).await, None);
+        cleanup_worktree(&worktree, "feat/on-trunk", repo.path(), true)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn detect_reports_linked_worktree_branch_and_refuses_main_and_detached() {
         let repo = TempRepo::new("detect identity");
         assert!(detect(repo.path()).await.is_none(), "main checkout");
@@ -5239,6 +5294,7 @@ wait
                         parent_root: root,
                         base_dir: Some(base),
                         base_ref: None,
+                        abandoned: Default::default(),
                         create_gate: None,
                     },
                     _repo: repo,
@@ -5655,6 +5711,49 @@ wait
                 &format!("refs/heads/{branch}")
             ));
             fixture.assert_parent_untouched();
+        }
+
+        #[tokio::test]
+        async fn a_stopped_child_with_edits_keeps_its_branch_and_the_report_says_so() {
+            let fixture = Fixture::new("isolation-stopped-dirty");
+            let (worktree, authorization) =
+                prepare(&fixture.plan, &fixture.parent()).await.unwrap();
+            let path = worktree.path().to_path_buf();
+            let branch = worktree.branch().to_string();
+            edit_tracked_file(&authorization, "partial").await;
+            // The child future is dropped (deadline, cancel) before `finish`.
+            drop(worktree);
+            let section = fixture
+                .plan
+                .abandoned
+                .render()
+                .await
+                .expect("a note for the stopped child");
+            assert!(section.contains("kept as branch"), "{section}");
+            assert!(section.contains(&branch), "{section}");
+            assert!(path.is_dir(), "the worktree is kept");
+            assert_eq!(
+                git_stdout(fixture.root(), ["show", &format!("{branch}:tracked.txt")]),
+                "partial"
+            );
+            fixture.assert_parent_untouched();
+        }
+
+        #[tokio::test]
+        async fn a_stopped_child_that_changed_nothing_is_discarded_and_reported() {
+            let fixture = Fixture::new("isolation-stopped-clean");
+            let (worktree, _authorization) =
+                prepare(&fixture.plan, &fixture.parent()).await.unwrap();
+            let path = worktree.path().to_path_buf();
+            let branch = worktree.branch().to_string();
+            drop(worktree);
+            let section = fixture.plan.abandoned.render().await.unwrap();
+            assert!(section.contains("were discarded"), "{section}");
+            assert!(!path.exists());
+            assert!(!optional_test_ref_exists(
+                fixture.root(),
+                &format!("refs/heads/{branch}")
+            ));
         }
 
         #[tokio::test]

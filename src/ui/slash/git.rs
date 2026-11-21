@@ -1292,16 +1292,26 @@ mod tests {
             action,
             PreparedAction::commit(selected, "literal $(danger); 'quote'\n\nbody".into()).unwrap()
         );
-        for answer in [
-            "done",
-            r#"{"message":""}"#,
-            r#"{"message":"m","paths":["other"]}"#,
-        ] {
+        for answer in ["done", r#"{"message":""}"#] {
             assert!(PreparedAction::generated_commit(vec!["one".into()], answer).is_err());
         }
+        // Extra fields are ignored: the frozen operands and the executed
+        // command never come from the model's JSON.
+        assert_eq!(
+            PreparedAction::generated_commit(
+                vec!["one".into()],
+                r#"{"message":"m","paths":["other"]}"#
+            )
+            .unwrap(),
+            PreparedAction::commit(vec!["one".into()], "m".into()).unwrap()
+        );
         assert!(PreparedAction::generated_pr(r#"{"title":"a\nb","body":"c"}"#).is_err());
-        assert!(
-            PreparedAction::generated_pr(r#"{"title":"a","body":"b","command":"unsafe"}"#).is_err()
+        assert_eq!(
+            PreparedAction::generated_pr(r#"{"title":"a","body":"b","command":"unsafe"}"#).unwrap(),
+            PreparedAction::PullRequest {
+                title: "a".into(),
+                body: "b".into()
+            }
         );
     }
 

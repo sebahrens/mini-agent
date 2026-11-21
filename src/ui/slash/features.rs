@@ -212,15 +212,15 @@ async fn handle_wt_merge(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
             return Ok(());
         }
     };
-    let target = if parts.len() >= 2 {
-        parts[1].trim().to_string()
+    let (target, source) = if parts.len() >= 2 {
+        (parts[1].trim().to_string(), "given on the command line")
     } else {
-        match crate::extras::git_worktree::default_branch(&info.main_repo_path).await {
-            Some(b) => b,
+        match crate::extras::git_worktree::resolve_merge_target(&info).await {
+            Some((b, source)) => (b, source.describe()),
             None => {
                 write_error(
                     ctx.renderer,
-                    "no target branch specified and couldn't detect main/master",
+                    "no target branch specified and none could be detected (no recorded base, checked-out branch, origin/HEAD, init.defaultBranch, main or master); pass one: /wt-merge <branch>",
                 );
                 return Ok(());
             }
@@ -230,7 +230,7 @@ async fn handle_wt_merge(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
     write_ok(
         ctx.renderer,
         format!(
-            "merging '{}' into '{}' in {}...",
+            "merging '{}' into '{}' ({source}) in {}...",
             info.branch, target, repo_name
         ),
     );

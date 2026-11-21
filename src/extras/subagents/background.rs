@@ -226,8 +226,124 @@ pub(crate) struct SavedTask {
     pub result: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<TaskDetails>,
+    /// What the job was asked to do: persona and the start of its first
+    /// prompt, clipped to [`MAX_LABEL_BYTES`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// The persona (`agent_type`) the job's children run as.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
+    /// How many children (prompts) the job runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub children: Option<u16>,
+    /// Unix seconds at which the job was admitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<u64>,
+    /// Why a cancelled job was cancelled (user request, context compaction).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_reason: Option<String>,
     #[serde(skip)]
     pub notified: bool,
+}
+
+/// Longest [`SavedTask::label`] kept.
+pub(crate) const MAX_LABEL_BYTES: usize = 60;
+const MAX_REASON_BYTES: usize = 200;
+/// Why compaction cancels background jobs; also shown to the model.
+pub(crate) const COMPACTION_CANCEL_REASON: &str =
+    "cancelled by context compaction; relaunch it if the work is still needed";
+const REQUEST_CANCEL_REASON: &str = "cancelled on request";
+
+impl SavedTask {
+    fn new(id: String) -> Self {
+        Self {
+            id,
+            status: Status::Running,
+            result: None,
+            details: None,
+            label: None,
+            agent_type: None,
+            children: None,
+            started_at: Some(unix_now()),
+            cancel_reason: None,
+            notified: false,
+        }
+    }
+
+    /// `id-prefix  status  age  agent  label`, one `/tasks` row.
+    pub(crate) fn summary_line(&self, now: u64) -> String {
+        let age = self
+            .started_at
+            .map(|started| format_age(now.saturating_sub(started)))
+            .unwrap_or_else(|| "-".to_string());
+        let mut line = format!("{}  {}  {}", short_id(&self.id), self.status.as_str(), age);
+        if let Some(agent) = &self.agent_type {
+            line.push_str("  ");
+            line.push_str(agent);
+        }
+        if let Some(children) = self.children.filter(|children| *children > 1) {
+            line.push_str(&format!("  x{children}"));
+        }
+        if let Some(label) = &self.label {
+            line.push_str("  ");
+            line.push_str(label);
+        }
+        line
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+/// The first 8 characters of a task id, as `/sessions` shows session ids.
+pub(crate) fn short_id(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
+}
+
+/// `45s`, `12m`, `3h`, `2d`.
+fn format_age(secs: u64) -> String {
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=86_399 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86_400),
+    }
+}
+
+/// The saved task whose id is exactly `prefix`, or the only one it starts.
+/// An ambiguous or unknown prefix is an error naming the candidates.
+pub(crate) fn resolve_task_id<'a>(
+    prefix: &str,
+    ids: impl IntoIterator<Item = &'a str>,
+) -> Result<String, String> {
+    let ids: Vec<&str> = ids.into_iter().collect();
+    if let Some(exact) = ids.iter().find(|id| **id == prefix) {
+        return Ok((*exact).to_string());
+    }
+    if prefix.len() < 4 {
+        return Err("task id prefix must have at least 4 characters".to_string());
+    }
+    let matches: Vec<&str> = ids
+        .iter()
+        .copied()
+        .filter(|id| id.starts_with(prefix))
+        .collect();
+    match matches.as_slice() {
+        [] => Err(format!("no task id starts with '{prefix}'")),
+        [one] => Ok((*one).to_string()),
+        many => Err(format!(
+            "'{prefix}' matches {} tasks ({}); type more of the id",
+            many.len(),
+            many.iter()
+                .take(5)
+                .map(|id| short_id(id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
 }
 
 /// Equality of the persisted representation: like the serialized form, it
@@ -238,6 +354,11 @@ impl PartialEq for SavedTask {
             && self.status == other.status
             && self.result == other.result
             && self.details == other.details
+            && self.label == other.label
+            && self.agent_type == other.agent_type
+            && self.children == other.children
+            && self.started_at == other.started_at
+            && self.cancel_reason == other.cancel_reason
     }
 }
 
@@ -264,6 +385,15 @@ pub(crate) fn read_history<'de, D: serde::Deserializer<'de>>(
                         .as_ref()
                         .is_some_and(|text| text.len() > MAX_SAVED_RESULT_BYTES)
                     || item.details.as_ref().is_some_and(|d| !d.within_bounds())
+                    || item
+                        .label
+                        .as_ref()
+                        .is_some_and(|text| text.len() > MAX_LABEL_BYTES * 2)
+                    || item.agent_type.as_ref().is_some_and(|text| text.len() > 64)
+                    || item
+                        .cancel_reason
+                        .as_ref()
+                        .is_some_and(|text| text.len() > MAX_REASON_BYTES * 2)
                     || items.iter().any(|prior: &SavedTask| prior.id == item.id)
                 {
                     return Err(serde::de::Error::custom(
@@ -422,6 +552,13 @@ type AskFactory = dyn Fn(
     + Send
     + Sync;
 
+/// How long a cancelled job's work may keep running to finish its own
+/// cancellation (build the partial report) before it is dropped.
+#[cfg(not(test))]
+const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(test)]
+const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
+
 /// How often a blocking wait re-reads job state.
 const WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 /// Longest single `task_result` wait, in seconds.
@@ -453,6 +590,9 @@ pub(crate) struct Pool {
     evidence: crate::extras::subagents::evidence::EvidenceIndex,
     /// Child conversations a later `task {"resume": id}` can continue.
     resumable: Arc<crate::extras::subagents::resume::ResumeStore>,
+    /// Ids the last history pause (compaction) cancelled, until a front end
+    /// reports them with [`Pool::take_compaction_cancelled`].
+    compaction_cancelled: Mutex<Vec<String>>,
 }
 
 impl std::fmt::Debug for Pool {
@@ -487,12 +627,34 @@ impl AskOrigin {
 
 pub(crate) struct NoticeLease {
     pool: Weak<Pool>,
-    entries: Vec<(String, Status)>,
+    entries: Vec<(String, Status, Option<String>, Option<String>)>,
     scope: Option<Weak<AgentWorkScope>>,
 }
 impl NoticeLease {
     pub(crate) fn messages(&self) -> Vec<String> {
-        self.entries.iter().map(|(id, status)| format!("[Background task {id} {}. Inspect its report with task_result; this notice grants no permission.]", status.as_str())).collect()
+        self.entries
+            .iter()
+            .map(|(id, state, reason, _)| {
+                let why = reason
+                    .as_deref()
+                    .map(|reason| format!(" ({reason})"))
+                    .unwrap_or_default();
+                format!("[Background task {id} {}{why}. Inspect its report with task_result; this notice grants no permission.]", state.as_str())
+            })
+            .collect()
+    }
+    /// Short names for a transcript line: the task's label, else its id prefix.
+    pub(crate) fn headlines(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .map(|(id, state, _, label)| {
+                format!(
+                    "{} {}",
+                    label.as_deref().unwrap_or_else(|| short_id(id)),
+                    state.as_str()
+                )
+            })
+            .collect()
     }
     pub(crate) fn with_scope(mut self, scope: Weak<AgentWorkScope>) -> Self {
         self.scope = Some(scope);
@@ -508,7 +670,7 @@ impl NoticeLease {
         }
         if let Some(pool) = self.pool.upgrade() {
             let mut state = pool.state.lock().unwrap_or_else(|e| e.into_inner());
-            for (id, status) in self.entries {
+            for (id, status, _, _) in self.entries {
                 if let Some(entry) = state.jobs.get_mut(&id)
                     && entry.observation.is_some()
                     && entry.saved.status == status
@@ -698,6 +860,7 @@ impl Pool {
             foreground: Arc::new(tokio::sync::Semaphore::new(concurrency.clamp(1, 32))),
             write_lane: Arc::new(tokio::sync::Semaphore::new(1)),
             recent: Mutex::default(),
+            compaction_cancelled: Mutex::default(),
             evidence: Default::default(),
             resumable: Arc::new(
                 crate::extras::subagents::resume::session_store_path(session.id.as_str())
@@ -813,13 +976,7 @@ impl Pool {
         state.jobs.insert(
             id.clone(),
             Entry {
-                saved: SavedTask {
-                    id: id.clone(),
-                    status: Status::Running,
-                    result: None,
-                    details: None,
-                    notified: false,
-                },
+                saved: SavedTask::new(id.clone()),
                 result: None,
                 scope: Some(job_scope.clone()),
                 observation: Some(observation.clone()),
@@ -884,6 +1041,7 @@ impl Pool {
     /// write at removed/rebased launch rows, and new admission stays paused
     /// until the history owner finishes or abandons its transition.
     pub(crate) async fn pause_for_history(self: &Arc<Self>) -> anyhow::Result<HistoryPause> {
+        let mut cancelled: Vec<String> = Vec::new();
         let jobs = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             anyhow::ensure!(
@@ -895,6 +1053,8 @@ impl Pool {
                 if let Some(scope) = &entry.scope {
                     scope.cancellation_handle().cancel();
                     entry.saved.status = Status::Cancelling;
+                    entry.saved.cancel_reason = Some(COMPACTION_CANCEL_REASON.to_string());
+                    cancelled.push(entry.saved.id.clone());
                     self.history.set(&entry.saved, entry.observation.as_ref());
                 }
             }
@@ -906,7 +1066,20 @@ impl Pool {
         };
         // Create before the first await: abandoning preparation always releases
         // the pause, while the already-cancelled jobs retain their real owners.
-        let pause = HistoryPause(self.clone());
+        if !cancelled.is_empty() {
+            tracing::warn!(
+                tasks = cancelled.len(),
+                "compaction cancelled background tasks"
+            );
+            self.compaction_cancelled
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(cancelled.iter().cloned());
+        }
+        let pause = HistoryPause {
+            pool: self.clone(),
+            cancelled,
+        };
         for scope in jobs {
             scope.wait_idle().await;
         }
@@ -991,6 +1164,17 @@ impl Pool {
         self.changed.notified().await;
     }
 
+    /// Ids that compaction cancelled since the last call, for the front end to
+    /// announce (`compaction_cancel_notice`).
+    pub(crate) fn take_compaction_cancelled(&self) -> Vec<String> {
+        std::mem::take(
+            &mut *self
+                .compaction_cancelled
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        )
+    }
+
     pub(crate) fn ensure_open(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             {
@@ -1012,7 +1196,14 @@ impl Pool {
                     && !entry.saved.notified
                     && !entry.saved.status.is_active()
             })
-            .map(|entry| (entry.saved.id.clone(), entry.saved.status))
+            .map(|entry| {
+                (
+                    entry.saved.id.clone(),
+                    entry.saved.status,
+                    entry.saved.cancel_reason.clone(),
+                    entry.saved.label.clone(),
+                )
+            })
             .collect::<Vec<_>>();
         if entries.is_empty() {
             None
@@ -1186,6 +1377,10 @@ impl Pool {
             .ok_or_else(|| anyhow::anyhow!("unknown task in this session"))?;
         if entry.saved.status.is_active() {
             entry.saved.status = Status::Cancelling;
+            entry
+                .saved
+                .cancel_reason
+                .get_or_insert_with(|| REQUEST_CANCEL_REASON.to_string());
             if let Some(scope) = &entry.scope {
                 scope.cancellation_handle().cancel();
             }
@@ -1277,6 +1472,25 @@ impl Admission {
     pub(crate) fn observation(&self) -> JobObservation {
         self.observation.clone()
     }
+    /// Record what this job runs, for `/tasks` and `task_list`.
+    pub(crate) fn describe(&self, label: &str, agent_type: Option<&str>, children: usize) {
+        let mut state = self.pool.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = state.jobs.get_mut(&self.id) {
+            let one_line = label.split_whitespace().collect::<Vec<_>>().join(" ");
+            entry.saved.label = Some(clip_bytes(&one_line, MAX_LABEL_BYTES));
+            entry.saved.agent_type = agent_type.map(|agent| clip_bytes(agent, 64));
+            entry.saved.children = u16::try_from(children).ok();
+            self.pool
+                .history
+                .set(&entry.saved, entry.observation.as_ref());
+            self.pool.changed.notify_one();
+        }
+    }
+    /// The job's cancellation scope; the scheduler observes it to stop
+    /// gracefully and keep the reports of children that already finished.
+    pub(crate) fn cancel_scope(&self) -> Arc<AgentWorkScope> {
+        self.job_scope.clone()
+    }
     /// The job's inbox for `task_send` messages to its running children.
     pub(crate) fn inbox(&self) -> Arc<crate::extras::subagents::inbox::JobInbox> {
         self.inbox.clone()
@@ -1325,18 +1539,44 @@ impl Admission {
                 job_scope.run_sync(|| drop(crate::agent::runner::spawn_async_scoped(bridge)));
             }
             let result = std::panic::AssertUnwindSafe(job_scope.run(async {
+                // Pool close (the root scope) drops the work at once. A job
+                // cancellation instead gets a short grace period: work that
+                // observes the scope (the task scheduler) then finishes its
+                // own cancellation, keeping the reports and tool logs of
+                // children that already completed.
                 tokio::select! {
                     biased;
                     _ = root.cancelled() => None,
-                    _ = job_scope.cancelled() => None,
-                    result = work => Some(result),
+                    result = async {
+                        let mut work = Box::pin(work);
+                        tokio::select! {
+                            biased;
+                            result = &mut work => Some(result),
+                            _ = job_scope.cancelled() => {
+                                tokio::time::timeout(CANCEL_GRACE, &mut work)
+                                    .await
+                                    .ok()
+                            }
+                        }
+                    } => result,
                 }
             }))
             .catch_unwind()
             .await;
+            let cancelled = job_scope.is_cancelled();
             // work is destroyed by select/catch before its actual children join.
             cleanup.settle().await;
             let (status, result, details) = match result {
+                Ok(Some((Ok(text), details))) if cancelled => (
+                    Status::Cancelled,
+                    Some(clip(&text, MAX_RESULT_BYTES)),
+                    details,
+                ),
+                Ok(Some((Err(text), details))) if cancelled => (
+                    Status::Cancelled,
+                    Some(clip(&text, MAX_RESULT_BYTES)),
+                    details,
+                ),
                 Ok(Some((Ok(text), details))) => (
                     Status::Completed,
                     Some(clip(&text, MAX_RESULT_BYTES)),
@@ -1383,15 +1623,47 @@ impl Drop for Admission {
         }
     }
 }
-pub(crate) struct HistoryPause(Arc<Pool>);
+pub(crate) struct HistoryPause {
+    pool: Arc<Pool>,
+    cancelled: Vec<String>,
+}
+impl HistoryPause {
+    /// Ids of the background tasks this pause cancelled.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn cancelled_ids(&self) -> &[String] {
+        &self.cancelled
+    }
+
+    /// The line each front end shows when compaction cancelled tasks.
+    pub(crate) fn notice(&self) -> Option<String> {
+        compaction_cancel_notice(&self.cancelled)
+    }
+}
+
+/// `compaction cancelled N background task(s): <ids>`, or `None` for zero.
+pub(crate) fn compaction_cancel_notice(ids: &[String]) -> Option<String> {
+    if ids.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "compaction cancelled {} background task{}: {}; relaunch {} if the work is still needed",
+        ids.len(),
+        if ids.len() == 1 { "" } else { "s" },
+        ids.iter()
+            .map(|id| short_id(id))
+            .collect::<Vec<_>>()
+            .join(", "),
+        if ids.len() == 1 { "it" } else { "them" }
+    ))
+}
 impl Drop for HistoryPause {
     fn drop(&mut self) {
-        self.0
+        self.pool
             .state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .history_paused = false;
-        self.0.changed.notify_one();
+        self.pool.changed.notify_one();
     }
 }
 
@@ -1430,11 +1702,10 @@ mod tests {
             (Status::Failed, Some("done".to_string()), true),
         ]
         .map(|(status, result, notified)| SavedTask {
-            id: id.clone(),
             status,
             result,
-            details: None,
             notified,
+            ..SavedTask::new(id.clone())
         });
         let other_id = SavedTask {
             id: uuid::Uuid::new_v4().to_string(),
@@ -1473,6 +1744,135 @@ mod tests {
         let recorder = session.file_checkpoints.recorder(&session.id, 0, true);
         (session, pool, root, run, recorder)
     }
+    #[test]
+    fn task_id_prefixes_resolve_uniquely_or_name_the_ambiguity() {
+        let a = "3f2a9c10-0000-4000-8000-000000000001";
+        let b = "3f2a9c11-0000-4000-8000-000000000002";
+        let c = "7b00aa00-0000-4000-8000-000000000003";
+        let ids = [a, b, c];
+        assert_eq!(resolve_task_id("7b00", ids).as_deref(), Ok(c));
+        assert_eq!(resolve_task_id(a, ids).as_deref(), Ok(a));
+        let ambiguous = resolve_task_id("3f2a9c1", ids).unwrap_err();
+        assert!(ambiguous.contains("matches 2 tasks"), "{ambiguous}");
+        assert!(
+            resolve_task_id("dead", ids)
+                .unwrap_err()
+                .contains("no task id")
+        );
+        assert!(
+            resolve_task_id("3f", ids)
+                .unwrap_err()
+                .contains("at least 4")
+        );
+    }
+
+    #[test]
+    fn task_rows_show_a_short_id_age_agent_and_label() {
+        let mut row = SavedTask::new("3f2a9c10-0000-4000-8000-000000000001".into());
+        row.started_at = Some(1_000);
+        row.agent_type = Some("rust-review".into());
+        row.children = Some(3);
+        row.label = Some("audit the parser".into());
+        let line = row.summary_line(1_000 + 125);
+        assert_eq!(
+            line,
+            "3f2a9c10  running  2m  rust-review  x3  audit the parser"
+        );
+        row.agent_type = None;
+        row.children = Some(1);
+        row.label = None;
+        row.started_at = None;
+        assert_eq!(row.summary_line(5), "3f2a9c10  running  -");
+        // The new fields persist and are bounded when read back.
+        let mut labelled = SavedTask::new("3f2a9c10-0000-4000-8000-000000000001".into());
+        labelled.label = Some("x".repeat(MAX_LABEL_BYTES * 3));
+        let json = serde_json::json!([labelled]);
+        assert!(serde_json::from_value::<History>(json).is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_job_keeps_what_its_work_had_already_produced() {
+        let root = crate::tests::OwnedTestDirectory::new("background-cancel-keeps");
+        let (_session, pool, workspace, run, recorder) = fixture(&root);
+        let admission = pool.reserve(&workspace, &run, &recorder).unwrap();
+        admission.describe("audit\nthe parser", Some("rust-review"), 2);
+        let scope = admission.cancel_scope();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let id = admission
+            .start_with_details(
+                async move {
+                    // A scheduler-like job: one finished child, one blocked;
+                    // on cancellation it renders what it has.
+                    ready_tx.send(()).unwrap();
+                    scope.cancelled().await;
+                    (
+                        Err("## Task 1\nfinished report\n[partial: cancelled]".to_string()),
+                        Some(TaskDetails {
+                            children: vec![ChildDetails {
+                                index: 0,
+                                turns: 1,
+                                tool_calls: 0,
+                                log: Vec::new(),
+                                unverified: None,
+                                evidence: None,
+                            }],
+                        }),
+                    )
+                },
+                run,
+            )
+            .unwrap();
+        ready_rx.await.unwrap();
+        let row = pool.request_cancel(&id).unwrap();
+        assert_eq!(row.cancel_reason.as_deref(), Some(REQUEST_CANCEL_REASON));
+        let settled = settled(&pool, &id).await;
+        assert_eq!(settled.status, Status::Cancelled);
+        let result = pool.result(&id).unwrap();
+        assert!(result.result.unwrap().contains("finished report"));
+        assert!(result.details.is_some(), "tool logs survive a cancel");
+        assert_eq!(result.label.as_deref(), Some("audit the parser"));
+        assert_eq!(result.agent_type.as_deref(), Some("rust-review"));
+        assert_eq!(result.children, Some(2));
+    }
+
+    #[tokio::test]
+    async fn compaction_cancels_visibly_with_a_reason_the_model_is_told() {
+        let root = crate::tests::OwnedTestDirectory::new("background-compaction-reason");
+        let (_session, pool, workspace, run, recorder) = fixture(&root);
+        let admission = pool.reserve(&workspace, &run, &recorder).unwrap();
+        let scope = admission.cancel_scope();
+        let id = admission
+            .start(
+                async move {
+                    scope.cancelled().await;
+                    Ok("partial".to_string())
+                },
+                run,
+            )
+            .unwrap();
+        let pause = pool.pause_for_history().await.unwrap();
+        assert_eq!(pause.cancelled_ids(), std::slice::from_ref(&id));
+        let notice = pause.notice().unwrap();
+        assert!(
+            notice.starts_with("compaction cancelled 1 background task:"),
+            "{notice}"
+        );
+        assert!(notice.contains(short_id(&id)), "{notice}");
+        drop(pause);
+        let row = settled(&pool, &id).await;
+        assert_eq!(row.status, Status::Cancelled);
+        assert_eq!(row.cancel_reason.as_deref(), Some(COMPACTION_CANCEL_REASON));
+        let lease = pool.pending_notices().expect("the cancel is announced");
+        let messages = lease.messages().join("\n");
+        assert!(
+            messages.contains("relaunch it if the work is still needed"),
+            "{messages}"
+        );
+        assert_eq!(pool.take_compaction_cancelled(), vec![id]);
+        assert!(pool.take_compaction_cancelled().is_empty());
+        assert!(compaction_cancel_notice(&[]).is_none());
+    }
+
     #[test]
     fn validating_the_retained_workspace_binding_validates_it_once() {
         let root = crate::tests::OwnedTestDirectory::new("background-validate-once");
@@ -1833,13 +2233,7 @@ mod tests {
         assert_eq!(reloaded.active_count(), 0);
         let too_many = serde_json::json!(
             (0..MAX_JOBS + 1)
-                .map(|_| SavedTask {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    status: Status::Running,
-                    result: None,
-                    details: None,
-                    notified: false
-                })
+                .map(|_| SavedTask::new(uuid::Uuid::new_v4().to_string()))
                 .collect::<Vec<_>>()
         );
         assert!(serde_json::from_value::<History>(too_many).is_err());
@@ -2272,7 +2666,26 @@ impl<const OP: u8> rig::tool::Tool for ControlTool<OP> {
             1 => Ok(serde_json::Value::Array(
                 pool.list()
                     .into_iter()
-                    .map(|task| serde_json::json!({"id":task.id,"status":task.status}))
+                    .map(|task| {
+                        let mut row = serde_json::json!({"id":task.id,"status":task.status});
+                        if let Some(object) = row.as_object_mut() {
+                            for (key, value) in [
+                                ("label", task.label.map(serde_json::Value::from)),
+                                ("agent_type", task.agent_type.map(serde_json::Value::from)),
+                                ("children", task.children.map(serde_json::Value::from)),
+                                ("started_at", task.started_at.map(serde_json::Value::from)),
+                                (
+                                    "cancel_reason",
+                                    task.cancel_reason.map(serde_json::Value::from),
+                                ),
+                            ] {
+                                if let Some(value) = value {
+                                    object.insert(key.into(), value);
+                                }
+                            }
+                        }
+                        row
+                    })
                     .collect(),
             )),
             2 => serde_json::to_value(

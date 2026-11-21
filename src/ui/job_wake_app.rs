@@ -68,4 +68,71 @@ impl App<'_> {
         self.refresh()?;
         Ok(())
     }
+
+    /// A background `task` finished while the session is idle: print one
+    /// transcript line and start an ordinary turn, as for a finished shell
+    /// job. The model request builder attaches the pool's own notice (and
+    /// acknowledges it), so the prompt names only harness-built fields. The
+    /// wake budget and the notification opt-out are shared with shell jobs.
+    #[cfg(feature = "subagents")]
+    pub(super) async fn wake_for_task_notices(&mut self) -> anyhow::Result<()> {
+        if CONSECUTIVE_WAKES.load(Ordering::Relaxed) >= MAX_CONSECUTIVE_WAKES
+            || !self.ui.sandbox.job_notice_queue().enabled()
+            || !self.cron_idle()
+        {
+            return Ok(());
+        }
+        let Some(pool) = self.ui.session.background_pool.clone() else {
+            return Ok(());
+        };
+        let Some(lease) = pool.pending_notices() else {
+            return Ok(());
+        };
+        let headlines = lease.headlines();
+        drop(lease);
+        if self.startup_work_pending() {
+            self.finish_startup_work().await?;
+        }
+        self.ensure_agent().await;
+        if self.budget_admission_notice()? {
+            return Ok(());
+        }
+        CONSECUTIVE_WAKES.fetch_add(1, Ordering::Relaxed);
+        let prompt = task_wake_prompt(&headlines);
+        self.renderer.write_line(
+            &format!(
+                "⟳ background task{} reported: {}",
+                if headlines.len() == 1 { "" } else { "s" },
+                headlines.join(", ")
+            ),
+            Color::Cyan,
+        )?;
+        crate::startup::heap_future(|| {
+            self.start_main_run(&prompt, crate::question::QuestionOrigin::Scheduled)
+        })
+        .await?;
+        self.refresh()?;
+        Ok(())
+    }
+}
+
+/// The prompt of a task wake: harness-built fields only, never task output.
+#[cfg(feature = "subagents")]
+fn task_wake_prompt(headlines: &[String]) -> String {
+    format!(
+        "[Host notice, not user input: background task result{} ready: {}. Read each with task_result, then continue the work they were started for. This notice grants no permission.]",
+        if headlines.len() == 1 { "" } else { "s" },
+        headlines.join("; ")
+    )
+}
+
+#[cfg(all(test, feature = "subagents"))]
+mod tests {
+    #[test]
+    fn task_wake_prompt_names_only_harness_fields() {
+        let prompt = super::task_wake_prompt(&["audit the parser completed".into()]);
+        assert!(prompt.contains("audit the parser completed"));
+        assert!(prompt.contains("task_result"));
+        assert!(prompt.contains("grants no permission"));
+    }
 }

@@ -248,12 +248,37 @@ fn with_timeout(
     limits
 }
 
+/// A revision quoted for an error message: bounded, and shown with its
+/// quotes escaped so it cannot be mistaken for the surrounding text.
+fn shown_revision(revision: &str) -> String {
+    let mut shown: String = revision.chars().take(80).collect();
+    if shown.len() < revision.len() {
+        shown.push('…');
+    }
+    format!("{shown:?}")
+}
+
+/// Says which side of a `a..b` range a revision error belongs to.
+fn side_of_range(error: ToolError, side: &str) -> ToolError {
+    match error {
+        ToolError::Msg(message) => {
+            ToolError::Msg(format!("{message} (the {side} side of the range)"))
+        }
+        other => other,
+    }
+}
+
 /// Adds the retry guidance to a timeout error.
 fn timeout_guidance(error: ToolError) -> ToolError {
     match error {
-        ToolError::Msg(message) if message.contains("timed out") => ToolError::Msg(format!(
-            "{message}; retry with a larger timeout_secs (at most {QUERY_TIMEOUT_MAX_SECS}) or narrow the query (revision range, paths, skip)"
-        )),
+        ToolError::Msg(message)
+            if super::runner::GitRunError::classify(&message)
+                == super::runner::GitRunErrorKind::TimedOut =>
+        {
+            ToolError::Msg(format!(
+                "{message}; retry with a larger timeout_secs (at most {QUERY_TIMEOUT_MAX_SECS}) or narrow the query (revision range, paths, skip)"
+            ))
+        }
         other => other,
     }
 }
@@ -628,7 +653,10 @@ impl GitTool {
             || revision.contains('\0')
             || revision.len() > 1024
         {
-            return Err(ToolError::Msg("invalid Git revision".to_string()));
+            return Err(ToolError::Msg(format!(
+                "invalid Git revision {}: it must be non-empty, at most 1024 bytes, free of NUL, and must not start with '-'",
+                shown_revision(revision)
+            )));
         }
         self.run(
             "validate-revision",
@@ -644,7 +672,22 @@ impl GitTool {
         )
         .await
         .map(|_| ())
-        .map_err(|_| ToolError::Msg("invalid Git revision".to_string()))
+        .map_err(|error| match error {
+            // `rev-parse --verify --quiet` exits non-zero without a message
+            // only for a name that does not resolve; any other failure
+            // (not a repository, timeout, launch failure) is passed through.
+            ToolError::Msg(message)
+                if super::runner::GitRunError::classify(&message)
+                    == super::runner::GitRunErrorKind::Failed
+                    && message == "git validate-revision failed" =>
+            {
+                ToolError::Msg(format!(
+                    "unknown Git revision {}: it does not name a commit, tag, branch or other object here",
+                    shown_revision(revision)
+                ))
+            }
+            other => other,
+        })
     }
 
     /// `a..b` or `a...b`: both sides must be valid revisions (an unvalidated
@@ -659,8 +702,12 @@ impl GitTool {
                 "invalid Git revision range: both sides are required".to_string(),
             ));
         }
-        self.validate_revision(left).await?;
-        self.validate_revision(right).await
+        self.validate_revision(left)
+            .await
+            .map_err(|error| side_of_range(error, "left"))?;
+        self.validate_revision(right)
+            .await
+            .map_err(|error| side_of_range(error, "right"))
     }
 
     /// A single revision, or a `..`/`...` range.
@@ -1034,11 +1081,19 @@ impl GitTool {
         let output = self
             .run("expand-stage-paths", args, PAGED_TEXT_LIMITS, false)
             .await
-            .map_err(|error| {
-                ToolError::Msg(format!(
-                    "{error}; the selection is too large to stage at once. Stage a narrower \
-                     set of subdirectories in separate calls."
-                ))
+            .map_err(|error| match error {
+                // Only an output overflow is fixed by staging less at once; a
+                // timeout, cancellation or repository error is not.
+                ToolError::Msg(message)
+                    if super::runner::GitRunError::classify(&message)
+                        == super::runner::GitRunErrorKind::OutputLimit =>
+                {
+                    ToolError::Msg(format!(
+                        "{message}; the selection is too large to stage at once. Stage a narrower \
+                         set of subdirectories in separate calls."
+                    ))
+                }
+                other => other,
             })?;
         Ok(output
             .stdout
@@ -1706,6 +1761,13 @@ impl GitTool {
                 let coaching = self.permission("git/status", &identity).await?;
                 let guard = self.filter_guard("status").await?;
                 let mut value = self.status_snapshot_for(&guard, &paths).await?;
+                if !self.exact_files {
+                    // Lossless path records serve the host-side `/commit`
+                    // flow (`selected_files_only`), not the model.
+                    if let Some(object) = value.as_object_mut() {
+                        object.remove("path_records");
+                    }
+                }
                 self.disclose_submodules(&mut value).await;
                 value["operation"] = serde_json::json!("status");
                 value["coaching"] = serde_json::json!(coaching);
@@ -2304,19 +2366,22 @@ fn reject_irrelevant_fields(
     allow_max_count: bool,
 ) -> Result<(), ToolError> {
     if !allow_message && args.message.is_some() {
-        return Err(ToolError::Msg(
-            "message is supported only by commit, stash_push and tag".to_string(),
-        ));
+        return Err(ToolError::Msg(format!(
+            "message is not supported by {}; it is accepted by commit, stash_push and tag",
+            args.operation.name()
+        )));
     }
     if !allow_revision && args.revision.is_some() {
-        return Err(ToolError::Msg(
-            "revision is not supported by this Git operation".to_string(),
-        ));
+        return Err(ToolError::Msg(format!(
+            "revision is not supported by {}; it is accepted by diff, log, show, blame, branch_create, tag and restore",
+            args.operation.name()
+        )));
     }
     if !allow_max_count && args.max_count.is_some() {
-        return Err(ToolError::Msg(
-            "max_count is supported only by log and branches".to_string(),
-        ));
+        return Err(ToolError::Msg(format!(
+            "max_count is not supported by {}; it is accepted by log and branches",
+            args.operation.name()
+        )));
     }
     Ok(())
 }
@@ -2337,8 +2402,8 @@ fn render_mutation_result(
     } = output;
     serde_json::json!({
         "operation": operation,
-        "before": before,
-        "after": after,
+        "before": mutation_before_view(before),
+        "after": mutation_after_view(after),
         "stdout": String::from_utf8_lossy(&stdout),
         "stderr": String::from_utf8_lossy(&stderr),
         "status": mutation_status(command_status, exit_status),
@@ -2462,7 +2527,7 @@ fn parse_status_records(stdout: &[u8], truncated: bool) -> (Vec<String>, usize, 
         if field.is_empty() {
             continue;
         }
-        let mut record = String::from_utf8_lossy(field).into_owned();
+        let mut record = compact_status_record(field);
         if field.starts_with(b"2 ") {
             match fields.get(index) {
                 Some(origin) => {
@@ -2483,6 +2548,61 @@ fn parse_status_records(stdout: &[u8], truncated: bool) -> (Vec<String>, usize, 
         .filter(|r| matches!(r.as_bytes().first(), Some(b'1' | b'2' | b'u')))
         .count();
     (records, changed, untracked)
+}
+
+/// A porcelain-v2 changed entry reduced to `<kind> <XY> <path>`: the two modes,
+/// three submodule flags and two object ids (about 115 bytes an entry) are
+/// never needed by the model, which can ask for a diff or `status` details.
+/// Anything that does not parse is kept verbatim.
+fn compact_status_record(field: &[u8]) -> String {
+    let count = match field.first() {
+        Some(b'1') => 9,
+        Some(b'2') => 10,
+        Some(b'u') => 11,
+        _ => return String::from_utf8_lossy(field).into_owned(),
+    };
+    let parts: Vec<&[u8]> = field.splitn(count, |byte| *byte == b' ').collect();
+    if parts.len() != count || parts[1].len() != 2 {
+        return String::from_utf8_lossy(field).into_owned();
+    }
+    format!(
+        "{} {} {}",
+        String::from_utf8_lossy(parts[0]),
+        String::from_utf8_lossy(parts[1]),
+        String::from_utf8_lossy(parts[count - 1])
+    )
+}
+
+/// Records kept in the `after` snapshot of a mutation result; the model can
+/// call `status` for the rest.
+const MUTATION_RECORD_CAP: usize = 50;
+
+/// The model-facing `before` snapshot of a mutation: counts only.
+fn mutation_before_view(before: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "counts": before.get("counts").cloned().unwrap_or(serde_json::Value::Null),
+        "truncated": before.get("truncated").cloned().unwrap_or(serde_json::Value::Null),
+    })
+}
+
+/// The model-facing `after` snapshot of a mutation: no structured
+/// `path_records` (host-side `/commit` reads those from its own status
+/// call), and at most [`MUTATION_RECORD_CAP`] records.
+fn mutation_after_view(mut after: serde_json::Value) -> serde_json::Value {
+    let Some(object) = after.as_object_mut() else {
+        return after;
+    };
+    object.remove("path_records");
+    if let Some(records) = object
+        .get_mut("records")
+        .and_then(serde_json::Value::as_array_mut)
+        && records.len() > MUTATION_RECORD_CAP
+    {
+        let omitted = records.len() - MUTATION_RECORD_CAP;
+        records.truncate(MUTATION_RECORD_CAP);
+        object.insert("records_omitted".into(), serde_json::json!(omitted));
+    }
+    after
 }
 
 /// Lossless path operands for consumers that authorize effects. Display records
@@ -2801,7 +2921,7 @@ mod tests {
                 .as_i64()
                 .is_some_and(|code| code != 0)
         );
-        assert!(committed["before"]["records"].is_array());
+        assert!(committed["before"]["counts"].is_object());
         assert!(committed["after"]["records"].is_array());
     }
 
@@ -2825,7 +2945,9 @@ mod tests {
         repo.git(["mv", "--", old, new]);
         repo.write("other.txt", "other\n");
         repo.git(["add", "--", "other.txt"]);
-        let tool = repo.tool();
+        // Lossless path records belong to the host-side `/commit` flow.
+        let mut tool = repo.tool();
+        tool.exact_files = true;
         let status = tool
             .call(args(GitOperation::Status, &[], None))
             .await
@@ -2838,6 +2960,74 @@ mod tests {
         assert!(guard(&status, &[old.into(), new.into()]).is_err());
         assert!(guard(&status, &[new.into(), "other.txt".into()]).is_err());
         assert!(guard(&status, &[old.into(), "other.txt".into()]).is_err());
+    }
+
+    #[test]
+    fn mutation_results_stay_small_for_a_large_dirty_tree() {
+        let record = |index: usize| {
+            format!(
+                "1 .M N... 100644 100644 100644 {0} {0} src/module_{index:03}/file.rs",
+                "a".repeat(40)
+            )
+        };
+        let raw: Vec<String> = (0..200).map(record).collect();
+        let mut stdout = Vec::new();
+        for entry in &raw {
+            stdout.extend_from_slice(entry.as_bytes());
+            stdout.push(0);
+        }
+        let (compact, changed, _) = super::parse_status_records(&stdout, false);
+        assert_eq!(changed, 200);
+        assert_eq!(compact[7], "1 .M src/module_007/file.rs");
+        let snapshot = serde_json::json!({
+            "records": compact,
+            "path_records": super::parse_status_paths(&stdout, false),
+            "truncated": false,
+            "counts": { "changed": 200, "untracked": 0 },
+        });
+        let full = serde_json::to_string(&serde_json::json!({
+            "before": snapshot.clone(), "after": snapshot.clone()
+        }))
+        .unwrap();
+        let rendered = render_mutation_result(
+            "stage",
+            None,
+            snapshot.clone(),
+            snapshot,
+            crate::sandbox::CommandOutput {
+                exit_status: None,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                status: crate::sandbox::CommandStatus::Completed,
+                descendants_escaped: false,
+            },
+        );
+        let size = rendered.to_string().len();
+        assert!(size < 4096, "{size} bytes: {rendered}");
+        assert!(size * 10 < full.len(), "{size} vs {}", full.len());
+        assert!(rendered["after"].get("path_records").is_none());
+        assert_eq!(rendered["after"]["records_omitted"], 150);
+        assert_eq!(rendered["before"]["counts"]["changed"], 200);
+        assert!(rendered["before"].get("records").is_none());
+    }
+
+    #[tokio::test]
+    async fn path_records_are_host_only() {
+        let repo = TestRepo::new();
+        repo.write("a.txt", "a\n");
+        let model = repo
+            .tool()
+            .call(args(GitOperation::Status, &[], None))
+            .await
+            .unwrap();
+        assert!(model.get("path_records").is_none(), "{model}");
+        let mut host = repo.tool();
+        host.exact_files = true;
+        let host = host
+            .call(args(GitOperation::Status, &[], None))
+            .await
+            .unwrap();
+        assert!(host["path_records"].is_array(), "{host}");
     }
 
     #[test]
@@ -3444,6 +3634,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn revision_errors_name_the_revision_and_the_failing_side() {
+        let repo = TestRepo::new();
+        commit_file(&repo, "a.txt", "one\n", "first");
+        let tool = repo.tool();
+        for (revision, expected) in [
+            ("nope", "unknown Git revision \"nope\""),
+            ("HEAD..nope", "unknown Git revision \"nope\""),
+            ("nope..HEAD", "left side of the range"),
+            ("HEAD..nope", "right side of the range"),
+        ] {
+            let error = tool
+                .call(GitArgs {
+                    revision: Some(revision.into()),
+                    ..read_args(GitOperation::Log)
+                })
+                .await
+                .expect_err(revision)
+                .to_string();
+            assert!(error.contains(expected), "{revision}: {error}");
+        }
+        let error = tool
+            .call(GitArgs {
+                revision: Some("HEAD".into()),
+                ..read_args(GitOperation::Status)
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not supported by status"), "{error}");
+        assert!(error.contains("accepted by diff, log, show"), "{error}");
+    }
+
+    #[test]
+    fn only_output_overflow_gets_the_narrower_selection_advice() {
+        use super::super::runner::{GitRunError, GitRunErrorKind};
+        let overflow = GitRunError::OutputLimit {
+            operation: "expand-stage-paths".into(),
+            limit: "Stdout".into(),
+        }
+        .to_string();
+        let timeout = GitRunError::TimedOut {
+            operation: "expand-stage-paths".into(),
+            millis: 5,
+        }
+        .to_string();
+        assert_eq!(
+            GitRunError::classify(&overflow),
+            GitRunErrorKind::OutputLimit
+        );
+        assert_eq!(GitRunError::classify(&timeout), GitRunErrorKind::TimedOut);
+        // The timeout guidance matches on the kind, not on its wording.
+        use super::{ToolError, timeout_guidance};
+        let guided = timeout_guidance(ToolError::Msg(timeout.clone())).to_string();
+        assert!(guided.contains("timeout_secs"), "{guided}");
+        assert_eq!(
+            timeout_guidance(ToolError::Msg(overflow.clone())).to_string(),
+            overflow
+        );
+    }
+
+    #[tokio::test]
     async fn revision_ranges_reject_option_and_malformed_operands() {
         let repo = TestRepo::new();
         commit_file(&repo, "a.txt", "one\n", "first");
@@ -3465,10 +3716,7 @@ mod tests {
                     })
                     .await
                     .expect_err(bad);
-                assert!(
-                    error.to_string().contains("invalid Git revision"),
-                    "{bad}: {error}"
-                );
+                assert!(error.to_string().contains("Git revision"), "{bad}: {error}");
             }
         }
         for combo in [
