@@ -5,9 +5,10 @@ name: Update model catalog
 # source of truth, so this only opens a PR when models.dev actually changes —
 # builds remain offline and reproducible. See scripts/gen-models-catalog.sh.
 #
-# The live workflow is currently disabled pending owner approval to resume
-# recurring PR automation. Until it is re-enabled, run the manual catalog
-# refresh in docs/agent/PUBLISHING_RELEASES.md before tagging a release.
+# The schedule below is live in this file. If the repository settings still
+# have the workflow disabled, the owner must enable it under Actions; until
+# then run the manual catalog refresh in docs/agent/PUBLISHING_RELEASES.md
+# before tagging a release (mini-agent-nvnkx.36).
 #
 # The generator processes remote JSON, so it runs in a read-only job without
 # persisted checkout credentials. Only the second job holds write tokens, and it

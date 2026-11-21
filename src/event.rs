@@ -23,6 +23,17 @@ pub struct UsageDelta {
     #[serde(default, skip_serializing_if = "is_zero")]
     pub hosted_search_requests: u64,
     pub reasoning_tokens: u64,
+    /// The cost the provider billed for this response in nano-USD (OpenRouter
+    /// `usage.cost`); preferred over the price table when positive.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reported_cost_nano_usd: u64,
+}
+
+impl UsageDelta {
+    /// The provider-reported cost in USD when one was reported and positive.
+    pub(crate) fn reported_cost(&self) -> Option<f64> {
+        (self.reported_cost_nano_usd > 0).then(|| self.reported_cost_nano_usd as f64 / 1e9)
+    }
 }
 
 fn is_zero(count: &u64) -> bool {
@@ -56,6 +67,9 @@ impl UsageDelta {
             reasoning_tokens: self
                 .reasoning_tokens
                 .saturating_sub(previous.reasoning_tokens),
+            reported_cost_nano_usd: self
+                .reported_cost_nano_usd
+                .saturating_sub(previous.reported_cost_nano_usd),
         }
     }
 
@@ -69,6 +83,7 @@ impl UsageDelta {
             self.tool_use_prompt_tokens,
             self.hosted_search_requests,
             self.reasoning_tokens,
+            self.reported_cost_nano_usd,
         ]
         .into_iter()
         .any(|count| count != 0)
@@ -100,6 +115,9 @@ impl UsageDelta {
                 .hosted_search_requests
                 .saturating_add(other.hosted_search_requests),
             reasoning_tokens: self.reasoning_tokens.saturating_add(other.reasoning_tokens),
+            reported_cost_nano_usd: self
+                .reported_cost_nano_usd
+                .saturating_add(other.reported_cost_nano_usd),
         }
     }
 }
@@ -382,6 +400,7 @@ mod hosted_search_tests {
     fn hosted_search_requests_are_counted_diffed_summed_and_serialized_only_when_set() {
         let usage = UsageDelta {
             hosted_search_requests: 3,
+            reported_cost_nano_usd: 0,
             ..Default::default()
         };
         assert!(usage.has_values(), "a search alone is reported usage");
@@ -389,6 +408,7 @@ mod hosted_search_tests {
             usage
                 .nonnegative_difference(UsageDelta {
                     hosted_search_requests: 1,
+                    reported_cost_nano_usd: 0,
                     ..Default::default()
                 })
                 .hosted_search_requests,

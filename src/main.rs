@@ -31,6 +31,7 @@ mod provider;
 mod provider_http;
 mod provider_listing;
 mod question;
+mod rate_limits;
 mod retry;
 mod sandbox;
 mod self_update;
@@ -1039,6 +1040,7 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
     // Started only once every one-shot command has returned: a network task
     // would otherwise be spawned and dropped by `--mcp-login`, `--setup`, etc.
     models_catalog::spawn_refresh_if_stale(cfg.models_catalog_refresh_days);
+    provider_http::pin::set_enabled(cfg.openrouter_pin_provider.unwrap_or(true));
 
     // Overlap the host sandbox backend probe (a process spawn) with the
     // remaining startup; the later availability check joins its result.

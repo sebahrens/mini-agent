@@ -2245,6 +2245,9 @@ impl HeadlessPricing {
     }
 
     pub(crate) fn cost(self, usage: Usage) -> f64 {
+        if let Some(reported) = crate::event::UsageDelta::from(usage).reported_cost() {
+            return reported;
+        }
         self.cache_prices.estimate_cost(
             self.anthropic_native,
             usage.into(),
@@ -2453,6 +2456,26 @@ pub(crate) async fn files_changed_since(
     files.into_iter().collect()
 }
 
+/// The headless result's `subagent_usage`: one row per finished `task`
+/// child, already included in `usage` and `total_cost_usd`.
+pub(crate) fn subagent_usage_json(
+    rows: &[(String, crate::event::UsageDelta)],
+) -> serde_json::Value {
+    serde_json::Value::Array(
+        rows.iter()
+            .map(|(agent, usage)| {
+                serde_json::json!({
+                    "agent": agent,
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "cached_input_tokens": usage.cached_input_tokens,
+                    "total_tokens": usage.total_tokens,
+                })
+            })
+            .collect(),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_headless_json(
     root: &Path,
@@ -2489,7 +2512,7 @@ pub(crate) fn render_headless_json(
             .filter(|message| matches!(message, Message::Assistant { .. }))
             .count() as u64,
         is_error: stop_reason.is_error(),
-        cost_unpriced: pricing.is_unpriced(),
+        cost_unpriced: pricing.is_unpriced() && usage.reported_cost_nano_usd == 0,
         stop_reason,
         #[cfg(feature = "goal")]
         goal: goal.map(HeadlessGoal::from_goal),

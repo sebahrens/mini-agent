@@ -111,8 +111,8 @@ mini-agent --provider openai --model gpt-4o
 ```
 
 When a built-in provider is selected without an explicit model, mini-agent uses
-these catalogued defaults: `claude-sonnet-5-5` for Anthropic, `gpt-5.5` for
-OpenAI, `gemini-3.7-flash` for Gemini/Google, `deepseek/deepseek-v4-pro` for OpenRouter,
+these catalogued defaults: `claude-sonnet-5-5` for Anthropic, `gpt-6.1-sol` for
+OpenAI, `gemini-3.8-flash` for Gemini/Google, `deepseek/deepseek-v4-pro` for OpenRouter,
 and `llama3.1` for Ollama. Direct-provider entries in the
 embedded catalog always include positive input and output prices; the refresh
 script omits entries whose upstream pricing is absent so the status line never

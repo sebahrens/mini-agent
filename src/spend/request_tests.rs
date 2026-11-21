@@ -377,7 +377,7 @@ async fn usd_budget_native_primary_and_repair_unknown_tools_fail_closed_on_unrea
         let root = crate::tests::OwnedTestDirectory::new("cost-native-primary-invalid");
         let wire = Wire::new(vec![Some(response("", true)), None]).await;
         let (client, cfg) = wire.client();
-        let (run, ledger) = profile(
+        let (run, _ledger) = profile(
             &root,
             &cfg,
             if repair {
@@ -427,17 +427,26 @@ async fn usd_budget_native_primary_and_repair_unknown_tools_fail_closed_on_unrea
             .await;
         assert!(turn.failure.is_some());
         // The SDK refused the tool before consuming its later usage chunk.
-        // No fabricated receipt is written, and the incomplete state survives
-        // checkpoint serialization and blocks required continuation/effects.
+        // The unread stream is settled as an upper-bound estimate instead of
+        // a latched tracking failure (mini-agent-nvnkx.159): no usage is
+        // fabricated for the turn, the account is charged the estimate, and
+        // the capped run may continue.
         assert_eq!(turn.usage.input_tokens, 0);
-        assert_eq!(ledger.summary().unwrap().all_time.records, 0);
-        assert!(run.account.snapshot().tracking_error);
-        assert!(run.admit().is_err());
-        assert!(run.admit_effect().is_err());
+        assert!(!run.account.snapshot().tracking_error);
+        assert!(run.account.snapshot().observed_cost > 0.0);
+        run.flush().await;
+        // The test's 0.0001 USD cap may be exhausted by the upper-bound
+        // estimate; what must not remain is the tracking-incomplete latch.
+        if let Err(error) = run.admit() {
+            assert!(
+                !format!("{error:#}").contains("tracking is incomplete"),
+                "{error:#}"
+            );
+        }
         let saved = serde_json::to_vec(&run.account).unwrap();
         let restored: Account = serde_json::from_slice(&saved).unwrap();
         restored.set_cap(Some(1.0)).unwrap();
-        assert!(restored.admit(run.prices).is_err());
+        assert!(!restored.snapshot().tracking_error);
         assert_eq!(wire.calls.load(Ordering::Acquire), 1);
         assert!(!root.path().join("NEVER").exists());
     }
@@ -619,8 +628,7 @@ async fn usd_budget_native_primary_success_repeated_and_sibling_profiles_charge_
 }
 
 #[tokio::test]
-async fn usd_budget_native_primary_cancel_before_final_preserves_incomplete_state_without_receipt()
-{
+async fn usd_budget_native_primary_cancel_before_final_settles_an_estimated_receipt() {
     let root = crate::tests::OwnedTestDirectory::new("cost-primary-cancel");
     let wire = Wire::new(vec![None]).await;
     let (client, cfg) = wire.client();
@@ -646,13 +654,19 @@ async fn usd_budget_native_primary_cancel_before_final_preserves_incomplete_stat
             "active stream is not retired yet"
         );
     }
-    assert!(run.account.snapshot().tracking_error);
-    assert!(run.admit().is_err() && run.admit_effect().is_err());
-    assert_eq!(ledger.summary().unwrap().all_time.records, 0);
+    // The dropped stream is settled at an upper bound instead of latching
+    // tracking failure, so the session continues while the cap counts it
+    // (mini-agent-nvnkx.159).
+    let snapshot = run.account.snapshot();
+    assert!(!snapshot.tracking_error);
+    assert!(snapshot.observed_cost > 0.0, "the estimate is charged");
+    run.flush().await;
+    assert!(run.admit().is_ok() && run.admit_effect().is_ok());
+    assert_eq!(ledger.summary().unwrap().all_time.records, 1);
     let restored: Account =
         serde_json::from_slice(&serde_json::to_vec(&run.account).unwrap()).unwrap();
     restored.set_cap(Some(1.0)).unwrap();
-    assert!(restored.admit(run.prices).is_err());
+    assert!(restored.admit(run.prices).is_ok());
 }
 
 #[tokio::test]
@@ -1557,7 +1571,7 @@ async fn usd_budget_native_reader_contention_report_is_readonly_for_paid_and_fre
                 assert!(
                     lines
                         .iter()
-                        .any(|line| line.starts_with("Session ledger: $0.000000; input 0"))
+                        .any(|line| line.starts_with("Session ledger: $0.000000; uncached input 0"))
                 );
                 assert!(lines.iter().any(|line| line.starts_with(if free {
                     "Session recorded spend: $0.000000"
@@ -1755,7 +1769,7 @@ async fn usd_budget_readonly_report_rechecks_paid_and_free_observation_after_ear
         assert!(
             lines
                 .iter()
-                .any(|line| line.starts_with("Session ledger: $0.000000; input 0")),
+                .any(|line| line.starts_with("Session ledger: $0.000000; uncached input 0")),
             "never add a new in-memory receipt to an earlier durable subtotal"
         );
         assert!(lines.iter().any(|line| line.starts_with(if free {

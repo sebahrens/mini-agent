@@ -30,9 +30,9 @@ fn total(label: &str, totals: &super::ledger::Totals) -> String {
             ""
         };
     format!(
-        "{label}: ${:.6}; input {} / cached {} / cache write {}{} / output {}{completeness}",
+        "{label}: ${:.6}; uncached input {} / cached {} / cache write {}{} / output {}{completeness}",
         totals.known_cost,
-        totals.input_tokens,
+        totals.uncached_input_tokens,
         totals.cached_input_tokens,
         totals.cache_creation_input_tokens,
         write_tiers(totals.cache_creation_input_tokens, totals.cache_creation),
@@ -57,8 +57,13 @@ pub(crate) async fn cost_lines(session: &Session, ledger: Ledger) -> anyhow::Res
         .map_err(anyhow::Error::from)??;
     cleanup.settle().await;
     let (snapshot, pending_after, revision_after) = session.spend_account.report_snapshot();
+    let lower_bound = if !uninitialised && snapshot.unpriced_tokens > 0 {
+        " (lower bound: unpriced usage excluded)"
+    } else {
+        ""
+    };
     let mut lines = vec![format!(
-        "Session recorded spend: ${:.6}",
+        "Session recorded spend: ${:.6}{lower_bound}",
         if uninitialised {
             legacy_cost
         } else {
@@ -94,9 +99,13 @@ pub(crate) async fn cost_lines(session: &Session, ledger: Ledger) -> anyhow::Res
             "Session USD ceiling: ${cap:.6} (reported usage estimate; not a provider billing limit)"
         ));
     }
-    if snapshot.tracking_error || snapshot.unpriced_tokens > 0 {
-        lines.push("Cost tracking incomplete; capped requests/effects are blocked".into());
-    }
+    lines.extend(tracking_notice(
+        snapshot.cap.is_some(),
+        snapshot.tracking_error,
+        snapshot.unpriced_tokens,
+        &session.provider,
+        &session.model,
+    ));
     if pending_after {
         lines.push("Observed receipts awaiting persistence; ledger totals below exclude unpersisted observations".into());
     } else if pending_before {
@@ -128,7 +137,39 @@ pub(crate) async fn cost_lines(session: &Session, ledger: Ledger) -> anyhow::Res
     }
     lines.push(total("Today (UTC)", &summary.today));
     lines.push(total("All time", &summary.all_time));
+    lines.extend(crate::rate_limits::report_lines(
+        &crate::rate_limits::snapshots(),
+    ));
     Ok(lines)
+}
+
+/// The incomplete-tracking notice. Only a session with a USD ceiling is
+/// actually blocked by it (mini-agent-nvnkx.290).
+pub(crate) fn tracking_notice(
+    capped: bool,
+    tracking_error: bool,
+    unpriced_tokens: u64,
+    provider: &str,
+    model: &str,
+) -> Option<String> {
+    if !tracking_error && unpriced_tokens == 0 {
+        return None;
+    }
+    if capped {
+        return Some(
+            "Cost tracking incomplete; capped requests/effects are blocked until prices are known"
+                .into(),
+        );
+    }
+    Some(if unpriced_tokens > 0 {
+        format!(
+            "{unpriced_tokens} tokens on {}/{} have no known price; the dollar figures above exclude them (set prices under [quick_models] or refresh the model catalog)",
+            identity(provider),
+            identity(model)
+        )
+    } else {
+        "Cost tracking incomplete: a request ended before its final usage report; dollar figures may be low".into()
+    })
 }
 
 /// The non-default `service_tier` forwarded through `extra_body` (OpenAI
@@ -293,5 +334,52 @@ mod tests {
                 && line.contains("uncached input 16 / cached input 4")),
             "routed input already includes its cached subset"
         );
+    }
+
+    #[test]
+    fn uncapped_unpriced_sessions_are_not_told_they_are_blocked() {
+        let uncapped = tracking_notice(false, false, 1234, "openrouter", "x/y").unwrap();
+        assert!(!uncapped.contains("blocked"), "{uncapped}");
+        assert!(
+            uncapped.contains("1234 tokens on openrouter/x/y"),
+            "{uncapped}"
+        );
+        let capped = tracking_notice(true, false, 1234, "openrouter", "x/y").unwrap();
+        assert!(capped.contains("capped requests/effects are blocked"));
+        assert!(tracking_notice(false, false, 0, "a", "b").is_none());
+    }
+
+    #[tokio::test]
+    async fn ledger_totals_report_uncached_input_per_provider_rule() {
+        let root = crate::tests::OwnedTestDirectory::new("uncached-totals");
+        let state = root.path().join("state");
+        crate::fs::ensure_private_directory(&state).unwrap();
+        let ledger = Ledger::new(&state);
+        let mut session = Session::new("anthropic", "m", 100_000, "");
+        session.spend_account = Account::new(&session.id, None, 0.0).unwrap();
+        let native = UsageDelta {
+            input_tokens: 100,
+            cached_input_tokens: 900,
+            ..Default::default()
+        };
+        let routed = UsageDelta {
+            input_tokens: 1000,
+            cached_input_tokens: 900,
+            ..Default::default()
+        };
+        for (provider, usage, anthropic) in [("anthropic", native, true), ("openai", routed, false)]
+        {
+            let prices = PriceSnapshot::capture(Some((2.0, 10.0)), Default::default(), anthropic);
+            let receipt =
+                Receipt::new(&session.id, provider, "m", RequestKind::Turn, usage, prices);
+            session.spend_account.observe(&receipt).unwrap();
+        }
+        ledger.flush(&session.spend_account).unwrap();
+        let lines = cost_lines(&session, Ledger::new(&state)).await.unwrap();
+        let line = lines
+            .iter()
+            .find(|l| l.starts_with("Session ledger:"))
+            .unwrap();
+        assert!(line.contains("uncached input 200 / cached 1800"), "{line}");
     }
 }

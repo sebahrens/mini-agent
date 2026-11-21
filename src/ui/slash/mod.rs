@@ -894,20 +894,18 @@ async fn handle_compress_unfloored(
             let usage = ui
                 .cfg
                 .normalize_usage(&ui.session.provider, observed.take());
-            ui.session
-                .charge_usage_delta(usage, ui.cfg.is_anthropic_native(&ui.session.provider));
+            crate::pricing::charge_compaction_usage(ui.session, ui.cfg, usage);
             return Err(error);
         }
     };
 
-    // Every rolling summarizer request ran on the session's model: charge it
-    // at the session's prices, and count it toward the goal round in progress
+    // Charge the summarizer at the `compaction_model`'s prices when one is
+    // configured, else the session's, and count it toward the goal round in progress
     // (auto-compaction runs before a finished round is settled). A manual
     // `/compress` between rounds has no round to join and is only charged
     // (mini-agent-i6q98).
     let usage = ui.cfg.normalize_usage(&ui.session.provider, usage);
-    ui.session
-        .charge_usage_delta(usage, ui.cfg.is_anthropic_native(&ui.session.provider));
+    crate::pricing::charge_compaction_usage(ui.session, ui.cfg, usage);
     #[cfg(feature = "goal")]
     if let Some(collector) = run.goal_round.as_mut() {
         collector.add_usage(usage);

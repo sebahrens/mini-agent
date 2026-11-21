@@ -205,6 +205,33 @@ impl CachePrices {
                 + tier(usage.cached_input_tokens, self.read)
                 + tier(usage.cache_creation_input_tokens, self.write);
         }
+        if !anthropic_native {
+            // OpenAI-style usage folds the cached subset into `input_tokens`:
+            // bill that subset at the cache-read rate when one is known
+            // (mini-agent-nvnkx.32). Cache writes (OpenRouter Claude routes)
+            // use the write rate when known. Without any cache price the
+            // whole input is billed at the base rate, as before.
+            let read = self.read.filter(|price| valid_price(*price));
+            let write = self.write.filter(|price| valid_price(*price));
+            if read.is_some() || write.is_some() {
+                let cached = if read.is_some() {
+                    usage.cached_input_tokens.min(usage.input_tokens)
+                } else {
+                    0
+                };
+                let created = if write.is_some() {
+                    usage
+                        .cache_creation_input_tokens
+                        .min(usage.input_tokens - cached)
+                } else {
+                    0
+                };
+                let plain = usage.input_tokens - cached - created;
+                return estimate_cost(plain, usage.output_tokens, input_price, output_price)
+                    + cached as f64 * read.unwrap_or(0.0) / 1_000_000.0
+                    + created as f64 * write.unwrap_or(0.0) / 1_000_000.0;
+            }
+        }
         estimate_cost(
             billable_input_tokens_with_multipliers(
                 anthropic_native,
@@ -463,6 +490,55 @@ pub(crate) fn cache_prices_for_model(
     }
 }
 
+/// `(anthropic_native, input/output prices if known, cache tiers)`.
+type CompactionPrices = (bool, Option<(f64, f64)>, CachePrices);
+
+/// The prices a rolling-compaction summarizer request is charged at: those of
+/// the configured `compaction_model` (a quick-model alias on the session's
+/// provider), or `None` when compaction runs on the session's own model.
+/// `Some((native, None, ..))` means the compaction model has no known price.
+/// (mini-agent-nvnkx.165)
+pub(crate) fn compaction_model_prices(
+    cfg: &crate::config::Config,
+    provider: &str,
+) -> Option<CompactionPrices> {
+    let (alias, model) = cfg.resolve_compaction_model(provider)?;
+    let quick = crate::config::quick_models_map(cfg);
+    let prices = quick
+        .get(&alias)
+        .and_then(|entry| entry.resolved_prices())
+        .or_else(|| crate::ui::slash::resolve_model_pricing(provider, &model, cfg, None));
+    let cache = cache_prices_for_model(
+        provider,
+        &model,
+        cfg,
+        Some(&alias),
+        prices.map_or(0.0, |prices| prices.0),
+    );
+    Some((cfg.is_anthropic_native(provider), prices, cache))
+}
+
+/// Charges `usage` on `session` at the compaction model's prices when one is
+/// configured, else at the session model's.
+pub(crate) fn charge_compaction_usage(
+    session: &mut crate::session::Session,
+    cfg: &crate::config::Config,
+    usage: crate::event::UsageDelta,
+) {
+    match compaction_model_prices(cfg, &session.provider) {
+        Some((native, Some((input, output)), cache)) => {
+            session.charge_usage_delta_at(usage, native, input, output, cache);
+        }
+        Some((native, None, _)) => {
+            session.charge_usage_delta_at(usage, native, 0.0, 0.0, CachePrices::default());
+        }
+        None => {
+            let native = cfg.is_anthropic_native(&session.provider);
+            session.charge_usage_delta(usage, native);
+        }
+    }
+}
+
 /// Effective (billable) input-token count, folding Anthropic's cache tiers into
 /// a single number priced at the base input rate. The cost-side sibling of
 /// [`Session::real_input_tokens`](crate::session::Session::real_input_tokens):
@@ -541,6 +617,106 @@ pub fn estimate_cost(
 #[cfg(test)]
 mod cache_pricing_tests {
     use super::*;
+
+    #[test]
+    fn compaction_usage_is_charged_at_the_compaction_models_prices() {
+        let cfg: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "compaction_model": "fast",
+            "quick_models": {
+                "fast": {"provider":"openai","model":"cheap-x","input_token_cost":1.0,"output_token_cost":2.0}
+            }
+        }))
+        .unwrap();
+        let usage = crate::event::UsageDelta {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            ..Default::default()
+        };
+        let mut session = crate::session::Session::new("openai", "gpt-5.5", 100_000, "");
+        session.set_input_output_prices(Some((5.0, 30.0)));
+        charge_compaction_usage(&mut session, &cfg, usage);
+        assert!(
+            (session.total_cost - 3.0).abs() < 1e-9,
+            "{}",
+            session.total_cost
+        );
+        // Without a compaction model the session's own prices apply.
+        let plain = crate::config::Config::default();
+        let mut other = crate::session::Session::new("openai", "gpt-5.5", 100_000, "");
+        other.set_input_output_prices(Some((5.0, 30.0)));
+        charge_compaction_usage(&mut other, &plain, usage);
+        // gpt-5.5's long-context tier (10/45 per M) applies to a 1M prompt.
+        assert!(
+            (other.total_cost - 55.0).abs() < 1e-6,
+            "{}",
+            other.total_cost
+        );
+    }
+
+    #[test]
+    fn reported_cost_beats_the_price_table_and_needs_no_prices() {
+        let usage = crate::event::UsageDelta {
+            input_tokens: 1_000,
+            output_tokens: 10,
+            reported_cost_nano_usd: 12_300_000,
+            ..Default::default()
+        };
+        let unpriced = crate::spend::PriceSnapshot::capture(None, Default::default(), false);
+        assert_eq!(unpriced.cost(usage), Some(0.0123));
+        let mut session = crate::session::Session::new("openrouter", "x/y", 100_000, "");
+        session.charge_usage_delta(usage, false);
+        assert!((session.total_cost - 0.0123).abs() < 1e-12);
+        let headless = crate::print::HeadlessPricing::from_session(
+            &session,
+            &crate::config::Config::default(),
+        );
+        assert!((headless.cost(usage.into()) - 0.0123).abs() < 1e-12);
+    }
+
+    #[test]
+    fn non_native_routes_price_cached_input_at_the_cache_read_rate() {
+        let usage = crate::event::UsageDelta {
+            input_tokens: 1_000_000,
+            cached_input_tokens: 900_000,
+            ..Default::default()
+        };
+        let cache = CachePrices {
+            read: Some(0.5),
+            ..Default::default()
+        };
+        let snapshot = crate::spend::PriceSnapshot::capture(Some((5.0, 30.0)), cache, false);
+        assert!((snapshot.cost(usage).unwrap() - 0.95).abs() < 1e-9);
+        // No known cache price: the whole input stays at the base rate.
+        let plain =
+            crate::spend::PriceSnapshot::capture(Some((5.0, 30.0)), Default::default(), false);
+        assert!((plain.cost(usage).unwrap() - 5.0).abs() < 1e-9);
+        // Catalog-driven rows for the shipped OpenAI and Gemini defaults.
+        for (provider, model, input, expected) in [
+            ("openai", "gpt-5.5", 5.0, 0.95),
+            ("gemini", "gemini-3.7-flash", 0.75, 0.1425),
+        ] {
+            let cache = CachePrices::from_catalog(provider, model, input);
+            assert!(cache.read.is_some(), "{model}");
+            let snapshot = crate::spend::PriceSnapshot::capture(Some((input, 0.0)), cache, false);
+            let cost = snapshot.cost(usage).unwrap();
+            assert!((cost - expected).abs() < 1e-6, "{model}: {cost}");
+        }
+        // The session total follows the same rule.
+        let mut session = crate::session::Session::new("openai", "gpt-5.5", 100_000, "");
+        session.set_input_output_prices(Some((5.0, 30.0)));
+        // Below the long-context threshold, so the base tiers apply.
+        let small = crate::event::UsageDelta {
+            input_tokens: 100_000,
+            cached_input_tokens: 90_000,
+            ..Default::default()
+        };
+        session.charge_usage_delta(small, false);
+        assert!(
+            (session.total_cost - 0.095).abs() < 1e-9,
+            "{}",
+            session.total_cost
+        );
+    }
 
     #[test]
     fn cache71_one_hour_rates_are_independent_validated_and_persisted() {

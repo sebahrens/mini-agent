@@ -37,6 +37,10 @@ const WRITE_LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(1
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Totals {
     pub input_tokens: u64,
+    /// Input tokens that were not cache reads, summed with each row's own
+    /// provider rule (Anthropic-native rows exclude cached tokens already;
+    /// OpenAI-style rows include them). mini-agent-nvnkx.289.
+    pub uncached_input_tokens: u64,
     pub output_tokens: u64,
     pub cached_input_tokens: u64,
     pub cache_creation_input_tokens: u64,
@@ -60,6 +64,17 @@ impl Totals {
             };
         }
         add!(input_tokens);
+        let uncached = if row.prices.anthropic_native {
+            row.usage.input_tokens
+        } else {
+            row.usage
+                .input_tokens
+                .saturating_sub(row.usage.cached_input_tokens)
+        };
+        self.uncached_input_tokens = self
+            .uncached_input_tokens
+            .checked_add(uncached)
+            .ok_or_else(|| anyhow::anyhow!("usage ledger token total exceeds limits"))?;
         add!(output_tokens);
         add!(cached_input_tokens);
         self.cache_creation = rig::completion::CacheCreationUsage::add_optional(
@@ -107,6 +122,7 @@ impl Totals {
             };
         }
         add!(input_tokens);
+        add!(uncached_input_tokens);
         add!(output_tokens);
         add!(cached_input_tokens);
         self.cache_creation = rig::completion::CacheCreationUsage::add_optional(
@@ -1685,6 +1701,10 @@ thread_local! {
 #[serde(deny_unknown_fields)]
 struct TotalsRecord {
     input_tokens: u64,
+    /// Absent in segments archived before nvnkx.289; those fall back to the
+    /// raw input sum.
+    #[serde(default)]
+    uncached_input_tokens: Option<u64>,
     output_tokens: u64,
     cached_input_tokens: u64,
     cache_creation_input_tokens: u64,
@@ -1701,6 +1721,7 @@ impl From<&Totals> for TotalsRecord {
     fn from(totals: &Totals) -> Self {
         Self {
             input_tokens: totals.input_tokens,
+            uncached_input_tokens: Some(totals.uncached_input_tokens),
             output_tokens: totals.output_tokens,
             cached_input_tokens: totals.cached_input_tokens,
             cache_creation_input_tokens: totals.cache_creation_input_tokens,
@@ -1721,6 +1742,7 @@ impl TotalsRecord {
         (known_cost.is_finite() && (0.0..=MAX_RECEIPT_USD).contains(&known_cost)).then_some(
             Totals {
                 input_tokens: self.input_tokens,
+                uncached_input_tokens: self.uncached_input_tokens.unwrap_or(self.input_tokens),
                 output_tokens: self.output_tokens,
                 cached_input_tokens: self.cached_input_tokens,
                 cache_creation_input_tokens: self.cache_creation_input_tokens,

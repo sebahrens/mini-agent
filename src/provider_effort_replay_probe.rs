@@ -2839,10 +2839,13 @@ async fn effort46_restored_inflight_after_opened_unobserved_http_keeps_account_i
         .await;
     assert!(turn.failure.is_some());
     assert!(!binding.accepted_progress());
+    // An opened stream with no accepted usage is settled at an upper-bound
+    // estimate instead of latching tracking failure (mini-agent-nvnkx.159).
     assert!(
-        session.spend_account.snapshot().tracking_error,
-        "actual opened200 without accepted usage is incomplete live"
+        !session.spend_account.snapshot().tracking_error,
+        "actual opened200 without accepted usage settles an estimate live"
     );
+    assert!(session.spend_account.snapshot().observed_cost > 0.0);
     drop(ticket);
     crate::session::lock::release_session(&session.id);
     let mut restored = crate::session::storage::load_session_exact(&session.id)

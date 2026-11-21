@@ -31,6 +31,8 @@ pub(crate) enum Protocol {
     OpenAiCompletions,
     /// Native Gemini `generateContent`: effort maps to `thinkingConfig`.
     Gemini,
+    /// Ollama's top-level `think` control.
+    Ollama,
     Other,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,7 +167,14 @@ fn claude_profile(model: &str) -> Option<Claude> {
 /// `thinkingBudget` on Gemini 2.5. `None` for models without thinking.
 fn gemini_thinking_config(model: &str, level: ReasoningEffort) -> Option<Value> {
     let name = model.strip_prefix("models/").unwrap_or(model);
-    if name.starts_with("gemini-3") {
+    // `gemini-<major>[.<minor>]-...`: major >= 3 and the rolling `-latest`
+    // aliases use thinkingLevel (mini-agent-nvnkx.40).
+    let major: Option<u32> = name.strip_prefix("gemini-").and_then(|rest| {
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
+    });
+    let latest_alias = major.is_none() && name.starts_with("gemini-") && name.contains("-latest");
+    if major.is_some_and(|m| m >= 3) || latest_alias {
         let level = match level {
             ReasoningEffort::None | ReasoningEffort::Minimal => "minimal",
             ReasoningEffort::Low => "low",
@@ -224,7 +233,7 @@ fn apply_gemini(
     let Some(thinking) = gemini_thinking_config(model, level) else {
         if session.effort.is_some() {
             return Err(ControlError(
-                "this Gemini model has no thinking controls; use a Gemini 2.5 or 3 model",
+                "this Gemini model has no thinking controls; use a current thinking-capable Gemini model",
             ));
         }
         tracing::warn!(
@@ -249,6 +258,125 @@ fn apply_gemini(
         Effective {
             effort: Some(level),
             source,
+            adaptive: false,
+        },
+    ))
+}
+
+/// OpenRouter's unified `reasoning` object for every non-Claude model
+/// (mini-agent-nvnkx.34). low/medium/high pass through, minimal stays
+/// minimal, xhigh/max cap at `high`, none disables reasoning. A raw
+/// `reasoning.effort` in extra_body is left untouched.
+fn apply_openrouter_generic(
+    level: Option<ReasoningEffort>,
+    source: Source,
+    session: SessionReasoning,
+    params: Option<Value>,
+) -> Result<(Option<Value>, Effective), ControlError> {
+    let mut body = params.unwrap_or(Value::Null);
+    let unchanged = level.is_none() && session.thinking.is_none();
+    if unchanged || (source == Source::Raw && session.thinking.is_none()) {
+        return Ok((
+            (!body.is_null()).then_some(body),
+            Effective {
+                effort: level,
+                source: if unchanged { Source::Provider } else { source },
+                adaptive: false,
+            },
+        ));
+    }
+    if body.is_null() {
+        body = json!({});
+    }
+    let fields = object(&mut body, "reasoning")?;
+    if let Some(level) = level.filter(|_| source != Source::Raw) {
+        if session.effort.is_some() {
+            fields.remove("max_tokens");
+        } else if fields.contains_key("max_tokens") {
+            return Err(ControlError(
+                "choose reasoning effort or a reasoning token budget, not both",
+            ));
+        }
+        match level {
+            ReasoningEffort::None => {
+                fields.remove("effort");
+                fields.insert("enabled".into(), json!(false));
+            }
+            ReasoningEffort::Minimal => {
+                fields.insert("effort".into(), json!("minimal"));
+            }
+            ReasoningEffort::Low | ReasoningEffort::Medium | ReasoningEffort::High => {
+                fields.insert("effort".into(), json!(level.as_wire_str()));
+            }
+            ReasoningEffort::Xhigh | ReasoningEffort::Max => {
+                fields.insert("effort".into(), json!("high"));
+            }
+        }
+    }
+    match session.thinking {
+        Some(ThinkingMode::Off) => {
+            fields.remove("effort");
+            fields.insert("enabled".into(), json!(false));
+        }
+        Some(ThinkingMode::On) => {
+            fields.insert("enabled".into(), json!(true));
+        }
+        None => {}
+    }
+    Ok((
+        Some(body),
+        Effective {
+            effort: level,
+            source,
+            adaptive: false,
+        },
+    ))
+}
+
+/// Ollama's top-level `think` control (bool, or low/medium/high for models
+/// such as gpt-oss). Only an explicit session override writes it: a global
+/// configured effort would make non-thinking local models fail.
+fn apply_ollama(
+    session: SessionReasoning,
+    params: Option<Value>,
+) -> Result<(Option<Value>, Effective), ControlError> {
+    let mut body = params.unwrap_or(Value::Null);
+    let raw = body.get("think").is_some();
+    if raw || (session.effort.is_none() && session.thinking.is_none()) {
+        return Ok((
+            (!body.is_null()).then_some(body),
+            Effective {
+                effort: None,
+                source: if raw { Source::Raw } else { Source::Provider },
+                adaptive: false,
+            },
+        ));
+    }
+    let think = match (session.thinking, session.effort) {
+        (Some(ThinkingMode::Off), _) | (None, Some(ReasoningEffort::None)) => json!(false),
+        (Some(ThinkingMode::On), None) => json!(true),
+        (_, Some(level)) => match level {
+            ReasoningEffort::None => json!(false),
+            ReasoningEffort::Minimal | ReasoningEffort::Low => json!("low"),
+            ReasoningEffort::Medium => json!("medium"),
+            ReasoningEffort::High | ReasoningEffort::Xhigh | ReasoningEffort::Max => {
+                json!("high")
+            }
+        },
+        (None, None) => unreachable!("checked above"),
+    };
+    if body.is_null() {
+        body = json!({});
+    }
+    let map = body.as_object_mut().ok_or(ControlError(
+        "request controls require an object extra_body",
+    ))?;
+    map.insert("think".into(), think);
+    Ok((
+        Some(body),
+        Effective {
+            effort: session.effort,
+            source: Source::Session,
             adaptive: false,
         },
     ))
@@ -302,7 +430,7 @@ pub(crate) fn apply(
         Protocol::Anthropic => "output_config",
         Protocol::OpenRouter => "reasoning",
         Protocol::OpenAiResponses | Protocol::OpenAiCompletions => "reasoning",
-        Protocol::Gemini | Protocol::Other => "",
+        Protocol::Gemini | Protocol::Ollama | Protocol::Other => "",
     };
     let raw = if matches!(
         protocol,
@@ -333,6 +461,12 @@ pub(crate) fn apply(
             session,
             (!body.is_null()).then_some(body),
         );
+    }
+    if protocol == Protocol::Ollama {
+        return apply_ollama(session, (!body.is_null()).then_some(body));
+    }
+    if protocol == Protocol::OpenRouter && native_model.is_none() {
+        return apply_openrouter_generic(level, source, session, (!body.is_null()).then_some(body));
     }
     if native_model.is_none() {
         if matches!(
@@ -622,6 +756,111 @@ pub(crate) fn thinking_enabled(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn openrouter_non_claude_models_map_effort_to_unified_reasoning() {
+        let (params, eff) = apply(
+            Protocol::OpenRouter,
+            "deepseek/deepseek-v4-pro",
+            Some(ReasoningEffort::High),
+            SessionReasoning::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(params.unwrap(), json!({"reasoning": {"effort": "high"}}));
+        assert_eq!(eff.effort, Some(ReasoningEffort::High));
+        // A session override no longer errors; xhigh caps at high.
+        let session = SessionReasoning {
+            effort: Some(ReasoningEffort::Xhigh),
+            thinking: None,
+        };
+        let (params, eff) =
+            apply(Protocol::OpenRouter, "openai/gpt-6", None, session, None).unwrap();
+        assert_eq!(params.unwrap()["reasoning"]["effort"], "high");
+        assert_eq!(eff.source, Source::Session);
+        // /reasoning off disables; on enables.
+        let off = SessionReasoning {
+            effort: None,
+            thinking: Some(ThinkingMode::Off),
+        };
+        let (params, _) = apply(Protocol::OpenRouter, "x-ai/grok", None, off, None).unwrap();
+        assert_eq!(params.unwrap(), json!({"reasoning": {"enabled": false}}));
+        // Raw extra_body effort is left untouched.
+        let raw = json!({"reasoning": {"effort": "low"}});
+        let (params, eff) = apply(
+            Protocol::OpenRouter,
+            "x-ai/grok",
+            None,
+            SessionReasoning::default(),
+            Some(raw.clone()),
+        )
+        .unwrap();
+        assert_eq!(params.unwrap(), raw);
+        assert_eq!(eff.source, Source::Raw);
+    }
+
+    #[test]
+    fn ollama_think_follows_session_controls_only() {
+        let session = SessionReasoning {
+            effort: Some(ReasoningEffort::Medium),
+            thinking: None,
+        };
+        let (params, _) = apply(Protocol::Ollama, "gpt-oss:20b", None, session, None).unwrap();
+        assert_eq!(params.unwrap(), json!({"think": "medium"}));
+        let on = SessionReasoning {
+            effort: None,
+            thinking: Some(ThinkingMode::On),
+        };
+        let (params, _) = apply(Protocol::Ollama, "qwen3", None, on, None).unwrap();
+        assert_eq!(params.unwrap(), json!({"think": true}));
+        // A configured effort never reaches non-thinking local models.
+        let (params, _) = apply(
+            Protocol::Ollama,
+            "llama3",
+            Some(ReasoningEffort::High),
+            SessionReasoning::default(),
+            None,
+        )
+        .unwrap();
+        assert!(params.is_none());
+    }
+
+    #[test]
+    fn gemini_thinking_follows_version_not_name_prefix() {
+        for model in [
+            "gemini-4-argon",
+            "gemini-pro-latest",
+            "gemini-flash-lite-latest",
+            "gemini-3.8-flash",
+        ] {
+            let (params, _) = apply(
+                Protocol::Gemini,
+                model,
+                Some(ReasoningEffort::High),
+                SessionReasoning::default(),
+                None,
+            )
+            .unwrap_or_else(|e| panic!("{model}: {e}"));
+            assert_eq!(
+                params.unwrap()["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+                "high",
+                "{model}"
+            );
+        }
+        let (params, _) = apply(
+            Protocol::Gemini,
+            "gemini-2.5-flash",
+            Some(ReasoningEffort::Low),
+            SessionReasoning::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            params.unwrap()["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            2048
+        );
+        assert!(gemini_thinking_config("gemini-2.0-flash", ReasoningEffort::High).is_none());
+    }
 
     #[test]
     fn unreleased_claude_ids_get_forward_compatible_effort() {

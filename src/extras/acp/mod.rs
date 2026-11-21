@@ -5909,6 +5909,21 @@ fn commit_prompt_transcript(
             pricing.cache_prices,
         );
     }
+    // Anchor the context estimate on the turn's real usage
+    // (mini-agent-nvnkx.163).
+    let calls = outcome
+        .progress
+        .as_deref()
+        .map(|progress| {
+            progress
+                .iter()
+                .filter(|message| matches!(message, rig::completion::Message::Assistant { .. }))
+                .count() as u64
+        })
+        .unwrap_or(0);
+    history
+        .session
+        .calibrate_from_turn_usage(usage, pricing.anthropic_native, calls);
     // Auxiliary requests belong to the same canonical financial checkpoint;
     // their separately captured receipt prices are never re-estimated here.
     history.session.total_cost = history
@@ -6995,6 +7010,12 @@ async fn start_runner(
         #[cfg(feature = "hooks")]
         scope.hook_context,
     )?;
+    // The built preamble's size, so the pre-turn compaction gate counts the
+    // system prompt, tool schemas and memory (mini-agent-nvnkx.163).
+    if let Some(snapshot) = agent.context_snapshot() {
+        history.session.overhead_tokens = snapshot.tokens;
+        history.session.overhead_parts = snapshot.parts.clone();
+    }
     let (agent, prior_history) = match native_owner.as_mut() {
         Some(owner) => {
             bind_native_history(

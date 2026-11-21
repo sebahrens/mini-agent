@@ -43,6 +43,9 @@ jobs:
             exit 1
           fi
 
+      - name: Require a recent model catalog snapshot
+        run: python3 scripts/check_catalog_age.py --max-days 45
+
       - name: Wait for a successful ci-success check on the tagged commit
         env:
           GH_TOKEN: ${{ github.token }}

@@ -534,13 +534,23 @@ impl Run {
         let result = crate::agent::runner::spawn_blocking_scoped(move || {
             let result = ledger.flush(&account);
             if result.is_err() {
-                account.tracking_failed();
+                account.ledger_write_failed();
             }
             result
         })
         .await;
-        if !matches!(result, Ok(Ok(()))) {
-            self.account.tracking_failed();
+        if matches!(result, Ok(Ok(()))) {
+            // Receipts are charge-once by id, so a later flush that wrote
+            // every pending row repairs an earlier lock-wait failure.
+            if !self.account.has_pending() {
+                self.account.ledger_write_recovered();
+                *self
+                    .tracking_detail
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = None;
+            }
+        } else {
+            self.account.ledger_write_failed();
             let detail = match &result {
                 Ok(Err(error)) => error.to_string(),
                 _ => "usage ledger write did not complete".to_owned(),
@@ -869,6 +879,10 @@ pub(crate) struct StreamGuard {
     run: Option<Run>,
     opened: std::sync::atomic::AtomicBool,
     finished: std::sync::atomic::AtomicBool,
+    /// Upper bound on the request's billable usage, set by the HTTP layer from
+    /// the request body (nvnkx.159). When present, an unfinished stream is
+    /// settled as an estimated receipt instead of latching tracking failure.
+    estimate: std::sync::Mutex<Option<UsageDelta>>,
 }
 impl StreamGuard {
     pub(crate) fn new(run: Option<Run>) -> Arc<Self> {
@@ -876,7 +890,13 @@ impl StreamGuard {
             run,
             opened: Default::default(),
             finished: Default::default(),
+            estimate: Default::default(),
         })
+    }
+    /// Records the conservative usage bound charged if this stream ends
+    /// before its final usage report.
+    pub(crate) fn set_estimate(&self, usage: UsageDelta) {
+        *self.estimate.lock().unwrap_or_else(|e| e.into_inner()) = Some(usage);
     }
     pub(crate) fn opened(&self) {
         self.opened
@@ -893,7 +913,18 @@ impl Drop for StreamGuard {
             && !self.finished.load(std::sync::atomic::Ordering::Acquire)
             && let Some(run) = &self.run
         {
-            run.account.tracking_failed();
+            let estimate = self
+                .estimate
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            match estimate {
+                // Settle the unfinished request at an upper bound: the cap
+                // stays conservative (it never assumed the request was free)
+                // and the session continues (mini-agent-nvnkx.159).
+                Some(bound) => run.observe(bound),
+                None => run.account.tracking_failed(),
+            }
         }
     }
 }
@@ -973,6 +1004,48 @@ mod first_item_tests {
             !before && !after,
             "unbilled overload keeps tracking healthy"
         );
+    }
+
+    #[tokio::test]
+    async fn dropped_stream_with_an_estimate_settles_instead_of_latching() {
+        let root = crate::tests::OwnedTestDirectory::new("first-item-estimate");
+        let account = Account::new("estimate", Some(1.0), 0.0).unwrap();
+        let run = Run::fixture(
+            account,
+            Arc::new(Ledger::new(root.path())),
+            "estimate",
+            PriceSnapshot::capture(Some((1.0, 2.0)), Default::default(), false),
+        );
+        let request = run.begin_sdk_request().unwrap();
+        request.guard.opened();
+        request.guard.set_estimate(UsageDelta {
+            input_tokens: 1_000,
+            output_tokens: 2_000,
+            total_tokens: 3_000,
+            ..Default::default()
+        });
+        drop(request);
+        let snapshot = run.account.snapshot();
+        assert!(!snapshot.tracking_error);
+        assert!(
+            (snapshot.observed_cost - 0.005).abs() < 1e-9,
+            "{snapshot:?}"
+        );
+        run.flush().await;
+        assert!(run.admit().is_ok(), "the session continues");
+    }
+
+    #[tokio::test]
+    async fn a_later_successful_flush_clears_a_failed_ledger_write() {
+        let account = Account::new("flush", Some(1.0), 0.0).unwrap();
+        account.ledger_write_failed();
+        assert!(account.snapshot().tracking_error);
+        account.ledger_write_recovered();
+        assert!(!account.snapshot().tracking_error);
+        // A different failure is never cleared by a flush.
+        account.tracking_failed();
+        account.ledger_write_recovered();
+        assert!(account.snapshot().tracking_error);
     }
 
     #[tokio::test]

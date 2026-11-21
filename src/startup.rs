@@ -813,6 +813,10 @@ pub(crate) struct Startup {
 }
 
 type OpenRouterPricingMap = std::collections::HashMap<String, provider::OpenRouterModelInfo>;
+/// How long startup waits for the live price list before moving on.
+const OPENROUTER_PRICING_INTERACTIVE_WAIT: std::time::Duration =
+    std::time::Duration::from_millis(1500);
+const OPENROUTER_PRICING_HEADLESS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 const OPENROUTER_PRICING_ABORT_JOIN_GRACE: std::time::Duration =
     std::time::Duration::from_millis(100);
 #[cfg(test)]
@@ -1300,11 +1304,11 @@ impl crate::session::compaction_run::Observer for HeadlessObserver<'_> {
         session: &mut Session,
         usage: crate::event::UsageDelta,
     ) -> crate::event::UsageDelta {
-        // Every rolling summarizer request ran on the session's model, so it is
-        // charged at the session's prices like any other completion
-        // (mini-agent-i6q98).
+        // Rolling summarizer requests are charged at the `compaction_model`'s
+        // prices when one is configured, else the session's
+        // (mini-agent-i6q98, nvnkx.165).
         let usage = self.cfg.normalize_usage(&session.provider, usage);
-        session.charge_usage_delta(usage, self.cfg.is_anthropic_native(&session.provider));
+        crate::pricing::charge_compaction_usage(session, self.cfg, usage);
         usage
     }
 
@@ -1456,6 +1460,20 @@ impl OpenRouterPricingRefresh {
         }
     }
 
+    /// Waits up to `wait` for the fetch, then abandons it like
+    /// [`Self::finish_without_wait`].
+    async fn finish_within(
+        &mut self,
+        wait: std::time::Duration,
+    ) -> Option<anyhow::Result<OpenRouterPricingMap>> {
+        if let Some(handle) = self.handle.as_mut()
+            && !handle.is_finished()
+        {
+            let _ = tokio::time::timeout(wait, &mut *handle).await;
+        }
+        self.finish_without_wait().await
+    }
+
     async fn finish_without_wait(&mut self) -> Option<anyhow::Result<OpenRouterPricingMap>> {
         let mut handle = self.handle.take()?;
         if !handle.is_finished() {
@@ -1495,14 +1513,31 @@ fn apply_openrouter_pricing_refresh_result(
     let Some(Ok(infos)) = result else {
         return;
     };
-    if session.provider != "openrouter" || session.model != refresh.model {
+    if session.model != refresh.model {
         return;
     }
     let Some(info) = infos.get(session.model.as_str()) else {
         return;
     };
-    if refresh.need_pricing && session.known_input_output_prices().is_none() {
+    if refresh.need_pricing
+        && session.provider == "openrouter"
+        && session.known_input_output_prices().is_none()
+    {
         session.set_input_output_prices(info.known_prices());
+        // Live cache-tier rates (mini-agent-nvnkx.32); an explicit tier on
+        // the session wins.
+        if info.known_prices().is_some()
+            && session.cache_read_token_cost.is_none()
+            && session.cache_write_token_cost.is_none()
+            && (info.cache_read.is_some() || info.cache_write.is_some())
+        {
+            session.set_cache_prices(crate::pricing::CachePrices {
+                read: info.cache_read,
+                write: info.cache_write,
+                write_1h: None,
+                split_required: false,
+            });
+        }
     }
     if refresh.need_context
         && session.context_window == refresh.initial_context_window
@@ -1512,14 +1547,14 @@ fn apply_openrouter_pricing_refresh_result(
     }
 }
 
-fn needs_openrouter_context_refresh(cfg: &Config, model: &str) -> bool {
+fn needs_context_refresh(cfg: &Config, provider: &str, model: &str) -> bool {
     cfg.context_window.is_none()
         && cfg.quick_models.as_ref().is_none_or(|quick_models| {
             quick_models
                 .values()
                 .all(|quick| quick.model.as_str() != model || quick.context_window.is_none())
         })
-        && Config::catalog_context_window("openrouter", model).is_none()
+        && Config::catalog_context_window(provider, model).is_none()
 }
 
 /// Headless detached work belongs to the session, including the final loop
@@ -2031,20 +2066,19 @@ impl Startup {
             cfg.known_context_window(session.provider.as_str(), session.model.as_str(), qm_map)
         {
             session.update_context_window(cw);
-        } else if is_interactive
-            && session.provider.as_str() != "openrouter"
-            && session.context_window == 128_000
-        {
-            // OpenRouter models are refreshed from the live listing after
-            // startup, so their window is not yet a fallback here.
-            eprintln!(
-                "{}",
-                Config::context_window_fallback_notice(
+            if is_interactive
+                && let Some(notice) = crate::models_catalog::inheritance_notice(
                     session.provider.as_str(),
-                    session.model.as_str()
+                    session.model.as_str(),
                 )
-            );
+            {
+                eprintln!("{notice}");
+            }
         }
+        // A session still on the 128k fallback gets one more chance after
+        // startup: the provider listing may report its window, and the
+        // fallback notice is printed there if it does not
+        // (finish_openrouter_pricing_refresh, mini-agent-nvnkx.38).
 
         // A resumed session replays its compaction summary as a recap; the
         // memory block must not carry the daily log's copy of it as well
@@ -2404,11 +2438,14 @@ impl Startup {
     }
 
     pub(crate) fn start_openrouter_pricing_refresh(&mut self) {
-        if self.provider != "openrouter" {
-            return;
-        }
-        let need_pricing = self.session.known_input_output_prices().is_none();
-        let need_context = needs_openrouter_context_refresh(&self.cfg, self.model.as_str());
+        // OpenRouter prices from its live listing; any other provider only
+        // reads a context window from its listing when nothing else knows it
+        // (custom gateways, Copilot; mini-agent-nvnkx.38).
+        let is_openrouter = self.provider == "openrouter";
+        let need_pricing = is_openrouter && self.session.known_input_output_prices().is_none();
+        let need_context =
+            needs_context_refresh(&self.cfg, self.provider.as_str(), self.model.as_str())
+                && (is_openrouter || self.session.context_window == 128_000);
         if !need_pricing && !need_context {
             return;
         }
@@ -2436,6 +2473,8 @@ impl Startup {
                                 output_cost: m.output_price.unwrap_or(0.0),
                                 context_length: m.context_length.map(u64::from),
                                 prices_known: Some(m.input_price.zip(m.output_price).is_some()),
+                                cache_read: m.cache_read_price,
+                                cache_write: m.cache_write_price,
                             },
                         )
                     })
@@ -2448,8 +2487,37 @@ impl Startup {
         let Some(mut refresh) = self.openrouter_pricing_refresh.take() else {
             return;
         };
-        let result = refresh.finish_without_wait().await;
+        // Give the fetch a bounded wait instead of discarding a slow answer:
+        // an unpriced session cannot report cost or enforce a USD cap
+        // (mini-agent-nvnkx.150).
+        let wait = if self.is_interactive {
+            OPENROUTER_PRICING_INTERACTIVE_WAIT
+        } else {
+            OPENROUTER_PRICING_HEADLESS_WAIT
+        };
+        let result = refresh.finish_within(wait).await;
         apply_openrouter_pricing_refresh_result(&mut self.session, &refresh, result);
+        if self.provider.as_str() != "openrouter"
+            && self.is_interactive
+            && refresh.need_context
+            && self.session.context_window == 128_000
+        {
+            eprintln!(
+                "{}",
+                Config::context_window_fallback_notice(self.provider.as_str(), self.model.as_str())
+            );
+        }
+        if self.provider.as_str() == "openrouter"
+            && self.cfg.max_budget_usd.is_some()
+            && self.session.known_input_output_prices().is_none()
+        {
+            eprintln!(
+                "warning: --max-budget-usd cannot be enforced: no price is known for {}/{} \
+                 (the OpenRouter price list did not arrive); capped requests will be refused. \
+                 Set prices under [quick_models] to proceed.",
+                self.provider, self.model
+            );
+        }
     }
 
     /// Phase 3: version-change prompts, MCP recommendations, ARCHITECTURE.md,
@@ -3422,6 +3490,10 @@ impl Startup {
                 )
             })
             .await;
+            if let Some(snapshot) = agent.context_snapshot() {
+                self.session.overhead_tokens = snapshot.tokens;
+                self.session.overhead_parts = snapshot.parts.clone();
+            }
             #[cfg(feature = "mcp")]
             {
                 report_headless_mcp_notices(
@@ -3702,10 +3774,20 @@ impl Startup {
         // auto-compaction that ran before it (mini-agent-i6q98). The
         // session was charged for that already, so it is added to the
         // reported figure only, never to `usage`, which is charged below.
-        let json_usage: rig::completion::Usage = crate::event::UsageDelta::from(usage)
+        let json_usage = crate::event::UsageDelta::from(usage)
             .saturating_add(compaction_usage)
-            .saturating_add(relief_usage)
-            .into();
+            .saturating_add(relief_usage);
+        // Delegated `task` children ran their own model calls; the result
+        // reports them too, with a per-child breakdown (mini-agent-nvnkx.151).
+        #[cfg(feature = "subagents")]
+        let (child_total, child_rows) =
+            crate::extras::subagents::child_usage_report(&self.session.id);
+        #[cfg(not(feature = "subagents"))]
+        let (child_total, child_rows): (
+            crate::event::UsageDelta,
+            Vec<(String, crate::event::UsageDelta)>,
+        ) = Default::default();
+        let json_usage: rig::completion::Usage = json_usage.saturating_add(child_total).into();
         // The JSON reports tool traffic over the earlier context-relief
         // segments plus the final one, as `json_usage` does for tokens
         // (mini-agent-bz8k0). Only `interactions` is persisted below: the
@@ -3749,6 +3831,15 @@ impl Startup {
             let anthropic_native = self.cfg.is_anthropic_native(&self.session.provider);
             self.session
                 .charge_usage_delta(usage.into(), anthropic_native);
+            // Anchor the context estimate on the turn's real usage so the
+            // next pre-turn compaction gate matches the TUI's
+            // (mini-agent-nvnkx.163).
+            let calls = interactions
+                .iter()
+                .filter(|message| matches!(message, rig::completion::Message::Assistant { .. }))
+                .count() as u64;
+            self.session
+                .calibrate_from_turn_usage(usage.into(), anthropic_native, calls);
         }
         if !self.cli.no_session {
             let session = &mut self.session;
@@ -3903,6 +3994,9 @@ impl Startup {
             if let Some(accounting) = title_accounting {
                 rendered["session_title_usage"] = accounting;
             }
+            if !child_rows.is_empty() {
+                rendered["subagent_usage"] = crate::print::subagent_usage_json(&child_rows);
+            }
             crate::print::emit_headless_result(
                 &rendered.to_string(),
                 output.format,
@@ -3950,7 +4044,7 @@ impl Startup {
     }
 
     #[cfg(feature = "loop")]
-    async fn dispatch_loop(self) -> anyhow::Result<()> {
+    async fn dispatch_loop(mut self) -> anyhow::Result<()> {
         // The goal is installed before the agent is built: the preamble's goal
         // block is captured at build time, and an agent built without it never
         // learns it is working toward anything.
@@ -4017,6 +4111,10 @@ impl Startup {
             mcp_manager.as_ref(),
         )
         .await;
+        if let Some(snapshot) = agent.context_snapshot() {
+            self.session.overhead_tokens = snapshot.tokens;
+            self.session.overhead_parts = snapshot.parts.clone();
+        }
         #[cfg(all(feature = "hooks", feature = "mcp"))]
         if let Some(scope) = crate::agent::runner::current_hook_work_scope() {
             scope.set_hook_mcp_peers(
@@ -6051,7 +6149,7 @@ mod tests {
     use super::{
         OpenRouterPricingRefresh, ResumeProviderDecision, apply_openrouter_pricing_refresh_result,
         apply_resume_provider_decision, compact_headless_session_with, headless_compaction_plan,
-        interactive_initial_message, js_runtime_banner_lines, needs_openrouter_context_refresh,
+        interactive_initial_message, js_runtime_banner_lines, needs_context_refresh,
         relieve_headless_turn, require_recent_session, require_recent_session_reporting,
         resolve_resume_provider_decision, run_startup_probes_concurrently,
         unavailable_sandbox_must_fail, validate_startup_permission_policy,
@@ -8030,11 +8128,12 @@ mod tests {
             ..Config::default()
         };
 
-        assert!(!needs_openrouter_context_refresh(
+        assert!(!needs_context_refresh(
             &cfg,
+            "openrouter",
             "uncatalogued/model"
         ));
-        assert!(needs_openrouter_context_refresh(&cfg, "other/model"));
+        assert!(needs_context_refresh(&cfg, "openrouter", "other/model"));
     }
 
     #[tokio::test]

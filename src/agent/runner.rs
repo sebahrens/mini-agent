@@ -2730,6 +2730,7 @@ impl From<Usage> for UsageDelta {
             tool_use_prompt_tokens: usage.tool_use_prompt_tokens,
             hosted_search_requests: usage.hosted_search_requests,
             reasoning_tokens: usage.reasoning_tokens,
+            reported_cost_nano_usd: usage.reported_cost_nano_usd,
         }
     }
 }
@@ -2746,6 +2747,7 @@ impl From<UsageDelta> for Usage {
             tool_use_prompt_tokens: delta.tool_use_prompt_tokens,
             hosted_search_requests: delta.hosted_search_requests,
             reasoning_tokens: delta.reasoning_tokens,
+            reported_cost_nano_usd: delta.reported_cost_nano_usd,
         }
     }
 }
@@ -3184,6 +3186,9 @@ pub(crate) fn usage_saturating_add(left: Usage, right: Usage) -> Usage {
             .hosted_search_requests
             .saturating_add(right.hosted_search_requests),
         reasoning_tokens: left.reasoning_tokens.saturating_add(right.reasoning_tokens),
+        reported_cost_nano_usd: left
+            .reported_cost_nano_usd
+            .saturating_add(right.reported_cost_nano_usd),
     }
 }
 
@@ -3220,6 +3225,7 @@ fn usage_nonnegative_difference(
         tool_use_prompt_tokens: difference!(tool_use_prompt_tokens),
         hosted_search_requests: difference!(hosted_search_requests),
         reasoning_tokens: difference!(reasoning_tokens),
+        reported_cost_nano_usd: difference!(reported_cost_nano_usd),
     }
 }
 
@@ -14112,6 +14118,7 @@ mod tests {
             cache_creation: None,
             tool_use_prompt_tokens: 10,
             hosted_search_requests: 0,
+            reported_cost_nano_usd: 0,
             reasoning_tokens: 10,
         };
         let saturated = Usage {
@@ -14123,6 +14130,7 @@ mod tests {
             cache_creation: None,
             tool_use_prompt_tokens: u64::MAX,
             hosted_search_requests: 0,
+            reported_cost_nano_usd: 0,
             reasoning_tokens: u64::MAX,
         };
         let mut ledger = UsageLedger::default();
@@ -14153,6 +14161,7 @@ mod tests {
             cache_creation: None,
             tool_use_prompt_tokens: u64::MAX - 1,
             hosted_search_requests: 0,
+            reported_cost_nano_usd: 0,
             reasoning_tokens: u64::MAX - 1,
         };
         let increment = Usage {
@@ -14164,6 +14173,7 @@ mod tests {
             cache_creation: None,
             tool_use_prompt_tokens: 10,
             hosted_search_requests: 0,
+            reported_cost_nano_usd: 0,
             reasoning_tokens: 10,
         };
         let saturated = Usage {
@@ -14175,6 +14185,7 @@ mod tests {
             cache_creation: None,
             tool_use_prompt_tokens: u64::MAX,
             hosted_search_requests: 0,
+            reported_cost_nano_usd: 0,
             reasoning_tokens: u64::MAX,
         };
         let mut ledger = UsageLedger::default();
@@ -14201,6 +14212,7 @@ mod tests {
             cache_creation: None,
             tool_use_prompt_tokens: u64::MAX - 1,
             hosted_search_requests: 0,
+            reported_cost_nano_usd: 0,
             reasoning_tokens: u64::MAX - 1,
         };
         let increment = Usage {
@@ -14212,6 +14224,7 @@ mod tests {
             cache_creation: None,
             tool_use_prompt_tokens: 10,
             hosted_search_requests: 0,
+            reported_cost_nano_usd: 0,
             reasoning_tokens: 10,
         };
         let calls = Arc::new(AtomicUsize::new(0));

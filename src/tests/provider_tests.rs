@@ -248,6 +248,7 @@ async fn compress_messages_sums_usage_across_rolling_requests() {
                     cache_creation: None,
                     tool_use_prompt_tokens: 0,
                     hosted_search_requests: 0,
+                    reported_cost_nano_usd: 0,
                     reasoning_tokens: 7 * n,
                 },
             ))
@@ -275,6 +276,7 @@ async fn compress_messages_sums_usage_across_rolling_requests() {
             cache_creation: None,
             tool_use_prompt_tokens: 0,
             hosted_search_requests: 0,
+            reported_cost_nano_usd: 0,
             reasoning_tokens: 42,
         }
     );
@@ -2543,7 +2545,9 @@ mod model_listing48_tests {
             )
             .await;
             assert_eq!(models.len(), 1);
-            assert_eq!(models[0].context_length, None);
+            // `context_length` is a probed OpenAI-compatible key
+            // (mini-agent-nvnkx.38); `max_input_tokens` is not.
+            assert_eq!(models[0].context_length, Some(999999));
             assert_eq!(models[0].input_price, None);
             assert!(calls[0].contains("authorization: bearer captured_listing_key"));
         }
