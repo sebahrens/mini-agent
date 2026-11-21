@@ -2,7 +2,7 @@
 // Every helper has one catalogue line below (`//@ name | signature | purpose | usage`) that
 // `help()` serves; the segment body must define each listed name on globalThis. Keep lines free of `|`.
 //@ yaml_parse | yaml_parse(text, {all?}) | parse a YAML 1.2 document (Kubernetes, compose, GitHub Actions, Helm values) | Block and flow maps and sequences, plain and quoted scalars, literal and folded block scalars (indent and chomp indicators), comments, anchors with aliases, the << merge key, and --- multi-document text. Core typing: true/false, null/~, ints, floats, .inf, .nan; yes/no/on/off stay strings; integers beyond 2^53 become BigInt; map keys are always strings. Several documents throw unless {all: true}, which returns an array (a trailing empty document is dropped). Anything outside the subset throws SyntaxError with the line number rather than guessing: tags (!), complex keys (?), tab indentation, directives, duplicate keys, an anchor on a key, an alias as a key, a single-pair flow entry. Caps: 4 MiB, nesting 64, 200000 expanded nodes counting alias expansion (RangeError). Example: yaml_parse('a: [1, two]\nb: &x {c: 1}\nd: *x\n').d.c === 1
-//@ yaml_stringify | yaml_stringify(value) | block-style YAML text for a plain JS value | Maps, arrays, strings, finite and non-finite numbers, BigInt, booleans, null and Date (as a string). Keys keep insertion order, undefined entries are skipped, indent is 2, strings that would read back as another type or contain special characters are double-quoted and multi-line text uses a literal block. yaml_parse(yaml_stringify(v)) gives back v. Functions, symbols and class instances throw TypeError; nesting over 64 (also a cycle) throws RangeError. Example: yaml_stringify({replicas: 3, ports: [80, 443]}) gives 'replicas: 3\nports:\n  - 80\n  - 443\n'
+//@ yaml_stringify | yaml_stringify(value) | block-style YAML text for a plain JS value | Maps, arrays, strings, finite and non-finite numbers, BigInt, booleans, null and Date (as a string). Keys keep insertion order (maps from yaml_parse keep document order, including integer-like keys), undefined entries are skipped, indent is 2, strings that would read back as another type or contain special characters are double-quoted and multi-line text uses a literal block. yaml_parse(yaml_stringify(v)) gives back v. Functions, symbols and class instances throw TypeError; nesting over 64 (also a cycle) throws RangeError. Example: yaml_stringify({replicas: 3, ports: [80, 443]}) gives 'replicas: 3\nports:\n  - 80\n  - 443\n'
 (function (g) {
   const define = (name, value) =>
     Object.defineProperty(g, name, { value, writable: true, configurable: true, enumerable: false });
@@ -12,8 +12,29 @@
   const MAX_OUT_NODES = 500000;
   const MAX_INT_DIGITS = 300;
   const SAFE = 9007199254740991n;
-  const setOwn = (obj, key, value) =>
-    Object.defineProperty(obj, key, { value, writable: true, configurable: true, enumerable: true });
+  // Plain objects enumerate integer-like keys first, so the document order of parsed maps is
+  // remembered here and consulted by yaml_stringify.
+  const keyOrder = new WeakMap();
+  const setOwn = (obj, key, value) => {
+    if (!Object.prototype.hasOwnProperty.call(obj, key)) {
+      const order = keyOrder.get(obj);
+      if (order) order.push(key);
+      else keyOrder.set(obj, [key]);
+    }
+    return Object.defineProperty(obj, key, { value, writable: true, configurable: true, enumerable: true });
+  };
+  const orderedKeys = (obj) => {
+    const own = Object.keys(obj);
+    const order = keyOrder.get(obj);
+    if (!order || own.length < 2) return own;
+    const present = new Set(own);
+    const out = order.filter((key) => present.has(key));
+    if (out.length < own.length) {
+      const seen = new Set(out);
+      for (const key of own) if (!seen.has(key)) out.push(key);
+    }
+    return out;
+  };
   const hasOwn = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
   const isWs = (c) => c === " " || c === "\t";
   const isDigit = (c) => c >= "0" && c <= "9";
@@ -883,7 +904,7 @@
         }
         return { lines };
       }
-      const keys = Object.keys(v).filter((key) => v[key] !== undefined);
+      const keys = orderedKeys(v).filter((key) => v[key] !== undefined);
       if (keys.length === 0) return { text: "{}" };
       for (const key of keys) {
         const head = pad + keyText(key) + ":";

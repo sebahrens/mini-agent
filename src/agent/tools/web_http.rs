@@ -248,10 +248,16 @@ pub(crate) const FETCH_RESPONSE_BODY_MAX_BYTES: usize = 1024 * 1024;
 // Only the JS broker transport uses these since the native exchange
 // returns `NativeFetchResult`.
 #[cfg_attr(not(all(feature = "js", feature = "sandbox")), allow(dead_code))]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct FetchResult {
     pub status: u16,
     pub text: String,
+    /// The body was cut at the response limit; `text` holds the first bytes that fit.
+    pub truncated: bool,
+    /// Invalid bytes were replaced while decoding `text`.
+    pub lossy: bool,
+    /// Absolute `Location` of a redirect the transport was asked not to follow.
+    pub location: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -600,6 +606,9 @@ static ASYNC_CLIENTS: PinnedClientCache<reqwest::Client> = PinnedClientCache::ne
 pub(crate) struct FetchTransport {
     client: reqwest::blocking::Client,
     limits: FetchLimits,
+    /// Hand a followable 3xx back as an ordinary result (status plus `location`) instead of
+    /// asking the caller to authorize the next hop itself.
+    return_redirects: bool,
 }
 
 #[cfg(all(feature = "js", feature = "sandbox"))]
@@ -664,7 +673,18 @@ impl FetchTransport {
             }
             None => build(None)?,
         };
-        Ok(Self { client, limits })
+        Ok(Self {
+            client,
+            limits,
+            return_redirects: false,
+        })
+    }
+
+    /// The script owns the next hop: it re-enters the broker as its own effect, with its own
+    /// audit intent, URL screening, destination screening and permission decision.
+    pub(crate) fn returning_redirects(mut self, enabled: bool) -> Self {
+        self.return_redirects = enabled;
+        self
     }
 
     pub(crate) fn execute(
@@ -724,16 +744,18 @@ impl FetchTransport {
             let redirect = url
                 .join(location)
                 .map_err(|_| FetchError::InvalidRedirect)?;
+            if self.return_redirects {
+                return Ok(FetchTransportOutcome::Complete(FetchResult {
+                    status: response.status().as_u16(),
+                    location: Some(redirect.to_string()),
+                    ..FetchResult::default()
+                }));
+            }
             return Ok(FetchTransportOutcome::Redirect(redirect));
         }
 
-        if response
-            .content_length()
-            .is_some_and(|length| length > self.limits.response_body_max_bytes as u64)
-        {
-            return Err(FetchError::ResponseBodyTooLarge);
-        }
-
+        let max = self.limits.response_body_max_bytes;
+        let mut truncated = false;
         let mut body = Vec::new();
         let mut buffer = [0_u8; 8192];
         loop {
@@ -747,19 +769,65 @@ impl FetchTransport {
             if read == 0 {
                 break;
             }
-            if body.len().saturating_add(read) > self.limits.response_body_max_bytes {
-                return Err(FetchError::ResponseBodyTooLarge);
+            if body.len().saturating_add(read) > max {
+                // Keep what fits and say so, as the native `web_fetch` does.
+                body.extend_from_slice(&buffer[..max - body.len()]);
+                truncated = true;
+                break;
             }
             body.extend_from_slice(&buffer[..read]);
         }
         if started.elapsed() >= self.limits.total_timeout {
             return Err(FetchError::TimedOut);
         }
-        let text = String::from_utf8(body).map_err(|_| FetchError::InvalidUtf8)?;
+        let (text, lossy) = decode_fetch_body(body, response.headers(), truncated);
         Ok(FetchTransportOutcome::Complete(FetchResult {
             status: response.status().as_u16(),
             text,
+            truncated,
+            lossy,
+            location: None,
         }))
+    }
+}
+
+/// Text of a retained response body: the declared (or sniffed) charset, else UTF-8. Bytes the
+/// decoder cannot represent become U+FFFD and set the returned `lossy` flag; an incomplete
+/// multi-byte sequence at a truncation point is dropped without counting as lossy.
+#[cfg(all(feature = "js", feature = "sandbox"))]
+fn decode_fetch_body(
+    mut body: Vec<u8>,
+    headers: &reqwest::header::HeaderMap,
+    truncated: bool,
+) -> (String, bool) {
+    let html = headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("html"));
+    let declared = native_charset(headers);
+    let sniffed = if declared.is_none() && html {
+        sniff_meta_charset(&body)
+    } else {
+        None
+    };
+    let encoding = declared
+        .as_deref()
+        .or(sniffed.as_deref())
+        .and_then(|label| encoding_rs::Encoding::for_label(label.as_bytes()))
+        .unwrap_or(encoding_rs::UTF_8);
+    if encoding != encoding_rs::UTF_8 {
+        let (text, _, had_errors) = encoding.decode(&body);
+        return (text.into_owned(), had_errors);
+    }
+    if truncated
+        && let Err(error) = std::str::from_utf8(&body)
+        && error.error_len().is_none()
+    {
+        body.truncate(error.valid_up_to());
+    }
+    match String::from_utf8(body) {
+        Ok(text) => (text, false),
+        Err(error) => (String::from_utf8_lossy(error.as_bytes()).into_owned(), true),
     }
 }
 

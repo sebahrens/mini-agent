@@ -28,9 +28,10 @@ use super::protocol::{
     GrepSkipped, JsDiagnosticHint, JsErrorCode, JsExceptionClass, MAX_CONSOLE_BYTES,
     MAX_CONSOLE_RECORD_BYTES, MAX_CONSOLE_RECORDS, MAX_RESULT_BYTES, ModelEffectProfile,
     ParentFrame, ParentWireFrame, ProtocolError, ProtocolFault, ProtocolFaultCode, ProtocolStage,
-    RunStep, ScriptRole, StepOutcome, StepResult, VERIFICATION_LOADER_VERSION,
-    VerificationCaseResult, VerificationResult, VerifyArtifact, WireFrame, WorkerFrame,
-    WorkerProtocol, WorkerWireFrame, read_frame, source_position_is_valid, write_frame,
+    RunStep, ScriptRole, SpawnEnvVar, SpawnOptions, StepOutcome, StepResult,
+    VERIFICATION_LOADER_VERSION, VerificationCaseResult, VerificationResult, VerifyArtifact,
+    WireFrame, WorkerFrame, WorkerProtocol, WorkerWireFrame, read_frame, source_position_is_valid,
+    write_frame,
 };
 #[cfg(feature = "sandbox")]
 use super::protocol::{HttpHeader, HttpMethod};
@@ -46,8 +47,8 @@ use super::types::FETCH_URL_MAX_BYTES;
 use super::types::{
     DISCOVERY_PATTERN_MAX_BYTES, EFFECT_PATH_MAX_BYTES, READ_FILES_MAX_PATH_BYTES,
     READ_FILES_MAX_PATHS, READ_LINES_MAX_COUNT, READ_LINES_MAX_SCAN_BYTES,
-    SPAWN_ARGUMENT_MAX_COUNT, SPAWN_ARGUMENTS_MAX_BYTES, STACK_LIMIT, STEP_TIMEOUT,
-    WRITE_FILE_MAX_BYTES,
+    SPAWN_ARGUMENT_MAX_COUNT, SPAWN_ARGUMENTS_MAX_BYTES, SPAWN_ENV_MAX_COUNT,
+    SPAWN_STDIN_MAX_BYTES, SPAWN_TIMEOUT_MAX_MS, STACK_LIMIT, STEP_TIMEOUT, WRITE_FILE_MAX_BYTES,
 };
 #[cfg(feature = "skills")]
 use crate::extras::js::skills::capability::{InvocationAuthorization, InvocationCapabilityRuntime};
@@ -214,6 +215,7 @@ struct WorkerSpawnResult {
     timed_out: bool,
     stdout_truncated: bool,
     stderr_truncated: bool,
+    signal: Option<String>,
 }
 
 impl<'js> IntoJs<'js> for WorkerSpawnResult {
@@ -225,6 +227,9 @@ impl<'js> IntoJs<'js> for WorkerSpawnResult {
         object.set("timed_out", self.timed_out)?;
         object.set("stdout_truncated", self.stdout_truncated)?;
         object.set("stderr_truncated", self.stderr_truncated)?;
+        if let Some(signal) = self.signal {
+            object.set("signal", signal)?;
+        }
         Ok(object.into())
     }
 }
@@ -233,6 +238,9 @@ impl<'js> IntoJs<'js> for WorkerSpawnResult {
 struct WorkerFetchResult {
     status: u16,
     text: String,
+    truncated: bool,
+    lossy: bool,
+    location: Option<String>,
 }
 
 #[cfg(feature = "sandbox")]
@@ -241,6 +249,11 @@ impl<'js> IntoJs<'js> for WorkerFetchResult {
         let object = Object::new(ctx.clone())?;
         object.set("status", self.status)?;
         object.set("text", self.text)?;
+        object.set("truncated", self.truncated)?;
+        object.set("lossy", self.lossy)?;
+        if let Some(location) = self.location {
+            object.set("location", location)?;
+        }
         Ok(object.into())
     }
 }
@@ -256,6 +269,7 @@ impl<'js> IntoJs<'js> for WorkerDirectoryEntry {
             match self.0.kind {
                 DirectoryEntryKind::File => "file",
                 DirectoryEntryKind::Directory => "directory",
+                DirectoryEntryKind::Symlink => "symlink",
             },
         )?;
         object.set("size", self.0.size)?;
@@ -266,6 +280,7 @@ impl<'js> IntoJs<'js> for WorkerDirectoryEntry {
 struct WorkerListDirResult {
     entries: Vec<DirectoryEntry>,
     truncated: bool,
+    ignored: u32,
 }
 
 impl<'js> IntoJs<'js> for WorkerListDirResult {
@@ -279,6 +294,7 @@ impl<'js> IntoJs<'js> for WorkerListDirResult {
                 .collect::<Vec<_>>(),
         )?;
         object.set("truncated", self.truncated)?;
+        object.set("ignored", self.ignored)?;
         Ok(object.into())
     }
 }
@@ -286,6 +302,7 @@ impl<'js> IntoJs<'js> for WorkerListDirResult {
 struct WorkerGlobResult {
     paths: Vec<String>,
     truncated: bool,
+    ignored: u32,
 }
 
 impl<'js> IntoJs<'js> for WorkerGlobResult {
@@ -293,6 +310,7 @@ impl<'js> IntoJs<'js> for WorkerGlobResult {
         let object = Object::new(ctx.clone())?;
         object.set("paths", self.paths)?;
         object.set("truncated", self.truncated)?;
+        object.set("ignored", self.ignored)?;
         Ok(object.into())
     }
 }
@@ -347,6 +365,7 @@ struct WorkerGrepResult {
     matches: Vec<GrepMatch>,
     truncated: bool,
     skipped: GrepSkipped,
+    ignored: u32,
 }
 
 impl<'js> IntoJs<'js> for WorkerGrepResult {
@@ -360,6 +379,7 @@ impl<'js> IntoJs<'js> for WorkerGrepResult {
                 .collect::<Vec<_>>(),
         )?;
         object.set("truncated", self.truncated)?;
+        object.set("ignored", self.ignored)?;
         let skipped = Object::new(ctx.clone())?;
         skipped.set("large", self.skipped.large)?;
         skipped.set("binary", self.skipped.binary)?;
@@ -429,31 +449,55 @@ fn install_model_effect_globals(
             },
         )?;
         let list_effects = effects.clone();
-        let list_dir = Function::new(ctx.clone(), move |ctx: Ctx<'_>, path: Opt<String>| {
-            let path = path.0.unwrap_or_else(|| ".".to_string());
-            validate_path(&path).map_err(|code| effect_error(&ctx, "list_dir", code))?;
-            super::memory::ensure_healthy(&ctx)?;
-            match list_effects(EffectOperation::ListDir { path }) {
-                EffectResult::ListDir { entries, truncated } => {
-                    Ok(WorkerListDirResult { entries, truncated })
+        let list_dir = Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'_>, path: Opt<String>, options: Opt<Object<'_>>| {
+                let path = path.0.unwrap_or_else(|| ".".to_string());
+                validate_path(&path).map_err(|code| effect_error(&ctx, "list_dir", code))?;
+                let include_ignored = parse_include_ignored_option(options.0.as_ref())
+                    .map_err(|code| effect_error(&ctx, "list_dir", code))?;
+                super::memory::ensure_healthy(&ctx)?;
+                match list_effects(EffectOperation::ListDir {
+                    path,
+                    include_ignored,
+                }) {
+                    EffectResult::ListDir {
+                        entries,
+                        truncated,
+                        ignored,
+                    } => Ok(WorkerListDirResult {
+                        entries,
+                        truncated,
+                        ignored,
+                    }),
+                    EffectResult::Error(error) => Err(effect_error_from(&ctx, "list_dir", &error)),
+                    _ => Err(rquickjs::Error::Unknown),
                 }
-                EffectResult::Error(error) => Err(effect_error_from(&ctx, "list_dir", &error)),
-                _ => Err(rquickjs::Error::Unknown),
-            }
-        })?;
+            },
+        )?;
         let glob_effects = effects.clone();
         let glob = Function::new(
             ctx.clone(),
             move |ctx: Ctx<'_>, pattern: String, options: Opt<Object<'_>>| {
                 validate_discovery_pattern(&pattern)
                     .map_err(|code| effect_error(&ctx, "glob", code))?;
-                let path = parse_glob_options(options.0.as_ref())
+                let (path, include_ignored) = parse_glob_options(options.0.as_ref())
                     .map_err(|code| effect_error(&ctx, "glob", code))?;
                 super::memory::ensure_healthy(&ctx)?;
-                match glob_effects(EffectOperation::Glob { path, pattern }) {
-                    EffectResult::Glob { paths, truncated } => {
-                        Ok(WorkerGlobResult { paths, truncated })
-                    }
+                match glob_effects(EffectOperation::Glob {
+                    path,
+                    pattern,
+                    include_ignored,
+                }) {
+                    EffectResult::Glob {
+                        paths,
+                        truncated,
+                        ignored,
+                    } => Ok(WorkerGlobResult {
+                        paths,
+                        truncated,
+                        ignored,
+                    }),
                     EffectResult::Error(error) => Err(effect_error_from(&ctx, "glob", &error)),
                     _ => Err(rquickjs::Error::Unknown),
                 }
@@ -477,10 +521,12 @@ fn install_model_effect_globals(
                         matches,
                         truncated,
                         skipped,
+                        ignored,
                     } => Ok(WorkerGrepResult {
                         matches,
                         truncated,
                         skipped,
+                        ignored,
                     }),
                     EffectResult::Error(error) => Err(effect_error_from(&ctx, "grep", &error)),
                     _ => Err(rquickjs::Error::Unknown),
@@ -522,9 +568,19 @@ fn install_model_effect_globals(
                         headers,
                         body,
                     }) {
-                        EffectResult::Fetch { status, body, .. } => {
-                            Ok(WorkerFetchResult { status, text: body })
-                        }
+                        EffectResult::Fetch {
+                            status,
+                            body,
+                            truncated,
+                            lossy,
+                            location,
+                        } => Ok(WorkerFetchResult {
+                            status,
+                            text: body,
+                            truncated,
+                            lossy,
+                            location,
+                        }),
                         EffectResult::Error(error) => Err(effect_error_from(&ctx, "fetch", &error)),
                         _ => Err(rquickjs::Error::Unknown),
                     }
@@ -546,11 +602,20 @@ fn install_model_effect_globals(
             let spawn_effects = effects.clone();
             let spawn = Function::new(
                 ctx.clone(),
-                move |ctx: Ctx<'_>, program: String, arguments: Vec<String>| {
+                move |ctx: Ctx<'_>,
+                      program: String,
+                      arguments: Vec<String>,
+                      options: Opt<Object<'_>>| {
                     validate_spawn(&program, &arguments)
                         .map_err(|code| effect_error(&ctx, "spawn", code))?;
+                    let options = parse_spawn_options(options.0.as_ref())
+                        .map_err(|code| effect_error(&ctx, "spawn", code))?;
                     super::memory::ensure_healthy(&ctx)?;
-                    match spawn_effects(EffectOperation::Spawn { program, arguments }) {
+                    match spawn_effects(EffectOperation::Spawn {
+                        program,
+                        arguments,
+                        options,
+                    }) {
                         EffectResult::Spawn {
                             stdout,
                             stderr,
@@ -558,6 +623,7 @@ fn install_model_effect_globals(
                             timed_out,
                             stdout_truncated,
                             stderr_truncated,
+                            signal,
                         } => Ok(WorkerSpawnResult {
                             stdout,
                             stderr,
@@ -565,6 +631,7 @@ fn install_model_effect_globals(
                             timed_out,
                             stdout_truncated,
                             stderr_truncated,
+                            signal,
                         }),
                         EffectResult::Error(error) => Err(effect_error_from(&ctx, "spawn", &error)),
                         _ => Err(rquickjs::Error::Unknown),
@@ -728,13 +795,30 @@ fn validate_discovery_pattern(pattern: &str) -> Result<(), EffectErrorCode> {
     }
 }
 
-fn parse_glob_options(options: Option<&Object<'_>>) -> Result<String, EffectErrorCode> {
+/// `list_dir(path, {include_ignored?})`: the only option; unknown keys are refused.
+fn parse_include_ignored_option(options: Option<&Object<'_>>) -> Result<bool, EffectErrorCode> {
     let Some(options) = options else {
-        return Ok(".".to_string());
+        return Ok(false);
     };
     for key in options.keys::<String>() {
         let key = key.map_err(|_| EffectErrorCode::InvalidTarget)?;
-        if key != "path" {
+        if key != "include_ignored" {
+            return Err(EffectErrorCode::InvalidTarget);
+        }
+    }
+    Ok(options
+        .get::<_, Option<bool>>("include_ignored")
+        .map_err(|_| EffectErrorCode::InvalidTarget)?
+        .unwrap_or(false))
+}
+
+fn parse_glob_options(options: Option<&Object<'_>>) -> Result<(String, bool), EffectErrorCode> {
+    let Some(options) = options else {
+        return Ok((".".to_string(), false));
+    };
+    for key in options.keys::<String>() {
+        let key = key.map_err(|_| EffectErrorCode::InvalidTarget)?;
+        if !matches!(key.as_str(), "path" | "include_ignored") {
             return Err(EffectErrorCode::InvalidTarget);
         }
     }
@@ -743,7 +827,11 @@ fn parse_glob_options(options: Option<&Object<'_>>) -> Result<String, EffectErro
         .map_err(|_| EffectErrorCode::InvalidTarget)?
         .unwrap_or_else(|| ".".to_string());
     validate_path(&path)?;
-    Ok(path)
+    let include_ignored = options
+        .get::<_, Option<bool>>("include_ignored")
+        .map_err(|_| EffectErrorCode::InvalidTarget)?
+        .unwrap_or(false);
+    Ok((path, include_ignored))
 }
 
 fn parse_grep_options(
@@ -754,7 +842,10 @@ fn parse_grep_options(
     };
     for key in options.keys::<String>() {
         let key = key.map_err(|_| EffectErrorCode::InvalidTarget)?;
-        if !matches!(key.as_str(), "path" | "include" | "case_sensitive") {
+        if !matches!(
+            key.as_str(),
+            "path" | "include" | "case_sensitive" | "include_ignored"
+        ) {
             return Err(EffectErrorCode::InvalidTarget);
         }
     }
@@ -773,11 +864,16 @@ fn parse_grep_options(
         .get::<_, Option<bool>>("case_sensitive")
         .map_err(|_| EffectErrorCode::InvalidTarget)?
         .unwrap_or(true);
+    let include_ignored = options
+        .get::<_, Option<bool>>("include_ignored")
+        .map_err(|_| EffectErrorCode::InvalidTarget)?
+        .unwrap_or(false);
     Ok((
         path,
         GrepOptions {
             include,
             case_sensitive,
+            include_ignored,
         },
     ))
 }
@@ -798,6 +894,66 @@ fn validate_spawn(program: &str, arguments: &[String]) -> Result<(), EffectError
     } else {
         Ok(())
     }
+}
+
+/// `spawn(program, args, {cwd?, env?, stdin?, timeout_ms?})`. Shape checks only; the parent
+/// re-validates every field and decides authority (cwd root, env names, bounds).
+fn parse_spawn_options(options: Option<&Object<'_>>) -> Result<SpawnOptions, EffectErrorCode> {
+    let Some(options) = options else {
+        return Ok(SpawnOptions::default());
+    };
+    for key in options.keys::<String>() {
+        let key = key.map_err(|_| EffectErrorCode::InvalidTarget)?;
+        if !matches!(key.as_str(), "cwd" | "env" | "stdin" | "timeout_ms") {
+            return Err(EffectErrorCode::InvalidTarget);
+        }
+    }
+    let cwd = options
+        .get::<_, Option<String>>("cwd")
+        .map_err(|_| EffectErrorCode::InvalidTarget)?;
+    if let Some(cwd) = &cwd {
+        validate_path(cwd)?;
+    }
+    let mut env = Vec::new();
+    if let Some(object) = options
+        .get::<_, Option<Object<'_>>>("env")
+        .map_err(|_| EffectErrorCode::InvalidTarget)?
+    {
+        for property in object.props::<String, String>() {
+            let (name, value) = property.map_err(|_| EffectErrorCode::InvalidTarget)?;
+            if env.len() == SPAWN_ENV_MAX_COUNT {
+                return Err(EffectErrorCode::TooLarge);
+            }
+            env.push(SpawnEnvVar { name, value });
+        }
+    }
+    let stdin = options
+        .get::<_, Option<String>>("stdin")
+        .map_err(|_| EffectErrorCode::InvalidTarget)?;
+    if stdin
+        .as_ref()
+        .is_some_and(|stdin| stdin.len() > SPAWN_STDIN_MAX_BYTES)
+    {
+        return Err(EffectErrorCode::TooLarge);
+    }
+    let timeout_ms = match options
+        .get::<_, Option<f64>>("timeout_ms")
+        .map_err(|_| EffectErrorCode::InvalidTarget)?
+    {
+        None => None,
+        Some(value)
+            if value.fract() == 0.0 && (1.0..=f64::from(SPAWN_TIMEOUT_MAX_MS)).contains(&value) =>
+        {
+            Some(value as u32)
+        }
+        Some(_) => return Err(EffectErrorCode::InvalidTarget),
+    };
+    Ok(SpawnOptions {
+        cwd,
+        env,
+        stdin,
+        timeout_ms,
+    })
 }
 
 #[cfg(feature = "sandbox")]
@@ -916,7 +1072,7 @@ pub(super) fn effect_error_from(
     error: &super::protocol::EffectError,
 ) -> rquickjs::Error {
     let (message, code) = effect_error_text(tool, error);
-    throw_effect_exception(ctx, &message, code)
+    throw_effect_exception(ctx, &message, code, error.index)
 }
 
 /// The exact message and closed `code` a direct effect global throws for `error`.
@@ -961,6 +1117,36 @@ fn effect_hint(tool: &str, code: &str) -> Option<String> {
             "limits: 256 paths, 1 MiB per file, 6 MiB total; read fewer files per call or use grep()",
         ),
         ("write_file", "too_large") => fixed("limit 1 MiB per write"),
+        ("write_file", "not_found" | "invalid_target") => fixed(
+            "parent directories are created for you; check the path is inside the write roots and no component is a symlink or a file",
+        ),
+        ("write_file", "not_text") => fixed(
+            "the existing file is not UTF-8 text, so write_file cannot replace it; write a new path or use the shell tool",
+        ),
+        ("read_file" | "read_files", "not_text") => fixed(
+            "not UTF-8 text (UTF-16 with a BOM is decoded); use read_lines() or grep(), which decode lossily",
+        ),
+        ("read_files", "invalid_target" | "not_found" | "is_directory" | "denied") => fixed(
+            "e.index is the position of the failing path in the array; drop it or read it with read_file()",
+        ),
+        ("fetch", "too_large") => fixed(
+            "request failed before a body was returned (headers or request over their limits); oversized bodies are cut and flagged truncated",
+        ),
+        ("fetch", "invalid_target") => fixed(
+            "url must be an absolute http(s) URL; custom headers must not be host-controlled ones",
+        ),
+        ("fetch", "dns_failed") => {
+            fixed("the host name did not resolve; check the spelling of the URL's host")
+        }
+        ("fetch", "backend_failure") => fixed(
+            "transport error, TLS failure, timeout or unsupported Content-Encoding; retry once or use another URL",
+        ),
+        ("fetch", "denied") => fixed(
+            "the URL, its resolved address or a permission rule was refused; redirects are returned as status 3xx with location, not followed",
+        ),
+        ("spawn", "invalid_target" | "denied") => fixed(
+            "check program, cwd (must be inside the workspace) and env names (no secrets, no LD_/DYLD_ names)",
+        ),
         ("spawn", "too_large") => Some(format!(
             "causes: program binary over {} MiB, or more than {SPAWN_ARGUMENT_MAX_COUNT} arguments; use the shell tool instead",
             crate::extras::js::broker::MAX_SPAWN_EXECUTABLE_BYTES / (1024 * 1024)
@@ -986,7 +1172,7 @@ fn effect_error_detail(
     detail: Option<&str>,
 ) -> rquickjs::Error {
     let (message, code) = effect_error_message(tool, code, detail);
-    throw_effect_exception(ctx, &message, code)
+    throw_effect_exception(ctx, &message, code, None)
 }
 
 fn effect_error_message(
@@ -1006,6 +1192,8 @@ fn effect_error_message(
         EffectErrorCode::BackendFailure => "backend_failure",
         EffectErrorCode::AuditFailure => "audit_failure",
         EffectErrorCode::OutcomeUnknown => "outcome_unknown",
+        EffectErrorCode::NotText => "not_text",
+        EffectErrorCode::DnsFailed => "dns_failed",
     };
     let hint = effect_hint(tool, code);
     let message = match (detail, hint) {
@@ -1016,11 +1204,22 @@ fn effect_error_message(
     (message, code)
 }
 
-fn throw_effect_exception(ctx: &Ctx<'_>, message: &str, code: &'static str) -> rquickjs::Error {
+fn throw_effect_exception(
+    ctx: &Ctx<'_>,
+    message: &str,
+    code: &'static str,
+    index: Option<u32>,
+) -> rquickjs::Error {
     let Ok(exception) = Exception::from_message(ctx.clone(), message) else {
         return rquickjs::Error::Unknown;
     };
     if exception.as_object().prop("code", code).is_err() {
+        return rquickjs::Error::Unknown;
+    }
+    // Position in the script's own request array, never target data.
+    if let Some(index) = index
+        && exception.as_object().prop("index", index).is_err()
+    {
         return rquickjs::Error::Unknown;
     }
     exception.throw()
@@ -1125,10 +1324,12 @@ mod effect_error_tests {
                         size: 0,
                     }],
                     truncated: false,
+                    ignored: 0,
                 },
                 EffectOperation::Glob { .. } => EffectResult::Glob {
                     paths: vec!["src/main.rs".into()],
                     truncated: true,
+                    ignored: 0,
                 },
                 EffectOperation::Grep { .. } => EffectResult::Grep {
                     matches: vec![GrepMatch {
@@ -1138,6 +1339,7 @@ mod effect_error_tests {
                     }],
                     truncated: false,
                     skipped: GrepSkipped::default(),
+                    ignored: 0,
                 },
                 _ => EffectResult::Error(super::super::protocol::EffectError::new(
                     EffectErrorCode::BackendFailure,
@@ -1168,10 +1370,14 @@ mod effect_error_tests {
         assert_eq!(
             *observed_operations.borrow(),
             vec![
-                EffectOperation::ListDir { path: ".".into() },
+                EffectOperation::ListDir {
+                    path: ".".into(),
+                    include_ignored: false,
+                },
                 EffectOperation::Glob {
                     path: "src".into(),
                     pattern: "**/*.rs".into(),
+                    include_ignored: false,
                 },
                 EffectOperation::Grep {
                     path: "src".into(),
@@ -1179,6 +1385,7 @@ mod effect_error_tests {
                     options: GrepOptions {
                         include: Some("*.rs".into()),
                         case_sensitive: false,
+                        include_ignored: false,
                     },
                 },
                 EffectOperation::Grep {
@@ -3605,6 +3812,8 @@ fn install_console(
         let wrapper = wrapper.restore(&ctx)?;
         for (name, level) in [
             ("log", ConsoleLevel::Log),
+            ("info", ConsoleLevel::Log),
+            ("debug", ConsoleLevel::Log),
             ("warn", ConsoleLevel::Warn),
             ("error", ConsoleLevel::Error),
         ] {
@@ -4537,7 +4746,9 @@ fn execute_verification_fake(
             .write_file(&path, &content)
             .map(|()| EffectResult::WriteFile)
             .map_err(|_| CapabilityError::DispatchDenied),
-        EffectOperation::Spawn { program, arguments } => fakes
+        EffectOperation::Spawn {
+            program, arguments, ..
+        } => fakes
             .spawn(&program, &arguments)
             .map(|response| EffectResult::Spawn {
                 stdout: response.stdout,
@@ -4546,6 +4757,7 @@ fn execute_verification_fake(
                 timed_out: response.timed_out,
                 stdout_truncated: response.stdout_truncated,
                 stderr_truncated: response.stderr_truncated,
+                signal: None,
             })
             .map_err(|_| CapabilityError::DispatchDenied),
         EffectOperation::Fetch { url, method, .. } => {
@@ -4558,6 +4770,9 @@ fn execute_verification_fake(
                 .map(|response| EffectResult::Fetch {
                     status: response.status,
                     body: response.body,
+                    truncated: false,
+                    lossy: false,
+                    location: None,
                 })
                 .map_err(|_| CapabilityError::DispatchDenied)
         }
@@ -4577,7 +4792,7 @@ fn verification_scope_allows(
     match operation {
         EffectOperation::ReadFile { path }
         | EffectOperation::ReadLines { path, .. }
-        | EffectOperation::ListDir { path }
+        | EffectOperation::ListDir { path, .. }
         | EffectOperation::Glob { path, .. }
         | EffectOperation::Grep { path, .. } => manifest
             .scope(HostCapability::ReadFile)

@@ -43,7 +43,7 @@ use crate::extras::js::broker::{
 };
 use crate::extras::js::protocol::{
     DirectoryEntry, DirectoryEntryKind, EffectOperation, EffectResult, GrepMatch, GrepOptions,
-    GrepSkipped,
+    GrepSkipped, SpawnOptions,
 };
 use crate::extras::js::session::{
     SCRATCH_VALUE_MAX_BYTES, STRUCTURED_RESULT_MAX_BYTES, ScratchStore, SessionStateError,
@@ -64,9 +64,13 @@ use crate::extras::js::types::{
     DISCOVERY_PATTERN_MAX_BYTES, EFFECT_PATH_MAX_BYTES, EffectServiceError, FETCH_URL_MAX_BYTES,
     GREP_FILE_MAX_BYTES, READ_FILE_MAX_BYTES, READ_FILES_MAX_PATH_BYTES, READ_FILES_MAX_PATHS,
     READ_FILES_MAX_RESULT_BYTES, READ_LINES_MAX_COUNT, READ_LINES_MAX_LINE_BYTES,
-    READ_LINES_MAX_SCAN_BYTES, SPAWN_ARGUMENT_MAX_COUNT, SPAWN_ARGUMENTS_MAX_BYTES, SpawnResult,
-    WRITE_FILE_MAX_BYTES, canonical_spawn_permission_subject, spawn_policy_input,
+    READ_LINES_MAX_SCAN_BYTES, SPAWN_ARGUMENT_MAX_COUNT, SPAWN_ARGUMENTS_MAX_BYTES,
+    SPAWN_ENV_MAX_BYTES, SPAWN_ENV_MAX_COUNT, SPAWN_STDIN_MAX_BYTES, SPAWN_TIMEOUT_MAX_MS,
+    SpawnResult, WRITE_FILE_MAX_BYTES, canonical_spawn_permission_subject_with,
+    spawn_policy_input_with,
 };
+#[cfg(test)]
+use crate::extras::js::types::{canonical_spawn_permission_subject, spawn_policy_input};
 #[cfg(target_os = "linux")]
 use crate::sandbox::SandboxCommand;
 #[cfg(any(unix, windows))]
@@ -559,7 +563,7 @@ fn resolve_policy_write_target(base: &Path, target: &Path) -> Result<PathBuf, Al
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let mut ancestor = absolute.as_path();
-            let mut missing = Vec::new();
+            let mut missing: Vec<std::ffi::OsString> = Vec::new();
             let canonical_parent = loop {
                 match std::fs::canonicalize(ancestor) {
                     Ok(canonical) => break canonical,
@@ -804,8 +808,12 @@ impl FetchSender for BoundFetchSender {
         let proxy = crate::agent::tools::web_proxy::proxy_for_url(&url)?;
         // A proxied DNS name has no pinned addresses; the proxy resolves it.
         let resolved = (!addresses.is_empty()).then_some((host, addresses));
+        // A 3xx is returned to the script (status + location); the script issues the next hop
+        // as its own brokered effect, so every hop has its own intent record, URL and
+        // destination screening and permission decision (spec: independent hop records).
         let transport =
-            FetchTransport::with_proxy(FetchLimits::default(), resolved, proxy.as_deref())?;
+            FetchTransport::with_proxy(FetchLimits::default(), resolved, proxy.as_deref())?
+                .returning_redirects(true);
         transport.execute(url, request, || permission_bridge.is_cancelled())
     }
 }
@@ -1314,8 +1322,53 @@ enum WriteMode {
 
 struct ResolvedWriteTarget {
     path: PathBuf,
+    /// Identity of the directory the file is created in, or, while `pending_dirs` is
+    /// non-empty, of the canonical existing ancestor the missing directories hang from.
     parent_identity: crate::fs::CheckedMetadata,
     mode: WriteMode,
+    /// Missing directory names between that ancestor and the file's parent, outermost first.
+    /// They are created only at execution, after the permission decision on the final path.
+    pending_dirs: Vec<std::ffi::OsString>,
+}
+
+impl ResolvedWriteTarget {
+    /// The existing directory the target is anchored to.
+    fn anchor(&self) -> Option<&Path> {
+        self.path.ancestors().nth(1 + self.pending_dirs.len())
+    }
+
+    /// Creates the missing parent directories one component at a time (never following a
+    /// symlink) and returns the target anchored to its real parent.
+    async fn materialize_parents(mut self) -> Result<Self, EffectServiceError> {
+        if self.pending_dirs.is_empty() {
+            return Ok(self);
+        }
+        let anchor = self.anchor().ok_or(EffectServiceError::InvalidTarget)?;
+        let current = crate::fs::stable_path_metadata(anchor)
+            .await
+            .map_err(file_path_error)?;
+        crate::fs::ensure_same_file(anchor, &self.parent_identity, &current)
+            .map_err(file_path_error)?;
+        let mut directory = anchor.to_path_buf();
+        for name in std::mem::take(&mut self.pending_dirs) {
+            directory.push(name);
+            match tokio::fs::create_dir(&directory).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(file_path_error(error)),
+            }
+            let metadata = tokio::fs::symlink_metadata(&directory)
+                .await
+                .map_err(file_path_error)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(EffectServiceError::InvalidTarget);
+            }
+        }
+        self.parent_identity = crate::fs::stable_path_metadata(&directory)
+            .await
+            .map_err(file_path_error)?;
+        Ok(self)
+    }
 }
 
 fn absolute_lexical(base: &Path, path: &Path) -> PathBuf {
@@ -1374,7 +1427,47 @@ async fn resolve_read_target(
     })
 }
 
-async fn read_approved_file(target: ResolvedReadTarget) -> Result<String, EffectServiceError> {
+/// Text served to the script plus, when it is the complete current text, the fingerprint the
+/// native `read` tool would record for it (see [`JsWriteGuard::record_full_read`]).
+#[derive(Debug)]
+struct ReadText {
+    text: String,
+    version: Option<ReadFingerprint>,
+}
+
+#[derive(Debug)]
+struct ReadFingerprint {
+    metadata: std::fs::Metadata,
+    crc: u32,
+}
+
+/// Decodes what `read_file` serves: UTF-8 (a leading BOM is dropped) or BOM-marked UTF-16.
+/// Any other byte sequence is `NotText` so the script is told what the file is instead of
+/// getting a bare invalid target.
+fn decode_effect_text(bytes: &[u8]) -> Result<String, EffectServiceError> {
+    if let Some(decoded) = crate::agent::tools::text_encoding::decode_utf16_bom(bytes) {
+        return decoded
+            .map(|(text, _)| text)
+            .map_err(|_| EffectServiceError::NotText);
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| EffectServiceError::NotText)?;
+    Ok(text.strip_prefix('\u{feff}').unwrap_or(text).to_owned())
+}
+
+fn read_text_from_bytes(
+    bytes: &[u8],
+    metadata: std::fs::Metadata,
+) -> Result<ReadText, EffectServiceError> {
+    let text = decode_effect_text(bytes)?;
+    // Only raw UTF-8 bytes can authorize an overwrite: a replacement of a UTF-16 file would
+    // change its encoding, which the guard (like the native write tool) never allows blindly.
+    let version = crate::agent::tools::write::full_text_fingerprint(bytes)
+        .ok()
+        .map(|(crc, _lines)| ReadFingerprint { metadata, crc });
+    Ok(ReadText { text, version })
+}
+
+async fn read_approved_file(target: ResolvedReadTarget) -> Result<ReadText, EffectServiceError> {
     if !target.identity.is_file() {
         return Err(if target.identity.is_dir() {
             EffectServiceError::IsDirectory
@@ -1385,7 +1478,7 @@ async fn read_approved_file(target: ResolvedReadTarget) -> Result<String, Effect
     if target.identity.len() > READ_FILE_MAX_BYTES as u64 {
         return Err(EffectServiceError::OutputLimit);
     }
-    let file = crate::fs::open_stable_file(&target.path)
+    let mut file = crate::fs::open_stable_file(&target.path)
         .await
         .map_err(file_path_error)?;
     let opened = crate::fs::checked_tokio_file_metadata(&file)
@@ -1405,14 +1498,16 @@ async fn read_approved_file(target: ResolvedReadTarget) -> Result<String, Effect
     }
 
     let mut bytes = Vec::new();
-    file.take((READ_FILE_MAX_BYTES + 1) as u64)
+    (&mut file)
+        .take((READ_FILE_MAX_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
         .await
         .map_err(file_path_error)?;
     if bytes.len() > READ_FILE_MAX_BYTES {
         return Err(EffectServiceError::OutputLimit);
     }
-    String::from_utf8(bytes).map_err(|_| EffectServiceError::InvalidBody)
+    let metadata = file.metadata().await.map_err(file_path_error)?;
+    read_text_from_bytes(&bytes, metadata)
 }
 
 /// Positions `file` at the start of its last `keep` lines by scanning backwards from EOF in
@@ -1552,6 +1647,7 @@ async fn resolve_write_target(
 
     let expanded = crate::fs::expand_tilde(path);
     let absolute = absolute_lexical(base, Path::new(&expanded));
+    let mut pending_dirs: Vec<std::ffi::OsString> = Vec::new();
     let (path, mode) = match tokio::fs::symlink_metadata(&absolute).await {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() {
@@ -1587,22 +1683,29 @@ async fn resolve_write_target(
                     Err(error) => return Err(file_path_error(error)),
                 }
             };
-            if missing.len() != 1 {
+            // Every missing component must be a plain name; the directories are created at
+            // execution time under the anchor (`ResolvedWriteTarget::materialize_parents`).
+            missing.reverse();
+            if missing.iter().any(|name| {
+                Path::new(name)
+                    .components()
+                    .any(|component| !matches!(component, Component::Normal(_)))
+            }) {
                 return Err(EffectServiceError::InvalidTarget);
             }
-            let relative = Path::new(&missing[0]);
-            if relative
-                .components()
-                .any(|component| !matches!(component, Component::Normal(_)))
-            {
-                return Err(EffectServiceError::InvalidTarget);
-            }
-            (canonical_parent.join(relative), WriteMode::Create)
+            let mut path = canonical_parent.clone();
+            path.extend(&missing);
+            missing.pop();
+            pending_dirs = missing;
+            (path, WriteMode::Create)
         }
         Err(error) => return Err(file_path_error(error)),
     };
     permission_path(&path)?;
-    let parent = path.parent().ok_or(EffectServiceError::InvalidTarget)?;
+    let parent = path
+        .ancestors()
+        .nth(1 + pending_dirs.len())
+        .ok_or(EffectServiceError::InvalidTarget)?;
     let parent_identity = crate::fs::stable_path_metadata(parent)
         .await
         .map_err(file_path_error)?;
@@ -1613,6 +1716,7 @@ async fn resolve_write_target(
         path,
         parent_identity,
         mode,
+        pending_dirs,
     })
 }
 
@@ -1641,6 +1745,7 @@ async fn write_approved_file_cancellable(
 ) -> Result<(), EffectServiceError> {
     match target.mode {
         WriteMode::Create => {
+            let target = target.materialize_parents().await?;
             crate::fs::atomic_create_resolved_checked_cancellable(
                 target.path,
                 content.as_bytes(),
@@ -1707,8 +1812,10 @@ impl JsWriteGuard {
         metadata: &std::fs::Metadata,
         current: &[u8],
     ) -> Result<(), EffectServiceError> {
+        // An existing file that is not UTF-8 text can never be authorized by any read; say so
+        // instead of sending the script into a read loop.
         let (crc, lines) = crate::agent::tools::write::full_text_fingerprint(current)
-            .map_err(|_| EffectServiceError::OverwriteNotAuthorized)?;
+            .map_err(|_| EffectServiceError::NotText)?;
         if self
             .tracker
             .permits_full_overwrite(key, metadata, crc, lines)
@@ -1717,6 +1824,14 @@ impl JsWriteGuard {
         } else {
             Err(EffectServiceError::OverwriteNotAuthorized)
         }
+    }
+
+    /// A script that read the complete current bytes through the parent broker is not
+    /// replacing the file blindly, so the read counts as the one the native `read` tool
+    /// records. The window `usize::MAX` lines never collides with a native read's repeat check.
+    fn record_full_read(&self, key: &str, fingerprint: &ReadFingerprint) {
+        self.tracker
+            .record_read(key, 0, usize::MAX, &fingerprint.metadata, fingerprint.crc);
     }
 
     fn read_preimage(
@@ -1891,10 +2006,24 @@ impl FileEffectService {
         bridge: PermissionBridge,
     ) -> Result<String, EffectServiceError> {
         let call = async {
-            match prepared {
-                PreparedReadEffect::Path(target) => read_approved_file(target).await,
-                PreparedReadEffect::Bound { file, .. } => read_capability_file(file).await,
+            let (key, read) = match prepared {
+                PreparedReadEffect::Path(target) => {
+                    let key = target.path.to_string_lossy().into_owned();
+                    (Some(key), read_approved_file(target).await?)
+                }
+                PreparedReadEffect::Bound { relative, file } => {
+                    let key = self
+                        .allow_config
+                        .workspace_binding()
+                        .and_then(|workspace| bound_write_key(workspace, &relative).ok());
+                    (key, read_capability_file(file).await?)
+                }
+            };
+            if let (Some(guard), Some(key), Some(version)) = (&self.write_guard, key, &read.version)
+            {
+                guard.record_full_read(&key, version);
             }
+            Ok(read.text)
         };
         tokio::select! {
             result = timeout(self.timeout, call) => result.map_err(|_| EffectServiceError::TimedOut)?,
@@ -2035,9 +2164,7 @@ impl FileEffectService {
                             .parent()
                             .filter(|parent| !parent.as_os_str().is_empty())
                             .unwrap_or_else(|| Path::new("."));
-                        workspace
-                            .open_dir_relative(parent)
-                            .map_err(file_path_error)?;
+                        ensure_bound_create_parent(&workspace, &relative, parent)?;
                         Ok(PreparedWriteEffect::BoundCreate {
                             workspace,
                             relative,
@@ -2133,8 +2260,8 @@ impl FileEffectService {
                     drop(existing);
                     guard.authorize_overwrite(&key, &metadata, &current)?;
                     let base = crate::fs::ContentDigest::of(&current);
-                    let before = String::from_utf8(current)
-                        .map_err(|_| EffectServiceError::OverwriteNotAuthorized)?;
+                    let before =
+                        String::from_utf8(current).map_err(|_| EffectServiceError::NotText)?;
                     let preimage_ok = crate::agent::tools::mutation_diff::preimage_allowed(
                         &guard.permission,
                         &key,
@@ -2177,6 +2304,50 @@ impl FileEffectService {
     }
 }
 
+/// A bound create may name directories that do not exist yet: `create_relative_atomic` makes
+/// them through the workspace capability, one no-follow component at a time, after permission.
+/// Here only an existing parent must open; a missing one is acceptable unless a component on
+/// the way is a symlink, which is refused rather than followed.
+fn ensure_bound_create_parent(
+    workspace: &crate::paths::WorkspaceBinding,
+    relative: &Path,
+    parent: &Path,
+) -> Result<(), EffectServiceError> {
+    match workspace.open_dir_relative(parent) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if workspace.symlink_component(relative).is_some() {
+                Err(EffectServiceError::InvalidTarget)
+            } else {
+                Ok(())
+            }
+        }
+        Err(error) => Err(file_path_error(error)),
+    }
+}
+
+/// A `read_files` item failed: report the closed code with the item's position in the script's
+/// own array. Cancellation and deadlines stay whole-call failures.
+fn read_files_item_failure(
+    error: EffectServiceError,
+    index: u32,
+) -> Result<EffectResult, HostEffectError> {
+    let error = HostEffectError::from(error);
+    match error {
+        HostEffectError::InvocationCancelled
+        | HostEffectError::EffectTimedOut
+        | HostEffectError::AskTimedOut
+        | HostEffectError::OutcomeUnknown => Err(error),
+        _ => Ok(EffectResult::Error(
+            crate::extras::js::protocol::EffectError {
+                code: error.wire_code(),
+                index: Some(index),
+                reason: None,
+            },
+        )),
+    }
+}
+
 fn bound_write_key(
     workspace: &crate::paths::WorkspaceBinding,
     relative: &Path,
@@ -2215,9 +2386,7 @@ async fn write_guarded_path(
         let (metadata, current) = guard.read_preimage(&mut existing)?;
         guard.authorize_overwrite(&key, &metadata, &current)?;
         base = Some(crate::fs::ContentDigest::of(&current));
-        before = Some(
-            String::from_utf8(current).map_err(|_| EffectServiceError::OverwriteNotAuthorized)?,
-        );
+        before = Some(String::from_utf8(current).map_err(|_| EffectServiceError::NotText)?);
     }
     crate::session::file_checkpoints::skipped();
     let after = crate::fs::ContentDigest::of(content.as_bytes());
@@ -2241,7 +2410,7 @@ async fn write_guarded_path(
     Ok(())
 }
 
-async fn read_capability_file(file: std::fs::File) -> Result<String, EffectServiceError> {
+async fn read_capability_file(file: std::fs::File) -> Result<ReadText, EffectServiceError> {
     let metadata = file.metadata().map_err(file_path_error)?;
     if !metadata.is_file() {
         return Err(if metadata.is_dir() {
@@ -2253,16 +2422,18 @@ async fn read_capability_file(file: std::fs::File) -> Result<String, EffectServi
     if metadata.len() > READ_FILE_MAX_BYTES as u64 {
         return Err(EffectServiceError::OutputLimit);
     }
-    let file = tokio::fs::File::from_std(file);
+    let mut file = tokio::fs::File::from_std(file);
     let mut bytes = Vec::new();
-    file.take((READ_FILE_MAX_BYTES + 1) as u64)
+    (&mut file)
+        .take((READ_FILE_MAX_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
         .await
         .map_err(file_path_error)?;
     if bytes.len() > READ_FILE_MAX_BYTES {
         return Err(EffectServiceError::OutputLimit);
     }
-    String::from_utf8(bytes).map_err(|_| EffectServiceError::InvalidBody)
+    let metadata = file.metadata().await.map_err(file_path_error)?;
+    read_text_from_bytes(&bytes, metadata)
 }
 
 /// Waits for an operation whose first poll can cross a mutation boundary.
@@ -2509,8 +2680,8 @@ fn fetch_service_error(error: &FetchError) -> EffectServiceError {
         }
         FetchError::InvalidUtf8 => EffectServiceError::InvalidBody,
         FetchError::OutcomeUnknown => EffectServiceError::OutcomeUnknown,
-        FetchError::DnsResolutionFailed
-        | FetchError::TooManyRedirects
+        FetchError::DnsResolutionFailed => EffectServiceError::DnsFailed,
+        FetchError::TooManyRedirects
         | FetchError::ClientBuild(_)
         | FetchError::ProxyUnusable(_)
         | FetchError::RequestFailed(_)
@@ -2719,6 +2890,8 @@ struct PreparedSpawnEffect {
     executable: SpawnExecutableIdentity,
     arguments: Vec<String>,
     target: PreparedSpawnTarget,
+    /// Validated `spawn` options; part of the permission subject the grant was bound to.
+    options: SpawnOptions,
 }
 
 enum PreparedSpawnTarget {
@@ -2838,6 +3011,7 @@ impl PreparedSpawnEffect {
                     target: PreparedSpawnTarget::SealedSnapshot(SealedExecutableSnapshot::new(
                         snapshot,
                     )),
+                    options: SpawnOptions::default(),
                 });
             }
             #[cfg(not(target_os = "linux"))]
@@ -2872,6 +3046,7 @@ impl PreparedSpawnEffect {
             executable,
             arguments,
             target,
+            options: SpawnOptions::default(),
         })
     }
 
@@ -3035,7 +3210,122 @@ fn provide_snapshot_fd(
     Ok(())
 }
 
+/// Checks the shape and bounds of the `spawn` options and applies the shell tool's environment
+/// rules: no loader-injection names, no credential-looking names, bounded values. Authority over
+/// `cwd` (it must resolve inside the workspace) is checked by [`SpawnEffectService::validate_options`].
+fn validate_spawn_options_shape(options: &SpawnOptions) -> Result<(), EffectServiceError> {
+    if let Some(cwd) = &options.cwd
+        && (cwd.is_empty() || cwd.contains('\0') || cwd.len() > EFFECT_PATH_MAX_BYTES)
+    {
+        return Err(EffectServiceError::InvalidTarget);
+    }
+    if options
+        .stdin
+        .as_ref()
+        .is_some_and(|stdin| stdin.len() > SPAWN_STDIN_MAX_BYTES)
+        || options
+            .timeout_ms
+            .is_some_and(|ms| ms == 0 || ms > SPAWN_TIMEOUT_MAX_MS)
+    {
+        return Err(EffectServiceError::InvalidTarget);
+    }
+    if options.env.len() > SPAWN_ENV_MAX_COUNT {
+        return Err(EffectServiceError::InvalidTarget);
+    }
+    let mut policy = crate::sandbox::ShellEnvPolicy::default();
+    let mut bytes = 0_usize;
+    for variable in &options.env {
+        bytes = bytes
+            .saturating_add(variable.name.len())
+            .saturating_add(variable.value.len());
+        if bytes > SPAWN_ENV_MAX_BYTES
+            || policy
+                .set
+                .insert(variable.name.clone(), variable.value.clone())
+                .is_some()
+        {
+            return Err(EffectServiceError::InvalidTarget);
+        }
+    }
+    policy
+        .validate()
+        .map_err(|_| EffectServiceError::InvalidTarget)
+}
+
+/// Closed signal name for a process that did not exit on its own.
+#[cfg(unix)]
+fn exit_signal_name(status: std::process::ExitStatus) -> Option<String> {
+    use std::os::unix::process::ExitStatusExt;
+    let signal = status.signal()?;
+    Some(
+        match signal {
+            1 => "SIGHUP",
+            2 => "SIGINT",
+            3 => "SIGQUIT",
+            4 => "SIGILL",
+            6 => "SIGABRT",
+            8 => "SIGFPE",
+            9 => "SIGKILL",
+            11 => "SIGSEGV",
+            13 => "SIGPIPE",
+            14 => "SIGALRM",
+            15 => "SIGTERM",
+            _ => return Some(format!("SIG{signal}")),
+        }
+        .to_string(),
+    )
+}
+
+#[cfg(not(unix))]
+fn exit_signal_name(_status: std::process::ExitStatus) -> Option<String> {
+    None
+}
+
 impl SpawnEffectService {
+    /// Parent-side validation of `spawn` options beyond their shape.
+    fn validate_options(&self, options: &SpawnOptions) -> Result<(), EffectServiceError> {
+        validate_spawn_options_shape(options)?;
+        // The AppContainer launcher takes neither a working directory, an environment nor stdin.
+        #[cfg(windows)]
+        if options.cwd.is_some() || !options.env.is_empty() || options.stdin.is_some() {
+            return Err(EffectServiceError::InvalidTarget);
+        }
+        if let Some(cwd) = &options.cwd {
+            self.sandbox
+                .command_in_workdir(cwd, "true")
+                .map_err(|_| EffectServiceError::InvalidTarget)?;
+        }
+        Ok(())
+    }
+
+    /// The sandbox that launches this call: the shared one, plus the validated model-supplied
+    /// variables layered over any operator `shell-env`.
+    #[cfg(unix)]
+    fn launch_sandbox(&self, options: &SpawnOptions) -> Sandbox {
+        if options.env.is_empty() {
+            return self.sandbox.clone();
+        }
+        let mut policy = self.sandbox.shell_env_policy().clone();
+        for variable in &options.env {
+            policy
+                .set
+                .insert(variable.name.clone(), variable.value.clone());
+        }
+        self.sandbox.clone().with_shell_env(policy)
+    }
+
+    #[cfg(unix)]
+    fn launch_script(&self, options: &SpawnOptions) -> Result<String, EffectServiceError> {
+        const EXEC: &str = r#"exec "$0" "$@""#;
+        match &options.cwd {
+            Some(cwd) => self
+                .sandbox
+                .command_in_workdir(cwd, EXEC)
+                .map_err(|_| EffectServiceError::InvalidTarget),
+            None => Ok(EXEC.to_string()),
+        }
+    }
+
     pub(crate) fn new(
         sandbox: Sandbox,
         permission_bridge: PermissionBridge,
@@ -3164,6 +3454,21 @@ impl SpawnEffectService {
         bridge: PermissionBridge,
     ) -> Result<SpawnResult, EffectServiceError> {
         prepared.revalidate()?;
+        // `wrap_command` stays the only launcher: `cwd` becomes the shell tool's validated
+        // `workdir` prefix and `env` rides the sandbox's shell-environment layer, whose
+        // injection and credential rules `validate_options` already applied.
+        #[cfg(unix)]
+        let launch_sandbox = self.launch_sandbox(&prepared.options);
+        #[cfg(unix)]
+        let launch_script = self.launch_script(&prepared.options)?;
+        let stdin = prepared
+            .options
+            .stdin
+            .as_ref()
+            .map(|stdin| stdin.as_bytes().to_vec());
+        let call_timeout = prepared.options.timeout_ms.map_or(self.timeout, |ms| {
+            self.timeout.min(Duration::from_millis(u64::from(ms)))
+        });
 
         #[cfg(windows)]
         let command = self
@@ -3186,9 +3491,8 @@ impl SpawnEffectService {
             PreparedSpawnTarget::OpenedPath(_) => {
                 // This compatibility path is model-authored/direct only. Learned skills require
                 // the sealed-snapshot branch and fail before permission/audit without it.
-                let mut command = self
-                    .sandbox
-                    .wrap_command(r#"exec "$0" "$@""#)
+                let mut command = launch_sandbox
+                    .wrap_command(&launch_script)
                     .map_err(|_| EffectServiceError::BackendFailure)?;
                 command
                     .arg(prepared.executable.canonical_path())
@@ -3203,9 +3507,8 @@ impl SpawnEffectService {
             // legacy availability with this immediately-preceding identity check and explicit
             // residual rename window between this check and exec.
             prepared.revalidate()?;
-            let mut command = self
-                .sandbox
-                .wrap_command(r#"exec "$0" "$@""#)
+            let mut command = launch_sandbox
+                .wrap_command(&launch_script)
                 .map_err(|_| EffectServiceError::BackendFailure)?;
             command
                 .arg(prepared.executable.canonical_path())
@@ -3213,7 +3516,7 @@ impl SpawnEffectService {
             command
         };
         let limits = CommandLimits {
-            timeout: self.timeout,
+            timeout: call_timeout,
             stdout_bytes: SPAWN_STDOUT_MAX_BYTES,
             stderr_bytes: SPAWN_STDERR_MAX_BYTES,
             combined_bytes: SPAWN_COMBINED_MAX_BYTES,
@@ -3226,6 +3529,7 @@ impl SpawnEffectService {
             command,
             limits,
             &process_cancellation,
+            stdin,
         ));
         let output = tokio::select! {
             biased;
@@ -3274,6 +3578,7 @@ impl SpawnEffectService {
             timed_out,
             stdout_truncated,
             stderr_truncated,
+            signal: output.exit_status.and_then(exit_signal_name),
         })
     }
 }
@@ -3421,6 +3726,7 @@ async fn prepare_discovery_root(
     file: &FileEffectService,
     path: &str,
     action: DiscoveryAction,
+    include_ignored: bool,
     cancellation: PermCancellation,
 ) -> Result<(PreparedDiscoveryEffect, Option<String>), HostEffectError> {
     validate_effect_workspace(file, &cancellation).await?;
@@ -3468,6 +3774,7 @@ async fn prepare_discovery_root(
             // rules hide are skipped, and denied directories are pruned.
             let directory = BoundDirectory::from_file(&walk_root, root)
                 .map_err(file_path_error)?
+                .with_include_ignored(include_ignored)
                 .with_hidden_filter(hidden);
             let directory = match single_file {
                 Some(name) => directory.with_entry_filter(only_file_filter(name)),
@@ -3526,7 +3833,9 @@ async fn prepare_discovery_root(
     } else {
         return Err(HostEffectError::InvalidTarget);
     };
-    let directory = directory.with_hidden_filter(hidden);
+    let directory = directory
+        .with_include_ignored(include_ignored)
+        .with_hidden_filter(hidden);
     let directory = match single_file {
         Some(name) => directory.with_entry_filter(only_file_filter(name)),
         None => directory,
@@ -3579,6 +3888,11 @@ fn json_encoded_len<T: serde::Serialize>(value: &T) -> serde_json::Result<usize>
     Ok(counter.0)
 }
 
+/// Entries the walks of `directory` hid because of ignore rules; a closed count.
+fn ignored_count(directory: &BoundDirectory) -> u32 {
+    u32::try_from(directory.ignore_mode().pruned_count()).unwrap_or(u32::MAX)
+}
+
 fn execute_discovery(
     prepared: PreparedDiscoveryEffect,
     control: &ExecutablePreparationControl,
@@ -3605,7 +3919,9 @@ fn execute_discovery(
                 bytes += next_bytes;
                 result.push(DirectoryEntry {
                     name,
-                    kind: if entry.is_directory {
+                    kind: if entry.is_symlink {
+                        DirectoryEntryKind::Symlink
+                    } else if entry.is_directory {
                         DirectoryEntryKind::Directory
                     } else {
                         DirectoryEntryKind::File
@@ -3617,6 +3933,7 @@ fn execute_discovery(
             Ok(EffectResult::ListDir {
                 entries: result,
                 truncated,
+                ignored: ignored_count(&prepared.directory),
             })
         }
         DiscoveryAction::Glob { matcher } => {
@@ -3654,7 +3971,12 @@ fn execute_discovery(
                 paths.push(path);
             }
             paths.sort();
-            Ok(EffectResult::Glob { paths, truncated })
+            drop(walker);
+            Ok(EffectResult::Glob {
+                paths,
+                truncated,
+                ignored: ignored_count(&prepared.directory),
+            })
         }
         DiscoveryAction::Grep { matcher, include } => {
             let root = prepared.directory.approved_root().to_path_buf();
@@ -3749,10 +4071,12 @@ fn execute_discovery(
                     .cmp(&right.path)
                     .then_with(|| left.line.cmp(&right.line))
             });
+            drop(walker);
             Ok(EffectResult::Grep {
                 matches,
                 truncated,
                 skipped,
+                ignored: ignored_count(&prepared.directory),
             })
         }
     }
@@ -3904,10 +4228,7 @@ async fn ensure_read_target_unchanged(
 async fn ensure_write_target_unchanged(
     target: &ResolvedWriteTarget,
 ) -> Result<(), EffectServiceError> {
-    let parent = target
-        .path
-        .parent()
-        .ok_or(EffectServiceError::InvalidTarget)?;
+    let parent = target.anchor().ok_or(EffectServiceError::InvalidTarget)?;
     let current = crate::fs::stable_path_metadata(parent)
         .await
         .map_err(file_path_error)?;
@@ -3974,7 +4295,7 @@ fn validate_effect_request_bounds(operation: &EffectOperation) -> Result<(), Hos
     let path = match operation {
         EffectOperation::ReadFile { path }
         | EffectOperation::ReadLines { path, .. }
-        | EffectOperation::ListDir { path }
+        | EffectOperation::ListDir { path, .. }
         | EffectOperation::Glob { path, .. }
         | EffectOperation::Grep { path, .. }
         | EffectOperation::WriteFile { path, .. } => Some(path),
@@ -3984,12 +4305,13 @@ fn validate_effect_request_bounds(operation: &EffectOperation) -> Result<(), Hos
         return Err(HostEffectError::OutputLimit);
     }
     match operation {
-        EffectOperation::Spawn { program, arguments }
-            if arguments.len() > SPAWN_ARGUMENT_MAX_COUNT
-                || std::iter::once(program.len())
-                    .chain(arguments.iter().map(String::len))
-                    .try_fold(0_usize, usize::checked_add)
-                    .is_none_or(|bytes| bytes > SPAWN_ARGUMENTS_MAX_BYTES) =>
+        EffectOperation::Spawn {
+            program, arguments, ..
+        } if arguments.len() > SPAWN_ARGUMENT_MAX_COUNT
+            || std::iter::once(program.len())
+                .chain(arguments.iter().map(String::len))
+                .try_fold(0_usize, usize::checked_add)
+                .is_none_or(|bytes| bytes > SPAWN_ARGUMENTS_MAX_BYTES) =>
         {
             Err(HostEffectError::OutputLimit)
         }
@@ -4063,16 +4385,29 @@ fn brokered_hook_gates(
         EffectOperation::Fetch { url, .. } => {
             Some(vec![("web_fetch", serde_json::json!({ "url": url }))])
         }
-        EffectOperation::Spawn { program, arguments } => {
-            let command = std::iter::once(program.as_str())
-                .chain(arguments.iter().map(String::as_str))
-                .collect::<Vec<_>>()
-                .join(" ");
+        EffectOperation::Spawn {
+            program,
+            arguments,
+            options,
+        } => {
+            let mut js_spawn = serde_json::json!({ "program": program, "arguments": arguments });
+            let command = if *options == SpawnOptions::default() {
+                std::iter::once(program.as_str())
+                    .chain(arguments.iter().map(String::as_str))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            } else {
+                // The gates see what the options feed the program; hooks may deny, not rewrite.
+                js_spawn["options"] = serde_json::json!({
+                    "cwd": options.cwd,
+                    "env": options.env.iter().map(|variable| variable.name.as_str()).collect::<Vec<_>>(),
+                    "stdin": options.stdin,
+                    "timeout_ms": options.timeout_ms,
+                });
+                spawn_policy_input_with(program, arguments, options)
+            };
             Some(vec![
-                (
-                    "js_spawn",
-                    serde_json::json!({ "program": program, "arguments": arguments }),
-                ),
+                ("js_spawn", js_spawn),
                 ("bash", serde_json::json!({ "command": command })),
             ])
         }
@@ -4123,7 +4458,7 @@ async fn dispatch_brokered_post_hooks(
     let (tool, input) = gates.into_iter().next_back().expect("one gate per effect");
     let outcome = match result {
         Ok(EffectResult::WriteFile) => Ok("file written".to_owned()),
-        Ok(EffectResult::Fetch { status, body }) => {
+        Ok(EffectResult::Fetch { status, body, .. }) => {
             Ok(format!("HTTP {status}, {} body bytes", body.len()))
         }
         Ok(EffectResult::Spawn {
@@ -4183,12 +4518,12 @@ impl ParentEffectService for ParentHostEffectService {
             {
                 Err(HostEffectError::OutputLimit)
             }
-            EffectOperation::ListDir { path }
+            EffectOperation::ListDir { path, .. }
                 if path.is_empty() || path.contains('\0') || path.len() > EFFECT_PATH_MAX_BYTES =>
             {
                 Err(HostEffectError::InvalidTarget)
             }
-            EffectOperation::Glob { path, pattern }
+            EffectOperation::Glob { path, pattern, .. }
                 if path.is_empty()
                     || path.contains('\0')
                     || path.len() > EFFECT_PATH_MAX_BYTES
@@ -4246,19 +4581,33 @@ impl ParentEffectService for ParentHostEffectService {
                 self.validated = Some(PreparedParentEffect::ScratchGet { key: key.clone() });
                 Ok(())
             }
-            EffectOperation::Spawn { program, arguments }
-                if program.is_empty()
-                    || program.contains('\0')
-                    || arguments.iter().any(|argument| argument.contains('\0')) =>
+            EffectOperation::Spawn {
+                program,
+                arguments,
+                options,
+            } if program.is_empty()
+                || program.contains('\0')
+                || arguments.iter().any(|argument| argument.contains('\0'))
+                || validate_spawn_options_shape(options).is_err() =>
             {
                 Err(HostEffectError::InvalidTarget)
             }
-            EffectOperation::Spawn { program, arguments }
-                if arguments.len() > SPAWN_ARGUMENT_MAX_COUNT
-                    || std::iter::once(program.len())
-                        .chain(arguments.iter().map(String::len))
-                        .try_fold(0_usize, usize::checked_add)
-                        .is_none_or(|bytes| bytes > SPAWN_ARGUMENTS_MAX_BYTES) =>
+            // The options are model-global authority only; a learned-skill principal never
+            // gets a working directory, environment or stdin, whatever its worker sends.
+            #[cfg(any(test, feature = "skills"))]
+            EffectOperation::Spawn { options, .. }
+                if *options != SpawnOptions::default()
+                    && matches!(_authorized.principal(), GrantPrincipal::Skill { .. }) =>
+            {
+                Err(HostEffectError::InvalidTarget)
+            }
+            EffectOperation::Spawn {
+                program, arguments, ..
+            } if arguments.len() > SPAWN_ARGUMENT_MAX_COUNT
+                || std::iter::once(program.len())
+                    .chain(arguments.iter().map(String::len))
+                    .try_fold(0_usize, usize::checked_add)
+                    .is_none_or(|bytes| bytes > SPAWN_ARGUMENTS_MAX_BYTES) =>
             {
                 Err(HostEffectError::OutputLimit)
             }
@@ -4336,13 +4685,18 @@ impl ParentEffectService for ParentHostEffectService {
         Box::pin(async move {
             #[cfg(feature = "hooks")]
             gate_brokered_effect_with_hooks(operation).await?;
-            let EffectOperation::Spawn { program, arguments } = operation else {
+            let EffectOperation::Spawn {
+                program,
+                arguments,
+                options,
+            } = operation
+            else {
                 return Ok(());
             };
             let bridge = self.spawn.permission_bridge.for_host_call(cancellation);
-            let subject = canonical_spawn_permission_subject(program, arguments)
+            let subject = canonical_spawn_permission_subject_with(program, arguments, options)
                 .map_err(HostEffectError::from)?;
-            let policy_input = spawn_policy_input(program, arguments);
+            let policy_input = spawn_policy_input_with(program, arguments, options);
             bridge
                 .check_structured_async("bash", &subject, policy_input)
                 .await
@@ -4389,23 +4743,37 @@ impl ParentEffectService for ParentHostEffectService {
                     self.validated = Some(PreparedParentEffect::ReadMany(targets));
                     Ok(NormalizedTarget::ReadFiles { workspace_relative })
                 }
-                EffectOperation::ListDir { path } => {
+                EffectOperation::ListDir {
+                    path,
+                    include_ignored,
+                } => {
                     let (prepared, workspace_relative) = prepare_discovery_root(
                         &self.file,
                         path,
                         DiscoveryAction::ListDir,
+                        *include_ignored,
                         cancellation,
                     )
                     .await?;
                     self.validated = Some(PreparedParentEffect::Discovery(prepared));
                     Ok(NormalizedTarget::ReadFile { workspace_relative })
                 }
-                EffectOperation::Glob { path, pattern } => {
+                EffectOperation::Glob {
+                    path,
+                    pattern,
+                    include_ignored,
+                } => {
                     let action = DiscoveryAction::Glob {
                         matcher: compile_discovery_glob(pattern)?,
                     };
-                    let (prepared, workspace_relative) =
-                        prepare_discovery_root(&self.file, path, action, cancellation).await?;
+                    let (prepared, workspace_relative) = prepare_discovery_root(
+                        &self.file,
+                        path,
+                        action,
+                        *include_ignored,
+                        cancellation,
+                    )
+                    .await?;
                     self.validated = Some(PreparedParentEffect::Discovery(prepared));
                     Ok(NormalizedTarget::ReadFile { workspace_relative })
                 }
@@ -4415,8 +4783,14 @@ impl ParentEffectService for ParentHostEffectService {
                     options,
                 } => {
                     let action = compile_discovery_grep(pattern, options)?;
-                    let (prepared, workspace_relative) =
-                        prepare_discovery_root(&self.file, path, action, cancellation).await?;
+                    let (prepared, workspace_relative) = prepare_discovery_root(
+                        &self.file,
+                        path,
+                        action,
+                        options.include_ignored,
+                        cancellation,
+                    )
+                    .await?;
                     self.validated = Some(PreparedParentEffect::Discovery(prepared));
                     Ok(NormalizedTarget::ReadFile { workspace_relative })
                 }
@@ -4446,9 +4820,7 @@ impl ParentEffectService for ParentHostEffectService {
                                         .parent()
                                         .filter(|parent| !parent.as_os_str().is_empty())
                                         .unwrap_or_else(|| Path::new("."));
-                                    workspace
-                                        .open_dir_relative(parent)
-                                        .map_err(file_path_error)?;
+                                    ensure_bound_create_parent(&workspace, &relative, parent)?;
                                     PreparedWriteEffect::BoundCreate {
                                         workspace,
                                         relative,
@@ -4502,15 +4874,27 @@ impl ParentEffectService for ParentHostEffectService {
                 EffectOperation::Result { .. }
                 | EffectOperation::ScratchPut { .. }
                 | EffectOperation::ScratchGet { .. } => Err(HostEffectError::BackendFailure),
-                EffectOperation::Spawn { program, arguments } => {
+                EffectOperation::Spawn {
+                    program,
+                    arguments,
+                    options,
+                } => {
                     if program.is_empty()
                         || program.contains('\0')
                         || arguments.iter().any(|argument| argument.contains('\0'))
                     {
                         return Err(HostEffectError::InvalidTarget);
                     }
+                    self.spawn
+                        .validate_options(options)
+                        .map_err(HostEffectError::from)?;
+                    // A working directory or environment is applied through the shell launch
+                    // (`Sandbox::wrap_command`), which the sealed-snapshot launcher does not
+                    // take; the compatibility launch is model-authored only, as before.
                     let snapshot_available =
-                        self.spawn.sandbox.supports_immutable_executable_snapshot();
+                        self.spawn.sandbox.supports_immutable_executable_snapshot()
+                            && options.cwd.is_none()
+                            && options.env.is_empty();
                     let deadline = Instant::now()
                         .checked_add(self.spawn.timeout)
                         .ok_or(HostEffectError::EffectTimedOut)?;
@@ -4523,6 +4907,8 @@ impl ParentEffectService for ParentHostEffectService {
                     )
                     .await
                     .map_err(HostEffectError::from)?;
+                    let mut prepared = prepared;
+                    prepared.options = options.clone();
                     let resolved = prepared.executable.clone();
                     self.validated = Some(PreparedParentEffect::Spawn(prepared));
                     Ok(NormalizedTarget::Spawn {
@@ -4795,7 +5181,9 @@ impl ParentEffectService for ParentHostEffectService {
                         .authorize_normalized(url, request, cancellation, control, deadline)
                         .await
                         .map_err(|error| HostEffectError::from(fetch_service_error(&error)))?;
-                    // Preserve A14: redirects remain denied until each hop has its own intent.
+                    // Redirects are never followed inside one effect: the production sender
+                    // returns a 3xx as a result, and any sender that still asks the executor
+                    // to follow one is refused, so no hop is sent without its own intent.
                     prepared.redirect_mode = FetchRedirectMode::DenyUnaudited;
                     let normalized_url = prepared.target.url.as_str().to_string();
                     (
@@ -4853,12 +5241,13 @@ impl ParentEffectService for ParentHostEffectService {
                         let bridge = self.file.permission_bridge.for_host_call(cancellation);
                         let mut contents = Vec::with_capacity(targets.len());
                         let mut encoded_bytes = 2usize;
-                        for target in targets {
-                            let content = self
-                                .file
-                                .execute_read(target, bridge.clone())
-                                .await
-                                .map_err(HostEffectError::from)?;
+                        for (index, target) in targets.into_iter().enumerate() {
+                            let index = index as u32;
+                            let content = match self.file.execute_read(target, bridge.clone()).await
+                            {
+                                Ok(content) => content,
+                                Err(error) => return read_files_item_failure(error, index),
+                            };
                             let item_bytes = json_encoded_len(&content)
                                 .map_err(|_| HostEffectError::BackendFailure)?;
                             encoded_bytes = encoded_bytes
@@ -4868,7 +5257,11 @@ impl ParentEffectService for ParentHostEffectService {
                                 })
                                 .ok_or(HostEffectError::OutputLimit)?;
                             if encoded_bytes > READ_FILES_MAX_RESULT_BYTES {
-                                return Err(HostEffectError::OutputLimit);
+                                // `index` leading items fit within the aggregate cap.
+                                return read_files_item_failure(
+                                    EffectServiceError::OutputLimit,
+                                    index,
+                                );
                             }
                             contents.push(content);
                         }
@@ -4918,6 +5311,7 @@ impl ParentEffectService for ParentHostEffectService {
                             timed_out: result.timed_out,
                             stdout_truncated: result.stdout_truncated,
                             stderr_truncated: result.stderr_truncated,
+                            signal: result.signal,
                         })
                     }
                     #[cfg(feature = "sandbox")]
@@ -4930,6 +5324,9 @@ impl ParentEffectService for ParentHostEffectService {
                         Ok(EffectResult::Fetch {
                             status: result.status,
                             body: result.text,
+                            truncated: result.truncated,
+                            lossy: result.lossy,
+                            location: result.location,
                         })
                     }
                     #[cfg(feature = "sandbox")]
@@ -5077,6 +5474,7 @@ mod tests {
                         timed_out: true,
                         stdout_truncated,
                         stderr_truncated,
+                        signal: None,
                     },
                     // Worst-case credit digits: the frame must still fit.
                     approval_wait_ms: u64::MAX,
@@ -5120,6 +5518,7 @@ mod tests {
             validate_effect_request_bounds(&EffectOperation::Spawn {
                 program: "tool".into(),
                 arguments: vec!["x".into(); SPAWN_ARGUMENT_MAX_COUNT + 1],
+                options: Default::default(),
             }),
             Err(HostEffectError::OutputLimit)
         );
@@ -5231,6 +5630,7 @@ mod tests {
             FetchTransportOutcome::Complete(FetchResult {
                 status: 200,
                 text: "hello".to_string(),
+                ..FetchResult::default()
             })
         );
         server.join().unwrap();
@@ -5260,6 +5660,7 @@ mod tests {
             Ok(FetchTransportOutcome::Complete(FetchResult {
                 status: 200,
                 text: "bound".to_string(),
+                ..FetchResult::default()
             }))
         );
         server.join().unwrap();
@@ -5303,9 +5704,52 @@ mod tests {
             FetchTransportOutcome::Complete(FetchResult {
                 status: 304,
                 text: String::new(),
+                ..FetchResult::default()
             })
         );
         not_modified_server.join().unwrap();
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[test]
+    fn js_fetch_transport_can_return_a_redirect_to_the_script() {
+        use std::io::Write as _;
+
+        let (url, server) = serve_fetch_once(|mut stream| {
+            read_fetch_request(&mut stream);
+            stream
+                .write_all(
+                    b"HTTP/1.1 301 Moved Permanently\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let expected = url.join("/next").unwrap().to_string();
+        let transport = FetchTransport::with_limits(test_fetch_limits(), None)
+            .unwrap()
+            .returning_redirects(true);
+        let FetchTransportOutcome::Complete(result) = transport
+            .execute(url, &FetchRequest::get(), || false)
+            .expect("redirect is an ordinary result")
+        else {
+            panic!("expected a complete response");
+        };
+        assert_eq!(result.status, 301);
+        assert_eq!(result.location.as_deref(), Some(expected.as_str()));
+        assert!(result.text.is_empty());
+        server.join().unwrap();
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[test]
+    fn js_fetch_dns_failure_has_its_own_code_and_hint() {
+        assert_eq!(
+            fetch_service_error(&FetchError::DnsResolutionFailed),
+            EffectServiceError::DnsFailed
+        );
+        assert_eq!(
+            HostEffectError::from(EffectServiceError::DnsFailed).wire_code(),
+            crate::extras::js::protocol::EffectErrorCode::DnsFailed
+        );
     }
 
     #[cfg(feature = "sandbox")]
@@ -5333,11 +5777,18 @@ mod tests {
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2048\r\nConnection: close\r\n\r\n")
                 .unwrap();
+            let _ = stream.write_all(&[b'y'; 2048]);
         });
-        assert_eq!(
-            transport.execute(length_url, &FetchRequest::get(), || false),
-            Err(FetchError::ResponseBodyTooLarge)
-        );
+        // A body over the limit is cut and flagged, not an error (mini-agent-nvnkx.327).
+        let FetchTransportOutcome::Complete(cut) = transport
+            .execute(length_url, &FetchRequest::get(), || false)
+            .expect("oversized body is truncated")
+        else {
+            panic!("expected a complete response");
+        };
+        assert_eq!(cut.status, 200);
+        assert_eq!(cut.text.len(), 1024);
+        assert!(cut.truncated && !cut.lossy);
         length_server.join().unwrap();
 
         let (stream_url, stream_server) = serve_fetch_once(|mut stream| {
@@ -5357,10 +5808,14 @@ mod tests {
             }
             let _ = stream.write_all(b"0\r\n\r\n");
         });
-        assert_eq!(
-            transport.execute(stream_url, &FetchRequest::get(), || false),
-            Err(FetchError::ResponseBodyTooLarge)
-        );
+        let FetchTransportOutcome::Complete(cut) = transport
+            .execute(stream_url, &FetchRequest::get(), || false)
+            .expect("oversized streamed body is truncated")
+        else {
+            panic!("expected a complete response");
+        };
+        assert_eq!(cut.text.len(), 1024);
+        assert!(cut.truncated);
         stream_server.join().unwrap();
     }
 
@@ -5435,6 +5890,7 @@ mod tests {
             Ok(FetchTransportOutcome::Complete(FetchResult {
                 status: 204,
                 text: String::new(),
+                ..FetchResult::default()
             }))
         );
         recovery_server.join().unwrap();
@@ -5468,11 +5924,35 @@ mod tests {
                 )
                 .unwrap();
         });
-        assert_eq!(
-            transport.execute(utf8_url, &FetchRequest::get(), || false),
-            Err(FetchError::InvalidUtf8)
-        );
+        // Undeclared non-UTF-8 bytes decode lossily and say so (mini-agent-nvnkx.327).
+        let FetchTransportOutcome::Complete(lossy) = transport
+            .execute(utf8_url, &FetchRequest::get(), || false)
+            .expect("binary body is decoded lossily")
+        else {
+            panic!("expected a complete response");
+        };
+        assert!(lossy.lossy && !lossy.truncated, "{lossy:?}");
+        assert!(lossy.text.contains('\u{fffd}'));
         utf8_server.join().unwrap();
+
+        // A declared charset is honoured and is not lossy.
+        let (latin_url, latin_server) = serve_fetch_once(|mut stream| {
+            read_fetch_request(&mut stream);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=iso-8859-1\r\nContent-Length: 3\r\nConnection: close\r\n\r\nna\xef",
+                )
+                .unwrap();
+        });
+        let FetchTransportOutcome::Complete(latin) = transport
+            .execute(latin_url, &FetchRequest::get(), || false)
+            .unwrap()
+        else {
+            panic!("expected a complete response");
+        };
+        assert_eq!(latin.text, "na\u{ef}");
+        assert!(!latin.lossy);
+        latin_server.join().unwrap();
 
         let (malformed_url, malformed_server) = serve_fetch_once(|mut stream| {
             read_fetch_request(&mut stream);
@@ -6002,6 +6482,7 @@ mod tests {
         FetchTransportOutcome::Complete(FetchResult {
             status: 200,
             text: "ok".to_string(),
+            ..FetchResult::default()
         })
     }
 
@@ -6179,12 +6660,21 @@ mod tests {
 
         let listed = broker
             .dispatch(
-                request(0, EffectOperation::ListDir { path: "src".into() }),
+                request(
+                    0,
+                    EffectOperation::ListDir {
+                        path: "src".into(),
+                        include_ignored: false,
+                    },
+                ),
                 PermCancellation::new(),
             )
             .await
             .unwrap();
-        let EffectResult::ListDir { entries, truncated } = listed else {
+        let EffectResult::ListDir {
+            entries, truncated, ..
+        } = listed
+        else {
             panic!("unexpected list result: {listed:?}");
         };
         assert!(!truncated);
@@ -6193,7 +6683,8 @@ mod tests {
                 .iter()
                 .map(|entry| entry.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["main.rs", "nested", "readme.txt"]
+            // `escape.rs` is a symlink: listed by name, never followed.
+            vec!["escape.rs", "main.rs", "nested", "readme.txt"]
         );
 
         let globbed = broker
@@ -6203,6 +6694,7 @@ mod tests {
                     EffectOperation::Glob {
                         path: ".".into(),
                         pattern: "**/*.rs".into(),
+                        include_ignored: false,
                     },
                 ),
                 PermCancellation::new(),
@@ -6214,6 +6706,7 @@ mod tests {
             EffectResult::Glob {
                 paths: vec!["src/main.rs".into(), "src/nested/lib.rs".into()],
                 truncated: false,
+                ignored: 1,
             }
         );
 
@@ -6227,6 +6720,7 @@ mod tests {
                         options: GrepOptions {
                             include: Some("**/*.rs".into()),
                             case_sensitive: false,
+                            include_ignored: false,
                         },
                     },
                 ),
@@ -6260,13 +6754,17 @@ mod tests {
                     EffectOperation::Glob {
                         path: "many".into(),
                         pattern: "*.txt".into(),
+                        include_ignored: false,
                     },
                 ),
                 PermCancellation::new(),
             )
             .await
             .unwrap();
-        let EffectResult::Glob { paths, truncated } = capped else {
+        let EffectResult::Glob {
+            paths, truncated, ..
+        } = capped
+        else {
             panic!("unexpected capped glob result: {capped:?}");
         };
         assert_eq!(paths.len(), DISCOVERY_MAX_RESULTS);
@@ -6435,6 +6933,7 @@ mod tests {
                     3,
                     EffectOperation::ListDir {
                         path: "$HOME".into(),
+                        include_ignored: false,
                     },
                 ),
                 PermCancellation::new(),
@@ -6461,6 +6960,7 @@ mod tests {
                         EffectOperation::Glob {
                             path: "~".into(),
                             pattern: "in.*".into(),
+                            include_ignored: false,
                         },
                     ),
                     PermCancellation::new(),
@@ -6469,6 +6969,7 @@ mod tests {
             Ok(EffectResult::Glob {
                 paths: vec![home.join("in.txt").to_string_lossy().into_owned()],
                 truncated: false,
+                ignored: 0,
             })
         );
         // An unexpanded `$FOO` component stays a literal workspace path.
@@ -6648,7 +7149,10 @@ mod tests {
                     c1o7m_request(
                         &grant,
                         ordinal,
-                        EffectOperation::ListDir { path: config_root },
+                        EffectOperation::ListDir {
+                            path: config_root,
+                            include_ignored: false,
+                        },
                     ),
                     PermCancellation::new(),
                 )
@@ -6673,6 +7177,7 @@ mod tests {
                         EffectOperation::Glob {
                             path: root.into(),
                             pattern: "**/*.txt".into(),
+                            include_ignored: false,
                         },
                     ),
                     PermCancellation::new(),
@@ -6685,6 +7190,7 @@ mod tests {
                 EffectResult::Glob {
                     paths: vec!["config/app.txt".into()],
                     truncated: false,
+                    ignored: 0,
                 },
                 "{root}"
             );
@@ -6872,6 +7378,7 @@ mod tests {
             matches,
             truncated,
             skipped,
+            ..
         } = result
         else {
             panic!("unexpected result");
@@ -7004,6 +7511,7 @@ mod tests {
             EffectOperation::Glob {
                 path: "denied".into(),
                 pattern: "*.txt".into(),
+                include_ignored: false,
             },
             true,
         );
@@ -7106,6 +7614,7 @@ mod tests {
                 EffectOperation::Spawn {
                     program: "printf".to_string(),
                     arguments: vec!["must-not-run".to_string()],
+                    options: Default::default(),
                 },
                 session_allows_capability,
             );
@@ -7271,6 +7780,7 @@ mod tests {
             operation: EffectOperation::Spawn {
                 program: executable.to_string_lossy().into_owned(),
                 arguments: vec![],
+                options: Default::default(),
             },
         };
         let audit_root = directory.path().join("audit-spawn-replacement");
@@ -7551,6 +8061,7 @@ mod tests {
                     "-c".into(),
                     "head -c 1048576 /dev/zero; head -c 600000 /dev/zero >&2".into(),
                 ],
+                options: Default::default(),
             },
         };
         let audit_root = directory.path().join("audit-spawn-escape-heavy-output");
@@ -7650,6 +8161,7 @@ mod tests {
             operation: EffectOperation::Spawn {
                 program: executable.to_string_lossy().into_owned(),
                 arguments: vec![],
+                options: Default::default(),
             },
         };
         let audit_root = directory.path().join("audit-spawn-snapshot-overwrite");
@@ -7790,6 +8302,7 @@ mod tests {
             EffectOperation::Spawn {
                 program: "printf".to_string(),
                 arguments: vec!["denied".to_string()],
+                options: Default::default(),
             },
             true,
         );
@@ -7837,6 +8350,7 @@ mod tests {
             operation: EffectOperation::Spawn {
                 program: "printf".into(),
                 arguments: vec!["available".into()],
+                options: Default::default(),
             },
         };
         let audit_root = directory.path().join("audit-model-spawn");
@@ -7915,6 +8429,7 @@ mod tests {
             EffectOperation::Spawn {
                 program: "printf".into(),
                 arguments: vec!["must-not-run".into()],
+                options: Default::default(),
             },
             true,
         );
@@ -7957,6 +8472,7 @@ mod tests {
             EffectOperation::Spawn {
                 program: "cmd".into(),
                 arguments: vec!["/C".into(), "exit".into(), "0".into()],
+                options: Default::default(),
             },
             true,
         );
@@ -8087,6 +8603,7 @@ mod tests {
             Ok(FetchResult {
                 status: 200,
                 text: "ok".to_string(),
+                ..FetchResult::default()
             })
         );
         assert_eq!(sender.call_count(), 1);
@@ -8462,6 +8979,7 @@ mod tests {
             FetchResult {
                 status: 200,
                 text: "ok".to_string(),
+                ..FetchResult::default()
             }
         );
     }
@@ -8726,7 +9244,8 @@ mod tests {
             result,
             Ok(FetchResult {
                 status: 200,
-                text: "ok".to_string()
+                text: "ok".to_string(),
+                ..FetchResult::default()
             })
         );
         assert_eq!(sender.call_count(), 2);
@@ -8919,7 +9438,8 @@ mod tests {
             result,
             Ok(FetchResult {
                 status: 200,
-                text: "ok".to_string()
+                text: "ok".to_string(),
+                ..FetchResult::default()
             })
         );
         assert_eq!(sender.call_count(), 1);
@@ -9707,6 +10227,41 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn write_file_creates_missing_parent_directories_inside_the_write_roots_only() {
+        let temp = TempDir::new("js-write-parents");
+        let allowed_root = temp.path().join("safe");
+        let sibling_root = temp.path().join("safe-evil");
+        std::fs::create_dir_all(&allowed_root).unwrap();
+        std::fs::create_dir_all(&sibling_root).unwrap();
+        let roots = vec![allowed_root.to_string_lossy().into_owned()];
+        let policy =
+            AllowConfig::from_settings(temp.path(), None, Some(&roots), Some(&roots), false, false);
+        let permission = host_permission(temp.path().to_path_buf(), Action::Allow, Action::Allow);
+
+        let nested = allowed_root.join("out/report/summary.json");
+        call_write_file_with_policy(
+            permission.clone(),
+            None,
+            nested.clone(),
+            "{}",
+            policy.clone(),
+        )
+        .await
+        .expect("a missing chain inside the write root is created");
+        assert_eq!(std::fs::read_to_string(&nested).unwrap(), "{}");
+
+        let outside = sibling_root.join("a/b/c.txt");
+        let error = call_write_file_with_policy(permission, None, outside, "no", policy)
+            .await
+            .expect_err("the same chain outside the write roots is denied");
+        assert!(error.contains("outside the configured roots"), "{error}");
+        assert!(
+            !sibling_root.join("a").exists(),
+            "a denied write must not create directories"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn js_file_allow_enforcement_revalidates_after_permission_wait() {
@@ -9921,7 +10476,7 @@ mod tests {
         let oversized = working_dir.join("oversized.txt");
         let non_utf8 = working_dir.join("non-utf8.txt");
         std::fs::write(&oversized, vec![b'x'; READ_FILE_MAX_BYTES + 1]).unwrap();
-        std::fs::write(&non_utf8, [0xff, 0xfe]).unwrap();
+        std::fs::write(&non_utf8, [0xff, 0xff]).unwrap();
 
         let error = call_read_file(standard_permission(working_dir.clone()), None, oversized)
             .await
@@ -9935,7 +10490,7 @@ mod tests {
             .await
             .expect_err("non-UTF-8 read should fail");
         assert!(
-            error.contains("invalid encoding"),
+            error.contains("not UTF-8 text"),
             "unexpected error: {error}"
         );
     }
@@ -10782,6 +11337,7 @@ mod brokered_hook_gate_tests {
         let spawn = EffectOperation::Spawn {
             program: "ls".into(),
             arguments: vec!["-l".into()],
+            options: Default::default(),
         };
         let reads = EffectOperation::ReadFile {
             path: "a.txt".into(),

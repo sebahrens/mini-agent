@@ -183,7 +183,7 @@ fn normalized_target(operation: &EffectOperation) -> Result<NormalizedTarget, Ho
         }),
         EffectOperation::ReadFile { path }
         | EffectOperation::ReadLines { path, .. }
-        | EffectOperation::ListDir { path }
+        | EffectOperation::ListDir { path, .. }
         | EffectOperation::Glob { path, .. }
         | EffectOperation::Grep { path, .. } => Ok(NormalizedTarget::ReadFile {
             workspace_relative: Some(path.clone()),
@@ -220,7 +220,7 @@ fn authorized_target(operation: &EffectOperation) -> AuthorizedTarget {
         },
         EffectOperation::ReadFile { path }
         | EffectOperation::ReadLines { path, .. }
-        | EffectOperation::ListDir { path }
+        | EffectOperation::ListDir { path, .. }
         | EffectOperation::Glob { path, .. }
         | EffectOperation::Grep { path, .. } => AuthorizedTarget::ReadFile {
             canonical_path: path.clone(),
@@ -319,6 +319,7 @@ fn operation_cases(invocation_id: &InvocationId) -> Vec<OperationCase> {
             operation: EffectOperation::Spawn {
                 program: "printf".into(),
                 arguments: vec!["%s".into(), "hello".into()],
+                options: Default::default(),
             },
             capability: HostCapability::Spawn,
             principal: skill("spawn"),
@@ -376,6 +377,7 @@ fn operation_cases(invocation_id: &InvocationId) -> Vec<OperationCase> {
             name: "list_dir",
             operation: EffectOperation::ListDir {
                 path: "docs".into(),
+                include_ignored: false,
             },
             capability: HostCapability::ReadFile,
             principal: skill("list"),
@@ -386,6 +388,7 @@ fn operation_cases(invocation_id: &InvocationId) -> Vec<OperationCase> {
             operation: EffectOperation::Glob {
                 path: "docs".into(),
                 pattern: "**/*.md".into(),
+                include_ignored: false,
             },
             capability: HostCapability::ReadFile,
             principal: skill("glob"),
@@ -432,15 +435,18 @@ fn success_for(operation: &EffectOperation) -> EffectResult {
         EffectOperation::ListDir { .. } => EffectResult::ListDir {
             entries: Vec::new(),
             truncated: false,
+            ignored: 0,
         },
         EffectOperation::Glob { .. } => EffectResult::Glob {
             paths: Vec::new(),
             truncated: false,
+            ignored: 0,
         },
         EffectOperation::Grep { .. } => EffectResult::Grep {
             matches: Vec::new(),
             truncated: false,
             skipped: Default::default(),
+            ignored: 0,
         },
         EffectOperation::WriteFile { .. } => EffectResult::WriteFile,
         EffectOperation::Result { json } => EffectResult::ResultAccepted { json: json.clone() },
@@ -449,6 +455,9 @@ fn success_for(operation: &EffectOperation) -> EffectResult {
         EffectOperation::Fetch { .. } => EffectResult::Fetch {
             status: 200,
             body: "ok".into(),
+            truncated: false,
+            lossy: false,
+            location: None,
         },
         EffectOperation::Spawn { .. } => EffectResult::Spawn {
             stdout: "hello".into(),
@@ -457,6 +466,7 @@ fn success_for(operation: &EffectOperation) -> EffectResult {
             timed_out: false,
             stdout_truncated: false,
             stderr_truncated: false,
+            signal: None,
         },
         EffectOperation::ProposeSkill { .. } => EffectResult::ProposalAccepted {
             skill_id: "a".repeat(64),
@@ -993,6 +1003,7 @@ async fn scoped_spawn_keeps_each_program_bound_to_its_own_executable_identity() 
     let operation = EffectOperation::Spawn {
         program: "foo".into(),
         arguments: vec![],
+        options: Default::default(),
     };
     let request = EffectRequest {
         effect_ordinal: 1,
@@ -1061,6 +1072,7 @@ async fn scoped_spawn_content_mismatch_denies_before_permission_audit_and_effect
         operation: EffectOperation::Spawn {
             program: "printf".into(),
             arguments: vec![],
+            options: Default::default(),
         },
     };
     let (mut broker, record, _audit_root) = broker_with_normalized_target(
@@ -2670,9 +2682,9 @@ fn raw_effect_fragments(operation: &EffectOperation) -> Vec<&str> {
     match operation {
         EffectOperation::ReadFile { path }
         | EffectOperation::ReadLines { path, .. }
-        | EffectOperation::ListDir { path } => vec![path],
+        | EffectOperation::ListDir { path, .. } => vec![path],
         EffectOperation::ReadFiles { paths } => paths.iter().map(String::as_str).collect(),
-        EffectOperation::Glob { path, pattern } => vec![path, pattern],
+        EffectOperation::Glob { path, pattern, .. } => vec![path, pattern],
         EffectOperation::Grep {
             path,
             pattern,
@@ -2689,7 +2701,9 @@ fn raw_effect_fragments(operation: &EffectOperation) -> Vec<&str> {
         EffectOperation::ScratchPut { key, json } => vec![key, json],
         EffectOperation::ScratchGet { key } => vec![key],
         EffectOperation::Fetch { .. } => vec!["example.test", "/api"],
-        EffectOperation::Spawn { program, arguments } => {
+        EffectOperation::Spawn {
+            program, arguments, ..
+        } => {
             let mut fragments = vec![program.as_str()];
             fragments.extend(arguments.iter().map(String::as_str));
             fragments

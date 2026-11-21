@@ -761,6 +761,10 @@ pub(crate) enum HostEffectError {
     NotFound,
     #[error("operation target is a directory")]
     IsDirectory,
+    #[error("operation target is not UTF-8 text")]
+    NotText,
+    #[error("name resolution failed")]
+    DnsFailed,
     #[error("operation target is outside the allowed scope")]
     TargetDenied,
     #[error("no file roots are configured")]
@@ -786,8 +790,10 @@ pub(crate) enum HostEffectError {
 }
 
 impl HostEffectError {
-    fn wire_code(self) -> EffectErrorCode {
+    pub(super) fn wire_code(self) -> EffectErrorCode {
         match self {
+            Self::NotText => EffectErrorCode::NotText,
+            Self::DnsFailed => EffectErrorCode::DnsFailed,
             Self::InvalidTarget => EffectErrorCode::InvalidTarget,
             Self::NotFound => EffectErrorCode::NotFound,
             Self::IsDirectory => EffectErrorCode::IsDirectory,
@@ -829,6 +835,7 @@ impl HostEffectError {
     fn into_wire_result(self) -> EffectResult {
         EffectResult::Error(EffectError {
             code: self.wire_code(),
+            index: None,
             reason: self.denial_reason(),
         })
     }
@@ -847,6 +854,9 @@ impl From<EffectServiceError> for HostEffectError {
             | EffectServiceError::FinalSymlink
             | EffectServiceError::TargetChanged
             | EffectServiceError::InvalidBody => Self::InvalidTarget,
+            EffectServiceError::NotText => Self::NotText,
+            #[cfg(any(test, feature = "sandbox"))]
+            EffectServiceError::DnsFailed => Self::DnsFailed,
             EffectServiceError::NotFound => Self::NotFound,
             EffectServiceError::IsDirectory => Self::IsDirectory,
             #[cfg(any(test, feature = "sandbox"))]
@@ -2230,12 +2240,13 @@ fn audit_result_code(result: &Result<EffectResult, HostEffectError>) -> AuditRes
             EffectErrorCode::TimedOut => AuditResultCode::TimedOut,
             EffectErrorCode::TooLarge => AuditResultCode::OutputLimit,
             EffectErrorCode::OutcomeUnknown => AuditResultCode::OutcomeUnknown,
-            EffectErrorCode::BackendFailure | EffectErrorCode::AuditFailure => {
-                AuditResultCode::BackendFailure
-            }
+            EffectErrorCode::BackendFailure
+            | EffectErrorCode::AuditFailure
+            | EffectErrorCode::DnsFailed => AuditResultCode::BackendFailure,
             EffectErrorCode::Denied
             | EffectErrorCode::CapabilityDenied
             | EffectErrorCode::InvalidTarget
+            | EffectErrorCode::NotText
             | EffectErrorCode::NotFound
             | EffectErrorCode::IsDirectory => AuditResultCode::Denied,
         },

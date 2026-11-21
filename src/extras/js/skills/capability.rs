@@ -63,6 +63,8 @@ pub(crate) fn effect_error_code_token(code: EffectErrorCode) -> &'static str {
         EffectErrorCode::BackendFailure => "backend_failure",
         EffectErrorCode::AuditFailure => "audit_failure",
         EffectErrorCode::OutcomeUnknown => "outcome_unknown",
+        EffectErrorCode::NotText => "not_text",
+        EffectErrorCode::DnsFailed => "dns_failed",
     }
 }
 
@@ -392,6 +394,7 @@ impl InvocationCapabilityRuntime {
                     operation.as_token(),
                     EffectError {
                         code: *code,
+                        index: None,
                         reason: *reason,
                     },
                 )),
@@ -471,6 +474,7 @@ fn decode_operation(
             Ok(EffectOperation::Spawn {
                 program: string(0)?,
                 arguments: command_arguments,
+                options: Default::default(),
             })
         }
         HostCapability::Fetch if (1..=2).contains(&arguments.len()) => {
@@ -534,11 +538,15 @@ fn encode_effect_result(result: EffectResult) -> Result<String, CapabilityError>
     let value = match result {
         EffectResult::ReadFile { content } => serde_json::Value::String(content),
         EffectResult::ReadFiles { contents } => serde_json::json!(contents),
-        EffectResult::ListDir { entries, truncated } => serde_json::json!({
+        EffectResult::ListDir {
+            entries, truncated, ..
+        } => serde_json::json!({
             "entries": entries,
             "truncated": truncated,
         }),
-        EffectResult::Glob { paths, truncated } => serde_json::json!({
+        EffectResult::Glob {
+            paths, truncated, ..
+        } => serde_json::json!({
             "paths": paths,
             "truncated": truncated,
         }),
@@ -546,13 +554,14 @@ fn encode_effect_result(result: EffectResult) -> Result<String, CapabilityError>
             matches,
             truncated,
             skipped,
+            ..
         } => serde_json::json!({
             "matches": matches,
             "truncated": truncated,
             "skipped": skipped,
         }),
         EffectResult::WriteFile => serde_json::Value::Null,
-        EffectResult::Fetch { status, body } => {
+        EffectResult::Fetch { status, body, .. } => {
             let mut response = serde_json::Map::new();
             response.insert("status".into(), serde_json::Value::from(status));
             response.insert("body".into(), serde_json::Value::String(body));
@@ -565,6 +574,7 @@ fn encode_effect_result(result: EffectResult) -> Result<String, CapabilityError>
             timed_out,
             stdout_truncated,
             stderr_truncated,
+            ..
         } => serde_json::json!({
             "stdout": stdout,
             "stderr": stderr,

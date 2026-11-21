@@ -1166,7 +1166,7 @@ fn helper_globals_doc() -> [String; 4] {
             .to_string(),
         "`json_exact(text: string): any` (pure; JSON.parse that returns integers beyond 2^53 as BigInt, not rounded; output with `String(x)`)."
             .to_string(),
-        "`toml_parse(text: string): object` and `csv_parse(text: string, {header?: boolean}): string[][] | object[]` (pure; 4 MiB max; TOML inline tables/arrays of tables/quoted keys, CSV quotes/CRLF; integers beyond 2^53 are BigInt)."
+        "`toml_parse(text: string): object` and `csv_parse(text: string, {header?: boolean, delimiter?: string}): string[][] | object[]` (pure; 4 MiB max; TOML inline tables/arrays of tables/quoted keys, CSV quotes/CRLF, one-character delimiter such as '\\t' or ';', unknown options throw; a leading BOM is ignored; toml_parse lists integer-like keys first; integers beyond 2^53 are BigInt)."
             .to_string(),
         format!(
             "`read_lines(path: string, from: number, count?: number): {{lines: string[], eof: boolean}}` (synchronous; one read effect; 1-based `from`, negative = last N lines, seeks back from EOF (any file size); files over {} MiB ok, scans max {} MiB, count max {}, about {} MiB returned else eof=false, lines cut at {} KiB). Example: `read_lines('app.log', -50).lines`.",
@@ -1192,11 +1192,14 @@ impl Tool for JsTool {
                  computation. Code runs as a strict script in a fresh runtime for every call, \
                  with top-level `await` supported and no persistent JavaScript state. The only \
                  brokered effect globals are `read_file(path: string): string`, \
-                 `list_dir(path?: string): {{entries: {{name: string, kind: \
-                 'file'|'directory', size: number}}[], truncated: boolean}}`, and \
+                 `list_dir(path?: string, options?: {{include_ignored?: boolean}}): {{entries: \
+                 {{name: string, kind: 'file'|'directory'|'symlink', size: number}}[], \
+                 truncated: boolean, ignored: number}}` (ignored and dependency/build \
+                 entries are omitted and counted unless include_ignored), and \
                  `grep(pattern: string, options?: {{path?: string, include?: string, \
-                 case_sensitive?: boolean}}): {{matches: {{path: string, line: number, text: \
-                 string}}[], truncated: boolean, skipped: {{large: number, binary: number, \
+                 case_sensitive?: boolean, include_ignored?: boolean}}): {{matches: {{path: \
+                 string, line: number, text: string}}[], truncated: boolean, ignored: number, \
+                 skipped: {{large: number, binary: number, \
                  non_utf8: number, unreadable: number}}}}`, plus `splitLines`, `json_exact`, and \
                  `read_lines`. {} `console.log` is available for bounded diagnostics. {} Writer, network, process, session-state, proposal, batch-read, and \
                  glob globals are absent. End the script with an expression that evaluates to a string, finite number, \
@@ -1214,20 +1217,20 @@ impl Tool for JsTool {
         }
         let mut globals = vec![
             format!(
-                "`read_file(path: string): string` (synchronous; max {} MiB). Example: `const text = read_file('src/main.rs');`",
+                "`read_file(path: string): string` (synchronous; max {} MiB; UTF-8 or BOM-marked UTF-16, else throws not_text; a complete read lets write_file replace the file). Example: `const text = read_file('src/main.rs');`",
                 READ_FILE_MAX_BYTES / (1024 * 1024)
             ),
             format!(
-                "`read_files(paths: string[]): string[]` (synchronous; one brokered batch, max {} paths and {} MiB aggregate JSON content). Example: `const texts = read_files(['README.md', 'SPEC.md']);`",
+                "`read_files(paths: string[]): string[]` (synchronous; one brokered batch, max {} paths and {} MiB aggregate JSON content; a failure carries `e.index`). Example: `const texts = read_files(['README.md', 'SPEC.md']);`",
                 READ_FILES_MAX_PATHS,
                 READ_FILES_MAX_RESULT_BYTES / (1024 * 1024)
             ),
             helper_globals_doc().join(" "),
-            "`list_dir(path?: string): {entries: {name: string, kind: 'file'|'directory', size: number}[], truncated: boolean}` (synchronous; defaults to '.').".to_string(),
-            "`glob(pattern: string, options?: {path?: string}): {paths: string[], truncated: boolean}` (synchronous, recursive, respects ignore files). Example: `const files = glob('**/*.rs').paths;`".to_string(),
-            "`grep(pattern: string, options?: {path?: string, include?: string, case_sensitive?: boolean}): {matches: {path: string, line: number, text: string}[], truncated: boolean, skipped: {large: number, binary: number, non_utf8: number, unreadable: number}}` (synchronous Rust regex search; case-sensitive by default; matched lines only; invalid UTF-8 decoded lossily; `skipped` counts files NOT searched (large >10 MiB, binary, unreadable) and non_utf8 files searched lossily: no matches with skipped>0 is not proof of absence).".to_string(),
+            "`list_dir(path?: string, options?: {include_ignored?: boolean}): {entries: {name: string, kind: 'file'|'directory'|'symlink', size: number}[], truncated: boolean, ignored: number}` (synchronous; defaults to '.'; ignored, VCS and dependency/build entries are omitted and counted in `ignored` unless include_ignored; symlinks are listed, not followed).".to_string(),
+            "`glob(pattern: string, options?: {path?: string, include_ignored?: boolean}): {paths: string[], truncated: boolean, ignored: number}` (synchronous, recursive, skips symlinks, respects ignore files; pruned entries are counted in `ignored`, include_ignored searches them). Example: `const files = glob('**/*.rs').paths;`".to_string(),
+            "`grep(pattern: string, options?: {path?: string, include?: string, case_sensitive?: boolean, include_ignored?: boolean}): {matches: {path: string, line: number, text: string}[], truncated: boolean, ignored: number, skipped: {large: number, binary: number, non_utf8: number, unreadable: number}}` (synchronous Rust regex search; ignored files are skipped unless include_ignored; case-sensitive by default; matched lines only; invalid UTF-8 decoded lossily; `skipped` counts files NOT searched (large >10 MiB, binary, unreadable) and non_utf8 files searched lossily: no matches with skipped>0 is not proof of absence).".to_string(),
             format!(
-                "`write_file(path: string, content: string): void` (synchronous; max {} MiB; overwriting needs a prior full `read` tool read, like `write`; /rewind-checkpointed). Example: `write_file('out.txt', 'done\\n');`",
+                "`write_file(path: string, content: string): void` (synchronous; max {} MiB; creates parent directories; overwriting needs a complete prior read (`read` tool or read_file), like `write`; /rewind-checkpointed). Example: `write_file('out.txt', 'done\\n');`",
                 WRITE_FILE_MAX_BYTES / (1024 * 1024)
             ),
             format!(
@@ -1243,7 +1246,7 @@ impl Tool for JsTool {
                 SCRATCH_MAX_ENTRIES
             ),
             format!(
-                "`console.log(...values): void` (max {} records, {} KiB each, {} KiB total). Example: `console.log('count', 3);`",
+                "`console.log(...values): void` (also console.info, console.debug, console.warn and console.error; max {} records, {} KiB each, {} KiB total). Example: `console.log('count', 3);`",
                 MAX_CONSOLE_RECORDS,
                 MAX_CONSOLE_RECORD_BYTES / 1024,
                 MAX_CONSOLE_BYTES / 1024
@@ -1252,14 +1255,14 @@ impl Tool for JsTool {
         #[cfg(feature = "sandbox")]
         {
             globals.push(format!(
-                "`fetch(url: string, options?: {{method?: 'GET'|'POST', headers?: Record<string,string>, body?: string}}): {{status: number, text: string}}` (synchronous; request bodies are POST-only and capped at {} KiB; response body max {} MiB; the result has no `ok`, `headers`, or `json()`). Example: `const r = fetch('https://example.com/data', {{method: 'GET'}}); console.log(r.status, r.text);`",
+                "`fetch(url: string, options?: {{method?: 'GET'|'POST', headers?: Record<string,string>, body?: string}}): {{status: number, text: string, truncated: boolean, lossy: boolean, location?: string}}` (synchronous; request bodies are POST-only and capped at {} KiB; a body over {} MiB is cut (`truncated`); non-UTF-8 is decoded by charset or lossily (`lossy`); redirects are not followed: a 3xx returns `location`, fetch it again; the result has no `ok`, `headers`, or `json()`). Example: `const r = fetch('https://example.com/data', {{method: 'GET'}}); console.log(r.status, r.text);`",
                 FETCH_REQUEST_BODY_MAX_BYTES / 1024,
                 FETCH_RESPONSE_BODY_MAX_BYTES / (1024 * 1024)
             ));
         }
         if self.sandbox.owns_complete_process_tree() {
             globals.push(format!(
-                "`spawn(program: string, args: string[]): {{stdout: string, stderr: string, code: number, timed_out: boolean, stdout_truncated: boolean, stderr_truncated: boolean}}` (synchronous; stdout and stderr max {} MiB each; program binary max {} MiB and at most {} arguments, otherwise too_large (use a command tool instead); `args` must be an array and no shell parsing occurs). Example: `const p = spawn('git', ['status', '--short']); console.log(p.code, p.stdout);`",
+                "`spawn(program: string, args: string[], options?: {{cwd?: string, env?: Record<string,string>, stdin?: string, timeout_ms?: number}}): {{stdout: string, stderr: string, code: number, signal?: string, timed_out: boolean, stdout_truncated: boolean, stderr_truncated: boolean}}` (synchronous; cwd inside the workspace, env as the shell tool allows, stdin max 256 KiB, timeout_ms only shortens the step budget; stdout and stderr max {} MiB each; program binary max {} MiB and at most {} arguments, otherwise too_large (use a command tool instead); `args` must be an array and no shell parsing occurs). Example: `const p = spawn('git', ['status', '--short']); console.log(p.code, p.stdout);`",
                 SPAWN_STDOUT_MAX_BYTES.min(SPAWN_STDERR_MAX_BYTES) / (1024 * 1024),
                 crate::extras::js::broker::MAX_SPAWN_EXECUTABLE_BYTES / (1024 * 1024),
                 crate::extras::js::types::SPAWN_ARGUMENT_MAX_COUNT
@@ -2106,6 +2109,9 @@ fn render_step_result(result: &StepResult) -> String {
     render_step_result_for(result, STEP_TIMEOUT)
 }
 
+/// Static note rendered when a script finishes without a value.
+const VOID_RESULT_NOTE: &str = "[js completed; the script returned undefined. End with an expression or call result(value) to return data]";
+
 fn render_step_result_for(result: &StepResult, budget: Duration) -> String {
     match &result.outcome {
         StepOutcome::Value(value) => {
@@ -2128,6 +2134,10 @@ fn render_step_result_for(result: &StepResult, budget: Duration) -> String {
             if text.ends_with('\n') {
                 text.pop();
             }
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(VOID_RESULT_NOTE);
             text
         }
         StepOutcome::Error(code) => render_failure(
@@ -3826,7 +3836,7 @@ mod js_permission_bridge {
             .description()
             .len();
         assert!(
-            full < 3384 + 1350 + 230 + 43 + 33 + 290 + 100,
+            full < 3384 + 1350 + 230 + 43 + 33 + 290 + 100 + 200 + 1100,
             "full description is {full} bytes"
         );
     }
@@ -3838,7 +3848,9 @@ mod js_permission_bridge {
         let root = std::env::current_dir().unwrap();
         let tool = helper_tool(ModelEffectProfile::Full, &root);
         let size = tool.description().len() + tool.parameters().to_string().len();
-        assert!(size <= 6_000, "js definition is {size} bytes");
+        // 6_000 before the effect options of mini-agent-nvnkx.319-.328 (include_ignored, spawn
+        // options, fetch fields, read_file decoding) added their one-line contracts.
+        assert!(size <= 6_600, "js definition is {size} bytes");
     }
 
     #[tokio::test]
@@ -4343,6 +4355,22 @@ k = true
         )
         .await;
         assert!(bad.contains("unterminated"), "{bad}");
+        let delimited = r#"JSON.stringify([
+            csv_parse('a\tb\n1\t2', {delimiter: '\t', header: true}),
+            csv_parse('a;b\n"1;x";2\n', {delimiter: ';'}),
+            json_exact('\ufeff{"a":1}'),
+            toml_parse('\ufeffa = 1'),
+        ])"#;
+        assert_eq!(
+            run_js(&tool, delimited).await,
+            r#"[[{"a":"1","b":"2"}],[["a","b"],["1;x","2"]],{"a":1},{"a":1}]"#
+        );
+        let typo = run_js(
+            &tool,
+            "try { csv_parse('a;b', {delim: ';'}) } catch (error) { error.message }",
+        )
+        .await;
+        assert!(typo.contains("unknown option"), "{typo}");
     }
 
     #[tokio::test]
@@ -4578,7 +4606,7 @@ mod step_result_rendering {
         assert_eq!(render_step_result(&result), "42");
         assert_eq!(
             render_step_result(&step(StepOutcome::Void, Vec::new(), None)),
-            ""
+            VOID_RESULT_NOTE
         );
     }
 
@@ -4606,7 +4634,10 @@ mod step_result_rendering {
             vec![record(ConsoleLevel::Log, "x")],
             None,
         );
-        assert_eq!(render_step_result(&void), "[console.log] x");
+        assert_eq!(
+            render_step_result(&void),
+            format!("[console.log] x\n{VOID_RESULT_NOTE}")
+        );
     }
 
     #[test]

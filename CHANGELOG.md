@@ -20,6 +20,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 - `$CLAUDE_PROJECT_DIR`/`$MINI_AGENT_PROJECT_DIR` prefixes in hook `command`/args are expanded at launch and `CLAUDE_PROJECT_DIR` is exported to hooks; a Claude-style command string with shell operators skips only that handler instead of the whole file (mini-agent-nvnkx.181).
 - `--trust-project-hooks` (env `MINI_AGENT_TRUST_PROJECT_HOOKS`) and `mini-agent hooks trust [--list|--yes]` let headless and CI runs approve project hooks; skipped bindings now raise a startup notice (mini-agent-nvnkx.179).
 - Brokered JS `writeFile`, `fetch` and `spawn` effects run PreToolUse hooks as `write`, `web_fetch` and `bash` (spawn also still as `js_spawn`), and PostToolUse/PostToolUseFailure after they settle (mini-agent-nvnkx.335).
+- JS `list_dir`, `glob` and `grep` accept `{include_ignored}` and return an `ignored` count; `list_dir` lists symlinks as `kind: 'symlink'` (mini-agent-nvnkx.324).
+- JS `spawn(program, args, {cwd, env, stdin, timeout_ms})` runs in a workspace subdirectory, with validated extra environment variables and bounded stdin, and reports `signal` (mini-agent-nvnkx.328).
+- JS `csv_parse` takes `{delimiter}` and rejects unknown options; `console.info`/`console.debug` are logged as `[console.log]` records (mini-agent-nvnkx.330, mini-agent-nvnkx.325).
 
 ### Fixed
 
@@ -140,6 +143,13 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Windows: cmd.exe and PowerShell shell commands ask for UTF-8 output (`chcp 65001`, `[Console]::OutputEncoding`). (mini-agent-nvnkx.303)
 - Windows: git for Windows is found behind a scoop shim (`<scoop>\\shims\\git.exe` to `apps\\git\\current`), and an unrecognised layout is refused with the resolved path and accepted layouts. (mini-agent-nvnkx.305)
 - Windows: a private directory that cannot be owned or given its closed ACL (exFAT, foreign owner) now reports the path and the likely cause. (mini-agent-nvnkx.363)
+- JS `write_file` creates missing parent directories inside the write roots (symlinked components are refused) (mini-agent-nvnkx.320).
+- A complete JS `read_file`/`read_files` now counts as the read that authorizes `write_file` on the same unchanged file (mini-agent-nvnkx.321).
+- A failing JS `read_files` item throws an error with `e.index` instead of an anonymous code (mini-agent-nvnkx.322).
+- JS `read_file` decodes BOM-marked UTF-16 and drops a UTF-8 BOM; other non-text files throw `not_text` with a hint; `json_exact` and `toml_parse` ignore a leading BOM (mini-agent-nvnkx.323).
+- A JS script that ends without a value now returns a fixed note instead of an empty result (mini-agent-nvnkx.326).
+- JS `fetch` returns a redirect as its status plus `location` instead of failing as `denied`, truncates bodies over 1 MiB (`truncated`), decodes other charsets (`lossy`) and reports DNS failure as `dns_failed` (mini-agent-nvnkx.319, mini-agent-nvnkx.327).
+- `yaml_stringify` keeps the document order of integer-like keys from `yaml_parse`, and `xml_build` keeps text and child order of mixed content from `xml_parse` (mini-agent-nvnkx.332, mini-agent-nvnkx.331).
 
 ### Added
 

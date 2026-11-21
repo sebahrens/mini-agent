@@ -28,6 +28,7 @@ mod agent_skill_catalog;
 mod auto_admission_end_to_end;
 #[cfg(feature = "skills")]
 mod capability_manifest_v2;
+mod effect_options;
 #[cfg(feature = "skills")]
 mod evidence_policy_scheduler;
 #[cfg(feature = "skills")]
@@ -301,7 +302,7 @@ async fn tool_description_prefers_javascript_for_computation() {
     assert!(description.contains("strict script in a fresh runtime"));
     assert!(description.contains("top-level `await` supported"));
     assert!(description.contains("Host globals are synchronous"));
-    assert!(description.contains("spawn(program: string, args: string[])"));
+    assert!(description.contains("spawn(program: string, args: string[]"));
 }
 
 #[tokio::test]

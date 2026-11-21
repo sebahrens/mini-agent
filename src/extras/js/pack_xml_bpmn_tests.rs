@@ -242,6 +242,22 @@ fn xml_build_escapes_and_round_trips_through_xml_parse() {
 }
 
 #[test]
+fn xml_build_keeps_mixed_content_order() {
+    let code = r##"
+        const same = ['<p>Hello <b>bold</b> world</p>', '<a><b/>tail</a>', '<a>x<![CDATA[<y>]]><b/>z<c/></a>']
+          .map((x) => xml_build(xml_parse(x)));
+        const t = xml_parse('<p>Hello <b>bold</b> world</p>');
+        t.text = 'changed';
+        JSON.stringify([same, xml_build(t)])"##;
+    let rows: serde_json::Value = serde_json::from_str(&run(code)).unwrap();
+    assert_eq!(rows[0][0], "<p>Hello <b>bold</b> world</p>");
+    assert_eq!(rows[0][1], "<a><b/>tail</a>");
+    assert_eq!(rows[0][2], "<a>x&lt;y&gt;<b/>z<c/></a>");
+    // A stale `parts` is ignored: text first, then children.
+    assert_eq!(rows[1], "<p>changed<b>bold</b></p>");
+}
+
+#[test]
 fn xml_build_is_bounded_and_canonicalises() {
     let code = r##"
         const msg = (f) => { try { f(); return 'OK'; } catch (e) { return e.name + ': ' + e.message; } };

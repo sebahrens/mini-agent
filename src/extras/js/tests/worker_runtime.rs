@@ -513,6 +513,7 @@ impl InvocationEffectHandler for OversizedEffects {
                     timed_out: false,
                     stdout_truncated: false,
                     stderr_truncated: false,
+                    signal: None,
                 },
                 EffectOperation::ReadFile { path } if path == "small" => EffectResult::ReadFile {
                     content: "small".into(),
@@ -1952,6 +1953,9 @@ impl InvocationEffectHandler for NestedFetchEffects {
                 EffectOperation::Fetch { .. } => EffectResult::Fetch {
                     status: 200,
                     body: "done".into(),
+                    truncated: false,
+                    lossy: false,
+                    location: None,
                 },
                 _ => panic!("unexpected nested fetch operation"),
             };

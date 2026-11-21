@@ -30,6 +30,10 @@ pub const EFFECT_PATH_MAX_BYTES: usize = READ_FILE_MAX_BYTES;
 pub const SPAWN_ARGUMENT_MAX_COUNT: usize = 4_096;
 pub const SPAWN_ARGUMENTS_MAX_BYTES: usize = 1024 * 1024;
 pub const FETCH_URL_MAX_BYTES: usize = 64 * 1024;
+pub const SPAWN_ENV_MAX_COUNT: usize = 64;
+pub const SPAWN_ENV_MAX_BYTES: usize = 64 * 1024;
+pub const SPAWN_STDIN_MAX_BYTES: usize = 256 * 1024;
+pub const SPAWN_TIMEOUT_MAX_MS: u32 = 3_600_000;
 
 /// Closed failures returned by parent-side effect services.
 ///
@@ -74,6 +78,11 @@ pub(crate) enum EffectServiceError {
     BodyLimit,
     #[error("invalid encoding: effect body is invalid")]
     InvalidBody,
+    #[error("effect target is not UTF-8 text")]
+    NotText,
+    #[cfg(any(test, feature = "sandbox"))]
+    #[error("name resolution failed")]
+    DnsFailed,
     #[error("effect backend is unavailable")]
     BackendFailure,
     #[error("effect outcome is unknown after dispatch")]
@@ -101,6 +110,66 @@ pub(crate) fn canonical_spawn_permission_subject(
         arguments,
     })
     .map_err(|_| EffectServiceError::InvalidTarget)
+}
+
+#[derive(serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct SpawnOptionsPermissionSubject<'a> {
+    version: u8,
+    program: &'a str,
+    arguments: &'a [String],
+    cwd: Option<&'a str>,
+    env: Vec<(&'a str, &'a str)>,
+    stdin: Option<&'a str>,
+    timeout_ms: Option<u32>,
+}
+
+/// As [`canonical_spawn_permission_subject`], binding the validated `spawn` options into the
+/// identity that is prompted for and remembered. Default options give the version-1 subject, so
+/// existing approvals keep their meaning.
+pub(crate) fn canonical_spawn_permission_subject_with(
+    program: &str,
+    arguments: &[String],
+    options: &super::protocol::SpawnOptions,
+) -> Result<String, EffectServiceError> {
+    if *options == super::protocol::SpawnOptions::default() {
+        return canonical_spawn_permission_subject(program, arguments);
+    }
+    let mut env = options
+        .env
+        .iter()
+        .map(|variable| (variable.name.as_str(), variable.value.as_str()))
+        .collect::<Vec<_>>();
+    env.sort_unstable();
+    serde_json::to_string(&SpawnOptionsPermissionSubject {
+        version: 2,
+        program,
+        arguments,
+        cwd: options.cwd.as_deref(),
+        env,
+        stdin: options.stdin.as_deref(),
+        timeout_ms: options.timeout_ms,
+    })
+    .map_err(|_| EffectServiceError::InvalidTarget)
+}
+
+/// [`spawn_policy_input`] plus what the options feed the program, so Bash policy rules see a
+/// shell reading its script from `stdin` or running under another `cwd`.
+pub(crate) fn spawn_policy_input_with(
+    program: &str,
+    arguments: &[String],
+    options: &super::protocol::SpawnOptions,
+) -> String {
+    let mut input = spawn_policy_input(program, arguments);
+    if let Some(cwd) = &options.cwd {
+        input = format!("cd {} && {input}", quote_spawn_policy_word(cwd));
+    }
+    if let Some(stdin) = &options.stdin {
+        input.push_str(" <<'STDIN'\n");
+        input.push_str(stdin);
+        input.push_str("\nSTDIN");
+    }
+    input
 }
 
 /// Compatibility rendering used only to evaluate existing Bash policy rules.
@@ -621,6 +690,8 @@ pub struct SpawnResult {
     pub timed_out: bool,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
+    /// Name of the signal that ended the process, when it died of one.
+    pub signal: Option<String>,
 }
 
 impl fmt::Debug for SpawnResult {
@@ -855,6 +926,7 @@ mod js_permission_types {
             timed_out: false,
             stdout_truncated: false,
             stderr_truncated: false,
+            signal: None,
         };
         let spawn_debug = format!("{spawn:?}");
         assert!(!spawn_debug.contains("SECRET_RESPONSE_BODY"));

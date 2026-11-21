@@ -1127,6 +1127,18 @@ async fn yaml_stringify_round_trips_and_quotes_what_would_change_type() {
 }
 
 #[tokio::test]
+async fn yaml_stringify_keeps_document_order_of_integer_like_keys() {
+    let root = std::env::current_dir().unwrap();
+    let tool = helper_tool(ModelEffectProfile::Full, &root);
+    let out = run_js(
+        &tool,
+        "const v = yaml_parse('b: 1\\n10: x\\n2: y\\na: 3\\n'); v.z = 9; yaml_stringify(v)",
+    )
+    .await;
+    assert_eq!(out, "b: 1\n\"10\": x\n\"2\": y\na: 3\nz: 9\n");
+}
+
+#[tokio::test]
 async fn yaml_parse_throws_with_line_numbers_on_unsupported_or_invalid_syntax() {
     let root = std::env::current_dir().unwrap();
     for profile in PROFILES {

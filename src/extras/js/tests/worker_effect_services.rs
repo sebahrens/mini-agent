@@ -380,6 +380,7 @@ async fn worker_effect_services_broker_rejects_unavailable_spawn_before_prompt()
         operation: EffectOperation::Spawn {
             program: "printf".to_string(),
             arguments: Vec::new(),
+            options: Default::default(),
         },
     };
     let mut broker = InvocationBroker::new(

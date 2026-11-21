@@ -207,3 +207,93 @@ async fn several_writes_in_one_call_name_the_single_shown_preview() {
     );
     assert!(result.extensions.get::<MutationDiff>().is_some());
 }
+
+#[tokio::test]
+async fn a_complete_js_read_authorizes_the_overwrite_of_that_file() {
+    let audits = TestTempDir::new("js-guard-jsread");
+    let root = crate::tests::OwnedTestDirectory::new("js-guard-jsread-ws");
+    std::fs::write(root.path().join("a.txt"), "alpha beta\n").unwrap();
+    std::fs::write(root.path().join("b.txt"), "untouched\n").unwrap();
+    std::fs::write(root.path().join("c.txt"), "changes\n").unwrap();
+    let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+    let tracker = ReadTracker::new(true);
+    let tool = guarded_tool(&workspace, &audits, &tracker);
+    let store = FileCheckpoints::default();
+
+    let result = scope(Some(store.recorder("session", 0, true)), async {
+        tool.call_structured(
+            JsArgs {
+                code: "const t = read_file('a.txt'); write_file('a.txt', t.replace('beta', 'gamma')); \
+                       const many = read_files(['c.txt']); write_file('c.txt', many[0] + 'more\\n'); 'ok'"
+                    .into(),
+            },
+            &ToolCallExtensions::new(),
+        )
+        .await
+        .unwrap()
+    })
+    .await;
+    assert!(result.output.starts_with("ok"), "{}", result.output);
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("a.txt")).unwrap(),
+        "alpha gamma\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("c.txt")).unwrap(),
+        "changes\nmore\n"
+    );
+    assert!(result.extensions.get::<MutationDiff>().is_some());
+    assert_eq!(store.restore("session", 0, &workspace).unwrap(), 2);
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("a.txt")).unwrap(),
+        "alpha beta\n"
+    );
+
+    // Without a read the guard still refuses, and a read does not outlive the write.
+    let blind = tool.call(code("b.txt", "blind\n")).await.unwrap();
+    assert!(blind.contains("not fully read"), "{blind}");
+    let twice = tool
+        .call(JsArgs {
+            code: "read_file('a.txt'); write_file('a.txt', '1\\n'); \
+                   try { write_file('a.txt', '2\\n'); 'second ok' } catch (e) { 'second refused' }"
+                .into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(twice, "second refused");
+}
+
+#[tokio::test]
+async fn a_js_read_followed_by_an_external_change_does_not_authorize_the_overwrite() {
+    let audits = TestTempDir::new("js-guard-jsstale");
+    let root = crate::tests::OwnedTestDirectory::new("js-guard-jsstale-ws");
+    std::fs::write(root.path().join("a.txt"), "one\n").unwrap();
+    let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+    let tracker = ReadTracker::new(true);
+    let tool = guarded_tool(&workspace, &audits, &tracker);
+    tool.call(JsArgs {
+        code: "read_file('a.txt'); 1".into(),
+    })
+    .await
+    .unwrap();
+    std::fs::write(root.path().join("a.txt"), "two (edited elsewhere)\n").unwrap();
+    let out = tool.call(code("a.txt", "mine\n")).await.unwrap();
+    assert!(out.contains("not fully read"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("a.txt")).unwrap(),
+        "two (edited elsewhere)\n"
+    );
+}
+
+#[tokio::test]
+async fn overwriting_a_non_text_file_says_so_instead_of_asking_for_a_read() {
+    let audits = TestTempDir::new("js-guard-nontext");
+    let root = crate::tests::OwnedTestDirectory::new("js-guard-nontext-ws");
+    std::fs::write(root.path().join("l1.txt"), b"na\xefve").unwrap();
+    let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+    let tracker = ReadTracker::new(true);
+    let tool = guarded_tool(&workspace, &audits, &tracker);
+    let out = tool.call(code("l1.txt", "x")).await.unwrap();
+    assert!(out.contains("not_text"), "{out}");
+    assert!(!out.contains("not fully read"), "{out}");
+}
