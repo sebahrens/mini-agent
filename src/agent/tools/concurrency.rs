@@ -173,9 +173,11 @@ struct LaneSlot {
     lane: Lane,
     /// How the bound tool classifies its calls; [`readmit_for_effective_args`]
     /// re-derives the lease from the arguments that will actually run.
+    #[cfg_attr(not(any(test, feature = "hooks")), allow(dead_code))]
     access: ToolAccess,
     lease: std::sync::Mutex<Option<Lease>>,
     /// The exclusive ordering ticket; held until the call ends.
+    #[cfg_attr(not(any(test, feature = "hooks")), allow(dead_code))]
     ticket: std::sync::Mutex<Option<tokio::sync::OwnedMutexGuard<()>>>,
 }
 
@@ -204,6 +206,7 @@ impl Lane {
 /// before anything runs, so no other call can observe the gap as an effect.
 /// A no-op outside a bound tool call, or while the lease is suspended for a
 /// prompt.
+#[cfg(any(test, feature = "hooks"))]
 pub(crate) async fn readmit_for_effective_args(effective: &str) {
     let Ok(slot) = LANE.try_with(Arc::clone) else {
         return;
