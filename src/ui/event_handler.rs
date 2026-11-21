@@ -446,6 +446,12 @@ pub async fn handle_agent_event(
                 run.agent_line_started = false;
             }
             run.response_start_block = None;
+            run.retry_wait = (delay_ms >= crate::event::RETRY_COUNTDOWN_MIN_MS).then(|| {
+                (
+                    std::time::Instant::now() + std::time::Duration::from_millis(delay_ms),
+                    reason.clone(),
+                )
+            });
             renderer.write_line(&crate::event::retry_notice_text(attempt, max, delay_ms, &reason), Color::Yellow)?;
         }
         AgentEvent::OutputTruncated { message } => {

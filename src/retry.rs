@@ -589,6 +589,15 @@ pub fn is_context_length_error_message(message: &str) -> bool {
 /// The user-facing text of a terminal provider error: the message plus
 /// recovery guidance for context overflow or a provider deadline.
 pub fn with_provider_error_hint(error: &(dyn std::error::Error + 'static)) -> String {
+    with_provider_error_hint_for(error, None)
+}
+
+/// [`with_provider_error_hint`] naming `provider` and the environment variable
+/// it reads its key from in the 401/403 hint.
+pub fn with_provider_error_hint_for(
+    error: &(dyn std::error::Error + 'static),
+    provider: Option<&str>,
+) -> String {
     let message = with_context_length_hint(&error.to_string());
     if is_quota_exhausted_error(error) {
         return format!("{message}\n{QUOTA_EXHAUSTED_HINT}");
@@ -597,6 +606,16 @@ pub fn with_provider_error_hint(error: &(dyn std::error::Error + 'static)) -> St
         return format!("{message}\n{PROVIDER_TIMEOUT_HINT}");
     }
     if let Some(hint) = status_hint(error, &message) {
+        if hint == AUTH_FAILURE_HINT
+            && let Some(provider) = provider
+        {
+            let env = crate::auth::ProviderKind::from_name(provider)
+                .map(|kind| format!("`{}`", kind.env_var_name()))
+                .unwrap_or_else(|| "its configured key".into());
+            return format!(
+                "{message}\nCheck the API key for provider `{provider}`: environment variable {env}, an `api_keys` entry in the config, or run /login (or `mini-agent setup`)."
+            );
+        }
         return format!("{message}\n{hint}");
     }
     match provider_retry_hint(error, SystemTime::now()) {
@@ -839,6 +858,11 @@ mod tests {
         assert!(
             hint.contains("/login") && hint.contains("api_keys"),
             "{hint}"
+        );
+        let named = with_provider_error_hint_for(&unauthorized, Some("anthropic"));
+        assert!(
+            named.contains("`anthropic`") && named.contains("ANTHROPIC_API_KEY"),
+            "{named}"
         );
         let missing = crate::provider_http::ProviderRetryAfterError::for_test(
             404,

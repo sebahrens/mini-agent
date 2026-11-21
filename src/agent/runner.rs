@@ -4549,7 +4549,12 @@ where
                 Err(error) => {
                     park_question!();
                     tracing::error!("agent stream start failed after retries: {error}");
-                    let error = retry::with_provider_error_hint(&error);
+                    let error = retry::with_provider_error_hint_for(
+                        &error,
+                        crate::spend::run::Run::current()
+                            .as_ref()
+                            .map(|run| run.provider_name()),
+                    );
                     let _ = event_tx
                         .send(AgentEvent::error_with(
                             CompactString::new(error),
@@ -5179,7 +5184,12 @@ where
                             break;
                         }
                         tracing::error!("agent stream error: {e}");
-                        let error = retry::with_provider_error_hint(&e);
+                        let error = retry::with_provider_error_hint_for(
+                            &e,
+                            crate::spend::run::Run::current()
+                                .as_ref()
+                                .map(|run| run.provider_name()),
+                        );
                         let _ = event_tx
                             .send(AgentEvent::error_with(
                                 CompactString::new(error),

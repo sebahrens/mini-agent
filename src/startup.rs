@@ -340,6 +340,13 @@ fn require_recent_session_reporting(
     require_recent_session(Ok(sessions), workspace)
 }
 
+/// Print mode generates a title only for an explicitly configured
+/// `session_title_model`; the default session-model title never delays or
+/// bills a scripted run (mini-agent-sskdu.12).
+fn headless_title_wanted(cfg: &Config) -> bool {
+    cfg.session_title_model.is_some()
+}
+
 fn unavailable_sandbox_must_fail(cli: &Cli, cfg: &Config, is_windows: bool) -> bool {
     cli.resolve_sandbox(cfg) && (is_windows || cli.sandbox_explicitly_requested(cfg))
 }
@@ -3565,7 +3572,7 @@ impl Startup {
                 // latency-sensitive, so the default (session model) title is
                 // left to the next interactive resume; only an explicit
                 // `session_title_model` is generated here (mini-agent-sskdu.12).
-                if failure.is_none() && self.cfg.session_title_model.is_some() {
+                if failure.is_none() && headless_title_wanted(&self.cfg) {
                     let cost_before = session.total_cost;
                     // This measured large title child must not add its
                     // construction copies to the primary request's poll.
@@ -6053,6 +6060,16 @@ mod tests {
     #[test]
     fn continue_requires_a_readable_existing_session() {
         let workspace = std::path::Path::new("/workspace/project");
+        let default_cfg = Config::default();
+        assert!(
+            !super::headless_title_wanted(&default_cfg),
+            "default title is skipped in print mode"
+        );
+        let explicit = Config {
+            session_title_model: Some("fast".into()),
+            ..Default::default()
+        };
+        assert!(super::headless_title_wanted(&explicit));
         let skipped = require_recent_session_reporting(
             Ok((
                 Vec::new(),
