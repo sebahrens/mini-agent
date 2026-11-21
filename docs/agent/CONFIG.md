@@ -3909,7 +3909,10 @@ and submits the literal approved plan as an ordinary user turn. It grants no
 tool permissions. Read-only and explicit denies remain effective. Failed,
 interrupted, oversized, or stale plans cannot start execution. Plans are capped
 at 64 KiB and their relevant history revision at 1 MiB; they are never silently
-truncated for approval. The built-in plan prompt includes this header. If an
+truncated for approval. The approved plan is the final assistant message of the
+planning turn, so the built-in plan prompt tells the model to send the full plan there
+even when it also saves a `PLAN-<topic>.md` file, to ask clarifying questions once via
+`ask_user_question`, and not to attempt the (denied) shell. The built-in plan prompt includes this header. If an
 older copy exists in your prompts directory, add the header or regenerate the
 built-in prompts to enable this flow. `[chain].plan-to-code = false` disables it.
 

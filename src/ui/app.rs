@@ -18195,7 +18195,7 @@ mod plan_approval_tests {
             );
             let calls = provider.calls();
             assert_eq!(calls.len(), 2);
-            assert!(calls[0].to_string().contains("Planning-Only Mode"));
+            assert!(calls[0].to_string().contains("Planning Mode"));
             assert!(calls[1].to_string().contains("Coding Mode"));
             let submitted = app
                 .ui
