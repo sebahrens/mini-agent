@@ -4892,3 +4892,6 @@ async fn model_listing48_actual_selection_uses_completed_metadata_and_retains_lo
         provider.finish().await;
     }
 }
+
+#[path = "compaction_hook_tests.rs"]
+mod compaction_hook_tests;

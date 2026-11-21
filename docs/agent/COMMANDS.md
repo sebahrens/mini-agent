@@ -229,6 +229,7 @@ files are skipped with a warning containing their path and read error.
 | `/compress [instructions]` | Compress conversation history to free context window space. The summarizer receives the history, the previous summary and your instructions in fenced sections; closing tags of those fences inside the text (such as `</message>` or `</transcript>` in a tool result) are neutralized with U+2060 WORD JOINER, and the summarizer is told the fenced history is data, not instructions. |
 | `/compact [instructions]` | Alias for `/compress`; after a manual compaction, show the active summary. |
 | `/compact show` | Show the active saved summary without making a provider request or changing session history. Imported file-request metadata remains untrusted historical data. |
+| `/compact undo` | Restore the transcript the newest compaction replaced from its `.precompact-<n>.jsonl` sidecar and drop that compaction record. Not available on native Anthropic sessions or while a turn runs; rewind checkpoints of the summarized turns stay retired. |
 | `/context` | Inspect the captured preamble, conversation and retained tool-result estimates, registered tool metadata, compaction state and next-request pruning projection. Works during a turn; makes no model request and does not change or save the session. |
 | `/doctor` | Show bounded build, config/key source, provider/pricing, cached sandbox/JS/integration and terminal metadata. Works during a turn, without starting an agent or saving history. |
 | `/top`, `/bottom` | Scroll the transcript to its start or end. A key-independent fallback for terminals without Home/End or PageUp/PageDown; they print nothing and work while a turn runs. |
@@ -887,9 +888,11 @@ not force a compaction and is unavailable in TUI, ACP, or loop mode. It is the o
 standing preference: automatic compaction in the TUI and ACP takes none, and the TUI's
 manual `/compact <instructions>` applies to that one compaction. Preferences are fenced
 below the summarization contract. A headless result that compacted carries a
-`compactions` object (`count`, `messages`, `tokens_freed`); ACP answers `/compact` with
+`compactions` object (`count`, `messages`, `tokens_freed`, and the summarizer `usage`), and `--output-format stream-json` also emits a `{"type":"compaction","messages","tokens_freed","usage"}` record as each compaction finishes; ACP answers `/compact` with
 what it did and `/compact show` with the active summary. Esc or Ctrl-C cancels a TUI
-compaction in progress and leaves the history unchanged.
+compaction in progress and leaves the history unchanged; while it runs the TUI prints a
+progress line every ten seconds with the elapsed time and the summarizer request in flight
+(`request k of ~n`, n a lower-bound estimate).
 
 ## Custom prompt commands
 

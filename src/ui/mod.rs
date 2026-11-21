@@ -717,9 +717,31 @@ static ACTIVE_COMPACTION: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>> =
 /// Registration of a cancellable compaction; deregisters on drop.
 pub(crate) struct CompactionCancel(Arc<tokio::sync::Notify>);
 
+#[cfg(test)]
+thread_local! {
+    /// The compaction registered on this (test) thread, so a test can cancel
+    /// its own without reaching one a parallel test registered.
+    static TEST_COMPACTION: std::cell::RefCell<Option<Arc<tokio::sync::Notify>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Cancel this thread's registered compaction as an Esc press would; true when
+/// one was waiting.
+#[cfg(test)]
+pub(crate) fn cancel_test_compaction() -> bool {
+    TEST_COMPACTION.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|notify| notify.notify_one())
+            .is_some()
+    })
+}
+
 impl CompactionCancel {
     pub(crate) fn begin() -> Self {
         let notify = Arc::new(tokio::sync::Notify::new());
+        #[cfg(test)]
+        TEST_COMPACTION.with(|slot| *slot.borrow_mut() = Some(notify.clone()));
         *ACTIVE_COMPACTION
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(notify.clone());
@@ -733,6 +755,8 @@ impl CompactionCancel {
 
 impl Drop for CompactionCancel {
     fn drop(&mut self) {
+        #[cfg(test)]
+        TEST_COMPACTION.with(|slot| *slot.borrow_mut() = None);
         *ACTIVE_COMPACTION
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;

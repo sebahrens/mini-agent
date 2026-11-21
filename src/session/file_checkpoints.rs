@@ -502,6 +502,28 @@ impl FileCheckpoints {
             })
             .collect();
     }
+    /// Reverses the index shift of [`compact_prefix`](Self::compact_prefix) when
+    /// a compaction that replaced `removed` messages is undone. Records the
+    /// compaction retired stay retired: their preimages cannot be told apart
+    /// from older retirements, so `/rewind` still cannot reach them.
+    pub(crate) fn uncompact_prefix(&self, removed: usize) {
+        let mut state = self.edit();
+        for record in &mut state.data.records {
+            if !record.retired {
+                record.turn = record.turn.saturating_sub(1).saturating_add(removed);
+            }
+        }
+        state.data.skipped = std::mem::take(&mut state.data.skipped)
+            .into_iter()
+            .map(|(turn, count)| {
+                if turn == usize::MAX {
+                    (turn, count)
+                } else {
+                    (turn.saturating_sub(1).saturating_add(removed), count)
+                }
+            })
+            .collect();
+    }
     /// Explicit operator action; all inputs remain bound to the current retained workspace.
     /// Preflight every file before the first write, then each publication checks identity+content again.
     pub(crate) fn restore(

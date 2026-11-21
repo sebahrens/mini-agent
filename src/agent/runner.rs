@@ -3845,24 +3845,24 @@ pub(crate) fn convert_history_prefix(
 }
 
 /// The cache-fork prefix for compacting `session` up to `cut_idx`, or `None`
-/// when the fork is ineligible: a native thinking chain is in play, images sit
-/// in the prefix, or the prefix would not fit the summarizer's input budget.
+/// when the fork is ineligible: images sit in the prefix, the prefix would not
+/// fit the summarizer's input budget, or (native Anthropic sessions) the native
+/// wire history cannot be cut at `cut_idx` with proof.
 /// The caller still has to check the agent route (`supports_cache_fork`) and
 /// that no separate `compaction_model` is configured (mini-agent-o2nut).
 ///
-/// Native Anthropic sessions are deliberately ineligible (mini-agent-sskdu.265):
-/// their requests replay signed thinking blocks from the native history, which
-/// the text projection used for this prefix cannot reproduce byte for byte, so a
-/// fork built from it would miss the cache it exists to reuse. The text
-/// summarizer is used instead; rebuilding the prefix from native frames is a
-/// separate feature.
+/// A native Anthropic session replays signed thinking blocks from its native
+/// history, which the text projection cannot reproduce byte for byte, so its
+/// prefix is the native wire history itself, cut before the user prompt at
+/// `cut_idx` (mini-agent-sskdu.265). The cut is verified: the wire history's
+/// user prompts must equal the session's own replay, one for one.
 pub(crate) fn cache_fork_history(
     session: &Session,
     cut_idx: usize,
     keep_recent_tool_results: usize,
     input_token_budget: u64,
 ) -> Option<Vec<Message>> {
-    if session.native_history_snapshot().is_some() || session.prefix_has_images(cut_idx) {
+    if session.prefix_has_images(cut_idx) {
         return None;
     }
     let first_live = session.compacted_context().1;
@@ -3874,11 +3874,81 @@ pub(crate) fn cache_fork_history(
     if tokens.saturating_add(2_000) > input_token_budget / 10 * 9 {
         return None;
     }
+    if let Some(native) = session.native_history_snapshot() {
+        return native_fork_prefix(session, native, cut_idx, keep_recent_tool_results);
+    }
     Some(convert_history_prefix(
         session,
         cut_idx,
         keep_recent_tool_results,
     ))
+}
+
+/// A user message that carries a prompt rather than tool results.
+fn is_prompt_message(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::User { content }
+            if content
+                .iter()
+                .all(|item| !matches!(item, rig::message::UserContent::ToolResult(_)))
+    )
+}
+
+fn native_fork_prefix(
+    session: &Session,
+    native: &crate::session::native_replay::NativeHistory,
+    cut_idx: usize,
+    keep_recent_tool_results: usize,
+) -> Option<Vec<Message>> {
+    use crate::session::native_replay::HistoryProtocol;
+    if !matches!(session.messages.get(cut_idx)?.role, MessageRole::User) {
+        return None;
+    }
+    let boundary = native.saved_boundary().ok()?;
+    let wire = session
+        .native_restore_history(HistoryProtocol::AnthropicMessages, boundary)
+        .ok()?;
+    let generic = convert_history_uncached(session, keep_recent_tool_results, false);
+    let prefix_prompts = convert_history_prefix(session, cut_idx, keep_recent_tool_results)
+        .iter()
+        .filter(|message| is_prompt_message(message))
+        .count();
+    cut_native_prefix(wire, &generic, prefix_prompts)
+}
+
+/// Cuts `wire` before its prompt number `prefix_prompts` (zero-based), after
+/// proving the wire history's prompts are exactly the session replay's prompts.
+/// Any mismatch means the position cannot be trusted and yields `None`.
+fn cut_native_prefix(
+    mut wire: Vec<Message>,
+    generic: &[Message],
+    prefix_prompts: usize,
+) -> Option<Vec<Message>> {
+    let positions: Vec<usize> = wire
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| is_prompt_message(message))
+        .map(|(index, _)| index)
+        .collect();
+    let generic_prompts: Vec<&Message> = generic
+        .iter()
+        .filter(|message| is_prompt_message(message))
+        .collect();
+    if positions.len() != generic_prompts.len() {
+        return None;
+    }
+    for (position, expected) in positions.iter().zip(&generic_prompts) {
+        if serde_json::to_value(&wire[*position]).ok()? != serde_json::to_value(expected).ok()? {
+            return None;
+        }
+    }
+    let cut = *positions.get(prefix_prompts)?;
+    if cut == 0 {
+        return None;
+    }
+    wire.truncate(cut);
+    Some(wire)
 }
 
 /// Rewrites a persisted tool identity into one that is safe to replay on its
