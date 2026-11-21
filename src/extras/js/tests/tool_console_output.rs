@@ -53,7 +53,10 @@ async fn js_tool_console_falls_back_safely_for_circular_and_non_json_objects() {
 #[tokio::test]
 async fn js_tool_returns_console_output_for_void_results() {
     let result = run("console.log('only')").await;
-    assert_eq!(result, "[console.log] only");
+    assert!(
+        result.starts_with("[console.log] only\n[js completed;"),
+        "{result}"
+    );
 }
 
 #[tokio::test]
@@ -103,7 +106,7 @@ async fn js_tool_malformed_source_reports_stage_and_script_role() {
 #[tokio::test]
 async fn js_tool_result_without_console_is_unchanged() {
     assert_eq!(run("21 * 2").await, "42");
-    assert_eq!(run("undefined").await, "");
+    assert!(run("undefined").await.starts_with("[js completed;"));
 }
 
 fn first_line(text: &str) -> &str {
@@ -213,4 +216,10 @@ async fn js_tool_limit_errors_state_the_limit_and_remedy() {
         list_file.contains("path must be a directory; use include for files, or read_file"),
         "{list_file}"
     );
+}
+
+#[tokio::test]
+async fn js_tool_console_info_and_debug_are_log_records() {
+    let result = run("console.info('a'); console.debug('b'); 1").await;
+    assert_eq!(result, "[console.log] a\n[console.log] b\n1");
 }

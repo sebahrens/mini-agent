@@ -61,6 +61,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 - The TUI falls back to 256 or 16 colours unless `COLORTERM`/`TERM`/`TERM_PROGRAM` show truecolor; `/doctor` shows the detected depth (mini-agent-nvnkx.252).
 - Setup wizard: `D` cycles the default provider/model among providers with a key or login, `T` checks a typed key with a model listing, and first run selects the one provider that has a credential (mini-agent-nvnkx.223, .224).
 - Unknown-key warnings now cover `[goal]`, `[lsp]`, `[colors]`, `[chain]`, `[statusline]` and `[embedding]`, with field lists taken from the structs (mini-agent-nvnkx.99).
+- JS `list_dir`, `glob` and `grep` accept `{include_ignored}` and return an `ignored` count; `list_dir` lists symlinks as `kind: 'symlink'` (mini-agent-nvnkx.324).
+- JS `spawn(program, args, {cwd, env, stdin, timeout_ms})` runs in a workspace subdirectory, with validated extra environment variables and bounded stdin, and reports `signal` (mini-agent-nvnkx.328).
+- JS `csv_parse` takes `{delimiter}` and rejects unknown options; `console.info`/`console.debug` are logged as `[console.log]` records (mini-agent-nvnkx.330, mini-agent-nvnkx.325).
 
 ### Fixed
 
@@ -259,6 +262,13 @@ Notable changes to mini-agent are documented in this file. The format follows
 - A symlinked or read-only global config loads (owner and mode checked, never chmod-ed) instead of exiting (mini-agent-nvnkx.192).
 - `managed-settings.json` and, on Windows, `managed-config.toml` must be administrator-owned; a planted file loads no hooks and fails closed (mini-agent-nvnkx.221).
 - Setup wizard: saving an existing custom provider keeps its headers, timeouts, model and prices; an empty key clears the stored key; keys are trimmed; unknown provider types are rejected (mini-agent-nvnkx.222).
+- JS `write_file` creates missing parent directories inside the write roots (symlinked components are refused) (mini-agent-nvnkx.320).
+- A complete JS `read_file`/`read_files` now counts as the read that authorizes `write_file` on the same unchanged file (mini-agent-nvnkx.321).
+- A failing JS `read_files` item throws an error with `e.index` instead of an anonymous code (mini-agent-nvnkx.322).
+- JS `read_file` decodes BOM-marked UTF-16 and drops a UTF-8 BOM; other non-text files throw `not_text` with a hint; `json_exact` and `toml_parse` ignore a leading BOM (mini-agent-nvnkx.323).
+- A JS script that ends without a value now returns a fixed note instead of an empty result (mini-agent-nvnkx.326).
+- JS `fetch` returns a redirect as its status plus `location` instead of failing as `denied`, truncates bodies over 1 MiB (`truncated`), decodes other charsets (`lossy`) and reports DNS failure as `dns_failed` (mini-agent-nvnkx.319, mini-agent-nvnkx.327).
+- `yaml_stringify` keeps the document order of integer-like keys from `yaml_parse`, and `xml_build` keeps text and child order of mixed content from `xml_parse` (mini-agent-nvnkx.332, mini-agent-nvnkx.331).
 
 ### Added
 

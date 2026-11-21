@@ -558,10 +558,16 @@ pub(crate) enum EffectOperation {
     },
     ListDir {
         path: String,
+        /// Also list entries `.gitignore`/`.ignore` rules and the built-in skip directories hide.
+        /// Permission and read-deny filters stay in force.
+        #[serde(default, skip_serializing_if = "is_false")]
+        include_ignored: bool,
     },
     Glob {
         path: String,
         pattern: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        include_ignored: bool,
     },
     Grep {
         path: String,
@@ -591,6 +597,8 @@ pub(crate) enum EffectOperation {
     Spawn {
         program: String,
         arguments: Vec<String>,
+        #[serde(default, skip_serializing_if = "SpawnOptions::is_default")]
+        options: SpawnOptions,
     },
     ProposeSkill {
         draft: SkillProposalDraft,
@@ -602,6 +610,22 @@ pub(crate) enum EffectOperation {
 pub(crate) struct GrepOptions {
     pub(crate) include: Option<String>,
     pub(crate) case_sensitive: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) include_ignored: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+impl SpawnOptions {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 impl Default for GrepOptions {
@@ -609,8 +633,33 @@ impl Default for GrepOptions {
         Self {
             include: None,
             case_sensitive: true,
+            include_ignored: false,
         }
     }
+}
+
+/// One `spawn` environment variable.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SpawnEnvVar {
+    pub(crate) name: String,
+    pub(crate) value: String,
+}
+
+/// Optional `spawn` knobs. Every field is validated parent-side (the worker's copy is advisory):
+/// `cwd` is resolved and authorized like a discovery root, `env` names pass the shell tool's
+/// environment rules, `stdin` is bounded and `timeout_ms` only shortens the step deadline.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SpawnOptions {
+    #[serde(default)]
+    pub(crate) cwd: Option<String>,
+    #[serde(default)]
+    pub(crate) env: Vec<SpawnEnvVar>,
+    #[serde(default)]
+    pub(crate) stdin: Option<String>,
+    #[serde(default)]
+    pub(crate) timeout_ms: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -618,6 +667,8 @@ impl Default for GrepOptions {
 pub(crate) enum DirectoryEntryKind {
     File,
     Directory,
+    /// Listed by name only; never followed.
+    Symlink,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -748,16 +799,23 @@ pub(crate) enum EffectResult {
     ListDir {
         entries: Vec<DirectoryEntry>,
         truncated: bool,
+        /// Entries hidden by ignore rules or the skip-directory list.
+        #[serde(default, skip_serializing_if = "is_zero_u32")]
+        ignored: u32,
     },
     Glob {
         paths: Vec<String>,
         truncated: bool,
+        #[serde(default, skip_serializing_if = "is_zero_u32")]
+        ignored: u32,
     },
     Grep {
         matches: Vec<GrepMatch>,
         truncated: bool,
         #[serde(default)]
         skipped: GrepSkipped,
+        #[serde(default, skip_serializing_if = "is_zero_u32")]
+        ignored: u32,
     },
     WriteFile,
     ResultAccepted {
@@ -770,6 +828,15 @@ pub(crate) enum EffectResult {
     Fetch {
         status: u16,
         body: String,
+        /// The body was cut at the response limit.
+        #[serde(default, skip_serializing_if = "is_false")]
+        truncated: bool,
+        /// Invalid bytes were replaced while decoding the body.
+        #[serde(default, skip_serializing_if = "is_false")]
+        lossy: bool,
+        /// `Location` of a 3xx response, which is never followed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        location: Option<String>,
     },
     Spawn {
         stdout: String,
@@ -778,6 +845,9 @@ pub(crate) enum EffectResult {
         timed_out: bool,
         stdout_truncated: bool,
         stderr_truncated: bool,
+        /// Closed name of the signal that ended the process, when it died of one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signal: Option<String>,
     },
     ProposalAccepted {
         skill_id: String,
@@ -817,6 +887,10 @@ impl ProposalStatus {
 #[serde(deny_unknown_fields)]
 pub(crate) struct EffectError {
     pub(crate) code: EffectErrorCode,
+    /// Position of the failing item in the script's own request array (`read_files`); derived
+    /// from the script's input, never from a target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) index: Option<u32>,
     /// Closed, non-sensitive refinement of `Denied`. Never carries a path or policy internals.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) reason: Option<DenialReason>,
@@ -824,13 +898,18 @@ pub(crate) struct EffectError {
 
 impl EffectError {
     pub(crate) const fn new(code: EffectErrorCode) -> Self {
-        Self { code, reason: None }
+        Self {
+            code,
+            index: None,
+            reason: None,
+        }
     }
 
     #[cfg(test)]
     pub(crate) const fn denied(reason: DenialReason) -> Self {
         Self {
             code: EffectErrorCode::Denied,
+            index: None,
             reason: Some(reason),
         }
     }
@@ -861,6 +940,10 @@ pub(crate) enum EffectErrorCode {
     BackendFailure,
     AuditFailure,
     OutcomeUnknown,
+    /// The target exists but is not UTF-8 text (or UTF-16 with a BOM).
+    NotText,
+    /// Name resolution of a fetch host failed.
+    DnsFailed,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

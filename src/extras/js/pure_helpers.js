@@ -13,7 +13,7 @@
     if (typeof text !== "string") throw new TypeError("json_exact: text must be a string");
     let out = "";
     const n = text.length;
-    let i = 0;
+    let i = text.charCodeAt(0) === 0xfeff ? 1 : 0;
     while (i < n) {
       const c = text[i];
       if (c === '"') {
@@ -52,6 +52,22 @@
   const hasOwn = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
   define("csv_parse", function csv_parse(text, options) {
     checkText("csv_parse", text);
+    let delimiter = ",";
+    if (options !== undefined && options !== null) {
+      if (typeof options !== "object") throw new TypeError("csv_parse: options must be an object");
+      for (const key of Object.keys(options)) {
+        if (key !== "header" && key !== "delimiter") {
+          throw new TypeError("csv_parse: unknown option '" + key + "' (expected header, delimiter)");
+        }
+      }
+      if (options.delimiter !== undefined) {
+        const d = options.delimiter;
+        if (typeof d !== "string" || d.length !== 1 || d === '"' || d === "\n" || d === "\r") {
+          throw new TypeError("csv_parse: delimiter must be one character other than a quote or newline");
+        }
+        delimiter = d;
+      }
+    }
     const header = !!(options && options.header);
     const rows = [];
     let row = [];
@@ -80,7 +96,7 @@
           } else field += text[i++];
         }
         closed = true;
-      } else if (c === ",") {
+      } else if (c === delimiter) {
         row.push(field);
         field = "";
         any = false;
@@ -109,7 +125,7 @@
   define("toml_parse", function toml_parse(text) {
     checkText("toml_parse", text);
     const n = text.length;
-    let i = 0;
+    let i = text.charCodeAt(0) === 0xfeff ? 1 : 0;
     const fail = (msg) => {
       let line = 1;
       for (let k = 0; k < i && k < n; k++) if (text[k] === "\n") line++;

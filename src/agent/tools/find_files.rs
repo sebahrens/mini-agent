@@ -719,6 +719,13 @@ impl IgnoreMode {
         })
     }
 
+    /// Entries pruned so far because ignore rules (or, for `list_dir`, the skip-directory
+    /// list) hid them.
+    #[cfg(feature = "js")]
+    pub(crate) fn pruned_count(&self) -> usize {
+        self.pruned.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn note(&self, path: &Path) {
         self.pruned
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1202,15 +1209,32 @@ impl BoundDirectory {
             } else {
                 kind
             };
-            let (is_directory, size) = match kind {
-                // Links and special files were never listed.
-                EntryKind::Symlink | EntryKind::Other => continue,
+            let (is_directory, is_symlink, size) = match kind {
+                // Special files were never listed; links are listed by name, never followed.
+                EntryKind::Other => continue,
+                EntryKind::Symlink => {
+                    let path = self.approved_root.join(&name);
+                    if self.is_hidden(&path, false) || prune_ignored(&chain, &path, false) {
+                        continue;
+                    }
+                    (false, true, 0)
+                }
                 EntryKind::Directory | EntryKind::File => {
                     let is_directory = kind == EntryKind::Directory;
                     let path = self.approved_root.join(&name);
-                    if (is_directory && skip_directory(&self.root, &name))
+                    // The dependency/build directory rule is an ignore rule here: it is
+                    // counted, and `include_ignored` lifts it for this one-level listing.
+                    if is_directory
+                        && !chain.mode.include_ignored
+                        && skip_directory(&self.root, &name)
+                    {
+                        if !self.is_hidden(&path, true) {
+                            chain.mode.note(&path);
+                        }
+                        continue;
+                    }
+                    if self.is_hidden(&path, is_directory)
                         || prune_ignored(&chain, &path, is_directory)
-                        || self.is_hidden(&path, is_directory)
                     {
                         continue;
                     }
@@ -1218,7 +1242,7 @@ impl BoundDirectory {
                     // classification and supplies the size.
                     match bound_platform::child_info(&self.root, &name) {
                         Ok((found, size)) if found == kind => {
-                            (is_directory, if is_directory { 0 } else { size })
+                            (is_directory, false, if is_directory { 0 } else { size })
                         }
                         _ => continue,
                     }
@@ -1235,13 +1259,19 @@ impl BoundDirectory {
                     let path = self.approved_root.join(&name);
                     let is_directory = metadata.is_dir();
                     if (!is_directory && !metadata.is_file())
-                        || (is_directory && skip_directory(&self.root, &name))
+                        || (is_directory
+                            && !chain.mode.include_ignored
+                            && skip_directory(&self.root, &name))
                         || prune_ignored(&chain, &path, is_directory)
                         || self.is_hidden(&path, is_directory)
                     {
                         continue;
                     }
-                    (is_directory, if is_directory { 0 } else { metadata.len() })
+                    (
+                        is_directory,
+                        false,
+                        if is_directory { 0 } else { metadata.len() },
+                    )
                 }
             };
             if entries.len() == max_entries {
@@ -1250,6 +1280,7 @@ impl BoundDirectory {
             entries.push(BoundDiscoveryEntry {
                 file_name: name,
                 is_directory,
+                is_symlink,
                 size,
             });
         }
@@ -1261,6 +1292,7 @@ impl BoundDirectory {
 pub(crate) struct BoundDiscoveryEntry {
     pub(crate) file_name: OsString,
     pub(crate) is_directory: bool,
+    pub(crate) is_symlink: bool,
     pub(crate) size: u64,
 }
 

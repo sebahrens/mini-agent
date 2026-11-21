@@ -674,10 +674,12 @@ fetch record stores only method, normalized scheme/effective port, one target ta
 normalized host, and a separate target tag for the canonical path and query; host labels, query
 names, and query values are never stored in plaintext.
 A command record stores its operation and a keyed digest of the resolved executable, with no
-arguments or environment. Redirect targets require independent records. Brokered fetch currently
-fails closed after the first response and before a redirected second send until independent-hop
-records are implemented; the direct legacy fetch mode may still follow its separately authorized
-redirect policy. The target-correlation
+arguments or environment. Redirect targets require independent records. Brokered fetch never follows a
+redirect inside one effect: a 3xx comes back to the script as `{status, text: '', location}` and the
+script's next `fetch(location)` is its own effect with its own intent record, URL and destination
+screening and permission decision (see "Delivered corrections (2026-11-21 effect behaviours)"); an
+executor asked to follow one itself still fails closed. The direct legacy fetch mode may still follow
+its separately authorized redirect policy. The target-correlation
 digest is separate from the audit chain hash, is domain-separated by operation and metadata type,
 and supports equality correlation only; it cannot be used as authorization or reversed to recover
 the target.
@@ -1771,3 +1773,55 @@ permission key; writes stay default-deny; `js-read-roots = []` is the explicit o
 
 `mini-agent-nvnkx.173`: idle worker shutdown is cleanup. It uses a 1 s deadline, forces the tree
 teardown on any fault, logs a warning, and a completed run keeps its own exit code.
+
+## Delivered corrections (2026-11-21 effect behaviours)
+
+All of these are parent-side effect handler changes; no worker authority changed, every new option is
+validated by the parent and bound to the invocation grant, and stored-skill principals receive none
+of them (a skill grant whose operation carries a non-default `spawn` option is refused at
+`validate_target`).
+
+`mini-agent-nvnkx.320`: `write_file` creates missing parent directories. Bound path: the existing
+`create_relative_atomic` capability mkdir (one no-follow component at a time) now runs because
+normalization no longer rejects a missing parent; a symlinked existing component is refused. Ambient
+path: `resolve_write_target` records the missing chain, the permission decision is taken on the final
+file path before anything is created, and `ResolvedWriteTarget::materialize_parents` creates the
+directories at execution under the identity-checked canonical ancestor. Directories created are not
+separately checkpointed (the native `write` tool does not either); `/rewind` removes the file.
+
+`mini-agent-nvnkx.321`: a complete `read_file`/`read_files` of UTF-8 text records the native `read`
+tool's fingerprint (metadata, content CRC, line count) in the session `ReadTracker` held by the
+write guard, under a window that never collides with a native repeated-read check. The overwrite
+guard is otherwise unchanged: a changed file, a partial `read_lines` or no read at all is refused,
+and each write untracks the path again.
+
+`mini-agent-nvnkx.322`: a failing `read_files` item carries `e.index`, the position in the script's
+own array (`EffectError.index`, wire field `index`, skipped when absent). The aggregate cap reports
+the index of the first item that did not fit (the number of leading items that did).
+
+`mini-agent-nvnkx.323`: `read_file` decodes UTF-8 (a leading BOM dropped) and BOM-marked UTF-16;
+anything else throws the new closed code `not_text` (wire `NotText`) with a static hint. The write
+guard reports `not_text` for an existing non-UTF-8 preimage. `json_exact` and `toml_parse` ignore a
+leading U+FEFF.
+
+`mini-agent-nvnkx.324`: `list_dir`, `glob` and `grep` take `{include_ignored}` (wire field on each
+operation, `GrepOptions.include_ignored`); results carry `ignored`, the count of entries hidden by
+ignore rules or the dependency/build skip list. Permission and read-deny filters stay in force and
+hidden entries are never counted. `list_dir` lists symlinks as `kind: 'symlink'` without following
+them; glob and grep still skip them.
+
+`mini-agent-nvnkx.319`/`.327`: the production fetch transport returns a followable 3xx as an
+ordinary result with `location` instead of failing as `denied`. A response body over 1 MiB is cut and
+flagged `truncated`; a body is decoded by its declared (or sniffed) charset, else UTF-8, and
+undecodable bytes set `lossy`. DNS failure is the closed code `dns_failed` (wire `DnsFailed`); static
+hints were added for the fetch codes.
+
+`mini-agent-nvnkx.328`: `spawn(program, args, {cwd, env, stdin, timeout_ms})`. `cwd` must resolve
+inside the workspace (the shell tool's `workdir` rule); `env` names pass `ShellEnvPolicy::validate`
+(no loader-injection or credential-looking names, bounded); `stdin` is at most 256 KiB;
+`timeout_ms` only shortens the step deadline. The options are part of the permission subject (subject
+version 2 when any is set; the default subject is unchanged) and of the policy input and hook
+payloads, so a script cannot feed a shell through `stdin` past a command rule. `Sandbox::wrap_command`
+remains the only launcher: `cwd`/`env` select the compatibility shell launch (never the sealed
+snapshot), and Windows refuses the options. The result reports `signal` for a signal death. The
+audit record still stores only the resolved executable digest.

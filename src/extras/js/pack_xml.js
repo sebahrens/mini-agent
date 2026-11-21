@@ -1,7 +1,7 @@
 // Lazily evaluated XML segment of the helper pack; see pack.rs and pack_boot.js.
 // One catalogue line per helper (`//@ name | signature | purpose | usage`); keep lines free of `|`.
-//@ xml_parse | xml_parse(text) | parse strict XML into a plain tree {name, attrs, children, text} | Elements, attributes, text, CDATA; names keep their prefix (bpmn:task). Comments and processing instructions are checked and dropped. text is the element's own character data joined in order (whitespace-only text beside child elements becomes ''). Rejects DOCTYPE/DTD, undefined entities (only &lt; &gt; &amp; &quot; &apos; and &#N; &#xH; are known), duplicate attributes, mismatched tags and illegal characters with SyntaxError '... (line L, column C)'; input over 4 MiB, depth over 256, over 500k nodes or over 1000 attributes on one element give RangeError. Never fetches anything. Example: xml_parse('<a x="1"><b>t</b></a>').children[0].text === 't'
-//@ xml_build | xml_build(node, opts?) | serialise an xml_parse tree back to an XML string | node is {name, attrs?, children?, text?} (text is written before the children). opts: indent (0 to 8 spaces, default compact), declaration (true adds the <?xml?> line), sort (true orders attributes by name, for canonical output). Escapes & < > and quotes, writes numeric references for tab, CR and LF in attributes, never emits CDATA, comments or DOCTYPE; throws on a bad name, a non-string attribute value, an illegal character, depth over 256, over 500k nodes or output over 16 MiB. xml_parse(xml_build(n)) deep-equals n. Example: xml_build({name: 'a', attrs: {x: '1'}, text: 'hi'}) === '<a x="1">hi</a>'
+//@ xml_parse | xml_parse(text) | parse strict XML into a plain tree {name, attrs, children, text} | Elements, attributes, text, CDATA; names keep their prefix (bpmn:task). Comments and processing instructions are checked and dropped. text is the element's own character data joined in order (whitespace-only text beside child elements becomes ''). Elements with both text and child elements also get a non-enumerable `parts` (lost when the tree is cloned or JSON-serialised), the text runs and child nodes in document order, so mixed content like <p>Hello <b>bold</b> world</p> round-trips through xml_build. Rejects DOCTYPE/DTD, undefined entities (only &lt; &gt; &amp; &quot; &apos; and &#N; &#xH; are known), duplicate attributes, mismatched tags and illegal characters with SyntaxError '... (line L, column C)'; input over 4 MiB, depth over 256, over 500k nodes or over 1000 attributes on one element give RangeError. Never fetches anything. Example: xml_parse('<a x="1"><b>t</b></a>').children[0].text === 't'
+//@ xml_build | xml_build(node, opts?) | serialise an xml_parse tree back to an XML string | node is {name, attrs?, children?, text?} (text is written before the children unless `parts` from xml_parse is present and still matches text and children, which keeps mixed content in order). opts: indent (0 to 8 spaces, default compact), declaration (true adds the <?xml?> line), sort (true orders attributes by name, for canonical output). Escapes & < > and quotes, writes numeric references for tab, CR and LF in attributes, never emits CDATA, comments or DOCTYPE; throws on a bad name, a non-string attribute value, an illegal character, depth over 256, over 500k nodes or output over 16 MiB. xml_parse(xml_build(n)) deep-equals n. Example: xml_build({name: 'a', attrs: {x: '1'}, text: 'hi'}) === '<a x="1">hi</a>'
 (function (g) {
   const define = (name, value) =>
     Object.defineProperty(g, name, { value, writable: true, configurable: true, enumerable: false });
@@ -111,8 +111,26 @@
     };
     const close = (frame) => {
       const node = frame.node;
-      const joined = frame.parts.length === 1 ? frame.parts[0] : frame.parts.join("");
+      let joined;
+      if (node.children.length === 0) {
+        joined = frame.parts.length === 1 ? frame.parts[0] : frame.parts.join("");
+      } else {
+        joined = frame.parts.filter((part) => typeof part === "string").join("");
+      }
       node.text = node.children.length && WS_ONLY.test(joined) ? "" : joined;
+      if (node.children.length && node.text !== "") {
+        // Mixed content: keep the text runs and child elements in document order so xml_build
+        // can write them back unchanged. `text` stays the joined convenience value.
+        const parts = [];
+        for (const part of frame.parts) {
+          if (typeof part !== "string") parts.push(part);
+          else if (part !== "") {
+            if (typeof parts[parts.length - 1] === "string") parts[parts.length - 1] += part;
+            else parts.push(part);
+          }
+        }
+        Object.defineProperty(node, "parts", { value: parts, writable: true, configurable: true, enumerable: false });
+      }
       stack.pop();
     };
     while (i < n) {
@@ -209,8 +227,10 @@
         }
         const node = { name, attrs, children: [], text: "" };
         const parent = stack[stack.length - 1];
-        if (parent) parent.node.children.push(node);
-        else root = node;
+        if (parent) {
+          parent.node.children.push(node);
+          parent.parts.push(node);
+        } else root = node;
         const frame = { node, parts: [], name, at: i };
         stack.push(frame);
         if (selfClose) close(frame);
@@ -272,6 +292,32 @@
         return;
       }
       push(head + ">");
+      // Mixed content from xml_parse: `parts` interleaves text runs and the child nodes. It is
+      // honoured only while it still agrees with `text` and `children`; otherwise the plain
+      // text-then-children order applies.
+      const parts = Array.isArray(el.parts) ? el.parts : null;
+      let ordered = false;
+      if (parts !== null && text !== "") {
+        let k = 0;
+        let joined = "";
+        ordered = true;
+        for (const part of parts) {
+          if (typeof part === "string") joined += part;
+          else if (part !== kids[k++]) {
+            ordered = false;
+            break;
+          }
+        }
+        ordered = ordered && k === kids.length && joined === text;
+      }
+      if (ordered) {
+        for (const part of parts) {
+          if (typeof part === "string") push(clean(part, "text").replace(/[&<>\r]/g, (m) => ESC_TEXT[m]));
+          else emit(part, depth + 1);
+        }
+        push("</" + el.name + ">");
+        return;
+      }
       if (text !== "") push(clean(text, "text").replace(/[&<>\r]/g, (m) => ESC_TEXT[m]));
       // Pretty-printing would add whitespace that parses back into the text, so it only applies
       // to elements without character data.

@@ -1028,6 +1028,7 @@ fn worker_protocol_v7_discovery_operations_and_results_are_closed() {
         options: GrepOptions {
             include: Some("**/*.rs".into()),
             case_sensitive: false,
+            include_ignored: false,
         },
     };
     let encoded = serde_json::to_string(&operation).unwrap();
@@ -1059,6 +1060,7 @@ fn worker_protocol_v7_discovery_operations_and_results_are_closed() {
             non_utf8: 3,
             unreadable: 4,
         },
+        ignored: 0,
     };
     let encoded = serde_json::to_string(&result).unwrap();
     assert!(

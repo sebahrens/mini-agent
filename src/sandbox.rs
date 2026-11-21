@@ -6595,6 +6595,7 @@ impl Sandbox {
         cmd: impl Into<ExecutionCommand>,
         limits: CommandLimits,
         cancellation: &CommandCancellation,
+        input: Option<Vec<u8>>,
     ) -> std::io::Result<CommandOutput> {
         if cancellation.is_cancelled() {
             return Ok(CommandOutput {
@@ -6610,7 +6611,7 @@ impl Sandbox {
             limits,
             Some(cancellation.subscribe()),
             None,
-            None,
+            input,
         )
         .await
     }
