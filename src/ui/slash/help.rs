@@ -152,7 +152,7 @@ pub(crate) fn help_lines(
     );
     emit(
         false,
-        "  /memory [status|search|read|write|editor|clear]  manage memory",
+        "  /memory [status|search|read|write|editor|clear|projects|adopt]  manage memory",
     );
     emit(false, "  /clear [/new]          clear the current session");
     emit(

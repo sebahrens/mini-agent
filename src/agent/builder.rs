@@ -794,7 +794,18 @@ fn configure_file_checkpoints(cfg: &Config) {
         Some(cfg.resolve_max_edit_file_size()),
     );
     #[cfg(not(test))]
-    crate::session::file_checkpoints::configure(limits);
+    {
+        crate::session::file_checkpoints::configure(limits);
+        use crate::config::types::{WorkspaceSnapshotsName, WorkspaceSnapshotsSetting};
+        use crate::session::workspace_snapshots::Mode;
+        crate::session::workspace_snapshots::configure(match checkpoints.workspace_snapshots {
+            None | Some(WorkspaceSnapshotsSetting::Named(WorkspaceSnapshotsName::Auto)) => {
+                Mode::Auto
+            }
+            Some(WorkspaceSnapshotsSetting::Flag(true)) => Mode::On,
+            Some(WorkspaceSnapshotsSetting::Flag(false)) => Mode::Off,
+        });
+    }
     #[cfg(test)]
     let _ = limits;
 }

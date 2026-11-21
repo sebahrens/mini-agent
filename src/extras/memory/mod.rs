@@ -306,9 +306,15 @@ pub fn append_memory_block(preamble: &mut String, memory: Option<&str>) {
 /// it does not supply instructions, grants, or a signed top-level system field.
 const CONTEXT_NOTICE: &str = "Persistent memory snapshot (user-maintained context; newer snapshots supersede earlier snapshots):\n";
 
-/// A patch to the memory reconstructed from the earlier notices: keep the first
-/// `prefix` bytes and the last `suffix` bytes, replace what lies between.
+/// Legacy byte-offset patch (read for sessions recorded before readable
+/// updates): keep the first `prefix` bytes and the last `suffix` bytes of the
+/// latest earlier snapshot, replace what lies between.
 const CONTEXT_UPDATE_NOTICE: &str = "Persistent memory update (user-maintained context; a patch against the latest earlier memory snapshot: keep its first `prefix` bytes and last `suffix` bytes, replace everything between with the text below; the result supersedes earlier snapshots):\n";
+
+/// A readable, line-based update to the latest earlier snapshot: the lines
+/// that were removed (`- `) and added (`+ `), under the section they belong
+/// to. The final `[patch ...]` line carries the byte offsets the host replays.
+const CONTEXT_DIFF_NOTICE: &str = "Persistent memory update (user-maintained context; the changes since the latest earlier memory snapshot, as lines removed (`- `) and added (`+ `) under the section they belong to; apply them to that snapshot, the result supersedes earlier snapshots):\n";
 
 /// Patches since the last full snapshot are bounded so the replayed chain
 /// stays short.
@@ -356,6 +362,10 @@ fn reconstruct_memory(history: &[rig::completion::Message]) -> Option<(String, u
                 current = current
                     .take()
                     .and_then(|(base, count)| apply_patch(&base, rest).map(|m| (m, count + 1)));
+            } else if let Some(rest) = text.strip_prefix(CONTEXT_DIFF_NOTICE) {
+                current = current
+                    .take()
+                    .and_then(|(base, count)| apply_diff(&base, rest).map(|m| (m, count + 1)));
             }
         }
     }
@@ -393,40 +403,160 @@ pub(crate) fn context_notice(memory: &str, history: &[rig::completion::Message])
     if previous.as_ref().is_some_and(|(text, _)| text == memory) {
         return None;
     }
+    let full = format!("{CONTEXT_NOTICE}bytes={}\n{memory}", memory.len());
     if let Some((base, updates)) = &previous
         && !memory.is_empty()
         && *updates < MAX_CHAINED_UPDATES
+        && let Some(diff) = diff_notice(base, memory)
+        && diff.len() + PATCH_MARGIN_BYTES < full.len()
     {
-        let mut prefix = base
-            .bytes()
-            .zip(memory.bytes())
-            .take_while(|(a, b)| a == b)
-            .count();
-        while !base.is_char_boundary(prefix) || !memory.is_char_boundary(prefix) {
-            prefix -= 1;
-        }
-        let max_suffix = base.len().min(memory.len()) - prefix;
-        let mut suffix = base
-            .bytes()
-            .rev()
-            .zip(memory.bytes().rev())
-            .take(max_suffix)
-            .take_while(|(a, b)| a == b)
-            .count();
-        while !base.is_char_boundary(base.len() - suffix)
+        return Some(diff);
+    }
+    Some(full)
+}
+
+fn text_lines(text: &str) -> Vec<&str> {
+    text.split_inclusive('\n')
+        .map(|line| line.strip_suffix('\n').unwrap_or(line))
+        .collect()
+}
+
+/// Builds the readable update from `base` to `memory`, or `None` when they do
+/// not differ. The changed region is widened to whole lines.
+fn diff_notice(base: &str, memory: &str) -> Option<String> {
+    let mut prefix = base
+        .bytes()
+        .zip(memory.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    while !base.is_char_boundary(prefix) || !memory.is_char_boundary(prefix) {
+        prefix -= 1;
+    }
+    // Back up to the start of the line holding the first difference.
+    while prefix > 0 && base.as_bytes()[prefix - 1] != b'\n' {
+        prefix -= 1;
+    }
+    let max_suffix = base.len().min(memory.len()) - prefix;
+    let mut suffix = base
+        .bytes()
+        .rev()
+        .zip(memory.bytes().rev())
+        .take(max_suffix)
+        .take_while(|(a, b)| a == b)
+        .count();
+    // The kept tail must begin at a line start (or be empty).
+    let line_start = |text: &str, suffix: usize| {
+        text.len() == suffix || text.as_bytes()[text.len() - suffix - 1] == b'\n'
+    };
+    while suffix > 0
+        && (!base.is_char_boundary(base.len() - suffix)
             || !memory.is_char_boundary(memory.len() - suffix)
-        {
-            suffix -= 1;
-        }
-        let middle = &memory[prefix..memory.len() - suffix];
-        if middle.len() + PATCH_MARGIN_BYTES < memory.len() {
-            return Some(format!(
-                "{CONTEXT_UPDATE_NOTICE}prefix={prefix} suffix={suffix} bytes={}\n{middle}",
-                memory.len()
-            ));
+            || !line_start(base, suffix)
+            || !line_start(memory, suffix))
+    {
+        suffix -= 1;
+    }
+    let old_middle = &base[prefix..base.len() - suffix];
+    let new_middle = &memory[prefix..memory.len() - suffix];
+    if old_middle == new_middle {
+        return None;
+    }
+    let section = base[..prefix]
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("## "));
+    let mut notice = String::from(CONTEXT_DIFF_NOTICE);
+    if let Some(section) = section {
+        notice.push_str(&format!("section: {section}\n"));
+    }
+    for line in text_lines(old_middle) {
+        notice.push_str(&format!("- {line}\n"));
+    }
+    for line in text_lines(new_middle) {
+        notice.push_str(&format!("+ {line}\n"));
+    }
+    let no_newline = !new_middle.is_empty() && !new_middle.ends_with('\n');
+    notice.push_str(&format!(
+        "[patch prefix={prefix} suffix={suffix} bytes={} nonl={}]",
+        memory.len(),
+        u8::from(no_newline)
+    ));
+    Some(notice)
+}
+
+/// Replays [`diff_notice`] on `base`; any inconsistency yields `None`.
+fn apply_diff(base: &str, patch: &str) -> Option<String> {
+    let (body, machine) = patch.rsplit_once('\n').unwrap_or(("", patch));
+    let machine = machine.strip_prefix("[patch ")?.strip_suffix(']')?;
+    let (mut prefix, mut suffix, mut no_newline) = (None, None, false);
+    for field in machine.split_whitespace() {
+        match field.split_once('=')? {
+            ("prefix", value) => prefix = value.parse::<usize>().ok(),
+            ("suffix", value) => suffix = value.parse::<usize>().ok(),
+            ("nonl", value) => no_newline = value == "1",
+            _ => {}
         }
     }
-    Some(format!("{CONTEXT_NOTICE}bytes={}\n{memory}", memory.len()))
+    let (prefix, suffix) = (prefix?, suffix?);
+    let tail_start = base.len().checked_sub(suffix)?;
+    if prefix > tail_start || !base.is_char_boundary(prefix) || !base.is_char_boundary(tail_start) {
+        return None;
+    }
+    let (mut removed, mut added) = (Vec::new(), Vec::new());
+    for line in body.split('\n') {
+        if line.starts_with("section: ") && removed.is_empty() && added.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix('-') {
+            removed.push(rest.strip_prefix(' ').unwrap_or(rest));
+        } else if let Some(rest) = line.strip_prefix('+') {
+            added.push(rest.strip_prefix(' ').unwrap_or(rest));
+        } else if !line.is_empty() {
+            return None;
+        }
+    }
+    if text_lines(&base[prefix..tail_start]) != removed {
+        return None;
+    }
+    let mut middle = added.join("\n");
+    if !added.is_empty() && !no_newline {
+        middle.push('\n');
+    }
+    Some(format!(
+        "{}{middle}{}",
+        &base[..prefix],
+        &base[tail_start..]
+    ))
+}
+
+#[cfg(test)]
+fn legacy_patch_notice(base: &str, memory: &str) -> Option<String> {
+    let mut prefix = base
+        .bytes()
+        .zip(memory.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    while !base.is_char_boundary(prefix) || !memory.is_char_boundary(prefix) {
+        prefix -= 1;
+    }
+    let max_suffix = base.len().min(memory.len()) - prefix;
+    let mut suffix = base
+        .bytes()
+        .rev()
+        .zip(memory.bytes().rev())
+        .take(max_suffix)
+        .take_while(|(a, b)| a == b)
+        .count();
+    while !base.is_char_boundary(base.len() - suffix)
+        || !memory.is_char_boundary(memory.len() - suffix)
+    {
+        suffix -= 1;
+    }
+    let middle = &memory[prefix..memory.len() - suffix];
+    Some(format!(
+        "{CONTEXT_UPDATE_NOTICE}prefix={prefix} suffix={suffix} bytes={}\n{middle}",
+        memory.len()
+    ))
 }
 
 /// Opaque, collision-resistant identity for a project path.
@@ -436,6 +566,92 @@ pub(crate) fn context_notice(memory: &str, history: &[rig::completion::Message])
 pub fn project_slug(path: &Path) -> String {
     let (encoding, identity) = project_path_identity(path);
     crate::paths::opaque_name("memory-project", &[encoding, identity.as_slice()])
+}
+
+/// The path whose bytes identify the project: the main worktree of the Git
+/// repository containing `workspace`, so linked worktrees and subdirectories
+/// of one repository share their project memory. Outside a repository, or when
+/// the Git metadata cannot be read, the workspace path itself. Only small
+/// pointer files are read; no Git process runs.
+pub fn repository_identity_root(workspace: &Path) -> PathBuf {
+    for dir in workspace.ancestors() {
+        let dot_git = dir.join(".git");
+        let Ok(metadata) = fs::symlink_metadata(&dot_git) else {
+            continue;
+        };
+        if metadata.is_dir() {
+            return dir.to_path_buf();
+        }
+        if !metadata.is_file() {
+            return workspace.to_path_buf();
+        }
+        let git_dir = read_git_pointer(&dot_git, Some("gitdir:")).map(|target| dir.join(target));
+        let Some(git_dir) = git_dir else {
+            return workspace.to_path_buf();
+        };
+        let common = read_git_pointer(&git_dir.join("commondir"), None)
+            .map(|target| git_dir.join(target))
+            .unwrap_or(git_dir);
+        let mut lexical = PathBuf::new();
+        for component in common.components() {
+            match component {
+                std::path::Component::ParentDir => {
+                    lexical.pop();
+                }
+                std::path::Component::CurDir => {}
+                other => lexical.push(other),
+            }
+        }
+        let common = lexical;
+        // `<main>/.git` is the common directory of a normal repository; a bare
+        // repository is its own identity.
+        return match (common.file_name(), common.parent()) {
+            (Some(name), Some(parent)) if name == ".git" => parent.to_path_buf(),
+            _ => common,
+        };
+    }
+    workspace.to_path_buf()
+}
+
+fn read_git_pointer(path: &Path, prefix: Option<&str>) -> Option<PathBuf> {
+    use std::io::Read;
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let mut contents = String::new();
+    fs::File::open(path)
+        .ok()?
+        .take(4096)
+        .read_to_string(&mut contents)
+        .ok()?;
+    let line = contents.lines().next()?;
+    let value = match prefix {
+        Some(prefix) => line.strip_prefix(prefix)?.trim(),
+        None => line.trim(),
+    };
+    (!value.is_empty()).then(|| PathBuf::from(value))
+}
+
+/// One project directory under the memory store, as `/memory projects` lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectInfo {
+    pub slug: String,
+    /// Workspace path recorded the last time notes were written, if any.
+    pub path: Option<String>,
+    pub name: Option<String>,
+    /// This process's project.
+    pub current: bool,
+    /// The recorded path still exists on disk.
+    pub path_exists: bool,
+}
+
+fn is_project_slug(slug: &str) -> bool {
+    !slug.is_empty()
+        && slug.len() <= 128
+        && slug
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 #[cfg(unix)]
@@ -540,7 +756,7 @@ impl Mem {
             .as_deref()
             .and_then(Path::parent)
             .expect("startup workspace must have a project path");
-        let project = project_slug(project_root);
+        let project = project_slug(&repository_identity_root(project_root));
         let today = jiff::ZonedDateTime::now().strftime("%Y-%m-%d").to_string();
         tracing::debug!("memory open: root={}, project={}", root.display(), project);
         Mem {
@@ -548,6 +764,116 @@ impl Mem {
             project,
             today,
         }
+    }
+
+    fn project_marker(&self) -> PathBuf {
+        self.project_dir().join("project.json")
+    }
+
+    /// Records which workspace this project's notes belong to (best effort), so
+    /// `/memory projects` can name them and `/memory adopt` can re-attach them
+    /// after the checkout moved. Only the current process's own project is
+    /// described.
+    fn write_project_marker(&self) {
+        let Ok(paths) = crate::paths::process_paths_ref() else {
+            return;
+        };
+        let Some(workspace) = paths.project_dir.as_deref().and_then(Path::parent) else {
+            return;
+        };
+        let identity = repository_identity_root(workspace);
+        if project_slug(&identity) != self.project {
+            return;
+        }
+        let marker = serde_json::json!({
+            "slug": self.project,
+            "path": workspace.display().to_string(),
+            "repository": identity.display().to_string(),
+            "name": identity.file_name().map(|name| name.to_string_lossy().into_owned()),
+        });
+        let Ok(text) = serde_json::to_string_pretty(&marker) else {
+            return;
+        };
+        let path = self.project_marker();
+        if fs::read_to_string(&path).is_ok_and(|current| current == text) {
+            return;
+        }
+        let _ = atomic_write(&path, &text);
+    }
+
+    /// Every project directory in the store, newest-named first by slug order.
+    pub fn list_projects(&self) -> Vec<ProjectInfo> {
+        let Ok(entries) = fs::read_dir(self.root.join("projects")) else {
+            return Vec::new();
+        };
+        let mut projects = Vec::new();
+        for entry in entries.flatten() {
+            let Some(slug) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if !entry.path().is_dir() || !is_project_slug(&slug) {
+                continue;
+            }
+            let marker = fs::read_to_string(entry.path().join("project.json"))
+                .ok()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+            let field = |key: &str| {
+                marker
+                    .as_ref()
+                    .and_then(|value| value.get(key))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
+            };
+            let path = field("repository").or_else(|| field("path"));
+            projects.push(ProjectInfo {
+                current: slug == self.project,
+                path_exists: path.as_deref().is_some_and(|path| Path::new(path).exists()),
+                name: field("name"),
+                path,
+                slug,
+            });
+        }
+        projects.sort_by(|a, b| a.slug.cmp(&b.slug));
+        projects
+    }
+
+    /// Moves another project's notes (scratchpad, daily logs, notes) into this
+    /// project, for a checkout that was moved or renamed. Refused when this
+    /// project already holds notes, so nothing is ever merged or overwritten.
+    pub fn adopt_project(&self, from: &str) -> std::io::Result<String> {
+        let invalid = |message: &str| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, message.to_owned())
+        };
+        if !is_project_slug(from) {
+            return Err(invalid("invalid project name"));
+        }
+        if from == self.project {
+            return Err(invalid("that is already the current project"));
+        }
+        let _store_lock = self.lock_store()?;
+        let source = self.root.join("projects").join(from);
+        if !fs::symlink_metadata(&source).is_ok_and(|m| m.is_dir()) {
+            return Err(invalid("no such project (see /memory projects)"));
+        }
+        let destination = self.project_dir();
+        if let Ok(entries) = fs::read_dir(&destination) {
+            let occupied = entries
+                .flatten()
+                .any(|entry| entry.file_name() != "project.json");
+            if occupied {
+                return Err(invalid(
+                    "the current project already has notes; adopting would overwrite or merge them",
+                ));
+            }
+            fs::remove_dir_all(&destination)?;
+        }
+        fs::create_dir_all(self.root.join("projects"))?;
+        fs::rename(&source, &destination)?;
+        self.write_project_marker();
+        Ok(format!(
+            "adopted project {from} into the current project ({})",
+            self.project
+        ))
     }
 
     pub(crate) fn memory_md(&self) -> PathBuf {
@@ -857,6 +1183,9 @@ continue with offset={end}, or tail=true for the newest entries]",
         };
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
+        }
+        if !matches!(target, WriteTarget::LongTerm) {
+            self.write_project_marker();
         }
         // Message state: `appended_len` is the byte count reported as written
         // (content bytes for overwrite, surviving bytes for a deduped append);
@@ -2292,7 +2621,7 @@ mod cache_placement_tests {
         for round in 0..3 {
             current = format!("{current}note {round} 雪\n");
             let notice = context_notice(&current, &history).unwrap();
-            assert!(notice.starts_with(CONTEXT_UPDATE_NOTICE), "round {round}");
+            assert!(notice.starts_with(CONTEXT_DIFF_NOTICE), "round {round}");
             total += notice.len();
             history.push(Message::assistant(notice));
             assert_eq!(reconstruct_memory(&history).unwrap().0, current);
@@ -2301,6 +2630,54 @@ mod cache_placement_tests {
         assert!(total < first.len() * 2, "{total} vs {}", first.len());
         let cleared = context_notice("", &history).unwrap();
         assert!(cleared.starts_with(CONTEXT_NOTICE));
+    }
+
+    /// mini-agent-nvnkx.217: an update names the section and shows removed and
+    /// added lines verbatim, and the host still reconstructs the exact block.
+    #[test]
+    fn nvnkx217_memory_update_is_readable_and_reconstructs_exactly() {
+        use rig::completion::Message;
+        let filler = "- long-term fact about the build system\n".repeat(30);
+        let before = format!(
+            "\n\n## Scratchpad (open items)\n- [ ] alpha task\n- [ ] bravo task\n- [ ] charlie task\n\n## Long-term memory (MEMORY.md)\n{filler}"
+        );
+        let after = before.replace("- [ ] bravo task\n", "");
+        let first = context_notice(&before, &[]).unwrap();
+        let history = vec![Message::assistant(first)];
+        let notice = context_notice(&after, &history).unwrap();
+        assert!(notice.starts_with(CONTEXT_DIFF_NOTICE), "{notice}");
+        assert!(
+            notice.contains("section: Scratchpad (open items)"),
+            "{notice}"
+        );
+        assert!(notice.contains("- - [ ] bravo task\n"), "{notice}");
+        assert!(!notice.contains("+ - [ ] bravo"), "{notice}");
+        assert!(notice.len() < before.len() / 2);
+        let history = vec![
+            Message::assistant(context_notice(&before, &[]).unwrap()),
+            Message::assistant(notice),
+        ];
+        assert_eq!(reconstruct_memory(&history).unwrap().0, after);
+        assert!(context_notice(&after, &history).is_none());
+        // Edits mid-line, additions without a trailing newline and an old
+        // byte-offset patch in the history all replay exactly.
+        let edited = after.replace("alpha task", "alpha task (done)");
+        let mut chain = history.clone();
+        chain.push(Message::assistant(
+            context_notice(&edited, &history).unwrap(),
+        ));
+        assert_eq!(reconstruct_memory(&chain).unwrap().0, edited);
+        let no_newline = format!("{edited}tail without newline");
+        chain.push(Message::assistant(
+            context_notice(&no_newline, &chain).unwrap(),
+        ));
+        assert_eq!(reconstruct_memory(&chain).unwrap().0, no_newline);
+        let legacy = legacy_patch_notice(&before, &after).unwrap();
+        let old_history = vec![
+            Message::assistant(context_notice(&before, &[]).unwrap()),
+            Message::assistant(legacy),
+        ];
+        assert_eq!(reconstruct_memory(&old_history).unwrap().0, after);
     }
 
     /// mini-agent-sskdu.190: a snapshot delivered as marked user-side context
@@ -2351,5 +2728,80 @@ mod cache_placement_tests {
             effective_session_reserve(100, Some("raw memory 雪"), &session),
             effective_reserve(100, Some("raw memory 雪"))
         );
+    }
+}
+
+#[cfg(test)]
+mod repository_identity_tests {
+    use super::*;
+
+    /// mini-agent-nvnkx.53: linked worktrees and subdirectories share the main
+    /// checkout's project; a moved checkout's notes can be adopted.
+    #[test]
+    fn nvnkx53_linked_worktrees_share_the_main_checkout_project() {
+        let root = crate::tests::OwnedTestDirectory::new("nvnkx53-identity");
+        let main = root.path().join("main");
+        let linked = root.path().join("linked");
+        let admin = main.join(".git").join("worktrees").join("linked");
+        fs::create_dir_all(&admin).unwrap();
+        fs::create_dir_all(main.join("pkg/sub")).unwrap();
+        fs::create_dir_all(&linked).unwrap();
+        fs::write(
+            linked.join(".git"),
+            format!("gitdir: {}\n", admin.display()),
+        )
+        .unwrap();
+        fs::write(admin.join("commondir"), "../..\n").unwrap();
+        let expected = project_slug(&main);
+        assert_eq!(repository_identity_root(&main), main);
+        assert_eq!(
+            project_slug(&repository_identity_root(&main.join("pkg/sub"))),
+            expected
+        );
+        let resolved = repository_identity_root(&linked);
+        assert_eq!(
+            fs::canonicalize(&resolved).unwrap(),
+            fs::canonicalize(&main).unwrap()
+        );
+        // Outside any repository the workspace path is the identity.
+        let plain = root.path().join("plain");
+        fs::create_dir_all(&plain).unwrap();
+        assert_eq!(repository_identity_root(&plain), plain);
+    }
+
+    #[test]
+    fn nvnkx53_projects_are_listed_and_adopted_after_a_move() {
+        let root = crate::tests::OwnedTestDirectory::new("nvnkx53-adopt");
+        let store = root.path().join("memory");
+        let old = "a".repeat(64);
+        let new = "b".repeat(64);
+        let mem = Mem {
+            root: store.clone(),
+            project: new.clone(),
+            today: "2026-01-01".into(),
+        };
+        let old_dir = store.join("projects").join(&old);
+        fs::create_dir_all(&old_dir).unwrap();
+        fs::write(old_dir.join("SCRATCHPAD.md"), "- [ ] carry on\n").unwrap();
+        fs::write(
+            old_dir.join("project.json"),
+            r#"{"slug":"x","repository":"/definitely/not/here","name":"proj"}"#,
+        )
+        .unwrap();
+        let projects = mem.list_projects();
+        assert_eq!(projects.len(), 1);
+        assert!(!projects[0].path_exists && !projects[0].current);
+        assert_eq!(projects[0].name.as_deref(), Some("proj"));
+        assert!(mem.adopt_project("../escape").is_err());
+        assert!(mem.adopt_project(&new).is_err());
+        mem.adopt_project(&old).unwrap();
+        assert_eq!(
+            fs::read_to_string(mem.scratchpad()).unwrap(),
+            "- [ ] carry on\n"
+        );
+        assert!(!old_dir.exists());
+        // A second adoption would merge into existing notes: refused.
+        fs::create_dir_all(store.join("projects").join(&old)).unwrap();
+        assert!(mem.adopt_project(&old).is_err());
     }
 }

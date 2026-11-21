@@ -15,6 +15,27 @@ pub(crate) enum RewindMode {
     Conversation,
     Files,
     Both,
+    /// Restore only the files whose current bytes still match their recorded
+    /// postimage; drifted or uncaptured files are left and named.
+    FilesUnchanged,
+    BothUnchanged,
+    /// Restore every non-ignored workspace file to the snapshot taken before
+    /// the range's first shell command, undoing shell changes too.
+    Workspace,
+}
+impl RewindMode {
+    pub(crate) fn restores_files(self) -> bool {
+        !matches!(self, Self::Conversation | Self::Workspace)
+    }
+    pub(crate) fn is_workspace(self) -> bool {
+        self == Self::Workspace
+    }
+    pub(crate) fn unchanged_only(self) -> bool {
+        matches!(self, Self::FilesUnchanged | Self::BothUnchanged)
+    }
+    pub(crate) fn rewinds_conversation(self) -> bool {
+        matches!(self, Self::Conversation | Self::Both | Self::BothUnchanged)
+    }
 }
 #[derive(Clone)]
 pub(crate) struct RewindBinding {
@@ -23,6 +44,8 @@ pub(crate) struct RewindBinding {
     checkpoints: [u8; 32],
     source: crate::session::file_checkpoints::FileCheckpoints,
     workspace: [u8; 32],
+    /// The bound workspace root, for the workspace-snapshot preview.
+    root: std::path::PathBuf,
 }
 /// SHA-256 of `value`'s JSON serialisation, streamed into the hasher so a
 /// long history is never materialised as one buffer. Byte-identical to
@@ -56,6 +79,7 @@ impl RewindBinding {
             workspace: workspace
                 .compatibility_fingerprint()
                 .map_err(anyhow::Error::msg)?,
+            root: workspace.root().to_path_buf(),
         })
     }
     pub(crate) fn valid(
@@ -82,6 +106,9 @@ enum Stage {
 const CONFIRM_REWIND: &str = "Conversation only";
 const CONFIRM_FILES: &str = "Restore files only";
 const CONFIRM_BOTH: &str = "Restore files and conversation";
+const CONFIRM_FILES_UNCHANGED: &str = "Restore unchanged files only";
+const CONFIRM_BOTH_UNCHANGED: &str = "Restore unchanged files and conversation";
+const CONFIRM_WORKSPACE: &str = "Restore workspace (undoes shell changes too)";
 const CONFIRM_CANCEL: &str = "Cancel";
 
 /// A two-level modal picker for `/rewind`: first pick an earlier
@@ -90,7 +117,7 @@ const CONFIRM_CANCEL: &str = "Cancel";
 /// loop, which owns the session and performs the actual rewind.
 pub struct RewindPicker {
     active: bool,
-    binding: RewindBinding,
+    binding: Box<RewindBinding>,
     stage: Stage,
     list: ListPicker,
     /// Message index of each rewind-able user turn, in order. The list shows
@@ -113,7 +140,7 @@ impl RewindPicker {
         let (targets, previews): (Vec<usize>, Vec<String>) = targets.into_iter().unzip();
         RewindPicker {
             active: false,
-            binding,
+            binding: Box::new(binding),
             stage: Stage::PickMessage,
             list,
             targets,
@@ -249,21 +276,34 @@ impl RewindPicker {
                             "{CONFIRM_BOTH} — {}",
                             self.binding.source.summary_from(&self.binding.session, idx)
                         ),
+                        format!("{CONFIRM_FILES_UNCHANGED} (leaves files changed since the edit, names them)"),
+                        format!("{CONFIRM_BOTH_UNCHANGED} (leaves files changed since the edit, names them)"),
+                        format!(
+                            "{CONFIRM_WORKSPACE} — {}",
+                            self.binding.source.workspace_summary(
+                                &self.binding.session,
+                                idx,
+                                &self.binding.root
+                            )
+                        ),
                         CONFIRM_CANCEL.to_string(),
                     ]);
                     self.list.activate();
                 }
             }
             Stage::Confirm => {
-                self.outcome = Some(if self.list.selected < 3 {
+                self.outcome = Some(if self.list.selected < 6 {
                     RewindOutcome::Confirmed(
                         self.chosen.unwrap_or(0),
                         match self.list.selected {
                             1 => RewindMode::Files,
                             2 => RewindMode::Both,
+                            3 => RewindMode::FilesUnchanged,
+                            4 => RewindMode::BothUnchanged,
+                            5 => RewindMode::Workspace,
                             _ => RewindMode::Conversation,
                         },
-                        self.binding.clone(),
+                        (*self.binding).clone(),
                     )
                 } else {
                     RewindOutcome::Cancelled
@@ -338,6 +378,7 @@ mod tests {
                 checkpoints: [0; 32],
                 source: Default::default(),
                 workspace: [0; 32],
+                root: std::path::PathBuf::new(),
             },
         );
         p.activate();
@@ -362,12 +403,28 @@ mod tests {
     fn confirm_step_cancel_option_backs_out() {
         let mut p = picker();
         p.handle(key(KeyCode::Enter)); // confirm step for the newest target
-        for _ in 0..3 {
+        for _ in 0..6 {
             p.handle(key(KeyCode::Down));
         } // move to "Cancel"
         p.handle(key(KeyCode::Enter));
         assert!(matches!(p.take_outcome(), Some(RewindOutcome::Cancelled)));
         assert!(!p.active());
+    }
+
+    #[test]
+    fn confirm_step_offers_unchanged_only_restore_modes() {
+        let mut p = picker();
+        p.handle(key(KeyCode::Enter));
+        for _ in 0..3 {
+            p.handle(key(KeyCode::Down));
+        }
+        p.handle(key(KeyCode::Enter));
+        let Some(RewindOutcome::Confirmed(3, mode, _)) = p.take_outcome() else {
+            panic!("expected a confirmed rewind");
+        };
+        assert_eq!(mode, RewindMode::FilesUnchanged);
+        assert!(mode.unchanged_only() && mode.restores_files() && !mode.rewinds_conversation());
+        assert!(RewindMode::BothUnchanged.rewinds_conversation());
     }
 
     #[test]
@@ -420,6 +477,7 @@ mod tests {
                 checkpoints: [0; 32],
                 source: Default::default(),
                 workspace: [0; 32],
+                root: std::path::PathBuf::new(),
             },
         );
         p.activate();

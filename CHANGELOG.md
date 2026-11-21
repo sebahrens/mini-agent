@@ -86,6 +86,13 @@ Notable changes to mini-agent are documented in this file. The format follows
 - ACP `initialize` advertises `authMethods` (provider credentials, and terminal logins for a client with `auth.terminal`), `authenticate` re-checks the credential, and `session/new` answers `auth_required` for such a client when the default provider has no credential (mini-agent-nvnkx.109).
 - ACP shell tool results carry `rawOutput` (`kind`, `status`, `workdir`, `output`); commands still run in mini-agent's sandbox rather than a client terminal (mini-agent-nvnkx.110).
 - ACP `additionalDirectories` map onto `--add-dir` when `add_dir_tool_access = true` (otherwise the -32602 error names the key) (mini-agent-nvnkx.111).
+- `git` tool local history operations `merge`, `cherry_pick`, `revert` (each with an `*_abort`), `reset` (`soft`/`mixed`, refused for a pushed HEAD), `branch_delete`, `branch_rename`, `stash_apply`, `stash_drop` and `stash_push` `include_untracked`, through the hardened runner with their own `git/merge`, `git/cherry_pick`, `git/revert`, `git/reset` and `git/branch_delete` permission keys; a conflict leaves the operation in progress and the result lists `conflicted_paths` (mini-agent-nvnkx.50).
+- `git` `status` reports `in_progress` (merge, rebase, cherry-pick, revert or bisect) with a note, and `commit` refuses inside a rebase or cherry-pick unless `allow_in_progress` is set (mini-agent-nvnkx.316).
+- In Git LFS repositories the `git` tool no longer refuses every operation: status, diff, blame, unstage and commit succeed with `lfs_pointers_not_resolved`/`lfs_paths`, while staging or committing LFS-tracked paths and rewriting the working tree are refused with a message that points to the shell (mini-agent-nvnkx.317).
+- `git restore` records the discarded working-tree content as file checkpoints, so `/rewind` brings it back; `switch`, stashes and the merge family register an uncaptured mutation, and the rewind picker notes ranges where shell or git commands ran (mini-agent-nvnkx.49).
+- `/rewind` offers "Restore unchanged files" (per-file restore that leaves files changed since the edit untouched and names them) instead of refusing everything when one file drifted or one edit was uncaptured (mini-agent-nvnkx.48).
+- Whole-workspace snapshots before a turn's first shell command (`[file_checkpoints] workspace_snapshots = "auto" | true | false`, default auto): `/rewind` "Restore workspace" undoes edits, creations and deletions made by shell commands, honours `.gitignore`, and refuses a workspace over 20000 files or 256 MiB (mini-agent-nvnkx.140).
+- `/memory projects` lists project memory directories and `/memory adopt <project>` moves a moved checkout's notes into the current project; each project directory records a `project.json` (mini-agent-nvnkx.53).
 
 ### Fixed
 
@@ -323,6 +330,11 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Fixed: a call that completed and was reported is no longer recorded as "outcome unknown" when the user interrupts before the UI read its result event (mini-agent-nvnkx.166).
 - Fixed: the loop guard lets an identical failing call run again after a `job_status` poll or eight other tool results, so polling for a port, CI run or lock is not blocked for the rest of the turn (mini-agent-nvnkx.19).
 - Shell calls with `workdir` are checked on the plain command with the directory as a separate field: built-in and configured allows, session prefix grants and the read-only classifier (confined to the directory) now match, so `cargo test` or `ls` with a `workdir` no longer prompt every time; an "always" approval stays per directory and a deny rule still wins (mini-agent-nvnkx.60).
+- Retired file-checkpoint records and their preimage blobs are reclaimed on compaction, conversation rewind and file restore, so a long-lived session no longer hits `max_records`/`max_total_bytes` from history that can never be restored (mini-agent-nvnkx.47).
+- File rewind says up front that Windows cannot restore files and stops capturing preimages there, instead of failing at restore time (mini-agent-nvnkx.57).
+- Project memory is keyed on the Git repository's main worktree, so linked worktrees and subdirectories of one repository share their notes (mini-agent-nvnkx.53).
+- A changed memory block is sent to the model as removed and added lines under their section heading instead of a byte-offset patch; older recorded patches still replay (mini-agent-nvnkx.217).
+- A forked session (`--fork-session`, lock-contention fork, cross-workspace resume) gets its own copies of the source's spill files and rewritten references, so they stay readable and survive deleting the source (mini-agent-nvnkx.218).
 
 ### Added
 

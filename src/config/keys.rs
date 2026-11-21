@@ -193,7 +193,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     key("max_text_file_size").shaped(ConfigShape::Integer),
     key("format_timeout_secs").described("Seconds one post-edit [format] command may run (default 10, clamped to 1-600).").shaped(ConfigShape::Integer),
     key("max_edit_file_size").described("Largest file edit/write/notebook_edit will change (default 16 MiB, or max_text_file_size if larger); independent of how much one read returns.").shaped(ConfigShape::Integer),
-    key("file_checkpoints").described("/rewind file checkpoint limits: max_file_bytes (default: the edit/write size limit), max_total_bytes (64 MiB), max_records (2048).").shaped(ConfigShape::Object),
+    key("file_checkpoints").described("/rewind file checkpoint limits: max_file_bytes (default: the edit/write size limit), max_total_bytes (64 MiB), max_records (2048), workspace_snapshots (\"auto\" | true | false: whole-workspace snapshot before a turn's first shell command so /rewind can undo shell changes).").shaped(ConfigShape::Object),
     key("max_read_lines").shaped(ConfigShape::Integer),
     key("max_bash_output_lines").shaped(ConfigShape::Integer),
     key("shell_timeout_secs").described("Foreground shell tool deadline. Other sandbox command classes retain their own limits; this does not alter brokered JavaScript spawn limits.").shaped(ConfigShape::Integer),

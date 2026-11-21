@@ -14,6 +14,7 @@ pub mod storage;
 pub mod title;
 pub(crate) mod tool_image;
 pub(crate) mod user;
+pub(crate) mod workspace_snapshots;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;

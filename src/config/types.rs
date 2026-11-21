@@ -1274,6 +1274,25 @@ pub struct FileCheckpointsConfig {
     pub max_total_bytes: Option<u64>,
     /// Mutation records (and distinct preimages) retained per session.
     pub max_records: Option<u64>,
+    /// Whole-workspace snapshots before a turn's first shell command, so
+    /// `/rewind` can also undo shell changes: `"auto"` (default; refused when
+    /// the workspace exceeds the file/byte caps), `true` (also announce a
+    /// refusal) or `false`.
+    pub workspace_snapshots: Option<WorkspaceSnapshotsSetting>,
+}
+
+/// `[file_checkpoints] workspace_snapshots`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum WorkspaceSnapshotsSetting {
+    Flag(bool),
+    Named(WorkspaceSnapshotsName),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkspaceSnapshotsName {
+    Auto,
 }
 
 /// `[tool_limits]`: output and traversal bounds for the built-in tools. Every

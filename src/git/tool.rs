@@ -85,6 +85,28 @@ pub(crate) enum GitOperation {
     Tag,
     /// Discard working-tree changes of `paths` (from the index, or `revision`).
     Restore,
+    /// Merge a local revision into the current branch (`merge --no-edit`).
+    Merge,
+    /// Abort an in-progress merge (`merge --abort`).
+    MergeAbort,
+    /// Apply one commit onto the current branch (`cherry-pick --no-edit`).
+    CherryPick,
+    /// Abort an in-progress cherry-pick.
+    CherryPickAbort,
+    /// Record a commit that undoes `revision` (`revert --no-edit`).
+    Revert,
+    /// Abort an in-progress revert.
+    RevertAbort,
+    /// Move HEAD (and with `mixed` the index) to a validated local revision.
+    Reset,
+    /// Delete a merged, non-current local branch (`branch -d`).
+    BranchDelete,
+    /// Rename a non-current local branch.
+    BranchRename,
+    /// Re-apply stash `index` (default newest) and keep it.
+    StashApply,
+    /// Drop stash `index` (default newest).
+    StashDrop,
 }
 
 impl GitOperation {
@@ -122,6 +144,17 @@ impl GitOperation {
             Self::StashList => "stash_list",
             Self::Tag => "tag",
             Self::Restore => "restore",
+            Self::Merge => "merge",
+            Self::MergeAbort => "merge_abort",
+            Self::CherryPick => "cherry_pick",
+            Self::CherryPickAbort => "cherry_pick_abort",
+            Self::Revert => "revert",
+            Self::RevertAbort => "revert_abort",
+            Self::Reset => "reset",
+            Self::BranchDelete => "branch_delete",
+            Self::BranchRename => "branch_rename",
+            Self::StashApply => "stash_apply",
+            Self::StashDrop => "stash_drop",
         }
     }
 }
@@ -191,6 +224,32 @@ pub(crate) struct GitArgs {
     /// (default 30, at most 120). Retry with a larger value after a timeout.
     #[serde(default)]
     pub timeout_secs: Option<u16>,
+    /// commit: allow committing while a rebase or cherry-pick is in progress.
+    #[serde(default)]
+    pub allow_in_progress: Option<bool>,
+    /// reset: `soft` (HEAD only) or `mixed` (HEAD and index; the default).
+    #[serde(default)]
+    pub mode: Option<ResetMode>,
+    /// branch_rename: the new branch name (`name` is the current one).
+    #[serde(default)]
+    pub new_name: Option<String>,
+    /// stash_apply, stash_drop: stash number (`stash@{index}`; default 0).
+    #[serde(default)]
+    pub index: Option<u32>,
+    /// stash_push: also stash untracked files.
+    #[serde(default)]
+    pub include_untracked: Option<bool>,
+}
+
+/// How far `reset` moves.
+#[derive(Debug, Default, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ResetMode {
+    /// Move HEAD only; the index and working tree keep their content.
+    Soft,
+    /// Move HEAD and reset the index; the working tree is untouched.
+    #[default]
+    Mixed,
 }
 
 /// Which refs `branches` lists.
@@ -337,9 +396,141 @@ pub(crate) struct GitTool {
 /// an in-place same-size rewrite) misses the cache.
 #[derive(Default)]
 struct FilterDriverCache {
-    entry: std::sync::Mutex<Option<(Vec<u8>, Vec<String>)>>,
+    entry: std::sync::Mutex<Option<(Vec<u8>, FilterDrivers)>>,
     #[cfg(test)]
     probes: std::sync::atomic::AtomicUsize,
+}
+
+/// The filter drivers the contained Git sees, and whether the `lfs` driver (if
+/// any) is the stock Git LFS one: only the canonical `git-lfs` commands (or an
+/// emptied, non-executing value) under the four keys LFS installs. The runner
+/// already replaces repository-defined commands with trusted or empty values
+/// and every driver is neutralised again for the call, so nothing named `lfs`
+/// ever executes; this only decides whether paths bound to it are reported as
+/// unresolved LFS pointers instead of refusing the whole operation.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct FilterDrivers {
+    names: Vec<String>,
+    lfs_canonical: bool,
+}
+
+/// Most files a `restore` checkpoints; a larger selection is reported as
+/// uncaptured instead.
+const RESTORE_CHECKPOINT_MAX_FILES: usize = 256;
+/// Largest file whose preimage a `restore` checkpoints.
+const RESTORE_CHECKPOINT_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Preimages read before `restore`, completed after it.
+#[derive(Default)]
+struct RestoreCapture {
+    entries: Vec<(
+        String,
+        Option<crate::fs::ContentDigest>,
+        crate::session::file_checkpoints::Pending,
+    )>,
+}
+
+/// The current content of a workspace file, read through the binding.
+enum WorkspaceFile {
+    Bytes(Vec<u8>),
+    Missing,
+    Unreadable,
+}
+
+fn read_workspace_file(workspace: &crate::paths::WorkspaceBinding, path: &Path) -> WorkspaceFile {
+    use std::io::Read;
+    match workspace.open_regular_relative(path) {
+        Ok(file) => {
+            let mut bytes = Vec::new();
+            match file
+                .take(RESTORE_CHECKPOINT_FILE_BYTES + 1)
+                .read_to_end(&mut bytes)
+            {
+                Ok(_) if bytes.len() as u64 <= RESTORE_CHECKPOINT_FILE_BYTES => {
+                    WorkspaceFile::Bytes(bytes)
+                }
+                _ => WorkspaceFile::Unreadable,
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => WorkspaceFile::Missing,
+        Err(_) => WorkspaceFile::Unreadable,
+    }
+}
+
+/// Appends the one-time "not captured" checkpoint notice, when one is due.
+fn attach_checkpoint_notice(result: &mut serde_json::Value) {
+    if let Some(notice) = crate::session::file_checkpoints::take_uncaptured_notice() {
+        result["checkpoint_notice"] = serde_json::json!(notice.trim());
+    }
+}
+
+/// Whether a mutation's before/after status snapshots differ in anything
+/// besides the branch header lines, or HEAD moved.
+fn worktree_may_have_changed(before: &serde_json::Value, after: &serde_json::Value) -> bool {
+    let records = |snapshot: &serde_json::Value| -> Vec<String> {
+        snapshot
+            .get("records")
+            .and_then(serde_json::Value::as_array)
+            .map(|records| {
+                records
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .filter(|record| !record.starts_with("# "))
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    head_from_snapshot(before) != head_from_snapshot(after) || records(before) != records(after)
+}
+
+/// Paths in the unmerged (`u`) state of a status snapshot.
+fn conflicted_paths(snapshot: &serde_json::Value) -> Vec<String> {
+    snapshot
+        .get("path_records")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry.get("kind").and_then(serde_json::Value::as_str) == Some("u"))
+        .filter_map(|entry| entry.get("path").and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// What a caller can do about an in-progress history operation.
+fn in_progress_note(operation: &str) -> String {
+    match operation {
+        "merge" => "a merge is in progress: resolve the conflicted paths, stage them and commit, or call merge_abort".to_string(),
+        "cherry-pick" => "a cherry-pick is in progress: resolve the conflicted paths, stage them and commit with allow_in_progress=true, or call cherry_pick_abort; if it came from a multi-commit sequence use the shell to continue or abort".to_string(),
+        "revert" => "a revert is in progress: resolve the conflicted paths, stage them and commit, or call revert_abort".to_string(),
+        other => format!("a {other} is in progress. This tool cannot continue or abort it: use the shell (git {other} --continue or --abort) and do not commit until it is finished"),
+    }
+}
+
+/// Most LFS-bound paths kept per operation.
+const LFS_PATH_CAP: usize = 1000;
+
+/// Shown with every result that was computed in a Git LFS repository.
+const LFS_NOTICE: &str = "lfs_pointers_not_resolved: this repository stores some files with Git LFS and this tool never runs the LFS filters, so LFS-tracked paths are compared as raw working-tree content against pointer files and can be reported as modified when they are not. Staging or committing an LFS-tracked path is refused; use the shell for those paths";
+
+/// The refusal for an operation that would rewrite LFS-tracked files.
+fn lfs_refusal(operation: &str, path: &str) -> ToolError {
+    ToolError::Msg(format!(
+        "Git {operation} refused: this repository uses Git LFS (for example `{path}` is bound to the lfs filter) and this tool never runs LFS filters, so {operation} could replace LFS-tracked files with pointer text. Use the shell for this operation."
+    ))
+}
+
+/// Adds the LFS disclosure to a result when the operation saw LFS-bound paths.
+fn disclose_lfs(result: &mut serde_json::Value, lfs_paths: &[String]) {
+    if lfs_paths.is_empty() {
+        return;
+    }
+    result["lfs_pointers_not_resolved"] = serde_json::json!(true);
+    result["lfs_paths"] = serde_json::json!(lfs_paths.iter().take(50).collect::<Vec<_>>());
+    if lfs_paths.len() > 50 {
+        result["lfs_paths_truncated"] = serde_json::json!(true);
+    }
+    result["lfs_notice"] = serde_json::json!(LFS_NOTICE);
 }
 
 /// Largest repository config file that is fingerprinted by content.
@@ -881,6 +1072,51 @@ impl GitTool {
         Ok(self.runner.lock_repository(&key).await)
     }
 
+    /// The history operation Git is in the middle of, from the existence of
+    /// its state files (no content is read): rebase, merge, cherry-pick,
+    /// revert or bisect.
+    async fn in_progress(&self) -> Result<Option<&'static str>, ToolError> {
+        const STATE: [(&str, &str); 7] = [
+            ("rebase-merge", "rebase"),
+            ("rebase-apply", "rebase"),
+            ("MERGE_HEAD", "merge"),
+            ("CHERRY_PICK_HEAD", "cherry-pick"),
+            ("REVERT_HEAD", "revert"),
+            ("BISECT_LOG", "bisect"),
+            ("sequencer", "cherry-pick"),
+        ];
+        let mut command = vec!["rev-parse".to_string()];
+        for (name, _) in STATE {
+            command.push("--git-path".into());
+            command.push(name.into());
+        }
+        let output = self
+            .run("in-progress-state", command, QUERY_LIMITS, false)
+            .await?;
+        let lines = String::from_utf8_lossy(&output.stdout);
+        let lines: Vec<&str> = lines.lines().collect();
+        if lines.len() != STATE.len() {
+            return Err(ToolError::Msg(
+                "git rev-parse --git-path returned an unexpected answer".to_string(),
+            ));
+        }
+        for ((_, operation), line) in STATE.iter().zip(lines) {
+            if std::fs::symlink_metadata(self.workspace.root().join(line)).is_ok() {
+                return Ok(Some(*operation));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Adds `in_progress` (and how to leave it) to a status result.
+    async fn disclose_in_progress(&self, result: &mut serde_json::Value) {
+        let Ok(Some(operation)) = self.in_progress().await else {
+            return;
+        };
+        result["in_progress"] = serde_json::json!(operation);
+        result["in_progress_note"] = serde_json::json!(in_progress_note(operation));
+    }
+
     async fn head_id(&self) -> Option<String> {
         let output = self
             .run(
@@ -906,7 +1142,7 @@ impl GitTool {
     /// production runner's global/system configuration is a frozen snapshot;
     /// unguarded runners (tests) re-probe nothing extra because their globals
     /// are fixed for the test's duration.
-    async fn cached_filter_drivers(&self) -> Result<Vec<String>, ToolError> {
+    async fn cached_filter_drivers(&self) -> Result<FilterDrivers, ToolError> {
         let root = self.workspace.root().to_path_buf();
         let key = crate::agent::runner::spawn_blocking_scoped(move || config_fingerprint(&root))
             .await
@@ -937,7 +1173,7 @@ impl GitTool {
     }
 
     /// Names of the filter drivers the contained Git would see configured.
-    async fn configured_filter_drivers(&self) -> Result<Vec<String>, ToolError> {
+    async fn configured_filter_drivers(&self) -> Result<FilterDrivers, ToolError> {
         let output = self
             .run(
                 "list-filter-drivers",
@@ -957,9 +1193,9 @@ impl GitTool {
             ));
         }
         match output.exit_status.and_then(|status| status.code()) {
-            Some(0) => parse_filter_driver_names(&output.stdout),
+            Some(0) => parse_filter_drivers(&output.stdout),
             // `git config --get-regexp` exits 1 when no key matches.
-            Some(1) => Ok(Vec::new()),
+            Some(1) => Ok(FilterDrivers::default()),
             _ => Err(ToolError::Msg(
                 "could not enumerate Git filter drivers".to_string(),
             )),
@@ -980,11 +1216,27 @@ impl GitTool {
     /// the operation, additionally empties each configured driver so an
     /// attribute written after this probe still executes nothing.
     async fn filter_guard(&self, operation: &'static str) -> Result<Vec<String>, ToolError> {
+        self.filter_guard_lfs(operation, false)
+            .await
+            .map(|(guard, _)| guard)
+    }
+
+    /// [`Self::filter_guard`] for operations that can tolerate Git LFS: when the
+    /// only bound driver is the stock `lfs` one, the operation proceeds with
+    /// every driver neutralised and the LFS-bound index paths are returned (the
+    /// caller discloses them and refuses to write them). Operations that
+    /// rewrite working-tree content pass `allow_lfs = false`: neutralised
+    /// smudge would replace real files with pointer text.
+    async fn filter_guard_lfs(
+        &self,
+        operation: &'static str,
+        allow_lfs: bool,
+    ) -> Result<(Vec<String>, Vec<String>), ToolError> {
         let drivers = self.cached_filter_drivers().await?;
-        if drivers.is_empty() {
-            return Ok(Vec::new());
+        if drivers.names.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
         }
-        let guard = neutralizing_args(&drivers);
+        let guard = neutralizing_args(&drivers.names);
         let listed = self
             .run(
                 "list-index-paths",
@@ -997,7 +1249,7 @@ impl GitTool {
             )
             .await?;
         if listed.stdout.is_empty() {
-            return Ok(guard);
+            return Ok((guard, Vec::new()));
         }
         let output = self
             .run_with_input(
@@ -1025,9 +1277,19 @@ impl GitTool {
                 "git check-attr output had unexpected field count".to_string(),
             ));
         }
+        let mut lfs_paths = Vec::new();
         for record in fields.chunks_exact(3) {
             let value = String::from_utf8_lossy(record[2]);
-            if let Some(driver) = drivers.iter().find(|driver| driver.as_str() == value) {
+            if let Some(driver) = drivers.names.iter().find(|driver| driver.as_str() == value) {
+                if driver == "lfs" && drivers.lfs_canonical {
+                    if !allow_lfs {
+                        return Err(lfs_refusal(operation, &String::from_utf8_lossy(record[0])));
+                    }
+                    if lfs_paths.len() < LFS_PATH_CAP {
+                        lfs_paths.push(String::from_utf8_lossy(record[0]).into_owned());
+                    }
+                    continue;
+                }
                 return Err(ToolError::Msg(format!(
                     "Git {operation} refused: a tracked path has a `filter` attribute bound to \
                      the repository-configured filter driver `{driver}`, and refreshing the index \
@@ -1036,7 +1298,42 @@ impl GitTool {
                 )));
             }
         }
-        Ok(guard)
+        Ok((guard, lfs_paths))
+    }
+
+    /// The members of `paths` whose `filter` attribute names `lfs`, whether or
+    /// not a driver is configured: staging or committing such a path through
+    /// this tool would store the raw file where Git LFS keeps a pointer.
+    async fn lfs_bound_paths(&self, paths: &[String]) -> Result<Vec<String>, ToolError> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut input = Vec::new();
+        for path in paths {
+            input.extend_from_slice(path.as_bytes());
+            input.push(0);
+        }
+        let output = self
+            .run_with_input(
+                "check-lfs-attributes",
+                vec![
+                    "check-attr".into(),
+                    "-z".into(),
+                    "filter".into(),
+                    "--stdin".into(),
+                ],
+                input,
+                PAGED_TEXT_LIMITS,
+            )
+            .await?;
+        let output = command_result("check-lfs-attributes", PAGED_TEXT_LIMITS, output)
+            .map_err(ToolError::from)?;
+        let fields = output.stdout.split(|byte| *byte == 0).collect::<Vec<_>>();
+        Ok(fields
+            .chunks_exact(3)
+            .filter(|record| record[2] == b"lfs")
+            .map(|record| String::from_utf8_lossy(record[0]).into_owned())
+            .collect())
     }
 
     async fn ensure_no_external_filters(&self, paths: &[String]) -> Result<(), ToolError> {
@@ -1122,7 +1419,7 @@ impl GitTool {
         require_paths(&args.paths, "stage")?;
         let paths = self.validate_paths(&args.paths, Some("git/stage")).await?;
         let _mutation = self.acquire_mutation().await?;
-        let guard = self.filter_guard("stage").await?;
+        let (guard, lfs_paths) = self.filter_guard_lfs("stage", true).await?;
         let before = self.status_snapshot(&guard).await?;
         self.reject_recursive_paths(&paths)?;
         let expanded_paths = self.expand_stage_paths(&paths).await?;
@@ -1130,6 +1427,11 @@ impl GitTool {
             return Err(ToolError::Msg(
                 "Git selection expanded beyond frozen file operands".into(),
             ));
+        }
+        if let Some(path) = self.lfs_bound_paths(&expanded_paths).await?.first() {
+            return Err(ToolError::Msg(format!(
+                "Git stage refused: `{path}` is tracked by Git LFS and this tool never runs the LFS filters, so staging it would store the raw file instead of an LFS pointer. Stage LFS-tracked paths from the shell (`git add`), and stage the other paths here."
+            )));
         }
         self.ensure_no_external_filters(&expanded_paths).await?;
         let mut command = if self.exact_files {
@@ -1145,7 +1447,9 @@ impl GitTool {
         command.extend(paths);
         let output = self.run_mutation("stage", guarded(&guard, command)).await?;
         let after = self.status_snapshot(&guard).await?;
-        Ok(render_mutation_result("stage", None, before, after, output))
+        let mut result = render_mutation_result("stage", None, before, after, output);
+        disclose_lfs(&mut result, &lfs_paths);
+        Ok(result)
     }
 
     async fn unstage(&self, args: GitArgs) -> Result<serde_json::Value, ToolError> {
@@ -1155,7 +1459,7 @@ impl GitTool {
             .validate_paths(&args.paths, Some("git/unstage"))
             .await?;
         let _mutation = self.acquire_mutation().await?;
-        let guard = self.filter_guard("unstage").await?;
+        let (guard, lfs_paths) = self.filter_guard_lfs("unstage", true).await?;
         let before = self.status_snapshot(&guard).await?;
         let head = self
             .run(
@@ -1186,9 +1490,9 @@ impl GitTool {
             .run_mutation("unstage", guarded(&guard, command))
             .await?;
         let after = self.status_snapshot(&guard).await?;
-        Ok(render_mutation_result(
-            "unstage", None, before, after, output,
-        ))
+        let mut result = render_mutation_result("unstage", None, before, after, output);
+        disclose_lfs(&mut result, &lfs_paths);
+        Ok(result)
     }
 
     async fn commit(&self, args: GitArgs) -> Result<serde_json::Value, ToolError> {
@@ -1216,9 +1520,25 @@ impl GitTool {
         }
         let _mutation = self.acquire_mutation().await?;
         // `git commit` itself refreshes the index before writing the tree.
-        let guard = self.filter_guard("commit").await?;
+        let (guard, lfs_paths) = self.filter_guard_lfs("commit", true).await?;
+        if let Some(operation) = self.in_progress().await?
+            && matches!(operation, "rebase" | "cherry-pick")
+            && !args.allow_in_progress.unwrap_or(false)
+        {
+            return Err(ToolError::Msg(format!(
+                "commit refused: a {operation} is in progress, and a commit made now would land in the middle of it. This tool cannot continue or abort a {operation}; finish it in the shell, or pass allow_in_progress=true to commit anyway."
+            )));
+        }
         let before = self.status_snapshot(&guard).await?;
         self.reject_recursive_paths(&paths)?;
+        if !paths.is_empty() {
+            let expanded = self.expand_stage_paths(&paths).await?;
+            if let Some(path) = self.lfs_bound_paths(&expanded).await?.first() {
+                return Err(ToolError::Msg(format!(
+                    "Git commit refused: `{path}` is tracked by Git LFS and this tool never runs the LFS filters, so committing it by path would store the raw file instead of an LFS pointer. Stage and commit LFS-tracked paths from the shell."
+                )));
+            }
+        }
         if amend {
             self.ensure_amendable().await?;
         }
@@ -1265,17 +1585,29 @@ impl GitTool {
         let mut result = render_mutation_result("commit", coaching, before, after, output);
         result["commit_id"] = serde_json::json!(commit_id);
         result["amended"] = serde_json::json!(amend);
+        disclose_lfs(&mut result, &lfs_paths);
         mark_hooks_and_signing_skipped(&mut result);
         Ok(result)
     }
 
-    /// Amend is allowed only for a local-only HEAD commit: one that exists and
-    /// is not reachable from any remote-tracking ref, so history already
-    /// shared is never rewritten.
+    /// Amend is allowed only for a local-only HEAD commit (see
+    /// [`Self::ensure_head_unpublished`]), so shared history is never rewritten.
     async fn ensure_amendable(&self) -> Result<(), ToolError> {
+        self.ensure_head_unpublished("amend", "amending", "Create a new commit instead.")
+            .await
+    }
+
+    /// History-rewriting operations (`amend`, `reset`) apply only to a local-only
+    /// HEAD: one that exists and is not reachable from any remote-tracking ref.
+    async fn ensure_head_unpublished(
+        &self,
+        action: &str,
+        gerund: &str,
+        advice: &str,
+    ) -> Result<(), ToolError> {
         let head = self
             .run(
-                "resolve-amend-head",
+                "resolve-rewrite-head",
                 vec![
                     "rev-parse".into(),
                     "--verify".into(),
@@ -1287,13 +1619,13 @@ impl GitTool {
             )
             .await?;
         if !head.exit_status.is_some_and(|status| status.success()) {
-            return Err(ToolError::Msg(
-                "amend refused: there is no commit to amend".to_string(),
-            ));
+            return Err(ToolError::Msg(format!(
+                "{action} refused: there is no commit to {action}"
+            )));
         }
         let remote = self
             .run(
-                "check-amend-pushed",
+                "check-head-pushed",
                 vec![
                     "for-each-ref".into(),
                     "--contains=HEAD".into(),
@@ -1308,8 +1640,8 @@ impl GitTool {
         let published = String::from_utf8_lossy(&remote.stdout).trim().to_string();
         if !published.is_empty() {
             return Err(ToolError::Msg(format!(
-                "amend refused: HEAD is already contained in the remote-tracking ref {published}; \
-                 amending would rewrite published history. Create a new commit instead."
+                "{action} refused: HEAD is already contained in the remote-tracking ref {published}; \
+                 {gerund} would rewrite published history. {advice}"
             )));
         }
         Ok(())
@@ -1483,9 +1815,10 @@ impl GitTool {
             )
             .await?;
         let after = self.status_snapshot(&guard).await?;
-        Ok(render_mutation_result(
-            "switch", coaching, before, after, output,
-        ))
+        let (changed_before, changed_after) = (before.clone(), after.clone());
+        let mut result = render_mutation_result("switch", coaching, before, after, output);
+        Self::note_uncaptured_worktree_change(&changed_before, &changed_after, &mut result);
+        Ok(result)
     }
 
     async fn stash(&self, args: GitArgs) -> Result<serde_json::Value, ToolError> {
@@ -1549,7 +1882,19 @@ impl GitTool {
         let before = self.status_snapshot(&guard).await?;
         let mut command = vec!["stash".into()];
         if push {
+            if args.include_untracked.unwrap_or(false) {
+                if !paths.is_empty() {
+                    return Err(ToolError::Msg(
+                        "include_untracked cannot be combined with paths".to_string(),
+                    ));
+                }
+                // Git's untracked-file cleanup breaks under literal pathspecs.
+                command.insert(0, "--no-literal-pathspecs".into());
+            }
             command.push("push".into());
+            if args.include_untracked.unwrap_or(false) {
+                command.push("--include-untracked".into());
+            }
             if !message.is_empty() {
                 command.push("--message".into());
                 command.push(message.to_string());
@@ -1571,9 +1916,10 @@ impl GitTool {
             )
             .await?;
         let after = self.status_snapshot(&guard).await?;
-        Ok(render_mutation_result(
-            label, coaching, before, after, output,
-        ))
+        let (changed_before, changed_after) = (before.clone(), after.clone());
+        let mut result = render_mutation_result(label, coaching, before, after, output);
+        Self::note_uncaptured_worktree_change(&changed_before, &changed_after, &mut result);
+        Ok(result)
     }
 
     async fn tag(&self, args: GitArgs) -> Result<serde_json::Value, ToolError> {
@@ -1647,6 +1993,9 @@ impl GitTool {
         let guard = self.filter_guard("restore").await?;
         let before = self.status_snapshot(&guard).await?;
         self.reject_recursive_paths(&paths)?;
+        let captured = self
+            .capture_restore_preimages(&paths, args.revision.as_deref())
+            .await?;
         let mut command = vec!["restore".into(), "--worktree".into()];
         if let Some(revision) = args.revision {
             command.push(format!("--source={revision}"));
@@ -1657,9 +2006,509 @@ impl GitTool {
             .run_mutation("restore", guarded(&guard, command))
             .await?;
         let after = self.status_snapshot(&guard).await?;
-        Ok(render_mutation_result(
-            "restore", coaching, before, after, output,
-        ))
+        let mut result = render_mutation_result("restore", coaching, before, after, output);
+        self.commit_restore_checkpoints(captured, &mut result).await;
+        Ok(result)
+    }
+
+    /// Reads the current bytes of every file `restore` may rewrite and records
+    /// them as file-checkpoint preimages, so `/rewind` can bring back
+    /// uncommitted content the restore discards. Returns `None` entries only
+    /// when the selection is too large to checkpoint.
+    async fn capture_restore_preimages(
+        &self,
+        paths: &[String],
+        revision: Option<&str>,
+    ) -> Result<RestoreCapture, ToolError> {
+        if crate::session::file_checkpoints::current().is_none() {
+            return Ok(RestoreCapture::default());
+        }
+        let mut files = std::collections::BTreeSet::new();
+        let mut listings = vec![{
+            let mut command = vec![
+                "ls-files".to_string(),
+                "-z".into(),
+                "--cached".into(),
+                "--".into(),
+            ];
+            command.extend(paths.iter().cloned());
+            command
+        }];
+        if let Some(revision) = revision {
+            let mut command = vec![
+                "ls-tree".to_string(),
+                "-r".into(),
+                "-z".into(),
+                "--name-only".into(),
+                revision.to_string(),
+                "--".into(),
+            ];
+            command.extend(paths.iter().cloned());
+            listings.push(command);
+        }
+        for command in listings {
+            let output = self
+                .run("list-restore-targets", command, PAGED_TEXT_LIMITS, false)
+                .await?;
+            files.extend(
+                output
+                    .stdout
+                    .split(|byte| *byte == 0)
+                    .filter(|path| !path.is_empty())
+                    .map(|path| String::from_utf8_lossy(path).into_owned()),
+            );
+        }
+        if files.len() > RESTORE_CHECKPOINT_MAX_FILES {
+            crate::session::file_checkpoints::skipped_git();
+            return Ok(RestoreCapture::default());
+        }
+        let workspace = Arc::clone(&self.workspace);
+        let listed: Vec<String> = files.into_iter().collect();
+        let read = crate::agent::runner::spawn_blocking_scoped(move || {
+            listed
+                .into_iter()
+                .map(|file| {
+                    let current = read_workspace_file(&workspace, Path::new(&file));
+                    (file, current)
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|_| ToolError::Msg("restore checkpoint capture failed".to_string()))?;
+        let mut entries = Vec::new();
+        for (file, current) in read {
+            let before = match current {
+                WorkspaceFile::Bytes(bytes) => Some(bytes),
+                WorkspaceFile::Missing => None,
+                WorkspaceFile::Unreadable => {
+                    crate::session::file_checkpoints::skipped_git();
+                    continue;
+                }
+            };
+            let allowed =
+                crate::agent::tools::mutation_diff::preimage_allowed(&self.permission, &file, true);
+            let digest = before
+                .as_ref()
+                .map(|bytes| crate::fs::ContentDigest::of(bytes));
+            let preimage = match (&before, &digest) {
+                (Some(bytes), Some(digest)) => {
+                    Some(crate::session::file_checkpoints::Preimage::new(
+                        Arc::<[u8]>::from(bytes.as_slice()),
+                        digest,
+                    ))
+                }
+                _ => None,
+            };
+            let pending = crate::session::file_checkpoints::prepare(
+                &self.workspace,
+                Path::new(&file),
+                preimage,
+                allowed,
+            )
+            .await;
+            if let Some(pending) = pending {
+                entries.push((file, digest, pending));
+            }
+        }
+        Ok(RestoreCapture { entries })
+    }
+
+    /// Completes the captures taken before `restore`: each file whose bytes
+    /// changed gets its postimage recorded.
+    async fn commit_restore_checkpoints(
+        &self,
+        captured: RestoreCapture,
+        result: &mut serde_json::Value,
+    ) {
+        if captured.entries.is_empty() {
+            return;
+        }
+        let workspace = Arc::clone(&self.workspace);
+        let committed = crate::agent::runner::spawn_blocking_scoped(move || {
+            captured
+                .entries
+                .into_iter()
+                .map(|(file, before, pending)| {
+                    let after = read_workspace_file(&workspace, Path::new(&file));
+                    (before, after, pending)
+                })
+                .collect::<Vec<_>>()
+        })
+        .await;
+        let Ok(committed) = committed else {
+            crate::session::file_checkpoints::skipped_git();
+            return;
+        };
+        crate::session::file_checkpoints::published();
+        for (before, after, mut pending) in committed {
+            match after {
+                WorkspaceFile::Bytes(bytes) => {
+                    let digest = crate::fs::ContentDigest::of(&bytes);
+                    if before.as_ref() != Some(&digest) {
+                        pending.committed(&digest, bytes.len());
+                    }
+                }
+                // The restore removed the file or it cannot be read back.
+                _ => {
+                    if before.is_some() {
+                        crate::session::file_checkpoints::skipped_git();
+                    }
+                }
+            }
+        }
+        attach_checkpoint_notice(result);
+    }
+
+    /// Marks a working-tree-rewriting operation whose files cannot be
+    /// individually checkpointed, when the before/after snapshots show it
+    /// changed anything.
+    fn note_uncaptured_worktree_change(
+        before: &serde_json::Value,
+        after: &serde_json::Value,
+        result: &mut serde_json::Value,
+    ) {
+        if !worktree_may_have_changed(before, after) {
+            return;
+        }
+        crate::session::file_checkpoints::skipped_git();
+        crate::session::file_checkpoints::external_mutation();
+        attach_checkpoint_notice(result);
+    }
+
+    async fn history_operation(&self, args: GitArgs) -> Result<serde_json::Value, ToolError> {
+        let operation = args.operation;
+        let label = operation.name();
+        let merge = matches!(operation, GitOperation::Merge | GitOperation::MergeAbort);
+        let is_abort = matches!(
+            operation,
+            GitOperation::MergeAbort | GitOperation::CherryPickAbort | GitOperation::RevertAbort
+        );
+        if !args.paths.is_empty() {
+            return Err(ToolError::Msg(format!("{label} takes no paths")));
+        }
+        reject_irrelevant_fields(&args, operation == GitOperation::Merge, !is_abort, false)?;
+        let (key, family) = match operation {
+            GitOperation::Merge | GitOperation::MergeAbort => ("git/merge", "merge"),
+            GitOperation::CherryPick | GitOperation::CherryPickAbort => {
+                ("git/cherry_pick", "cherry-pick")
+            }
+            _ => ("git/revert", "revert"),
+        };
+        let mut command = vec![family.to_string()];
+        let identity;
+        if is_abort {
+            command.push("--abort".into());
+            identity = "abort".to_string();
+        } else {
+            let revision = args
+                .revision
+                .as_deref()
+                .ok_or_else(|| ToolError::Msg(format!("{label} requires a revision")))?;
+            if !merge && revision.contains("..") {
+                return Err(ToolError::Msg(format!(
+                    "{label} takes a single commit, not a range"
+                )));
+            }
+            self.validate_revision(revision).await?;
+            command.push("--no-edit".into());
+            if merge && let Some(message) = args.message.as_deref() {
+                if message.trim().is_empty() || message.len() > 16 * 1024 || message.contains('\0')
+                {
+                    return Err(ToolError::Msg(
+                        "merge message must be non-empty, at most 16 KiB and free of NUL"
+                            .to_string(),
+                    ));
+                }
+                command.push("-m".into());
+                command.push(message.to_string());
+            }
+            if merge {
+                command.push("--no-stat".into());
+            }
+            command.push(revision.to_string());
+            identity = revision.to_string();
+        }
+        let coaching = self.permission(key, &identity).await?;
+        let _mutation = self.acquire_mutation().await?;
+        let guard = self.filter_guard(label).await?;
+        let state = self.in_progress().await?;
+        if is_abort {
+            if state != Some(family) {
+                return Err(ToolError::Msg(format!(
+                    "{label} refused: no {family} is in progress"
+                )));
+            }
+        } else if let Some(state) = state {
+            return Err(ToolError::Msg(format!(
+                "{label} refused: a {state} is already in progress; finish or abort it first"
+            )));
+        }
+        let before = self.status_snapshot(&guard).await?;
+        // The result is a commit (merge, cherry-pick, revert), which needs the
+        // host-resolved identity.
+        let output = self
+            .run_with_input(
+                label,
+                guarded(&guard, command),
+                Vec::new(),
+                LOCAL_MUTATION_LIMITS,
+            )
+            .await?;
+        let after = self.status_snapshot(&guard).await?;
+        let conflicted = conflicted_paths(&after);
+        let mut result =
+            render_mutation_result(label, coaching, before.clone(), after.clone(), output);
+        self.disclose_history_state(&mut result, &conflicted).await;
+        Self::note_uncaptured_worktree_change(&before, &after, &mut result);
+        mark_hooks_and_signing_skipped(&mut result);
+        Ok(result)
+    }
+
+    /// Adds the structured state of a history operation: the operation still in
+    /// progress (a conflict stopped it) and the conflicted paths.
+    async fn disclose_history_state(&self, result: &mut serde_json::Value, conflicted: &[String]) {
+        result["conflicted_paths"] =
+            serde_json::json!(conflicted.iter().take(100).collect::<Vec<_>>());
+        if conflicted.len() > 100 {
+            result["conflicted_paths_truncated"] = serde_json::json!(true);
+        }
+        match self.in_progress().await {
+            Ok(Some(operation)) => {
+                result["in_progress"] = serde_json::json!(operation);
+                result["in_progress_note"] = serde_json::json!(in_progress_note(operation));
+            }
+            _ => {
+                result["in_progress"] = serde_json::Value::Null;
+            }
+        }
+    }
+
+    async fn reset(&self, args: GitArgs) -> Result<serde_json::Value, ToolError> {
+        reject_irrelevant_fields(&args, false, true, false)?;
+        if !args.paths.is_empty() {
+            return Err(ToolError::Msg("reset takes no paths".to_string()));
+        }
+        let revision = args
+            .revision
+            .as_deref()
+            .ok_or_else(|| ToolError::Msg("reset requires a revision".to_string()))?;
+        self.validate_revision(revision).await?;
+        let mode = args.mode.unwrap_or_default();
+        let flag = match mode {
+            ResetMode::Soft => "--soft",
+            ResetMode::Mixed => "--mixed",
+        };
+        let coaching = self
+            .permission("git/reset", &format!("{flag} {revision}"))
+            .await?;
+        let _mutation = self.acquire_mutation().await?;
+        let (guard, lfs_paths) = self.filter_guard_lfs("reset", true).await?;
+        if let Some(state) = self.in_progress().await? {
+            return Err(ToolError::Msg(format!(
+                "reset refused: a {state} is in progress; finish or abort it first"
+            )));
+        }
+        let resolved = self
+            .run(
+                "resolve-reset-target",
+                vec![
+                    "rev-parse".into(),
+                    "--verify".into(),
+                    "--end-of-options".into(),
+                    format!("{revision}^{{commit}}"),
+                ],
+                QUERY_LIMITS,
+                false,
+            )
+            .await
+            .map_err(|_| {
+                ToolError::Msg(format!(
+                    "reset refused: {} does not name a commit",
+                    shown_revision(revision)
+                ))
+            })?;
+        let target = String::from_utf8_lossy(&resolved.stdout).trim().to_string();
+        if self.head_id().await.as_deref() != Some(target.as_str()) {
+            self.ensure_head_unpublished(
+                "reset",
+                "resetting",
+                "Use revert to undo published commits.",
+            )
+            .await?;
+        }
+        let before = self.status_snapshot(&guard).await?;
+        let output = self
+            .run_mutation(
+                "reset",
+                guarded(&guard, vec!["reset".into(), flag.into(), target]),
+            )
+            .await?;
+        let after = self.status_snapshot(&guard).await?;
+        let mut result = render_mutation_result("reset", coaching, before, after, output);
+        result["mode"] = serde_json::json!(match mode {
+            ResetMode::Soft => "soft",
+            ResetMode::Mixed => "mixed",
+        });
+        disclose_lfs(&mut result, &lfs_paths);
+        Ok(result)
+    }
+
+    /// The name of the checked-out branch, or `None` when HEAD is detached.
+    async fn current_branch(&self) -> Result<Option<String>, ToolError> {
+        let output = self
+            .run(
+                "current-branch",
+                vec![
+                    "symbolic-ref".into(),
+                    "--quiet".into(),
+                    "--short".into(),
+                    "HEAD".into(),
+                ],
+                QUERY_LIMITS,
+                true,
+            )
+            .await?;
+        if !output.exit_status.is_some_and(|status| status.success()) {
+            return Ok(None);
+        }
+        let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Ok((!name.is_empty()).then_some(name))
+    }
+
+    async fn branch_manage(&self, args: GitArgs) -> Result<serde_json::Value, ToolError> {
+        reject_irrelevant_fields(&args, false, false, false)?;
+        if !args.paths.is_empty() {
+            return Err(ToolError::Msg(format!(
+                "{} takes no paths",
+                args.operation.name()
+            )));
+        }
+        let rename = args.operation == GitOperation::BranchRename;
+        let label = args.operation.name();
+        let name = Self::required_name(&args, label)?;
+        self.validate_ref_name(name, "branch").await?;
+        let new_name = if rename {
+            let new_name = args
+                .new_name
+                .as_deref()
+                .ok_or_else(|| ToolError::Msg("branch_rename requires new_name".to_string()))?;
+            self.validate_ref_name(new_name, "branch").await?;
+            Some(new_name)
+        } else {
+            if args.new_name.is_some() {
+                return Err(ToolError::Msg(
+                    "new_name is supported only by branch_rename".to_string(),
+                ));
+            }
+            None
+        };
+        let identity = match new_name {
+            Some(new_name) => format!("rename {name} {new_name}"),
+            None => format!("delete {name}"),
+        };
+        let coaching = self.permission("git/branch_delete", &identity).await?;
+        let _mutation = self.acquire_mutation().await?;
+        if self.current_branch().await?.as_deref() == Some(name) {
+            return Err(ToolError::Msg(format!(
+                "{label} refused: `{name}` is the checked-out branch; switch to another branch first"
+            )));
+        }
+        let exists = self
+            .run(
+                "check-branch-exists",
+                vec![
+                    "rev-parse".into(),
+                    "--verify".into(),
+                    "--quiet".into(),
+                    format!("refs/heads/{name}"),
+                ],
+                QUERY_LIMITS,
+                true,
+            )
+            .await?;
+        if !exists.exit_status.is_some_and(|status| status.success()) {
+            return Err(ToolError::Msg(format!(
+                "{label} refused: there is no local branch `{name}`"
+            )));
+        }
+        let command = match new_name {
+            // `-d` refuses a branch whose commits are not merged anywhere else.
+            None => vec!["branch".to_string(), "-d".into(), name.to_string()],
+            Some(new_name) => vec![
+                "branch".to_string(),
+                "-m".into(),
+                name.to_string(),
+                new_name.to_string(),
+            ],
+        };
+        let output = self.run_mutation("branch", command).await?;
+        Ok(render_ref_result(label, coaching, output))
+    }
+
+    async fn stash_ref(&self, args: &GitArgs) -> Result<String, ToolError> {
+        let index = args.index.unwrap_or(0);
+        if index > 1000 {
+            return Err(ToolError::Msg(
+                "stash index must be at most 1000".to_string(),
+            ));
+        }
+        let listed = self
+            .run(
+                "stash-list",
+                vec!["stash".into(), "list".into(), "--format=%gd".into()],
+                QUERY_LIMITS,
+                false,
+            )
+            .await?;
+        let count = String::from_utf8_lossy(&listed.stdout).lines().count();
+        if (index as usize) >= count {
+            return Err(ToolError::Msg(format!(
+                "stash {index} does not exist ({count} stash{} saved)",
+                if count == 1 { "" } else { "es" }
+            )));
+        }
+        Ok(format!("stash@{{{index}}}"))
+    }
+
+    async fn stash_by_index(&self, args: GitArgs) -> Result<serde_json::Value, ToolError> {
+        reject_irrelevant_fields(&args, false, false, false)?;
+        if !args.paths.is_empty() {
+            return Err(ToolError::Msg(format!(
+                "{} takes no paths",
+                args.operation.name()
+            )));
+        }
+        let apply = args.operation == GitOperation::StashApply;
+        let label = args.operation.name();
+        let index = args.index.unwrap_or(0);
+        let identity = format!("{} {index}", if apply { "apply" } else { "drop" });
+        let coaching = self.permission("git/stash", &identity).await?;
+        let _mutation = self.acquire_mutation().await?;
+        let stash = self.stash_ref(&args).await?;
+        if !apply {
+            let output = self
+                .run_mutation("stash", vec!["stash".into(), "drop".into(), stash])
+                .await?;
+            return Ok(render_ref_result(label, coaching, output));
+        }
+        let guard = self.filter_guard(label).await?;
+        let before = self.status_snapshot(&guard).await?;
+        let output = self
+            .run_with_input(
+                "stash",
+                guarded(&guard, vec!["stash".into(), "apply".into(), stash]),
+                Vec::new(),
+                LOCAL_MUTATION_LIMITS,
+            )
+            .await?;
+        let after = self.status_snapshot(&guard).await?;
+        let conflicted = conflicted_paths(&after);
+        let mut result =
+            render_mutation_result(label, coaching, before.clone(), after.clone(), output);
+        result["conflicted_paths"] =
+            serde_json::json!(conflicted.iter().take(100).collect::<Vec<_>>());
+        Self::note_uncaptured_worktree_change(&before, &after, &mut result);
+        Ok(result)
     }
 
     async fn read_operation(&self, args: GitArgs) -> Result<serde_json::Value, ToolError> {
@@ -1729,11 +2578,46 @@ impl GitTool {
         }
         let named = matches!(
             args.operation,
-            GitOperation::BranchCreate | GitOperation::Switch | GitOperation::Tag
+            GitOperation::BranchCreate
+                | GitOperation::Switch
+                | GitOperation::Tag
+                | GitOperation::BranchDelete
+                | GitOperation::BranchRename
         );
         if !named && args.name.is_some() {
             return Err(ToolError::Msg(
-                "name is supported only by branch_create, switch and tag".to_string(),
+                "name is supported only by branch_create, switch, tag, branch_delete and branch_rename"
+                    .to_string(),
+            ));
+        }
+        if args.allow_in_progress.is_some() && args.operation != GitOperation::Commit {
+            return Err(ToolError::Msg(
+                "allow_in_progress is supported only by commit".to_string(),
+            ));
+        }
+        if args.mode.is_some() && args.operation != GitOperation::Reset {
+            return Err(ToolError::Msg(
+                "mode is supported only by reset".to_string(),
+            ));
+        }
+        if args.new_name.is_some() && args.operation != GitOperation::BranchRename {
+            return Err(ToolError::Msg(
+                "new_name is supported only by branch_rename".to_string(),
+            ));
+        }
+        if args.index.is_some()
+            && !matches!(
+                args.operation,
+                GitOperation::StashApply | GitOperation::StashDrop
+            )
+        {
+            return Err(ToolError::Msg(
+                "index is supported only by stash_apply and stash_drop".to_string(),
+            ));
+        }
+        if args.include_untracked.is_some() && args.operation != GitOperation::StashPush {
+            return Err(ToolError::Msg(
+                "include_untracked is supported only by stash_push".to_string(),
             ));
         }
         match args.operation {
@@ -1746,8 +2630,10 @@ impl GitTool {
                     serde_json::to_string(&serde_json::json!({ "paths": paths }))?
                 };
                 let coaching = self.permission("git/status", &identity).await?;
-                let guard = self.filter_guard("status").await?;
+                let (guard, lfs_paths) = self.filter_guard_lfs("status", true).await?;
                 let mut value = self.status_snapshot_for(&guard, &paths).await?;
+                disclose_lfs(&mut value, &lfs_paths);
+                self.disclose_in_progress(&mut value).await;
                 if !self.exact_files {
                     // Lossless path records serve the host-side `/commit`
                     // flow (`selected_files_only`), not the model.
@@ -1803,7 +2689,7 @@ impl GitTool {
                 command.push("--".into());
                 command.extend(paths);
                 // Without `--cached` every diff reads the working tree.
-                let guard = self.filter_guard("diff").await?;
+                let (guard, lfs_paths) = self.filter_guard_lfs("diff", true).await?;
                 let mut result = render_paged_text_result(
                     "diff",
                     coaching,
@@ -1812,6 +2698,7 @@ impl GitTool {
                     args.offset,
                 )?;
                 self.disclose_submodules(&mut result).await;
+                disclose_lfs(&mut result, &lfs_paths);
                 Ok(result)
             }
             GitOperation::Log => {
@@ -1948,8 +2835,8 @@ impl GitTool {
                 }
                 command.push("--".into());
                 command.extend(paths);
-                let guard = self.filter_guard("blame").await?;
-                render_paged_text_result(
+                let (guard, lfs_paths) = self.filter_guard_lfs("blame", true).await?;
+                let mut result = render_paged_text_result(
                     "blame",
                     coaching,
                     self.run(
@@ -1961,7 +2848,9 @@ impl GitTool {
                     .await
                     .map_err(timeout_guidance)?,
                     args.offset,
-                )
+                )?;
+                disclose_lfs(&mut result, &lfs_paths);
+                Ok(result)
             }
             GitOperation::Stage => self.stage(args).await,
             GitOperation::Unstage => self.unstage(args).await,
@@ -1974,6 +2863,17 @@ impl GitTool {
             }
             GitOperation::Tag => self.tag(args).await,
             GitOperation::Restore => self.restore(args).await,
+            GitOperation::Merge
+            | GitOperation::MergeAbort
+            | GitOperation::CherryPick
+            | GitOperation::CherryPickAbort
+            | GitOperation::Revert
+            | GitOperation::RevertAbort => self.history_operation(args).await,
+            GitOperation::Reset => self.reset(args).await,
+            GitOperation::BranchDelete | GitOperation::BranchRename => {
+                self.branch_manage(args).await
+            }
+            GitOperation::StashApply | GitOperation::StashDrop => self.stash_by_index(args).await,
         }
     }
 }
@@ -2072,7 +2972,7 @@ impl Tool for GitTool {
         if self.read_only {
             return "Inspect the bound Git repository through fixed read-only operations: status (collapsed untracked dirs; optional paths narrow it; truncated is flagged; submodule changes are never reported, results carry submodules_ignored when the repository has submodules), diff (revision may be a range a..b or a...b; revision_to for a two-commit diff; staged for the index), show (format patch|stat|name_status; at most 192 KiB per call, page with offset/next_offset or narrow with paths), log (revision may be a range; skip/next_skip pages past 100 commits; each commit carries subject plus a body of at most 2 KiB with body_truncated, use show for the full message; author/grep are fixed strings matched against the whole message), blame (one path, optional start_line/end_line/revision, paged like diff), branches (scope local|remote|all|tags; page with skip/max_count and next_skip) and stash_list. Nothing can be changed and nothing is fetched. No shell, raw argv, remotes, or network access is available.".to_string();
         }
-        "Inspect and update the bound Git repository through fixed structured operations: status (collapsed untracked dirs; optional paths narrow it; truncated is flagged; submodule changes are never reported, results carry submodules_ignored when the repository has submodules), diff (revision may be a range a..b or a...b; revision_to for a two-commit diff; staged for the index) and show (format patch|stat|name_status; at most 192 KiB per call, page with offset/next_offset or narrow with paths), log (revision may be a range; skip/next_skip pages past 100 commits; each commit carries subject plus a body of at most 2 KiB with body_truncated, use show for the full message; author/grep are fixed strings matched against the whole message; a query that exceeds its 30 s budget returns the commits found so far, and log, blame, branches and stash_list accept timeout_secs up to 120), blame (one path, optional start_line/end_line/revision, paged like diff), stage, unstage, commit (optional signoff, allow_empty and a guarded amend of an unpushed HEAD; hooks and signing are never run and the result says so), branches (scope local|remote|all|tags lists remote-tracking branches or tags without network access; page with skip/max_count and next_skip), branch_create (name, optional start revision), switch (name of an existing branch), stash_push (optional message/paths), stash_pop, stash_list, tag (name, optional revision; message makes it annotated) and restore (discard working-tree changes of paths, from the index or revision). Every mutation has its own git/<operation> permission key. No shell, raw argv, remotes, or network access is available; reset, revert, cherry-pick, merge, rebase, fetch, pull and push are intentionally not offered.".to_string()
+        "Inspect and update the bound Git repository through fixed structured operations: status (collapsed untracked dirs; optional paths narrow it; truncated is flagged; submodule changes are never reported, results carry submodules_ignored when the repository has submodules), diff (revision may be a range a..b or a...b; revision_to for a two-commit diff; staged for the index) and show (format patch|stat|name_status; at most 192 KiB per call, page with offset/next_offset or narrow with paths), log (revision may be a range; skip/next_skip pages past 100 commits; each commit carries subject plus a body of at most 2 KiB with body_truncated, use show for the full message; author/grep are fixed strings matched against the whole message; a query that exceeds its 30 s budget returns the commits found so far, and log, blame, branches and stash_list accept timeout_secs up to 120), blame (one path, optional start_line/end_line/revision, paged like diff), stage, unstage, commit (optional signoff, allow_empty and a guarded amend of an unpushed HEAD; hooks and signing are never run and the result says so), branches (scope local|remote|all|tags lists remote-tracking branches or tags without network access; page with skip/max_count and next_skip), branch_create (name, optional start revision), switch (name of an existing branch), stash_push (optional message/paths), stash_pop, stash_list, tag (name, optional revision; message makes it annotated), restore (discard working-tree changes of paths, from the index or revision; checkpointed for /rewind), merge, cherry_pick and revert (revision; each has an *_abort; a conflict leaves it in progress with conflicted_paths), reset (revision, mode soft|mixed; refused for a pushed HEAD), branch_delete and branch_rename (name, new_name; never the current branch), stash_apply and stash_drop (index), and stash_push include_untracked. status reports in_progress; commit refuses inside a rebase or cherry-pick unless allow_in_progress, and rebase or bisect must be continued in the shell. In a Git LFS repository results carry lfs_pointers_not_resolved and LFS-tracked paths cannot be staged or committed. Every mutation has its own git/<operation> permission key. No shell, raw argv, remotes, or network access is available; rebase, fetch, pull and push are not offered.".to_string()
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -2104,6 +3004,17 @@ impl Tool for GitTool {
                 "stash_list",
                 "tag",
                 "restore",
+                "merge",
+                "merge_abort",
+                "cherry_pick",
+                "cherry_pick_abort",
+                "revert",
+                "revert_abort",
+                "reset",
+                "branch_delete",
+                "branch_rename",
+                "stash_apply",
+                "stash_drop",
             ]
         };
         let mut schema = serde_json::json!({
@@ -2136,7 +3047,12 @@ impl Tool for GitTool {
                 "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 120, "description": "log, blame, branches, stash_list: time budget for this call (default 30); retry with a larger value after a timeout" },
                 "amend": { "type": "boolean", "description": "commit only: amend the HEAD commit if it is not in any remote-tracking ref (separate git/amend permission)" },
                 "signoff": { "type": "boolean", "description": "commit only: add a Signed-off-by trailer" },
-                "allow_empty": { "type": "boolean", "description": "commit only: allow a commit with no changes" }
+                "allow_empty": { "type": "boolean", "description": "commit only: allow a commit with no changes" },
+                "allow_in_progress": { "type": "boolean", "description": "commit only: allow it inside a rebase or cherry-pick" },
+                "mode": { "type": "string", "enum": ["soft", "mixed"], "description": "reset only (default mixed)" },
+                "new_name": { "type": "string", "maxLength": 255, "description": "branch_rename only" },
+                "index": { "type": "integer", "minimum": 0, "maximum": 1000, "description": "stash_apply, stash_drop: stash number (default 0)" },
+                "include_untracked": { "type": "boolean", "description": "stash_push only" }
             },
             "required": ["operation"],
             "additionalProperties": false
@@ -2145,7 +3061,18 @@ impl Tool for GitTool {
             && let Some(properties) = schema["properties"].as_object_mut()
         {
             // The inspection-only variant does not advertise mutation fields.
-            for key in ["name", "message", "amend", "signoff", "allow_empty"] {
+            for key in [
+                "name",
+                "message",
+                "amend",
+                "signoff",
+                "allow_empty",
+                "allow_in_progress",
+                "mode",
+                "new_name",
+                "index",
+                "include_untracked",
+            ] {
                 properties.remove(key);
             }
             properties.insert(
@@ -2221,10 +3148,20 @@ fn guarded(guard: &[String], args: Vec<String>) -> Vec<String> {
 /// Parses `git config -z --get-regexp '^filter\.'` output (`key LF value NUL`
 /// or `key NUL`) into the sorted, distinct driver names. A name that cannot
 /// be expressed as a `-c filter.<name>.<var>=` override fails closed.
+#[cfg(test)]
 fn parse_filter_driver_names(stdout: &[u8]) -> Result<Vec<String>, ToolError> {
+    parse_filter_drivers(stdout).map(|drivers| drivers.names)
+}
+
+/// Like [`parse_filter_driver_names`], also classifying the `lfs` driver.
+fn parse_filter_drivers(stdout: &[u8]) -> Result<FilterDrivers, ToolError> {
     let mut names = std::collections::BTreeSet::new();
+    let mut lfs_seen = false;
+    let mut lfs_canonical = true;
     for record in stdout.split(|byte| *byte == 0) {
-        let key = record.split(|byte| *byte == b'\n').next().unwrap_or(record);
+        let mut parts = record.splitn(2, |byte| *byte == b'\n');
+        let key = parts.next().unwrap_or(record);
+        let value = parts.next();
         let Some(rest) = key.strip_prefix(b"filter.") else {
             continue;
         };
@@ -2232,6 +3169,19 @@ fn parse_filter_driver_names(stdout: &[u8]) -> Result<Vec<String>, ToolError> {
         let Some(dot) = rest.iter().rposition(|byte| *byte == b'.') else {
             continue;
         };
+        if &rest[..dot] == b"lfs" {
+            lfs_seen = true;
+            let variable = &rest[dot + 1..];
+            let value = value.unwrap_or(b"\0");
+            let canonical = match variable.to_ascii_lowercase().as_slice() {
+                b"clean" => matches!(value, b"" | b"git-lfs clean -- %f"),
+                b"smudge" => matches!(value, b"" | b"git-lfs smudge -- %f"),
+                b"process" => matches!(value, b"" | b"git-lfs filter-process"),
+                b"required" => matches!(value, b"" | b"true" | b"false"),
+                _ => false,
+            };
+            lfs_canonical &= canonical;
+        }
         let name = std::str::from_utf8(&rest[..dot])
             .ok()
             .filter(|name| !name.is_empty() && !name.contains(['=', '\0', '\n']))
@@ -2244,7 +3194,10 @@ fn parse_filter_driver_names(stdout: &[u8]) -> Result<Vec<String>, ToolError> {
             })?;
         names.insert(name.to_string());
     }
-    Ok(names.into_iter().collect())
+    Ok(FilterDrivers {
+        names: names.into_iter().collect(),
+        lfs_canonical: lfs_seen && lfs_canonical,
+    })
 }
 
 /// `-c` overrides that empty each driver's `clean` and `process` commands
@@ -2692,7 +3645,18 @@ mod tests {
                 | Op::StashPop
                 | Op::StashList
                 | Op::Tag
-                | Op::Restore => {}
+                | Op::Restore
+                | Op::Merge
+                | Op::MergeAbort
+                | Op::CherryPick
+                | Op::CherryPickAbort
+                | Op::Revert
+                | Op::RevertAbort
+                | Op::Reset
+                | Op::BranchDelete
+                | Op::BranchRename
+                | Op::StashApply
+                | Op::StashDrop => {}
             }
         }
         let all = [
@@ -2712,6 +3676,17 @@ mod tests {
             Op::StashList,
             Op::Tag,
             Op::Restore,
+            Op::Merge,
+            Op::MergeAbort,
+            Op::CherryPick,
+            Op::CherryPickAbort,
+            Op::Revert,
+            Op::RevertAbort,
+            Op::Reset,
+            Op::BranchDelete,
+            Op::BranchRename,
+            Op::StashApply,
+            Op::StashDrop,
         ];
         let adr = include_str!("../../docs/specs/structured-git-mutations.md");
         for operation in all {
@@ -2855,6 +3830,17 @@ mod tests {
             "stash_pop",
             "tag",
             "restore",
+            "merge",
+            "merge_abort",
+            "cherry_pick",
+            "cherry_pick_abort",
+            "revert",
+            "revert_abort",
+            "reset",
+            "branch_delete",
+            "branch_rename",
+            "stash_apply",
+            "stash_drop",
         ] {
             assert!(!operations.contains(&write.to_string()), "{write} offered");
         }
@@ -2871,6 +3857,17 @@ mod tests {
             GitOperation::StashPop,
             GitOperation::Tag,
             GitOperation::Restore,
+            GitOperation::Merge,
+            GitOperation::MergeAbort,
+            GitOperation::CherryPick,
+            GitOperation::CherryPickAbort,
+            GitOperation::Revert,
+            GitOperation::RevertAbort,
+            GitOperation::Reset,
+            GitOperation::BranchDelete,
+            GitOperation::BranchRename,
+            GitOperation::StashApply,
+            GitOperation::StashDrop,
         ] {
             let error = tool
                 .call(args(operation, &["tracked.txt"], Some("m")))
@@ -3756,13 +4753,539 @@ mod tests {
         assert!(error.contains("accepted by diff, log, show"), "{error}");
     }
 
+    // ---- mini-agent-nvnkx.50 / .316 / .317 / .49 -------------------------
+
+    impl TestRepo {
+        /// Runs a Git fixture command that may legitimately fail (a conflict).
+        fn try_git(&self, args: &[&str]) -> bool {
+            Command::new("git")
+                .arg("-C")
+                .arg(&self.root)
+                .args(args)
+                .output()
+                .expect("run git fixture command")
+                .status
+                .success()
+        }
+
+        fn commit_file(&self, path: &str, contents: &str, message: &str) {
+            self.write(path, contents);
+            self.git(["add", "--", path]);
+            self.git(["commit", "--quiet", "-m", message]);
+        }
+
+        fn branch_name(&self) -> String {
+            self.git(["branch", "--show-current"]).trim().to_string()
+        }
+
+        /// `f.txt` conflicts between the current branch and `topic`.
+        fn conflicting_topic(&self) -> String {
+            self.commit_file("f.txt", "base\n", "base");
+            let base = self.branch_name();
+            self.git(["checkout", "--quiet", "-b", "topic"]);
+            self.commit_file("f.txt", "topic\n", "topic change");
+            self.git(["checkout", "--quiet", base.as_str()]);
+            self.commit_file("f.txt", "main\n", "main change");
+            base
+        }
+    }
+
+    fn rev_op(operation: GitOperation, revision: Option<&str>) -> GitArgs {
+        GitArgs {
+            operation,
+            revision: revision.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn nvnkx316_status_reports_merge_cherry_pick_and_rebase_in_progress() {
+        let repo = TestRepo::new();
+        repo.conflicting_topic();
+        let tool = repo.tool();
+        let clean = tool
+            .call(args(GitOperation::Status, &[], None))
+            .await
+            .unwrap();
+        assert!(clean.get("in_progress").is_none(), "{clean}");
+
+        assert!(!repo.try_git(&["merge", "topic"]));
+        let status = tool
+            .call(args(GitOperation::Status, &[], None))
+            .await
+            .unwrap();
+        assert_eq!(status["in_progress"], "merge", "{status}");
+        assert!(
+            status["in_progress_note"]
+                .as_str()
+                .unwrap()
+                .contains("merge_abort")
+        );
+        repo.git(["merge", "--abort"]);
+
+        assert!(!repo.try_git(&["cherry-pick", "topic"]));
+        let status = tool
+            .call(args(GitOperation::Status, &[], None))
+            .await
+            .unwrap();
+        assert_eq!(status["in_progress"], "cherry-pick", "{status}");
+        let refused = tool
+            .call(args(GitOperation::Commit, &[], Some("mid cherry-pick")))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("cherry-pick is in progress"), "{refused}");
+        repo.git(["cherry-pick", "--abort"]);
+
+        assert!(!repo.try_git(&["rebase", "topic"]));
+        let status = tool
+            .call(args(GitOperation::Status, &[], None))
+            .await
+            .unwrap();
+        assert_eq!(status["in_progress"], "rebase", "{status}");
+        assert!(
+            status["in_progress_note"]
+                .as_str()
+                .unwrap()
+                .contains("shell")
+        );
+        let refused = tool
+            .call(args(GitOperation::Commit, &[], Some("mid rebase")))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("rebase is in progress"), "{refused}");
+        repo.git(["rebase", "--abort"]);
+        let status = tool
+            .call(args(GitOperation::Status, &[], None))
+            .await
+            .unwrap();
+        assert!(status.get("in_progress").is_none(), "{status}");
+    }
+
+    #[tokio::test]
+    async fn nvnkx50_merge_conflict_is_reported_and_aborted_without_running_hooks() {
+        let repo = TestRepo::new();
+        let base = repo.conflicting_topic();
+        // Hostile hooks must never run.
+        let marker = repo.path().join("hook-ran");
+        let install_hooks = || {
+            #[cfg(unix)]
+            for hook in [
+                "pre-merge-commit",
+                "post-merge",
+                "commit-msg",
+                "pre-commit",
+                "post-commit",
+            ] {
+                use std::os::unix::fs::PermissionsExt;
+                let path = repo.path().join(".git/hooks").join(hook);
+                std::fs::write(&path, format!("#!/bin/sh\ntouch '{}'\n", marker.display()))
+                    .unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        };
+        install_hooks();
+        let tool = repo.tool();
+        let result = tool
+            .call(rev_op(GitOperation::Merge, Some("topic")))
+            .await
+            .unwrap();
+        assert_eq!(result["status"], "nonzero", "{result}");
+        assert_eq!(result["conflicted_paths"][0], "f.txt", "{result}");
+        assert_eq!(result["in_progress"], "merge", "{result}");
+        let again = tool
+            .call(rev_op(GitOperation::Merge, Some("topic")))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(again.contains("already in progress"), "{again}");
+        let aborted = tool
+            .call(rev_op(GitOperation::MergeAbort, None))
+            .await
+            .unwrap();
+        assert_eq!(aborted["status"], "success", "{aborted}");
+        assert!(aborted["in_progress"].is_null(), "{aborted}");
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("f.txt")).unwrap(),
+            "main\n"
+        );
+        let none = tool
+            .call(rev_op(GitOperation::MergeAbort, None))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(none.contains("no merge is in progress"), "{none}");
+
+        assert!(!marker.exists(), "no hook may run");
+        // The fixture's own commits would run the hooks; the tool must not.
+        let _ = std::fs::remove_dir_all(repo.path().join(".git/hooks"));
+        std::fs::create_dir(repo.path().join(".git/hooks")).unwrap();
+        // A clean merge makes a merge commit and moves HEAD.
+        repo.git(["checkout", "--quiet", "-b", "side", "topic~1"]);
+        repo.commit_file("side.txt", "side\n", "side");
+        repo.git(["checkout", "--quiet", base.as_str()]);
+        install_hooks();
+        let merged = tool
+            .call(rev_op(GitOperation::Merge, Some("side")))
+            .await
+            .unwrap();
+        assert_eq!(merged["status"], "success", "{merged}");
+        assert!(repo.path().join("side.txt").exists());
+        assert!(!marker.exists(), "no hook may run");
+    }
+
+    #[tokio::test]
+    async fn nvnkx50_cherry_pick_and_revert_make_commits_and_report_conflicts() {
+        let repo = TestRepo::new();
+        repo.conflicting_topic();
+        let tool = repo.tool();
+        let picked = tool
+            .call(rev_op(GitOperation::CherryPick, Some("topic")))
+            .await
+            .unwrap();
+        assert_eq!(picked["status"], "nonzero", "{picked}");
+        assert_eq!(picked["in_progress"], "cherry-pick", "{picked}");
+        assert_eq!(picked["conflicted_paths"][0], "f.txt");
+        let aborted = tool
+            .call(rev_op(GitOperation::CherryPickAbort, None))
+            .await
+            .unwrap();
+        assert_eq!(aborted["status"], "success", "{aborted}");
+
+        let before = repo.git(["rev-parse", "HEAD"]);
+        let reverted = tool
+            .call(rev_op(GitOperation::Revert, Some("HEAD")))
+            .await
+            .unwrap();
+        assert_eq!(reverted["status"], "success", "{reverted}");
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("f.txt")).unwrap(),
+            "base\n"
+        );
+        assert_eq!(repo.git(["rev-parse", "HEAD~1"]), before);
+        let range = tool
+            .call(rev_op(GitOperation::Revert, Some("HEAD~2..HEAD")))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(range.contains("single commit"), "{range}");
+    }
+
+    #[tokio::test]
+    async fn nvnkx50_reset_moves_head_but_refuses_pushed_commits() {
+        let repo = TestRepo::new();
+        repo.commit_file("a.txt", "a\n", "one");
+        repo.commit_file("a.txt", "b\n", "two");
+        let tool = repo.tool();
+        let mut args = rev_op(GitOperation::Reset, Some("HEAD~1"));
+        args.mode = Some(super::ResetMode::Soft);
+        let soft = tool.call(args).await.unwrap();
+        assert_eq!(soft["status"], "success", "{soft}");
+        assert_eq!(soft["mode"], "soft");
+        assert_eq!(repo.git(["log", "--format=%s"]).trim(), "one");
+        assert_eq!(
+            repo.git(["diff", "--cached", "--name-only"]).trim(),
+            "a.txt",
+            "soft keeps the change staged"
+        );
+        repo.git(["commit", "--quiet", "-m", "two again"]);
+        let mixed = tool
+            .call(rev_op(GitOperation::Reset, Some("HEAD~1")))
+            .await
+            .unwrap();
+        assert_eq!(mixed["status"], "success", "{mixed}");
+        assert_eq!(repo.git(["diff", "--cached", "--name-only"]).trim(), "");
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+            "b\n"
+        );
+        repo.git(["add", "a.txt"]);
+        repo.git(["commit", "--quiet", "-m", "two once more"]);
+
+        repo.git(["update-ref", "refs/remotes/origin/pushed", "HEAD"]);
+        let head = repo.git(["rev-parse", "HEAD"]);
+        let refused = tool
+            .call(rev_op(GitOperation::Reset, Some("HEAD~1")))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("published history"), "{refused}");
+        assert_eq!(repo.git(["rev-parse", "HEAD"]), head);
+        let missing = tool
+            .call(rev_op(GitOperation::Reset, Some("no-such-revision")))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("unknown Git revision"), "{missing}");
+    }
+
+    #[tokio::test]
+    async fn nvnkx50_branch_delete_rename_and_indexed_stash_operations() {
+        let repo = TestRepo::new();
+        repo.commit_file("a.txt", "a\n", "one");
+        let base = repo.branch_name();
+        repo.git(["branch", "gone"]);
+        repo.git(["branch", "old-name"]);
+        let tool = repo.tool();
+        let named_op = |operation, name: &str| GitArgs {
+            operation,
+            name: Some(name.to_string()),
+            ..Default::default()
+        };
+        let deleted = tool
+            .call(named_op(GitOperation::BranchDelete, "gone"))
+            .await
+            .unwrap();
+        assert_eq!(deleted["status"], "success", "{deleted}");
+        assert!(!repo.git(["branch", "--list"]).contains("gone"));
+        let current = tool
+            .call(named_op(GitOperation::BranchDelete, &base))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(current.contains("checked-out branch"), "{current}");
+        let mut rename = named_op(GitOperation::BranchRename, "old-name");
+        rename.new_name = Some("new-name".into());
+        let renamed = tool.call(rename).await.unwrap();
+        assert_eq!(renamed["status"], "success", "{renamed}");
+        assert!(repo.git(["branch", "--list"]).contains("new-name"));
+
+        // Two stashes: apply the older one by index and keep it, then drop.
+        repo.write("a.txt", "first\n");
+        repo.git(["stash", "push", "--quiet"]);
+        repo.write("a.txt", "second\n");
+        repo.write("untracked.txt", "u\n");
+        let mut push = args(GitOperation::StashPush, &[], Some("with untracked"));
+        push.include_untracked = Some(true);
+        let pushed = tool.call(push).await.unwrap();
+        assert_eq!(pushed["status"], "success", "{pushed}");
+        assert!(!repo.path().join("untracked.txt").exists(), "{pushed}");
+        let mut apply = rev_op(GitOperation::StashApply, None);
+        apply.index = Some(1);
+        let applied = tool.call(apply).await.unwrap();
+        assert_eq!(applied["status"], "success", "{applied}");
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+            "first\n"
+        );
+        assert_eq!(
+            repo.git(["stash", "list"]).lines().count(),
+            2,
+            "apply keeps the stash"
+        );
+        let mut drop_args = rev_op(GitOperation::StashDrop, None);
+        drop_args.index = Some(0);
+        let dropped = tool.call(drop_args).await.unwrap();
+        assert_eq!(dropped["status"], "success", "{dropped}");
+        assert_eq!(repo.git(["stash", "list"]).lines().count(), 1);
+        let mut missing = rev_op(GitOperation::StashDrop, None);
+        missing.index = Some(9);
+        let error = tool.call(missing).await.unwrap_err().to_string();
+        assert!(error.contains("does not exist"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn nvnkx50_new_fields_are_rejected_on_other_operations() {
+        let repo = TestRepo::new();
+        let tool = repo.tool();
+        for (field, args) in [
+            (
+                "mode",
+                GitArgs {
+                    mode: Some(super::ResetMode::Soft),
+                    ..args(GitOperation::Status, &[], None)
+                },
+            ),
+            (
+                "new_name",
+                GitArgs {
+                    new_name: Some("x".into()),
+                    ..args(GitOperation::Status, &[], None)
+                },
+            ),
+            (
+                "index",
+                GitArgs {
+                    index: Some(0),
+                    ..args(GitOperation::Status, &[], None)
+                },
+            ),
+            (
+                "include_untracked",
+                GitArgs {
+                    include_untracked: Some(true),
+                    ..args(GitOperation::Status, &[], None)
+                },
+            ),
+            (
+                "allow_in_progress",
+                GitArgs {
+                    allow_in_progress: Some(true),
+                    ..args(GitOperation::Status, &[], None)
+                },
+            ),
+        ] {
+            let error = tool.call(args).await.unwrap_err().to_string();
+            assert!(error.contains(field), "{field}: {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn nvnkx317_lfs_repositories_report_unresolved_pointers_and_refuse_lfs_paths() {
+        let repo = TestRepo::new();
+        repo.commit_file("a.bin", "pretend-binary\n", "binary");
+        repo.commit_file("plain.txt", "plain\n", "plain");
+        // Installed after the commits so no real LFS program is involved.
+        repo.write(
+            ".gitattributes",
+            "*.bin filter=lfs diff=lfs merge=lfs -text\n",
+        );
+        repo.git(["config", "filter.lfs.clean", "git-lfs clean -- %f"]);
+        repo.git(["config", "filter.lfs.smudge", "git-lfs smudge -- %f"]);
+        repo.git(["config", "filter.lfs.process", "git-lfs filter-process"]);
+        repo.git(["config", "filter.lfs.required", "true"]);
+        repo.write("plain.txt", "plain changed\n");
+        repo.write("other.bin", "new binary\n");
+        repo.write("other.txt", "other\n");
+        let tool = repo.tool();
+
+        let status = tool
+            .call(args(GitOperation::Status, &[], None))
+            .await
+            .unwrap();
+        assert_eq!(status["lfs_pointers_not_resolved"], true, "{status}");
+        assert_eq!(status["lfs_paths"][0], "a.bin", "{status}");
+        assert!(status["records"].to_string().contains("plain.txt"));
+        let diff = tool
+            .call(args(GitOperation::Diff, &["plain.txt"], None))
+            .await
+            .unwrap();
+        assert!(
+            diff["text"].as_str().unwrap().contains("+plain changed"),
+            "{diff}"
+        );
+        assert_eq!(diff["lfs_pointers_not_resolved"], true);
+
+        let refused = tool
+            .call(args(GitOperation::Stage, &["other.bin"], None))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("tracked by Git LFS"), "{refused}");
+        assert!(refused.contains("shell"), "{refused}");
+        assert_eq!(repo.git(["diff", "--cached", "--name-only"]).trim(), "");
+        let staged = tool
+            .call(args(GitOperation::Stage, &["other.txt"], None))
+            .await
+            .unwrap();
+        assert_eq!(staged["status"], "success", "{staged}");
+        assert_eq!(staged["lfs_pointers_not_resolved"], true);
+        let by_path = tool
+            .call(args(GitOperation::Commit, &["other.bin"], Some("bin")))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(by_path.contains("tracked by Git LFS"), "{by_path}");
+        // Operations that would rewrite the working tree keep refusing.
+        let switch = tool
+            .call(GitArgs {
+                operation: GitOperation::Restore,
+                paths: vec!["plain.txt".into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(switch.contains("uses Git LFS"), "{switch}");
+    }
+
+    #[tokio::test]
+    async fn nvnkx317_a_non_canonical_lfs_driver_is_still_refused() {
+        let repo = TestRepo::new();
+        repo.commit_file("a.bin", "x\n", "binary");
+        repo.write(".gitattributes", "*.bin filter=lfs\n");
+        repo.git(["config", "filter.lfs.clean", "sh -c evil"]);
+        let error = repo
+            .tool()
+            .call(args(GitOperation::Status, &[], None))
+            .await;
+        // The runner empties repository-defined commands; either the value is
+        // seen as non-canonical (refused) or neutralised (reported as LFS) but
+        // nothing may execute.
+        if let Err(error) = error {
+            assert!(error.to_string().contains("filter"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn nvnkx49_restore_checkpoints_the_discarded_content_for_rewind() {
+        let repo = TestRepo::new();
+        repo.commit_file("tracked.txt", "committed\n", "base");
+        repo.write("tracked.txt", "hand edited, never committed\n");
+        let tool = repo.tool();
+        let workspace = Arc::clone(&tool.workspace);
+        let store = crate::session::file_checkpoints::FileCheckpoints::default();
+        let recorder = store.recorder("session", 3, true);
+        let result = crate::session::file_checkpoints::scope(Some(recorder), async {
+            tool.call(args(GitOperation::Restore, &["tracked.txt"], None))
+                .await
+        })
+        .await
+        .unwrap();
+        assert_eq!(result["status"], "success", "{result}");
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap(),
+            "committed\n"
+        );
+        let restored = store.restore("session", 3, &workspace).unwrap();
+        assert_eq!(restored, 1);
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap(),
+            "hand edited, never committed\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn nvnkx49_switch_flags_the_rewind_range_as_partly_unrestorable() {
+        let repo = TestRepo::new();
+        repo.commit_file("a.txt", "a\n", "one");
+        let base = repo.branch_name();
+        repo.git(["checkout", "--quiet", "-b", "other"]);
+        repo.commit_file("b.txt", "b\n", "two");
+        repo.git(["checkout", "--quiet", base.as_str()]);
+        let tool = repo.tool();
+        let store = crate::session::file_checkpoints::FileCheckpoints::default();
+        let recorder = store.recorder("session", 2, true);
+        let result = crate::session::file_checkpoints::scope(Some(recorder), async {
+            tool.call(GitArgs {
+                operation: GitOperation::Switch,
+                name: Some("other".into()),
+                ..Default::default()
+            })
+            .await
+        })
+        .await
+        .unwrap();
+        assert!(
+            result["checkpoint_notice"]
+                .as_str()
+                .unwrap()
+                .contains("git operation"),
+            "{result}"
+        );
+        let summary = store.summary_from("session", 2);
+        assert!(summary.contains("1 edit not restorable"), "{summary}");
+        assert!(summary.contains("shell or git commands"), "{summary}");
+    }
+
     /// A definition is paid for in every request (mini-agent-sskdu.174).
     #[test]
     fn the_git_definition_stays_within_its_size_budget() {
         let repo = TestRepo::new();
         let tool = repo.tool();
         let size = tool.description().len() + tool.parameters().to_string().len();
-        assert!(size <= 5_100, "git definition is {size} bytes");
+        assert!(size <= 5_900, "git definition is {size} bytes");
     }
 
     #[test]

@@ -2133,3 +2133,50 @@ fn recent_workspace_lookup_skips_sessions_without_a_prompt() {
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].id, real.id);
 }
+
+// mini-agent-nvnkx.218: a fork owns copies of the spill files its tool results
+// reference, so they stay readable in the fork and survive deleting the source.
+#[test]
+fn nvnkx218_fork_copies_spill_files_and_survives_source_deletion() {
+    let _env = setup_test_env();
+    let mut source = Session::new("openai", "gpt-4", 128_000, "source");
+    save_session(&source).unwrap();
+    let big = "x".repeat(TOOL_RESULT_SAVE_THRESHOLD + 4096);
+    let (content, artifact) =
+        source.add_tool_result_with_images("call-1", "bash", &big, Vec::new());
+    let old = artifact.expect("a long result spills");
+    assert!(content.contains(old.to_str().unwrap()));
+    let gone = save_tool_output(&source.id, "bash", "vanishes").unwrap();
+    source.add_tool_result_with_images("call-2", "bash", "short", Vec::new());
+    if let Some(PersistedToolMessage::Result { artifact_path, .. }) =
+        &mut source.messages.last_mut().unwrap().tool
+    {
+        *artifact_path = Some(gone.to_string_lossy().as_ref().into());
+    }
+    std::fs::remove_file(&gone).unwrap();
+
+    let fork = crate::session::lock::fork_session(&source).unwrap();
+    let fork_dir = tool_output_dir(&fork.id);
+    let rows: Vec<_> = fork
+        .messages
+        .iter()
+        .filter_map(|message| match &message.tool {
+            Some(PersistedToolMessage::Result { artifact_path, .. }) => {
+                Some((message, artifact_path.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    let (message, path) = &rows[0];
+    let new = std::path::PathBuf::from(path.as_deref().unwrap());
+    assert_eq!(new.parent(), Some(fork_dir.as_path()));
+    assert_eq!(std::fs::read_to_string(&new).unwrap(), big);
+    assert!(message.content.contains(new.to_str().unwrap()));
+    assert!(!message.content.contains(old.to_str().unwrap()));
+    assert!(rows[1].1.is_none(), "a missing spill loses its reference");
+
+    crate::session::lock::release_session(&source.id);
+    delete_session(&source.id).unwrap();
+    assert!(!old.exists());
+    assert!(new.exists(), "the fork's copy outlives the source");
+}

@@ -327,6 +327,8 @@ Requires the `memory` feature, which is included in the default build.
 | `/memory write daily <content>` | Append to today's daily log. |
 | `/memory write note:<name> <content>` | Append to a named note. |
 | `/memory editor` | Open MEMORY.md in your system `$EDITOR`. |
+| `/memory projects` | List project memory directories (slug, recorded checkout path, `[current]`, missing paths flagged). |
+| `/memory adopt <project>` | Move another project's notes into the current project after a checkout moved; refused when the current project already has notes. |
 | `/memory clear scratchpad` | Clear all scratchpad items. |
 | `/memory clear daily` | Clear all of today's entries. |
 

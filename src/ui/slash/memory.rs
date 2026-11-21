@@ -51,10 +51,12 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
             Some("write") => handle_write(parts, ctx),
             Some("editor") => return handle_editor(ctx),
             Some("clear") => handle_clear(parts, ctx),
+            Some("projects") => handle_projects(ctx),
+            Some("adopt") => handle_adopt(parts, ctx),
             _ => {
                 write_usage(
                     ctx.renderer,
-                    "usage: /memory [status|search|read|write|editor|clear]",
+                    "usage: /memory [status|search|read|write|editor|clear|projects|adopt]",
                 );
             }
         }
@@ -68,7 +70,7 @@ fn handle_status(ctx: &mut SlashCtx<'_>) {
     write_ok(ctx.renderer, "memory status:");
     write_usage(
         ctx.renderer,
-        "usage: /memory <status|search|read|write|editor|clear>  (press Tab for options)",
+        "usage: /memory <status|search|read|write|editor|clear|projects|adopt>  (press Tab for options)",
     );
 
     let long_term = mem.memory_md();
@@ -114,6 +116,52 @@ fn handle_status(ctx: &mut SlashCtx<'_>) {
         }
     } else {
         write_result(ctx.renderer, "  today: (no entries)");
+    }
+}
+
+#[cfg(feature = "memory")]
+fn handle_projects(ctx: &mut SlashCtx<'_>) {
+    let mem = Mem::open();
+    let projects = mem.list_projects();
+    write_ok(ctx.renderer, "memory projects:");
+    if projects.is_empty() {
+        write_result(ctx.renderer, "  (none)");
+    }
+    for project in &projects {
+        let location = match (&project.path, project.path_exists) {
+            (Some(path), true) => path.clone(),
+            (Some(path), false) => format!("{path} (missing; moved?)"),
+            (None, _) => "(unrecorded)".to_string(),
+        };
+        write_result(
+            ctx.renderer,
+            format!(
+                "  {}{}  {location}",
+                project.slug,
+                if project.current { "  [current]" } else { "" }
+            ),
+        );
+    }
+    if projects.iter().any(|p| !p.current) {
+        write_usage(
+            ctx.renderer,
+            "to move another project's notes into this one: /memory adopt <project>",
+        );
+    }
+}
+
+#[cfg(feature = "memory")]
+fn handle_adopt(parts: &[&str], ctx: &mut SlashCtx<'_>) {
+    let Some(from) = parts.get(2) else {
+        write_usage(
+            ctx.renderer,
+            "usage: /memory adopt <project>  (see /memory projects)",
+        );
+        return;
+    };
+    match Mem::open().adopt_project(from) {
+        Ok(message) => write_ok(ctx.renderer, message),
+        Err(error) => write_error(ctx.renderer, format!("adopt error: {error}")),
     }
 }
 
