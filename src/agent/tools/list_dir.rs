@@ -161,8 +161,9 @@ impl Tool for ListDirTool {
     type Output = String;
 
     fn description(&self) -> String {
+        let skip_dirs = crate::agent::tools::skip_dirs_phrase();
         format!(
-            "List files and directories in a directory. Respects .gitignore by default (the listing counts the ignored entries it hid; pass no_ignore=true to show them) and hides VCS metadata, node_modules and target directories beside a build manifest unless requested explicitly. Shows type, size, entry count for subdirectories. Sorted: directories first, then alphabetical.{} Page with offset (the truncation notice names the next offset); depth 2-3 expands subdirectories into an indented tree under the same cap.",
+            "List files and directories in a directory. Respects .gitignore by default (the listing counts the ignored entries it hid; pass no_ignore=true to show them) and hides VCS metadata, {skip_dirs} unless requested explicitly. Shows type, size, entry count for subdirectories. Sorted: directories first, then alphabetical.{} Page with offset (the truncation notice names the next offset); depth 2-3 expands subdirectories into an indented tree under the same cap.",
             match self.max_entries {
                 Some(cap) => format!(" Returns at most {cap} entries per call."),
                 None => String::new(),
@@ -211,8 +212,19 @@ impl Tool for ListDirTool {
                 "list_dir depth must be between 1 and {MAX_LIST_DEPTH}"
             )));
         }
-        if args.limit == Some(0) {
-            return Err(ToolError::Msg("list_dir limit must be at least 1".into()));
+        let configured_cap = self.max_entries.and_then(|cap| usize::try_from(cap).ok());
+        if args
+            .limit
+            .is_some_and(|limit| limit == 0 || configured_cap.is_some_and(|cap| limit > cap))
+        {
+            let cap = configured_cap.map_or_else(
+                || "the configured cap".to_string(),
+                |cap| format!("the configured cap {cap}"),
+            );
+            return Err(ToolError::Msg(format!(
+                "list_dir limit must be between 1 and {cap}. Example: {{\"path\":\"src\",\"limit\":{}}}",
+                configured_cap.map_or(100, |cap| cap.min(100))
+            )));
         }
         let offset = args.offset.unwrap_or(0);
         crate::agent::tools::validate_workspace_binding(self.workspace.as_ref())?;
@@ -238,7 +250,12 @@ impl Tool for ListDirTool {
                             NOT_A_DIRECTORY_HINT,
                         )
                     } else {
-                        crate::agent::tools::bound_open_error(workspace, relative, error)
+                        crate::agent::tools::bound_open_error_for(
+                            Some("list_dir"),
+                            workspace,
+                            relative,
+                            error,
+                        )
                     }
                 })?;
             let bound = BoundDirectory::from_file(&logical, directory)?
@@ -258,7 +275,9 @@ impl Tool for ListDirTool {
             .await?;
             (bound, coaching)
         } else {
-            let resolved = tokio::fs::canonicalize(&requested).await?;
+            let resolved = tokio::fs::canonicalize(&requested).await.map_err(|error| {
+                crate::agent::tools::missing_path_error("list_dir", &requested, error)
+            })?;
             let checked_metadata = crate::fs::stable_path_metadata(&resolved).await?;
             if checked_metadata.is_file() {
                 return Err(crate::agent::tools::not_a_directory_error(

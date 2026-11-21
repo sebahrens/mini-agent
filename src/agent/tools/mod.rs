@@ -14,11 +14,14 @@ mod home_path_tests;
 #[cfg(feature = "multimodal")]
 pub(crate) mod image_fit;
 pub(crate) mod job_monitor;
+pub(crate) mod lenient;
 pub(crate) mod limits;
 pub(crate) mod list_dir;
 #[cfg(feature = "lsp")]
 pub(crate) mod lsp;
 pub(crate) mod memoize;
+#[cfg(test)]
+mod missing_path_tests;
 pub(crate) mod mutation_diff;
 pub(crate) mod normalize;
 pub(crate) mod notebook;
@@ -184,6 +187,18 @@ pub(crate) fn bound_open_error(
     relative: &Path,
     error: io::Error,
 ) -> ToolError {
+    bound_open_error_for(None, workspace, relative, error)
+}
+
+/// Like [`bound_open_error`], but a missing path, a directory given to a
+/// file tool or a denied open names `tool` and the path with a next step
+/// (see [`missing_path_error`]) instead of a bare errno string.
+pub(crate) fn bound_open_error_for(
+    tool: Option<&str>,
+    workspace: &crate::paths::WorkspaceBinding,
+    relative: &Path,
+    error: io::Error,
+) -> ToolError {
     // The refusal's errno is platform-dependent: `ELOOP` from `O_NOFOLLOW`,
     // `ENOTDIR` from `O_DIRECTORY|O_NOFOLLOW` on some kernels, cap-std's
     // `PermissionDenied` escape error when a link leaves its directory, or the
@@ -202,7 +217,34 @@ pub(crate) fn bound_open_error(
             target.as_deref(),
         ));
     }
-    error.into()
+    match tool {
+        Some(tool) => missing_path_error(tool, relative, error),
+        None => error.into(),
+    }
+}
+
+/// Turn a path-resolution `io::Error` into a message that names the tool and
+/// the path and says what to do next. `NotFound`, `IsADirectory` and
+/// `PermissionDenied` get the explanation; any other error passes through.
+pub(crate) fn missing_path_error(tool: &str, path: &Path, error: io::Error) -> ToolError {
+    let shown = path.display();
+    match error.kind() {
+        io::ErrorKind::NotFound => {
+            let hint = match tool {
+                "read" => "Use find_files or list_dir to locate it.",
+                "edit" => "Use find_files or list_dir to locate it, or write to create a new file.",
+                _ => "Use list_dir or find_files to locate it.",
+            };
+            ToolError::Msg(format!("{tool}: '{shown}' does not exist. {hint}"))
+        }
+        io::ErrorKind::IsADirectory => ToolError::Msg(format!(
+            "{tool}: '{shown}' is a directory, not a file. Use list_dir to see its contents."
+        )),
+        io::ErrorKind::PermissionDenied => ToolError::Msg(format!(
+            "{tool}: permission denied for '{shown}'. Check the path and its access rights."
+        )),
+        _ => error.into(),
+    }
 }
 
 /// Diagnostic classification: whether `path` currently names a regular file
@@ -269,6 +311,8 @@ pub(crate) struct ReadTracker {
     /// untrack touches only that path's few windows.
     tracked: std::sync::Arc<Mutex<TrackedReads>>,
     pub(crate) instructions: Option<Arc<crate::context::instructions::WorkspaceInstructions>>,
+    /// The last parsed PDF, so consecutive page windows parse it once.
+    pub(crate) pdf_cache: Arc<pdf_text::DocumentCache>,
     /// The ACP client's file methods, present only when the operator opted in
     /// and the client advertised them. `None` (the default) keeps every tool
     /// on the local disk.
@@ -390,6 +434,7 @@ impl ReadTracker {
             deny_repeated_reads,
             tracked: std::sync::Arc::new(Mutex::new(TrackedReads::default())),
             instructions: None,
+            pdf_cache: Arc::default(),
             client_fs: None,
             #[cfg(feature = "multimodal")]
             image_support: read_image::ImageReadSupport::default(),
@@ -730,6 +775,19 @@ pub fn is_skip_dir(name: &str) -> bool {
     }
 }
 
+/// How tool descriptions name the directories search and listing tools skip,
+/// following the configured `[tool_limits] skip_dirs` (mini-agent-sskdu.177).
+pub(crate) fn skip_dirs_phrase() -> String {
+    skip_dirs_phrase_for(limits::skip_dirs().as_deref())
+}
+
+fn skip_dirs_phrase_for(configured: Option<&[String]>) -> String {
+    match configured {
+        Some(names) => format!("the configured skip_dirs ({})", names.join(", ")),
+        None => "node_modules and target directories beside a build manifest (Cargo.toml, pom.xml, build.gradle, build.sbt)".to_string(),
+    }
+}
+
 pub fn is_vcs_metadata(name: &str) -> bool {
     matches!(name, ".git" | ".hg" | ".svn" | ".bzr")
 }
@@ -738,12 +796,16 @@ pub fn is_vcs_metadata(name: &str) -> bool {
 #[serde(deny_unknown_fields)]
 pub struct ReadArgs {
     pub path: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::flag")]
     pub raw_notebook: bool,
+    #[serde(default, deserialize_with = "lenient::offset_usize")]
     pub offset: Option<usize>,
+    #[serde(default, deserialize_with = "lenient::limit_usize")]
     pub limit: Option<usize>,
     /// 1-indexed Unicode scalar value offset, independent of text lines.
+    #[serde(default, deserialize_with = "lenient::character_offset_usize")]
     pub character_offset: Option<usize>,
+    #[serde(default, deserialize_with = "lenient::character_limit_usize")]
     pub character_limit: Option<usize>,
     /// 1-indexed PDF page selection such as `1-5` or `2,4`.
     #[serde(default)]
@@ -793,25 +855,30 @@ pub(crate) struct EditOp {
 #[serde(deny_unknown_fields)]
 pub struct BashArgs {
     pub command: String,
+    #[serde(
+        default,
+        alias = "timeout_ms",
+        deserialize_with = "lenient::shell_timeout_ms"
+    )]
     pub timeout: Option<u64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::flag")]
     pub background: bool,
     /// Run under a pseudo-terminal (Unix): stdin/stdout/stderr are one TTY.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::flag")]
     pub pty: bool,
     /// Capture stdout and stderr separately instead of one merged stream.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::flag")]
     pub separate_streams: bool,
     /// Directory to run in: workspace-relative or absolute inside the
     /// workspace. Each call is a fresh shell, so `cd` does not persist.
     #[serde(default)]
     pub workdir: Option<String>,
     /// Promote the foreground command to a background job at its deadline.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::optional_flag")]
     pub auto_background: Option<bool>,
     /// Retry this one command outside the sandbox after interactive user
     /// approval. Only offered when `shell-allow-escalation` is on.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::flag")]
     pub escalate: bool,
     /// Why the command needs to leave the sandbox; shown in the approval.
     #[serde(default)]
@@ -840,10 +907,10 @@ pub struct JobStatusArgs {
     pub id: Option<String>,
     #[serde(default)]
     pub action: JobAction,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::timeout_ms_u64")]
     pub timeout_ms: Option<u64>,
     /// Byte offset to read job output from instead of the previous read end.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::since_u64")]
     pub since: Option<u64>,
     /// Text typed into a `pty = true` job with `action = "input"`.
     #[serde(default)]
@@ -1002,22 +1069,24 @@ pub struct GrepArgs {
     pub pattern: String,
     pub path: Option<String>,
     pub include: Option<String>,
+    #[serde(default, deserialize_with = "lenient::context_lines_usize")]
     pub context_lines: Option<usize>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::flag")]
     pub case_insensitive: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::flag")]
     pub files_only: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::flag")]
     pub count: bool,
     /// A call may lower, but never raise, the configured result cap.
+    #[serde(default, deserialize_with = "lenient::max_results_u64")]
     pub max_results: Option<u64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::flag")]
     pub multiline: bool,
     /// Result lines (or matching files) to skip, for paging.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::offset_u64")]
     pub offset: Option<u64>,
     /// Also search files that `.gitignore`/`.ignore`/global excludes hide.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::flag")]
     pub no_ignore: bool,
 }
 
@@ -1043,10 +1112,10 @@ pub enum FindFilesSort {
 pub struct FindFilesArgs {
     pub pattern: String,
     /// Matches to skip (0-based) for paging past the result cap.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::offset_usize")]
     pub offset: Option<usize>,
     /// Lower the configured result cap for this call.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::limit_usize")]
     pub limit: Option<usize>,
     pub path: Option<String>,
     /// Auto treats glob metacharacters and path separators as a path glob.
@@ -1055,7 +1124,7 @@ pub struct FindFilesArgs {
     #[serde(default)]
     pub sort: FindFilesSort,
     /// Also list files that `.gitignore`/`.ignore`/global excludes hide.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::flag")]
     pub no_ignore: bool,
 }
 
@@ -1064,16 +1133,16 @@ pub struct FindFilesArgs {
 pub struct ListDirArgs {
     pub path: Option<String>,
     /// Entries to skip (0-based) for paging past the entry cap.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::offset_usize")]
     pub offset: Option<usize>,
     /// Lower the configured entry cap for this call.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::limit_usize")]
     pub limit: Option<usize>,
     /// Levels to expand (1 = this directory only; at most 3).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::depth_usize")]
     pub depth: Option<usize>,
     /// Also list entries that `.gitignore`/`.ignore`/global excludes hide.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::flag")]
     pub no_ignore: bool,
 }
 

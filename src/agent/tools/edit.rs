@@ -1428,14 +1428,21 @@ impl EditTool {
                 .await
                 .map_err(|_| ToolError::Msg("Edit open job failed".to_string()))?
                 .map_err(|error| {
-                    crate::agent::tools::bound_open_error(workspace, relative, error)
+                    crate::agent::tools::bound_open_error_for(
+                        Some("edit"),
+                        workspace,
+                        relative,
+                        error,
+                    )
                 })?;
                 (Some(opened.0), Some(opened.1?))
             }
             None => (None, None),
         };
         let resolved = if bound_workspace.is_none() {
-            Some(tokio::fs::canonicalize(&requested).await?)
+            Some(tokio::fs::canonicalize(&requested).await.map_err(|error| {
+                crate::agent::tools::missing_path_error("edit", &requested, error)
+            })?)
         } else {
             None
         };

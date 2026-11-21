@@ -68,13 +68,12 @@ use `JSON.stringify(value)` for Date, Map, Set, class instances, or objects cont
 `undefined`, NaN/Infinity, holes, or accessors.";
 
 pub const READ_TOOL_PROMPT: &str = "\n\n## File reads\n\
-- **read** reads file contents. Repeated reads of the same path/offset/limit are blocked until the \
-file changes. Read enough context at once and do not re-read unchanged sections. Five identical \
+- **read** reads file contents. Repeated reads of the same path/offset/limit may be blocked until the \
+file changes (when repeated-read denial is enabled). Read enough context at once and do not re-read unchanged sections. Five identical \
 read/search results stop a turn; reuse retained evidence or change the range or approach.\n\
 - Read a file before changing it and verify changed areas after editing.";
 
-pub const WRITE_TOOL_PROMPT: &str =
-    "\n- **write** creates new files only and fails if the target exists.";
+pub const WRITE_TOOL_PROMPT: &str = "\n- **write** creates new files and fails if the target exists, unless `overwrite=true` follows a complete current read of that file (a guarded full replacement). Prefer **edit** for targeted changes.";
 pub const EDIT_TOOL_PROMPT: &str =
     "\n- **edit** changes existing files; copy exact source text and re-read after a failed match.";
 pub const GREP_TOOL_PROMPT: &str =
@@ -84,21 +83,22 @@ pub const FIND_FILES_TOOL_PROMPT: &str =
 pub const LIST_DIR_TOOL_PROMPT: &str =
     "\n- **list_dir** lists a directory; do not re-list unchanged directories.";
 pub const TODO_TOOL_PROMPT: &str = "\n- **todo_write** replaces the session's persistent task list; use it for work with at least three dependent steps or progress that must survive compaction. Keep at most one item in progress and update milestones. The list holds at most 50 short items (500 characters each). **todo_read** recalls the list after compaction or an agent rebuild.";
-pub const TASK_TOOL_PROMPT: &str = "\n- **task** delegates read-only investigation to fresh-context subagents. Keep single-file or known-location work local; delegate when research crosses several files or has two or more independent, bounded questions. Prefer structured `briefs` with a precise objective, file scope hints, constraints, and expected evidence; use legacy `prompts` only for simple questions, and never send both. Verify and reuse the returned findings. For domain-specific work, select an optional specialist `agent_type` from the tool schema. When the user writes `@agent:<name>`, delegate that part through **task** with `agent_type` set to `<name>` and write the brief yourself.";
+pub const TASK_TOOL_PROMPT: &str = "\n- **task** delegates investigation to fresh-context subagents (read-only unless a configured persona has write access). Keep single-file or known-location work local; delegate when research crosses several files or has two or more independent, bounded questions. Prefer structured `briefs` with a precise objective, file scope hints, constraints, and expected evidence; use legacy `prompts` only for simple questions, and never send both. Verify and reuse the returned findings. For domain-specific work, select an optional specialist `agent_type` from the tool schema. When the user writes `@agent:<name>`, delegate that part through **task** with `agent_type` set to `<name>` and write the brief yourself.";
 
 /// Appended to the preamble when LSP integration is active (`[lsp]
 /// enabled = true`) and its query tool is registered.
 #[cfg(feature = "lsp")]
 pub const LSP_PROMPT: &str = "\n\n## LSP diagnostics\n\
 Language servers are running for this project. Use **lsp_diagnostics** to query \
-a file or list diagnostics across the project. Files with no configured server \
-return no diagnostics.";
+a file or list diagnostics across the project. A file with no configured \
+server is reported as \"Not checked\", which is not a clean result.";
 
 #[cfg(feature = "lsp")]
 pub const LSP_NAVIGATE_PROMPT: &str = "\n\n## LSP navigation\n\
-Use **lsp_navigate** for semantic code navigation (definition, references, implementation, \
-type_definition, hover, symbols, workspace_symbols) instead of guessing with grep when a \
-language server covers the file. Positions are 1-based line/column of the symbol.";
+Use **lsp_navigate** for semantic code navigation instead of guessing with grep when a \
+language server covers the file; the tool schema lists every operation, including call \
+hierarchy, `rename` (previews a workspace-wide rename) and `code_actions` (quick fixes for a \
+diagnostic). Positions are 1-based line/column of the symbol.";
 
 #[cfg(feature = "lsp")]
 pub const LSP_MUTATION_PROMPT: &str = "\nFresh diagnostics are appended after supported file changes. Trust them and \
@@ -170,6 +170,26 @@ mod tests {
         assert!(JS_TOOL_PROMPT.contains("`JSON.stringify(value)`"));
         assert!(!SYSTEM_PROMPT.contains("**js**"));
         assert!(!SYSTEM_PROMPT.contains("**read**"));
+    }
+
+    // mini-agent-sskdu.90 / .178: tool guidance must not contradict the tools.
+    #[test]
+    fn tool_guidance_matches_the_tools() {
+        use super::{READ_TOOL_PROMPT, WRITE_TOOL_PROMPT};
+        assert!(WRITE_TOOL_PROMPT.contains("overwrite=true"));
+        assert!(!WRITE_TOOL_PROMPT.contains("new files only"));
+        assert!(READ_TOOL_PROMPT.contains("may be blocked"));
+        assert!(!TASK_TOOL_PROMPT.contains("delegates read-only"));
+        #[cfg(feature = "lsp")]
+        {
+            use super::{LSP_NAVIGATE_PROMPT, LSP_PROMPT};
+            assert!(!LSP_PROMPT.contains("return no diagnostics"));
+            assert!(LSP_PROMPT.contains("Not checked"));
+            // The schema enum is authoritative; the prompt names no partial list.
+            assert!(!LSP_NAVIGATE_PROMPT.contains("workspace_symbols"));
+            assert!(LSP_NAVIGATE_PROMPT.contains("rename"));
+            assert!(LSP_NAVIGATE_PROMPT.contains("code_actions"));
+        }
     }
 
     #[test]

@@ -84,7 +84,7 @@ impl Tool for LspTool {
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "File to inspect (optional; omit for all files)" },
-                "offset": { "type": "integer", "minimum": 0, "description": "Diagnostics to skip; pass the offset named by the previous truncation line" },
+                "offset": { "type": "integer", "minimum": 0, "description": "Diagnostics to skip (0-based count); pass the offset named by the previous truncation line" },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Most diagnostics to return (default 200)" },
                 "severity": { "type": "string", "enum": ["error", "warning"], "description": "Only diagnostics of this severity" },
                 "directory": { "type": "string", "description": "Project-wide listing only: workspace-relative directory to restrict to" },
@@ -457,7 +457,7 @@ impl Tool for LspNavigateTool {
                 "end_line": { "type": "integer", "minimum": 1, "description": "code_actions: 1-based end line of the range" },
                 "end_column": { "type": "integer", "minimum": 1, "description": "code_actions: 1-based end column of the range" },
                 "action": { "type": "integer", "minimum": 1, "description": "code_actions: preview the edit of this action number" },
-                "offset": { "type": "integer", "minimum": 0, "description": "Results (rename / action previews: edits) to skip; pass the next_offset of the previous page" },
+                "offset": { "type": "integer", "minimum": 0, "description": "Results (rename / action previews: edits) to skip (0-based count); pass the next_offset of the previous page" },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Most results or edits per page (default 100 results, 200 edits)" },
                 "edit": { "type": "integer", "minimum": 1, "description": "rename / code action edit: complete replacement text of the edit with this number from the listing" },
                 "full_text": { "type": "boolean", "description": "rename / code action edit: show every replacement in full (pages end early at a byte budget; continue with next_offset)" },

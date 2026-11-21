@@ -389,7 +389,7 @@ impl Tool for ShellTool {
             "Execute a {dialect} command in the current working directory. Foreground commands have a hard \
              {} second deadline and bounded output. Set background=true for builds, test suites, or servers; \
              this returns a session-scoped job id for the job_status tool and uses a 24 hour maximum. The \
-             optional timeout can lower the applicable deadline. Commands keep the same sandbox and permission \
+             optional timeout_ms (milliseconds) can lower the applicable deadline. Commands keep the same sandbox and permission \
              policy in either mode.",
             self.foreground_timeout.as_secs()
         );
@@ -421,11 +421,11 @@ impl Tool for ShellTool {
             "type": "object",
             "properties": {
                 "command": { "type": "string", "description": format!("{dialect} command to execute") },
-                "timeout": {
+                "timeout_ms": {
                     "type": "integer",
-                    "minimum": 1,
+                    "minimum": 1000,
                     "maximum": 86_400_000,
-                    "description": format!("Lower command deadline in milliseconds (optional; maximum {} foreground or 86400000 background)", self.foreground_timeout.as_secs() * 1000)
+                    "description": format!("Lower command deadline in MILLISECONDS, not seconds: 120000 is two minutes (optional; at least 1000; maximum {} foreground or 86400000 background)", self.foreground_timeout.as_secs() * 1000)
                 },
                 "workdir": {
                     "type": "string",
@@ -652,7 +652,7 @@ impl ShellTool {
                 "foreground"
             };
             return Err(ToolError::Msg(format!(
-                "shell timeout must be between 1 and {} milliseconds for {mode} commands. For longer foreground work, use a background job. Example: {{\"command\":\"cargo test\",\"background\":true,\"timeout\":120000}}",
+                "shell timeout must be between 1 and {} milliseconds for {mode} commands. For longer foreground work, use a background job. Example: {{\"command\":\"cargo test\",\"background\":true,\"timeout_ms\":120000}}",
                 maximum.as_millis()
             )));
         }
@@ -834,8 +834,15 @@ impl ShellTool {
         }
 
         let transcript = self.spill_line_capped_output(transcript, &result);
-        let mut result = bound_output_lines(result, self.max_output_lines);
+        let mut result = bound_output_lines(result, self.max_output_lines, &transcript);
         push_log_footer(&mut result, &transcript);
+        if result.is_empty()
+            && output
+                .exit_status
+                .is_some_and(|status| status.code() == Some(0))
+        {
+            result = SUCCESS_NO_OUTPUT.to_string();
+        }
 
         let result = match coaching {
             Some(msg) => format!("{}\n\n{}", msg, result),
@@ -982,8 +989,11 @@ impl ShellTool {
             result.push_str(&ended);
         }
         let transcript = self.spill_line_capped_output(transcript, &result);
-        let mut result = bound_output_lines(result, self.max_output_lines);
+        let mut result = bound_output_lines(result, self.max_output_lines, &transcript);
         push_log_footer(&mut result, &transcript);
+        if result.is_empty() && snapshot.exit_code == Some(0) {
+            result = SUCCESS_NO_OUTPUT.to_string();
+        }
         Ok(Some(result))
     }
 }
@@ -2148,13 +2158,31 @@ fn render_background_job(output: BackgroundJobOutput, max_output_lines: Option<u
 /// short tail around an omitted-count marker so the model sees how the output
 /// starts and ends (exit codes and final errors live at the end). `None`
 /// returns the text unchanged.
-fn bound_output_lines(text: String, max_output_lines: Option<u64>) -> String {
-    bound_output_lines_with_hint(
-        text,
-        max_output_lines,
-        "re-run with a narrower invocation or pipe through `head`/`tail`/`grep` to see the rest",
-    )
+fn bound_output_lines(
+    text: String,
+    max_output_lines: Option<u64>,
+    transcript: &OutputTranscript,
+) -> String {
+    match &transcript.log {
+        Some(log) => bound_output_lines_with_hint(
+            text,
+            max_output_lines,
+            &format!(
+                "the omitted lines are saved in the output log {}; read or grep that log instead of re-running the command",
+                log.path.display()
+            ),
+        ),
+        None => bound_output_lines_with_hint(
+            text,
+            max_output_lines,
+            "re-run with a narrower invocation or pipe through `head`/`tail`/`grep` to see the rest",
+        ),
+    }
 }
+
+/// Positive confirmation for a command that exited 0 and printed nothing, so
+/// an empty tool result is never mistaken for a dropped one.
+const SUCCESS_NO_OUTPUT: &str = "[exit code 0; no output]";
 
 fn bound_output_lines_with_hint(text: String, max_output_lines: Option<u64>, hint: &str) -> String {
     let Some(cap) = max_output_lines else {
@@ -2199,7 +2227,8 @@ fn resource_limit_error(
         CommandStatus::Failed => "[status: failed]".to_string(),
         CommandStatus::Completed => unreachable!("completed output is handled before this helper"),
     };
-    let mut partial = bound_output_lines(render_transcript(transcript), max_output_lines);
+    let mut partial =
+        bound_output_lines(render_transcript(transcript), max_output_lines, transcript);
     push_log_footer(&mut partial, transcript);
     let message = if partial.is_empty() {
         metadata
@@ -2359,6 +2388,12 @@ mod tests {
             .await
             .unwrap();
         assert!(result.contains("lines omitted"), "{result}");
+        // mini-agent-sskdu.95: the marker points at the log, not at a re-run.
+        assert!(!result.contains("re-run with a narrower"), "{result}");
+        assert!(
+            result.contains("the omitted lines are saved in the output log"),
+            "{result}"
+        );
         let footer = result
             .lines()
             .find(|line| line.contains("saved to"))
@@ -2382,6 +2417,26 @@ mod tests {
             .unwrap();
         assert!(!small.contains("saved to"), "{small}");
         assert_eq!(std::fs::read_dir(&logs).unwrap().count(), 1);
+    }
+
+    // mini-agent-sskdu.85: a successful command with no output is confirmed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_command_without_output_reports_exit_zero() {
+        let dir = crate::tests::support::temp::TempDir::new("no-output");
+        for command in [
+            "true".to_string(),
+            format!("printf x > {}", dir.path().join("f").display()),
+        ] {
+            let output = test_tool()
+                .call(BashArgs {
+                    command,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(output, "[exit code 0; no output]");
+        }
     }
 
     #[cfg(unix)]
@@ -2644,7 +2699,7 @@ mod tests {
         let tool = test_tool().with_foreground_timeout_secs(u64::MAX);
         assert!(tool.description().contains("600 second deadline"));
         assert!(
-            tool.parameters()["properties"]["timeout"]["description"]
+            tool.parameters()["properties"]["timeout_ms"]["description"]
                 .as_str()
                 .unwrap()
                 .contains("600000 foreground")
@@ -3072,7 +3127,9 @@ mod tests {
             .to_string();
 
         assert!(error.contains("between 1 and 120000 milliseconds"));
-        assert!(error.contains(r#"{"command":"cargo test","background":true,"timeout":120000}"#));
+        assert!(
+            error.contains(r#"{"command":"cargo test","background":true,"timeout_ms":120000}"#)
+        );
     }
 
     #[cfg(unix)]

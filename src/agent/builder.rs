@@ -711,6 +711,20 @@ fn task_tool_available(cfg: &Config) -> bool {
     should_register_task_tool(cfg.task_enabled, crate::extras::subagents::is_initialized())
 }
 
+/// Whether grep may suggest `task` in its result hint: only when the main
+/// agent actually has that tool (mini-agent-sskdu.91).
+fn grep_task_hint(cfg: &Config) -> bool {
+    #[cfg(feature = "subagents")]
+    {
+        task_tool_available(cfg)
+    }
+    #[cfg(not(feature = "subagents"))]
+    {
+        let _ = cfg;
+        false
+    }
+}
+
 #[cfg(feature = "subagents")]
 fn should_register_task_tool(task_enabled: Option<bool>, runtime_initialized: bool) -> bool {
     task_enabled.unwrap_or(true) && runtime_initialized
@@ -1218,6 +1232,7 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         }
         base_tools.push(Box::new(
             tools::GrepTool::new(permission.clone(), ask_tx.clone(), max_grep_results)
+                .with_task_hint(grep_task_hint(cfg))
                 .with_workspace_binding(workspace.clone()),
         ));
         base_tools.push(Box::new(tools::notebook::NotebookTool::new(
@@ -2518,7 +2533,7 @@ mod extra_file_tests {
             .unwrap();
         assert!(shell.description.contains("321 second deadline"));
         assert!(
-            shell.parameters["properties"]["timeout"]["description"]
+            shell.parameters["properties"]["timeout_ms"]["description"]
                 .as_str()
                 .unwrap()
                 .contains("321000 foreground")

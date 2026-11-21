@@ -766,7 +766,7 @@ Accepted top-level keys:
 | `file_checkpoints`        | object  | `/rewind` file checkpoint limits: `max_file_bytes` (largest pre-/postimage captured; default follows the edit/write size limit), `max_total_bytes` (preimage bytes per session, default `67108864` = 64 MiB) and `max_records` (mutation records and distinct preimages per session, default `2048`). Values are clamped to 1 GiB, 4 GiB and 100000. The first mutation a session cannot capture appends a one-time notice to that tool result, and the `/rewind` picker reports `N edits not restorable (<reason>)`. See [file-checkpoints.md](file-checkpoints.md). |
 | `max_read_lines`          | integer | Default maximum lines returned by one `read` call. Default: `2000`. |
 | `max_bash_output_lines`   | integer | Line cap for shell tool output returned to the model, applied to successful output and to the partial output embedded in timeout/output-limit errors. Longer output keeps its head and tail around an `[... N lines omitted ...]` marker. Default: `2000`. Set `0` to disable line truncation (the 1 MiB per-stream / 1.5 MiB combined byte limits still apply). |
-| `shell_timeout_secs`      | integer | Foreground shell tool deadline in seconds. Default: `120`; clamped to 1–600. The tool definition publishes this effective cap; a call's millisecond `timeout` can only lower it. Background shell jobs retain their 24-hour cap, other command classes retain their existing limits, and brokered JS `spawn` is bounded by `js-step-timeout-secs`. Sensitive in project-local configuration: changing it requires project trust. |
+| `shell_timeout_secs`      | integer | Foreground shell tool deadline in seconds. Default: `120`; clamped to 1–600. The tool definition publishes this effective cap; a call's millisecond `timeout_ms` can only lower it. Background shell jobs retain their 24-hour cap, other command classes retain their existing limits, and brokered JS `spawn` is bounded by `js-step-timeout-secs`. Sensitive in project-local configuration: changing it requires project trust. |
 | `shell_auto_background` | boolean | Default for the shell call flag `auto_background`: a foreground command that reaches its deadline keeps running as a background job (its id and output so far are returned) instead of being killed. Default: `false`. Same sandbox, permission decision and job limits as `background = true`. Sensitive in project-local configuration. |
 | `command_timeout_secs` | integer | Deadline of `!` commands (TUI and headless) in seconds. Default: `120`; clamped to 1–600. A single command can set its own deadline with `!timeout=300 cargo test` (same clamp). A timed-out run reports `timed out after N s` and how to raise it. Loop/goal validators, hooks and brokered JS `spawn` keep their own deadlines. Output volume never fails these commands: `!` commands, `verify_command`, goal checks and loop validators capture a spooled 500 KiB head plus 256 KiB tail (fixed, not configurable), write the full output to a private log in the session's tool-output directory (readable with `read`, which pages with offset/limit) once it overflows, and name that log in the result (`[output truncated: N bytes omitted ...; full output log: PATH ...]`). Only a 64 MiB total-output ceiling stops a command, reported as `output_truncated` / `hard ceiling`; the command's real exit status otherwise decides pass or fail. Sensitive in project-local configuration. |
 | `update_check`            | boolean | Opt-in release notice at interactive startup. Default: `false`. Checks the package's GitHub repository anonymously, directly over HTTPS, at most once every 24 hours, with a two-second request bound and a 128 KiB response cap. Loop and ACP modes skip it; `-p` prints a one-line stderr notice from the cached result only (no network; `--quiet` silences it). Requires project trust when set locally. Nothing is downloaded unless you run `mini-agent update`. |
@@ -2564,8 +2564,8 @@ fail-closed instead (deny, then ask, then allow). A matching `external_directory
 
 Tool argument validation happens before permissions or execution. `read.limit` must
 be positive (including an effective configured default); invalid windows return a
-JSON example instead of an inverted line range. Shell `timeout` must be positive
-and at most the effective foreground deadline (120000 ms by default, configured
+JSON example instead of an inverted line range. Shell `timeout_ms` (the older name
+`timeout` is still accepted; milliseconds) must be at least 1000 and at most the effective foreground deadline (120000 ms by default, configured
 by `shell_timeout_secs`), or 86400000 ms in background mode; larger values are rejected
 with a background-job example rather than silently clamped. `todo_write` accepts
 only case-sensitive statuses `pending`, `in_progress`, `completed`, `cancelled` and
@@ -2654,7 +2654,7 @@ retrying outside containment.
 
 Foreground shell commands have a mandatory deadline of 120 seconds by default.
 `shell_timeout_secs` sets that deadline between 1 and 600 seconds. A tool call's optional
-`timeout` value is milliseconds and can only lower that deadline. Brokered JS
+`timeout_ms` value is milliseconds and can only lower that deadline. Brokered JS
 `spawn` and other sandbox command classes retain their separate limits. Captured raw
 output is limited to 1 MiB of stdout, 1 MiB of stderr, and 1.5 MiB combined;
 both pipes are drained concurrently. Timeout, cancellation, or any output cap

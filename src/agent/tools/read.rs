@@ -14,7 +14,7 @@ const DEFAULT_MAX_TEXT_SIZE: u64 = 1024 * 1024;
 
 /// Characters of the tool-result backstop reserved for the file header,
 /// coaching and continuation notices around a line-mode excerpt.
-const READ_RESULT_RESERVE_CHARS: usize = 2_000;
+pub(crate) const READ_RESULT_RESERVE_CHARS: usize = 2_000;
 /// Approximate per-line rendering overhead (line number, tag, separator)
 /// counted against the character budget.
 const READ_LINE_OVERHEAD_CHARS: usize = 20;
@@ -389,7 +389,14 @@ impl ReadTool {
                 } else {
                     workspace.open_relative(relative)
                 })
-                .map_err(|error| crate::agent::tools::bound_open_error(workspace, relative, error))
+                .map_err(|error| {
+                    crate::agent::tools::bound_open_error_for(
+                        Some("read"),
+                        workspace,
+                        relative,
+                        error,
+                    )
+                })
             })
             .transpose()?;
         let offset = args.offset.unwrap_or(1).saturating_sub(1);
@@ -406,7 +413,9 @@ impl ReadTool {
                     .await?,
             )
         } else {
-            let resolved = tokio::fs::canonicalize(&requested).await?;
+            let resolved = tokio::fs::canonicalize(&requested).await.map_err(|error| {
+                crate::agent::tools::missing_path_error("read", &requested, error)
+            })?;
             let coaching = check_perm_canonicalized_path(
                 &self.permission,
                 &self.ask_tx,
@@ -416,6 +425,22 @@ impl ReadTool {
             .await?;
             (Some(resolved), coaching)
         };
+        // A directory gets a next step instead of a raw `Is a directory` or
+        // "not a regular file" error (mini-agent-sskdu.84).
+        let names_directory = match (&capability_file, &resolved) {
+            (Some(file), _) => file.metadata().is_ok_and(|metadata| metadata.is_dir()),
+            (None, Some(resolved)) => tokio::fs::metadata(resolved)
+                .await
+                .is_ok_and(|metadata| metadata.is_dir()),
+            (None, None) => false,
+        };
+        if names_directory {
+            return Err(crate::agent::tools::missing_path_error(
+                "read",
+                &requested,
+                std::io::Error::from(std::io::ErrorKind::IsADirectory),
+            ));
+        }
         let spill_file = resolved.as_deref().and_then(|resolved| {
             self.permission.as_ref().and_then(|permission| {
                 permission
@@ -583,11 +608,23 @@ impl ReadTool {
                     cap / (1024 * 1024)
                 )));
             }
-            let mut bytes = Vec::with_capacity(metadata.len() as usize);
-            reader.take(cap + 1).read_to_end(&mut bytes).await?;
-            if bytes.len() as u64 > cap {
-                return Err(ToolError::Msg("PDF grew beyond the read limit".into()));
-            }
+            let pdf_key = super::pdf_text::DocumentKey {
+                path: permission_path.clone(),
+                len: metadata.len(),
+                modified: metadata.modified().ok(),
+            };
+            let cached_pdf = self.read_tracker.pdf_cache.get(&pdf_key);
+            let bytes = if cached_pdf.is_some() {
+                None
+            } else {
+                let mut bytes = Vec::with_capacity(metadata.len() as usize);
+                reader.take(cap + 1).read_to_end(&mut bytes).await?;
+                if bytes.len() as u64 > cap {
+                    return Err(ToolError::Msg("PDF grew beyond the read limit".into()));
+                }
+                Some(bytes)
+            };
+            let pdf_cache = std::sync::Arc::clone(&self.read_tracker.pdf_cache);
             let budget = super::limits::current()
                 .max_result_chars
                 .saturating_sub(READ_RESULT_RESERVE_CHARS);
@@ -617,8 +654,11 @@ impl ReadTool {
             #[cfg(not(feature = "multimodal"))]
             let native_pdf = false;
             let rendered = crate::agent::runner::spawn_blocking_scoped(move || {
-                super::pdf_text::render_with_images(
-                    &bytes,
+                super::pdf_text::render_cached(
+                    &pdf_cache,
+                    pdf_key,
+                    cached_pdf,
+                    bytes.as_deref(),
                     &render_path,
                     pages.as_deref(),
                     budget,
