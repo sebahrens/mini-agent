@@ -641,13 +641,14 @@ mod dirty {
         for i in 0..40 {
             r.feed_mut().push_line(BlockStyle::Plain, format!("p{i}"));
         }
-        let expanded = (0..30).map(|i| format!("e{i}")).collect::<Vec<_>>().join("\n");
-        r.feed_mut().place_block_after_anchor("", crate::ui::feed::Block::foldable(
-            BlockStyle::ToolResult,
-            "summary",
-            expanded,
-            false,
-        ));
+        let expanded = (0..30)
+            .map(|i| format!("e{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        r.feed_mut().place_block_after_anchor(
+            "",
+            crate::ui::feed::Block::foldable(BlockStyle::ToolResult, "summary", expanded, false),
+        );
         for i in 0..40 {
             r.feed_mut().push_line(BlockStyle::Plain, format!("q{i}"));
         }
@@ -686,12 +687,10 @@ mod dirty {
         }
         assert_eq!(r.ctrl_t_fold_target(), 1);
         // A newer result below the viewport: Ctrl+T still picks the visible one.
-        r.feed_mut().place_block_after_anchor("", crate::ui::feed::Block::foldable(
-            BlockStyle::ToolResult,
-            "newer",
-            "x\ny",
-            false,
-        ));
+        r.feed_mut().place_block_after_anchor(
+            "",
+            crate::ui::feed::Block::foldable(BlockStyle::ToolResult, "newer", "x\ny", false),
+        );
         assert_eq!(r.ctrl_t_fold_target(), 2);
         r.feed_mut().refresh_fold_hint();
         let w = r.line_width();
@@ -708,6 +707,18 @@ mod dirty {
         assert_eq!(trim_url("https://e.com`"), "https://e.com");
         assert_eq!(trim_url("https://e.com/a_(b)"), "https://e.com/a_(b)");
         assert_eq!(trim_url("https://e.com/a),"), "https://e.com/a");
+    }
+
+    #[test]
+    fn recent_notices_keep_the_last_twenty_in_order() {
+        let mut r = Renderer::new().unwrap();
+        for i in 0..25 {
+            r.show_notice(&format!("notice {i}"), crossterm::style::Color::White);
+        }
+        let notices = r.recent_notices();
+        assert_eq!(notices.len(), 20);
+        assert_eq!(notices[0], "notice 5");
+        assert_eq!(notices[19], "notice 24");
     }
 
     #[test]
@@ -1807,7 +1818,9 @@ mod tool_output_folding {
             .push_anchored_block("b", BlockStyle::Tool, "◈ read \"b\"");
         let view = tool_result_view(&long_output(), false, ResolvedToolOutput::Collapsed);
         r.write_tool_result("a", &view).unwrap();
-        assert_eq!(r.feed().block_text(1), Some(view.collapsed.as_str()));
+        // The newest folded summary carries the Ctrl+T hint.
+        let hinted = format!("{} (Ctrl+T)", view.collapsed);
+        assert_eq!(r.feed().block_text(1), Some(hinted.as_str()));
         assert_eq!(r.feed().block_count(), 3);
         r.mark_chat_clean();
         assert_eq!(r.set_tool_output_fold(1, None), Some(true));

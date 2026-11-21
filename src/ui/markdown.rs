@@ -858,9 +858,10 @@ fn apply_marks(rows: &mut [LineEntry], palette: super::feed::ForegroundPalette) 
         }
         let state = |open: &[i32; 5]| {
             let mut attrs = 0u8;
-            for (count, bit) in open[..4]
-                .iter()
-                .zip([ATTR_BOLD, ATTR_ITALIC, ATTR_STRIKE, ATTR_UNDERLINE])
+            for (count, bit) in
+                open[..4]
+                    .iter()
+                    .zip([ATTR_BOLD, ATTR_ITALIC, ATTR_STRIKE, ATTR_UNDERLINE])
             {
                 if *count > 0 {
                     attrs |= bit;

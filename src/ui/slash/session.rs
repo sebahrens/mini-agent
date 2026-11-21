@@ -88,7 +88,7 @@ async fn handle_export(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
 }
 
 #[cfg(feature = "export")]
-fn default_export_filename(session_id: &str) -> String {
+pub(super) fn default_export_filename(session_id: &str) -> String {
     format!("mini-agent-session-{}.html", short_id(session_id))
 }
 

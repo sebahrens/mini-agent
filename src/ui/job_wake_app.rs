@@ -78,3 +78,16 @@ impl App<'_> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_session_change_or_user_turn_restores_the_wake_budget() {
+        CONSECUTIVE_WAKES.store(MAX_CONSECUTIVE_WAKES, Ordering::Relaxed);
+        assert!(CONSECUTIVE_WAKES.load(Ordering::Relaxed) >= MAX_CONSECUTIVE_WAKES);
+        user_turn_started();
+        assert_eq!(CONSECUTIVE_WAKES.load(Ordering::Relaxed), 0);
+    }
+}

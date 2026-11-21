@@ -303,7 +303,11 @@ fn write_attrs(out: &mut impl Write, attrs: u8, on: bool) -> io::Result<()> {
         (ATTR_BOLD, Attribute::Bold, Attribute::NormalIntensity),
         (ATTR_ITALIC, Attribute::Italic, Attribute::NoItalic),
         (ATTR_STRIKE, Attribute::CrossedOut, Attribute::NotCrossedOut),
-        (ATTR_UNDERLINE, Attribute::Underlined, Attribute::NoUnderline),
+        (
+            ATTR_UNDERLINE,
+            Attribute::Underlined,
+            Attribute::NoUnderline,
+        ),
     ] {
         if attrs & bit != 0 {
             write!(out, "{}", SetAttribute(if on { set } else { unset }))?;
@@ -1089,6 +1093,8 @@ pub struct Renderer {
     /// Transient status-line message (e.g. a copy result) that must not
     /// become a permanent transcript entry.
     notice: Option<Notice>,
+    /// The last [`NOTICE_LOG_LEN`] notices, for `/notices`.
+    notice_log: std::collections::VecDeque<CompactString>,
     /// Report agent activity in the terminal title (config `terminal_title`).
     title_status: bool,
     /// Activity last written to the title, so unchanged frames write nothing.
@@ -1166,6 +1172,8 @@ impl Write for TestSink {
 }
 
 /// How long a transient notice stays on the status line.
+/// Notices kept for `/notices`.
+pub(crate) const NOTICE_LOG_LEN: usize = 20;
 pub(crate) const NOTICE_DURATION: std::time::Duration = std::time::Duration::from_secs(3);
 
 impl Renderer {
@@ -1240,6 +1248,7 @@ impl Renderer {
             statusline_builds: 0,
             bottom_cursor: None,
             notice: None,
+            notice_log: std::collections::VecDeque::new(),
             title_status: false,
             title_activity: None,
             activity_signals: crate::ui::terminal::ActivitySignals::default(),
@@ -1528,11 +1537,20 @@ impl Renderer {
             self.chat_dirty = true;
             duration += std::time::Duration::from_millis(50 * text.chars().count().min(160) as u64);
         }
+        if self.notice_log.len() == NOTICE_LOG_LEN {
+            self.notice_log.pop_front();
+        }
+        self.notice_log.push_back(CompactString::from(text));
         self.notice = Some(Notice {
             text: CompactString::from(text),
             color,
             until: std::time::Instant::now() + duration,
         });
+    }
+
+    /// The recent statusline notices, oldest first.
+    pub(crate) fn recent_notices(&self) -> Vec<String> {
+        self.notice_log.iter().map(|n| n.to_string()).collect()
     }
 
     /// When the current notice expires, so the UI loop can repaint then.
@@ -2470,7 +2488,8 @@ impl Renderer {
                     entry.theme_accent.hash(&mut state);
                     if let Some(spans) = &entry.syntax_spans {
                         for span in spans.iter() {
-                            (span.range.start, span.range.end, span.color, span.attrs).hash(&mut state);
+                            (span.range.start, span.range.end, span.color, span.attrs)
+                                .hash(&mut state);
                         }
                     }
                     selected_range(line).hash(&mut state);
@@ -2542,12 +2561,8 @@ impl Renderer {
                     self.write_chat_margin(&mut stdout)?;
                     write!(stdout, "{}", SetForegroundColor(self.line_color(entry)))?;
                     set_fragment(fragment_url(&buffer, line));
-                    let painted_row = paint_styled_row(
-                        &mut stdout,
-                        entry,
-                        selected_range(line),
-                        self.monochrome,
-                    );
+                    let painted_row =
+                        paint_styled_row(&mut stdout, entry, selected_range(line), self.monochrome);
                     set_fragment(None);
                     painted_row?;
                 }
@@ -4766,7 +4781,10 @@ mod syntax_paint_tests {
         renderer.set_monochrome(true);
         renderer.render_viewport().unwrap();
         let mono = renderer.captured_output();
-        assert!(mono.contains("\x1b[1m") && mono.contains("\x1b[9m"), "{mono:?}");
+        assert!(
+            mono.contains("\x1b[1m") && mono.contains("\x1b[9m"),
+            "{mono:?}"
+        );
         assert!(mono.contains("bold") && !mono.contains("**"));
     }
 
@@ -5143,8 +5161,14 @@ mod frame_buffer_tests {
     #[test]
     fn the_spinner_tick_uses_the_same_colour_as_the_full_bottom_draw() {
         let mut renderer = filled_renderer();
-        let mut palette = ForegroundPalette::default();
-        palette.tool = Color::Rgb { r: 11, g: 22, b: 33 };
+        let palette = ForegroundPalette {
+            tool: Color::Rgb {
+                r: 11,
+                g: 22,
+                b: 33,
+            },
+            ..Default::default()
+        };
         renderer.set_foreground_palette(palette);
         renderer.render_viewport().unwrap();
         renderer.draw_bottom("", 0, &[], 0, true).unwrap();

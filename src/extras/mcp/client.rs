@@ -307,6 +307,13 @@ pub(crate) struct CachedListing {
 }
 
 impl ToolListCache {
+    /// Tools in the cached listing, without any RPC; `None` before the first
+    /// successful listing.
+    pub(crate) fn cached_count(&self) -> Option<usize> {
+        let cell = self.cell.lock().unwrap_or_else(|e| e.into_inner());
+        cell.get().map(|listed| listed.entries.len())
+    }
+
     pub(crate) fn with_flag(changed: Arc<std::sync::atomic::AtomicBool>) -> Self {
         Self {
             cell: Mutex::default(),

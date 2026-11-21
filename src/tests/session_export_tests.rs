@@ -980,9 +980,18 @@ fn a_failed_tool_result_persists_its_error_flag_and_old_records_still_load() {
     assert!(ok.get("is_error").is_none(), "false is not written");
     let old: PersistedToolMessage =
         serde_json::from_str(r#"{"kind":"result","output":"x"}"#).unwrap();
-    assert!(matches!(old, PersistedToolMessage::Result { is_error: false, .. }));
+    assert!(matches!(
+        old,
+        PersistedToolMessage::Result {
+            is_error: false,
+            ..
+        }
+    ));
     let back: PersistedToolMessage = serde_json::from_value(json).unwrap();
-    assert!(matches!(back, PersistedToolMessage::Result { is_error: true, .. }));
+    assert!(matches!(
+        back,
+        PersistedToolMessage::Result { is_error: true, .. }
+    ));
 }
 
 #[cfg(feature = "export")]
@@ -995,5 +1004,8 @@ fn exports_mark_an_unpriced_cost_instead_of_printing_zero_dollars() {
     assert!(html.contains("price unknown"));
     assert!(!html.contains("$0.0000"));
     let markdown = crate::extras::export::session_to_markdown(&session);
-    assert!(markdown.contains("\"cost_incomplete\":true") || markdown.contains("\"cost_incomplete\": true"));
+    assert!(
+        markdown.contains("\"cost_incomplete\":true")
+            || markdown.contains("\"cost_incomplete\": true")
+    );
 }

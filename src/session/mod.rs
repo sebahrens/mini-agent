@@ -2150,6 +2150,7 @@ impl Session {
 
     /// The cost as the statusline and exports show it: the recorded amount,
     /// marked `+?` when it may be incomplete, or `?` when nothing is priced.
+    #[cfg(feature = "export")]
     pub(crate) fn cost_display(&self) -> String {
         let amount = self.recorded_total_cost();
         match (self.cost_is_incomplete(), amount > 0.0) {

@@ -1071,6 +1071,14 @@ async fn actual_app_global_add_catalogue_status_and_remove_are_owned_and_never_c
     command(&mut app, "/doctor").await;
     assert!(app.renderer.captured_output().contains("failed: Failed"));
     assert_eq!(server.requests.lock().unwrap().len(), requests_before);
+    command(&mut app, "/mcp").await;
+    let status = app.renderer.captured_output();
+    assert!(
+        status.contains("attempt #") && status.contains(": failed"),
+        "{status}"
+    );
+    assert!(status.contains("reason:"), "{status}");
+    assert!(status.contains("tools: "), "{status}");
     command(&mut app, "/mcp remove failed").await;
     drain(&mut app).await;
     command(&mut app, "/mcp remove owned").await;

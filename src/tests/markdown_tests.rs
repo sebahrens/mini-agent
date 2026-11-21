@@ -545,7 +545,11 @@ fn emphasis_spans_survive_wrapping_and_never_widen_rows() {
     assert!(rows.len() > 1);
     for row in &rows {
         assert!(display_width(&row.text) <= 12);
-        assert!(row.syntax_spans.as_ref().is_some_and(|s| s.iter().all(|s| s.attrs != 0)));
+        assert!(
+            row.syntax_spans
+                .as_ref()
+                .is_some_and(|s| s.iter().all(|s| s.attrs != 0))
+        );
     }
 }
 
@@ -555,14 +559,22 @@ fn heading_levels_differ_by_attribute() {
     let h1 = &markdown_to_styled("# One", 80)[0];
     let h2 = &markdown_to_styled("## Two", 80)[0];
     let h3 = &markdown_to_styled("### Three", 80)[0];
-    assert_eq!(h1.syntax_spans.as_ref().unwrap()[0].attrs, ATTR_BOLD | ATTR_UNDERLINE);
+    assert_eq!(
+        h1.syntax_spans.as_ref().unwrap()[0].attrs,
+        ATTR_BOLD | ATTR_UNDERLINE
+    );
     assert_eq!(h2.syntax_spans.as_ref().unwrap()[0].attrs, ATTR_BOLD);
     assert_ne!(h3.syntax_spans.as_ref().unwrap()[0].attrs, ATTR_BOLD);
 }
 
 #[test]
 fn layout_marks_have_no_width_and_model_text_cannot_forge_them() {
-    assert_eq!(display_width("\u{2061}\u{2062}\u{2063}\u{2064}\u{206A}\u{206B}\u{206C}\u{206D}\u{206E}\u{206F}"), 0);
+    assert_eq!(
+        display_width(
+            "\u{2061}\u{2062}\u{2063}\u{2064}\u{206A}\u{206B}\u{206C}\u{206D}\u{206E}\u{206F}"
+        ),
+        0
+    );
     let rows = markdown_to_styled("x\u{2061}y", 80);
     assert_eq!(rows[0].text, "xy");
     assert!(rows[0].syntax_spans.is_none());

@@ -5,6 +5,9 @@ mod job_wake_app;
 #[cfg(feature = "mcp")]
 #[path = "mcp_admin_app.rs"]
 mod mcp_admin_app;
+#[cfg(feature = "export")]
+#[path = "share_app.rs"]
+mod share_app;
 
 use std::io;
 use std::ops::ControlFlow;
@@ -879,6 +882,7 @@ impl App<'_> {
     fn open_link(&self, url: String) {
         #[cfg(test)]
         {
+            let _ = renderer_mod::open_url;
             OPENED_LINKS.with(|opened| opened.borrow_mut().push(url));
         }
         #[cfg(not(test))]
@@ -1800,10 +1804,22 @@ mod reasoning_display_tests {
     async fn a_url_opens_on_a_plain_click_release_and_never_on_a_drag() {
         let root = crate::tests::OwnedTestDirectory::new("link-click-controls");
         let _environment = crate::tests::ScopedProcessEnv::set(&[
-            ("MINI_AGENT_CONFIG_DIR", Some(root.path().join("config").into_os_string())),
-            ("MINI_AGENT_DATA_DIR", Some(root.path().join("data").into_os_string())),
-            ("MINI_AGENT_STATE_DIR", Some(root.path().join("state").into_os_string())),
-            ("MINI_AGENT_CACHE_DIR", Some(root.path().join("cache").into_os_string())),
+            (
+                "MINI_AGENT_CONFIG_DIR",
+                Some(root.path().join("config").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_DATA_DIR",
+                Some(root.path().join("data").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_STATE_DIR",
+                Some(root.path().join("state").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_CACHE_DIR",
+                Some(root.path().join("cache").into_os_string()),
+            ),
         ]);
         let cli = crate::cli::Cli {
             no_session: true,
@@ -1836,26 +1852,46 @@ mod reasoning_display_tests {
             None,
         );
         let mut app = test_support::fixture_app(ui);
-        app.renderer
-            .feed_mut()
-            .push_line(crate::ui::feed::BlockStyle::Plain, "see https://example.com/x ok");
+        app.renderer.feed_mut().push_line(
+            crate::ui::feed::BlockStyle::Plain,
+            "see https://example.com/x ok",
+        );
         let row = (0..app.renderer.visible_lines() as u16)
             .find(|row| app.renderer.buffer_line_at_row(*row) == Some(0))
             .unwrap();
         let col = 8u16;
         let opened = || OPENED_LINKS.with(|o| o.borrow().len());
         let before = opened();
-        let _ = app.handle_user_event(UserEvent::MouseDown { row, col }).await.unwrap();
+        let _ = app
+            .handle_user_event(UserEvent::MouseDown { row, col })
+            .await
+            .unwrap();
         assert_eq!(opened(), before, "button-down alone opens nothing");
-        let _ = app.handle_user_event(UserEvent::MouseUp { row, col }).await.unwrap();
+        let _ = app
+            .handle_user_event(UserEvent::MouseUp { row, col })
+            .await
+            .unwrap();
         assert_eq!(opened(), before + 1);
         // A drag across the URL selects and never opens.
         std::thread::sleep(std::time::Duration::from_millis(700));
-        let _ = app.handle_user_event(UserEvent::MouseDown { row, col: 6 }).await.unwrap();
+        let _ = app
+            .handle_user_event(UserEvent::MouseDown { row, col: 6 })
+            .await
+            .unwrap();
         assert!(app.renderer.selection_active);
-        let _ = app.handle_user_event(UserEvent::MouseDrag { row, col: 14 }).await.unwrap();
-        let _ = app.handle_user_event(UserEvent::MouseUp { row, col: 14 }).await.unwrap();
-        assert_eq!(opened(), before + 1, "a drag over a URL selects, never opens");
+        let _ = app
+            .handle_user_event(UserEvent::MouseDrag { row, col: 14 })
+            .await
+            .unwrap();
+        let _ = app
+            .handle_user_event(UserEvent::MouseUp { row, col: 14 })
+            .await
+            .unwrap();
+        assert_eq!(
+            opened(),
+            before + 1,
+            "a drag over a URL selects, never opens"
+        );
         OPENED_LINKS.with(|o| assert_eq!(o.borrow().last().unwrap(), "https://example.com/x"));
     }
 
@@ -3948,6 +3984,8 @@ impl<'a> App<'a> {
                 let _ = self.save_session();
                 return Ok(ControlFlow::Break(()));
             }
+            #[cfg(feature = "export")]
+            UserEvent::ShareDone(result) => self.finish_share(result)?,
             UserEvent::LinkOpenFailed(error) => {
                 self.renderer
                     .write_line(&format!("cannot open link: {error}"), C_ERROR)?;
@@ -4305,6 +4343,11 @@ impl<'a> App<'a> {
             self.renderer.clear_selection();
             return Ok(());
         }
+        #[cfg(feature = "export")]
+        if key.code == KeyCode::Esc && share_app::cancel_active() {
+            self.renderer.write_line("share cancelled", C_AGENT)?;
+            return Ok(());
+        }
 
         if action == Some(KeyAction::HistorySearch) {
             if self.input.history_search_active() {
@@ -4362,7 +4405,8 @@ impl<'a> App<'a> {
             if self
                 .renderer
                 .set_tool_output_fold(self.renderer.ctrl_t_fold_target(), None)
-                .is_none() {
+                .is_none()
+            {
                 self.renderer
                     .show_notice("no tool output to expand yet", Color::DarkGrey);
             }
@@ -6931,6 +6975,10 @@ impl<'a> App<'a> {
         } else {
             echo_submission(&mut self.renderer, text)?;
         }
+        #[cfg(feature = "export")]
+        if share_app::is_confirm(text) {
+            return self.start_share();
+        }
 
         // Commands that hand the tty to a synchronous stdin consumer must not
         // race the crossterm event thread for keystrokes (same pattern as
@@ -6968,6 +7016,8 @@ impl<'a> App<'a> {
             self.rebind_event_thread();
         }
         if prior_question_session != self.ui.session.id {
+            // /new and /resume start a fresh wake budget.
+            job_wake_app::user_turn_started();
             self.adopt_saved_cron()?;
         }
         if prior_question_session != self.ui.session.id
