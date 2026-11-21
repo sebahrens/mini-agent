@@ -2377,7 +2377,7 @@ fn warn_unknown_stream_item<R: serde::Serialize>(item: &MultiTurnStreamItem<R>) 
     tracing::warn!("unknown stream item variant: {detail}");
 }
 
-use crate::agent::output_truncation::{OutputTruncation, TruncationDecision};
+mod turn_state;
 
 fn duration_millis(delay: std::time::Duration) -> u64 {
     u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)
@@ -3250,23 +3250,6 @@ const MAX_STOP_BLOCKS: u32 = 8;
 // headless (`run_print_*`) turn loops. The loops keep their own I/O and
 // ordering; only logic that was identical in both lives here, so a fix lands
 // in one place.
-
-/// Bookkeeping for one observed `CompletionCall`: resets the mid-stream retry
-/// budget, charges the turn and folds the usage into the ledger and the spend
-/// run. Returns the usage delta.
-fn record_completion_call(
-    retry_state: &mut CompletionRetryState,
-    retry_config: &RetryConfig,
-    turns_used: &mut usize,
-    usage_ledger: &mut UsageLedger,
-    usage: Usage,
-) -> UsageDelta {
-    retry_state.reset(retry_config);
-    *turns_used = turns_used.saturating_add(1);
-    let delta = usage_ledger.record(usage);
-    crate::spend::run::observe_current(delta);
-    delta
-}
 
 /// Applies the cumulative token budget after a completion. An exhausted budget
 /// is remembered so the next tool item fails; a text-only completion that
@@ -4931,18 +4914,16 @@ where
         .await;
         let retry_history = history;
         let mut first_attempt_history = Some(retry_history.to_vec());
-        let mut interactions: Vec<Message> = Vec::new();
-        let mut tool_calls = ToolCallTracker::default();
-        let mut exhausted_budget_after_completion = None;
+        let mut turn = turn_state::TurnState::new(&retry_config, turn_token_budget);
         let mut completed_interactions: Vec<Message> = Vec::new();
         // Canonical messages for work that already completed when a terminal
         // failure ends the turn. Clients that commit history only on `Done`
         // would otherwise have no record of an effect that already happened.
         macro_rules! completed_so_far {
             () => {{
-                tool_calls.finalize_unresolved(&mut interactions);
+                turn.tool_calls.finalize_unresolved(&mut turn.interactions);
                 let mut retained = std::mem::take(&mut completed_interactions);
-                retained.append(&mut interactions);
+                retained.append(&mut turn.interactions);
                 retained
             }};
         }
@@ -4952,8 +4933,12 @@ where
         macro_rules! park_question {
             () => {
                 if let Some(question) = crate::question::required() {
-                    finalize_interactive_tool_calls(&mut tool_calls, &mut interactions, &event_tx)
-                        .await;
+                    finalize_interactive_tool_calls(
+                        &mut turn.tool_calls,
+                        &mut turn.interactions,
+                        &event_tx,
+                    )
+                    .await;
                     let _ = event_tx
                         .send(AgentEvent::AwaitingUser {
                             question: Box::new(question),
@@ -4969,10 +4954,13 @@ where
         // `ToolResult` arms.
         macro_rules! stop_if_budget_exhausted {
             () => {
-                if let Some(message) = token_budget_stop_message(exhausted_budget_after_completion)
-                {
-                    finalize_interactive_tool_calls(&mut tool_calls, &mut interactions, &event_tx)
-                        .await;
+                if let Some(message) = turn.budget_stop() {
+                    finalize_interactive_tool_calls(
+                        &mut turn.tool_calls,
+                        &mut turn.interactions,
+                        &event_tx,
+                    )
+                    .await;
                     let _ = event_tx
                         .send(AgentEvent::error_with(
                             CompactString::from(message),
@@ -4986,10 +4974,6 @@ where
         // `None` means the initial prompt. Continuations install only their
         // small replacement instruction instead of cloning the initial prompt.
         let mut stream_prompt: Option<String> = None;
-        let mut empty_response_count: u32 = 0;
-        let mut goal_report_accepted = false;
-        let mut workspace_may_have_changed = false;
-        let mut verification_attempt = 0u32;
         let max_turns_total = agent.default_max_turns.unwrap_or(1);
         // A context-relief segment continues the same prompt: only the
         // remainder of the per-prompt turn and token budgets is available
@@ -5007,13 +4991,9 @@ where
                 .await;
             return;
         }
-        let turn_token_budget = turn_token_budget.map(|budget| budget.saturating_sub(prior_tokens));
-        let mut turns_used = 0usize;
-        let mut turns_at_stream_start = turns_used;
-        let mut response = String::new();
-        let mut response_len_at_stream_start = response.len();
-        let mut usage_ledger = UsageLedger::default();
-        let mut completion_retry = CompletionRetryState::new(&retry_config);
+        turn.set_turn_token_budget(
+            turn_token_budget.map(|budget| budget.saturating_sub(prior_tokens)),
+        );
         let mut compaction_requested = false;
         // Boundary events whose decision the runner did not wait for.
         let mut unparked_decisions = 0usize;
@@ -5034,17 +5014,7 @@ where
                 }
             };
         }
-        usage_ledger.start_stream();
-        // Overrides the next continuation message (bottom of the outer
-        // `loop`); set when a `Stop` hook forces continuation instead of the
-        // default re-injected `retry_prompt`.
-        let mut next_instruction: Option<String> = None;
-        let mut output_truncation = OutputTruncation::default();
         let mut args_streaming = ArgsStreaming::default();
-        #[cfg(feature = "hooks")]
-        let mut stop_hook_active = false;
-        #[cfg(feature = "hooks")]
-        let mut consecutive_stop_blocks: u32 = 0;
 
         if max_turns == 0 {
             let message = if prior_turns > 0 {
@@ -5140,9 +5110,9 @@ where
                 match item {
                     Ok(MultiTurnStreamItem::InputInjected(messages)) => {
                         steering_hook.steering.take_pending();
-                        response.clear();
-                        response_len_at_stream_start = 0;
-                        interactions.extend(messages.iter().cloned());
+                        turn.response.clear();
+                        turn.response_len_at_stream_start = 0;
+                        turn.interactions.extend(messages.iter().cloned());
                         let (checkpoint, acknowledgement) =
                             crate::session::file_checkpoints::steering_handoff();
                         if event_tx
@@ -5163,7 +5133,7 @@ where
                             let _ = event_tx
                                 .send(AgentEvent::error_with(
                                     "Steering checkpoint handoff was not accepted",
-                                    interactions.clone(),
+                                    turn.interactions.clone(),
                                 ))
                                 .await;
                             return;
@@ -5173,7 +5143,7 @@ where
                         // Ingestion is independent of display: native opaque
                         // completed blocks remain available to the transcript.
                         if let StreamedAssistantContent::Reasoning(item) = &content {
-                            append_reasoning(&mut interactions, item);
+                            append_reasoning(&mut turn.interactions, item);
                         }
                         if let Some(reasoning) =
                             streamed_reasoning_text(&content, native_capture.is_native())
@@ -5184,8 +5154,7 @@ where
 
                         match content {
                             StreamedAssistantContent::Text(text) => {
-                                response.push_str(&text.text);
-                                append_streamed_text(&mut interactions, &text.text);
+                                turn.on_text(&text.text);
                                 let _ = event_tx
                                     .send(AgentEvent::Token(CompactString::from(text.text)))
                                     .await;
@@ -5196,18 +5165,17 @@ where
                             } => {
                                 stop_if_budget_exhausted!();
                                 let tool_name = &tool_call.function.name;
-                                workspace_may_have_changed |= tool_may_mutate_workspace(tool_name);
                                 tracing::debug!(
                                     "agent tool start: name={}, internal_call_id={}, args_len={}",
                                     tool_name,
                                     internal_call_id,
                                     tool_call.function.arguments.to_string().len(),
                                 );
-                                if let Err(error) = tool_calls.record(&internal_call_id, &tool_call)
+                                if let Err(error) = turn.on_tool_call(&internal_call_id, &tool_call)
                                 {
                                     finalize_interactive_tool_calls(
-                                        &mut tool_calls,
-                                        &mut interactions,
+                                        &mut turn.tool_calls,
+                                        &mut turn.interactions,
                                         &event_tx,
                                     )
                                     .await;
@@ -5219,9 +5187,6 @@ where
                                         .await;
                                     return;
                                 }
-                                response.clear();
-                                response_len_at_stream_start = 0;
-                                append_tool_call(&mut interactions, &tool_call);
                                 #[cfg(feature = "acp")]
                                 crate::permission::ask::record_tool_call(
                                     &tool_call.function.name,
@@ -5276,12 +5241,9 @@ where
                         internal_call_id,
                     })) => {
                         stop_if_budget_exhausted!();
-                        let Some((tool_name, output)) = append_attributed_tool_result(
-                            &mut tool_calls,
-                            &mut interactions,
-                            &internal_call_id,
-                            &tool_result,
-                        ) else {
+                        let Some((tool_name, output)) =
+                            turn.on_tool_result(&internal_call_id, &tool_result)
+                        else {
                             continue;
                         };
                         native_capture.tool_result(&internal_call_id, &tool_result);
@@ -5292,7 +5254,6 @@ where
                         );
                         #[cfg(feature = "acp")]
                         crate::permission::ask::finish_tool_call(&tool_name, &internal_call_id);
-                        goal_report_accepted |= take_accepted_goal_report(&internal_call_id);
                         let loop_notice = take_tool_loop_notice(&internal_call_id);
                         let is_error = take_tool_failure(&internal_call_id);
                         // Delivered normally: the interrupt fallback is not needed.
@@ -5330,11 +5291,11 @@ where
                             .await;
                         drain_compaction_decisions!();
                         if compaction_requested
-                            && tool_calls.pending.is_empty()
+                            && turn.tool_calls.pending.is_empty()
                             && crate::question::required().is_none()
                         {
                             let mut boundary_interactions = completed_interactions.clone();
-                            boundary_interactions.extend(interactions.iter().cloned());
+                            boundary_interactions.extend(turn.interactions.iter().cloned());
                             let _ = event_tx
                                 .send(AgentEvent::CompactionBoundary {
                                     interactions: boundary_interactions,
@@ -5376,10 +5337,13 @@ where
                                 .await;
                         }
                         let usage = res.usage();
-                        let context_complete = !usage_ledger.stream_has_observed_usage();
-                        let terminal_delta = reconcile_terminal_usage(&mut usage_ledger, usage);
+                        let context_complete = !turn.usage_ledger.stream_has_observed_usage();
+                        let terminal_delta = turn.reconcile_terminal(usage);
                         if let Some(carry) = &interactive_carry {
-                            carry.note_segment(turns_used, observed_tokens(usage_ledger.total));
+                            carry.note_segment(
+                                turn.turns_used,
+                                observed_tokens(turn.usage_ledger.total),
+                            );
                         }
                         if terminal_delta.has_values() {
                             let _ = event_tx
@@ -5391,18 +5355,13 @@ where
                                 .await;
                         }
                         let response_text = res.output;
-                        let terminal_was_streamed = reconcile_final_output(
-                            &mut response,
-                            response_len_at_stream_start,
-                            &response_text,
-                            &mut interactions,
-                        );
+                        let terminal_was_streamed = turn.reconcile_final(&response_text);
                         // Rig's grouped delta (already in `completed_interactions`)
                         // is authoritative for this stream; keeping the streamed
                         // copies would make terminal errors report them twice.
                         // Only the synthetic unresolved-tool results appended
                         // below remain in `interactions`.
-                        interactions.clear();
+                        turn.interactions.clear();
                         tracing::info!(
                             "agent done: input_tokens={}, output_tokens={}, cached_input_tokens={}, cache_creation_input_tokens={}",
                             usage.input_tokens,
@@ -5414,8 +5373,8 @@ where
                         park_question!();
 
                         if finalize_interactive_tool_calls(
-                            &mut tool_calls,
-                            &mut interactions,
+                            &mut turn.tool_calls,
+                            &mut turn.interactions,
                             &event_tx,
                         )
                         .await
@@ -5430,15 +5389,13 @@ where
                             return;
                         }
 
-                        if let Some(decision) = output_truncation.final_response() {
-                            tracing::warn!("{}", decision.notice());
+                        if let Some((notice, instruction)) = turn.final_truncation() {
                             let _ = event_tx
                                 .send(AgentEvent::OutputTruncated {
-                                    message: CompactString::from(decision.notice()),
+                                    message: CompactString::from(notice),
                                 })
                                 .await;
-                            if let TruncationDecision::Continue { instruction, .. } = decision {
-                                next_instruction = Some(instruction);
+                            if instruction.is_some() {
                                 break;
                             }
                         }
@@ -5447,13 +5404,11 @@ where
                         // no closing text follows it (mini-agent-64qyf).
                         if terminal_was_streamed
                             || !response_text.is_empty()
-                            || goal_report_accepted
+                            || turn.goal_report_accepted
                             || native_capture.completes_without_visible_text()
                         {
-                            let verification_ran = workspace_may_have_changed
-                                && completion_verification
-                                    .as_ref()
-                                    .is_some_and(CompletionVerification::has_command);
+                            let verification_ran =
+                                turn.verification_applies(completion_verification.as_ref());
                             if verification_ran
                                 && let Some(verification) = completion_verification.as_ref()
                             {
@@ -5467,7 +5422,7 @@ where
                                         .await;
                                     return;
                                 }
-                                verification_attempt = verification_attempt.saturating_add(1);
+                                let verification_attempt = turn.begin_verification();
                                 let result = verification.run().await;
                                 let passed = result.succeeded();
                                 #[cfg(feature = "skills")]
@@ -5481,43 +5436,34 @@ where
                                         output: CompactString::new(&diagnostic),
                                     })
                                     .await;
-                                if !passed {
-                                    if verification_attempt < verification.max_attempts {
-                                        next_instruction = Some(verification_retry_instruction(
-                                            verification.command.as_deref().unwrap_or(""),
-                                            verification_attempt,
-                                            verification.max_attempts,
-                                            &diagnostic,
-                                        ));
-                                        break;
+                                match turn.verification_finished(verification, passed, &diagnostic)
+                                {
+                                    turn_state::VerificationNext::Passed => {}
+                                    turn_state::VerificationNext::Retry => break,
+                                    turn_state::VerificationNext::Exhausted => {
+                                        let _ = event_tx
+                                            .send(AgentEvent::error_with(
+                                                CompactString::from(format!(
+                                                    "Verification failed after {verification_attempt} attempts.\n{diagnostic}"
+                                                )),
+                                                completed_so_far!(),
+                                            ))
+                                            .await;
+                                        return;
                                     }
-                                    let _ = event_tx
-                                        .send(AgentEvent::error_with(
-                                            CompactString::from(format!(
-                                                "Verification failed after {verification_attempt} attempts.\n{diagnostic}"
-                                            )),
-                                            completed_so_far!(),
-                                        ))
-                                        .await;
-                                    return;
                                 }
                             }
                             #[cfg(feature = "hooks")]
                             if let crate::extras::hooks::StopGate::Continue { reason } =
                                 crate::extras::hooks::dispatch_stop(
-                                    stop_hook_active,
+                                    turn.stop_hook_active,
                                     loop_info.map(|info| u64::from(info.iteration)),
                                     loop_info.map(|info| info.active),
                                     goal_hook_info(),
                                 )
                                 .await
-                                && let Some(instruction) = stop_block_continuation(
-                                    &mut consecutive_stop_blocks,
-                                    &mut stop_hook_active,
-                                    reason,
-                                )
+                                && turn.stop_blocked(reason)
                             {
-                                next_instruction = Some(instruction);
                                 break;
                             }
                             #[cfg(feature = "skills")]
@@ -5525,16 +5471,16 @@ where
                                 && let Some(verification) = completion_verification.as_ref()
                             {
                                 verification
-                                    .record_verification_skipped(workspace_may_have_changed);
+                                    .record_verification_skipped(turn.workspace_may_have_changed);
                             }
                             tracing::debug!(
-                                response_bytes = response.len(),
+                                response_bytes = turn.response.len(),
                                 interactions = completed_interactions.len(),
                                 "agent model completion ready for terminal event delivery"
                             );
                             if event_tx
                                 .send(AgentEvent::Done {
-                                    response: CompactString::from(response.clone()),
+                                    response: CompactString::from(turn.response.clone()),
                                     interactions: completed_interactions,
                                 })
                                 .await
@@ -5546,10 +5492,7 @@ where
                             }
                             return;
                         }
-                        if empty_response_limit_reached(&mut empty_response_count) {
-                            tracing::warn!(
-                                "agent: {MAX_EMPTY_RESPONSES} consecutive empty responses, aborting"
-                            );
+                        if matches!(turn.on_empty_final(), turn_state::EmptyFinal::Abort) {
                             let _ = event_tx
                                 .send(AgentEvent::error_with(
                                     CompactString::from(
@@ -5563,17 +5506,13 @@ where
                         break;
                     }
                     Ok(MultiTurnStreamItem::CompletionCall(call)) => {
-                        output_truncation.observe_call(&call);
                         let usage = call.usage;
-                        let delta = record_completion_call(
-                            &mut completion_retry,
-                            &retry_config,
-                            &mut turns_used,
-                            &mut usage_ledger,
-                            usage,
-                        );
+                        let delta = turn.on_completion_call(&call, &retry_config);
                         if let Some(carry) = &interactive_carry {
-                            carry.note_segment(turns_used, observed_tokens(usage_ledger.total));
+                            carry.note_segment(
+                                turn.turns_used,
+                                observed_tokens(turn.usage_ledger.total),
+                            );
                         }
                         tracing::debug!(
                             "agent completion: input_tokens={}, output_tokens={}, cached_input_tokens={}, cache_creation_input_tokens={}, cumulative_tokens={}",
@@ -5581,7 +5520,7 @@ where
                             usage.output_tokens,
                             usage.cached_input_tokens,
                             usage.cache_creation_input_tokens,
-                            observed_tokens(usage_ledger.total),
+                            observed_tokens(turn.usage_ledger.total),
                         );
                         // Decided before the event is visible to the UI, and
                         // recorded in event order so the UI knows whether the
@@ -5646,144 +5585,115 @@ where
                             // tool batch. The UI is aborting this run.
                             return;
                         }
-                        note_budget_after_completion(
-                            usage_ledger.total,
-                            turn_token_budget,
-                            &mut exhausted_budget_after_completion,
-                        );
+                        turn.note_budget();
                     }
                     Err(e) => {
                         finalize_interactive_tool_calls(
-                            &mut tool_calls,
-                            &mut interactions,
+                            &mut turn.tool_calls,
+                            &mut turn.interactions,
                             &event_tx,
                         )
                         .await;
                         park_question!();
-                        if is_max_turns_stream_error(&e) {
-                            tracing::warn!(
-                                "agent: maximum turn budget ({max_turns_total}) exhausted"
-                            );
-                            let _ = event_tx
-                                .send(AgentEvent::error_with(
-                                    CompactString::from(max_turns_exhausted_message(
-                                        max_turns_total,
-                                    )),
-                                    completed_so_far!(),
-                                ))
-                                .await;
-                            return;
-                        }
-                        if let Some(decision) = output_truncation.stream_error(&e.to_string()) {
-                            tracing::warn!("{}: {e}", decision.notice());
-                            let _ = event_tx
-                                .send(AgentEvent::OutputTruncated {
-                                    message: CompactString::from(decision.notice()),
-                                })
-                                .await;
-                            if let TruncationDecision::Continue { instruction, .. } = decision {
-                                next_instruction = Some(instruction);
+                        match turn.on_stream_error(&e, &retry_config, true) {
+                            turn_state::StreamErrorAction::MaxTurns => {
+                                tracing::warn!(
+                                    "agent: maximum turn budget ({max_turns_total}) exhausted"
+                                );
+                                let _ = event_tx
+                                    .send(AgentEvent::error_with(
+                                        CompactString::from(max_turns_exhausted_message(
+                                            max_turns_total,
+                                        )),
+                                        completed_so_far!(),
+                                    ))
+                                    .await;
+                                return;
+                            }
+                            turn_state::StreamErrorAction::Truncated {
+                                notice,
+                                instruction,
+                            } => {
+                                let _ = event_tx
+                                    .send(AgentEvent::OutputTruncated {
+                                        message: CompactString::from(notice.as_str()),
+                                    })
+                                    .await;
+                                if instruction.is_some() {
+                                    retrying_interrupted_completion = true;
+                                    break;
+                                }
+                                let _ = event_tx
+                                    .send(AgentEvent::error_with(
+                                        CompactString::from(notice),
+                                        completed_so_far!(),
+                                    ))
+                                    .await;
+                                return;
+                            }
+                            turn_state::StreamErrorAction::Retry { attempt, delay } => {
+                                let _ = event_tx
+                                    .send(AgentEvent::Retrying {
+                                        attempt,
+                                        max: retry_config.max_attempts,
+                                        delay_ms: duration_millis(delay),
+                                        reason: retry::retry_reason(&e),
+                                    })
+                                    .await;
+                                tokio::time::sleep(delay).await;
                                 retrying_interrupted_completion = true;
                                 break;
                             }
-                            let _ = event_tx
-                                .send(AgentEvent::error_with(
-                                    CompactString::from(decision.notice()),
-                                    completed_so_far!(),
-                                ))
-                                .await;
-                            return;
+                            turn_state::StreamErrorAction::Fatal => {
+                                tracing::error!("agent stream error: {e}");
+                                let error = retry::with_provider_error_hint_for(
+                                    &e,
+                                    crate::spend::run::Run::current()
+                                        .as_ref()
+                                        .map(|run| run.provider_name()),
+                                );
+                                let _ = event_tx
+                                    .send(AgentEvent::error_with(
+                                        CompactString::new(error),
+                                        completed_so_far!(),
+                                    ))
+                                    .await;
+                                return;
+                            }
                         }
-                        if let Some((attempt, delay)) =
-                            midstream_retry(&mut completion_retry, &retry_config, &e)
-                        {
-                            let _ = event_tx
-                                .send(AgentEvent::Retrying {
-                                    attempt,
-                                    max: retry_config.max_attempts,
-                                    delay_ms: duration_millis(delay),
-                                    reason: retry::retry_reason(&e),
-                                })
-                                .await;
-                            tokio::time::sleep(delay).await;
-                            next_instruction = Some(TRANSIENT_PROVIDER_CONTINUATION.to_string());
-                            retrying_interrupted_completion = true;
-                            break;
-                        }
-                        tracing::error!("agent stream error: {e}");
-                        let error = retry::with_provider_error_hint_for(
-                            &e,
-                            crate::spend::run::Run::current()
-                                .as_ref()
-                                .map(|run| run.provider_name()),
-                        );
-                        let _ = event_tx
-                            .send(AgentEvent::error_with(
-                                CompactString::new(error),
-                                completed_so_far!(),
-                            ))
-                            .await;
-                        return;
                     }
                     Ok(item) => warn_unknown_stream_item(&item),
                 }
             }
 
-            finalize_interactive_tool_calls(&mut tool_calls, &mut interactions, &event_tx).await;
+            finalize_interactive_tool_calls(
+                &mut turn.tool_calls,
+                &mut turn.interactions,
+                &event_tx,
+            )
+            .await;
             park_question!();
 
-            if !terminal_response_seen
-                && !retrying_interrupted_completion
-                && let Err(error) =
-                    charge_nonterminal_eof(&mut turns_used, turns_at_stream_start, max_turns)
-            {
-                tracing::warn!(
-                    attempts = error.attempts,
-                    limit = error.limit,
-                    "agent stream EOF budget exhausted"
-                );
-                let _ = event_tx
-                    .send(AgentEvent::error_with(
-                        CompactString::new(error.to_string()),
-                        completed_so_far!(),
-                    ))
-                    .await;
-                return;
-            }
-
-            let remaining_turns = max_turns.saturating_sub(turns_used);
-            if remaining_turns == 0 {
-                tracing::warn!(
-                    "agent: maximum turn budget ({max_turns}) exhausted before continuation"
-                );
-                let _ = event_tx
-                    .send(AgentEvent::error_with(
-                        CompactString::from(format!(
-                            "Agent exhausted its maximum turn budget ({max_turns}) before completing.{}",
-                            crate::cli::MAX_AGENT_TURNS_HINT
-                        )),
-                        completed_so_far!(),
-                    ))
-                    .await;
-                return;
-            }
-            if let Some(message) = token_budget_stop_message(exhausted_token_budget(
-                usage_ledger.total,
-                turn_token_budget,
-            )) {
-                tracing::warn!("agent: cumulative token budget exhausted before continuation");
-                let _ = event_tx
-                    .send(AgentEvent::error_with(
-                        CompactString::from(message),
-                        completed_so_far!(),
-                    ))
-                    .await;
-                return;
-            }
-            let continuation_instruction = next_instruction
-                .take()
-                .unwrap_or_else(|| DEFAULT_CONTINUATION.to_string());
-            let new_interactions = take_new_interactions(&mut interactions);
+            let turn_state::Continuation {
+                remaining_turns,
+                instruction: continuation_instruction,
+                new_interactions,
+            } = match turn.begin_continuation(
+                terminal_response_seen,
+                retrying_interrupted_completion,
+                max_turns,
+            ) {
+                Ok(continuation) => continuation,
+                Err(stop) => {
+                    let _ = event_tx
+                        .send(AgentEvent::error_with(
+                            CompactString::from(stop.message()),
+                            completed_so_far!(),
+                        ))
+                        .await;
+                    return;
+                }
+            };
             // A non-terminal EOF has no Rig FinalResponse to supply an
             // authoritative delta. Preserve the replay payload only in that
             // exceptional path; completed streams use Rig's grouped messages.
@@ -5813,9 +5723,7 @@ where
                 )
                 .await,
             );
-            usage_ledger.start_stream();
-            turns_at_stream_start = turns_used;
-            response_len_at_stream_start = response.len();
+            turn.stream_started();
         }
     });
 
@@ -6186,46 +6094,30 @@ where
     let mut stream = stream_policy.apply(stream);
 
     let retry_history = history;
-    // Interactions of the stream currently being consumed; drained into the
-    // continuation bridge (and `committed_interactions`) at every stream end.
-    let mut interactions: Vec<Message> = Vec::new();
+    // `turn.interactions` are those of the stream currently being consumed;
+    // drained into the continuation bridge (and `committed_interactions`) at
+    // every stream end.
+    let mut turn = turn_state::TurnState::new(retry_config, turn_token_budget);
     // Every completed stream's interactions, in order. This is what the caller
     // persists, so it must span the whole turn, not just the last stream
     // (mini-agent-ut1v).
     let mut committed_interactions: Vec<Message> = Vec::new();
     let mut continuation_bridge: Vec<Message> = Vec::new();
-    let mut full_response = String::new();
-    let mut response_len_at_stream_start = full_response.len();
-    let mut tool_calls = ToolCallTracker::default();
-    let mut exhausted_budget_after_completion = None;
-    let mut usage_ledger = UsageLedger::default();
-    let mut completion_retry = CompletionRetryState::new(retry_config);
-    usage_ledger.start_stream();
-    let mut turns_used = 0usize;
-    let mut turns_at_stream_start = turns_used;
     // Drives the outer loop for either a `Stop`-forced continuation or recovery
     // from a provider stream that ended without a terminal response.
     let mut continue_turn = true;
-    // Bounded retry of empty terminal responses, mirroring `spawn_agent`: an
-    // empty response must never be returned (and persisted) as the turn.
-    let mut empty_response_count: u32 = 0;
-    let mut goal_report_accepted = false;
-    let mut workspace_may_have_changed = false;
-    let mut verification_attempt = 0u32;
-    let mut next_instruction: Option<String> = None;
-    let mut output_truncation = OutputTruncation::default();
     // Every terminal failure below returns through this, so the completed tool
     // records and observed usage of the failed turn survive for persistence.
     macro_rules! turn_failure {
         ($($arg:tt)*) => {{
-            tool_calls.finalize_unresolved(&mut interactions);
-            committed_interactions.append(&mut interactions);
+            turn.tool_calls.finalize_unresolved(&mut turn.interactions);
+            committed_interactions.append(&mut turn.interactions);
             if let Some(carry) = &budget_carry {
-                carry.add(turns_used, observed_tokens(usage_ledger.total));
+                carry.add(turn.turns_used, observed_tokens(turn.usage_ledger.total));
             }
             HeadlessTurn {
-                response: std::mem::take(&mut full_response),
-                usage: usage_ledger.total,
+                response: std::mem::take(&mut turn.response),
+                usage: turn.usage_ledger.total,
                 interactions: std::mem::take(&mut committed_interactions),
                 failure: Some(anyhow::anyhow!($($arg)*)),
             }
@@ -6236,8 +6128,8 @@ where
     }
     macro_rules! stop_if_budget_exhausted {
         () => {
-            if let Some(message) = token_budget_stop_message(exhausted_budget_after_completion) {
-                tool_calls.finalize_unresolved(&mut interactions);
+            if let Some(message) = turn.budget_stop() {
+                turn.tool_calls.finalize_unresolved(&mut turn.interactions);
                 fail_turn!(message);
             }
         };
@@ -6263,10 +6155,6 @@ where
             }
         };
     }
-    #[cfg(feature = "hooks")]
-    let mut stop_hook_active = false;
-    #[cfg(feature = "hooks")]
-    let mut consecutive_stop_blocks: u32 = 0;
     let mid_turn_policy = HEADLESS_MID_TURN.try_with(|policy| *policy).ok();
     // Pressure of the latest completion that crossed the mid-turn threshold;
     // honored at the next correlated tool result once the batch is complete.
@@ -6299,8 +6187,7 @@ where
                     Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(
                         text,
                     ))) => {
-                        full_response.push_str(&text.text);
-                        append_streamed_text(&mut interactions, &text.text);
+                        turn.on_text(&text.text);
                         if let Err(error) = output_policy.assistant_text(&text.text).await {
                             fail_turn!(error);
                         }
@@ -6308,7 +6195,7 @@ where
                     Ok(MultiTurnStreamItem::StreamAssistantItem(
                         StreamedAssistantContent::Reasoning(r),
                     )) => {
-                        append_reasoning(&mut interactions, &r);
+                        append_reasoning(&mut turn.interactions, &r);
                         if !native_capture.is_native()
                             && let Err(error) = output_policy.reasoning(&r.display_text()).await
                         {
@@ -6331,18 +6218,13 @@ where
                     )) => {
                         stop_if_budget_exhausted!();
                         let name = &tool_call.function.name;
-                        workspace_may_have_changed |= tool_may_mutate_workspace(name);
-                        if let Err(error) = tool_calls.record(&internal_call_id, &tool_call) {
-                            tool_calls.finalize_unresolved(&mut interactions);
+                        // Also clears the turn's response: text written before a
+                        // tool call is its own transcript segment, not a prefix
+                        // of the answer (mini-agent-knwk1).
+                        if let Err(error) = turn.on_tool_call(&internal_call_id, &tool_call) {
+                            turn.tool_calls.finalize_unresolved(&mut turn.interactions);
                             fail_turn!(error);
                         }
-                        // The turn's response is the text of its final completion,
-                        // exactly as in the interactive runner: text written before
-                        // a tool call is its own transcript segment, not a prefix
-                        // of the answer (mini-agent-knwk1).
-                        full_response.clear();
-                        response_len_at_stream_start = 0;
-                        append_tool_call(&mut interactions, &tool_call);
                         if let Err(error) = output_policy
                             .tool_call(
                                 &internal_call_id,
@@ -6365,18 +6247,14 @@ where
                         internal_call_id,
                     })) => {
                         stop_if_budget_exhausted!();
-                        let Some((name, output)) = append_attributed_tool_result(
-                            &mut tool_calls,
-                            &mut interactions,
-                            &internal_call_id,
-                            &tool_result,
-                        ) else {
+                        let Some((name, output)) =
+                            turn.on_tool_result(&internal_call_id, &tool_result)
+                        else {
                             return Ok(true);
                         };
                         native_capture.tool_result(&internal_call_id, &tool_result);
                         #[cfg(feature = "acp")]
                         crate::permission::ask::finish_tool_call(&name, &internal_call_id);
-                        goal_report_accepted |= take_accepted_goal_report(&internal_call_id);
                         // A `read` image that cannot be decoded ends the turn here, as
                         // it does interactively, instead of failing at persistence.
                         if let Err(error) = tool_result_images(&name, &tool_result) {
@@ -6401,7 +6279,7 @@ where
                             fail_turn!(error);
                         }
                         if let Some(pressure) = mid_turn_pressure
-                            && tool_calls.pending.is_empty()
+                            && turn.tool_calls.pending.is_empty()
                             && crate::question::required().is_none()
                         {
                             fail_turn!(MidTurnCompactionBoundary { pressure });
@@ -6413,15 +6291,11 @@ where
                         {
                             mid_turn_pressure = Some(pressure);
                         }
-                        output_truncation.observe_call(&call);
-                        let delta = record_completion_call(
-                            &mut completion_retry,
-                            retry_config,
-                            &mut turns_used,
-                            &mut usage_ledger,
-                            call.usage,
-                        );
-                        if let Err(error) = output_policy.usage(delta, usage_ledger.total).await {
+                        let delta = turn.on_completion_call(&call, retry_config);
+                        if let Err(error) = output_policy
+                            .usage(delta, turn.usage_ledger.total)
+                            .await
+                        {
                             fail_turn!(error);
                         }
                         tracing::debug!(
@@ -6430,29 +6304,23 @@ where
                             call.usage.output_tokens,
                             call.usage.cached_input_tokens,
                             call.usage.cache_creation_input_tokens,
-                            observed_tokens(usage_ledger.total),
+                            observed_tokens(turn.usage_ledger.total),
                         );
-                        note_budget_after_completion(
-                            usage_ledger.total,
-                            turn_token_budget,
-                            &mut exhausted_budget_after_completion,
-                        );
+                        turn.note_budget();
                     }
                     Ok(MultiTurnStreamItem::FinalResponse(res)) => {
                         terminal_response_seen = true;
-                        let delta = reconcile_terminal_usage(&mut usage_ledger, res.usage());
-                        if let Err(error) = output_policy.usage(delta, usage_ledger.total).await {
+                        let delta = turn.reconcile_terminal(res.usage());
+                        if let Err(error) = output_policy
+                            .usage(delta, turn.usage_ledger.total)
+                            .await
+                        {
                             fail_turn!(error);
                         }
                         // A terminal answer that was never streamed must still
                         // reach the continuation transcript and the terminal, as
                         // it does interactively (mini-agent-4v2iq).
-                        let terminal_was_streamed = reconcile_final_output(
-                            &mut full_response,
-                            response_len_at_stream_start,
-                            &res.output,
-                            &mut interactions,
-                        );
+                        let terminal_was_streamed = turn.reconcile_final(&res.output);
                         if !terminal_was_streamed
                             && !res.output.is_empty()
                             && let Err(error) = output_policy.assistant_text(&res.output).await
@@ -6470,21 +6338,20 @@ where
                             }
                         }
                         park_question!();
-                        if !tool_calls.finalize_unresolved(&mut interactions).is_empty() {
+                        if !turn
+                            .tool_calls
+                            .finalize_unresolved(&mut turn.interactions)
+                            .is_empty()
+                        {
                             fail_turn!(UNRESOLVED_TOOL_CALLS_ERROR);
                         }
-                        if let Some(decision) = output_truncation.final_response() {
-                            tracing::warn!("{}", decision.notice());
-                            if let Err(error) = crate::print::headless_stderr_async(format!(
-                                "{}\n",
-                                decision.notice()
-                            ))
-                            .await
+                        if let Some((notice, instruction)) = turn.final_truncation() {
+                            if let Err(error) =
+                                crate::print::headless_stderr_async(format!("{notice}\n")).await
                             {
                                 fail_turn!(error);
                             }
-                            if let TruncationDecision::Continue { instruction, .. } = decision {
-                                next_instruction = Some(instruction);
+                            if instruction.is_some() {
                                 continue_turn = true;
                                 return Ok(false);
                             }
@@ -6492,32 +6359,24 @@ where
                         // A round whose work ended in an accepted `goal_report` has
                         // said what it had to say; it is complete, not empty
                         // (mini-agent-64qyf).
-                        if full_response.len() == response_len_at_stream_start
-                            && !goal_report_accepted
+                        if turn.response.len() == turn.response_len_at_stream_start
+                            && !turn.goal_report_accepted
                             && !native_capture.completes_without_visible_text()
                         {
-                            if empty_response_limit_reached(&mut empty_response_count) {
-                                tracing::warn!(
-                                    "agent: {MAX_EMPTY_RESPONSES} consecutive empty responses, aborting"
-                                );
+                            if matches!(turn.on_empty_final(), turn_state::EmptyFinal::Abort) {
                                 fail_turn!("Agent returned empty response too many times, aborting.");
                             }
-                            tracing::warn!(
-                                "agent: empty terminal response ({empty_response_count}/{MAX_EMPTY_RESPONSES}), asking the model to continue"
-                            );
                             continue_turn = true;
                             return Ok(false);
                         }
-                        let verification_ran = workspace_may_have_changed
-                            && completion_verification
-                                .as_ref()
-                                .is_some_and(CompletionVerification::has_command);
+                        let verification_ran =
+                            turn.verification_applies(completion_verification.as_ref());
                         if verification_ran && let Some(verification) = completion_verification.as_ref()
                         {
                             if let Err(error) = crate::spend::run::admit_current_effect().await {
                                 fail_turn!(error);
                             }
-                            verification_attempt = verification_attempt.saturating_add(1);
+                            let verification_attempt = turn.begin_verification();
                             let result = await_turn!(verification.run());
                             let passed = result.succeeded();
                             #[cfg(feature = "skills")]
@@ -6532,23 +6391,19 @@ where
                             {
                                 fail_turn!(error);
                             }
-                            if !passed {
-                                if let Err(error) =
+                            if !passed
+                                && let Err(error) =
                                     crate::print::headless_stderr_async(format!("{diagnostic}\n")).await
-                                {
-                                    fail_turn!(error);
-                                }
-                                if verification_attempt < verification.max_attempts {
-                                    next_instruction =
-                                        Some(verification_retry_instruction(
-                                                verification.command.as_deref().unwrap_or(""),
-                                                verification_attempt,
-                                                verification.max_attempts,
-                                                &diagnostic,
-                                            ));
+                            {
+                                fail_turn!(error);
+                            }
+                            match turn.verification_finished(verification, passed, &diagnostic) {
+                                turn_state::VerificationNext::Passed => {}
+                                turn_state::VerificationNext::Retry => {
                                     continue_turn = true;
                                     return Ok(false);
-                                } else {
+                                }
+                                turn_state::VerificationNext::Exhausted => {
                                     fail_turn!(
                                         "Verification failed after {verification_attempt} attempts.\n{diagnostic}"
                                     );
@@ -6558,18 +6413,13 @@ where
                         #[cfg(feature = "hooks")]
                         if let crate::extras::hooks::StopGate::Continue { reason } =
                             await_turn!(crate::extras::hooks::dispatch_stop(
-                                stop_hook_active,
+                                turn.stop_hook_active,
                                 loop_info.map(|info| u64::from(info.iteration)),
                                 loop_info.map(|info| info.active),
                                 goal_hook_info(),
                             ))
-                            && let Some(instruction) = stop_block_continuation(
-                                &mut consecutive_stop_blocks,
-                                &mut stop_hook_active,
-                                reason,
-                            )
+                            && turn.stop_blocked(reason)
                         {
-                            next_instruction = Some(instruction);
                             continue_turn = true;
                         }
                         #[cfg(feature = "skills")]
@@ -6577,46 +6427,47 @@ where
                             && !verification_ran
                             && let Some(verification) = completion_verification.as_ref()
                         {
-                            verification.record_verification_skipped(workspace_may_have_changed);
+                            verification.record_verification_skipped(turn.workspace_may_have_changed);
                         }
                         return Ok(false);
                     }
                     Ok(_) => {}
                     Err(e) => {
-                        tool_calls.finalize_unresolved(&mut interactions);
+                        turn.tool_calls.finalize_unresolved(&mut turn.interactions);
                         park_question!();
-                        if is_max_turns_stream_error(&e) {
-                            fail_turn!(max_turns_exhausted_message(max_turns_total));
-                        }
-                        if let Some(decision) = output_truncation.stream_error(&e.to_string()) {
-                            tracing::warn!("{}: {e}", decision.notice());
-                            let notice = decision.notice().to_string();
-                            if let TruncationDecision::Continue { instruction, .. } = decision {
+                        match turn.on_stream_error(&e, retry_config, true) {
+                            turn_state::StreamErrorAction::MaxTurns => {
+                                fail_turn!(max_turns_exhausted_message(max_turns_total));
+                            }
+                            turn_state::StreamErrorAction::Truncated {
+                                notice,
+                                instruction,
+                            } => {
+                                if instruction.is_none() {
+                                    fail_turn!(notice);
+                                }
                                 if let Err(error) =
                                     crate::print::headless_stderr_async(format!("{notice}\n"))
                                         .await
                                 {
                                     fail_turn!(error);
                                 }
-                                next_instruction = Some(instruction);
                                 retrying_interrupted_completion = true;
                                 continue_turn = true;
                                 return Ok(false);
                             }
-                            fail_turn!(notice);
+                            turn_state::StreamErrorAction::Retry { delay, .. } => {
+                                await_turn!(tokio::time::sleep(delay));
+                                retrying_interrupted_completion = true;
+                                continue_turn = true;
+                                return Ok(false);
+                            }
+                            // Propagate an exhausted or non-retryable stream failure
+                            // instead of returning `Ok` with a truncated response.
+                            turn_state::StreamErrorAction::Fatal => {
+                                fail_turn!(retry::ClassifiedProviderError::from_error(&e));
+                            }
                         }
-                        if let Some((_, delay)) =
-                            midstream_retry(&mut completion_retry, retry_config, &e)
-                        {
-                            await_turn!(tokio::time::sleep(delay));
-                            next_instruction = Some(TRANSIENT_PROVIDER_CONTINUATION.to_string());
-                            retrying_interrupted_completion = true;
-                            continue_turn = true;
-                            return Ok(false);
-                        }
-                        // Propagate an exhausted or non-retryable stream failure
-                        // instead of returning `Ok` with a truncated response.
-                        fail_turn!(retry::ClassifiedProviderError::from_error(&e));
                     }
                 }
                 Ok(true)
@@ -6628,36 +6479,22 @@ where
             }
         }
 
-        tool_calls.finalize_unresolved(&mut interactions);
+        turn.tool_calls.finalize_unresolved(&mut turn.interactions);
         park_question!();
 
-        if !terminal_response_seen && !retrying_interrupted_completion {
-            if let Err(error) =
-                charge_nonterminal_eof(&mut turns_used, turns_at_stream_start, max_turns)
-            {
-                fail_turn!(error);
-            }
-            continue_turn = true;
-        }
-
-        if continue_turn {
-            let remaining_turns = max_turns.saturating_sub(turns_used);
-            if remaining_turns == 0 {
-                fail_turn!(
-                    "Agent exhausted its maximum turn budget ({max_turns}) before completing.{}",
-                    crate::cli::MAX_AGENT_TURNS_HINT
-                );
-            }
-            if let Some(message) = token_budget_stop_message(exhausted_token_budget(
-                usage_ledger.total,
-                turn_token_budget,
-            )) {
-                fail_turn!(message);
-            }
-            let continuation_instruction = next_instruction
-                .take()
-                .unwrap_or_else(|| DEFAULT_CONTINUATION.to_string());
-            let new_interactions = take_new_interactions(&mut interactions);
+        if continue_turn || (!terminal_response_seen && !retrying_interrupted_completion) {
+            let turn_state::Continuation {
+                remaining_turns,
+                instruction: continuation_instruction,
+                new_interactions,
+            } = match turn.begin_continuation(
+                terminal_response_seen,
+                retrying_interrupted_completion,
+                max_turns,
+            ) {
+                Ok(continuation) => continuation,
+                Err(stop) => fail_turn!(stop.into_error()),
+            };
             committed_interactions.extend(new_interactions.iter().cloned());
             continuation_bridge = normalized_continuation_bridge(
                 std::mem::take(&mut continuation_bridge),
@@ -6676,9 +6513,8 @@ where
                 remaining_turns,
                 native_capture.clone(),
             )));
-            usage_ledger.start_stream();
-            turns_at_stream_start = turns_used;
-            response_len_at_stream_start = full_response.len();
+            turn.stream_started();
+            continue_turn = true;
         }
     }
 
@@ -6689,10 +6525,10 @@ where
     {
         fail_turn!(error);
     }
-    committed_interactions.append(&mut interactions);
+    committed_interactions.append(&mut turn.interactions);
     HeadlessTurn {
-        response: full_response,
-        usage: usage_ledger.total,
+        response: turn.response,
+        usage: turn.usage_ledger.total,
         interactions: committed_interactions,
         failure: None,
     }
@@ -6962,19 +6798,16 @@ where
         }
     };
 
-    let mut full_response = String::new();
+    // The loop's decisions are the shared turn state's; `usage_ledger` stays the
+    // subagent's own (shared with its admission hook).
+    let mut turn = turn_state::TurnState::new(retry_config, token_budget);
     let mut child_history = Vec::new();
-    let mut turns = 0u32;
     let mut tool_calls = 0u32;
     let mut tool_log: Vec<ToolLogEntry> = Vec::new();
     // Rig call id -> row in `tool_log` (rows past the bound are not tracked).
     let mut logged: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut turn_budget_exhausted = false;
-    let mut output_truncation = OutputTruncation::default();
     // Mid-stream retry: what this stream produced so far, to resume from it.
-    let mut completion_retry = CompletionRetryState::new(retry_config);
-    let mut interactions: Vec<Message> = Vec::new();
-    let mut tracker = ToolCallTracker::default();
     let mut bridge: Vec<Message> = Vec::new();
     // Messages before the current stream's own (original prompt + bridge) once resumed.
     let mut resumed_prefix: Vec<Message> = Vec::new();
@@ -6984,7 +6817,7 @@ where
                 response: $response,
                 usage: usage_ledger.total(),
                 history: child_history,
-                turns,
+                turns: u32::try_from(turn.turns_used).unwrap_or(u32::MAX),
                 tool_calls,
                 tool_log,
                 turn_budget_exhausted,
@@ -6996,8 +6829,7 @@ where
     while let Some(item) = stream.next().await {
         match item {
             Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text))) => {
-                full_response.push_str(&text.text);
-                append_streamed_text(&mut interactions, &text.text);
+                turn.on_text(&text.text);
                 crate::extras::subagents::partial::record_text(&text.text);
             }
             Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall {
@@ -7005,8 +6837,8 @@ where
                 internal_call_id,
             })) => {
                 tool_calls = tool_calls.saturating_add(1);
-                let _ = tracker.record(&internal_call_id, &tool_call);
-                append_tool_call(&mut interactions, &tool_call);
+                let _ = turn.tool_calls.record(&internal_call_id, &tool_call);
+                append_tool_call(&mut turn.interactions, &tool_call);
                 crate::extras::subagents::partial::record_tool_call();
                 if tool_log.len() < MAX_TOOL_LOG_ENTRIES {
                     logged.insert(internal_call_id, tool_log.len());
@@ -7030,12 +6862,7 @@ where
                 internal_call_id,
             })) => {
                 let failed = take_tool_failure(&internal_call_id);
-                let _ = append_attributed_tool_result(
-                    &mut tracker,
-                    &mut interactions,
-                    &internal_call_id,
-                    &tool_result,
-                );
+                let _ = turn.on_tool_result(&internal_call_id, &tool_result);
                 if let Some(entry) = logged
                     .remove(&internal_call_id)
                     .and_then(|row| tool_log.get_mut(row))
@@ -7055,25 +6882,23 @@ where
             }
             Ok(MultiTurnStreamItem::FinalResponse(res)) => {
                 usage_ledger.reconcile_terminal(res.usage());
-                full_response = res.output.to_string();
+                turn.response = res.output.to_string();
                 child_history = resumed_prefix
                     .drain(..)
                     .chain(res.messages().map(<[Message]>::to_vec).unwrap_or_default())
                     .collect();
                 // A report cut off at the output-token limit must not reach the
                 // parent as complete findings (mini-agent-sskdu.86).
-                if output_truncation.final_response().is_some() {
-                    full_response.push_str(SUBAGENT_OUTPUT_TRUNCATED_PARTIAL);
+                if turn.final_truncation().is_some() {
+                    turn.response.push_str(SUBAGENT_OUTPUT_TRUNCATED_PARTIAL);
                 }
                 break;
             }
             Ok(MultiTurnStreamItem::CompletionCall(call)) => {
-                output_truncation.observe_call(&call);
-                completion_retry.reset(retry_config);
-                turns = turns.saturating_add(1);
+                turn.begin_completion(&call, retry_config);
                 usage_ledger.record_completion(call.usage);
                 if exhausted_token_budget(usage_ledger.total(), token_budget).is_some() {
-                    append_subagent_turn_budget_partial(&mut full_response);
+                    append_subagent_turn_budget_partial(&mut turn.response);
                     break;
                 }
             }
@@ -7090,11 +6915,12 @@ where
                     .as_ref()
                     .is_some_and(|gate| !(gate.allowed)()) =>
             {
-                full_response.push_str("\n[partial: task cost-unit budget exhausted]");
+                turn.response
+                    .push_str("\n[partial: task cost-unit budget exhausted]");
                 break;
             }
             Err(error) if is_subagent_turn_budget_error(&error) => {
-                append_subagent_turn_budget_partial(&mut full_response);
+                append_subagent_turn_budget_partial(&mut turn.response);
                 turn_budget_exhausted = true;
                 // The error carries the whole conversation, tool results
                 // included, so a tool-free write-up turn can use it.
@@ -7121,79 +6947,81 @@ where
                 return out;
             }
             Err(e) => {
-                // A tool call cut off at the output-token limit was not
-                // executed; everything before it is still the child's work.
-                if output_truncation.stream_error(&e.to_string()).is_some() {
-                    full_response.push_str(SUBAGENT_OUTPUT_TRUNCATED_PARTIAL);
-                    break;
-                }
-                // A transient error mid-stream: resume from what the child has
-                // accumulated instead of discarding the investigation.
-                let remaining = max_turns.saturating_sub(turns as usize);
-                if remaining > 0
-                    && let Some((_, delay)) =
-                        midstream_retry(&mut completion_retry, retry_config, &e)
-                {
-                    tokio::time::sleep(delay).await;
-                    tracker.finalize_unresolved(&mut interactions);
-                    let new_interactions = take_new_interactions(&mut interactions);
-                    bridge = normalized_continuation_bridge(
-                        std::mem::take(&mut bridge),
-                        &new_interactions,
-                        TRANSIENT_PROVIDER_CONTINUATION,
-                    );
-                    let (current, earlier) = bridge
-                        .split_last()
-                        .expect("a continuation bridge ends with its prompt");
-                    let mut resumed_history = history.clone();
-                    resumed_history.push(Message::user(prompt.to_string()));
-                    resumed_history.extend_from_slice(earlier);
-                    resumed_prefix = std::iter::once(Message::user(prompt.to_string()))
-                        .chain(earlier.iter().cloned())
-                        .collect();
-                    let current = current.clone();
-                    let resumed = crate::startup::heap_future(|| {
-                        retry::retry_stream_chat(retry_config, || {
-                            let current = current.clone();
-                            let history = resumed_history.clone();
-                            let admission = usage_ledger.clone();
-                            crate::startup::heap_future(|| async move {
-                                agent
-                                    .stream_chat(current, history)
-                                    .max_turns(remaining)
-                                    .add_hook(admission)
-                                    .tool_concurrency(
-                                        crate::agent::tools::concurrency::tool_concurrency(),
-                                    )
-                                    .add_hook(crate::spend::run::AdmissionHook(
-                                        crate::spend::run::Run::current(),
-                                    ))
-                                    .tool_extensions(crate::spend::run::current_extensions())
-                                    .await
+                // A transient error mid-stream resumes from what the child has
+                // accumulated while a model call is left, instead of
+                // discarding the investigation.
+                let remaining = max_turns.saturating_sub(turn.turns_used);
+                match turn.on_stream_error(&e, retry_config, remaining > 0) {
+                    // A tool call cut off at the output-token limit was not
+                    // executed; everything before it is still the child's work.
+                    turn_state::StreamErrorAction::Truncated { .. } => {
+                        turn.response.push_str(SUBAGENT_OUTPUT_TRUNCATED_PARTIAL);
+                        break;
+                    }
+                    turn_state::StreamErrorAction::Retry { delay, .. } => {
+                        tokio::time::sleep(delay).await;
+                        turn.tool_calls.finalize_unresolved(&mut turn.interactions);
+                        let new_interactions = take_new_interactions(&mut turn.interactions);
+                        bridge = normalized_continuation_bridge(
+                            std::mem::take(&mut bridge),
+                            &new_interactions,
+                            TRANSIENT_PROVIDER_CONTINUATION,
+                        );
+                        let (current, earlier) = bridge
+                            .split_last()
+                            .expect("a continuation bridge ends with its prompt");
+                        let mut resumed_history = history.clone();
+                        resumed_history.push(Message::user(prompt.to_string()));
+                        resumed_history.extend_from_slice(earlier);
+                        resumed_prefix = std::iter::once(Message::user(prompt.to_string()))
+                            .chain(earlier.iter().cloned())
+                            .collect();
+                        let current = current.clone();
+                        let resumed = crate::startup::heap_future(|| {
+                            retry::retry_stream_chat(retry_config, || {
+                                let current = current.clone();
+                                let history = resumed_history.clone();
+                                let admission = usage_ledger.clone();
+                                crate::startup::heap_future(|| async move {
+                                    agent
+                                        .stream_chat(current, history)
+                                        .max_turns(remaining)
+                                        .add_hook(admission)
+                                        .tool_concurrency(
+                                            crate::agent::tools::concurrency::tool_concurrency(),
+                                        )
+                                        .add_hook(crate::spend::run::AdmissionHook(
+                                            crate::spend::run::Run::current(),
+                                        ))
+                                        .tool_extensions(crate::spend::run::current_extensions())
+                                        .await
+                                })
                             })
                         })
-                    })
-                    .await;
-                    if let Ok(resumed) = resumed {
-                        stream = resumed;
-                        continue;
+                        .await;
+                        if let Ok(resumed) = resumed {
+                            stream = resumed;
+                            continue;
+                        }
                     }
+                    turn_state::StreamErrorAction::MaxTurns
+                    | turn_state::StreamErrorAction::Fatal => {}
                 }
                 // Keep what the child did (calls, results, turns) and the text
                 // it had written; a bare error discards the whole investigation.
-                return finish!(Err(subagent_stream_error(&e.to_string(), &full_response)));
+                return finish!(Err(subagent_stream_error(&e.to_string(), &turn.response)));
             }
         }
     }
 
-    if full_response.is_empty() {
+    if turn.response.is_empty() {
         return SubagentRunOutput::bare(
             Err("subagent returned empty response".to_string()),
             usage_ledger.total(),
         );
     }
 
-    finish!(Ok(full_response))
+    finish!(Ok(turn.response.clone()))
 }
 
 #[cfg(test)]
