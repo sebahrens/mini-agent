@@ -934,8 +934,8 @@ where
 }
 
 /// The agent and conversation prefix for a cache-reusing compaction fork, when
-/// the fork is safe: a native prompt-cache route, no provider-native replay
-/// history, no images (the request-time image budget would diverge from the
+/// the fork is safe: a native prompt-cache route, a prefix `cache_fork_history`
+/// can build (a native Anthropic session forks from its native wire history), no images (the request-time image budget would diverge from the
 /// prefix), and a prefix that fits the summarizer budget in one request.
 async fn cache_fork_input(
     ui: &mut UiContext<'_>,

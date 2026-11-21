@@ -1742,7 +1742,7 @@ place, so those turns surface the error directly.
 | Kept verbatim | the most recent `keep_recent_tokens`, cut at a user/assistant record or a completed tool batch | same | mid-turn relief keeps `keep_recent_tokens` at the same legal cuts (falling back to the whole history when the tail alone is too large); turn-count/byte pressure and `/compact` cut at a turn boundary or summarize everything |
 | Stored summary bound | window-scaled (see above) | window-scaled | the summarizer's window-scaled budget |
 | File windows restored | yes (`compact_restore_read_tokens`) | yes | yes |
-| Cache fork | yes, on a native prompt-cache route, for sessions without a native (Anthropic replay) history; once a native Anthropic turn has run the session takes the text summarizer | same | no |
+| Cache fork | yes, on a native prompt-cache route. A native Anthropic session forks from its native wire history (signed thinking blocks intact), cut before the user prompt at the compaction cut after the prompt sequence is proven identical to the session replay; otherwise, and for mid-turn relief, the text summarizer runs | same between turns | no |
 | Relief cap per prompt | none | none (stops on no progress) | 3 for non-native sessions |
 | Native (Anthropic replay) session | chain restarted as a new epoch | same | between prompts and mid-turn at a tool-batch boundary; chain restarted |
 | Summarizer failure | history kept, error shown | history kept, run continues | history kept under token pressure, evicted only for the byte bound or turn cap; the client is told why |

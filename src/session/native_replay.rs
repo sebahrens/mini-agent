@@ -1321,6 +1321,59 @@ mod tests {
         .unwrap()
     }
 
+    /// mini-agent-sskdu.265: a native Anthropic session forks compaction from
+    /// its native wire history, cut before the prompt at the compaction cut.
+    #[test]
+    fn native_session_cache_fork_prefix_is_cut_from_the_native_history() {
+        use crate::agent::native_capture::NativeTurnProjection;
+        let mut source = body();
+        source["messages"][1]["content"] = json!([{"type":"text","text":"done"}]);
+        let endpoint = "https://example.test/v1/messages".parse().unwrap();
+        let commitment = NativeCommitment::capture(&endpoint, &source, true).unwrap();
+        let frame = |turn: usize, delta: Vec<rig::completion::Message>, answer: &str| {
+            NativeTurnProjection {
+                sdk_run_id: "owned-run".into(),
+                turn,
+                configured_model: "claude-opus-5-5".into(),
+                content: rig::OneOrMany::one(rig::completion::AssistantContent::text(answer)),
+                advertised_tools: Vec::new(),
+                native_tool_results: Vec::new(),
+                native_input_delta: Some(delta),
+                native_commitment: Some(commitment.clone()),
+            }
+        };
+        let history = NativeHistory::from_capture(
+            0,
+            vec![rig::completion::Message::user("q1")],
+            vec![
+                frame(1, Vec::new(), "a1"),
+                frame(2, vec![rig::completion::Message::user("q2")], "a2"),
+            ],
+        )
+        .unwrap()
+        .with_retired_outcome(RetiredNativeOutcome::Completed)
+        .unwrap();
+        let mut session = super::super::Session::new("anthropic", "claude-opus-5-5", 32_000, "");
+        for (role, text) in [
+            (super::super::MessageRole::User, "q1"),
+            (super::super::MessageRole::Assistant, "a1"),
+            (super::super::MessageRole::User, "q2"),
+            (super::super::MessageRole::Assistant, "a2"),
+        ] {
+            session.add_message(role, text);
+        }
+        session.store_native_history(history).unwrap();
+        let prefix = crate::agent::runner::cache_fork_history(&session, 2, 0, 1_000_000)
+            .expect("native fork prefix");
+        assert_eq!(prefix.len(), 2, "q1 and a1 only: {prefix:?}");
+        assert_eq!(serde_json::to_string(&prefix[0]).unwrap().matches("q1").count(), 1);
+        // A cut that is not a user prompt, or one the wire cannot prove, is refused.
+        assert!(crate::agent::runner::cache_fork_history(&session, 1, 0, 1_000_000).is_none());
+        let mut drifted = session.clone();
+        drifted.messages[2].content = "q2 edited".into();
+        assert!(crate::agent::runner::cache_fork_history(&drifted, 2, 0, 1_000_000).is_none());
+    }
+
     #[test]
     fn native_context_anchor_refuses_unobserved_messages_and_compaction_without_erasing_data() {
         let mut original = super::super::Session::new("anthropic", "claude-opus-5-5", 32_000, "");
