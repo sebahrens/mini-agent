@@ -2411,7 +2411,14 @@ fn persist_user_delta_blocks(
         let crate::session::user::UserBlock::Text { text } = blocks.remove(0) else {
             unreachable!()
         };
-        session.add_message(MessageRole::User, &text);
+        // Host continuation text (verification failure, hook reason, truncation
+        // or retry notice) is stored as a host row, never as the user's words.
+        let role = if crate::agent::input::is_host_instruction(&text) {
+            MessageRole::System
+        } else {
+            MessageRole::User
+        };
+        session.add_message(role, &text);
     } else {
         let user =
             crate::session::user::PersistedUserMessage::new(blocks).map_err(anyhow::Error::msg)?;

@@ -419,3 +419,13 @@ command credential middleware can recognize the initial issued key and renew it
 on a 401. The application regression in `src/key_command.rs` sends actual SDK
 requests through a loopback server, verifies decoded initial and renewed keys,
 and covers streaming reuse. No dependency or public API changes.
+
+## Invalid tool-call arguments (mini-agent-sskdu.252)
+
+`json_utils::{INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_ERROR_KEY, invalid_tool_arguments,
+invalid_tool_arguments_error}` (re-exported at the crate root) and
+`providers/internal/openai_chat_completions_compatible.rs`: a pending tool call whose argument text does
+not parse is kept, with arguments `{"__invalid_json": <raw, bounded>, "__invalid_json_error": <error>}`,
+when the stream ended with a `tool_calls` finish reason, and the eviction path uses the same marker
+instead of `{}`. A stream that ends without a finish reason still drops a partial call. The host
+short-circuits a marked call with a corrective tool result.

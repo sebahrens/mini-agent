@@ -419,24 +419,38 @@ impl PendingMainTurn {
             .filter(|message| message.role == crate::session::MessageRole::ToolResult)
             .filter_map(|message| message.tool_call_id.as_deref().map(str::to_owned))
             .collect();
-        let mut unresolved = Vec::new();
+        let mut unresolved: Vec<(String, String)> = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        for id in session.messages[turn_start..]
+        for message in session.messages[turn_start..]
             .iter()
             .filter(|message| message.role == crate::session::MessageRole::ToolCall)
-            .filter_map(|message| message.tool_call_id.as_deref())
         {
+            let Some(id) = message.tool_call_id.as_deref() else {
+                continue;
+            };
             if !resolved.contains(id) && seen.insert(id.to_owned()) {
-                unresolved.push(id.to_owned());
+                // The call message names the tool; keep it on the closing result.
+                let name = match &message.tool {
+                    Some(crate::session::PersistedToolMessage::Call { name, .. }) => {
+                        name.to_string()
+                    }
+                    _ => "unknown".to_owned(),
+                };
+                unresolved.push((id.to_owned(), name));
             }
         }
 
-        for id in unresolved {
-            session.add_tool_result_with_id(
-                &id,
-                "unknown",
-                crate::agent::runner::UNKNOWN_TOOL_OUTCOME,
-            );
+        for (id, name) in unresolved {
+            // A call that finished while its batch was still running has a real
+            // result; only calls that really did not finish are "unknown".
+            match crate::agent::runner::take_settled_result(&id) {
+                Some(result) => session.add_tool_result_with_id(&id, &name, &result),
+                None => session.add_tool_result_with_id(
+                    &id,
+                    &name,
+                    crate::agent::runner::UNKNOWN_TOOL_OUTCOME,
+                ),
+            };
         }
     }
 

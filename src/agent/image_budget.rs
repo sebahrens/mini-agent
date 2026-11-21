@@ -699,6 +699,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn headless_runs_drain_the_elision_notices() {
+        use crate::tests::fake_model::text_turns;
+        let _guard = CAP_TEST_LOCK.lock().await;
+        reset_cap_for_tests();
+        let model = text_turns([["ok"]]);
+        let agent = rig::agent::AgentBuilder::new(model.clone())
+            .add_hook(ImageBudgetHook::for_provider("anthropic", "claude-x"))
+            .build();
+        let history: Vec<Message> = (0..24).map(|id| tool_image_message(id, 64)).collect();
+        let (text, _, _) = crate::agent::runner::run_print(
+            &agent,
+            "look again",
+            false,
+            &crate::retry::RetryConfig::default(),
+            None,
+            history,
+            #[cfg(feature = "hooks")]
+            None,
+        )
+        .await
+        .expect("headless run");
+        assert_eq!(text, "ok");
+        // The run showed (and so consumed) the notice; none is left for an
+        // unrelated later turn.
+        assert!(take_notices().is_empty());
+        reset_cap_for_tests();
+    }
+
+    #[tokio::test]
     async fn a_prompt_over_the_hard_limit_or_a_tightened_cap_is_refused_clearly() {
         use crate::tests::fake_model::text_turns;
         use futures::StreamExt;

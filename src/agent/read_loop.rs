@@ -24,33 +24,14 @@ pub(super) struct ReadLoopState {
 }
 
 pub(super) fn is_evidence_read(tool: &str) -> bool {
-    matches!(
-        tool,
-        "read"
-            | "read_image"
-            | "grep"
-            | "find_files"
-            | "list_dir"
-            | "docs"
-            | "skill_search"
-            | "skill_list"
-            | "todo_read"
-    )
+    super::tools::tool_class(tool) == super::tools::ToolClass::Evidence
 }
 
 /// Unknown/executable tools can mutate even when they subsequently report an error.
-/// Polling does not erase read history; the next completed read itself detects changed bytes.
+/// Polling and other read-only calls do not erase read history; the next completed
+/// read itself detects changed bytes.
 pub(super) fn invalidates_evidence(tool: &str) -> bool {
-    !is_evidence_read(tool)
-        && !matches!(
-            tool,
-            "job_status"
-                | "wait"
-                | "web_search"
-                | "web_fetch"
-                | "ask_user_question"
-                | "schedule_wakeup"
-        )
+    super::tools::tool_class(tool) == super::tools::ToolClass::Mutating
 }
 
 impl ReadLoopState {
@@ -152,14 +133,63 @@ mod tests {
         }
         for tool in [
             "job_status",
-            "wait",
             "web_search",
             "web_fetch",
             "schedule_wakeup",
+            "skills_search",
+            "lsp_navigate",
+            "memory_read",
+            "memory_search",
+            "task_evidence",
+            "advisor",
+            "list_mcp_resources",
+            "read_mcp_resource",
         ] {
             assert!(!invalidates_evidence(tool), "{tool}");
         }
+        for tool in ["skills_search", "lsp_navigate", "memory_search"] {
+            assert!(is_evidence_read(tool), "{tool}");
+        }
         assert!(invalidates_evidence("shell"));
         assert!(is_evidence_read("grep"));
+    }
+
+    /// Every name in the classification table is a tool that can really be
+    /// registered, so a renamed or phantom tool fails here instead of silently
+    /// classifying as mutating (or as read-only) forever.
+    #[test]
+    fn classification_table_names_only_real_tools() {
+        use crate::agent::tools::{EVIDENCE_TOOLS, READ_ONLY_TOOLS, ToolClass, tool_class};
+        // Registered built-in names, including feature-gated ones.
+        const REAL: &[&str] = &[
+            "advisor",
+            "ask_user_question",
+            "find_files",
+            "grep",
+            "job_status",
+            "list_dir",
+            "list_mcp_resources",
+            "lsp_diagnostics",
+            "lsp_navigate",
+            "memory_read",
+            "memory_search",
+            "read",
+            "read_mcp_resource",
+            "schedule_wakeup",
+            "skills_search",
+            "task_evidence",
+            "todo_read",
+            "web_fetch",
+            "web_search",
+        ];
+        for name in EVIDENCE_TOOLS.iter().chain(READ_ONLY_TOOLS) {
+            assert!(REAL.contains(name), "phantom tool name {name}");
+        }
+        for name in REAL {
+            assert_ne!(tool_class(name), ToolClass::Mutating, "{name}");
+        }
+        for phantom in ["skill_search", "skill_list", "docs", "read_image"] {
+            assert_eq!(tool_class(phantom), ToolClass::Mutating, "{phantom}");
+        }
     }
 }

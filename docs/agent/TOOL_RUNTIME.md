@@ -1056,6 +1056,34 @@ an owned Unix child held before exec. Explicit unlock ends the lock's ownership
 before receipt acknowledgement; inherited descriptors cannot extend it after
 the ledger operation completes. Corrupt-tail failures retain bytes and charges.
 
+### Unknown tool names and malformed arguments
+
+A call to a tool name that is not advertised for the turn (`bash` for `shell`,
+`multi_tool_use.parallel`, a deferred MCP tool that was never loaded) does not end the run. The
+`ToolLoopGuard` hook answers Rig's invalid-tool-call event with `Flow::skip`, so the model gets a
+paired tool result: `Tool \`bash\` is not available; it was not executed. Did you mean: shell?`
+followed by the available names, and the rest of the batch is suppressed by Rig. `retry::is_retryable`
+never classifies `UnknownToolCall`, `PromptCancelled` or `MaxTurnsError` as transient, whatever tool
+names their text contains.
+
+Chat Completions streams whose tool-call argument text is not valid JSON are no longer dropped
+silently when the provider finished with `tool_calls`: the call is kept with
+`{"__invalid_json": "<raw, 2 KiB max>", "__invalid_json_error": "<parse error>"}` and `ToolLoopGuard`
+answers it with a corrective result asking for a valid JSON object (`patched-deps/rig-core`, see
+`PATCH.md`).
+
+### Tool classification
+
+`agent::tools::tool_class` is the single table behind "may this call change the workspace"
+(`tool_may_mutate_workspace`, which gates `verify_command` and the goal round summary) and the
+read-loop guard (`is_evidence_read`, `invalidates_evidence`). Listed read-only and evidence tools
+(`read`, `grep`, `find_files`, `list_dir`, `todo_read`, `skills_search`, `lsp_navigate`,
+`memory_read`, `memory_search`, `web_fetch`, `web_search`, `job_status`, `task_evidence`, `advisor`,
+`lsp_diagnostics`, MCP resource tools, `ask_user_question`, `schedule_wakeup`) never count as
+mutations; anything else, including MCP tools, is treated as mutating. A completed mutating call also
+resets the identical-failure counters of `ToolLoopGuard`, so a call that failed before an edit can run
+again after it.
+
 ### Unknown tool arguments
 
 Every model-facing tool argument struct (`shell`, `job_status`, `read`, `write`, `edit` and its

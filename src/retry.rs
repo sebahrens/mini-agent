@@ -404,6 +404,23 @@ pub fn simple_jitter(range_ms: u64) -> Duration {
 }
 
 pub fn is_retryable(error: &(dyn std::error::Error + 'static)) -> bool {
+    // Local, deterministic loop failures. Their text embeds tool lists and
+    // other names, which the substring fallbacks below would otherwise match
+    // ("dns_lookup", "timeout_ms"), turning a model mistake into a "transient
+    // provider error".
+    for candidate in error_sources(error) {
+        if matches!(
+            candidate.downcast_ref::<rig::completion::PromptError>(),
+            Some(
+                rig::completion::PromptError::UnknownToolCall { .. }
+                    | rig::completion::PromptError::PromptCancelled { .. }
+                    | rig::completion::PromptError::MaxTurnsError { .. }
+            )
+        ) {
+            return false;
+        }
+    }
+
     // Context overflow cannot recover without changing the request. Check the
     // entire source chain before provider status or message fallbacks so token
     // counts such as 213500 never masquerade as HTTP 500.
@@ -1291,6 +1308,24 @@ mod tests {
         assert_eq!(cfg.max_backoff_ms, 30_000);
         assert!(cfg.max_attempts <= MAX_RETRY_ATTEMPTS);
         assert_eq!(cfg.max_retry_after_ms, DEFAULT_MAX_RETRY_AFTER_MS);
+    }
+
+    #[test]
+    fn local_loop_errors_are_not_classified_by_tool_names_in_their_text() {
+        use rig::completion::PromptError;
+        let unknown = PromptError::UnknownToolCall {
+            tool_name: "bash".into(),
+            available_tools: vec!["dns_lookup".into(), "shell".into()],
+            allowed_tools: vec!["dns_lookup".into(), "shell".into()],
+            chat_history: Box::default(),
+        };
+        assert!(unknown.to_string().contains("dns"));
+        assert!(!is_retryable(&unknown));
+        let cancelled = PromptError::PromptCancelled {
+            chat_history: Vec::new(),
+            reason: "timeout while waiting for the user".into(),
+        };
+        assert!(!is_retryable(&cancelled));
     }
 
     #[test]

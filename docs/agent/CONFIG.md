@@ -712,9 +712,11 @@ verify_max_attempts = 3
 
 After the agent invokes a potentially mutating tool, mini-agent runs this command
 in the startup workspace through the configured general sandbox. Known
-read-only tools do not trigger the gate; unknown tools are treated
-conservatively as potentially mutating. A failed attempt sends a sanitized,
-bounded tail of stdout/stderr back to the model and allows it to repair the
+read-only tools (see "Tool classification" in `TOOL_RUNTIME.md`) do not trigger the
+gate; unknown tools are treated conservatively as potentially mutating. A failed
+attempt sends a marked host message that names the command and its attempt number,
+with a sanitized, fenced, bounded tail of stdout/stderr as untrusted output, back to
+the model and allows it to repair the
 problem within both `verify_max_attempts` and the remaining
 `max_agent_turns`. Exhausting either bound fails the turn instead of emitting a
 successful completion. Interactive TUI and ACP clients receive verification
@@ -739,7 +741,7 @@ Accepted top-level keys:
 | `max_session_input_tokens` | integer | Optional global ceiling on input tokens (cached input included) observed across the logical session, its subagents and `/cron` fires. Needs no model prices, so it bounds unpriced providers. Once reached, further model requests and model-dispatched effects are refused like an exhausted USD budget (`stop_reason: "budget"` headless). Resumed sessions count their ledger history. An admitted request can overshoot. Project layers cannot set it. See [COST_TRACKING.md](COST_TRACKING.md). |
 | `max_session_total_tokens` | integer | As `max_session_input_tokens`, over input plus output tokens. |
 | `max_budget_usd`          | number | Optional finite nonnegative USD ceiling for recorded logical-session spend, including auxiliary models. CLI `--max-budget-usd` overrides this global-only setting; project layers cannot change it. Unknown prices or incomplete tracking block capped continuation. Already admitted work can exceed it; this is not a vendor billing limit. See [COST_TRACKING.md](COST_TRACKING.md). |
-| `max_agent_turns`         | integer | Maximum model round trips (agent turns) per user prompt. Default: `1000` (was 200); spend caps (`turn_token_budget`, `max_budget_usd`, session token ceilings) are the primary safety net. When reached, the turn fails with an "exhausted its maximum turn budget" error, but completed tool work and messages stay in the session: ask the agent to continue (or rerun with `--continue`) or raise the limit. Headless context-relief segments of one prompt share this budget (and `turn_token_budget`), so relief never multiplies the cap. `--max-agent-turns` overrides it.                                                                                                                           |
+| `max_agent_turns`         | integer | Maximum model round trips (agent turns) per user prompt. Default: `1000` (was 200); spend caps (`turn_token_budget`, `max_budget_usd`, session token ceilings) are the primary safety net. When reached (at the continuation boundary or as Rig's own turn-limit error mid-stream), the turn fails with an "exhausted its maximum turn budget" error carrying this hint, and stream-json reports `error_max_turns`; but completed tool work and messages stay in the session: ask the agent to continue (or rerun with `--continue`) or raise the limit. Headless context-relief segments of one prompt share this budget (and `turn_token_budget`), so relief never multiplies the cap. `--max-agent-turns` overrides it.                                                                                                                           |
 | `verify_command`          | string  | Optional trusted command that must pass before a turn which invoked a potentially mutating tool may complete. Unset or blank disables the gate. Project-local values are sensitive and require content-bound trust. |
 | `goal_checks`             | array   | Commands that must exit zero before a goal may be reported complete. Sensitive: an untrusted project config cannot supply one, exactly as for `verify_command`. Additive with `--goal-check` and `/goal check`. |
 | `goal_judge_model`        | string  | A `quick_models` entry name used to judge goal completion claims. Sensitive: the judge receives a bounded transcript tail, so naming its endpoint decides where that text is sent. |

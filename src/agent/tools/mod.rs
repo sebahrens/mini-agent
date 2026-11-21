@@ -43,6 +43,64 @@ pub(crate) mod write;
 
 pub(crate) use normalize::{normalize_line_into, normalize_whitespace};
 
+/// How the agent loop treats a tool call, in one place.
+///
+/// The turn loops, the goal driver and the read-loop guard each used to keep
+/// their own string list of "read-only" tools, and the lists drifted from the
+/// registered names. Everything that asks "may this call change the
+/// workspace?" or "is this a repeatable evidence read?" derives from
+/// [`tool_class`]. A name that is not listed (an MCP tool, `js`, a future
+/// built-in) is [`ToolClass::Mutating`]: failing closed keeps verification and
+/// evidence invalidation conservative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolClass {
+    /// Reads workspace or catalog state; repeated identical calls that return
+    /// identical bytes are tracked by the read-loop guard.
+    Evidence,
+    /// Does not change the workspace and is not tracked as evidence: network
+    /// reads, background-job polling, pure prompts to the user, advisory calls.
+    ReadOnly,
+    /// May change the workspace (or is unknown).
+    Mutating,
+}
+
+/// Tools that [`ToolClass::Evidence`] covers.
+pub(crate) const EVIDENCE_TOOLS: &[&str] = &[
+    "read",
+    "grep",
+    "find_files",
+    "list_dir",
+    "todo_read",
+    "skills_search",
+    "lsp_navigate",
+    "memory_read",
+    "memory_search",
+];
+
+/// Tools that [`ToolClass::ReadOnly`] covers.
+pub(crate) const READ_ONLY_TOOLS: &[&str] = &[
+    "web_search",
+    "web_fetch",
+    "job_status",
+    "task_evidence",
+    "advisor",
+    "lsp_diagnostics",
+    "list_mcp_resources",
+    "read_mcp_resource",
+    "ask_user_question",
+    "schedule_wakeup",
+];
+
+pub(crate) fn tool_class(name: &str) -> ToolClass {
+    if EVIDENCE_TOOLS.contains(&name) {
+        ToolClass::Evidence
+    } else if READ_ONLY_TOOLS.contains(&name) {
+        ToolClass::ReadOnly
+    } else {
+        ToolClass::Mutating
+    }
+}
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
