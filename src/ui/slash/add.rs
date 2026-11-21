@@ -109,6 +109,18 @@ async fn add_one(arg: &str, ctx: &mut SlashCtx<'_>) -> bool {
             Err(error) => Err(error),
         };
         match loaded {
+            Ok((attachment, _))
+                if matches!(
+                    attachment,
+                    crate::extras::multimodal::MediaAttachment::Image { .. }
+                ) && let Err(refusal) = crate::extras::multimodal::ensure_vision(
+                    &ctx.session.provider,
+                    &ctx.session.model,
+                ) =>
+            {
+                write_error(ctx.renderer, format!("not attached: {refusal}"));
+                return false;
+            }
             Ok((attachment, note)) => {
                 let size = attachment.size();
                 let mime_str: &str = match &attachment {

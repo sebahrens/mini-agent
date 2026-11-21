@@ -200,6 +200,30 @@ pub fn fit_image_attachment(attachment: &mut MediaAttachment) -> Result<Option<S
     Ok(Some(note))
 }
 
+/// Refuse images for a model the catalog lists as text-only. An unknown model
+/// is allowed: the provider then reports its own error. Shared by the headless
+/// turn, ACP prompts and the TUI `/add` and clipboard-paste paths.
+pub(crate) fn ensure_vision(provider: &str, model: &str) -> Result<(), String> {
+    vision_verdict(
+        crate::models_catalog::model_image_input(provider, model),
+        provider,
+        model,
+    )
+}
+
+pub(crate) fn vision_verdict(
+    known: Option<bool>,
+    provider: &str,
+    model: &str,
+) -> Result<(), String> {
+    match known {
+        Some(false) => Err(format!(
+            "model {model} ({provider}) does not accept image input; choose a vision model or drop the images"
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Load a regular media file, limiting bytes read even if it grows while open.
 /// Symlinks to regular files are supported. Metadata and content are read from
 /// the same handle so a later pathname replacement cannot switch the input.

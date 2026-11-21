@@ -1947,6 +1947,12 @@ fn install_background_ask_factory(
     session_id: &SessionId,
     policy: &policy::SessionPolicy,
 ) -> Result<(), agent_client_protocol::Error> {
+    // Tell the editor when a background task finishes (see `tasks::watch`).
+    cx.spawn(tasks::watch(
+        cx.clone(),
+        session_id.clone(),
+        Arc::downgrade(pool),
+    ))?;
     {
         let cx = cx.clone();
         let idle = state.idle.clone();
@@ -2268,7 +2274,7 @@ async fn set_model_override(
         if next.model.is_some() && native {
             return Err(agent_client_protocol::Error::new(
                 -32000,
-                "native session changes require a new ACP session",
+                native_model_refusal(),
             ));
         }
     } else {
@@ -3127,7 +3133,7 @@ fn image_route_refusal(
     prompt_input
         .persisted_user()
         .is_some_and(|user| user.has_images())
-        .then(|| crate::headless_media::ensure_vision(provider, model).err())
+        .then(|| crate::extras::multimodal::ensure_vision(provider, model).err())
         .flatten()
 }
 
@@ -4079,21 +4085,31 @@ mod tool_presentation_tests {
     #[test]
     fn subagent_lines_attach_to_the_single_open_task_call() {
         let mut activity = TaskActivity::default();
-        assert!(activity.note("grep foo").is_none(), "no open task call");
+        assert!(
+            activity.note(None, "grep foo").is_none(),
+            "no open task call"
+        );
         activity.call_started("task-1");
-        let first = activity.note("grep foo").unwrap();
+        let first = activity.note(None, "grep foo").unwrap();
         assert_eq!(first.tool_call_id.0.as_ref(), "task-1");
-        activity.note("read a.rs").unwrap();
+        activity.note(None, "read a.rs").unwrap();
         activity.call_started("task-2");
-        assert!(activity.note("grep bar").is_none(), "ambiguous with two");
+        assert!(
+            activity.note(None, "grep bar").is_none(),
+            "ambiguous with two"
+        );
+        // A named outer call is attributed even with several open.
+        let named = activity.note(Some("task-2"), "grep bar").unwrap();
+        assert_eq!(named.tool_call_id.0.as_ref(), "task-2");
+        assert!(activity.note(Some("unknown"), "x").is_none());
         activity.call_finished("task-2");
         activity.call_finished("task-1");
-        assert!(activity.note("grep baz").is_none());
+        assert!(activity.note(None, "grep baz").is_none());
         activity.call_started("task-3");
         for _ in 0..TaskActivity::MAX_LINES {
-            let _ = activity.note("line");
+            let _ = activity.note(None, "line");
         }
-        assert!(activity.note("one too many").is_none());
+        assert!(activity.note(None, "one too many").is_none());
     }
 }
 
@@ -4598,6 +4614,11 @@ fn last_assistant_text(progress: &[Message]) -> String {
     }
 }
 
+/// Refusal for switching the model of a session with provider-native state.
+fn native_model_refusal() -> String {
+    "The model cannot be switched in this session: it holds provider-managed (native) conversation state tied to its model. Reset the model to default, or start a new session to use another model.".to_owned()
+}
+
 /// Refusal for a context-changing command on a session that carries
 /// provider-native state: say which command and what to do instead.
 fn native_command_refusal(command: &commands::Command) -> String {
@@ -4636,6 +4657,7 @@ async fn run_prompt(
     control: Arc<TurnControl>,
     registration: &TurnRegistration,
 ) -> Result<(), agent_client_protocol::Error> {
+    let native_at_start = crate::session::native_publication::is_native_bearing(&history.session);
     if let Some(command) = command.as_ref() {
         let mutates_native_context = match command {
             commands::Command::Undo | commands::Command::Compact | commands::Command::Rename(_) => {
@@ -5286,6 +5308,11 @@ async fn run_prompt(
     } else {
         let _ = respond_terminal(registration, responder, outcome.reason);
     }
+    // The first native publication makes /compact, /undo and /rename refusals;
+    // stop advertising them (a busy history cannot be inspected by `announce`).
+    if !native_at_start && crate::session::native_publication::is_native_bearing(&history.session) {
+        let _ = commands::announce_for(state, &session_id, &cx, true).await;
+    }
     if title_eligible {
         crate::startup::heap_future(|| generate_session_title(state, history, &session_id, &cx))
             .await;
@@ -5735,10 +5762,7 @@ async fn execute_prompt(
     let route = match overrides.model.as_deref() {
         Some(alias) => {
             if crate::session::native_publication::is_native_bearing(&history.session) {
-                return Ok(PromptOutcome::failed(
-                    "native session changes require a new ACP session; reset the model to default"
-                        .into(),
-                ));
+                return Ok(PromptOutcome::failed(native_model_refusal()));
             }
             model_options::route_for(&state.cfg, alias)
         }
@@ -6711,14 +6735,14 @@ fn send_tool_update(session_id: &SessionId, cx: &ConnectionTo<Client>, update: T
 }
 
 /// Child activity of in-flight `task` calls, shown as lines on the outer call.
-/// Subagent events carry no outer call id, so lines are attributed only while
-/// exactly one `task` call is open; with several the attribution would be a
-/// guess and the lines are dropped.
+/// Events name their outer call when the emitter could tell; without it a line
+/// is attributed only while exactly one `task` call is open (with several it
+/// would be a guess and is dropped).
 #[cfg(feature = "subagents")]
 #[derive(Default)]
 struct TaskActivity {
     open: Vec<String>,
-    lines: Vec<String>,
+    lines: HashMap<String, Vec<String>>,
 }
 
 #[cfg(feature = "subagents")]
@@ -6730,23 +6754,29 @@ impl TaskActivity {
         if !self.open.iter().any(|open| open == id) {
             self.open.push(id.to_owned());
         }
-        self.lines.clear();
+        self.lines.remove(id);
     }
 
     fn call_finished(&mut self, id: &str) {
         self.open.retain(|open| open != id);
-        self.lines.clear();
+        self.lines.remove(id);
     }
 
-    fn note(&mut self, line: &str) -> Option<ToolCallUpdate> {
-        let [id] = self.open.as_slice() else {
-            return None;
+    fn note(&mut self, outer: Option<&str>, line: &str) -> Option<ToolCallUpdate> {
+        let id = match outer {
+            Some(id) if self.open.iter().any(|open| open == id) => id.to_owned(),
+            Some(_) => return None,
+            None => match self.open.as_slice() {
+                [only] => only.clone(),
+                _ => return None,
+            },
         };
-        if self.lines.len() >= Self::MAX_LINES {
+        let lines = self.lines.entry(id.clone()).or_default();
+        if lines.len() >= Self::MAX_LINES {
             return None;
         }
-        self.lines.push(toolcall::clip(line, 160));
-        Some(tool_progress_update(id, &self.lines.join("\n")))
+        lines.push(toolcall::clip(line, 160));
+        Some(tool_progress_update(&id, &lines.join("\n")))
     }
 }
 
@@ -6847,18 +6877,22 @@ async fn relay_prompt_events(
                 }
             }
             #[cfg(feature = "subagents")]
-            AgentEvent::SubagentToolCall { name, args } => {
+            AgentEvent::SubagentToolCall { name, args, outer } => {
                 // Never a new ACP call (it could not receive a matching
                 // result): one line appended to the outer `task` call.
                 let line = toolcall::title_for(&name, &args);
-                if let Some(update) = task_activity.note(&line) {
+                if let Some(update) = task_activity.note(outer.as_deref(), &line) {
                     send_tool_update(&session_id, &cx, update);
                 }
             }
             #[cfg(feature = "subagents")]
-            AgentEvent::SubagentStarted { agent_type, source } => {
+            AgentEvent::SubagentStarted {
+                agent_type,
+                source,
+                outer,
+            } => {
                 let line = format!("specialist {agent_type} ({source})");
-                if let Some(update) = task_activity.note(&line) {
+                if let Some(update) = task_activity.note(outer.as_deref(), &line) {
                     send_tool_update(&session_id, &cx, update);
                 }
             }
@@ -6885,6 +6919,9 @@ async fn relay_prompt_events(
             } => {
                 let id = id.to_string();
                 toolcall::forget_args(&id);
+                if is_error {
+                    toolcall::record_failed_result(session_id.0.as_ref(), &output);
+                }
                 #[cfg(feature = "subagents")]
                 task_activity.call_finished(&id);
                 let mut content = Vec::new();
@@ -10769,6 +10806,7 @@ mod protocol_tests {
                             AgentEvent::SubagentToolCall {
                                 name: "nested-display-only".into(),
                                 args: serde_json::json!({"not": "canonical"}),
+                                outer: None,
                             },
                             AgentEvent::ToolCall {
                                 id: "lifecycle-w".into(),

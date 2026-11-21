@@ -3121,6 +3121,19 @@ impl<'a> App<'a> {
             )?;
             return Ok(true);
         }
+        // A text-only model cannot use the image: say so instead of staging it.
+        if matches!(result, Ok(Some(_)))
+            && let Err(refusal) = crate::extras::multimodal::ensure_vision(
+                &self.ui.session.provider,
+                &self.ui.session.model,
+            )
+        {
+            self.renderer.write_line(
+                &format!("clipboard image was not attached: {refusal}"),
+                C_ERROR,
+            )?;
+            return Ok(true);
+        }
         match result.and_then(|image| {
             image
                 .map(|image| {

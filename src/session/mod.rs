@@ -550,6 +550,9 @@ pub enum PersistedToolMessage {
         /// recovery path without parsing marker-like text from the tool.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         artifact_path: Option<CompactString>,
+        /// The tool failed, was denied, or its outcome is unknown.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        is_error: bool,
     },
 }
 
@@ -2056,9 +2059,27 @@ impl Session {
                 output: CompactString::new(replay_output),
                 images,
                 artifact_path,
+                is_error: false,
             }),
         );
         (content, artifact)
+    }
+
+    /// Flag stored tool results whose output `failed` recognises, so a replay
+    /// can show them as failed. Already-flagged rows are left alone.
+    #[cfg(feature = "acp")]
+    pub(crate) fn mark_failed_tool_results(&mut self, mut failed: impl FnMut(&str) -> bool) {
+        for message in &mut self.messages {
+            if let Some(PersistedToolMessage::Result {
+                output,
+                is_error: is_error @ false,
+                ..
+            }) = &mut message.tool
+                && failed(output)
+            {
+                *is_error = true;
+            }
+        }
     }
 
     /// Evidence that an imported/legacy transcript may contain prior model

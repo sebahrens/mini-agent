@@ -1233,6 +1233,12 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     ("src/extras/acp/mod.rs", ".status(status)", 1, "NON-PROCESS"),
     ("src/extras/acp/mod.rs", "cx.spawn({", 1, "NON-PROCESS"),
+    (
+        "src/extras/acp/mod.rs",
+        "cx.spawn(tasks::watch(",
+        1,
+        "NON-PROCESS",
+    ),
     // The ACP /cron driver is a connection task on the ACP executor, not a process.
     (
         "src/extras/acp/cron.rs",

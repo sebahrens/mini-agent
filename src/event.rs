@@ -163,11 +163,16 @@ pub enum AgentEvent {
     SubagentToolCall {
         name: CompactString,
         args: serde_json::Value,
+        /// Internal id of the outer `task` call this child call belongs to,
+        /// when the emitting task could tell (display attribution only).
+        outer: Option<CompactString>,
     },
     #[cfg(feature = "subagents")]
     SubagentStarted {
         agent_type: CompactString,
         source: CompactString,
+        /// Internal id of the outer `task` call, when known.
+        outer: Option<CompactString>,
     },
     /// A terminal failure, with the canonical messages for work that already
     /// completed in this turn. A tool effect can happen and a later provider
