@@ -6516,3 +6516,118 @@ fn unknown_quick_model_headless_is_exit_2_with_failure_record() {
         assert!(!root.0.join("sessions").exists());
     }
 }
+
+/// With the default (unset) `session_title_model` a print-mode run must not
+/// issue the title request at all, so a title endpoint that never answers cannot
+/// delay the JSON result (mini-agent-sskdu.12). The fake provider answers the
+/// turn and then holds every further connection open without replying.
+#[test]
+fn headless_json_result_does_not_wait_for_a_never_answering_title() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    let root = TempRoot::new();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    // No `session_title_model`: the default title is the one that must be skipped.
+    std::fs::write(
+        root.0.join("config.toml"),
+        format!(
+            "[custom_providers.local-test]\nprovider_type=\"openai\"\nbase_url=\"http://{address}/v1\"\napi_key_env=\"HEADLESS_LOCAL_TEST_KEY\"\napi_style=\"completions\"\n"
+        ),
+    )
+    .unwrap();
+    let done = Arc::new(AtomicBool::new(false));
+    let extra = Arc::new(AtomicUsize::new(0));
+    let server = {
+        let (done, extra) = (done.clone(), extra.clone());
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            let mut answered = false;
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while !done.load(Ordering::SeqCst) && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut socket, _)) if !answered => {
+                        answered = true;
+                        socket.set_nonblocking(false).unwrap();
+                        socket
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        let mut head = Vec::new();
+                        while !head.ends_with(b"\r\n\r\n") {
+                            let mut byte = [0];
+                            socket.read_exact(&mut byte).unwrap();
+                            head.push(byte[0]);
+                        }
+                        let length = String::from_utf8_lossy(&head)
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .unwrap();
+                        let mut body = vec![0; length];
+                        socket.read_exact(&mut body).unwrap();
+                        let chunk = |delta: serde_json::Value, finish: serde_json::Value| {
+                            serde_json::json!({
+                                "id":"t", "object":"chat.completion.chunk", "created":0, "model":"test",
+                                "choices":[{"index":0, "delta":delta, "finish_reason":finish}]
+                            })
+                        };
+                        let mut last = chunk(serde_json::json!({}), serde_json::json!("stop"));
+                        last["usage"] = serde_json::json!({"prompt_tokens":10,"completion_tokens":2,"total_tokens":12});
+                        let body = format!(
+                            "data: {}\n\ndata: {last}\n\ndata: [DONE]\n\n",
+                            chunk(
+                                serde_json::json!({"role":"assistant","content":"finished"}),
+                                serde_json::Value::Null
+                            )
+                        );
+                        write!(
+                            socket,
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .unwrap();
+                    }
+                    Ok((socket, _)) => {
+                        // A title request: accept it and never answer.
+                        extra.fetch_add(1, Ordering::SeqCst);
+                        held.push(socket);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            }
+        })
+    };
+    let mut command = root.provider_command("write");
+    command.args(["-p", "--output", "json", "say finished"]);
+    let started = Instant::now();
+    let output = bounded_output(command);
+    let elapsed = started.elapsed();
+    done.store(true, Ordering::SeqCst);
+    server.join().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("one JSON result");
+    assert_eq!(value["result"], "finished", "{value}");
+    assert_eq!(
+        extra.load(Ordering::SeqCst),
+        0,
+        "a second (title) request was issued: {stderr}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "the result waited for a title: {elapsed:?}"
+    );
+}
