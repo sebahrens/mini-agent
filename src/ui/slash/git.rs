@@ -1897,7 +1897,12 @@ mod native_hook_tests {
         let AgentEvent::Error { message, .. } = actor.terminal().await else {
             panic!("rewritten confirmed operands must fail")
         };
-        assert!(message.contains("changed confirmed"), "{message}");
+        // Either guard refuses the rewrite: the lane check (a shared read rewritten into
+        // a write is not executed) or the confirmed-operand comparison.
+        assert!(
+            message.contains("changed confirmed") || message.contains("needs exclusive access"),
+            "{message}"
+        );
         assert_eq!(repo.git(&["rev-parse", "HEAD"]).await, before);
         assert!(
             repo.git(&["diff", "--cached", "--name-only"])
