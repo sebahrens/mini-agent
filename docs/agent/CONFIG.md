@@ -1746,9 +1746,19 @@ place, so those turns surface the error directly.
 | Report | line with messages, tokens freed net of the summary and the sidecar path | stderr line and a `compactions` object (`count`, `messages`, `tokens_freed`) on the final JSON / stream-json result | agent-thought notice, or the `/compact` reply; `/compact show` prints the active summary |
 | User instructions | `/compact <instructions>` (manual only) | `--compact-instructions` | none |
 
+The summarizer is asked for a handoff summary with fixed sections in this order:
+`## Task` (the user's requests and standing constraints verbatim, latest request
+marked), `## Progress`, `## Decisions` (with reasons and rejected approaches),
+`## Findings` (errors with root cause and fix, exact identifiers), `## Open Items`,
+`## Next Step` and `## Files` (last; the host re-attaches the full file list). It must
+merge the previous summary without re-paraphrasing quotes or identifiers and drop an
+item only when the new material shows it resolved. Storage bounding keeps each
+`## ` section's heading, so the section names are part of the contract but are not parsed.
+
 After a relief the continuation prompt tells the model that its earlier work is
-condensed in the "[Recap of my prior work in this conversation]" message above and
-that details missing from the recap must be re-read; it is host text, so `/undo`,
+condensed in the "[Recap of my prior work in this conversation]" message above (summary,
+restored file windows that may be stale, then the live todo list and goal), to resume from
+the recap's Next Step, and that details missing from the recap must be re-read; it is host text, so `/undo`,
 session titles and later summaries do not treat it as the user's words. A session's
 derived title is remembered at its first compaction and survives later ones. The
 summarizer's output replaces the previous summary, and only its own prose (not the
