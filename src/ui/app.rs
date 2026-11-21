@@ -5315,6 +5315,9 @@ impl<'a> App<'a> {
             && let Some(goal) = self.ui.session.goal_store.snapshot()
             && !goal.status.is_terminal()
         {
+            // A second interrupt with no round settled in between is the user
+            // insisting: park the goal rather than leave it armed.
+            let insisted = goal.last_evaluation_was_interrupt();
             let summary =
                 collector.finish(&goal, crate::extras::goal::gate::RoundEnd::Cancelled, 0);
             let outcome = crate::extras::goal::driver::apply_decision(
@@ -5325,6 +5328,18 @@ impl<'a> App<'a> {
             );
             if let crate::extras::goal::driver::RoundOutcome::Stopped { line, .. } = outcome {
                 let _ = self.renderer.write_line(&line, C_AGENT);
+            }
+            if insisted {
+                self.ui.session.goal_store.with_mut(|goal| {
+                    goal.set_status(
+                        crate::extras::goal::GoalStatus::Paused,
+                        Some(crate::extras::goal::PauseReason::UserRequested),
+                    )
+                });
+                let _ = self.renderer.write_line(
+                    "goal: paused after a second interrupt; /goal resume to continue",
+                    C_AGENT,
+                );
             }
             self.chain.loop_label = None;
         }
@@ -6143,6 +6158,16 @@ impl<'a> App<'a> {
         );
         self.chain.plan = Default::default();
         self.reconcile_native_chain_for_prompt().await?;
+        // A refused start is a notice, not an error: an error leaving this
+        // function would unwind to the event loop and end the session, and the
+        // user's message must stay in the editor.
+        #[cfg(feature = "goal")]
+        if super::native_goal_blocks_start(&self.ui) {
+            self.restore_interrupted_prompt(text);
+            self.renderer
+                .write_line(super::NATIVE_GOAL_NOTICE, C_ERROR)?;
+            return Ok(());
+        }
         // The echo is already on screen; show the spinner and Working
         // activity before memory refresh, prebuild adoption and agent build.
         self.paint_submission_started()?;
@@ -7683,9 +7708,10 @@ impl<'a> App<'a> {
                 // user's next message.
                 #[cfg(feature = "goal")]
                 if !self.run.is_running
-                    && let Some(goal) = self.ui.session.goal_store.snapshot().filter(|g| {
-                        g.context_file.is_some() && g.status.is_running() && g.progress.rounds == 0
-                    })
+                    && let Some(goal) =
+                        self.ui.session.goal_store.snapshot().filter(|g| {
+                            g.autostart && g.status.is_running() && g.progress.rounds == 0
+                        })
                 {
                     self.ensure_agent().await;
                     self.run.request_tool_results_cleared = 0;
@@ -11635,6 +11661,7 @@ mod permission_loop_tests {
             let mut goal =
                 crate::extras::goal::Goal::new("fork waits for input", Vec::new()).unwrap();
             goal.context_file = Some(root.path().join("UNREAD_FORK_PLAN.md"));
+            goal.autostart = true;
             session.goal_store.set(goal, false).unwrap();
         }
         session.working_dir = workspace.root().to_string_lossy().into();
@@ -14664,6 +14691,65 @@ mod git_command_consumer_tests {
                 .contains("DEFER_GIT:/commit fabricated")
         );
     }
+    /// On a direct Anthropic session a running goal refuses the next message.
+    /// That must be an inline notice that keeps the input, not an error that
+    /// unwinds to the event loop (mini-agent-sskdu.203).
+    #[cfg(feature = "goal")]
+    #[tokio::test]
+    async fn a_native_session_with_a_running_goal_refuses_a_message_inline() {
+        #[cfg(feature = "hooks")]
+        let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+        let repo = Repo::seeded().await;
+        let cli = crate::cli::Cli {
+            no_session: true,
+            no_tools: true,
+            ..Default::default()
+        };
+        let cfg = config();
+        let mut session = history(&repo);
+        session
+            .goal_store
+            .set(
+                crate::extras::goal::Goal::new("keep going", Vec::new()).unwrap(),
+                false,
+            )
+            .unwrap();
+        let mut files = crate::context::load(true).for_workspace_binding(true, &repo.workspace);
+        let mut app = fixture_app(context(&cli, &cfg, &mut session, &mut files, &repo));
+        let gateway: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "custom_providers": {"gw": {"provider_type": "anthropic", "base_url": "http://127.0.0.1:9"}}
+        }))
+        .unwrap();
+        app.ui.client = crate::provider::create_client(
+            "gw",
+            Some("unused-local-key"),
+            gateway.custom_providers_map(),
+            None,
+        )
+        .unwrap();
+
+        app.start_main_run("hello", crate::question::QuestionOrigin::NewUserTurn)
+            .await
+            .expect("a refusal is a notice, not an error");
+        assert!(!app.run.is_running);
+        assert!(
+            app.renderer
+                .captured_output()
+                .contains("direct Anthropic route"),
+            "the user is told why"
+        );
+        assert_eq!(app.input.buffer, "hello", "the message stays in the editor");
+
+        // A parked goal does not block chat.
+        app.ui.session.goal_store.with_mut(|goal| {
+            goal.set_status(
+                crate::extras::goal::GoalStatus::Paused,
+                Some(crate::extras::goal::PauseReason::UserRequested),
+            )
+        });
+        assert!(!super::super::native_goal_blocks_start(&app.ui));
+    }
+
     #[tokio::test]
     async fn actual_app_native_failed_retirement_blocks_new_admission_until_receiver_settles() {
         #[cfg(feature = "hooks")]
@@ -14907,6 +14993,7 @@ mod context_diagnostic_tests {
             let mut goal =
                 crate::extras::goal::Goal::new("PENDING_FIRST_ROUND", Vec::new()).unwrap();
             goal.context_file = Some(root.path().join("UNREAD_PENDING_PLAN.md"));
+            goal.autostart = true;
             session.goal_store.set(goal, false).unwrap();
         }
 

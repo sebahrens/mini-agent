@@ -50,7 +50,9 @@ charge an already recorded round again when saving is retried.
 
 You are not locked out while a goal runs. Typing a message is a normal turn; the gate simply
 evaluates at its end. Pressing Esc stops the current round but leaves the goal active: the next
-message you send continues it (`goal: interrupted — still active`), and `/goal pause` parks it.
+message you send continues it (`goal: interrupted — still active`), and `/goal pause` parks it. The
+status line marks such an armed goal `idle`, and a second interrupt with no round settled in between
+parks it for you (`/goal resume` to continue).
 While a round runs, `/goal status`, `/goal pause`, `/goal bounds` and `/goal check` work; `/goal
 clear`, `resume`, `reopen` and a new objective wait until you press Esc or pause first. A pause
 lets the running round finish, and its cost is still counted. A goal that is already parked keeps
@@ -126,7 +128,9 @@ second opinion from something that did not just do the work — weaker than a di
 
 The judge gets no tools and no workspace: only the objective, a bounded tail of the conversation
 (the newest 24 KiB; tool results keep both their start and their end, and the `goal_report` claim
-is shown whole), and the result of any checks the harness ran that round, all fenced as untrusted data. If it cannot be
+is shown whole), the files the session's mutating tool calls named, the agent's recent reports
+(labelled as its own account), and the result of any checks the harness ran that round, all fenced
+as untrusted data. If it cannot be
 reached, the goal keeps working rather than completing or ending; three consecutive failures on
 completion claims park the goal so an outage cannot pass for verification.
 
@@ -252,6 +256,8 @@ round, which is how an editor already works. The gate's instruction for that rou
 check's output, the judge's assessment) is carried to the next prompt as a non-persisted turn
 directive. A goal that asked a question resumes when the answer is sent, and a `session/cancel`
 during verification stops the running check. `/goal` accepts `status`, `pause`, `resume`, `reopen`,
-`clear`, `bounds` and `check` as in the terminal. Each round's decision comes back
+`clear`, `bounds` and `check` as in the terminal. Both surfaces share one parser: a verb counts only
+when it stands alone, and any other single word (a mistyped verb) is refused instead of becoming
+an objective. Each round's decision comes back
 as a thought chunk and as `_meta.goal`, carrying the status, the round, whether
 a command proved the verdict, and what the evidence was.

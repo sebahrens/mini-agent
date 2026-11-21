@@ -75,6 +75,7 @@ pub fn loop_goal(
     // The plan file travels with the goal and is re-read every round, which is
     // what the loop's own prompt did.
     goal.context_file = Some(plan_file.to_path_buf());
+    goal.autostart = true;
 
     let unmapped = Vec::new();
     if let Some(command) = run_cmd.map(str::trim).filter(|c| !c.is_empty()) {

@@ -2,7 +2,7 @@
 //!
 //! Owning specification: `docs/specs/goals.md` (Surfaces).
 
-use crate::extras::goal::{Goal, GoalStatus, PauseReason};
+use crate::extras::goal::{Goal, GoalCommand, GoalStatus, PauseReason};
 use crate::ui::slash::write_usage;
 use crate::ui::slash::{SlashCtx, write_error, write_ok, write_result};
 
@@ -294,16 +294,12 @@ pub(crate) fn render_status(goal: &Goal) -> String {
 
 pub(crate) async fn handle_goal(parts: &[&str], body: &str, ctx: &mut SlashCtx<'_>) {
     let store = ctx.session.goal_store.clone();
-    let subcommand = parts.get(1).copied().unwrap_or("status");
+    let command = crate::extras::goal::parse_goal_command(body);
 
-    // The verbs that take no argument only match when none was given.
-    // Otherwise `/goal clear the cache` deletes the goal instead of setting
-    // one, and `/goal pause the deploy` parks it: an objective that happens to
-    // start with a command word is still an objective.
-    let bare = parts.len() <= 2;
-
-    match subcommand {
-        "status" if bare => match store.snapshot() {
+    // The classification (and the rule that a verb only counts when it stands
+    // alone) lives in `parse_goal_command`, shared with the editor surface.
+    match command {
+        GoalCommand::Status => match store.snapshot() {
             Some(goal) => {
                 let mut status = render_status(&goal);
                 status.push_str(&unpriced_judge_line(ctx.session.unpriced_judge_tokens));
@@ -311,14 +307,14 @@ pub(crate) async fn handle_goal(parts: &[&str], body: &str, ctx: &mut SlashCtx<'
             }
             None => write_result(ctx.renderer, "no goal set — /goal <objective> to set one"),
         },
-        "clear" if bare => match store.clear() {
+        GoalCommand::Clear => match store.clear() {
             Some(goal) => {
                 write_ok(ctx.renderer, format!("goal cleared: {}", goal.objective));
                 ctx.rebuild_agent().await;
             }
             None => write_result(ctx.renderer, "no goal to clear"),
         },
-        "pause" if bare => {
+        GoalCommand::Pause => {
             // A goal that is already parked keeps the status and reason the
             // harness gave it; pausing it again would overwrite them.
             let changed = store.with_mut(|goal| {
@@ -350,7 +346,7 @@ pub(crate) async fn handle_goal(parts: &[&str], body: &str, ctx: &mut SlashCtx<'
                 None => write_error(ctx.renderer, "no goal to pause"),
             }
         }
-        "resume" if bare => {
+        GoalCommand::Resume => {
             let resumed = store.with_mut(|goal| {
                 let resumed = goal.resume();
                 (
@@ -381,7 +377,7 @@ pub(crate) async fn handle_goal(parts: &[&str], body: &str, ctx: &mut SlashCtx<'
                 None => write_error(ctx.renderer, "no goal to resume"),
             }
         }
-        "reopen" if bare => {
+        GoalCommand::Reopen => {
             let reopened = store.with_mut(|goal| (goal.reopen(), goal.status));
             match reopened {
                 Some((true, _)) => {
@@ -398,7 +394,7 @@ pub(crate) async fn handle_goal(parts: &[&str], body: &str, ctx: &mut SlashCtx<'
                 None => write_error(ctx.renderer, "no goal to reopen"),
             }
         }
-        "bounds" => {
+        GoalCommand::Bounds(_) => {
             if parts.len() < 3 {
                 match store.snapshot() {
                     Some(goal) => write_result(
@@ -443,7 +439,7 @@ pub(crate) async fn handle_goal(parts: &[&str], body: &str, ctx: &mut SlashCtx<'
                 ctx.rebuild_agent().await;
             }
         }
-        "check" => {
+        GoalCommand::Check(_) => {
             if parts.len() < 3 {
                 write_usage(
                     ctx.renderer,
@@ -472,7 +468,14 @@ pub(crate) async fn handle_goal(parts: &[&str], body: &str, ctx: &mut SlashCtx<'
                 None => write_error(ctx.renderer, "no goal to add a check to"),
             }
         }
-        _ => {
+        GoalCommand::UnknownWord(word) => {
+            write_error(
+                ctx.renderer,
+                format!("unknown /goal command {word:?}; a new objective needs at least two words"),
+            );
+            write_result(ctx.renderer, USAGE);
+        }
+        GoalCommand::Objective => {
             if body.trim().is_empty() {
                 write_error(ctx.renderer, USAGE);
                 return;
