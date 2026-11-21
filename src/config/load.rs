@@ -1909,6 +1909,7 @@ fn load_from_path_with_sources(
 
     emit_config_warnings(&mut warnings, std::mem::take(&mut cfg.load_warnings));
     cfg.load_warnings = warnings;
+    crate::provider_presets::apply(&mut cfg);
 
     (cfg, is_first_startup)
 }

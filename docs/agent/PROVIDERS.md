@@ -28,6 +28,35 @@ Select a provider via the config file, the `--provider` CLI flag, or the
 mini-agent --provider anthropic
 ```
 
+## OpenAI-compatible presets
+
+These vendors speak the OpenAI Chat Completions protocol, so they ship as
+ready-made `custom_providers` entries. `--provider groq`, `/provider`, the
+`--setup` wizard and completion list all know them; nothing needs to be written
+in the config file. Each preset is credential-isolated like any custom
+provider: it reads only its own env var or `api_keys.<name>`, never the
+`OPENAI_API_KEY` of the built-in `openai` provider. LM Studio is a keyless
+loopback server. A `[custom_providers.<name>]` table of the same name replaces
+the preset entirely, and untouched presets are never written back to the config
+file. `mini-agent --provider groq --print-config` shows the expanded entry.
+
+| Vendor | `--provider` name | Base URL | Default env var for API key |
+| --- | --- | --- | --- |
+| xAI | `xai` | `https://api.x.ai/v1` | `XAI_API_KEY` |
+| Groq | `groq` | `https://api.groq.com/openai/v1` | `GROQ_API_KEY` |
+| Mistral | `mistral` | `https://api.mistral.ai/v1` | `MISTRAL_API_KEY` |
+| DeepSeek | `deepseek` | `https://api.deepseek.com/v1` | `DEEPSEEK_API_KEY` |
+| Together AI | `together` | `https://api.together.xyz/v1` | `TOGETHER_API_KEY` |
+| Fireworks AI | `fireworks` | `https://api.fireworks.ai/inference/v1` | `FIREWORKS_API_KEY` |
+| Cerebras | `cerebras` | `https://api.cerebras.ai/v1` | `CEREBRAS_API_KEY` |
+| LM Studio (local) | `lmstudio` | `http://127.0.0.1:1234/v1` | (no key; loopback) |
+
+The embedded model catalog has no tables for these vendors, so their models
+are unpriced (spend shows no cost) unless you add
+`custom_providers.<name>.model_prices.<model id>`. Pass the vendor's model id
+with `--model`. These presets were written from each vendor's documented
+OpenAI-compatible base URL and were not exercised against live accounts.
+
 ## Sign in with ChatGPT
 
 OpenAI documents [ChatGPT plan usage for open-source and locally hosted apps](https://developers.openai.com/siwc/token-sharing-open-source).
@@ -631,6 +660,44 @@ Google's [Claude request contract](https://docs.cloud.google.com/gemini-enterpri
 documents the publisher route and Vertex body version. The official
 [ADC builder](https://docs.rs/google-cloud-auth/1.17.0/google_cloud_auth/credentials/struct.Builder.html)
 documents source selection and scopes.
+
+## Vertex AI Gemini
+
+Select `provider = "vertex-gemini"` (alias `vertex-ai-gemini`) to run Gemini
+models through Vertex AI instead of an AI Studio key. Project, location,
+Application Default Credentials and `VERTEX_ACCESS_TOKEN` / `api_keys.vertex-gemini`
+work exactly as for [Vertex AI Claude](#vertex-ai-claude); the AI Studio
+`GEMINI_API_KEY` is never borrowed or sent.
+
+```toml
+provider = "vertex-gemini"
+model = "gemini-2.5-pro"
+```
+
+rig's Gemini client builds `/v1beta/models/MODEL:streamGenerateContent?alt=sse`.
+The Vertex auth owner rewrites that, before any token is acquired, to the one
+path this client is pinned to,
+`/v1/projects/PROJECT/locations/LOCATION/publishers/google/models/MODEL:streamGenerateContent?alt=sse`
+(`:generateContent` for blocking calls), strips the placeholder key and any
+`x-goog-api-key`, and adds the bearer token. Any other path, method, query
+parameter or origin is refused. Redirects are disabled.
+Model listing is not available on this route. Catalog context windows and prices
+come from the `gemini` catalog entries. Loopback tests cover the pinned,
+authorized request shape; it was not run against a live Vertex project.
+
+## Bedrock Converse (non-Claude models): partial
+
+Amazon Nova, Llama, Mistral, DeepSeek and other non-`anthropic.` Bedrock ids use
+`POST https://bedrock-runtime.REGION.amazonaws.com/model/MODEL_ID/converse-stream`.
+`src/provider_bedrock_converse.rs` implements the wire layer: Converse request
+encoding (system, text, tool use, tool results, tool config, inference config),
+SigV4 signing through the same signer as the Claude route, the
+`application/vnd.amazon.eventstream` frame decoder (CRC-checked) and the event
+accumulator (text, tool-use fragments assembled into JSON arguments, stop reason,
+usage, modelled exceptions). It is tested on recorded frames and a signed-request
+witness. It is **not yet attached** to a model client, so `provider = "bedrock"`
+still serves Claude only; the missing piece is a rig `CompletionModel` over these
+functions plus an agent variant. Not verified against a live AWS account.
 
 ## GitHub Copilot credential ownership
 

@@ -125,6 +125,7 @@ impl<'a> UiContext<'a> {
     /// Borrow the pieces [`AgentBuildCtx::rebuild_agent`] needs.
     pub(crate) fn agent_build_ctx(&self) -> AgentBuildCtx<'_> {
         AgentBuildCtx {
+            provider: &self.session.provider,
             native_js_context: self.session.native_js_context(),
             prebuild_invalidated: Some(&self.prebuild_invalidated),
             cli: self.cli,
@@ -195,6 +196,8 @@ impl<'a> UiContext<'a> {
 /// temperature, extra_body) and the `build_agent` call itself so every
 /// rebuild path stays in sync.
 pub(crate) struct AgentBuildCtx<'a> {
+    /// The provider `client` belongs to (the session's provider).
+    pub(crate) provider: &'a str,
     pub(crate) native_js_context: crate::provider::NativeJsContext,
     /// Foreground builds supersede the startup snapshot. Only the startup
     /// prebuild itself passes None.
@@ -234,7 +237,7 @@ impl AgentBuildCtx<'_> {
         );
         let temperature = crate::config::resolve_temperature(self.cli, self.cfg, model_id);
         let extra_body = crate::config::resolve_extra_body(self.cfg, model_id);
-        crate::provider::build_agent_in_workspace(
+        let agent = crate::provider::build_agent_in_workspace(
             model,
             self.cli,
             self.cfg,
@@ -260,7 +263,50 @@ impl AgentBuildCtx<'_> {
             #[cfg(feature = "mcp")]
             self.mcp_manager,
         )
-        .await
+        .await;
+        self.with_cross_provider_fallback(agent, reasoning_enabled)
+            .await
+    }
+
+    /// With `fallback_interactive` on and a `fallback_model` alias that
+    /// belongs to another provider, also build the agent that fallback runs
+    /// on: the alias provider's own client and the same tool context
+    /// (mini-agent-nvnkx.43). A fallback that cannot be built (no credential)
+    /// is skipped with a log line; the primary agent is unaffected.
+    async fn with_cross_provider_fallback(
+        &self,
+        agent: AnyAgent,
+        reasoning_enabled: bool,
+    ) -> AnyAgent {
+        if self.cfg.fallback_interactive != Some(true) {
+            return agent;
+        }
+        let Some(quick) = crate::provider::cross_provider_fallback_alias(self.cfg, self.provider)
+        else {
+            return agent;
+        };
+        let client = match crate::provider::create_client(
+            &quick.provider,
+            self.cli.api_key_for(self.cfg, &quick.provider),
+            self.cfg.custom_providers_map(),
+            self.cfg.api_keys.as_ref(),
+        ) {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::warn!(
+                    provider = %quick.provider,
+                    "cross-provider fallback unavailable: {error}"
+                );
+                return agent;
+            }
+        };
+        let sub = AgentBuildCtx {
+            client: &client,
+            provider: &quick.provider,
+            ..*self
+        };
+        let fallback = Box::pin(sub.rebuild_agent(&quick.model, reasoning_enabled)).await;
+        agent.with_cross_provider_fallback(fallback)
     }
 }
 

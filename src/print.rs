@@ -3608,6 +3608,27 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
             },
         ),
     ];
+    if let Some(entry) = cfg.custom_providers_map().get(provider.as_str()) {
+        model_entries.push((
+            "provider entry",
+            format!(
+                "{} -> {} ({}{})",
+                entry.provider_type,
+                entry.base_url,
+                entry
+                    .api_key_env
+                    .as_deref()
+                    .map(|env| format!("key from ${env}"))
+                    .unwrap_or_else(|| "no env key".into()),
+                match crate::provider_presets::find(provider.as_str())
+                    .filter(|_| crate::provider_presets::is_untouched(provider.as_str(), entry))
+                {
+                    Some(preset) => format!(", built-in preset: {}", preset.label),
+                    None => String::new(),
+                }
+            ),
+        ));
+    }
     if let Some(temp) = temperature {
         model_entries.push(("temperature", temp.to_string()));
     }

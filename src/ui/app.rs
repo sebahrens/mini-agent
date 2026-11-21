@@ -1332,6 +1332,7 @@ impl<'a> App<'a> {
         let prebuild = if auto_trigger_msg.is_none() && run.agent.is_none() {
             let client_clone = ui.client.clone();
             let session_model = ui.session.model.to_string();
+            let session_provider = ui.session.provider.to_string();
             let native_js_context = ui.session.native_js_context();
             let tool_output_session_id = ui.session.id.to_string();
             let tool_result_spills = ui.session.tool_result_spills.clone();
@@ -1376,6 +1377,7 @@ impl<'a> App<'a> {
                     };
 
                     let a = crate::ui::state::AgentBuildCtx {
+                        provider: &session_provider,
                         native_js_context,
                         prebuild_invalidated: None,
                         cli: &cli_clone,

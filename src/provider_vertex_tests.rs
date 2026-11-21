@@ -428,3 +428,159 @@ async fn vertex81_same_origin_redirect_cannot_bypass_project_binding() {
     .await
     .unwrap();
 }
+
+#[test]
+fn vertex_gemini44_kind_credentials_and_pinned_path() {
+    assert_eq!(
+        ProviderKind::from_name("vertex-gemini"),
+        Some(ProviderKind::VertexGemini)
+    );
+    assert_eq!(
+        ProviderKind::from_name("vertex-ai-gemini"),
+        Some(ProviderKind::VertexGemini)
+    );
+    // Not Anthropic-native: Gemini on Vertex keeps the ordinary accounting.
+    assert!(!crate::config::Config::default().is_anthropic_native("vertex-gemini"));
+    let route = route(&env).unwrap();
+    assert_eq!(
+        gemini_path(&route, "gemini-2.5-pro", true).unwrap(),
+        "/v1/projects/owned-project/locations/us-east5/publishers/google/models/gemini-2.5-pro:streamGenerateContent"
+    );
+    assert!(gemini_path(&route, "a/b", false).is_err());
+    let resolver = AuthResolver::new(ProviderKind::VertexGemini);
+    assert_eq!(
+        resolver.resolve_credential_with_env(env).unwrap(),
+        ResolvedCredential::GoogleAdc
+    );
+    // An AI Studio key is never borrowed.
+    assert_eq!(
+        resolver
+            .resolve_credential_with_env(|key| if key == "GEMINI_API_KEY" {
+                Ok("DO_NOT_BORROW".into())
+            } else {
+                env(key)
+            })
+            .unwrap(),
+        ResolvedCredential::GoogleAdc
+    );
+}
+
+#[tokio::test]
+async fn vertex_gemini44_auth_rewrites_only_the_exact_gemini_shape() {
+    let route = route(&env).unwrap();
+    let auth = VertexAuth::with_publisher(
+        ResolvedCredential::GoogleAdc,
+        "https://cloud.example",
+        route.clone(),
+        true,
+    )
+    .unwrap();
+    for bad in [
+        "https://evil.example/v1beta/models/gemini-x:generateContent?key=k",
+        "https://cloud.example/v1beta/models/gemini-x:embedContent?key=k",
+        "https://cloud.example/v1beta/models?key=k",
+        "https://cloud.example/v1beta/models/gemini-x:generateContent?key=k&other=1",
+        "https://cloud.example/v1beta/models/gemini-x:generateContent?alt=json",
+        "https://cloud.example/v1beta/models/a%2Fb:generateContent",
+    ] {
+        let mut request = http::Request::post(bad)
+            .body(Bytes::from_static(b"exact bytes"))
+            .unwrap();
+        assert!(auth.prepare(&mut request).await.is_err(), "{bad}");
+        // Refused before any ADC work.
+        assert!(auth.adc.get().is_none());
+        assert_eq!(request.body(), b"exact bytes".as_slice());
+    }
+    let auth = VertexAuth::with_publisher(
+        ResolvedCredential::Bearer("OWNED_TOKEN".into()),
+        "https://cloud.example",
+        route,
+        true,
+    )
+    .unwrap();
+    for (streaming, query, expected) in [
+        (
+            true,
+            "?alt=sse&key=vertex-adc",
+            "https://cloud.example/v1/projects/owned-project/locations/us-east5/publishers/google/models/gemini-2.5-pro:streamGenerateContent?alt=sse",
+        ),
+        (
+            false,
+            "?key=vertex-adc",
+            "https://cloud.example/v1/projects/owned-project/locations/us-east5/publishers/google/models/gemini-2.5-pro:generateContent",
+        ),
+    ] {
+        let action = if streaming {
+            "streamGenerateContent"
+        } else {
+            "generateContent"
+        };
+        let mut request = http::Request::post(format!(
+            "https://cloud.example/v1beta/models/gemini-2.5-pro:{action}{query}"
+        ))
+        .header("x-goog-api-key", "AI_STUDIO_KEY")
+        .body(Bytes::from_static(b"{}"))
+        .unwrap();
+        auth.prepare(&mut request).await.unwrap();
+        assert_eq!(request.uri().to_string(), expected);
+        assert_eq!(request.headers()["authorization"], "Bearer OWNED_TOKEN");
+        assert!(!request.headers().contains_key("x-goog-api-key"));
+        assert!(!request.uri().to_string().contains("key="));
+    }
+}
+
+#[tokio::test]
+async fn vertex_gemini44_real_client_sends_a_signed_pinned_generate_content_stream() {
+    let (listener, endpoint) = bind().await;
+    let custom = HashMap::from([(
+        "gemini-on-vertex".into(),
+        serde_json::from_value::<crate::config::CustomProviderConfig>(json!({
+            "provider_type": "vertex-gemini", "base_url": endpoint,
+        }))
+        .unwrap(),
+    )]);
+    let client = crate::provider::create_client_with_env(
+        "gemini-on-vertex",
+        Some("OWNED_TOKEN"),
+        &custom,
+        None,
+        env,
+    )
+    .unwrap();
+    let crate::provider::AnyModel::Gemini(model) = client.completion_model("gemini-2.5-pro") else {
+        panic!("Gemini model required")
+    };
+    let server = async {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let req = read_request(&mut socket).await;
+        let (headers, body) = (req.headers.clone(), req.json());
+        assert!(
+            headers.starts_with("post /v1/projects/owned-project/locations/us-east5/publishers/google/models/gemini-2.5-pro:streamgeneratecontent?alt=sse http/1.1"),
+            "{headers}"
+        );
+        assert!(headers.contains("authorization: bearer owned_token"));
+        assert!(!headers.contains("x-goog-api-key"));
+        assert!(!headers.contains("key="));
+        assert!(body.to_string().contains("owned gemini task"));
+        let event = json!({"candidates":[{"content":{"role":"model","parts":[{"text":"VERTEX_GEMINI_DONE"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":3,"totalTokenCount":13}});
+        respond_sse(&mut socket, &format!("data: {event}\n\n")).await;
+    };
+    let task = crate::startup::heap_future(|| async move {
+        let agent = rig::agent::AgentBuilder::new(model).max_tokens(32).build();
+        let mut stream = agent
+            .stream_chat("owned gemini task", Vec::<Message>::new())
+            .await;
+        let mut output = None;
+        while let Some(item) = stream.next().await {
+            if let rig::agent::MultiTurnStreamItem::FinalResponse(result) = item.unwrap() {
+                output = Some(result.output);
+            }
+        }
+        assert_eq!(output.as_deref(), Some("VERTEX_GEMINI_DONE"));
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(server, task);
+    })
+    .await
+    .unwrap();
+}

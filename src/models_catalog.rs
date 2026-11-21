@@ -311,6 +311,29 @@ pub(crate) fn inheritance_notice(provider: &str, model: &str) -> Option<String> 
 /// The catalog key for `provider/model`: the exact entry, or for Bedrock and
 /// Vertex the native Anthropic id (with or without its date suffix).
 fn catalog_key(provider: &str, model: &str) -> Option<(&'static str, String)> {
+    // Gemini on Vertex and non-Claude ids on Bedrock / Vertex resolve to
+    // their own catalog entries (mini-agent-nvnkx.44): a Vertex Gemini id is a
+    // Gemini entry, and any other exact id is looked up across providers.
+    let provider = if matches!(provider, "vertex-gemini" | "vertex-ai-gemini") {
+        "gemini"
+    } else {
+        provider
+    };
+    if claude_route(provider) && !is_claude_family(model) {
+        let bare = model.rsplit('/').next().unwrap_or(model);
+        let wanted = if provider.starts_with("vertex") {
+            ["gemini", "openrouter", "openai"]
+        } else {
+            ["openrouter", "openai", "gemini"]
+        };
+        return wanted.iter().find_map(|key| {
+            let (key, entries) = CATALOG.entries.get_key_value(*key)?;
+            entries
+                .iter()
+                .any(|entry| entry.id == bare)
+                .then(|| (key.as_str(), bare.to_string()))
+        });
+    }
     let (provider_key, _) = CATALOG.entries.get_key_value(provider).unzip();
     if let Some(provider_key) = provider_key
         && CATALOG.entries[provider_key]

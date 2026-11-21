@@ -234,6 +234,11 @@ pub struct Config {
     /// progress (overload, rate limit, 5xx). `--fallback-model` wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_model: Option<CompactString>,
+    /// Opt-in: interactive (TUI) and ACP turns also switch to
+    /// `fallback_model` for one turn when the primary fails with retries
+    /// exhausted before any progress. Default false; headless is unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_interactive: Option<bool>,
     /// Opt-in: refresh the model catalog cache from models.dev at startup
     /// when it is older than this many days (network access; default off).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -421,7 +426,10 @@ pub struct Config {
     /// interactive start. Default `true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub architecture_prompt: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "crate::provider_presets::nothing_to_persist",
+        serialize_with = "crate::provider_presets::serialize_custom_providers"
+    )]
     pub custom_providers: Option<HashMap<String, types::CustomProviderConfig>>,
     /// Embedding backend for the skill library. Absent means the built-in
     /// offline deterministic backend.

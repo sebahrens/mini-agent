@@ -30,6 +30,7 @@ mod project_root;
 mod provider;
 mod provider_http;
 mod provider_listing;
+mod provider_presets;
 mod question;
 mod rate_limits;
 mod retry;

@@ -2309,3 +2309,221 @@ async fn compaction_timeout_is_per_request_and_the_failure_names_its_key() {
         "{error}"
     );
 }
+
+async fn collect_events(
+    mut runner: crate::agent::runner::AgentRunner,
+) -> Vec<crate::event::AgentEvent> {
+    let mut events = Vec::new();
+    loop {
+        let Ok(next) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), runner.event_rx.recv()).await
+        else {
+            panic!("turn did not finish; events so far: {events:?}");
+        };
+        let Some(event) = next else { break };
+        // Answer compaction boundaries like the UI: this exercises the
+        // decision channel the fallback proxy forwards to the active runner.
+        if matches!(
+            event,
+            crate::event::AgentEvent::UsageDelta {
+                awaits_compaction_decision: true,
+                ..
+            }
+        ) && let Some(decisions) = &runner.compaction_decision_tx
+        {
+            decisions
+                .send(crate::agent::runner::CompactionBoundaryDecision::Continue)
+                .await
+                .unwrap();
+        }
+        let done = matches!(
+            event,
+            crate::event::AgentEvent::Done { .. } | crate::event::AgentEvent::Error { .. }
+        );
+        events.push(event);
+        if done {
+            break;
+        }
+    }
+    events
+}
+
+fn interactive_cfg(wire: &Wire) -> (AnyClient, Config) {
+    let (client, mut cfg) = wire.client();
+    cfg.retry.max_attempts = 2;
+    cfg.retry.initial_backoff_ms = 1;
+    cfg.retry.max_backoff_ms = 1;
+    cfg.retry.max_retry_after_ms = 0;
+    cfg.quick_models = Some(
+        serde_json::from_value(serde_json::json!({
+            "small": {"provider": "cost-wire", "model": "fixture-small",
+                      "input_token_cost": 1.0, "output_token_cost": 2.0}
+        }))
+        .unwrap(),
+    );
+    cfg.fallback_model = Some("small".into());
+    (client, cfg)
+}
+
+#[tokio::test]
+async fn interactive_turn_falls_back_after_primary_overload_when_opted_in() {
+    let overloaded = status_response(
+        529,
+        r#"{"error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+    );
+    let root = crate::tests::OwnedTestDirectory::new("fallback-interactive");
+    let wire = Wire::new(vec![
+        Some(overloaded.clone()),
+        Some(overloaded),
+        Some(response("from fallback", false)),
+    ])
+    .await;
+    let (client, mut cfg) = interactive_cfg(&wire);
+    cfg.fallback_interactive = Some(true);
+    let (run, ledger) = profile(&root, &cfg, RequestKind::Turn, Some(1.0));
+    let session = crate::session::Session::new("cost-wire", "fixture", 128_000, "");
+    let agent = primary_agent(&client, run).with_main_session(&cfg, &session);
+    let runner = agent
+        .spawn_runner(
+            "hello".into(),
+            Vec::<rig::completion::Message>::new(),
+            cfg.retry.clone(),
+            #[cfg(feature = "hooks")]
+            None,
+        )
+        .await;
+    let events = collect_events(runner).await;
+    assert!(
+        matches!(events.last(), Some(crate::event::AgentEvent::Done { .. })),
+        "{events:?}"
+    );
+    let notice = events.iter().find_map(|event| match event {
+        crate::event::AgentEvent::OutputTruncated { message } => Some(message.to_string()),
+        _ => None,
+    });
+    let notice = notice.expect("the feed carries a fallback notice");
+    assert!(
+        notice.contains("fixture") && notice.contains("falling back to fixture-small"),
+        "{notice}"
+    );
+    assert!(events.iter().any(
+        |event| matches!(event, crate::event::AgentEvent::Token(t) if t.contains("from fallback"))
+    ));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, crate::event::AgentEvent::Error { .. }))
+    );
+    let bodies = wire.bodies.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 3);
+    assert_eq!(bodies[2]["model"], "fixture-small");
+    let summary = ledger.summary().unwrap();
+    assert!(
+        summary
+            .by_model
+            .contains_key(&("cost-wire".to_string(), "fixture-small".to_string())),
+        "spend is attributed to the fallback model"
+    );
+}
+
+#[tokio::test]
+async fn interactive_turn_does_not_fall_back_unless_opted_in_or_after_auth_errors() {
+    let overloaded = status_response(
+        529,
+        r#"{"error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+    );
+    for (opted_in, body) in [
+        (false, overloaded.clone()),
+        (
+            true,
+            status_response(401, r#"{"error":{"message":"invalid api key"}}"#),
+        ),
+    ] {
+        let root = crate::tests::OwnedTestDirectory::new("fallback-interactive-off");
+        let wire = Wire::new(vec![Some(body.clone()), Some(body)]).await;
+        let (client, mut cfg) = interactive_cfg(&wire);
+        cfg.fallback_interactive = Some(opted_in);
+        let (run, _ledger) = profile(&root, &cfg, RequestKind::Turn, Some(1.0));
+        let session = crate::session::Session::new("cost-wire", "fixture", 128_000, "");
+        let agent = primary_agent(&client, run).with_main_session(&cfg, &session);
+        let runner = agent
+            .spawn_runner(
+                "hello".into(),
+                Vec::<rig::completion::Message>::new(),
+                cfg.retry.clone(),
+                #[cfg(feature = "hooks")]
+                None,
+            )
+            .await;
+        let events = collect_events(runner).await;
+        assert!(
+            matches!(events.last(), Some(crate::event::AgentEvent::Error { .. })),
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, crate::event::AgentEvent::OutputTruncated { .. }))
+        );
+    }
+}
+
+#[tokio::test]
+async fn cross_provider_alias_resolves_to_a_route_and_runs_on_the_attached_agent() {
+    let overloaded = status_response(
+        529,
+        r#"{"error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+    );
+    let root = crate::tests::OwnedTestDirectory::new("fallback-cross-provider");
+    let primary_wire = Wire::new(vec![Some(overloaded.clone()), Some(overloaded)]).await;
+    let backup_wire = Wire::new(vec![Some(response("from other provider", false))]).await;
+    let (client, mut cfg) = interactive_cfg(&primary_wire);
+    let (backup_client, _) = backup_wire.client();
+    cfg.fallback_interactive = Some(true);
+    cfg.quick_models = Some(
+        serde_json::from_value(serde_json::json!({
+            "backup": {"provider": "other-wire", "model": "fixture-backup",
+                       "input_token_cost": 1.0, "output_token_cost": 2.0}
+        }))
+        .unwrap(),
+    );
+    cfg.fallback_model = Some("backup".into());
+    let session = crate::session::Session::new("cost-wire", "fixture", 128_000, "");
+    // Without an attached agent a cross-provider alias is still refused.
+    assert!(crate::provider::resolve_fallback_route(&cfg, &session).is_none());
+    assert_eq!(
+        crate::provider::cross_provider_fallback_alias(&cfg, "cost-wire")
+            .unwrap()
+            .provider
+            .as_str(),
+        "other-wire"
+    );
+    assert!(crate::provider::cross_provider_fallback_alias(&cfg, "other-wire").is_none());
+    let (run, _ledger) = profile(&root, &cfg, RequestKind::Turn, Some(1.0));
+    let backup = primary_agent(&backup_client, run.clone());
+    let agent = primary_agent(&client, run)
+        .with_cross_provider_fallback(backup)
+        .with_main_session(&cfg, &session);
+    let runner = agent
+        .spawn_runner(
+            "hello".into(),
+            Vec::<rig::completion::Message>::new(),
+            cfg.retry.clone(),
+            #[cfg(feature = "hooks")]
+            None,
+        )
+        .await;
+    let events = collect_events(runner).await;
+    assert!(
+        matches!(events.last(), Some(crate::event::AgentEvent::Done { .. })),
+        "{events:?}"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        crate::event::AgentEvent::OutputTruncated { message } if message.contains("other-wire/fixture-backup")
+    )));
+    assert_eq!(
+        backup_wire.bodies.lock().unwrap()[0]["model"],
+        "fixture-backup"
+    );
+}
