@@ -25,27 +25,39 @@ fn provider(
     std::thread::spawn(move || {
         listener.set_nonblocking(true).unwrap();
         let deadline = Instant::now() + Duration::from_secs(60);
-        let mut socket = loop {
-            match listener.accept() {
-                Ok((socket, _)) => break socket,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(Instant::now() < deadline, "provider was never contacted");
-                    std::thread::sleep(Duration::from_millis(10));
+        let (headers, mut socket) = loop {
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "provider was never contacted");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("{error}"),
                 }
-                Err(error) => panic!("{error}"),
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                socket.read_exact(&mut byte).unwrap();
+                headers.push(byte[0]);
             }
+            let headers = String::from_utf8(headers).unwrap();
+            if headers.starts_with("GET ") {
+                // The startup context-window probe lists models; serve none.
+                socket
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                continue;
+            }
+            break (headers, socket);
         };
-        socket.set_nonblocking(false).unwrap();
-        socket
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
-        let mut headers = Vec::new();
-        while !headers.ends_with(b"\r\n\r\n") {
-            let mut byte = [0];
-            socket.read_exact(&mut byte).unwrap();
-            headers.push(byte[0]);
-        }
-        let headers = String::from_utf8(headers).unwrap();
         let length: usize = headers
             .lines()
             .find_map(|line| {

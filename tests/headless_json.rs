@@ -490,43 +490,54 @@ impl TempRoot {
                 1
             };
             for index in 0..requests {
-                let deadline = Instant::now() + Duration::from_secs(15);
-                let mut socket = loop {
-                    match listener.accept() {
-                        Ok((socket, _)) => break socket,
-                        Err(error)
-                            if error.kind() == io::ErrorKind::WouldBlock
-                                && budget_fixture
-                                && session_path
-                                    .parent()
-                                    .unwrap()
-                                    .join("budget.fixture_done")
-                                    .exists() =>
-                        {
-                            return Ok(());
+                let (headers, mut socket) = loop {
+                    let deadline = Instant::now() + Duration::from_secs(15);
+                    let mut socket = loop {
+                        match listener.accept() {
+                            Ok((socket, _)) => break socket,
+                            Err(error)
+                                if error.kind() == io::ErrorKind::WouldBlock
+                                    && budget_fixture
+                                    && session_path
+                                        .parent()
+                                        .unwrap()
+                                        .join("budget.fixture_done")
+                                        .exists() =>
+                            {
+                                return Ok(());
+                            }
+                            Err(error)
+                                if error.kind() == io::ErrorKind::WouldBlock
+                                    && Instant::now() < deadline =>
+                            {
+                                std::thread::sleep(Duration::from_millis(10))
+                            }
+                            Err(error) => return Err(error),
                         }
-                        Err(error)
-                            if error.kind() == io::ErrorKind::WouldBlock
-                                && Instant::now() < deadline =>
-                        {
-                            std::thread::sleep(Duration::from_millis(10))
+                    };
+                    socket.set_nonblocking(false)?;
+                    socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+                    socket.set_write_timeout(Some(Duration::from_secs(5)))?;
+                    let mut headers = Vec::new();
+                    while !headers.ends_with(b"\r\n\r\n") {
+                        if headers.len() >= 64 * 1024 {
+                            return Err(io::Error::other("request headers too large"));
                         }
-                        Err(error) => return Err(error),
+                        let mut byte = [0];
+                        socket.read_exact(&mut byte)?;
+                        headers.push(byte[0]);
                     }
+                    let headers = String::from_utf8(headers).map_err(io::Error::other)?;
+                    if headers.starts_with("GET ") {
+                        // The startup context-window probe lists the provider's models;
+                        // this fixture serves no listing, which must not break the run.
+                        socket.write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )?;
+                        continue;
+                    }
+                    break (headers, socket);
                 };
-                socket.set_nonblocking(false)?;
-                socket.set_read_timeout(Some(Duration::from_secs(5)))?;
-                socket.set_write_timeout(Some(Duration::from_secs(5)))?;
-                let mut headers = Vec::new();
-                while !headers.ends_with(b"\r\n\r\n") {
-                    if headers.len() >= 64 * 1024 {
-                        return Err(io::Error::other("request headers too large"));
-                    }
-                    let mut byte = [0];
-                    socket.read_exact(&mut byte)?;
-                    headers.push(byte[0]);
-                }
-                let headers = String::from_utf8(headers).map_err(io::Error::other)?;
                 let length = headers
                     .lines()
                     .find_map(|line| {
@@ -761,6 +772,10 @@ impl TempRoot {
                     finish["usage"] = serde_json::json!({"prompt_tokens":100,"completion_tokens":20,"total_tokens":120});
                     body.push_str(&format!("data: {finish}\n\ndata: [DONE]\n\n"));
                     if outcome == "persistence_failure" {
+                        // The in-progress turn journal already created `sessions/`.
+                        if session_path.is_dir() {
+                            std::fs::remove_dir_all(&session_path)?;
+                        }
                         std::fs::write(&session_path, "blocked")?;
                     }
                     ("200 OK", "text/event-stream", body)
@@ -818,6 +833,20 @@ impl TempRoot {
                 "test",
             ]);
         command
+    }
+
+    /// True once a session file records a settled turn. The headless prompt
+    /// checkpoint writes the open user turn (zero tokens) before the model
+    /// answers, so a bare file's existence no longer marks a settled save.
+    fn settled_session_saved(&self) -> bool {
+        std::fs::read_dir(self.0.join("sessions")).is_ok_and(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+                .filter_map(|entry| std::fs::read(entry.path()).ok())
+                .filter_map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .any(|session| session["total_input_tokens"].as_u64().unwrap_or(0) > 0)
+        })
     }
 
     fn saved_session(&self) -> serde_json::Value {
@@ -1144,7 +1173,7 @@ fn startup_errors_keep_provider_guidance_without_mislabeling_other_failures() {
     ] {
         let root = TempRoot::new();
         std::fs::write(root.0.join("config.toml"),
-            "[custom_providers.missing-key]\nprovider_type=\"openai\"\nbase_url=\"http://127.0.0.1:1/v1\"\napi_key_env=\"HEADLESS_MISSING_TEST_KEY\"\n"
+            "[custom_providers.missing-key]\nprovider_type=\"openai\"\nbase_url=\"https://missing-key.invalid/v1\"\napi_key_env=\"HEADLESS_MISSING_TEST_KEY\"\n"
         ).unwrap();
         let mut command = root.command();
         command
@@ -2374,31 +2403,42 @@ fn scripted_provider(
     std::thread::spawn(move || -> io::Result<Vec<serde_json::Value>> {
         let mut bodies = Vec::new();
         for reply in replies {
-            let deadline = Instant::now() + Duration::from_secs(15);
-            let mut socket = loop {
-                match listener.accept() {
-                    Ok((socket, _)) => break socket,
-                    Err(error)
-                        if error.kind() == io::ErrorKind::WouldBlock
-                            && Instant::now() < deadline =>
-                    {
-                        std::thread::sleep(Duration::from_millis(10))
+            let (headers, mut socket) = loop {
+                let deadline = Instant::now() + Duration::from_secs(15);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error)
+                            if error.kind() == io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(10))
+                        }
+                        Err(error) => return Err(error),
                     }
-                    Err(error) => return Err(error),
+                };
+                socket.set_nonblocking(false)?;
+                socket.set_read_timeout(Some(Duration::from_secs(10)))?;
+                let mut headers = Vec::new();
+                while !headers.ends_with(b"\r\n\r\n") {
+                    if headers.len() >= 64 * 1024 {
+                        return Err(io::Error::other("request headers too large"));
+                    }
+                    let mut byte = [0];
+                    socket.read_exact(&mut byte)?;
+                    headers.push(byte[0]);
                 }
+                let headers = String::from_utf8(headers).map_err(io::Error::other)?;
+                if headers.starts_with("GET ") {
+                    // The startup context-window probe lists the provider's models;
+                    // this fixture serves no listing, which must not break the run.
+                    socket.write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )?;
+                    continue;
+                }
+                break (headers, socket);
             };
-            socket.set_nonblocking(false)?;
-            socket.set_read_timeout(Some(Duration::from_secs(10)))?;
-            let mut headers = Vec::new();
-            while !headers.ends_with(b"\r\n\r\n") {
-                if headers.len() >= 64 * 1024 {
-                    return Err(io::Error::other("request headers too large"));
-                }
-                let mut byte = [0];
-                socket.read_exact(&mut byte)?;
-                headers.push(byte[0]);
-            }
-            let headers = String::from_utf8(headers).map_err(io::Error::other)?;
             let length = headers
                 .lines()
                 .find_map(|line| {
@@ -4239,11 +4279,7 @@ fn stalled_open_stdout_has_bounded_signal_cleanup_and_preserves_accounting_witho
             std::fs::write(root.0.join("provider.release"), "release").unwrap();
             let payload_start = prefix.len();
             if !matches!(mode, "active-stream" | "resume-active") {
-                while !std::fs::read_dir(root.0.join("sessions")).is_ok_and(|entries| {
-                    entries
-                        .filter_map(Result::ok)
-                        .any(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
-                }) {
+                while !root.settled_session_saved() {
                     assert!(
                         Instant::now() < deadline,
                         "{mode}: final snapshot before output admission; stderr={:?}; files={}",
@@ -4385,7 +4421,7 @@ fn stalled_open_stdout_has_bounded_signal_cleanup_and_preserves_accounting_witho
         );
         if matches!(mode, "active-stream" | "resume-active") {
             assert!(
-                !root.0.join("sessions").exists(),
+                !root.settled_session_saved(),
                 "pending admitted writer must remain owned before exact join or forced exit"
             );
         }
@@ -4456,10 +4492,28 @@ fn stalled_open_stdout_has_bounded_signal_cleanup_and_preserves_accounting_witho
         }
         if mode == "system" {
             assert!(!root.0.join("sessions").exists());
-            assert!(
-                matches!(system_listener.unwrap().accept(), Err(error) if error.kind()==std::io::ErrorKind::WouldBlock),
-                "blocked system output must not start provider work"
-            );
+            // The startup context-window probe is a read-only GET of the
+            // provider's model listing; no completion request may arrive.
+            let listener = system_listener.unwrap();
+            loop {
+                match listener.accept() {
+                    Ok((mut socket, _)) => {
+                        use std::io::Read;
+                        socket.set_nonblocking(false).unwrap();
+                        socket
+                            .set_read_timeout(Some(Duration::from_millis(500)))
+                            .unwrap();
+                        let mut head = [0u8; 4];
+                        let _ = socket.read(&mut head);
+                        assert_eq!(
+                            &head, b"GET ",
+                            "blocked system output must not start provider work"
+                        );
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => panic!("{error}"),
+                }
+            }
         } else {
             assert!(
                 root.0.join("sessions").is_dir(),
@@ -4762,17 +4816,7 @@ fn stalled_stderr_progress_and_runtime_reports_and_both_sinks_settle_owned_work_
             // The actual ordinary-error reporter runs after durable turn
             // settlement, so its stalled sink must not lose history or cost.
             if !mode.starts_with("retry-log") {
-                wait(
-                    deadline,
-                    || {
-                        std::fs::read_dir(root.0.join("sessions")).is_ok_and(|entries| {
-                            entries.filter_map(Result::ok).any(|entry| {
-                                entry.path().extension().is_some_and(|ext| ext == "json")
-                            })
-                        })
-                    },
-                    diagnostics,
-                );
+                wait(deadline, || root.settled_session_saved(), diagnostics);
                 assert_eq!(root.saved_session()["total_input_tokens"], 100);
             }
         }
@@ -6645,7 +6689,6 @@ fn headless_json_result_does_not_wait_for_a_never_answering_title() {
             while !done.load(Ordering::SeqCst) && Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut socket, _)) if !answered => {
-                        answered = true;
                         socket.set_nonblocking(false).unwrap();
                         socket
                             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -6656,6 +6699,14 @@ fn headless_json_result_does_not_wait_for_a_never_answering_title() {
                             socket.read_exact(&mut byte).unwrap();
                             head.push(byte[0]);
                         }
+                        if head.starts_with(b"GET ") {
+                            // The startup context-window probe; no listing here.
+                            socket
+                                .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                                .unwrap();
+                            continue;
+                        }
+                        answered = true;
                         let length = String::from_utf8_lossy(&head)
                             .lines()
                             .find_map(|line| {
