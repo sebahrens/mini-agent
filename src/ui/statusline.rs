@@ -217,6 +217,12 @@ pub(crate) fn sandbox_auto_allow_label(
 static SPEC: OnceLock<StatusLineConfig> = OnceLock::new();
 static NEEDS_GIT_STATUS: OnceLock<bool> = OnceLock::new();
 static TIME_ITEMS: OnceLock<TimeItems> = OnceLock::new();
+static COMMAND_SPECS: OnceLock<Vec<crate::ui::statusline_command::CommandSpec>> = OnceLock::new();
+
+/// The validated `command` segments of the configured statusline.
+pub(crate) fn command_specs() -> &'static [crate::ui::statusline_command::CommandSpec] {
+    COMMAND_SPECS.get().map(Vec::as_slice).unwrap_or(&[])
+}
 
 /// Which time-dependent items the spec shows; computed once with the spec so
 /// [`cache_key`] does not scan every segment on every frame.
@@ -254,6 +260,13 @@ pub fn init(cfg: &Config) {
     }
     spec.lines.truncate(MAX_STATUS_LINES);
     let needs_git = spec.needs_git_status();
+    let _ = COMMAND_SPECS.set(
+        spec.lines
+            .iter()
+            .flat_map(|line| &line.segments)
+            .filter_map(crate::ui::statusline_command::CommandSpec::of)
+            .collect(),
+    );
     let _ = TIME_ITEMS.set(TimeItems::of(&spec));
     let _ = SPEC.set(spec);
     let _ = NEEDS_GIT_STATUS.set(needs_git);
@@ -350,6 +363,7 @@ pub fn cache_key(session: &Session, ctx: &StatusContext) -> u64 {
     ctx.btw_in.hash(&mut state);
     ctx.btw_out.hash(&mut state);
     ctx.sandbox_label.hash(&mut state);
+    crate::ui::statusline_command::generation().hash(&mut state);
 
     let uses = time_items();
     if uses.clock {
@@ -477,9 +491,12 @@ fn build_line(line: &StatusLineLine, session: &Session, ctx: &StatusContext) -> 
             }
             item => {
                 let always = seg.always.unwrap_or(false);
-                if let Some(mut text) =
-                    resolve_item(item, session, ctx, always).map(|text| single_line_safe(&text))
-                {
+                let resolved = if item == "command" {
+                    crate::ui::statusline_command::cached_text(seg)
+                } else {
+                    resolve_item(item, session, ctx, always)
+                };
+                if let Some(mut text) = resolved.map(|text| single_line_safe(&text)) {
                     let plain = text.clone();
                     let live_color = dynamic_item_color(item, session);
                     let layout = SpanLayout::Item {

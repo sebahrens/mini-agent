@@ -2445,6 +2445,31 @@ fn statusline_value_needs_git_status(value: &toml::Value) -> bool {
         .any(|item| crate::config::STATUSLINE_GIT_STATUS_ITEMS.contains(&item))
 }
 
+/// Drop every `command` segment from a raw project `statusline` table: a
+/// status-bar command is an executable setting, so it is honoured only from
+/// the global config. Returns how many segments were removed.
+pub(crate) fn strip_statusline_commands(value: &mut toml::Value) -> usize {
+    let Some(lines) = value.get_mut("lines").and_then(toml::Value::as_array_mut) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for line in lines {
+        let Some(segments) = line
+            .get_mut("segments")
+            .and_then(toml::Value::as_array_mut)
+        else {
+            continue;
+        };
+        let before = segments.len();
+        segments.retain(|segment| {
+            segment.get("item").and_then(toml::Value::as_str) != Some("command")
+                && segment.get("command").is_none()
+        });
+        removed += before - segments.len();
+    }
+    removed
+}
+
 /// Keys only the global config (or the command line) may set. A project layer
 /// cannot lift financial caps, the permission-mode cycle or the required
 /// guards, whatever its trust.
@@ -2716,6 +2741,20 @@ fn split_project_override_with_sensitive_fields(
             tracing::warn!("project config: {key} is global-only and was ignored");
             continue;
         }
+        let stripped;
+        let value = if key == "statusline" {
+            let mut copy = value.clone();
+            let removed = strip_statusline_commands(&mut copy);
+            if removed > 0 {
+                tracing::warn!(
+                    "project config: {removed} statusline command segment(s) are global-only and were ignored"
+                );
+            }
+            stripped = copy;
+            &stripped
+        } else {
+            value
+        };
         if !BENIGN_PROJECT_CONFIG_KEYS.contains(&key.as_str())
             || (key == "statusline" && statusline_value_needs_git_status(value))
         {

@@ -651,6 +651,19 @@ pub struct StatusLineSegment {
     /// Literal compact form; never evaluated as a directive or template.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min: Option<CompactString>,
+    /// `item = "command"`: the program whose first output line is shown.
+    /// Run directly (no shell) with `args`; only honoured from the global
+    /// config, a project layer's command segments are dropped at load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<Vec<String>>,
+    /// Seconds between runs of a `command` segment (minimum 1, default 10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_secs: Option<u64>,
+    /// Seconds before a `command` segment's process is killed (1-10, default 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

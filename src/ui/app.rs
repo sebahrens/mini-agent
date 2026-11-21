@@ -805,6 +805,9 @@ pub(crate) struct App<'a> {
     rewind_escape: Option<std::time::Instant>,
     git_status_tx: mpsc::Sender<GitStatusRefresh>,
     git_status_rx: mpsc::Receiver<GitStatusRefresh>,
+    /// A command-backed status segment's text changed (repaint wanted).
+    command_segment_tx: mpsc::Sender<()>,
+    command_segment_rx: mpsc::Receiver<()>,
     git_status_in_flight: bool,
     ask_rx: Option<mpsc::Receiver<crate::permission::ask::UserRequest>>,
     permission_prompt: Option<PermissionState>,
@@ -1432,6 +1435,7 @@ impl<'a> App<'a> {
         let (btw_tx, btw_rx) = mpsc::channel::<BtwEvent>(32);
         let (title_tx, title_rx) = mpsc::channel::<SessionTitleResult>(4);
         let (git_status_tx, git_status_rx) = mpsc::channel(1);
+        let (command_segment_tx, command_segment_rx) = mpsc::channel(1);
 
         // Saved `/cron` schedules are held disarmed until `/cron resume`.
         let cron = super::cron::CronStore::from_saved(&ui.session.cron_schedule);
@@ -1465,6 +1469,8 @@ impl<'a> App<'a> {
             rewind_escape: None,
             git_status_tx,
             git_status_rx,
+            command_segment_tx,
+            command_segment_rx,
             git_status_in_flight: false,
             ask_rx,
             permission_prompt: None,
@@ -1548,6 +1554,33 @@ impl<'a> App<'a> {
             Err(_) => {}
         }
         Ok(())
+    }
+
+    /// Start the command-backed statusline segments whose interval elapsed.
+    /// Each runs on its own task, off the UI loop, and asks for a repaint only
+    /// when its shown text changed.
+    fn request_command_segments(&mut self) {
+        let specs = crate::ui::statusline::command_specs();
+        if specs.is_empty() {
+            return;
+        }
+        let due = crate::ui::statusline_command::due(specs, std::time::Instant::now());
+        if due.is_empty() {
+            return;
+        }
+        let input = crate::ui::statusline_command::input_json(
+            self.ui.session,
+            self.ui.workspace.root(),
+        );
+        for spec in due {
+            let tx = self.command_segment_tx.clone();
+            let input = input.clone();
+            tokio::spawn(async move {
+                if crate::ui::statusline_command::run(spec, input).await {
+                    let _ = tx.try_send(());
+                }
+            });
+        }
     }
 
     /// Dispatch a branch/status refresh when the adaptive schedule says one
@@ -1745,6 +1778,7 @@ impl<'a> App<'a> {
                 .git_poll
                 .observe_running(self.run.is_running, std::time::Instant::now());
             self.request_git_status_refresh();
+            self.request_command_segments();
             let tick_deadline = self.loop_state.running_tick.deadline(
                 std::time::Instant::now(),
                 self.run.is_running,
@@ -1817,6 +1851,9 @@ impl<'a> App<'a> {
                     self.session_start_task = None;
                     self.adopt_session_start_result(result)?;
                     self.ui.join_native_startup(&mut self.run).await?;
+                    self.refresh()?;
+                }
+                Some(()) = self.command_segment_rx.recv() => {
                     self.refresh()?;
                 }
                 Some(refresh) = self.git_status_rx.recv() => {

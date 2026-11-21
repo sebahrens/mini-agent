@@ -41,6 +41,7 @@ pub(crate) mod renderer;
 pub(crate) mod slash;
 pub(crate) mod state;
 pub(crate) mod statusline;
+pub(crate) mod statusline_command;
 pub(crate) mod terminal;
 pub(crate) mod tool_output;
 pub(crate) mod utils;
