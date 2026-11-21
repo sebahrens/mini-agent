@@ -3828,6 +3828,13 @@ pub(crate) fn convert_history_prefix(
 /// in the prefix, or the prefix would not fit the summarizer's input budget.
 /// The caller still has to check the agent route (`supports_cache_fork`) and
 /// that no separate `compaction_model` is configured (mini-agent-o2nut).
+///
+/// Native Anthropic sessions are deliberately ineligible (mini-agent-sskdu.265):
+/// their requests replay signed thinking blocks from the native history, which
+/// the text projection used for this prefix cannot reproduce byte for byte, so a
+/// fork built from it would miss the cache it exists to reuse. The text
+/// summarizer is used instead; rebuilding the prefix from native frames is a
+/// separate feature.
 pub(crate) fn cache_fork_history(
     session: &Session,
     cut_idx: usize,
