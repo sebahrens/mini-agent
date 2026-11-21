@@ -681,3 +681,90 @@ fn unreadable_trust_store_is_not_overwritten() {
     assert!(error.contains("not overwriting"), "{error}");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not a set");
 }
+
+#[test]
+fn nvnkx179_trust_flag_keeps_project_hooks_for_one_run_without_persisting() {
+    let root = crate::tests::OwnedTestDirectory::new("nvnkx179-flag");
+    let global = root.path().join("missing-global.json");
+    let native = root.path().join(".mini-agent/settings.json");
+    let managed = root.path().join("missing-managed.json");
+    let store = root.path().join("trusted.json");
+    write_settings(
+        &native,
+        r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"echo","args":["x"]}]}]}}"#,
+    );
+    let load = |headless: bool, trust_flag: bool| {
+        trust::build_dispatcher_from_paths_with_backend(
+            &global,
+            &native,
+            &managed,
+            root.path(),
+            false,
+            headless,
+            &store,
+            &|_| panic!("headless must not prompt"),
+            "unused",
+            trust_flag,
+        )
+    };
+    let skipped = load(true, false);
+    assert!(skipped.handlers_for("PreToolUse", "bash").is_empty());
+    assert!(
+        skipped
+            .startup_notices()
+            .iter()
+            .any(|notice| notice.contains("1 project hook(s) did not run (PreToolUse)")),
+        "{:?}",
+        skipped.startup_notices()
+    );
+    let trusted = load(true, true);
+    assert_eq!(trusted.handlers_for("PreToolUse", "bash").len(), 1);
+    assert!(trusted.startup_notices().is_empty());
+    assert!(!store.exists(), "per-run trust must not be persisted");
+    // Without the flag the hook is skipped again.
+    assert!(
+        load(true, false)
+            .handlers_for("PreToolUse", "bash")
+            .is_empty()
+    );
+}
+
+#[test]
+fn nvnkx179_operator_approval_records_the_binding_for_headless_runs() {
+    let root = crate::tests::OwnedTestDirectory::new("nvnkx179-approve");
+    let global = root.path().join("missing-global.json");
+    let native = root.path().join(".mini-agent/settings.json");
+    let managed = root.path().join("missing-managed.json");
+    let store = root.path().join("trusted-hooks.json");
+    write_settings(
+        &native,
+        r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"echo","args":["x"]}]}]}}"#,
+    );
+    let approved = trust::build_dispatcher_from_paths_with_backend(
+        &global,
+        &native,
+        &managed,
+        root.path(),
+        false,
+        false,
+        &store,
+        &|description| description.starts_with("project hook:"),
+        "unused",
+        false,
+    );
+    assert_eq!(approved.handlers_for("PreToolUse", "bash").len(), 1);
+    assert!(store.exists());
+    let headless = trust::build_dispatcher_from_paths_with_backend(
+        &global,
+        &native,
+        &managed,
+        root.path(),
+        false,
+        true,
+        &store,
+        &|_| panic!("headless must not prompt"),
+        "unused",
+        false,
+    );
+    assert_eq!(headless.handlers_for("PreToolUse", "bash").len(), 1);
+}

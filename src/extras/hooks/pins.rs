@@ -13,10 +13,12 @@
 //! (see `trust::pin_configured_hook_content`), so a rewrite in one session is
 //! also caught at the next start.
 //!
-//! Operands are the resolved executable, each argument, and every
-//! whitespace/shell-punctuation-separated token of the arguments and the `if`
-//! condition, plus `$MINI_AGENT_PROJECT_DIR`-prefixed tokens expanded to the
-//! workspace. Only operands that resolve (lexically or after following links)
+//! Operands are the resolved executable, the script operand of a known
+//! interpreter (`sh hooks/guard.sh`), and the tokens of inline `-c` text or the
+//! `if` condition that are themselves executable or shebang files, plus
+//! `$MINI_AGENT_PROJECT_DIR`/`$CLAUDE_PROJECT_DIR`-prefixed tokens expanded to
+//! the workspace. Data and configuration operands (`ruff --config
+//! pyproject.toml`) are not bound. Only operands that resolve (lexically or after following links)
 //! into the workspace and name an existing regular file are bound. Other
 //! variable expansion, files a script sources or reads on its own, and the
 //! short window between verification and `exec` are outside this best-effort
@@ -206,20 +208,28 @@ impl HookContentPins {
             return pins;
         }
         let search_path = handler_search_path(handler);
-        if let Some(command) = handler.command.as_deref()
-            && let Ok(program) = resolve_hook_program(command, search_path.as_deref(), &root)
-        {
+        let args: Vec<String> = handler
+            .args
+            .iter()
+            .flatten()
+            .map(|arg| expand_leading_project_dir(arg, &root))
+            .collect();
+        let program = handler.command.as_deref().and_then(|command| {
+            let command = expand_leading_project_dir(command, &root);
+            resolve_hook_program(&command, search_path.as_deref(), &root).ok()
+        });
+        if let Some(program) = &program {
             pins.insert_operand(&root, program.as_os_str());
-        }
-        for token in operand_tokens(handler.args.iter().flatten().map(String::as_str), &root) {
-            pins.insert_operand(&root, std::ffi::OsStr::new(&token));
+            for token in executed_operands(program, &args, &root) {
+                pins.insert_operand(&root, std::ffi::OsStr::new(&token));
+            }
         }
         if let Some(condition) = handler.condition.as_deref() {
             let (shell, _) = condition_shell();
             if let Ok(program) = resolve_hook_program(shell, search_path.as_deref(), &root) {
                 pins.insert_operand(&root, program.as_os_str());
             }
-            for token in operand_tokens(std::iter::once(condition), &root) {
+            for token in executable_text_tokens(condition, &root) {
                 pins.insert_operand(&root, std::ffi::OsStr::new(&token));
             }
         }
@@ -297,7 +307,7 @@ impl HookContentPins {
             return Err(reason.clone());
         }
         let operands = std::iter::once(program.as_os_str().to_os_string()).chain(
-            operand_tokens(args.iter().map(String::as_str), root)
+            executed_operands(program, args, root)
                 .into_iter()
                 .map(std::ffi::OsString::from),
         );
@@ -379,52 +389,131 @@ pub(crate) fn resolve_hook_program(
     }
 }
 
-/// Every argument plus its whitespace/shell-punctuation separated tokens, so
-/// `sh -c "./check.sh --fast"` and `--config=hook.toml` bind their files.
-/// A token that starts with `$MINI_AGENT_PROJECT_DIR` or
-/// `${MINI_AGENT_PROJECT_DIR}` is also bound with that prefix replaced by
-/// `root`, because the hook child receives exactly that value and a shell
-/// condition or script argument expands it. Other variables are not expanded.
-fn operand_tokens<'a>(args: impl Iterator<Item = &'a str>, root: &Path) -> Vec<String> {
-    let mut tokens: Vec<String> = Vec::new();
-    for arg in args {
-        tokens.push(arg.to_string());
-        tokens.extend(
-            arg.split(|c: char| {
-                c.is_whitespace()
-                    || matches!(
-                        c,
-                        ';' | '|' | '&' | '(' | ')' | '<' | '>' | '\'' | '"' | '`' | '='
-                    )
-            })
-            .filter(|token| !token.is_empty() && *token != arg)
-            .map(str::to_string),
-        );
+/// Interpreters whose first non-option argument (or `-c` text) is code the
+/// hook executes.
+fn is_interpreter(program: &Path) -> bool {
+    let name = program
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "sh" | "bash" | "zsh" | "dash" | "ksh" | "node" | "ruby" | "perl" | "pwsh" | "powershell"
+    ) || name.starts_with("python")
+}
+
+/// The operands a launch executes, as opposed to data or configuration the
+/// hook merely names: the script operand of a known interpreter (its first
+/// non-option argument), and the tokens of its inline `-c`/`-Command` text
+/// that are themselves executable files or carry a shebang. The resolved
+/// program is verified separately. `ruff --config pyproject.toml` or
+/// `sh -c "git add Cargo.lock"` therefore bind nothing, so editing those files
+/// never disables the hook (mini-agent-nvnkx.338).
+fn executed_operands(program: &Path, args: &[String], root: &Path) -> Vec<String> {
+    if !is_interpreter(program) {
+        return Vec::new();
     }
-    let expanded: Vec<String> = tokens
-        .iter()
-        .filter_map(|token| expand_project_dir(token, root))
+    let mut operands: Vec<String> = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-c" | "-Command" | "-command" | "-e" => {
+                if let Some(text) = iter.next() {
+                    operands.extend(executable_text_tokens(text, root));
+                }
+                break;
+            }
+            "-m" => break,
+            option if option.starts_with('-') => {}
+            script => {
+                operands.push(script.to_string());
+                operands.extend(expand_project_dir(script, root));
+                break;
+            }
+        }
+    }
+    operands.sort_unstable();
+    operands.dedup();
+    operands
+}
+
+/// Whitespace/shell-punctuation separated tokens of inline shell text that name
+/// an executable or shebang file inside `root`; `$MINI_AGENT_PROJECT_DIR` and
+/// `$CLAUDE_PROJECT_DIR` prefixes are expanded to `root`. Other variables are
+/// not expanded.
+fn executable_text_tokens(text: &str, root: &Path) -> Vec<String> {
+    let mut tokens: Vec<String> = text
+        .split(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    ';' | '|' | '&' | '(' | ')' | '<' | '>' | '\'' | '"' | '`' | '='
+                )
+        })
+        .filter(|token| !token.is_empty())
+        .flat_map(|token| {
+            let expanded = expand_project_dir(token, root);
+            std::iter::once(token.to_string()).chain(expanded)
+        })
+        .filter(|token| {
+            workspace_file(root, Path::new(token))
+                .is_some_and(|(_, path)| is_executable_file(&path))
+        })
         .collect();
-    tokens.extend(expanded);
     tokens.sort_unstable();
     tokens.dedup();
     tokens
 }
 
+/// An executable-bit or shebang file: the kinds of file a shell line runs.
+fn is_executable_file(path: &Path) -> bool {
+    use std::io::Read;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::metadata(path).is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+        {
+            return true;
+        }
+    }
+    let mut head = [0u8; 2];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut head))
+        .is_ok()
+        && &head == b"#!"
+}
+
+/// `arg` with a leading `$MINI_AGENT_PROJECT_DIR` / `$CLAUDE_PROJECT_DIR` (or
+/// braced) variable replaced by `root`, exactly as a launch does before the
+/// executable is resolved. Other text is returned unchanged.
+pub(crate) fn expand_leading_project_dir(arg: &str, root: &Path) -> String {
+    expand_project_dir(arg, root).unwrap_or_else(|| arg.to_string())
+}
+
 /// The hook environment variable naming the selected workspace.
 const PROJECT_DIR_VARIABLE: &str = crate::product::HOOK_PROJECT_DIR_ENV;
+/// The Claude Code compatibility spelling of the same workspace variable.
+pub(crate) const CLAUDE_PROJECT_DIR_VARIABLE: &str = "CLAUDE_PROJECT_DIR";
 
-fn expand_project_dir(token: &str, root: &Path) -> Option<String> {
+pub(crate) fn expand_project_dir(token: &str, root: &Path) -> Option<String> {
     let rest = token.strip_prefix('$')?;
-    let braced = format!("{{{PROJECT_DIR_VARIABLE}}}");
-    let rest = match rest.strip_prefix(braced.as_str()) {
-        Some(rest) => rest,
-        // `$MINI_AGENT_PROJECT_DIRX` names a different variable.
-        None => rest
-            .strip_prefix(PROJECT_DIR_VARIABLE)
-            .filter(|rest| !rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_'))?,
-    };
-    Some(format!("{}{rest}", root.to_string_lossy()))
+    for variable in [PROJECT_DIR_VARIABLE, CLAUDE_PROJECT_DIR_VARIABLE] {
+        let braced = format!("{{{variable}}}");
+        let rest = match rest.strip_prefix(braced.as_str()) {
+            Some(rest) => rest,
+            // `$MINI_AGENT_PROJECT_DIRX` names a different variable.
+            None => match rest
+                .strip_prefix(variable)
+                .filter(|rest| !rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_'))
+            {
+                Some(rest) => rest,
+                None => continue,
+            },
+        };
+        return Some(format!("{}{rest}", root.to_string_lossy()));
+    }
+    None
 }
 
 /// Returns the pin key and canonical path when `operand` names an existing

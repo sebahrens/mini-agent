@@ -1220,17 +1220,17 @@ Hooks let external commands observe or gate agent behavior at defined points
 starting/ending, a subagent starting/stopping), using the same
 `settings.json` shape, stdin envelope, and exit-code/stdout-JSON contract as
 Claude Code, so an existing CC hooks setup is largely compatible (see the
-`$CLAUDE_PROJECT_DIR` caveat below for the one script-level change some
-setups need).
+compatibility note below for command strings and `$CLAUDE_PROJECT_DIR`).
 
 ### Config file locations and precedence
 
 Hook config lives in a `settings.json` (JSON, not `config.toml`/`.yaml`) at up
-to three locations, loaded and merged in this order:
+to four locations, loaded and merged in this order:
 
 | Location | Trust |
 | -------- | ----- |
 | `<config-root>/settings.json`, e.g. `~/.mini-agent/settings.json` (global; existing Linux install `~/.config/mini-agent/settings.json`, on macOS `~/Library/Application Support/mini-agent/settings.json`; on Windows `%APPDATA%\mini-agent\settings.json`, experimental) | Trusted by default |
+| `<project>/.claude/settings.json` (Claude Code's project file; only its `hooks` and `disableAllHooks` keys are read, `~/.claude/settings.json` is never read) | **Not** trusted by default — each binding needs the same exact approval as a native project hook (see Trust model below) |
 | `.mini-agent/settings.json` (project, relative to CWD) | **Not** trusted by default — see Trust model below |
 | `/etc/mini-agent/managed-settings.json` (Linux) / `/Library/Application Support/mini-agent/managed-settings.json` (macOS) / `C:\ProgramData\mini-agent\managed-settings.json` (Windows, experimental) — admin-controlled | Always trusted; unaffected by `disableAllHooks` |
 
@@ -1240,12 +1240,20 @@ or project file) or the `--no-hooks` CLI flag suppresses every non-managed
 hook; managed hooks still run regardless. A missing or invalid file is not an
 error — it just contributes nothing.
 
-**Largely compatible with Claude Code's `.claude/settings.json`**: mini-agent
-does not read that file directly, but its own `settings.json` uses the same
-basic `hooks` schema. For security, every command handler must add an `args`
-array (use `[]` when the executable takes no arguments); mini-agent never
-implicitly passes `command` to a shell. Scripts may also need a change because
-mini-agent sets `$MINI_AGENT_PROJECT_DIR` rather than `$CLAUDE_PROJECT_DIR`.
+**Largely compatible with Claude Code's `.claude/settings.json`**: the
+project's `.claude/settings.json` is read (its hook groups load beside the
+native project file and need the same trust approval); Claude Code's global
+`~/.claude/settings.json` is not imported. mini-agent's own `settings.json`
+uses the same basic `hooks` schema. mini-agent never passes `command` to a
+shell. A command string is tokenised into an executable and arguments (quotes
+are honoured), so `"$CLAUDE_PROJECT_DIR"/.claude/hooks/check.sh --fast` works:
+a leading `$CLAUDE_PROJECT_DIR` or `$MINI_AGENT_PROJECT_DIR` (also in braces) in
+`command` or in an argument is replaced by the selected workspace at launch and
+the file is content-bound; both variables are exported to the child. A command
+string that uses shell operators (`;`, `|`, `&`, `<`, `>`) skips only that
+handler with a startup notice; write it as `"command": "/bin/sh", "args":
+["-c", "..."]` instead. Handlers written with an explicit `args` array need no
+change.
 
 ### Handler schema
 
@@ -1278,10 +1286,23 @@ mini-agent sets `$MINI_AGENT_PROJECT_DIR` rather than `$CLAUDE_PROJECT_DIR`.
 | `args` | array of strings | Required, but may be empty. Passed directly as the executable's argv with no shell metacharacter expansion. |
 | `timeout` | integer (seconds) | Per-hook timeout (also bounds its `if` condition); the whole process group is killed on expiry. Default: 60 for the gating events `UserPromptSubmit`, `PreToolUse` and `PermissionRequest` (a stuck gate fails fast; a timed-out `PreToolUse` denies the tool with `Hook failure: PreToolUse hook '<command>' timed out`; a `PreToolUse` hook that cannot start or exits other than 0 or 2 is named the same way, distinct from a hook's own `Blocked by guard rail` decision). Other events fail open: a handler that exits other than 0 or 2, times out or cannot start is ignored but reported once per session as a one-line notice (`hook '<command>' (Stop) exited 1; ignored (exit 2 blocks)`), 600 for every other event (as in Claude Code, so long test/lint hooks on `Stop` or `PostToolUse` are not killed). |
 | `async` | boolean | When `true`, the hook's `if` condition and handler run in the background and its decision is ignored. Agent-turn work owns the background task, so turn cancellation still terminates and reaps it before the turn settles. Default: `false`. |
-| `if` | string | A shell command evaluated (with the same stdin envelope) before the handler runs; the handler only runs if it exits `0`. Fails closed: a broken/unparseable/timed-out condition still runs the handler, with a warning. |
+| `if` | string | Either a Claude Code permission rule, `Tool` or `Tool(pattern)` (for example `Bash(git push *)`, `Edit`, `Read(./.env)`; `*` is a wildcard, the legacy `Bash(npm:*)` prefix form works), matched in process against the event's tool name and primary input (command, path or URL) with no subprocess; or a shell command evaluated (with the same stdin envelope) before the handler runs, which must exit `0`. Shell text fails closed: a timed-out condition, one that cannot run, or one that exits 2, 126 or 127 (syntax error, not executable, not found) still runs the handler and is reported once as a notice; any other non-zero exit skips the handler. |
 | `once` | boolean | Runs the handler at most once per event per session. A false `if` condition or a policy/preflight/spawn denial does not consume the binding; a successfully started child does. |
 | `trust` | `"sandboxed"` or `"trusted"` | Subprocess authority. Default: `"sandboxed"`, which requires the configured general workspace sandbox and denies the hook and guarded action before child creation if the backend is unavailable. `"trusted"` is an explicit, audited containment bypass for reviewed automation; it does not restore the parent environment. |
 | `env` | object of string values | Explicit environment additions. Values are literal (no shell expansion). The reserved `MINI_AGENT_PROJECT_DIR` key cannot be overridden in any ASCII case. Invalid names, NUL values, or case-insensitively colliding keys deny launch for portable Windows semantics. |
+
+A handler that cannot be launched at all (a pinned workspace file changed after
+load, the sandbox wrapper failed, launch preparation failed) is an infrastructure
+failure, not a verdict: `PreToolUse` denies the call with `Hook failure: ...
+could not launch ...` and `UserPromptSubmit` rejects the prompt, while `Stop`,
+`SubagentStop`, `SessionStart`, `PostToolUse`, `PostToolUseFailure` and the
+notification events fail open and report it once as `hook 'x' (Stop) could not
+launch: ...; restart to review it`. `PostToolUse` and `PostToolUseFailure`
+handlers that exit non-zero, time out, exceed the output limit or cannot launch
+are reported the same way instead of being skipped silently. A hook is finished
+when its own process exits: descendants that keep stdout/stderr open (a daemon
+or `cmd &`) get a 250 ms drain period and are then terminated with the hook's
+process group; they never hold the hook until its timeout.
 
 Project-hook approval remains bound to the immutable canonical startup project
 root where the configuration was loaded. Worktree selection does not reload or
@@ -1456,7 +1477,14 @@ failed turn, a persistence failure, and a goal that exits with its own code.
 
 Only `PreToolUse` is permission-blockable by default. A handler's stdout JSON
 may set `"permissionDecision"` to `"deny"`, `"ask"`, `"allow"`, or omit it
-(defer to the normal permission system). `deny` always blocks, holding even
+(defer to the normal permission system). Claude Code's nested form is the
+primary shape: `{"hookSpecificOutput": {"hookEventName": "PreToolUse",
+"permissionDecision": "deny", "permissionDecisionReason": "...",
+"updatedInput": {...}}}`. The flat `permissionDecision`/`permissionDecisionReason`
+(or `reason`)/`updatedInput` fields, the deprecated top-level `decision`
+(`"block"` is deny, `"approve"` is allow), and `"continue": false` (deny, with
+`stopReason` as the reason) are accepted too; nested fields win. An unknown
+`permissionDecision` value defers and logs a warning once. `deny` always blocks, holding even
 under `--yolo`. `ask` forces an interactive confirmation regardless of
 permission mode, and escalates to deny in non-interactive contexts (`-p`,
 `--loop`) where no confirmation is possible, or when the permission system is
@@ -1534,7 +1562,24 @@ re-confirmation. Confirmations persist to
 the state root at `hooks/trusted-hooks.json` (a user-level file, so child
 processes/orchestrated subagents sharing it inherit trust automatically). In
 headless contexts (`-p`, `--loop`) an unconfirmed project hook is skipped with
-a warning rather than prompting.
+a warning rather than prompting, and one startup notice on stderr (also in the
+dispatcher's startup notices) says how many project hooks did not run. An
+operator approves them out of band with `mini-agent hooks trust --yes` (see
+Global switches) or accepts them for one run with `--trust-project-hooks`.
+
+**Brokered JS effects and hook matchers.** A `js` tool call is one tool call to
+hooks (`js`, input = the script). The effects a script performs are also gated
+under the ordinary tool names, so a guard written for the tool covers the same
+action taken from a script: `writeFile` runs `PreToolUse` as `write` (input
+`{"path", "content"}`), `fetch` as `web_fetch` (`{"url"}`), and `spawn` as both
+`js_spawn` (`{"program", "arguments"}`) and `bash` (`{"command"}`, program and
+arguments joined by spaces). A deny, an `ask` (no approval prompt is possible
+here) or an exit-2 hook fails the effect with a permission error; a hook cannot
+rewrite the input, because the grant is bound to the original target.
+`PostToolUse` and `PostToolUseFailure` run after the effect settles with a
+short summary (`file written`, `HTTP 200, N body bytes`, `exit 0, timed out:
+false`) and are observation only. Read effects (`readFile`, `listDir`, ...) are
+not hook-gated; permission rules still apply to every effect.
 
 Project confirmation and subprocess authority are separate decisions. The
 confirmation hash includes `trust` and `env`, so either change requires new
@@ -1542,14 +1587,18 @@ consent. Global and managed provenance does not silently select the trusted
 bypass: omitted `trust` still means `"sandboxed"` for every source.
 
 **Workspace hook files are content-bound.** A hook executable or script that
-lives inside the workspace (`./guard.sh`, `sh hooks/guard.sh`,
-`--config=hooks/policy.toml`, or a file named in an `if` condition such as
-`./check.sh`) is ordinary workspace content the model could otherwise rewrite
-to approve its own tool calls or escape the sandbox. When hooks load,
-mini-agent records a SHA-256 digest of every such file: each argument, and each
-whitespace/shell-punctuation separated token of the arguments and condition,
-that resolves to an existing regular file inside the workspace (lexically or
-through a symlink) is bound, as is the resolved executable. Before every
+lives inside the workspace (`./guard.sh`, `sh hooks/guard.sh`, or a script
+named in an `if` condition such as `./check.sh`) is ordinary workspace content
+the model could otherwise rewrite to approve its own tool calls or escape the
+sandbox. When hooks load, mini-agent records a SHA-256 digest of every file the
+hook executes: the resolved executable; the script operand of a known
+interpreter (`sh`, `bash`, `zsh`, `dash`, `ksh`, `python*`, `node`, `ruby`,
+`perl`, `pwsh`; its first non-option argument); and the tokens of inline `-c`
+text and of an `if` condition that are themselves executable-bit or shebang
+files inside the workspace (lexically or through a symlink). Data and
+configuration operands (`ruff --config pyproject.toml`, `git add Cargo.lock`)
+are not executed and are not bound, so editing them neither disables the hook
+nor makes the agent's write tools refuse them. Before every
 launch the same operands are re-resolved against the selected workspace; a
 changed file, a file that did not exist at load time, or a symlink retargeted
 elsewhere denies the launch (which blocks a `PreToolUse` call, fail-closed)
@@ -1606,6 +1655,8 @@ and execution-root validation still run for each launch.
 | ---- | ------ |
 | `--no-hooks` | Disables all non-managed hooks for this run. |
 | `disableAllHooks: true` (in global or project `settings.json`) | Same effect, via config. |
+| `--trust-project-hooks` (env `MINI_AGENT_TRUST_PROJECT_HOOKS`) | Runs this repository's project hooks for this run only, without the confirmation prompt and without recording anything. For CI and containers where the trust store is empty and no TTY exists. The content binding is captured at startup, so a hook script rewritten during the run is still refused. Consent comes from the operator's flag or environment, never from the repository. |
+| `mini-agent hooks trust [--list\|--yes]` | Operator-side approval for unattended runs. Prints each pending project hook binding exactly as the interactive prompt does (event, matcher, argv, trust, environment keys, workspace file digests) and asks y/N; `--list` only prints, `--yes` records every pending binding in the user trust store. Global and managed hook changes are never approved here. |
 | `--hooks-test <tool> [--hooks-test-input <json>]` | Dry-runs `PreToolUse` for `tool` against the loaded/trust-filtered dispatcher and prints the merged verdict/reason/`updatedInput`, then exits — no session, agent, or API key required. |
 
 See [COMMANDS.md](COMMANDS.md#hooks) for the `/hooks` slash command.
@@ -4887,7 +4938,8 @@ notification.
 
 Project `.claude/settings.json` hook groups load alongside native project hook
 settings. Each project binding still requires the existing exact trust approval;
-headless runs skip unapproved or changed bindings. Project `disableAllHooks`
+headless runs skip unapproved or changed bindings unless the operator ran
+`mini-agent hooks trust` or passes `--trust-project-hooks`. Project `disableAllHooks`
 cannot turn off global or managed guards. No global Claude configuration is
 implicitly imported.
 

@@ -231,11 +231,59 @@ fn pins_capture_only_existing_workspace_files() {
     configured.condition = Some("test -d src".into());
     let pins = HookContentPins::capture(&project.root, &configured);
     let locations: Vec<String> = pins.entries().into_iter().map(|(path, _)| path).collect();
-    assert_eq!(
-        locations,
-        vec!["workspace:guard.sh", "workspace:hooks/policy.toml"]
-    );
+    assert_eq!(locations, vec!["workspace:guard.sh"]);
     assert!(HookContentPins::capture(&project.root, &handler("sh", &["-c", "exit 0"])).is_empty());
+}
+
+/// Data and configuration operands are not executed, so they are not pinned
+/// (mini-agent-nvnkx.338); the script operand of an interpreter still is.
+#[test]
+fn nvnkx338_pins_bind_only_executed_files() {
+    let project = Project::new("narrow");
+    std::fs::write(project.root.join("pyproject.toml"), "[tool.ruff]\n").unwrap();
+    std::fs::write(project.root.join("Cargo.lock"), "# lock\n").unwrap();
+    project.write_script("hooks/guard.sh", DENY_SCRIPT);
+    let locations = |configured: &HookHandler| -> Vec<String> {
+        HookContentPins::capture(&project.root, configured)
+            .entries()
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect()
+    };
+    assert!(locations(&handler("ruff", &["check", "--config", "pyproject.toml"])).is_empty());
+    assert!(locations(&handler("sh", &["-c", "cargo fmt && git add Cargo.lock"])).is_empty());
+    assert_eq!(
+        locations(&handler("sh", &["hooks/guard.sh"])),
+        vec!["workspace:hooks/guard.sh"]
+    );
+    assert_eq!(
+        locations(&handler(
+            "sh",
+            &["-c", "./hooks/guard.sh && echo Cargo.lock"]
+        )),
+        vec!["workspace:hooks/guard.sh"]
+    );
+    // `$CLAUDE_PROJECT_DIR` is expanded like `$MINI_AGENT_PROJECT_DIR`.
+    assert_eq!(
+        locations(&handler("sh", &["$CLAUDE_PROJECT_DIR/hooks/guard.sh"])),
+        vec!["workspace:hooks/guard.sh"]
+    );
+    // Editing a data file no longer disables the hook.
+    let pins = HookContentPins::capture(
+        &project.root,
+        &handler("ruff", &["check", "--config", "pyproject.toml"]),
+    );
+    std::fs::write(
+        project.root.join("pyproject.toml"),
+        "[tool.ruff]\nline-length = 99\n",
+    )
+    .unwrap();
+    pins.verify_launch(
+        &project.root,
+        Path::new("/usr/bin/ruff"),
+        &["check".into(), "--config".into(), "pyproject.toml".into()],
+    )
+    .unwrap();
 }
 
 #[test]
@@ -557,5 +605,37 @@ fn recently_changed_pinned_file_is_hashed_on_every_launch() {
         test_digest_calls() - before,
         2,
         "a file changed inside the quiet window is never fingerprint-trusted"
+    );
+}
+
+/// `$CLAUDE_PROJECT_DIR/x.sh` command strings from Claude Code settings are
+/// expanded to the execution root at launch, content-pinned, and the child sees
+/// the variable (mini-agent-nvnkx.181).
+#[cfg(unix)]
+#[tokio::test]
+async fn nvnkx181_claude_project_dir_command_is_expanded_and_pinned() {
+    let project = Project::new("claude-project-dir");
+    project.write_script("hooks/guard.sh", DENY_SCRIPT);
+    let configured = handler("$CLAUDE_PROJECT_DIR/hooks/guard.sh", &[]);
+    let pins = HookContentPins::capture(&project.root, &configured);
+    let locations: Vec<String> = pins.entries().into_iter().map(|(path, _)| path).collect();
+    assert_eq!(locations, vec!["workspace:hooks/guard.sh"]);
+    let dispatcher = HookDispatcher::from_config_with_backend_and_root(
+        &pre_tool_config(configured),
+        "unused",
+        &project.root,
+    )
+    .unwrap();
+    assert_eq!(pre_tool(&dispatcher, &project).await.verdict, Verdict::Deny);
+    project.write_script("hooks/guard.sh", ALLOW_SCRIPT);
+    let rewritten = pre_tool(&dispatcher, &project).await;
+    assert_eq!(rewritten.verdict, Verdict::Deny, "rewrite must be refused");
+    assert!(
+        rewritten
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("could not launch")),
+        "{:?}",
+        rewritten.reason
     );
 }

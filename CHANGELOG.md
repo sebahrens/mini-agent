@@ -16,6 +16,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Persona frontmatter `background: true` (delegations detach as background tasks), `memory: user|project|local` (private notes directory injected at start and writable through an `agent_memory` tool) and `hooks:` (scoped to the child's tool calls) are now implemented; memory and hooks are opt-in via `[subagents] agent_memory` / `agent_hooks` (mini-agent-scu2y).
 - Skills run with `/<name> args` now substitute `$ARGUMENTS`, `$ARGUMENTS[N]`, `$N` and `${CLAUDE_SKILL_DIR}`, rewrite ``!`cmd` `` spans into shell-tool instructions (`skills_shell_placeholders`), and honour `context: fork` with `agent:` by delegating the body to one `task` child (mini-agent-h7wxv).
 - Skill frontmatter `model` (forked skills; the `task` tool takes a per-call `model` limited to configured `[quick_models]` aliases and never overrides a persona-pinned model) and `paths` (automatic selection only when the request names a matching file); `effort` and `hooks` now report a reason (mini-agent-h7wxv).
+- `$CLAUDE_PROJECT_DIR`/`$MINI_AGENT_PROJECT_DIR` prefixes in hook `command`/args are expanded at launch and `CLAUDE_PROJECT_DIR` is exported to hooks; a Claude-style command string with shell operators skips only that handler instead of the whole file (mini-agent-nvnkx.181).
+- `--trust-project-hooks` (env `MINI_AGENT_TRUST_PROJECT_HOOKS`) and `mini-agent hooks trust [--list|--yes]` let headless and CI runs approve project hooks; skipped bindings now raise a startup notice (mini-agent-nvnkx.179).
+- Brokered JS `writeFile`, `fetch` and `spawn` effects run PreToolUse hooks as `write`, `web_fetch` and `bash` (spawn also still as `js_spawn`), and PostToolUse/PostToolUseFailure after they settle (mini-agent-nvnkx.335).
 
 ### Fixed
 
@@ -98,6 +101,13 @@ Notable changes to mini-agent are documented in this file. The format follows
   caps concurrent relays at 256 (mini-agent-y42nd). `update` and `install.sh` treat a `gh` whose
   `attestation verify --help` lacks the pin flags as unavailable (upgrade gh), not a failed
   verification (mini-agent-0cshc).
+- PreToolUse hooks now read Claude Code's nested `hookSpecificOutput.permissionDecision`/`permissionDecisionReason`/`updatedInput` (plus flat `permissionDecisionReason`, legacy `decision: block|approve` and `continue: false`), so a guard hook written for Claude Code no longer fails open (mini-agent-nvnkx.178).
+- A hook that could not be launched (changed pinned file, failed sandbox wrapper) no longer forces `Stop`/`SubagentStop` continuations: those events fail open and report it once; `PreToolUse` words it as a hook failure (mini-agent-nvnkx.334).
+- A hook finishes when its process exits instead of waiting for stdout/stderr held open by descendants (250 ms drain, then the group is terminated) (mini-agent-nvnkx.337).
+- Failing, timed-out or unlaunchable `PostToolUse`/`PostToolUseFailure` hooks are reported once instead of skipped silently (mini-agent-nvnkx.336).
+- Hook content pinning binds only files a hook executes (program, interpreter script operand, executable `-c`/`if` tokens), so editing a config or lock file named in a hook's arguments no longer disables the hook or blocks the agent's write tools (mini-agent-nvnkx.338).
+- Hook `if` rules written as Claude Code permission rules (`Bash(git push *)`) are matched in process; a shell condition that cannot be evaluated (exit 2, 126, 127) runs the handler with a notice instead of disabling it (mini-agent-nvnkx.180).
+- `docs/agent/CONFIG.md` no longer says `.claude/settings.json` is not read; the project file is listed with its trust rule (mini-agent-nvnkx.355).
 
 ### Added
 

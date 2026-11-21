@@ -4,6 +4,7 @@ pub(crate) mod decorator;
 pub(crate) mod dispatcher;
 pub(crate) use dispatcher::take_hook_problem_notices;
 pub(crate) mod envelope;
+pub(crate) mod if_rule;
 pub(crate) mod normalize;
 pub(crate) mod pins;
 pub(crate) mod settings;
@@ -230,6 +231,33 @@ pub(crate) async fn gate_brokered_pre_tool_use(
         return Ok(input);
     };
     gate_brokered_pre_tool_use_with(&dispatcher, &best_effort_ctx(), tool_name, input).await
+}
+
+/// Observation-only PostToolUse (`Ok`) or PostToolUseFailure (`Err`) for a
+/// brokered host effect that has settled. Whatever a hook says is dropped: the
+/// script's result is fixed by the broker.
+#[cfg(feature = "js")]
+pub(crate) async fn dispatch_brokered_post_tool_use(
+    tool_name: &str,
+    input: serde_json::Value,
+    outcome: Result<String, String>,
+) {
+    let Some(dispatcher) = get_dispatcher() else {
+        return;
+    };
+    let ctx = best_effort_ctx();
+    match outcome {
+        Ok(response) => {
+            let _ = dispatcher
+                .dispatch_post_tool_use(&ctx, tool_name, input, &response)
+                .await;
+        }
+        Err(error) => {
+            dispatcher
+                .dispatch_post_tool_use_failure(&ctx, tool_name, input, &error)
+                .await;
+        }
+    }
 }
 
 #[cfg(any(feature = "js", test))]

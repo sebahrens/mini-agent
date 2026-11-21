@@ -774,8 +774,8 @@ impl HookDispatcher {
             },
             mcp,
         );
-        let outputs = self
-            .run_handlers(
+        let labeled = self
+            .run_handlers_labeled(
                 "PostToolUse",
                 &handlers,
                 &envelope,
@@ -783,6 +783,8 @@ impl HookDispatcher {
                 &execution_root,
             )
             .await;
+        report_hook_problems("PostToolUse", &labeled);
+        let outputs: Vec<HookOutput> = labeled.into_iter().map(|(_, output)| output).collect();
         merge_post_tool_use_decisions(&outputs, tool_response)
     }
 
@@ -875,8 +877,8 @@ impl HookDispatcher {
             },
             mcp,
         );
-        let _ = self
-            .run_handlers(
+        let labeled = self
+            .run_handlers_labeled(
                 "PostToolUseFailure",
                 &handlers,
                 &envelope,
@@ -884,6 +886,7 @@ impl HookDispatcher {
                 &execution_root,
             )
             .await;
+        report_hook_problems("PostToolUseFailure", &labeled);
     }
 
     /// Runs matching handlers: skips a handler already consumed by `once`,
@@ -1011,6 +1014,17 @@ impl HookDispatcher {
                 continue;
             }
 
+            // A Claude Code style rule (`Bash(git push *)`) is matched in
+            // process against the envelope instead of run as shell text.
+            let rule_verdict = handler
+                .condition
+                .as_deref()
+                .and_then(|condition| super::if_rule::evaluate(condition, envelope));
+            if rule_verdict == Some(false) {
+                continue;
+            }
+            let run_shell_condition = rule_verdict.is_none();
+
             if handler.is_async {
                 let handler = (*handler).clone();
                 let event = event.to_string();
@@ -1026,7 +1040,9 @@ impl HookDispatcher {
                         HookPolicy::new(handler.trust, &sandbox_backend, handler.env.clone())
                             .with_content_pins(content_pins)
                             .with_project_dir_memo(dir_memo);
-                    if let Some(condition) = &handler.condition {
+                    if let Some(condition) =
+                        handler.condition.as_ref().filter(|_| run_shell_condition)
+                    {
                         let cond_timeout = std::time::Duration::from_secs(
                             handler.timeout.unwrap_or(default_timeout_secs(&event)),
                         );
@@ -1057,7 +1073,16 @@ impl HookDispatcher {
                             | HookStatus::Failed
                             | HookStatus::PolicyDenied => match cond_output.exit_code {
                                 Some(0) => {}
-                                Some(_) => return,
+                                Some(code)
+                                    if !condition_could_not_evaluate(
+                                        &event,
+                                        &handler_label(&handler.kind, &command),
+                                        code,
+                                    ) =>
+                                {
+                                    return;
+                                }
+                                Some(_) => {}
                                 None => tracing::warn!(
                                     "hooks: `if` condition for {command:?} could not be completed; failing closed (running the handler)"
                                 ),
@@ -1108,7 +1133,7 @@ impl HookDispatcher {
             // The `if` condition runs inside the handler's own future, so
             // conditions and handlers of one event overlap instead of each
             // condition waiting out its timeout before the next one starts.
-            let condition = handler.condition.clone();
+            let condition = handler.condition.clone().filter(|_| run_shell_condition);
             let timeout = std::time::Duration::from_secs(
                 handler.timeout.unwrap_or(default_timeout_secs(event)),
             );
@@ -1151,7 +1176,16 @@ impl HookDispatcher {
                         HookStatus::Completed | HookStatus::Failed | HookStatus::PolicyDenied => {
                             match cond_output.exit_code {
                                 Some(0) => {}
-                                Some(_) => return None,
+                                Some(code)
+                                    if !condition_could_not_evaluate(
+                                        &audit_event,
+                                        &label,
+                                        code,
+                                    ) =>
+                                {
+                                    return None;
+                                }
+                                Some(_) => {}
                                 None => {
                                     tracing::warn!(
                                         "hooks: `if` condition for {command:?} could not be completed; failing closed (running the handler)"
@@ -1396,14 +1430,40 @@ fn report_hook_problems(event: &str, outputs: &[(String, HookOutput)]) {
             },
             ChannelResult::TimedOut => "timed out; ignored".to_owned(),
             ChannelResult::OutputLimitExceeded => "exceeded its output limit; ignored".to_owned(),
+            ChannelResult::PolicyDenied { reason } => {
+                format!("could not launch: {reason}; restart to review it")
+            }
             _ => continue,
         };
         tracing::warn!(hook = label.as_str(), event, "hooks: hook {problem}");
-        let notice = format!("hook '{label}' ({event}) {problem}");
-        let mut state = HOOK_PROBLEMS.lock().unwrap_or_else(|e| e.into_inner());
-        if state.1.len() < 256 && state.1.insert(notice.clone()) {
-            state.0.push(notice);
-        }
+        record_hook_problem(format!("hook '{label}' ({event}) {problem}"));
+    }
+}
+
+/// Queues one user notice, deduplicated per process and bounded.
+fn record_hook_problem(notice: String) {
+    let mut state = HOOK_PROBLEMS.lock().unwrap_or_else(|e| e.into_inner());
+    if state.1.len() < 256 && state.1.insert(notice.clone()) {
+        state.0.push(notice);
+    }
+}
+
+/// Exit statuses a shell uses for "the condition could not be evaluated"
+/// (syntax error, not executable, not found). The documented fail-closed rule
+/// runs the handler for these instead of treating them as a false condition.
+fn condition_could_not_evaluate(event: &str, label: &str, code: i32) -> bool {
+    if matches!(code, 2 | 126 | 127) {
+        tracing::warn!(
+            hook = label,
+            event,
+            "hooks: `if` condition exited {code}; it could not be evaluated, running the handler"
+        );
+        record_hook_problem(format!(
+            "hook '{label}' ({event}) `if` condition could not be evaluated (exit {code}); ran the handler anyway"
+        ));
+        true
+    } else {
+        false
     }
 }
 
@@ -1413,6 +1473,77 @@ struct PreDecisionPart {
     updated_input: Option<serde_json::Value>,
 }
 
+/// Reads a PreToolUse verdict from the hook's stdout JSON. Claude Code's
+/// documented shape nests `permissionDecision`, `permissionDecisionReason` and
+/// `updatedInput` under `hookSpecificOutput`; the flat fields, the deprecated
+/// top-level `decision` (`block`/`approve`) and `continue: false` are accepted
+/// as fallbacks. Nested fields win over flat ones.
+fn parse_pre_decision_json(label: &str, value: &serde_json::Value) -> PreDecisionPart {
+    let nested = value.get("hookSpecificOutput").filter(|specific| {
+        specific
+            .get("hookEventName")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|name| name == "PreToolUse")
+    });
+    fn text<'a>(object: Option<&'a serde_json::Value>, key: &str) -> Option<&'a str> {
+        object
+            .and_then(|o| o.get(key))
+            .and_then(serde_json::Value::as_str)
+    }
+    let decision = text(nested, "permissionDecision")
+        .or_else(|| text(Some(value), "permissionDecision"))
+        .map(|d| (d, true))
+        .or_else(|| match text(Some(value), "decision") {
+            Some("block") => Some(("deny", false)),
+            Some("approve") => Some(("allow", false)),
+            Some(other) => Some((other, false)),
+            None => None,
+        });
+    let verdict = match decision {
+        Some(("deny", _)) => Verdict::Deny,
+        Some(("ask", _)) => Verdict::Ask,
+        Some(("allow", _)) => Verdict::Allow,
+        Some((other, _)) => {
+            warn_unknown_permission_decision(label, other);
+            Verdict::Defer
+        }
+        None => Verdict::Defer,
+    };
+    let (verdict, continue_reason) =
+        if value.get("continue").and_then(serde_json::Value::as_bool) == Some(false) {
+            (
+                Verdict::Deny,
+                text(Some(value), "stopReason").map(String::from),
+            )
+        } else {
+            (verdict, None)
+        };
+    let reason = text(nested, "permissionDecisionReason")
+        .or_else(|| text(Some(value), "permissionDecisionReason"))
+        .or_else(|| text(Some(value), "reason"))
+        .map(String::from)
+        .or(continue_reason);
+    let updated_input = nested
+        .and_then(|o| o.get("updatedInput"))
+        .or_else(|| value.get("updatedInput"))
+        .cloned();
+    PreDecisionPart {
+        verdict,
+        reason,
+        updated_input,
+    }
+}
+
+fn warn_unknown_permission_decision(label: &str, decision: &str) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            hook = label,
+            "hooks: unknown PreToolUse permissionDecision {decision:?}; deferring"
+        );
+    });
+}
+
 fn parse_pre_decision_part(label: &str, output: &HookOutput) -> PreDecisionPart {
     match interpret_hook_output(output) {
         ChannelResult::Block { stderr } => PreDecisionPart {
@@ -1420,24 +1551,7 @@ fn parse_pre_decision_part(label: &str, output: &HookOutput) -> PreDecisionPart 
             reason: Some(stderr),
             updated_input: None,
         },
-        ChannelResult::NoObjection { json: Some(value) } => {
-            let verdict = match value.get("permissionDecision").and_then(|v| v.as_str()) {
-                Some("deny") => Verdict::Deny,
-                Some("ask") => Verdict::Ask,
-                Some("allow") => Verdict::Allow,
-                _ => Verdict::Defer,
-            };
-            let reason = value
-                .get("reason")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            let updated_input = value.get("updatedInput").cloned();
-            PreDecisionPart {
-                verdict,
-                reason,
-                updated_input,
-            }
-        }
+        ChannelResult::NoObjection { json: Some(value) } => parse_pre_decision_json(label, &value),
         ChannelResult::NoObjection { json: None } => PreDecisionPart {
             verdict: Verdict::Defer,
             reason: None,
@@ -1491,7 +1605,9 @@ fn parse_pre_decision_part(label: &str, output: &HookOutput) -> PreDecisionPart 
         }
         ChannelResult::PolicyDenied { reason } => PreDecisionPart {
             verdict: Verdict::Deny,
-            reason: Some(format!("hook subprocess policy denied launch: {reason}")),
+            reason: Some(format!(
+                "{HOOK_FAILURE_PREFIX} PreToolUse hook '{label}' could not launch: {reason}; tool call denied"
+            )),
             updated_input: None,
         },
     }
@@ -1589,9 +1705,14 @@ fn parse_decision(event: &str, output: &HookOutput) -> Decision {
         ChannelResult::Error { .. }
         | ChannelResult::TimedOut
         | ChannelResult::OutputLimitExceeded => Decision::Continue,
-        ChannelResult::PolicyDenied { reason } => Decision::Block {
-            reason: format!("hook subprocess policy denied launch: {reason}"),
+        // A hook that could not be launched is an infrastructure failure the
+        // user must fix. It only gates prompts (the documented fail-closed
+        // event); Stop, SubagentStop and the other events fail open and the
+        // user is told through `report_hook_problems`.
+        ChannelResult::PolicyDenied { reason } if event == "UserPromptSubmit" => Decision::Block {
+            reason: format!("{HOOK_FAILURE_PREFIX} hook subprocess policy denied launch: {reason}"),
         },
+        ChannelResult::PolicyDenied { .. } => Decision::Continue,
     }
 }
 
@@ -2058,6 +2179,48 @@ mod tests {
             ]),
             None
         );
+    }
+
+    #[test]
+    fn nvnkx178_pre_tool_use_reads_nested_and_flat_decisions() {
+        use super::Verdict;
+        let parse = |v: serde_json::Value| super::parse_pre_decision_part("t", &json_output(v));
+        let nested = parse(serde_json::json!({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse", "permissionDecision": "deny",
+            "permissionDecisionReason": "no", "updatedInput": {"a": 1}
+        }}));
+        assert_eq!(nested.verdict, Verdict::Deny);
+        assert_eq!(nested.reason.as_deref(), Some("no"));
+        assert_eq!(nested.updated_input, Some(serde_json::json!({"a": 1})));
+        let ask = parse(serde_json::json!({"hookSpecificOutput": {"permissionDecision": "ask"}}));
+        assert_eq!(ask.verdict, Verdict::Ask);
+        // A nested object for another event is not a PreToolUse verdict.
+        let other = parse(serde_json::json!({"hookSpecificOutput": {
+            "hookEventName": "PostToolUse", "permissionDecision": "deny"
+        }}));
+        assert_eq!(other.verdict, Verdict::Defer);
+        let flat = parse(serde_json::json!({
+            "permissionDecision": "deny", "permissionDecisionReason": "flat",
+            "updatedInput": {"b": 2}
+        }));
+        assert_eq!(flat.verdict, Verdict::Deny);
+        assert_eq!(flat.reason.as_deref(), Some("flat"));
+        assert_eq!(flat.updated_input, Some(serde_json::json!({"b": 2})));
+        let legacy_reason =
+            parse(serde_json::json!({"permissionDecision": "allow", "reason": "r"}));
+        assert_eq!(legacy_reason.verdict, Verdict::Allow);
+        assert_eq!(legacy_reason.reason.as_deref(), Some("r"));
+        let block = parse(serde_json::json!({"decision": "block", "reason": "old"}));
+        assert_eq!(block.verdict, Verdict::Deny);
+        assert_eq!(block.reason.as_deref(), Some("old"));
+        let approve = parse(serde_json::json!({"decision": "approve"}));
+        assert_eq!(approve.verdict, Verdict::Allow);
+        let stop = parse(serde_json::json!({"continue": false, "stopReason": "halt"}));
+        assert_eq!(stop.verdict, Verdict::Deny);
+        assert_eq!(stop.reason.as_deref(), Some("halt"));
+        let unknown = parse(serde_json::json!({"permissionDecision": "maybe"}));
+        assert_eq!(unknown.verdict, Verdict::Defer);
+        assert_eq!(parse(serde_json::json!({})).verdict, Verdict::Defer);
     }
 
     use super::apply_redactions;

@@ -1105,11 +1105,28 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
         crate::extras::hooks::set_permission_decisions_enabled(
             cfg.hooks_permission_decisions.unwrap_or(false),
         );
+        if let Some(mode) = cli.hooks_trust.as_deref() {
+            use crate::extras::hooks::trust::HooksTrustMode;
+            let mode = match mode {
+                "list" => HooksTrustMode::List,
+                "yes" => HooksTrustMode::Yes,
+                _ => HooksTrustMode::Ask,
+            };
+            let report = crate::extras::hooks::trust::run_hooks_trust(
+                &app_paths,
+                mode,
+                &cli.resolve_sandbox_backend(&cfg),
+            )
+            .map_err(|error| anyhow::anyhow!(error))?;
+            println!("{report}");
+            return Ok(());
+        }
         crate::extras::hooks::init_dispatcher(crate::extras::hooks::trust::load_dispatcher(
             &app_paths,
             cli.no_hooks,
             !is_interactive,
             &cli.resolve_sandbox_backend(&cfg),
+            cli.trust_project_hooks,
         ));
 
         if let Some(tool_name) = &cli.hooks_test {

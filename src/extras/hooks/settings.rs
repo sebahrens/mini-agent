@@ -284,7 +284,21 @@ pub(crate) fn parse_hooks_config_with_skips(
                         if handler.args.is_none()
                             && let Some(command) = handler.command.as_deref()
                         {
-                            let mut argv = split_command_string(command)?;
+                            let mut argv = match split_command_string(command) {
+                                Ok(argv) => argv,
+                                Err(_) => {
+                                    // Skip only this handler; the rest of the
+                                    // file stays loaded (mini-agent-nvnkx.181).
+                                    skip_hook(
+                                        &mut skipped,
+                                        event,
+                                        format!(
+                                            "skipping one command hook for event {event:?}: the command string uses shell syntax or is malformed; use command = \"/bin/sh\" with args = [\"-c\", \"...\"]"
+                                        ),
+                                    );
+                                    continue;
+                                }
+                            };
                             // Preserve existing single-program bindings
                             // (including Windows backslashes) and their
                             // persisted trust identity.

@@ -554,11 +554,14 @@ fn pin_configured_hook_content(
 /// interactive contexts consult `confirm`, recording an acceptance in
 /// `trusted_hashes`. The content binding each kept handler was approved
 /// with is recorded in `approved`.
+#[allow(clippy::too_many_arguments)]
 fn filter_trusted_project_hooks(
     hooks: HooksConfig,
     project_root: &Path,
     trusted_hashes: &mut HashSet<String>,
     headless: bool,
+    trust_for_run: bool,
+    skipped: &mut Vec<String>,
     confirm: &dyn Fn(&str) -> bool,
     approved: &mut HashMap<HookHandler, HookContentPins>,
 ) -> HooksConfig {
@@ -579,11 +582,22 @@ fn filter_trusted_project_hooks(
                 if trusted_hashes.contains(&hash) {
                     record_approved_pins(approved, &handler, pins, false);
                     kept_handlers.push(handler);
+                } else if trust_for_run {
+                    // Operator consent for this run only (`--trust-project-hooks`
+                    // or its environment variable); nothing is persisted, and
+                    // the content binding captured now is what every launch
+                    // verifies.
+                    tracing::info!(
+                        "hooks: project hook for event {event:?} trusted for this run only"
+                    );
+                    record_approved_pins(approved, &handler, pins, false);
+                    kept_handlers.push(handler);
                 } else if headless {
                     tracing::warn!(
                         "hooks: skipping unconfirmed project hook for event {event:?} \
-                         (headless; run interactively once to confirm)"
+                         (headless; run `mini-agent hooks trust` once to confirm)"
                     );
+                    skipped.push(event.clone());
                 } else if confirm(&format!(
                     "project hook: {}",
                     hook_confirmation_description(
@@ -645,11 +659,12 @@ pub(crate) fn build_dispatcher_from_paths(
         trust_store_path,
         confirm,
         backend,
+        false,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_dispatcher_from_paths_with_backend(
+pub(crate) fn build_dispatcher_from_paths_with_backend(
     global_path: &Path,
     project_path: &Path,
     managed_path: &Path,
@@ -659,6 +674,7 @@ fn build_dispatcher_from_paths_with_backend(
     trust_store_path: &Path,
     confirm: &dyn Fn(&str) -> bool,
     sandbox_backend: &str,
+    trust_project_hooks: bool,
 ) -> HookDispatcher {
     let mut global = load_settings_file(global_path);
     let compatibility_path = project_root.join(".claude/settings.json");
@@ -724,14 +740,26 @@ fn build_dispatcher_from_paths_with_backend(
             &mut approved_pins,
         );
         merge_into(&mut merged, global.hooks);
+        let mut skipped_events: Vec<String> = Vec::new();
         let filtered_project = filter_trusted_project_hooks(
             project.hooks,
             project_root,
             &mut store,
             headless,
+            trust_project_hooks,
+            &mut skipped_events,
             confirm,
             &mut approved_pins,
         );
+        if !skipped_events.is_empty() {
+            let count = skipped_events.len();
+            skipped_events.sort();
+            skipped_events.dedup();
+            notices.push(format!(
+                "{count} project hook(s) did not run ({}): not trusted. Run `mini-agent hooks trust` once, or pass --trust-project-hooks for this run",
+                skipped_events.join(", ")
+            ));
+        }
         merge_into(&mut merged, filtered_project);
     }
 
@@ -798,6 +826,7 @@ pub(crate) fn load_dispatcher(
     no_hooks_flag: bool,
     headless: bool,
     sandbox_backend: &str,
+    trust_project_hooks: bool,
 ) -> HookDispatcher {
     let trust_unavailable = crate::paths::artifact_disabled("hook trust");
     let dispatcher = build_dispatcher_from_paths_with_backend(
@@ -810,11 +839,92 @@ pub(crate) fn load_dispatcher(
         &default_trust_store_path(paths),
         &confirm_untrusted_hook,
         sandbox_backend,
+        trust_project_hooks,
     );
     for notice in dispatcher.startup_notices() {
         eprintln!("warning: {notice}");
     }
     dispatcher
+}
+
+/// How `mini-agent hooks trust` treats each pending project hook binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HooksTrustMode {
+    /// Print the pending bindings and record nothing.
+    List,
+    /// Print each binding exactly as the interactive prompt does, then ask.
+    Ask,
+    /// Print each binding and record it as trusted without asking.
+    Yes,
+}
+
+/// Operator-side approval of project hooks for unattended runs: the same
+/// bindings and descriptions as the interactive startup prompt, recorded in
+/// the user-level trust store. Consent only ever comes from this command or
+/// the per-run flag, never from repository content. Returns the report.
+pub(crate) fn run_hooks_trust(
+    paths: &crate::paths::AppPaths,
+    mode: HooksTrustMode,
+    sandbox_backend: &str,
+) -> Result<String, String> {
+    if crate::paths::artifact_disabled("hook trust") {
+        return Err("hook trust persistence is disabled (no-persist mode)".to_owned());
+    }
+    let pending = std::cell::Cell::new(0usize);
+    let trusted = std::cell::Cell::new(0usize);
+    let confirm = |description: &str| -> bool {
+        // Global and managed content changes are never approved from here.
+        if !description.starts_with("project hook:") {
+            return false;
+        }
+        pending.set(pending.get() + 1);
+        match mode {
+            HooksTrustMode::List => {
+                println!("Pending {description}");
+                false
+            }
+            HooksTrustMode::Ask => {
+                let accepted = confirm_untrusted_hook(description);
+                trusted.set(trusted.get() + usize::from(accepted));
+                accepted
+            }
+            HooksTrustMode::Yes => {
+                println!("Trusting {description}");
+                trusted.set(trusted.get() + 1);
+                true
+            }
+        }
+    };
+    let dispatcher = build_dispatcher_from_paths_with_backend(
+        &global_settings_path(paths),
+        &project_settings_path(paths),
+        &managed_settings_path(),
+        &current_project_root(paths),
+        false,
+        false,
+        &default_trust_store_path(paths),
+        &confirm,
+        sandbox_backend,
+        false,
+    );
+    let problems: Vec<&String> = dispatcher
+        .startup_notices()
+        .iter()
+        .filter(|notice| notice.contains("trust decisions won't persist"))
+        .collect();
+    if let Some(problem) = problems.first() {
+        return Err((*problem).clone());
+    }
+    Ok(match (pending.get(), mode) {
+        (0, _) => "No project hooks are waiting for approval.".to_owned(),
+        (count, HooksTrustMode::List) => format!(
+            "{count} project hook binding(s) pending. Run `mini-agent hooks trust --yes` to trust them."
+        ),
+        (count, _) => format!(
+            "Trusted {} of {count} project hook binding(s).",
+            trusted.get()
+        ),
+    })
 }
 
 #[cfg(test)]
