@@ -92,6 +92,19 @@ pub enum PauseReason {
 }
 
 impl PauseReason {
+    /// The snake_case name this reason serializes under, for scripts.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::NoProgress => "no_progress",
+            Self::JudgeUnavailable => "judge_unavailable",
+            Self::ContextOverflow => "context_overflow",
+            Self::RoundFailure => "round_failure",
+            Self::UnknownStatusOnLoad => "unknown_status_on_load",
+            Self::UserRequested => "user_requested",
+            Self::CheckUnavailable => "check_unavailable",
+        }
+    }
+
     /// Operator-facing text. Shown by `/goal status` and the headless summary.
     pub fn describe(self) -> &'static str {
         match self {
@@ -159,6 +172,19 @@ impl GoalStatus {
             | Self::Paused
             | Self::Blocked
             | Self::BudgetLimited => true,
+        }
+    }
+
+    /// The snake_case name this status serializes under, for scripts.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::AwaitingUser => "awaiting_user",
+            Self::Paused => "paused",
+            Self::Blocked => "blocked",
+            Self::BudgetLimited => "budget_limited",
+            Self::Met => "met",
+            Self::Impossible => "impossible",
         }
     }
 
@@ -1299,6 +1325,15 @@ mod tests {
         assert_eq!(store.status_label().as_deref(), Some("goal 3/7"));
         store.with_mut(|g| g.status = GoalStatus::Paused);
         assert_eq!(store.status_label().as_deref(), Some("goal 3/7 paused"));
+        // The wrap-up round runs after the bound; the counter never passes it.
+        store.with_mut(|g| {
+            g.progress.rounds = 8;
+            g.progress.wrap_up_issued = true;
+        });
+        assert_eq!(
+            store.status_label().as_deref(),
+            Some("goal 7/7 +wrap-up paused")
+        );
         store.with_mut(|g| g.status = GoalStatus::Met);
         assert_eq!(store.status_label(), None);
         assert_eq!(SNAPSHOT_CALLS.with(std::cell::Cell::get), before);

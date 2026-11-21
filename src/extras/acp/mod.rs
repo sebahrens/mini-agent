@@ -125,6 +125,11 @@ struct SessionHistory {
     policy: policy::SessionPolicy,
     pending_question: Option<crate::question::QuestionRequired>,
     manual_compact: bool,
+    /// The goal gate's relaunch prompt for the next prompt of this session:
+    /// the editor drives each round, so the instruction (check output, judge
+    /// assessment) is carried to the next admitted prompt here.
+    #[cfg(feature = "goal")]
+    pending_goal_instruction: Option<String>,
     /// Servers and managers that outlive a single prompt.
     reuse: SessionReuse,
     /// Compaction triggers, refreshed from config and the routed model's
@@ -293,6 +298,8 @@ impl Default for SessionHistory {
             policy: Default::default(),
             pending_question: None,
             manual_compact: false,
+            #[cfg(feature = "goal")]
+            pending_goal_instruction: None,
             reuse: Default::default(),
             limits: Default::default(),
             context_window: 0,
@@ -690,6 +697,14 @@ struct TurnControl {
     cancelled: Notify,
     runner_cancel: StdMutex<Option<crate::agent::runner::AgentWorkCancellation>>,
     sandbox: StdMutex<Option<crate::sandbox::Sandbox>>,
+    /// A goal's verification is running after the turn's own cancellation
+    /// ownership completed; `session/cancel` is routed to it instead.
+    #[cfg(feature = "goal")]
+    verifying: std::sync::atomic::AtomicBool,
+    #[cfg(feature = "goal")]
+    verification_cancelled: std::sync::atomic::AtomicBool,
+    #[cfg(feature = "goal")]
+    verification_cancel: Notify,
 }
 
 impl TurnControl {
@@ -699,6 +714,34 @@ impl TurnControl {
             cancelled: Notify::new(),
             runner_cancel: StdMutex::new(None),
             sandbox: StdMutex::new(None),
+            #[cfg(feature = "goal")]
+            verifying: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "goal")]
+            verification_cancelled: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "goal")]
+            verification_cancel: Notify::new(),
+        }
+    }
+
+    #[cfg(feature = "goal")]
+    fn begin_verification(&self) {
+        self.verifying.store(true, Ordering::Release);
+    }
+
+    #[cfg(feature = "goal")]
+    fn end_verification(&self) {
+        self.verifying.store(false, Ordering::Release);
+    }
+
+    /// Resolves when a `session/cancel` arrives during goal verification.
+    #[cfg(feature = "goal")]
+    async fn verification_cancelled(&self) {
+        loop {
+            let notified = self.verification_cancel.notified();
+            if self.verification_cancelled.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
         }
     }
 
@@ -713,6 +756,13 @@ impl TurnControl {
             )
             .is_err()
         {
+            // Too late for the turn itself, but a goal verification that runs
+            // after it can still be stopped.
+            #[cfg(feature = "goal")]
+            if self.verifying.load(Ordering::Acquire) {
+                self.verification_cancelled.store(true, Ordering::Release);
+                self.verification_cancel.notify_waiters();
+            }
             return false;
         }
         if let Some(cancel) = lock_unpoisoned(&self.runner_cancel).as_ref() {
@@ -2086,6 +2136,8 @@ async fn install_session(
                 policy,
                 pending_question,
                 manual_compact: false,
+                #[cfg(feature = "goal")]
+                pending_goal_instruction: None,
                 reuse: Default::default(),
                 limits: Default::default(),
                 context_window: 0,
@@ -4122,17 +4174,92 @@ async fn run_prompt(
             }
             #[cfg(feature = "goal")]
             commands::Command::Goal(arguments) => {
+                let arguments = arguments.trim();
+                let verb = arguments.split_whitespace().next().unwrap_or("");
+                let rest = arguments[verb.len()..].trim();
                 if arguments.is_empty() || arguments == "status" {
                     Some(goal_store.snapshot().map_or_else(
                         || "No goal is set.".into(),
-                        |goal| format!("Goal ({}): {}", goal.status.label(), goal.objective),
+                        |goal| crate::ui::slash::goal::render_status(&goal),
                     ))
                 } else if arguments == "clear" {
                     goal_store.clear();
                     Some("Goal cleared.".into())
+                } else if arguments == "pause" {
+                    Some(
+                        goal_store
+                            .with_mut(|goal| {
+                                if goal.status.is_running()
+                                    && goal.set_status(
+                                        crate::extras::goal::GoalStatus::Paused,
+                                        Some(crate::extras::goal::PauseReason::UserRequested),
+                                    )
+                                {
+                                    "Goal paused.".to_string()
+                                } else {
+                                    format!("The goal is already {}.", goal.status.label())
+                                }
+                            })
+                            .unwrap_or_else(|| "No goal to pause.".into()),
+                    )
+                } else if arguments == "resume" || arguments == "reopen" {
+                    let reopen = arguments == "reopen";
+                    Some(
+                        goal_store
+                            .with_mut(|goal| {
+                                let done = if reopen { goal.reopen() } else { goal.resume() };
+                                if done {
+                                    "Goal active again; send a prompt to continue.".to_string()
+                                } else if reopen {
+                                    "Only a goal marked impossible can reopen.".to_string()
+                                } else {
+                                    "The goal is final; set a new one with /goal <objective>."
+                                        .to_string()
+                                }
+                            })
+                            .unwrap_or_else(|| "No goal to resume.".into()),
+                    )
+                } else if verb == "bounds" {
+                    Some(
+                        goal_store
+                            .with_mut(|goal| {
+                                if rest.is_empty() {
+                                    return crate::ui::slash::goal::render_bounds(goal);
+                                }
+                                let mut lines = Vec::new();
+                                for assignment in rest.split_whitespace() {
+                                    lines.push(
+                                        crate::ui::slash::goal::parse_bound(goal, assignment)
+                                            .unwrap_or_else(|error| error),
+                                    );
+                                }
+                                // Raising a bound is how a budget stop is answered.
+                                if goal.status == crate::extras::goal::GoalStatus::BudgetLimited
+                                    && goal.resume()
+                                {
+                                    lines.push("goal active again".into());
+                                }
+                                lines.join("\n")
+                            })
+                            .unwrap_or_else(|| "No goal to configure.".into()),
+                    )
+                } else if verb == "check" && !rest.is_empty() {
+                    Some(
+                        goal_store
+                            .with_mut(|goal| {
+                                if rest == "clear" {
+                                    goal.checks.clear();
+                                    "Checks cleared.".to_string()
+                                } else {
+                                    goal.checks.push(crate::extras::goal::GoalCheck::new(rest));
+                                    format!("Check added: {rest}")
+                                }
+                            })
+                            .unwrap_or_else(|| "No goal to add a check to.".into()),
+                    )
                 } else {
                     let goal = match crate::extras::goal::Goal::configured(
-                        arguments.clone(),
+                        arguments.to_string(),
                         Vec::new(),
                         crate::extras::goal::GoalDefaults {
                             cfg: &state.cfg,
@@ -4257,6 +4384,24 @@ async fn run_prompt(
     let mut reactive_used = false;
     #[cfg(feature = "goal")]
     let mut carried_usage = rig::completion::Usage::default();
+    // The answer to a question the goal asked is what it was waiting for, as in
+    // the terminal: admitting the prompt resumes it, so the round it starts is
+    // settled. `/compact` is housekeeping and answers nothing.
+    #[cfg(feature = "goal")]
+    if !matches!(command, Some(commands::Command::Compact)) {
+        goal_store.with_mut(|goal| {
+            if goal.status == crate::extras::goal::GoalStatus::AwaitingUser {
+                goal.resume();
+            }
+        });
+        // The gate's last instruction (a failing check's output, the judge's
+        // assessment) reaches the worker as a non-persisted turn directive;
+        // otherwise the editor user sees the failure and the model never does.
+        let pending = history.pending_goal_instruction.take();
+        if let Some(instruction) = pending.filter(|_| goal_store.is_active()) {
+            current_input = acp_goal_directive(&current_input, &instruction);
+        }
+    }
     let result = loop {
         let compactions_at_segment_start = history.session.compactions.len();
         let result = crate::startup::heap_future(|| {
@@ -4509,7 +4654,9 @@ async fn run_prompt(
                 match crate::extras::goal::driver::park_for_question(&goal_store_for_gate, summary)
                 {
                     crate::extras::goal::driver::RoundOutcome::Stopped { line, .. } => {
-                        goal_store_for_gate.snapshot().map(|goal| (line, goal))
+                        goal_store_for_gate
+                            .snapshot()
+                            .map(|goal| (line, goal, None))
                     }
                     _ => None,
                 }
@@ -4528,6 +4675,7 @@ async fn run_prompt(
             &todo_snapshot,
             state,
             &sandbox_for_gate,
+            &control,
             &crate::extras::goal::driver::RoundCost {
                 usage: outcome.usage,
                 // What the agent worked for, excluding whatever the user spent
@@ -4646,7 +4794,8 @@ async fn run_prompt(
     // thoughts, and an agent that kept working with no visible reason is the
     // complaint this exists to prevent.
     #[cfg(feature = "goal")]
-    if let Some((line, goal)) = goal_line {
+    if let Some((line, goal, relaunch)) = goal_line {
+        history.pending_goal_instruction = relaunch;
         let mut meta = serde_json::Map::new();
         meta.insert(
             "goal".to_string(),
@@ -4913,8 +5062,9 @@ async fn settle_acp_goal_round(
     todos: &[crate::agent::tools::todo::TodoItem],
     state: &AcpState,
     sandbox: &crate::sandbox::Sandbox,
+    control: &TurnControl,
     cost: &crate::extras::goal::driver::RoundCost,
-) -> Option<(String, crate::extras::goal::Goal)> {
+) -> Option<(String, crate::extras::goal::Goal, Option<String>)> {
     let cfg = &state.cfg;
     use crate::extras::goal::driver::{self, RoundOutcome};
     use crate::extras::goal::gate::RoundEnd;
@@ -4950,47 +5100,66 @@ async fn settle_acp_goal_round(
     let judge = crate::extras::goal::judge::resolve(&goal.judge, cfg, &main_provider, &main_model);
     store.record_judge(judge.as_ref());
     let transcript = crate::extras::goal::judge::transcript_from_interactions(interactions);
+    // The turn's own cancellation ownership has completed by now, so a
+    // `session/cancel` during verification is observed through this separate
+    // signal rather than through `TurnControl::cancel`'s success.
+    control.begin_verification();
     let outcome = driver::settle_round(store, summary, |request| async move {
-        let checks = crate::extras::goal::checks::run(&goal, &request, sandbox, cfg).await;
+        let (checks, mut interrupted) =
+            crate::extras::goal::checks::run_with_interrupt(&goal, &request, sandbox, cfg, async {
+                control.verification_cancelled().await;
+                Ok(())
+            })
+            .await;
         // A failing check already decides the claim, so the judge is not asked
         // for an answer the gate will not read.
         let checks_rejected = checks.as_ref().is_some_and(|o| !o.all_passed);
         let judged = match judge {
-            Some(resolved) if request.run_judge && !checks_rejected => {
+            Some(resolved) if request.run_judge && !checks_rejected && !interrupted => {
                 match state
                     .provider_clients
                     .get(&state.cli, cfg, &resolved.provider)
                 {
-                    Ok(client) => Some(
-                        crate::extras::goal::judge::ask_with_transcript_observed(
-                            &goal,
-                            &request,
-                            &resolved,
-                            &client,
-                            &transcript,
-                            cfg,
-                            checks.as_ref(),
-                            crate::spend::run::Run::current().map_or_else(
-                                Default::default,
-                                |run| {
-                                    crate::spend::run::UsageObserver::with_run(
-                                        run.for_judge(
-                                            &resolved,
-                                            cfg,
-                                            resolved
-                                                .same_provider_as_session
-                                                .then(|| {
-                                                    client.listing_key(&resolved.provider).ok()
-                                                })
-                                                .flatten()
-                                                .as_ref(),
-                                        ),
-                                    )
-                                },
+                    Ok(client) => {
+                        let call = crate::extras::goal::driver::unless_interrupted(
+                            crate::extras::goal::judge::ask_with_transcript_observed(
+                                &goal,
+                                &request,
+                                &resolved,
+                                &client,
+                                &transcript,
+                                cfg,
+                                checks.as_ref(),
+                                crate::spend::run::Run::current().map_or_else(
+                                    Default::default,
+                                    |run| {
+                                        crate::spend::run::UsageObserver::with_run(
+                                            run.for_judge(
+                                                &resolved,
+                                                cfg,
+                                                resolved
+                                                    .same_provider_as_session
+                                                    .then(|| {
+                                                        client.listing_key(&resolved.provider).ok()
+                                                    })
+                                                    .flatten()
+                                                    .as_ref(),
+                                            ),
+                                        )
+                                    },
+                                ),
                             ),
+                            async {
+                                control.verification_cancelled().await;
+                                Ok(())
+                            },
                         )
-                        .await,
-                    ),
+                        .await;
+                        if call.is_none() {
+                            interrupted = true;
+                        }
+                        call
+                    }
                     // Fail open, like every other judge failure: an editor
                     // without a reachable judge still gets its checks.
                     Err(error) => Some(crate::extras::goal::judge::JudgeCall::unmetered(
@@ -5006,15 +5175,45 @@ async fn settle_acp_goal_round(
             checks,
             judge_tokens: judged.as_ref().map_or(0, |call| call.tokens),
             judge: judged.map(|call| call.outcome),
+            interrupted,
             ..driver::Verification::default()
         }
     })
     .await;
-    let line = match outcome {
+    control.end_verification();
+    let (line, relaunch) = match outcome {
         RoundOutcome::Inactive => return None,
-        RoundOutcome::Relaunch { line, .. } | RoundOutcome::Stopped { line, .. } => line,
+        RoundOutcome::Relaunch { line, relaunch } => (line, Some(relaunch.prompt)),
+        RoundOutcome::Stopped { line, .. } => (line, None),
     };
-    store.snapshot().map(|goal| (line, goal))
+    store.snapshot().map(|goal| (line, goal, relaunch))
+}
+
+/// The turn directive that carries the gate's last instruction into the next
+/// ACP prompt. A directive is bounded, so a long instruction keeps its first
+/// line (the round header) and its end, where a failing command's cause is.
+#[cfg(feature = "goal")]
+fn acp_goal_directive(
+    input: &crate::agent::input::PromptInput,
+    instruction: &str,
+) -> crate::agent::input::PromptInput {
+    const BUDGET: usize = crate::agent::input::TURN_DIRECTIVE_MAX_BYTES - 128;
+    let framed = if instruction.len() <= BUDGET {
+        instruction.to_string()
+    } else {
+        let head = instruction.lines().next().unwrap_or("");
+        let head = &head[..head.len().min(120)];
+        let mut start = instruction.len() - (BUDGET - head.len() - 8);
+        while !instruction.is_char_boundary(start) {
+            start += 1;
+        }
+        format!("{head}\n…\n{}", &instruction[start..])
+    };
+    let directive = match input.turn_directive() {
+        Some(existing) => format!("{existing}\n\n[goal] {framed}"),
+        None => format!("[goal] {framed}"),
+    };
+    input.clone().with_turn_directive(Some(directive))
 }
 
 /// Mid-turn compaction trigger for one ACP segment (mini-agent-sgzh0): real
@@ -15248,6 +15447,37 @@ mod goal_acp_tests {
         let mut map = serde_json::Map::new();
         map.insert("goal".to_string(), value);
         map
+    }
+
+    /// The gate's instruction rides the next ACP prompt as a bounded,
+    /// non-persisted directive that keeps the cause at the end of a long
+    /// failing output (mini-agent-sskdu.215).
+    #[test]
+    fn the_gate_instruction_becomes_a_bounded_turn_directive() {
+        let input = crate::agent::input::PromptInput::text("continue".into());
+        let short = acp_goal_directive(&input, "Verification failed:\nno");
+        assert_eq!(
+            short.turn_directive(),
+            Some("[goal] Verification failed:\nno")
+        );
+        assert_eq!(
+            short.literal_text(),
+            "continue",
+            "the prompt text is untouched"
+        );
+
+        let long = format!(
+            "--- Goal round 2 of 9 ---\n{}\nROOT CAUSE",
+            "x".repeat(5_000)
+        );
+        let bounded = acp_goal_directive(&input, &long);
+        let directive = bounded.turn_directive().expect("directive");
+        assert!(directive.len() <= crate::agent::input::TURN_DIRECTIVE_MAX_BYTES);
+        assert!(
+            directive.contains("ROOT CAUSE"),
+            "the end survives: {directive}"
+        );
+        assert!(directive.contains("Goal round 2"));
     }
 
     fn store_with(objective: &str) -> crate::extras::goal::GoalStore {

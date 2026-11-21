@@ -1052,6 +1052,36 @@ mod tests {
         assert_eq!(carried_summary(&g, 0, ""), None);
     }
 
+    /// A restart round carries the instruction once, and an over-budget summary
+    /// keeps its newest lines (mini-agent-sskdu.225).
+    #[test]
+    fn the_summary_drops_a_copy_of_the_instruction_and_keeps_its_newest_lines() {
+        let mut g = goal();
+        g.push_report(report(ReportStatus::Progress, 1, "oldest report"));
+        g.push_report(report(ReportStatus::Progress, 2, "newest report"));
+        g.last_verdict = Some(crate::extras::goal::Verdict {
+            outcome: crate::extras::goal::Outcome::NotYet,
+            reason: "fix the validator".into(),
+            source: crate::extras::goal::VerdictSource::Checks,
+            evidence: Vec::new(),
+            at: compact_str::CompactString::new("now"),
+        });
+        let summary = carried_summary(&g, 10_000, "fix the validator").unwrap();
+        assert!(!summary.contains("fix the validator"), "{summary}");
+        let clipped = carried_summary(&g, 20, "fix the validator").unwrap();
+        assert!(clipped.contains("newest report"), "{clipped}");
+        assert!(!clipped.contains("oldest report"), "{clipped}");
+    }
+
+    #[test]
+    fn an_interrupt_says_the_goal_is_still_active() {
+        let line = decision_line(&goal(), &crate::extras::goal::gate::gate_interrupted());
+        assert!(
+            line.contains("still active") && line.contains("/goal pause"),
+            "{line}"
+        );
+    }
+
     #[test]
     fn the_wrap_up_round_is_capped_so_it_cannot_start_new_work() {
         let g = goal();

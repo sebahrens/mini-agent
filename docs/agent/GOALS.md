@@ -14,6 +14,10 @@ done when:
 - cargo test passes
 ```
 
+`/goal <objective>` only records the goal: nothing runs until you send a message, and the next
+typed message starts the first round. `/goal resume` likewise says `send a message to continue`. On
+the direct Anthropic route `/goal` and `/loop` are refused up front (see below).
+
 Automatic headless goals and `--loop` currently require a compatible non-native
 history route (for example an OpenRouter profile). Native Anthropic replay does
 not yet have an automatic-round publication owner, so those paths refuse before
@@ -45,7 +49,17 @@ process runs; it skips disk persistence. A failed session save does not append o
 charge an already recorded round again when saving is retried.
 
 You are not locked out while a goal runs. Typing a message is a normal turn; the gate simply
-evaluates at its end.
+evaluates at its end. Pressing Esc stops the current round but leaves the goal active: the next
+message you send continues it (`goal: interrupted — still active`), and `/goal pause` parks it.
+While a round runs, `/goal status`, `/goal pause`, `/goal bounds` and `/goal check` work; `/goal
+clear`, `resume`, `reopen` and a new objective wait until you press Esc or pause first. A pause
+lets the running round finish, and its cost is still counted. A goal that is already parked keeps
+its status and reason when you pause it again.
+
+A round that hits `max_agent_turns` or `turn_token_budget` is counted as an ordinary round, not as
+a failed run; only genuine provider or run errors feed the "consecutive agent runs failed" pause.
+The gate's instruction for the next round is built from the round that just ended; the previous
+round's failure, stop reason or question is never replayed.
 
 ## When the agent may stop
 
@@ -58,6 +72,12 @@ Claiming completion starts verification rather than ending the goal.
    earlier.
 3. **A judge model** reviews last. It can withhold completion but can never overturn a command that
    exited zero.
+
+A check that times out (`verify_timeout_secs`, default 300 s, which bounds every goal check and
+`verify_command`) or cannot start is not reported to the agent as a failed verification. The
+second such result in a row parks the goal as `paused (a goal check could not run to completion)`
+and names the setting to raise. A round that changed nothing does not rerun the checks: the last
+result stands until something is edited.
 
 By default checks run only when the agent claims to be finished. With `/goal bounds
 check_every_round=true` (or `[goal] check_every_round = true`) they also run at the end of every
@@ -104,8 +124,9 @@ session's own model in a fresh context. That last fallback means a single-model 
 second opinion from something that did not just do the work — weaker than a distinct model, and
 `/goal status` labels it as such. `[goal] judge = "off"` turns the tier off.
 
-The judge gets no tools and no workspace: only the objective, a bounded tail of the conversation, and
-the result of any checks the harness ran that round, all fenced as untrusted data. If it cannot be
+The judge gets no tools and no workspace: only the objective, a bounded tail of the conversation
+(the newest 24 KiB; tool results keep both their start and their end, and the `goal_report` claim
+is shown whole), and the result of any checks the harness ran that round, all fenced as untrusted data. If it cannot be
 reached, the goal keeps working rather than completing or ending; three consecutive failures on
 completion claims park the goal so an outage cannot pass for verification.
 
@@ -129,7 +150,7 @@ charged to the session at the session model's prices.
 | `awaiting user` | The agent asked you something. Answer it and the goal resumes. |
 | `blocked` | The same blocker survived several rounds with no progress, or a refusal only you can lift (for example `[subagents] allow_write = true` for a write persona) was hit: the goal parks at once and names the setting; change it, then `/goal resume`. |
 | `paused` | Parked, by the harness or by you. `/goal status` says why. |
-| `budget limited` | Rounds, tokens, or time ran out. Raise a bound and resume. |
+| `budget limited` | Rounds, tokens, or time ran out. Raise a bound with `/goal bounds max_rounds=<n>` (which also resumes it), or `/goal resume` to buy one more round. |
 | `met` | Reached, and verified as deeply as you configured. |
 | `impossible` | Cannot be satisfied as written. `/goal reopen` to try again. |
 
@@ -149,7 +170,9 @@ blocked_rounds = 3
 ```
 
 Raise one mid-flight with `/goal bounds max_rounds=100`, which also re-arms a goal that stopped on
-it. When a bound is exhausted the agent gets one short wrap-up round to land what it has, rather
+it; `/goal bounds` alone lists every bound with what has been used. `/goal resume` on a goal whose
+bound is still used up says so and buys a single round. A zero `max_tokens` or `max_active_secs`
+removes the bound; a zero `wrap_up_max_agent_turns` makes the round bound exact. When a bound is exhausted the agent gets one short wrap-up round to land what it has, rather
 than being cut off mid-edit or allowed to start something new.
 
 Time spent waiting on a permission prompt does not count: the budget measures how long the agent
@@ -165,13 +188,19 @@ impossible, `21` blocked, `22` awaiting you, `23` paused, `24` budget limited. `
 a `goal` object with the status, rounds, tokens, and the evidence behind the verdict, so a CI job can
 branch without parsing prose.
 
+`mini-agent -p --continue --goal-resume` resumes the session's parked goal (a budget limited,
+paused or blocked one; `--goal-max-rounds` then sets its new bound). With `--continue` and a
+prompt, a goal in `awaiting user` resumes and the prompt is the answer. The JSON `goal` object also
+carries `status_code` (snake_case), `paused_reason` and `max_rounds`.
+
 `--no-tools` and `--goal` are incompatible: the agent could never report progress, so every round
 would look like a stall.
 
 ## Records
 
 Each gate evaluation writes one JSON record under `state/goals/<goal-id>/round-NNNN.json` with what
-was checked and what was concluded. Exports carry the objective too.
+was checked and what was concluded. A second evaluation of the same round (after an interrupt)
+writes `round-NNNN-a2.json` rather than replacing the first. Exports carry the objective too.
 
 ## Limitations
 
@@ -219,6 +248,10 @@ prompt is admitted: a prompt rejected because the session already has an active
 turn leaves that turn's goal untouched.
 
 One prompt is one round. The client sends the next prompt to run the next
-round, which is how an editor already works. Each round's decision comes back
+round, which is how an editor already works. The gate's instruction for that round (a failing
+check's output, the judge's assessment) is carried to the next prompt as a non-persisted turn
+directive. A goal that asked a question resumes when the answer is sent, and a `session/cancel`
+during verification stops the running check. `/goal` accepts `status`, `pause`, `resume`, `reopen`,
+`clear`, `bounds` and `check` as in the terminal. Each round's decision comes back
 as a thought chunk and as `_meta.goal`, carrying the status, the round, whether
 a command proved the verdict, and what the evidence was.

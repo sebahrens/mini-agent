@@ -35,7 +35,7 @@ pub(crate) fn parse_objective(body: &str) -> (String, Vec<String>) {
     (objective.join(" "), criteria)
 }
 
-fn parse_bound(goal: &mut Goal, assignment: &str) -> Result<String, String> {
+pub(crate) fn parse_bound(goal: &mut Goal, assignment: &str) -> Result<String, String> {
     let (key, value) = assignment
         .split_once('=')
         .ok_or_else(|| format!("expected key=value, got {assignment:?}"))?;
@@ -331,11 +331,11 @@ pub(crate) async fn handle_goal(parts: &[&str], body: &str, ctx: &mut SlashCtx<'
                 }
             });
             match changed {
-                Some((true, status)) if *ctx.is_running => write_ok(
+                Some((true, current)) if *ctx.is_running => write_ok(
                     ctx.renderer,
                     format!(
                         "goal {} — the current round will finish first (Esc stops it now)",
-                        status.label()
+                        current.label()
                     ),
                 ),
                 Some((true, status)) => write_ok(ctx.renderer, format!("goal {}", status.label())),
@@ -376,7 +376,7 @@ pub(crate) async fn handle_goal(parts: &[&str], body: &str, ctx: &mut SlashCtx<'
                     // build time, so a parked build would lack it.
                     ctx.rebuild_agent().await;
                 }
-                Some((false, status, _)) => write_error(ctx.renderer, cannot_resume(status)),
+                Some((false, current, _)) => write_error(ctx.renderer, cannot_resume(current)),
                 None => write_error(ctx.renderer, "no goal to resume"),
             }
         }
@@ -564,6 +564,63 @@ mod tests {
 
         // Read as one string it is neither.
         assert!(parse_bound(&mut goal, tail).is_err());
+    }
+
+    /// `/goal resume` on a met goal must not send the user to `/goal reopen`,
+    /// which refuses met goals (mini-agent-sskdu.114).
+    #[test]
+    fn resuming_a_met_goal_does_not_recommend_reopen() {
+        assert!(!cannot_resume(GoalStatus::Met).contains("reopen"));
+        assert!(cannot_resume(GoalStatus::Met).contains("/goal <objective>"));
+        assert!(cannot_resume(GoalStatus::Impossible).contains("/goal reopen"));
+    }
+
+    #[test]
+    fn zero_bounds_agree_with_config() {
+        let mut goal = Goal::new("x", Vec::new()).unwrap();
+        assert_eq!(
+            parse_bound(&mut goal, "wrap_up_max_agent_turns=0").unwrap(),
+            "wrap_up_max_agent_turns = 0"
+        );
+        assert_eq!(goal.bounds.wrap_up_max_agent_turns, 0);
+        assert_eq!(
+            parse_bound(&mut goal, "max_tokens=0").unwrap(),
+            "max_tokens = unlimited"
+        );
+        assert_eq!(
+            parse_bound(&mut goal, "max_active_secs=0").unwrap(),
+            "max_active_secs = unlimited"
+        );
+    }
+
+    #[test]
+    fn status_lists_checks_and_budget_left() {
+        let mut goal = Goal::new("x", Vec::new()).unwrap();
+        goal.checks
+            .push(crate::extras::goal::GoalCheck::new("cargo test --lib"));
+        goal.bounds.max_tokens = Some(1000);
+        goal.progress.tokens_used = 250;
+        goal.bounds.max_rounds = 5;
+        goal.progress.rounds = 6;
+        goal.progress.wrap_up_issued = true;
+        let rendered = render_status(&goal);
+        assert!(rendered.contains("- cargo test --lib"), "{rendered}");
+        assert!(rendered.contains("tokens: 250 of 1000"), "{rendered}");
+        assert!(
+            rendered.contains("round: 5 of 5 (wrap-up round issued)"),
+            "{rendered}"
+        );
+        assert!(render_bounds(&goal).contains("max_tokens = 1000 (used 250)"));
+    }
+
+    #[test]
+    fn bounds_and_check_are_allowed_while_a_round_runs() {
+        assert!(crate::ui::allowed_while_running(
+            "/goal bounds max_rounds=9"
+        ));
+        assert!(crate::ui::allowed_while_running("/goal check cargo test"));
+        assert!(!crate::ui::allowed_while_running("/goal clear"));
+        assert!(!crate::ui::allowed_while_running("/goal resume"));
     }
 
     #[test]

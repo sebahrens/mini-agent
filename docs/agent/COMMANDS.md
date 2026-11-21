@@ -617,15 +617,16 @@ A goal never changes the security mode, the permission allowlist, or the sandbox
 | Command | Description |
 | ------- | ----------- |
 | `/goal <objective>` | Set the objective. Lines after a `done when:` line become criteria. |
-| `/goal status` | Objective, criteria, status, round, tokens, verification, judge, last check. |
+| `/goal status` | Objective, criteria, status, round, bounds used, check commands, judge, last decision. |
 | `/goal check <cmd>` | Require a command to exit zero before the goal may be reported complete. |
-| `/goal bounds <k>=<v>` | Change `max_rounds`, `max_tokens`, `continuation`, and the rest. |
-| `/goal pause` / `/goal resume` | Park the goal, or put it back to work. |
+| `/goal bounds [<k>=<v>]` | Change `max_rounds`, `max_tokens`, `continuation`, and the rest; with no argument, list them. Works while a round runs. |
+| `/goal pause` / `/goal resume` | Park the goal, or put it back to work (send a message to continue). |
 | `/goal reopen` | Reopen a goal that was declared impossible. |
 | `/goal clear` | Discard the goal. Setting a new one over an unfinished goal is refused. |
 
 Headless flags: `--goal`, `--goal-done` (repeatable), `--goal-check` (repeatable),
-`--goal-max-rounds`, `--goal-continuation continue|restart`, `--goal-replace`. A goal with
+`--goal-max-rounds`, `--goal-continuation continue|restart`, `--goal-replace`, `--goal-resume` (with
+`--continue`: resume the parked goal). A goal with
 `--no-tools` is refused: the agent could never report progress, so every round would look like a
 stall.
 

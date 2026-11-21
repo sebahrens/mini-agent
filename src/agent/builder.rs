@@ -3766,8 +3766,16 @@ mod js_tests {
             let first = preamble_with(Some(&goal));
             goal.progress.rounds = 31;
             goal.progress.tokens_used = 250_000;
-            goal.set_status(GoalStatus::Blocked, None);
             assert_eq!(preamble_with(Some(&goal)), first);
+
+            // Parking changes the rules paragraph once (a parked goal must not
+            // tell the model to call a tool that refuses); it is still stable
+            // for as long as the goal stays parked.
+            goal.set_status(GoalStatus::Blocked, None);
+            let parked = preamble_with(Some(&goal));
+            assert_ne!(parked, first);
+            goal.progress.rounds = 40;
+            assert_eq!(preamble_with(Some(&goal)), parked);
         }
 
         #[test]

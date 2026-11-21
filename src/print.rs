@@ -1940,8 +1940,15 @@ pub(crate) struct HeadlessGoal {
     /// What the goal was working toward. A caller has the id either way; this
     /// is what makes the object readable without the session beside it.
     pub objective: String,
+    /// The display label, with spaces (`budget limited`).
     pub status: String,
+    /// The same status in the snake_case used by `stop_reason`, for scripts.
+    pub status_code: &'static str,
+    /// Why a paused goal is paused (snake_case), so exit 23 can be told apart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paused_reason: Option<&'static str>,
     pub rounds: u32,
+    pub max_rounds: u32,
     pub tokens: u64,
     /// What actually backed the verdict; empty when no command proved it.
     pub evidence: Vec<String>,
@@ -1955,7 +1962,10 @@ impl HeadlessGoal {
             id: goal.id.to_string(),
             objective: goal.objective.clone(),
             status: goal.status.label().to_string(),
+            status_code: goal.status.code(),
+            paused_reason: goal.paused_reason.map(|reason| reason.code()),
             rounds: goal.progress.rounds,
+            max_rounds: goal.bounds.max_rounds,
             tokens: goal.progress.tokens_used,
             evidence: goal
                 .last_verdict
@@ -3517,6 +3527,31 @@ fn system_instruction_entries(cli: &cli::Cli) -> Vec<(&'static str, String)> {
             show(cli.append_system_prompt.as_deref(), "none"),
         ),
     ]
+}
+
+#[cfg(all(test, feature = "goal"))]
+mod headless_goal_tests {
+    use super::*;
+
+    /// A script can tell exit 23's causes apart without parsing prose
+    /// (mini-agent-sskdu.217).
+    #[test]
+    fn the_json_goal_object_carries_machine_readable_status_and_pause_reason() {
+        use crate::extras::goal::{Goal, GoalStatus, PauseReason};
+        let mut goal = Goal::new("ship it", Vec::new()).unwrap();
+        goal.set_status(GoalStatus::Paused, Some(PauseReason::CheckUnavailable));
+        let value = serde_json::to_value(HeadlessGoal::from_goal(&goal)).unwrap();
+        assert_eq!(value["status"], "paused");
+        assert_eq!(value["status_code"], "paused");
+        assert_eq!(value["paused_reason"], "check_unavailable");
+        assert_eq!(value["max_rounds"], 50);
+
+        goal.set_status(GoalStatus::BudgetLimited, None);
+        let value = serde_json::to_value(HeadlessGoal::from_goal(&goal)).unwrap();
+        assert_eq!(value["status"], "budget limited");
+        assert_eq!(value["status_code"], "budget_limited");
+        assert!(value.get("paused_reason").is_none());
+    }
 }
 
 #[cfg(test)]

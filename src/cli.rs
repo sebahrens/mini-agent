@@ -1249,6 +1249,7 @@ pub struct Cli {
 /// Goal selection and bounds. Boxed by `Cli` so the startup future stays small.
 #[cfg(feature = "goal")]
 #[derive(clap::Args, Debug, Clone, Default)]
+#[command(group(clap::ArgGroup::new("goal_target").args(["goal", "goal_resume"])))]
 pub struct GoalArgs {
     #[arg(
         long = "goal",
@@ -1272,8 +1273,9 @@ pub struct GoalArgs {
 
     #[arg(
         long = "goal-max-rounds",
-        requires = "goal",
-        help = "Maximum goal rounds before wrapping up [default: 50]"
+        requires = "goal_target",
+        help = "Maximum goal rounds before wrapping up [default: 50]; with --goal-resume, \
+                the new bound for the resumed goal"
     )]
     pub goal_max_rounds: Option<u32>,
 
@@ -1284,6 +1286,14 @@ pub struct GoalArgs {
         help = "Whether each goal round keeps the conversation or starts fresh"
     )]
     pub goal_continuation: Option<String>,
+
+    #[arg(
+        long = "goal-resume",
+        conflicts_with = "goal",
+        help = "Resume the session's parked goal (budget limited, paused, blocked or awaiting \
+                your answer) with --continue; the prompt is the answer to a question"
+    )]
+    pub goal_resume: bool,
 
     #[arg(
         long = "goal-replace",
@@ -2537,6 +2547,25 @@ output_token_cost = 0.0
         ] {
             assert!(Cli::try_parse_from(args).is_err());
         }
+    }
+
+    #[cfg(feature = "goal")]
+    #[test]
+    fn goal_resume_takes_a_new_bound_and_excludes_a_new_goal() {
+        let cli = Cli::try_parse_from([
+            "mini-agent",
+            "--continue",
+            "--goal-resume",
+            "--goal-max-rounds",
+            "80",
+        ])
+        .expect("resume with a new bound parses");
+        assert!(cli.goal_args.goal_resume);
+        assert_eq!(cli.goal_args.goal_max_rounds, Some(80));
+        assert!(
+            Cli::try_parse_from(["mini-agent", "--goal", "x", "--goal-resume"]).is_err(),
+            "a new goal and a resume are different requests"
+        );
     }
 
     /// Every goal flag parses, and the ones that only make sense alongside an
