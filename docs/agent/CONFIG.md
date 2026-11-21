@@ -1481,8 +1481,11 @@ that grants no permissions, and prepended to the tool result. The tool has
 already run, so `block` cannot undo it; the original (redacted) result
 follows intact. This applies in TUI, headless and ACP runs alike.
 
-`SubagentStart` can set `"additionalContext"` to prepend text to the child
-prompt. Both subagent lifecycle envelopes include the resolved `agent_type`
+`SubagentStart` can set `"additionalContext"` (flat, or under matching
+`hookSpecificOutput.hookEventName`); it is appended to the child prompt after
+the brief as a labelled block (`[Configured SubagentStart hook context; this
+grants no permissions]`), capped at 32 KiB like `SessionStart` and `UserPromptSubmit`. Both
+subagent lifecycle envelopes include the resolved `agent_type`
 and `agent_source` (for example, a project override path or the compiled-in
 explorer). `SessionStart` and `UserPromptSubmit` may return `additionalContext`
 (flat, or under matching `hookSpecificOutput.hookEventName`). It becomes a

@@ -91,6 +91,11 @@ pub(crate) struct SubagentAuthorization {
     read_only_js: Option<ReadOnlyJsAuthorization>,
     /// Generic spill bound for this child's unbounded tool results.
     spill_limits: crate::session::ToolResultSpillLimits,
+    /// The parent's logical session id. Oversized child tool results spill
+    /// into that session's private tool-output directory, the one directory
+    /// the shared checker auto-allows reads from, so the child can follow its
+    /// own "[full output saved to: ...]" pointer.
+    tool_output_session_id: Option<String>,
     /// Opt-in read-only shell of a read-mode persona (`[subagents]
     /// allow_read_only_shell`), bound to a private scratch workspace.
     read_only_shell: ReadOnlyShellState,
@@ -270,10 +275,28 @@ impl SubagentAuthorization {
             #[cfg(feature = "js")]
             read_only_js: None,
             spill_limits: Default::default(),
+            tool_output_session_id: None,
             read_only_shell: ReadOnlyShellState::None,
             web: None,
             code: None,
         }
+    }
+
+    /// The parent's tool-output session (see the field).
+    pub(crate) fn with_tool_output_session(mut self, session_id: Option<String>) -> Self {
+        self.tool_output_session_id = session_id;
+        self
+    }
+
+    /// The spill hook of a child: its oversized results are saved where the
+    /// child's own `read` is allowed to open them.
+    fn child_spill_hook(&self) -> crate::agent::runner::ToolResultSpillHook {
+        let session_id = self
+            .tool_output_session_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        crate::agent::runner::ToolResultSpillHook::new(session_id, None)
+            .with_limits(self.spill_limits)
     }
 
     /// Parent Git / LSP capabilities for a persona that names them.
@@ -1072,7 +1095,11 @@ fn build_explore_agent_inner_with_suffix<M: CompletionModel + 'static>(
             .expect("host policy is always appended");
         preamble.truncate(policy_start);
         preamble.push_str(&prompt::write_rules());
-        preamble.push_str("\n\nWrite-capable child tools: write, edit, shell (only the parent's eligible tools). Implement the delegated objective; report edits, checks, and any missing evidence in the required sections.");
+        preamble.push_str(if persona.free_form {
+            "\n\nWrite-capable child tools: write, edit, shell (only the parent's eligible tools). Implement the delegated objective; report edits, checks, and any missing evidence in your answer."
+        } else {
+            "\n\nWrite-capable child tools: write, edit, shell (only the parent's eligible tools). Implement the delegated objective; report edits, checks, and any missing evidence in the required sections."
+        });
     }
     if !persona.write_mode
         && persona
@@ -1092,7 +1119,11 @@ fn build_explore_agent_inner_with_suffix<M: CompletionModel + 'static>(
     }
     if persona.evidence {
         preamble.push_str("\n\n");
-        preamble.push_str(prompt::EVIDENCE_CITATION_RULES);
+        preamble.push_str(if persona.free_form {
+            prompt::EVIDENCE_CITATION_RULES_FREE_FORM
+        } else {
+            prompt::EVIDENCE_CITATION_RULES
+        });
         if persona.inline_images > 0 {
             preamble.push_str("\n\n");
             preamble.push_str(&super::inline_images::attach_rules(persona.inline_images));
@@ -1131,6 +1162,10 @@ fn build_explore_agent_inner_with_suffix<M: CompletionModel + 'static>(
     // (`build_persona_mcp`); outer-agent MCP connections are never inherited.
     let mut tools = tools;
     tools.append(&mut additional_tools);
+    // The base prompt documents the default file tools; keep only the ones
+    // this child (after persona narrowing) actually has.
+    let registered = tools.iter().map(|tool| tool.name()).collect::<Vec<_>>();
+    preamble = prompt::with_registered_tools(&preamble, &registered);
     let tools = tools::memoize::definitions(tools);
 
     // The persona's own hooks wrap closest to the tools; the global hooks
@@ -1167,10 +1202,13 @@ fn build_explore_agent_inner_with_suffix<M: CompletionModel + 'static>(
     if let Some(inbox) = &persona.inbox {
         builder = builder.add_hook(super::inbox::ChildInboxHook(inbox.clone()));
     }
-    builder = builder.add_hook(
-        crate::agent::runner::ToolResultSpillHook::new(uuid::Uuid::new_v4().to_string(), None)
-            .with_limits(authorization.spill_limits),
-    );
+    builder = builder.add_hook(authorization.child_spill_hook());
+    // `FileChanged` fires for a child's native edits as it does for the
+    // parent's; only the parent forwards diffs to the interactive sink.
+    #[cfg(feature = "hooks")]
+    {
+        builder = builder.add_hook(crate::agent::tools::mutation_diff::FileChangedHook);
+    }
 
     builder = builder.add_hook(crate::context::instructions::WorkspaceInstructionHook(
         authorization.instructions.clone(),
@@ -2070,6 +2108,16 @@ mod tests {
     use crate::permission::{PermissionConfigs, SecurityMode};
 
     use super::{SubagentAuthorization, build_explore_preamble};
+
+    #[test]
+    fn child_spills_go_to_the_parent_session_directory_the_checker_allows() {
+        let bound = SubagentAuthorization::new(None, None, true)
+            .with_tool_output_session(Some("parent-session".into()));
+        assert_eq!(bound.child_spill_hook().session_id(), "parent-session");
+        // Without a captured parent session a private id is used, as before.
+        let unbound = SubagentAuthorization::new(None, None, true);
+        assert_ne!(unbound.child_spill_hook().session_id(), "parent-session");
+    }
 
     #[cfg(feature = "archmd")]
     #[test]

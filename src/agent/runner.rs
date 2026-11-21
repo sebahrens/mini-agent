@@ -92,6 +92,11 @@ impl ToolResultSpillHook {
     }
 
     #[cfg(test)]
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    #[cfg(test)]
     pub(crate) fn limits(&self) -> crate::session::ToolResultSpillLimits {
         self.limits
     }

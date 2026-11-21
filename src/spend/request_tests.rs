@@ -527,7 +527,10 @@ async fn usd_budget_native_git_proposal_uses_captured_receipt_and_blocks_next_re
             .contains(super::run::BUDGET_STOP)
     );
     assert_eq!(wire.calls.load(Ordering::Acquire), 1);
-    assert_eq!(wire.bodies.lock().unwrap()[0]["max_tokens"], 1024);
+    assert_eq!(
+        wire.bodies.lock().unwrap()[0]["max_tokens"],
+        crate::provider::GIT_PROPOSAL_MAX_TOKENS
+    );
     assert_eq!(ledger.summary().unwrap().all_time.records, 1);
     let row: serde_json::Value = serde_json::from_str(
         std::fs::read_to_string(root.path().join("usage.jsonl"))

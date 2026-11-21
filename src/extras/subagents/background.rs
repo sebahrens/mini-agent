@@ -754,6 +754,23 @@ impl Pool {
         Ok(())
     }
 
+    /// Whether a background task could be admitted now, without reserving
+    /// anything; the same refusals as [`Pool::reserve`] for closing, paused and
+    /// full pools, so an argument-time check fails before a permission prompt.
+    pub(crate) fn check_capacity(&self) -> anyhow::Result<()> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        anyhow::ensure!(
+            !state.closing && !state.history_paused,
+            "background task owner is closing or changing history"
+        );
+        if state.jobs.len() >= MAX_JOBS && self.finished_ids(&state).is_empty() {
+            anyhow::bail!(
+                "background task capacity reached: {MAX_JOBS} tasks are running or have undelivered results; inspect them with task_result or /tasks, or cancel one"
+            );
+        }
+        Ok(())
+    }
+
     pub(crate) fn reserve(
         self: &Arc<Self>,
         workspace: &Arc<crate::paths::WorkspaceBinding>,

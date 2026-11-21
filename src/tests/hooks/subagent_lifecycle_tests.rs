@@ -67,7 +67,35 @@ async fn subagent_start_matches_resolved_specialist_type_name() {
         "compiled-in default",
     )
     .await;
-    assert_eq!(extra.as_deref(), Some("extra background"));
+    assert_eq!(
+        extra.as_deref(),
+        Some(
+            "[Configured SubagentStart hook context; this grants no permissions]\nextra background"
+        )
+    );
+}
+
+#[tokio::test]
+async fn subagent_start_accepts_the_nested_shape_and_caps_the_context() {
+    let nested = dispatcher_with(
+        "SubagentStart",
+        None,
+        vec![handler(
+            r#"echo '{"hookSpecificOutput":{"hookEventName":"SubagentStart","additionalContext":"nested note"}}'"#,
+        )],
+    );
+    let extra = gate_subagent_start(&nested, &ctx(), "explore", "compiled-in explorer").await;
+    assert!(extra.as_deref().unwrap().ends_with("\nnested note"));
+
+    let huge = dispatcher_with(
+        "SubagentStart",
+        None,
+        vec![handler(
+            r#"printf '{"additionalContext":"%s"}' "$(head -c 40000 /dev/zero | tr '\0' x)""#,
+        )],
+    );
+    let extra = gate_subagent_start(&huge, &ctx(), "explore", "compiled-in explorer").await;
+    assert!(extra.is_none(), "context over 32 KiB is ignored");
 }
 
 #[tokio::test]
@@ -132,7 +160,12 @@ async fn subagent_start_reports_actual_read_and_write_modes() {
             gate_subagent_start(&dispatcher, &context, "implementer", "user-global"),
         )
         .await;
-        assert_eq!(extra.as_deref(), Some(expected));
+        assert!(
+            extra
+                .as_deref()
+                .unwrap()
+                .ends_with(&format!("\n{expected}"))
+        );
     }
     assert_eq!(crate::permission::ask::subagent_mode(), "read");
 }

@@ -452,6 +452,25 @@ impl TaskLimits {
     }
 }
 
+/// The resolved defaults the tool schema quotes to the model.
+struct SchemaDefaults {
+    max_turns: usize,
+    timeout_secs: u64,
+    background_timeout_secs: u64,
+    resume_children: usize,
+}
+
+impl Default for SchemaDefaults {
+    fn default() -> Self {
+        Self {
+            max_turns: 20,
+            timeout_secs: DEFAULT_CALL_TIMEOUT.as_secs(),
+            background_timeout_secs: DEFAULT_BACKGROUND_TIMEOUT.as_secs(),
+            resume_children: super::resume::MAX_RESUMABLE_CHILDREN,
+        }
+    }
+}
+
 /// The configured ceilings for per-call and persona run settings.
 fn run_ceilings(config: &crate::config::Config) -> (usize, u64) {
     let policy = config.subagents.as_ref();
@@ -518,6 +537,31 @@ fn apply_run_settings(
     Ok(())
 }
 
+/// The checks on per-call options that need neither the persona nor the
+/// permission answer: the isolation enum, `base_ref` syntax and the
+/// call-level `max_turns`/`timeout_secs` bounds.
+fn validate_call_options(
+    options: &TaskCallOptions,
+    config: &crate::config::Config,
+) -> Result<(), ToolError> {
+    match options.isolation.as_deref() {
+        None | Some("none") | Some("worktree") => {}
+        Some(other) => {
+            return Err(ToolError::Msg(format!(
+                "task: isolation must be \"worktree\" or \"none\", got {other:?}"
+            )));
+        }
+    }
+    if let Some(base) = options.base_ref.as_deref() {
+        super::isolation::validate_base_ref(base).map_err(ToolError::Msg)?;
+    }
+    // Reuses the ceiling checks with no persona, which only validates the
+    // call's own values.
+    let mut turns = 1;
+    let mut limits = TaskLimits::from_config(config);
+    apply_run_settings(options, None, config, &mut turns, &mut limits)
+}
+
 /// A persona's tool narrowing with the opt-in read-only shell added, when it
 /// is eligible (the parsed narrowing of a read persona never contains it).
 fn with_read_only_shell_tool(
@@ -571,6 +615,16 @@ fn validate_prompts(prompts: &[String], limits: TaskLimits) -> Result<(), ToolEr
 }
 
 fn prepare_task_prompts(args: &TaskArgs, limits: TaskLimits) -> Result<Vec<String>, ToolError> {
+    prepare_task_prompts_for(args, limits, false)
+}
+
+/// As [`prepare_task_prompts`], with the structured-brief trailer worded for
+/// a persona whose report is free-form (`contract: none`).
+fn prepare_task_prompts_for(
+    args: &TaskArgs,
+    limits: TaskLimits,
+    free_form: bool,
+) -> Result<Vec<String>, ToolError> {
     let Some(briefs) = args.briefs.as_ref() else {
         validate_prompts(&args.prompts, limits)?;
         return Ok(args.prompts.clone());
@@ -589,11 +643,19 @@ fn prepare_task_prompts(args: &TaskArgs, limits: TaskLimits) -> Result<Vec<Strin
     briefs
         .iter()
         .enumerate()
-        .map(|(index, brief)| render_task_brief(index, brief))
+        .map(|(index, brief)| render_task_brief_for(index, brief, free_form))
         .collect()
 }
 
 fn render_task_brief(index: usize, brief: &TaskBrief) -> Result<String, ToolError> {
+    render_task_brief_for(index, brief, false)
+}
+
+fn render_task_brief_for(
+    index: usize,
+    brief: &TaskBrief,
+    free_form: bool,
+) -> Result<String, ToolError> {
     if brief.objective.trim().is_empty() {
         return Err(ToolError::Msg(format!(
             "task: brief {} objective must not be empty",
@@ -648,11 +710,16 @@ fn render_task_brief(index: usize, brief: &TaskBrief) -> Result<String, ToolErro
          ### Files\n{}\n\n\
          ### Constraints\n{}\n\n\
          ### Expected content\n{}\n\n\
-         Place expected content inside the host-required Findings, Unverified, and Coverage sections; do not replace those headings.",
+         {}",
         json(brief.objective.trim()),
         json_list(&brief.files),
         json_list(&brief.constraints),
         json_list(&brief.expected_sections),
+        if free_form {
+            "Cover the expected content in your plain-text answer."
+        } else {
+            "Place expected content inside the host-required Findings, Unverified, and Coverage sections; do not replace those headings."
+        },
     );
     if rendered.len() > MAX_BRIEF_BYTES {
         return Err(ToolError::Msg(format!(
@@ -1322,16 +1389,34 @@ editing in a known location, grepping for a literal you will act on immediately.
     }
 
     fn parameters(&self) -> serde_json::Value {
-        let (max_prompts, (turns_ceiling, timeout_ceiling)) = with_config(|cfg| {
+        let (max_prompts, (turns_ceiling, timeout_ceiling), defaults) = with_config(|cfg| {
             (
                 cfg.config.resolve_task_max_prompts(),
                 run_ceilings(&cfg.config),
+                SchemaDefaults {
+                    max_turns: cfg.max_turns,
+                    timeout_secs: cfg.config.resolve_task_timeout_secs(),
+                    background_timeout_secs: cfg
+                        .config
+                        .subagents
+                        .as_ref()
+                        .and_then(|policy| policy.task_background_timeout_secs)
+                        .unwrap_or(DEFAULT_BACKGROUND_TIMEOUT.as_secs()),
+                    resume_children: super::resume::ResumeLimits::from_config(&cfg.config).children,
+                },
             )
         })
         .unwrap_or((
             DEFAULT_MAX_PROMPTS,
             (DEFAULT_MAX_TURNS_CEILING, DEFAULT_TIMEOUT_CEILING_SECS),
+            SchemaDefaults::default(),
         ));
+        let SchemaDefaults {
+            max_turns: default_turns,
+            timeout_secs: default_timeout,
+            background_timeout_secs: default_background_timeout,
+            resume_children: default_resume_children,
+        } = defaults;
         let (specialist_entries, listing_note) =
             crate::context::agents::available_schema_entries_for_workspace(
                 self.workspace.as_deref(),
@@ -1391,13 +1476,13 @@ editing in a known location, grepping for a literal you will act on immediately.
                     "type": "integer",
                     "minimum": 1,
                     "maximum": turns_ceiling,
-                    "description": format!("Optional model turns per child for this call (default: the persona's max_turns, else task_max_turns, normally 20). Values above the configured ceiling ({turns_ceiling}, [subagents] task_max_turns_ceiling) are rejected.")
+                    "description": format!("Optional model turns per child for this call (default: the persona's max_turns, else task_max_turns, currently {default_turns}). Values above the configured ceiling ({turns_ceiling}, [subagents] task_max_turns_ceiling) are rejected.")
                 },
                 "timeout_secs": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": timeout_ceiling,
-                    "description": format!("Optional whole-call deadline in seconds (default: the persona's timeout_secs, else task_timeout_secs 300 in the foreground or task_background_timeout_secs 3600 in the background). Values above the configured ceiling ({timeout_ceiling}, [subagents] task_timeout_ceiling_secs) are rejected.")
+                    "description": format!("Optional whole-call deadline in seconds (default: the persona's timeout_secs, else task_timeout_secs {default_timeout} in the foreground or task_background_timeout_secs {default_background_timeout} in the background). Values above the configured ceiling ({timeout_ceiling}, [subagents] task_timeout_ceiling_secs) are rejected.")
                 },
                 "isolation": {
                     "type": "string",
@@ -1414,7 +1499,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                 },
                 "resume": {
                     "type": "string",
-                    "description": "Optional child id printed after an earlier child's report ([child id: …]). Continues that child's conversation, tool results included, with the single prompt as a follow-up; same agent_type, permissions and budgets. Ids expire after the most recent children (default 16, [subagents] task_resume_max_children) or when a conversation exceeds [subagents] task_resume_max_bytes; a session's ids are restored by --continue/--resume subject to those count/byte limits, but not by a fresh session."
+                    "description": format!("Optional child id printed after an earlier child's report ([child id: …]). Continues that child's conversation, tool results included, with the single prompt as a follow-up; same agent_type, permissions and budgets. Ids expire after the most recent children (currently {default_resume_children}, [subagents] task_resume_max_children) or when a conversation exceeds [subagents] task_resume_max_bytes; a session's ids are restored by --continue/--resume subject to those count/byte limits, but not by a fresh session.")
                 },
                 "run_in_background": {
                     "type": "boolean",
@@ -1516,6 +1601,17 @@ editing in a known location, grepping for a literal you will act on immediately.
         let permission_source = agent_type.as_deref().map(|agent_type| {
             crate::context::agents::source_hint_for_workspace(agent_type, self.workspace.as_deref())
         });
+        // Argument-only mistakes are reported before any permission prompt, so
+        // a corrected retry does not ask the user to approve the same
+        // delegation twice.
+        validate_call_options(&args.options, &config)?;
+        if args.run_in_background
+            && let Some(pool) =
+                crate::spend::run::Run::current().and_then(|run| run.background_pool())
+        {
+            pool.check_capacity()
+                .map_err(|error| ToolError::Msg(error.to_string()))?;
+        }
         let delegation_input = permission_input(
             &prompts,
             agent_type.as_deref(),
@@ -1549,6 +1645,13 @@ editing in a known location, grepping for a literal you will act on immediately.
             args.run_in_background = true;
             limits = limits.for_background(&config)?;
             prompts = prepare_task_prompts(&args, limits)?;
+        }
+        if specialization
+            .as_ref()
+            .is_some_and(|persona| persona.run.free_form)
+            && args.briefs.is_some()
+        {
+            prompts = prepare_task_prompts_for(&args, limits, true)?;
         }
         let write_mode = specialization
             .as_ref()
@@ -1812,6 +1915,7 @@ editing in a known location, grepping for a literal you will act on immediately.
         )
         .with_workspace_binding(self.workspace.clone())
         .with_workspace_instructions(self.instructions.clone())
+        .with_tool_output_session(self.parent_web.as_ref().map(|web| web.session_id.clone()))
         .with_code_tools(self.parent_code.clone())
         .with_write_tools(if write_mode {
             self.write_tools.clone()
@@ -2003,7 +2107,9 @@ editing in a known location, grepping for a literal you will act on immediately.
                 )
                 .await
                 {
-                    Some(extra) => format!("{extra}\n\n{prompt_text}"),
+                    // Labelled, capped hook text goes after the brief so the
+                    // child cannot mistake it for the delegated objective.
+                    Some(extra) => format!("{prompt_text}\n\n{extra}"),
                     None => prompt_text,
                 };
                 #[cfg(not(feature = "hooks"))]
@@ -2395,6 +2501,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                         withheld,
                         &selection.listed,
                         &selection.notes,
+                        report_policy.free_form,
                     ),
                     _ => None,
                 };
@@ -2588,11 +2695,25 @@ fn turn_budget_header(turns: u32, tool_calls: u32, written_up: bool) -> String {
 }
 
 /// Final prompt for a child out of turns: report from the conversation so far.
-fn turn_budget_writeup_prompt(turns: u32, tool_calls: u32, max_report_bytes: usize) -> String {
-    format!(
+fn turn_budget_writeup_prompt(
+    turns: u32,
+    tool_calls: u32,
+    max_report_bytes: usize,
+    free_form: bool,
+) -> String {
+    let lead = format!(
         "Your turn budget is exhausted after {turns} model turns and {tool_calls} tool calls. \
          You cannot call tools any more and must not try. Using only what your earlier tool \
-         results in this conversation established, write your final report now, in exactly \
+         results in this conversation established, write your final report now"
+    );
+    if free_form {
+        return format!(
+            "{lead}, in plain text. Lead with caveats and missing evidence, and say what you did \
+             not check.\n\nKeep the report under {max_report_bytes} bytes."
+        );
+    }
+    format!(
+        "{lead}, in exactly \
          these sections in this order:\n\n\
          ## Findings\n\
          - [confidence: high|medium|low] Evidence-backed finding citing the files or results \
@@ -2706,7 +2827,12 @@ where
         if !run.history.is_empty() && !budget_exhausted() {
             let writeup = continue_tool_free(
                 Continuation::WriteUp,
-                turn_budget_writeup_prompt(run.turns, run.tool_calls, max_report_bytes),
+                turn_budget_writeup_prompt(
+                    run.turns,
+                    run.tool_calls,
+                    max_report_bytes,
+                    policy.free_form,
+                ),
                 run.history.clone(),
             )
             .await;
@@ -3379,20 +3505,28 @@ fn render_evidence_section(
     withheld: bool,
     attached: &std::collections::BTreeSet<usize>,
     inline_notes: &[String],
+    free_form: bool,
 ) -> Option<String> {
     use super::evidence::Retention;
     let total = stored.metas.len();
     if total == 0 && stored.unrecorded == 0 {
         return None;
     }
-    let scan = scan_report(report, Some(total));
+    // A free-form report has no Findings section, so its citations are
+    // collected from the whole text.
+    let (cited, uncited_high) = if free_form {
+        (free_form_citations(report, total), 0)
+    } else {
+        let scan = scan_report(report, Some(total));
+        (scan.cited, scan.uncited_high)
+    };
     let rows: Vec<_> = if withheld {
         stored.metas.iter().take(WITHHELD_EVIDENCE_ROWS).collect()
     } else {
         stored
             .metas
             .iter()
-            .filter(|meta| scan.cited.contains(&meta.number) || attached.contains(&meta.number))
+            .filter(|meta| cited.contains(&meta.number) || attached.contains(&meta.number))
             .collect()
     };
     let mut section = format!(
@@ -3445,10 +3579,9 @@ fn render_evidence_section(
             stored.unrecorded
         ));
     }
-    if !withheld && scan.uncited_high > 0 {
+    if !withheld && uncited_high > 0 {
         section.push_str(&format!(
-            "Note: {} high-confidence finding(s) cite no evidence.\n",
-            scan.uncited_high
+            "Note: {uncited_high} high-confidence finding(s) cite no evidence.\n"
         ));
     }
     if !inline_notes.is_empty() {
@@ -3904,6 +4037,28 @@ fn line_citations(line: &str) -> Result<Vec<usize>, ()> {
         rest = end + 1;
     }
     Ok(cited)
+}
+
+/// Valid evidence numbers cited anywhere in a free-form report (outside code
+/// fences); malformed or out-of-range tags are ignored, since a free-form
+/// report is not validated.
+fn free_form_citations(report: &str, total: usize) -> std::collections::BTreeSet<usize> {
+    let mut cited = std::collections::BTreeSet::new();
+    let mut in_fence = false;
+    for line in report.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        if let Ok(numbers) = line_citations(line) {
+            cited.extend(numbers.into_iter().filter(|number| *number <= total));
+        }
+    }
+    cited
 }
 
 fn scan_report(response: &str, evidence_ids: Option<usize>) -> ReportScan {
@@ -4462,7 +4617,7 @@ fn report_withheld_by_host(response: &str, violations: &[&'static str]) -> bool 
 /// not normalize is replaced by a fixed-size repair that withholds the raw
 /// child text, so the repair never grows with (or relays) a malformed or
 /// unverifiable response; the user can still read the withheld text, marked
-/// unverified, with `/tasks result <id>`.
+/// unverified, with `/tasks result <id>` (the model has no tool for it).
 fn host_repaired_report(response: &str, violations: &[&'static str]) -> String {
     if let Some(normalized) = normalized_repair(response, violations) {
         return normalized;
@@ -4476,7 +4631,8 @@ fn host_repaired_report(response: &str, violations: &[&'static str]) -> String {
          ## Coverage\n\
          - Covered: Not reported in the required structure.\n\
          - Skipped: {}.\n\n\
-         Raw child text stored for the user: /tasks result <id>\n",
+         The raw child text is kept for the user only and is not available to you; \
+         re-run the task with a narrower brief if you need its content.\n",
         violations.join("; ")
     )
 }
@@ -5601,6 +5757,53 @@ fn main() {
     }
 
     #[test]
+    fn task_schema_quotes_the_configured_defaults() {
+        let mut config = crate::config::Config::default();
+        config.task_timeout_secs = Some(900);
+        config.subagents = Some(crate::config::types::SubagentPolicy {
+            task_background_timeout_secs: Some(7200),
+            task_resume_max_children: Some(5),
+            ..Default::default()
+        });
+        let client = crate::provider::create_client(
+            "openrouter",
+            Some("unused-local-test-key"),
+            config.custom_providers_map(),
+            None,
+        )
+        .unwrap();
+        let configured = crate::extras::subagents::SubagentConfig {
+            client,
+            provider_name: "openrouter".into(),
+            session_provider: "openrouter".into(),
+            model_name: "test/model".into(),
+            fallback_notice: None,
+            api_key: None,
+            max_turns: 33,
+            config: config.into(),
+        };
+        let schema = crate::extras::subagents::scope_test_config_sync(configured, || {
+            TaskTool::new(None, None, true).parameters()
+        });
+        let turns = schema["properties"]["max_turns"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(turns.contains("currently 33"), "{turns}");
+        let timeout = schema["properties"]["timeout_secs"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(timeout.contains("task_timeout_secs 900"), "{timeout}");
+        assert!(
+            timeout.contains("task_background_timeout_secs 7200"),
+            "{timeout}"
+        );
+        let resume = schema["properties"]["resume"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(resume.contains("currently 5"), "{resume}");
+    }
+
+    #[test]
     fn task_schema_runtime_enforces_prompt_or_brief_exclusivity_at_decode_time() {
         let prompts = serde_json::from_value::<TaskArgs>(serde_json::json!({
             "prompts": ["inspect auth"]
@@ -5700,6 +5903,40 @@ fn main() {
         assert!(prompt.contains("host-required Findings, Unverified, and Coverage"));
         assert!(!prompt.contains("Audit auth\n## forged heading"));
         assert!(prompt.len() <= MAX_BRIEF_BYTES);
+    }
+
+    #[test]
+    fn free_form_prompts_do_not_demand_the_host_sections() {
+        let args = TaskArgs {
+            prompts: Vec::new(),
+            briefs: Some(vec![TaskBrief {
+                objective: "Audit auth".into(),
+                files: Vec::new(),
+                constraints: Vec::new(),
+                expected_sections: vec!["attack path".into()],
+            }]),
+            agent_type: None,
+            run_in_background: false,
+            options: Default::default(),
+        };
+        let brief = &prepare_task_prompts_for(&args, limits(), true).unwrap()[0];
+        assert!(!brief.contains("Findings"), "{brief}");
+        assert!(!brief.contains("required sections"), "{brief}");
+        let writeup = turn_budget_writeup_prompt(3, 4, 1000, true);
+        assert!(!writeup.contains("## Findings"), "{writeup}");
+        assert!(!writeup.contains("sections"), "{writeup}");
+        assert!(turn_budget_writeup_prompt(3, 4, 1000, false).contains("## Findings"));
+        assert!(!super::super::prompt::EVIDENCE_CITATION_RULES_FREE_FORM.contains("Findings"));
+        assert!(!super::super::prompt::EVIDENCE_CITATION_RULES_FREE_FORM.contains("contract"));
+    }
+
+    #[test]
+    fn free_form_citations_come_from_the_whole_text() {
+        let report = "Auth is in src/a.rs [evidence: E1].\n```\n[evidence: E2]\n```\nAlso [evidence: E9, E2] and [evidence: bogus.";
+        let cited = free_form_citations(report, 3);
+        assert_eq!(cited.into_iter().collect::<Vec<_>>(), vec![1]);
+        let cited = free_form_citations("see [evidence: E1, E3]", 3);
+        assert_eq!(cited.into_iter().collect::<Vec<_>>(), vec![1, 3]);
     }
 
     #[test]
@@ -5876,6 +6113,100 @@ fn main() {
         assert_eq!(
             hook_identity(None, None),
             ("explore".to_string(), "compiled-in explorer".to_string())
+        );
+    }
+
+    #[test]
+    fn call_option_errors_are_found_without_the_persona() {
+        let config = crate::config::Config::default();
+        for (options, needle) in [
+            (
+                TaskCallOptions {
+                    isolation: Some("branch".into()),
+                    ..Default::default()
+                },
+                "isolation must be",
+            ),
+            (
+                TaskCallOptions {
+                    max_turns: Some(100_000),
+                    ..Default::default()
+                },
+                "exceeds the ceiling",
+            ),
+            (
+                TaskCallOptions {
+                    timeout_secs: Some(0),
+                    ..Default::default()
+                },
+                "at least 1",
+            ),
+        ] {
+            let error = validate_call_options(&options, &config)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(needle), "{error}");
+        }
+        validate_call_options(&TaskCallOptions::default(), &config).unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_isolation_is_rejected_before_any_permission_prompt() {
+        let config = crate::config::Config::default();
+        let client = crate::provider::create_client(
+            "openrouter",
+            Some("unused-local-test-key"),
+            config.custom_providers_map(),
+            None,
+        )
+        .unwrap();
+        let configured = crate::extras::subagents::SubagentConfig {
+            client,
+            provider_name: "openrouter".into(),
+            session_provider: "openrouter".into(),
+            model_name: "test/model".into(),
+            fallback_notice: None,
+            api_key: None,
+            max_turns: 2,
+            config: config.into(),
+        };
+        let checker = crate::permission::checker::PermissionChecker::new(
+            &crate::permission::PermissionConfigs::from(crate::permission::PermissionConfig {
+                default: Some(crate::permission::Action::Ask),
+                ..Default::default()
+            }),
+            crate::permission::SecurityMode::Standard,
+            Some(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .canonicalize()
+                    .unwrap(),
+            ),
+            Some(vec!["guarded".into(), "standard".into(), "yolo".into()]),
+        )
+        .unwrap();
+        let permission: Option<PermCheck> = Some(Arc::new(std::sync::Mutex::new(checker)));
+        let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(4);
+        let task = TaskTool::new(permission, Some(ask_tx), true);
+        let bad: TaskArgs =
+            serde_json::from_value(serde_json::json!({"prompts": ["look"], "isolation": "branch"}))
+                .unwrap();
+        let error = crate::extras::subagents::scope_test_config(configured.clone(), task.call(bad))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("isolation must be"), "{error}");
+        assert!(ask_rx.try_recv().is_err(), "the bad call must not prompt");
+        // A valid call does reach the permission prompt (and then waits).
+        let good: TaskArgs =
+            serde_json::from_value(serde_json::json!({"prompts": ["look"]})).unwrap();
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(300),
+            crate::extras::subagents::scope_test_config(configured, task.call(good)),
+        )
+        .await;
+        assert!(
+            ask_rx.try_recv().is_ok(),
+            "a valid call asks once: {outcome:?}"
         );
     }
 
@@ -8910,7 +9241,9 @@ mod child_continuation_tests {
             !parent_text.contains("RAW_CHILD_TEXT"),
             "raw text must not reach the parent"
         );
-        assert!(parent_text.contains("/tasks result"));
+        assert!(parent_text.contains("not available to you"));
+        assert!(!parent_text.contains("/tasks result"));
+        assert!(!parent_text.contains("<id>"));
     }
 
     #[tokio::test]
@@ -9291,7 +9624,8 @@ mod evidence_contract_tests {
     async fn evidence_section_lists_only_cited_metadata_and_never_content() {
         let stored = stored().await;
         let section =
-            render_evidence_section(&stored, REPORT, false, &Default::default(), &[]).unwrap();
+            render_evidence_section(&stored, REPORT, false, &Default::default(), &[], false)
+                .unwrap();
         assert!(section.starts_with("## Evidence\n"), "{section}");
         assert!(section.contains("\"task_id\":\"task-xyz\""));
         assert!(section.contains("| E1 | read | src/a.rs |"), "{section}");
@@ -9303,7 +9637,8 @@ mod evidence_contract_tests {
 
         // A withheld report still offers the index, with sanitized targets.
         let withheld =
-            render_evidence_section(&stored, "replaced", true, &Default::default(), &[]).unwrap();
+            render_evidence_section(&stored, "replaced", true, &Default::default(), &[], false)
+                .unwrap();
         assert!(withheld.contains("report was withheld"));
         assert!(
             withheld.contains("| E3 | read | notes...x.. |"),
@@ -9317,7 +9652,8 @@ mod evidence_contract_tests {
     async fn the_evidence_section_follows_the_closing_quote_fence() {
         let stored = stored().await;
         let suffix =
-            render_evidence_section(&stored, REPORT, false, &Default::default(), &[]).unwrap();
+            render_evidence_section(&stored, REPORT, false, &Default::default(), &[], false)
+                .unwrap();
         let expected_suffix = suffix.clone();
         let executor: TaskExecutor = Arc::new(move |_, _| {
             let suffix = suffix.clone();
