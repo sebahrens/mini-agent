@@ -11,6 +11,8 @@
 //! [`OutputTruncation`] to emit a visible notice and continue the turn with an
 //! explicit instruction, at most [`MAX_TRUNCATION_CONTINUATIONS`] times.
 
+use rig::completion::StopReason;
+
 /// Automatic continuations after truncation within one user turn. Beyond
 /// this the notice is still shown, and the turn ends (or fails for a cut-off
 /// tool call) instead of looping on a model that cannot fit its output.
@@ -23,12 +25,18 @@ pub(crate) enum TruncationDecision {
     Continue { notice: String, instruction: String },
     /// Show `notice`; the continuation budget is spent.
     Exhausted { notice: String },
+    /// Show `notice` only: the provider ended the response with a stop reason
+    /// that is neither success nor recoverable here (a refusal, a content
+    /// filter, a context-window stop).
+    Notice { notice: String },
 }
 
 impl TruncationDecision {
     pub(crate) fn notice(&self) -> &str {
         match self {
-            Self::Continue { notice, .. } | Self::Exhausted { notice } => notice,
+            Self::Continue { notice, .. }
+            | Self::Exhausted { notice }
+            | Self::Notice { notice } => notice,
         }
     }
 }
@@ -38,6 +46,7 @@ impl TruncationDecision {
 pub(crate) struct OutputTruncation {
     last_call_truncated: bool,
     last_output_tokens: u64,
+    last_stop_reason: Option<StopReason>,
     continuations: u32,
 }
 
@@ -46,12 +55,14 @@ impl OutputTruncation {
     pub(crate) fn observe_call(&mut self, call: &rig::agent::CompletionCall) {
         self.last_call_truncated = call.output_truncated;
         self.last_output_tokens = call.usage.output_tokens;
+        self.last_stop_reason = call.stop_reason;
     }
 
     /// The terminal answer is complete unless the last call was truncated.
     pub(crate) fn final_response(&mut self) -> Option<TruncationDecision> {
+        let stop_reason = self.last_stop_reason.take();
         if !std::mem::take(&mut self.last_call_truncated) {
-            return None;
+            return self.stop_reason_decision(stop_reason?);
         }
         let tokens = self.tokens_phrase();
         let notice =
@@ -65,6 +76,39 @@ impl OutputTruncation {
                  document, write it in smaller pieces."
             ),
         ))
+    }
+
+    /// A provider stop reason other than a normal end or an output-limit cut:
+    /// a refusal and a content filter get one visible notice, `pause_turn`
+    /// (a hosted tool still running) continues the turn, and a context-window
+    /// stop is reported. (mini-agent-nvnkx.35)
+    fn stop_reason_decision(&mut self, reason: StopReason) -> Option<TruncationDecision> {
+        match reason {
+            StopReason::Refusal | StopReason::ContentFilter => Some(TruncationDecision::Notice {
+                notice: format!(
+                    "the model declined to answer (stop_reason: {})",
+                    reason.as_str()
+                ),
+            }),
+            StopReason::ContextWindow => Some(TruncationDecision::Notice {
+                notice: format!(
+                    "the response was cut off because the context window was exceeded \
+                     (stop_reason: {}); run /compact and retry",
+                    reason.as_str()
+                ),
+            }),
+            StopReason::PauseTurn => Some(self.decide(
+                "the provider paused the turn while a hosted tool was still running (stop_reason: pause_turn)"
+                    .to_string(),
+                "[pause_turn] Your previous turn was paused while a hosted tool was still \
+                 running. Continue exactly where it stopped."
+                    .to_string(),
+            )),
+            StopReason::EndTurn
+            | StopReason::ToolUse
+            | StopReason::MaxTokens
+            | StopReason::Other => None,
+        }
     }
 
     /// A stream error that reports a cut-off tool call, or `None` for any
@@ -505,5 +549,41 @@ mod tests {
             decision.notice()
         );
         server.await.unwrap();
+    }
+
+    #[test]
+    fn refusal_and_content_filter_get_a_notice_without_continuing() {
+        for reason in [StopReason::Refusal, StopReason::ContentFilter] {
+            let mut state = OutputTruncation::default();
+            state.observe_call(&call(false, 3).with_stop_reason(Some(reason)));
+            let decision = state.final_response().expect("a visible notice");
+            assert!(matches!(decision, TruncationDecision::Notice { .. }));
+            assert!(decision.notice().contains("declined to answer"));
+            assert!(decision.notice().contains(reason.as_str()));
+            // One notice per call.
+            assert_eq!(state.final_response(), None);
+        }
+    }
+
+    #[test]
+    fn pause_turn_continues_and_normal_stops_do_not() {
+        let mut state = OutputTruncation::default();
+        state.observe_call(&call(false, 3).with_stop_reason(Some(StopReason::PauseTurn)));
+        assert!(matches!(
+            state.final_response(),
+            Some(TruncationDecision::Continue { .. })
+        ));
+        for reason in [StopReason::EndTurn, StopReason::ToolUse, StopReason::Other] {
+            state.observe_call(&call(false, 3).with_stop_reason(Some(reason)));
+            assert_eq!(state.final_response(), None);
+        }
+    }
+
+    #[test]
+    fn context_window_stop_reports_a_notice() {
+        let mut state = OutputTruncation::default();
+        state.observe_call(&call(false, 3).with_stop_reason(Some(StopReason::ContextWindow)));
+        let decision = state.final_response().expect("notice");
+        assert!(decision.notice().contains("context window"));
     }
 }

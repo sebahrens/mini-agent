@@ -30,8 +30,22 @@ fn provider_response_from_compatible_sse_data(data: &str) -> Option<CompletionEr
     let error = value
         .get("error")
         .filter(|error| error.is_object() || error.as_str().is_some_and(|s| !s.is_empty()))?;
-    if value.get("choices").is_some() {
-        return None;
+    // A chunk with live `choices` is normally content that merely carries an
+    // `error` annotation. OpenRouter's documented mid-stream failure is the
+    // exception: a top-level `error` plus a choice that finished with
+    // `finish_reason: "error"`. (mini-agent patch, nvnkx.307)
+    if let Some(choices) = value.get("choices") {
+        let finished_with_error = choices.as_array().is_some_and(|choices| {
+            choices.iter().any(|choice| {
+                choice
+                    .get("finish_reason")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("error")
+            })
+        });
+        if !finished_with_error {
+            return None;
+        }
     }
 
     if let Some(message) = error.get("message").and_then(serde_json::Value::as_str) {
@@ -47,6 +61,8 @@ pub(crate) enum CompatibleFinishReason {
     /// `finish_reason: length`: the output-token limit was reached
     /// (mini-agent patch).
     Length,
+    /// `finish_reason: content_filter` (mini-agent patch, nvnkx.35).
+    ContentFilter,
     Other,
 }
 
@@ -67,15 +83,6 @@ impl CompatibleToolCallChunk {
         self.arguments
             .as_ref()
             .is_some_and(|arguments| !arguments.is_empty())
-    }
-
-    fn starts_new_tool_call(&self) -> bool {
-        self.has_nonempty_name()
-            && self
-                .arguments
-                .as_ref()
-                .map(|arguments| arguments.is_empty())
-                .unwrap_or(true)
     }
 
     fn is_complete_single_chunk(&self) -> bool {
@@ -174,6 +181,12 @@ pub(crate) trait CompatibleStreamProfile: WasmCompatSend {
         response
     }
 
+    /// Record that a choice finished with `finish_reason: content_filter`.
+    /// Profiles whose final response cannot carry the flag keep it unchanged.
+    fn mark_content_filtered(&self, response: Self::FinalResponse) -> Self::FinalResponse {
+        response
+    }
+
     fn uses_distinct_tool_call_eviction(&self) -> bool {
         false
     }
@@ -211,15 +224,20 @@ pub(crate) fn should_evict_distinct_named_tool_call(
     existing: &RawStreamingToolCall,
     incoming: &CompatibleToolCallChunk,
 ) -> bool {
+    // A chunk that carries a new non-empty id AND a non-empty name announces a
+    // new call, even when it repeats the pending call's name and brings
+    // complete arguments: two `read` calls that share (or omit) an index stay
+    // separate. Continuation chunks carry an empty name (some gateways, such as
+    // GLM-4, put a fresh id on every continuation), so they never evict.
+    // (mini-agent patch, nvnkx.309)
     if let Some(new_id) = &incoming.id
         && !new_id.is_empty()
-        && let Some(new_name) = &incoming.name
         && incoming.has_nonempty_name()
         && !existing.id.is_empty()
         && existing.id != *new_id
         && !existing.name.is_empty()
     {
-        return existing.name != *new_name || incoming.starts_new_tool_call();
+        return true;
     }
 
     false
@@ -242,6 +260,7 @@ where
         let mut tool_calls: HashMap<usize, RawStreamingToolCall> = HashMap::new();
         let mut final_usage = None;
         let mut output_truncated = false;
+        let mut content_filtered = false;
         let mut terminated_with_error = false;
 
         while let Some(event_result) = event_source.next().await {
@@ -363,6 +382,7 @@ where
                     }
 
                     output_truncated |= choice.finish_reason == CompatibleFinishReason::Length;
+                    content_filtered |= choice.finish_reason == CompatibleFinishReason::ContentFilter;
                     if choice.finish_reason == CompatibleFinishReason::ToolCalls {
                         for tool_call in take_finalized_tool_calls(
                             &mut tool_calls,
@@ -412,6 +432,11 @@ where
         let final_response = profile.build_final_response(final_usage);
         let final_response = if output_truncated {
             profile.mark_output_truncated(final_response)
+        } else {
+            final_response
+        };
+        let final_response = if content_filtered {
+            profile.mark_content_filtered(final_response)
         } else {
             final_response
         };
@@ -730,6 +755,10 @@ mod tests {
         assert!(
             detect(r#"{"error":{"message":"x"},"choices":[{"delta":{"content":"hi"}}]}"#).is_none()
         );
+        // OpenRouter's mid-stream error: error object plus finish_reason "error".
+        let openrouter = r#"{"id":"x","error":{"code":502,"message":"Provider disconnected"},"choices":[{"index":0,"delta":{"content":""},"finish_reason":"error"}]}"#;
+        let error = detect(openrouter).expect("finish_reason error chunk is an error");
+        assert_eq!(error.provider_response_body(), Some(openrouter));
 
         // A non-empty string `error` IS detected, preserving the raw body.
         let string_body = r#"{"error":"oops"}"#;
@@ -1068,6 +1097,37 @@ mod tests {
             collected_tool_calls[1].function.arguments,
             serde_json::json!({"query":"two"})
         );
+    }
+
+    #[tokio::test]
+    async fn same_index_same_name_calls_with_distinct_ids_stay_separate() {
+        let client = MockStreamingClient {
+            sse_bytes: sse_bytes_from_data_lines(["complete_one", "complete_two", "finish"]),
+        };
+        let req = http::Request::builder()
+            .method("POST")
+            .uri("http://localhost/v1/chat/completions")
+            .body(Vec::new())
+            .expect("request should build");
+        let mut stream =
+            send_compatible_streaming_request(client, req, DistinctToolCallEvictionProfile)
+                .await
+                .expect("stream should start");
+
+        let mut calls = Vec::new();
+        while let Some(item) = stream.next().await {
+            if let StreamedAssistantContent::ToolCall { tool_call, .. } =
+                item.expect("stream item should be ok")
+            {
+                calls.push(tool_call);
+            }
+        }
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].function.arguments, serde_json::json!({"path":"a"}));
+        assert_eq!(calls[1].id, "call_2");
+        assert_eq!(calls[1].function.arguments, serde_json::json!({"path":"b"}));
     }
 
     #[tokio::test]

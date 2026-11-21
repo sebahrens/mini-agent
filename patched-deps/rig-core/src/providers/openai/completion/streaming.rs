@@ -120,6 +120,9 @@ pub struct StreamingCompletionResponse<U = Usage> {
     /// A choice finished with `finish_reason: length` (mini-agent patch).
     #[serde(skip)]
     pub output_truncated: bool,
+    /// A choice finished with `finish_reason: content_filter` (mini-agent patch).
+    #[serde(skip)]
+    pub content_filtered: bool,
 }
 
 impl<U> GetTokenUsage for StreamingCompletionResponse<U>
@@ -132,6 +135,16 @@ where
 
     fn output_truncated(&self) -> bool {
         self.output_truncated
+    }
+
+    fn stop_reason(&self) -> Option<crate::completion::StopReason> {
+        if self.content_filtered {
+            Some(crate::completion::StopReason::ContentFilter)
+        } else if self.output_truncated {
+            Some(crate::completion::StopReason::MaxTokens)
+        } else {
+            None
+        }
     }
 }
 
@@ -296,6 +309,7 @@ where
                     finish_reason: match &choice.finish_reason {
                         Some(FinishReason::ToolCalls) => CompatibleFinishReason::ToolCalls,
                         Some(FinishReason::Length) => CompatibleFinishReason::Length,
+                        Some(FinishReason::ContentFilter) => CompatibleFinishReason::ContentFilter,
                         Some(FinishReason::Other(other)) if other == "function_call" => {
                             CompatibleFinishReason::ToolCalls
                         }
@@ -320,11 +334,17 @@ where
         StreamingCompletionResponse {
             usage,
             output_truncated: false,
+            content_filtered: false,
         }
     }
 
     fn mark_output_truncated(&self, mut response: Self::FinalResponse) -> Self::FinalResponse {
         response.output_truncated = true;
+        response
+    }
+
+    fn mark_content_filtered(&self, mut response: Self::FinalResponse) -> Self::FinalResponse {
+        response.content_filtered = true;
         response
     }
 
@@ -973,5 +993,45 @@ mod tests {
             .unwrap();
 
         assert_zero_arg_tool_call_is_emitted(stream, "call_123", "ping", true).await;
+    }
+
+    #[tokio::test]
+    async fn openrouter_error_chunk_after_text_yields_error_without_final_response() {
+        use crate::test_utils::MockStreamingClient;
+        use futures::StreamExt;
+        let client = MockStreamingClient {
+            sse_bytes: sse_bytes_from_data_lines([
+                "{\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}",
+                "{\"id\":\"x\",\"error\":{\"code\":502,\"message\":\"Provider disconnected\"},\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"},\"finish_reason\":\"error\"}]}",
+            ]),
+        };
+        let req = http::Request::builder()
+            .method("POST")
+            .uri("http://localhost/v1/chat/completions")
+            .body(Vec::new())
+            .expect("request should build");
+        let mut stream = send_compatible_streaming_request(client, req)
+            .await
+            .expect("stream should start");
+
+        let mut saw_text = false;
+        let mut error = None;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(streaming::StreamedAssistantContent::Final(_)) => {
+                    panic!("no final response expected")
+                }
+                Ok(streaming::StreamedAssistantContent::Text(_)) => saw_text = true,
+                Ok(_) => {}
+                Err(e) => error = Some(e),
+            }
+        }
+        assert!(saw_text);
+        assert!(
+            error
+                .expect("stream error")
+                .to_string()
+                .contains("Provider disconnected")
+        );
     }
 }

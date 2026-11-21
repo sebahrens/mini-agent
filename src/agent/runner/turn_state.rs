@@ -277,7 +277,9 @@ impl TurnState {
                 self.next_instruction = Some(instruction.clone());
                 (notice, Some(instruction))
             }
-            TruncationDecision::Exhausted { .. } => (notice, None),
+            TruncationDecision::Exhausted { .. } | TruncationDecision::Notice { .. } => {
+                (notice, None)
+            }
         })
     }
 
@@ -370,7 +372,7 @@ impl TurnState {
                     self.next_instruction = Some(instruction.clone());
                     Some(instruction)
                 }
-                TruncationDecision::Exhausted { .. } => None,
+                TruncationDecision::Exhausted { .. } | TruncationDecision::Notice { .. } => None,
             };
             return StreamErrorAction::Truncated {
                 notice,

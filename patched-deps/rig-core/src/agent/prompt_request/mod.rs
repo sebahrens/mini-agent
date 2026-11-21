@@ -226,6 +226,9 @@ pub struct CompletionCall {
     /// response (text or tool-call arguments) is incomplete. (mini-agent patch)
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub output_truncated: bool,
+    /// The provider's normalised stop reason, when reported. (mini-agent patch)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<crate::completion::StopReason>,
 }
 
 impl CompletionCall {
@@ -235,12 +238,19 @@ impl CompletionCall {
             call_index,
             usage,
             output_truncated: false,
+            stop_reason: None,
         }
     }
 
     /// Mark this call as stopped by the provider's output-token limit.
     pub fn with_output_truncated(mut self, output_truncated: bool) -> Self {
         self.output_truncated = output_truncated;
+        self
+    }
+
+    /// Record the provider's normalised stop reason.
+    pub fn with_stop_reason(mut self, stop_reason: Option<crate::completion::StopReason>) -> Self {
+        self.stop_reason = stop_reason;
         self
     }
 }

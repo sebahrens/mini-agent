@@ -98,6 +98,17 @@ Notable changes to mini-agent are documented in this file. The format follows
   caps concurrent relays at 256 (mini-agent-y42nd). `update` and `install.sh` treat a `gh` whose
   `attestation verify --help` lacks the pin flags as unavailable (upgrade gh), not a failed
   verification (mini-agent-0cshc).
+- Anthropic in-stream `error` events (for example `overloaded_error`) now surface as retryable stream errors, and a stream that ends without a `message_delta` stop reason is a retryable "stream ended" error instead of a finished turn with zero usage (mini-agent-nvnkx.306).
+- OpenRouter mid-stream error chunks (a top-level `error` plus `finish_reason: "error"`) end the stream with an error instead of a silently truncated successful answer (mini-agent-nvnkx.307).
+- OpenRouter usage reads `completion_tokens_details.reasoning_tokens`, for blocking and streamed responses (mini-agent-nvnkx.308).
+- Two streamed tool calls to the same tool that share an index but carry distinct ids stay separate calls instead of merging into one with invalid arguments (mini-agent-nvnkx.309).
+- Gemini: an unknown `finishReason` or `blockReason` no longer fails the whole stream (mini-agent-nvnkx.310); a blocked prompt (`promptFeedback.blockReason`) is reported as an error naming the reason, and SAFETY/RECITATION/BLOCKLIST/PROHIBITED_CONTENT/SPII stops produce the stop-reason notice (mini-agent-nvnkx.311); a `functionCall` without `args` is accepted as `{}` (mini-agent-nvnkx.312).
+- Gemini tool schemas: unsupported `format` values fold into the description, untyped properties become `string`, non-string enums are dropped, and `required` is pruned to surviving properties (mini-agent-nvnkx.195); self-referential or mutually recursive `$ref` schemas, and missing or unsupported references, become permissive object nodes instead of overflowing the stack or failing every request (mini-agent-nvnkx.194).
+- OpenAI Responses and Copilot Responses streams that end without `response.completed` are retryable "stream ended" errors instead of finished turns with no usage (mini-agent-nvnkx.197); Copilot `response.incomplete` keeps its raw event, so `max_output_tokens` truncation continues automatically (mini-agent-nvnkx.196).
+- Provider stop reasons are normalised (`StopReason`) and reported per completion call: a refusal or content filter (Anthropic `refusal`, OpenAI `content_filter`, Gemini safety stops) prints one visible notice, `pause_turn` continues the turn, and `model_context_window_exceeded` prints a notice (mini-agent-nvnkx.35).
+- Chat Completions requests send the generated `prompt_cache_key` and the global `reasoning_effort` default only to the built-in OpenAI endpoint and Azure, not to custom gateways; an explicit `null` in `extra_body` removes a generated default (mini-agent-nvnkx.33).
+- Responses requests send `store: false` by default while encrypted reasoning content is requested; `[reasoning] store = true` opts back in (mini-agent-nvnkx.204).
+- The configured `[reasoning] effort` now reaches non-Claude OpenRouter models as `reasoning.effort` (mini-agent-nvnkx.156).
 
 ### Added
 

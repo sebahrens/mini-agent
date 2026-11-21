@@ -1485,6 +1485,26 @@ mod tests {
         assert!(is_retryable(&err));
     }
 
+    /// nvnkx.306/.197: an Anthropic in-stream `overloaded_error` event (no HTTP
+    /// status) and a cut-off stream are both retryable, and the former is
+    /// classified as unbilled.
+    #[test]
+    fn test_is_retryable_in_stream_error_event_and_cut_off_streams() {
+        let overloaded = rig::completion::CompletionError::from_provider_body(
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+        );
+        assert!(is_retryable(&overloaded));
+        assert!(is_unbilled_stream_error(&overloaded));
+
+        for message in [
+            "stream ended before message_stop",
+            "stream ended before response.completed",
+        ] {
+            let err = rig::completion::CompletionError::ProviderError(message.into());
+            assert!(is_retryable(&err), "{message}");
+        }
+    }
+
     #[test]
     fn test_is_retryable_anthropic_overload_message_fallback() {
         let err = io::Error::other(r#"Invalid status code 529: {"type":"overloaded_error"}"#);

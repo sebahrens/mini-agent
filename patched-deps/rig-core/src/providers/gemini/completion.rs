@@ -374,7 +374,9 @@ impl TryFrom<completion::ToolDefinition> for Tool {
 impl TryFrom<Vec<std::sync::Arc<completion::ToolDefinition>>> for Tool {
     type Error = CompletionError;
 
-    fn try_from(tools: Vec<std::sync::Arc<completion::ToolDefinition>>) -> Result<Self, Self::Error> {
+    fn try_from(
+        tools: Vec<std::sync::Arc<completion::ToolDefinition>>,
+    ) -> Result<Self, Self::Error> {
         Tool::try_from(
             tools
                 .into_iter()
@@ -1275,6 +1277,8 @@ pub mod gemini_api_types {
         /// and dashes, with a maximum length of 63.
         pub name: String,
         /// Optional. The function parameters and values in JSON object format.
+        /// Parameterless tools may omit it (mini-agent patch, nvnkx.312).
+        #[serde(default)]
         pub args: serde_json::Value,
     }
 
@@ -1484,6 +1488,9 @@ pub mod gemini_api_types {
         Blocklist,
         /// Prompt was blocked due to prohibited content.
         ProhibitedContent,
+        /// A block reason this crate does not know yet (mini-agent patch, nvnkx.310).
+        #[serde(other)]
+        Unrecognized,
     }
 
     #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1519,6 +1526,10 @@ pub mod gemini_api_types {
         TooManyToolCalls,
         /// The provider could not parse the generated response into a valid protocol shape.
         MalformedResponse,
+        /// A finish reason this crate does not know yet; keeps one new value
+        /// from failing the whole stream (mini-agent patch, nvnkx.310).
+        #[serde(other)]
+        Unrecognized,
     }
 
     #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1796,7 +1807,9 @@ pub mod gemini_api_types {
             ));
         };
 
-        resolve_refs(&mut schema, defs_obj)?;
+        let mut chain = Vec::new();
+        let mut budget = MAX_REF_EXPANSIONS;
+        resolve_refs(&mut schema, defs_obj, &mut chain, &mut budget);
 
         // removing $defs from the final schema because we have inlined everything
         if let Some(obj) = schema.as_object_mut() {
@@ -1807,43 +1820,66 @@ pub mod gemini_api_types {
         Ok(schema)
     }
 
+    /// Upper bound on `$ref` expansions for one schema, so a pathological
+    /// (non-cyclic but exponentially fanning) definition set stays finite.
+    const MAX_REF_EXPANSIONS: usize = 2_000;
+
+    /// Node that replaces a reference Gemini cannot receive: a cycle, an
+    /// exhausted budget, or a missing/unsupported target. It keeps the one
+    /// property permissive instead of failing every request of the session
+    /// (mini-agent patch, nvnkx.194).
+    fn permissive_schema_node() -> Value {
+        json!({"type": "object"})
+    }
+
     /// Recursively resolves all `$ref` references in a JSON value by
     /// replacing them with their definitions.
+    ///
+    /// `chain` holds the definition names currently being expanded; a name that
+    /// is already on it is a cycle and becomes a permissive node. Unresolvable
+    /// references also become permissive nodes rather than request errors.
     fn resolve_refs(
         value: &mut Value,
         defs: &serde_json::Map<String, Value>,
-    ) -> Result<(), CompletionError> {
+        chain: &mut Vec<String>,
+        budget: &mut usize,
+    ) {
         match value {
             Value::Object(obj) => {
                 if let Some(ref_value) = obj.get("$ref")
                     && let Some(ref_str) = ref_value.as_str()
                 {
                     // "#/$defs/Person" -> "Person"
-                    let def_name = parse_ref_path(ref_str)?;
-
-                    let def = defs.get(&def_name).ok_or_else(|| {
-                        CompletionError::ResponseError(format!("Reference not found: {}", ref_str))
-                    })?;
-
-                    let mut resolved = def.clone();
-                    resolve_refs(&mut resolved, defs)?;
+                    let resolved = match parse_ref_path(ref_str) {
+                        Ok(def_name)
+                            if !chain.contains(&def_name)
+                                && *budget > 0
+                                && defs.contains_key(&def_name) =>
+                        {
+                            *budget -= 1;
+                            let mut resolved = defs[&def_name].clone();
+                            chain.push(def_name);
+                            resolve_refs(&mut resolved, defs, chain, budget);
+                            chain.pop();
+                            resolved
+                        }
+                        _ => permissive_schema_node(),
+                    };
                     *value = resolved;
-                    return Ok(());
+                    return;
                 }
 
                 for (_, v) in obj.iter_mut() {
-                    resolve_refs(v, defs)?;
+                    resolve_refs(v, defs, chain, budget);
                 }
             }
             Value::Array(arr) => {
                 for item in arr.iter_mut() {
-                    resolve_refs(item, defs)?;
+                    resolve_refs(item, defs, chain, budget);
                 }
             }
             _ => {}
         }
-
-        Ok(())
     }
 
     /// Parses a JSON Schema `$ref` path to extract the definition name.
@@ -1996,7 +2032,20 @@ pub mod gemini_api_types {
         } else if obj.contains_key("enum") {
             "string".to_string()
         } else {
-            String::new()
+            // An untyped property (an "any" value, or one described only by
+            // `const`) must still carry a type for Gemini. (nvnkx.195)
+            "string".to_string()
+        }
+    }
+
+    /// Gemini accepts only these `format` values per type; anything else
+    /// (`uri`, `email`, `uuid`, `date`, ...) rejects the whole request.
+    fn gemini_format_allowed(schema_type: &str, format: &str) -> bool {
+        match schema_type {
+            "string" => matches!(format, "enum" | "date-time"),
+            "integer" => matches!(format, "int32" | "int64"),
+            "number" => matches!(format, "float" | "double"),
+            _ => false,
         }
     }
 
@@ -2041,18 +2090,90 @@ pub mod gemini_api_types {
                     items
                 };
 
+                let raw_description = obj
+                    .get("description")
+                    .or_else(|| props_source.get("description"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let raw_format = obj
+                    .get("format")
+                    .or_else(|| props_source.get("format"))
+                    .and_then(|v| v.as_str());
+                let (kept_format, mut description) = match raw_format {
+                    Some(format) if gemini_format_allowed(&schema_type, format) => {
+                        (Some(format.to_string()), raw_description)
+                    }
+                    // Unsupported formats are folded into the description so the
+                    // model still sees the constraint.
+                    Some(format) => (
+                        None,
+                        Some(match raw_description {
+                            Some(text) if !text.is_empty() => format!("{text} (format: {format})"),
+                            _ => format!("format: {format}"),
+                        }),
+                    ),
+                    None => (None, raw_description),
+                };
+
+                // Gemini enums are string-only. A list with any non-string value
+                // is dropped together with the key and folded into the description.
+                let enum_values = obj
+                    .get("enum")
+                    .or_else(|| props_source.get("enum"))
+                    .and_then(|v| v.as_array())
+                    .and_then(|arr| {
+                        if arr.iter().all(Value::is_string) {
+                            Some(
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect::<Vec<_>>(),
+                            )
+                        } else {
+                            let listed = arr
+                                .iter()
+                                .map(|v| v.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            description = Some(match description.take() {
+                                Some(text) if !text.is_empty() => {
+                                    format!("{text} (allowed values: {listed})")
+                                }
+                                _ => format!("allowed values: {listed}"),
+                            });
+                            None
+                        }
+                    });
+
+                // A property whose sub-schema fails conversion is dropped, so
+                // `required` is pruned to the properties that survived.
+                let properties: Option<HashMap<String, Schema>> = props_source
+                    .get("properties")
+                    .and_then(|v| v.as_object())
+                    .map(|map| {
+                        map.iter()
+                            .filter_map(|(k, v)| {
+                                v.clone().try_into().ok().map(|schema| (k.clone(), schema))
+                            })
+                            .collect()
+                    });
+                let required: Option<Vec<String>> = props_source
+                    .get("required")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .filter(|name| {
+                                properties
+                                    .as_ref()
+                                    .is_none_or(|props| props.contains_key(name))
+                            })
+                            .collect()
+                    });
+
                 Ok(Schema {
                     r#type: schema_type,
-                    format: obj
-                        .get("format")
-                        .or_else(|| props_source.get("format"))
-                        .and_then(|v| v.as_str())
-                        .map(String::from),
-                    description: obj
-                        .get("description")
-                        .or_else(|| props_source.get("description"))
-                        .and_then(|v| v.as_str())
-                        .map(String::from),
+                    format: kept_format,
+                    description,
                     nullable: if schema_is_nullable(obj)
                         || composition_source.as_ref().is_some_and(schema_is_nullable)
                     {
@@ -2060,15 +2181,7 @@ pub mod gemini_api_types {
                     } else {
                         None
                     },
-                    r#enum: obj
-                        .get("enum")
-                        .or_else(|| props_source.get("enum"))
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_str().map(String::from))
-                                .collect()
-                        }),
+                    r#enum: enum_values,
                     max_items: obj
                         .get("maxItems")
                         .and_then(|v| v.as_i64())
@@ -2077,24 +2190,8 @@ pub mod gemini_api_types {
                         .get("minItems")
                         .and_then(|v| v.as_i64())
                         .map(|v| v as i32),
-                    properties: props_source
-                        .get("properties")
-                        .and_then(|v| v.as_object())
-                        .map(|map| {
-                            map.iter()
-                                .filter_map(|(k, v)| {
-                                    v.clone().try_into().ok().map(|schema| (k.clone(), schema))
-                                })
-                                .collect()
-                        }),
-                    required: props_source
-                        .get("required")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_str().map(String::from))
-                                .collect()
-                        }),
+                    properties,
+                    required,
                     items,
                 })
             } else {
@@ -2222,7 +2319,8 @@ mod tests {
                 message::ToolResultContent::text("scanned"),
                 message::ToolResultContent::pdf_base64("JVBERg=="),
             ])
-            .unwrap(), is_error: None,
+            .unwrap(),
+            is_error: None,
         });
         let part = Part::try_from(content).unwrap();
         let json = serde_json::to_value(&part).unwrap();
@@ -2231,7 +2329,6 @@ mod tests {
             serde_json::json!({"mimeType":"application/pdf","data":"JVBERg=="})
         );
     }
-
 
     use crate::{
         message,
@@ -2971,6 +3068,122 @@ mod tests {
     }
 
     #[test]
+    fn self_referential_ref_converts_to_a_finite_schema() {
+        let schema = tool_parameters_to_schema(json!({
+            "type": "object",
+            "properties": {"root": {"$ref": "#/$defs/Node"}},
+            "$defs": {"Node": {"type": "object", "properties": {
+                "children": {"type": "array", "items": {"$ref": "#/$defs/Node"}}
+            }}}
+        }))
+        .expect("schema conversion")
+        .expect("schema");
+        let root = &schema.properties.expect("properties")["root"];
+        let children = &root.properties.as_ref().expect("root properties")["children"];
+        // The cyclic occurrence is cut to a permissive object node.
+        assert_eq!(children.items.as_ref().expect("items").r#type, "object");
+        serde_json::to_string(&children).expect("serialisable");
+    }
+
+    #[test]
+    fn mutually_recursive_refs_convert_to_a_finite_schema() {
+        let schema = tool_parameters_to_schema(json!({
+            "type": "object",
+            "properties": {"a": {"$ref": "#/$defs/A"}},
+            "$defs": {
+                "A": {"type": "object", "properties": {"b": {"$ref": "#/$defs/B"}}},
+                "B": {"type": "object", "properties": {"a": {"$ref": "#/$defs/A"}}}
+            }
+        }))
+        .expect("schema conversion")
+        .expect("schema");
+        assert!(serde_json::to_string(&schema).is_ok());
+    }
+
+    #[test]
+    fn missing_ref_becomes_a_permissive_property_not_an_error() {
+        let schema = tool_parameters_to_schema(json!({
+            "type": "object",
+            "properties": {"x": {"$ref": "#/$defs/Nope"}, "y": {"$ref": "http://e/x"}},
+            "$defs": {"Other": {"type": "string"}}
+        }))
+        .expect("an odd reference must not fail the request")
+        .expect("schema");
+        let props = schema.properties.expect("properties");
+        assert_eq!(props["x"].r#type, "object");
+        assert_eq!(props["y"].r#type, "object");
+    }
+
+    #[test]
+    fn unsupported_format_is_folded_into_the_description() {
+        let schema = tool_parameters_to_schema(json!({
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "format": "uri", "description": "target"},
+                "when": {"type": "string", "format": "date-time"},
+                "n": {"type": "integer", "format": "int64"},
+                "m": {"type": "integer", "format": "uint32"}
+            }
+        }))
+        .unwrap()
+        .unwrap();
+        let props = schema.properties.unwrap();
+        assert_eq!(props["url"].format, None);
+        assert_eq!(
+            props["url"].description.as_deref(),
+            Some("target (format: uri)")
+        );
+        assert_eq!(props["when"].format.as_deref(), Some("date-time"));
+        assert_eq!(props["n"].format.as_deref(), Some("int64"));
+        assert_eq!(props["m"].format, None);
+    }
+
+    #[test]
+    fn untyped_property_defaults_to_string_and_non_string_enum_is_dropped() {
+        let schema = tool_parameters_to_schema(json!({
+            "type": "object",
+            "properties": {
+                "anything": {"description": "any value"},
+                "level": {"type": "integer", "enum": [1, 2, 3]},
+                "mode": {"type": "string", "enum": ["a", "b"]}
+            },
+            "required": ["anything", "level"]
+        }))
+        .unwrap()
+        .unwrap();
+        let props = schema.properties.unwrap();
+        assert_eq!(props["anything"].r#type, "string");
+        assert_eq!(props["level"].r#enum, None);
+        assert_eq!(
+            props["level"].description.as_deref(),
+            Some("allowed values: 1, 2, 3")
+        );
+        assert_eq!(props["mode"].r#enum, Some(vec!["a".into(), "b".into()]));
+    }
+
+    #[test]
+    fn required_is_pruned_to_surviving_properties() {
+        let schema = tool_parameters_to_schema(json!({
+            "type": "object",
+            "properties": {"kept": {"type": "string"}},
+            "required": ["kept", "ghost"]
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(schema.required, Some(vec!["kept".to_string()]));
+    }
+
+    #[test]
+    fn function_call_part_without_args_deserializes() {
+        let part: Part = serde_json::from_value(json!({"functionCall": {"name": "todo_list"}}))
+            .expect("parameterless call");
+        match part.part {
+            PartKind::FunctionCall(call) => assert!(call.args.is_null()),
+            other => panic!("unexpected part {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_tool_parameters_to_schema_handles_nullable_type_arrays() {
         let schema_json = json!({
             "type": "object",
@@ -3164,7 +3377,8 @@ mod tests {
                 media_type: Some(ImageMediaType::PNG),
                 detail: None,
                 additional_params: None,
-            })), is_error: None,
+            })),
+            is_error: None,
         };
 
         let user_content = message::UserContent::ToolResult(tool_result);

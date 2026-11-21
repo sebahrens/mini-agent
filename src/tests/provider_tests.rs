@@ -1139,7 +1139,124 @@ fn openai_responses_requests_encrypted_reasoning_content_by_default() {
     assert_eq!(body["include"].as_array().unwrap().len(), 1);
     // No reasoning object is invented when nothing is configured.
     assert!(body.get("reasoning").is_none());
+    // nvnkx.204: the agent replays full input statelessly, so responses are
+    // not retained server-side by default.
+    assert_eq!(body["store"], false);
+}
+
+/// nvnkx.204: `[reasoning] store = true` is the explicit opt-in, and without
+/// encrypted content the ids need server state so `store` stays unset.
+#[test]
+fn openai_responses_store_opt_in_and_unset_without_encrypted_content() {
+    let opt_in = ReasoningConfig {
+        store: Some(true),
+        ..Default::default()
+    };
+    let body = openai_responses_extra_body(None, "session-a", Some(&opt_in)).unwrap();
+    assert_eq!(body["store"], true);
+
+    let stateful = ReasoningConfig {
+        encrypted_content: Some(false),
+        ..Default::default()
+    };
+    let body = openai_responses_extra_body(None, "session-a", Some(&stateful)).unwrap();
     assert!(body.get("store").is_none());
+
+    let overridden =
+        openai_responses_extra_body(Some(serde_json::json!({"store": true})), "session-a", None)
+            .unwrap();
+    assert_eq!(overridden["store"], true);
+}
+
+/// nvnkx.156: the configured effort reaches a non-Claude OpenRouter model as
+/// `reasoning.effort`; Claude ids (handled by `provider_effort`), `max`, and an
+/// unset effort add nothing, and routing params still win.
+#[test]
+fn openrouter_non_claude_models_receive_the_configured_effort() {
+    use crate::provider::openrouter_reasoning_default;
+    let high = ReasoningConfig {
+        effort: Some(ReasoningEffort::High),
+        ..Default::default()
+    };
+    let body = openrouter_reasoning_default(None, "moonshotai/kimi-k3.1-pro", Some(&high)).unwrap();
+    assert_eq!(body["reasoning"]["effort"], "high");
+    assert_eq!(
+        openrouter_reasoning_default(None, "anthropic/claude-opus-5.5", Some(&high)),
+        None
+    );
+    assert_eq!(
+        openrouter_reasoning_default(None, "~anthropic/claude-opus-latest", Some(&high)),
+        None
+    );
+    assert_eq!(openrouter_reasoning_default(None, "x/y", None), None);
+    let max = ReasoningConfig {
+        effort: Some(ReasoningEffort::Max),
+        ..Default::default()
+    };
+    assert_eq!(openrouter_reasoning_default(None, "x/y", Some(&max)), None);
+    let routed = openrouter_reasoning_default(
+        Some(serde_json::json!({"provider": {"order": ["a"]}})),
+        "x/y",
+        Some(&high),
+    )
+    .unwrap();
+    assert_eq!(routed["provider"]["order"][0], "a");
+    assert_eq!(routed["reasoning"]["effort"], "high");
+}
+
+/// nvnkx.33: a custom gateway gets neither generated key, built-in OpenAI and
+/// Azure keep them, and an explicit `null` removes a generated default.
+#[test]
+fn completions_cache_key_is_gated_on_the_openai_route() {
+    use crate::provider::{
+        completions_route_accepts_openai_fields, openai_completions_extra_body_for_route,
+    };
+    assert!(completions_route_accepts_openai_fields(
+        "https://api.openai.com/v1"
+    ));
+    assert!(completions_route_accepts_openai_fields(
+        "https://acme.openai.azure.com/openai/v1"
+    ));
+    assert!(!completions_route_accepts_openai_fields(
+        "https://api.mistral.ai/v1"
+    ));
+    assert!(!completions_route_accepts_openai_fields("not a url"));
+
+    let reasoning = ReasoningConfig {
+        effort: Some(ReasoningEffort::High),
+        ..Default::default()
+    };
+    assert_eq!(
+        openai_completions_extra_body_for_route(
+            None,
+            "session-a",
+            "gpt-5.5",
+            Some(&reasoning),
+            false
+        ),
+        None
+    );
+    let user = serde_json::json!({"top_k": 4});
+    assert_eq!(
+        openai_completions_extra_body_for_route(Some(user.clone()), "s", "m", None, false),
+        Some(user)
+    );
+    let on_openai =
+        openai_completions_extra_body_for_route(None, "session-a", "gpt-5.5", None, true).unwrap();
+    assert!(on_openai.get("prompt_cache_key").is_some());
+
+    let removed = openai_completions_extra_body_for_route(
+        Some(serde_json::json!({"prompt_cache_key": null})),
+        "session-a",
+        "gpt-5.5",
+        None,
+        true,
+    )
+    .unwrap();
+    assert!(removed.get("prompt_cache_key").is_none());
+    // A null for a key nothing generated is kept as written.
+    let kept = merge_extra_body(None, Some(serde_json::json!({"x": null}))).unwrap();
+    assert!(kept.get("x").is_some());
 }
 
 #[test]

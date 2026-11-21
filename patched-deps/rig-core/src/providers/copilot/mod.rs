@@ -1122,6 +1122,7 @@ where
                 let span = tracing::Span::current();
 
                 let mut terminated_with_error = false;
+                let mut saw_response_completed = false;
 
                 while let Some(event_result) = event_source.next().await {
                     match event_result {
@@ -1223,6 +1224,7 @@ where
                                 let responses_api::streaming::ResponseChunk { kind, response, .. } = *chunk;
                                 match kind {
                                     responses_api::streaming::ResponseChunkKind::ResponseCompleted => {
+                                        saw_response_completed = true;
                                         span.record("gen_ai.response.id", response.id.as_str());
                                         span.record("gen_ai.response.model", response.model.as_str());
                                         if let Some(usage) = response.usage {
@@ -1240,15 +1242,25 @@ where
                                         // stream, so there is no HTTP status to attach (status: None).
                                         // When the object is absent we emit a Rig-authored
                                         // `ProviderError` diagnostic (provider_response_body() is None).
-                                        match response.error.as_ref() {
-                                            Some(_) => yield Err(
+                                        //
+                                        // `response.incomplete` carries `incomplete_details` and a null
+                                        // `error`, so it always keeps the raw event: the runner recognises
+                                        // `max_output_tokens` truncation (and a `content_filter` reason is
+                                        // visible) only through that body. (mini-agent patch, nvnkx.196)
+                                        let is_incomplete = matches!(
+                                            kind,
+                                            responses_api::streaming::ResponseChunkKind::ResponseIncomplete
+                                        );
+                                        if response.error.is_some() || is_incomplete {
+                                            yield Err(
                                                 crate::provider_response::completion_error_from_body(
                                                     evt.data.clone(),
                                                 ),
-                                            ),
-                                            None => yield Err(CompletionError::ProviderError(
+                                            );
+                                        } else {
+                                            yield Err(CompletionError::ProviderError(
                                                 "Copilot response stream failed".into(),
-                                            )),
+                                            ));
                                         }
                                         break;
                                     }
@@ -1270,6 +1282,16 @@ where
                 event_source.close();
 
                 if terminated_with_error {
+                    return;
+                }
+
+                if !saw_response_completed {
+                    // The body closed without `response.completed`: a cut-off
+                    // stream, not a finished turn. "stream ended" is retryable.
+                    // (mini-agent patch, nvnkx.197)
+                    yield Err(CompletionError::ProviderError(
+                        "stream ended before response.completed".into(),
+                    ));
                     return;
                 }
 
@@ -1706,6 +1728,7 @@ impl CompatibleStreamProfile for CopilotChatCompatibleProfile {
         CopilotStreamingResponse::Chat(openai::completion::streaming::StreamingCompletionResponse {
             usage,
             output_truncated: false,
+            content_filtered: false,
         })
     }
 
@@ -2253,6 +2276,78 @@ mod tests {
             stream.next().await.is_none(),
             "responses stream should terminate immediately after a terminal error"
         );
+    }
+
+    #[tokio::test]
+    async fn responses_incomplete_keeps_the_raw_event_with_its_reason() {
+        let incomplete = serde_json::json!({
+            "type": "response.incomplete",
+            "sequence_number": 2,
+            "response": {
+                "id": "resp_123",
+                "object": "response",
+                "created_at": 1700000000,
+                "status": "incomplete",
+                "error": null,
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "instructions": null,
+                "max_output_tokens": null,
+                "model": "gpt-5.3-codex",
+                "usage": null,
+                "output": [],
+                "tools": []
+            }
+        });
+        let client = Client::builder()
+            .api_key("copilot-token")
+            .http_client(MockStreamingClient {
+                sse_bytes: sse_bytes_from_json_events(&[incomplete]),
+            })
+            .build()
+            .expect("build client");
+        let model = client.completion_model("gpt-5.3-codex");
+        let request = model.completion_request("hello").build();
+        let mut stream = model.stream(request).await.expect("stream should start");
+        let err = match stream.next().await.expect("stream should yield an item") {
+            Ok(_) => panic!("incomplete must surface as an error"),
+            Err(err) => err,
+        };
+        let text = err.to_string();
+        assert!(
+            text.contains("max_output_tokens") && text.contains("incomplete"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_stream_without_completed_is_a_retryable_error() {
+        let delta = serde_json::json!({
+            "type": "response.output_text.delta",
+            "sequence_number": 1,
+            "item_id": "msg_1",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "partial"
+        });
+        let client = Client::builder()
+            .api_key("copilot-token")
+            .http_client(MockStreamingClient {
+                sse_bytes: sse_bytes_from_json_events(&[delta]),
+            })
+            .build()
+            .expect("build client");
+        let model = client.completion_model("gpt-5.3-codex");
+        let request = model.completion_request("hello").build();
+        let mut stream = model.stream(request).await.expect("stream should start");
+        let mut last = None;
+        while let Some(item) = stream.next().await {
+            last = Some(item);
+        }
+        let err = match last.expect("items") {
+            Ok(_) => panic!("a cut-off stream must not finish"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("stream ended"), "{err}");
     }
 
     #[tokio::test]

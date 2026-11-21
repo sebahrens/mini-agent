@@ -1978,8 +1978,13 @@ Selecting the built-in `openai` provider with no custom entry uses no
 
 Responses requests include an opaque SHA-256 `prompt_cache_key` derived from the
 stable session ID, keeping consecutive turns on the same provider cache route.
-An explicit `prompt_cache_key` in `extra_body` overrides this generated default.
-Chat Completions requests get the identical generated key for an OpenAI-family
+An explicit `prompt_cache_key` in `extra_body` overrides this generated default,
+and an explicit `"prompt_cache_key": null` removes it.
+On Chat Completions the generated `prompt_cache_key` (and the global
+`[reasoning] effort` as `reasoning_effort`) is sent only to the built-in OpenAI
+endpoint and Azure OpenAI; a custom OpenAI-compatible gateway that validates the
+body strictly never receives them unless `extra_body` sets them explicitly.
+Chat Completions requests on those routes get the identical generated key for an OpenAI-family
 model id (same session, same key, whichever `api_style` is selected), unless
 the model id is in the Claude family, which instead uses the `cache_control`
 markers described next (mini-agent-fb20s).
@@ -2197,11 +2202,12 @@ server-side state the upstream happened to keep. Set
 `encrypted_content = false` only for an endpoint that rejects the `include`
 value.
 
-`store` defaults to `true` at OpenAI, meaning responses are retained server side
-and reasoning ids resolve on the next turn. A gateway that does not persist
-state, or that rewrites ids, breaks that continuation — set `store = false`
-there and rely on encrypted reasoning content instead. `store = false` is also
-the right setting for a zero-retention deployment.
+The Responses request sends `store: false` by default whenever encrypted
+reasoning content is requested (the default): this agent always replays the full
+input and encrypted reasoning, so server-side retention buys nothing and only
+keeps file contents and command output retrievable by response id. Set
+`store = true` to opt back in. With `encrypted_content = false` the ids need
+server state, so `store` is left to the provider default (true at OpenAI).
 
 `previous_response_id` is deliberately not exposed. This agent always sends the
 full input for a turn, so a globally pinned id would resend the whole

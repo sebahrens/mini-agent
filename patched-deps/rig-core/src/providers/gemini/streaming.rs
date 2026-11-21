@@ -5,7 +5,8 @@ use tracing::{Level, enabled, info_span};
 use tracing_futures::Instrument;
 
 use super::completion::gemini_api_types::{
-    ContentCandidate, FinishReason, ModalityTokenCount, Part, PartKind, TrafficType,
+    BlockReason, ContentCandidate, FinishReason, ModalityTokenCount, Part, PartKind,
+    PromptFeedback, TrafficType,
 };
 use super::completion::{
     CompletionModel, create_request_body, function_call_finish_reason_error, resolve_request_model,
@@ -69,6 +70,24 @@ pub struct StreamGenerateContentResponse {
     pub candidates: Vec<ContentCandidate>,
     pub model_version: Option<String>,
     pub usage_metadata: Option<PartialUsage>,
+    /// Set when the prompt was blocked before generation (mini-agent patch,
+    /// nvnkx.311).
+    #[serde(default)]
+    pub prompt_feedback: Option<PromptFeedback>,
+}
+
+/// The `blockReason` string when the prompt was blocked, else `None`.
+fn prompt_block_reason(feedback: &PromptFeedback) -> Option<String> {
+    let reason = feedback.block_reason.as_ref()?;
+    if matches!(reason, BlockReason::BlockReasonUnspecified) {
+        return None;
+    }
+    Some(
+        serde_json::to_value(reason)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_else(|| format!("{reason:?}")),
+    )
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -89,6 +108,20 @@ impl GetTokenUsage for StreamingCompletionResponse {
 
     fn output_truncated(&self) -> bool {
         matches!(self.finish_reason, Some(FinishReason::MaxTokens))
+    }
+
+    fn stop_reason(&self) -> Option<crate::completion::StopReason> {
+        use crate::completion::StopReason;
+        Some(match self.finish_reason.as_ref()? {
+            FinishReason::Stop => StopReason::EndTurn,
+            FinishReason::MaxTokens => StopReason::MaxTokens,
+            FinishReason::Safety
+            | FinishReason::Recitation
+            | FinishReason::Blocklist
+            | FinishReason::ProhibitedContent
+            | FinishReason::Spii => StopReason::ContentFilter,
+            _ => StopReason::Other,
+        })
     }
 }
 
@@ -189,6 +222,18 @@ where
                             final_usage = Some(usage.clone());
                         }
 
+                        if let Some(reason) = data
+                            .prompt_feedback
+                            .as_ref()
+                            .and_then(prompt_block_reason)
+                        {
+                            stream_failed = true;
+                            yield Err(CompletionError::ResponseError(format!(
+                                "Gemini blocked the prompt (blockReason: {reason})"
+                            )));
+                            break;
+                        }
+
                         // Process the response data
                         let Some(choice) = data.candidates.into_iter().next() else {
                             tracing::debug!("There is no content candidate");
@@ -265,8 +310,14 @@ where
                                     thought_signature,
                                     ..
                                 } => {
+                                    // A parameterless call may omit `args` (null): send `{}`.
+                                    let args = if function_call.args.is_null() {
+                                        serde_json::json!({})
+                                    } else {
+                                        function_call.args.clone()
+                                    };
                                     yield Ok(streaming::RawStreamingChoice::ToolCall(
-                                        streaming::RawStreamingToolCall::new(function_call.name.clone(), function_call.name.clone(), function_call.args.clone())
+                                        streaming::RawStreamingToolCall::new(function_call.name.clone(), function_call.name.clone(), args)
                                             .with_signature(thought_signature)
                                     ));
                                 },
@@ -839,5 +890,113 @@ mod tests {
         assert_eq!(token_usage.reasoning_tokens, 15);
         assert_eq!(token_usage.tool_use_prompt_tokens, 12);
         assert_eq!(token_usage.total_tokens, 190);
+    }
+
+    async fn collect_gemini(
+        sse: &str,
+    ) -> Vec<
+        Result<streaming::StreamedAssistantContent<StreamingCompletionResponse>, CompletionError>,
+    > {
+        use crate::client::CompletionClient;
+        use crate::completion::CompletionModel as _;
+        use crate::test_utils::MockStreamingClient;
+
+        let client = crate::providers::gemini::Client::builder()
+            .api_key("test-key")
+            .http_client(MockStreamingClient {
+                sse_bytes: bytes::Bytes::from(sse.to_string()),
+            })
+            .build()
+            .expect("client should build");
+        let model = client.completion_model("gemini-2.5-flash");
+        let request = model.completion_request("hello").build();
+        let mut stream = model.stream(request).await.expect("stream should start");
+        let mut items = Vec::new();
+        while let Some(item) = stream.next().await {
+            items.push(item);
+        }
+        items
+    }
+
+    #[test]
+    fn unknown_finish_reason_deserializes() {
+        let response: StreamGenerateContentResponse = serde_json::from_value(json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "hi"}], "role": "model"},
+                "finishReason": "SOME_NEW_REASON"
+            }]
+        }))
+        .unwrap();
+        assert!(matches!(
+            response.candidates[0].finish_reason,
+            Some(FinishReason::Unrecognized)
+        ));
+    }
+
+    #[tokio::test]
+    async fn unknown_finish_reason_streams_text_and_final_response() {
+        let sse = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}],\"role\":\"model\"},\"finishReason\":\"SOME_NEW_REASON\"}]}\n\n";
+        let items = collect_gemini(sse).await;
+        assert!(items.iter().all(|item| item.is_ok()), "{items:?}");
+        assert!(
+            items
+                .iter()
+                .any(|item| matches!(item, Ok(streaming::StreamedAssistantContent::Text(_))))
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| matches!(item, Ok(streaming::StreamedAssistantContent::Final(_))))
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_block_reason_yields_error_naming_it() {
+        let sse = "data: {\"promptFeedback\":{\"blockReason\":\"SAFETY\"}}\n\n";
+        let items = collect_gemini(sse).await;
+        let error = items
+            .iter()
+            .find_map(|item| item.as_ref().err())
+            .expect("a block must surface as an error");
+        assert!(error.to_string().contains("SAFETY"), "{error}");
+        assert!(
+            !items
+                .iter()
+                .any(|item| matches!(item, Ok(streaming::StreamedAssistantContent::Final(_))))
+        );
+    }
+
+    #[tokio::test]
+    async fn safety_finish_reason_reports_content_filter_stop() {
+        let sse = "data: {\"candidates\":[{\"finishReason\":\"SAFETY\"}]}\n\n";
+        let items = collect_gemini(sse).await;
+        let final_response = items
+            .into_iter()
+            .find_map(|item| match item {
+                Ok(streaming::StreamedAssistantContent::Final(response)) => Some(response),
+                _ => None,
+            })
+            .expect("final response");
+        assert_eq!(
+            final_response.stop_reason(),
+            Some(crate::completion::StopReason::ContentFilter)
+        );
+    }
+
+    #[tokio::test]
+    async fn function_call_without_args_streams_empty_object() {
+        let sse = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"todo_list\"}}],\"role\":\"model\"},\"finishReason\":\"STOP\"}]}\n\n";
+        let items = collect_gemini(sse).await;
+        let call = items
+            .into_iter()
+            .find_map(|item| match item {
+                Ok(streaming::StreamedAssistantContent::ToolCall { tool_call, .. }) => {
+                    Some(tool_call)
+                }
+                _ => None,
+            })
+            .expect("tool call");
+        assert_eq!(call.function.name, "todo_list");
+        assert_eq!(call.function.arguments, json!({}));
     }
 }

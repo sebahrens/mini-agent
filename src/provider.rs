@@ -541,7 +541,17 @@ pub(crate) fn merge_extra_body(
 ) -> Option<serde_json::Value> {
     match (base, extra) {
         (Some(serde_json::Value::Object(mut b)), Some(serde_json::Value::Object(e))) => {
-            b.extend(e);
+            for (key, value) in e {
+                // An explicit `null` deletes a generated default (for example
+                // `prompt_cache_key`), so a user always has an escape hatch from
+                // a key their gateway rejects. A `null` for a key the base does
+                // not generate stays as written. (mini-agent-nvnkx.33)
+                if value.is_null() && b.contains_key(&key) {
+                    b.remove(&key);
+                } else {
+                    b.insert(key, value);
+                }
+            }
             Some(serde_json::Value::Object(b))
         }
         (base, None) => base,
@@ -1029,18 +1039,54 @@ pub(crate) fn provider_request_params(
 ) -> Option<serde_json::Value> {
     let reasoning = cfg.reasoning.as_ref();
     match model {
-        AnyModel::OpenRouter(_, routing) => merge_extra_body(routing.clone(), provider_extra_body),
+        AnyModel::OpenRouter(m, routing) => merge_extra_body(
+            openrouter_reasoning_default(routing.clone(), &m.model, reasoning),
+            provider_extra_body,
+        ),
         AnyModel::OpenAI(OpenAiModel::Responses(_)) => {
             openai_responses_extra_body(provider_extra_body, session_id, reasoning)
         }
-        AnyModel::OpenAI(OpenAiModel::Completions(m)) => {
-            openai_completions_extra_body(provider_extra_body, session_id, &m.model, reasoning)
-        }
+        AnyModel::OpenAI(OpenAiModel::Completions(m)) => openai_completions_extra_body_for_route(
+            provider_extra_body,
+            session_id,
+            &m.model,
+            reasoning,
+            completions_route_accepts_openai_fields(m.base_url()),
+        ),
         AnyModel::Anthropic(_)
         | AnyModel::Gemini(_)
         | AnyModel::Ollama(_)
         | AnyModel::Copilot(_) => provider_extra_body,
     }
+}
+
+/// Adds the configured `[reasoning] effort` as OpenRouter's unified
+/// `reasoning.effort` for a non-Claude model id. Claude ids (`anthropic/...`)
+/// are mapped by `provider_effort` onto their native controls, but every other
+/// id used to ignore the configured effort entirely, so a reasoning model ran
+/// at its default depth whatever the user set. `extra_body` keeps precedence
+/// (it is merged over this). `max` has no OpenRouter wire value and is not
+/// sent. (mini-agent-nvnkx.156)
+pub(crate) fn openrouter_reasoning_default(
+    base: Option<serde_json::Value>,
+    model_id: &str,
+    reasoning: Option<&ReasoningConfig>,
+) -> Option<serde_json::Value> {
+    use crate::config::ReasoningEffort;
+    let Some(effort) = reasoning.and_then(|config| config.effort) else {
+        return base;
+    };
+    let slug = model_id.strip_prefix('~').unwrap_or(model_id);
+    if slug.starts_with("anthropic/") || effort == ReasoningEffort::Max {
+        return base;
+    }
+    let mut generated = serde_json::Map::new();
+    generated.insert(
+        "reasoning".to_string(),
+        serde_json::json!({ "effort": effort.as_wire_str() }),
+    );
+    // The routing params win over the generated default on a key clash.
+    merge_extra_body(Some(serde_json::Value::Object(generated)), base)
 }
 
 /// The one `include` value this agent requests on the Responses path, and the
@@ -1093,6 +1139,15 @@ pub(crate) fn openai_responses_extra_body(
             base.insert("store".to_string(), serde_json::Value::Bool(store));
         }
     }
+    // The agent always replays full input and never reads `previous_response_id`,
+    // so server-side retention buys nothing: send `store: false` whenever
+    // encrypted reasoning content is requested (the default), which makes the
+    // reasoning replay stateless. `[reasoning] store = true` is the explicit
+    // opt-in; without encrypted content the ids need server state, so `store`
+    // stays unset. (mini-agent-nvnkx.204)
+    if !base.contains_key("store") && ReasoningConfig::wants_encrypted_content(reasoning) {
+        base.insert("store".to_string(), serde_json::Value::Bool(false));
+    }
     if !reasoning_object.is_empty() {
         base.insert(
             "reasoning".to_string(),
@@ -1125,12 +1180,44 @@ pub(crate) fn openai_responses_extra_body(
 /// redundant at best. Explicit user `extra_body` configuration keeps
 /// precedence over every generated default, matching the Responses path's
 /// merge order.
+#[cfg(test)]
 pub(crate) fn openai_completions_extra_body(
     extra: Option<serde_json::Value>,
     session_id: &str,
     model_id: &str,
     reasoning: Option<&ReasoningConfig>,
 ) -> Option<serde_json::Value> {
+    openai_completions_extra_body_for_route(extra, session_id, model_id, reasoning, true)
+}
+
+/// Whether a Chat Completions endpoint is the built-in OpenAI API or Azure
+/// OpenAI, the routes that define `prompt_cache_key` and the global
+/// `reasoning_effort` default. Any other `base_url` is a third-party gateway
+/// that may validate the body strictly (Mistral answers 422 `extra_forbidden`
+/// for unknown fields), so it gets neither generated key; `extra_body` can
+/// still send them explicitly. (mini-agent-nvnkx.33)
+pub(crate) fn completions_route_accepts_openai_fields(base_url: &str) -> bool {
+    let Some(host) = reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+    else {
+        return false;
+    };
+    host == "api.openai.com" || host.ends_with(".azure.com")
+}
+
+/// [`openai_completions_extra_body`] for an explicit route: `openai_route` is
+/// [`completions_route_accepts_openai_fields`] for the model's endpoint.
+pub(crate) fn openai_completions_extra_body_for_route(
+    extra: Option<serde_json::Value>,
+    session_id: &str,
+    model_id: &str,
+    reasoning: Option<&ReasoningConfig>,
+    openai_route: bool,
+) -> Option<serde_json::Value> {
+    if !openai_route {
+        return extra;
+    }
     let mut base = serde_json::Map::new();
     if !is_claude_model_family(model_id) {
         use std::fmt::Write as _;
@@ -6440,6 +6527,7 @@ async fn build_openai_agent(
         ),
         OpenAiModel::Completions(m) => {
             let model_id = m.model.clone();
+            let base_url = m.base_url().to_owned();
             OpenAiAgent::Completions(
                 builder::build_agent_inner_with_snapshot(
                     context_snapshot,
@@ -6462,11 +6550,12 @@ async fn build_openai_agent(
                     tool_result_spills,
                     reasoning_enabled,
                     temperature,
-                    openai_completions_extra_body(
+                    openai_completions_extra_body_for_route(
                         extra_body,
                         tool_output_session_id,
                         &model_id,
                         cfg.reasoning.as_ref(),
+                        completions_route_accepts_openai_fields(&base_url),
                     ),
                     #[cfg(feature = "js")]
                     js_worker_containment_status,
@@ -6667,6 +6756,15 @@ async fn build_agent_with_probe_snapshot(
     // stack test (mini-agent-session-picker-one-mib). Box each one right
     // where it is awaited, matching the heap_future pattern used throughout
     // startup/app.rs for the same reason.
+    // The configured `[reasoning] effort` reaches a non-Claude OpenRouter model
+    // as the unified `reasoning.effort` request field (mini-agent-nvnkx.156).
+    let model = match model {
+        AnyModel::OpenRouter(m, routing) => {
+            let routing = openrouter_reasoning_default(routing, &m.model, cfg.reasoning.as_ref());
+            AnyModel::OpenRouter(m, routing)
+        }
+        other => other,
+    };
     let inner = match model {
         AnyModel::OpenRouter(m, routing) => AnyAgentInner::OpenRouter(
             crate::startup::heap_future(|| {
@@ -7335,6 +7433,15 @@ pub async fn build_btw_agent(
     });
     #[cfg(feature = "multimodal")]
     let image_support = model.image_read_support(extra_body.as_ref());
+    // The configured `[reasoning] effort` reaches a non-Claude OpenRouter model
+    // as the unified `reasoning.effort` request field (mini-agent-nvnkx.156).
+    let model = match model {
+        AnyModel::OpenRouter(m, routing) => {
+            let routing = openrouter_reasoning_default(routing, &m.model, cfg.reasoning.as_ref());
+            AnyModel::OpenRouter(m, routing)
+        }
+        other => other,
+    };
     let inner = match model {
         AnyModel::OpenRouter(m, routing) => AnyAgentInner::OpenRouter(
             crate::startup::heap_future(|| {
@@ -7389,11 +7496,12 @@ pub async fn build_btw_agent(
             ),
             OpenAiModel::Completions(m) => {
                 let model_id = m.model.clone();
-                let completions_extra_body = openai_completions_extra_body(
+                let completions_extra_body = openai_completions_extra_body_for_route(
                     extra_body,
                     tool_output_session_id,
                     &model_id,
                     cfg.reasoning.as_ref(),
+                    completions_route_accepts_openai_fields(m.base_url()),
                 );
                 OpenAiAgent::Completions(
                     crate::startup::heap_future(|| {
