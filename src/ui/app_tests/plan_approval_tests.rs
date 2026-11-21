@@ -1059,11 +1059,20 @@ pub(super) async fn drive_native_effort_fixture(ui: UiContext<'_>) -> Vec<Sessio
         )))
     })
     .await;
+    // A failed control publication is recovered at the next prompt by design:
+    // the failed chain is dropped and the transcript republished as a new
+    // epoch before the request dispatches, so the signed prefix of the failed
+    // value is never replayed. The new turn is then in flight and its file is
+    // denied (in-flight) until it retires, which the final assertion checks.
+    let _ = refused.expect("the failed publication is recovered before the next request");
     assert!(
-        refused.is_err(),
-        "failed control publication must stop the next request before dispatch"
+        app.run.is_running,
+        "the recovered chain must dispatch as a new epoch"
     );
-    assert!(!app.run.is_running);
+    assert!(
+        app.ui.session.native_history.is_none(),
+        "the failed chain must not be replayed"
+    );
     assert_eq!(
         (
             app.ui.session.total_input_tokens,
@@ -4900,7 +4909,7 @@ async fn model_listing48_actual_selection_uses_completed_metadata_and_retains_lo
                 .unwrap(),
         );
         let operator = async {
-            app.input.buffer = "/model selection48-live".into();
+            app.input.buffer = "/model --force selection48-live".into();
             app.input.cursor = app.input.buffer.len();
             user(
                 &mut app,

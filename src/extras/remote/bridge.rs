@@ -142,7 +142,7 @@ impl EventMapper {
             }
             AgentEvent::ToolResult {
                 name,
-                output,
+                output: tool_text,
                 is_error,
                 ..
             } => {
@@ -150,7 +150,7 @@ impl EventMapper {
                 out.push(serde_json::json!({
                     "type": "result",
                     "name": bounded(name),
-                    "summary": bounded(output),
+                    "summary": bounded(tool_text),
                     "error": is_error,
                 }));
             }
