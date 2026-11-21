@@ -221,6 +221,17 @@ pub(crate) fn native_claude_id(model: &str) -> String {
     name
 }
 
+/// Whether `model` names a Claude model under any accepted spelling: bare,
+/// Bedrock/Vertex (`anthropic.claude-...`, `us.anthropic.claude-...`,
+/// `claude-...@date`) or a gateway path (`bedrock/anthropic.claude-...`,
+/// `anthropic/claude-3.5-sonnet`). Only the last `/` segment is considered, so a
+/// bare substring such as `declaude-mini` never matches.
+pub(crate) fn is_claude_family(model: &str) -> bool {
+    let slug = model.trim().strip_prefix('~').unwrap_or(model.trim());
+    let segment = slug.rsplit('/').next().unwrap_or(slug);
+    native_claude_id(segment).starts_with("claude-")
+}
+
 /// The catalog key for `provider/model`: the exact entry, or for Bedrock and
 /// Vertex the native Anthropic id (with or without its date suffix).
 fn catalog_key(provider: &str, model: &str) -> Option<(&'static str, String)> {

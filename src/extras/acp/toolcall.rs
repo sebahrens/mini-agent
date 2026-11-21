@@ -6,6 +6,7 @@
 //! IDE.
 
 use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 use agent_client_protocol::schema::v1::{Diff, ToolCallContent, ToolCallLocation, ToolKind};
@@ -14,6 +15,8 @@ use serde_json::Value;
 use crate::agent::tools::mutation_diff::{DiffKind, MAX_DIFF_BYTES, MutationDiff};
 
 const TITLE_MAX_CHARS: usize = 120;
+/// Characters of a `task` prompt kept in its call title.
+const TASK_PROMPT_CHARS: usize = 60;
 /// Edit blocks previewed in one permission request.
 const MAX_PREVIEW_BLOCKS: usize = 16;
 /// Pending edit/write argument sets kept for permission previews.
@@ -31,7 +34,7 @@ pub(super) fn kind_for(tool: &str) -> ToolKind {
     }
 }
 
-fn clip(text: &str, max: usize) -> String {
+pub(super) fn clip(text: &str, max: usize) -> String {
     let clean = crate::ui::events::sanitize_for_review(text);
     let one_line: String = clean.split_whitespace().collect::<Vec<_>>().join(" ");
     if one_line.chars().count() <= max {
@@ -46,14 +49,61 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key)?.as_str().filter(|value| !value.is_empty())
 }
 
-/// Descriptive title: the tool plus its path, command or pattern.
+/// Subject of a `task` call: the agent type and the first prompt or brief
+/// objective, so a list of fan-out calls is distinguishable.
+fn task_subject(args: &Value) -> Option<String> {
+    let first = args
+        .get("prompts")
+        .and_then(Value::as_array)
+        .and_then(|prompts| prompts.first())
+        .and_then(Value::as_str)
+        .or_else(|| {
+            args.get("briefs")
+                .and_then(Value::as_array)
+                .and_then(|briefs| briefs.first())
+                .and_then(|brief| brief.get("objective"))
+                .and_then(Value::as_str)
+        })
+        .map(|text| clip(text, TASK_PROMPT_CHARS));
+    match (str_arg(args, "agent_type"), first) {
+        (Some(agent), Some(text)) => Some(format!("{agent}: {text}")),
+        (Some(agent), None) => Some(agent.to_owned()),
+        (None, text) => text,
+    }
+}
+
+/// Subject of a `git` call: the operation and the paths it names.
+fn git_subject(args: &Value) -> Option<String> {
+    let operation = str_arg(args, "operation")?;
+    let paths = args
+        .get("paths")
+        .and_then(Value::as_array)
+        .map(|paths| {
+            paths
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|paths| !paths.is_empty());
+    Some(match paths {
+        Some(paths) => format!("{operation} {paths}"),
+        None => operation.to_owned(),
+    })
+}
+
+/// Descriptive title: the tool plus its path, command, pattern or, for
+/// `task`, `git` and `job_status`, the subject that tells calls apart.
 pub(super) fn title_for(tool: &str, args: &Value) -> String {
     let subject = match tool {
-        "shell" => str_arg(args, "command"),
-        "grep" | "find_files" => str_arg(args, "pattern"),
-        "web_fetch" => str_arg(args, "url"),
-        "web_search" => str_arg(args, "query"),
-        _ => str_arg(args, "path"),
+        "shell" => str_arg(args, "command").map(str::to_owned),
+        "grep" | "find_files" => str_arg(args, "pattern").map(str::to_owned),
+        "web_fetch" => str_arg(args, "url").map(str::to_owned),
+        "web_search" => str_arg(args, "query").map(str::to_owned),
+        "task" => task_subject(args),
+        "git" => git_subject(args),
+        "job_status" => str_arg(args, "id").map(str::to_owned),
+        _ => str_arg(args, "path").map(str::to_owned),
     };
     match subject {
         Some(subject) => clip(&format!("{tool} {subject}"), TITLE_MAX_CHARS),
@@ -61,8 +111,23 @@ pub(super) fn title_for(tool: &str, args: &Value) -> String {
     }
 }
 
+/// ACP requires absolute file paths. The model usually sends workspace-relative
+/// ones, so join them onto the session root (no filesystem access).
+fn absolute_path(root: Option<&Path>, path: &str) -> String {
+    match root {
+        Some(root) if !Path::new(path).is_absolute() => {
+            root.join(path).to_string_lossy().into_owned()
+        }
+        _ => path.to_owned(),
+    }
+}
+
 /// Files a path-taking tool touches, for follow-along in the IDE.
-pub(super) fn locations_for(tool: &str, args: &Value) -> Vec<ToolCallLocation> {
+pub(super) fn locations_for(
+    tool: &str,
+    args: &Value,
+    root: Option<&Path>,
+) -> Vec<ToolCallLocation> {
     if !matches!(
         tool,
         "read" | "edit" | "write" | "notebook_edit" | "list_dir" | "grep" | "find_files"
@@ -72,7 +137,7 @@ pub(super) fn locations_for(tool: &str, args: &Value) -> Vec<ToolCallLocation> {
     let Some(path) = str_arg(args, "path") else {
         return Vec::new();
     };
-    let mut location = ToolCallLocation::new(path);
+    let mut location = ToolCallLocation::new(absolute_path(root, path));
     if tool == "read"
         && let Some(offset) = args.get("offset").and_then(Value::as_u64)
         && let Ok(offset) = u32::try_from(offset)
@@ -255,25 +320,49 @@ pub(super) fn mutation_diff_content(diff: &MutationDiff) -> Option<ToolCallConte
     Some(ToolCallContent::Diff(out))
 }
 
-type PendingKey = String;
+/// One announced call kept until its result: the title shown to the user and,
+/// for `edit`/`write`, the arguments a permission preview is built from.
+struct PendingCall {
+    id: String,
+    title: String,
+    args: Option<Value>,
+}
 
-fn pending() -> &'static Mutex<VecDeque<(PendingKey, Value)>> {
-    static PENDING: OnceLock<Mutex<VecDeque<(PendingKey, Value)>>> = OnceLock::new();
+fn pending() -> &'static Mutex<VecDeque<PendingCall>> {
+    static PENDING: OnceLock<Mutex<VecDeque<PendingCall>>> = OnceLock::new();
     PENDING.get_or_init(|| Mutex::new(VecDeque::new()))
 }
 
-/// Remember an edit/write call's arguments until its result, so the
-/// permission bridge (a separate task) can build a diff for the dialog.
-pub(super) fn remember_args(tool_call_id: &str, tool: &str, args: &Value) {
-    if !matches!(tool, "edit" | "write") {
-        return;
-    }
+/// Remember a call's title (every tool) and, for edit/write, its arguments
+/// until the result, so the permission bridge (a separate task) can keep the
+/// descriptive title and build a diff for the dialog. A relative `path` is
+/// made absolute with `root` so the diff header is a valid ACP path.
+pub(super) fn remember_args(
+    tool_call_id: &str,
+    tool: &str,
+    args: &Value,
+    title: &str,
+    root: Option<&Path>,
+) {
+    let args = matches!(tool, "edit" | "write").then(|| {
+        let mut args = args.clone();
+        if let Some(path) = str_arg(&args, "path").map(|path| absolute_path(root, path))
+            && let Some(object) = args.as_object_mut()
+        {
+            object.insert("path".to_owned(), Value::String(path));
+        }
+        args
+    });
     let mut guard = pending().lock().unwrap_or_else(|e| e.into_inner());
-    guard.retain(|(id, _)| id != tool_call_id);
+    guard.retain(|call| call.id != tool_call_id);
     if guard.len() >= MAX_PENDING {
         guard.pop_front();
     }
-    guard.push_back((tool_call_id.to_owned(), args.clone()));
+    guard.push_back(PendingCall {
+        id: tool_call_id.to_owned(),
+        title: title.to_owned(),
+        args,
+    });
 }
 
 pub(super) fn recall_args(tool_call_id: &str) -> Option<Value> {
@@ -281,15 +370,26 @@ pub(super) fn recall_args(tool_call_id: &str) -> Option<Value> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
-        .find(|(id, _)| id == tool_call_id)
-        .map(|(_, args)| args.clone())
+        .find(|call| call.id == tool_call_id)
+        .and_then(|call| call.args.clone())
+}
+
+/// The title the call was announced with, so an approval request does not
+/// rename it to the bare tool name.
+pub(super) fn recall_title(tool_call_id: &str) -> Option<String> {
+    pending()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|call| call.id == tool_call_id)
+        .map(|call| call.title.clone())
 }
 
 pub(super) fn forget_args(tool_call_id: &str) {
     pending()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .retain(|(id, _)| id != tool_call_id);
+        .retain(|call| call.id != tool_call_id);
 }
 
 #[cfg(test)]
@@ -306,10 +406,75 @@ mod tests {
         assert_eq!(kind_for("mystery"), ToolKind::Other);
         let args = json!({"path": "src/a.rs", "offset": 10});
         assert_eq!(title_for("read", &args), "read src/a.rs");
-        let locations = locations_for("read", &args);
+        let locations = locations_for("read", &args, None);
         assert_eq!(locations[0].path.to_str(), Some("src/a.rs"));
         assert_eq!(locations[0].line, Some(9));
-        assert!(locations_for("shell", &json!({"command": "ls"})).is_empty());
+        assert!(locations_for("shell", &json!({"command": "ls"}), None).is_empty());
+    }
+
+    #[test]
+    fn locations_and_preview_paths_are_absolute_under_the_workspace() {
+        let root = std::env::temp_dir().join("acp-root");
+        let relative = json!({"path": "src/a.rs"});
+        let locations = locations_for("edit", &relative, Some(&root));
+        assert_eq!(locations[0].path, root.join("src/a.rs"));
+        let absolute = root.join("b.rs");
+        let args = json!({"path": absolute.to_string_lossy()});
+        assert_eq!(locations_for("read", &args, Some(&root))[0].path, absolute);
+
+        remember_args(
+            "abs-1",
+            "write",
+            &json!({"path": "c.txt", "content": "x"}),
+            "write c.txt",
+            Some(&root),
+        );
+        let recalled = recall_args("abs-1").unwrap();
+        let out = pending_diffs("write", &recalled);
+        let [ToolCallContent::Diff(diff)] = out.as_slice() else {
+            panic!("expected one diff");
+        };
+        assert_eq!(diff.path, root.join("c.txt"));
+        forget_args("abs-1");
+    }
+
+    #[test]
+    fn titles_name_the_subject_of_task_git_and_job_calls() {
+        let task = json!({"agent_type": "explore", "prompts": ["find where retries are decided"]});
+        assert_eq!(
+            title_for("task", &task),
+            "task explore: find where retries are decided"
+        );
+        let briefs = json!({"briefs": [{"objective": "map the parser"}]});
+        assert_eq!(title_for("task", &briefs), "task map the parser");
+        let long = json!({"prompts": ["p".repeat(200)]});
+        assert!(title_for("task", &long).chars().count() <= TITLE_MAX_CHARS);
+        let git = json!({"operation": "stage", "paths": ["a.rs", "b.rs"]});
+        assert_eq!(title_for("git", &git), "git stage a.rs b.rs");
+        assert_eq!(
+            title_for("git", &json!({"operation": "status"})),
+            "git status"
+        );
+        assert_eq!(
+            title_for("job_status", &json!({"id": "job-3", "action": "wait"})),
+            "job_status job-3"
+        );
+        assert_eq!(title_for("task", &json!({})), "task");
+    }
+
+    #[test]
+    fn remembered_title_survives_for_every_tool() {
+        remember_args(
+            "title-1",
+            "shell",
+            &json!({"command": "cargo test"}),
+            "shell cargo test",
+            None,
+        );
+        assert_eq!(recall_title("title-1").as_deref(), Some("shell cargo test"));
+        assert!(recall_args("title-1").is_none());
+        forget_args("title-1");
+        assert!(recall_title("title-1").is_none());
     }
 
     #[test]
@@ -427,13 +592,25 @@ mod tests {
     #[test]
     fn pending_args_are_bounded() {
         for index in 0..(MAX_PENDING + 10) {
-            remember_args(&format!("bound-{index}"), "write", &json!({"path": "a"}));
+            remember_args(
+                &format!("bound-{index}"),
+                "write",
+                &json!({"path": "a"}),
+                "write a",
+                None,
+            );
         }
         assert!(recall_args("bound-0").is_none());
         assert!(recall_args(&format!("bound-{}", MAX_PENDING + 9)).is_some());
         forget_args(&format!("bound-{}", MAX_PENDING + 9));
         assert!(recall_args(&format!("bound-{}", MAX_PENDING + 9)).is_none());
-        remember_args("shell-1", "shell", &json!({"command": "x"}));
+        remember_args(
+            "shell-1",
+            "shell",
+            &json!({"command": "x"}),
+            "shell x",
+            None,
+        );
         assert!(recall_args("shell-1").is_none());
     }
 }

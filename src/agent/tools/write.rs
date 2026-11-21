@@ -46,15 +46,27 @@ fn overwrite_not_authorized(path: &str) -> ToolError {
 }
 
 /// The not-authorized error plus, when the file cannot fit one read result,
-/// the real cause: windows do not compose into a complete read.
+/// the real cause: windows do not compose into a complete read. A file that
+/// fits one result but has more lines than the default read window only
+/// needs an explicit `limit` (read accepts any limit).
 fn overwrite_not_authorized_sized(path: &str, bytes: usize, lines: usize) -> ToolError {
+    /// Default `max_read_lines`; an explicit read `limit` may exceed it.
+    const DEFAULT_READ_LINES: usize = 2_000;
     let limits = crate::agent::tools::limits::current();
-    let chars_budget = limits.max_result_chars.saturating_sub(2_000);
-    if bytes <= chars_budget && lines <= 2_000 {
-        return overwrite_not_authorized(path);
+    let chars_budget = limits
+        .max_result_chars
+        .saturating_sub(super::read::READ_RESULT_RESERVE_CHARS);
+    if bytes <= chars_budget {
+        let error = overwrite_not_authorized(path);
+        if lines <= DEFAULT_READ_LINES {
+            return error;
+        }
+        return ToolError::Msg(format!(
+            "{error} This file has {lines} lines, more than the default read window: read it in one call with offset 1 and limit >= {lines}, then retry."
+        ));
     }
     ToolError::Msg(format!(
-        "Cannot overwrite '{path}': overwrite=true requires one complete read, but this file ({bytes} bytes, {lines} lines) is larger than a single read result can hold (max_result_chars={} characters, about {} bytes of text, and the read line limit, default 2000 lines); reading it in several windows does not add up to a complete read. Use the edit tool for targeted changes, or replace it with the shell tool (for example write the new content to a temporary file and move it over this path).",
+        "Cannot overwrite '{path}': overwrite=true requires one complete read, but this file ({bytes} bytes, {lines} lines) is larger than a single read result can hold (max_result_chars={} characters, about {} bytes of text); reading it in several windows does not add up to a complete read. Use the edit tool for targeted changes, or replace it with the shell tool (for example write the new content to a temporary file and move it over this path).",
         limits.max_result_chars, chars_budget
     ))
 }
@@ -949,6 +961,44 @@ mod tests {
         );
         assert!(error.contains("edit tool"), "{error}");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), body);
+    }
+
+    // mini-agent-sskdu.89: many short lines fit one result; an explicit read
+    // limit authorizes the overwrite and the refusal says so.
+    #[tokio::test]
+    async fn overwrite_of_a_long_but_small_file_needs_only_an_explicit_read_limit() {
+        let temp = TempDir::new("write-long-overwrite");
+        let target = temp.path().join("long.txt");
+        std::fs::write(&target, "a\n".repeat(2_500)).unwrap();
+        let tracker = ReadTracker::new(true);
+        let read = ReadTool::new_with_tracker(None, None, None, 2000, tracker.clone())
+            .with_workspace(temp.path());
+        let write =
+            WriteTool::new_with_tracker(None, None, None, tracker).with_workspace(temp.path());
+        let read_args = |limit: Option<usize>| ReadArgs {
+            pages: None,
+            raw_notebook: false,
+            character_offset: None,
+            character_limit: None,
+            path: "long.txt".into(),
+            offset: None,
+            limit,
+        };
+        let write_args = || WriteArgs {
+            path: "long.txt".into(),
+            content: "new\n".into(),
+            overwrite: true,
+        };
+        read.call(read_args(None)).await.unwrap();
+        let error = write.call(write_args()).await.unwrap_err().to_string();
+        assert!(error.contains("limit >= 2500"), "{error}");
+        assert!(
+            !error.contains("larger than a single read result"),
+            "{error}"
+        );
+        read.call(read_args(Some(2_500))).await.unwrap();
+        write.call(write_args()).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
     }
 
     #[tokio::test]

@@ -376,6 +376,34 @@ If you want to use mini-agent from scripts or other programs, these CLI flags ar
 | `--status-socket <path>` | Send start/stop status messages to a Unix socket. |
 | `--load-prompt <prompt>` | Use a specific prompt |
 
+Permission-mode flags (`--restrictive`, `--read-only`, `--guarded`, `--accept-all`, `--yolo`,
+`--dangerously-skip-permissions`) are mutually exclusive: giving two is a usage error naming both.
+Stream-json companions (`--include-partial-messages`, `--stream-json-schema`,
+`--stream-json-preview-bytes`, `--stream-json-control`, `--input-format stream-json`) require
+`--output stream-json`, and `--pure-stdout` requires `-p`; `--json` only applies to the
+learned-skill operator commands (use `--output json` with `-p`). `--setup` needs a terminal and
+conflicts with `-p`/`--print-config`. `--log-level` takes `off`, `error`, `warn`, `info`, `debug` or
+`trace`. `--login`/`--logout` take `openai` or `copilot`. `--tools` rejects a name that is a
+near miss of a built-in tool (and any unknown name when no MCP server is configured). Path flags
+(`--add-dir`, `--image`, `--output-schema`, `--log-file`) expand a leading `~`. `--config KEY=VALUE`
+errors name the failing override (`--config #2`); values are TOML literals, so strings need quotes,
+for example `--config 'model="gpt-5"'`. `mini-agent update --help` prints the self-update usage.
+
+With `-p --output json` (or `stream-json`), stdout always ends with one result record, including
+when startup fails before a turn (missing credential, unknown session): `is_error: true`,
+`stop_reason: "failed"`.
+
+#### Exit codes
+
+| Exit | Meaning |
+| ---- | ------- |
+| `0` | Success (a met goal is also `0`). |
+| `1` | Runtime failure: provider, tool, budget or schema failure. |
+| `2` | Usage error: bad or conflicting flags, empty prompt, unknown quick model or tool name, malformed `--config`, unknown session. Retrying cannot succeed. |
+| `20`-`24` | Goal outcome: impossible, blocked, awaiting an answer (`22`), paused, budget limited (see [COMMANDS.md](COMMANDS.md#goal-feature-gated)). |
+| `22` | Also: `-p` is waiting for an answer to a question; send a new user message. |
+| `130` | Interrupted; cleanup was bounded. |
+
 In default text mode, stdout contains the canonical final answer after the turn and its session
 save settle. Intermediate assistant text and tool transcripts remain in the saved session;
 bounded, terminal-safe tool summaries and reasoning go to stderr. `--pure-stdout` retains the
@@ -716,8 +744,10 @@ or unreadable entries make them partial; the TUI does not scan disk. When LSP
 is enabled, the CLI checks executable metadata for at most 32 effective servers
 through 128 absolute PATH entries, without launching them or showing arguments
 and environment values. Terminal protocol emission is reported separately from
-confirmed terminal support. The embedded model snapshot currently carries no
-catalogue date; the report identifies that limitation and its build fingerprint.
+confirmed terminal support. The report names the model catalogue in use (embedded
+snapshot or models.dev cache) with its generation date and age, lists each
+distinct config load-warning class with a count, and points to `--print-config`
+for the full warnings.
 Review local paths and custom server/model names before sharing the report.
 For build identity alone, `mini-agent --version` prints the version, fingerprint
 and compilation target without initializing application storage.

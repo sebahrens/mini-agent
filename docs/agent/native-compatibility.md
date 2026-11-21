@@ -38,8 +38,7 @@ An unfinished context (`InFlight`) and raw request overrides
 (`UnsupportedOverride`) are never discarded this way. The restart is published
 like an effort change: the old value is denied on disk first, then the healthy
 payload without a chain replaces it, under the exact retained writer; a failed
-publication leaves the context refused. Compaction mid-turn and ACP compaction of
-a native session stay unsupported (ACP refuses before any summarizer spend).
+publication leaves the context refused. ACP compacts a native session between turns under token pressure and mid-turn at a tool-batch boundary; both restart the thinking chain from the compacted transcript as a new epoch.
 
 The manual SDK cache policy regenerates every message-level cache marker on each
 request (a tail marker plus spares every 18 blocks), so under that policy marker

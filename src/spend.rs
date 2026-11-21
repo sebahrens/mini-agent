@@ -592,6 +592,24 @@ struct State {
     call_history_complete: bool,
 }
 
+/// Why `Account::admit*` refused: each cause names the limit that stopped the
+/// run, so a token ceiling is never reported as a USD budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum BudgetRefusal {
+    #[error("session token ceiling (max_session_total_tokens) reached")]
+    TokenCeiling,
+    #[error("session USD budget exhausted")]
+    UsdExhausted,
+    #[error(
+        "cost cap requires known model pricing; add model_prices for this model or switch model"
+    )]
+    UnknownPricing,
+    #[error("cost cap cannot continue while usage tracking is incomplete")]
+    TrackingIncomplete,
+    #[error("usage ledger persistence is pending")]
+    LedgerPending,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Account(Arc<Mutex<State>>);
 
@@ -603,6 +621,25 @@ pub(crate) struct AccountSnapshot {
     pub observed_cost: f64,
     pub unpriced_tokens: u64,
     pub tracking_error: bool,
+}
+
+/// The line shown when a submit is refused at a budget limit, naming the limit,
+/// what was spent where that applies, and how to continue.
+pub(crate) fn budget_notice_text(
+    reason: Option<BudgetRefusal>,
+    snapshot: AccountSnapshot,
+) -> String {
+    match reason {
+        Some(BudgetRefusal::UsdExhausted) => format!(
+            "USD budget reached: ${:.2} of ${:.2} spent; restart with a higher --max-budget-usd or use /new. Queued input is retained; /cost shows the recorded estimates.",
+            snapshot.recorded_spend(),
+            snapshot.cap.unwrap_or_default()
+        ),
+        Some(BudgetRefusal::TokenCeiling) => "Token budget reached (max_session_total_tokens); raise it or use /new. Queued input is retained; /cost shows usage.".into(),
+        Some(BudgetRefusal::UnknownPricing) => "Cost cap needs a known price for this model; add model_prices for it or switch model with /model. Queued input is retained.".into(),
+        Some(other) => format!("Budget check refused further model requests: {other}. Queued input is retained; /cost shows the recorded estimates."),
+        None => "Budget check refused further model requests; queued input is retained. /cost shows the recorded estimates.".into(),
+    }
 }
 
 impl AccountSnapshot {
@@ -981,26 +1018,39 @@ impl Account {
             .unwrap_or_else(|error| error.into_inner())
             .ledger_ready
     }
+    #[cfg(test)]
     pub(crate) fn admit_effect(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(!self.tokens_exhausted(), "session token budget exhausted");
+        self.admit_effect_reason().map_err(Into::into)
+    }
+    pub(crate) fn admit(&self, prices: PriceSnapshot) -> anyhow::Result<()> {
+        self.admit_reason(prices).map_err(Into::into)
+    }
+    /// [`Self::admit_effect`] with the typed refusal, so callers can name the
+    /// limit that actually stopped the run.
+    pub(crate) fn admit_effect_reason(&self) -> Result<(), BudgetRefusal> {
+        if self.tokens_exhausted() {
+            return Err(BudgetRefusal::TokenCeiling);
+        }
         let state = self.snapshot();
         if state.cap.is_none() {
             return Ok(());
         }
-        anyhow::ensure!(!self.has_pending(), "usage ledger persistence is pending");
-        anyhow::ensure!(!state.exhausted(), "session USD budget exhausted");
-        anyhow::ensure!(
-            !state.tracking_error && state.unpriced_tokens == 0,
-            "cost cap cannot continue while usage tracking is incomplete"
-        );
+        if self.has_pending() {
+            return Err(BudgetRefusal::LedgerPending);
+        }
+        if state.exhausted() {
+            return Err(BudgetRefusal::UsdExhausted);
+        }
+        if state.tracking_error || state.unpriced_tokens != 0 {
+            return Err(BudgetRefusal::TrackingIncomplete);
+        }
         Ok(())
     }
-    pub(crate) fn admit(&self, prices: PriceSnapshot) -> anyhow::Result<()> {
-        self.admit_effect()?;
-        anyhow::ensure!(
-            self.snapshot().cap.is_none() || prices.is_known(),
-            "cost cap requires known model pricing"
-        );
+    pub(crate) fn admit_reason(&self, prices: PriceSnapshot) -> Result<(), BudgetRefusal> {
+        self.admit_effect_reason()?;
+        if self.snapshot().cap.is_some() && !prices.is_known() {
+            return Err(BudgetRefusal::UnknownPricing);
+        }
         Ok(())
     }
     pub(crate) fn observe(&self, receipt: &Receipt) -> anyhow::Result<bool> {
@@ -1455,6 +1505,40 @@ mod tests {
             1,
         );
         assert!(serde_json::from_str::<Row>(&duplicate).is_err());
+    }
+
+    #[test]
+    fn budget_notice_text_reports_spend_and_the_next_step() {
+        let snapshot = Account::new("s", Some(1.0), 1.02).unwrap().snapshot();
+        let text = budget_notice_text(Some(BudgetRefusal::UsdExhausted), snapshot);
+        assert!(
+            text.contains("$1.02 of $1.00") && text.contains("--max-budget-usd"),
+            "{text}"
+        );
+        let text = budget_notice_text(Some(BudgetRefusal::UnknownPricing), snapshot);
+        assert!(
+            text.contains("model_prices") && !text.contains("USD"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn admit_refusals_name_the_limit_that_stopped_the_run() {
+        let unpriced = Account::new("s", Some(1.0), 0.0).unwrap();
+        let error = unpriced.admit_reason(prices(None)).unwrap_err();
+        assert_eq!(error, BudgetRefusal::UnknownPricing);
+        assert!(error.to_string().contains("pricing"));
+        assert!(!error.to_string().contains("USD"));
+        let tokens = Account::new("s", None, 0.0).unwrap();
+        tokens.set_token_caps(None, Some(0));
+        let error = tokens.admit_reason(prices(Some(0.0))).unwrap_err();
+        assert_eq!(error, BudgetRefusal::TokenCeiling);
+        assert!(!error.to_string().contains("USD"));
+        let capped = Account::new("s", Some(0.0), 0.0).unwrap();
+        assert_eq!(
+            capped.admit_reason(prices(Some(0.0))).unwrap_err(),
+            BudgetRefusal::UsdExhausted
+        );
     }
 
     #[test]

@@ -49,47 +49,49 @@ mod subagent_registration_tests {
     }
 }
 
-#[cfg(any(feature = "mcp", all(test, feature = "goal", feature = "js")))]
+/// Every built-in tool name, including ones gated behind features this build
+/// may lack. MCP tools may not take these names, and `--tools` accepts them.
+pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
+    "read",
+    "write",
+    "edit",
+    "notebook_edit",
+    "web_fetch",
+    "web_search",
+    "grep",
+    "find_files",
+    "list_dir",
+    "todo_write",
+    "todo_read",
+    "goal_report",
+    "shell",
+    "job_status",
+    "bash",
+    "git",
+    "js",
+    "task",
+    "task_result",
+    "task_list",
+    "task_cancel",
+    "task_send",
+    "task_evidence",
+    "memory_write",
+    "memory_edit",
+    "memory_read",
+    "memory_search",
+    "advisor",
+    "lsp_diagnostics",
+    "lsp_navigate",
+    "skills_search",
+    "ask_user_question",
+    "mcp_search",
+    "list_mcp_resources",
+    "read_mcp_resource",
+    "schedule_wakeup",
+];
+
 pub(crate) fn is_reserved_builtin_tool_name(name: &str) -> bool {
-    matches!(
-        name,
-        "read"
-            | "write"
-            | "edit"
-            | "notebook_edit"
-            | "web_fetch"
-            | "web_search"
-            | "grep"
-            | "find_files"
-            | "list_dir"
-            | "todo_write"
-            | "todo_read"
-            | "goal_report"
-            | "shell"
-            | "job_status"
-            | "bash"
-            | "git"
-            | "js"
-            | "task"
-            | "task_result"
-            | "task_list"
-            | "task_cancel"
-            | "task_send"
-            | "task_evidence"
-            | "memory_write"
-            | "memory_edit"
-            | "memory_read"
-            | "memory_search"
-            | "advisor"
-            | "lsp_diagnostics"
-            | "lsp_navigate"
-            | "skills_search"
-            | "ask_user_question"
-            | "mcp_search"
-            | "list_mcp_resources"
-            | "read_mcp_resource"
-            | "schedule_wakeup"
-    )
+    BUILTIN_TOOL_NAMES.contains(&name)
 }
 
 #[cfg(feature = "mcp")]
@@ -750,6 +752,20 @@ fn task_tool_available(cfg: &Config) -> bool {
     should_register_task_tool(cfg.task_enabled, crate::extras::subagents::is_initialized())
 }
 
+/// Whether grep may suggest `task` in its result hint: only when the main
+/// agent actually has that tool (mini-agent-sskdu.91).
+fn grep_task_hint(cfg: &Config) -> bool {
+    #[cfg(feature = "subagents")]
+    {
+        task_tool_available(cfg)
+    }
+    #[cfg(not(feature = "subagents"))]
+    {
+        let _ = cfg;
+        false
+    }
+}
+
 #[cfg(feature = "subagents")]
 fn should_register_task_tool(task_enabled: Option<bool>, runtime_initialized: bool) -> bool {
     task_enabled.unwrap_or(true) && runtime_initialized
@@ -1257,6 +1273,7 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         }
         base_tools.push(Box::new(
             tools::GrepTool::new(permission.clone(), ask_tx.clone(), max_grep_results)
+                .with_task_hint(grep_task_hint(cfg))
                 .with_workspace_binding(workspace.clone()),
         ));
         base_tools.push(Box::new(tools::notebook::NotebookTool::new(
@@ -2533,7 +2550,7 @@ mod extra_file_tests {
             .unwrap();
         assert!(shell.description.contains("321 second deadline"));
         assert!(
-            shell.parameters["properties"]["timeout"]["description"]
+            shell.parameters["properties"]["timeout_ms"]["description"]
                 .as_str()
                 .unwrap()
                 .contains("321000 foreground")
@@ -3865,8 +3882,16 @@ mod js_tests {
             let first = preamble_with(Some(&goal));
             goal.progress.rounds = 31;
             goal.progress.tokens_used = 250_000;
-            goal.set_status(GoalStatus::Blocked, None);
             assert_eq!(preamble_with(Some(&goal)), first);
+
+            // Parking changes the rules paragraph once (a parked goal must not
+            // tell the model to call a tool that refuses); it is still stable
+            // for as long as the goal stays parked.
+            goal.set_status(GoalStatus::Blocked, None);
+            let parked = preamble_with(Some(&goal));
+            assert_ne!(parked, first);
+            goal.progress.rounds = 40;
+            assert_eq!(preamble_with(Some(&goal)), parked);
         }
 
         #[test]

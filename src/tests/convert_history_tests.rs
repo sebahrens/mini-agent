@@ -612,3 +612,30 @@ fn empty_assistant_records_are_not_replayed() {
     );
     assert_eq!(history.last(), Some(&Message::user("next")));
 }
+
+#[test]
+fn continuation_prompt_names_the_recap_label_the_replay_uses() {
+    // mini-agent-sskdu.186: the prompt must point at the message the model
+    // actually sees, not at a "system summary".
+    let prompt = crate::agent::runner::HEADLESS_CONTEXT_RELIEF_PROMPT;
+    assert!(prompt.contains(crate::agent::runner::COMPACTION_RECAP_LABEL));
+    assert!(!prompt.contains("full prior history"));
+    assert!(!prompt.contains("system summary"));
+
+    let mut session = sample_session();
+    session.add_message(MessageRole::User, "q");
+    session.add_message(MessageRole::Assistant, "a");
+    session.compress("did some prior work".into(), 2, 0);
+    let history = convert_history(&session);
+    let Message::Assistant { content, .. } = &history[0] else {
+        panic!("recap must be an assistant message");
+    };
+    let text = content
+        .iter()
+        .filter_map(|item| match item {
+            AssistantContent::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert!(text.starts_with(crate::agent::runner::COMPACTION_RECAP_LABEL));
+}

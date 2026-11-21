@@ -303,17 +303,6 @@ impl ListPicker {
         self.monochrome
     }
 
-    /// Move the item names out, leaving the list empty.
-    pub(crate) fn take_items(&mut self) -> Vec<String> {
-        self.items_lower.clear();
-        self.name_width = 0;
-        self.match_indices.clear();
-        std::mem::take(&mut self.items)
-            .into_iter()
-            .map(Cow::into_owned)
-            .collect()
-    }
-
     pub fn set_items(&mut self, items: Vec<String>) {
         self.set_names(items);
         self.descriptions.clear();

@@ -290,7 +290,7 @@ fn opens_sub_picker(command: &str, ctx: &CommandPickerCtx) -> bool {
         }
         "/theme" => !ctx.theme_names.is_empty(),
         "/provider" => !ctx.provider_names.is_empty(),
-        "/models-subagent" => !ctx.quick_model_names.is_empty(),
+        "/subagent-models" | "/models-subagent" => !ctx.quick_model_names.is_empty(),
         "/queue" | "/add" => true,
         "/mode" => ctx.security_mode.is_some(),
         _ => argument_picker_spec(command).is_some(),
@@ -303,7 +303,10 @@ pub(crate) fn argument_picker_spec(
     command: &str,
 ) -> Option<(&'static [&'static str], &'static str)> {
     match command {
-        "/permissions" => Some((&["yolo", "auto", "manual"], "/permissions ")),
+        "/permissions" => Some((
+            &["yolo", "auto", "manual", "rules", "forget"],
+            "/permissions ",
+        )),
         "/mode" => Some((
             &[
                 "standard",
@@ -338,6 +341,13 @@ pub(crate) fn argument_picker_spec(
         )),
         "/mcp" => Some((&["login", "logout"], "/mcp ")),
         "/loop" => Some((&["status", "stop"], "/loop ")),
+        "/sandbox" => Some((&["workspace", "host-read", "host-full"], "/sandbox ")),
+        "/effort" => Some((
+            &["low", "medium", "high", "xhigh", "max", "default"],
+            "/effort ",
+        )),
+        "/cron" => Some((&["list", "stop", "run", "resume"], "/cron ")),
+        "/jobs" => Some((&["stop"], "/jobs ")),
         "/goal" => Some((
             &[
                 "status", "pause", "resume", "reopen", "clear", "check", "bounds",
@@ -361,6 +371,10 @@ pub(crate) const FINITE_ARGUMENT_COMMANDS: &[&str] = &[
     "/mcp",
     "/loop",
     "/goal",
+    "/sandbox",
+    "/effort",
+    "/cron",
+    "/jobs",
 ];
 
 /// Replace the typed `/query` with the highlighted command plus a space, and
@@ -425,6 +439,9 @@ fn accept_command(
                                 "/agent" => (with_default(ctx.agent_names), "/agent "),
                                 "/theme" => (with_default(ctx.theme_names), "/theme "),
                                 "/provider" => (ctx.provider_names.to_vec(), "/provider "),
+                                "/subagent-models" => {
+                                    (ctx.quick_model_names.to_vec(), "/subagent-models ")
+                                }
                                 "/models-subagent" => {
                                     (ctx.quick_model_names.to_vec(), "/models-subagent ")
                                 }
@@ -971,7 +988,7 @@ mod tests {
     #[test]
     fn finite_argument_commands_open_consistent_sub_pickers() {
         let (permissions, prefix) = argument_picker_spec("/permissions").unwrap();
-        assert_eq!(permissions, ["yolo", "auto", "manual"]);
+        assert_eq!(permissions, ["yolo", "auto", "manual", "rules", "forget"]);
         assert_eq!(prefix, "/permissions ");
 
         let (modes, prefix) = argument_picker_spec("/mode").unwrap();

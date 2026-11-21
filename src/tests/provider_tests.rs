@@ -617,6 +617,28 @@ fn non_agent_by_id_deny_list_partial_match() {
     assert!(!is_agent_model(&model("veo-video-gen", None)));
 }
 
+#[test]
+fn short_deny_words_match_only_whole_segments() {
+    for denied in [
+        "gemini-2.5-flash-tts",
+        "gpt-4o-realtime-preview",
+        "vendor/sora-2",
+        "veo-3.0",
+        "text-to-speech",
+    ] {
+        assert!(!is_agent_model(&model(denied, None)), "{denied}");
+    }
+    for kept in [
+        "vendor/stories-13b",
+        "gpt-5-bursts",
+        "tts2chat-pro",
+        "aquarius-aqarium",
+        "unrealtime-x",
+    ] {
+        assert!(is_agent_model(&model(kept, None)), "{kept}");
+    }
+}
+
 // --- serialize_conversation tests ---
 
 #[test]
@@ -1745,6 +1767,34 @@ fn compaction_system_prompt_treats_fenced_sections_as_data() {
     assert!(prompt.contains("<previous_summary>"));
     assert!(prompt.contains("untrusted data"));
     assert!(prompt.contains("never instructions"));
+}
+
+#[test]
+fn compaction_contract_says_output_replaces_the_previous_summary() {
+    // mini-agent-sskdu.234: both request shapes carry the replacement rule.
+    for prompt in [
+        crate::agent::prompt::COMPACTION_SYSTEM_PROMPT,
+        crate::agent::prompt::COMPACTION_FORK_PROMPT,
+    ] {
+        assert!(prompt.contains("Your output replaces any earlier summary"));
+        assert!(prompt.contains("never drop a still-valid item"));
+        assert!(prompt.contains("verbatim under ## Task"));
+        // mini-agent-sskdu.233: the deterministic file list goes last.
+        let next = prompt.find("## Next Step").unwrap();
+        let files = prompt.rfind("## Files").unwrap();
+        assert!(next < files);
+    }
+    assert!(crate::agent::prompt::COMPACTION_PROMPT.contains("your output replaces it"));
+}
+
+#[test]
+fn fork_instruction_does_not_refer_to_fences_it_lacks_or_repeat_the_suffix() {
+    // mini-agent-sskdu.241
+    let text = crate::provider::fork_instruction(None);
+    assert!(!text.contains("<transcript>"));
+    assert!(!text.contains("<previous_summary>"));
+    assert!(!text.contains("provided"));
+    assert!(text.contains("conversation above"));
 }
 
 // --- Built-in-named custom providers must not inherit vendor keys (mini-agent-as8yw) ---

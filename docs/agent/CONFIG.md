@@ -379,7 +379,7 @@ configured provider endpoints win endpoint environment fallbacks.
 | `GIT_CONFIG_GLOBAL` | Explicit operator Git configuration source. Its bounded include graph is captured before project/model effects; the exact platform null device disables that source. Repository-owned sources cannot grant executable authority. |
 | `EDITOR` | Editor command fallback after config `editor`; otherwise the command is `editor`. |
 | `RUST_LOG` | Standard tracing filter for stderr; explicit `--log-level` wins. File logging remains controlled by `--verbose`/`--log-file`. |
-| `MINI_AGENT_ACP_API_KEY` | ACP TCP authentication key; non-empty environment value wins the configured `acp_api_key`. |
+| `MINI_AGENT_ACP_API_KEY` | ACP TCP authentication key; non-empty environment value wins the `api_key` of the matching `acp_servers` TCP entry. |
 | `MINI_AGENT_ACP_TLS_CERT`, `MINI_AGENT_ACP_TLS_KEY` | ACP TCP TLS certificate/key paths, supplied together; the remote listener requires TLS unless the explicit insecure-remote override below is enabled. |
 | `MINI_AGENT_ACP_ALLOW_INSECURE_REMOTE` | Value `1` explicitly permits an insecure remote ACP TCP listener; other values retain the TLS requirement. |
 | `MINI_AGENT_ACP_TRUST_CLIENT_MCP` | Value `1` authorizes ACP client-supplied MCP registrations to launch; otherwise they are not trusted. It does not replace configured MCP policy. |
@@ -712,9 +712,11 @@ verify_max_attempts = 3
 
 After the agent invokes a potentially mutating tool, mini-agent runs this command
 in the startup workspace through the configured general sandbox. Known
-read-only tools do not trigger the gate; unknown tools are treated
-conservatively as potentially mutating. A failed attempt sends a sanitized,
-bounded tail of stdout/stderr back to the model and allows it to repair the
+read-only tools (see "Tool classification" in `TOOL_RUNTIME.md`) do not trigger the
+gate; unknown tools are treated conservatively as potentially mutating. A failed
+attempt sends a marked host message that names the command and its attempt number,
+with a sanitized, fenced, bounded tail of stdout/stderr as untrusted output, back to
+the model and allows it to repair the
 problem within both `verify_max_attempts` and the remaining
 `max_agent_turns`. Exhausting either bound fails the turn instead of emitting a
 successful completion. Interactive TUI and ACP clients receive verification
@@ -739,19 +741,19 @@ Accepted top-level keys:
 | `max_session_input_tokens` | integer | Optional global ceiling on input tokens (cached input included) observed across the logical session, its subagents and `/cron` fires. Needs no model prices, so it bounds unpriced providers. Once reached, further model requests and model-dispatched effects are refused like an exhausted USD budget (`stop_reason: "budget"` headless). Resumed sessions count their ledger history. An admitted request can overshoot. Project layers cannot set it. See [COST_TRACKING.md](COST_TRACKING.md). |
 | `max_session_total_tokens` | integer | As `max_session_input_tokens`, over input plus output tokens. |
 | `max_budget_usd`          | number | Optional finite nonnegative USD ceiling for recorded logical-session spend, including auxiliary models. CLI `--max-budget-usd` overrides this global-only setting; project layers cannot change it. Unknown prices or incomplete tracking block capped continuation. Already admitted work can exceed it; this is not a vendor billing limit. See [COST_TRACKING.md](COST_TRACKING.md). |
-| `max_agent_turns`         | integer | Maximum model round trips (agent turns) per user prompt. Default: `1000` (was 200); spend caps (`turn_token_budget`, `max_budget_usd`, session token ceilings) are the primary safety net. When reached, the turn fails with an "exhausted its maximum turn budget" error, but completed tool work and messages stay in the session: ask the agent to continue (or rerun with `--continue`) or raise the limit. Headless context-relief segments of one prompt share this budget (and `turn_token_budget`), so relief never multiplies the cap. `--max-agent-turns` overrides it.                                                                                                                           |
+| `max_agent_turns`         | integer | Maximum model round trips (agent turns) per user prompt. Default: `1000` (was 200); spend caps (`turn_token_budget`, `max_budget_usd`, session token ceilings) are the primary safety net. When reached (at the continuation boundary or as Rig's own turn-limit error mid-stream), the turn fails with an "exhausted its maximum turn budget" error carrying this hint, and stream-json reports `error_max_turns`; but completed tool work and messages stay in the session: ask the agent to continue (or rerun with `--continue`) or raise the limit. Headless context-relief segments of one prompt share this budget (and `turn_token_budget`), so relief never multiplies the cap. `--max-agent-turns` overrides it.                                                                                                                           |
 | `verify_command`          | string  | Optional trusted command that must pass before a turn which invoked a potentially mutating tool may complete. Unset or blank disables the gate. Project-local values are sensitive and require content-bound trust. |
 | `goal_checks`             | array   | Commands that must exit zero before a goal may be reported complete. Sensitive: an untrusted project config cannot supply one, exactly as for `verify_command`. Additive with `--goal-check` and `/goal check`. |
 | `goal_judge_model`        | string  | A `quick_models` entry name used to judge goal completion claims. Sensitive: the judge receives a bounded transcript tail, so naming its endpoint decides where that text is sent. |
-| `session_title_model` | string | Defaults to the session provider/model. Set `"off"` (or an empty string) to keep first-message titles without a title request; a `quick_models` alias selects a trusted override. After the first completed exchange, a no-tools request receives at most 2,000 bytes of the first user message and 1,000 bytes of the first reply, with a 64-token output cap and a 20-second deadline. Interactive generation runs as owned background work; headless saves title afterward. Names always win. Observed title usage is charged once at captured title-model prices, including on failure or cancellation; it does not change conversation context calibration. `--no-session` skips titles. Model/provider overrides remain sensitive project configuration. |
+| `session_title_model` | string | Defaults to the session provider/model. Set `"off"` (or an empty string) to keep first-message titles without a title request; a `quick_models` alias selects a trusted override. After the first completed exchange, a no-tools request receives at most 2,000 bytes of the first user message and 1,000 bytes of the first reply, with a 64-token output cap and a 20-second deadline. Interactive generation runs as owned background work. Headless (`-p`) runs only generate a title when `session_title_model` is set explicitly (the default session-model title is left to the next interactive resume, so JSON output is never delayed by it); a session whose title attempts failed twice is not asked again (`title_attempts`). Names always win. Observed title usage is charged once at captured title-model prices, including on failure or cancellation; it does not change conversation context calibration. `--no-session` skips titles. Model/provider overrides remain sensitive project configuration. |
 | `goal`                    | object  | Goal defaults: `judge` (`"auto"`, `"off"`, `"session"`, or a `quick_models` name), `continuation` (`"continue"` or `"restart"`), `max_rounds` (50), `max_tokens`, `max_active_secs`, `no_progress_rounds` (3), `blocked_rounds` (3), `wrap_up_max_agent_turns` (4), `reinject_every` (6), `judge_every` (5), `check_every_round` (false: run checks only on a completion claim; true also runs them every round as feedback). The duration and progress limits are benign project settings. Selecting `judge` requires project trust because an alias can route a review to a different provider. |
 | `headless_agent_mentions` | boolean | Opt-in `@agent:<name>` routing for headless `-p` and ACP `session/prompt` prompts. Default: `false` (prompts pass through literally). When `true`, resolved mentions are normalised and routed through a non-persisted note; an unknown name fails `-p` with a nonzero exit before any provider request and fails an ACP prompt with JSON-RPC `-32602`. Accepted but inert without the `subagents` feature. Read at startup; a saved change applies after a restart. See [SUBAGENTS.md](SUBAGENTS.md#referencing-a-specialist-with-agent). |
 | `cron_max_fires`          | integer | Fires each `/cron` schedule may start before it is removed. Default: `24`; values below `1` count as `1`. Applies to TUI and ACP schedules. Read at startup; a saved change applies after a restart. See [COMMANDS.md](COMMANDS.md#cron). |
-| `verify_timeout_secs`     | integer | Wall-clock timeout for each `verify_command` attempt. Default: `300`; clamped to `1..=3600`. |
+| `verify_timeout_secs`     | integer | Wall-clock timeout for each `verify_command` attempt and each goal check. Default: `300`; clamped to `1..=3600`. |
 | `verify_max_attempts`     | integer | Maximum verification attempts in one agent turn, including the first check. Default: `3`; clamped to `1..=8` and also bounded by the remaining `max_agent_turns` budget. |
 | `temperature`             | number  | Model temperature (`0.0` to `2.0`). Precedence is `--temperature`, then the active quick model's value, then this global value; values are clamped to the supported range. |
 | `extra_body`              | object  | Provider-specific JSON shallow-merged into every completion request body as a global default (e.g. OpenRouter `plugins` routing presets). A matching `quick_models` entry's `extra_body` overrides this. See Provider-specific request body parameters below. |
-| `retry`                   | object  | Retry policy with `max_attempts` (default `6`, clamped to 1–10), `initial_backoff_ms` (`500`), `max_backoff_ms` (`30000`), and `max_retry_after_ms` (`300000`, clamped to at most `600000`); both backoffs are clamped to at most `60000` and `initial_backoff_ms` to at most `max_backoff_ms`, with a startup warning for each clamped field. A retry without a provider hint sleeps the current backoff plus jitter but never longer than `max_backoff_ms`. A provider wait hint may extend that sleep beyond `max_backoff_ms` up to the hint ceiling `max_retry_after_ms` (never below `max_backoff_ms`; set `0` to cap hints at `max_backoff_ms` again). The retry notice shows the actual wait (`retrying in 45s... (1/6)`). A project `.mini-agent/config.toml` may only tighten these values (see project-local trust above). The same configured policy drives ordinary completion starts and compaction summarizer calls through one shared retry primitive; interactive starts receive retry events from that primitive. The bound applies independently to each provider completion call in a tool-using turn; transient failures resume from preserved interactions and do not replay completed tools. Transient HTTP statuses `408`, `409`, `425`, `429`, `500`, `502`, `503`, `504`, and `529` are retried. The provider HTTP adapter preserves actual `Retry-After` headers on each failed request’s typed error source. `retry-after-ms` (milliseconds, preferred) and `Retry-After` integer seconds or HTTP dates extend the delay to the greater of the hint and backoff plus jitter, capped at `max_retry_after_ms`; malformed or past hints retain ordinary backoff. An explicit `x-should-retry: true`/`false` response header (sent by Anthropic) overrides the status classification, except that context-window errors are never retried. Without `Retry-After`/`retry-after-ms`, a `429` response's rate-limit reset headers (`anthropic-ratelimit-*-reset` instants, OpenAI `x-ratelimit-reset-*` durations) set the wait, using the latest reset. Quota and billing failures (`insufficient_quota`, `billing_hard_limit_reached`, "exceeded your current quota", "credit balance is too low", `usage_limit_reached`) are never retried, even as `429`, and the error says to check the account's plan and billing; a terminal rate-limit error reports when the limit resets. Concurrent requests and subagents cannot share or consume another request’s hint. Provider status codes are classified structurally when available and by explicit HTTP/status syntax otherwise; unrelated digits or words such as `connection` do not make an application error retryable. Context-window errors bypass retry and immediately include compaction guidance. |
+| `retry`                   | object  | Retry policy with `max_attempts` (default `6`, clamped to 1–10), `initial_backoff_ms` (`500`), `max_backoff_ms` (`30000`), and `max_retry_after_ms` (`300000`, clamped to at most `600000`); both backoffs are clamped to at most `60000` and `initial_backoff_ms` to at most `max_backoff_ms`, with a startup warning for each clamped field. A retry without a provider hint sleeps the current backoff plus jitter but never longer than `max_backoff_ms`. A provider wait hint may extend that sleep beyond `max_backoff_ms` up to the hint ceiling `max_retry_after_ms` (never below `max_backoff_ms`; set `0` to cap hints at `max_backoff_ms` again). The retry notice names the cause and the actual wait (`rate limited; retrying in 45s... (1/6), Esc to cancel`). A project `.mini-agent/config.toml` may only tighten these values (see project-local trust above). The same configured policy drives ordinary completion starts and compaction summarizer calls through one shared retry primitive; interactive starts receive retry events from that primitive. The bound applies independently to each provider completion call in a tool-using turn; transient failures resume from preserved interactions and do not replay completed tools. Transient HTTP statuses `408`, `409`, `425`, `429`, `500`, `502`, `503`, `504`, and `529` are retried. The provider HTTP adapter preserves actual `Retry-After` headers on each failed request’s typed error source. `retry-after-ms` (milliseconds, preferred) and `Retry-After` integer seconds or HTTP dates extend the delay to the greater of the hint and backoff plus jitter, capped at `max_retry_after_ms`; malformed or past hints retain ordinary backoff. An explicit `x-should-retry: true`/`false` response header (sent by Anthropic) overrides the status classification, except that context-window errors are never retried. Without `Retry-After`/`retry-after-ms`, a `429` response's rate-limit reset headers (`anthropic-ratelimit-*-reset` instants, OpenAI `x-ratelimit-reset-*` durations) set the wait, using the latest reset. Quota and billing failures (`insufficient_quota`, `billing_hard_limit_reached`, "exceeded your current quota", "credit balance is too low", `usage_limit_reached`) are never retried, even as `429`, and the error says to check the account's plan and billing; a terminal rate-limit error reports when the limit resets. Concurrent requests and subagents cannot share or consume another request’s hint. Provider status codes are classified structurally when available and by explicit HTTP/status syntax otherwise; unrelated digits or words such as `connection` do not make an application error retryable. Context-window errors bypass retry and immediately include compaction guidance. |
 | `provider_timeouts`       | object  | HTTP deadlines in seconds for every provider client, built-in and custom: `connect_timeout_secs` (default `30`) and `stream_idle_timeout_secs` (default `300`; the wait for response headers and between streamed events, reset on every read). A custom provider's own values take precedence. Values are clamped to 1–86400. Read at startup; not a benign project key. A turn that fails on a deadline names these keys. See [PROVIDERS.md](PROVIDERS.md#connection-and-stream-deadlines). |
 | `fallback_model`          | string  | Optional model for headless (`-p`) turns whose primary model fails with retries exhausted before any progress (no streamed text, no tool effect): HTTP 408/409/425/429/5xx/529 or transport failures. A quick-model alias (its provider must match the session's) or a raw model id on the session's provider; a cross-provider alias is ignored with a warning. The turn is re-sent once to the fallback, a `notice:` line on stderr names both models and the reason, the output cap is clamped to the fallback's catalog ceiling, reasoning controls are recomputed for it, and spend is recorded against the fallback model (a capped run refuses an unpriced fallback). Context-window, authentication, budget and other client errors never fall back. `--fallback-model` overrides it. Interactive sessions do not switch automatically; use `/models`. Not a benign project key. |
 | `models_catalog_refresh_days` | integer | Opt-in network access, default unset (never). At startup, when the model catalog cache (`models-catalog.json` in the cache directory) is missing or older than this many days, fetch `https://models.dev/api.json` in the background (32 MiB limit) and write the cache; it overlays the embedded snapshot from the next start, replacing each provider it lists. Fetch failures only log a warning. `/models catalog-refresh` does the same on demand. Not a benign project key. |
@@ -766,7 +768,7 @@ Accepted top-level keys:
 | `file_checkpoints`        | object  | `/rewind` file checkpoint limits: `max_file_bytes` (largest pre-/postimage captured; default follows the edit/write size limit), `max_total_bytes` (preimage bytes per session, default `67108864` = 64 MiB) and `max_records` (mutation records and distinct preimages per session, default `2048`). Values are clamped to 1 GiB, 4 GiB and 100000. The first mutation a session cannot capture appends a one-time notice to that tool result, and the `/rewind` picker reports `N edits not restorable (<reason>)`. See [file-checkpoints.md](file-checkpoints.md). |
 | `max_read_lines`          | integer | Default maximum lines returned by one `read` call. Default: `2000`. |
 | `max_bash_output_lines`   | integer | Line cap for shell tool output returned to the model, applied to successful output and to the partial output embedded in timeout/output-limit errors. Longer output keeps its head and tail around an `[... N lines omitted ...]` marker. Default: `2000`. Set `0` to disable line truncation (the 1 MiB per-stream / 1.5 MiB combined byte limits still apply). |
-| `shell_timeout_secs`      | integer | Foreground shell tool deadline in seconds. Default: `120`; clamped to 1–600. The tool definition publishes this effective cap; a call's millisecond `timeout` can only lower it. Background shell jobs retain their 24-hour cap, other command classes retain their existing limits, and brokered JS `spawn` is bounded by `js-step-timeout-secs`. Sensitive in project-local configuration: changing it requires project trust. |
+| `shell_timeout_secs`      | integer | Foreground shell tool deadline in seconds. Default: `120`; clamped to 1–600. The tool definition publishes this effective cap; a call's millisecond `timeout_ms` can only lower it. Background shell jobs retain their 24-hour cap, other command classes retain their existing limits, and brokered JS `spawn` is bounded by `js-step-timeout-secs`. Sensitive in project-local configuration: changing it requires project trust. |
 | `shell_auto_background` | boolean | Default for the shell call flag `auto_background`: a foreground command that reaches its deadline keeps running as a background job (its id and output so far are returned) instead of being killed. Default: `false`. Same sandbox, permission decision and job limits as `background = true`. Sensitive in project-local configuration. |
 | `command_timeout_secs` | integer | Deadline of `!` commands (TUI and headless) in seconds. Default: `120`; clamped to 1–600. A single command can set its own deadline with `!timeout=300 cargo test` (same clamp). A timed-out run reports `timed out after N s` and how to raise it. Loop/goal validators, hooks and brokered JS `spawn` keep their own deadlines. Output volume never fails these commands: `!` commands, `verify_command`, goal checks and loop validators capture a spooled 500 KiB head plus 256 KiB tail (fixed, not configurable), write the full output to a private log in the session's tool-output directory (readable with `read`, which pages with offset/limit) once it overflows, and name that log in the result (`[output truncated: N bytes omitted ...; full output log: PATH ...]`). Only a 64 MiB total-output ceiling stops a command, reported as `output_truncated` / `hard ceiling`; the command's real exit status otherwise decides pass or fail. Sensitive in project-local configuration. |
 | `update_check`            | boolean | Opt-in release notice at interactive startup. Default: `false`. Checks the package's GitHub repository anonymously, directly over HTTPS, at most once every 24 hours, with a two-second request bound and a 128 KiB response cap. Loop and ACP modes skip it; `-p` prints a one-line stderr notice from the cached result only (no network; `--quiet` silences it). Requires project trust when set locally. Nothing is downloaded unless you run `mini-agent update`. |
@@ -901,7 +903,7 @@ Accepted top-level keys:
 | `acp_servers`             | object  | ACP server config map when compiled with the `acp` feature. See the ACP section below.                                                                                       |
 | `acp_host`                | string  | TCP bind host for ACP server mode (equivalent to `--acp-host`).                                                                                                              |
 | `acp_port`                | integer | TCP bind port for ACP server mode (equivalent to `--acp-port`, default: 7243).                                                                                               |
-| `acp_accept_timeout_secs` | integer | Maximum seconds to wait for the first authenticated ACP TCP peer (equivalent to `--acp-accept-timeout-secs`, default: 300).                                                  |
+| `acp_accept_timeout_secs` | integer | Maximum seconds to wait for the first authenticated ACP TCP peer, then exit with an error (equivalent to `--acp-accept-timeout-secs`, default: 300; `0` waits indefinitely). |
 | `task_max_turns`          | integer | Maximum model turns per subagent. Default: `20`; requires `subagents`. |
 | `task_max_prompts`        | integer | Maximum prompts in one `task` call. Default: `8`; requires `subagents`. |
 | `task_max_concurrency`    | integer | Maximum concurrently polled child futures. Default: `4`; requires `subagents`. |
@@ -1410,7 +1412,7 @@ prompt and model are shown in the project-hook approval prompt; `command`, `args
   tools. The model is still the startup model, not live `/model` switches.
 
 Hook envelopes use the current logical session ID and transcript path, including after
-`/new` or `/resume`. ACP uses its own session ID and an empty transcript path. Child work
+`/new` or `/sessions`. ACP uses its own session ID and an empty transcript path. Child work
 inherits its owning session identity and its explicitly selected workspace. Ignore matching
 checks each parent before descending: an ignore file inside an excluded directory cannot
 re-include a child; `.ignore` overrides `.gitignore`, which overrides `.git/info/exclude`.
@@ -1633,7 +1635,7 @@ progress between them). Between turns a provider-native (Anthropic replay) sessi
 auto-compaction and `/compact`, headless pre-turn compaction, and ACP prompts under token pressure): its signed thinking chain cannot be
 summarized in place, so the compaction restarts the chain from the compacted transcript as a new
 replay epoch, with a one-line notice (earlier thinking blocks are dropped). Mid-turn, headless
-and TUI turns on one compact too (see below); ACP does not compact mid-turn yet, but an ACP prompt is never refused for want of in-place compaction. Tools with their own output limits (`read`,
+and TUI turns on one compact too (see below), and ACP compacts mid-turn at a complete tool batch (see the per-front-end notes below). Tools with their own output limits (`read`,
 `shell`, `grep`, `find_files`, `list_dir`, `js`, `web_fetch`, `web_search`,
 and the subagent `task` tool) retain their documented line, byte, and result
 limits in both live and replayed history. Their
@@ -1714,9 +1716,13 @@ the configured reserve unless the reserve is below 256), and the stored summary
 keeps up to four bytes per such token (at least 16 KiB; 80,000 bytes for a 1M
 window). A 128k window keeps the historical 4,096-token / 16 KiB bounds. When a
 rolling summary exceeds its storage bound, each structured summary section
-retains its heading and prefix instead of dropping the middle sections. Compaction boundaries also snap backward to a
-user or assistant message so a retained tool result is never separated from
-its call. If a provider still rejects an ordinary headless request (`-p`, `--loop`
+retains its heading and prefix instead of dropping the middle sections. Compaction boundaries snap backward to a
+user or assistant message, or to the start of a completed tool-call batch (a call
+record that follows a result with every earlier call already answered), so a
+retained tool result is never separated from its call and a turn made only of
+unnarrated tool calls still has a cut point. A cut at or before the previous
+summary is treated as nothing to summarize (TUI and headless), so relief never
+re-summarizes only the previous summary. If a provider still rejects an ordinary headless request (`-p`, `--loop`
 or goal rounds) for exceeding its context limit, mini-agent records the progress the
 turn already made, compacts the session once and retries once (continuing the task
 when tools already ran). A second rejection, or a session with nothing older than the
@@ -1724,9 +1730,29 @@ kept recent history, surfaces the error, which points to `/compress` and
 `compact_enabled` recovery. Native Anthropic replay history cannot be compacted in
 place, so those turns surface the error directly.
 
+Per-front-end notes. The TUI and headless keep the most recent
+`keep_recent_tokens` verbatim, bound the stored summary by the window-scaled budget,
+re-attach file windows and may fork the conversation's own cached request; the TUI
+reports tokens freed net of the inserted summary. After a relief the continuation
+prompt tells the model that its earlier work is condensed in the
+"[Recap of my prior work in this conversation]" message above and that details
+missing from the recap must be re-read; it is host text, so `/undo`, session titles
+and later summaries do not treat it as the user's words. A session's derived title is
+remembered at its first compaction and survives later ones. The summarizer's output
+replaces the previous summary, and only the summarizer's own prose (not the appended
+file list, todo/goal blocks or restored windows) is handed back as the previous
+summary. A summary that used its whole output allowance ends with
+`[summary truncated by the output limit]`. ACP compacts at its own turn
+boundaries, compacts at most three times per non-native prompt, does not restore file
+windows and bounds the stored summary at 16 KiB; when the summarizer fails it evicts
+history only if the hard byte bound or the turn cap forces it, otherwise the prompt
+runs on the unchanged history. `PostCompact` and `SessionStart(compact)` fire only when
+a compaction record was committed; headless `PreCompact` fires once per compaction,
+before the first summarizer request of either path.
+
 Compaction is paid for like any other completion. The summarizer runs on the
-session's model, so the usage of every rolling request is summed and charged to
-the session's token and cost counters at the session model's prices, whether
+session's model (or on `compaction_model` when set, at that model's prices), so the usage of every rolling request is summed and charged to
+the session's token and cost counters, whether
 the compaction was automatic (between turns, mid-turn, or before a headless
 `-p` request) or a manual `/compress`. A headless `--output json` object
 includes the compaction that ran before its turn in `usage` and `cost`. When a
@@ -2564,8 +2590,8 @@ fail-closed instead (deny, then ask, then allow). A matching `external_directory
 
 Tool argument validation happens before permissions or execution. `read.limit` must
 be positive (including an effective configured default); invalid windows return a
-JSON example instead of an inverted line range. Shell `timeout` must be positive
-and at most the effective foreground deadline (120000 ms by default, configured
+JSON example instead of an inverted line range. Shell `timeout_ms` (the older name
+`timeout` is still accepted; milliseconds) must be at least 1000 and at most the effective foreground deadline (120000 ms by default, configured
 by `shell_timeout_secs`), or 86400000 ms in background mode; larger values are rejected
 with a background-job example rather than silently clamped. `todo_write` accepts
 only case-sensitive statuses `pending`, `in_progress`, `completed`, `cancelled` and
@@ -2654,7 +2680,7 @@ retrying outside containment.
 
 Foreground shell commands have a mandatory deadline of 120 seconds by default.
 `shell_timeout_secs` sets that deadline between 1 and 600 seconds. A tool call's optional
-`timeout` value is milliseconds and can only lower that deadline. Brokered JS
+`timeout_ms` value is milliseconds and can only lower that deadline. Brokered JS
 `spawn` and other sandbox command classes retain their separate limits. Captured raw
 output is limited to 1 MiB of stdout, 1 MiB of stderr, and 1.5 MiB combined;
 both pipes are drained concurrently. Timeout, cancellation, or any output cap
@@ -3204,7 +3230,7 @@ name or URL. Custom servers—including servers using the same name or
 endpoint—follow normal MCP permission rules, and any unlisted tool on a
 built-in server does too.
 
-## ACP (Agent Communication Protocol) configuration
+## ACP (Agent Client Protocol) configuration
 
 When compiled with the `acp` feature, mini-agent can act as an ACP agent server.
 The following config keys are available:

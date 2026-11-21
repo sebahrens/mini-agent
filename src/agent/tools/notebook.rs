@@ -227,6 +227,10 @@ pub(crate) enum NotebookMode {
 pub(crate) struct NotebookArgs {
     pub path: String,
     pub mode: NotebookMode,
+    #[serde(
+        default,
+        deserialize_with = "crate::agent::tools::lenient::cell_index_usize"
+    )]
     pub cell_index: Option<usize>,
     pub cell_id: Option<String>,
     pub source: Option<String>,

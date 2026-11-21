@@ -241,6 +241,19 @@ impl DoctorReport {
             None => report.row("managed policy", "none"),
         }
         report.row("load warnings", cfg.load_warnings.len().to_string());
+        for (class, count) in warning_classes(&cfg.load_warnings) {
+            report.row(
+                "  warning",
+                if count > 1 {
+                    format!("{class} (x{count})")
+                } else {
+                    class.to_owned()
+                },
+            );
+        }
+        if !cfg.load_warnings.is_empty() {
+            report.row("load warning details", "run --print-config to list them");
+        }
         #[cfg(feature = "lsp")]
         for warning in cfg.lsp_config_warnings() {
             report.row("lsp config", warning);
@@ -308,8 +321,9 @@ impl DoctorReport {
                 .unwrap_or_else(|| "unknown".into()),
         );
         report.row(
-            "catalogue date",
-            "not recorded in embedded snapshot; build fingerprint identifies it",
+            "model catalog",
+            crate::models_catalog::catalog_age_line(jiff::Timestamp::now())
+                .trim_start_matches("model catalog: "),
         );
 
         report.section("Sandbox");
@@ -548,8 +562,31 @@ fn directory_bytes(path: &Path) -> String {
     )
 }
 
+/// Distinct warning lines in first-seen order with their multiplicity. The
+/// diagnostic loader has already reduced each warning to a value-free class.
+fn warning_classes(warnings: &[String]) -> Vec<(&str, usize)> {
+    let mut classes: Vec<(&str, usize)> = Vec::new();
+    for warning in warnings {
+        match classes
+            .iter_mut()
+            .find(|(class, _)| *class == warning.as_str())
+        {
+            Some((_, count)) => *count += 1,
+            None => classes.push((warning.as_str(), 1)),
+        }
+    }
+    classes
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn warning_classes_count_repeats_in_first_seen_order() {
+        let warnings: Vec<String> = ["a", "b", "a", "a"].map(String::from).into();
+        assert_eq!(super::warning_classes(&warnings), vec![("a", 3), ("b", 1)]);
+        assert!(super::warning_classes(&[]).is_empty());
+    }
+
     use super::*;
 
     #[test]

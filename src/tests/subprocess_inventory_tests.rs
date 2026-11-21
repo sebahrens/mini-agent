@@ -970,7 +970,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/acp/commands.rs",
         "commands.push(AvailableCommand::new(",
-        1,
+        2,
         "NON-PROCESS",
     ),
     // ACP protocol statuses and the Bedrock HTTP response builder are data.
@@ -982,7 +982,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/extras/acp/sessions.rs",
-        ".status(ToolCallStatus::Pending),",
+        ".status(ToolCallStatus::Failed)",
         1,
         "NON-PROCESS",
     ),
@@ -4858,18 +4858,6 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
             ),
             (
                 "eb01710697adef617d3b9c5e6adffdafb27387e6f9314f65d69c3eec0916ec57",
-                1,
-            ),
-            (
-                "3674e3a0675136a0f470c7cdbca81210d48240febf669d68bbce6c8ba9f4b56d",
-                1,
-            ),
-            (
-                "78dbcfd88f653fc234da51d227836690c8b565af55dcb5a4bb8033e6e1e9b2d2",
-                1,
-            ),
-            (
-                "cc98982a13f5283c58b9e73e437cbe92fd3433b13ffcb4044d7e84c1680f7192",
                 1,
             ),
             (

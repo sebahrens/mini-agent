@@ -2347,8 +2347,9 @@ impl Tool for FindFilesTool {
     type Output = String;
 
     fn description(&self) -> String {
+        let skip_dirs = crate::agent::tools::skip_dirs_phrase();
         format!(
-            "Recursively find files using relative-path globs such as `src/*.rs` or `**/*.rs`; basename globs such as `test_*.rs` match at any depth. Auto detects glob syntax; use mode `regex` for filename regular expressions. Respects .gitignore and skips the same directories as grep (pass no_ignore=true to include ignored entries). Sorts by name by default, or newest modification time with sort `mtime`; ties use path order, unavailable times sort last. Skipped directories are named in a notice; pass one as path to search it. A call visits at most {} directory entries and depth {}; a partial result names the first unsearched path.",
+            "Recursively find files using relative-path globs such as `src/*.rs` or `**/*.rs`; basename globs such as `test_*.rs` match at any depth. Auto detects glob syntax; use mode `regex` for filename regular expressions. Respects .gitignore by default (pass no_ignore=true to include ignored entries). Sorts by name by default, or newest modification time with sort `mtime`; ties use path order, unavailable times sort last. Skips VCS metadata, {skip_dirs}, naming skipped ones in a notice; pass such a directory as path to search it. A call visits at most {} directory entries and depth {}; a partial result names the first unsearched path.",
             super::limits::current().search_max_entries,
             super::limits::current().search_max_depth
         )
@@ -2404,11 +2405,23 @@ impl Tool for FindFilesTool {
             args.pattern,
             args.path.as_deref().unwrap_or("."),
         );
-        let coaching =
-            check_perm(&self.permission, &self.ask_tx, "find_files", &args.pattern).await?;
-
         let pattern = FindFilesPattern::compile(&args.pattern, args.mode)?;
         let no_matches_hint = pattern.no_matches_hint();
+        let configured_cap = usize::try_from(self.max_results).unwrap_or(usize::MAX);
+        if args.limit == Some(0) {
+            return Err(ToolError::Msg(
+                "find_files limit must be at least 1. Example: {\"pattern\":\"*.rs\",\"limit\":50}"
+                    .to_string(),
+            ));
+        }
+        // A request above the configured cap is served at the cap and says so.
+        let cap_note = args.limit.filter(|limit| *limit > configured_cap).map(|limit| {
+            format!("[limit {limit} exceeds the cap {configured_cap}; showing up to {configured_cap}]")
+        });
+        // Arguments are validated before any permission effect, so a prompt is
+        // never raised for a call that fails on its own arguments.
+        let coaching =
+            check_perm(&self.permission, &self.ask_tx, "find_files", &args.pattern).await?;
 
         let requested_path = args.path.as_deref().unwrap_or(".");
         if requested_path.is_empty() {
@@ -2438,7 +2451,12 @@ impl Tool for FindFilesTool {
                             NOT_A_DIRECTORY_HINT,
                         )
                     } else {
-                        crate::agent::tools::bound_open_error(workspace, relative, error)
+                        crate::agent::tools::bound_open_error_for(
+                            Some("find_files"),
+                            workspace,
+                            relative,
+                            error,
+                        )
                     }
                 })?;
             let bound = BoundDirectory::from_file(&logical, directory)?
@@ -2458,7 +2476,11 @@ impl Tool for FindFilesTool {
             .await?;
             (bound, coaching)
         } else {
-            let traversal_root = tokio::fs::canonicalize(&search_path).await?;
+            let traversal_root = tokio::fs::canonicalize(&search_path)
+                .await
+                .map_err(|error| {
+                    crate::agent::tools::missing_path_error("find_files", &search_path, error)
+                })?;
             let authorized_metadata = crate::fs::stable_path_metadata(&traversal_root).await?;
             if authorized_metadata.is_file() {
                 return Err(crate::agent::tools::not_a_directory_error(
@@ -2483,12 +2505,11 @@ impl Tool for FindFilesTool {
             .await?;
             (bound, coaching)
         };
-        let coaching = combine_coaching(coaching, path_coaching);
+        let coaching = combine_coaching(combine_coaching(coaching, path_coaching), cap_note);
 
-        let configured_cap = usize::try_from(self.max_results).unwrap_or(usize::MAX);
         let max_results = args
             .limit
-            .map_or(configured_cap, |limit| limit.clamp(1, configured_cap));
+            .map_or(configured_cap, |limit| limit.min(configured_cap));
         let offset = args.offset.unwrap_or(0);
         // The heap keeps the first `offset + page` matches in stable order.
         let keep = offset.saturating_add(max_results);

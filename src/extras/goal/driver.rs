@@ -180,7 +180,7 @@ impl RoundCollector {
                 // A failure the stream reported wins over a generic "done":
                 // the runner emits `Error` and still closes the channel.
                 RoundEnd::Done => match self.failure.take() {
-                    Some(message) => RoundEnd::Failed(message),
+                    Some(message) => RoundEnd::from_error(message),
                     None => RoundEnd::Done,
                 },
                 other => other,
@@ -406,7 +406,7 @@ pub fn next_round(goal: &Goal, decision: &GateDecision) -> Option<Relaunch> {
             prompt.push_str("\n\n");
             prompt.push_str(&round_header(goal, round));
             push_context_file(&mut prompt, goal);
-            if let Some(summary) = carried_summary(goal, summary_chars) {
+            if let Some(summary) = carried_summary(goal, summary_chars, instruction) {
                 prompt.push_str("\n\nWhat happened so far:\n");
                 prompt.push_str(&summary);
             }
@@ -494,7 +494,7 @@ fn round_header(goal: &Goal, round: u32) -> String {
 /// Built by the harness from the goal's own record, never from free model
 /// prose. A model asked to summarize its way into the next round is a model
 /// given the chance to quietly restate the objective as something smaller.
-fn carried_summary(goal: &Goal, budget: usize) -> Option<String> {
+fn carried_summary(goal: &Goal, budget: usize, instruction: &str) -> Option<String> {
     if budget == 0 {
         return None;
     }
@@ -511,18 +511,24 @@ fn carried_summary(goal: &Goal, budget: usize) -> Option<String> {
         }
     }
     lines.reverse();
+    // The gate stores its instruction as the last verdict's reason, and the
+    // prompt carries the instruction right after this summary; repeating it
+    // here would spend the small budget on a copy.
     if let Some(verdict) = &goal.last_verdict
         && !verdict.reason.is_empty()
+        && verdict.reason != instruction
     {
-        lines.push(format!("- last check: {}", verdict.reason));
+        lines.push(format!("- last decision: {}", verdict.reason));
     }
     if lines.is_empty() {
         return None;
     }
     let mut out = lines.join("\n");
-    if out.chars().count() > budget {
-        out = out.chars().take(budget).collect::<String>();
-        out.push('…');
+    let length = out.chars().count();
+    if length > budget {
+        // Keep the newest lines: the oldest report is the least useful one.
+        let tail: String = out.chars().skip(length - budget).collect();
+        out = format!("…{tail}");
     }
     Some(out)
 }
@@ -546,7 +552,14 @@ pub fn decision_line(goal: &Goal, decision: &GateDecision) -> String {
                     met_caveat(goal)
                 )
             }
+            GoalStatus::Active if reason == "interrupted" => "goal: interrupted — still active; \
+                 your next message continues it, /goal pause to park it"
+                .to_string(),
             GoalStatus::Active => format!("goal: {reason}"),
+            GoalStatus::BudgetLimited => format!(
+                "goal: budget limited — {reason}; raise it with /goal bounds max_rounds=<n> \
+                 (or max_tokens, max_active_secs), then /goal resume"
+            ),
             other => format!("goal: {} — {reason}", other.label()),
         },
     }
@@ -1024,19 +1037,49 @@ mod tests {
                 &format!("did thing {round}"),
             ));
         }
-        let summary = carried_summary(&g, 10_000).expect("reports present");
+        let summary = carried_summary(&g, 10_000, "").expect("reports present");
         assert!(summary.contains("did thing 6"));
         assert!(
             !summary.contains("did thing 1"),
             "only the recent rounds are carried"
         );
 
-        let clipped = carried_summary(&g, 20).expect("reports present");
+        let clipped = carried_summary(&g, 20, "").expect("reports present");
         assert!(
             clipped.chars().count() <= 21,
             "budget is honored: {clipped}"
         );
-        assert_eq!(carried_summary(&g, 0), None);
+        assert_eq!(carried_summary(&g, 0, ""), None);
+    }
+
+    /// A restart round carries the instruction once, and an over-budget summary
+    /// keeps its newest lines (mini-agent-sskdu.225).
+    #[test]
+    fn the_summary_drops_a_copy_of_the_instruction_and_keeps_its_newest_lines() {
+        let mut g = goal();
+        g.push_report(report(ReportStatus::Progress, 1, "oldest report"));
+        g.push_report(report(ReportStatus::Progress, 2, "newest report"));
+        g.last_verdict = Some(crate::extras::goal::Verdict {
+            outcome: crate::extras::goal::Outcome::NotYet,
+            reason: "fix the validator".into(),
+            source: crate::extras::goal::VerdictSource::Checks,
+            evidence: Vec::new(),
+            at: compact_str::CompactString::new("now"),
+        });
+        let summary = carried_summary(&g, 10_000, "fix the validator").unwrap();
+        assert!(!summary.contains("fix the validator"), "{summary}");
+        let clipped = carried_summary(&g, 20, "fix the validator").unwrap();
+        assert!(clipped.contains("newest report"), "{clipped}");
+        assert!(!clipped.contains("oldest report"), "{clipped}");
+    }
+
+    #[test]
+    fn an_interrupt_says_the_goal_is_still_active() {
+        let line = decision_line(&goal(), &crate::extras::goal::gate::gate_interrupted());
+        assert!(
+            line.contains("still active") && line.contains("/goal pause"),
+            "{line}"
+        );
     }
 
     #[test]
@@ -1397,9 +1440,20 @@ pub fn apply_decision(
         // it: an interrupted evaluation is an attempt at the same round.
         let round = goal.progress.current_round();
         super::gate::apply(goal, summary, &decision, judge, verification.cause());
-        super::transcript::save_round(goal, summary, &decision, decision.reason(), checks, judge);
+        if summary.end != RoundEnd::Cancelled {
+            super::gate::note_checks(goal, checks);
+        }
         let line = decision_line(goal, &decision);
-        goal.push_history(round, line.strip_prefix("goal: ").unwrap_or(&line));
+        let attempt = goal.push_history(round, line.strip_prefix("goal: ").unwrap_or(&line));
+        super::transcript::save_round(
+            goal,
+            super::transcript::Evaluation { round, attempt },
+            summary,
+            &decision,
+            decision.reason(),
+            checks,
+            judge,
+        );
         line
     }) {
         Some(line) => line,
@@ -1868,6 +1922,7 @@ mod settle_tests {
             Verification {
                 interrupted: true,
                 checks: Some(crate::extras::goal::gate::CheckOutcome {
+                    failure_kind: Default::default(),
                     all_passed: false,
                     failure_tail: Some("[validation status=cancelled]".into()),
                     verified: Vec::new(),
@@ -1951,6 +2006,7 @@ mod settle_tests {
         settle_round(&store, summary, |_| async {
             Verification {
                 checks: Some(crate::extras::goal::gate::CheckOutcome {
+                    failure_kind: Default::default(),
                     all_passed: true,
                     failure_tail: None,
                     verified: vec![crate::extras::goal::VerificationKind::Checks],
@@ -2099,7 +2155,7 @@ pub fn summary_from_headless_turn(
             {
                 RoundEnd::Cancelled
             }
-            Some(error) => RoundEnd::Failed(error.to_string()),
+            Some(error) => RoundEnd::from_error(error.to_string()),
             None => RoundEnd::Done,
         },
         tool_calls,

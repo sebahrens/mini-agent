@@ -439,7 +439,7 @@ pub async fn handle_agent_event(
                 run.request_tool_results_cleared,
             );
         }
-        AgentEvent::Retrying { attempt, max, delay_ms } => {
+        AgentEvent::Retrying { attempt, max, delay_ms, reason } => {
             run.was_reasoning = false;
             finalize_response_segment(renderer, run)?;
             if run.agent_line_started {
@@ -447,7 +447,13 @@ pub async fn handle_agent_event(
                 run.agent_line_started = false;
             }
             run.response_start_block = None;
-            renderer.write_line(&crate::event::retry_notice_text(attempt, max, delay_ms), Color::Yellow)?;
+            run.retry_wait = (delay_ms >= crate::event::RETRY_COUNTDOWN_MIN_MS).then(|| {
+                (
+                    std::time::Instant::now() + std::time::Duration::from_millis(delay_ms),
+                    reason.clone(),
+                )
+            });
+            renderer.write_line(&crate::event::retry_notice_text(attempt, max, delay_ms, &reason), Color::Yellow)?;
         }
         AgentEvent::OutputTruncated { message } => {
             finalize_response_segment(renderer, run)?;
@@ -604,7 +610,28 @@ pub(crate) fn commit_turn_response(
         adopted_provider_identities = adopted,
         "committing turn response; tool records were persisted live"
     );
+    persist_host_instructions(session, interactions);
     session.add_message(MessageRole::Assistant, response);
+}
+
+/// Host continuation instructions (verification failure, Stop-hook reason,
+/// truncation or retry notice) are not streamed as events, so they exist only
+/// in the turn's batch. Store them as host rows, as headless `-p` does, so a
+/// later turn or resume shows why the extra work happened and never attributes
+/// the text to the user (mini-agent-sskdu.187).
+fn persist_host_instructions(session: &mut Session, interactions: &[Message]) {
+    for message in interactions {
+        let Message::User { content } = message else {
+            continue;
+        };
+        for item in content.iter() {
+            if let rig::message::UserContent::Text(text) = item
+                && crate::agent::input::is_host_instruction(&text.text)
+            {
+                session.add_message(MessageRole::System, &text.text);
+            }
+        }
+    }
 }
 
 async fn handle_agent_done(
@@ -688,7 +715,12 @@ async fn handle_agent_done(
             .actionable_size_pressure(ui.cfg.resolve_compact_size_fraction()),
         loop_running,
     ) {
-        let compress_result = handle_compress(None, true, run, renderer, ui, true).await;
+        // Rebuild with the session's own reasoning setting, not a literal
+        // `true`, so `/reasoning off` survives an automatic compaction
+        // (mini-agent-sskdu.231).
+        let reasoning_enabled = ui.session.reasoning_enabled;
+        let compress_result =
+            handle_compress(None, reasoning_enabled, run, renderer, ui, true).await;
         if let Err(e) = compress_result {
             renderer.write_line(&format!("auto-compact error: {}", e), C_ERROR)?;
         }
@@ -773,6 +805,28 @@ async fn run_goal_round(
     };
     let goal = ui.session.goal_store.snapshot();
     let Some(goal) = goal.filter(|g| g.status.is_running()) else {
+        // The goal was paused (or cleared) while this round ran. The round's
+        // cost is real and was charged to the session, so fold it into the
+        // goal's counters without a gate decision; otherwise `tokens:` and
+        // `max_tokens` undercount.
+        if let Some(parked) = ui.session.goal_store.snapshot()
+            && !parked.status.is_terminal()
+        {
+            let spent = collector.finish(&parked, gate::RoundEnd::Done, 0);
+            ui.session.goal_store.with_mut(|goal| {
+                goal.progress.tokens_used =
+                    goal.progress.tokens_used.saturating_add(spent.tokens_used);
+                goal.progress.active_secs = goal
+                    .progress
+                    .active_secs
+                    .saturating_add(spent.active.as_secs());
+                goal.touch();
+            });
+            renderer.write_line(
+                "goal: the round that was running when you paused finished; its cost was counted",
+                C_AGENT,
+            )?;
+        }
         return Ok(false);
     };
 
@@ -837,6 +891,7 @@ async fn start_goal_verification(
         &ui.session.provider,
         &ui.session.model,
     );
+    ui.session.goal_store.record_judge(judge.as_ref());
     let transcript = crate::extras::goal::judge::transcript_tail(ui.session);
     let spend =
         crate::spend::run::Run::for_session(ui.session, ui.cfg, crate::spend::RequestKind::Judge);

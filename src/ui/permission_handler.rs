@@ -34,6 +34,25 @@ pub(super) fn premature_prompt_key(
     }
 }
 
+/// A paste into a one-line draft: line breaks become single spaces (so pasted
+/// lines are not glued together) and every other control character is dropped.
+fn one_line_paste(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                chars.next_if_eq(&'\n');
+                out.push(' ');
+            }
+            '\n' => out.push(' '),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 pub(super) fn prompt_arming_delay() -> std::time::Duration {
     PROMPT_ARMING_DELAY
 }
@@ -384,14 +403,19 @@ impl PermissionState {
     fn show_note(&self, renderer: &mut Renderer) -> anyhow::Result<()> {
         let request = self.request.as_ref().expect("approval owns its request");
         renderer.permission_prompt = Some(super::renderer::PermissionPrompt {
+            // The request stays the header (long ones are elided there); the
+            // note sits in the options block, which the layout never cuts.
             tool: format!(
-                "[permission] {}: {} - note for the model: {}",
+                "[permission] {}: {}",
                 request.tool,
                 sanitize_for_review(&request.input),
+            )
+            .into(),
+            options: format!(
+                "note for the model: {}\n[Enter] deny and send the note  [Esc] back to the prompt",
                 sanitize_for_review(self.note.as_deref().unwrap_or_default())
             )
             .into(),
-            options: "[Enter] deny and send the note to the model  [Esc] back to the prompt".into(),
             expanded: false,
         });
         draw_prompt(renderer)?;
@@ -483,9 +507,7 @@ impl PermissionState {
                     }
                     _ => {}
                 },
-                UserEvent::Paste(text) => {
-                    note.extend(text.chars().filter(|character| !character.is_control()));
-                }
+                UserEvent::Paste(text) => note.push_str(&one_line_paste(text)),
                 _ => return Ok(PermissionEvent::Unhandled),
             }
             self.show_note(renderer)?;
@@ -522,7 +544,7 @@ impl PermissionState {
                 },
                 UserEvent::Paste(text) => {
                     // One line; a paste cannot submit or replay queued input.
-                    instruction.extend(text.chars().filter(|character| !character.is_control()));
+                    instruction.push_str(&one_line_paste(text));
                 }
                 _ => return Ok(PermissionEvent::Unhandled),
             }
@@ -845,6 +867,12 @@ mod tests {
             early,
             delay
         ));
+    }
+
+    #[test]
+    fn pasted_line_breaks_in_one_line_drafts_become_spaces() {
+        assert_eq!(one_line_paste("a\r\nb\rc\nd\x1b[0me"), "a b c d[0me");
+        assert_eq!(one_line_paste("tab\tx"), "tabx");
     }
 
     #[test]

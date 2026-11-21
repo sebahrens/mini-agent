@@ -11,7 +11,11 @@ use std::sync::Arc;
 
 pub(crate) enum SessionPick {
     Selected(ResumeSelection),
-    Reload(bool),
+    /// Re-list with the other workspace scope, keeping the typed filter.
+    Reload {
+        all: bool,
+        query: String,
+    },
     Cancelled,
 }
 
@@ -175,7 +179,10 @@ impl SessionsPicker {
                 }
             }
             KeyCode::Tab if plain => {
-                self.outcome = Some(SessionPick::Reload(!self.all));
+                self.outcome = Some(SessionPick::Reload {
+                    all: !self.all,
+                    query: self.query.clone(),
+                });
                 self.active = false;
             }
             KeyCode::Down if plain && !self.matches.is_empty() => {
@@ -389,12 +396,13 @@ pub(crate) fn choose(
             _ => continue,
         }
         match picker.take_outcome() {
-            Some(SessionPick::Reload(all)) => {
+            Some(SessionPick::Reload { all, query }) => {
                 picker = SessionsPicker::new(
                     crate::session::catalogue::list(&workspace, all)?,
                     workspace.clone(),
                     all,
                 );
+                picker.paste(&query);
                 picker.set_monochrome(monochrome);
             }
             Some(SessionPick::Cancelled) => return Ok(None),
@@ -522,11 +530,17 @@ mod tests {
             _ => panic!("expected exact selection"),
         }
         picker.active = true;
+        picker.query.clear();
+        picker.paste("needle");
         picker.handle(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert!(matches!(
-            picker.take_outcome(),
-            Some(SessionPick::Reload(true))
-        ));
+        match picker.take_outcome() {
+            Some(SessionPick::Reload { all, query }) => {
+                assert!(all);
+                assert_eq!(query, "needle", "the filter survives the scope toggle");
+            }
+            _ => panic!("expected a reload"),
+        }
+        picker.query.clear();
         picker.active = true;
         picker.handle(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(matches!(

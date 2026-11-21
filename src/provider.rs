@@ -448,14 +448,8 @@ pub(crate) fn openrouter_anthropic_routing(model_id: &str) -> Option<serde_json:
 /// model id reused on a custom gateway (segment split on `/` only, since
 /// Claude version numbers themselves contain dots, e.g. `claude-3.5-sonnet`).
 pub(crate) fn is_claude_model_family(model_id: &str) -> bool {
-    let slug = model_id.strip_prefix('~').unwrap_or(model_id);
-    slug.starts_with("claude-")
-        || slug.starts_with("bedrock.anthropic.")
-        || slug.starts_with("vertex.anthropic.")
-        || slug
-            .rsplit('/')
-            .next()
-            .is_some_and(|segment| segment.starts_with("claude-"))
+    // One recogniser for pricing, effort and cache markers (mini-agent-sskdu.10).
+    crate::models_catalog::is_claude_family(model_id)
 }
 
 /// Shallow-merges user-configured `extra_body` into provider-internal routing
@@ -1301,6 +1295,15 @@ impl AnyClient {
             AnyClient::OpenAI(c) => {
                 let prompt_caching = matches!(c, OpenAiClient::Completions(_, true));
                 let model = c.completion_model(name.clone());
+                if prompt_caching && !is_claude_model_family(&name) {
+                    static WARNED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        tracing::warn!(
+                            "prompt_caching is enabled but model `{name}` is not recognised as a Claude model; no cache_control markers are sent"
+                        );
+                    }
+                }
                 let model = if prompt_caching && is_claude_model_family(&name) {
                     match model {
                         OpenAiModel::Completions(model) => {
@@ -1608,8 +1611,8 @@ impl AnyClient {
         let request_timeout = request_timeout
             .unwrap_or_else(|| default_compaction_request_timeout(input_token_budget));
         let preamble = summarizer_preamble();
-        // Without a provider tokenizer, one UTF-8 byte per configured token is
-        // the provider-neutral conservative fallback. `input_token_budget`
+        // `compaction_request_limits` converts tokens to a request budget (about
+        // 3.25 narrow-text characters per token, not one byte). `input_token_budget`
         // already excludes the configured response reserve. We also reserve a
         // provider-envelope allowance and borrow enough input headroom to keep
         // a useful response cap when a custom reserve is smaller than 256.
@@ -2067,6 +2070,11 @@ pub struct ModelEntry {
 pub fn is_agent_model(m: &ModelEntry) -> bool {
     if let Some(t) = m.kind.as_deref() {
         let t = t.to_lowercase();
+        // A typed text-output listing outranks id substrings (OpenRouter
+        // `architecture.output_modalities`).
+        if t == "text" {
+            return true;
+        }
         if [
             "embed",
             "image",
@@ -2084,6 +2092,10 @@ pub fn is_agent_model(m: &ModelEntry) -> bool {
         }
     }
     let id = m.id.to_lowercase();
+    // Short words must be a whole `-`/`/`/`_`/`.`/`:` delimited segment, so an
+    // id that merely contains them (`...-bursts`, `stories`) stays listed.
+    const DENY_SEGMENT: &[&str] = &["tts", "sora", "veo", "aqa", "imagen", "speech", "realtime"];
+    // Longer, distinctive fragments stay substring matches.
     const DENY: &[&str] = &[
         "embedding",
         "embed-",
@@ -2091,23 +2103,20 @@ pub fn is_agent_model(m: &ModelEntry) -> bool {
         "gemini-embedding",
         "whisper",
         "transcribe",
-        "tts",
         "-audio",
-        "realtime",
-        "speech",
         "dall-e",
         "gpt-image",
         "image-generation",
-        "imagen",
-        "sora",
-        "veo",
         "moderation",
         "rerank",
-        "aqa",
         "davinci-002",
         "babbage-002",
     ];
-    !DENY.iter().any(|d| id.contains(d))
+    if DENY.iter().any(|d| id.contains(d)) {
+        return false;
+    }
+    !id.split(['-', '/', '_', '.', ':'])
+        .any(|segment| DENY_SEGMENT.contains(&segment))
 }
 
 impl AnyClient {
@@ -2378,6 +2387,9 @@ where
     .await
 }
 
+/// Appended to a summary whose response used the whole output allowance.
+pub(crate) const SUMMARY_TRUNCATED_MARKER: &str = "\n\n[summary truncated by the output limit]";
+
 async fn run_summarizer_with<M, F, Fut>(
     make_request: F,
     max_output_tokens: u64,
@@ -2420,7 +2432,18 @@ where
         )
         .await
         {
-            Ok(done) => return Ok(done),
+            Ok((mut text, usage)) => {
+                // A response that used its whole output allowance was cut off:
+                // say so instead of storing it as complete (mini-agent-sskdu.233).
+                if max_output_tokens > 0 && usage.output_tokens >= max_output_tokens {
+                    tracing::warn!(
+                        max_output_tokens,
+                        "compaction summary hit the output limit and was cut off"
+                    );
+                    text.push_str(SUMMARY_TRUNCATED_MARKER);
+                }
+                return Ok((text, usage));
+            }
             Err(SummarizerFailure::Fatal(error)) => return Err(error),
             Err(SummarizerFailure::Retry(delay, error)) => {
                 tracing::warn!(
@@ -2783,11 +2806,13 @@ where
 /// summarizer contract plus the user's compression preference, applied to the
 /// conversation that precedes it.
 pub(crate) fn fork_instruction(instructions: Option<&str>) -> String {
-    let mut text = summarizer_preamble();
+    // The user's global suffix is already part of the forked agent's system
+    // prompt, so it is not repeated here (mini-agent-sskdu.241).
+    let mut text = prompt::COMPACTION_FORK_PROMPT.to_string();
     text.push_str(
         "\n\n---\n\nThis message is a summarization request, not a continuation of the work. \
          Do not call tools and do not answer the conversation. Summarize the entire conversation \
-         above, including any earlier compaction summary it begins with, following the contract above.",
+         above, following the contract above.",
     );
     if let Some(instructions) = instructions {
         text.push_str(
@@ -2864,6 +2889,8 @@ pub(crate) fn defang_closing_tags<'a>(text: &'a str, names: &[&str]) -> Cow<'a, 
 /// never injectable.
 fn serialize_message(msg: &SessionMessage) -> String {
     let role_tag = match msg.role {
+        // The host's relief continuation is not the user's own words.
+        crate::session::MessageRole::User if !msg.is_user_authored() => "host_continuation",
         crate::session::MessageRole::User => "user",
         crate::session::MessageRole::Assistant => "assistant",
         crate::session::MessageRole::System => "system",
@@ -3417,8 +3444,7 @@ pub(crate) fn fallback_eligible(turn: &runner::HeadlessTurn) -> bool {
     {
         return false;
     }
-    let error: &(dyn std::error::Error + 'static) = error.as_ref();
-    crate::retry::is_retryable(error)
+    crate::retry::is_retryable_flattened(error)
 }
 
 #[derive(Clone)]
@@ -4114,7 +4140,7 @@ impl AnyAgent {
                 )
             })??;
         Ok(CompactionOutput {
-            summary: prefix_at_most(&summary, summary_byte_budget).to_string(),
+            summary: bound_summary(&summary, summary_byte_budget),
             summary_byte_budget,
             messages_included,
             usage: usage.into(),
@@ -9577,5 +9603,21 @@ mod fallback_notice_tests {
             "HTTP status 401 unauthorized"
         ));
         assert!(!super::fallback_eligible(&auth));
+        // A 400 whose body merely mentions "timeout" must not fall back once
+        // the typed status has been flattened away.
+        let bad_request = crate::provider_http::ProviderRetryAfterError::for_test(
+            400,
+            &[],
+            "timeout must be <= 600",
+        );
+        let flattened = super::runner::HeadlessTurn::failed_before_start(anyhow::Error::new(
+            crate::retry::ClassifiedProviderError::from_error(&bad_request),
+        ));
+        assert!(!super::fallback_eligible(&flattened));
+        let overloaded = crate::provider_http::ProviderRetryAfterError::for_test(529, &[], "x");
+        let flattened = super::runner::HeadlessTurn::failed_before_start(anyhow::Error::new(
+            crate::retry::ClassifiedProviderError::from_error(&overloaded),
+        ));
+        assert!(super::fallback_eligible(&flattened));
     }
 }

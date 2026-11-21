@@ -481,7 +481,21 @@ impl TryFrom<UncheckedSessionMessage> for SessionMessage {
     }
 }
 
+/// Whether `text` is the host's own continuation prompt after a context
+/// relief (current or earlier wording), which is persisted as a `User` record
+/// but is not the user's words (mini-agent-sskdu.237).
+pub(crate) fn is_continuation_prompt(text: &str) -> bool {
+    let text = text.trim_start();
+    text.starts_with("[Earlier context was compacted to save space")
+        || text.starts_with("[Context was compacted to save space")
+}
+
 impl SessionMessage {
+    /// A `User` record carrying the user's own words, not a host continuation.
+    pub(crate) fn is_user_authored(&self) -> bool {
+        self.role == MessageRole::User && !is_continuation_prompt(&self.content)
+    }
+
     pub(crate) fn validate_user(&self) -> Result<(), &'static str> {
         self.validate_user_with(false)
     }
@@ -825,6 +839,12 @@ pub struct Compaction {
     #[serde(default)]
     pub(crate) file_requests: compaction::FileRequests,
     pub summary: CompactString,
+    /// The summarizer's own prose (bounded), without the machine-appended file
+    /// list, todo/goal blocks and restored file windows that `summary` carries.
+    /// The next compaction hands only this to the summarizer as the previous
+    /// summary (mini-agent-sskdu.235). Absent in older sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) prose: Option<CompactString>,
     pub first_kept_index: usize,
     pub summarized_count: usize,
     pub token_savings: u64,
@@ -943,6 +963,16 @@ pub struct Session {
     /// unless that opt-in setting is on (mini-agent-3wsib).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generated_title: Option<CompactString>,
+    /// The first user message's text, kept when a compaction drains it so the
+    /// derived title does not change with every compaction
+    /// (mini-agent-sskdu.238). Absent until a first compaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_prompt: Option<CompactString>,
+    /// Title requests that ran and produced nothing usable. Persisted so a
+    /// failing title model is not asked again by every prompt or resume
+    /// (mini-agent-sskdu.11); see `title::MAX_TITLE_ATTEMPTS`.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub title_attempts: u8,
     /// Closed session data only; never a runtime permission or replay owner.
     #[serde(
         default,
@@ -1543,6 +1573,8 @@ impl Session {
             id: CompactString::new(Uuid::new_v4().to_string()),
             name: CompactString::new(name),
             generated_title: None,
+            first_prompt: None,
+            title_attempts: 0,
             reasoning_controls: Default::default(),
             memory_placement: MemoryPlacement::Messages,
             native_history: None,
@@ -2886,16 +2918,52 @@ impl Session {
             accumulated = accumulated.saturating_add(msg.estimated_tokens);
         }
         if cut_idx > 0 && cut_idx < messages.len() {
+            // A model that calls tools without narrating leaves no User or
+            // Assistant record for a long stretch, so a completed call/result
+            // batch boundary is also a legal cut: a `ToolCall` that follows a
+            // `ToolResult` while no earlier call is still waiting for its
+            // result (mini-agent-sskdu.227).
+            let batch_starts = Self::completed_batch_starts(&messages[..=cut_idx]);
             while cut_idx > 0
                 && !matches!(
                     messages[cut_idx].role,
                     MessageRole::User | MessageRole::Assistant
                 )
+                && !batch_starts[cut_idx]
             {
                 cut_idx -= 1;
             }
         }
         cut_idx
+    }
+
+    /// For each index of `messages`, whether it is a `ToolCall` record that
+    /// starts a new batch: its predecessor is a `ToolResult` and every earlier
+    /// call already has its result, so cutting before it never separates a
+    /// call from its result.
+    fn completed_batch_starts(messages: &[SessionMessage]) -> Vec<bool> {
+        let mut open: HashSet<&str> = HashSet::new();
+        let mut starts = Vec::with_capacity(messages.len());
+        for (i, msg) in messages.iter().enumerate() {
+            starts.push(
+                i > 0
+                    && msg.role == MessageRole::ToolCall
+                    && messages[i - 1].role == MessageRole::ToolResult
+                    && open.is_empty(),
+            );
+            if let Some(id) = msg.tool_call_id.as_deref().filter(|id| !id.is_empty()) {
+                match msg.role {
+                    MessageRole::ToolCall => {
+                        open.insert(id);
+                    }
+                    MessageRole::ToolResult => {
+                        open.remove(id);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        starts
     }
 
     /// Returns true when the pending payload cannot fit even if the entire
@@ -2932,18 +3000,16 @@ impl Session {
         {
             return title.to_string();
         }
-        let Some(first) = self
-            .messages
-            .iter()
-            .find(|m| m.role == MessageRole::User && !m.content.trim().is_empty())
-        else {
+        let first = self.first_prompt.as_deref().or_else(|| {
+            self.messages
+                .iter()
+                .find(|m| m.is_user_authored() && !m.content.trim().is_empty())
+                .map(|m| m.content.as_str())
+        });
+        let Some(first) = first else {
             return String::new();
         };
-        let line = first
-            .content
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
+        let line = first.split_whitespace().collect::<Vec<_>>().join(" ");
         if line.chars().count() <= SESSION_TITLE_CHARS {
             return line;
         }
@@ -3066,6 +3132,10 @@ impl Session {
         restore_read_tokens: u64,
     ) {
         let memory_ref = CompactString::new(compaction_ref(&summary));
+        let prose = CompactString::new(crate::provider::bound_summary(
+            &summary,
+            summary_byte_budget,
+        ));
         let restored_reads = compaction::restored_read_windows(
             &self.messages[..first_kept_index.min(self.messages.len())],
             restore_read_tokens,
@@ -3118,6 +3188,28 @@ impl Session {
             tool: None,
         };
 
+        // The title is derived from the first user message; remember it before
+        // the drain removes it (mini-agent-sskdu.238).
+        if self.first_prompt.is_none() {
+            self.first_prompt = self.messages[..first_kept_index.min(self.messages.len())]
+                .iter()
+                .find(|m| m.is_user_authored() && !m.content.trim().is_empty())
+                .map(|m| {
+                    // Bounded in chars: one huge word must not be copied whole.
+                    let line = m
+                        .content
+                        .split_whitespace()
+                        .take(SESSION_TITLE_CHARS)
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    CompactString::new(
+                        line.chars()
+                            .take(SESSION_TITLE_CHARS * 2)
+                            .collect::<String>(),
+                    )
+                });
+        }
+
         // Remove summarized messages and insert summary
         self.messages.drain(..first_kept_index);
         self.messages.insert(0, summary_msg);
@@ -3132,9 +3224,12 @@ impl Session {
             images,
             file_requests,
             summary: CompactString::from(summary),
+            prose: Some(prose),
             first_kept_index: 1, // The summary is at index 0
             summarized_count,
-            token_savings,
+            // Net of the inserted summary, restored windows and blocks: what
+            // the compaction actually freed (mini-agent-sskdu.242).
+            token_savings: token_savings.saturating_sub(summary_tokens),
             created_at: CompactString::new(rfc3339_utc(jiff::Timestamp::now())),
             memory_ref: Some(memory_ref),
             pruned: None,
@@ -3168,6 +3263,14 @@ impl Session {
     /// left out here rather than sent twice (mini-agent-g8m5v). It is still
     /// part of the drained prefix: the new summary replaces it. Callers drain
     /// `skipped + compaction_drain_len(cut_idx - skipped, included)`.
+    /// The previous compaction's summary as the summarizer should see it: the
+    /// model's prose without machine-appended blocks (mini-agent-sskdu.235).
+    pub fn previous_summary_prose(&self) -> Option<String> {
+        self.compactions
+            .last()
+            .map(|c| c.prose.as_ref().unwrap_or(&c.summary).to_string())
+    }
+
     pub fn compaction_input(
         &self,
         cut_idx: usize,
@@ -4374,6 +4477,7 @@ mod compaction_history_tests {
             created_at: "t".into(),
             memory_ref: None,
             pruned: None,
+            prose: None,
         };
         let chain = |summaries: &[&str]| {
             summaries
@@ -4626,4 +4730,8 @@ mod rfc3339_format_tests {
         let text = rfc3339_utc(jiff::Timestamp::now());
         assert_eq!(rfc3339_utc(text.parse().unwrap()), text);
     }
+}
+
+fn is_zero_u8(value: &u8) -> bool {
+    *value == 0
 }
