@@ -274,7 +274,18 @@ async fn effort46_native_zero_tool_signed_and_interrupted_blocks_are_distinct() 
             .await
             .unwrap();
         while let Some(part) = response.next().await {
-            part.unwrap();
+            match part {
+                Ok(_) => {}
+                // A stream cut before message_stop is a stream error by design.
+                Err(error) if !stopped => {
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("stream ended before message_stop")
+                    );
+                }
+                Err(error) => panic!("{error}"),
+            }
         }
         let reasoning: Vec<_> = response
             .choice

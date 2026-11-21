@@ -1266,6 +1266,9 @@ fn held_ledger_flush_child(root: &std::path::Path) -> ! {
         cfg["model"] = serde_json::json!("cost-fixture");
         cfg["session_title_model"] = serde_json::json!("off");
         cfg["no_tools"] = serde_json::json!(true);
+        // A known window keeps the startup context refresh from probing
+        // GET /models on this single-response wire (mini-agent-nvnkx.38).
+        cfg["context_window"] = serde_json::json!(128_000);
         let paths = crate::paths::process_paths_ref().unwrap();
         crate::fs::ensure_private_directory(&paths.config_dir).unwrap();
         let cfg: Config = serde_json::from_value(cfg).unwrap();

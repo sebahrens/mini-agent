@@ -428,13 +428,25 @@ async fn effort46_native_interrupted_nonempty_thinking_is_display_only() {
         .await
         .unwrap();
     let mut displayed = String::new();
+    let mut ended_with_error = false;
     while let Some(item) = stream.next().await {
-        if let rig::streaming::StreamedAssistantContent::ReasoningDelta { reasoning, .. } =
-            item.unwrap()
-        {
-            displayed.push_str(&reasoning);
+        match item {
+            Ok(rig::streaming::StreamedAssistantContent::ReasoningDelta { reasoning, .. }) => {
+                displayed.push_str(&reasoning);
+            }
+            Ok(_) => {}
+            // A stream cut before message_stop is a stream error by design.
+            Err(error) => {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("stream ended before message_stop")
+                );
+                ended_with_error = true;
+            }
         }
     }
+    assert!(ended_with_error);
     assert_eq!(displayed, "partial display");
     assert!(
         !stream
