@@ -328,6 +328,10 @@ pub(crate) struct RunStep {
     /// This controls whether the worker installs the model-facing `spawn` global at all. The
     /// broker still enforces the corresponding grant on every call.
     pub(crate) spawn_available: bool,
+    /// Whether the parent bound a tool server for the brokered `call_tool` global. Absent
+    /// (false) keeps the global out of the realm; the broker still checks the grant per call.
+    #[serde(default)]
+    pub(crate) call_tool_available: bool,
     /// Configured whole-step deadline in milliseconds (`js-step-timeout-secs`);
     /// `None` keeps the built-in 30 s. The worker refuses values outside the
     /// configurable bounds.
@@ -355,6 +359,7 @@ impl RunStep {
             model_grant_id: None,
             model_effect_profile: ModelEffectProfile::Full,
             spawn_available: false,
+            call_tool_available: false,
             timeout_ms: None,
             #[cfg(feature = "skills")]
             proposal_grant_id: None,
@@ -387,6 +392,11 @@ impl RunStep {
 
     pub(crate) fn with_spawn_available(mut self, available: bool) -> Self {
         self.spawn_available = available;
+        self
+    }
+
+    pub(crate) fn with_call_tool_available(mut self, available: bool) -> Self {
+        self.call_tool_available = available;
         self
     }
 
@@ -534,6 +544,11 @@ pub(crate) struct EffectRequest {
     pub(crate) grant_id: GrantId,
     pub(crate) advisory: AdvisoryAttribution,
     pub(crate) operation: EffectOperation,
+    /// Console records emitted since the previous effect request. The worker streams them so a
+    /// parent-side deadline kill still has the progress the script logged; the parent bounds
+    /// them with the same caps as the terminal result and treats them as untrusted text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) console: Vec<ConsoleRecord>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -588,6 +603,10 @@ pub(crate) enum EffectOperation {
     ScratchGet {
         key: String,
     },
+    ScratchDelete {
+        key: String,
+    },
+    ScratchKeys,
     Fetch {
         url: String,
         method: HttpMethod,
@@ -603,6 +622,48 @@ pub(crate) enum EffectOperation {
     ProposeSkill {
         draft: SkillProposalDraft,
     },
+    /// Call one read-only tool (a read-only built-in or an MCP tool declaring `readOnlyHint`)
+    /// through the agent's tool server. `arguments_json` is a JSON object; the parent validates
+    /// it, the tool name and the grant before anything runs.
+    CallTool {
+        name: String,
+        arguments_json: String,
+    },
+    /// Independent fetches the parent authorizes one by one and then runs concurrently.
+    FetchAll {
+        requests: Vec<FetchBatchItem>,
+    },
+    /// Independent spawns the parent authorizes one by one and then runs concurrently.
+    SpawnAll {
+        commands: Vec<SpawnBatchItem>,
+    },
+}
+
+/// Most items one batch effect may carry.
+pub(crate) const MAX_BATCH_ITEMS: usize = 8;
+/// Largest `call_tool` argument object, in encoded bytes.
+pub(crate) const CALL_TOOL_ARGUMENTS_MAX_BYTES: usize = 256 * 1024;
+/// Largest `call_tool` result text returned to the script; more is cut and flagged.
+pub(crate) const CALL_TOOL_RESULT_MAX_BYTES: usize = 1024 * 1024;
+/// Longest tool name `call_tool` accepts.
+pub(crate) const CALL_TOOL_NAME_MAX_BYTES: usize = 128;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FetchBatchItem {
+    pub(crate) url: String,
+    pub(crate) method: HttpMethod,
+    pub(crate) headers: Vec<HttpHeader>,
+    pub(crate) body: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SpawnBatchItem {
+    pub(crate) program: String,
+    pub(crate) arguments: Vec<String>,
+    #[serde(default, skip_serializing_if = "SpawnOptions::is_default")]
+    pub(crate) options: SpawnOptions,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -825,6 +886,13 @@ pub(crate) enum EffectResult {
     ScratchGet {
         json: Option<String>,
     },
+    /// Whether the key existed before the delete.
+    ScratchDelete {
+        existed: bool,
+    },
+    ScratchKeys {
+        keys: Vec<String>,
+    },
     Fetch {
         status: u16,
         body: String,
@@ -848,6 +916,23 @@ pub(crate) enum EffectResult {
         /// Closed name of the signal that ended the process, when it died of one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signal: Option<String>,
+    },
+    CallTool {
+        /// The tool ran and reported success; `text` is its output. When false, `text` is the
+        /// tool's own error message.
+        ok: bool,
+        text: String,
+        /// `text` was cut at [`CALL_TOOL_RESULT_MAX_BYTES`].
+        #[serde(default, skip_serializing_if = "is_false")]
+        truncated: bool,
+    },
+    /// Per-item results in request order: each is a `Fetch` result or an `Error`.
+    FetchAll {
+        items: Vec<EffectResult>,
+    },
+    /// Per-item results in request order: each is a `Spawn` result or an `Error`.
+    SpawnAll {
+        items: Vec<EffectResult>,
     },
     ProposalAccepted {
         skill_id: String,
@@ -924,6 +1009,10 @@ pub(crate) enum DenialReason {
     PermissionDenied,
     /// `write_file` onto an existing file the model has not fully read.
     UnreadOverwrite,
+    /// `scratch_put` of a new key while the store already holds its entry-count maximum.
+    ScratchEntryLimit,
+    /// `scratch_put` that would push the store past its total-bytes maximum.
+    ScratchByteLimit,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -982,6 +1071,8 @@ pub(crate) enum JsErrorCode {
     StackLimit,
     JobLimit,
     EffectLimit,
+    /// The awaited completion promise is still pending after the job queue drained.
+    Unsettled,
     InvalidResult,
     Internal,
 }

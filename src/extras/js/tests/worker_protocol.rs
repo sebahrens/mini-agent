@@ -129,6 +129,7 @@ fn effect_request(sequence: u64, ordinal: u32) -> WorkerWireFrame {
             operation: EffectOperation::ReadFile {
                 path: "README.md".into(),
             },
+            console: Vec::new(),
         })),
     )
 }
@@ -592,6 +593,7 @@ fn worker_protocol_bounds_outbound_and_nested_payloads() {
                     predecessor_id: None,
                 },
             },
+            console: Vec::new(),
         })),
     );
     assert!(matches!(
@@ -814,6 +816,7 @@ fn worker_protocol_rejects_wrong_invocation_and_effect_identity() {
             grant_id: grant(),
             advisory: AdvisoryAttribution::default(),
             operation: EffectOperation::ReadFile { path: "x".into() },
+            console: Vec::new(),
         })),
     );
     assert!(matches!(

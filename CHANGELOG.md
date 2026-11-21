@@ -69,6 +69,11 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Large pastes (more than 10 lines or 1,000 characters) become an atomic `[Pasted text #N +M lines]` chip in the prompt that the cursor steps over and Backspace removes whole; submit, history and the external editor use the full text (mini-agent-nvnkx.88).
 - `/vim` Normal mode: operators `d`/`c`/`y` with counts, motions (`w e b 0 ^ $ gg G f F t T`, `iw`/`aw`), `x X D C p P o O r ~` and `.` repeat of the last change (mini-agent-nvnkx.89).
 - Pasting or dragging an image file path into the prompt attaches the image as `/add <path>` would, when the permission policy allows reading it (mini-agent-nvnkx.256).
+- Added: brokered JS `call_tool(name, args?)` calls one read-only tool (`read`, `grep`, `find_files`, `list_dir`, `lsp_*`, `web_search`, `web_fetch`, `memory_*`, MCP resource tools, `job_status`, `task_evidence`, `todo_read` and eager MCP tools declaring `readOnlyHint`) through the agent's tool server under that tool's own permission rules and hooks, so a script can loop over tool calls and return only the aggregate; stored skills never get it (mini-agent-nvnkx.116).
+- Added: brokered JS `fetch_all(requests)` and `spawn_all(commands)` authorize up to 8 independent items one by one (own audit intent and completion each) and run them four at a time; a denied item is an `{error, message}` entry, not a failed batch (mini-agent-nvnkx.119).
+- Added: JS `scratch_delete(key)` and `scratch_keys()`; a full scratch store names the entry or byte limit it hit, and the first `scratch_get` miss on a never-written store appends a note that scratch does not survive resume (mini-agent-nvnkx.120).
+- Added: the `js` tool description names every catalogued pure helper and states the file policy (allowed roots, or the config key that disables reads/writes) instead of advertising globals that can only fail (mini-agent-nvnkx.115, .123).
+- Added: JS effect audit retention checkpoints and prunes old segments (a new epoch every 16 segments) instead of refusing every effect at a cap, a reopen validates only the newest checkpoint window, and a corrupt slot is renamed `*.quarantine-<ms>` so the next free slot is used; spawn audit targets carry a keyed cwd/env digest (mini-agent-nvnkx.118, .328).
 
 ### Fixed
 
@@ -1868,6 +1873,12 @@ upstream changes that are new relative to this fork.
   picker loads in the background.
 - Development builds compile dependencies at opt-level 1. Release builds use opt-level 3
   (previously `z`), with thin LTO and one codegen unit.
+- Fixed: time a `js` call spends queued behind another one (or the first call's worker launch) no longer counts against `js-step-timeout-secs`; a call that waited past its queue cap says the script never ran (mini-agent-nvnkx.117, .170).
+- Fixed: a `js` call ended by the parent deadline now names the in-flight effect and keeps the console logged before it (mini-agent-nvnkx.125).
+- Fixed: `js` ReferenceError/TypeError results name the offending identifier from the model's own source, with a closed did-you-mean from the helper catalogue (mini-agent-nvnkx.122).
+- Fixed: an uncaught `js` effect failure reports the failed operation, its closed code and denial reason (`; last failed effect: read_file -> denied (...)`) (mini-agent-nvnkx.114).
+- Fixed: an awaited promise that never settles is reported as such instead of `job limit exceeded` (mini-agent-nvnkx.329).
+- Fixed: a `js` worker that will not be reused is torn down on the blocking pool instead of stalling the async executor (mini-agent-nvnkx.174).
 
 ## [1.10.4] - 2026-10-24
 

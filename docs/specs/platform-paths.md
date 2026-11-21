@@ -195,7 +195,10 @@ loss must never delete the authoritative skill database or disable primitive JS 
 exclusive writer per directory, so concurrent mini-agent processes each claim the first free
 slot through `AppPaths::effect_audit_slot(n)`: slot 0 is `<state_dir>/audit/js-effects` and slot
 `n` is `<state_dir>/audit/js-effects-<n>` (at most 64). A slot is only an integer-derived fixed
-child, a freed slot is reused by the next process, and no slot directory is ever deleted. Each
+child, a freed slot is reused by the next process, and no slot directory is ever deleted (a slot whose
+stored data is corrupt or over its retention limit is renamed to `js-effects[-n].quarantine-<unix-ms>`
+beside it for inspection, and the next free slot is used; see the Phase 6 spec for checkpointed
+retention). Each
 slot is an independent hash-linked chain with its own key. It fixes the directory
 at `<state_dir>/audit/js-effects`, the writer lock at `writer.lock`, and opaque monotonically
 numbered segment names. Its parent-only target-correlation key is fixed at `target-hmac-v1.key`;

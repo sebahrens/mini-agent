@@ -388,6 +388,7 @@ async fn model_authored_proposal_uses_one_exact_grant_and_durable_audit_envelope
         operation: EffectOperation::ProposeSkill {
             draft: wire_proposal(""),
         },
+        console: Vec::new(),
     };
     let expected_skill_id = JsProposal::try_from(wire_proposal(""))
         .unwrap()
@@ -468,6 +469,7 @@ async fn proposal_denial_and_cancellation_enqueue_nothing_and_audit_denials() {
         operation: EffectOperation::ProposeSkill {
             draft: wire_proposal("-denied"),
         },
+        console: Vec::new(),
     };
     let mut broker = InvocationBroker::new(
         invocation,
@@ -513,6 +515,7 @@ async fn proposal_denial_and_cancellation_enqueue_nothing_and_audit_denials() {
                     operation: EffectOperation::ProposeSkill {
                         draft: wire_proposal("-cancelled"),
                     },
+                    console: Vec::new(),
                 },
                 cancellation,
             )
@@ -565,6 +568,7 @@ async fn malformed_parent_proposals_do_not_consume_the_session_budget() {
                     grant_id: grant_id.clone(),
                     advisory: AdvisoryAttribution::default(),
                     operation: EffectOperation::ProposeSkill { draft: oversized },
+                    console: Vec::new(),
                 },
                 PermCancellation::new(),
             )
@@ -582,6 +586,7 @@ async fn malformed_parent_proposals_do_not_consume_the_session_budget() {
                 operation: EffectOperation::ProposeSkill {
                     draft: wire_proposal("-well-formed"),
                 },
+                console: Vec::new(),
             },
             PermCancellation::new(),
         )
@@ -648,6 +653,7 @@ async fn wire_proposal_rejects_33_nested_scope_entries_before_enqueue() {
                     grant_id: grant.grant_id().clone(),
                     advisory: AdvisoryAttribution::default(),
                     operation: EffectOperation::ProposeSkill { draft },
+                    console: Vec::new(),
                 },
                 PermCancellation::new(),
             )
@@ -726,6 +732,7 @@ async fn wire_proposal_rejects_oversized_nested_strings_before_enqueue() {
                         grant_id: grant_id.clone(),
                         advisory: AdvisoryAttribution::default(),
                         operation: EffectOperation::ProposeSkill { draft },
+                        console: Vec::new(),
                     },
                     PermCancellation::new(),
                 )
@@ -817,7 +824,7 @@ async fn model_cannot_execute_a_proposal_in_the_same_step() {
         .expect("closed execution result");
     assert!(
         output.starts_with("JS ReferenceError at ")
-            && output.ends_with("(stage: evaluation; script: model)"),
+            && output.contains("(stage: evaluation; script: model)"),
         "unexpected: {output}"
     );
     drop(tool);
@@ -859,7 +866,9 @@ async fn proposal_host_wiring_enforces_session_budget() {
         .expect("structured JS error");
     assert!(
         exhausted.starts_with("JS exception at ")
-            && exhausted.ends_with("(stage: evaluation; script: model)"),
+            && exhausted.contains(
+                "(stage: evaluation; script: model); last failed effect: propose_skill -> denied"
+            ),
         "unexpected: {exhausted}"
     );
     drop(tool);
@@ -890,7 +899,7 @@ async fn proposal_host_validation_failures_do_not_consume_the_session_budget() {
                 .expect("structured validation error");
             assert!(
                 output.starts_with("JS exception at ")
-                    && output.ends_with("(stage: evaluation; script: model)"),
+                    && output.contains("(stage: evaluation; script: model)"),
                 "unexpected: {output}"
             );
         }
@@ -917,7 +926,7 @@ async fn proposal_host_validation_failures_do_not_consume_the_session_budget() {
         .expect("structured budget error");
     assert!(
         exhausted.starts_with("JS exception at ")
-            && exhausted.ends_with("(stage: evaluation; script: model)"),
+            && exhausted.contains("(stage: evaluation; script: model)"),
         "unexpected: {exhausted}"
     );
     drop(tool);

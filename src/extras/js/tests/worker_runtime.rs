@@ -2743,7 +2743,15 @@ fn exercise_invocation_interruption(stop: InvocationStop, fault: Option<Interrup
                 tokio::time::advance(Duration::from_secs(3)).await;
                 let polled = futures::poll!(&mut request);
                 tokio::time::resume();
-                assert_eq!(polled, std::task::Poll::Ready(Err(WorkerError::EffectOutcomeUnknown)),
+                // The worker teardown runs on the blocking pool (mini-agent-nvnkx.174), so the
+                // result may take a real-time turn after the virtual drain deadline passes.
+                let settled = match polled {
+                    std::task::Poll::Ready(result) => result,
+                    std::task::Poll::Pending => tokio::time::timeout(LAUNCH_FIXTURE_GUARD, &mut request)
+                        .await
+                        .expect("uncooperative cancellation did not settle after its drain"),
+                };
+                assert_eq!(settled, Err(WorkerError::EffectOutcomeUnknown),
                     "uncooperative cancellation must reconcile at the bounded drain");
                 assert!(gated.dropped.load(Ordering::Acquire), "expired cancellation drain retained the effect");
             } else if stop == InvocationStop::CallerDrop {
@@ -4137,6 +4145,7 @@ fn run_scripted_supervisor_worker() -> ! {
                             operation: EffectOperation::ReadFile {
                                 path: "fixture".into(),
                             },
+                            console: Vec::new(),
                         })),
                     );
                     protocol.on_send(&effect).unwrap();
@@ -4363,4 +4372,105 @@ fn worker_bootstrap_test_child() {
         }
         crate::extras::js::worker::exit_test_worker();
     }
+}
+
+/// Launches the scripted test worker after a fixed delay, like a cold start that clones and
+/// attests a worker image.
+#[derive(Clone)]
+struct SlowLaunchLauncher {
+    delay: Duration,
+}
+
+impl WorkerLauncher for SlowLaunchLauncher {
+    fn containment_status(&self) -> crate::sandbox::worker::WorkerContainmentStatus {
+        TestWorkerLauncher::scripted_internal_worker(0).containment_status()
+    }
+
+    fn launch(&self) -> Result<WorkerProcess, WorkerLaunchError> {
+        std::thread::sleep(self.delay);
+        TestWorkerLauncher::scripted_internal_worker(0).launch()
+    }
+}
+
+/// mini-agent-nvnkx.170: a call that holds the transport lease gets its step budget from the
+/// moment the worker is Ready, so a slow cold launch is not charged to it; the same deadline
+/// without a lease keeps bounding launch.
+#[tokio::test]
+async fn worker_supervisor_step_budget_excludes_a_slow_launch_when_the_lease_is_held() {
+    let supervisor = JsWorkerSupervisor::with_launcher_and_watchdog_for_test(
+        SlowLaunchLauncher {
+            delay: Duration::from_millis(1_500),
+        },
+        Duration::from_secs(10),
+    );
+    let step = Duration::from_millis(1_000);
+
+    let unleased = supervisor
+        .execute_bound_with_deadline(
+            InvocationId::new("inv-unleased-launch").unwrap(),
+            RunStep::new("success".into()),
+            RecordingEffects::default(),
+            PermCancellation::new(),
+            Some(Instant::now() + step),
+        )
+        .await;
+    assert_eq!(
+        unleased.unwrap_err(),
+        WorkerError::TimedOut,
+        "without a lease the launch still counts against the deadline"
+    );
+    supervisor.shutdown().await.unwrap();
+
+    let cancellation = PermCancellation::new();
+    let lease = supervisor
+        .acquire_lease(&cancellation, Instant::now() + Duration::from_secs(5))
+        .await
+        .unwrap();
+    let leased = supervisor
+        .execute_bound_leased(
+            InvocationId::new("inv-leased-launch").unwrap(),
+            RunStep::new("success".into()),
+            RecordingEffects::default(),
+            cancellation,
+            Some(Instant::now() + step),
+            Some(lease),
+        )
+        .await
+        .expect("a slow launch is not charged to the leased step budget");
+    assert_eq!(leased.outcome, StepOutcome::Value("success".into()));
+    supervisor.shutdown().await.unwrap();
+}
+
+/// mini-agent-nvnkx.174: retiring a non-reusable worker runs on the blocking pool, so a timer
+/// scheduled on a current-thread runtime is not delayed by the reap.
+#[test]
+fn worker_supervisor_retires_a_non_reusable_worker_off_the_async_executor() {
+    use crate::extras::js::supervisor::RETIRE_OBSERVER;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let supervisor = JsWorkerSupervisor::with_launcher_for_test(
+            TestWorkerLauncher::scripted_internal_worker(0),
+        );
+        let (observed, mut retirements) = tokio::sync::mpsc::unbounded_channel();
+        let result = RETIRE_OBSERVER
+            .scope(
+                observed,
+                supervisor.execute(
+                    RunStep::new("timeout-step".into()),
+                    RecordingEffects::default(),
+                    PermCancellation::new(),
+                ),
+            )
+            .await;
+        // A timeout outcome is a non-reusable terminal: its worker goes to the blocking pool.
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            retirements.try_recv().is_ok(),
+            "the non-reusable connection was handed to the blocking pool"
+        );
+    });
 }

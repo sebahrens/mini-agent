@@ -61,6 +61,8 @@ tokio::task_local! {
     pub(crate) static WORKER_READ_OBSERVER: tokio::sync::mpsc::UnboundedSender<()>;
     /// Actual native status being classified, before invocation cleanup.
     pub(crate) static WORKER_EXIT_OBSERVER: tokio::sync::mpsc::UnboundedSender<ExitStatus>;
+    /// A non-reusable connection handed to the blocking pool for teardown.
+    pub(crate) static RETIRE_OBSERVER: tokio::sync::mpsc::UnboundedSender<()>;
 }
 
 pub(crate) type EffectFuture<'a> = Pin<Box<dyn Future<Output = EffectResult> + Send + 'a>>;
@@ -117,6 +119,8 @@ pub(crate) enum WorkerError {
     Cancelled,
     #[error("JavaScript worker invocation exceeded its deadline")]
     TimedOut,
+    #[error("JavaScript call waited too long for another call to finish with the worker")]
+    QueueTimedOut,
     #[error("JavaScript permission prompt was not answered before the invocation deadline")]
     PermissionPromptTimedOut,
     #[error("JavaScript effect completed with an unknown outcome")]
@@ -155,7 +159,7 @@ static SHARED_SUPERVISOR: OnceLock<Arc<JsWorkerSupervisor>> = OnceLock::new();
 
 // BEGIN AUTHORITY-FREE SUPERVISOR STATE
 struct SupervisorInner {
-    transport: tokio::sync::Mutex<SupervisorState>,
+    transport: Arc<tokio::sync::Mutex<SupervisorState>>,
     launch_gate: Arc<tokio::sync::Mutex<()>>,
     launcher: Arc<dyn WorkerLauncher>,
     active_generation: AtomicU64,
@@ -575,11 +579,11 @@ impl JsWorkerSupervisor {
         reuse_policy: WorkerReusePolicy,
     ) -> Self {
         Self(Arc::new(SupervisorInner {
-            transport: tokio::sync::Mutex::new(SupervisorState {
+            transport: Arc::new(tokio::sync::Mutex::new(SupervisorState {
                 idle: None,
                 next_generation: 1,
                 next_invocation: 1,
-            }),
+            })),
             launch_gate: Arc::new(tokio::sync::Mutex::new(())),
             launcher,
             active_generation: AtomicU64::new(0),
@@ -683,21 +687,39 @@ impl JsWorkerSupervisor {
         &self,
         invocation: InvocationId,
         request: RunStep,
-        mut effects: impl InvocationEffectHandler,
+        effects: impl InvocationEffectHandler,
         cancellation: PermCancellation,
         deadline: Option<Instant>,
     ) -> Result<StepResult, WorkerError> {
-        self.execute_inner(
-            request,
+        self.execute_bound_leased(invocation, request, effects, cancellation, deadline, None)
+            .await
+    }
+
+    /// Like [`Self::execute_bound_with_deadline`], for a caller that already holds the transport
+    /// lease (`acquire_lease`): `deadline` then starts after queueing and excludes worker launch.
+    #[cfg(any(test, not(feature = "skills")))]
+    pub(crate) async fn execute_bound_leased(
+        &self,
+        invocation: InvocationId,
+        request: RunStep,
+        mut effects: impl InvocationEffectHandler,
+        cancellation: PermCancellation,
+        deadline: Option<Instant>,
+        lease: Option<WorkerLease>,
+    ) -> Result<StepResult, WorkerError> {
+        self.execute_inner_request(
+            InvocationRequest::Run(request),
             &mut effects,
             cancellation,
             Some(invocation),
             deadline,
+            lease,
         )
         .await
     }
 
     #[cfg(feature = "skills")]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn execute_bound_with_deadline_and_skills(
         &self,
         invocation: InvocationId,
@@ -706,6 +728,7 @@ impl JsWorkerSupervisor {
         mut effects: impl InvocationEffectHandler,
         cancellation: PermCancellation,
         deadline: Option<Instant>,
+        lease: Option<WorkerLease>,
     ) -> Result<StepResult, WorkerError> {
         self.execute_inner_request(
             InvocationRequest::RunWithSkills(request, skill_bundle),
@@ -713,6 +736,7 @@ impl JsWorkerSupervisor {
             cancellation,
             Some(invocation),
             deadline,
+            lease,
         )
         .await
     }
@@ -732,6 +756,7 @@ impl JsWorkerSupervisor {
             cancellation,
             invocation,
             deadline_override,
+            None,
         )
         .await
     }
@@ -743,6 +768,7 @@ impl JsWorkerSupervisor {
         cancellation: PermCancellation,
         invocation: Option<InvocationId>,
         deadline_override: Option<Instant>,
+        lease: Option<WorkerLease>,
     ) -> Result<StepResult, WorkerError> {
         match self
             .invoke_interactive(
@@ -751,6 +777,7 @@ impl JsWorkerSupervisor {
                 cancellation,
                 invocation,
                 deadline_override,
+                lease,
             )
             .await?
         {
@@ -793,22 +820,35 @@ impl JsWorkerSupervisor {
             .map_err(|error| *error)
     }
 
-    async fn invoke_interactive<H: InvocationEffectHandler>(
+    /// How long a worker launch may take when the step budget excludes it.
+    pub(crate) fn launch_allowance(&self) -> Duration {
+        self.0.watchdog
+    }
+
+    /// Wait for the single worker's transport lease under its own cancellable queue bound.
+    ///
+    /// Queueing is not charged to a step budget: the caller starts its step deadline, grant
+    /// expiry and effect-service deadlines only after this returns, so a call that merely waited
+    /// behind another one is never reported as a slow script. Expiry of `queue_deadline` yields
+    /// the distinct [`WorkerError::QueueTimedOut`].
+    pub(crate) async fn acquire_lease(
         &self,
-        request: InvocationRequest,
-        mut effects: Option<&mut H>,
-        cancellation: PermCancellation,
-        invocation: Option<InvocationId>,
-        deadline_override: Option<Instant>,
-    ) -> Result<InvocationTerminal, WorkerError> {
-        // The single deadline starts before lease acquisition and therefore bounds queueing,
-        // startup, protocol I/O, JavaScript execution, and parent-brokered effect handling.
-        // If a deadline is provided from the caller (e.g., from JsTool::call), use that absolute
-        // deadline. Otherwise, create a fresh deadline from the watchdog duration.
-        let deadline = deadline_override.unwrap_or_else(|| Instant::now() + self.0.watchdog);
+        cancellation: &PermCancellation,
+        queue_deadline: Instant,
+    ) -> Result<WorkerLease, WorkerError> {
+        self.acquire_lease_inner(cancellation, queue_deadline, WorkerError::QueueTimedOut)
+            .await
+    }
+
+    async fn acquire_lease_inner(
+        &self,
+        cancellation: &PermCancellation,
+        deadline: Instant,
+        on_timeout: WorkerError,
+    ) -> Result<WorkerLease, WorkerError> {
         #[cfg(any(test, feature = "skills"))]
         let waiter = self.0.priority.register_interactive();
-        let lock = self.0.transport.lock();
+        let lock = self.0.transport.clone().lock_owned();
         #[cfg(test)]
         let lock = async {
             tokio::pin!(lock);
@@ -825,16 +865,47 @@ impl JsWorkerSupervisor {
             })
             .await
         };
-        let mut state = await_controlled(lock, &cancellation, deadline).await?;
-        #[cfg(any(test, feature = "skills"))]
-        let _active_interactive = waiter.activate();
+        let state = match await_controlled(lock, cancellation, deadline).await {
+            Err(WorkerError::TimedOut) => return Err(on_timeout),
+            other => other?,
+        };
+        Ok(WorkerLease {
+            state,
+            #[cfg(any(test, feature = "skills"))]
+            _active: waiter.activate(),
+        })
+    }
+
+    async fn invoke_interactive<H: InvocationEffectHandler>(
+        &self,
+        request: InvocationRequest,
+        mut effects: Option<&mut H>,
+        cancellation: PermCancellation,
+        invocation: Option<InvocationId>,
+        deadline_override: Option<Instant>,
+        lease: Option<WorkerLease>,
+    ) -> Result<InvocationTerminal, WorkerError> {
+        // Without a lease the single deadline starts before lease acquisition and therefore
+        // bounds queueing, startup, protocol I/O, JavaScript execution, and parent-brokered
+        // effect handling. A caller that acquired its lease first (`acquire_lease`) supplies a
+        // deadline that starts after queueing, and worker launch is excluded from it too.
+        let launch_excluded = lease.is_some();
+        let deadline = deadline_override.unwrap_or_else(|| Instant::now() + self.0.watchdog);
+        let mut lease = match lease {
+            Some(lease) => lease,
+            None => {
+                self.acquire_lease_inner(&cancellation, deadline, WorkerError::TimedOut)
+                    .await?
+            }
+        };
         self.invoke_with_state(
-            &mut state,
+            &mut lease.state,
             request,
             &mut effects,
             cancellation,
             invocation,
             deadline,
+            launch_excluded,
         )
         .await
     }
@@ -855,6 +926,7 @@ impl JsWorkerSupervisor {
                 cancellation,
                 None,
                 deadline,
+                false,
             )
             .await?
         {
@@ -863,6 +935,7 @@ impl JsWorkerSupervisor {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn invoke_with_state<H: InvocationEffectHandler>(
         &self,
         state: &mut SupervisorState,
@@ -871,6 +944,7 @@ impl JsWorkerSupervisor {
         cancellation: PermCancellation,
         invocation: Option<InvocationId>,
         deadline: Instant,
+        launch_excluded: bool,
     ) -> Result<InvocationTerminal, WorkerError> {
         let mut authority = InvocationAuthority::new(effects.take());
         // `Option::filter` only exposes `&T` to its predicate, but `permits` needs `&mut` to
@@ -878,26 +952,53 @@ impl JsWorkerSupervisor {
         // connection that fails the check (age, invocation count, or now-too-close-to-the-CPU-
         // ceiling) is dropped here, which retires it (`Drop for WorkerConnection` terminates and
         // reaps it) instead of offering it for reuse.
-        let reusable = state.idle.take().and_then(|mut idle| {
-            self.0
-                .reuse_policy
-                .permits(&mut idle, Instant::now())
-                .then_some(idle)
-        });
+        let mut idle_rejected = None;
+        let reusable = match state.idle.take() {
+            Some(mut idle) => {
+                if self.0.reuse_policy.permits(&mut idle, Instant::now()) {
+                    Some(idle)
+                } else {
+                    idle_rejected = Some(idle);
+                    None
+                }
+            }
+            None => None,
+        };
+        // The reap polls and sleeps, so it never runs on the async executor (mini-agent-nvnkx.174);
+        // it is awaited here, before this call proceeds and while the transport lease is still
+        // held, so ordering and the one-live-worker invariant are unchanged.
+        retire_connection(idle_rejected).await;
+        let launch_started = Instant::now();
         let mut connection = match reusable {
             Some(connection) => connection,
             None => {
                 let generation = allocate_counter(&mut state.next_generation)?;
+                // A step budget that excludes launch gives the launch its own allowance.
+                let launch_deadline = if launch_excluded {
+                    launch_started
+                        .checked_add(self.0.watchdog)
+                        .unwrap_or(deadline)
+                } else {
+                    deadline
+                };
                 launch_connection(
                     self.0.launcher.clone(),
                     self.0.launch_gate.clone(),
                     generation,
                     self.0.accepts_test_preamble,
                     &cancellation,
-                    deadline,
+                    launch_deadline,
                 )
                 .await?
             }
+        };
+        // The step budget starts when the worker is Ready, not when the call asked for it.
+        let deadline = if launch_excluded {
+            deadline
+                .checked_add(launch_started.elapsed())
+                .unwrap_or(deadline)
+        } else {
+            deadline
         };
         let invocation = match invocation {
             Some(invocation) => invocation,
@@ -951,11 +1052,16 @@ impl JsWorkerSupervisor {
         } else {
             authority.recycle();
         }
-        if reusable_terminal && self.0.reuse_policy.permits(&mut connection, Instant::now()) {
-            store_idle_with_retirement(&self.0, state, connection);
-        }
+        let retired =
+            if reusable_terminal && self.0.reuse_policy.permits(&mut connection, Instant::now()) {
+                store_idle_with_retirement(&self.0, state, connection);
+                None
+            } else {
+                Some(connection)
+            };
         active.armed = false;
         self.0.active_generation.store(0, Ordering::Release);
+        retire_connection(retired).await;
         result
     }
 
@@ -1665,6 +1771,7 @@ fn step_outcome_is_reusable(outcome: &StepOutcome) -> bool {
                 JsErrorCode::Syntax
                     | JsErrorCode::Exception
                     | JsErrorCode::EffectLimit
+                    | JsErrorCode::Unsettled
                     | JsErrorCode::InvalidResult
             )
     )
@@ -1706,6 +1813,28 @@ fn verification_diagnostics_are_closed(result: &VerificationResult) -> bool {
                 }
         }
     })
+}
+
+/// Terminate-and-reap a connection that will not be reused on the blocking pool and wait for it.
+/// `Drop for WorkerConnection` polls with `thread::sleep` for up to ~1 s, which must never stall
+/// an executor thread.
+async fn retire_connection(connection: Option<WorkerConnection>) {
+    let Some(connection) = connection else {
+        return;
+    };
+    #[cfg(test)]
+    let _ = RETIRE_OBSERVER.try_with(|observer| {
+        let _ = observer.send(());
+    });
+    let _ = tokio::task::spawn_blocking(move || drop(connection)).await;
+}
+
+/// Exclusive lease on the single worker transport. Holding it is what makes an invocation the
+/// one live user of the worker; dropping it releases the next waiter.
+pub(crate) struct WorkerLease {
+    state: tokio::sync::OwnedMutexGuard<SupervisorState>,
+    #[cfg(any(test, feature = "skills"))]
+    _active: ActiveInteractive,
 }
 
 fn store_idle_with_retirement(

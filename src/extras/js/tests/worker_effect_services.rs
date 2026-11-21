@@ -210,6 +210,7 @@ async fn worker_effect_services_real_broker_prepares_then_executes_exact_target(
         operation: EffectOperation::ReadFile {
             path: target.to_string_lossy().into_owned(),
         },
+        console: Vec::new(),
     };
     let mut broker = InvocationBroker::new(
         invocation,
@@ -256,6 +257,7 @@ async fn worker_effect_services_real_broker_prepares_then_executes_exact_target(
             path: directory.0.join("too-large").to_string_lossy().into_owned(),
             content: "x".repeat(WRITE_FILE_MAX_BYTES + 1),
         },
+        console: Vec::new(),
     };
     let mut broker = InvocationBroker::new(
         invocation,
@@ -310,6 +312,7 @@ async fn worker_effect_services_read_files_is_one_ordered_audited_effect() {
                 second.to_string_lossy().into_owned(),
             ],
         },
+        console: Vec::new(),
     };
     let mut broker = InvocationBroker::new(
         invocation,
@@ -382,6 +385,7 @@ async fn worker_effect_services_broker_rejects_unavailable_spawn_before_prompt()
             arguments: Vec::new(),
             options: Default::default(),
         },
+        console: Vec::new(),
     };
     let mut broker = InvocationBroker::new(
         invocation,

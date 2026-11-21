@@ -16,7 +16,14 @@ use crate::paths::EffectAuditPathOwner;
 const FORMAT_VERSION: u16 = 1;
 const MAX_RECORD_BYTES: usize = 64 * 1024;
 const DEFAULT_MAX_SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
-const DEFAULT_MAX_SEGMENTS: u64 = 256;
+/// Segments per retention epoch. When the live chain has this many segments since its last
+/// checkpoint, the next rotation starts a new epoch (a checkpoint `Open`) and the epoch before
+/// the one that just ended is deleted. Disk therefore stays under about twice this many
+/// segments and a reopen validates at most this many.
+const DEFAULT_MAX_SEGMENTS: u64 = 16;
+/// If pruning cannot keep the segment count under this multiple of the epoch length (for
+/// example because deletion keeps failing), appends stop with `RetentionLimit`.
+const RETENTION_HARD_FACTOR: u64 = 4;
 const MAX_IDENTIFIER_BYTES: usize = 256;
 const TARGET_KEY_BYTES: usize = 32;
 const TARGET_KEY_VERSION: u16 = 1;
@@ -40,6 +47,7 @@ pub(crate) enum AuditCapability {
     Spawn,
     SessionState,
     ProposeSkill,
+    CallTool,
 }
 
 impl AuditCapability {
@@ -51,6 +59,7 @@ impl AuditCapability {
             Self::Spawn => "spawn",
             Self::SessionState => "session_state",
             Self::ProposeSkill => "propose_skill",
+            Self::CallTool => "call_tool",
         }
     }
 }
@@ -125,6 +134,14 @@ enum SanitizedTargetKind {
     Spawn {
         key_version: u16,
         executable_tag: String,
+        /// Keyed digest of the working directory and environment (names and values), present
+        /// only when the call set either (mini-agent-nvnkx.328). Absent in older records.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        options_tag: Option<String>,
+    },
+    CallTool {
+        key_version: u16,
+        tool_tag: String,
     },
     SessionState {
         key_version: u16,
@@ -194,11 +211,22 @@ impl SanitizedTarget {
         })
     }
 
-    fn spawn(key: &[u8; TARGET_KEY_BYTES], program: &str) -> Self {
+    fn spawn(key: &[u8; TARGET_KEY_BYTES], program: &str, options: Option<&str>) -> Self {
         Self {
             kind: SanitizedTargetKind::Spawn {
                 key_version: TARGET_KEY_VERSION,
                 executable_tag: target_tag(key, "spawn", "resolved_executable", program.as_bytes()),
+                options_tag: options
+                    .map(|options| target_tag(key, "spawn", "cwd_env", options.as_bytes())),
+            },
+        }
+    }
+
+    fn call_tool(key: &[u8; TARGET_KEY_BYTES], tool_name: &str) -> Self {
+        Self {
+            kind: SanitizedTargetKind::CallTool {
+                key_version: TARGET_KEY_VERSION,
+                tool_tag: target_tag(key, "call_tool", "tool_name", tool_name.as_bytes()),
             },
         }
     }
@@ -374,6 +402,11 @@ enum StoredKind {
         previous_segment_hash: String,
         target_key_version: u16,
         target_key_digest: String,
+        /// A retention checkpoint: older segments may have been deleted, and validation accepts
+        /// this segment's `previous_segment_hash` as the chain origin. Absent in legacy data,
+        /// so existing record hashes are unchanged.
+        #[serde(default, skip_serializing_if = "is_false")]
+        checkpoint: bool,
     },
     Close {
         segment_index: u64,
@@ -397,6 +430,10 @@ struct EffectBody {
     state: AuditState,
     decision: String,
     result_code: Option<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Serialize)]
@@ -486,6 +523,11 @@ pub(crate) struct EffectAudit {
     active: BTreeMap<String, EffectAuditRecord>,
     terminal: HashSet<String>,
     rotation_anchors: usize,
+    /// First segment of the live retention epoch: the newest checkpoint (or 0 for the original
+    /// chain). Validation on open starts here.
+    epoch_start: u64,
+    #[cfg(test)]
+    open_bytes_read: u64,
     poisoned: bool,
     /// Completion records appended since the last file sync (group commit). Every later
     /// intent, denial, rotation or terminal `sync_pending` makes them durable.
@@ -516,9 +558,6 @@ impl EffectAudit {
             segment_indices(&owner).map_err(|error| report_open_stage("segment_indices", error))?;
         let _initialized = initialization_marker_exists(&owner)
             .map_err(|error| report_open_stage("initialization_marker_exists", error))?;
-        if indices.len() as u64 > options.max_segments {
-            return Err(AuditError::RetentionLimit);
-        }
         let target_key = load_or_create_target_key(&owner, indices.is_empty(), options.failure)
             .map_err(|error| report_open_stage("target_key", error))?;
         let mut audit = if indices.is_empty() {
@@ -538,6 +577,9 @@ impl EffectAudit {
                 active: BTreeMap::new(),
                 terminal: HashSet::new(),
                 rotation_anchors: 0,
+                epoch_start: 0,
+                #[cfg(test)]
+                open_bytes_read: 0,
                 poisoned: false,
                 pending_sync: false,
                 #[cfg(test)]
@@ -550,12 +592,16 @@ impl EffectAudit {
                 previous_segment_hash: ZERO_HASH.into(),
                 target_key_version: TARGET_KEY_VERSION,
                 target_key_digest: sha256_hex(&audit.target_key),
+                checkpoint: false,
             })?;
             audit.sync_file()?;
             audit.rotation_anchors = 1;
             audit
         } else {
-            validate_contiguous_indices(&indices)?;
+            // Only the segments from the newest checkpoint on are read and validated; anything
+            // older is retention history that a corrupt or missing segment cannot block.
+            let first_retained = newest_checkpoint_position(&owner, &indices)?;
+            validate_contiguous_indices(&indices[first_retained..])?;
             let last = *indices.last().ok_or(AuditError::MissingSegment)?;
             let file = open_private_rw(&owner.segment_file(last), false, false)
                 .map_err(|_| AuditError::PathUnavailable)?;
@@ -573,6 +619,9 @@ impl EffectAudit {
                 active: BTreeMap::new(),
                 terminal: HashSet::new(),
                 rotation_anchors: 0,
+                epoch_start: 0,
+                #[cfg(test)]
+                open_bytes_read: 0,
                 poisoned: false,
                 pending_sync: false,
                 #[cfg(test)]
@@ -582,7 +631,15 @@ impl EffectAudit {
         };
 
         if !indices.is_empty() {
-            audit.validate_existing(&indices)?;
+            let first_retained = newest_checkpoint_position(&audit.owner, &indices)?;
+            audit.validate_existing(&indices[first_retained..])?;
+            // An epoch that grew past its cap (data written before retention existed, or a
+            // process that crashed before rotating) is checkpointed and pruned now.
+            if audit.current_segment.saturating_sub(audit.epoch_start) + 1
+                > audit.options.max_segments
+            {
+                audit.rotate()?;
+            }
         }
         audit
             .ensure_initialization_marker()
@@ -730,8 +787,16 @@ impl EffectAudit {
         SanitizedTarget::fetch(&self.target_key, normalized_url, method)
     }
 
-    pub(crate) fn spawn_target(&self, resolved_executable: &str) -> SanitizedTarget {
-        SanitizedTarget::spawn(&self.target_key, resolved_executable)
+    pub(crate) fn spawn_target(
+        &self,
+        resolved_executable: &str,
+        options_fingerprint: Option<&str>,
+    ) -> SanitizedTarget {
+        SanitizedTarget::spawn(&self.target_key, resolved_executable, options_fingerprint)
+    }
+
+    pub(crate) fn call_tool_target(&self, tool_name: &str) -> SanitizedTarget {
+        SanitizedTarget::call_tool(&self.target_key, tool_name)
     }
 
     pub(crate) fn session_state_target(
@@ -754,6 +819,12 @@ impl EffectAudit {
         self.file_syncs
     }
 
+    /// Bytes of segment data `open` read to validate the retained history.
+    #[cfg(test)]
+    pub(crate) fn open_bytes_read_for_test(&self) -> u64 {
+        self.open_bytes_read
+    }
+
     #[cfg(test)]
     pub(crate) fn rotation_anchor_count(&self) -> usize {
         self.rotation_anchors
@@ -764,6 +835,7 @@ impl EffectAudit {
         let mut prior_was_close = false;
         let mut expected_open_previous = ZERO_HASH.to_string();
         let key_digest = sha256_hex(&self.target_key);
+        self.epoch_start = indices.first().copied().unwrap_or(0);
 
         for (position, index) in indices.iter().copied().enumerate() {
             let is_last = position + 1 == indices.len();
@@ -785,6 +857,25 @@ impl EffectAudit {
             if entries.is_empty() {
                 return Err(AuditError::CorruptRecord);
             }
+            #[cfg(test)]
+            {
+                self.open_bytes_read += valid_length;
+            }
+            if position == 0 && index != 0 {
+                // A retained history that does not start at segment 0 must start at a
+                // checkpoint, whose own links become the chain origin.
+                match &entries[0].kind {
+                    StoredKind::Open {
+                        previous_segment_hash,
+                        checkpoint: true,
+                        ..
+                    } => {
+                        expected_previous = entries[0].previous_hash.clone();
+                        expected_open_previous = previous_segment_hash.clone();
+                    }
+                    _ => return Err(AuditError::MissingSegment),
+                }
+            }
 
             let mut effect_records = 0_u64;
             let entry_count = entries.len();
@@ -799,6 +890,7 @@ impl EffectAudit {
                         previous_segment_hash,
                         target_key_version,
                         target_key_digest,
+                        ..
                     } if entry_position == 0
                         && *segment_index == index
                         && previous_segment_hash == &expected_open_previous
@@ -995,8 +1087,26 @@ impl EffectAudit {
             .current_segment
             .checked_add(1)
             .ok_or(AuditError::RecordTooLarge)?;
-        if next >= self.options.max_segments {
-            return Err(AuditError::RetentionLimit);
+        // The epoch that is ending has `next - epoch_start` segments; at the cap the new segment
+        // becomes a checkpoint and the epoch before the ended one is dropped.
+        let checkpoint = next.saturating_sub(self.epoch_start) >= self.options.max_segments;
+        if checkpoint {
+            // History older than the live epoch is never needed again: drop it before this
+            // checkpoint. What survives that (stale files that cannot be deleted) is the only
+            // backlog that counts against the cap.
+            self.prune_segments_before(self.epoch_start);
+            let stale = segment_indices(&self.owner)?
+                .into_iter()
+                .filter(|index| *index < self.epoch_start)
+                .count() as u64;
+            if stale
+                > self
+                    .options
+                    .max_segments
+                    .saturating_mul(RETENTION_HARD_FACTOR)
+            {
+                return Err(AuditError::RetentionLimit);
+            }
         }
         self.append_stored(StoredKind::Close {
             segment_index: self.current_segment,
@@ -1017,10 +1127,36 @@ impl EffectAudit {
             previous_segment_hash: self.previous_hash.clone(),
             target_key_version: TARGET_KEY_VERSION,
             target_key_digest: sha256_hex(&self.target_key),
+            checkpoint,
         })?;
         self.sync_file()?;
         self.rotation_anchors += 1;
+        if checkpoint {
+            self.epoch_start = next;
+        }
         Ok(())
+    }
+
+    /// Best-effort deletion of the retention history older than the epoch that just ended.
+    /// The new checkpoint is already durable, so a failure here only leaves old files for the
+    /// next checkpoint to remove.
+    fn prune_segments_before(&self, boundary: u64) {
+        let Ok(indices) = segment_indices(&self.owner) else {
+            return;
+        };
+        let mut removed = false;
+        for index in indices.into_iter().take_while(|index| *index < boundary) {
+            match std::fs::remove_file(self.owner.segment_file(index)) {
+                Ok(()) => removed = true,
+                Err(error) => {
+                    tracing::warn!(index, %error, "JS effect audit could not delete an old segment");
+                    break;
+                }
+            }
+        }
+        if removed {
+            let _ = self.sync_directory();
+        }
     }
 
     fn append_stored(&mut self, kind: StoredKind) -> Result<(), AuditError> {
@@ -1165,7 +1301,13 @@ fn validate_effect_body(body: &EffectBody) -> Result<(), AuditError> {
     validate_optional_identifier(body.export.as_deref())?;
     if !matches!(
         body.capability.as_str(),
-        "read_file" | "write_file" | "fetch" | "spawn" | "session_state" | "propose_skill"
+        "read_file"
+            | "write_file"
+            | "fetch"
+            | "spawn"
+            | "session_state"
+            | "propose_skill"
+            | "call_tool"
     ) {
         return Err(AuditError::InvalidMetadata);
     }
@@ -1247,9 +1389,22 @@ fn validate_target(capability: &str, target: &SanitizedTarget) -> Result<(), Aud
             SanitizedTargetKind::Spawn {
                 key_version,
                 executable_tag,
+                options_tag,
             },
             "spawn",
-        ) if *key_version == TARGET_KEY_VERSION && valid_hash(executable_tag) => Ok(()),
+        ) if *key_version == TARGET_KEY_VERSION
+            && valid_hash(executable_tag)
+            && options_tag.as_ref().is_none_or(|tag| valid_hash(tag)) =>
+        {
+            Ok(())
+        }
+        (
+            SanitizedTargetKind::CallTool {
+                key_version,
+                tool_tag,
+            },
+            "call_tool",
+        ) if *key_version == TARGET_KEY_VERSION && valid_hash(tool_tag) => Ok(()),
         (
             SanitizedTargetKind::SessionState {
                 key_version,
@@ -1259,7 +1414,10 @@ fn validate_target(capability: &str, target: &SanitizedTarget) -> Result<(), Aud
             },
             "session_state",
         ) if *key_version == TARGET_KEY_VERSION
-            && matches!(operation.as_str(), "result" | "scratch_put" | "scratch_get")
+            && matches!(
+                operation.as_str(),
+                "result" | "scratch_put" | "scratch_get" | "scratch_delete" | "scratch_keys"
+            )
             && key_tag.as_ref().is_none_or(|tag| valid_hash(tag))
             && match operation.as_str() {
                 "result" => {
@@ -1270,7 +1428,8 @@ fn validate_target(capability: &str, target: &SanitizedTarget) -> Result<(), Aud
                     key_tag.is_some()
                         && *encoded_bytes <= super::session::SCRATCH_VALUE_MAX_BYTES as u64
                 }
-                "scratch_get" => key_tag.is_some() && *encoded_bytes == 0,
+                "scratch_get" | "scratch_delete" => key_tag.is_some() && *encoded_bytes == 0,
+                "scratch_keys" => key_tag.is_none() && *encoded_bytes == 0,
                 _ => false,
             } =>
         {
@@ -1424,13 +1583,60 @@ fn segment_indices(owner: &EffectAuditPathOwner) -> Result<Vec<u64>, AuditError>
     Ok(indices)
 }
 
+/// Position in `indices` of the newest checkpoint segment, or 0 when the chain has none. Only the
+/// first record of each segment is read, newest first, so the cost does not depend on how much
+/// history exists. A history that neither contains a checkpoint nor starts at segment 0 is
+/// missing its beginning.
+fn newest_checkpoint_position(
+    owner: &EffectAuditPathOwner,
+    indices: &[u64],
+) -> Result<usize, AuditError> {
+    for (position, index) in indices.iter().copied().enumerate().rev() {
+        if index == 0 {
+            return Ok(position);
+        }
+        // An unreadable first record cannot vouch for a checkpoint: look further back.
+        if first_record_is_checkpoint(&owner.segment_file(index)).unwrap_or(false) {
+            return Ok(position);
+        }
+    }
+    Err(AuditError::MissingSegment)
+}
+
+fn first_record_is_checkpoint(path: &Path) -> Result<bool, AuditError> {
+    let mut file = open_private_rw(path, false, false).map_err(|_| AuditError::PathUnavailable)?;
+    let mut prefix = [0_u8; 4];
+    file.read_exact(&mut prefix)
+        .map_err(|_| AuditError::CorruptRecord)?;
+    let length = u32::from_be_bytes(prefix) as usize;
+    if length == 0 || length > MAX_RECORD_BYTES {
+        return Err(AuditError::CorruptRecord);
+    }
+    let mut body = vec![0_u8; length];
+    file.read_exact(&mut body)
+        .map_err(|_| AuditError::CorruptRecord)?;
+    let record =
+        serde_json::from_slice::<StoredRecord>(&body).map_err(|_| AuditError::CorruptRecord)?;
+    record.validate_hash()?;
+    Ok(matches!(
+        record.kind,
+        StoredKind::Open {
+            checkpoint: true,
+            ..
+        }
+    ))
+}
+
+/// `indices` is the retained history: consecutive, starting at 0 or at a checkpoint.
 fn validate_contiguous_indices(indices: &[u64]) -> Result<(), AuditError> {
-    if indices.first() != Some(&0)
-        || indices
-            .iter()
-            .copied()
-            .enumerate()
-            .any(|(expected, actual)| actual != expected as u64)
+    let Some(first) = indices.first().copied() else {
+        return Err(AuditError::MissingSegment);
+    };
+    if indices
+        .iter()
+        .copied()
+        .enumerate()
+        .any(|(offset, actual)| actual != first + offset as u64)
     {
         return Err(AuditError::MissingSegment);
     }

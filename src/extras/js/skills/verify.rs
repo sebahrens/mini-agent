@@ -367,6 +367,7 @@ pub(crate) fn worker_error(error: WorkerError) -> VerificationError {
         | WorkerError::PermissionPromptTimedOut
         | WorkerError::EffectOutcomeUnknown
         | WorkerError::StaleGeneration
+        | WorkerError::QueueTimedOut
         | WorkerError::IdentityExhausted
         | WorkerError::BlockingVerifyInAsyncRuntime => {
             // WorkerError is a closed, fieldless parent enum. Its static reason
