@@ -306,9 +306,15 @@ pub fn append_memory_block(preamble: &mut String, memory: Option<&str>) {
 /// it does not supply instructions, grants, or a signed top-level system field.
 const CONTEXT_NOTICE: &str = "Persistent memory snapshot (user-maintained context; newer snapshots supersede earlier snapshots):\n";
 
-/// A patch to the memory reconstructed from the earlier notices: keep the first
-/// `prefix` bytes and the last `suffix` bytes, replace what lies between.
+/// Legacy byte-offset patch (read for sessions recorded before readable
+/// updates): keep the first `prefix` bytes and the last `suffix` bytes of the
+/// latest earlier snapshot, replace what lies between.
 const CONTEXT_UPDATE_NOTICE: &str = "Persistent memory update (user-maintained context; a patch against the latest earlier memory snapshot: keep its first `prefix` bytes and last `suffix` bytes, replace everything between with the text below; the result supersedes earlier snapshots):\n";
+
+/// A readable, line-based update to the latest earlier snapshot: the lines
+/// that were removed (`- `) and added (`+ `), under the section they belong
+/// to. The final `[patch ...]` line carries the byte offsets the host replays.
+const CONTEXT_DIFF_NOTICE: &str = "Persistent memory update (user-maintained context; the changes since the latest earlier memory snapshot, as lines removed (`- `) and added (`+ `) under the section they belong to; apply them to that snapshot, the result supersedes earlier snapshots):\n";
 
 /// Patches since the last full snapshot are bounded so the replayed chain
 /// stays short.
@@ -356,6 +362,10 @@ fn reconstruct_memory(history: &[rig::completion::Message]) -> Option<(String, u
                 current = current
                     .take()
                     .and_then(|(base, count)| apply_patch(&base, rest).map(|m| (m, count + 1)));
+            } else if let Some(rest) = text.strip_prefix(CONTEXT_DIFF_NOTICE) {
+                current = current
+                    .take()
+                    .and_then(|(base, count)| apply_diff(&base, rest).map(|m| (m, count + 1)));
             }
         }
     }
@@ -393,40 +403,160 @@ pub(crate) fn context_notice(memory: &str, history: &[rig::completion::Message])
     if previous.as_ref().is_some_and(|(text, _)| text == memory) {
         return None;
     }
+    let full = format!("{CONTEXT_NOTICE}bytes={}\n{memory}", memory.len());
     if let Some((base, updates)) = &previous
         && !memory.is_empty()
         && *updates < MAX_CHAINED_UPDATES
+        && let Some(diff) = diff_notice(base, memory)
+        && diff.len() + PATCH_MARGIN_BYTES < full.len()
     {
-        let mut prefix = base
-            .bytes()
-            .zip(memory.bytes())
-            .take_while(|(a, b)| a == b)
-            .count();
-        while !base.is_char_boundary(prefix) || !memory.is_char_boundary(prefix) {
-            prefix -= 1;
-        }
-        let max_suffix = base.len().min(memory.len()) - prefix;
-        let mut suffix = base
-            .bytes()
-            .rev()
-            .zip(memory.bytes().rev())
-            .take(max_suffix)
-            .take_while(|(a, b)| a == b)
-            .count();
-        while !base.is_char_boundary(base.len() - suffix)
+        return Some(diff);
+    }
+    Some(full)
+}
+
+fn text_lines(text: &str) -> Vec<&str> {
+    text.split_inclusive('\n')
+        .map(|line| line.strip_suffix('\n').unwrap_or(line))
+        .collect()
+}
+
+/// Builds the readable update from `base` to `memory`, or `None` when they do
+/// not differ. The changed region is widened to whole lines.
+fn diff_notice(base: &str, memory: &str) -> Option<String> {
+    let mut prefix = base
+        .bytes()
+        .zip(memory.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    while !base.is_char_boundary(prefix) || !memory.is_char_boundary(prefix) {
+        prefix -= 1;
+    }
+    // Back up to the start of the line holding the first difference.
+    while prefix > 0 && base.as_bytes()[prefix - 1] != b'\n' {
+        prefix -= 1;
+    }
+    let max_suffix = base.len().min(memory.len()) - prefix;
+    let mut suffix = base
+        .bytes()
+        .rev()
+        .zip(memory.bytes().rev())
+        .take(max_suffix)
+        .take_while(|(a, b)| a == b)
+        .count();
+    // The kept tail must begin at a line start (or be empty).
+    let line_start = |text: &str, suffix: usize| {
+        text.len() == suffix || text.as_bytes()[text.len() - suffix - 1] == b'\n'
+    };
+    while suffix > 0
+        && (!base.is_char_boundary(base.len() - suffix)
             || !memory.is_char_boundary(memory.len() - suffix)
-        {
-            suffix -= 1;
-        }
-        let middle = &memory[prefix..memory.len() - suffix];
-        if middle.len() + PATCH_MARGIN_BYTES < memory.len() {
-            return Some(format!(
-                "{CONTEXT_UPDATE_NOTICE}prefix={prefix} suffix={suffix} bytes={}\n{middle}",
-                memory.len()
-            ));
+            || !line_start(base, suffix)
+            || !line_start(memory, suffix))
+    {
+        suffix -= 1;
+    }
+    let old_middle = &base[prefix..base.len() - suffix];
+    let new_middle = &memory[prefix..memory.len() - suffix];
+    if old_middle == new_middle {
+        return None;
+    }
+    let section = base[..prefix]
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("## "));
+    let mut notice = String::from(CONTEXT_DIFF_NOTICE);
+    if let Some(section) = section {
+        notice.push_str(&format!("section: {section}\n"));
+    }
+    for line in text_lines(old_middle) {
+        notice.push_str(&format!("- {line}\n"));
+    }
+    for line in text_lines(new_middle) {
+        notice.push_str(&format!("+ {line}\n"));
+    }
+    let no_newline = !new_middle.is_empty() && !new_middle.ends_with('\n');
+    notice.push_str(&format!(
+        "[patch prefix={prefix} suffix={suffix} bytes={} nonl={}]",
+        memory.len(),
+        u8::from(no_newline)
+    ));
+    Some(notice)
+}
+
+/// Replays [`diff_notice`] on `base`; any inconsistency yields `None`.
+fn apply_diff(base: &str, patch: &str) -> Option<String> {
+    let (body, machine) = patch.rsplit_once('\n').unwrap_or(("", patch));
+    let machine = machine.strip_prefix("[patch ")?.strip_suffix(']')?;
+    let (mut prefix, mut suffix, mut no_newline) = (None, None, false);
+    for field in machine.split_whitespace() {
+        match field.split_once('=')? {
+            ("prefix", value) => prefix = value.parse::<usize>().ok(),
+            ("suffix", value) => suffix = value.parse::<usize>().ok(),
+            ("nonl", value) => no_newline = value == "1",
+            _ => {}
         }
     }
-    Some(format!("{CONTEXT_NOTICE}bytes={}\n{memory}", memory.len()))
+    let (prefix, suffix) = (prefix?, suffix?);
+    let tail_start = base.len().checked_sub(suffix)?;
+    if prefix > tail_start || !base.is_char_boundary(prefix) || !base.is_char_boundary(tail_start) {
+        return None;
+    }
+    let (mut removed, mut added) = (Vec::new(), Vec::new());
+    for line in body.split('\n') {
+        if line.starts_with("section: ") && removed.is_empty() && added.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix('-') {
+            removed.push(rest.strip_prefix(' ').unwrap_or(rest));
+        } else if let Some(rest) = line.strip_prefix('+') {
+            added.push(rest.strip_prefix(' ').unwrap_or(rest));
+        } else if !line.is_empty() {
+            return None;
+        }
+    }
+    if text_lines(&base[prefix..tail_start]) != removed {
+        return None;
+    }
+    let mut middle = added.join("\n");
+    if !added.is_empty() && !no_newline {
+        middle.push('\n');
+    }
+    Some(format!(
+        "{}{middle}{}",
+        &base[..prefix],
+        &base[tail_start..]
+    ))
+}
+
+#[cfg(test)]
+fn legacy_patch_notice(base: &str, memory: &str) -> Option<String> {
+    let mut prefix = base
+        .bytes()
+        .zip(memory.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    while !base.is_char_boundary(prefix) || !memory.is_char_boundary(prefix) {
+        prefix -= 1;
+    }
+    let max_suffix = base.len().min(memory.len()) - prefix;
+    let mut suffix = base
+        .bytes()
+        .rev()
+        .zip(memory.bytes().rev())
+        .take(max_suffix)
+        .take_while(|(a, b)| a == b)
+        .count();
+    while !base.is_char_boundary(base.len() - suffix)
+        || !memory.is_char_boundary(memory.len() - suffix)
+    {
+        suffix -= 1;
+    }
+    let middle = &memory[prefix..memory.len() - suffix];
+    Some(format!(
+        "{CONTEXT_UPDATE_NOTICE}prefix={prefix} suffix={suffix} bytes={}\n{middle}",
+        memory.len()
+    ))
 }
 
 /// Opaque, collision-resistant identity for a project path.
@@ -2292,7 +2422,7 @@ mod cache_placement_tests {
         for round in 0..3 {
             current = format!("{current}note {round} 雪\n");
             let notice = context_notice(&current, &history).unwrap();
-            assert!(notice.starts_with(CONTEXT_UPDATE_NOTICE), "round {round}");
+            assert!(notice.starts_with(CONTEXT_DIFF_NOTICE), "round {round}");
             total += notice.len();
             history.push(Message::assistant(notice));
             assert_eq!(reconstruct_memory(&history).unwrap().0, current);
@@ -2301,6 +2431,54 @@ mod cache_placement_tests {
         assert!(total < first.len() * 2, "{total} vs {}", first.len());
         let cleared = context_notice("", &history).unwrap();
         assert!(cleared.starts_with(CONTEXT_NOTICE));
+    }
+
+    /// mini-agent-nvnkx.217: an update names the section and shows removed and
+    /// added lines verbatim, and the host still reconstructs the exact block.
+    #[test]
+    fn nvnkx217_memory_update_is_readable_and_reconstructs_exactly() {
+        use rig::completion::Message;
+        let filler = "- long-term fact about the build system\n".repeat(30);
+        let before = format!(
+            "\n\n## Scratchpad (open items)\n- [ ] alpha task\n- [ ] bravo task\n- [ ] charlie task\n\n## Long-term memory (MEMORY.md)\n{filler}"
+        );
+        let after = before.replace("- [ ] bravo task\n", "");
+        let first = context_notice(&before, &[]).unwrap();
+        let history = vec![Message::assistant(first)];
+        let notice = context_notice(&after, &history).unwrap();
+        assert!(notice.starts_with(CONTEXT_DIFF_NOTICE), "{notice}");
+        assert!(
+            notice.contains("section: Scratchpad (open items)"),
+            "{notice}"
+        );
+        assert!(notice.contains("- - [ ] bravo task\n"), "{notice}");
+        assert!(!notice.contains("+ - [ ] bravo"), "{notice}");
+        assert!(notice.len() < before.len() / 2);
+        let history = vec![
+            Message::assistant(context_notice(&before, &[]).unwrap()),
+            Message::assistant(notice),
+        ];
+        assert_eq!(reconstruct_memory(&history).unwrap().0, after);
+        assert!(context_notice(&after, &history).is_none());
+        // Edits mid-line, additions without a trailing newline and an old
+        // byte-offset patch in the history all replay exactly.
+        let edited = after.replace("alpha task", "alpha task (done)");
+        let mut chain = history.clone();
+        chain.push(Message::assistant(
+            context_notice(&edited, &history).unwrap(),
+        ));
+        assert_eq!(reconstruct_memory(&chain).unwrap().0, edited);
+        let no_newline = format!("{edited}tail without newline");
+        chain.push(Message::assistant(
+            context_notice(&no_newline, &chain).unwrap(),
+        ));
+        assert_eq!(reconstruct_memory(&chain).unwrap().0, no_newline);
+        let legacy = legacy_patch_notice(&before, &after).unwrap();
+        let old_history = vec![
+            Message::assistant(context_notice(&before, &[]).unwrap()),
+            Message::assistant(legacy),
+        ];
+        assert_eq!(reconstruct_memory(&old_history).unwrap().0, after);
     }
 
     /// mini-agent-sskdu.190: a snapshot delivered as marked user-side context

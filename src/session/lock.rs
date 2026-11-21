@@ -584,6 +584,7 @@ pub fn fork_session(source: &Session) -> anyhow::Result<Session> {
     fork.native_frontier = source.native_frontier.fork();
     fork.file_checkpoints = Default::default();
     fork.id = CompactString::new(Uuid::new_v4().to_string());
+    super::storage::fork_tool_outputs(&source.id, &mut fork);
     if !fork.name.is_empty() {
         fork.name = CompactString::new(format!("{} (fork)", fork.name));
     }

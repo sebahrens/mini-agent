@@ -1003,6 +1003,81 @@ pub fn save_tool_output(
     Ok(path)
 }
 
+/// Largest spill file a fork copies; a larger one is left to the source and
+/// its reference is dropped from the fork.
+const MAX_FORKED_SPILL_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Gives a fork its own copy of every spill file its tool results reference.
+/// The read capability is bound to one session's directory and deleting the
+/// source removes that directory, so references into the source would be
+/// unreadable in the fork and dangle later. Copied rows are rewritten to the
+/// fork's path; a spill that no longer exists (or is too large to copy) loses
+/// its `artifact_path`, so the model is told to re-run the tool instead.
+pub(crate) fn fork_tool_outputs(source_id: &str, fork: &mut crate::session::Session) {
+    if disabled("tool outputs") || crate::paths::process_paths_ref().is_err() {
+        return;
+    }
+    let source_dir = tool_output_dir(source_id);
+    let fork_dir = tool_output_dir(&fork.id);
+    let mut copied: std::collections::HashMap<String, Option<String>> = Default::default();
+    for message in &mut fork.messages {
+        let Some(crate::session::PersistedToolMessage::Result {
+            artifact_path,
+            output,
+            ..
+        }) = &mut message.tool
+        else {
+            continue;
+        };
+        let Some(old) = artifact_path.as_deref().map(str::to_owned) else {
+            continue;
+        };
+        let old_path = PathBuf::from(&old);
+        if old_path.parent() != Some(source_dir.as_path()) {
+            continue;
+        }
+        let new = copied
+            .entry(old.clone())
+            .or_insert_with(|| copy_spill(&old_path, &fork_dir))
+            .clone();
+        match new {
+            Some(new) => {
+                *artifact_path = Some(new.as_str().into());
+                if message.content.contains(&old) {
+                    message.content = message.content.replace(&old, &new).into();
+                }
+                if output.contains(&old) {
+                    *output = output.replace(&old, &new).into();
+                }
+            }
+            None => *artifact_path = None,
+        }
+    }
+}
+
+fn copy_spill(old: &Path, fork_dir: &Path) -> Option<String> {
+    let name = old.file_name()?;
+    let file = crate::fs::open_private_file(old).ok()?;
+    if file.metadata().ok()?.len() > MAX_FORKED_SPILL_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_FORKED_SPILL_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_FORKED_SPILL_BYTES {
+        return None;
+    }
+    crate::paths::ensure_private_directory(fork_dir).ok()?;
+    let new = fork_dir.join(name);
+    match crate::fs::private_atomic_create_sync(&new, &bytes) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => return None,
+    }
+    new.to_str().map(str::to_owned)
+}
+
 /// Remove a tool-output artifact created by an uncommitted UI turn. The path
 /// is accepted only when it is an immediate child of this session's private,
 /// opaque output directory; callers cannot use rollback bookkeeping as an

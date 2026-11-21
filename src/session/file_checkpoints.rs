@@ -65,6 +65,11 @@ impl Limits {
         }
     }
 }
+/// Whether this platform can publish a checked replacement or retirement of a
+/// workspace file. Windows has no compare-and-replace primitive (see
+/// `paths::exchange_relative`), so file rewind is refused there; capturing
+/// preimages that can never be restored would only consume the session limits.
+pub(crate) const FILE_RESTORE_SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "macos"));
 static LIMITS: std::sync::RwLock<Limits> = std::sync::RwLock::new(Limits::DEFAULT);
 /// Installs the process-wide checkpoint limits (agent construction).
 #[cfg_attr(test, allow(dead_code))]
@@ -84,6 +89,10 @@ enum SkipReason {
     FileSize(usize),
     TotalBytes(usize),
     Storage,
+    /// A typed git operation rewrote working-tree files that were not captured.
+    GitOperation,
+    /// The platform cannot restore files at all.
+    Platform,
 }
 impl SkipReason {
     fn describe(self) -> String {
@@ -100,6 +109,13 @@ impl SkipReason {
                 "the session reached its {limit}-byte checkpoint storage limit (file_checkpoints.max_total_bytes)"
             ),
             Self::Storage => "checkpoint storage failed".into(),
+            Self::GitOperation => {
+                "a git operation rewrote working-tree files that are not checkpointed".into()
+            }
+            Self::Platform => {
+                "file rewind is not supported on this platform; only conversation rewind is available"
+                    .into()
+            }
         }
     }
 }
@@ -123,6 +139,11 @@ struct Data {
     skipped: BTreeMap<usize, usize>,
     #[serde(default)]
     mutations: u64,
+    /// Turns in which a shell command or a git operation ran. Their file
+    /// effects are not checkpointed, so a rewind range containing one is
+    /// flagged in the picker.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    external: BTreeMap<usize, usize>,
     /// Why the most recent uncaptured mutation was skipped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     skip_reason: Option<String>,
@@ -195,6 +216,7 @@ impl<'de> Deserialize<'de> for FileCheckpoints {
         let data = Data::deserialize(d)?;
         let hard = Limits::HARD;
         if data.skipped.len() > hard.records
+            || data.external.len() > hard.records
             || data.records.len() > hard.records
             || data.blobs.len() > hard.records
             || data.blobs.values().any(|n| *n > hard.file_bytes)
@@ -453,8 +475,13 @@ impl FileCheckpoints {
                     .unwrap_or_default()
             )
         };
+        let external = if state.data.external.range(index..).next().is_some() {
+            "; shell or git commands also ran in this range and their changes are not restorable"
+        } else {
+            ""
+        };
         format!(
-            "{} files{unavailable}: {names}{}",
+            "{} files{unavailable}{external}: {names}{}",
             paths.len(),
             if paths.len() > 5 { ", …" } else { "" }
         )
@@ -471,12 +498,17 @@ impl FileCheckpoints {
             .data
             .skipped
             .retain(|turn, _| *turn < index || *turn == usize::MAX);
+        state
+            .data
+            .external
+            .retain(|turn, _| *turn < index || *turn == usize::MAX);
         if state.data.skipped.len() != skipped_before {
             // The one optional reason describes the latest uncaptured edit.
             // Once its suffix is removed it cannot describe an earlier one;
             // omit it rather than inventing a reason (mini-agent-gkqd4.14).
             state.data.skip_reason = None;
         }
+        reclaim_retired(&mut state);
     }
     /// The summary replaces a prefix, so surviving user rows move together
     /// with their exact checkpoints. Pruned turns cannot become later turns.
@@ -489,23 +521,27 @@ impl FileCheckpoints {
                 record.turn = record.turn.saturating_sub(removed).saturating_add(1);
             }
         }
-        state.data.skipped = std::mem::take(&mut state.data.skipped)
-            .into_iter()
-            .filter_map(|(turn, count)| {
-                if turn == usize::MAX {
-                    Some((turn, count))
-                } else if turn >= removed {
-                    Some((turn - removed + 1, count))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let shift = |map: BTreeMap<usize, usize>| -> BTreeMap<usize, usize> {
+            map.into_iter()
+                .filter_map(|(turn, count)| {
+                    if turn == usize::MAX {
+                        Some((turn, count))
+                    } else if turn >= removed {
+                        Some((turn - removed + 1, count))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        state.data.skipped = shift(std::mem::take(&mut state.data.skipped));
+        state.data.external = shift(std::mem::take(&mut state.data.external));
+        reclaim_retired(&mut state);
     }
     /// Reverses the index shift of [`compact_prefix`](Self::compact_prefix) when
-    /// a compaction that replaced `removed` messages is undone. Records the
-    /// compaction retired stay retired: their preimages cannot be told apart
-    /// from older retirements, so `/rewind` still cannot reach them.
+    /// a compaction that replaced `removed` messages is undone. The records the
+    /// compaction retired were reclaimed with their preimages, so `/rewind`
+    /// cannot reach them.
     pub(crate) fn uncompact_prefix(&self, removed: usize) {
         let mut state = self.edit();
         for record in &mut state.data.records {
@@ -513,16 +549,19 @@ impl FileCheckpoints {
                 record.turn = record.turn.saturating_sub(1).saturating_add(removed);
             }
         }
-        state.data.skipped = std::mem::take(&mut state.data.skipped)
-            .into_iter()
-            .map(|(turn, count)| {
-                if turn == usize::MAX {
-                    (turn, count)
-                } else {
-                    (turn.saturating_sub(1).saturating_add(removed), count)
-                }
-            })
-            .collect();
+        let shift = |map: BTreeMap<usize, usize>| -> BTreeMap<usize, usize> {
+            map.into_iter()
+                .map(|(turn, count)| {
+                    if turn == usize::MAX {
+                        (turn, count)
+                    } else {
+                        (turn.saturating_sub(1).saturating_add(removed), count)
+                    }
+                })
+                .collect()
+        };
+        state.data.skipped = shift(std::mem::take(&mut state.data.skipped));
+        state.data.external = shift(std::mem::take(&mut state.data.external));
     }
     /// Explicit operator action; all inputs remain bound to the current retained workspace.
     /// Preflight every file before the first write, then each publication checks identity+content again.
@@ -532,7 +571,20 @@ impl FileCheckpoints {
         index: usize,
         workspace: &crate::paths::WorkspaceBinding,
     ) -> anyhow::Result<usize> {
-        self.restore_with_root(session, index, workspace, None)
+        self.restore_with_root(session, index, workspace, None, false)
+            .map(|report| report.restored)
+    }
+    /// Like [`restore`](Self::restore) but per file: paths whose current bytes
+    /// are no longer the recorded postimage (a formatter, an editor or a shell
+    /// command changed them) are left untouched and named in the report, and
+    /// uncaptured mutations in the range no longer refuse the others.
+    pub(crate) fn restore_unchanged(
+        &self,
+        session: &str,
+        index: usize,
+        workspace: &crate::paths::WorkspaceBinding,
+    ) -> anyhow::Result<RestoreReport> {
+        self.restore_with_root(session, index, workspace, None, true)
     }
     fn restore_with_root(
         &self,
@@ -540,16 +592,28 @@ impl FileCheckpoints {
         index: usize,
         workspace: &crate::paths::WorkspaceBinding,
         root: Option<&Path>,
-    ) -> anyhow::Result<usize> {
+        partial: bool,
+    ) -> anyhow::Result<RestoreReport> {
+        anyhow::ensure!(
+            FILE_RESTORE_SUPPORTED,
+            "{}",
+            SkipReason::Platform.describe()
+        );
         let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         anyhow::ensure!(state.trusted, "imported checkpoints cannot restore files");
+        let uncaptured = state
+            .data
+            .skipped
+            .range(index..)
+            .fold(0usize, |total, (_, count)| total.saturating_add(*count));
         anyhow::ensure!(
-            state.data.skipped.range(index..).next().is_none(),
+            partial || uncaptured == 0,
             "some changes have no restorable checkpoint; choose conversation only"
         );
         let fingerprint = workspace
             .compatibility_fingerprint()
             .map_err(anyhow::Error::msg)?;
+        let mut left = Vec::<String>::new();
         let mut selected = BTreeMap::<String, Record>::new();
         for record in state
             .data
@@ -561,12 +625,17 @@ impl FileCheckpoints {
                 record.workspace == fingerprint,
                 "checkpoint belongs to another workspace identity"
             );
+            if left.contains(&record.path) {
+                continue;
+            }
             if let Some(prior) = selected.get_mut(&record.path) {
                 // Intervening edits outside this checkpoint chain must never be silently undone.
-                anyhow::ensure!(
-                    record.before.as_deref() == Some(prior.after.as_str()),
-                    "checkpoint chain has an intervening change"
-                );
+                if record.before.as_deref() != Some(prior.after.as_str()) {
+                    anyhow::ensure!(partial, "checkpoint chain has an intervening change");
+                    selected.remove(&record.path);
+                    left.push(record.path.clone());
+                    continue;
+                }
                 prior.after = record.after.clone();
             } else {
                 selected.insert(record.path.clone(), record.clone());
@@ -574,40 +643,47 @@ impl FileCheckpoints {
         }
         let mut prepared = Vec::new();
         for record in selected.values() {
-            let path = Path::new(&record.path);
-            anyhow::ensure!(
-                workspace.symlink_component(path).is_none(),
-                "checkpoint path now contains a symbolic link"
-            );
-            let mut current = workspace.open_regular_relative(path)?;
-            let expected = crate::fs::checked_file_metadata(&current)?;
-            let mut bytes = Vec::new();
-            current
-                .by_ref()
-                .take(Limits::HARD_FILE_BYTES as u64 + 1)
-                .read_to_end(&mut bytes)?;
-            anyhow::ensure!(
-                bytes.len() <= Limits::HARD_FILE_BYTES && digest(&bytes) == record.after,
-                "file changed since checkpoint: {}",
-                record.path
-            );
-            let before = match &record.before {
-                Some(hash) => Some(match state.memory.get(hash) {
-                    Some(bytes) => bytes.clone(),
-                    None => read_blob(
-                        root.map(Path::to_path_buf)
-                            .unwrap_or_else(|| blob_root(session)),
-                        hash,
-                    )?,
-                }),
-                None => None,
+            let prepare = || -> anyhow::Result<_> {
+                let path = Path::new(&record.path);
+                anyhow::ensure!(
+                    workspace.symlink_component(path).is_none(),
+                    "checkpoint path now contains a symbolic link"
+                );
+                let mut current = workspace.open_regular_relative(path)?;
+                let expected = crate::fs::checked_file_metadata(&current)?;
+                let mut bytes = Vec::new();
+                current
+                    .by_ref()
+                    .take(Limits::HARD_FILE_BYTES as u64 + 1)
+                    .read_to_end(&mut bytes)?;
+                anyhow::ensure!(
+                    bytes.len() <= Limits::HARD_FILE_BYTES && digest(&bytes) == record.after,
+                    "file changed since checkpoint: {}",
+                    record.path
+                );
+                let before = match &record.before {
+                    Some(hash) => Some(match state.memory.get(hash) {
+                        Some(bytes) => bytes.clone(),
+                        None => read_blob(
+                            root.map(Path::to_path_buf)
+                                .unwrap_or_else(|| blob_root(session)),
+                            hash,
+                        )?,
+                    }),
+                    None => None,
+                };
+                Ok((
+                    record.path.clone(),
+                    expected,
+                    crate::fs::ContentDigest::of(&bytes),
+                    before,
+                ))
             };
-            prepared.push((
-                record.path.clone(),
-                expected,
-                crate::fs::ContentDigest::of(&bytes),
-                before,
-            ));
+            match prepare() {
+                Ok(item) => prepared.push(item),
+                Err(_) if partial => left.push(record.path.clone()),
+                Err(error) => return Err(error),
+            }
         }
         drop(state);
         let mut restored = 0;
@@ -622,6 +698,11 @@ impl FileCheckpoints {
                 None => workspace.retire_relative_expecting(Path::new(&path), &expected, &base),
             };
             if let Err(error) = result {
+                if partial && error.kind() == std::io::ErrorKind::PermissionDenied {
+                    // A race changed this file after the preflight: leave it.
+                    left.push(path);
+                    continue;
+                }
                 anyhow::bail!("restored {restored} files; stopped at {path}: {error}");
             }
             restored += 1;
@@ -631,7 +712,87 @@ impl FileCheckpoints {
                 }
             }
         }
-        Ok(restored)
+        reclaim_retired(&mut self.edit());
+        left.sort();
+        Ok(RestoreReport {
+            restored,
+            left,
+            uncaptured,
+        })
+    }
+}
+
+/// Outcome of a per-file rewind.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct RestoreReport {
+    pub restored: usize,
+    /// Paths left untouched because their current bytes no longer match the
+    /// recorded postimage (or their chain/blob could not be verified).
+    pub left: Vec<String>,
+    /// Edits in the range that were never captured.
+    pub uncaptured: usize,
+}
+
+/// Drops retired records (their preimages can no longer be restored) and
+/// deletes the blobs no surviving record references, so retired history does
+/// not count against the per-session record and byte limits.
+fn reclaim_retired(state: &mut State) {
+    if !state.data.records.iter().any(|r| r.retired) {
+        return;
+    }
+    let sessions: std::collections::BTreeSet<String> = state
+        .data
+        .records
+        .iter()
+        .filter(|r| r.retired)
+        .map(|r| r.session.clone())
+        .collect();
+    // Only preimages a dropped record referenced are candidates: a blob that
+    // a concurrent, not yet committed capture just stored is never touched.
+    let dropped: std::collections::BTreeSet<String> = state
+        .data
+        .records
+        .iter()
+        .filter(|r| r.retired)
+        .filter_map(|r| r.before.clone())
+        .collect();
+    state.data.records.retain(|r| !r.retired);
+    let live: std::collections::BTreeSet<&str> = state
+        .data
+        .records
+        .iter()
+        .filter_map(|r| r.before.as_deref())
+        .collect();
+    let garbage: Vec<String> = dropped
+        .into_iter()
+        .filter(|hash| !live.contains(hash.as_str()) && state.data.blobs.contains_key(hash))
+        .collect();
+    if garbage.is_empty() {
+        return;
+    }
+    let mut roots: Vec<PathBuf> = sessions.iter().map(|s| blob_root(s)).collect();
+    if let Some(scanned) = state.scanned.clone()
+        && !roots.contains(&scanned)
+    {
+        roots.push(scanned);
+    }
+    for hash in &garbage {
+        state.data.blobs.remove(hash);
+        state.memory.remove(hash);
+    }
+    for root in roots {
+        let Ok(binding) = crate::paths::WorkspaceBinding::capture(&root) else {
+            continue;
+        };
+        if binding.validate_private_root().is_err() {
+            continue;
+        }
+        let Ok(directory) = binding.open_dir_relative(Path::new("")) else {
+            continue;
+        };
+        for hash in &garbage {
+            let _ = directory.remove_file(format!("{hash}.bin"));
+        }
     }
 }
 
@@ -764,6 +925,33 @@ pub(crate) fn skipped() {
     if let Some(recorder) = current() {
         let mut state = recorder.edit_store();
         skip(&mut state, recorder.turn(), SkipReason::Outside);
+        state.mark();
+    }
+}
+/// Records working-tree files rewritten by a typed git operation (switch,
+/// stash) whose individual preimages are not captured.
+pub(crate) fn skipped_git() {
+    if let Some(recorder) = current() {
+        let mut state = recorder.edit_store();
+        skip(&mut state, recorder.turn(), SkipReason::GitOperation);
+        state.mark();
+    }
+}
+/// Marks the current turn as having run a shell command or git operation whose
+/// file effects are not checkpointed, so the rewind picker can say so.
+pub(crate) fn external_mutation() {
+    if let Some(recorder) = current() {
+        let mut state = recorder.edit_store();
+        let hard = Limits::HARD_RECORDS;
+        let turn = recorder.turn();
+        let key = if state.data.external.len() >= hard && !state.data.external.contains_key(&turn) {
+            state.data.external.pop_last();
+            usize::MAX
+        } else {
+            turn
+        };
+        let count = state.data.external.entry(key).or_default();
+        *count = count.saturating_add(1);
         state.mark();
     }
 }
@@ -934,6 +1122,11 @@ fn prepare_with(
     read_allowed: bool,
 ) -> Option<Pending> {
     let mut state = recorder.edit_store();
+    if !FILE_RESTORE_SUPPORTED {
+        skip(&mut state, recorder.turn(), SkipReason::Platform);
+        state.mark();
+        return None;
+    }
     let limits = state.limits();
     let mut reason = SkipReason::Storage;
     let make = (|| -> anyhow::Result<Record> {
@@ -1954,6 +2147,115 @@ mod tests {
         assert_eq!(state.data.blobs.len(), 6, "orphan merged plus five new");
         drop(state);
         assert_eq!(std::fs::read_dir(&blobs).unwrap().count(), 6);
+    }
+    #[tokio::test]
+    async fn nvnkx47_compaction_reclaims_retired_records_and_blob_files() {
+        let root = crate::tests::OwnedTestDirectory::new("nvnkx47-reclaim");
+        let blobs = root.path().join("blobs");
+        crate::paths::ensure_private_directory(&blobs).unwrap();
+        for path in ["a", "b", "c", "d"] {
+            std::fs::write(root.path().join(path), format!("old-{path}")).unwrap();
+        }
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let store = FileCheckpoints::default();
+        store.set_limits_for_test(Limits {
+            file_bytes: 1024,
+            total_bytes: 1024 * 1024,
+            records: 2,
+        });
+        let mut recorder = store.recorder("session", 1, false);
+        recorder.blob_root = Some(blobs.clone());
+        scope(Some(recorder.clone()), async {
+            overwrite(&workspace, "a", "new").await;
+            overwrite(&workspace, "b", "new").await;
+        })
+        .await;
+        assert_eq!(std::fs::read_dir(&blobs).unwrap().count(), 2);
+        store.compact_prefix(5);
+        assert_eq!(std::fs::read_dir(&blobs).unwrap().count(), 0);
+        assert!(store.0.lock().unwrap().data.records.is_empty());
+        scope(Some(recorder), async {
+            overwrite(&workspace, "c", "new").await;
+            overwrite(&workspace, "d", "new").await;
+        })
+        .await;
+        let state = store.0.lock().unwrap();
+        assert_eq!(state.data.records.len(), 2);
+        assert!(state.data.skipped.is_empty(), "no capture was skipped");
+        drop(state);
+        assert_eq!(std::fs::read_dir(&blobs).unwrap().count(), 2);
+    }
+    #[tokio::test]
+    async fn nvnkx48_partial_rewind_restores_unchanged_files_and_names_the_drifted_one() {
+        let root = crate::tests::OwnedTestDirectory::new("nvnkx48-partial");
+        for path in ["a", "z"] {
+            std::fs::write(root.path().join(path), "old").unwrap();
+        }
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let store = FileCheckpoints::default();
+        scope(Some(store.recorder("session", 4, true)), async {
+            overwrite(&workspace, "a", "new").await;
+            overwrite(&workspace, "z", "new").await;
+        })
+        .await;
+        std::fs::write(root.path().join("z"), "formatter").unwrap();
+        assert!(store.restore("session", 4, &workspace).is_err());
+        let report = store.restore_unchanged("session", 4, &workspace).unwrap();
+        assert_eq!(report.restored, 1);
+        assert_eq!(report.left, vec!["z".to_string()]);
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("a")).unwrap(),
+            "old"
+        );
+        assert_eq!(std::fs::read(root.path().join("z")).unwrap(), b"formatter");
+    }
+    #[tokio::test]
+    async fn nvnkx48_partial_rewind_proceeds_past_uncaptured_edits() {
+        let root = crate::tests::OwnedTestDirectory::new("nvnkx48-uncaptured");
+        std::fs::write(root.path().join("a"), "old").unwrap();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let store = FileCheckpoints::default();
+        scope(Some(store.recorder("session", 4, true)), async {
+            overwrite(&workspace, "a", "new").await;
+            skipped_git();
+        })
+        .await;
+        assert!(store.restore("session", 4, &workspace).is_err());
+        let report = store.restore_unchanged("session", 4, &workspace).unwrap();
+        assert_eq!((report.restored, report.uncaptured), (1, 1));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("a")).unwrap(),
+            "old"
+        );
+    }
+    #[tokio::test]
+    async fn nvnkx49_external_mutations_are_flagged_in_the_rewind_summary() {
+        let store = FileCheckpoints::default();
+        assert!(
+            !store
+                .summary_from("session", 1)
+                .contains("shell or git commands")
+        );
+        scope(Some(store.recorder("session", 3, true)), async {
+            external_mutation();
+        })
+        .await;
+        assert!(
+            store
+                .summary_from("session", 2)
+                .contains("shell or git commands also ran in this range")
+        );
+        assert!(!store.summary_from("session", 4).contains("shell or git"));
+        store.compact_prefix(2);
+        assert!(store.summary_from("session", 1).contains("shell or git"));
+        let reloaded: FileCheckpoints =
+            serde_json::from_value(serde_json::to_value(&store).unwrap()).unwrap();
+        assert!(reloaded.summary_from("session", 1).contains("shell or git"));
+    }
+    #[test]
+    fn nvnkx57_platform_skip_reason_is_readable() {
+        assert!(SkipReason::Platform.describe().contains("not supported"));
+        assert!(FILE_RESTORE_SUPPORTED, "macOS and Linux restore files");
     }
 }
 

@@ -34,7 +34,7 @@ use crate::ui::event_handler;
 use crate::ui::events::{render_session, sanitize_output};
 use crate::ui::input::{InputEditor, Picker};
 use crate::ui::permission_handler::{PermissionEvent, PermissionState};
-use crate::ui::pickers::rewind::{RewindBinding, RewindMode, RewindOutcome};
+use crate::ui::pickers::rewind::{RewindBinding, RewindOutcome};
 use crate::ui::question_handler::{QuestionEvent, QuestionState};
 use crate::ui::renderer::{
     self as renderer_mod, ChainPrompt, ClipboardCopyOutcome, Renderer, SelectionPoint,
@@ -3401,23 +3401,65 @@ impl<'a> App<'a> {
                 }
                 #[cfg(feature = "subagents")]
                 self.ui.session.reset_background_tasks().await;
-                if mode != RewindMode::Conversation {
+                if mode.restores_files() {
                     // Like session publication, this bounded native operation stays
                     // owned by the foreground key handler through completion.
-                    let restored = self.ui.session.file_checkpoints.restore(
-                        &self.ui.session.id,
-                        idx,
-                        &self.ui.workspace,
-                    );
+                    let restored = if mode.unchanged_only() {
+                        self.ui.session.file_checkpoints.restore_unchanged(
+                            &self.ui.session.id,
+                            idx,
+                            &self.ui.workspace,
+                        )
+                    } else {
+                        self.ui
+                            .session
+                            .file_checkpoints
+                            .restore(&self.ui.session.id, idx, &self.ui.workspace)
+                            .map(|restored| crate::session::file_checkpoints::RestoreReport {
+                                restored,
+                                ..Default::default()
+                            })
+                    };
                     match restored {
-                        Ok(count) => {
-                            if count > 0 {
+                        Ok(report) => {
+                            if report.restored > 0 {
                                 self.ui.session.read_tracker.clear();
                                 self.ui.invalidate_prebuild();
                                 self.run.agent = None;
                             }
-                            self.renderer
-                                .write_line(&format!("restored {count} files"), Color::Green)?;
+                            self.renderer.write_line(
+                                &format!("restored {} files", report.restored),
+                                Color::Green,
+                            )?;
+                            if !report.left.is_empty() {
+                                let names = report
+                                    .left
+                                    .iter()
+                                    .take(8)
+                                    .map(|path| format!("{path:?}"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                self.renderer.write_line(
+                                    &format!(
+                                        "left {} changed file{} untouched: {}{}",
+                                        report.left.len(),
+                                        if report.left.len() == 1 { "" } else { "s" },
+                                        sanitize_output(&names),
+                                        if report.left.len() > 8 { ", …" } else { "" }
+                                    ),
+                                    C_ERROR,
+                                )?;
+                            }
+                            if report.uncaptured > 0 {
+                                self.renderer.write_line(
+                                    &format!(
+                                        "{} edit{} had no checkpoint and could not be restored",
+                                        report.uncaptured,
+                                        if report.uncaptured == 1 { "" } else { "s" }
+                                    ),
+                                    C_ERROR,
+                                )?;
+                            }
                         }
                         Err(error) => {
                             // A later per-file publication can fail after earlier
@@ -3428,8 +3470,13 @@ impl<'a> App<'a> {
                             self.run.agent = None;
                             self.renderer.write_line(
                                 &format!(
-                                    "file rewind refused: {}",
-                                    sanitize_output(&error.to_string())
+                                    "file rewind refused: {}{}",
+                                    sanitize_output(&error.to_string()),
+                                    if mode.unchanged_only() {
+                                        ""
+                                    } else {
+                                        " (\"Restore unchanged files only\" skips files that changed since the edit)"
+                                    }
                                 ),
                                 C_ERROR,
                             )?;
@@ -3437,7 +3484,7 @@ impl<'a> App<'a> {
                         }
                     }
                 }
-                if mode != RewindMode::Files
+                if mode.rewinds_conversation()
                     && crate::ui::slash::rewind_selected_turn(self.ui.session, &mut self.input, idx)
                         > 0
                 {
