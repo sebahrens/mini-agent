@@ -1770,6 +1770,29 @@ static BWRAP_AVAILABLE: OnceLock<bool> = OnceLock::new();
 static SEATBELT_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 #[cfg(target_os = "macos")]
 static SEATBELT_AVAILABLE: OnceLock<bool> = OnceLock::new();
+/// Closed diagnostic recorded when the cached Seatbelt preflight fails; only ever holds one of the
+/// `SEATBELT_*_DIAGNOSTIC` constants (preflight stderr is classified, never echoed).
+#[cfg(target_os = "macos")]
+static SEATBELT_DIAGNOSTIC: OnceLock<&'static str> = OnceLock::new();
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const SEATBELT_NESTED_DIAGNOSTIC: &str = "sandbox-exec could not apply a profile (sandbox_apply: Operation not permitted); mini-agent is probably already running inside another Seatbelt sandbox (an editor terminal, another agent or a sandboxed CI runner) — run it outside that sandbox, or pass --no-sandbox to accept running shell commands UNSANDBOXED";
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const SEATBELT_MISSING_DIAGNOSTIC: &str = "/usr/bin/sandbox-exec is missing or is not a trusted system executable; restore it or pass --no-sandbox to accept running shell commands UNSANDBOXED";
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const SEATBELT_PREFLIGHT_FAILED_DIAGNOSTIC: &str = "Seatbelt preflight failed or timed out; run `sandbox-exec -p '(version 1)(allow default)' /usr/bin/true` to see why";
+
+/// Map `sandbox-exec` preflight stderr to a closed diagnostic; the raw text is never returned.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn classify_seatbelt_preflight_stderr(stderr: &[u8]) -> &'static str {
+    let text = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    if text.contains("sandbox_apply") && text.contains("operation not permitted") {
+        return SEATBELT_NESTED_DIAGNOSTIC;
+    }
+    SEATBELT_PREFLIGHT_FAILED_DIAGNOSTIC
+}
 
 fn cached_backend_availability(cache: &OnceLock<bool>, probe: impl FnOnce() -> bool) -> bool {
     *cache.get_or_init(probe)
@@ -1863,8 +1886,8 @@ fn bwrap_git_metadata_binds_with_capability(
 #[cfg(target_os = "linux")]
 static BWRAP_DIAGNOSTIC: OnceLock<&'static str> = OnceLock::new();
 
-/// Upper bound on preflight stderr read for classification; bubblewrap reports one short line.
-#[cfg(target_os = "linux")]
+/// Upper bound on preflight stderr read for classification; backends report one short line.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const BWRAP_PROBE_STDERR_LIMIT: usize = 4096;
 
 #[cfg(any(target_os = "linux", test))]
@@ -1875,6 +1898,9 @@ pub(crate) const BWRAP_APPARMOR_USERNS_DIAGNOSTIC: &str = "bubblewrap could not 
 
 #[cfg(any(target_os = "linux", test))]
 pub(crate) const BWRAP_USERNS_DISABLED_DIAGNOSTIC: &str = "bubblewrap could not create an unprivileged user namespace; the kernel or a security module (AppArmor on Ubuntu, or kernel.unprivileged_userns_clone=0) forbids it — see the Linux prerequisites in README.md";
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) const BWRAP_TOO_OLD_DIAGNOSTIC: &str = "bubblewrap lacks --bind-fd/--ro-bind-fd, which every contained shell launch requires; bubblewrap 0.8.0 or later is needed — upgrade it, or run with --no-sandbox to accept running shell commands UNSANDBOXED — see the Linux prerequisites in README.md";
 
 #[cfg(any(target_os = "linux", test))]
 pub(crate) const BWRAP_PREFLIGHT_FAILED_DIAGNOSTIC: &str = "bubblewrap preflight failed; run `bwrap --unshare-user --ro-bind / / true` to see why — see the Linux prerequisites in README.md";
@@ -1900,7 +1926,7 @@ pub(crate) fn classify_bwrap_preflight_stderr(stderr: &[u8]) -> &'static str {
 
 /// Read at most `BWRAP_PROBE_STDERR_LIMIT` bytes already buffered on an exited probe's stderr
 /// pipe without blocking: a descendant that kept the pipe open cannot stall the caller.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[allow(unsafe_code)]
 pub(crate) fn read_exited_probe_stderr(stderr: Option<std::process::ChildStderr>) -> Vec<u8> {
     use std::io::Read;
@@ -1944,6 +1970,20 @@ pub(crate) fn bwrap_unavailable_diagnostic() -> Option<&'static str> {
     None
 }
 
+/// The closed reason the cached Seatbelt preflight failed, if it ran and failed.
+#[cfg(target_os = "macos")]
+pub(crate) fn seatbelt_unavailable_diagnostic() -> Option<&'static str> {
+    if seatbelt_exists() {
+        return None;
+    }
+    SEATBELT_DIAGNOSTIC.get().copied()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn seatbelt_unavailable_diagnostic() -> Option<&'static str> {
+    None
+}
+
 #[cfg(target_os = "linux")]
 fn probe_bwrap() -> bool {
     match run_bwrap_probe() {
@@ -1961,6 +2001,12 @@ fn run_bwrap_probe() -> Result<(), &'static str> {
     let Some(bwrap) = bwrap_path() else {
         return Err(BWRAP_MISSING_DIAGNOSTIC);
     };
+    // Every general launch retains the workspace and Git metadata through
+    // descriptor binds; an older bubblewrap would pass the namespace probe below
+    // and then refuse each shell command, so it is unavailable here.
+    if !bwrap_supports_bind_fd(bwrap) {
+        return Err(BWRAP_TOO_OLD_DIAGNOSTIC);
+    }
     let Some(probe_executable) = find_trusted_system_executable("true") else {
         return Err(BWRAP_PREFLIGHT_FAILED_DIAGNOSTIC);
     };
@@ -2043,12 +2089,24 @@ fn seatbelt_path() -> Option<&'static Path> {
 
 #[cfg(target_os = "macos")]
 fn probe_seatbelt() -> bool {
+    match run_seatbelt_probe() {
+        Ok(()) => true,
+        Err(diagnostic) => {
+            let _ = SEATBELT_DIAGNOSTIC.set(diagnostic);
+            tracing::warn!(diagnostic, "seatbelt sandbox preflight failed");
+            false
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn run_seatbelt_probe() -> Result<(), &'static str> {
     let Some(seatbelt) = seatbelt_path() else {
-        return false;
+        return Err(SEATBELT_MISSING_DIAGNOSTIC);
     };
     let probe_executable = Path::new("/usr/bin/true");
     if !is_trusted_system_path(probe_executable) {
-        return false;
+        return Err(SEATBELT_MISSING_DIAGNOSTIC);
     }
     let mut command = std::process::Command::new(seatbelt);
     command
@@ -2060,8 +2118,14 @@ fn probe_seatbelt() -> bool {
         .arg(probe_executable)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    bounded_backend_probe(command).is_ok()
+        .stderr(Stdio::piped());
+    match bounded_backend_probe(command) {
+        Ok(()) => Ok(()),
+        Err(Some(stderr)) => Err(classify_seatbelt_preflight_stderr(
+            &read_exited_probe_stderr(Some(stderr)),
+        )),
+        Err(None) => Err(SEATBELT_PREFLIGHT_FAILED_DIAGNOSTIC),
+    }
 }
 
 /// Run a backend probe for at most three seconds. A probe that exits unsuccessfully returns its
@@ -3375,7 +3439,33 @@ impl Sandbox {
         }
         match self.backend.as_str() {
             "bwrap" => bwrap_unavailable_diagnostic(),
+            "seatbelt" => seatbelt_unavailable_diagnostic(),
             _ => None,
+        }
+    }
+
+    /// One honest line answering "am I contained?": enforcement status, backend and
+    /// profile, with the closed diagnostic when the backend is unavailable.
+    pub(crate) fn status_line(&self) -> String {
+        match self.policy() {
+            SandboxPolicy::Disabled if self.is_unavailable_default_fallback() => format!(
+                "sandbox: OFF, backend '{}' unavailable{}",
+                self.backend,
+                self.unavailable_diagnostic_suffix()
+            ),
+            SandboxPolicy::Disabled => {
+                "sandbox: OFF (--no-sandbox or disabled by configuration)".into()
+            }
+            SandboxPolicy::RequiredAndAvailable => format!(
+                "sandbox: enforced ({}), profile {}",
+                self.backend,
+                self.profile.name()
+            ),
+            SandboxPolicy::RequiredButUnavailable => format!(
+                "sandbox: UNAVAILABLE, backend '{}' cannot start (shell launches are refused){}",
+                self.backend,
+                self.unavailable_diagnostic_suffix()
+            ),
         }
     }
 
@@ -3442,6 +3532,10 @@ impl Sandbox {
         #[cfg(target_os = "linux")]
         if self.backend == "bwrap" && BWRAP_AVAILABLE.get() == Some(&false) {
             return BWRAP_DIAGNOSTIC.get().copied();
+        }
+        #[cfg(target_os = "macos")]
+        if self.backend == "seatbelt" && SEATBELT_AVAILABLE.get() == Some(&false) {
+            return SEATBELT_DIAGNOSTIC.get().copied();
         }
         None
     }
@@ -8737,6 +8831,29 @@ mod sandbox_tests {
     }
 
     #[test]
+    fn status_line_leads_with_enforcement_not_the_stored_profile() {
+        let off = Sandbox::new(false, "bwrap");
+        assert!(
+            off.status_line().starts_with("sandbox: OFF"),
+            "{}",
+            off.status_line()
+        );
+        assert!(!off.status_line().contains("profile"));
+        let fallback = Sandbox::new(false, "bwrap").with_unavailable_default_fallback();
+        let line = fallback.status_line();
+        assert!(
+            line.starts_with("sandbox: OFF, backend 'bwrap' unavailable"),
+            "{line}"
+        );
+        let unavailable = Sandbox::new(true, "no-such-backend");
+        let line = unavailable.status_line();
+        assert!(
+            line.starts_with("sandbox: UNAVAILABLE, backend 'no-such-backend'"),
+            "{line}"
+        );
+    }
+
+    #[test]
     fn bwrap_preflight_other_failures_map_to_closed_diagnostics_without_echoing_stderr() {
         assert_eq!(
             classify_bwrap_preflight_stderr(
@@ -8759,6 +8876,25 @@ mod sandbox_tests {
             BWRAP_PREFLIGHT_FAILED_DIAGNOSTIC
         );
         assert!(BWRAP_MISSING_DIAGNOSTIC.contains("apt install bubblewrap"));
+        assert!(BWRAP_TOO_OLD_DIAGNOSTIC.contains("0.8.0"));
+        assert!(BWRAP_TOO_OLD_DIAGNOSTIC.contains("--no-sandbox"));
+        assert!(!BWRAP_TOO_OLD_DIAGNOSTIC.contains('\n'));
+        // mini-agent-sskdu.152: Seatbelt failures are classified into closed constants too.
+        assert_eq!(
+            classify_seatbelt_preflight_stderr(
+                b"sandbox-exec: sandbox_apply: Operation not permitted\n"
+            ),
+            SEATBELT_NESTED_DIAGNOSTIC
+        );
+        assert_eq!(
+            classify_seatbelt_preflight_stderr(b"something unexpected \x1b[31m"),
+            SEATBELT_PREFLIGHT_FAILED_DIAGNOSTIC
+        );
+        assert_eq!(
+            classify_seatbelt_preflight_stderr(b""),
+            SEATBELT_PREFLIGHT_FAILED_DIAGNOSTIC
+        );
+        assert!(!SEATBELT_MISSING_DIAGNOSTIC.contains('\n'));
     }
 
     #[test]
