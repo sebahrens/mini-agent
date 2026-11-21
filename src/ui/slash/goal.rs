@@ -3,6 +3,7 @@
 //! Owning specification: `docs/specs/goals.md` (Surfaces).
 
 use crate::extras::goal::{Goal, GoalStatus, PauseReason};
+use crate::ui::slash::write_usage;
 use crate::ui::slash::{SlashCtx, write_error, write_ok, write_result};
 
 const USAGE: &str = "usage: /goal <objective>  |  /goal status | pause | resume | reopen | clear \
@@ -253,7 +254,7 @@ pub(crate) async fn handle_goal(parts: &[&str], body: &str, ctx: &mut SlashCtx<'
         },
         "bounds" => {
             if parts.len() < 3 {
-                write_error(ctx.renderer, "usage: /goal bounds <key>=<value>");
+                write_usage(ctx.renderer, "usage: /goal bounds <key>=<value>");
                 return;
             }
             let mut applied = Vec::new();
@@ -284,7 +285,7 @@ pub(crate) async fn handle_goal(parts: &[&str], body: &str, ctx: &mut SlashCtx<'
         }
         "check" => {
             if parts.len() < 3 {
-                write_error(
+                write_usage(
                     ctx.renderer,
                     "usage: /goal check <command>  |  /goal check clear",
                 );

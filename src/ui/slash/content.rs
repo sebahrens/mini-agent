@@ -1,5 +1,6 @@
 use crate::context;
 use crate::session::storage;
+use crate::ui::slash::write_usage;
 use crate::ui::slash::{SlashCtx, write_error, write_ok, write_result};
 use crate::ui::{PromptModeOutcome, apply_main_agent, apply_prompt_mode};
 
@@ -38,7 +39,7 @@ async fn handle_agent(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<
                 ctx.context.agent_definitions[&name].list_entry(&name),
             );
         }
-        write_result(ctx.renderer, "usage: /agent <name>  |  /agent default");
+        write_usage(ctx.renderer, "usage: /agent <name>  |  /agent default");
         return Ok(());
     }
 
@@ -166,7 +167,7 @@ async fn handle_prompt(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
             for name in &sorted {
                 write_result(ctx.renderer, format!("  {}", name));
             }
-            write_result(ctx.renderer, "usage: /prompt <name>  |  /prompt default");
+            write_usage(ctx.renderer, "usage: /prompt <name>  |  /prompt default");
         }
     } else if parts[1] == "default" {
         if ctx.context.current_prompt.is_none() {
@@ -286,7 +287,7 @@ async fn handle_theme(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<
             for name in &sorted {
                 write_result(ctx.renderer, format!("  {}", name));
             }
-            write_result(ctx.renderer, "usage: /theme <name>  |  /theme default");
+            write_usage(ctx.renderer, "usage: /theme <name>  |  /theme default");
         }
     } else if parts[1] == "default" {
         if ctx.context.current_theme_name.is_none() && storage::load_theme_name().is_none() {
@@ -561,11 +562,15 @@ mod prompt_default_tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
-    /// `/prompt default` keeps a model the user picked when the prompt was
-    /// never routed to one, drops the prompt's security mode and grant offer,
-    /// and says which model and mode are now active.
-    #[tokio::test]
-    async fn clearing_a_prompt_keeps_the_model_and_restores_the_user_mode() {
+    struct Cleared {
+        model: String,
+        mode: crate::permission::SecurityMode,
+        context_window: u64,
+        input_cost: f64,
+        transcript: Vec<String>,
+    }
+
+    async fn clear_prompt(cfg: crate::config::Config) -> Cleared {
         let root = crate::tests::OwnedTestDirectory::new("prompt-default-clear");
         let _environment = crate::tests::ScopedProcessEnv::set(&[
             (
@@ -586,13 +591,13 @@ mod prompt_default_tests {
             ),
         ]);
         let cli = crate::cli::Cli::default();
-        let cfg = crate::config::Config::default();
         let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
         let mut context = context::load(true).for_workspace_binding(true, &workspace);
         context.current_prompt = Some("body".into());
         context.current_prompt_name = Some("plan".into());
         let mut renderer = crate::ui::renderer::Renderer::new().unwrap();
-        let mut session = crate::session::Session::new("anthropic", "picked-model", 128_000, "");
+        let mut session = crate::session::Session::new("anthropic", "picked-model", 777, "");
+        session.set_input_output_prices(Some((9.0, 9.0)));
         let mut client = crate::provider::create_client(
             "anthropic",
             Some("unused-test-key"),
@@ -656,21 +661,60 @@ mod prompt_default_tests {
         handle_prompt(&["/prompt", "default"], &mut ctx)
             .await
             .unwrap();
-        assert_eq!(ctx.session.model.as_str(), "picked-model");
+        let model = ctx.session.model.to_string();
+        let context_window = ctx.session.context_window;
+        let input_cost = ctx.session.input_token_cost;
         assert!(ctx.context.current_prompt.is_none());
-        assert_eq!(
-            permission.as_ref().unwrap().lock().unwrap().mode(),
-            crate::permission::SecurityMode::Standard
-        );
         let feed = ctx.renderer.feed();
-        let transcript: Vec<_> = (0..feed.block_count())
-            .filter_map(|index| feed.block_text(index))
+        let transcript = (0..feed.block_count())
+            .filter_map(|index| feed.block_text(index).map(str::to_owned))
             .collect();
+        Cleared {
+            model,
+            mode: permission.as_ref().unwrap().lock().unwrap().mode(),
+            context_window,
+            input_cost,
+            transcript,
+        }
+    }
+
+    /// `/prompt default` keeps a model the user picked when the prompt was
+    /// never routed to one, drops the prompt's security mode and grant offer,
+    /// and says which model and mode are now active.
+    #[tokio::test]
+    async fn clearing_a_prompt_keeps_the_model_and_restores_the_user_mode() {
+        let cleared = clear_prompt(crate::config::Config::default()).await;
+        assert_eq!(cleared.model, "picked-model");
+        assert_eq!(cleared.mode, crate::permission::SecurityMode::Standard);
+        assert_eq!(
+            cleared.context_window, 777,
+            "an unrouted prompt leaves capacity alone"
+        );
         assert!(
-            transcript
+            cleared
+                .transcript
                 .iter()
                 .any(|line| line.contains("model: picked-model, security mode: standard")),
-            "{transcript:?}"
+            "{:?}",
+            cleared.transcript
+        );
+    }
+
+    /// A prompt routed through `[prompt_to_model]` reverts to the default
+    /// model, and prices and context window follow it like any `/model` switch.
+    #[tokio::test]
+    async fn clearing_a_routed_prompt_reprices_and_resizes_for_the_default_model() {
+        let cfg: crate::config::Config = toml::from_str(
+            "context_window = 64000\n[quick_models.cheap]\nprovider = \"anthropic\"\nmodel = \"cheap-model\"\n[prompt_to_model]\nplan = \"cheap\"\n",
+        )
+        .unwrap();
+        let default_model = crate::cli::Cli::default().resolve_model(&cfg);
+        let cleared = clear_prompt(cfg).await;
+        assert_eq!(cleared.model, default_model.to_string());
+        assert_eq!(cleared.context_window, 64_000);
+        assert_ne!(
+            cleared.input_cost, 9.0,
+            "the previous model's price is gone"
         );
     }
 }

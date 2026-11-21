@@ -1,3 +1,4 @@
+use crate::ui::slash::write_usage;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -72,7 +73,7 @@ async fn handle_add(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
                 );
             }
         }
-        write_result(ctx.renderer, "usage: /add <path>  |  /drop <number|path>");
+        write_usage(ctx.renderer, "usage: /add <path>  |  /drop <number|path>");
         return Ok(());
     }
 
@@ -215,7 +216,7 @@ async fn add_one(arg: &str, ctx: &mut SlashCtx<'_>) -> bool {
 
 async fn handle_drop(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     if parts.len() < 2 {
-        write_error(
+        write_usage(
             ctx.renderer,
             "usage: /drop <number|path>...  (numbers: see /add)",
         );

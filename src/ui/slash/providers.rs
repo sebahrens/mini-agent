@@ -1,3 +1,4 @@
+use crate::ui::slash::write_usage;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -34,7 +35,7 @@ async fn handle_login(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<
     let provider = parts.get(1).copied().unwrap_or("openai");
     if provider.eq_ignore_ascii_case("copilot") {
         if parts.len() > 2 {
-            write_error(
+            write_usage(
                 ctx.renderer,
                 "usage: /login copilot, /logout copilot (one account per GitHub host)",
             );
@@ -89,7 +90,7 @@ async fn handle_login(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<
         return Ok(());
     }
     if parts.len() > if parts[0] == "/login" { 3 } else { 2 } {
-        write_error(
+        write_usage(
             ctx.renderer,
             "usage: /login openai [new|account-number] | copilot, /logout openai | copilot",
         );
@@ -637,7 +638,7 @@ async fn handle_provider(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
                 write_result(ctx.renderer, line);
             }
         }
-        write_result(
+        write_usage(
             ctx.renderer,
             "usage: /provider <name>  (press Tab to list providers)",
         );
@@ -742,7 +743,7 @@ async fn handle_model(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<
             ctx.renderer,
             "  /model <alias|id> switches (Tab in the picker toggles quick aliases and provider models); /models lists them",
         );
-        write_result(
+        write_usage(
             ctx.renderer,
             "usage: /model <name>  (press Tab to list provider models)",
         );

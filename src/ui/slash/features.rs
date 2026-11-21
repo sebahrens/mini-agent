@@ -2,6 +2,8 @@
 use crate::ui::slash::write_ok;
 #[cfg(feature = "loop")]
 use crate::ui::slash::write_result;
+#[cfg(any(feature = "loop", feature = "git-worktree"))]
+use crate::ui::slash::write_usage;
 use crate::ui::slash::{SlashCtx, write_error};
 
 /// Canonical `/loop` usage; `status` is accepted too.
@@ -157,7 +159,7 @@ async fn handle_loop(_parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<
 #[cfg(feature = "git-worktree")]
 async fn handle_worktree(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     if parts.len() < 2 {
-        write_error(ctx.renderer, "usage: /worktree <name>");
+        write_usage(ctx.renderer, "usage: /worktree <name>");
         return Ok(());
     }
     let name = parts[1].trim();

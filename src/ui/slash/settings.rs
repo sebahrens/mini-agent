@@ -1,13 +1,14 @@
 use crate::agent::tools;
 use crate::config::types::EditSystem;
 use crate::permission::SecurityMode;
+use crate::ui::slash::write_usage;
 use crate::ui::slash::{SlashCtx, write_error, write_ok, write_result};
 
 pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     match parts[0] {
         "/keys" => {
             if parts.len() != 1 {
-                write_error(ctx.renderer, "usage: /keys");
+                write_usage(ctx.renderer, "usage: /keys");
                 return Ok(());
             }
             write_ok(
@@ -39,7 +40,7 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
                 ["/vim", "on"] => true,
                 ["/vim", "off"] => false,
                 _ => {
-                    write_error(ctx.renderer, "usage: /vim [on|off]");
+                    write_usage(ctx.renderer, "usage: /vim [on|off]");
                     return Ok(());
                 }
             };
@@ -55,7 +56,7 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
         }
         "/cost" => {
             if parts.len() != 1 {
-                write_error(ctx.renderer, "usage: /cost");
+                write_usage(ctx.renderer, "usage: /cost");
                 return Ok(());
             }
             let result = match crate::paths::process_paths_ref() {
@@ -268,7 +269,7 @@ async fn handle_advisor(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resul
                 ctx.rebuild_agent().await;
                 write_ok(ctx.renderer, format!("advisor model: {selected}"));
             } else {
-                write_error(ctx.renderer, "usage: /advisor model <name>");
+                write_usage(ctx.renderer, "usage: /advisor model <name>");
             }
         }
         "max-uses" => {
@@ -282,7 +283,7 @@ async fn handle_advisor(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resul
                 advisor::init_config(cfg);
                 write_ok(ctx.renderer, format!("advisor max uses: {}", label));
             } else {
-                write_error(
+                write_usage(
                     ctx.renderer,
                     "usage: /advisor max-uses <number|0=unlimited>",
                 );
@@ -303,7 +304,7 @@ async fn handle_advisor(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resul
                     ),
                 );
             } else {
-                write_error(ctx.renderer, "usage: /advisor context-limit <kilobytes>");
+                write_usage(ctx.renderer, "usage: /advisor context-limit <kilobytes>");
             }
         }
         _ => {
@@ -347,7 +348,7 @@ async fn handle_sandbox(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resul
         return Ok(());
     }
     if parts.len() != 2 {
-        write_error(
+        write_usage(
             ctx.renderer,
             "usage: /sandbox [workspace|host-read|host-full]",
         );
@@ -595,7 +596,7 @@ async fn set_mode(ctx: &mut SlashCtx<'_>, mode: SecurityMode) {
 
 async fn handle_toggle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     if parts.len() < 2 {
-        write_ok(ctx.renderer, "usage: /toggle <feature> [on|off]");
+        write_usage(ctx.renderer, "usage: /toggle <feature> [on|off]");
         write_ok(ctx.renderer, "features:");
         write_result(
             ctx.renderer,
@@ -930,7 +931,7 @@ fn resolve_oauth_server(
 #[cfg(feature = "mcp")]
 async fn handle_mcp_login(name: Option<&str>, ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     let Some(name) = name.filter(|n| !n.is_empty()) else {
-        write_error(ctx.renderer, "usage: /mcp login <server>");
+        write_usage(ctx.renderer, "usage: /mcp login <server>");
         return Ok(());
     };
     // Validate config here so errors get friendly messages. The actual login
@@ -946,7 +947,7 @@ async fn handle_mcp_login(name: Option<&str>, ctx: &mut SlashCtx<'_>) -> anyhow:
 #[cfg(feature = "mcp")]
 fn handle_mcp_logout(name: Option<&str>, ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     let Some(name) = name.filter(|n| !n.is_empty()) else {
-        write_error(ctx.renderer, "usage: /mcp logout <server>");
+        write_usage(ctx.renderer, "usage: /mcp logout <server>");
         return Ok(());
     };
     let (url, settings) = match resolve_oauth_server(ctx, name) {

@@ -4567,11 +4567,13 @@ impl<'a> App<'a> {
                 let t = text.trim_start();
                 if t == "/queue" || t.starts_with("/queue ") {
                     let arg = t.strip_prefix("/queue").unwrap_or("").trim();
+                    echo_submission(&mut self.renderer, text.trim_start())?;
                     self.run_queue_command(arg)?;
                     return Ok(());
                 }
             }
             if let Some((expand, arg)) = crate::ui::tool_output::fold_command(&text) {
+                echo_submission(&mut self.renderer, &text)?;
                 self.run_fold_command(expand, arg);
                 return Ok(());
             }
@@ -6604,6 +6606,7 @@ impl<'a> App<'a> {
         if command != "/effort" && !native_mode {
             return Ok(false);
         }
+        echo_submission(&mut self.renderer, text)?;
         let current = self.ui.session.reasoning_controls;
         if command == "/effort" && parts.len() == 1 {
             match self
@@ -7007,6 +7010,7 @@ impl<'a> App<'a> {
         }
         let services = self.ui.instruction_services()?;
         if name == "skills" {
+            echo_submission(&mut self.renderer, text)?;
             if text.trim() != "/skills" {
                 self.renderer.write_line("usage: /skills", C_ERROR)?;
                 return Ok(true);

@@ -1,3 +1,4 @@
+use crate::ui::slash::write_usage;
 use compact_str::CompactString;
 
 use crate::ui::events::render_session;
@@ -105,7 +106,7 @@ fn resolve_export_path(workspace_root: &std::path::Path, requested: &str) -> std
 #[cfg(feature = "export")]
 async fn handle_import(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     let Some(path) = parts.get(1).map(|p| p.trim()).filter(|p| !p.is_empty()) else {
-        write_error(ctx.renderer, "usage: /import <file.jsonl|session.json>");
+        write_usage(ctx.renderer, "usage: /import <file.jsonl|session.json>");
         return Ok(());
     };
     let content = match read_bounded_import(path) {
@@ -371,7 +372,7 @@ async fn handle_share(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<
             return Ok(());
         }
         Some(_) => {
-            write_error(ctx.renderer, "usage: /share, then /share confirm to upload");
+            write_usage(ctx.renderer, "usage: /share, then /share confirm to upload");
             return Ok(());
         }
     }
@@ -515,7 +516,7 @@ async fn handle_sessions(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
         ctx.input
             .start_loading_session_picker(ctx.workspace.clone(), all, "");
     } else if parts[1] == "delete" && parts.len() < 3 {
-        write_error(ctx.renderer, "usage: /sessions delete <id-or-name>");
+        write_usage(ctx.renderer, "usage: /sessions delete <id-or-name>");
     } else if parts[1] == "delete" {
         let prefix = parts[2].trim();
         let sessions = crate::session::storage::find_sessions_by_prefix(prefix)?;
@@ -646,12 +647,12 @@ async fn handle_fork(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
         [_, value] => match value.parse::<usize>() {
             Ok(turn) => Some(turn),
             Err(_) => {
-                write_error(ctx.renderer, "usage: /fork [user-turn number]");
+                write_usage(ctx.renderer, "usage: /fork [user-turn number]");
                 return Ok(());
             }
         },
         _ => {
-            write_error(ctx.renderer, "usage: /fork [user-turn number]");
+            write_usage(ctx.renderer, "usage: /fork [user-turn number]");
             return Ok(());
         }
     };

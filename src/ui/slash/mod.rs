@@ -418,6 +418,17 @@ pub(crate) fn write_result(renderer: &mut Renderer, msg: impl std::fmt::Display)
     let _ = renderer.write_line(&msg.to_string(), C_RESULT);
 }
 
+/// A usage line: one severity for every command, always `usage:`-prefixed.
+pub(crate) fn write_usage(renderer: &mut Renderer, msg: impl std::fmt::Display) {
+    let text = msg.to_string();
+    let text = if text.starts_with("usage:") {
+        text
+    } else {
+        format!("usage: {text}")
+    };
+    let _ = renderer.write_line(&text, C_ERROR);
+}
+
 pub(crate) fn write_error(renderer: &mut Renderer, msg: impl std::fmt::Display) {
     let _ = renderer.write_line(&msg.to_string(), C_ERROR);
 }
@@ -1330,7 +1341,6 @@ mod feature_missing_tests {
 /// terminal or the event thread), signalled through `Err` and downcast once in
 /// `App::handle_slash_result`.
 #[derive(Debug)]
-#[allow(dead_code)] // some variants exist only in feature builds
 pub(crate) enum DeferredSlash {
     /// `/compact [instructions]`.
     Compress(Option<String>),
@@ -1339,8 +1349,10 @@ pub(crate) enum DeferredSlash {
     /// `/review`: the prompt to run as an internal turn.
     Review(String),
     /// `/memory editor`: the file to open.
+    #[cfg(feature = "memory")]
     Editor(std::path::PathBuf),
     /// `/mcp login <server>`: the OAuth login runs as a background task.
+    #[cfg(feature = "mcp")]
     McpLogin(String),
 }
 
@@ -1350,7 +1362,9 @@ impl std::fmt::Display for DeferredSlash {
             Self::Compress(_) => "deferred slash action: compact",
             Self::Init(_) => "deferred slash action: init",
             Self::Review(_) => "deferred slash action: review",
+            #[cfg(feature = "memory")]
             Self::Editor(_) => "deferred slash action: editor",
+            #[cfg(feature = "mcp")]
             Self::McpLogin(_) => "deferred slash action: mcp login",
         })
     }

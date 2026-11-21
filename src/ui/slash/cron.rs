@@ -15,6 +15,7 @@
 use super::{write_error, write_ok, write_result};
 use crate::ui::cron::{self, ArmError, CronStore};
 use crate::ui::renderer::Renderer;
+use crate::ui::slash::write_usage;
 use tokio::time::Instant;
 
 const USAGE: &str = "usage: /cron <interval> <prompt>  |  /cron <prompt>  |  /cron list  |  /cron stop <id>|all  |  /cron run <id>  |  /cron resume";
@@ -114,9 +115,9 @@ pub(crate) fn handle(
             now,
         ),
         ["/cron", interval] if cron::is_interval_token(interval) => {
-            write_error(renderer, "usage: /cron <interval> <prompt>");
+            write_usage(renderer, "usage: /cron <interval> <prompt>");
         }
-        ["/cron", "list" | "stop" | "run", ..] => write_error(renderer, USAGE),
+        ["/cron", "list" | "stop" | "run", ..] => write_usage(renderer, USAGE),
         // A lone word that is a verb of a sibling command (/goal, /loop,
         // /queue, /tasks) is a typo, not a prompt worth a paid model turn.
         [
@@ -137,7 +138,7 @@ pub(crate) fn handle(
                 .join(" ");
             arm_dynamic(&prompt, store, renderer, max_fires, budget_capped, now);
         }
-        _ => write_error(renderer, USAGE),
+        _ => write_usage(renderer, USAGE),
     }
 }
 

@@ -16,9 +16,9 @@ duplicate option labels, oversized strings and malformed batches are rejected
 before requesting an answer. Runtime limits are UTF-8 bytes: question 2,048,
 label 128, description 512, batch 16,384 and each free-text answer 4,096.
 
-In the TUI, the prompt displays its exact question ID and numbered options above
+In the TUI, the prompt displays its question number and numbered options above
 the input. Choose a displayed number, or press `t` to type another answer when
-free text is offered; press Enter to submit text. Each question in the batch is
+free text is offered; press Enter to submit text. Esc in typing mode of a choice question clears the draft and returns to the options; Esc from the option list stops. Pastes are normalised like the editor's (carriage returns become newlines) and capped at 4,096 bytes with a notice. Each question in the batch is
 shown in sequence. The ordinary input draft stays separate; held choice-key repeats do not answer
 the next question. Escape or Ctrl+C
 cancels the exact pending reply and stops its owning run. A cancelled or stale
