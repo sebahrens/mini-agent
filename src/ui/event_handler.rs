@@ -192,6 +192,16 @@ pub async fn handle_agent_event(
     crate::session::storage::report_pending_save_notices(ui.session, |notice| {
         let _ = renderer.write_line(&format!("warning: {notice}"), C_ERROR);
     });
+    #[cfg(feature = "otel")]
+    if let Some(collector) = crate::extras::otel::global() {
+        collector.observe(&event);
+        if matches!(
+            event,
+            AgentEvent::Done { .. } | AgentEvent::Error { .. } | AgentEvent::Interrupted { .. }
+        ) {
+            tokio::spawn(crate::extras::otel::flush());
+        }
+    }
     // Every event contributes to the round the gate will judge, so the goal
     // sees the run exactly as it happened rather than as the final response
     // describes it.

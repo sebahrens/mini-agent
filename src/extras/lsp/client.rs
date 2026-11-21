@@ -386,21 +386,6 @@ impl DiagStoreState {
         }
     }
 
-    /// Composite keys of the secondary servers' entries for `uri`, sorted.
-    pub fn secondary_keys(&self, uri: &str) -> Vec<String> {
-        let prefix = format!("{uri}{SECONDARY_KEY_SEPARATOR}");
-        let mut keys: Vec<String> = self
-            .map
-            .lock()
-            .unwrap()
-            .keys()
-            .filter(|key| key.starts_with(&prefix))
-            .cloned()
-            .collect();
-        keys.sort();
-        keys
-    }
-
     /// Files whose diagnostics were lost to a full cache and not republished.
     pub fn dropped_files(&self) -> usize {
         let dropped = self.dropped.lock().unwrap();

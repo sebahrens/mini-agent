@@ -954,7 +954,8 @@ impl<'a> App<'a> {
         // its sole owner instead of flushing or racing raw terminal input.
         // The query is sent now and its reply collected after the renderer,
         // input editor and history are built, overlapping the round trip.
-        let background_query = crate::ui::terminal::start_background_query(!(ui.cli.no_color || screen_reader));
+        let background_query =
+            crate::ui::terminal::start_background_query(!(ui.cli.no_color || screen_reader));
 
         ui.session.show_cost_always = ui.cfg.resolve_show_cost_always();
         crate::ui::statusline::init(ui.cfg);

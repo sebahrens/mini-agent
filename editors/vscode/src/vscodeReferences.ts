@@ -1,5 +1,8 @@
 import * as vscode from 'vscode';
 import { MAX_REFERENCES, type ReferenceInput } from './references';
+import {
+  activeEditorReference, diagnosticsReference, type ActiveEditorState, type DiagnosticItem,
+} from './editorContext';
 
 interface UriLike { readonly scheme: string; readonly fsPath: string }
 interface BinaryLike { readonly mimeType: string; data(): PromiseLike<Uint8Array> }
@@ -90,6 +93,54 @@ export async function collectReferences(
         startLine: editor.selection.start.line, endLine: editor.selection.end.line,
       });
     }
+  }
+  return out;
+}
+
+/**
+ * Context attached to every prompt without a `/selection` command: the active
+ * file or selection (setting `mini-agent.attachActiveEditor`, default on) and,
+ * only when enabled, the workspace's error and warning diagnostics.
+ */
+export function collectEditorContext(alreadyHasSelection: boolean): ReferenceInput[] {
+  const config = vscode.workspace.getConfiguration('mini-agent');
+  const out: ReferenceInput[] = [];
+  if (!alreadyHasSelection) {
+    const editor = vscode.window.activeTextEditor;
+    const state: ActiveEditorState | undefined = editor
+      ? {
+        scheme: editor.document.uri.scheme,
+        fsPath: editor.document.uri.fsPath,
+        languageId: editor.document.languageId,
+        cursorLine: editor.selection.active.line,
+        ...(editor.selection.isEmpty ? {} : {
+          selection: {
+            startLine: editor.selection.start.line,
+            endLine: editor.selection.end.line,
+            text: editor.document.getText(editor.selection),
+          },
+        }),
+      }
+      : undefined;
+    const reference = activeEditorReference(state, config.get<boolean>('attachActiveEditor', true));
+    if (reference) { out.push(reference); }
+  }
+  if (config.get<boolean>('attachDiagnostics', false)) {
+    const open = new Set(vscode.workspace.textDocuments.filter(d => d.uri.scheme === 'file').map(d => d.uri.toString()));
+    const items: DiagnosticItem[] = [];
+    for (const [uri, diagnostics] of vscode.languages.getDiagnostics()) {
+      if (!open.has(uri.toString())) { continue; }
+      for (const diagnostic of diagnostics) {
+        if (diagnostic.severity === vscode.DiagnosticSeverity.Error || diagnostic.severity === vscode.DiagnosticSeverity.Warning) {
+          items.push({
+            fsPath: uri.fsPath, line: diagnostic.range.start.line, message: diagnostic.message,
+            severity: diagnostic.severity === vscode.DiagnosticSeverity.Error ? 'error' : 'warning',
+          });
+        }
+      }
+    }
+    const reference = diagnosticsReference(items, true);
+    if (reference) { out.push(reference); }
   }
   return out;
 }

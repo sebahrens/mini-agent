@@ -31,6 +31,12 @@ pub mod export;
 #[cfg(feature = "advisor")]
 pub mod advisor;
 
+#[cfg(feature = "otel")]
+pub mod otel;
+
+#[cfg(feature = "remote")]
+pub mod remote;
+
 #[cfg(feature = "hooks")]
 pub mod hooks;
 
