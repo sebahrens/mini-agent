@@ -911,6 +911,8 @@ pub(crate) fn is_destructive_shell_script(script: &str) -> bool {
             r"^(?:",
             // rm with a recursive or force flag, in any flag spelling.
             r"rm\s+(?:\S+\s+)*-(?:-recursive|-force|[A-Za-z]*[rRf][A-Za-z]*)\b",
+            // rm with a glob operand (`rm *.tmp`), even without flags.
+            r"|rm\s+(?:\S+\s+)*\S*[*?]",
             r"|(?:dd|shred|wipefs|mkswap|fdisk|sfdisk|parted)\b",
             r"|mkfs(?:\.\w+)?\b",
             r"|find\b.*\s-delete\b",
@@ -1007,7 +1009,14 @@ mod windows_destructive_tests {
 }
 
 pub fn default_deny_regex_rules() -> Vec<(/* tool */ &'static str, /* regex */ &'static str)> {
-    vec![("bash", r"^rm\s+.*\*")]
+    // Only the catastrophic whole-root forms are a hard deny: one `rm`
+    // command (optionally behind `sudo`, at the start of the script or of a
+    // `;`/`&`/`|` segment) whose target is `/*`, `~/*` or `$HOME/*`. Every
+    // other wildcard `rm` is an ordinary ask (mini-agent-nvnkx.65).
+    vec![(
+        "bash",
+        r#"(?:^|[;&|]\s*)(?:sudo\s+)?rm\s+(?:[^\s;&|]+\s+)*["']?(?:/|~/|\$HOME/|\$\{HOME\}/)\*"#,
+    )]
 }
 
 /// Operator-facing notice for a session whose implicitly selected default
@@ -1125,7 +1134,10 @@ pub fn default_bash_rules() -> Vec<(&'static str, Action)> {
         ("pip list", Action::Allow),
         ("rm -rf /**", Action::Deny),
         ("sudo rm -rf /**", Action::Deny),
-        ("dd **", Action::Deny),
+        // Writing to a device is a hard deny; any other `dd` is an ask
+        // (`is_destructive_shell_script` covers yolo; mini-agent-nvnkx.65).
+        ("dd **of=/dev/**", Action::Deny),
+        ("sudo dd **of=/dev/**", Action::Deny),
         ("mkfs **", Action::Deny),
         ("fdisk **", Action::Deny),
         ("mkswap **", Action::Deny),
