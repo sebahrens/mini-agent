@@ -1638,6 +1638,50 @@ async fn mcp_tools_list_hang_does_not_block_other_servers() {
     fixture.cleanup();
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn an_exited_stdio_server_is_reported_disconnected_with_the_reconnect_hint() {
+    let fixture = FixtureBuild::compile();
+    let lease = fixture.lease("exited-stdio");
+    let cfg = fixture.config(
+        fixture.executable.display().to_string(),
+        Vec::new(),
+        "normal",
+        &lease,
+    );
+    let handle = McpClientHandle::connect(CompactString::new("mortal"), &cfg)
+        .await
+        .unwrap();
+    let configured = HashMap::from([("mortal".to_string(), cfg)]);
+    let manager = McpClientManager::from_handles(vec![handle]);
+    assert_eq!(manager.server_statuses(&configured)[0].status, "connected");
+    let pid = wait_for_pid(&lease).await;
+    Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status()
+        .unwrap();
+    let mut row = None;
+    for _ in 0..100 {
+        let current = manager.server_statuses(&configured).remove(0);
+        if current.status != "connected" {
+            row = Some(current);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let row = row.expect("the exit was never observed");
+    assert_eq!(row.status, "disconnected");
+    assert!(
+        row.error
+            .as_deref()
+            .is_some_and(|e| e.contains("/mcp reconnect mortal")),
+        "{:?}",
+        row.error
+    );
+    shutdown(manager).await;
+    fixture.cleanup();
+}
+
 #[tokio::test]
 async fn server_without_the_tools_capability_is_not_asked_for_tools() {
     let fixture = FixtureBuild::compile();

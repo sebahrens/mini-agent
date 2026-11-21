@@ -102,7 +102,8 @@ impl ServerLink {
     /// Bounded, credential-free reason shown for a failed server.
     pub(crate) fn failure_message(&self) -> String {
         format!(
-            "connection dropped; {MAX_RECONNECT_ATTEMPTS} reconnect attempts failed (reconnect from /mcp)"
+            "connection dropped; {MAX_RECONNECT_ATTEMPTS} reconnect attempts failed (run /mcp reconnect {})",
+            self.name
         )
     }
 
@@ -119,7 +120,12 @@ impl ServerLink {
     /// The live connection, reconnecting first when the transport closed.
     pub(crate) async fn ensure_connected(&self) -> Result<Conn, String> {
         let _serial = self.serialise.lock().await;
-        let retired = || "MCP connection retired; reconnect before calling tools".to_owned();
+        let retired = || {
+            format!(
+                "MCP connection retired; server '{0}' was replaced or removed, ask the user to run /mcp reconnect {0}",
+                self.name
+            )
+        };
         if self.retired.load(Ordering::Acquire) {
             return Err(retired());
         }
@@ -212,7 +218,7 @@ impl ServerLink {
 
 fn retired_or_cancelled(retired: bool) -> String {
     if retired {
-        "MCP connection retired; reconnect before calling tools".to_owned()
+        "MCP connection retired; ask the user to run /mcp reconnect".to_owned()
     } else {
         "MCP reconnect cancelled".to_owned()
     }

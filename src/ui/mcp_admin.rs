@@ -413,6 +413,13 @@ pub(super) fn prepare(
 mod tests {
     use super::*;
     #[test]
+    fn reconnect_is_left_to_the_existing_server_command_handler() {
+        assert!(matches!(
+            parse("/mcp reconnect files"),
+            Ok(Action::Existing)
+        ));
+    }
+    #[test]
     fn literal_parser_final_word_respects_total_and_unicode_byte_bounds() {
         assert_eq!(words(&vec!["x"; 128].join(" ")).unwrap().len(), 128);
         assert!(words(&vec!["x"; 129].join(" ")).is_err());

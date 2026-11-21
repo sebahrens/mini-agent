@@ -299,8 +299,19 @@ impl McpClientManager {
                     .find(|handle| handle.server_name.as_str() == name.as_str())
                     .and_then(|handle| handle.link.as_ref());
                 let link_state = link.map(|link| link.state());
+                // A stdio server has no reconnect link: a closed transport
+                // means the process exited and only a manual reconnect helps.
+                let transport_closed = self
+                    .handles
+                    .iter()
+                    .find(|handle| handle.server_name.as_str() == name.as_str())
+                    .is_some_and(|handle| {
+                        handle.link.is_none() && handle.live_peer().is_transport_closed()
+                    });
                 let status = if !enabled {
                     "disabled"
+                } else if connected && transport_closed {
+                    "disconnected"
                 } else if connected && link_state == Some(reconnect::LinkState::Reconnecting) {
                     "pending"
                 } else if connected && link_state == Some(reconnect::LinkState::Failed) {
@@ -322,11 +333,19 @@ impl McpClientManager {
                     status,
                     error: (status != "connected")
                         .then(|| {
-                            self.connect_errors.get(name).cloned().or_else(|| {
-                                (link_state == Some(reconnect::LinkState::Failed))
-                                    .then(|| link.map(|link| link.failure_message()))
-                                    .flatten()
-                            })
+                            self.connect_errors
+                                .get(name)
+                                .cloned()
+                                .or_else(|| {
+                                    (link_state == Some(reconnect::LinkState::Failed))
+                                        .then(|| link.map(|link| link.failure_message()))
+                                        .flatten()
+                                })
+                                .or_else(|| {
+                                    transport_closed.then(|| {
+                                        format!("connection closed; run /mcp reconnect {name}")
+                                    })
+                                })
                         })
                         .flatten(),
                 }

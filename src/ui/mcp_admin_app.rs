@@ -157,13 +157,37 @@ impl App<'_> {
                 omitted = true;
             }
         }
+        let statuses = self
+            .ui
+            .mcp_manager
+            .as_ref()
+            .zip(cfg.mcp_servers.as_ref())
+            .map(|(manager, servers)| manager.server_statuses(servers))
+            .unwrap_or_default();
         let mut rows = Vec::new();
         for name in names {
-            let connected = self
-                .ui
-                .mcp_manager
-                .as_ref()
-                .is_some_and(|mgr| mgr.handles.iter().any(|handle| handle.server_name == name));
+            // The live state, not mere handle presence: a stdio server that
+            // exited or a remote link that gave up is not "connected".
+            let live_state = statuses.iter().find(|row| row.name == name);
+            let connected = live_state.is_some_and(|row| row.status == "connected");
+            let state_text = match live_state.map(|row| row.status) {
+                Some("disconnected") => Some("disconnected (process exited; run /mcp reconnect)"),
+                Some("failed")
+                    if self.ui.mcp_manager.as_ref().is_some_and(|mgr| {
+                        mgr.handles.iter().any(|handle| handle.server_name == name)
+                    }) =>
+                {
+                    Some("failed (run /mcp reconnect)")
+                }
+                Some("pending")
+                    if self.ui.mcp_manager.as_ref().is_some_and(|mgr| {
+                        mgr.handles.iter().any(|handle| handle.server_name == name)
+                    }) =>
+                {
+                    Some("reconnecting")
+                }
+                _ => None,
+            };
             if let Some(origins) = cfg.mcp_origins.get(&name) {
                 for origin in origins {
                     let state = if let Some(reason) = &origin.inactive {
@@ -172,6 +196,8 @@ impl App<'_> {
                         "shadowed".into()
                     } else if connected {
                         "connected".into()
+                    } else if let Some(text) = state_text {
+                        text.into()
                     } else {
                         "not connected".into()
                     };
@@ -191,7 +217,7 @@ impl App<'_> {
                     if connected {
                         "connected"
                     } else {
-                        "not connected"
+                        state_text.unwrap_or("not connected")
                     }
                 ));
             }
@@ -562,6 +588,28 @@ impl App<'_> {
                 } else {
                     if parts[1]=="login" { self.start_mcp_login(parts[2].to_owned()).await?; }
                     else { self.start_mcp_logout(parts[2].to_owned()).await?; }
+                }
+                return Ok(true);
+            }
+            if parts.get(1) == Some(&"reconnect") {
+                if parts.len() != 3 {
+                    self.renderer
+                        .write_line("usage: /mcp reconnect <server>", C_ERROR)?;
+                } else if self.mcp_edit_busy()
+                    || self
+                        .mcp_admin
+                        .as_ref()
+                        .is_some_and(|state| state.work.is_some() || state.approval.is_some())
+                {
+                    self.renderer.write_line(
+                        "Finish or stop active work before reconnecting an MCP server",
+                        C_ERROR,
+                    )?;
+                } else if self.mcp_server_config(parts[2]).is_none() {
+                    self.renderer
+                        .write_line("MCP server is inactive or absent", C_ERROR)?;
+                } else {
+                    self.start_mcp_reconnect(parts[2].to_owned()).await?;
                 }
                 return Ok(true);
             }

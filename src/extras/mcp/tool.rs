@@ -441,7 +441,11 @@ impl ToolDyn for McpTool {
         let reconnect = self.reconnect.clone();
 
         Box::pin(async move {
-            ensure_client_current(source_proof.as_deref(), client_is_live.as_ref())?;
+            ensure_client_current(
+                &server_name,
+                source_proof.as_deref(),
+                client_is_live.as_ref(),
+            )?;
             // Set when any wait between the two source checks actually
             // suspended; only then can the approved source have outlived its
             // revision unnoticed. Never carried across calls.
@@ -485,9 +489,13 @@ impl ToolDyn for McpTool {
             // check is still the same synchronous step; the cheap liveness
             // check always repeats and the source check repeats on suspension.
             if suspended.load(Ordering::Relaxed) {
-                ensure_client_current(source_proof.as_deref(), client_is_live.as_ref())?;
+                ensure_client_current(
+                    &server_name,
+                    source_proof.as_deref(),
+                    client_is_live.as_ref(),
+                )?;
             } else if !client_is_live() {
-                return Err(client_retired_error());
+                return Err(client_retired_error(&server_name));
             }
             // A remote server whose transport dropped is re-established here,
             // after permission and source checks and before the request is
@@ -607,18 +615,22 @@ impl ToolDyn for McpTool {
 }
 
 fn ensure_client_current(
+    server: &str,
     proof: Option<&super::project::ServerSourceProof>,
     client_is_live: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<(), ToolError> {
     if !client_is_live() {
-        return Err(client_retired_error());
+        return Err(client_retired_error(server));
     }
     ensure_source_current(proof)
 }
 
-fn client_retired_error() -> ToolError {
+fn client_retired_error(server: &str) -> ToolError {
     ToolError::ToolCallError(Box::new(McpToolError(
-        "MCP connection retired; reconnect before calling tools".into(),
+        format!(
+            "MCP connection retired: server '{server}' has exited or was replaced; ask the user to run /mcp reconnect {server}"
+        )
+        .into(),
     )))
 }
 
