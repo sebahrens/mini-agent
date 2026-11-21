@@ -766,11 +766,15 @@ pub const HEADLESS_INTERRUPTED: &str = "headless agent interrupted";
 /// Continuation prompt after headless context relief (a compaction inside a
 /// turn). Like the TUI's mid-turn prompt it frames the summary as work already
 /// done rather than as new instructions.
-pub(crate) const HEADLESS_CONTEXT_RELIEF_PROMPT: &str = "[Context was compacted to save space; \
-the full prior history is in the system summary above.]\n\nContinue with the \
-user's original task. Do not redo work already completed per the summary; focus \
-on what remains. Context was tight, so prefer narrower follow-up tool calls over \
-wide ones until pressure subsides.";
+pub(crate) const HEADLESS_CONTEXT_RELIEF_PROMPT: &str = "[Earlier context was compacted to save \
+space. Your earlier work is condensed in the \"[Recap of my prior work in this conversation]\" \
+message above, and the most recent messages are kept verbatim. Details not in the recap are \
+gone; re-read files when you need them.]\n\nContinue with the user's original task. Do not \
+redo work already completed per the recap; focus on what remains. Context was tight, so prefer \
+narrower follow-up tool calls over wide ones until pressure subsides.";
+
+/// The label `convert_history_uncached` puts on the replayed compaction summary.
+pub(crate) const COMPACTION_RECAP_LABEL: &str = "[Recap of my prior work in this conversation]";
 
 pub(crate) fn tool_may_mutate_workspace(name: &str) -> bool {
     !matches!(
@@ -3537,8 +3541,8 @@ fn convert_history_uncached(
     // voice.
     if let Some(summary) = summary {
         messages.push(Message::assistant(format!(
-            "[Recap of my prior work in this conversation]\n{}",
-            summary
+            "{}\n{}",
+            COMPACTION_RECAP_LABEL, summary
         )));
         if let Some(evidence) = session
             .compactions

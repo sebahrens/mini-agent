@@ -1633,7 +1633,7 @@ progress between them). Between turns a provider-native (Anthropic replay) sessi
 auto-compaction and `/compact`, headless pre-turn compaction, and ACP prompts under token pressure): its signed thinking chain cannot be
 summarized in place, so the compaction restarts the chain from the compacted transcript as a new
 replay epoch, with a one-line notice (earlier thinking blocks are dropped). Mid-turn, headless
-and TUI turns on one compact too (see below); ACP does not compact mid-turn yet, but an ACP prompt is never refused for want of in-place compaction. Tools with their own output limits (`read`,
+and TUI turns on one compact too (see below), and ACP compacts mid-turn at a complete tool batch (see the per-front-end notes below). Tools with their own output limits (`read`,
 `shell`, `grep`, `find_files`, `list_dir`, `js`, `web_fetch`, `web_search`,
 and the subagent `task` tool) retain their documented line, byte, and result
 limits in both live and replayed history. Their
@@ -1714,9 +1714,13 @@ the configured reserve unless the reserve is below 256), and the stored summary
 keeps up to four bytes per such token (at least 16 KiB; 80,000 bytes for a 1M
 window). A 128k window keeps the historical 4,096-token / 16 KiB bounds. When a
 rolling summary exceeds its storage bound, each structured summary section
-retains its heading and prefix instead of dropping the middle sections. Compaction boundaries also snap backward to a
-user or assistant message so a retained tool result is never separated from
-its call. If a provider still rejects an ordinary headless request (`-p`, `--loop`
+retains its heading and prefix instead of dropping the middle sections. Compaction boundaries snap backward to a
+user or assistant message, or to the start of a completed tool-call batch (a call
+record that follows a result with every earlier call already answered), so a
+retained tool result is never separated from its call and a turn made only of
+unnarrated tool calls still has a cut point. A cut at or before the previous
+summary is treated as nothing to summarize (TUI and headless), so relief never
+re-summarizes only the previous summary. If a provider still rejects an ordinary headless request (`-p`, `--loop`
 or goal rounds) for exceeding its context limit, mini-agent records the progress the
 turn already made, compacts the session once and retries once (continuing the task
 when tools already ran). A second rejection, or a session with nothing older than the
@@ -1724,9 +1728,29 @@ kept recent history, surfaces the error, which points to `/compress` and
 `compact_enabled` recovery. Native Anthropic replay history cannot be compacted in
 place, so those turns surface the error directly.
 
+Per-front-end notes. The TUI and headless keep the most recent
+`keep_recent_tokens` verbatim, bound the stored summary by the window-scaled budget,
+re-attach file windows and may fork the conversation's own cached request; the TUI
+reports tokens freed net of the inserted summary. After a relief the continuation
+prompt tells the model that its earlier work is condensed in the
+"[Recap of my prior work in this conversation]" message above and that details
+missing from the recap must be re-read; it is host text, so `/undo`, session titles
+and later summaries do not treat it as the user's words. A session's derived title is
+remembered at its first compaction and survives later ones. The summarizer's output
+replaces the previous summary, and only the summarizer's own prose (not the appended
+file list, todo/goal blocks or restored windows) is handed back as the previous
+summary. A summary that used its whole output allowance ends with
+`[summary truncated by the output limit]`. ACP compacts at its own turn
+boundaries, compacts at most three times per non-native prompt, does not restore file
+windows and bounds the stored summary at 16 KiB; when the summarizer fails it evicts
+history only if the hard byte bound or the turn cap forces it, otherwise the prompt
+runs on the unchanged history. `PostCompact` and `SessionStart(compact)` fire only when
+a compaction record was committed; headless `PreCompact` fires once per compaction,
+before the first summarizer request of either path.
+
 Compaction is paid for like any other completion. The summarizer runs on the
-session's model, so the usage of every rolling request is summed and charged to
-the session's token and cost counters at the session model's prices, whether
+session's model (or on `compaction_model` when set, at that model's prices), so the usage of every rolling request is summed and charged to
+the session's token and cost counters, whether
 the compaction was automatic (between turns, mid-turn, or before a headless
 `-p` request) or a manual `/compress`. A headless `--output json` object
 includes the compaction that ran before its turn in `usage` and `cost`. When a

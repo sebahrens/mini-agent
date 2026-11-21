@@ -47,7 +47,9 @@ use crate::permission::ask::AskSender;
 use crate::permission::checker::PermCheck;
 use crate::provider::{AnyAgent, AnyClient};
 use crate::sandbox::Sandbox;
-use crate::session::{MessageRole, Session};
+#[cfg(test)]
+use crate::session::MessageRole;
+use crate::session::Session;
 use crate::ui::events::render_session;
 use crate::ui::input::InputEditor;
 use crate::ui::renderer::Renderer;
@@ -426,7 +428,7 @@ pub fn undo_last(session: &mut Session) -> usize {
     let Some(start) = session
         .messages
         .iter()
-        .rposition(|message| message.role == MessageRole::User)
+        .rposition(|message| message.is_user_authored())
     else {
         return 0;
     };
@@ -778,10 +780,21 @@ async fn handle_compress_unfloored(
             crate::ui::C_ERROR,
         )?,
     }
+    // Report what was freed, not the size of what was removed: the summary,
+    // restored file windows and todo/goal blocks were added back
+    // (mini-agent-sskdu.242).
+    let summary_tokens = ui
+        .session
+        .messages
+        .first()
+        .map_or(0, |m| m.estimated_tokens);
     renderer.write_line(
         &format!(
-            "compressed {} messages (saved ~{} tokens)",
-            first_kept_index, tokens_before,
+            "compressed {} messages (freed ~{} tokens net; removed ~{}, new summary ~{})",
+            first_kept_index,
+            tokens_before.saturating_sub(summary_tokens),
+            tokens_before,
+            summary_tokens,
         ),
         C_AGENT,
     )?;
@@ -830,8 +843,11 @@ pub(crate) fn plan_tui_compaction(
         return TuiCompactionGate::WithinBudget;
     }
     let projected = session.context_messages_with_pruned_tool_results(keep_recent_tool_results);
+    // A cut at or before the live start would only re-summarize the previous
+    // summary (mini-agent-sskdu.227).
+    let first_live = session.compacted_context().1;
     match Session::select_compaction_cut(&projected, keep_recent) {
-        0 => TuiCompactionGate::NothingToSummarize,
+        cut_idx if cut_idx <= first_live => TuiCompactionGate::NothingToSummarize,
         cut_idx => TuiCompactionGate::Cut(cut_idx),
     }
 }
@@ -919,10 +935,7 @@ where
         None => None,
     };
     let (skipped, messages) = session.compaction_input(cut_idx, keep_recent_tool_results);
-    let previous_summary = session
-        .compactions
-        .last()
-        .map(|compaction| compaction.summary.to_string());
+    let previous_summary = session.previous_summary_prose();
     let crate::provider::CompactionOutput {
         summary,
         summary_byte_budget,

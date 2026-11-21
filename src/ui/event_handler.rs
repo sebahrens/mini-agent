@@ -687,7 +687,12 @@ async fn handle_agent_done(
             .actionable_size_pressure(ui.cfg.resolve_compact_size_fraction()),
         loop_running,
     ) {
-        let compress_result = handle_compress(None, true, run, renderer, ui, true).await;
+        // Rebuild with the session's own reasoning setting, not a literal
+        // `true`, so `/reasoning off` survives an automatic compaction
+        // (mini-agent-sskdu.231).
+        let reasoning_enabled = ui.session.reasoning_enabled;
+        let compress_result =
+            handle_compress(None, reasoning_enabled, run, renderer, ui, true).await;
         if let Err(e) = compress_result {
             renderer.write_line(&format!("auto-compact error: {}", e), C_ERROR)?;
         }

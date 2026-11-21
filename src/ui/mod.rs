@@ -1822,18 +1822,9 @@ pub(crate) fn persist_session_if_settled(
     Ok(true)
 }
 
-/// Continuation prompt injected after a mid-turn compaction. Hardcoded as a
-/// `const` rather than a `prompts/*.md` file: every `.md` under `prompts/` is
-/// loaded as a selectable mode, so a file here would pollute the prompt picker.
-/// Acknowledging the compaction is deliberate — it frames the summary as "what
-/// I already did," not as new user instructions. The narrow-tool-calls line is
-/// always present because any mid-turn fire means the configured ceiling was
-/// hit, so the urgency always applies.
-const MID_TURN_CONTINUE_PROMPT: &str = "[Context was compacted to save space; \
-the full prior history is in the system summary above.]\n\nContinue with the \
-user's original task. Do not redo work already completed per the summary; focus \
-on what remains. Context was tight, so prefer narrower follow-up tool calls over \
-wide ones until pressure subsides.";
+/// Continuation prompt injected after a mid-turn compaction; shared with the
+/// headless and ACP paths (mini-agent-sskdu.186).
+const MID_TURN_CONTINUE_PROMPT: &str = crate::agent::runner::HEADLESS_CONTEXT_RELIEF_PROMPT;
 
 /// Mid-turn auto-compaction (PR H). Invoked when real provider prompt pressure
 /// (`CompletionCall` usage / context window) crosses
@@ -1907,13 +1898,8 @@ async fn compact_and_respawn(
     if !run.response_buf.trim().is_empty() {
         recap.push_str(run.response_buf.trim());
     }
-    if let Some(todo_context) = ui.session.todos.critical_context() {
-        if !recap.is_empty() {
-            recap.push('\n');
-        }
-        recap.push_str(&todo_context);
-        recap.push('\n');
-    }
+    // The open-todo block is not repeated here: compaction re-attaches it to
+    // the summary itself (mini-agent-sskdu.236).
     let recap = recap.trim();
     if !recap.is_empty() {
         ui.session.add_message(MessageRole::Assistant, recap);
@@ -1939,7 +1925,7 @@ async fn compact_and_respawn(
 
     // Measured provider pressure is authoritative even when the local
     // window-minus-reserve estimate is lower (mini-agent-p0h9g.3).
-    let compactions_before = ui.session.compactions.len();
+    let compactions_before = ui.session.compaction_count();
     crate::ui::slash::handle_compress_with_force(
         None,
         true,
@@ -1959,7 +1945,7 @@ async fn compact_and_respawn(
     })?;
     // No old prefix is a legitimate no-op, not a successful relief. Continue
     // this prompt without repeatedly stopping at the same irreducible batch.
-    run.mid_turn_compaction_disabled = ui.session.compactions.len() == compactions_before;
+    run.mid_turn_compaction_disabled = ui.session.compaction_count() == compactions_before;
 
     // 4. Respawn on the compacted history with the continuation prompt.
     ensure_agent(&mut run.agent, ui, slash.reasoning_enabled).await;

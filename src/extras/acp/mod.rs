@@ -503,7 +503,11 @@ impl SessionHistory {
                     Some(self.session.approx_persisted_bytes());
                 return Some(usage);
             }
-            let previous = self.session.compacted_context().0.map(str::to_owned);
+            let previous = self
+                .session
+                .compacted_context()
+                .0
+                .and_then(|_| self.session.previous_summary_prose());
             // Shared provider serialization describes attachments without putting
             // base64 into text; apply_compaction retains the original pixels.
             let messages = self.session.messages[self.live_start()..cut].to_vec();
@@ -514,8 +518,17 @@ impl SessionHistory {
             };
             let output = match result {
                 Ok(output) if output.messages_included > 0 => output,
-                _ => {
-                    self.emergency_compact();
+                failed => {
+                    match &failed {
+                        Err(error) => tracing::warn!(
+                            %error,
+                            "ACP summarizer failed; history compaction skipped"
+                        ),
+                        Ok(_) => tracing::warn!(
+                            "ACP summarizer included no messages; history compaction skipped"
+                        ),
+                    }
+                    self.fall_back_after_summary_failure();
                     return Some(usage);
                 }
             };
@@ -547,10 +560,23 @@ impl SessionHistory {
                 .max()
                 .or_else(|| (consumed == self.session.messages.len()).then_some(consumed));
             let Some(completed_cut) = completed_cut else {
-                self.emergency_compact();
+                self.fall_back_after_summary_failure();
                 return Some(usage);
             };
-            self.session.compress(output.summary, completed_cut, 0);
+            // Honour the summarizer's window-scaled byte budget instead of the
+            // fixed 16 KiB clamp, and record the tokens removed
+            // (mini-agent-sskdu.230, partial).
+            let removed: u64 = self.session.messages[..completed_cut]
+                .iter()
+                .map(|message| message.estimated_tokens)
+                .sum();
+            self.session.compress_with_budget_restoring(
+                output.summary,
+                completed_cut,
+                removed,
+                output.summary_byte_budget,
+                0,
+            );
             self.manual_compact = false;
             needs = self.needs_compaction();
         }
@@ -559,6 +585,17 @@ impl SessionHistory {
     #[cfg(feature = "memory")]
     fn active_compaction_ref(&self) -> Option<String> {
         self.session.active_compaction_ref().map(str::to_owned)
+    }
+    /// A failed summarizer evicts history only when a hard bound (the live
+    /// byte guard or the turn cap) leaves no other way to proceed; plain token
+    /// pressure keeps the transcript intact and lets the prompt run, since the
+    /// reactive path still covers a real overflow (mini-agent-sskdu.229).
+    fn fall_back_after_summary_failure(&mut self) {
+        if self.over_turn_cap() || self.exceeds_hard_bound() {
+            self.emergency_compact();
+        } else {
+            self.manual_compact = false;
+        }
     }
     fn emergency_compact(&mut self) {
         self.manual_compact = false;
@@ -4258,7 +4295,7 @@ async fn run_prompt(
     #[cfg(feature = "goal")]
     let mut carried_usage = rig::completion::Usage::default();
     let result = loop {
-        let compactions_at_segment_start = history.session.compactions.len();
+        let compactions_at_segment_start = history.session.compaction_count();
         let result = crate::startup::heap_future(|| {
             execute_prompt(
                 state,
@@ -4330,7 +4367,7 @@ async fn run_prompt(
             // saved), then let the next segment compact the saved transcript
             // and restart the thinking chain from it as a new epoch
             // (mini-agent-wkzav).
-            let compacted = history.session.compactions.len() > compactions_at_segment_start;
+            let compacted = history.session.compaction_count() > compactions_at_segment_start;
             if let Some(why) = native_relief_stop(reliefs, &progress, compacted) {
                 outcome.compaction_boundary = false;
                 outcome.error = Some(why);
@@ -5415,6 +5452,8 @@ async fn execute_prompt(
     let mut compaction_usage = crate::event::UsageDelta::default();
     if needs_compaction {
         #[cfg(feature = "hooks")]
+        let compactions_before = history.session.compaction_count();
+        #[cfg(feature = "hooks")]
         crate::startup::heap_future(|| crate::extras::hooks::dispatch_pre_compact(true, None))
             .await;
         let quick_models = crate::config::quick_models_map(&state.cfg);
@@ -5514,8 +5553,11 @@ async fn execute_prompt(
                 "retained historical image evidence exceeds the ACP history limit; start a fresh session or provide fewer/smaller images".into(),
             ));
         }
+        // `PostCompact` and `SessionStart(compact)` fire only when a
+        // `Compaction` record was committed, not when nothing was cut or the
+        // summarizer failed (mini-agent-sskdu.239).
         #[cfg(feature = "hooks")]
-        {
+        if history.session.compaction_count() > compactions_before {
             let summary = history.session.compacted_context().0.map(str::to_owned);
             crate::startup::heap_future(|| {
                 crate::extras::hooks::dispatch_post_compact(true, summary.as_deref())
@@ -7156,6 +7198,39 @@ mod history_tests {
                 ))]
             );
         }
+    }
+
+    /// mini-agent-sskdu.229: under token pressure alone a failing summarizer
+    /// leaves the transcript intact instead of evicting it.
+    #[tokio::test]
+    async fn failed_summary_under_token_pressure_keeps_history() {
+        let mut history = SessionHistory::default();
+        history.limits.token_pressure = Some(AcpTokenPressure {
+            window: 1_000,
+            reserve: 100,
+            keep_recent_tokens: 10,
+            keep_recent_tool_results: 4,
+        });
+        for i in 0..4 {
+            history.commit_completed_turn(
+                &format!("question {i} {}", "word ".repeat(400)),
+                vec![Message::assistant(format!("answer {i}"))],
+            );
+        }
+        assert!(history.over_token_pressure().is_some());
+        assert!(!history.over_turn_cap() && !history.exceeds_hard_bound());
+        let before = history.session.messages.len();
+        let result = history
+            .compact_with(
+                &TurnControl::new(),
+                #[cfg(feature = "goal")]
+                None,
+                |_, _| async move { anyhow::bail!("429 after retries") },
+            )
+            .await;
+        assert!(result.is_some());
+        assert_eq!(history.session.messages.len(), before);
+        assert_eq!(history.session.compaction_count(), 0);
     }
 
     /// mini-agent-p9oyv: the turn's memory block leaves out a daily-log copy
