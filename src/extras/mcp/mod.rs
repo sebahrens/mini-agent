@@ -614,9 +614,26 @@ impl McpClientManager {
     /// of control characters, and fenced so it cannot close its own block or
     /// claim system authority. Empty when no server sent any.
     pub(crate) fn instructions_section(&self) -> String {
+        self.instructions_section_filtered(None)
+    }
+
+    /// As [`Self::instructions_section`], limited to servers with at least
+    /// one tool in the final tool set (eager or deferred).
+    pub(crate) fn instructions_section_for(
+        &self,
+        admitted: &std::collections::BTreeSet<String>,
+    ) -> String {
+        self.instructions_section_filtered(Some(admitted))
+    }
+
+    fn instructions_section_filtered(
+        &self,
+        admitted: Option<&std::collections::BTreeSet<String>>,
+    ) -> String {
         let mut servers: Vec<(String, String)> = self
             .handles
             .iter()
+            .filter(|handle| admitted.is_none_or(|set| set.contains(handle.server_name.as_str())))
             .filter_map(|handle| {
                 let info = handle.peer().peer_info()?;
                 let text = info.instructions.as_deref()?;
@@ -776,6 +793,7 @@ impl McpClientManager {
                     let reached_tool_cap = tools.reached_tool_cap;
                     let mut truncated_descriptions = 0usize;
                     let mut rejected_schemas = 0usize;
+                    let mut flattened_schemas = 0usize;
                     let mut reduced_schemas = 0usize;
                     let mut replaced_schemas = 0usize;
                     for listed in &tools.entries {
@@ -785,6 +803,7 @@ impl McpClientManager {
                         };
                         match bounded.schema_fit {
                             tool::SchemaFit::Verbatim => {}
+                            tool::SchemaFit::Flattened => flattened_schemas += 1,
                             tool::SchemaFit::Reduced { .. } => reduced_schemas += 1,
                             tool::SchemaFit::Replaced { .. } => replaced_schemas += 1,
                         }
@@ -838,6 +857,11 @@ impl McpClientManager {
                             "; use enabled_tools/disabled_tools to select which tools to keep",
                         );
                         self.push_tool_notice(notice);
+                    }
+                    if flattened_schemas > 0 {
+                        self.push_tool_notice(format!(
+                            "MCP server '{server_name}' had {flattened_schemas} tool input schema(s) with a top-level oneOf/anyOf/allOf/not/enum or a non-object root; each is sent as a permissive object and the server validates arguments",
+                        ));
                     }
                     if reduced_schemas > 0 {
                         self.push_tool_notice(format!(

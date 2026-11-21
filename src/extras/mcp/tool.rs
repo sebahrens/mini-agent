@@ -77,12 +77,22 @@ impl McpTool {
             .len();
         let mut schema = serde_json::Value::Object((*definition.input_schema).clone());
         let mut schema_fit = SchemaFit::Verbatim;
+        // Providers reject a top-level combinator (or a non-object root) in a
+        // tool's input schema, and the rejection fails the whole request.
+        if flatten_top_level_combinators(&mut schema) {
+            schema_fit = SchemaFit::Flattened;
+            description.push_str(
+                "\n[input schema was a union; it is shown as one permissive object, pass the arguments the server documents]",
+            );
+        }
         if size > MCP_TOOL_SCHEMA_MAX_BYTES {
             // Keep the tool callable: first drop examples and comments, then
             // prose (descriptions, titles, defaults), and only as a last
             // resort accept any object, saying so in the description.
             strip_schema(&mut schema, StripLevel::Examples);
-            schema_fit = SchemaFit::Reduced { original: size };
+            if schema_fit == SchemaFit::Verbatim {
+                schema_fit = SchemaFit::Reduced { original: size };
+            }
             if serialized_len(&schema) > MCP_TOOL_SCHEMA_MAX_BYTES {
                 strip_schema(&mut schema, StripLevel::Prose);
             }
@@ -107,6 +117,9 @@ impl McpTool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SchemaFit {
     Verbatim,
+    /// A top-level `oneOf`/`anyOf`/`allOf`/`not`/`enum` (or a non-object
+    /// root) was folded into one permissive object schema.
+    Flattened,
     /// Examples (and, if needed, descriptions/titles/defaults) removed.
     Reduced {
         original: usize,
@@ -122,6 +135,50 @@ pub(super) struct FittedMetadata {
     pub(super) parameters: serde_json::Value,
     pub(super) description_truncated: bool,
     pub(super) schema_fit: SchemaFit,
+}
+
+/// Folds a root schema that is not a plain object schema into one permissive
+/// object: the union of every variant's properties, no `required`, extra
+/// properties allowed. Returns whether anything changed.
+fn flatten_top_level_combinators(schema: &mut serde_json::Value) -> bool {
+    const COMBINATORS: [&str; 5] = ["oneOf", "anyOf", "allOf", "not", "enum"];
+    let Some(root) = schema.as_object() else {
+        return false;
+    };
+    let plain_object = root.get("type").and_then(serde_json::Value::as_str) == Some("object");
+    if plain_object && !COMBINATORS.iter().any(|key| root.contains_key(*key)) {
+        return false;
+    }
+    let mut properties = serde_json::Map::new();
+    let mut collect = |source: &serde_json::Value| {
+        if let Some(found) = source
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+        {
+            for (name, value) in found {
+                properties
+                    .entry(name.clone())
+                    .or_insert_with(|| value.clone());
+            }
+        }
+    };
+    collect(schema);
+    for key in ["oneOf", "anyOf", "allOf"] {
+        if let Some(variants) = schema.get(key).and_then(serde_json::Value::as_array) {
+            variants.iter().for_each(&mut collect);
+        }
+    }
+    let mut flat = serde_json::Map::new();
+    flat.insert("type".into(), "object".into());
+    flat.insert("properties".into(), serde_json::Value::Object(properties));
+    flat.insert("additionalProperties".into(), true.into());
+    for key in ["$defs", "definitions"] {
+        if let Some(defs) = schema.get(key) {
+            flat.insert(key.into(), defs.clone());
+        }
+    }
+    *schema = serde_json::Value::Object(flat);
+    true
 }
 
 fn serialized_len(value: &serde_json::Value) -> usize {
@@ -860,6 +917,29 @@ mod tests {
         }))
         .unwrap();
         McpTool::bounded_model_metadata(&definition).unwrap()
+    }
+
+    #[test]
+    fn top_level_unions_become_one_permissive_object() {
+        let fitted = fit(serde_json::json!({
+            "oneOf": [
+                {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]},
+                {"type": "object", "properties": {"b": {"type": "integer"}}, "required": ["b"]}
+            ]
+        }));
+        assert_eq!(fitted.schema_fit, SchemaFit::Flattened);
+        assert_eq!(fitted.parameters["type"], "object");
+        assert!(fitted.parameters.get("oneOf").is_none());
+        assert!(fitted.parameters.get("required").is_none());
+        assert_eq!(fitted.parameters["properties"]["a"]["type"], "string");
+        assert_eq!(fitted.parameters["properties"]["b"]["type"], "integer");
+        assert!(fitted.description.contains("was a union"));
+        // A plain object schema is untouched.
+        let plain = fit(
+            serde_json::json!({"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]}),
+        );
+        assert_eq!(plain.schema_fit, SchemaFit::Verbatim);
+        assert_eq!(plain.parameters["required"][0], "q");
     }
 
     #[test]

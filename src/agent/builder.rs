@@ -1086,6 +1086,10 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         *diagnostic_lsp = lsp_manager.clone();
     }
 
+    // Servers with at least one admitted tool: only their instructions are
+    // sent to the model.
+    #[cfg(feature = "mcp")]
+    let mut admitted_mcp_servers = std::collections::BTreeSet::<String>::new();
     let all_tools = if !tools_enabled {
         #[cfg(feature = "mcp")]
         context.mcp_discovery.retire(tool_output_session_id);
@@ -1465,6 +1469,7 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
             let total = mcp_tools.len();
             let mut native_eager_fallback = false;
             for t in mcp_tools {
+                admitted_mcp_servers.insert(t.server_name.to_string());
                 let name = rig::tool::ToolDyn::name(&t);
                 let definition = rig::completion::ToolDefinition {
                     name: name.clone(),
@@ -1743,10 +1748,8 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
         );
     }
     #[cfg(feature = "mcp")]
-    if cli.tools.is_empty()
-        && let Some(manager) = mcp_manager
-    {
-        let section = manager.instructions_section();
+    if let Some(manager) = mcp_manager {
+        let section = manager.instructions_section_for(&admitted_mcp_servers);
         if !section.is_empty() {
             composition.text.push_str(&section);
             record_part(

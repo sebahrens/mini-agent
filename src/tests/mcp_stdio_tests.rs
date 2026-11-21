@@ -3257,6 +3257,16 @@ async fn mcp_server_initialize_instructions_reach_the_prompt_bounded_and_fenced(
             .unwrap();
         let manager = McpClientManager::from_handles(vec![handle]);
         sections.push(manager.instructions_section());
+        if mode == "aux-instructions" {
+            let admitted = std::collections::BTreeSet::from(["owned".to_string()]);
+            assert_eq!(manager.instructions_section_for(&admitted), sections[0]);
+            // A server none of whose tools is admitted sends no instructions.
+            assert!(
+                manager
+                    .instructions_section_for(&std::collections::BTreeSet::new())
+                    .is_empty()
+            );
+        }
         manager.shutdown().await;
     }
     fixture.cleanup();
