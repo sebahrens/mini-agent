@@ -607,9 +607,12 @@ async fn handle_compress_unfloored(
 
     // Announce only once we know compression will actually run.
     if auto {
-        renderer.write_line("auto-compacting...", crossterm::style::Color::DarkGrey)?;
+        renderer.write_line(
+            "auto-compacting... (Esc cancels)",
+            crossterm::style::Color::DarkGrey,
+        )?;
     } else {
-        renderer.write_line("compressing...", C_AGENT)?;
+        renderer.write_line("compressing... (Esc cancels)", C_AGENT)?;
     }
     renderer.write_line("", crossterm::style::Color::White)?;
 
@@ -659,7 +662,11 @@ async fn handle_compress_unfloored(
     let restore_read_tokens = ui
         .cfg
         .resolve_compact_restore_read_tokens(ui.session.context_window);
-    let compacted = compact_session_with_restoring(
+    // The input thread consumes Esc/Ctrl-C while this is registered, so a slow
+    // or stalled summarizer can be abandoned; history is only touched after the
+    // summary arrives, so a cancelled compaction leaves it intact.
+    let cancel = crate::ui::CompactionCancel::begin();
+    let compaction = compact_session_with_restoring(
         ui.session,
         cut_idx,
         summarizer_input_budget,
@@ -721,8 +728,15 @@ async fn handle_compress_unfloored(
             #[cfg(not(feature = "memory"))]
             let _ = (summary, first_kept_index);
         },
-    )
-    .await;
+    );
+    let compacted = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(anyhow::anyhow!(
+            "compaction cancelled; the history is unchanged"
+        )),
+        result = compaction => result,
+    };
+    drop(cancel);
     let (first_kept_index, tokens_before, usage) = match compacted {
         Ok(compacted) => compacted,
         Err(error) => {
@@ -788,13 +802,23 @@ async fn handle_compress_unfloored(
         .messages
         .first()
         .map_or(0, |m| m.estimated_tokens);
+    let kept = if ui.cli.no_session {
+        String::new()
+    } else {
+        crate::session::storage::precompact_path(&ui.session.id, ui.session.compaction_count())
+            .map_or_else(
+                |_| String::new(),
+                |path| format!("; the replaced transcript is kept at {}", path.display()),
+            )
+    };
     renderer.write_line(
         &format!(
-            "compressed {} messages (freed ~{} tokens net; removed ~{}, new summary ~{})",
+            "compressed {} messages (freed ~{} tokens net; removed ~{}, new summary ~{}){}",
             first_kept_index,
             tokens_before.saturating_sub(summary_tokens),
             tokens_before,
             summary_tokens,
+            kept,
         ),
         C_AGENT,
     )?;

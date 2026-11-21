@@ -169,7 +169,10 @@ pub(super) async fn announce(
         None => Vec::new(),
     };
     let mut commands = vec![
-        AvailableCommand::new("compact", "Summarize the completed session context (`/compact show` prints the active summary)"),
+        AvailableCommand::new(
+            "compact",
+            "Summarize the completed session context (`/compact show` prints the active summary)",
+        ),
         AvailableCommand::new(
             "undo",
             "Remove the last conversation turn; files and billed usage remain",

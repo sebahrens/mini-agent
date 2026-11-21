@@ -1115,6 +1115,56 @@ pub(crate) fn append_stdin_reference(prompt: &str, stdin: &str) -> String {
     combined
 }
 
+/// Compactions this headless run performed: (count, records summarized,
+/// tokens freed net of the summary), reported once on the next final result
+/// so scripts can tell a run was lossy (mini-agent-sskdu.243).
+#[cfg(not(test))]
+static HEADLESS_COMPACTIONS: std::sync::Mutex<(u64, u64, u64)> = std::sync::Mutex::new((0, 0, 0));
+// Tests run in parallel in one process: keep each test's counters to its own
+// thread so a compaction in one cannot leak a field into another's output.
+#[cfg(test)]
+thread_local! {
+    static HEADLESS_COMPACTIONS_TEST: std::cell::Cell<(u64, u64, u64)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+pub(crate) fn record_headless_compaction(messages: usize, tokens_freed: u64) {
+    #[cfg(not(test))]
+    {
+        let mut totals = HEADLESS_COMPACTIONS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        totals.0 += 1;
+        totals.1 = totals.1.saturating_add(messages as u64);
+        totals.2 = totals.2.saturating_add(tokens_freed);
+    }
+    #[cfg(test)]
+    HEADLESS_COMPACTIONS_TEST.with(|totals| {
+        let (count, seen, freed) = totals.get();
+        totals.set((
+            count + 1,
+            seen.saturating_add(messages as u64),
+            freed.saturating_add(tokens_freed),
+        ));
+    });
+}
+
+/// The `compactions` object for a final result, resetting the counters; `None`
+/// when nothing was compacted so existing output is unchanged.
+fn take_headless_compactions() -> Option<serde_json::Value> {
+    #[cfg(not(test))]
+    let (count, messages, tokens_freed) = std::mem::take(
+        &mut *HEADLESS_COMPACTIONS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    #[cfg(test)]
+    let (count, messages, tokens_freed) = HEADLESS_COMPACTIONS_TEST.with(|totals| totals.take());
+    (count > 0).then(
+        || serde_json::json!({"count": count, "messages": messages, "tokens_freed": tokens_freed}),
+    )
+}
+
 /// Final records alone may claim durable session identity.
 pub(crate) async fn emit_headless_result(
     rendered: &str,
@@ -1128,6 +1178,9 @@ pub(crate) async fn emit_headless_result(
     value["session_name"] = session.map_or(serde_json::Value::Null, |(_, name)| name.into());
     value["session_persisted"] = persisted.into();
     value["duration_ms"] = take_run_duration_ms().into();
+    if let Some(compactions) = take_headless_compactions() {
+        value["compactions"] = compactions;
+    }
     if format == cli::OutputFormat::StreamJson {
         value["type"] = "result".into();
         if claude_schema() {
@@ -3521,6 +3574,19 @@ fn system_instruction_entries(cli: &cli::Cli) -> Vec<(&'static str, String)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compactions_are_reported_once_and_only_when_they_happened() {
+        // mini-agent-sskdu.243
+        assert!(super::take_headless_compactions().is_none());
+        super::record_headless_compaction(5, 100);
+        super::record_headless_compaction(2, 30);
+        let value = super::take_headless_compactions().unwrap();
+        assert_eq!(value["count"], 2);
+        assert_eq!(value["messages"], 7);
+        assert_eq!(value["tokens_freed"], 130);
+        assert!(super::take_headless_compactions().is_none());
+    }
+
     use super::{Path, normalize_tool_path};
 
     #[test]

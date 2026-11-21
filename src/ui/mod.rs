@@ -686,6 +686,61 @@ pub(crate) fn spawn_event_thread(
     spawn_event_thread_with_events(user_tx, running, VecDeque::new())
 }
 
+/// The compaction currently awaiting its summarizer, if any. The input thread
+/// consumes an Esc or Ctrl-C while one is registered and wakes it, since the
+/// event loop is busy awaiting the compaction and cannot read input itself
+/// (mini-agent-sskdu.232).
+static ACTIVE_COMPACTION: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>> =
+    std::sync::Mutex::new(None);
+
+/// Registration of a cancellable compaction; deregisters on drop.
+pub(crate) struct CompactionCancel(Arc<tokio::sync::Notify>);
+
+impl CompactionCancel {
+    pub(crate) fn begin() -> Self {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        *ACTIVE_COMPACTION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(notify.clone());
+        Self(notify)
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        self.0.notified().await;
+    }
+}
+
+impl Drop for CompactionCancel {
+    fn drop(&mut self) {
+        *ACTIVE_COMPACTION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
+/// Whether `key` cancels a running compaction.
+fn is_compaction_cancel_key(key: &crossterm::event::KeyEvent) -> bool {
+    key.code == KeyCode::Esc
+        || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+/// Wake the registered compaction for a cancel key; true when one consumed it.
+fn cancel_active_compaction(key: &crossterm::event::KeyEvent) -> bool {
+    if !is_compaction_cancel_key(key) {
+        return false;
+    }
+    let active = ACTIVE_COMPACTION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match active.as_ref() {
+        Some(notify) => {
+            notify.notify_one();
+            true
+        }
+        None => false,
+    }
+}
+
 pub(crate) fn spawn_event_thread_with_events(
     user_tx: mpsc::Sender<UserEvent>,
     running: Arc<AtomicBool>,
@@ -734,6 +789,9 @@ pub(crate) fn spawn_event_thread_with_events(
             match next_event {
                 Ok(event::Event::Key(key)) => {
                     if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
+                    if cancel_active_compaction(&key) {
                         continue;
                     }
                     // A paste-newline key (bare Enter, or Ctrl+J — a raw
@@ -2662,5 +2720,41 @@ mod main_start_budget_carry_tests {
             assert!(std::sync::Arc::ptr_eq(&carry, &run.budget_carry));
             run.budget_carry = std::sync::Arc::clone(&previous);
         }
+    }
+}
+
+#[cfg(test)]
+mod compaction_cancel_tests {
+    use super::*;
+
+    #[test]
+    fn only_esc_and_ctrl_c_cancel_a_compaction() {
+        // mini-agent-sskdu.232
+        let key = |code, modifiers| crossterm::event::KeyEvent::new(code, modifiers);
+        assert!(is_compaction_cancel_key(&key(
+            KeyCode::Esc,
+            KeyModifiers::NONE
+        )));
+        assert!(is_compaction_cancel_key(&key(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(!is_compaction_cancel_key(&key(
+            KeyCode::Char('c'),
+            KeyModifiers::NONE
+        )));
+        assert!(!is_compaction_cancel_key(&key(
+            KeyCode::Enter,
+            KeyModifiers::NONE
+        )));
+    }
+
+    #[tokio::test]
+    async fn a_registered_compaction_is_woken() {
+        let cancel = CompactionCancel::begin();
+        cancel.0.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), cancel.cancelled())
+            .await
+            .expect("a notified compaction wakes");
     }
 }

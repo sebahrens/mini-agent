@@ -1200,6 +1200,11 @@ pub struct Session {
     history_conversion_cache: HistoryConversionCache,
     #[serde(skip)]
     pub(crate) save_notice_state: storage::SaveNoticeState,
+    /// The transcript prefix the latest compaction replaced, with that
+    /// compaction's number, until the next save writes it to a sidecar file
+    /// (mini-agent-sskdu.244). Process-local; never serialized.
+    #[serde(skip)]
+    pub(crate) pending_precompact: Option<(usize, Vec<SessionMessage>)>,
     #[serde(skip)]
     history_revision: u64,
 }
@@ -1663,6 +1668,7 @@ impl Session {
             environment: None,
             history_conversion_cache: HistoryConversionCache::default(),
             save_notice_state: storage::SaveNoticeState::default(),
+            pending_precompact: None,
             history_revision: 0,
         }
     }
@@ -2954,6 +2960,20 @@ impl Session {
         cut_idx
     }
 
+    /// Whether cutting before `messages[idx]` (or at the end) never separates a
+    /// tool call from its result and lands on a record a compaction may start
+    /// the kept tail with.
+    #[cfg(feature = "acp")]
+    pub(crate) fn is_legal_cut(messages: &[SessionMessage], idx: usize) -> bool {
+        if idx == 0 || idx >= messages.len() {
+            return idx == messages.len();
+        }
+        matches!(
+            messages[idx].role,
+            MessageRole::User | MessageRole::Assistant
+        ) || Self::completed_batch_starts(&messages[..=idx])[idx]
+    }
+
     /// For each index of `messages`, whether it is a `ToolCall` record that
     /// starts a new batch: its predecessor is a `ToolResult` and every earlier
     /// call already has its result, so cutting before it never separates a
@@ -3217,6 +3237,13 @@ impl Session {
                     )
                 });
         }
+
+        // Keep the replaced transcript for the sidecar the next save writes:
+        // compaction is otherwise irreversible (mini-agent-sskdu.244).
+        self.pending_precompact = Some((
+            self.compaction_count() + 1,
+            self.messages[..first_kept_index.min(self.messages.len())].to_vec(),
+        ));
 
         // Remove summarized messages and insert summary
         self.messages.drain(..first_kept_index);

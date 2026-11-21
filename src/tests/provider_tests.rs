@@ -1766,6 +1766,15 @@ fn compaction_contract_says_output_replaces_the_previous_summary() {
 }
 
 #[test]
+fn a_summary_cut_off_at_the_output_limit_says_so() {
+    // mini-agent-sskdu.233: rig's `output_truncated()` is the stop reason.
+    let capped = crate::provider::mark_cut_off_summary("## Task\nlong".into(), true);
+    assert!(capped.ends_with(crate::provider::SUMMARY_TRUNCATED_MARKER));
+    let whole = crate::provider::mark_cut_off_summary("## Task\nok".into(), false);
+    assert_eq!(whole, "## Task\nok");
+}
+
+#[test]
 fn fork_instruction_does_not_refer_to_fences_it_lacks_or_repeat_the_suffix() {
     // mini-agent-sskdu.241
     let text = crate::provider::fork_instruction(None);

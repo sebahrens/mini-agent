@@ -1076,14 +1076,15 @@ async fn compact_headless_session(
     if let Some(compacted) = &compacted {
         // The auto-compacting line announced the work; say what it did so a
         // script log shows the run was compacted (mini-agent-sskdu.243).
+        let freed = session
+            .compactions
+            .last()
+            .map_or(0, |compaction| compaction.token_savings);
         eprintln!(
-            "compacted {} messages into a summary (freed ~{} tokens net)",
+            "compacted {} messages into a summary (freed ~{freed} tokens net)",
             compacted.first_kept_index,
-            session
-                .compactions
-                .last()
-                .map_or(0, |compaction| compaction.token_savings),
         );
+        crate::print::record_headless_compaction(compacted.first_kept_index, freed);
     }
     Ok((
         compacted

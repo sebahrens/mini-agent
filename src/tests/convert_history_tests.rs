@@ -667,7 +667,11 @@ fn recap_renders_live_todos_not_a_frozen_snapshot() {
             .collect::<String>()
     };
     assert!(text(&session).contains("ship the parser fix"));
-    assert!(!session.compactions[0].summary.contains("ship the parser fix"));
+    assert!(
+        !session.compactions[0]
+            .summary
+            .contains("ship the parser fix")
+    );
     session.todos.replace(Vec::new());
     assert!(!text(&session).contains("ship the parser fix"));
 }
@@ -683,8 +687,7 @@ fn fork_prefix_recaps_only_the_summary_prose() {
     session.add_message(MessageRole::User, "next");
     session.compress("MODEL PROSE".into(), 4, 0);
     assert!(session.compactions[0].summary.len() > "MODEL PROSE".len());
-    let prefix =
-        crate::agent::runner::convert_history_prefix(&session, session.messages.len(), 4);
+    let prefix = crate::agent::runner::convert_history_prefix(&session, session.messages.len(), 4);
     let Message::Assistant { content, .. } = &prefix[0] else {
         panic!("recap");
     };
@@ -697,6 +700,9 @@ fn fork_prefix_recaps_only_the_summary_prose() {
         .collect();
     assert_eq!(
         text,
-        format!("{}\nMODEL PROSE", crate::agent::runner::COMPACTION_RECAP_LABEL)
+        format!(
+            "{}\nMODEL PROSE",
+            crate::agent::runner::COMPACTION_RECAP_LABEL
+        )
     );
 }
