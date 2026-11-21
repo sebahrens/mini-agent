@@ -2038,10 +2038,17 @@ pub struct ModelEntry {
     pub cache_write_price: Option<f64>,
 }
 
+/// `ModelEntry::kind` suffix for a listed model that advertises its supported
+/// parameters without `tools`, so an agent cannot use it.
+pub(crate) const NO_TOOLS_KIND: &str = "no-tools";
+
 /// Chat/completion model suitable as an agent (not embedding/image/audio/etc.)?
 pub fn is_agent_model(m: &ModelEntry) -> bool {
     if let Some(t) = m.kind.as_deref() {
         let t = t.to_lowercase();
+        if t.contains(NO_TOOLS_KIND) {
+            return false;
+        }
         // A typed text-output listing outranks id substrings (OpenRouter
         // `architecture.output_modalities`).
         if t == "text" {
@@ -6036,6 +6043,7 @@ pub fn check_client_credentials(
         .with_config_keys(config_api_keys)
         .with_custom_provider_name(Some(provider_name))
         .with_credential_isolation(config.credential_isolation)
+        .with_local_base_url(config.base_url.as_deref())
         .resolve_credential_with_env(get_env)?;
     Ok(())
 }
@@ -6144,7 +6152,8 @@ where
         .with_env_override(config.api_key_env.as_deref())
         .with_config_keys(config_api_keys)
         .with_custom_provider_name(Some(provider_name))
-        .with_credential_isolation(config.credential_isolation);
+        .with_credential_isolation(config.credential_isolation)
+        .with_local_base_url(base_url.as_deref());
     let credential = resolver.resolve_credential_with_env(&get_env)?;
     let key = credential.secret();
 

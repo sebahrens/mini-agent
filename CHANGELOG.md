@@ -17,6 +17,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Skills run with `/<name> args` now substitute `$ARGUMENTS`, `$ARGUMENTS[N]`, `$N` and `${CLAUDE_SKILL_DIR}`, rewrite ``!`cmd` `` spans into shell-tool instructions (`skills_shell_placeholders`), and honour `context: fork` with `agent:` by delegating the body to one `task` child (mini-agent-h7wxv).
 - Skill frontmatter `model` (forked skills; the `task` tool takes a per-call `model` limited to configured `[quick_models]` aliases and never overrides a persona-pinned model) and `paths` (automatic selection only when the request names a matching file); `effort` and `hooks` now report a reason (mini-agent-h7wxv).
 - `install.sh --uninstall` removes the binary and its `share/doc/mini-agent` directory (mini-agent-nvnkx.356).
+- ChatGPT sign-in accepts a pasted `http://127.0.0.1:PORT/auth/callback?...` address on stdin (`--login openai`), a fixed `MINI_AGENT_LOGIN_PORT` for SSH forwarding, and waits 10 minutes instead of 3 (mini-agent-nvnkx.201).
+- `/logout openai all` and `--logout openai --login-account all|N` revoke and clear every (or one numbered) ChatGPT registration under one lock; plain logout reports how many others stay signed in (mini-agent-nvnkx.206).
+- A custom provider on a loopback `base_url` (LM Studio, llama.cpp, vLLM) needs no API key and sends no `Authorization` header; `api_keys.<name> = "none"` declares any other route keyless; CONFIG.md gains a local-server recipe (mini-agent-nvnkx.41).
+- Bedrock resolves its region from the selected AWS profile in `~/.aws/config` when `AWS_REGION`/`AWS_DEFAULT_REGION` are unset (mini-agent-nvnkx.313).
 
 ### Fixed
 
@@ -120,6 +124,13 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Exact-URL `web_fetch`/`web_search`/`fetch` allow and ask rules match the bare URL of a live fetch (mini-agent-nvnkx.66).
 - The destructive-command recognizer (yolo ask) knows cmd.exe and PowerShell forms such as `del /s /q`, `rd /s /q`, `Remove-Item -Recurse -Force`, and strips `cmd /c`, `call`, `start` and `powershell -Command` wrappers (mini-agent-nvnkx.362).
 - `guarded` auto-allows scripts proven read-only and withholds the built-in `cargo fmt/build/test/check/clippy` allows; `readonly` and `planwrite` allow proven read-only scripts when the sandbox is enforced (mini-agent-nvnkx.64).
+- A provider `401` on a ChatGPT or Copilot login drops the cached token, acquires a fresh one and resends once instead of replaying the rejected token until its local expiry (mini-agent-nvnkx.198).
+- A network error or 5xx while renewing a ChatGPT/Copilot token is typed transient, retried like a model-request error, and no longer says to sign in again; only a refused grant keeps the re-login hint (mini-agent-nvnkx.199).
+- Building a ChatGPT/Copilot client, `/login` status and provider switches read the credential record without the lock instead of failing "busy" while another instance refreshes (mini-agent-nvnkx.200).
+- Copilot and ChatGPT errors for a model the plan or organization does not enable (`model_not_supported`, `model_not_found`, `unsupported_api_for_model`) or a content filter get authored sentences instead of the generic account text (mini-agent-nvnkx.205).
+- A refused Copilot token exchange (HTTP 401/403/404) explains that the endpoint is limited to approved integrations and names the token fallbacks; live verification against github.com is still pending (mini-agent-nvnkx.207).
+- Bedrock credential-chain failures say which class failed (no credentials, timeout, provider error) and an expired SSO session names `aws sso login --profile` (mini-agent-nvnkx.314).
+- A 404 or 400 that says the model or its endpoints cannot call tools, an OpenRouter data-policy 404 and a wrong-path 404 no longer tell you to run /models, HTTP 402 is treated as exhausted credit, and OpenRouter models whose `supported_parameters` lack `tools` are hidden from the agent model list (mini-agent-nvnkx.42).
 
 ### Added
 

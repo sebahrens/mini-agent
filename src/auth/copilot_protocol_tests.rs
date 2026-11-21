@@ -488,3 +488,108 @@ async fn copilot_valid_model_token_is_served_without_reopening_the_locked_store(
     assert!(registration.auth_context().await.is_err());
     assert_eq!(STORE_OPENS.with(std::cell::Cell::get), 2);
 }
+
+#[tokio::test]
+async fn copilot199_transient_exchange_failures_are_retryable_and_refusals_are_not() {
+    // Refused connection: transient, retryable, and no re-login advice.
+    let (listener, profile) = fixture().await;
+    drop(listener);
+    let error = model_token(&profile, "PRIVATE_GITHUB").await.err().unwrap();
+    let failure = super::super::AuthFailure::of(&error).expect("typed failure");
+    assert_eq!(failure.kind, super::super::AuthFailureKind::Transient);
+    assert!(!error.to_string().contains("/login"), "{error}");
+    let boxed: Box<dyn std::error::Error + Send + Sync> = error.into();
+    let wrapped = rig::http_client::Error::Instance(boxed);
+    assert!(crate::retry::is_retryable(&wrapped));
+
+    // HTTP 502 from the token endpoint: transient too.
+    let (listener, profile) = fixture().await;
+    let server = async {
+        let (socket, _, _) = request(&listener).await;
+        answer(socket, 502, json!({})).await;
+    };
+    let (_, error) = tokio::join!(server, model_token(&profile, "PRIVATE_GITHUB"));
+    let error = error.err().unwrap();
+    assert!(error.to_string().contains("temporarily unavailable"));
+    assert!(crate::retry::is_retryable(
+        &rig::http_client::Error::Instance(error.into())
+    ));
+
+    // 403/404: a refusal that explains itself and is never retried.
+    for status in [403u16, 404] {
+        let (listener, profile) = fixture().await;
+        let server = async {
+            let (socket, _, _) = request(&listener).await;
+            answer(socket, status, json!({"message":"PRIVATE_BODY"})).await;
+        };
+        let (_, error) = tokio::join!(server, model_token(&profile, "PRIVATE_GITHUB"));
+        let error = error.err().unwrap();
+        let text = error.to_string();
+        assert!(text.contains("approved editor integrations"), "{text}");
+        assert!(!text.contains("PRIVATE_BODY") && !text.contains("PRIVATE_GITHUB"));
+        let wrapped = rig::http_client::Error::Instance(error.into());
+        assert!(!crate::retry::is_retryable(&wrapped));
+    }
+}
+
+#[test]
+fn copilot200_selection_and_status_do_not_wait_for_the_credential_lock() {
+    let temp = crate::tests::OwnedTestDirectory::new("copilot200-lock");
+    let credentials = temp.path().join("credentials");
+    let directory = credentials.join("copilot").join("github.com");
+    let profile = profile();
+    let mut held = LockedStore::open(directory.clone(), true).unwrap().unwrap();
+    held.data = Some(store(profile.clone()));
+    held.save().unwrap();
+    // `held` keeps session.lock for the whole test: a refresh in flight.
+    assert!(LockedStore::open(directory.clone(), false).is_err());
+    let registration = selected_for_profile_at(&credentials, &profile)
+        .unwrap()
+        .expect("selected without the lock");
+    assert_eq!(registration.directory, directory);
+    // `status_at` reads the host from the environment; the lock-free reader it
+    // uses is the same one exercised here.
+    let data = read_store(&credentials, "github.com").unwrap().unwrap();
+    assert_eq!(data.login, "owned-user");
+    drop(held);
+}
+
+#[tokio::test]
+async fn copilot198_invalidate_clears_the_model_token_so_the_next_context_exchanges_again() {
+    let temp = crate::tests::OwnedTestDirectory::new("copilot198-invalidate");
+    let directory = temp.path().join("credentials");
+    let (listener, profile) = fixture().await;
+    let registration = registration(directory.clone(), profile, false);
+    let mut next = model();
+    let server = async {
+        let (socket, _, _) = request(&listener).await;
+        answer(socket, 200, model()).await;
+        next["token"] = json!("RENEWED_MODEL_TOKEN");
+        let (socket, _, _) = request(&listener).await;
+        answer(socket, 200, next.clone()).await;
+    };
+    let task = async {
+        assert_eq!(
+            registration.auth_context().await.unwrap().api_key,
+            "OWNED_MODEL_TOKEN"
+        );
+        // A 401 from the provider: the cached and stored model token go.
+        registration.invalidate().await.unwrap();
+        assert!(
+            LockedStore::open(directory.clone(), false)
+                .unwrap()
+                .unwrap()
+                .data
+                .unwrap()
+                .model
+                .is_none()
+        );
+        assert_eq!(
+            registration.auth_context().await.unwrap().api_key,
+            "RENEWED_MODEL_TOKEN"
+        );
+    };
+    tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(server, task) })
+        .await
+        .unwrap();
+}

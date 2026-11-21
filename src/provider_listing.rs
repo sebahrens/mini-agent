@@ -383,6 +383,15 @@ fn decode(protocol: Protocol, value: &Value) -> anyhow::Result<Option<ModelEntry
                 });
             }
         }
+        // A listing that advertises `supported_parameters` without `tools`
+        // names a model that cannot call tools; `is_agent_model` hides it
+        // (mini-agent-nvnkx.42).
+        if let Some(parameters) = value.get("supported_parameters").and_then(Value::as_array)
+            && !parameters.iter().any(|p| p.as_str() == Some("tools"))
+        {
+            let base = model.kind.take().unwrap_or_else(|| "text".into());
+            model.kind = Some(format!("{base},{}", crate::provider::NO_TOOLS_KIND));
+        }
     }
     Ok(Some(model))
 }
@@ -390,6 +399,28 @@ fn decode(protocol: Protocol, value: &Value) -> anyhow::Result<Option<ModelEntry
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn openrouter_supported_parameters_without_tools_hide_the_model_from_agents() {
+        let tools = decode(
+            Protocol::OpenRouter,
+            &serde_json::json!({"id":"vendor/a","supported_parameters":["tools","temperature"]}),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(crate::provider::is_agent_model(&tools));
+        let plain = decode(
+            Protocol::OpenRouter,
+            &serde_json::json!({"id":"vendor/b","architecture":{"output_modalities":["text"]},"supported_parameters":["temperature"]}),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!crate::provider::is_agent_model(&plain));
+        let unknown = decode(Protocol::OpenRouter, &serde_json::json!({"id":"vendor/c"}))
+            .unwrap()
+            .unwrap();
+        assert!(crate::provider::is_agent_model(&unknown));
+    }
+
     #[test]
     fn model_listing48_decoder_and_pagination_preserve_exact_native_metadata() {
         let anthropic = decode(Protocol::Anthropic,&serde_json::json!({"id":"claude-opus-5-5","display_name":"Opus 雪","max_input_tokens":200000,"max_tokens":64000})).unwrap().unwrap();

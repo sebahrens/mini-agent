@@ -23,9 +23,24 @@ pub(crate) fn region<F>(env: &F) -> anyhow::Result<String>
 where
     F: Fn(&str) -> Result<String, std::env::VarError>,
 {
-    let region = env("AWS_REGION")
-        .or_else(|_| env("AWS_DEFAULT_REGION"))
-        .map_err(|_| anyhow::anyhow!("Bedrock requires AWS_REGION or AWS_DEFAULT_REGION"))?;
+    let region = match env("AWS_REGION")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| env("AWS_DEFAULT_REGION").ok().filter(|v| !v.is_empty()))
+    {
+        Some(region) => region,
+        None => {
+            let profile = env("AWS_PROFILE")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "default".into());
+            profile_region(env, &profile).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Bedrock needs a region: set AWS_REGION (or AWS_DEFAULT_REGION), or set `region` in the `{profile}` profile of the AWS config file"
+                )
+            })?
+        }
+    };
     anyhow::ensure!(
         !region.is_empty()
             && region.len() <= 64
@@ -35,6 +50,70 @@ where
         "invalid Bedrock region"
     );
     Ok(region)
+}
+
+/// `region` of `profile` in the AWS config file (`AWS_CONFIG_FILE` or
+/// `~/.aws/config`), read the way the AWS CLI selects it: `[default]` or
+/// `[profile NAME]`. Only that one key is read; the file is bounded.
+fn profile_region<F>(env: &F, profile: &str) -> Option<String>
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    const LIMIT: u64 = 1024 * 1024;
+    let path = match env("AWS_CONFIG_FILE").ok().filter(|p| !p.is_empty()) {
+        Some(path) => match path.strip_prefix("~/") {
+            Some(rest) => std::path::Path::new(&home(env)?).join(rest),
+            None => std::path::PathBuf::from(path),
+        },
+        None => std::path::Path::new(&home(env)?)
+            .join(".aws")
+            .join("config"),
+    };
+    use std::io::Read as _;
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(LIMIT)
+        .read_to_string(&mut text)
+        .ok()?;
+    let mut inside = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.starts_with(';') || line.is_empty() {
+            continue;
+        }
+        if let Some(header) = line.strip_prefix('[').and_then(|l| l.split(']').next()) {
+            let header = header.trim();
+            inside = header == profile
+                || header.strip_prefix("profile").is_some_and(|name| {
+                    name.starts_with(char::is_whitespace) && name.trim() == profile
+                });
+            // `[default]` is only the `default` profile; a bare `[name]` section
+            // matches only `default` in the CLI, but is accepted for default alone.
+            if header == profile && profile != "default" {
+                inside = false;
+            }
+            continue;
+        }
+        if inside
+            && let Some((key, value)) = line.split_once('=')
+            && key.trim() == "region"
+        {
+            let value = value.trim();
+            return (!value.is_empty()).then(|| value.to_owned());
+        }
+    }
+    None
+}
+
+fn home<F>(env: &F) -> Option<String>
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    env("HOME")
+        .or_else(|_| env("USERPROFILE"))
+        .ok()
+        .filter(|value| !value.is_empty())
 }
 
 pub(crate) fn endpoint(endpoint: Option<&str>, region: &str) -> anyhow::Result<String> {
@@ -63,8 +142,53 @@ pub(crate) fn endpoint(endpoint: Option<&str>, region: &str) -> anyhow::Result<S
     Ok(url.to_string().trim_end_matches('/').to_owned())
 }
 
-fn auth_error(message: &'static str) -> http_client::Error {
-    http_client::Error::Instance(Box::new(std::io::Error::other(message)))
+fn auth_error(message: impl Into<String>) -> http_client::Error {
+    http_client::Error::Instance(Box::new(std::io::Error::other(message.into())))
+}
+
+/// A secret-free, actionable sentence for a failed AWS credential chain. Only
+/// the failure class is shown (never the SDK's text), plus the profile name
+/// for an expired SSO session (mini-agent-nvnkx.314).
+fn credentials_failure(
+    error: &aws_credential_types::provider::error::CredentialsError,
+    profile: Option<&str>,
+) -> String {
+    use aws_credential_types::provider::error::CredentialsError as E;
+    const TAIL: &str = "configure AWS credentials or supply a Bedrock API key";
+    let sso = {
+        let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error);
+        let mut found = false;
+        for _ in 0..16 {
+            let Some(current) = cause else { break };
+            let text = current.to_string().to_ascii_lowercase();
+            if text.contains("sso")
+                && (text.contains("expired") || text.contains("token") || text.contains("login"))
+            {
+                found = true;
+                break;
+            }
+            cause = current.source();
+        }
+        found
+    };
+    if sso {
+        return match profile {
+            Some(profile) => {
+                format!("AWS SSO session expired: run `aws sso login --profile {profile}`")
+            }
+            None => "AWS SSO session expired: run `aws sso login`".into(),
+        };
+    }
+    let class = match error {
+        E::CredentialsNotLoaded(_) => "no credentials found",
+        E::ProviderTimedOut(_) => "the credential provider timed out",
+        E::InvalidConfiguration(_) => "the AWS profile configuration is invalid",
+        E::ProviderError(_) => {
+            "the credential provider failed (assume-role denied or endpoint unreachable?)"
+        }
+        _ => "credential acquisition failed",
+    };
+    format!("AWS credential chain failed: {class}; {TAIL}")
 }
 
 /// Request-scoped auth never mutates model input, tools, system, or stream data.
@@ -145,19 +269,34 @@ impl BedrockAuth {
         }
         let credentials = tokio::time::timeout(AUTH_TIMEOUT, async {
             self.check_profiles().await?;
-            let sdk = self.sdk.get_or_init(|| async {
-                let connector = CredentialsHttp(self.credentials_http.clone(), AUTH_TIMEOUT);
-                aws_config::defaults(aws_config::BehaviorVersion::latest())
-                    .region(aws_config::Region::new(self.region.clone()))
-                    .http_client(http_client_fn(move |settings, _| {
-                        let bound = settings.connect_timeout().unwrap_or(AUTH_TIMEOUT).min(settings.read_timeout().unwrap_or(AUTH_TIMEOUT)).min(AUTH_TIMEOUT);
-                        SharedHttpConnector::new(CredentialsHttp(connector.0.clone(), bound))
-                    }))
-                    .load().await
-            }).await;
-            let provider = sdk.credentials_provider().ok_or_else(|| auth_error("AWS credential provider unavailable"))?;
-            provider.provide_credentials().await.map_err(|_| auth_error("AWS credential chain failed; configure AWS credentials or supply a Bedrock API key"))
-        }).await.map_err(|_| auth_error("AWS credential acquisition timed out"))??;
+            let sdk = self
+                .sdk
+                .get_or_init(|| async {
+                    let connector = CredentialsHttp(self.credentials_http.clone(), AUTH_TIMEOUT);
+                    aws_config::defaults(aws_config::BehaviorVersion::latest())
+                        .region(aws_config::Region::new(self.region.clone()))
+                        .http_client(http_client_fn(move |settings, _| {
+                            let bound = settings
+                                .connect_timeout()
+                                .unwrap_or(AUTH_TIMEOUT)
+                                .min(settings.read_timeout().unwrap_or(AUTH_TIMEOUT))
+                                .min(AUTH_TIMEOUT);
+                            SharedHttpConnector::new(CredentialsHttp(connector.0.clone(), bound))
+                        }))
+                        .load()
+                        .await
+                })
+                .await;
+            let provider = sdk
+                .credentials_provider()
+                .ok_or_else(|| auth_error("AWS credential provider unavailable"))?;
+            provider.provide_credentials().await.map_err(|error| {
+                let profile = std::env::var("AWS_PROFILE").ok().filter(|p| !p.is_empty());
+                auth_error(credentials_failure(&error, profile.as_deref()))
+            })
+        })
+        .await
+        .map_err(|_| auth_error("AWS credential acquisition timed out"))??;
         if credentials
             .expiry()
             .is_some_and(|expiry| expiry <= SystemTime::now())

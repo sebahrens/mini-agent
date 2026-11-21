@@ -393,12 +393,46 @@ pub(crate) fn diagnostic_state_at(credentials_dir: &std::path::Path) -> super::L
     inspect().unwrap_or(LoginRecordState::Unavailable)
 }
 
-pub(crate) fn selected() -> anyhow::Result<Option<Registration>> {
-    let root = root()?;
-    let Some(store) = LockedStore::open(root.clone(), false)? else {
+/// The stored record read without the credential lock. Every save is an atomic
+/// replace, so a reader sees either the old or the new record, never a torn
+/// one; client builds, `/login` status and provider switches therefore do not
+/// fail "busy" while another process holds the lock across a token refresh
+/// (mini-agent-nvnkx.200). `None` when no record exists.
+fn read_store_unlocked(credentials_dir: &std::path::Path) -> anyhow::Result<Option<Store>> {
+    let Some(bytes) = super::diagnostic_record_at(
+        credentials_dir,
+        &["provider-oauth", "openai.json"],
+        MAX_BYTES,
+    )?
+    else {
         return Ok(None);
     };
-    Ok(store.data.active.as_ref().map(|id| Registration {
+    let store: Store = serde_json::from_slice(&bytes)
+        .map_err(|_| anyhow::anyhow!("Invalid provider credential record"))?;
+    store.validate()?;
+    Ok(Some(store))
+}
+fn credentials_dir() -> anyhow::Result<PathBuf> {
+    Ok(crate::paths::process_paths_ref()?.credentials_dir.clone())
+}
+
+pub(crate) fn selected() -> anyhow::Result<Option<Registration>> {
+    selected_at(&credentials_dir()?)
+}
+fn selected_at(credentials_dir: &std::path::Path) -> anyhow::Result<Option<Registration>> {
+    let root = credentials_dir.join("provider-oauth");
+    let data = match read_store_unlocked(credentials_dir) {
+        Ok(Some(data)) => data,
+        Ok(None) => return Ok(None),
+        // An unreadable record is reported by the repairing, locking path.
+        Err(_) => {
+            let Some(store) = LockedStore::open(root.clone(), false)? else {
+                return Ok(None);
+            };
+            store.data
+        }
+    };
+    Ok(data.active.as_ref().map(|id| Registration {
         root,
         client_id: id.clone(),
         #[cfg(test)]
@@ -406,32 +440,43 @@ pub(crate) fn selected() -> anyhow::Result<Option<Registration>> {
     }))
 }
 pub(crate) fn status() -> anyhow::Result<Vec<String>> {
-    let Some(store) = LockedStore::open(root()?, false)? else {
-        return Ok(vec!["ChatGPT: not signed in".into()]);
+    status_at(&credentials_dir()?)
+}
+fn status_at(credentials_dir: &std::path::Path) -> anyhow::Result<Vec<String>> {
+    let data = match read_store_unlocked(credentials_dir) {
+        Ok(Some(data)) => data,
+        Ok(None) => return Ok(vec!["ChatGPT: not signed in".into()]),
+        Err(_) => {
+            let Some(store) = LockedStore::open(credentials_dir.join("provider-oauth"), false)?
+            else {
+                return Ok(vec!["ChatGPT: not signed in".into()]);
+            };
+            store.data
+        }
     };
     let mut lines =
         vec!["ChatGPT registrations (use /login openai <number> to reauthorize):".into()];
-    for (i, a) in store.data.accounts.iter().enumerate() {
+    for (i, a) in data.accounts.iter().enumerate() {
         let label = a.email.as_deref().unwrap_or("account");
         lines.push(format!(
             "  {}: {} {} ({})",
             i + 1,
             crate::ui::events::sanitize_output(label),
-            if store.data.active.as_deref() == Some(&a.client_id) {
+            if data.active.as_deref() == Some(&a.client_id) {
                 "[active]"
             } else {
                 ""
             },
             if a.tokens.is_some() {
                 "signed in"
-            } else if store.data.active.as_deref() == Some(&a.client_id) {
+            } else if data.active.as_deref() == Some(&a.client_id) {
                 "sign-in required"
             } else {
                 "signed out"
             }
         ));
     }
-    if store.data.accounts.is_empty() {
+    if data.accounts.is_empty() {
         lines.push("ChatGPT: not signed in".into());
     }
     Ok(lines)
@@ -468,10 +513,35 @@ fn json_response<T: serde::de::DeserializeOwned>(
         {
             return Err(ReauthorizationRequired.into());
         }
+        if matches!(status.as_u16(), 408 | 425 | 429 | 500..=599) {
+            return Err(super::AuthFailure::transient(
+                format!(
+                    "ChatGPT sign-in service temporarily unavailable (HTTP {})",
+                    status.as_u16()
+                ),
+                Some(status.as_u16()),
+            )
+            .into());
+        }
         anyhow::bail!("Provider authentication HTTP status {}", status.as_u16());
     }
     serde_json::from_slice(&bytes)
         .map_err(|_| anyhow::anyhow!("Invalid provider authentication response"))
+}
+/// A refused connection, DNS failure or timeout while renewing is the
+/// network's problem, not a revoked grant: it is retryable and does not tell
+/// the user to sign in again (mini-agent-nvnkx.199).
+fn refresh_transport_failure(error: &reqwest::Error) -> anyhow::Error {
+    let what = if error.is_timeout() {
+        "timed out"
+    } else {
+        "could not be reached"
+    };
+    super::AuthFailure::transient(
+        format!("ChatGPT sign-in service {what}; temporarily unavailable, try again"),
+        None,
+    )
+    .into()
 }
 fn verify_id(
     token: &str,
@@ -687,6 +757,59 @@ impl Registration {
             valid_until: expires.saturating_sub(60),
         });
     }
+    /// The provider rejected the token this registration last served (HTTP
+    /// 401): drop the in-memory entry and mark the stored token expired under
+    /// the credential lock, so the next acquisition renews it instead of
+    /// replaying a token the provider no longer accepts, until the local
+    /// clock catches up (mini-agent-nvnkx.198).
+    pub(crate) async fn invalidate(&self) -> anyhow::Result<()> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(35);
+        loop {
+            let registration = self.clone();
+            let result = crate::agent::runner::spawn_blocking_scoped(move || {
+                registration.invalidate_blocking()
+            })
+            .await
+            .context("Provider refresh worker failed")?;
+            match result {
+                Err(error) if error.is::<CredentialBusy>() => {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    ensure!(
+                        !remaining.is_zero(),
+                        "Provider credential refresh lock wait timed out"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20).min(remaining)).await;
+                }
+                result => return result,
+            }
+        }
+    }
+    fn invalidate_blocking(&self) -> anyhow::Result<()> {
+        ACCESS_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|entry| !(entry.root == self.root && entry.client_id == self.client_id));
+        let Some(mut store) = LockedStore::open(self.root.clone(), false)? else {
+            return Ok(());
+        };
+        if store.data.active.as_deref() != Some(self.client_id.as_str()) {
+            return Ok(());
+        }
+        let Some(tokens) = store
+            .data
+            .accounts
+            .iter_mut()
+            .find(|a| a.client_id == self.client_id)
+            .and_then(|a| a.tokens.as_mut())
+        else {
+            return Ok(());
+        };
+        if tokens.expires != 0 {
+            tokens.expires = 0;
+            store.save()?;
+        }
+        Ok(())
+    }
     fn access_token_blocking(&self) -> anyhow::Result<String> {
         if let Some(access) = self.cached_access() {
             return Ok(access);
@@ -721,9 +844,7 @@ impl Registration {
                     ("resource", RESOURCE),
                 ])
                 .send()
-                .map_err(|_| {
-                    anyhow::anyhow!("ChatGPT refresh failed; sign in again if access was revoked")
-                })?,
+                .map_err(|error| refresh_transport_failure(&error))?,
         );
         let response = match response {
             Ok(response) => response,
@@ -743,7 +864,7 @@ impl Registration {
             let keys: Jwks = json_response(
                 http.get(&endpoints.jwks)
                     .send()
-                    .map_err(|_| anyhow::anyhow!("Provider signing keys unavailable"))?,
+                    .map_err(|error| refresh_transport_failure(&error))?,
             )?;
             accept_tokens(
                 response,
@@ -782,6 +903,46 @@ impl Registration {
         }
         AuthEndpoints::default()
     }
+}
+
+/// How long a sign-in waits for the browser redirect (or a pasted address).
+const LOGIN_WAIT: Duration = Duration::from_secs(600);
+
+/// A fixed loopback port from `MINI_AGENT_LOGIN_PORT`, so an SSH/container
+/// session can forward it before signing in (mini-agent-nvnkx.201).
+fn login_port() -> anyhow::Result<Option<u16>> {
+    match std::env::var("MINI_AGENT_LOGIN_PORT") {
+        Ok(value) if !value.trim().is_empty() => value
+            .trim()
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port >= 1024)
+            .map(Some)
+            .context("MINI_AGENT_LOGIN_PORT must be a port from 1024 to 65535"),
+        _ => Ok(None),
+    }
+}
+
+/// Lines typed on stdin, for pasting the redirected address back when the
+/// browser runs on another machine. A detached thread: a read that never
+/// returns must not keep the process alive after sign-in finishes.
+pub(crate) fn stdin_lines() -> tokio::sync::mpsc::UnboundedReceiver<String> {
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match std::io::stdin().read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    if sender.send(line.trim().to_owned()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    receiver
 }
 
 pub(crate) struct Login {
@@ -872,9 +1033,19 @@ impl Login {
         })
         .await
         .context("Provider credential worker failed")??;
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
-            .context("OAuth loopback listener unavailable")?;
+        let fixed_port = login_port()?;
+        let listener = tokio::net::TcpListener::bind((
+            std::net::Ipv4Addr::LOCALHOST,
+            fixed_port.unwrap_or(0),
+        ))
+        .await
+        .with_context(|| {
+            if fixed_port.is_some() {
+                "OAuth loopback port from MINI_AGENT_LOGIN_PORT is unavailable; choose another port"
+            } else {
+                "OAuth loopback listener unavailable"
+            }
+        })?;
         let redirect = format!(
             "http://127.0.0.1:{}/auth/callback",
             listener.local_addr()?.port()
@@ -927,13 +1098,45 @@ impl Login {
             endpoints: None,
         })
     }
+    #[cfg(test)]
     pub(crate) async fn complete(self) -> anyhow::Result<()> {
+        self.complete_with_paste(&mut None).await
+    }
+    /// Waits for the loopback redirect and, when `paste` is given, also for a
+    /// pasted `http://127.0.0.1:PORT/auth/callback?...` address. Both go
+    /// through the same `callback` validation (state, client, code).
+    pub(crate) async fn complete_with_paste(
+        self,
+        paste: &mut Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+    ) -> anyhow::Result<()> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let endpoints = self.endpoints();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+        let deadline = tokio::time::Instant::now() + LOGIN_WAIT;
         let (code, client) = loop {
             let (mut stream, peer) = tokio::select! { biased;
                 _ = tokio::signal::ctrl_c() => return Err(anyhow::anyhow!("Sign-in cancelled")),
+                line = async {
+                    match paste.as_mut() {
+                        Some(lines) => lines.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let Some(line) = line else {
+                        *paste = None;
+                        continue;
+                    };
+                    if line.is_empty() {
+                        continue;
+                    }
+                    match self.callback_from_paste(&line) {
+                        Ok(Some(value)) => break value,
+                        Ok(None) => anyhow::bail!("Sign-in declined; current credentials were not changed"),
+                        Err(error) => {
+                            eprintln!("That address was not accepted ({error}); paste the full address from the failed redirect, or finish in the browser.");
+                            continue;
+                        }
+                    }
+                }
                 result = tokio::time::timeout_at(deadline, self.listener.accept()) => result.context("Sign-in timed out")??,
             };
             if !peer.ip().is_loopback() {
@@ -1013,6 +1216,23 @@ impl Login {
         .await
         .context("Provider credential worker failed")?
     }
+    /// The callback validation applied to a pasted redirect address. The
+    /// pasted port is ignored: only path, state, client and code count.
+    fn callback_from_paste(&self, line: &str) -> anyhow::Result<Option<(String, String)>> {
+        ensure!(line.len() <= 8192, "Pasted address is too long");
+        let url = reqwest::Url::parse(line.trim()).map_err(|_| {
+            anyhow::anyhow!("not a http://127.0.0.1:PORT/auth/callback?... address")
+        })?;
+        ensure!(
+            url.scheme() == "http" && matches!(url.host_str(), Some("127.0.0.1" | "localhost")),
+            "not a http://127.0.0.1:PORT/auth/callback?... address"
+        );
+        let query = url.query().context("the address has no query")?;
+        self.callback(&format!(
+            "GET {}?{query} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            url.path()
+        ))
+    }
     fn callback(&self, request: &str) -> anyhow::Result<Option<(String, String)>> {
         let mut words = request
             .lines()
@@ -1074,44 +1294,142 @@ impl Login {
     }
 }
 
-pub(crate) async fn logout() -> anyhow::Result<String> {
-    crate::agent::runner::spawn_blocking_scoped(|| logout_at(root()?, REVOKE))
+/// Which registrations a logout clears.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LogoutScope {
+    /// The active registration (the default).
+    Active,
+    /// Every signed-in registration (`/logout openai all`).
+    All,
+    /// The numbered registration listed by `/login` status (1-based).
+    Number(usize),
+}
+impl LogoutScope {
+    fn parse(value: Option<&str>) -> anyhow::Result<Self> {
+        match value {
+            None => Ok(Self::Active),
+            Some(v) if v.eq_ignore_ascii_case("all") => Ok(Self::All),
+            Some(v) => v
+                .parse::<usize>()
+                .ok()
+                .filter(|n| *n > 0)
+                .map(Self::Number)
+                .context("Use all or a positive ChatGPT account number"),
+        }
+    }
+}
+
+/// Sign out of ChatGPT: the active account, `all` of them, or one by number.
+pub(crate) async fn logout(scope: Option<&str>) -> anyhow::Result<String> {
+    let scope = LogoutScope::parse(scope)?;
+    crate::agent::runner::spawn_blocking_scoped(move || logout_scoped(root()?, REVOKE, scope))
         .await
         .context("Provider credential worker failed")?
 }
+#[cfg(test)]
 fn logout_at(root: PathBuf, revoke: &str) -> anyhow::Result<String> {
+    logout_scoped(root, revoke, LogoutScope::Active)
+}
+/// Revokes one refresh token; true only when the service confirmed it.
+fn revoke_refresh_token(revoke: &str, refresh: &str, client_id: &str) -> bool {
+    http()
+        .and_then(|http| {
+            http.post(revoke)
+                .form(&[
+                    ("token", refresh),
+                    ("token_type_hint", "refresh_token"),
+                    ("client_id", client_id),
+                ])
+                .send()
+                .map_err(Into::into)
+        })
+        .is_ok_and(|r| r.status().as_u16() == 200)
+}
+fn logout_scoped(root: PathBuf, revoke: &str, scope: LogoutScope) -> anyhow::Result<String> {
     let Some(mut store) = LockedStore::open(root, false)? else {
         return Ok("ChatGPT: not signed in".into());
     };
-    let Some(id) = store.data.active.take() else {
-        return Ok("ChatGPT: not signed in".into());
+    let active = store.data.active.clone();
+    let targets: Vec<String> = match scope {
+        LogoutScope::Active => match store.data.active.take() {
+            Some(id) => vec![id],
+            None => return Ok("ChatGPT: not signed in".into()),
+        },
+        LogoutScope::All => {
+            store.data.active = None;
+            store
+                .data
+                .accounts
+                .iter()
+                .filter(|a| a.tokens.is_some())
+                .map(|a| a.client_id.clone())
+                .collect()
+        }
+        LogoutScope::Number(n) => {
+            let account = store
+                .data
+                .accounts
+                .get(n - 1)
+                .context("Unknown ChatGPT account number")?;
+            let id = account.client_id.clone();
+            if active.as_deref() == Some(id.as_str()) {
+                store.data.active = None;
+            }
+            vec![id]
+        }
     };
-    let account = store
+    let (mut revoked, mut local_only) = (0usize, 0usize);
+    for id in &targets {
+        let account = store
+            .data
+            .accounts
+            .iter_mut()
+            .find(|a| a.client_id == *id)
+            .context("Provider registration unavailable")?;
+        let Some(token) = account.tokens.take() else {
+            continue;
+        };
+        if revoke_refresh_token(revoke, &token.refresh, id) {
+            revoked += 1;
+        } else {
+            local_only += 1;
+        }
+    }
+    store.save()?;
+    let remaining = store
         .data
         .accounts
-        .iter_mut()
-        .find(|a| a.client_id == id)
-        .context("Provider registration unavailable")?;
-    let token = account.tokens.take();
-    let revoked = token.as_ref().is_some_and(|t| {
-        http()
-            .and_then(|http| {
-                http.post(revoke)
-                    .form(&[
-                        ("token", t.refresh.as_str()),
-                        ("token_type_hint", "refresh_token"),
-                        ("client_id", id.as_str()),
-                    ])
-                    .send()
-                    .map_err(Into::into)
-            })
-            .is_ok_and(|r| r.status().as_u16() == 200)
-    });
-    store.save()?;
-    Ok(if revoked { "Signed out of ChatGPT; renewable session revoked" } else { "Signed out locally; remote revocation was not confirmed. Disconnect mini-agent in ChatGPT Settings if needed" }.into())
+        .iter()
+        .filter(|a| a.tokens.is_some())
+        .count();
+    let mut message = match (scope, revoked, local_only) {
+        (LogoutScope::Active | LogoutScope::Number(_), 1, 0) => {
+            "Signed out of ChatGPT; renewable session revoked".to_owned()
+        }
+        (LogoutScope::Active | LogoutScope::Number(_), 0, _) => {
+            "Signed out locally; remote revocation was not confirmed. Disconnect mini-agent in ChatGPT Settings if needed".to_owned()
+        }
+        (_, 0, 0) => "ChatGPT: no signed-in accounts".to_owned(),
+        _ => format!(
+            "Signed out of {} ChatGPT account(s): {revoked} revoked remotely, {local_only} cleared locally only (disconnect mini-agent in ChatGPT Settings to be sure)",
+            revoked + local_only
+        ),
+    };
+    if remaining > 0 {
+        message.push_str(&format!(
+            "\n{remaining} other ChatGPT account(s) remain signed in; run /logout openai all (or --logout openai --login-account all) to sign them all out"
+        ));
+    }
+    Ok(message)
 }
 
-pub(crate) async fn sign_in(provider: &str, account: Option<&str>) -> anyhow::Result<()> {
+/// `paste` also accepts the redirected address typed on stdin (the one-shot
+/// `--login` path; the TUI owns stdin, so `/login` passes false).
+pub(crate) async fn sign_in(
+    provider: &str,
+    account: Option<&str>,
+    paste: bool,
+) -> anyhow::Result<()> {
     ensure!(
         provider.eq_ignore_ascii_case("openai"),
         "{}",
@@ -1135,6 +1453,7 @@ pub(crate) async fn sign_in(provider: &str, account: Option<&str>) -> anyhow::Re
         .transpose()?;
     let scope = crate::agent::runner::AgentWorkScope::new();
     let cleanup = crate::agent::runner::AgentRunCleanupGuard::auxiliary(scope.clone());
+    let mut lines = paste.then(stdin_lines);
     let result = scope
         .run(async {
             let mut retry = None;
@@ -1143,13 +1462,18 @@ pub(crate) async fn sign_in(provider: &str, account: Option<&str>) -> anyhow::Re
                     Login::begin_with_retry(account, Some(retry)).await?
                 } else { Login::begin(account).await? };
                 println!(
-                    "Continue with ChatGPT in your browser (Ctrl-C cancels while waiting).\n{}",
+                    "Continue with ChatGPT in your browser (Ctrl-C cancels while waiting up to 10 minutes).\n{}",
                     login.display_url()?
                 );
+                if paste {
+                    println!(
+                        "Browser on another machine (SSH, container)? Open the URL there; when the redirect to 127.0.0.1 fails, paste that full address here and press Enter. Or forward a fixed port and set MINI_AGENT_LOGIN_PORT before signing in."
+                    );
+                }
                 if crate::ui::renderer::open_url(login.url()).await.is_err() {
                     println!("Open the URL above in your system browser.");
                 }
-                match login.complete().await {
+                match login.complete_with_paste(&mut lines).await {
                     Err(error) if attempt == 0 && error.is::<CodeRetry>() => {
                         retry = Some(error.downcast::<CodeRetry>()?);
                         println!("Authorization code expired; reopening the same registration with a fresh code.");

@@ -336,20 +336,51 @@ pub(crate) fn diagnostic_state_at(
     inspect().unwrap_or(LoginRecordState::Unavailable)
 }
 
-pub(crate) fn selected() -> anyhow::Result<Option<Registration>> {
-    let host = std::env::var("COPILOT_GITHUB_HOST")
-        .unwrap_or_else(|_| "github.com".into())
-        .to_ascii_lowercase();
-    selected_for_profile(&Profile::for_host(&host)?)
-}
-pub(crate) fn selected_for_profile(profile: &Profile) -> anyhow::Result<Option<Registration>> {
-    profile.validate()?;
-    let host = &profile.host;
-    let directory = root()?.join(host);
-    let Some(store) = LockedStore::open(directory.clone(), false)? else {
+/// The stored record read without the credential lock (saves are atomic
+/// replaces), so building a client or reading status never fails "busy"
+/// while another process renews its token (mini-agent-nvnkx.200).
+fn read_store_unlocked(
+    credentials_dir: &std::path::Path,
+    host: &str,
+) -> anyhow::Result<Option<Store>> {
+    let Some(bytes) = super::diagnostic_record_at(
+        credentials_dir,
+        &["copilot", host, "session.json"],
+        MAX_BYTES,
+    )?
+    else {
         return Ok(None);
     };
-    let Some(data) = store.data.filter(|d| d.tokens.is_some()) else {
+    let data: Store = serde_json::from_slice(&bytes)
+        .map_err(|_| anyhow::anyhow!("Invalid Copilot credential record"))?;
+    data.validate()?;
+    Ok(Some(data))
+}
+/// The record for `host`: lock-free, falling back to the repairing locked
+/// open when the lock-free read cannot trust the directory.
+fn read_store(credentials_dir: &std::path::Path, host: &str) -> anyhow::Result<Option<Store>> {
+    match read_store_unlocked(credentials_dir, host) {
+        Ok(data) => Ok(data),
+        Err(_) => Ok(
+            LockedStore::open(credentials_dir.join("copilot").join(host), false)?
+                .and_then(|store| store.data),
+        ),
+    }
+}
+pub(crate) fn selected_for_profile(profile: &Profile) -> anyhow::Result<Option<Registration>> {
+    selected_for_profile_at(&credentials_dir()?, profile)
+}
+fn credentials_dir() -> anyhow::Result<PathBuf> {
+    Ok(crate::paths::process_paths_ref()?.credentials_dir.clone())
+}
+fn selected_for_profile_at(
+    credentials_dir: &std::path::Path,
+    profile: &Profile,
+) -> anyhow::Result<Option<Registration>> {
+    profile.validate()?;
+    let host = &profile.host;
+    let directory = credentials_dir.join("copilot").join(host);
+    let Some(data) = read_store(credentials_dir, host)?.filter(|d| d.tokens.is_some()) else {
         return Ok(None);
     };
     ensure!(
@@ -382,17 +413,26 @@ fn http() -> anyhow::Result<reqwest::Client> {
 async fn json_response(request: reqwest::RequestBuilder) -> anyhow::Result<serde_json::Value> {
     tokio::time::timeout(REQUEST_TIMEOUT, async {
         let mut response = request.send().await.map_err(|error| {
-            if error.is_timeout() {
-                anyhow::anyhow!("Copilot authorization request timed out")
-            } else {
-                anyhow::anyhow!("Copilot authorization HTTP failed")
-            }
+            super::AuthFailure::transient(
+                if error.is_timeout() {
+                    "Copilot authorization request timed out; temporarily unavailable, try again"
+                } else {
+                    "Copilot authorization service could not be reached; temporarily unavailable, try again"
+                },
+                None,
+            )
         })?;
         let response_code = response.status().as_u16();
-        ensure!(
-            (200..300).contains(&response_code),
-            "Copilot authorization HTTP status {response_code}"
-        );
+        if !(200..300).contains(&response_code) {
+            let text = if matches!(response_code, 408 | 425 | 429 | 500..=599) {
+                format!(
+                    "Copilot authorization service temporarily unavailable (HTTP {response_code})"
+                )
+            } else {
+                format!("Copilot authorization HTTP status {response_code}")
+            };
+            return Err(super::AuthFailure::for_status(text, response_code).into());
+        }
         ensure!(
             response
                 .content_length()
@@ -415,7 +455,12 @@ async fn json_response(request: reqwest::RequestBuilder) -> anyhow::Result<serde
             .map_err(|_| anyhow::anyhow!("Invalid Copilot authorization response"))
     })
     .await
-    .map_err(|_| anyhow::anyhow!("Copilot authorization request timed out"))?
+    .map_err(|_| {
+        super::AuthFailure::transient(
+            "Copilot authorization request timed out; temporarily unavailable, try again",
+            None,
+        )
+    })?
 }
 #[derive(Deserialize)]
 struct TokenResponse {
@@ -454,6 +499,21 @@ fn tokens(value: serde_json::Value) -> anyhow::Result<GitHubTokens> {
         verified: false,
     })
 }
+/// What a refused Copilot token exchange most likely means, from the status
+/// GitHub answered with (mini-agent-nvnkx.207). Only a fixed sentence is shown.
+fn refused_exchange(error: anyhow::Error) -> anyhow::Error {
+    let status = super::AuthFailure::of(&error).and_then(|failure| failure.status);
+    let text = match status {
+        Some(401) => {
+            "GitHub rejected the Copilot token request (HTTP 401): the sign-in token is invalid or revoked; run /login copilot again"
+        }
+        Some(403 | 404) => {
+            "GitHub refused to issue a Copilot token for this OAuth app (HTTP 403/404). The Copilot token endpoint is only open to GitHub-approved editor integrations and to accounts with an active Copilot subscription; an arbitrary OAuth app may not be allowed. Use a Copilot-enabled account, or set GITHUB_COPILOT_API_TOKEN / COPILOT_GITHUB_TOKEN instead (see docs/agent/PROVIDERS.md)"
+        }
+        _ => return error,
+    };
+    super::AuthFailure::reauthorize(text, status).into()
+}
 async fn model_token(profile: &Profile, access: &str) -> anyhow::Result<ModelToken> {
     let value = json_response(
         http()?
@@ -469,7 +529,8 @@ async fn model_token(profile: &Profile, access: &str) -> anyhow::Result<ModelTok
                 concat!("mini-agent/", env!("CARGO_PKG_VERSION")),
             ),
     )
-    .await?;
+    .await
+    .map_err(refused_exchange)?;
     let token = value
         .get("token")
         .and_then(|v| v.as_str())
@@ -525,6 +586,35 @@ impl Registration {
         tokio::time::timeout(REQUEST_TIMEOUT, self.auth_context_inner())
             .await
             .map_err(|_| anyhow::anyhow!("Copilot credential acquisition timed out"))?
+    }
+    /// The provider answered 401: evict the cached model token and clear the
+    /// stored one under the credential lock, so the next acquisition exchanges
+    /// the GitHub token for a fresh one (mini-agent-nvnkx.198).
+    pub(crate) async fn invalidate(&self) -> anyhow::Result<()> {
+        CONTEXT_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|entry| {
+                !(entry.directory == self.directory && entry.generation == self.generation)
+            });
+        let mut store = loop {
+            match LockedStore::open(self.directory.clone(), false) {
+                Ok(Some(store)) => break store,
+                Ok(None) => return Ok(()),
+                Err(error) if error.is::<CredentialsBusy>() => {
+                    tokio::time::sleep(Duration::from_millis(20)).await
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        if let Some(data) = store.data.as_mut()
+            && data.generation == self.generation
+            && data.model.is_some()
+        {
+            data.model = None;
+            store.save()?;
+        }
+        Ok(())
     }
     fn cached_context(&self) -> Option<rig::providers::copilot::AuthContext> {
         let (fingerprint, context, valid_until) = {
@@ -850,12 +940,17 @@ pub(crate) async fn sign_in() -> anyhow::Result<()> {
     }
 }
 pub(crate) fn status() -> anyhow::Result<Vec<String>> {
-    let Some(registration) = selected()? else {
+    status_at(&credentials_dir()?)
+}
+fn status_at(credentials_dir: &std::path::Path) -> anyhow::Result<Vec<String>> {
+    let host = std::env::var("COPILOT_GITHUB_HOST")
+        .unwrap_or_else(|_| "github.com".into())
+        .to_ascii_lowercase();
+    let profile = Profile::for_host(&host)?;
+    let Some(data) = read_store(credentials_dir, &profile.host)?.filter(|d| d.tokens.is_some())
+    else {
         return Ok(vec!["Copilot: signed out".into()]);
     };
-    let store = LockedStore::open(registration.directory, false)?
-        .context("Copilot registration unavailable")?;
-    let data = store.data.context("Copilot registration unavailable")?;
     Ok(vec![format!(
         "Copilot: signed in as {} on {}",
         data.login, data.profile.host
@@ -883,6 +978,12 @@ pub(crate) async fn logout() -> anyhow::Result<String> {
 
 #[derive(Default)]
 pub(crate) struct ExternalTokenCache(Option<ModelToken>);
+impl ExternalTokenCache {
+    /// Forget the cached model token (the provider answered 401).
+    pub(crate) fn invalidate(&mut self) {
+        self.0 = None;
+    }
+}
 pub(crate) async fn external_context(
     profile: &Profile,
     access: &str,

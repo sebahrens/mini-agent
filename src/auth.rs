@@ -44,6 +44,56 @@ impl FileFingerprint {
     }
 }
 
+/// Why a ChatGPT/Copilot credential acquisition failed, so retry logic and the
+/// user-facing text can tell a flaky network from a revoked grant
+/// (mini-agent-nvnkx.199). A store problem carries no `AuthFailure` (local).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AuthFailureKind {
+    /// Connect/timeout/5xx/429 while talking to the token service: retryable
+    /// and never a reason to tell the user to sign in again.
+    Transient,
+    /// The grant was refused (`invalid_grant`, 401/403, ...): sign in again.
+    Reauthorize,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub(crate) struct AuthFailure {
+    pub kind: AuthFailureKind,
+    pub message: String,
+    /// The HTTP status of the token service, when there was one.
+    pub status: Option<u16>,
+}
+
+impl AuthFailure {
+    pub(crate) fn transient(message: impl Into<String>, status: Option<u16>) -> Self {
+        Self {
+            kind: AuthFailureKind::Transient,
+            message: message.into(),
+            status,
+        }
+    }
+    pub(crate) fn reauthorize(message: impl Into<String>, status: Option<u16>) -> Self {
+        Self {
+            kind: AuthFailureKind::Reauthorize,
+            message: message.into(),
+            status,
+        }
+    }
+    /// 408/425/429 and 5xx are the service's problem, not the account's.
+    pub(crate) fn for_status(message: impl Into<String>, code: u16) -> Self {
+        if matches!(code, 408 | 425 | 429) || (500..=599).contains(&code) {
+            Self::transient(message, Some(code))
+        } else {
+            Self::reauthorize(message, Some(code))
+        }
+    }
+    /// The failure inside `error`, if it is (or wraps) one.
+    pub(crate) fn of(error: &anyhow::Error) -> Option<&Self> {
+        error.downcast_ref::<Self>()
+    }
+}
+
 /// Local, read-only presence metadata. This never grants request authority or
 /// claims that an account is valid with the remote provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,6 +257,45 @@ mod diagnostic_source_tests {
     }
 
     #[test]
+    fn loopback_custom_provider_needs_no_key_but_remote_still_errors() {
+        let none = |_: &str| Err(VarError::NotPresent);
+        let local = AuthResolver::new(ProviderKind::OpenAI)
+            .with_custom_provider_name(Some("lmstudio"))
+            .with_local_base_url(Some("http://127.0.0.1:1234/v1"));
+        assert_eq!(
+            local.credential_source_with_env(none).unwrap(),
+            CredentialSource::NotRequired
+        );
+        assert_eq!(local.resolve_with_env(none).unwrap(), "");
+        let remote = AuthResolver::new(ProviderKind::OpenAI)
+            .with_custom_provider_name(Some("gateway"))
+            .with_local_base_url(Some("https://gateway.example/v1"));
+        let error = remote.resolve_with_env(none).unwrap_err().to_string();
+        assert!(error.contains("api_keys.gateway"), "{error}");
+        // The loopback default applies only to custom providers.
+        assert!(
+            AuthResolver::new(ProviderKind::OpenAI)
+                .with_local_base_url(Some("http://127.0.0.1:1234/v1"))
+                .resolve_with_env(none)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn none_marker_in_own_config_slot_declares_a_remote_route_keyless() {
+        let keys: HashMap<String, String> = [("gateway".to_owned(), "None".to_owned())].into();
+        let resolver = AuthResolver::new(ProviderKind::OpenAI)
+            .with_custom_provider_name(Some("gateway"))
+            .with_config_keys(Some(&keys));
+        assert_eq!(
+            resolver
+                .credential_source_with_env(|_| Err(VarError::NotPresent))
+                .unwrap(),
+            CredentialSource::NotRequired
+        );
+    }
+
+    #[test]
     fn doctor_custom_route_cannot_borrow_vendor_credentials_or_ignored_token() {
         let resolver = AuthResolver::new(ProviderKind::Anthropic)
             .with_custom_provider_name(Some("anthropic"))
@@ -292,7 +381,14 @@ pub struct AuthResolver {
     /// third-party `base_url`); `Some(false)` lets the name fall back to
     /// the built-in kind's env var and `api_keys` slot.
     pub credential_isolation: Option<bool>,
+    /// The route's `base_url` is a loopback address, so a custom provider
+    /// with no configured key source is a local OpenAI-compatible server
+    /// (LM Studio, llama.cpp, vLLM) that needs none (mini-agent-nvnkx.41).
+    pub keyless_local: bool,
 }
+
+/// `api_keys.<custom provider>` value that declares the route keyless.
+const KEYLESS_MARKER: &str = "none";
 
 impl AuthResolver {
     pub fn new(kind: ProviderKind) -> Self {
@@ -303,7 +399,15 @@ impl AuthResolver {
             config_api_keys: None,
             custom_provider_name: None,
             credential_isolation: None,
+            keyless_local: false,
         }
+    }
+
+    /// Records whether `base_url` addresses this machine; see
+    /// [`AuthResolver::keyless_local`].
+    pub fn with_local_base_url(mut self, base_url: Option<&str>) -> Self {
+        self.keyless_local = crate::provider::is_localhost(base_url);
+        self
     }
 
     pub fn with_cli_key(mut self, key: Option<&str>) -> Self {
@@ -472,6 +576,12 @@ impl AuthResolver {
                     if let Some(name) = own_config_slot
                         && let Some(key) = lookup(name)
                     {
+                        if key.eq_ignore_ascii_case(KEYLESS_MARKER) {
+                            return Ok((
+                                ResolvedCredential::ApiKey(String::new()),
+                                CredentialSource::NotRequired,
+                            ));
+                        }
                         return Ok((
                             self.explicit_credential(key),
                             CredentialSource::Config(name.into()),
@@ -534,9 +644,18 @@ impl AuthResolver {
             ));
         }
 
+        // A custom provider on a loopback base_url is a local server (LM
+        // Studio, llama.cpp, vLLM, ...) that normally needs no key.
+        if custom.is_some() && self.keyless_local {
+            return Ok((
+                ResolvedCredential::ApiKey(String::new()),
+                CredentialSource::NotRequired,
+            ));
+        }
+
         match custom {
             Some(name) => anyhow::bail!(
-                "No API key found for custom provider '{name}'. {}{}pass --api-key, or run `mini-agent --setup` to configure interactively. Built-in vendor credentials are never sent to a custom provider's base_url unless its custom_providers entry sets `inherit_builtin_key = true`.",
+                "No API key found for custom provider '{name}'. {}{}pass --api-key, or run `mini-agent --setup` to configure interactively. A local server needs no key: use a loopback base_url or set api_keys.{name} = \"none\". Built-in vendor credentials are never sent to a custom provider's base_url unless its custom_providers entry sets `inherit_builtin_key = true`.",
                 match env_var {
                     Some(env_var) => format!("Set the {env_var} environment variable, "),
                     None => format!(
