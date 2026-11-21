@@ -569,6 +569,29 @@ pub(crate) fn verify_resume_provider_safety() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The argument checks that only need the CLI and the loaded configuration
+/// (`--quick-model`, `--tools`). A headless run reports a failure as a usage
+/// error (exit 2) with a machine-readable record, before any provider or
+/// session setup; an interactive one returns the error as is.
+pub(crate) async fn validate_cli_against_config(
+    cli: &Cli,
+    cfg: &Config,
+    workspace_root: &std::path::Path,
+) -> anyhow::Result<()> {
+    let checked = cli
+        .validate_quick_model(cfg)
+        .and_then(|()| cli.validate_tool_allowlist(cfg));
+    let Err(error) = checked else {
+        return Ok(());
+    };
+    if !cli.print {
+        return Err(error);
+    }
+    let message = error.to_string();
+    crate::print::emit_headless_preflight_failure(cli, workspace_root, &message).await?;
+    Err(HeadlessUsageError(message).into())
+}
+
 /// Error for a `--load-prompt NAME` that matches no prompt, listing the
 /// available names once (the message is the only output; callers must not
 /// print the list separately).
@@ -1688,24 +1711,7 @@ impl Startup {
             });
         }
 
-        if let Err(error) = cli.validate_quick_model(&cfg) {
-            if !cli.print {
-                return Err(error);
-            }
-            // Headless: a usage error (exit 2) with a machine-readable
-            // failure record, before any provider/session setup.
-            let message = error.to_string();
-            crate::print::emit_headless_preflight_failure(&cli, workspace.root(), &message).await?;
-            return Err(HeadlessUsageError(message).into());
-        }
-        if let Err(error) = cli.validate_tool_allowlist(&cfg) {
-            if !cli.print {
-                return Err(error);
-            }
-            let message = error.to_string();
-            crate::print::emit_headless_preflight_failure(&cli, workspace.root(), &message).await?;
-            return Err(HeadlessUsageError(message).into());
-        }
+        validate_cli_against_config(&cli, &cfg, workspace.root()).await?;
         let max_budget_usd = cli.resolve_max_budget_usd(&cfg)?;
         cfg.max_budget_usd = max_budget_usd;
         if let Some(warning) =

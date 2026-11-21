@@ -266,9 +266,9 @@ fn normalize_failure_text(error: &str) -> String {
 /// The failure fingerprint of a headless round, from its recorded messages.
 ///
 /// The counterpart of the live collector: `Some` only when the round made
-/// mutating calls and every one of them failed. A turn record keeps no error
-/// flag, so a failure is recognised from the result text, the same way replayed
-/// results are rendered.
+/// mutating calls and every one of them failed. A failure is the result's
+/// `is_error` flag, the same signal the live collector reads from the event, so
+/// the two surfaces fingerprint the same round alike.
 fn failure_fingerprint_from_turn(interactions: &[rig::completion::Message]) -> Option<u64> {
     use rig::message::{AssistantContent, Message, ToolResultContent, UserContent};
 
@@ -305,7 +305,7 @@ fn failure_fingerprint_from_turn(interactions: &[rig::completion::Message]) -> O
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
-                    if crate::ui::tool_output::looks_like_error(&text) {
+                    if result.is_error == Some(true) {
                         failed += 1;
                         hash = Some(fold_failure(hash, &name, &text));
                     }
@@ -647,7 +647,18 @@ mod tests {
                     serde_json::json!({ "path": format!("f{i}") }),
                 )),
             });
-            interactions.push(Message::tool_result(id.as_str(), *output));
+            // The turn record carries the runner's failure flag; these fixtures
+            // flag the outputs their scenario means as failures.
+            interactions.push(Message::User {
+                content: OneOrMany::one(rig::message::UserContent::ToolResult(
+                    rig::message::ToolResult {
+                        id: id.clone(),
+                        call_id: None,
+                        content: OneOrMany::one(rig::message::ToolResultContent::text(*output)),
+                        is_error: Some(crate::ui::tool_output::looks_like_error(output)),
+                    },
+                )),
+            });
         }
         let cost = RoundCost::default();
         summary_from_headless_turn(goal, &interactions, &cost, None, 0, false)

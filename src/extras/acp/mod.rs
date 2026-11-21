@@ -9208,7 +9208,7 @@ mod protocol_tests {
                         ),
                         (
                             format!(
-                                "/goal {}",
+                                "/goal {} y",
                                 "x".repeat(crate::extras::goal::MAX_OBJECTIVE_CHARS + 1)
                             ),
                             "invalid ACP goal",

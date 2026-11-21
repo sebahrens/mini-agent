@@ -910,7 +910,7 @@ fn compaction_queues_the_replaced_transcript_for_a_sidecar() {
 fn shared_compaction_commit_drains_only_the_summarized_prefix() {
     for (included, expect_kept) in [(4usize, 4usize), (2, 2), (9, 4)] {
         let mut s = session_with_messages(6, 40);
-        let (skipped, input) = s.compaction_input(4, 0);
+        let (skipped, input) = s.compaction_input(4);
         assert_eq!((skipped, input.len()), (0, 4));
         let per_message = Session::estimate_tokens(&"x".repeat(40));
         let mut staged = None;
