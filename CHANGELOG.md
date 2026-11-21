@@ -37,6 +37,13 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Bedrock resolves its region from the selected AWS profile in `~/.aws/config` when `AWS_REGION`/`AWS_DEFAULT_REGION` are unset (mini-agent-nvnkx.313).
 - `read` with `visual:true` attaches the selected PDF pages as page images or a native document block even when they have a text layer, and text pages that also paint images now say so with the exact `visual:true` call to see them (mini-agent-nvnkx.236).
 - `read` returns PNG and JPEG outputs of notebook cells in the selected window as image blocks (at most 4, mapped by `image N = cell C output O`) when the model accepts images; other outputs and text-only models keep the mime label (mini-agent-nvnkx.240).
+- `git` tool local history operations `merge`, `cherry_pick`, `revert` (each with an `*_abort`), `reset` (`soft`/`mixed`, refused for a pushed HEAD), `branch_delete`, `branch_rename`, `stash_apply`, `stash_drop` and `stash_push` `include_untracked`, through the hardened runner with their own `git/merge`, `git/cherry_pick`, `git/revert`, `git/reset` and `git/branch_delete` permission keys; a conflict leaves the operation in progress and the result lists `conflicted_paths` (mini-agent-nvnkx.50).
+- `git` `status` reports `in_progress` (merge, rebase, cherry-pick, revert or bisect) with a note, and `commit` refuses inside a rebase or cherry-pick unless `allow_in_progress` is set (mini-agent-nvnkx.316).
+- In Git LFS repositories the `git` tool no longer refuses every operation: status, diff, blame, unstage and commit succeed with `lfs_pointers_not_resolved`/`lfs_paths`, while staging or committing LFS-tracked paths and rewriting the working tree are refused with a message that points to the shell (mini-agent-nvnkx.317).
+- `git restore` records the discarded working-tree content as file checkpoints, so `/rewind` brings it back; `switch`, stashes and the merge family register an uncaptured mutation, and the rewind picker notes ranges where shell or git commands ran (mini-agent-nvnkx.49).
+- `/rewind` offers "Restore unchanged files" (per-file restore that leaves files changed since the edit untouched and names them) instead of refusing everything when one file drifted or one edit was uncaptured (mini-agent-nvnkx.48).
+- Whole-workspace snapshots before a turn's first shell command (`[file_checkpoints] workspace_snapshots = "auto" | true | false`, default auto): `/rewind` "Restore workspace" undoes edits, creations and deletions made by shell commands, honours `.gitignore`, and refuses a workspace over 20000 files or 256 MiB (mini-agent-nvnkx.140).
+- `/memory projects` lists project memory directories and `/memory adopt <project>` moves a moved checkout's notes into the current project; each project directory records a `project.json` (mini-agent-nvnkx.53).
 
 ### Fixed
 
@@ -206,6 +213,11 @@ Notable changes to mini-agent are documented in this file. The format follows
 - `notebook_edit` results name the affected index, the new cell's id and the cell count when the preimage may be disclosed, and `replace` accepts `cell_type` to convert a cell (outputs and `execution_count` are dropped when leaving code and added when entering it) (mini-agent-nvnkx.241).
 - `read` downscales images that are within the 5 MiB / 8000 px limits but exceed 2000 px on the long edge or 1 MiB (GIFs only for pixels), keeping the `resized from` note; small images stay byte-identical and `full_resolution:true` keeps the original pixels (mini-agent-nvnkx.242).
 - `task` calls that name a read-only persona (`explore` or any persona that is not `mode: write` and has no memory, hooks or MCP servers) share the tool lane like an argument-free call, so a model that writes `"agent_type":"explore"` still overlaps with other readers (mini-agent-nvnkx.243).
+- Retired file-checkpoint records and their preimage blobs are reclaimed on compaction, conversation rewind and file restore, so a long-lived session no longer hits `max_records`/`max_total_bytes` from history that can never be restored (mini-agent-nvnkx.47).
+- File rewind says up front that Windows cannot restore files and stops capturing preimages there, instead of failing at restore time (mini-agent-nvnkx.57).
+- Project memory is keyed on the Git repository's main worktree, so linked worktrees and subdirectories of one repository share their notes (mini-agent-nvnkx.53).
+- A changed memory block is sent to the model as removed and added lines under their section heading instead of a byte-offset patch; older recorded patches still replay (mini-agent-nvnkx.217).
+- A forked session (`--fork-session`, lock-contention fork, cross-workspace resume) gets its own copies of the source's spill files and rewritten references, so they stay readable and survive deleting the source (mini-agent-nvnkx.218).
 
 ### Added
 

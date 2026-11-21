@@ -3401,6 +3401,37 @@ impl<'a> App<'a> {
                 }
                 #[cfg(feature = "subagents")]
                 self.ui.session.reset_background_tasks().await;
+                if mode.is_workspace() {
+                    let restored = self.ui.session.file_checkpoints.restore_workspace(
+                        &self.ui.session.id,
+                        idx,
+                        &self.ui.workspace,
+                    );
+                    // Whatever happened, files may have changed: never keep
+                    // read or agent caches built on the old tree.
+                    self.ui.session.read_tracker.clear();
+                    self.ui.invalidate_prebuild();
+                    self.run.agent = None;
+                    match restored {
+                        Ok(report) => self.renderer.write_line(
+                            &format!(
+                                "workspace restored to before the shell commands of turn {}: {} file{} changed",
+                                report.snapshot_turn,
+                                report.changed,
+                                if report.changed == 1 { "" } else { "s" }
+                            ),
+                            Color::Green,
+                        )?,
+                        Err(error) => self.renderer.write_line(
+                            &format!(
+                                "workspace rewind refused: {}",
+                                sanitize_output(&error.to_string())
+                            ),
+                            C_ERROR,
+                        )?,
+                    }
+                    return Ok(());
+                }
                 if mode.restores_files() {
                     // Like session publication, this bounded native operation stays
                     // owned by the foreground key handler through completion.

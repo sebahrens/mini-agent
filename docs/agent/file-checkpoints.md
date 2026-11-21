@@ -26,7 +26,7 @@ tool returned its complete current contents, exactly like `write`; a refused
 overwrite names the rule and leaves the file untouched. `read_file` inside a
 script does not count as a read. One `js` result carries one mutation diff
 (the first file written); further writes in the same call are counted in the
-result, not previewed. Shell commands and arbitrary external processes are not checkpointed.
+result, not previewed. The typed `git` tool's `restore` is checkpointed the same way (the content it discards is recorded per file); `switch`, stashes and the merge family rewrite the working tree without per-file preimages and are reported as uncaptured. Shell commands and arbitrary external processes are not file-checkpointed, and the rewind picker says when shell or git commands ran in the chosen range; the optional workspace snapshot tier below covers them.
 
 Preimages are SHA-256 addressed private `.bin` files in the session's existing
 `tool-outputs/<opaque-session-directory>/checkpoints` directory. The private
@@ -46,6 +46,8 @@ checkpoints prevent file restoration for it. Content blobs may remain after an i
 same recorded byte budget, and are never interpreted as executable instructions.
 `--no-session` uses an in-memory preimage store and creates no checkpoint files.
 
+Retired records (turns removed by compaction, a conversation rewind or a completed restore) are dropped from the inventory together with the preimage blobs nothing else references, so they stop counting against the record and byte limits.
+
 Restoration is an explicit operator action. It never grants the agent new
 permissions. Every checkpoint must match the current session and the retained
 workspace's physical fingerprint. Every current postimage and preimage blob is
@@ -58,8 +60,16 @@ Existing files use the same checked atomic replacement as native tools. Created
 files are moved into an exclusively-created private sibling retirement directory,
 validated there, and deleted only if their identity and content still match.
 A raced foreign object is retained and create-only rollback never overwrites a
-newer file. Windows checked workspace replacement/retirement remains unsupported;
-file rewind refuses that operation. Conversation-only rewind remains available.
+newer file. Windows has no atomic compare-and-replace primitive (see
+`paths::exchange_relative`), so checked workspace replacement/retirement is
+unsupported there: file rewind is refused up front, no preimages are captured (the
+first edit says so once), and conversation-only rewind remains available.
+
+`/rewind` also offers **Restore unchanged files only**: every selected file whose
+current bytes still match the recorded postimage is restored, files changed since
+(a formatter, an editor, a shell command) or whose chain cannot be verified are left
+untouched and named, and uncaptured edits in the range no longer refuse the rest.
+The strict modes keep refusing everything on any drift.
 
 Restoring several files is not a single filesystem transaction. All files are
 preflighted together; if a race or I/O error occurs during publication, the
@@ -67,3 +77,26 @@ error reports the completed count, already-restored paths are retired from the
 inventory, and the conversation is retained. The current save policy still
 applies to later session persistence failures. Rewind does not refund usage,
 restore old permission grants, execute commands, or call a provider.
+
+## Workspace snapshots (shell changes)
+
+Before the first shell command of a turn the whole workspace is recorded as a
+content-addressed manifest in the session's private `tool-outputs/<dir>/workspace-snapshots`
+directory: every regular file the ignore rules (`.gitignore`, `.ignore`,
+`.git/info/exclude`) do not exclude, hashed and stored once per distinct content.
+`.git`, ignored files and symbolic links are never recorded and never touched.
+The user's own Git metadata is not used. Limits: 20000 files and 256 MiB per snapshot
+(a larger workspace is refused as a whole, never recorded partially), 16 MiB per file
+(a larger file is left out and left alone on restore), 1 GiB of new snapshot content per
+session. `[file_checkpoints] workspace_snapshots` is `"auto"` (default), `true` (also
+announces a refusal once) or `false`.
+
+`/rewind` then offers **Restore workspace**: the confirmation lists how many files
+would be restored and deleted (and the first names), and the restore rewrites changed
+files, recreates deleted ones and removes files created since the snapshot, all through
+the same checked primitives as file rewind (identity and content are re-verified for
+every publication; a damaged snapshot blob changes nothing). It restores the state before
+the first shell command at or after the chosen turn, so native edits made earlier in that
+same turn are part of the restored state; it is a separate mode from the per-file restore
+and is refused on Windows. Snapshots follow the conversation: a conversation rewind
+discards the snapshots of the removed turns and compaction renumbers the kept ones.

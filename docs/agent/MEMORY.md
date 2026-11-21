@@ -33,7 +33,7 @@ Every `memory_write`/`memory_edit` holds an exclusive advisory lock on `.memory.
 
 ### Project Slug
 
-Per-project files (scratchpad, daily, notes) are scoped by a 64-character lowercase SHA-256 component derived from a versioned namespace plus the native bytes (Unix) or UTF-16LE units (Windows) of the captured startup workspace. Display names never become persistent path components, and distinct project paths remain isolated. `MEMORY.md` is global — shared across all projects.
+Per-project files (scratchpad, daily, notes) are scoped by a 64-character lowercase SHA-256 component derived from a versioned namespace plus the native bytes (Unix) or UTF-16LE units (Windows) of the project identity path: the main worktree of the Git repository that contains the startup workspace (read from `.git`/`commondir` pointer files, no Git process), so linked worktrees and subdirectories of one repository share their notes, or the workspace itself outside a repository. Each project directory records a `project.json` (checkout path, name) when notes are written; `/memory projects` lists the directories and `/memory adopt <project>` moves a moved checkout's notes into the current project. Display names never become persistent path components, and distinct project paths remain isolated. `MEMORY.md` is global — shared across all projects.
 
 ### Write Targets
 

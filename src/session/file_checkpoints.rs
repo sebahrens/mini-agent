@@ -91,6 +91,8 @@ enum SkipReason {
     Storage,
     /// A typed git operation rewrote working-tree files that were not captured.
     GitOperation,
+    /// The whole-workspace snapshot for a turn was refused (caps or storage).
+    WorkspaceSnapshot,
     /// The platform cannot restore files at all.
     Platform,
 }
@@ -112,6 +114,9 @@ impl SkipReason {
             Self::GitOperation => {
                 "a git operation rewrote working-tree files that are not checkpointed".into()
             }
+            Self::WorkspaceSnapshot => {
+                "the workspace snapshot for shell commands was refused (see /rewind)".into()
+            }
             Self::Platform => {
                 "file rewind is not supported on this platform; only conversation rewind is available"
                     .into()
@@ -131,6 +136,17 @@ struct Record {
     #[serde(default)]
     retired: bool,
 }
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+/// The snapshot taken before a turn's first shell command, or why none exists.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct WorkspaceRef {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    manifest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refused: Option<String>,
+}
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 struct Data {
     records: Vec<Record>,
@@ -144,6 +160,12 @@ struct Data {
     /// flagged in the picker.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     external: BTreeMap<usize, usize>,
+    /// Whole-workspace snapshots by turn (see `workspace_snapshots`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    workspace: BTreeMap<usize, WorkspaceRef>,
+    /// Bytes newly stored by those snapshots, against the per-session cap.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    workspace_bytes: u64,
     /// Why the most recent uncaptured mutation was skipped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     skip_reason: Option<String>,
@@ -217,6 +239,11 @@ impl<'de> Deserialize<'de> for FileCheckpoints {
         let hard = Limits::HARD;
         if data.skipped.len() > hard.records
             || data.external.len() > hard.records
+            || data.workspace.len() > hard.records
+            || data.workspace.values().any(|w| {
+                w.manifest.as_deref().is_some_and(|m| !valid_digest(m))
+                    || w.refused.as_ref().is_some_and(|r| r.len() > 512)
+            })
             || data.records.len() > hard.records
             || data.blobs.len() > hard.records
             || data.blobs.values().any(|n| *n > hard.file_bytes)
@@ -502,6 +529,7 @@ impl FileCheckpoints {
             .data
             .external
             .retain(|turn, _| *turn < index || *turn == usize::MAX);
+        state.data.workspace.retain(|turn, _| *turn < index);
         if state.data.skipped.len() != skipped_before {
             // The one optional reason describes the latest uncaptured edit.
             // Once its suffix is removed it cannot describe an earlier one;
@@ -536,6 +564,12 @@ impl FileCheckpoints {
         };
         state.data.skipped = shift(std::mem::take(&mut state.data.skipped));
         state.data.external = shift(std::mem::take(&mut state.data.external));
+        state.data.workspace = std::mem::take(&mut state.data.workspace)
+            .into_iter()
+            .filter_map(|(turn, snapshot)| {
+                (turn >= removed).then_some((turn - removed + 1, snapshot))
+            })
+            .collect();
         reclaim_retired(&mut state);
     }
     /// Reverses the index shift of [`compact_prefix`](Self::compact_prefix) when
@@ -562,6 +596,10 @@ impl FileCheckpoints {
         };
         state.data.skipped = shift(std::mem::take(&mut state.data.skipped));
         state.data.external = shift(std::mem::take(&mut state.data.external));
+        state.data.workspace = std::mem::take(&mut state.data.workspace)
+            .into_iter()
+            .map(|(turn, snapshot)| (turn.saturating_sub(1).saturating_add(removed), snapshot))
+            .collect();
     }
     /// Explicit operator action; all inputs remain bound to the current retained workspace.
     /// Preflight every file before the first write, then each publication checks identity+content again.
@@ -719,6 +757,198 @@ impl FileCheckpoints {
             left,
             uncaptured,
         })
+    }
+}
+
+/// Result of a workspace restore.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct WorkspaceReport {
+    pub changed: usize,
+    pub snapshot_turn: usize,
+}
+
+impl FileCheckpoints {
+    /// The earliest snapshot at or after `index` (the state just before that
+    /// turn's first shell command).
+    fn workspace_from(&self, index: usize) -> Option<(usize, WorkspaceRef)> {
+        let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .data
+            .workspace
+            .range(index..)
+            .next()
+            .map(|(turn, snapshot)| (*turn, snapshot.clone()))
+    }
+
+    /// Records the workspace before the first shell command of `turn`.
+    /// Blocking; returns the refusal reason when no snapshot could be taken.
+    fn capture_workspace_with(
+        &self,
+        turn: usize,
+        root: &Path,
+        dir: &Path,
+        caps: super::workspace_snapshots::Caps,
+    ) -> Option<String> {
+        {
+            let mut state = self.edit();
+            if state.data.workspace.contains_key(&turn) {
+                return None;
+            }
+            let reason = (state.data.workspace_bytes >= caps.session_bytes)
+                .then(|| "the session's snapshot storage cap was reached".to_string());
+            state.data.workspace.insert(
+                turn,
+                WorkspaceRef {
+                    manifest: None,
+                    refused: Some(
+                        reason
+                            .clone()
+                            .unwrap_or_else(|| "capture in progress".into()),
+                    ),
+                },
+            );
+            if reason.is_some() {
+                return reason;
+            }
+        }
+        let result = super::workspace_snapshots::capture(root, dir, caps);
+        let mut state = self.edit();
+        match result {
+            Ok((manifest, written)) => {
+                state.data.workspace_bytes = state.data.workspace_bytes.saturating_add(written);
+                state.data.workspace.insert(
+                    turn,
+                    WorkspaceRef {
+                        manifest: Some(manifest),
+                        refused: None,
+                    },
+                );
+                None
+            }
+            Err(reason) => {
+                let reason: String = reason.chars().take(400).collect();
+                state.data.workspace.insert(
+                    turn,
+                    WorkspaceRef {
+                        manifest: None,
+                        refused: Some(reason.clone()),
+                    },
+                );
+                Some(reason)
+            }
+        }
+    }
+
+    /// One line for the rewind confirmation: what restoring the workspace
+    /// would change, or why it cannot be offered.
+    pub(crate) fn workspace_summary(&self, session: &str, index: usize, root: &Path) -> String {
+        self.workspace_summary_with(index, root, &workspace_dir(session))
+    }
+    fn workspace_summary_with(&self, index: usize, root: &Path, dir: &Path) -> String {
+        let Some((_, snapshot)) = self.workspace_from(index) else {
+            return "no workspace snapshot in this range (no shell command ran)".into();
+        };
+        let Some(id) = snapshot.manifest else {
+            return format!(
+                "unavailable: {}",
+                snapshot.refused.unwrap_or_else(|| "refused".into())
+            );
+        };
+        match super::workspace_snapshots::read_manifest(dir, &id).and_then(|manifest| {
+            super::workspace_snapshots::plan(
+                root,
+                &manifest,
+                super::workspace_snapshots::Caps::DEFAULT,
+            )
+        }) {
+            Ok(plan) if plan.is_empty() => "nothing has changed since the snapshot".into(),
+            Ok(plan) => plan.summary(),
+            Err(error) => format!("unavailable: {error}"),
+        }
+    }
+
+    /// Restores every non-ignored file to the snapshot taken before the first
+    /// shell command at or after `index`: changed files are rewritten, deleted
+    /// ones recreated, files created since removed. Refused when the snapshot
+    /// was refused, is damaged, or the platform cannot restore files.
+    pub(crate) fn restore_workspace(
+        &self,
+        session: &str,
+        index: usize,
+        workspace: &crate::paths::WorkspaceBinding,
+    ) -> anyhow::Result<WorkspaceReport> {
+        self.restore_workspace_with(index, workspace, &workspace_dir(session))
+    }
+    fn restore_workspace_with(
+        &self,
+        index: usize,
+        workspace: &crate::paths::WorkspaceBinding,
+        dir: &Path,
+    ) -> anyhow::Result<WorkspaceReport> {
+        anyhow::ensure!(
+            FILE_RESTORE_SUPPORTED,
+            "{}",
+            SkipReason::Platform.describe()
+        );
+        anyhow::ensure!(
+            self.0.lock().unwrap_or_else(|e| e.into_inner()).trusted,
+            "imported checkpoints cannot restore files"
+        );
+        let (turn, snapshot) = self
+            .workspace_from(index)
+            .ok_or_else(|| anyhow::anyhow!("no workspace snapshot exists for this range"))?;
+        let id = snapshot.manifest.ok_or_else(|| {
+            anyhow::anyhow!(
+                "workspace snapshot unavailable: {}",
+                snapshot.refused.unwrap_or_else(|| "refused".into())
+            )
+        })?;
+        let caps = super::workspace_snapshots::Caps::DEFAULT;
+        let manifest =
+            super::workspace_snapshots::read_manifest(dir, &id).map_err(anyhow::Error::msg)?;
+        let plan = super::workspace_snapshots::plan(workspace.root(), &manifest, caps)
+            .map_err(anyhow::Error::msg)?;
+        let changed = super::workspace_snapshots::apply(workspace, dir, &manifest, &plan)
+            .map_err(anyhow::Error::msg)?;
+        Ok(WorkspaceReport {
+            changed,
+            snapshot_turn: turn,
+        })
+    }
+}
+
+fn workspace_dir(session: &str) -> PathBuf {
+    super::storage::tool_output_dir(session).join("workspace-snapshots")
+}
+
+/// Records the workspace before a turn's first shell command (once per turn).
+/// Blocking filesystem work runs on the blocking pool; a refusal is kept for
+/// the rewind picker and, with `workspace_snapshots = true`, announced once.
+pub(crate) async fn before_shell(root: &Path) {
+    let mode = super::workspace_snapshots::mode();
+    if mode == super::workspace_snapshots::Mode::Off || !FILE_RESTORE_SUPPORTED {
+        return;
+    }
+    let Some(recorder) = current() else { return };
+    if recorder.ephemeral {
+        return;
+    }
+    let turn = recorder.turn();
+    let dir = workspace_dir(&recorder.session);
+    let root = root.to_path_buf();
+    let store = recorder.store.clone();
+    let reason = crate::agent::runner::spawn_blocking_scoped(move || {
+        store.capture_workspace_with(turn, &root, &dir, super::workspace_snapshots::Caps::DEFAULT)
+    })
+    .await
+    .ok()
+    .flatten();
+    if reason.is_some() && mode == super::workspace_snapshots::Mode::On {
+        let mut state = recorder.edit_store();
+        if matches!(state.notice, UncapturedNotice::None) {
+            state.notice = UncapturedNotice::Pending(SkipReason::WorkspaceSnapshot);
+        }
+        state.mark();
     }
 }
 
@@ -2256,6 +2486,135 @@ mod tests {
     fn nvnkx57_platform_skip_reason_is_readable() {
         assert!(SkipReason::Platform.describe().contains("not supported"));
         assert!(FILE_RESTORE_SUPPORTED, "macOS and Linux restore files");
+    }
+    #[test]
+    fn nvnkx140_rewind_restores_what_a_shell_turn_edited_created_and_deleted() {
+        let root = crate::tests::OwnedTestDirectory::new("nvnkx140-turn");
+        let store_dir = crate::tests::OwnedTestDirectory::new("nvnkx140-turn-store");
+        let dir = store_dir.path().join("snapshots");
+        let ws = root.path();
+        std::fs::write(ws.join(".gitignore"), "ignored/\n").unwrap();
+        std::fs::create_dir(ws.join("ignored")).unwrap();
+        std::fs::write(ws.join("edited.txt"), "before\n").unwrap();
+        std::fs::write(ws.join("deleted.txt"), "doomed\n").unwrap();
+        std::fs::write(ws.join("ignored/cache"), "cache\n").unwrap();
+        let binding = crate::paths::WorkspaceBinding::capture(ws).unwrap();
+        let checkpoints = FileCheckpoints::default();
+        let caps = super::super::workspace_snapshots::Caps::DEFAULT;
+        // The turn's first shell command: snapshot, then the command runs.
+        assert!(
+            checkpoints
+                .capture_workspace_with(5, ws, &dir, caps)
+                .is_none()
+        );
+        assert!(
+            checkpoints
+                .capture_workspace_with(5, ws, &dir, caps)
+                .is_none()
+        );
+        std::fs::write(ws.join("edited.txt"), "sed -i was here\n").unwrap();
+        std::fs::remove_file(ws.join("deleted.txt")).unwrap();
+        std::fs::write(ws.join("created.txt"), "codegen\n").unwrap();
+        std::fs::write(ws.join("ignored/cache"), "rebuilt\n").unwrap();
+
+        let summary = checkpoints.workspace_summary_with(5, ws, &dir);
+        assert!(summary.contains("2 to restore, 1 to delete"), "{summary}");
+        let report = checkpoints
+            .restore_workspace_with(5, &binding, &dir)
+            .unwrap();
+        assert_eq!(
+            report,
+            WorkspaceReport {
+                changed: 3,
+                snapshot_turn: 5
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws.join("edited.txt")).unwrap(),
+            "before\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws.join("deleted.txt")).unwrap(),
+            "doomed\n"
+        );
+        assert!(!ws.join("created.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(ws.join("ignored/cache")).unwrap(),
+            "rebuilt\n"
+        );
+        // A later index (after every snapshot) has nothing to restore.
+        assert!(
+            checkpoints
+                .restore_workspace_with(6, &binding, &dir)
+                .is_err()
+        );
+        // The inventory survives a save and reload and is shifted by compaction.
+        let reloaded: FileCheckpoints =
+            serde_json::from_value(serde_json::to_value(&checkpoints).unwrap()).unwrap();
+        assert!(reloaded.workspace_from(5).is_some());
+        checkpoints.compact_prefix(3);
+        assert!(checkpoints.workspace_from(3).is_some());
+        assert!(
+            checkpoints
+                .workspace_from(0)
+                .is_some_and(|(turn, _)| turn == 3)
+        );
+        checkpoints.retire_from(0);
+        assert!(checkpoints.workspace_from(0).is_none());
+    }
+
+    #[test]
+    fn nvnkx140_an_oversized_workspace_is_refused_not_partially_restored() {
+        let root = crate::tests::OwnedTestDirectory::new("nvnkx140-refuse");
+        let store_dir = crate::tests::OwnedTestDirectory::new("nvnkx140-refuse-store");
+        let dir = store_dir.path().join("snapshots");
+        for n in 0..4 {
+            std::fs::write(root.path().join(format!("f{n}")), "x").unwrap();
+        }
+        let binding = crate::paths::WorkspaceBinding::capture(root.path()).unwrap();
+        let checkpoints = FileCheckpoints::default();
+        let tight = super::super::workspace_snapshots::Caps {
+            files: 2,
+            ..super::super::workspace_snapshots::Caps::DEFAULT
+        };
+        let reason = checkpoints
+            .capture_workspace_with(1, root.path(), &dir, tight)
+            .expect("refused");
+        assert!(reason.contains("more than 2 files"), "{reason}");
+        std::fs::write(root.path().join("f0"), "changed").unwrap();
+        let error = checkpoints
+            .restore_workspace_with(1, &binding, &dir)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("snapshot unavailable"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("f0")).unwrap(),
+            "changed"
+        );
+        assert!(
+            checkpoints
+                .workspace_summary_with(1, root.path(), &dir)
+                .starts_with("unavailable")
+        );
+    }
+
+    #[test]
+    fn nvnkx140_workspace_snapshot_setting_parses_auto_and_booleans() {
+        use crate::config::types::{
+            FileCheckpointsConfig, WorkspaceSnapshotsName, WorkspaceSnapshotsSetting as S,
+        };
+        for (text, expected) in [
+            (
+                "workspace_snapshots = 'auto'",
+                S::Named(WorkspaceSnapshotsName::Auto),
+            ),
+            ("workspace_snapshots = true", S::Flag(true)),
+            ("workspace_snapshots = false", S::Flag(false)),
+        ] {
+            let parsed: FileCheckpointsConfig = toml::from_str(text).unwrap();
+            assert_eq!(parsed.workspace_snapshots, Some(expected), "{text}");
+        }
+        assert!(toml::from_str::<FileCheckpointsConfig>("workspace_snapshots = 'maybe'").is_err());
     }
 }
 

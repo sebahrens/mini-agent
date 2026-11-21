@@ -507,8 +507,7 @@ impl Tool for ShellTool {
     }
 
     async fn call(&self, args: BashArgs) -> Result<String, ToolError> {
-        // Shell effects are not file-checkpointed: flag the turn for /rewind.
-        crate::session::file_checkpoints::external_mutation();
+        self.before_command().await;
         self.execute(args)
             .await
             .map(|(text, _)| self.with_job_notices(text))
@@ -519,7 +518,7 @@ impl Tool for ShellTool {
         args: BashArgs,
         _extensions: &rig::tool::ToolCallExtensions,
     ) -> Result<rig::tool::ToolReturn<String>, ToolError> {
-        crate::session::file_checkpoints::external_mutation();
+        self.before_command().await;
         self.execute(args).await.map(|(text, metadata)| {
             let result = rig::tool::ToolReturn::success(self.with_job_notices(text));
             match metadata {
@@ -531,6 +530,15 @@ impl Tool for ShellTool {
 }
 
 impl ShellTool {
+    /// Shell effects are not file-checkpointed: flag the turn for `/rewind`
+    /// and record the whole-workspace snapshot of the turn's first command.
+    async fn before_command(&self) {
+        crate::session::file_checkpoints::external_mutation();
+        if let Some(root) = self.sandbox.workspace_root() {
+            crate::session::file_checkpoints::before_shell(&root).await;
+        }
+    }
+
     /// Append the session's pending job notices. A scoped (subagent) shell
     /// shares its parent's sandbox and so its notice queue, which belongs to
     /// the parent session: draining it here would lose the notices for good.

@@ -19,10 +19,16 @@ pub(crate) enum RewindMode {
     /// postimage; drifted or uncaptured files are left and named.
     FilesUnchanged,
     BothUnchanged,
+    /// Restore every non-ignored workspace file to the snapshot taken before
+    /// the range's first shell command, undoing shell changes too.
+    Workspace,
 }
 impl RewindMode {
     pub(crate) fn restores_files(self) -> bool {
-        self != Self::Conversation
+        !matches!(self, Self::Conversation | Self::Workspace)
+    }
+    pub(crate) fn is_workspace(self) -> bool {
+        self == Self::Workspace
     }
     pub(crate) fn unchanged_only(self) -> bool {
         matches!(self, Self::FilesUnchanged | Self::BothUnchanged)
@@ -38,6 +44,8 @@ pub(crate) struct RewindBinding {
     checkpoints: [u8; 32],
     source: crate::session::file_checkpoints::FileCheckpoints,
     workspace: [u8; 32],
+    /// The bound workspace root, for the workspace-snapshot preview.
+    root: std::path::PathBuf,
 }
 /// SHA-256 of `value`'s JSON serialisation, streamed into the hasher so a
 /// long history is never materialised as one buffer. Byte-identical to
@@ -71,6 +79,7 @@ impl RewindBinding {
             workspace: workspace
                 .compatibility_fingerprint()
                 .map_err(anyhow::Error::msg)?,
+            root: workspace.root().to_path_buf(),
         })
     }
     pub(crate) fn valid(
@@ -99,6 +108,7 @@ const CONFIRM_FILES: &str = "Restore files only";
 const CONFIRM_BOTH: &str = "Restore files and conversation";
 const CONFIRM_FILES_UNCHANGED: &str = "Restore unchanged files only";
 const CONFIRM_BOTH_UNCHANGED: &str = "Restore unchanged files and conversation";
+const CONFIRM_WORKSPACE: &str = "Restore workspace (undoes shell changes too)";
 const CONFIRM_CANCEL: &str = "Cancel";
 
 /// A two-level modal picker for `/rewind`: first pick an earlier
@@ -268,13 +278,21 @@ impl RewindPicker {
                         ),
                         format!("{CONFIRM_FILES_UNCHANGED} (leaves files changed since the edit, names them)"),
                         format!("{CONFIRM_BOTH_UNCHANGED} (leaves files changed since the edit, names them)"),
+                        format!(
+                            "{CONFIRM_WORKSPACE} — {}",
+                            self.binding.source.workspace_summary(
+                                &self.binding.session,
+                                idx,
+                                &self.binding.root
+                            )
+                        ),
                         CONFIRM_CANCEL.to_string(),
                     ]);
                     self.list.activate();
                 }
             }
             Stage::Confirm => {
-                self.outcome = Some(if self.list.selected < 5 {
+                self.outcome = Some(if self.list.selected < 6 {
                     RewindOutcome::Confirmed(
                         self.chosen.unwrap_or(0),
                         match self.list.selected {
@@ -282,6 +300,7 @@ impl RewindPicker {
                             2 => RewindMode::Both,
                             3 => RewindMode::FilesUnchanged,
                             4 => RewindMode::BothUnchanged,
+                            5 => RewindMode::Workspace,
                             _ => RewindMode::Conversation,
                         },
                         self.binding.clone(),
@@ -359,6 +378,7 @@ mod tests {
                 checkpoints: [0; 32],
                 source: Default::default(),
                 workspace: [0; 32],
+                root: std::path::PathBuf::new(),
             },
         );
         p.activate();
@@ -383,7 +403,7 @@ mod tests {
     fn confirm_step_cancel_option_backs_out() {
         let mut p = picker();
         p.handle(key(KeyCode::Enter)); // confirm step for the newest target
-        for _ in 0..5 {
+        for _ in 0..6 {
             p.handle(key(KeyCode::Down));
         } // move to "Cancel"
         p.handle(key(KeyCode::Enter));
@@ -457,6 +477,7 @@ mod tests {
                 checkpoints: [0; 32],
                 source: Default::default(),
                 workspace: [0; 32],
+                root: std::path::PathBuf::new(),
             },
         );
         p.activate();

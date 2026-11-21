@@ -4220,6 +4220,13 @@ impl Sandbox {
         }
     }
 
+    /// The bound workspace root, when one is bound.
+    pub(crate) fn workspace_root(&self) -> Option<PathBuf> {
+        self.workspace_binding
+            .as_ref()
+            .map(|workspace| workspace.root().to_path_buf())
+    }
+
     #[cfg(test)]
     pub(crate) fn workspace_root_for_test(&self) -> Option<&Path> {
         self.workspace_binding

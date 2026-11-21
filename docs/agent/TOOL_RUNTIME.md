@@ -881,7 +881,7 @@ to that record (`\torig: <path>`) and counts it as one entry. `log`, `blame`,
 `branches` and `stash_list` run with a 30 s budget; a call may pass
 `timeout_secs` (1-120) to retry larger, and a timed-out `log` returns the commits
 found so far with `timed_out`, `next_skip` and a narrowing note. Each mutation has its own permission key
-(`git/branch`, `git/switch`, `git/stash`, `git/tag`, `git/restore`; restore and
+(`git/branch`, `git/switch`, `git/stash`, `git/tag`, `git/restore`, `git/merge`, `git/cherry_pick`, `git/revert`, `git/reset`, `git/branch_delete`; restore and
 stash paths additionally need `write`); listing reuses `git/status`. Names are
 validated with `git check-ref-format`; stashes and annotated tags receive the
 host-resolved commit identity. Operations that touch the working tree use the
