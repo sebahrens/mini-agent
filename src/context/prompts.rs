@@ -1098,4 +1098,33 @@ mod plan_next_tests {
             None
         );
     }
+
+    #[test]
+    fn bundled_plan_prompt_matches_planwrite_contract() {
+        let plan = EMBEDDED
+            .get_file("plan.md")
+            .and_then(|f| f.contents_utf8())
+            .expect("bundled plan prompt");
+        let d = parse_directives(plan);
+        assert_eq!(d.mode, Some("planwrite"));
+        assert_eq!(d.next, Some(PromptNext::Code));
+        // Truthful about what planwrite permits: plan file is `PLAN*.md`, the
+        // shell is denied, clarification goes through ask_user_question, and the
+        // approved text is the final message (capped at 64 KiB).
+        assert!(plan.contains("PLAN-<short-topic>.md"));
+        assert!(plan.contains("ask_user_question"));
+        assert!(plan.contains("the shell, is denied"));
+        assert!(plan.contains("final message"));
+        assert!(plan.contains("**Verify:**"));
+        // The prompt must not tell the model to use denied tools or to save
+        // plans unasked, and must stay compact (cached prefix cost).
+        assert!(!plan.contains("shell tool directly"));
+        assert!(!plan.to_lowercase().contains("run tests,"));
+        assert!(
+            plan.len() < 4_500,
+            "plan prompt grew to {} bytes",
+            plan.len()
+        );
+        assert!(!plan.contains("{{"), "no per-turn placeholders");
+    }
 }
