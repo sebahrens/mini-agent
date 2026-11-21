@@ -193,7 +193,8 @@ impl QuestionState {
                     answer = Some(Answer::Text(self.draft.clone()))
                 }
                 KeyCode::Backspace => {
-                    self.draft.pop();
+                    let start = crate::ui::input::prev_char_boundary(&self.draft, self.draft.len());
+                    self.draft.truncate(start);
                 }
                 KeyCode::Char(c)
                     if !key

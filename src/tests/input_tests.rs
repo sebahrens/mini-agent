@@ -253,7 +253,10 @@ fn keys73_undo_refuses_oversized_history_and_blank_remapped_submission() {
     editor.handle_key(ctrl('z'));
     assert!(editor.buffer.is_empty());
     type_str(&mut editor, "small");
-    editor.handle_paste("x".repeat(2 * 1024 * 1024 + 1));
+    // A large paste is a chip; build the oversized buffer directly.
+    editor.buffer = "x".repeat(2 * 1024 * 1024 + 1).into();
+    editor.cursor = editor.buffer.len();
+    editor.handle_key(press(KeyCode::Char('y')));
     let oversized_len = editor.buffer.len();
     editor.handle_key(ctrl('z'));
     assert_eq!(editor.buffer.len(), oversized_len);
@@ -409,11 +412,11 @@ fn enter_on_whitespace_only_input_submits_nothing() {
 // --- bracketed paste sanitizing (mini-agent-el3xe) ---
 
 #[test]
-fn paste_normalizes_line_endings_expands_tabs_and_drops_controls() {
+fn paste_normalizes_line_endings_keeps_tabs_and_drops_controls() {
     use crate::ui::input::sanitize_paste;
     assert_eq!(sanitize_paste("a\rb\r\nc\nd"), "a\nb\nc\nd");
     assert_eq!(sanitize_paste("\r\r\n"), "\n\n");
-    assert_eq!(sanitize_paste("x\ty"), "x    y");
+    assert_eq!(sanitize_paste("x\ty"), "x\ty");
     assert_eq!(sanitize_paste("red \x1b[31mtext\x1b[0m!"), "red text!");
     assert_eq!(sanitize_paste("\x1b]0;title\x07ok"), "ok");
     assert_eq!(sanitize_paste("\x1b]8;;https://x\x1b\\link"), "link");
@@ -427,11 +430,11 @@ fn paste_normalizes_line_endings_expands_tabs_and_drops_controls() {
 fn a_carriage_return_paste_becomes_lines_and_is_not_sent_raw() {
     let mut editor = InputEditor::new();
     editor.handle_paste("one\rtwo\t3\x1b[2J".to_string());
-    assert_eq!(editor.buffer.as_str(), "one\ntwo    3");
+    assert_eq!(editor.buffer.as_str(), "one\ntwo\t3");
     assert_eq!(editor.cursor, editor.buffer.len());
     // A paste made only of controls changes nothing.
     editor.handle_paste("\x1b[A".to_string());
-    assert_eq!(editor.buffer.as_str(), "one\ntwo    3");
+    assert_eq!(editor.buffer.as_str(), "one\ntwo\t3");
 }
 
 // --- byte-offset regressions: Ctrl+U / Ctrl+K / Alt+Y with multi-byte text ---
@@ -805,4 +808,190 @@ fn doubled_backslash_enter_still_submits() {
     type_str(&mut editor, "path\\\\");
     let submitted = editor.handle_key(press(KeyCode::Enter));
     assert_eq!(submitted.as_deref(), Some("path\\\\"));
+}
+
+// --- grapheme editing (mini-agent-nvnkx.85) ---
+
+const FAMILY: &str = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+const FLAG: &str = "\u{1F1E9}\u{1F1EA}";
+
+#[test]
+fn backspace_removes_a_whole_zwj_family_flag_and_skin_tone_emoji() {
+    for cluster in [FAMILY, FLAG, "\u{1F44D}\u{1F3FD}", "e\u{301}"] {
+        let mut editor = InputEditor::new();
+        type_str(&mut editor, &format!("a{cluster}"));
+        editor.handle_key(press(KeyCode::Backspace));
+        assert_eq!(editor.buffer.as_str(), "a", "{cluster:?}");
+        editor.handle_key(press(KeyCode::Backspace));
+        assert!(editor.buffer.is_empty());
+    }
+    let mut editor = InputEditor::new();
+    editor.load_text(FAMILY);
+    editor.handle_key(press(KeyCode::Backspace));
+    assert!(editor.buffer.is_empty());
+}
+
+#[test]
+fn arrows_and_delete_step_over_whole_grapheme_clusters() {
+    let mut editor = InputEditor::new();
+    editor.load_text("e\u{301}");
+    editor.handle_key(press(KeyCode::Left));
+    assert_eq!(editor.cursor, 0);
+    editor.handle_key(press(KeyCode::Right));
+    assert_eq!(editor.cursor, editor.buffer.len());
+
+    let mut editor = InputEditor::new();
+    editor.load_text(&format!("{FLAG}{FLAG}x"));
+    editor.handle_key(ctrl('a'));
+    editor.handle_key(press(KeyCode::Right));
+    assert_eq!(editor.cursor, FLAG.len());
+    editor.handle_key(press(KeyCode::Delete));
+    assert_eq!(editor.buffer.as_str(), format!("{FLAG}x"));
+    editor.handle_key(ctrl('a'));
+    editor.handle_key(ctrl('d'));
+    assert_eq!(editor.buffer.as_str(), "x");
+}
+
+#[test]
+fn vim_x_and_h_l_move_by_grapheme() {
+    let mut editor = InputEditor::new();
+    editor.load_text(&format!("{FAMILY}z"));
+    editor.set_vim_enabled(true);
+    editor.set_cursor(0);
+    editor.handle_key(press(KeyCode::Esc));
+    type_str(&mut editor, "l");
+    assert_eq!(editor.cursor, FAMILY.len());
+    type_str(&mut editor, "h");
+    assert_eq!(editor.cursor, 0);
+    type_str(&mut editor, "x");
+    assert_eq!(editor.buffer.as_str(), "z");
+}
+
+// --- Ctrl+U / Ctrl+K kill to the line edge (mini-agent-nvnkx.86) ---
+
+#[test]
+fn ctrl_k_and_ctrl_u_kill_only_the_current_line() {
+    let mut editor = InputEditor::new();
+    editor.load_text("a\nbc\nd");
+    editor.set_cursor("a\nb".len());
+    editor.handle_key(ctrl('k'));
+    assert_eq!(editor.buffer.as_str(), "a\nb\nd");
+    editor.handle_key(ctrl('u'));
+    assert_eq!(editor.buffer.as_str(), "a\n\nd");
+    assert_eq!(editor.cursor, 2);
+    editor.handle_key(ctrl('y'));
+    assert_eq!(editor.buffer.as_str(), "a\nb\nd");
+}
+
+#[test]
+fn ctrl_k_and_ctrl_u_at_a_line_edge_join_lines() {
+    let mut editor = InputEditor::new();
+    editor.load_text("one\ntwo");
+    editor.set_cursor(3);
+    editor.handle_key(ctrl('k'));
+    assert_eq!(editor.buffer.as_str(), "onetwo");
+    editor.handle_key(ctrl('a'));
+    editor.handle_key(ctrl('u'));
+    assert_eq!(editor.buffer.as_str(), "onetwo");
+    editor.load_text("x\n\ny");
+    editor.set_cursor(2);
+    editor.handle_key(ctrl('u'));
+    assert_eq!(editor.buffer.as_str(), "x\ny");
+}
+
+// --- tabs stay in the prompt text (mini-agent-nvnkx.87) ---
+
+#[test]
+fn pasted_tabs_reach_the_submitted_text_and_draw_at_four_columns() {
+    let mut editor = InputEditor::new();
+    editor.handle_paste("a:\n\tcmd".to_owned());
+    assert_eq!(editor.buffer.as_str(), "a:\n\tcmd");
+    let submitted = editor.handle_key(press(KeyCode::Enter)).unwrap();
+    assert!(submitted.contains('\t'));
+
+    use crate::ui::input::wrap::{cursor_position, expand_tabs, wrap_rows};
+    let text = "a\tb";
+    let rows = wrap_rows(text, 20);
+    assert_eq!(cursor_position(text, &rows, 2), (0, 5));
+    assert_eq!(expand_tabs("\tx"), "    x");
+    // A tab counts four columns when wrapping.
+    assert_eq!(wrap_rows("\t\tab", 8).len(), 2);
+}
+
+// --- large pastes become chips (mini-agent-nvnkx.88) ---
+
+#[test]
+fn a_large_paste_is_one_chip_expanded_on_submit() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "see ");
+    let log: String = (0..500).map(|i| format!("line {i}\n")).collect();
+    let log = log.trim_end().to_owned();
+    editor.handle_paste(log.clone());
+    assert_eq!(editor.buffer.as_str(), "see [Pasted text #1 +500 lines]");
+    assert_eq!(editor.cursor, editor.buffer.len());
+    type_str(&mut editor, " ok");
+    let submitted = editor.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(submitted.as_str(), format!("see {log} ok"));
+    // History keeps the full text.
+    editor.handle_key(press(KeyCode::Up));
+    assert_eq!(editor.buffer.as_str(), format!("see {log} ok"));
+}
+
+#[test]
+fn a_paste_chip_is_atomic_for_cursor_and_backspace() {
+    let mut editor = InputEditor::new();
+    editor.handle_paste("x\n".repeat(30));
+    let chip = editor.buffer.clone();
+    assert!(chip.starts_with("[Pasted text #1"), "{chip}");
+    editor.handle_key(press(KeyCode::Left));
+    assert_eq!(editor.cursor, 0);
+    editor.handle_key(press(KeyCode::Right));
+    assert_eq!(editor.cursor, chip.len());
+    editor.set_cursor(5);
+    assert_eq!(editor.cursor, 0);
+    editor.handle_key(ctrl('e'));
+    editor.handle_key(press(KeyCode::Backspace));
+    assert!(editor.buffer.is_empty());
+    // A small paste stays text.
+    editor.handle_paste("one\ntwo".to_owned());
+    assert_eq!(editor.buffer.as_str(), "one\ntwo");
+    // A long single line becomes a chip too.
+    editor.clear_buffer();
+    editor.handle_paste("y".repeat(2000));
+    assert_eq!(editor.buffer.as_str(), "[Pasted text #1 2000 chars]");
+}
+
+// --- prompt undo is bound by default (mini-agent-nvnkx.90) ---
+
+#[test]
+fn ctrl_underscore_undoes_a_word_kill_by_default() {
+    for key in [
+        KeyEvent::new(KeyCode::Char('_'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('7'), KeyModifiers::CONTROL),
+        KeyEvent::new(
+            KeyCode::Char('_'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ),
+    ] {
+        let mut editor = InputEditor::new();
+        type_str(&mut editor, "abc def");
+        editor.handle_key(ctrl('w'));
+        assert_eq!(editor.buffer.as_str(), "abc ");
+        editor.handle_key(key);
+        assert_eq!(editor.buffer.as_str(), "abc def", "{key:?}");
+    }
+}
+
+#[test]
+fn typing_coalesces_into_word_sized_undo_steps() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "abc def");
+    let undo = KeyEvent::new(KeyCode::Char('_'), KeyModifiers::CONTROL);
+    editor.handle_key(undo);
+    assert_eq!(editor.buffer.as_str(), "abc ");
+    editor.handle_key(undo);
+    assert_eq!(editor.buffer.as_str(), "abc");
+    editor.handle_key(undo);
+    assert_eq!(editor.buffer.as_str(), "");
 }

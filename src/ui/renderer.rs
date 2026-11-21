@@ -3492,8 +3492,8 @@ impl Renderer {
 
             // A hanging space at a wrap point may overrun by one column;
             // `display_prefix` keeps the row inside the text area.
-            let display =
-                crate::ui::utils::display_prefix(&input_line[row.start..row.end], visible_width);
+            let row_text = crate::ui::input::wrap::expand_tabs(&input_line[row.start..row.end]);
+            let display = crate::ui::utils::display_prefix(&row_text, visible_width);
             write!(stdout, "{}", display)?;
             write!(stdout, "{}", Clear(ClearType::UntilNewLine))?;
             write!(stdout, "{}", ResetColor)?;

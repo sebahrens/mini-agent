@@ -3331,6 +3331,7 @@ dependencies = [
  "tracing-subscriber",
  "unicase",
  "unicode-normalization",
+ "unicode-segmentation",
  "unicode-width",
  "url",
  "uuid",
